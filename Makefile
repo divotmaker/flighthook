@@ -43,7 +43,7 @@ deploy: ui
 	cd app && cargo build --release --target $(WIN_TARGET) $(DEPLOY_CARGO_FLAGS)
 	@echo "==> deploying to $(host):$(dir)"
 	ssh "$(host)" "mkdir $(dir) 2>nul & echo ok"
-	scp app/target/$(WIN_TARGET)/release/flighthook.exe "$(host):$(dir)/"
+	scp target/$(WIN_TARGET)/release/flighthook.exe "$(host):$(dir)/"
 	$(if $(filter true,$(headless)),@echo "==> starting flighthook on $(host)" && ssh -t "$(host)" "cd $(dir) && flighthook.exe --headless $(args)")
 
 # Ensure Rust toolchain, wasm target, and trunk are installed
