@@ -1,6 +1,6 @@
 [package]
 name = "flighthook-app"
-version = "0.0.2"
+version = "0.0.1"
 edition = "2024"
 description = "Golf simulator central event bus - bridges launch monitors and simulation software"
 license = "MIT OR Apache-2.0"

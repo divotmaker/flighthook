@@ -6,7 +6,7 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 
 ## Status
 
-> **Alpha (0.0.x)** — This project is in early development. The API, configuration format, and internal interfaces may change at any time. No semver compatibility guarantees are provided until a stable 1.0 release.
+**Alpha (0.0.x)** — This project is in early development. The API, configuration format, and internal interfaces may change at any time. No semver compatibility guarantees are provided until a stable 1.0 release.
 
 ## Features
 
