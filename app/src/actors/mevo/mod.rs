@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ironsight::{ConnError, Message};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Message labeling (audit log)
