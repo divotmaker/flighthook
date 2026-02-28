@@ -1,0 +1,37 @@
+[package]
+name = "flighthook-ui"
+version = "0.0.1"
+edition = "2024"
+description = "egui dashboard for flighthook (WASM + native)"
+license = "MIT OR Apache-2.0"
+keywords = ["golf", "launch-monitor", "egui", "dashboard"]
+categories = ["gui"]
+repository = "https://github.com/divotmaker/flighthook"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+flighthook = { path = "../lib" }
+egui = "0.33"
+ewebsock = "0.7"
+ehttp = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+egui_commonmark = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+
+# eframe backend is platform-specific: x11+wayland on Linux, Win32 on Windows, web-sys on WASM.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }
+web-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))'.dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }

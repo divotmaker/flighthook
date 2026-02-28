@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>flighthook</title>
+<style>
+html {
+    touch-action: manipulation;
+}
+html, body {
+    overflow: hidden;
+    margin: 0 !important;
+    padding: 0 !important;
+    height: 100%;
+    width: 100%;
+    /* iOS safe area */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left) !important;
+}
+canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    /* Prevent iOS rubber-banding from affecting canvas */
+    touch-action: none;
+}
+</style>
+<link data-trunk rel="rust" data-wasm-opt="2" />
+<script>
+// Handle WebGL context loss (iOS Safari is aggressive about this).
+// preventDefault() tells the browser we want to attempt recovery.
+document.addEventListener('DOMContentLoaded', function() {
+    var canvas = document.getElementById('the_canvas_id');
+    if (canvas) {
+        canvas.addEventListener('webglcontextlost', function(e) {
+            console.warn('WebGL context lost — preventing default, will attempt recovery');
+            e.preventDefault();
+        });
+        canvas.addEventListener('webglcontextrestored', function() {
+            console.info('WebGL context restored — reloading page');
+            window.location.reload();
+        });
+    }
+});
+</script>
+</head>
+<body><canvas id="the_canvas_id"></canvas></body>
+</html>
