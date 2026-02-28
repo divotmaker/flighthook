@@ -1,6 +1,6 @@
 [package]
 name = "flighthook-app"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Golf simulator central event bus - bridges launch monitors and simulation software"
 license = "MIT OR Apache-2.0"
@@ -18,7 +18,7 @@ headless = []
 gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
-ironsight = { version = "0.0.1", features = ["serde"] }
+ironsight = { version = "0.0.2", features = ["serde"] }
 flighthook = { path = "../lib", features = ["clap"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

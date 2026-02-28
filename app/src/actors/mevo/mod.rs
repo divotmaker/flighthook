@@ -227,10 +227,10 @@ fn run(
         ) {
             Ok(()) => break,
             Err(e) => {
-                error!("session error: {e}");
+                warn!("session error: {e}");
                 emit_alert(
                     &sender,
-                    AlertLevel::Error,
+                    AlertLevel::Warn,
                     format!("Device connection error: {e}"),
                 );
                 let backoff_status = if ever_connected {
