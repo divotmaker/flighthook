@@ -18,7 +18,7 @@ headless = []
 gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
-ironsight = { version = "0.0.2", features = ["serde"] }
+ironsight = { version = "0.0.3", features = ["serde"] }
 flighthook = { path = "../lib", features = ["clap"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

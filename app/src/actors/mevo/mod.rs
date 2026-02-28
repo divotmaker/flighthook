@@ -32,6 +32,7 @@ fn msg_label(msg: &Message) -> &'static str {
         Message::DspStatus(_) => "DspStatus(0xAA)",
         Message::PiStatus(_) => "PiStatus(0xAA)",
         Message::ConfigAck(_) => "ConfigAck(0x95)",
+        Message::ConfigNack(_) => "ConfigNack(0x94)",
         Message::ModeAck(_) => "ModeAck(0xB1)",
         Message::Text(_) => "Text(0xE3)",
         Message::ModeSet(_) => "ModeSet(0xA5)",
