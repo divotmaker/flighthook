@@ -320,6 +320,9 @@ Full persisted config (mirrors `config.toml`).
 
 ```json
 {
+  "default_units": "imperial",
+  "chipping_clubs": ["GW", "SW", "LW"],
+  "putting_clubs": ["PT"],
   "webserver": {
     "0": {
       "name": "Web Server",

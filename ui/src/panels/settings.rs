@@ -1,7 +1,7 @@
 use crate::app::FlighthookApp;
 use crate::net;
 use crate::types::{
-    Distance, FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, PartialMode,
+    Club, Distance, FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, PartialMode,
     RandomClubSection, UnitSystem, WebserverSection,
 };
 
@@ -229,6 +229,8 @@ pub(crate) enum SaveTarget {
 #[derive(Clone)]
 pub(crate) struct SettingsForm {
     pub(crate) default_units: UnitSystem,
+    pub(crate) chipping_clubs: Vec<Club>,
+    pub(crate) putting_clubs: Vec<Club>,
     pub(crate) global_dirty: bool,
     pub(crate) actors: Vec<ActorFormEntry>,
     pub(crate) loaded: bool,
@@ -243,6 +245,8 @@ impl Default for SettingsForm {
     fn default() -> Self {
         Self {
             default_units: UnitSystem::default(),
+            chipping_clubs: flighthook::default_chipping_clubs(),
+            putting_clubs: flighthook::default_putting_clubs(),
             global_dirty: false,
             actors: Vec::new(),
             loaded: false,
@@ -258,6 +262,8 @@ impl SettingsForm {
     pub(crate) fn load_from(&mut self, s: &FlighthookConfig) {
         self.original_config = Some(s.clone());
         self.default_units = s.default_units;
+        self.chipping_clubs = s.chipping_clubs.clone();
+        self.putting_clubs = s.putting_clubs.clone();
         self.global_dirty = false;
 
         self.actors.clear();
@@ -445,6 +451,8 @@ impl SettingsForm {
 
         FlighthookConfig {
             default_units: self.default_units,
+            chipping_clubs: self.chipping_clubs.clone(),
+            putting_clubs: self.putting_clubs.clone(),
             webserver,
             mevo,
             mock_monitor,
@@ -461,6 +469,8 @@ impl SettingsForm {
             .clone()
             .unwrap_or_else(|| self.to_request());
         config.default_units = self.default_units;
+        config.chipping_clubs = self.chipping_clubs.clone();
+        config.putting_clubs = self.putting_clubs.clone();
         config
     }
 
@@ -483,6 +493,8 @@ impl SettingsForm {
             SaveTarget::Global => {
                 if let Some(ref mut orig) = self.original_config {
                     orig.default_units = self.default_units;
+                    orig.chipping_clubs = self.chipping_clubs.clone();
+                    orig.putting_clubs = self.putting_clubs.clone();
                 }
             }
             SaveTarget::Actor(idx) => {
@@ -667,6 +679,52 @@ impl FlighthookApp {
                         self.show_api_docs = true;
                     }
                 });
+
+                // --- Club-to-mode mapping ---
+                ui.add_space(6.0);
+                for (label, mode_clubs, other_clubs) in [
+                    ("Chipping Clubs:", "chipping", "putting"),
+                    ("Putting Clubs:", "putting", "chipping"),
+                ] {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(label);
+                        for &club in Club::ALL {
+                            let in_this = match mode_clubs {
+                                "chipping" => self.settings.chipping_clubs.contains(&club),
+                                _ => self.settings.putting_clubs.contains(&club),
+                            };
+                            let btn = egui::Button::new(
+                                egui::RichText::new(format!("{club}")).size(11.0),
+                            );
+                            let btn = if in_this {
+                                btn.fill(egui::Color32::from_rgb(60, 100, 160))
+                            } else {
+                                btn
+                            };
+                            if ui.add(btn).clicked() {
+                                // Toggle: remove if present, add if absent
+                                if in_this {
+                                    match mode_clubs {
+                                        "chipping" => self.settings.chipping_clubs.retain(|c| *c != club),
+                                        _ => self.settings.putting_clubs.retain(|c| *c != club),
+                                    }
+                                } else {
+                                    // Remove from the other list first
+                                    match other_clubs {
+                                        "chipping" => self.settings.chipping_clubs.retain(|c| *c != club),
+                                        _ => self.settings.putting_clubs.retain(|c| *c != club),
+                                    }
+                                    match mode_clubs {
+                                        "chipping" => self.settings.chipping_clubs.push(club),
+                                        _ => self.settings.putting_clubs.push(club),
+                                    }
+                                }
+                                self.settings.global_dirty = true;
+                                self.settings.dirty = true;
+                            }
+                        }
+                    });
+                }
 
                 ui.add_space(8.0);
                 ui.separator();

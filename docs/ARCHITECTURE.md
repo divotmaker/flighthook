@@ -10,6 +10,9 @@ no `type` discriminator field needed. Section keys are integer indices starting
 at `"0"`.
 
 ```toml
+chipping_clubs = ["GW", "SW", "LW"]
+putting_clubs = ["PT"]
+
 [webserver.0]
 name = "Web Server"
 bind = "0.0.0.0:3030"
@@ -49,6 +52,8 @@ address = "127.0.0.1:921"
 
 ```rust
 pub struct FlighthookConfig {
+    pub chipping_clubs: Vec<Club>,
+    pub putting_clubs: Vec<Club>,
     pub webserver: HashMap<String, WebserverSection>,
     pub mevo: HashMap<String, MevoSection>,
     pub mock_monitor: HashMap<String, MockMonitorSection>,
@@ -197,7 +202,8 @@ pub enum GameStateCommandEvent {
 ```
 
 The `SystemActor` auto-derives `SetMode` from `SetClubInfo` (using
-`Club::mode()` to map club to detection mode). Integrations only
+`config.club_mode()` to map club to detection mode via the configurable
+`chipping_clubs`/`putting_clubs` lists). Integrations only
 need to emit `SetClubInfo`; the SystemActor handles mode derivation
 centrally. Launch monitor actors react to `SetMode` to reconfigure the
 device. Mode is global state, not per-device.

@@ -257,7 +257,7 @@ fn run(
                     GameStateCommandEvent::SetClubInfo { club_info } => {
                         writer.set_club_info(club_info.clone());
                         // Auto-derive detection mode from club selection
-                        let mode = club_info.club.mode();
+                        let mode = state.system.snapshot().club_mode(club_info.club);
                         writer.set_mode(mode);
                         sender.send(FlighthookMessage::new(GameStateCommandEvent::SetMode {
                             mode,

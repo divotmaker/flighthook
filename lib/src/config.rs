@@ -4,6 +4,8 @@ use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
+use crate::game_state::Club;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
@@ -357,6 +359,18 @@ impl fmt::Display for UnitSystem {
 }
 
 // ---------------------------------------------------------------------------
+// Club-to-mode mapping defaults
+// ---------------------------------------------------------------------------
+
+pub fn default_chipping_clubs() -> Vec<Club> {
+    vec![Club::GapWedge, Club::SandWedge, Club::LobWedge]
+}
+
+pub fn default_putting_clubs() -> Vec<Club> {
+    vec![Club::Putter]
+}
+
+// ---------------------------------------------------------------------------
 // Persisted config types (shared between app and UI)
 // ---------------------------------------------------------------------------
 
@@ -367,6 +381,12 @@ pub struct FlighthookConfig {
     /// Default unit system for shot display (freedom units by default)
     #[serde(default)]
     pub default_units: UnitSystem,
+    /// Clubs that trigger Chipping mode on selection.
+    #[serde(default = "default_chipping_clubs")]
+    pub chipping_clubs: Vec<Club>,
+    /// Clubs that trigger Putting mode on selection.
+    #[serde(default = "default_putting_clubs")]
+    pub putting_clubs: Vec<Club>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub webserver: std::collections::HashMap<String, WebserverSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -431,6 +451,22 @@ pub struct RandomClubSection {
     pub name: String,
 }
 
+impl FlighthookConfig {
+    /// Look up the detection mode for a club based on the configured mapping.
+    ///
+    /// Clubs in `putting_clubs` → Putting, in `chipping_clubs` → Chipping,
+    /// everything else → Full.
+    pub fn club_mode(&self, club: Club) -> ShotDetectionMode {
+        if self.putting_clubs.contains(&club) {
+            ShotDetectionMode::Putting
+        } else if self.chipping_clubs.contains(&club) {
+            ShotDetectionMode::Chipping
+        } else {
+            ShotDetectionMode::Full
+        }
+    }
+}
+
 impl Default for FlighthookConfig {
     /// Known good defaults: a single Mevo device and a GSPro target.
     fn default() -> Self {
@@ -469,6 +505,8 @@ impl Default for FlighthookConfig {
         );
         Self {
             default_units: UnitSystem::default(),
+            chipping_clubs: default_chipping_clubs(),
+            putting_clubs: default_putting_clubs(),
             webserver,
             mevo,
             mock_monitor: std::collections::HashMap::new(),

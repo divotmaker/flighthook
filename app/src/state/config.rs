@@ -49,6 +49,10 @@ pub fn default_config_path() -> PathBuf {
 struct LegacyFlighthookConfig {
     #[serde(default)]
     default_units: flighthook::UnitSystem,
+    #[serde(default = "flighthook::default_chipping_clubs")]
+    chipping_clubs: Vec<flighthook::Club>,
+    #[serde(default = "flighthook::default_putting_clubs")]
+    putting_clubs: Vec<flighthook::Club>,
     webserver: Option<flighthook::WebserverSection>,
     #[serde(default)]
     mevo: HashMap<String, flighthook::MevoSection>,
@@ -71,6 +75,8 @@ impl LegacyFlighthookConfig {
         }
         FlighthookConfig {
             default_units: self.default_units,
+            chipping_clubs: self.chipping_clubs,
+            putting_clubs: self.putting_clubs,
             webserver,
             mevo: self.mevo,
             mock_monitor: self.mock_monitor,

@@ -18,6 +18,7 @@ pub use flighthook::{
     BallFlight,
     ClubData,
     // Global state types
+    Club,
     ClubInfo,
     // Config types
     Distance,
