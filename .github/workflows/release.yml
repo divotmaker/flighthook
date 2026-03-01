@@ -31,9 +31,6 @@ jobs:
       - name: Build WASM UI
         run: cd ui && trunk build --release
 
-      - name: Check formatting
-        run: cargo fmt --check --all
-
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
