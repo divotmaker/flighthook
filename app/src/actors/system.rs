@@ -46,7 +46,8 @@ pub(crate) fn apply_config_reload(
     scope: Option<&str>,
 ) -> ConfigReloadOutcome {
     let snap = state.system.snapshot();
-    let resolved = resolve_actors(&snap);
+    let current_mode = state.game.snapshot().mode;
+    let resolved = resolve_actors(&snap, current_mode);
 
     // Pre-build into a map so we can pull actors out for restart/new cases
     let mut resolved_map: HashMap<String, ResolvedActor> =

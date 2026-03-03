@@ -1,17 +1,27 @@
 pub(crate) mod accumulator;
-mod client;
 pub mod settings;
 
-pub use client::MevoClient;
 pub use settings::SessionConfig;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use ironsight::{ConnError, Message};
+use ironsight::protocol::shot::FlightResultV1;
+use ironsight::{BinaryClient, BinaryConnection, BinaryEvent, ConnError, Message};
 use tracing::{debug, info, warn};
+
+use super::{Actor, ReconfigureOutcome};
+use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::state::SystemState;
+use accumulator::convert_shot;
+use settings::cam_config;
+
+use flighthook::{
+    ActorState, ActorStatus, AlertLevel, AlertMessage, ConfigChanged, FlighthookEvent,
+    FlighthookMessage, GameStateCommandEvent, LaunchMonitorEvent, ShotDetectionMode,
+};
 
 // ---------------------------------------------------------------------------
 // Message labeling (audit log)
@@ -60,18 +70,18 @@ fn msg_label(msg: &Message) -> &'static str {
     }
 }
 
-use super::{Actor, ReconfigureOutcome};
-use crate::bus::{BusReceiver, BusSender, PollError};
-use crate::state::SystemState;
-use accumulator::ShotAccumulator;
-use flighthook::{
-    ActorState, ActorStatus, AlertLevel, AlertMessage, ConfigChanged, FlighthookEvent,
-    FlighthookMessage, GameStateCommandEvent, LaunchMonitorEvent, ShotDetectionMode,
-};
+/// No events for this long → treat as disconnected.
+const STALE_TIMEOUT: Duration = Duration::from_secs(10);
 
-const RECV_TIMEOUT: Duration = Duration::from_millis(900);
+/// Keepalive cadence for BinaryClient.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Reconnect backoff bounds.
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// TCP connect timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Mevo session actor. Connects to a Mevo/Mevo+ device, runs the handshake,
 /// arms, and processes shots in a reconnecting event loop.
@@ -137,40 +147,8 @@ impl Actor for MevoActor {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn is_transient(e: &ConnError) -> bool {
-    matches!(e, ConnError::Timeout { .. } | ConnError::Protocol(_))
-}
-
 fn same_mode(a: ShotDetectionMode, b: ShotDetectionMode) -> bool {
     std::mem::discriminant(&a) == std::mem::discriminant(&b)
-}
-
-fn change_mode(
-    client: &mut MevoClient,
-    mode: ShotDetectionMode,
-    session_config: &SessionConfig,
-) -> Result<(), ConnError> {
-    client.configure(session_config, &mode)?;
-    client.arm()
-}
-
-/// Build a telemetry state map for status emission.
-fn telemetry_state(
-    battery_pct: u8,
-    tilt: f64,
-    roll: f64,
-    temp_c: f64,
-    external_power: bool,
-    armed: bool,
-) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("battery_pct".into(), battery_pct.to_string());
-    m.insert("tilt".into(), format!("{tilt:.1}"));
-    m.insert("roll".into(), format!("{roll:.1}"));
-    m.insert("temp_c".into(), format!("{temp_c:.1}"));
-    m.insert("external_power".into(), external_power.to_string());
-    m.insert("armed".into(), armed.to_string());
-    m
 }
 
 fn emit_device_status(sender: &BusSender, status: ActorStatus, state: HashMap<String, String>) {
@@ -249,8 +227,8 @@ fn run(
                 };
                 info!("{} in {}s", verb.to_lowercase(), backoff.as_secs());
 
-                let deadline = std::time::Instant::now() + backoff;
-                while std::time::Instant::now() < deadline {
+                let deadline = Instant::now() + backoff;
+                while Instant::now() < deadline {
                     if receiver.poll().is_err() {
                         emit_device_status(&sender, ActorStatus::Disconnected, HashMap::new());
                         return;
@@ -280,72 +258,65 @@ fn connect_and_run(
     let device_id = sender.actor_id();
 
     // 1. Connect
-    info!("connecting...");
-    let mut client = MevoClient::connect(addr)?;
+    info!("connecting to {addr}...");
+    let mut conn = BinaryConnection::connect_timeout(addr, CONNECT_TIMEOUT)?;
     *ever_connected = true;
 
-    // 2. Handshake
-    info!("handshaking...");
-    let handshake_info = client.handshake()?;
+    // Set up send/recv audit logging callbacks
+    let send_id = device_id.to_string();
+    conn.set_on_send(move |cmd, dest| {
+        tracing::debug!("{send_id} send >> {dest:?} {:?} [{}]", cmd, cmd.debug_hex(dest));
+    });
+    let audit_id = device_id.to_string();
+    conn.set_on_recv(move |env| {
+        let hex: String =
+            env.raw
+                .iter()
+                .fold(String::with_capacity(env.raw.len() * 2), |mut s, b| {
+                    use std::fmt::Write;
+                    let _ = write!(s, "{b:02X}");
+                    s
+                });
+        tracing::debug!(
+            "{audit_id} recv << 0x{:02X} {hex} | {:?}",
+            env.type_id,
+            env.message,
+        );
+    });
 
-    info!(
-        "handshake complete: {} | battery {}%{} | tilt {:.1} roll {:.1}",
-        handshake_info.device_info,
-        handshake_info.battery_pct,
-        if handshake_info.external_power {
-            " (charging)"
-        } else {
-            ""
-        },
-        handshake_info.tilt,
-        handshake_info.roll,
-    );
+    // 2. Create non-blocking client
+    let mut client = BinaryClient::from_tcp(conn)?;
+    client.set_keepalive_interval(KEEPALIVE_INTERVAL);
 
-    // Emit connected status with device info and initial telemetry
-    let mut init_state = telemetry_state(
-        handshake_info.battery_pct,
-        handshake_info.tilt,
-        handshake_info.roll,
-        0.0,
-        handshake_info.external_power,
-        false,
-    );
-    init_state.insert("device_info".into(), handshake_info.device_info);
-    emit_device_status(sender, ActorStatus::Connected, init_state);
-    emit_ready_state(sender, false);
+    // 3. Enqueue startup operations
+    let avr = session_config.to_avr_settings(&initial_mode);
+    let cam = cam_config();
+    client.handshake();
+    client.configure_avr(avr);
+    client.configure_cam(cam);
+    client.arm();
 
-    // 3. Configure
-    let mode_wire = SessionConfig::mode_label(&initial_mode);
-    info!("configuring: mode={:?} wire={mode_wire}", initial_mode);
-    client.configure(session_config, &initial_mode)?;
-
-    // 4. Arm
-    client.arm()?;
-    let mut armed_state = telemetry_state(
-        handshake_info.battery_pct,
-        handshake_info.tilt,
-        handshake_info.roll,
-        0.0,
-        handshake_info.external_power,
-        true,
-    );
-    armed_state.insert("mode".into(), mode_wire.into());
-    emit_device_status(&sender, ActorStatus::Connected, armed_state);
-    emit_ready_state(sender, true);
-    info!("armed -- mode={mode_wire} -- waiting for shots");
-
-    // 5. Event loop
-    let mut accumulator = ShotAccumulator::new();
+    // 4. Event loop state
     let mut current_mode = initial_mode;
-    let mut consecutive_keepalive_failures: u32 = 0;
-    const MAX_KEEPALIVE_FAILURES: u32 = 6; // ~10s at 900ms recv + 900ms keepalive per cycle
+    let mut pending_reconfig: Option<ShotDetectionMode> = None;
+    let mut stashed_e8: Option<FlightResultV1> = None;
+
+    // Staleness + poll backoff
+    let mut last_event_time = Instant::now();
+    let mut idle_count: u32 = 0;
+
+    // Persistent telemetry cache. Updated incrementally, always emitted
+    // in full so downstream consumers never lose fields.
+    let mut telemetry: HashMap<String, String> = HashMap::new();
 
     loop {
-        // Drain bus commands
+        // ==============================================================
+        // Phase 1: Drain bus commands
+        // ==============================================================
         loop {
             match receiver.poll() {
                 Err(PollError::Shutdown) => {
-                    client.shutdown();
+                    drop(client); // close TCP connection
                     return Ok(());
                 }
                 Ok(None) => break,
@@ -354,79 +325,46 @@ fn connect_and_run(
                         session_config.apply_config_event(&changed.config);
                         info!("config updated: {:?}", changed.config);
 
-                        emit_device_status(sender, ActorStatus::Starting, HashMap::new());
-                        emit_ready_state(sender, false);
-                        let mode_wire = SessionConfig::mode_label(&current_mode);
-                        match client
-                            .configure(session_config, &current_mode)
-                            .and_then(|()| client.arm())
-                        {
-                            Ok(()) => {
-                                emit_device_status(sender, ActorStatus::Connected, {
-                                    let mut m = HashMap::new();
-                                    m.insert("armed".into(), "true".into());
-                                    m.insert("mode".into(), mode_wire.into());
-                                    m
-                                });
-                                emit_ready_state(sender, true);
-                            }
-                            Err(ref e) if is_transient(e) => {
-                                warn!("reconfigure failed (transient): {e}");
-                                emit_alert(
-                                    sender,
-                                    AlertLevel::Warn,
-                                    format!("Settings update failed: {e}"),
-                                );
-                                emit_device_status(sender, ActorStatus::Connected, {
-                                    let mut m = HashMap::new();
-                                    m.insert("armed".into(), "true".into());
-                                    m.insert("mode".into(), mode_wire.into());
-                                    m
-                                });
-                                emit_ready_state(sender, true);
-                            }
-                            Err(e) => return Err(e),
+                        if client.is_armed() {
+                            let wire = SessionConfig::mode_label(&current_mode);
+                            info!("reconfiguring device with updated settings (mode={wire})");
+                            client.configure_avr(
+                                session_config.to_avr_settings(&current_mode),
+                            );
+                            client.arm();
+                            telemetry.insert("armed".into(), "false".into());
+                            telemetry.insert("mode".into(), wire.into());
+                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                            emit_ready_state(sender, false);
+                        } else {
+                            pending_reconfig = Some(current_mode);
+                            info!("deferred settings reconfig (operation in progress)");
                         }
                     }
                     FlighthookEvent::GameStateCommand(cmd) => match cmd.event {
                         GameStateCommandEvent::SetMode { mode: new_mode } => {
                             if !same_mode(current_mode, new_mode) {
-                                let old = current_mode;
-                                let new_wire = SessionConfig::mode_label(&new_mode);
-                                info!("mode change: {old:?} -> {new_mode:?} wire={new_wire}");
-                                emit_device_status(sender, ActorStatus::Starting, HashMap::new());
-                                emit_ready_state(sender, false);
-                                match change_mode(&mut client, new_mode, session_config) {
-                                    Ok(()) => {
-                                        current_mode = new_mode;
-                                        info!("mode changed to {new_mode:?} wire={new_wire}");
-                                        emit_device_status(sender, ActorStatus::Connected, {
-                                            let mut m = HashMap::new();
-                                            m.insert("armed".into(), "true".into());
-                                            m.insert("mode".into(), new_wire.into());
-                                            m
-                                        });
-                                        emit_ready_state(sender, true);
-                                    }
-                                    Err(ref e) if is_transient(e) => {
-                                        warn!("mode change failed (transient): {e}");
-                                        emit_alert(
-                                            sender,
-                                            AlertLevel::Warn,
-                                            format!("Mode change failed: {e}"),
-                                        );
-                                        emit_device_status(sender, ActorStatus::Connected, {
-                                            let mut m = HashMap::new();
-                                            m.insert("armed".into(), "true".into());
-                                            m.insert(
-                                                "mode".into(),
-                                                SessionConfig::mode_label(&current_mode).into(),
-                                            );
-                                            m
-                                        });
-                                        emit_ready_state(sender, true);
-                                    }
-                                    Err(e) => return Err(e),
+                                if client.is_armed() {
+                                    let new_wire = SessionConfig::mode_label(&new_mode);
+                                    info!(
+                                        "mode change: {:?} -> {:?} wire={new_wire}",
+                                        current_mode, new_mode
+                                    );
+                                    client.configure_avr(
+                                        SessionConfig::to_avr_settings_mode_only(&new_mode),
+                                    );
+                                    client.arm();
+                                    current_mode = new_mode;
+                                    telemetry.insert("armed".into(), "false".into());
+                                    telemetry.insert("mode".into(), new_wire.into());
+                                    emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                                    emit_ready_state(sender, false);
+                                } else {
+                                    pending_reconfig = Some(new_mode);
+                                    info!(
+                                        "deferred mode change to {:?} (operation in progress)",
+                                        new_mode
+                                    );
                                 }
                             }
                         }
@@ -440,63 +378,100 @@ fn connect_and_run(
             }
         }
 
-        match client.recv_timeout(RECV_TIMEOUT) {
-            Ok(env) => {
-                consecutive_keepalive_failures = 0;
-                let msg = &env.message;
-                let label = msg_label(msg);
+        // ==============================================================
+        // Phase 2: Drive BinaryClient
+        // ==============================================================
+        match client.poll() {
+            Ok(Some(event)) => {
+                last_event_time = Instant::now();
+                idle_count = 0;
+                debug!("poll -> {event:?}");
 
-                // Build raw hex for bus payload (hex-first policy — always populate)
-                let raw_hex = env.raw.clone();
-                let debug_str = format!("{:?}", env.message);
+                match event {
+                    BinaryEvent::Handshake(h) => {
+                        let gen_label = h.dsp.hw_info.device_gen().label();
+                        let device_info = format!("{} ({})", h.avr.dev_info.text, gen_label);
+                        let battery_pct = h.dsp.status.battery_percent();
+                        let external_power = h.dsp.status.external_power();
+                        let tilt = h.avr.status.tilt;
+                        let roll = -h.avr.status.roll;
 
-                // Log raw payload to audit tracing target (filtered by RUST_LOG)
-                {
-                    let hex: String = raw_hex.iter().fold(
-                        String::with_capacity(raw_hex.len() * 2),
-                        |mut s, b| {
-                            use std::fmt::Write;
-                            let _ = write!(s, "{b:02X}");
-                            s
-                        },
-                    );
-                    info!(
-                        target: "audit",
-                        "{device_id} recv 0x{:02X} {hex} | {debug_str}",
-                        env.type_id,
-                    );
-                }
+                        info!(
+                            "handshake complete: {device_info} | battery {battery_pct}%{} | tilt {tilt:.1} roll {roll:.1}",
+                            if external_power { " (charging)" } else { "" },
+                        );
 
-                let was_active = accumulator.active;
-                let auto_activated = accumulator.handle(msg);
-
-                if was_active || accumulator.active {
-                    if let Message::ShotText(st) = msg {
-                        debug!("shot-cycle msg: ShotText(0xE5) \"{}\"", st.text);
-                    } else {
-                        debug!("shot-cycle msg: {label}");
-                    }
-                }
-
-                if auto_activated {
-                    info!("shot data before trigger text -- auto-started accumulator on {label}");
-                }
-
-                match msg {
-                    Message::ShotText(st) if st.is_trigger() => {
-                        emit_device_status(sender, ActorStatus::Connected, {
-                            let mut m = HashMap::new();
-                            m.insert("shooting".into(), "true".into());
-                            m
-                        });
+                        telemetry.insert("device_info".into(), device_info);
+                        telemetry.insert("battery_pct".into(), battery_pct.to_string());
+                        telemetry.insert("tilt".into(), format!("{tilt:.1}"));
+                        telemetry.insert("roll".into(), format!("{roll:.1}"));
+                        telemetry.insert("temp_c".into(), "0.0".into());
+                        telemetry.insert("external_power".into(), external_power.to_string());
+                        telemetry.insert("armed".into(), "false".into());
+                        telemetry.insert("shooting".into(), "false".into());
+                        emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
                         emit_ready_state(sender, false);
                     }
-                    Message::ShotText(st) if st.is_processed() => {
-                        let had_flight = accumulator.has_flight();
-                        let had_flight_v1 = accumulator.has_flight_v1();
-                        let had_club = accumulator.has_club();
-                        let had_spin = accumulator.has_spin();
-                        match accumulator.finalize(device_id) {
+
+                    BinaryEvent::Disarmed => {
+                        info!("device disarmed (preparing for reconfigure)");
+                    }
+
+                    BinaryEvent::Configured => {
+                        let wire = SessionConfig::mode_label(&current_mode);
+                        info!("device configured (mode={wire})");
+                    }
+
+                    BinaryEvent::Armed => {
+                        let wire = SessionConfig::mode_label(&current_mode);
+                        info!("armed -- mode={wire} -- waiting for shots");
+
+                        telemetry.insert("armed".into(), "true".into());
+                        telemetry.insert("shooting".into(), "false".into());
+                        telemetry.insert("mode".into(), wire.into());
+                        emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                        emit_ready_state(sender, true);
+
+                        // Apply pending reconfig now that we're idle
+                        if let Some(target) = pending_reconfig.take() {
+                            let target_wire = SessionConfig::mode_label(&target);
+                            let is_mode_change = !same_mode(current_mode, target);
+                            if is_mode_change {
+                                info!(
+                                    "applying deferred mode change to {target:?} wire={target_wire}"
+                                );
+                            } else {
+                                info!("applying deferred settings reconfig");
+                            }
+                            current_mode = target;
+                            let avr = if is_mode_change {
+                                SessionConfig::to_avr_settings_mode_only(&target)
+                            } else {
+                                session_config.to_avr_settings(&target)
+                            };
+                            client.configure_avr(avr);
+                            client.arm();
+                            telemetry.insert("armed".into(), "false".into());
+                            telemetry.insert("mode".into(), target_wire.into());
+                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                            emit_ready_state(sender, false);
+                        }
+                    }
+
+                    BinaryEvent::Trigger => {
+                        debug!("ball trigger detected");
+                        telemetry.insert("shooting".into(), "true".into());
+                        emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                        emit_ready_state(sender, false);
+                    }
+
+                    BinaryEvent::Shot(shot_data) => {
+                        let had_d4 = shot_data.flight.is_some();
+                        let had_e8 = stashed_e8.is_some();
+                        let had_club = shot_data.club.is_some();
+                        let had_spin = shot_data.spin.is_some();
+
+                        match convert_shot(&shot_data, stashed_e8.as_ref(), device_id) {
                             Some(shot) => {
                                 let ball_mph = shot.ball.launch_speed.as_mph();
                                 let carry_yd = shot
@@ -504,7 +479,7 @@ fn connect_and_run(
                                     .carry_distance
                                     .map(|d| d.as_yards())
                                     .unwrap_or(0.0);
-                                let source = if had_flight { "D4" } else { "E8" };
+                                let source = if had_d4 { "D4" } else { "E8" };
                                 info!(
                                     "shot #{} ({}): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm",
                                     shot.shot_number,
@@ -519,83 +494,114 @@ fn connect_and_run(
                                 sender.send(
                                     FlighthookMessage::new(LaunchMonitorEvent::ShotResult {
                                         shot: Box::new(shot),
-                                    })
-                                    .raw_binary(raw_hex.clone()),
+                                    }),
                                 );
                             }
                             None => {
                                 warn!(
-                                    "trigger processed but no shot produced \
-                                     (D4={had_flight}, E8={had_flight_v1}, club={had_club}, spin={had_spin})"
+                                    "shot processed but no result produced \
+                                     (D4={had_d4}, E8={had_e8}, club={had_club}, spin={had_spin})"
                                 );
                                 emit_alert(
                                     sender,
                                     AlertLevel::Warn,
                                     format!(
-                                        "Shot triggered but no result produced (D4={had_flight}, E8={had_flight_v1}, club={had_club}, spin={had_spin})"
+                                        "Shot triggered but no result produced (D4={had_d4}, E8={had_e8}, club={had_club}, spin={had_spin})"
                                     ),
                                 );
                             }
                         }
 
-                        emit_device_status(sender, ActorStatus::Starting, HashMap::new());
-                        loop {
-                            match client.complete_shot() {
-                                Ok(()) => break,
-                                Err(ref e) if is_transient(e) => {
-                                    info!("post-shot retry: {e}");
-                                    continue;
-                                }
-                                Err(e) => return Err(e),
+                        stashed_e8 = None;
+
+                        // Device is auto-re-armed by BinaryClient's ShotSequencer.
+                        // Apply pending reconfig if any.
+                        if let Some(target) = pending_reconfig.take() {
+                            let target_wire = SessionConfig::mode_label(&target);
+                            let is_mode_change = !same_mode(current_mode, target);
+                            if is_mode_change {
+                                info!(
+                                    "applying deferred mode change to {target:?} wire={target_wire}"
+                                );
+                            } else {
+                                info!("applying deferred settings reconfig");
                             }
+                            current_mode = target;
+                            let avr = if is_mode_change {
+                                SessionConfig::to_avr_settings_mode_only(&target)
+                            } else {
+                                session_config.to_avr_settings(&target)
+                            };
+                            client.configure_avr(avr);
+                            client.arm();
+                            telemetry.insert("armed".into(), "false".into());
+                            telemetry.insert("mode".into(), target_wire.into());
+                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                            emit_ready_state(sender, false);
                         }
-                        emit_device_status(sender, ActorStatus::Connected, {
-                            let mut m = HashMap::new();
-                            m.insert("armed".into(), "true".into());
-                            m.insert(
-                                "mode".into(),
-                                SessionConfig::mode_label(&current_mode).into(),
-                            );
-                            m
-                        });
-                        emit_ready_state(sender, true);
                     }
-                    _ => {}
+
+                    BinaryEvent::Keepalive(status) => {
+                        // Update avr fields first so emission has fresh tilt/roll
+                        if let Some(avr) = &status.avr {
+                            telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
+                            telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
+                        }
+                        if let Some(dsp) = &status.dsp {
+                            telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
+                            telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
+                            telemetry.insert("external_power".into(), dsp.external_power().to_string());
+                            telemetry.insert("armed".into(), client.is_armed().to_string());
+                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                        }
+                    }
+
+                    BinaryEvent::Message(env) => {
+                        let label = msg_label(&env.message);
+
+                        // Stash E8 for fallback when D4 is absent
+                        if let Message::FlightResultV1(ref e8) = env.message {
+                            stashed_e8 = Some(e8.clone());
+                            debug!("stashed {label} for E8 fallback");
+                        }
+
+                        // Update telemetry cache from status messages
+                        match &env.message {
+                            Message::DspStatus(dsp) => {
+                                telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
+                                telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
+                                telemetry.insert("external_power".into(), dsp.external_power().to_string());
+                                telemetry.insert("armed".into(), client.is_armed().to_string());
+                                emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                            }
+                            Message::AvrStatus(avr) => {
+                                telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
+                                telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
 
-            Err(ConnError::Timeout { .. }) => match client.keepalive() {
-                Ok(status) => {
-                    consecutive_keepalive_failures = 0;
-                    let mut ts = telemetry_state(
-                        status.battery_pct,
-                        status.tilt,
-                        status.roll,
-                        status.temp_c,
-                        status.external_power,
-                        true,
-                    );
-                    ts.insert(
-                        "mode".into(),
-                        SessionConfig::mode_label(&current_mode).into(),
-                    );
-                    emit_device_status(sender, ActorStatus::Connected, ts);
+            Ok(None) => {
+                idle_count += 1;
+                if idle_count >= 3 {
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(ref e) if is_transient(e) => {
-                    consecutive_keepalive_failures += 1;
-                    if consecutive_keepalive_failures >= MAX_KEEPALIVE_FAILURES {
-                        warn!(
-                            "keepalive failed {consecutive_keepalive_failures} times, assuming disconnected"
-                        );
-                        return Err(ConnError::Disconnected);
-                    }
-                    info!(
-                        "keepalive: {e} ({consecutive_keepalive_failures}/{MAX_KEEPALIVE_FAILURES})"
+                if idle_count == 1 || idle_count % 200 == 0 {
+                    debug!(
+                        "poll -> None (idle={idle_count}, stale_in={:.1}s, armed={})",
+                        STALE_TIMEOUT.saturating_sub(last_event_time.elapsed()).as_secs_f64(),
+                        client.is_armed(),
                     );
                 }
-                Err(e) => return Err(e),
-            },
+            }
 
+            Err(ref e @ ConnError::Timeout) => {
+                warn!("operation timeout: {e}");
+                return Err(ConnError::Timeout);
+            }
             Err(ConnError::Disconnected) => {
                 info!("device disconnected");
                 return Err(ConnError::Disconnected);
@@ -608,6 +614,17 @@ fn connect_and_run(
                 }));
             }
             Err(e) => return Err(e),
+        }
+
+        // ==============================================================
+        // Staleness check
+        // ==============================================================
+        if last_event_time.elapsed() >= STALE_TIMEOUT {
+            warn!(
+                "no events for {}s, assuming disconnected",
+                STALE_TIMEOUT.as_secs()
+            );
+            return Err(ConnError::Disconnected);
         }
     }
 }

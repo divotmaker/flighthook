@@ -1,3 +1,4 @@
+use ironsight::protocol::camera::CamConfig;
 use ironsight::protocol::config::{
     MODE_CHIPPING, MODE_OUTDOOR, MODE_PUTTING, ParamData, ParamValue, RadarCal,
 };
@@ -66,12 +67,9 @@ impl SessionConfig {
         }
     }
 
+    /// Full AVR settings for initial configuration: params + RadarCal.
     pub(crate) fn to_avr_settings(&self, mode: &ShotDetectionMode) -> AvrSettings {
-        let comms_index = match mode {
-            ShotDetectionMode::Full => MODE_OUTDOOR,
-            ShotDetectionMode::Putting => MODE_PUTTING,
-            ShotDetectionMode::Chipping => MODE_CHIPPING,
-        };
+        let comms_index = Self::comms_index(mode);
 
         AvrSettings {
             mode: comms_index,
@@ -89,10 +87,29 @@ impl SessionConfig {
                     value: ParamData::Float40(self.tee_height.as_meters()),
                 },
             ],
-            radar_cal: RadarCal {
+            radar_cal: Some(RadarCal {
                 range_mm: self.range.as_mm(),
                 height_mm: (self.surface_height.as_inches() * 25.4).floor() as u8,
-            },
+            }),
+        }
+    }
+
+    /// Minimal AVR settings for mode changes: ModeSet only, no params or
+    /// RadarCal. Full params trigger ~29s of ConfigNack retries on ARM;
+    /// mode-only significantly reduces (but does not eliminate) retries.
+    pub(crate) fn to_avr_settings_mode_only(mode: &ShotDetectionMode) -> AvrSettings {
+        AvrSettings {
+            mode: Self::comms_index(mode),
+            params: vec![],
+            radar_cal: None,
+        }
+    }
+
+    fn comms_index(mode: &ShotDetectionMode) -> u8 {
+        match mode {
+            ShotDetectionMode::Full => MODE_OUTDOOR,
+            ShotDetectionMode::Putting => MODE_PUTTING,
+            ShotDetectionMode::Chipping => MODE_CHIPPING,
         }
     }
 
@@ -105,5 +122,43 @@ impl SessionConfig {
             track_pct: self.track_pct,
             use_partial: self.use_partial,
         }
+    }
+}
+
+/// Default camera configuration for Mevo+ sessions.
+///
+/// Uses standard resolution (1024×768) with conservative buffer settings.
+/// The `standard_preset()` values from ironsight use -1 sentinel values
+/// for unused raw-camera fields, which is correct for the wire protocol.
+/// We keep our own explicit config to control ringbuffer timing and
+/// sub-sampling independently.
+pub(crate) fn cam_config() -> CamConfig {
+    CamConfig {
+        dynamic_config: true,
+        resolution_width: 1024,
+        resolution_height: 768,
+        rotation: 0,
+        ev: 0,
+        quality: 80,
+        framerate: 20,
+        streaming_framerate: 1,
+        ringbuffer_pretime_ms: 1000,
+        ringbuffer_posttime_ms: 4000,
+        raw_camera_mode: 0,
+        fusion_camera_mode: false,
+        raw_shutter_speed_max: 0.0,
+        raw_ev_roi_x: 0,
+        raw_ev_roi_y: 0,
+        raw_ev_roi_width: 0,
+        raw_ev_roi_height: 0,
+        raw_x_offset: 0,
+        raw_bin44: false,
+        raw_live_preview_write_interval_ms: 0,
+        raw_y_offset: 0,
+        buffer_sub_sampling_pre_trigger_div: 1,
+        buffer_sub_sampling_post_trigger_div: 1,
+        buffer_sub_sampling_switch_time_offset: 0.0,
+        buffer_sub_sampling_total_buffer_size: 0,
+        buffer_sub_sampling_pre_trigger_buffer_size: 0,
     }
 }

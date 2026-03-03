@@ -65,10 +65,16 @@ pub struct ResolvedActor {
 /// Iterates all config sections (mevo, mock_monitor, gspro, random_club,
 /// webserver) and constructs the appropriate concrete actor for each.
 /// Invalid addresses are logged and skipped.
-pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor> {
+///
+/// `current_mode` is the active detection mode from game state. Falls back
+/// to `Full` when no mode has been set yet (e.g. first startup).
+pub fn resolve_actors(
+    config: &FlighthookConfig,
+    current_mode: Option<flighthook::ShotDetectionMode>,
+) -> Vec<ResolvedActor> {
     use flighthook::ShotDetectionMode;
 
-    let mode = ShotDetectionMode::Full;
+    let mode = current_mode.unwrap_or(ShotDetectionMode::Full);
     let mut actors = Vec::new();
 
     // Mevo devices
