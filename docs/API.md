@@ -3,31 +3,42 @@
 ## Quick-Start: Real-Time Shot Stream
 
 The fastest way to get shot data is the WebSocket at `/api/ws`. After a brief
-init handshake, you'll receive a JSON message for every shot as it happens -- no
-polling needed. This is ideal for video timestamp tagging, overlay triggers, stat
-trackers, or any integration that needs to react to shots in real time.
+init handshake, you'll receive JSON messages for every shot lifecycle event as
+it happens -- no polling needed. This is ideal for video timestamp tagging,
+overlay triggers, stat trackers, or any integration that needs to react to
+shots in real time.
 
-Every `shot_result` event contains the full `ShotData` object (ball flight, club
-data if available, spin data if available). Velocities and distances are
-unit-tagged strings (e.g. `"67.2mps"`, `"180.5m"`). To convert to a standard
-unit system without parsing suffixes yourself, POST the `ShotData` to
-`/api/shots/convert?units=imperial` (or `metric`). You can also use `?units=` on
-`GET /api/shots` for historical data. Angles are degrees, spin is RPM. The
-`estimated` flag is `true` when the shot was synthesized from partial radar data.
+Shot data arrives as a sequence of correlated events sharing a `ShotKey`:
+
+1. `shot_trigger` -- ball strike detected (no data yet)
+2. `ball_flight` -- ball flight data (speed, angles, distances, spin)
+3. `club_path` -- club data (speed, path, attack angle, face angle, loft)
+4. `shot_finished` -- shot complete, accumulators should finalize
+
+Use the `ShotAccumulator` pattern (or wait for `shot_finished`) to collect the
+full shot. The `estimated` flag on `ball_flight` is `true` when the shot was
+synthesized from partial radar data.
+
+Velocities and distances are unit-tagged strings (e.g. `"67.2mps"`,
+`"180.5m"`). To convert to a standard unit system without parsing suffixes
+yourself, POST the `ShotData` to `/api/shots/convert?units=imperial` (or
+`metric`). You can also use `?units=` on `GET /api/shots` for historical data.
+Angles are degrees, spin is RPM.
 
 Other useful events on the same connection:
 
 - `actor_status` -- device/integration lifecycle + state (battery, tilt, club, etc.)
-- `game_state_command` / `set_mode` -- global detection mode changed (full/chipping/putting)
+- `shot_detection_mode` -- global detection mode changed (full/chipping/putting)
+- `launch_monitor_state` -- device armed/ball-detected state changes
 
 ### Terminal
 
 ```bash
 # Stream shots with websocat + jq (install: cargo install websocat)
-# Send the init handshake, keep stdin open to hold the connection, filter for shot results
+# Send the init handshake, keep stdin open to hold the connection, filter for shot events
 (echo '{"type":"start","name":"cli"}'; cat) | \
   websocat ws://localhost:3030/api/ws | \
-  jq 'select(.event.kind == "launch_monitor" and .event.event.type == "shot_result") | .event.event.shot'
+  jq 'select(.event.kind == "shot_finished")'
 ```
 
 ```bash
@@ -49,23 +60,26 @@ async def main():
         init = json.loads(await ws.recv())
         print(f"Connected: source_id={init['source_id']}")
 
-        # Stream events
+        # Accumulate shot data
+        shots = {}  # key: (source, shot_id) -> {ball, club}
         async for msg in ws:
             event = json.loads(msg)
-            fh_event = event["event"]
-            if fh_event["kind"] == "launch_monitor":
-                inner = fh_event["event"]
-                if inner["type"] == "shot_result":
-                    shot = inner["shot"]
-                    # Convert to imperial via /api/shots/convert (no suffix parsing needed)
-                    import requests
-                    converted = requests.post(
-                        "http://localhost:3030/api/shots/convert?units=imperial",
-                        json=shot,
-                    ).json()
-                    ball = converted["ball"]
-                    print(f"Shot #{converted['shot_number']}: "
-                          f"speed={ball['launch_speed']}, carry={ball['carry_distance']}")
+            fh = event["event"]
+            kind = fh["kind"]
+
+            if kind == "ball_flight":
+                key = (event["source"], fh["key"]["shot_id"])
+                shots[key] = {"ball": fh["ball"], "estimated": fh["estimated"]}
+            elif kind == "club_path":
+                key = (event["source"], fh["key"]["shot_id"])
+                if key in shots:
+                    shots[key]["club"] = fh["club"]
+            elif kind == "shot_finished":
+                key = (event["source"], fh["key"]["shot_id"])
+                shot = shots.pop(key, None)
+                if shot:
+                    print(f"Shot #{fh['key']['shot_number']}: "
+                          f"speed={shot['ball']['launch_speed']}")
 
 asyncio.run(main())
 ```
@@ -74,25 +88,32 @@ asyncio.run(main())
 
 ```javascript
 const ws = new WebSocket("ws://localhost:3030/api/ws");
+const shots = new Map();
+
 ws.onopen = () => {
   ws.send(JSON.stringify({ type: "start", name: "my-dashboard" }));
 };
-ws.onmessage = async (e) => {
+ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
   if (msg.type === "init") {
     console.log("Connected:", msg.source_id);
     return;
   }
-  const { event } = msg;
-  if (event.kind === "launch_monitor" && event.event.type === "shot_result") {
-    const { shot } = event.event;
-    // Convert to imperial via /api/shots/convert (no suffix parsing needed)
-    const resp = await fetch(
-      "http://localhost:3030/api/shots/convert?units=imperial",
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(shot) },
-    );
-    const converted = await resp.json();
-    console.log(`Shot #${converted.shot_number}`, converted.ball);
+  const { event, source } = msg;
+  const key = event.key ? `${source}:${event.key.shot_id}` : null;
+
+  switch (event.kind) {
+    case "ball_flight":
+      shots.set(key, { ball: event.ball, estimated: event.estimated });
+      break;
+    case "club_path":
+      if (shots.has(key)) shots.get(key).club = event.club;
+      break;
+    case "shot_finished":
+      const shot = shots.get(key);
+      shots.delete(key);
+      if (shot) console.log(`Shot #${event.key.shot_number}`, shot.ball);
+      break;
   }
 };
 ```
@@ -187,10 +208,6 @@ Shot history (most recent N shots, FIFO, max 1000 stored).
       "club_offset": "0.005m",
       "club_height": "0.012m"
     },
-    "spin": {
-      "total_spin": 3230,
-      "spin_axis": -8.0
-    },
     "estimated": false
   }
 ]
@@ -218,8 +235,7 @@ With `?units=imperial`:
   Velocity fields are unit-tagged strings (`"67.2mps"`, `"150.3mph"`).
   Distance fields are unit-tagged strings (`"180.5m"`, `"197.4yd"`).
 - `club`: `ClubData` or `null`. Club head data.
-- `spin`: `SpinData` or `null`. Total spin and axis.
-- `estimated`: `true` if synthesized from E8 fallback (no D4 received).
+- `estimated`: `true` if synthesized from partial radar data.
 
 ---
 
@@ -236,7 +252,7 @@ unit-tagged strings and re-implement conversion math.
 
 - `units` (required): `"imperial"` or `"metric"`
 
-**Request** -- `ShotData` (as received from the WebSocket `shot_result` event):
+**Request** -- `ShotData` (as accumulated from shot lifecycle events):
 
 ```json
 {
@@ -259,10 +275,6 @@ unit-tagged strings and re-implement conversion math.
     "face_angle": 1.2,
     "dynamic_loft": 18.4,
     "smash_factor": 1.42
-  },
-  "spin": {
-    "total_spin": 3230,
-    "spin_axis": -8.0
   },
   "estimated": false
 }
@@ -295,8 +307,8 @@ Angles (degrees) and spin (RPM) pass through unchanged. The `estimated` and
 
 ### POST /api/mode
 
-Change the global detection mode. Emits `GameStateCommand::SetMode` on the
-bus; all launch monitor actors react to the mode change.
+Change the global detection mode. Emits `ShotDetectionMode` on the bus;
+all launch monitor actors react to the mode change.
 
 **Request**:
 
@@ -337,15 +349,15 @@ Full persisted config (mirrors `config.toml`).
       "tee_height": "1.5in",
       "range": "9ft",
       "surface_height": "0in",
-      "track_pct": 80.0,
-      "use_partial": "chipping_only"
+      "track_pct": 80.0
     }
   },
   "mock_monitor": {},
   "gspro": {
     "0": {
       "name": "Local GSPro",
-      "address": "127.0.0.1:921"
+      "address": "127.0.0.1:921",
+      "use_estimated": "chipping_only"
     }
   },
   "random_club": {}
@@ -354,6 +366,8 @@ Full persisted config (mirrors `config.toml`).
 
 - Keys are type-prefixed global IDs: `mevo.0`, `mock_monitor.0`, `gspro.0`, `random_club.0`, `webserver.0`
 - All launch monitor config fields are optional (omitted = use defaults)
+- `use_estimated` on GSPro sections controls whether estimated ball flights are
+  forwarded to the integration: `"never"`, `"chipping_only"` (default), `"always"`
 
 ---
 
@@ -368,25 +382,20 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 
 ```json
 {
-  "restart_required": false,
   "restarted": ["mevo.0"],
   "stopped": ["gspro.1"]
 }
 ```
 
-- `restart_required`: `true` only when a webserver bind address changed
-  (cannot be reloaded at runtime). Actor-level restarts are handled automatically.
 - `restarted`: actors that were stopped and recreated (e.g. address changed).
   Omitted when empty.
 - `stopped`: actors that were removed from the config. Omitted when empty.
 
 **Side effects**:
 
-- Emits `ConfigCommand::ReplaceAll` on the bus (processed by SystemActor)
+- Emits `ConfigCommand` (action: `ReplaceAll`) on the bus (processed by SystemActor)
 - SystemActor persists the new config to disk and reconciles actors:
-  - Radar settings changes (ball type, tee height, etc.) are applied in-place
-    via `reconfigure()` emitting `ConfigChanged` on the bus (no actor restart)
-  - Address changes trigger actor restart (shutdown + recreate)
+  - Address/routing/settings changes trigger actor restart (shutdown + recreate)
   - Removed config sections stop the corresponding actor
   - New config sections start new actors
 - SystemActor emits `ConfigOutcome` on the bus (used for request-reply + actor
@@ -470,15 +479,179 @@ messages share this envelope:
 
 #### Event Kinds
 
-Events are tagged by the `"kind"` field on the `event` object. Sub-events within
-each kind are tagged by `"type"`.
+Events are tagged by the `"kind"` field on the `event` object. All fields are
+directly on the event object (flat struct variants).
+
+---
+
+##### shot_trigger
+
+Ball strike detected. Emitted immediately by the launch monitor -- no data yet.
+
+```json
+{
+  "source": "mevo.0",
+  "timestamp": "...",
+  "event": {
+    "kind": "shot_trigger",
+    "key": { "shot_id": "550e8400-e29b-41d4-a716-446655440000", "shot_number": 42 }
+  }
+}
+```
+
+- `key.shot_id`: UUID v4 string, globally unique across sessions
+- `key.shot_number`: session-level monotonic counter from the launch monitor
+
+---
+
+##### ball_flight
+
+Ball flight data available. May arrive before or after `club_path`.
+
+```json
+{
+  "source": "mevo.0",
+  "timestamp": "...",
+  "event": {
+    "kind": "ball_flight",
+    "key": { "shot_id": "550e8400-...", "shot_number": 42 },
+    "ball": {
+      "launch_speed": "67.2mps",
+      "launch_azimuth": -1.3,
+      "launch_elevation": 14.2,
+      "carry_distance": "180.5m",
+      "max_height": "28.3m",
+      "total_distance": "195.0m",
+      "backspin_rpm": 3200,
+      "sidespin_rpm": -450
+    },
+    "estimated": false
+  }
+}
+```
+
+- `estimated`: `true` when synthesized from partial radar data.
+  Integrations decide whether to use estimated shots via `use_estimated` config.
+
+---
+
+##### club_path
+
+Club path data available. May arrive before or after `ball_flight`.
+
+```json
+{
+  "source": "mevo.0",
+  "timestamp": "...",
+  "event": {
+    "kind": "club_path",
+    "key": { "shot_id": "550e8400-...", "shot_number": 42 },
+    "club": {
+      "club_speed": "42.1mps",
+      "path": -2.1,
+      "attack_angle": -3.5,
+      "face_angle": 1.2,
+      "dynamic_loft": 18.4,
+      "smash_factor": 1.42
+    }
+  }
+}
+```
+
+---
+
+##### shot_finished
+
+Shot sequence complete. Accumulators should finalize and emit the composed shot.
+
+```json
+{
+  "source": "mevo.0",
+  "timestamp": "...",
+  "event": {
+    "kind": "shot_finished",
+    "key": { "shot_id": "550e8400-...", "shot_number": 42 }
+  }
+}
+```
+
+---
+
+##### launch_monitor_state
+
+Armed/ready/ball state from a launch monitor.
+
+```json
+{
+  "source": "mevo.0",
+  "timestamp": "...",
+  "event": {
+    "kind": "launch_monitor_state",
+    "armed": true,
+    "ball_detected": true
+  }
+}
+```
+
+---
+
+##### player_info
+
+Player info update (handedness).
+
+```json
+{
+  "source": "gspro.0",
+  "timestamp": "...",
+  "event": {
+    "kind": "player_info",
+    "player_info": { "handed": "RH" }
+  }
+}
+```
+
+---
+
+##### club_info
+
+Club selection update.
+
+```json
+{
+  "source": "gspro.0",
+  "timestamp": "...",
+  "event": {
+    "kind": "club_info",
+    "club_info": { "club": "7I" }
+  }
+}
+```
+
+---
+
+##### shot_detection_mode
+
+Global detection mode changed.
+
+```json
+{
+  "source": "system",
+  "timestamp": "...",
+  "event": {
+    "kind": "shot_detection_mode",
+    "mode": "chipping"
+  }
+}
+```
+
+- `mode`: `"full"` | `"putting"` | `"chipping"`
 
 ---
 
 ##### actor_status
 
 Generic actor lifecycle and state update. Emitted by all actors (launch monitors
-and integrations) when their status or state changes.
+and integrations) when their status or telemetry changes.
 
 ```json
 {
@@ -486,147 +659,65 @@ and integrations) when their status or state changes.
   "timestamp": "...",
   "event": {
     "kind": "actor_status",
-    "status": {
-      "status": "connected",
-      "telemetry": {
-        "armed": "true",
-        "battery_pct": "85",
-        "tilt": "0.5",
-        "roll": "-0.2",
-        "temp_c": "28.5",
-        "external_power": "false"
-      },
+    "status": "connected",
+    "telemetry": {
+      "armed": "true",
+      "battery_pct": "85",
+      "tilt": "0.5",
+      "roll": "-0.2",
+      "temp_c": "28.5",
+      "external_power": "false"
     }
   }
 }
 ```
 
-- `status.status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`
-- `status.telemetry`: actor-specific key/value pairs (all string values)
+- `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`
+- `telemetry`: actor-specific key/value pairs (all string values)
 
 ---
 
-##### launch_monitor
+##### config_command
 
-Shot data from a launch monitor.
+Config mutation request (emitted by POST handler, processed by SystemActor).
+External consumers can observe these to track config changes in flight.
 
 ```json
 {
-  "source": "mevo.0",
+  "source": "web",
   "timestamp": "...",
   "event": {
-    "kind": "launch_monitor",
-    "event": {
-      "type": "shot_result",
-      "shot": {
-        "source": "mevo.0",
-        "shot_number": 42,
-        "ball": {
-          "launch_speed": "67.2mps",
-          "launch_azimuth": -1.3,
-          "launch_elevation": 14.2,
-          "carry_distance": "180.5m",
-          "max_height": "28.3m",
-          "total_distance": "195.0m",
-          "backspin_rpm": 3200,
-          "sidespin_rpm": -450
-        },
-        "club": null,
-        "spin": null,
-        "estimated": false
-      }
-    }
+    "kind": "config_command",
+    "request_id": "abc123",
+    "action": { "type": "replace_all", "config": { ... } }
   }
 }
 ```
 
 ---
 
-##### config_changed
+##### config_outcome
 
-Configuration update notification. Emitted when an actor's settings change
-via the settings panel / `reconfigure()`. Consumed by integrations (e.g.
-the GSPro bridge uses `use_partial` to filter partial shots).
+Config mutation outcome (emitted by SystemActor after processing). Always
+emitted after a `config_command`, even for fire-and-forget commands.
 
 ```json
 {
-  "source": "mevo.0",
+  "source": "system",
   "timestamp": "...",
   "event": {
-    "kind": "config_changed",
-    "config": {
-      "ball_type": 0,
-      "tee_height": "1.5in",
-      "range": "9ft",
-      "surface_height": "0in",
-      "track_pct": 80.0,
-      "use_partial": "chipping_only"
-    }
+    "kind": "config_outcome",
+    "request_id": "abc123",
+    "restarted": ["mevo.0"],
+    "stopped": [],
+    "started": []
   }
 }
 ```
 
----
-
-##### global_state_command
-
-Global state mutation from an integration or WebSocket client.
-
-```json
-{
-  "source": "gspro.0",
-  "timestamp": "...",
-  "event": {
-    "kind": "global_state_command",
-    "event": {
-      "type": "set_club_info",
-      "club_info": {
-        "club": "7 Iron"
-      }
-    }
-  }
-}
-```
-
-- The originating integration is identified by `source` on the outer `FlighthookMessage`
-
-Sub-events (`"type"` values): `set_player_info`, `set_club_info`, `set_mode`.
-
----
-
-##### global_state_snapshot
-
-Full snapshot of the current global state. Emitted after a `global_state_command`
-is applied.
-
-```json
-{
-  "timestamp": "...",
-  "event": {
-    "kind": "global_state_snapshot",
-    "player_info": { "handed": "RH" },
-    "club_info": { "club": "7 Iron" }
-  }
-}
-```
-
----
-
-##### user_data
-
-Opaque data from a third-party WebSocket client.
-
-```json
-{
-  "timestamp": "...",
-  "event": {
-    "kind": "user_data",
-    "integration_type": "custom",
-    "source_id": "a1b2c3d4",
-    "data": { ... }
-  }
-}
-```
+- `request_id`: correlation ID from the originating `config_command`, or omitted
+  for fire-and-forget mutations
+- `restarted`, `stopped`, `started`: lists of affected actor IDs (omitted when empty)
 
 ---
 
@@ -659,7 +750,7 @@ the init handshake -- they emit events on the unified bus.
 
 #### mode
 
-Change the global detection mode. Emits `GameStateCommand::SetMode` on the bus.
+Change the global detection mode. Emits `ShotDetectionMode` on the bus.
 
 ```json
 {
@@ -692,7 +783,7 @@ Change the global detection mode. Emits `GameStateCommand::SetMode` on the bus.
 
 `"full"` | `"putting"` | `"chipping"`
 
-### PartialMode
+### EstimatedMode
 
 `"never"` | `"chipping_only"` | `"always"`
 

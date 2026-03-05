@@ -1,11 +1,11 @@
 use crate::app::FlighthookApp;
 use crate::net;
 use crate::types::{
-    Club, Distance, FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, PartialMode,
-    RandomClubSection, UnitSystem, WebserverSection,
+    Club, Distance, EstimatedMode, FlighthookConfig, GsProSection, MevoSection,
+    MockMonitorSection, RandomClubSection, UnitSystem, WebserverSection,
 };
 
-const PARTIAL_OPTIONS: &[(&str, &str)] = &[
+const ESTIMATED_OPTIONS: &[(&str, &str)] = &[
     ("never", "Never"),
     ("chipping_only", "Chipping only"),
     ("always", "Always"),
@@ -35,19 +35,19 @@ fn unit_suffix(key: &str) -> &str {
         .unwrap_or("in")
 }
 
-fn partial_mode_to_str(m: PartialMode) -> &'static str {
+fn estimated_mode_to_str(m: EstimatedMode) -> &'static str {
     match m {
-        PartialMode::Never => "never",
-        PartialMode::ChippingOnly => "chipping_only",
-        PartialMode::Always => "always",
+        EstimatedMode::Never => "never",
+        EstimatedMode::ChippingOnly => "chipping_only",
+        EstimatedMode::Always => "always",
     }
 }
 
-fn str_to_partial_mode(s: &str) -> PartialMode {
+fn str_to_estimated_mode(s: &str) -> EstimatedMode {
     match s {
-        "never" => PartialMode::Never,
-        "always" => PartialMode::Always,
-        _ => PartialMode::ChippingOnly,
+        "never" => EstimatedMode::Never,
+        "always" => EstimatedMode::Always,
+        _ => EstimatedMode::ChippingOnly,
     }
 }
 
@@ -88,7 +88,6 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) surface_height_val: String,
     pub(crate) surface_height_unit: String,
     pub(crate) track_pct: String,
-    pub(crate) use_partial: String,
     pub(crate) dirty: bool,
 }
 
@@ -97,7 +96,6 @@ impl DeviceFormEntry {
         let tee = s.tee_height.unwrap_or(Distance::Inches(1.5));
         let rng = s.range.unwrap_or(Distance::Feet(8.0));
         let surf = s.surface_height.unwrap_or(Distance::Inches(0.0));
-        let partial = s.use_partial.unwrap_or_default();
         Self {
             id: id.into(),
             monitor_type: "mevo".into(),
@@ -111,7 +109,6 @@ impl DeviceFormEntry {
             surface_height_val: format_distance_value(surf.value()),
             surface_height_unit: surf.unit_key().into(),
             track_pct: format!("{:.0}", s.track_pct.unwrap_or(80.0)),
-            use_partial: partial_mode_to_str(partial).into(),
             dirty: false,
         }
     }
@@ -130,7 +127,6 @@ impl DeviceFormEntry {
             surface_height_val: "0".into(),
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
-            use_partial: "chipping_only".into(),
             dirty: false,
         }
     }
@@ -154,6 +150,8 @@ pub(crate) struct IntegrationFormEntry {
     pub(crate) chipping_monitor: String,
     /// Routing: actor ID for putting monitor, or empty = "Any".
     pub(crate) putting_monitor: String,
+    /// Whether to forward estimated ball flights.
+    pub(crate) use_estimated: String,
     pub(crate) dirty: bool,
 }
 
@@ -289,6 +287,7 @@ impl SettingsForm {
                     full_monitor: section.full_monitor.clone().unwrap_or_default(),
                     chipping_monitor: section.chipping_monitor.clone().unwrap_or_default(),
                     putting_monitor: section.putting_monitor.clone().unwrap_or_default(),
+                    use_estimated: estimated_mode_to_str(section.use_estimated.unwrap_or_default()).into(),
                     dirty: false,
                 }));
         }
@@ -302,6 +301,7 @@ impl SettingsForm {
                     full_monitor: String::new(),
                     chipping_monitor: String::new(),
                     putting_monitor: String::new(),
+                    use_estimated: String::new(),
                     dirty: false,
                 }));
             let _ = section;
@@ -316,6 +316,7 @@ impl SettingsForm {
                     full_monitor: String::new(),
                     chipping_monitor: String::new(),
                     putting_monitor: String::new(),
+                    use_estimated: String::new(),
                     dirty: false,
                 }));
         }
@@ -384,7 +385,6 @@ impl SettingsForm {
                                     |v| Distance::from_value_and_unit(v, &dev.surface_height_unit),
                                 ),
                                 track_pct: dev.track_pct.parse().ok(),
-                                use_partial: Some(str_to_partial_mode(&dev.use_partial)),
                             },
                         );
                     }
@@ -423,6 +423,11 @@ impl SettingsForm {
                                     None
                                 } else {
                                     Some(entry.putting_monitor.clone())
+                                },
+                                use_estimated: if entry.use_estimated.is_empty() {
+                                    None
+                                } else {
+                                    Some(str_to_estimated_mode(&entry.use_estimated))
                                 },
                             },
                         );
@@ -548,7 +553,6 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                                 Distance::from_value_and_unit(v, &dev.surface_height_unit)
                             }),
                             track_pct: dev.track_pct.parse().ok(),
-                            use_partial: Some(str_to_partial_mode(&dev.use_partial)),
                         },
                     );
                 }
@@ -592,6 +596,11 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             } else {
                                 Some(entry.putting_monitor.clone())
                             },
+                            use_estimated: if entry.use_estimated.is_empty() {
+                                None
+                            } else {
+                                Some(str_to_estimated_mode(&entry.use_estimated))
+                            },
                         },
                     );
                 }
@@ -632,11 +641,30 @@ impl FlighthookApp {
             .auto_shrink(false)
             .show(ui, |ui| {
                 // --- GLOBAL ---
-                ui.label(
-                    egui::RichText::new("Global")
-                        .strong()
-                        .color(egui::Color32::from_rgb(180, 200, 255)),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Global")
+                            .strong()
+                            .color(egui::Color32::from_rgb(180, 200, 255)),
+                    );
+                    let save_btn = if self.settings.global_dirty {
+                        egui::Button::new(
+                            egui::RichText::new("Save").size(11.0).color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(200, 50, 50))
+                    } else {
+                        egui::Button::new(egui::RichText::new("Save").size(11.0))
+                    };
+                    if ui.add_enabled(self.settings.global_dirty && self.settings.is_valid() && !self.settings.saving, save_btn).clicked() {
+                        self.settings.saving = true;
+                        self.settings.save_target = Some(crate::panels::settings::SaveTarget::Global);
+                        let req = self.settings.build_global_request();
+                        net::post_settings(ctx, &self.pending, &req, None);
+                    }
+                    if ui.button(egui::RichText::new("API Docs").size(11.0)).clicked() {
+                        self.show_api_docs = true;
+                    }
+                });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("Default Units:").on_hover_text("Default unit system for shot display. Can be toggled per-session in the Shots tab.");
@@ -661,23 +689,6 @@ impl FlighthookApp {
                                 self.units_toggle = UnitSystem::Metric;
                             }
                         });
-                    let save_btn = if self.settings.global_dirty {
-                        egui::Button::new(
-                            egui::RichText::new("Save").size(11.0).color(egui::Color32::WHITE),
-                        )
-                        .fill(egui::Color32::from_rgb(200, 50, 50))
-                    } else {
-                        egui::Button::new(egui::RichText::new("Save").size(11.0))
-                    };
-                    if ui.add_enabled(self.settings.global_dirty && self.settings.is_valid() && !self.settings.saving, save_btn).clicked() {
-                        self.settings.saving = true;
-                        self.settings.save_target = Some(crate::panels::settings::SaveTarget::Global);
-                        let req = self.settings.build_global_request();
-                        net::post_settings(ctx, &self.pending, &req, None);
-                    }
-                    if ui.button(egui::RichText::new("API Docs").size(11.0)).clicked() {
-                        self.show_api_docs = true;
-                    }
                 });
 
                 // --- Club-to-mode mapping ---
@@ -925,25 +936,6 @@ impl FlighthookApp {
                                     ui.label("%");
                                 });
 
-                                // Partial
-                                ui.horizontal(|ui| {
-                                    ui.add_space(16.0);
-                                    ui.label("Partial:").on_hover_text("Accept partial (E8-only) shot results when the device\ncannot compute a full flight result (D4).\nCommon for short chips and marginal shots.\n\nNever: only accept full results.\nChipping only: allow partial in chipping mode.\nAlways: allow partial in any mode.");
-                                    egui::ComboBox::from_id_salt(format!("partial_{}", dev.id))
-                                        .selected_text(combo_label(PARTIAL_OPTIONS, &dev.use_partial))
-                                        .width(field_width)
-                                        .show_ui(ui, |ui| {
-                                            for &(value, label) in PARTIAL_OPTIONS {
-                                                if ui
-                                                    .selectable_label(dev.use_partial == value, label)
-                                                    .clicked()
-                                                {
-                                                    dev.use_partial = value.to_string();
-                                                    dev.dirty = true;
-                                                }
-                                            }
-                                        });
-                                });
                             }
                         }
                         ActorFormEntry::Integration(entry) => {
@@ -1018,6 +1010,26 @@ impl FlighthookApp {
                                             });
                                     });
                                 }
+
+                                // Estimated shots
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label("Estimated:").on_hover_text("Forward estimated ball flights to this integration.\nEstimated shots may lack full flight data but can still be\nusable in-game. Common for short chips and marginal shots.\n\nNever: only forward full results.\nChipping only: forward estimated in chipping mode.\nAlways: forward estimated in any mode.");
+                                    egui::ComboBox::from_id_salt(format!("estimated_{}", entry.id))
+                                        .selected_text(combo_label(ESTIMATED_OPTIONS, &entry.use_estimated))
+                                        .width(field_width)
+                                        .show_ui(ui, |ui| {
+                                            for &(value, label) in ESTIMATED_OPTIONS {
+                                                if ui
+                                                    .selectable_label(entry.use_estimated == value, label)
+                                                    .clicked()
+                                                {
+                                                    entry.use_estimated = value.to_string();
+                                                    entry.dirty = true;
+                                                }
+                                            }
+                                        });
+                                });
                             }
                         }
                     }
@@ -1061,7 +1073,6 @@ impl FlighthookApp {
                                     surface_height_val: "0".into(),
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
-                                    use_partial: "chipping_only".into(),
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
@@ -1082,6 +1093,7 @@ impl FlighthookApp {
                                     full_monitor: String::new(),
                                     chipping_monitor: String::new(),
                                     putting_monitor: String::new(),
+                                    use_estimated: "chipping_only".into(),
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
@@ -1102,6 +1114,7 @@ impl FlighthookApp {
                                     full_monitor: String::new(),
                                     chipping_monitor: String::new(),
                                     putting_monitor: String::new(),
+                                    use_estimated: String::new(),
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;

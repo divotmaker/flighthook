@@ -70,7 +70,6 @@ impl FlighthookApp {
 
                         for shot in &self.shots {
                             let converted = shot.to_unit_system(units);
-                            let f = &converted.ball;
                             // Device display name (look up from actor key)
                             let dev_display = self
                                 .actors
@@ -85,20 +84,27 @@ impl FlighthookApp {
                             // Shot number with estimated indicator
                             if shot.estimated {
                                 ui.label(
-                                    egui::RichText::new(format!("{} (E8)", shot.shot_number))
+                                    egui::RichText::new(format!("{} (est)", shot.shot_number))
                                         .color(egui::Color32::from_rgb(180, 180, 100))
                                         .size(11.0),
                                 );
                             } else {
                                 ui.label(format!("{}", shot.shot_number));
                             }
-                            ui.label(format!("{:.1}", f.launch_speed.value()));
-                            ui.label(format!("{:.1}", f.launch_elevation));
-                            ui.label(format!("{:.1}", f.launch_azimuth));
-                            ui.label(opt_f(f.carry_distance.map(|d| d.value()), 1));
-                            ui.label(opt_f(f.max_height.map(|d| d.value()), 1));
-                            ui.label(opt_i(f.backspin_rpm));
-                            ui.label(opt_i(f.sidespin_rpm));
+
+                            if let Some(ref f) = converted.ball {
+                                ui.label(format!("{:.1}", f.launch_speed.value()));
+                                ui.label(format!("{:.1}", f.launch_elevation));
+                                ui.label(format!("{:.1}", f.launch_azimuth));
+                                ui.label(opt_f(f.carry_distance.map(|d| d.value()), 1));
+                                ui.label(opt_f(f.max_height.map(|d| d.value()), 1));
+                                ui.label(opt_i(f.backspin_rpm));
+                                ui.label(opt_i(f.sidespin_rpm));
+                            } else {
+                                for _ in 0..7 {
+                                    ui.label("-");
+                                }
+                            }
 
                             if let Some(ref c) = converted.club {
                                 ui.label(format!("{:.1}", c.club_speed.value()));

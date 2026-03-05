@@ -18,8 +18,8 @@ use crate::actors::{Actor, ReconfigureOutcome, actor_names};
 use crate::bus::{BusReceiver, BusSender};
 use crate::state::SystemState;
 use flighthook::{
-    ActorState, ActorStatus, ActorStatusResponse, FlighthookEvent, FlighthookMessage,
-    GameStateCommandEvent, LaunchMonitorEvent, ShotData,
+    ActorStatus, ActorStatusResponse, FlighthookEvent, FlighthookMessage,
+    ShotAccumulator, ShotData, ShotKey,
 };
 
 const MAX_SHOTS: usize = 1000;
@@ -65,7 +65,7 @@ fn emit_status(
         telemetry.insert("error".into(), "bind failed".into());
     }
     let _ = bus_tx
-        .send(FlighthookMessage::new(ActorState::new(status, telemetry)).source(&state.actor_id));
+        .send(FlighthookMessage::new(FlighthookEvent::ActorStatus { status, telemetry }).source(&state.actor_id));
 }
 
 /// Emit Connected telemetry (convenience for periodic emitter + ws handlers).
@@ -128,7 +128,7 @@ impl Actor for WebActor {
         let index = sender.actor_id().strip_prefix("webserver.").unwrap_or("0");
         let new_bind = snap.webserver.get(index).map(|w| w.bind.as_str());
         match new_bind.and_then(|b| b.parse::<SocketAddr>().ok()) {
-            Some(new_addr) if new_addr == self.addr => ReconfigureOutcome::NoChange,
+            Some(new_addr) if new_addr == self.addr => ReconfigureOutcome::Applied,
             _ => ReconfigureOutcome::RestartRequired,
         }
     }
@@ -235,9 +235,11 @@ async fn run(
 
 /// Background task that subscribes to the bus and keeps WebState current.
 async fn state_updater(state: Arc<WebState>, mut bus_rx: broadcast::Receiver<FlighthookMessage>) {
+    let mut accumulators: HashMap<(String, ShotKey), ShotAccumulator> = HashMap::new();
+
     loop {
         match bus_rx.recv().await {
-            Ok(msg) => apply_bus_event(&state, &msg).await,
+            Ok(msg) => apply_bus_event(&state, &msg, &mut accumulators).await,
             Err(broadcast::error::RecvError::Closed) => break,
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("web state updater: lagged, dropped {n} events");
@@ -246,55 +248,77 @@ async fn state_updater(state: Arc<WebState>, mut bus_rx: broadcast::Receiver<Fli
     }
 }
 
-async fn apply_bus_event(state: &WebState, msg: &FlighthookMessage) {
+async fn apply_bus_event(
+    state: &WebState,
+    msg: &FlighthookMessage,
+    accumulators: &mut HashMap<(String, ShotKey), ShotAccumulator>,
+) {
     match &msg.event {
-        FlighthookEvent::ActorStatus(update) => {
+        FlighthookEvent::ActorStatus {
+            status,
+            telemetry,
+        } => {
             let mut actors = state.actors.write().await;
             let actor = actors
                 .entry(msg.source.clone())
                 .or_insert_with(|| new_actor(String::new()));
-            actor.status = update.status;
-            actor.telemetry = update.telemetry.clone();
+            actor.status = *status;
+            actor.telemetry = telemetry.clone();
         }
-        FlighthookEvent::LaunchMonitor(recv) => match &recv.event {
-            LaunchMonitorEvent::ShotResult { shot } => {
-                let mut shots = state.shots.write().await;
-                if shots.len() >= MAX_SHOTS {
-                    shots.pop_front();
-                }
-                shots.push_back(shot.as_ref().clone());
+        FlighthookEvent::ShotTrigger { key } => {
+            let acc = ShotAccumulator::new(msg.source.clone(), key.clone());
+            accumulators.insert((msg.source.clone(), key.clone()), acc);
+        }
+        FlighthookEvent::BallFlight {
+            key,
+            ball,
+            estimated,
+        } => {
+            if let Some(acc) = accumulators.get_mut(&(msg.source.clone(), key.clone())) {
+                acc.set_ball(*ball.clone(), *estimated);
             }
-            LaunchMonitorEvent::ReadyState { .. } => {}
-        },
-        FlighthookEvent::GameStateCommand(cmd) => {
-            match &cmd.event {
-                GameStateCommandEvent::SetPlayerInfo { player_info } => {
-                    // GameState update handled by SystemActor; cache for UI
-                    let mut actors = state.actors.write().await;
-                    if let Some(actor) = actors.get_mut(&msg.source) {
-                        actor
-                            .telemetry
-                            .insert("handed".into(), player_info.handed.clone());
+        }
+        FlighthookEvent::ClubPath { key, club } => {
+            if let Some(acc) = accumulators.get_mut(&(msg.source.clone(), key.clone())) {
+                acc.set_club(*club.clone());
+            }
+        }
+        FlighthookEvent::ShotFinished { key } => {
+            if let Some(acc) = accumulators.remove(&(msg.source.clone(), key.clone())) {
+                if let Some(shot) = acc.finish() {
+                    let mut shots = state.shots.write().await;
+                    if shots.len() >= MAX_SHOTS {
+                        shots.pop_front();
                     }
-                }
-                GameStateCommandEvent::SetClubInfo { club_info } => {
-                    // GameState update handled by SystemActor; cache for UI
-                    let mut actors = state.actors.write().await;
-                    if let Some(actor) = actors.get_mut(&msg.source) {
-                        actor
-                            .telemetry
-                            .insert("club".into(), club_info.club.to_string());
-                    }
-                }
-                GameStateCommandEvent::SetMode { .. } => {
-                    // GameState update handled by SystemActor
+                    shots.push_back(shot);
                 }
             }
         }
-        FlighthookEvent::ConfigOutcome(result) => {
-            if !result.started.is_empty()
-                || !result.stopped.is_empty()
-                || !result.restarted.is_empty()
+        FlighthookEvent::PlayerInfo { player_info } => {
+            let mut actors = state.actors.write().await;
+            if let Some(actor) = actors.get_mut(&msg.source) {
+                actor
+                    .telemetry
+                    .insert("handed".into(), player_info.handed.clone());
+            }
+        }
+        FlighthookEvent::ClubInfo { club_info } => {
+            let mut actors = state.actors.write().await;
+            if let Some(actor) = actors.get_mut(&msg.source) {
+                actor
+                    .telemetry
+                    .insert("club".into(), club_info.club.to_string());
+            }
+        }
+        FlighthookEvent::ConfigOutcome {
+            started,
+            stopped,
+            restarted,
+            ..
+        } => {
+            if !started.is_empty()
+                || !stopped.is_empty()
+                || !restarted.is_empty()
             {
                 // Refresh actor names from config
                 let snap = state.root.system.snapshot();
@@ -308,12 +332,12 @@ async fn apply_bus_event(state: &WebState, msg: &FlighthookMessage) {
                     entry.name = name.clone();
                 }
                 // Remove stopped actors from cache
-                for id in &result.stopped {
+                for id in stopped {
                     actors.remove(id);
                 }
             }
         }
-        // Alert, GameStateSnapshot, UserData, ConfigCommand — no web state update needed
+        // Alert, LaunchMonitorState, ShotDetectionMode, ConfigCommand — no web state update needed
         _ => {}
     }
 }

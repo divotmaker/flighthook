@@ -7,16 +7,11 @@ use flighthook::ShotData;
 pub fn map_shot(shot: &ShotData) -> GsProMessage {
     let b = &shot.ball;
 
-    // Spin: prefer SpinData when available, fall back to BallFlight backspin/sidespin.
-    let (total_spin, spin_axis) = if let Some(ref spin) = shot.spin {
-        (f64::from(spin.total_spin), spin.spin_axis)
-    } else {
-        let bs = b.backspin_rpm.unwrap_or(0) as f64;
-        let ss = b.sidespin_rpm.unwrap_or(0) as f64;
-        let total = (bs * bs + ss * ss).sqrt();
-        let axis = ss.atan2(bs).to_degrees();
-        (total, axis)
-    };
+    // Derive total_spin and spin_axis from backspin + sidespin in BallFlight.
+    let bs = b.backspin_rpm.unwrap_or(0) as f64;
+    let ss = b.sidespin_rpm.unwrap_or(0) as f64;
+    let total_spin = (bs * bs + ss * ss).sqrt();
+    let spin_axis = ss.atan2(bs).to_degrees();
 
     // Club data: use ClubData when present, otherwise zero-fill.
     let (club_data, contains_club) = if let Some(ref club) = shot.club {

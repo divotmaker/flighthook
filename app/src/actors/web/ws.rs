@@ -16,8 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use super::{WebState, emit_telemetry};
 use crate::state::SystemState;
 use crate::state::config;
-use flighthook::ShotDetectionMode;
-use flighthook::{FlighthookMessage, GameStateCommandEvent};
+use flighthook::{FlighthookEvent, FlighthookMessage, ShotDetectionMode};
 
 /// GET /api/ws — upgrade to WebSocket.
 pub async fn ws_upgrade(
@@ -168,7 +167,7 @@ fn handle_ws_command(
             };
             if let Some(m) = mode {
                 let _ = bus_tx.send(
-                    FlighthookMessage::new(GameStateCommandEvent::SetMode { mode: m })
+                    FlighthookMessage::new(FlighthookEvent::ShotDetectionMode { mode: m })
                         .source(source),
                 );
             }

@@ -11,8 +11,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::ShotDetectionMode;
-use crate::{ActorState, MevoConfigEvent, ShotData};
-use crate::{ClubInfo, GameStateSnapshot, PlayerInfo};
+use std::collections::HashMap;
+
+use crate::{ActorStatus, BallFlight, ClubData};
+use crate::{ClubInfo, PlayerInfo};
 use crate::{
     FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, RandomClubSection,
     WebserverSection,
@@ -59,52 +61,6 @@ impl FlighthookMessage {
     pub fn raw_binary(mut self, raw: Vec<u8>) -> Self {
         self.raw_payload = Some(RawPayload::Binary(raw));
         self
-    }
-}
-
-// ---------------------------------------------------------------------------
-// From impls — inner event types -> FlighthookEvent
-// ---------------------------------------------------------------------------
-
-impl From<LaunchMonitorEvent> for FlighthookEvent {
-    fn from(event: LaunchMonitorEvent) -> Self {
-        FlighthookEvent::LaunchMonitor(LaunchMonitorRecv { event })
-    }
-}
-
-impl From<GameStateCommandEvent> for FlighthookEvent {
-    fn from(event: GameStateCommandEvent) -> Self {
-        FlighthookEvent::GameStateCommand(GameStateCommand { event })
-    }
-}
-
-impl From<ConfigChanged> for FlighthookEvent {
-    fn from(changed: ConfigChanged) -> Self {
-        FlighthookEvent::ConfigChanged(changed)
-    }
-}
-
-impl From<ActorState> for FlighthookEvent {
-    fn from(state: ActorState) -> Self {
-        FlighthookEvent::ActorStatus(state)
-    }
-}
-
-impl From<ConfigCommand> for FlighthookEvent {
-    fn from(cmd: ConfigCommand) -> Self {
-        FlighthookEvent::ConfigCommand(cmd)
-    }
-}
-
-impl From<ConfigOutcome> for FlighthookEvent {
-    fn from(result: ConfigOutcome) -> Self {
-        FlighthookEvent::ConfigOutcome(result)
-    }
-}
-
-impl From<AlertMessage> for FlighthookEvent {
-    fn from(alert: AlertMessage) -> Self {
-        FlighthookEvent::Alert(alert)
     }
 }
 
@@ -156,6 +112,20 @@ impl fmt::Display for RawPayload {
 }
 
 // ---------------------------------------------------------------------------
+// ShotKey — correlates shot lifecycle events
+// ---------------------------------------------------------------------------
+
+/// Globally unique shot identifier. Generated once by the producer at trigger
+/// time, then carried on every event in the shot lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ShotKey {
+    /// Unique shot ID (UUID v4 string). Survives across sessions, databases, replays.
+    pub shot_id: String,
+    /// Session-level shot number from the launch monitor (monotonic per-source).
+    pub shot_number: i32,
+}
+
+// ---------------------------------------------------------------------------
 // Event variants
 // ---------------------------------------------------------------------------
 
@@ -163,116 +133,74 @@ impl fmt::Display for RawPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FlighthookEvent {
-    /// Data from a launch monitor (shots).
-    LaunchMonitor(LaunchMonitorRecv),
-    /// Configuration changed (emitted by reconfigure, consumed by integrations).
-    ConfigChanged(ConfigChanged),
-    /// Global state command (from an integration or WS client).
-    GameStateCommand(GameStateCommand),
-    /// Global state snapshot (emitted after GameStateCommand is applied).
-    GameStateSnapshot(GameStateSnapshot),
-    /// Third-party user data (from WS clients via integrations).
-    UserData(UserDataMessage),
-    /// Generic actor status update (replaces per-type status events).
-    ActorStatus(ActorState),
-    /// Config mutation request (emitted by POST handler).
-    ConfigCommand(ConfigCommand),
+    // -- Shot lifecycle (correlated by ShotKey + message source) --
+    /// Ball strike detected. Emitted immediately — no data yet.
+    ShotTrigger { key: ShotKey },
+    /// Ball flight data available. `estimated` = true means the shot may not have fully read, but could still be usable in-game.
+    BallFlight {
+        key: ShotKey,
+        ball: Box<BallFlight>,
+        estimated: bool,
+    },
+    /// Club path data available.
+    ClubPath { key: ShotKey, club: Box<ClubData> },
+    /// Shot sequence complete. Accumulators should finalize.
+    ShotFinished { key: ShotKey },
+
+    // -- Launch monitor state --
+    /// Armed/ready/ball state from a launch monitor.
+    LaunchMonitorState { armed: bool, ball_detected: bool },
+
+    // -- Game state --
+    /// Player info update (handedness).
+    PlayerInfo { player_info: PlayerInfo },
+    /// Club selection update.
+    ClubInfo { club_info: ClubInfo },
+    /// Shot detection mode update.
+    ShotDetectionMode { mode: ShotDetectionMode },
+
+    // -- Config --
+    /// Config mutation request (emitted by POST handler, processed by SystemActor).
+    ConfigCommand {
+        /// Opaque correlation ID for request-reply pattern.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        action: ConfigAction,
+    },
     /// Config mutation outcome (emitted by SystemActor after processing).
-    ConfigOutcome(ConfigOutcome),
+    ConfigOutcome {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restarted: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stopped: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        started: Vec<String>,
+    },
+
+    // -- Infrastructure --
+    /// Generic actor status update (lifecycle + telemetry).
+    ActorStatus {
+        status: ActorStatus,
+        #[serde(default)]
+        telemetry: HashMap<String, String>,
+    },
     /// Alert for user-visible warn/error conditions.
-    Alert(AlertMessage),
+    Alert { level: AlertLevel, message: String },
 }
 
 impl FlighthookEvent {
     /// Returns true if this is an ActorStatus event containing telemetry
     /// (battery_pct key in state map). Used for heartbeat filtering in audit.
     pub fn is_actor_status_with_telemetry(&self) -> bool {
-        matches!(self, FlighthookEvent::ActorStatus(state) if state.telemetry.contains_key("battery_pct"))
+        matches!(self, FlighthookEvent::ActorStatus { telemetry, .. } if telemetry.contains_key("battery_pct"))
     }
 }
 
 // ---------------------------------------------------------------------------
-// LaunchMonitor — shot data from a launch monitor
+// ConfigAction — specific config mutations
 // ---------------------------------------------------------------------------
-
-/// Envelope for events from a launch monitor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LaunchMonitorRecv {
-    pub event: LaunchMonitorEvent,
-}
-
-/// Individual events from a launch monitor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum LaunchMonitorEvent {
-    /// Completed shot.
-    ShotResult { shot: Box<ShotData> },
-    /// Armed/ready state change.
-    ReadyState { armed: bool, ball_detected: bool },
-}
-
-// ---------------------------------------------------------------------------
-// ConfigChanged — generic configuration update notification
-// ---------------------------------------------------------------------------
-
-/// Configuration changed notification. Emitted by `reconfigure()` when an
-/// actor's settings change; consumed by integrations (e.g. GSPro bridge).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigChanged {
-    pub config: MevoConfigEvent,
-}
-
-// ---------------------------------------------------------------------------
-// GameStateCommand — from integrations / WS clients
-// ---------------------------------------------------------------------------
-
-/// A command to update global state, originating from an integration or WS client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GameStateCommand {
-    pub event: GameStateCommandEvent,
-}
-
-/// The specific global state mutation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum GameStateCommandEvent {
-    SetPlayerInfo { player_info: PlayerInfo },
-    SetClubInfo { club_info: ClubInfo },
-    SetMode { mode: ShotDetectionMode },
-}
-
-// ---------------------------------------------------------------------------
-// UserData — third-party WS integrations
-// ---------------------------------------------------------------------------
-
-/// Opaque data from a third-party WS client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserDataMessage {
-    #[serde(default)]
-    pub integration_type: String,
-    #[serde(default)]
-    pub source_id: String,
-    #[serde(default)]
-    pub data: serde_json::Value,
-}
-
-// ---------------------------------------------------------------------------
-// ConfigCommand — config mutation request
-// ---------------------------------------------------------------------------
-
-/// A request to mutate the system configuration.
-///
-/// Emitted on the bus by the POST handler. Processed exclusively by
-/// `SystemActor`, which applies the mutation, reconciles actors, and
-/// optionally emits a `ConfigOutcome`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigCommand {
-    /// Opaque correlation ID. When present, SystemActor emits a ConfigOutcome
-    /// with the same ID after processing (request-reply pattern).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    pub action: ConfigAction,
-}
 
 /// The specific config mutation to apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,24 +238,7 @@ pub enum ConfigAction {
 }
 
 // ---------------------------------------------------------------------------
-// ConfigOutcome — config mutation acknowledgment
-// ---------------------------------------------------------------------------
-
-/// Acknowledgment of a config mutation, emitted by SystemActor after
-/// processing a `ConfigCommand` that had a `request_id`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigOutcome {
-    pub request_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub restarted: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub stopped: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub started: Vec<String>,
-}
-
-// ---------------------------------------------------------------------------
-// AlertMessage — user-visible warn/error notifications
+// AlertLevel
 // ---------------------------------------------------------------------------
 
 /// Severity level for alert messages.
@@ -345,12 +256,4 @@ impl fmt::Display for AlertLevel {
             AlertLevel::Error => write!(f, "error"),
         }
     }
-}
-
-/// A user-visible alert. Info/debug/trace stays in the tracing backend;
-/// warn/error conditions surface here for the UI log panel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AlertMessage {
-    pub level: AlertLevel,
-    pub message: String,
 }

@@ -4,9 +4,7 @@ use std::net::TcpStream;
 use super::BridgeError;
 use super::api;
 use crate::bus::BusSender;
-use flighthook::{
-    AlertLevel, AlertMessage, Club, ClubInfo, FlighthookMessage, GameStateCommandEvent, PlayerInfo,
-};
+use flighthook::{AlertLevel, Club, ClubInfo, FlighthookEvent, FlighthookMessage, PlayerInfo};
 
 pub(crate) fn send_message(
     stream: &mut TcpStream,
@@ -70,7 +68,7 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
                     tracing::info!("gspro <- {}: {}", resp.code, resp.message);
                 } else {
                     tracing::warn!("gspro <- GSPro returned {}: {}", resp.code, resp.message);
-                    sender.send(FlighthookMessage::new(AlertMessage {
+                    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                         level: AlertLevel::Warn,
                         message: format!("GSPro returned {}: {}", resp.code, resp.message),
                     }));
@@ -79,24 +77,20 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
                 // Emit player info if present
                 if let Some(ref player) = resp.player {
                     if let Some(ref handed) = player.handed {
-                        sender.send(FlighthookMessage::new(
-                            GameStateCommandEvent::SetPlayerInfo {
-                                player_info: PlayerInfo {
-                                    handed: handed.clone(),
-                                },
+                        sender.send(FlighthookMessage::new(FlighthookEvent::PlayerInfo {
+                            player_info: PlayerInfo {
+                                handed: handed.clone(),
                             },
-                        ));
+                        }));
                     }
                     if let Some(ref club_str) = player.club {
                         if let Some(club) = Club::from_code(club_str) {
-                            sender.send(FlighthookMessage::new(
-                                GameStateCommandEvent::SetClubInfo {
-                                    club_info: ClubInfo { club },
-                                },
-                            ));
+                            sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
+                                club_info: ClubInfo { club },
+                            }));
                         } else {
                             tracing::warn!("gspro: unknown club code '{club_str}', ignoring");
-                            sender.send(FlighthookMessage::new(AlertMessage {
+                            sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                                 level: AlertLevel::Warn,
                                 message: format!("GSPro: unknown club code '{club_str}'"),
                             }));
@@ -107,7 +101,7 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
             Err(e) => {
                 if !parsed_any {
                     tracing::warn!("gspro <- parse error: {e}");
-                    sender.send(FlighthookMessage::new(AlertMessage {
+                    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                         level: AlertLevel::Warn,
                         message: format!("Could not parse GSPro response: {e}"),
                     }));

@@ -23,9 +23,7 @@ use crate::state::config::{FlighthookConfig, global_id};
 
 /// Outcome of calling `Actor::reconfigure()` after a config change.
 pub enum ReconfigureOutcome {
-    /// Config unchanged — no action needed.
-    NoChange,
-    /// Applied in-place (e.g. sent UpdateConfig on bus).
+    /// Config applied (or unchanged) — no restart needed.
     Applied,
     /// Must stop and recreate the actor (e.g. address changed).
     RestartRequired,
@@ -43,9 +41,9 @@ pub trait Actor: Send + Sync {
 
     /// React to a config change. Implementations compare the current config
     /// snapshot against the actor's construction params and return the
-    /// appropriate action. Default: `NoChange`.
+    /// appropriate action. Default: `Applied` (no change needed).
     fn reconfigure(&self, _state: &Arc<SystemState>, _sender: &BusSender) -> ReconfigureOutcome {
-        ReconfigureOutcome::NoChange
+        ReconfigureOutcome::Applied
     }
 }
 
@@ -124,7 +122,11 @@ pub fn resolve_actors(
                 actors.push(ResolvedActor {
                     id,
                     name: section.name.clone(),
-                    actor: Box::new(gspro::GsProActor { addr, routing }),
+                    actor: Box::new(gspro::GsProActor {
+                        addr,
+                        routing,
+                        use_estimated: section.use_estimated.unwrap_or_default(),
+                    }),
                 });
             }
             Err(e) => {

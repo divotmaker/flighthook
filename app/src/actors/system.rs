@@ -1,8 +1,8 @@
 //! System actor — default actor that always runs and handles internal
 //! housekeeping for updating `SystemState`.
 //!
-//! Subscribes to the bus and processes `GameStateCommand` events to keep
-//! `GameState` (player info, club selection, detection mode) in sync.
+//! Subscribes to the bus and processes game state events (PlayerInfo,
+//! ClubInfo, ShotDetectionMode) to keep `GameState` in sync.
 //! Also processes `ConfigCommand` events for config mutations (from the
 //! REST API). This runs independently of the web server, so `SystemState`
 //! is always consistent even in headless mode.
@@ -18,7 +18,7 @@ use tokio::sync::broadcast;
 use crate::actors::{Actor, ReconfigureOutcome, ResolvedActor, resolve_actors, start_actor};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::{GameStateWriter, SystemState};
-use flighthook::{FlighthookEvent, FlighthookMessage, GameStateCommandEvent};
+use flighthook::{FlighthookEvent, FlighthookMessage};
 
 // ---------------------------------------------------------------------------
 // Config reload
@@ -26,7 +26,6 @@ use flighthook::{FlighthookEvent, FlighthookMessage, GameStateCommandEvent};
 
 /// Result of applying a config reload.
 pub(crate) struct ConfigReloadOutcome {
-    pub applied: Vec<String>,
     pub restarted: Vec<String>,
     pub stopped: Vec<String>,
     pub started: Vec<String>,
@@ -57,7 +56,6 @@ pub(crate) fn apply_config_reload(
     let expected_ids: Vec<String> = resolved_map.keys().cloned().collect();
 
     let mut result = ConfigReloadOutcome {
-        applied: Vec::new(),
         restarted: Vec::new(),
         stopped: Vec::new(),
         started: Vec::new(),
@@ -71,10 +69,6 @@ pub(crate) fn apply_config_reload(
             let reconf = state.reconfigure_actor(target, state, &sender);
 
             match reconf {
-                Some(ReconfigureOutcome::Applied) => {
-                    tracing::info!("config reload (scoped): applied in-place for '{target}'");
-                    result.applied.push(target.to_string());
-                }
                 Some(ReconfigureOutcome::RestartRequired) => {
                     tracing::info!("config reload (scoped): restarting '{target}'");
                     state.stop_actor(target);
@@ -85,7 +79,7 @@ pub(crate) fn apply_config_reload(
                         result.restarted.push(target.to_string());
                     }
                 }
-                Some(ReconfigureOutcome::NoChange) | None => {}
+                Some(ReconfigureOutcome::Applied) | None => {}
             }
         } else if !current_ids.contains(&target.to_string())
             && expected_ids.contains(&target.to_string())
@@ -131,10 +125,6 @@ pub(crate) fn apply_config_reload(
             let reconf = state.reconfigure_actor(id, state, &sender);
 
             match reconf {
-                Some(ReconfigureOutcome::Applied) => {
-                    tracing::info!("config reload: applied in-place for '{id}'");
-                    result.applied.push(id.clone());
-                }
                 Some(ReconfigureOutcome::RestartRequired) => {
                     tracing::info!("config reload: restarting '{id}'");
                     state.stop_actor(id);
@@ -145,7 +135,7 @@ pub(crate) fn apply_config_reload(
                         result.restarted.push(id.clone());
                     }
                 }
-                Some(ReconfigureOutcome::NoChange) | None => {}
+                Some(ReconfigureOutcome::Applied) | None => {}
             }
         }
 
@@ -251,25 +241,23 @@ fn run(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Ok(Some(msg)) => match &msg.event {
-                FlighthookEvent::GameStateCommand(cmd) => match &cmd.event {
-                    GameStateCommandEvent::SetPlayerInfo { player_info } => {
-                        writer.set_player_info(player_info.clone());
-                    }
-                    GameStateCommandEvent::SetClubInfo { club_info } => {
-                        writer.set_club_info(club_info.clone());
-                        // Auto-derive detection mode from club selection
-                        let mode = state.system.snapshot().club_mode(club_info.club);
-                        writer.set_mode(mode);
-                        sender.send(FlighthookMessage::new(GameStateCommandEvent::SetMode {
-                            mode,
-                        }));
-                    }
-                    GameStateCommandEvent::SetMode { mode } => {
-                        writer.set_mode(*mode);
-                    }
-                },
-                FlighthookEvent::ConfigCommand(cmd) => {
-                    handle_config_command(cmd, &state, &bus_tx, &sender);
+                FlighthookEvent::PlayerInfo { player_info } => {
+                    writer.set_player_info(player_info.clone());
+                }
+                FlighthookEvent::ClubInfo { club_info } => {
+                    writer.set_club_info(*club_info);
+                    // Auto-derive detection mode from club selection
+                    let mode = state.system.snapshot().club_mode(club_info.club);
+                    writer.set_mode(mode);
+                    sender.send(FlighthookMessage::new(
+                        FlighthookEvent::ShotDetectionMode { mode },
+                    ));
+                }
+                FlighthookEvent::ShotDetectionMode { mode } => {
+                    writer.set_mode(*mode);
+                }
+                FlighthookEvent::ConfigCommand { .. } => {
+                    handle_config_command(&msg.event, &state, &bus_tx, &sender);
                 }
                 _ => {}
             },
@@ -278,17 +266,25 @@ fn run(
 }
 
 fn handle_config_command(
-    cmd: &flighthook::ConfigCommand,
+    event: &FlighthookEvent,
     state: &Arc<SystemState>,
     bus_tx: &broadcast::Sender<FlighthookMessage>,
     sender: &BusSender,
 ) {
-    use flighthook::{ConfigAction, ConfigOutcome};
+    use flighthook::ConfigAction;
+
+    let FlighthookEvent::ConfigCommand {
+        ref request_id,
+        ref action,
+    } = *event
+    else {
+        return;
+    };
 
     // Determine scope for actor reconciliation
     let scope: Option<String>;
 
-    match &cmd.action {
+    match action {
         ConfigAction::ReplaceAll { config } => {
             state.system.replace(config.clone());
             scope = None;
@@ -360,13 +356,10 @@ fn handle_config_command(
     // Reconcile actors (webserver included — its reconfigure() handles bind changes)
     let result = apply_config_reload(state, bus_tx, scope.as_deref());
 
-    // Emit result if request_id is present
-    if let Some(request_id) = &cmd.request_id {
-        sender.send(FlighthookMessage::new(ConfigOutcome {
-            request_id: request_id.clone(),
-            restarted: result.restarted,
-            stopped: result.stopped,
-            started: result.started,
-        }));
-    }
+    sender.send(FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
+        request_id: request_id.clone(),
+        restarted: result.restarted,
+        stopped: result.stopped,
+        started: result.started,
+    }));
 }

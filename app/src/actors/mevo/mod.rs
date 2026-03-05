@@ -1,4 +1,3 @@
-pub(crate) mod accumulator;
 pub mod settings;
 
 pub use settings::SessionConfig;
@@ -8,67 +7,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ironsight::protocol::shot::FlightResultV1;
+use ironsight::seq::ShotDatum;
 use ironsight::{BinaryClient, BinaryConnection, BinaryEvent, ConnError, Message};
 use tracing::{debug, info, warn};
 
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
-use accumulator::convert_shot;
 use settings::cam_config;
 
 use flighthook::{
-    ActorState, ActorStatus, AlertLevel, AlertMessage, ConfigChanged, FlighthookEvent,
-    FlighthookMessage, GameStateCommandEvent, LaunchMonitorEvent, ShotDetectionMode,
+    ActorStatus, AlertLevel, BallFlight, ClubData,
+    Distance, FlighthookEvent, FlighthookMessage, ShotDetectionMode, ShotKey, Velocity,
 };
-
-// ---------------------------------------------------------------------------
-// Message labeling (audit log)
-// ---------------------------------------------------------------------------
-
-fn msg_label(msg: &Message) -> &'static str {
-    match msg {
-        Message::FlightResult(_) => "FlightResult(0xD4)",
-        Message::FlightResultV1(_) => "FlightResultV1(0xE8)",
-        Message::ClubResult(_) => "ClubResult(0xED)",
-        Message::SpinResult(_) => "SpinResult(0xEF)",
-        Message::SpeedProfile(_) => "SpeedProfile(0xD9)",
-        Message::TrackingStatus(_) => "TrackingStatus(0xE9)",
-        Message::PrcData(_) => "PrcData(0xEC)",
-        Message::ClubPrc(_) => "ClubPrc(0xEE)",
-        Message::ShotText(_) => "ShotText(0xE5)",
-        Message::AvrStatus(_) => "AvrStatus(0xAA)",
-        Message::DspStatus(_) => "DspStatus(0xAA)",
-        Message::PiStatus(_) => "PiStatus(0xAA)",
-        Message::ConfigAck(_) => "ConfigAck(0x95)",
-        Message::ConfigNack(_) => "ConfigNack(0x94)",
-        Message::ModeAck(_) => "ModeAck(0xB1)",
-        Message::Text(_) => "Text(0xE3)",
-        Message::ModeSet(_) => "ModeSet(0xA5)",
-        Message::ParamValue(_) => "ParamValue(0xBF)",
-        Message::RadarCal(_) => "RadarCal(0xA4)",
-        Message::ConfigResp(_) => "ConfigResp(0xA0)",
-        Message::AvrConfigResp(_) => "AvrConfigResp(0xA2)",
-        Message::DspQueryResp(_) => "DspQueryResp(0xC8)",
-        Message::DevInfoResp(_) => "DevInfoResp(0xE7)",
-        Message::ProdInfoResp(_) => "ProdInfoResp(0xFD)",
-        Message::NetConfigResp(_) => "NetConfigResp(0xDE)",
-        Message::CalParamResp(_) => "CalParamResp(0xD1)",
-        Message::CalDataResp(_) => "CalDataResp(0xD3)",
-        Message::TimeSync(_) => "TimeSync(0x9B)",
-        Message::CamState(_) => "CamState(0x81)",
-        Message::CamConfig(_) => "CamConfig(0x82)",
-        Message::CamImageAvail(_) => "CamImageAvail(0x84)",
-        Message::SensorActResp(_) => "SensorActResp(0x89)",
-        Message::WifiScan { .. } => "WifiScan(0x87)",
-        Message::DspDebug(_) => "DspDebug(0xF0)",
-        Message::Unknown { type_id, .. } => {
-            let _ = type_id;
-            "Unknown"
-        }
-    }
-}
 
 /// No events for this long → treat as disconnected.
 const STALE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -111,7 +62,7 @@ impl Actor for MevoActor {
         let actor_id = sender.actor_id();
         let (_, index) = match actor_id.split_once('.') {
             Some(pair) => pair,
-            None => return ReconfigureOutcome::NoChange,
+            None => return ReconfigureOutcome::Applied,
         };
 
         let snap = state.system.snapshot();
@@ -130,16 +81,13 @@ impl Actor for MevoActor {
             return ReconfigureOutcome::RestartRequired;
         }
 
-        // Check if session config changed -> emit ConfigChanged on bus
+        // Check if session config changed -> restart to apply
         let new_session = SessionConfig::from_mevo_section(section);
         if new_session != self.session_config {
-            sender.send(FlighthookMessage::new(ConfigChanged {
-                config: new_session.to_config_event(),
-            }));
-            return ReconfigureOutcome::Applied;
+            return ReconfigureOutcome::RestartRequired;
         }
 
-        ReconfigureOutcome::NoChange
+        ReconfigureOutcome::Applied
     }
 }
 
@@ -151,19 +99,22 @@ fn same_mode(a: ShotDetectionMode, b: ShotDetectionMode) -> bool {
     std::mem::discriminant(&a) == std::mem::discriminant(&b)
 }
 
-fn emit_device_status(sender: &BusSender, status: ActorStatus, state: HashMap<String, String>) {
-    sender.send(FlighthookMessage::new(ActorState::new(status, state)));
+fn emit_device_status(sender: &BusSender, status: ActorStatus, telemetry: HashMap<String, String>) {
+    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+        status,
+        telemetry,
+    }));
 }
 
 fn emit_alert(sender: &BusSender, level: AlertLevel, message: impl Into<String>) {
-    sender.send(FlighthookMessage::new(AlertMessage {
+    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
         level,
         message: message.into(),
     }));
 }
 
 fn emit_ready_state(sender: &BusSender, armed: bool) {
-    sender.send(FlighthookMessage::new(LaunchMonitorEvent::ReadyState {
+    sender.send(FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
         armed,
         ball_detected: armed, // Mevo has no ball sensor
     }));
@@ -183,11 +134,6 @@ fn run(
     let mut backoff = MIN_BACKOFF;
     let mut session_config = initial_session_config;
     let mut ever_connected = false;
-
-    // Broadcast initial config
-    sender.send(FlighthookMessage::new(ConfigChanged {
-        config: session_config.to_config_event(),
-    }));
 
     loop {
         if receiver.poll().is_err() {
@@ -299,7 +245,12 @@ fn connect_and_run(
     // 4. Event loop state
     let mut current_mode = initial_mode;
     let mut pending_reconfig: Option<ShotDetectionMode> = None;
-    let mut stashed_e8: Option<FlightResultV1> = None;
+
+    // Shot lifecycle state
+    let mut shot_counter: i32 = 0;
+    let mut current_shot_key: Option<ShotKey> = None;
+    let mut shot_had_d4 = false;
+    let mut stashed_e8: Option<ironsight::protocol::shot::FlightResultV1> = None;
 
     // Staleness + poll backoff
     let mut last_event_time = Instant::now();
@@ -321,58 +272,35 @@ fn connect_and_run(
                 }
                 Ok(None) => break,
                 Ok(Some(msg)) => match msg.event {
-                    FlighthookEvent::ConfigChanged(changed) => {
-                        session_config.apply_config_event(&changed.config);
-                        info!("config updated: {:?}", changed.config);
-
-                        if client.is_armed() {
-                            let wire = SessionConfig::mode_label(&current_mode);
-                            info!("reconfiguring device with updated settings (mode={wire})");
-                            client.configure_avr(
-                                session_config.to_avr_settings(&current_mode),
-                            );
-                            client.arm();
-                            telemetry.insert("armed".into(), "false".into());
-                            telemetry.insert("mode".into(), wire.into());
-                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                            emit_ready_state(sender, false);
-                        } else {
-                            pending_reconfig = Some(current_mode);
-                            info!("deferred settings reconfig (operation in progress)");
-                        }
-                    }
-                    FlighthookEvent::GameStateCommand(cmd) => match cmd.event {
-                        GameStateCommandEvent::SetMode { mode: new_mode } => {
-                            if !same_mode(current_mode, new_mode) {
-                                if client.is_armed() {
-                                    let new_wire = SessionConfig::mode_label(&new_mode);
-                                    info!(
-                                        "mode change: {:?} -> {:?} wire={new_wire}",
-                                        current_mode, new_mode
-                                    );
-                                    client.configure_avr(
-                                        SessionConfig::to_avr_settings_mode_only(&new_mode),
-                                    );
-                                    client.arm();
-                                    current_mode = new_mode;
-                                    telemetry.insert("armed".into(), "false".into());
-                                    telemetry.insert("mode".into(), new_wire.into());
-                                    emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                                    emit_ready_state(sender, false);
-                                } else {
-                                    pending_reconfig = Some(new_mode);
-                                    info!(
-                                        "deferred mode change to {:?} (operation in progress)",
-                                        new_mode
-                                    );
-                                }
+                    FlighthookEvent::ShotDetectionMode { mode: new_mode } => {
+                        if !same_mode(current_mode, new_mode) {
+                            if client.is_armed() {
+                                let new_wire = SessionConfig::mode_label(&new_mode);
+                                info!(
+                                    "mode change: {:?} -> {:?} wire={new_wire}",
+                                    current_mode, new_mode
+                                );
+                                client.configure_avr(
+                                    SessionConfig::to_avr_settings_mode_only(&new_mode),
+                                );
+                                client.arm();
+                                current_mode = new_mode;
+                                telemetry.insert("armed".into(), "false".into());
+                                telemetry.insert("mode".into(), new_wire.into());
+                                emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                                emit_ready_state(sender, false);
+                            } else {
+                                pending_reconfig = Some(new_mode);
+                                info!(
+                                    "deferred mode change to {:?} (operation in progress)",
+                                    new_mode
+                                );
                             }
                         }
-                        GameStateCommandEvent::SetPlayerInfo { player_info } => {
-                            info!("player handedness: {}", player_info.handed);
-                        }
-                        _ => {}
-                    },
+                    }
+                    FlighthookEvent::PlayerInfo { ref player_info } => {
+                        info!("player handedness: {}", player_info.handed);
+                    }
                     _ => {}
                 },
             }
@@ -459,60 +387,110 @@ fn connect_and_run(
                     }
 
                     BinaryEvent::Trigger => {
-                        debug!("ball trigger detected");
+                        shot_counter += 1;
+                        let key = ShotKey {
+                            shot_id: uuid::Uuid::new_v4().to_string(),
+                            shot_number: shot_counter,
+                        };
+                        debug!("ball trigger detected — shot_id={}", key.shot_id);
+                        sender.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
+                            key: key.clone(),
+                        }));
+                        current_shot_key = Some(key);
+                        shot_had_d4 = false;
+                        stashed_e8 = None;
                         telemetry.insert("shooting".into(), "true".into());
                         emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
                         emit_ready_state(sender, false);
                     }
 
-                    BinaryEvent::Shot(shot_data) => {
-                        let had_d4 = shot_data.flight.is_some();
-                        let had_e8 = stashed_e8.is_some();
-                        let had_club = shot_data.club.is_some();
-                        let had_spin = shot_data.spin.is_some();
-
-                        match convert_shot(&shot_data, stashed_e8.as_ref(), device_id) {
-                            Some(shot) => {
-                                let ball_mph = shot.ball.launch_speed.as_mph();
-                                let carry_yd = shot
-                                    .ball
-                                    .carry_distance
-                                    .map(|d| d.as_yards())
-                                    .unwrap_or(0.0);
-                                let source = if had_d4 { "D4" } else { "E8" };
-                                info!(
-                                    "shot #{} ({}): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm",
-                                    shot.shot_number,
-                                    source,
-                                    ball_mph,
-                                    shot.ball.launch_elevation,
-                                    shot.ball.launch_azimuth,
-                                    carry_yd,
-                                    shot.ball.backspin_rpm.unwrap_or(0),
-                                    shot.ball.sidespin_rpm.unwrap_or(0),
-                                );
-                                sender.send(
-                                    FlighthookMessage::new(LaunchMonitorEvent::ShotResult {
-                                        shot: Box::new(shot),
-                                    }),
-                                );
-                            }
-                            None => {
-                                warn!(
-                                    "shot processed but no result produced \
-                                     (D4={had_d4}, E8={had_e8}, club={had_club}, spin={had_spin})"
-                                );
-                                emit_alert(
-                                    sender,
-                                    AlertLevel::Warn,
-                                    format!(
-                                        "Shot triggered but no result produced (D4={had_d4}, E8={had_e8}, club={had_club}, spin={had_spin})"
-                                    ),
-                                );
+                    BinaryEvent::ShotDatum(datum) => {
+                        if let Some(ref key) = current_shot_key {
+                            match datum {
+                                ShotDatum::Flight(d4) => {
+                                    shot_had_d4 = true;
+                                    let ball = ball_from_d4(&d4);
+                                    info!(
+                                        "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm",
+                                        key.shot_number,
+                                        ball.launch_speed.as_mph(),
+                                        ball.launch_elevation,
+                                        ball.launch_azimuth,
+                                        ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
+                                        ball.backspin_rpm.unwrap_or(0),
+                                        ball.sidespin_rpm.unwrap_or(0),
+                                    );
+                                    sender.send(FlighthookMessage::new(
+                                        FlighthookEvent::BallFlight {
+                                            key: key.clone(),
+                                            ball: Box::new(ball),
+                                            estimated: false,
+                                        },
+                                    ));
+                                }
+                                ShotDatum::FlightV1(e8) => {
+                                    debug!("stashed E8 for fallback");
+                                    stashed_e8 = Some(e8);
+                                }
+                                ShotDatum::Club(ed) => {
+                                    let club = club_from_ed(&ed);
+                                    sender.send(FlighthookMessage::new(
+                                        FlighthookEvent::ClubPath {
+                                            key: key.clone(),
+                                            club: Box::new(club),
+                                        },
+                                    ));
+                                }
+                                ShotDatum::Spin(_) => {
+                                    // Spin axis / total spin are derived from
+                                    // backspin + sidespin in BallFlight; EF is redundant.
+                                }
                             }
                         }
+                    }
 
+                    BinaryEvent::ShotComplete(_shot_data) => {
+                        if let Some(key) = current_shot_key.take() {
+                            // E8 fallback: emit BallFlight from stashed E8 if no D4
+                            if !shot_had_d4 {
+                                if let Some(e8) = stashed_e8.take() {
+                                    let ball = ball_from_e8(&e8);
+                                    info!(
+                                        "shot #{} (E8): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd",
+                                        key.shot_number,
+                                        ball.launch_speed.as_mph(),
+                                        ball.launch_elevation,
+                                        ball.launch_azimuth,
+                                        ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
+                                    );
+                                    sender.send(FlighthookMessage::new(
+                                        FlighthookEvent::BallFlight {
+                                            key: key.clone(),
+                                            ball: Box::new(ball),
+                                            estimated: true,
+                                        },
+                                    ));
+                                } else {
+                                    warn!(
+                                        "shot #{} processed but no flight result (D4 or E8)",
+                                        key.shot_number,
+                                    );
+                                    emit_alert(
+                                        sender,
+                                        AlertLevel::Warn,
+                                        format!(
+                                            "Shot #{} triggered but no flight result produced",
+                                            key.shot_number,
+                                        ),
+                                    );
+                                }
+                            }
+                            sender.send(FlighthookMessage::new(
+                                FlighthookEvent::ShotFinished { key },
+                            ));
+                        }
                         stashed_e8 = None;
+                        shot_had_d4 = false;
 
                         // Device is auto-re-armed by BinaryClient's ShotSequencer.
                         // Apply pending reconfig if any.
@@ -557,14 +535,6 @@ fn connect_and_run(
                     }
 
                     BinaryEvent::Message(env) => {
-                        let label = msg_label(&env.message);
-
-                        // Stash E8 for fallback when D4 is absent
-                        if let Message::FlightResultV1(ref e8) = env.message {
-                            stashed_e8 = Some(e8.clone());
-                            debug!("stashed {label} for E8 fallback");
-                        }
-
                         // Update telemetry cache from status messages
                         match &env.message {
                             Message::DspStatus(dsp) => {
@@ -608,7 +578,7 @@ fn connect_and_run(
             }
             Err(ref e @ ConnError::Wire(_)) | Err(ref e @ ConnError::Protocol(_)) => {
                 warn!(message = "Could not process message", error = ?e);
-                sender.send(FlighthookMessage::new(AlertMessage {
+                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                     level: AlertLevel::Warn,
                     message: format!("Could not process message: {e:?}"),
                 }));
@@ -626,5 +596,55 @@ fn connect_and_run(
             );
             return Err(ConnError::Disconnected);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Protocol type → bus type conversion helpers
+// ---------------------------------------------------------------------------
+
+fn ball_from_d4(d4: &ironsight::protocol::shot::FlightResult) -> BallFlight {
+    BallFlight {
+        launch_speed: Velocity::MetersPerSecond(d4.launch_speed),
+        launch_elevation: d4.launch_elevation,
+        launch_azimuth: d4.launch_azimuth,
+        carry_distance: Some(Distance::Meters(d4.carry_distance)),
+        total_distance: None,
+        max_height: Some(Distance::Meters(d4.max_height)),
+        flight_time: Some(d4.flight_time),
+        roll_distance: None,
+        backspin_rpm: Some(d4.backspin_rpm),
+        sidespin_rpm: Some(d4.sidespin_rpm),
+    }
+}
+
+fn ball_from_e8(e8: &ironsight::protocol::shot::FlightResultV1) -> BallFlight {
+    BallFlight {
+        launch_speed: Velocity::MetersPerSecond(e8.ball_velocity),
+        launch_elevation: e8.elevation,
+        launch_azimuth: e8.azimuth,
+        carry_distance: Some(Distance::Meters(e8.distance)),
+        total_distance: None,
+        max_height: Some(Distance::Meters(e8.height)),
+        flight_time: Some(e8.flight_time),
+        roll_distance: None,
+        backspin_rpm: Some(e8.backspin_rpm),
+        sidespin_rpm: None, // always zero in E8 — None, not Some(0)
+    }
+}
+
+fn club_from_ed(ed: &ironsight::protocol::shot::ClubResult) -> ClubData {
+    ClubData {
+        club_speed: Velocity::MetersPerSecond(ed.pre_club_speed),
+        path: Some(ed.strike_direction),
+        attack_angle: Some(ed.attack_angle),
+        face_angle: Some(ed.face_angle),
+        dynamic_loft: Some(ed.dynamic_loft),
+        smash_factor: Some(ed.smash_factor),
+        club_speed_post: Some(Velocity::MetersPerSecond(ed.post_club_speed)),
+        swing_plane_horizontal: Some(ed.swing_plane_horizontal),
+        swing_plane_vertical: Some(ed.swing_plane_vertical),
+        club_offset: Some(Distance::Meters(ed.club_offset)),
+        club_height: Some(Distance::Meters(ed.club_height)),
     }
 }

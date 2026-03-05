@@ -1,8 +1,9 @@
 //! Mock launch monitor actor — produces a random shot every 30 seconds.
 //!
-//! No ironsight dependency. Generates `ShotData` directly from schema types,
-//! using the current mode (derived from club selection in global state) to
-//! pick realistic values. Useful for testing the full pipeline without hardware.
+//! No ironsight dependency. Generates shot lifecycle events directly from
+//! schema types, using the current mode (derived from club selection in
+//! global state) to pick realistic values. Useful for testing the full
+//! pipeline without hardware.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,8 +15,8 @@ use crate::actors::Actor;
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use flighthook::{
-    ActorState, ActorStatus, BallFlight, ClubData, Distance, FlighthookEvent, FlighthookMessage,
-    GameStateCommandEvent, LaunchMonitorEvent, ShotData, ShotDetectionMode, SpinData, Velocity,
+    ActorStatus, BallFlight, ClubData, Distance, FlighthookEvent, FlighthookMessage,
+    ShotDetectionMode, ShotKey, Velocity,
 };
 
 const SHOT_INTERVAL: Duration = Duration::from_secs(30);
@@ -57,18 +58,17 @@ fn telemetry(shot_count: i32, mode: ShotDetectionMode) -> HashMap<String, String
 }
 
 fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusReceiver) {
-    let device_id = sender.actor_id().to_string();
     let mut current_mode = initial_mode;
     let mut shot_count: i32 = 0;
     // Backdate so the first shot fires after ~1s instead of waiting the full interval.
     let mut last_shot = Instant::now() - SHOT_INTERVAL + Duration::from_secs(1);
 
     // Go straight to ready
-    sender.send(FlighthookMessage::new(ActorState::new(
-        ActorStatus::Connected,
-        telemetry(shot_count, current_mode),
-    )));
-    sender.send(FlighthookMessage::new(LaunchMonitorEvent::ReadyState {
+    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+        status: ActorStatus::Connected,
+        telemetry: telemetry(shot_count, current_mode),
+    }));
+    sender.send(FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
         armed: true,
         ball_detected: true,
     }));
@@ -80,36 +80,33 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
         loop {
             match receiver.poll() {
                 Err(PollError::Shutdown) => {
-                    sender.send(FlighthookMessage::new(ActorState::new(
-                        ActorStatus::Disconnected,
-                        HashMap::new(),
-                    )));
+                    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                        status: ActorStatus::Disconnected,
+                        telemetry: HashMap::new(),
+                    }));
                     return;
                 }
                 Ok(None) => break,
-                Ok(Some(msg)) => match msg.event {
-                    FlighthookEvent::GameStateCommand(cmd) => {
-                        if let GameStateCommandEvent::SetMode { mode } = cmd.event {
-                            if std::mem::discriminant(&current_mode)
-                                != std::mem::discriminant(&mode)
-                            {
-                                info!("mock: mode change: {current_mode:?} -> {mode:?}");
-                                current_mode = mode;
-                                mode_changed = true;
-                            }
+                Ok(Some(msg)) => {
+                    if let FlighthookEvent::ShotDetectionMode { mode } = msg.event {
+                        if std::mem::discriminant(&current_mode)
+                            != std::mem::discriminant(&mode)
+                        {
+                            info!("mock: mode change: {current_mode:?} -> {mode:?}");
+                            current_mode = mode;
+                            mode_changed = true;
                         }
                     }
-                    _ => {}
-                },
+                }
             }
         }
 
         // Emit updated telemetry on mode change
         if mode_changed {
-            sender.send(FlighthookMessage::new(ActorState::new(
-                ActorStatus::Connected,
-                telemetry(shot_count, current_mode),
-            )));
+            sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                status: ActorStatus::Connected,
+                telemetry: telemetry(shot_count, current_mode),
+            }));
         }
 
         // Generate shot if due
@@ -117,36 +114,53 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
             shot_count += 1;
             last_shot = Instant::now();
 
-            let shot = generate_shot(shot_count, current_mode, &device_id);
-            let ball_mph = shot.ball.launch_speed.as_mph();
-            let carry_yd = shot
-                .ball
+            let key = ShotKey {
+                shot_id: uuid::Uuid::new_v4().to_string(),
+                shot_number: shot_count,
+            };
+            let (ball, club) = generate_shot(shot_count, current_mode);
+
+            let ball_mph = ball.launch_speed.as_mph();
+            let carry_yd = ball
                 .carry_distance
                 .map(|d| d.as_yards())
                 .unwrap_or(0.0);
             info!(
                 "mock shot #{}: ball={:.1}mph VLA={:.1} carry={:.1}yd",
-                shot.shot_number, ball_mph, shot.ball.launch_elevation, carry_yd,
+                shot_count, ball_mph, ball.launch_elevation, carry_yd,
             );
 
             let mut shooting = telemetry(shot_count, current_mode);
             shooting.insert("shooting".into(), "true".into());
-            sender.send(FlighthookMessage::new(ActorState::new(
-                ActorStatus::Connected,
-                shooting,
-            )));
-            sender.send(FlighthookMessage::new(LaunchMonitorEvent::ReadyState {
+            sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                status: ActorStatus::Connected,
+                telemetry: shooting,
+            }));
+            sender.send(FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
                 armed: false,
                 ball_detected: false,
             }));
-            sender.send(FlighthookMessage::new(LaunchMonitorEvent::ShotResult {
-                shot: Box::new(shot),
+            // Emit shot lifecycle events
+            sender.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
+                key: key.clone(),
             }));
-            sender.send(FlighthookMessage::new(ActorState::new(
-                ActorStatus::Connected,
-                telemetry(shot_count, current_mode),
-            )));
-            sender.send(FlighthookMessage::new(LaunchMonitorEvent::ReadyState {
+            sender.send(FlighthookMessage::new(FlighthookEvent::BallFlight {
+                key: key.clone(),
+                ball: Box::new(ball),
+                estimated: false,
+            }));
+            sender.send(FlighthookMessage::new(FlighthookEvent::ClubPath {
+                key: key.clone(),
+                club: Box::new(club),
+            }));
+            sender.send(FlighthookMessage::new(FlighthookEvent::ShotFinished {
+                key,
+            }));
+            sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                status: ActorStatus::Connected,
+                telemetry: telemetry(shot_count, current_mode),
+            }));
+            sender.send(FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
                 armed: true,
                 ball_detected: true,
             }));
@@ -156,25 +170,28 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
     }
 }
 
-fn generate_shot(n: i32, mode: ShotDetectionMode, source: &str) -> ShotData {
+fn generate_shot(
+    n: i32,
+    mode: ShotDetectionMode,
+) -> (BallFlight, ClubData) {
     let v = (n as f64 * 0.7).sin(); // -1..1 variation seed
 
     let (ball_speed, vla, hla, carry, height, backspin, sidespin, club_speed, aoa, loft) =
         match mode {
             ShotDetectionMode::Full => (
-                53.0 + 3.0 * v, // ~120 mph (7-iron)
+                53.0 + 3.0 * v,
                 17.0 + 1.5 * v,
                 0.8 * v,
                 155.0 + 10.0 * v,
                 26.0 + 2.0 * v,
                 5500.0 + 300.0 * v,
                 80.0 * v,
-                36.0 + 2.0 * v, // ~80 mph
+                36.0 + 2.0 * v,
                 -4.0 + 0.8 * v,
                 22.0 + 1.0 * v,
             ),
             ShotDetectionMode::Chipping => (
-                18.0 + 2.0 * v, // ~40 mph
+                18.0 + 2.0 * v,
                 35.0 + 3.0 * v,
                 0.5 * v,
                 27.0 + 4.0 * v,
@@ -186,7 +203,7 @@ fn generate_shot(n: i32, mode: ShotDetectionMode, source: &str) -> ShotData {
                 38.0 + 2.0 * v,
             ),
             ShotDetectionMode::Putting => (
-                3.5 + 0.5 * v, // ~8 mph
+                3.5 + 0.5 * v,
                 2.0 + 0.3 * v,
                 0.3 * v,
                 4.5 + 1.0 * v,
@@ -201,41 +218,32 @@ fn generate_shot(n: i32, mode: ShotDetectionMode, source: &str) -> ShotData {
 
     let face_angle = hla * 0.7;
     let path = hla * 0.4;
-    let total_spin = (backspin * backspin + sidespin * sidespin).sqrt();
-    let spin_axis = sidespin.atan2(backspin).to_degrees();
 
-    ShotData {
-        source: source.to_string(),
-        shot_number: n,
-        ball: BallFlight {
-            launch_speed: Velocity::MetersPerSecond(ball_speed),
-            launch_elevation: vla,
-            launch_azimuth: hla,
-            carry_distance: Some(Distance::Meters(carry)),
-            total_distance: Some(Distance::Meters(carry * 1.1)),
-            max_height: Some(Distance::Meters(height)),
-            flight_time: Some(5.0),
-            roll_distance: Some(Distance::Meters(carry * 0.1)),
-            backspin_rpm: Some(backspin as i32),
-            sidespin_rpm: Some(sidespin as i32),
-        },
-        club: Some(ClubData {
-            club_speed: Velocity::MetersPerSecond(club_speed),
-            path: Some(path),
-            attack_angle: Some(aoa),
-            face_angle: Some(face_angle),
-            dynamic_loft: Some(loft),
-            smash_factor: Some(ball_speed / club_speed),
-            club_speed_post: Some(Velocity::MetersPerSecond(club_speed * 0.7)),
-            swing_plane_horizontal: Some(0.0),
-            swing_plane_vertical: Some(45.0),
-            club_offset: None,
-            club_height: None,
-        }),
-        spin: Some(SpinData {
-            total_spin: total_spin as i16,
-            spin_axis,
-        }),
-        estimated: false,
-    }
+    let ball = BallFlight {
+        launch_speed: Velocity::MetersPerSecond(ball_speed),
+        launch_elevation: vla,
+        launch_azimuth: hla,
+        carry_distance: Some(Distance::Meters(carry)),
+        total_distance: Some(Distance::Meters(carry * 1.1)),
+        max_height: Some(Distance::Meters(height)),
+        flight_time: Some(5.0),
+        roll_distance: Some(Distance::Meters(carry * 0.1)),
+        backspin_rpm: Some(backspin as i32),
+        sidespin_rpm: Some(sidespin as i32),
+    };
+    let club = ClubData {
+        club_speed: Velocity::MetersPerSecond(club_speed),
+        path: Some(path),
+        attack_angle: Some(aoa),
+        face_angle: Some(face_angle),
+        dynamic_loft: Some(loft),
+        smash_factor: Some(ball_speed / club_speed),
+        club_speed_post: Some(Velocity::MetersPerSecond(club_speed * 0.7)),
+        swing_plane_horizontal: Some(0.0),
+        swing_plane_vertical: Some(45.0),
+        club_offset: None,
+        club_height: None,
+    };
+
+    (ball, club)
 }

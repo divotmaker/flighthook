@@ -62,11 +62,11 @@ tee_height = "1.5in"
 range = "8ft"
 surface_height = "0in"
 track_pct = 80.0
-use_partial = "chipping_only"  # never | chipping_only | always
 
 [gspro.0]
 name = "Local GSPro"
 address = "127.0.0.1:921"
+use_estimated = "chipping_only"  # never | chipping_only | always
 ```
 
 Section prefixes encode component type: `mevo`, `mock_monitor`, `gspro`,

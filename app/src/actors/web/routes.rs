@@ -14,10 +14,7 @@ use tokio::sync::broadcast;
 use super::WebState;
 use super::types::{ModeRequest, PostSettingsResponse, StatusResponse};
 use crate::state::config::FlighthookConfig;
-use flighthook::{
-    ConfigAction, ConfigCommand, FlighthookEvent, FlighthookMessage, GameStateCommandEvent,
-    ShotData, UnitSystem,
-};
+use flighthook::{ConfigAction, FlighthookEvent, FlighthookMessage, ShotData, UnitSystem};
 
 // ---------------------------------------------------------------------------
 // Embedded UI assets (built by `make ui` in flighthook/ui/)
@@ -144,7 +141,7 @@ pub async fn post_mode(
     let mode = body.mode;
     let _ = state
         .bus_tx
-        .send(FlighthookMessage::new(GameStateCommandEvent::SetMode { mode }).source("web"));
+        .send(FlighthookMessage::new(FlighthookEvent::ShotDetectionMode { mode }).source("web"));
     StatusCode::ACCEPTED
 }
 
@@ -167,7 +164,7 @@ pub async fn post_settings(
 
     // Emit ConfigCommand on the bus
     let _ = state.bus_tx.send(
-        FlighthookMessage::new(ConfigCommand {
+        FlighthookMessage::new(FlighthookEvent::ConfigCommand {
             request_id: Some(request_id.clone()),
             action: ConfigAction::ReplaceAll { config: new_config },
         })
@@ -179,9 +176,15 @@ pub async fn post_settings(
         loop {
             match bus_rx.recv().await {
                 Ok(msg) => {
-                    if let FlighthookEvent::ConfigOutcome(ref r) = msg.event {
-                        if r.request_id == request_id {
-                            return Some(r.clone());
+                    if let FlighthookEvent::ConfigOutcome {
+                        request_id: Some(ref rid),
+                        ref restarted,
+                        ref stopped,
+                        ..
+                    } = msg.event
+                    {
+                        if *rid == request_id {
+                            return Some((restarted.clone(), stopped.clone()));
                         }
                     }
                 }
@@ -193,9 +196,9 @@ pub async fn post_settings(
     .await;
 
     match result {
-        Ok(Some(r)) => Json(PostSettingsResponse {
-            restarted: r.restarted,
-            stopped: r.stopped,
+        Ok(Some((restarted, stopped))) => Json(PostSettingsResponse {
+            restarted,
+            stopped,
         }),
         _ => {
             tracing::warn!("config update: timed out waiting for ConfigOutcome");

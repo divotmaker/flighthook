@@ -1,6 +1,6 @@
 //! Random club integration — logs shots, always connected.
 //!
-//! Subscribes to bus for shots, emits GameStateCommand for connection status.
+//! Subscribes to bus for shots, emits club/player updates for connection status.
 //! Randomly cycles club and handedness after each shot to exercise the UI.
 //! Useful for testing without a real simulator (GSPro, etc.).
 
@@ -13,8 +13,7 @@ use super::super::Actor;
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use flighthook::{
-    ActorState, ActorStatus, Club, ClubInfo, FlighthookEvent, FlighthookMessage,
-    GameStateCommandEvent, LaunchMonitorEvent, PlayerInfo,
+    ActorStatus, Club, ClubInfo, FlighthookEvent, FlighthookMessage, PlayerInfo,
 };
 
 const HANDEDNESS: &[&str] = &["RH", "LH"];
@@ -51,10 +50,10 @@ fn emit_status(sender: &BusSender, club: Club, handed: &str) {
     let mut telemetry = HashMap::new();
     telemetry.insert("club".into(), club.to_string());
     telemetry.insert("handed".into(), handed.to_string());
-    sender.send(FlighthookMessage::new(ActorState::new(
-        ActorStatus::Connected,
+    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+        status: ActorStatus::Connected,
         telemetry,
-    )));
+    }));
 }
 
 fn run(sender: BusSender, mut receiver: BusReceiver) {
@@ -69,14 +68,12 @@ fn run(sender: BusSender, mut receiver: BusReceiver) {
 
     // Report connected with telemetry + emit game state
     emit_status(&sender, club, &handed);
-    sender.send(FlighthookMessage::new(
-        GameStateCommandEvent::SetPlayerInfo {
-            player_info: PlayerInfo {
-                handed: handed.clone(),
-            },
+    sender.send(FlighthookMessage::new(FlighthookEvent::PlayerInfo {
+        player_info: PlayerInfo {
+            handed: handed.clone(),
         },
-    ));
-    sender.send(FlighthookMessage::new(GameStateCommandEvent::SetClubInfo {
+    }));
+    sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
         club_info: ClubInfo { club },
     }));
 
@@ -90,32 +87,17 @@ fn run(sender: BusSender, mut receiver: BusReceiver) {
                 std::thread::sleep(Duration::from_millis(100));
             }
             Ok(Some(msg)) => {
-                if let FlighthookEvent::LaunchMonitor(recv) = &msg.event {
-                    let LaunchMonitorEvent::ShotResult { ref shot } = recv.event else {
-                        continue;
-                    };
-                    let b = &shot.ball;
-                    let summary = format!(
-                        "shot #{}: speed={:.1}m/s carry={:.1}m spin={}rpm",
-                        shot.shot_number,
-                        b.launch_speed.as_mps(),
-                        b.carry_distance.map(|d| d.as_meters()).unwrap_or(0.0),
-                        b.backspin_rpm.unwrap_or(0),
-                    );
-                    tracing::info!("random_club '{name}': {summary}");
-
-                    // Cycle to a new random club and handedness after each shot
+                // Cycle club/handedness on each completed shot
+                if let FlighthookEvent::ShotFinished { .. } = &msg.event {
                     club = Club::ALL[next_rand(&mut seed) % Club::ALL.len()];
                     handed = HANDEDNESS[next_rand(&mut seed) % HANDEDNESS.len()].to_string();
                     emit_status(&sender, club, &handed);
-                    sender.send(FlighthookMessage::new(
-                        GameStateCommandEvent::SetPlayerInfo {
-                            player_info: PlayerInfo {
-                                handed: handed.clone(),
-                            },
+                    sender.send(FlighthookMessage::new(FlighthookEvent::PlayerInfo {
+                        player_info: PlayerInfo {
+                            handed: handed.clone(),
                         },
-                    ));
-                    sender.send(FlighthookMessage::new(GameStateCommandEvent::SetClubInfo {
+                    }));
+                    sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
                         club_info: ClubInfo { club },
                     }));
                 }

@@ -6,9 +6,8 @@ use crate::net::{self, PendingHandle, WsPollEvent};
 use crate::panels::Tab;
 use crate::panels::settings::{PendingRemoval, SettingsForm};
 use crate::types::{
-    ActorState, ActorStatus, ActorStatusResponse, FlighthookEvent, FlighthookMessage,
-    GameStateCommand, GameStateCommandEvent, LaunchMonitorEvent, LaunchMonitorRecv, LogEntry,
-    ShotData, UnitSystem,
+    ActorStatus, ActorStatusResponse, FlighthookEvent, FlighthookMessage, LogEntry, ShotRow,
+    UnitSystem,
 };
 use chrono::SecondsFormat;
 
@@ -31,7 +30,7 @@ pub struct FlighthookApp {
     pub(crate) actors: HashMap<String, ActorStatusResponse>,
 
     // Data
-    pub(crate) shots: Vec<ShotData>,
+    pub(crate) shots: Vec<ShotRow>,
 
     // Global state
     pub(crate) current_mode: String,
@@ -59,8 +58,7 @@ pub struct FlighthookApp {
     pub(crate) log_entries: Vec<LogEntry>,
     pub(crate) log_auto_scroll: bool,
     pub(crate) log_type_filters: HashMap<String, bool>,
-    /// Alert level filter: 0 = error only, 1 = warn (includes error). Default: warn.
-    pub(crate) log_alert_filter: usize,
+    pub(crate) log_filter_open: bool,
 }
 
 impl FlighthookApp {
@@ -95,7 +93,7 @@ impl FlighthookApp {
                 .iter()
                 .map(|&k| (k.to_string(), true))
                 .collect(),
-            log_alert_filter: 1, // default: warn (show warn + error)
+            log_filter_open: false,
         }
     }
 
@@ -115,7 +113,7 @@ impl FlighthookApp {
         }
 
         if let Some(shots) = p.shots.take() {
-            self.shots = shots;
+            self.shots = shots.into_iter().map(ShotRow::from).collect();
         }
 
         if let Some(s) = p.settings.take()
@@ -229,56 +227,61 @@ impl FlighthookApp {
         // Route event to UI state
         let source = msg.source.clone();
         match msg.event {
-            FlighthookEvent::ActorStatus(update) => {
-                self.handle_actor_status(&source, update);
+            FlighthookEvent::ActorStatus {
+                status,
+                telemetry,
+            } => {
+                let actor = self
+                    .actors
+                    .entry(source)
+                    .or_insert_with(|| new_actor(String::new()));
+                actor.status = status;
+                actor.telemetry = telemetry;
             }
-            FlighthookEvent::LaunchMonitor(recv) => {
-                self.handle_monitor_recv(&source, recv);
+            FlighthookEvent::ShotTrigger { key } => {
+                self.shots.push(ShotRow {
+                    source: source.clone(),
+                    shot_id: key.shot_id.clone(),
+                    shot_number: key.shot_number,
+                    ball: None,
+                    club: None,
+                    estimated: false,
+                });
             }
-            FlighthookEvent::GameStateCommand(cmd) => {
-                self.handle_game_state_command(&source, cmd);
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_actor_status(&mut self, source: &str, update: ActorState) {
-        let actor = self
-            .actors
-            .entry(source.to_string())
-            .or_insert_with(|| new_actor(String::new()));
-        actor.status = update.status;
-        actor.telemetry = update.telemetry;
-    }
-
-    fn handle_monitor_recv(&mut self, _source: &str, recv: LaunchMonitorRecv) {
-        match recv.event {
-            LaunchMonitorEvent::ShotResult { shot } => {
-                self.shots.push(*shot);
-            }
-            LaunchMonitorEvent::ReadyState { .. } => {
-                // Handled by integration actors (GSPro); UI doesn't need this.
-            }
-        }
-    }
-
-    fn handle_game_state_command(&mut self, source: &str, cmd: GameStateCommand) {
-        match cmd.event {
-            GameStateCommandEvent::SetPlayerInfo { player_info } => {
-                if let Some(actor) = self.actors.get_mut(source) {
-                    actor.telemetry.insert("handed".into(), player_info.handed);
+            FlighthookEvent::BallFlight {
+                key,
+                ball,
+                estimated,
+            } => {
+                if let Some(row) = self.shots.iter_mut().rev().find(|r| r.shot_id == key.shot_id) {
+                    row.ball = Some(*ball);
+                    row.estimated = estimated;
                 }
             }
-            GameStateCommandEvent::SetClubInfo { club_info } => {
-                if let Some(actor) = self.actors.get_mut(source) {
+            FlighthookEvent::ClubPath { key, club } => {
+                if let Some(row) = self.shots.iter_mut().rev().find(|r| r.shot_id == key.shot_id) {
+                    row.club = Some(*club);
+                }
+            }
+            FlighthookEvent::ShotFinished { .. } => {}
+            FlighthookEvent::PlayerInfo { player_info } => {
+                if let Some(actor) = self.actors.get_mut(&source) {
+                    actor
+                        .telemetry
+                        .insert("handed".into(), player_info.handed);
+                }
+            }
+            FlighthookEvent::ClubInfo { club_info } => {
+                if let Some(actor) = self.actors.get_mut(&source) {
                     actor
                         .telemetry
                         .insert("club".into(), club_info.club.to_string());
                 }
             }
-            GameStateCommandEvent::SetMode { mode } => {
+            FlighthookEvent::ShotDetectionMode { mode } => {
                 self.current_mode = mode.to_string();
             }
+            _ => {}
         }
     }
 }

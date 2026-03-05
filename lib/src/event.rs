@@ -3,11 +3,10 @@
 //! These are pure data structures with no channel affinity. The bus message
 //! types in `message.rs` reference them.
 
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Distance, PartialMode, UnitSystem, Velocity};
+use crate::{Distance, ShotKey, UnitSystem, Velocity};
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -30,7 +29,7 @@ pub struct BallFlight {
     pub flight_time: Option<f64>, // s
     #[serde(default)]
     pub roll_distance: Option<Distance>,
-    // Spin from ball flight message (D4/E8) — separate from SpinData (EF)
+    // Spin
     #[serde(default)]
     pub backspin_rpm: Option<i32>,
     #[serde(default)]
@@ -63,12 +62,6 @@ pub struct ClubData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpinData {
-    pub total_spin: i16, // RPM
-    pub spin_axis: f64,  // deg
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShotData {
     #[serde(default)]
     pub source: String,
@@ -76,8 +69,6 @@ pub struct ShotData {
     pub ball: BallFlight,
     #[serde(default)]
     pub club: Option<ClubData>,
-    #[serde(default)]
-    pub spin: Option<SpinData>,
     #[serde(default)]
     pub estimated: bool,
 }
@@ -133,7 +124,6 @@ impl ShotData {
             shot_number: self.shot_number,
             ball,
             club,
-            spin: self.spin.clone(),
             estimated: self.estimated,
         }
     }
@@ -183,20 +173,9 @@ impl ShotData {
             shot_number: self.shot_number,
             ball,
             club,
-            spin: self.spin.clone(),
             estimated: self.estimated,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MevoConfigEvent {
-    pub ball_type: u8,
-    pub tee_height: Distance,
-    pub range: Distance,
-    pub surface_height: Distance,
-    pub track_pct: f64, // 0-100 (user units)
-    pub use_partial: PartialMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,17 +203,53 @@ impl std::fmt::Display for ActorStatus {
     }
 }
 
-/// Actor state emitted on the bus. Carries lifecycle status and
-/// actor-specific key/value telemetry (battery, tilt, club, etc.).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActorState {
-    pub status: ActorStatus,
-    #[serde(default)]
-    pub telemetry: HashMap<String, String>,
+// ---------------------------------------------------------------------------
+// ShotAccumulator — consumer-side shot assembly
+// ---------------------------------------------------------------------------
+
+/// Collects shot lifecycle events (`BallFlight`, `ClubPath`) and produces a
+/// complete [`ShotData`] on `ShotFinished`.
+///
+/// Used by consumers that need all shot fields together (GSPro bridge,
+/// web shot cache, UI shot grid). Keyed by `(source, ShotKey)`.
+#[derive(Debug)]
+pub struct ShotAccumulator {
+    pub source: String,
+    pub key: ShotKey,
+    ball: Option<(BallFlight, bool)>,
+    club: Option<ClubData>,
 }
 
-impl ActorState {
-    pub fn new(status: ActorStatus, telemetry: HashMap<String, String>) -> Self {
-        Self { status, telemetry }
+impl ShotAccumulator {
+    /// Create a new accumulator for a shot trigger.
+    pub fn new(source: String, key: ShotKey) -> Self {
+        Self {
+            source,
+            key,
+            ball: None,
+            club: None,
+        }
+    }
+
+    /// Record ball flight data.
+    pub fn set_ball(&mut self, ball: BallFlight, estimated: bool) {
+        self.ball = Some((ball, estimated));
+    }
+
+    /// Record club path data.
+    pub fn set_club(&mut self, club: ClubData) {
+        self.club = Some(club);
+    }
+
+    /// Finalize into a `ShotData`. Returns `None` if no ball data arrived.
+    pub fn finish(self) -> Option<ShotData> {
+        let (ball, estimated) = self.ball?;
+        Some(ShotData {
+            source: self.source,
+            shot_number: self.key.shot_number,
+            ball,
+            club: self.club,
+            estimated,
+        })
     }
 }

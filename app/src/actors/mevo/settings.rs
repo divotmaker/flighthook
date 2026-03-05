@@ -5,8 +5,7 @@ use ironsight::protocol::config::{
 use ironsight::seq::AvrSettings;
 
 use crate::state::config::MevoSection;
-use flighthook::MevoConfigEvent;
-use flighthook::{Distance, PartialMode, ShotDetectionMode};
+use flighthook::{Distance, ShotDetectionMode};
 
 /// Mutable session configuration. Distance fields carry both value and unit;
 /// wire-protocol conversions happen on demand in `to_avr_settings()`.
@@ -17,7 +16,6 @@ pub struct SessionConfig {
     pub range: Distance,
     pub surface_height: Distance,
     pub track_pct: f64, // 0-100 (user units)
-    pub use_partial: PartialMode,
 }
 
 impl Default for SessionConfig {
@@ -28,7 +26,6 @@ impl Default for SessionConfig {
             range: Distance::Feet(8.0),
             surface_height: Distance::Inches(0.0),
             track_pct: 80.0,
-            use_partial: PartialMode::default(),
         }
     }
 }
@@ -44,17 +41,7 @@ impl SessionConfig {
             range: s.range.unwrap_or(defaults.range),
             surface_height: s.surface_height.unwrap_or(defaults.surface_height),
             track_pct: s.track_pct.unwrap_or(defaults.track_pct),
-            use_partial: s.use_partial.unwrap_or(defaults.use_partial),
         }
-    }
-
-    pub fn apply_config_event(&mut self, event: &MevoConfigEvent) {
-        self.ball_type = event.ball_type;
-        self.tee_height = event.tee_height;
-        self.range = event.range;
-        self.surface_height = event.surface_height;
-        self.track_pct = event.track_pct;
-        self.use_partial = event.use_partial;
     }
 
     /// Human-readable label for the detection mode wire value.
@@ -113,16 +100,6 @@ impl SessionConfig {
         }
     }
 
-    pub fn to_config_event(&self) -> MevoConfigEvent {
-        MevoConfigEvent {
-            ball_type: self.ball_type,
-            tee_height: self.tee_height,
-            range: self.range,
-            surface_height: self.surface_height,
-            track_pct: self.track_pct,
-            use_partial: self.use_partial,
-        }
-    }
 }
 
 /// Default camera configuration for Mevo+ sessions.

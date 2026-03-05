@@ -18,7 +18,7 @@ headless = []
 gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
-ironsight = { version = "0.0.7", features = ["serde"] }
+ironsight = { path = "../../../ironsight/ironsight", features = ["serde"] }
 flighthook = { path = "../lib", features = ["clap"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
@@ -33,6 +33,7 @@ futures-util = "0.3"
 toml = "0.8"
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.

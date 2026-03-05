@@ -1,8 +1,8 @@
 //! GSPro Open Connect V1 bridge.
 //!
 //! Subscribes to the unified bus for shot data and forwards to GSPro's TCP API
-//! (port 921). Emits GameStateCommand for club/player changes and Internal
-//! events for connection status. Reconnects with exponential backoff on failure.
+//! (port 921). Emits PlayerInfo/ClubInfo for club/player changes and
+//! ActorStatus for connection status. Reconnects with exponential backoff on failure.
 
 pub mod api;
 pub mod mapper;
@@ -21,8 +21,8 @@ use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use flighthook::{
-    ActorState, ActorStatus, AlertLevel, AlertMessage, FlighthookEvent, FlighthookMessage,
-    GameStateCommandEvent, LaunchMonitorEvent, PartialMode, ShotDetectionMode,
+    ActorStatus, AlertLevel, EstimatedMode, FlighthookEvent, FlighthookMessage,
+    ShotAccumulator, ShotDetectionMode, ShotKey,
 };
 
 /// Bridge-internal error type.
@@ -40,12 +40,12 @@ impl fmt::Display for BridgeError {
     }
 }
 
-/// Decide whether a partial (E8-only) shot should be forwarded to GSPro.
-fn should_forward_partial(mode: ShotDetectionMode, use_partial: PartialMode) -> bool {
-    match use_partial {
-        PartialMode::Always => true,
-        PartialMode::ChippingOnly => matches!(mode, ShotDetectionMode::Chipping),
-        PartialMode::Never => false,
+/// Decide whether an estimated ball flight should be forwarded.
+fn should_forward_estimated(mode: ShotDetectionMode, use_estimated: EstimatedMode) -> bool {
+    match use_estimated {
+        EstimatedMode::Always => true,
+        EstimatedMode::ChippingOnly => matches!(mode, ShotDetectionMode::Chipping),
+        EstimatedMode::Never => false,
     }
 }
 
@@ -62,17 +62,19 @@ pub struct GsProRouting {
 pub struct GsProActor {
     pub addr: SocketAddr,
     pub routing: GsProRouting,
+    pub use_estimated: EstimatedMode,
 }
 
 impl Actor for GsProActor {
     fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let addr = self.addr;
         let routing = self.routing.clone();
+        let use_estimated = self.use_estimated;
         let thread_name = format!("gspro:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
-            .spawn(move || run(addr, routing, sender, receiver))
+            .spawn(move || run(addr, routing, use_estimated, sender, receiver))
             .expect("failed to spawn gspro thread");
     }
 
@@ -80,7 +82,7 @@ impl Actor for GsProActor {
         let actor_id = sender.actor_id();
         let (_, index) = match actor_id.split_once('.') {
             Some(pair) => pair,
-            None => return ReconfigureOutcome::NoChange,
+            None => return ReconfigureOutcome::Applied,
         };
 
         let snap = state.system.snapshot();
@@ -106,12 +108,18 @@ impl Actor for GsProActor {
             return ReconfigureOutcome::RestartRequired;
         }
 
-        ReconfigureOutcome::NoChange
+        // Check use_estimated changes
+        let new_estimated = section.use_estimated.unwrap_or_default();
+        if new_estimated != self.use_estimated {
+            return ReconfigureOutcome::RestartRequired;
+        }
+
+        ReconfigureOutcome::Applied
     }
 }
 
 /// Main bridge loop. Reconnects forever until the bus closes.
-fn run(addr: SocketAddr, routing: GsProRouting, sender: BusSender, mut receiver: BusReceiver) {
+fn run(addr: SocketAddr, routing: GsProRouting, use_estimated: EstimatedMode, sender: BusSender, mut receiver: BusReceiver) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
 
@@ -120,7 +128,7 @@ fn run(addr: SocketAddr, routing: GsProRouting, sender: BusSender, mut receiver:
             tracing::info!("gspro bridge: shutting down");
             return;
         }
-        match connect_and_run(addr, &routing, &sender, &mut receiver) {
+        match connect_and_run(addr, &routing, use_estimated, &sender, &mut receiver) {
             Ok(()) => {
                 tracing::info!("gspro bridge: shutting down");
                 return;
@@ -131,14 +139,14 @@ fn run(addr: SocketAddr, routing: GsProRouting, sender: BusSender, mut receiver:
             }
             Err(e) => {
                 tracing::info!("gspro bridge: {e}, reconnecting in {backoff:?}");
-                sender.send(FlighthookMessage::new(AlertMessage {
+                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                     level: AlertLevel::Error,
                     message: format!("GSPro connection failed: {e}"),
                 }));
-                sender.send(FlighthookMessage::new(ActorState::new(
-                    ActorStatus::Reconnecting,
-                    HashMap::new(),
-                )));
+                sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                    status: ActorStatus::Reconnecting,
+                    telemetry: HashMap::new(),
+                }));
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(max_backoff);
             }
@@ -184,6 +192,7 @@ fn shot_matches_routing(routing: &GsProRouting, mode: ShotDetectionMode, source:
 fn connect_and_run(
     addr: SocketAddr,
     routing: &GsProRouting,
+    use_estimated: EstimatedMode,
     sender: &BusSender,
     receiver: &mut BusReceiver,
 ) -> Result<(), BridgeError> {
@@ -197,18 +206,19 @@ fn connect_and_run(
         .map_err(BridgeError::Io)?;
 
     tracing::info!("gspro bridge: connected to {addr}");
-    sender.send(FlighthookMessage::new(ActorState::new(
-        ActorStatus::Connected,
-        HashMap::new(),
-    )));
+    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+        status: ActorStatus::Connected,
+        telemetry: HashMap::new(),
+    }));
 
     let mut current_mode = ShotDetectionMode::Full;
-    let mut use_partial = PartialMode::default();
     // Backdate so the first heartbeat fires after ~1s instead of waiting the full 10s.
     let mut last_heartbeat = Instant::now() - Duration::from_secs(9);
     let mut read_buf = vec![0u8; 4096];
     let mut monitor_state: HashMap<String, (bool, bool)> = HashMap::new();
     let mut prev_readiness = (false, false);
+    // Per-source shot accumulators, keyed by (source, shot_key)
+    let mut accumulators: HashMap<(String, ShotKey), ShotAccumulator> = HashMap::new();
 
     loop {
         if receiver.is_shutdown() {
@@ -220,7 +230,7 @@ fn connect_and_run(
         match stream.read(&mut read_buf) {
             Ok(0) => {
                 tracing::warn!("gspro <- connection closed");
-                sender.send(FlighthookMessage::new(AlertMessage {
+                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                     level: AlertLevel::Warn,
                     message: "GSPro closed the connection".into(),
                 }));
@@ -245,7 +255,7 @@ fn connect_and_run(
                     || e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
                 tracing::warn!("gspro <- read error: {e}");
-                sender.send(FlighthookMessage::new(AlertMessage {
+                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                     level: AlertLevel::Warn,
                     message: format!("GSPro read error: {e}"),
                 }));
@@ -261,12 +271,36 @@ fn connect_and_run(
                 Err(PollError::Shutdown) => return Err(BridgeError::Shutdown),
                 Ok(None) => break,
                 Ok(Some(msg)) => match msg.event {
-                    FlighthookEvent::LaunchMonitor(recv) => match recv.event {
-                        LaunchMonitorEvent::ShotResult { shot } => {
+                    FlighthookEvent::ShotTrigger { ref key } => {
+                        let acc = ShotAccumulator::new(msg.source.clone(), key.clone());
+                        accumulators.insert((msg.source.clone(), key.clone()), acc);
+                    }
+                    FlighthookEvent::BallFlight {
+                        ref key,
+                        ref ball,
+                        estimated,
+                    } => {
+                        if let Some(acc) =
+                            accumulators.get_mut(&(msg.source.clone(), key.clone()))
+                        {
+                            acc.set_ball(*ball.clone(), estimated);
+                        }
+                    }
+                    FlighthookEvent::ClubPath { ref key, ref club } => {
+                        if let Some(acc) =
+                            accumulators.get_mut(&(msg.source.clone(), key.clone()))
+                        {
+                            acc.set_club(*club.clone());
+                        }
+                    }
+                    FlighthookEvent::ShotFinished { ref key } => {
+                        if let Some(acc) =
+                            accumulators.remove(&(msg.source.clone(), key.clone()))
+                        {
                             if !shot_matches_routing(routing, current_mode, &msg.source) {
                                 tracing::debug!(
                                     "gspro bridge: skipping shot #{} from '{}' (routed to {:?} for mode {current_mode:?})",
-                                    shot.shot_number,
+                                    key.shot_number,
                                     msg.source,
                                     match current_mode {
                                         ShotDetectionMode::Full => &routing.full_monitor,
@@ -274,37 +308,34 @@ fn connect_and_run(
                                         ShotDetectionMode::Putting => &routing.putting_monitor,
                                     },
                                 );
-                            } else if shot.estimated
-                                && !should_forward_partial(current_mode, use_partial)
-                            {
-                                tracing::debug!(
-                                    "gspro bridge: skipping estimated shot #{} (mode={current_mode:?}, use_partial={use_partial:?})",
-                                    shot.shot_number,
-                                );
-                            } else {
-                                shot_to_send = Some(shot);
+                            } else if let Some(shot) = acc.finish() {
+                                if shot.estimated
+                                    && !should_forward_estimated(current_mode, use_estimated)
+                                {
+                                    tracing::debug!(
+                                        "gspro bridge: skipping estimated shot #{} (mode={current_mode:?}, use_estimated={use_estimated:?})",
+                                        shot.shot_number,
+                                    );
+                                } else {
+                                    shot_to_send = Some(Box::new(shot));
+                                }
                             }
                         }
-                        LaunchMonitorEvent::ReadyState {
-                            armed,
-                            ball_detected,
-                        } => {
-                            monitor_state.insert(msg.source.clone(), (armed, ball_detected));
-                            readiness_changed = true;
-                        }
-                    },
-                    FlighthookEvent::ConfigChanged(changed) => {
-                        use_partial = changed.config.use_partial;
                     }
-                    FlighthookEvent::GameStateCommand(cmd) => {
-                        if let GameStateCommandEvent::SetMode { mode } = cmd.event {
-                            current_mode = mode;
-                            readiness_changed = true;
-                        }
+                    FlighthookEvent::LaunchMonitorState {
+                        armed,
+                        ball_detected,
+                    } => {
+                        monitor_state.insert(msg.source.clone(), (armed, ball_detected));
+                        readiness_changed = true;
                     }
-                    FlighthookEvent::ActorStatus(ref state) => {
+                    FlighthookEvent::ShotDetectionMode { mode } => {
+                        current_mode = mode;
+                        readiness_changed = true;
+                    }
+                    FlighthookEvent::ActorStatus { status, .. } => {
                         if matches!(
-                            state.status,
+                            status,
                             ActorStatus::Disconnected | ActorStatus::Reconnecting
                         ) {
                             if monitor_state.contains_key(&msg.source) {

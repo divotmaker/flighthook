@@ -22,7 +22,6 @@ name = "Mevo WiFi"
 address = "192.168.2.1:5100"
 ball_type = 0
 track_pct = 80.0
-use_partial = "chipping_only"
 tee_height = "1.5in"
 range = "8ft"
 surface_height = "0in"
@@ -30,6 +29,7 @@ surface_height = "0in"
 [gspro.0]
 name = "Local GSPro"
 address = "127.0.0.1:921"
+use_estimated = "chipping_only"
 # full_monitor = "mevo.0"       # optional: route full-swing shots from specific monitor
 # chipping_monitor = "mevo.0"   # optional: route chipping shots
 # putting_monitor = "mevo.0"    # optional: route putting shots
@@ -42,13 +42,15 @@ address = "127.0.0.1:921"
 - `[webserver.<idx>]` -- web server instance
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
 - Radar settings (ball_type, tee_height, etc.) are per-mevo only
+- `use_estimated` is per-integration -- controls whether estimated ball flights
+  are forwarded (`never` / `chipping_only` / `always`)
 - Mock sections show only name (no address or radar fields)
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `gspro.0`)
 - WebSocket source IDs = `"ws.{8-hex-chars}"`
 
 ### Rust types
 
-**schemas/src/config.rs** (shared config types, used by both app and UI):
+**lib/src/config.rs** (shared config types, used by both app and UI):
 
 ```rust
 pub struct FlighthookConfig {
@@ -62,18 +64,18 @@ pub struct FlighthookConfig {
 }
 
 pub struct WebserverSection { pub name: String, pub bind: String }
-pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_partial: Option<PartialMode> }
+pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64> }
 pub struct MockMonitorSection { pub name: String }
-pub struct GsProSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
+pub struct GsProSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String>, pub use_estimated: Option<EstimatedMode> }
 pub struct RandomClubSection { pub name: String }
 ```
 
-**schemas/src/api.rs** (shared REST API types, used by both app and UI):
+**lib/src/api.rs** (shared REST API types, used by both app and UI):
 
 ```rust
 pub struct StatusResponse { pub actors: HashMap<String, ActorStatusResponse>, pub mode: Option<ShotDetectionMode> }
 pub struct ActorStatusResponse { pub name: String, pub status: ActorStatus, pub telemetry: HashMap<String, String> }
-pub struct PostSettingsResponse { pub restart_required: bool, pub restarted: Vec<String>, pub stopped: Vec<String> }
+pub struct PostSettingsResponse { pub restarted: Vec<String>, pub stopped: Vec<String> }
 pub struct ModeRequest { pub mode: ShotDetectionMode }
 ```
 
@@ -113,8 +115,8 @@ Helper functions: `global_id(prefix, index) -> String` builds `"{prefix}.{index}
 **All types that cross the app<->UI boundary (REST API, WebSocket, config)
 MUST live in `flighthook`.** The UI crate never defines its own
 "response" mirror types. Both crates import the canonical type from schemas.
-This eliminates drift between serializer (app) and deserializer (UI) —
-e.g., `ActorStatus` enum vs string, `PartialMode` enum vs string.
+This eliminates drift between serializer (app) and deserializer (UI) --
+e.g., `ActorStatus` enum vs string, `EstimatedMode` enum vs string.
 
 ## Unified FlighthookMessage Bus
 
@@ -145,87 +147,74 @@ pub enum RawPayload {
 
 ### FlighthookEvent
 
-The typed event payload. Tagged with `kind` in JSON serialization.
+The typed event payload. Tagged with `kind` in JSON serialization. All variants
+are flat struct variants with named fields (no wrapper types).
 
 ```rust
 pub enum FlighthookEvent {
-    LaunchMonitor(LaunchMonitorRecv),
-    ConfigChanged(ConfigChanged),
-    GameStateCommand(GameStateCommand),
-    GameStateSnapshot(GameStateSnapshot),
-    UserData(UserDataMessage),
-    ActorStatus(ActorState),
-    ConfigCommand(ConfigCommand),     // config mutation request
-    ConfigOutcome(ConfigOutcome),       // config mutation acknowledgment
-    Alert(AlertMessage),              // user-visible warn/error
+    // Shot lifecycle (correlated by ShotKey + message source)
+    ShotTrigger { key: ShotKey },
+    BallFlight { key: ShotKey, ball: Box<BallFlight>, estimated: bool },
+    ClubPath { key: ShotKey, club: Box<ClubData> },
+    ShotFinished { key: ShotKey },
+
+    // Launch monitor state
+    LaunchMonitorState { armed: bool, ball_detected: bool },
+
+    // Game state
+    PlayerInfo { player_info: PlayerInfo },
+    ClubInfo { club_info: ClubInfo },
+    ShotDetectionMode { mode: ShotDetectionMode },
+
+    // Config
+    ConfigCommand { request_id: Option<String>, action: ConfigAction },
+    ConfigOutcome { request_id: Option<String>, restarted: Vec<String>, stopped: Vec<String>, started: Vec<String> },
+
+    // Infrastructure
+    ActorStatus { status: ActorStatus, telemetry: HashMap<String, String> },
+    Alert { level: AlertLevel, message: String },
 }
 ```
 
-### LaunchMonitor -- shot data from a launch monitor
-
-Source is on `FlighthookMessage.source`, not repeated in the inner type:
+### ShotKey -- shot lifecycle correlation
 
 ```rust
-pub struct LaunchMonitorRecv {
-    pub event: LaunchMonitorEvent,
-}
-
-pub enum LaunchMonitorEvent {
-    ShotResult { shot: Box<ShotData> },
-    ReadyState { armed: bool, ball_detected: bool },
+pub struct ShotKey {
+    pub shot_id: String,      // UUID v4 string, globally unique
+    pub shot_number: i32,     // session-level monotonic counter per-source
 }
 ```
 
-### ConfigChanged -- generic configuration update
+Shot data arrives as correlated events sharing a `ShotKey` and `source`:
+`ShotTrigger` -> `BallFlight` -> `ClubPath` -> `ShotFinished`. Consumers
+use `ShotAccumulator` to collect events into a final `ShotData`.
 
-Emitted by `reconfigure()` when an actor's settings change. Consumed by
-integrations (e.g. the GSPro bridge reads `use_partial` from this event).
+### Game state events
 
-```rust
-pub struct ConfigChanged {
-    pub config: MevoConfigEvent,
-}
-```
+Game state is mutated via typed events on the bus:
 
-### GameStateCommand -- from integrations / WS clients
+- `PlayerInfo { player_info }` -- player handedness
+- `ClubInfo { club_info }` -- club selection
+- `ShotDetectionMode { mode }` -- detection mode (full/chipping/putting)
 
-```rust
-pub struct GameStateCommand {
-    pub event: GameStateCommandEvent,  // originator in FlighthookMessage.source
-}
-
-pub enum GameStateCommandEvent {
-    SetPlayerInfo { player_info: PlayerInfo },
-    SetClubInfo { club_info: ClubInfo },
-    SetMode { mode: ShotDetectionMode },
-}
-```
-
-The `SystemActor` auto-derives `SetMode` from `SetClubInfo` (using
+The `SystemActor` auto-derives `ShotDetectionMode` from `ClubInfo` (using
 `config.club_mode()` to map club to detection mode via the configurable
 `chipping_clubs`/`putting_clubs` lists). Integrations only
-need to emit `SetClubInfo`; the SystemActor handles mode derivation
-centrally. Launch monitor actors react to `SetMode` to reconfigure the
-device. Mode is global state, not per-device.
+need to emit `ClubInfo`; the SystemActor handles mode derivation
+centrally. Launch monitor actors react to `ShotDetectionMode` to reconfigure
+the device. Mode is global state, not per-device.
 
 ### ActorStatus -- generic actor lifecycle
 
-All actors emit `ActorStatus` events on the bus with a generic status + key/value
-state map. Replaces per-actor-type status events (`StateChanged`, `Telemetry`,
-`LaunchMonitorInfo`, `ReadyStatus`, `InternalEvent`).
+All actors emit `ActorStatus` events on the bus with a status + key/value
+telemetry map.
 
 ```rust
 pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
-
-pub struct ActorState {
-    pub status: ActorStatus,
-    pub telemetry: HashMap<String, String>,   // actor-specific k/v pairs
-}
 ```
 
-`ActorState` is the bus event type. `ActorStatusResponse` (in `schemas/api.rs`)
-adds a `name` field and is used as the cached per-actor state in both the web
-layer and the UI.
+`ActorStatusResponse` (in `lib/src/api.rs`) adds a `name` field and is used
+as the cached per-actor state in both the web layer and the UI.
 
 Launch monitor actors use telemetry keys:
 `mode`, `armed`, `shooting`, `battery_pct`, `tilt`, `roll`, `temp_c`,
@@ -242,10 +231,9 @@ exclusively by SystemActor. This parallels the GameState pattern (sole
 writer via `GameStateWriter`).
 
 ```rust
-pub struct ConfigCommand {
-    pub request_id: Option<String>,  // correlation ID for request-reply
-    pub action: ConfigAction,
-}
+// ConfigCommand fields (on FlighthookEvent)
+request_id: Option<String>,  // correlation ID for request-reply
+action: ConfigAction,
 
 pub enum ConfigAction {
     ReplaceAll { config: FlighthookConfig },        // POST /api/settings
@@ -257,17 +245,17 @@ pub enum ConfigAction {
     Remove { id: String },                          // "mevo.0", "gspro.1", "webserver.0", etc.
 }
 
-pub struct ConfigOutcome {
-    pub request_id: String,
-    pub restart_required: bool,
-    pub restarted: Vec<String>,
-    pub stopped: Vec<String>,
-    pub started: Vec<String>,
-}
+// ConfigOutcome fields (on FlighthookEvent)
+request_id: Option<String>,
+restarted: Vec<String>,
+stopped: Vec<String>,
+started: Vec<String>,
 ```
 
 The POST handler uses request-reply: emit `ConfigCommand` with a `request_id`,
 subscribe to the bus, and wait for `ConfigOutcome` with the matching ID.
+`ConfigOutcome` is always emitted after processing, even for fire-and-forget
+commands (where `request_id` is `None`).
 
 ## GameState
 
@@ -302,8 +290,7 @@ pub struct GameStateSnapshot {
 ## ActorStatus Lifecycle
 
 Generic actor lifecycle. All actors (launch monitors and integrations) emit
-`ActorStatus` events on the bus via `emit_device_status()` or
-`emit_integration_status()`.
+`ActorStatus` events on the bus.
 
 ```
 Starting -> Connected -> (error) -> Reconnecting -> Connected -> ...
@@ -338,27 +325,26 @@ independent of config. It holds the sole `GameStateWriter`, `Arc<SystemState>`,
 and `broadcast::Sender`, enforcing at the type level that only `SystemActor`
 can mutate game state and process config mutations. It handles:
 
-- **Game state**: subscribes to `GameStateCommand` bus events, updates game
-  state via the writer (player info, club selection, detection mode).
-  **Auto-derives detection mode from club selection**: when `SetClubInfo` is
-  received, calls `club_to_mode()` and emits `SetMode` on the bus. This
-  centralizes mode derivation so all integrations trigger mode changes.
+- **Game state**: subscribes to `PlayerInfo`, `ClubInfo`, and
+  `ShotDetectionMode` bus events, updates game state via the writer.
+  **Auto-derives detection mode from club selection**: when `ClubInfo` is
+  received, calls `club_mode()` and emits `ShotDetectionMode` on the bus.
+  This centralizes mode derivation so all integrations trigger mode changes.
 - **Config mutations**: subscribes to `ConfigCommand` bus events (from the
   REST API). Applies the mutation to `SystemConfig`, calls
   `apply_config_reload()` to reconcile actors, and emits a `ConfigOutcome`
-  if the command had a `request_id` (request-reply pattern). This provides
-  natural sequencing — all config mutations are processed one at a time on
-  the SystemActor thread.
+  on the bus. This provides natural sequencing -- all config mutations are
+  processed one at a time on the SystemActor thread.
 - Ensures game state and config are consistent even without the web server
 
 Created via `SystemActor::new(writer, state, bus_tx)` in `main()` before
 config-driven actors, registered with ID `"system"`. Skipped by
 `apply_config_reload()` (not config-driven).
 
-`actors/system.rs` also contains the `create_and_start_actor()` factory and
-`apply_config_reload()` reconciliation function (moved from `main.rs`).
+`actors/system.rs` also contains the `apply_config_reload()` reconciliation
+function.
 
-The web layer's `state_updater` task does NOT update game state — it only
+The web layer's `state_updater` task does NOT update game state -- it only
 caches club/handed values in the per-actor telemetry map for the UI. It
 also handles `ConfigOutcome` events to refresh actor name caches.
 
@@ -416,8 +402,7 @@ Single WS connection (`/api/ws`), three-phase handshake:
 3. Server streams `FlighthookMessage` events (serialized directly as JSON)
 
 Bus events are serialized and forwarded as-is. The `kind` tag on
-`FlighthookEvent` identifies the event type. Consumers filter by `kind` and
-nested event `type` tags.
+`FlighthookEvent` identifies the event type. Consumers filter by `kind`.
 
 Client -> server commands:
 
@@ -425,9 +410,9 @@ Client -> server commands:
 { "cmd": "mode", "mode": "putting" }
 ```
 
-Mode commands emit `GameStateCommand::SetMode` on the bus (mode is global,
-not per-device). Config updates go through `POST /api/settings` →
-`ConfigCommand` on the bus → SystemActor processes → `ConfigOutcome` reply.
+Mode commands emit `ShotDetectionMode` on the bus (mode is global,
+not per-device). Config updates go through `POST /api/settings` ->
+`ConfigCommand` on the bus -> SystemActor processes -> `ConfigOutcome` reply.
 
 ## Threading Model
 
@@ -450,10 +435,9 @@ main thread (eframe)       std::thread per actor              tokio runtime (bac
 ```
 
 **Bus-based command delivery**: actor threads poll the bus via `BusReceiver::poll()`
-in their event loop. They filter for `ConfigChanged` events (from
-`reconfigure()`) and `GameStateCommand` events (including `SetMode` for mode
-changes). The `SystemActor` auto-derives `SetMode` from `SetClubInfo` using
-`Club::mode()`, so integrations only need to emit `SetClubInfo`. There is
+in their event loop. They filter for `ShotDetectionMode` events (for mode
+changes). The `SystemActor` auto-derives `ShotDetectionMode` from `ClubInfo`
+using `club_mode()`, so integrations only need to emit `ClubInfo`. There is
 no per-device `mpsc` channel and no centralized router task.
 
 **Actor trait and bus wrappers**: all actors implement the `Actor` trait
@@ -466,7 +450,7 @@ returns `Ok(None)` if empty, `Err(PollError::Shutdown)` if the per-actor
 shutdown flag is set or bus is closed) and `is_shutdown()`.
 Actor structs hold their config; `start()` clones what it
 needs and spawns a thread. `reconfigure()` compares current config against
-construction params and returns `NoChange`, `Applied`, or `RestartRequired`.
+construction params and returns `Applied` or `RestartRequired`.
 Actors are registered in `SystemState.actors` for dynamic
 start/stop/reconfigure.
 
@@ -476,7 +460,7 @@ config-driven). Then each config section constructs an actor struct and calls
 `Arc<AtomicBool>` shutdown flag shared between the `BusReceiver` and the
 registry. Launch monitor actors (mevo, mock::launch) run event loops polling
 the bus. Integration actors (gspro, mock::randomclub) subscribe to the bus
-and emit `GameStateCommand` (for club/player changes) and `ActorStatus`
+and emit `PlayerInfo`/`ClubInfo` (for club/player changes) and `ActorStatus`
 (for connection status) back onto the bus.
 
 **Drain subscriber**: a tokio task that consumes all bus messages to keep the
@@ -487,9 +471,9 @@ broadcast channel healthy when no other subscriber is active.
 Config reloads are event-sourced through the bus. All config mutations flow
 as `ConfigCommand` events, processed exclusively by `SystemActor`:
 
-- **REST API** -- `POST /api/settings` emits `ConfigCommand::ReplaceAll` on
-  the bus with a `request_id`, then awaits the matching `ConfigOutcome`
-  (request-reply pattern, 10s timeout).
+- **REST API** -- `POST /api/settings` emits `ConfigCommand` (action:
+  `ReplaceAll`) on the bus with a `request_id`, then awaits the matching
+  `ConfigOutcome` (request-reply pattern, 10s timeout).
 - **Per-section upserts** -- `POST /api/settings?scope=<id>` emits a scoped
   `ConfigAction` variant (e.g. `UpsertMevo`).
 
@@ -498,8 +482,7 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
 1. Applies the `ConfigAction` mutation to `SystemConfig` (replace, reload,
    upsert, or remove)
 2. Calls `apply_config_reload()` to reconcile actors
-3. Detects webserver bind changes (old vs new config snapshot)
-4. Emits `ConfigOutcome` on the bus if `request_id` was present
+3. Emits `ConfigOutcome` on the bus (always, not just for request-reply)
 
 `apply_config_reload()` (in `actors/system.rs`) orchestrates actor lifecycle:
 
@@ -507,23 +490,17 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
 2. Compute current vs expected actor IDs
 3. **Deleted actors** (current but not expected): stop + remove
 4. **Existing actors**: call `reconfigure()` on each
-   - `Applied`: config sent to running actor via bus (e.g. radar settings)
    - `RestartRequired`: stop old actor, create and start new one
-   - `NoChange`: skip
-5. **New actors** (expected but not current): create via `create_and_start_actor()`
+   - `Applied`: no change needed, skip
+5. **New actors** (expected but not current): create and start
 
 The web layer's `state_updater` handles `ConfigOutcome` events to refresh
 actor name caches and remove stopped actors.
 
-`create_and_start_actor()` is a factory function that constructs the right actor
-struct, creates a per-actor `Arc<AtomicBool>` shutdown flag, calls `start()`,
-and registers the actor + flag in `SystemState`.
-
 `ReconfigureOutcome` enum:
 
-- `NoChange` -- default for mock actors
-- `Applied` -- MevoActor: session config differs, emitted `ConfigChanged` on bus
-- `RestartRequired` -- address changed or section removed; must stop and recreate
+- `Applied` -- config unchanged or applied without restart (default for mock actors)
+- `RestartRequired` -- address/routing/settings changed; must stop and recreate
 
 ## Settings Panel
 
@@ -549,11 +526,14 @@ Global
     Monitor-to-Ball: [8.0] [ft v]
     Surface Height: [0.0] [in v]
     Track %: [80] %
-    Partial: [Chipping only v]
 
   Local GSPro            [GSPro]  [Remove] [Save]
     Name: [Local GSPro]
     Address: [127.0.0.1:921]
+    Full Monitor: [Any v]
+    Chipping Monitor: [Any v]
+    Putting Monitor: [Any v]
+    Estimated: [Chipping only v]
 
   [+ Add v]  (dropdown: Mevo, GSPro, Web Server)
 ```
@@ -562,6 +542,8 @@ Global
   updates the name cache in WebState, so subsequent status responses and shot
   data use the new name.
 - Type shown as a badge label next to the heading
+- `Estimated` is per-integration (GSPro only) -- controls whether estimated
+  ball flights are forwarded
 - Mock launch monitor and Random Club are developer-only types (must be added
   manually to the config TOML; they do not appear in the Add dropdown)
 - Add/remove modify the form Vec, save writes back to TOML
@@ -570,14 +552,14 @@ Global
   only that section's changes) and passes `?scope=<actor_id>` to the backend.
   The backend only reconfigures the target actor. The UI stores the original
   config from the last load/save and updates it per-section on successful save.
-- Config changes auto-reconfigure actors (address changes restart, radar settings apply in-place)
+- Config changes auto-reconfigure actors (all changes trigger restart)
 - Webserver bind changes trigger a restart (same as address changes for other actors)
 
 ### API
 
 `GET/POST /api/settings` returns/accepts the full `FlighthookConfig` shape
-(type-prefixed maps + webserver section). `POST` emits a `ConfigCommand::ReplaceAll`
-on the bus and waits for a `ConfigOutcome` reply.
+(type-prefixed maps + webserver section). `POST` emits a `ConfigCommand`
+(action: `ReplaceAll`) on the bus and waits for a `ConfigOutcome` reply.
 
 ## Telemetry Tab
 
@@ -605,14 +587,14 @@ rendered one per row, sorted alphabetically, indented under the actor header.
 
 Detection mode is **global state** (not per-device). The mode selector
 buttons are in the tab bar, between the tab selectors and the title.
-Clicking a mode button emits `GameStateCommand::SetMode` on the bus.
-Launch monitor actors react to `SetMode` to reconfigure the device.
+Clicking a mode button emits `ShotDetectionMode` on the bus.
+Launch monitor actors react to `ShotDetectionMode` to reconfigure the device.
 
 Each actor shows a name and status badge (green=connected, yellow=starting,
 red=disconnected/reconnecting). Telemetry (battery, tilt, roll, temp)
 and club/handed are read from the actor's telemetry map.
 
 The web layer caches telemetry from `ActorStatus` events plus club/handed from
-`GameStateCommand` events so reconnecting clients recover latest values
+`ClubInfo`/`PlayerInfo` events so reconnecting clients recover latest values
 immediately. If any actor has status `disconnected` or `reconnecting`, the
 Telemetry tab label turns red.

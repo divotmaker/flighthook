@@ -3,41 +3,56 @@ use crate::types::{AlertLevel, FlighthookEvent};
 
 use super::extract_time;
 
-/// Alert level filter options for the dropdown.
-const ALERT_LEVELS: &[&str] = &["error", "warn"];
-
 /// All message type keys in display order.
 pub(crate) const MESSAGE_TYPES: &[&str] = &[
-    "alert",
-    "launch_monitor",
+    "alert_error",
+    "alert_warn",
+    "shot_trigger",
+    "ball_flight",
+    "club_path",
+    "shot_finished",
+    "ready_state",
     "actor_status",
-    "game_state_command",
-    "config_changed",
+    "player_info",
+    "club_info",
+    "mode",
     "config_command",
     "config_outcome",
-    "game_state_snapshot",
-    "user_data",
+];
+
+/// Filter groups for the dropdown.
+const FILTER_GROUPS: &[(&str, &[&str])] = &[
+    ("Launch Monitor", &["shot_trigger", "ball_flight", "club_path", "shot_finished", "ready_state"]),
+    ("Game", &["player_info", "club_info", "mode"]),
+    ("System", &["actor_status", "config_command", "config_outcome"]),
+    ("Alert", &["alert_error", "alert_warn"]),
 ];
 
 /// Return the root FlighthookEvent kind (the serde `kind` tag).
 pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
     match event {
-        FlighthookEvent::LaunchMonitor(_) => "launch_monitor",
-        FlighthookEvent::ConfigChanged(_) => "config_changed",
-        FlighthookEvent::GameStateCommand(_) => "game_state_command",
-        FlighthookEvent::GameStateSnapshot(_) => "game_state_snapshot",
-        FlighthookEvent::UserData(_) => "user_data",
-        FlighthookEvent::ActorStatus(_) => "actor_status",
-        FlighthookEvent::ConfigCommand(_) => "config_command",
-        FlighthookEvent::ConfigOutcome(_) => "config_outcome",
-        FlighthookEvent::Alert(_) => "alert",
+        FlighthookEvent::ShotTrigger { .. } => "shot_trigger",
+        FlighthookEvent::BallFlight { .. } => "ball_flight",
+        FlighthookEvent::ClubPath { .. } => "club_path",
+        FlighthookEvent::ShotFinished { .. } => "shot_finished",
+        FlighthookEvent::LaunchMonitorState { .. } => "ready_state",
+        FlighthookEvent::PlayerInfo { .. } => "player_info",
+        FlighthookEvent::ClubInfo { .. } => "club_info",
+        FlighthookEvent::ShotDetectionMode { .. } => "mode",
+        FlighthookEvent::ActorStatus { .. } => "actor_status",
+        FlighthookEvent::ConfigCommand { .. } => "config_command",
+        FlighthookEvent::ConfigOutcome { .. } => "config_outcome",
+        FlighthookEvent::Alert { level, .. } => match level {
+            AlertLevel::Error => "alert_error",
+            AlertLevel::Warn => "alert_warn",
+        },
     }
 }
 
 /// Extract the alert level if this is an Alert event, otherwise None.
 pub(crate) fn alert_level(event: &FlighthookEvent) -> Option<AlertLevel> {
     match event {
-        FlighthookEvent::Alert(alert) => Some(alert.level),
+        FlighthookEvent::Alert { level, .. } => Some(*level),
         _ => None,
     }
 }
@@ -45,15 +60,32 @@ pub(crate) fn alert_level(event: &FlighthookEvent) -> Option<AlertLevel> {
 /// Debug representation of the inner event (unwraps envelope layers).
 pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
     match event {
-        FlighthookEvent::LaunchMonitor(recv) => format!("{:?}", recv.event),
-        FlighthookEvent::ConfigChanged(changed) => format!("{:?}", changed.config),
-        FlighthookEvent::GameStateCommand(cmd) => format!("{:?}", cmd.event),
-        FlighthookEvent::GameStateSnapshot(snap) => format!("{snap:?}"),
-        FlighthookEvent::UserData(data) => format!("{data:?}"),
-        FlighthookEvent::ActorStatus(update) => format!("{:?}", update.status),
-        FlighthookEvent::ConfigCommand(cmd) => format!("{:?}", cmd.action),
-        FlighthookEvent::ConfigOutcome(result) => format!("{result:?}"),
-        FlighthookEvent::Alert(alert) => format!("[{}] {}", alert.level, alert.message),
+        FlighthookEvent::ShotTrigger { key } => format!("trigger #{}", key.shot_number),
+        FlighthookEvent::BallFlight { key, estimated, .. } => {
+            format!(
+                "ball #{}{}",
+                key.shot_number,
+                if *estimated { " (estimated)" } else { "" }
+            )
+        }
+        FlighthookEvent::ClubPath { key, .. } => format!("club #{}", key.shot_number),
+        FlighthookEvent::ShotFinished { key } => format!("finished #{}", key.shot_number),
+        FlighthookEvent::LaunchMonitorState {
+            armed,
+            ball_detected,
+        } => format!("armed={armed} ball={ball_detected}"),
+        FlighthookEvent::PlayerInfo { player_info } => {
+            format!("handed={}", player_info.handed)
+        }
+        FlighthookEvent::ClubInfo { club_info } => format!("club={}", club_info.club),
+        FlighthookEvent::ShotDetectionMode { mode } => format!("{mode:?}"),
+        FlighthookEvent::ActorStatus { status, .. } => format!("{status:?}"),
+        FlighthookEvent::ConfigCommand { action, .. } => format!("{action:?}"),
+        FlighthookEvent::ConfigOutcome { request_id, .. } => match request_id {
+            Some(rid) => format!("outcome({rid})"),
+            None => "outcome".into(),
+        },
+        FlighthookEvent::Alert { level, message } => format!("[{level}] {message}"),
     }
 }
 
@@ -66,33 +98,77 @@ impl FlighthookApp {
             ui.checkbox(&mut self.log_auto_scroll, "Auto-scroll");
             ui.separator();
 
-            // Toggle-all checkbox
-            let all_checked = self.log_type_filters.iter().all(|(_, v)| *v);
-            let mut toggle_all = all_checked;
-            if ui.checkbox(&mut toggle_all, "All").clicked() {
-                for v in self.log_type_filters.values_mut() {
-                    *v = toggle_all;
-                }
+            // Filter dropdown button
+            let enabled_count = self.log_type_filters.values().filter(|v| **v).count();
+            let total_count = self.log_type_filters.len();
+            let filter_label = if enabled_count == total_count {
+                "Filters: all".to_string()
+            } else {
+                format!("Filters: {enabled_count}/{total_count}")
+            };
+            let popup_id = ui.make_persistent_id("log_filter_popup");
+            let filter_btn = ui.button(&filter_label);
+            if filter_btn.clicked() {
+                self.log_filter_open = !self.log_filter_open;
             }
+            if self.log_filter_open {
+                let area = egui::Area::new(popup_id)
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(filter_btn.rect.left_bottom())
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            // Toggle all
+                            let all_checked =
+                                self.log_type_filters.iter().all(|(_, v)| *v);
+                            let mut toggle_all = all_checked;
+                            if ui.checkbox(&mut toggle_all, "All").clicked() {
+                                for v in self.log_type_filters.values_mut() {
+                                    *v = toggle_all;
+                                }
+                            }
+                            ui.separator();
 
-            // Per-type filters
-            for &key in MESSAGE_TYPES {
-                if key == "alert" {
-                    // Alert gets a dropdown instead of a checkbox
-                    if let Some(checked) = self.log_type_filters.get_mut(key) {
-                        ui.checkbox(checked, "alert:");
-                    }
-                    let selected = ALERT_LEVELS[self.log_alert_filter];
-                    egui::ComboBox::from_id_salt("log_alert_level")
-                        .width(60.0)
-                        .selected_text(selected)
-                        .show_ui(ui, |ui| {
-                            for (i, &level) in ALERT_LEVELS.iter().enumerate() {
-                                ui.selectable_value(&mut self.log_alert_filter, i, level);
+                            for &(group_name, keys) in FILTER_GROUPS {
+                                // Group heading with toggle-all checkbox
+                                let group_all = keys.iter().all(|k| {
+                                    self.log_type_filters
+                                        .get(*k)
+                                        .copied()
+                                        .unwrap_or(true)
+                                });
+                                let mut group_toggle = group_all;
+                                let heading = egui::RichText::new(group_name).strong();
+                                if ui.checkbox(&mut group_toggle, heading).clicked() {
+                                    for &k in keys {
+                                        if let Some(v) =
+                                            self.log_type_filters.get_mut(k)
+                                        {
+                                            *v = group_toggle;
+                                        }
+                                    }
+                                }
+
+                                for &key in keys {
+                                    if let Some(checked) =
+                                        self.log_type_filters.get_mut(key)
+                                    {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(16.0);
+                                            ui.checkbox(checked, key);
+                                        });
+                                    }
+                                }
+                                ui.add_space(4.0);
                             }
                         });
-                } else if let Some(checked) = self.log_type_filters.get_mut(key) {
-                    ui.checkbox(checked, key);
+                    });
+
+                // Close popup when clicking outside it
+                if ui.input(|i| i.pointer.any_click())
+                    && !area.response.contains_pointer()
+                    && !filter_btn.contains_pointer()
+                {
+                    self.log_filter_open = false;
                 }
             }
 
@@ -113,12 +189,6 @@ impl FlighthookApp {
             let warn_color = egui::Color32::from_rgb(255, 200, 60);
             let error_color = egui::Color32::from_rgb(255, 80, 80);
 
-            // Resolve the minimum alert level from the dropdown
-            let min_alert_level = match self.log_alert_filter {
-                0 => AlertLevel::Error,
-                _ => AlertLevel::Warn,
-            };
-
             egui::Grid::new("log_grid")
                 .num_columns(3)
                 .min_col_width(0.0)
@@ -133,15 +203,6 @@ impl FlighthookApp {
                             .unwrap_or(true)
                         {
                             continue;
-                        }
-
-                        // For alert entries, apply the level filter
-                        if entry.message_type == "alert" {
-                            if let Some(level) = entry.alert_level {
-                                if level < min_alert_level {
-                                    continue;
-                                }
-                            }
                         }
 
                         let time_str = extract_time(&entry.timestamp);

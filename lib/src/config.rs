@@ -319,17 +319,18 @@ impl fmt::Display for Velocity {
     }
 }
 
-/// Controls whether the E8 (FlightResultV1) fallback is used when the device
-/// does not send a full D4 flight result (common for short chips).
+/// Controls whether estimated ball flights are forwarded to the integration.
+/// Estimated shots may lack full flight data but can still be usable in-game.
+/// Common for short chips and marginal shots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PartialMode {
+pub enum EstimatedMode {
     Never,
     ChippingOnly,
     Always,
 }
 
-impl Default for PartialMode {
+impl Default for EstimatedMode {
     fn default() -> Self {
         Self::ChippingOnly
     }
@@ -417,7 +418,6 @@ pub struct MevoSection {
     pub range: Option<Distance>,
     pub surface_height: Option<Distance>,
     pub track_pct: Option<f64>,
-    pub use_partial: Option<PartialMode>,
 }
 
 /// A mock launch monitor instance.
@@ -428,7 +428,7 @@ pub struct MockMonitorSection {
 }
 
 /// A GSPro integration instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GsProSection {
     #[serde(default)]
     pub name: String,
@@ -442,6 +442,9 @@ pub struct GsProSection {
     /// Actor ID for putting shots. None = accept from any monitor.
     #[serde(default)]
     pub putting_monitor: Option<String>,
+    /// Whether to forward estimated ball flights to this integration.
+    #[serde(default)]
+    pub use_estimated: Option<EstimatedMode>,
 }
 
 /// A random club cycling integration instance.
@@ -481,7 +484,6 @@ impl Default for FlighthookConfig {
                 range: Some(Distance::Feet(8.0)),
                 surface_height: Some(Distance::Inches(0.0)),
                 track_pct: Some(80.0),
-                use_partial: Some(PartialMode::ChippingOnly),
             },
         );
         let mut gspro = std::collections::HashMap::new();
@@ -493,6 +495,7 @@ impl Default for FlighthookConfig {
                 full_monitor: None,
                 chipping_monitor: None,
                 putting_monitor: None,
+                use_estimated: Some(EstimatedMode::ChippingOnly),
             },
         );
         let mut webserver = std::collections::HashMap::new();
