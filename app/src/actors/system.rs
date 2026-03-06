@@ -256,6 +256,22 @@ fn run(
                 FlighthookEvent::ShotDetectionMode { mode } => {
                     writer.set_mode(*mode);
                 }
+                FlighthookEvent::LaunchMonitorState {
+                    armed,
+                    ball_detected,
+                } => {
+                    writer.set_launch_monitor_state(
+                        msg.source.clone(),
+                        *armed,
+                        *ball_detected,
+                    );
+                }
+                FlighthookEvent::ActorStatus {
+                    status: flighthook::ActorStatus::Disconnected,
+                    ..
+                } => {
+                    writer.remove_launch_monitor(&msg.source);
+                }
                 FlighthookEvent::ConfigCommand { .. } => {
                     handle_config_command(&msg.event, &state, &bus_tx, &sender);
                 }

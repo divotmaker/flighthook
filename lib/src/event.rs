@@ -253,3 +253,74 @@ impl ShotAccumulator {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// ShotAggregator — feed FlighthookMessages, get complete ShotData out
+// ---------------------------------------------------------------------------
+
+/// High-level shot collector that manages multiple in-flight shots.
+///
+/// Feed [`FlighthookMessage`](crate::FlighthookMessage) events via
+/// [`feed`](Self::feed) and receive complete [`ShotData`] when a shot
+/// lifecycle finishes.
+///
+/// ```no_run
+/// # use flighthook::{ShotAggregator, FlighthookClient};
+/// let mut client = FlighthookClient::connect("ws://localhost:3030/api/ws", "my-app").unwrap();
+/// let mut shots = ShotAggregator::new();
+///
+/// loop {
+///     let msg = client.recv().unwrap();
+///     if let Some(shot) = shots.feed(&msg) {
+///         println!("shot #{}: {:?}", shot.shot_number, shot.ball.launch_speed);
+///     }
+/// }
+/// ```
+#[derive(Debug, Default)]
+pub struct ShotAggregator {
+    pending: std::collections::HashMap<(String, ShotKey), ShotAccumulator>,
+}
+
+impl ShotAggregator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process a bus message. Returns a completed [`ShotData`] when a
+    /// `ShotFinished` event finalizes an accumulated shot.
+    pub fn feed(&mut self, msg: &crate::FlighthookMessage) -> Option<ShotData> {
+        match &msg.event {
+            crate::FlighthookEvent::ShotTrigger { key } => {
+                let acc = ShotAccumulator::new(msg.source.clone(), key.clone());
+                self.pending.insert((msg.source.clone(), key.clone()), acc);
+                None
+            }
+            crate::FlighthookEvent::BallFlight {
+                key,
+                ball,
+                estimated,
+            } => {
+                if let Some(acc) = self.pending.get_mut(&(msg.source.clone(), key.clone())) {
+                    acc.set_ball(*ball.clone(), *estimated);
+                }
+                None
+            }
+            crate::FlighthookEvent::ClubPath { key, club } => {
+                if let Some(acc) = self.pending.get_mut(&(msg.source.clone(), key.clone())) {
+                    acc.set_club(*club.clone());
+                }
+                None
+            }
+            crate::FlighthookEvent::ShotFinished { key } => self
+                .pending
+                .remove(&(msg.source.clone(), key.clone()))
+                .and_then(ShotAccumulator::finish),
+            _ => None,
+        }
+    }
+
+    /// Number of shots currently being accumulated.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}

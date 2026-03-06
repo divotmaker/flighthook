@@ -67,6 +67,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
         return;
     }
 
+    // Send current launch monitor states so the client has a complete picture
+    for (id, lm) in state.root.game.launch_monitor_states() {
+        let msg = FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
+            armed: lm.armed,
+            ball_detected: lm.ball_detected,
+        })
+        .source(id);
+        if let Ok(json) = serde_json::to_string(&msg) {
+            if ws_tx.send(Message::text(json)).await.is_err() {
+                return;
+            }
+        }
+    }
+
     // Phase 3: Stream bus events + receive commands
     let mut bus_rx = state.bus_tx.subscribe();
 

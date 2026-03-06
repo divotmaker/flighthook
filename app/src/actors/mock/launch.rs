@@ -20,6 +20,21 @@ use flighthook::{
 };
 
 const SHOT_INTERVAL: Duration = Duration::from_secs(30);
+const ARM_DELAY: Duration = Duration::from_secs(2);
+const BALL_READY_DELAY: Duration = Duration::from_secs(1);
+const POST_SHOT_DELAY: Duration = Duration::from_secs(1);
+
+/// Mock device lifecycle phase.
+enum Phase {
+    /// Just connected or post-shot, waiting to arm.
+    Idle { since: Instant },
+    /// Armed, waiting for ball detection.
+    Armed { since: Instant },
+    /// Armed + ball detected, waiting for shot timer.
+    Ready { since: Instant },
+    /// Shot in progress (brief pause before re-arming).
+    PostShot { since: Instant },
+}
 
 /// Mock launch monitor actor. Generates random shots at a fixed interval.
 pub struct MockLaunchActor {
@@ -60,19 +75,19 @@ fn telemetry(shot_count: i32, mode: ShotDetectionMode) -> HashMap<String, String
 fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusReceiver) {
     let mut current_mode = initial_mode;
     let mut shot_count: i32 = 0;
-    // Backdate so the first shot fires after ~1s instead of waiting the full interval.
-    let mut last_shot = Instant::now() - SHOT_INTERVAL + Duration::from_secs(1);
+    let mut phase = Phase::Idle {
+        since: Instant::now(),
+    };
 
-    // Go straight to ready
     sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
         status: ActorStatus::Connected,
         telemetry: telemetry(shot_count, current_mode),
     }));
     sender.send(FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
-        armed: true,
-        ball_detected: true,
+        armed: false,
+        ball_detected: false,
     }));
-    info!("mock: ready -- generating shots every {SHOT_INTERVAL:?}");
+    info!("mock: connected -- arming in {ARM_DELAY:?}");
 
     loop {
         // Drain bus commands
@@ -101,7 +116,6 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
             }
         }
 
-        // Emit updated telemetry on mode change
         if mode_changed {
             sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
                 status: ActorStatus::Connected,
@@ -109,64 +123,106 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
             }));
         }
 
-        // Generate shot if due
-        if last_shot.elapsed() >= SHOT_INTERVAL {
-            shot_count += 1;
-            last_shot = Instant::now();
+        // State machine
+        match phase {
+            Phase::Idle { since } if since.elapsed() >= ARM_DELAY => {
+                info!("mock: armed -- waiting for ball");
+                sender.send(FlighthookMessage::new(
+                    FlighthookEvent::LaunchMonitorState {
+                        armed: true,
+                        ball_detected: false,
+                    },
+                ));
+                let mut t = telemetry(shot_count, current_mode);
+                t.insert("armed".into(), "true".into());
+                sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                    status: ActorStatus::Connected,
+                    telemetry: t,
+                }));
+                phase = Phase::Armed {
+                    since: Instant::now(),
+                };
+            }
+            Phase::Armed { since } if since.elapsed() >= BALL_READY_DELAY => {
+                info!("mock: ball detected -- ready to fire");
+                sender.send(FlighthookMessage::new(
+                    FlighthookEvent::LaunchMonitorState {
+                        armed: true,
+                        ball_detected: true,
+                    },
+                ));
+                phase = Phase::Ready {
+                    since: Instant::now(),
+                };
+            }
+            Phase::Ready { since } if since.elapsed() >= SHOT_INTERVAL => {
+                shot_count += 1;
 
-            let key = ShotKey {
-                shot_id: uuid::Uuid::new_v4().to_string(),
-                shot_number: shot_count,
-            };
-            let (ball, club) = generate_shot(shot_count, current_mode);
+                let key = ShotKey {
+                    shot_id: uuid::Uuid::new_v4().to_string(),
+                    shot_number: shot_count,
+                };
+                let (ball, club) = generate_shot(shot_count, current_mode);
 
-            let ball_mph = ball.launch_speed.as_mph();
-            let carry_yd = ball
-                .carry_distance
-                .map(|d| d.as_yards())
-                .unwrap_or(0.0);
-            info!(
-                "mock shot #{}: ball={:.1}mph VLA={:.1} carry={:.1}yd",
-                shot_count, ball_mph, ball.launch_elevation, carry_yd,
-            );
+                let ball_mph = ball.launch_speed.as_mph();
+                let carry_yd = ball
+                    .carry_distance
+                    .map(|d| d.as_yards())
+                    .unwrap_or(0.0);
+                info!(
+                    "mock shot #{}: ball={:.1}mph VLA={:.1} carry={:.1}yd",
+                    shot_count, ball_mph, ball.launch_elevation, carry_yd,
+                );
 
-            let mut shooting = telemetry(shot_count, current_mode);
-            shooting.insert("shooting".into(), "true".into());
-            sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-                status: ActorStatus::Connected,
-                telemetry: shooting,
-            }));
-            sender.send(FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
-                armed: false,
-                ball_detected: false,
-            }));
-            // Emit shot lifecycle events
-            sender.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-                key: key.clone(),
-            }));
-            sender.send(FlighthookMessage::new(FlighthookEvent::BallFlight {
-                key: key.clone(),
-                ball: Box::new(ball),
-                estimated: false,
-            }));
-            sender.send(FlighthookMessage::new(FlighthookEvent::ClubPath {
-                key: key.clone(),
-                club: Box::new(club),
-            }));
-            sender.send(FlighthookMessage::new(FlighthookEvent::ShotFinished {
-                key,
-            }));
-            sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-                status: ActorStatus::Connected,
-                telemetry: telemetry(shot_count, current_mode),
-            }));
-            sender.send(FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
-                armed: true,
-                ball_detected: true,
-            }));
+                // Disarm
+                sender.send(FlighthookMessage::new(
+                    FlighthookEvent::LaunchMonitorState {
+                        armed: false,
+                        ball_detected: false,
+                    },
+                ));
+                let mut shooting = telemetry(shot_count, current_mode);
+                shooting.insert("shooting".into(), "true".into());
+                sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                    status: ActorStatus::Connected,
+                    telemetry: shooting,
+                }));
+
+                // Shot lifecycle
+                sender.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
+                    key: key.clone(),
+                }));
+                sender.send(FlighthookMessage::new(FlighthookEvent::BallFlight {
+                    key: key.clone(),
+                    ball: Box::new(ball),
+                    estimated: false,
+                }));
+                sender.send(FlighthookMessage::new(FlighthookEvent::ClubPath {
+                    key: key.clone(),
+                    club: Box::new(club),
+                }));
+                sender.send(FlighthookMessage::new(FlighthookEvent::ShotFinished {
+                    key,
+                }));
+
+                sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                    status: ActorStatus::Connected,
+                    telemetry: telemetry(shot_count, current_mode),
+                }));
+                phase = Phase::PostShot {
+                    since: Instant::now(),
+                };
+            }
+            Phase::PostShot { since } if since.elapsed() >= POST_SHOT_DELAY => {
+                info!("mock: re-arming");
+                phase = Phase::Idle {
+                    since: Instant::now(),
+                };
+            }
+            _ => {}
         }
 
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
