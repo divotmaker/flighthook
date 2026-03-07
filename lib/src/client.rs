@@ -48,7 +48,7 @@ use crate::FlighthookMessage;
 #[derive(Debug)]
 pub enum ClientError {
     /// WebSocket connection or I/O error.
-    WebSocket(tungstenite::Error),
+    WebSocket(Box<tungstenite::Error>),
     /// JSON serialization/deserialization error.
     Json(serde_json::Error),
     /// The connection was closed.
@@ -68,7 +68,7 @@ impl fmt::Display for ClientError {
 impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ClientError::WebSocket(e) => Some(e),
+            ClientError::WebSocket(e) => Some(e.as_ref()),
             ClientError::Json(e) => Some(e),
             ClientError::Closed => None,
         }
@@ -77,7 +77,7 @@ impl std::error::Error for ClientError {
 
 impl From<tungstenite::Error> for ClientError {
     fn from(e: tungstenite::Error) -> Self {
-        ClientError::WebSocket(e)
+        ClientError::WebSocket(Box::new(e))
     }
 }
 
@@ -139,7 +139,7 @@ impl FlighthookClient {
         match self.socket.get_ref() {
             MaybeTlsStream::Plain(tcp) => tcp
                 .set_nonblocking(nonblocking)
-                .map_err(|e| ClientError::WebSocket(tungstenite::Error::Io(e))),
+                .map_err(|e| ClientError::WebSocket(Box::new(tungstenite::Error::Io(e)))),
             _ => Ok(()),
         }
     }

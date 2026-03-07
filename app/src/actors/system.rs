@@ -300,7 +300,7 @@ fn handle_config_command(
     // Determine scope for actor reconciliation
     let scope: Option<String>;
 
-    match action {
+    match action.as_ref() {
         ConfigAction::ReplaceAll { config } => {
             state.system.replace(config.clone());
             scope = None;

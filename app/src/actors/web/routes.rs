@@ -166,7 +166,7 @@ pub async fn post_settings(
     let _ = state.bus_tx.send(
         FlighthookMessage::new(FlighthookEvent::ConfigCommand {
             request_id: Some(request_id.clone()),
-            action: ConfigAction::ReplaceAll { config: new_config },
+            action: Box::new(ConfigAction::ReplaceAll { config: new_config }),
         })
         .source("web"),
     );

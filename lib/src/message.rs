@@ -165,7 +165,7 @@ pub enum FlighthookEvent {
         /// Opaque correlation ID for request-reply pattern.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
-        action: ConfigAction,
+        action: Box<ConfigAction>,
     },
     /// Config mutation outcome (emitted by SystemActor after processing).
     ConfigOutcome {

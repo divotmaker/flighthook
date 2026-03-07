@@ -68,7 +68,7 @@ impl FlighthookApp {
     }
 
     pub(crate) fn render_error_banner(&self, ui: &mut egui::Ui) {
-        for (_id, actor) in &self.actors {
+        for actor in self.actors.values() {
             if let Some(err) = actor.telemetry.get("error") {
                 let frame = egui::Frame::new()
                     .fill(egui::Color32::from_rgb(220, 53, 69))

@@ -3,7 +3,6 @@
 //! These are pure data structures with no channel affinity. The bus message
 //! types in `message.rs` reference them.
 
-
 use serde::{Deserialize, Serialize};
 
 use crate::{Distance, ShotKey, UnitSystem, Velocity};
