@@ -182,10 +182,9 @@ pub async fn post_settings(
                         ref stopped,
                         ..
                     } = msg.event
+                        && *rid == request_id
                     {
-                        if *rid == request_id {
-                            return Some((restarted.clone(), stopped.clone()));
-                        }
+                        return Some((restarted.clone(), stopped.clone()));
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,

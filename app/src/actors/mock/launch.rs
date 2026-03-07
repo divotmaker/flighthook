@@ -103,14 +103,13 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
                 }
                 Ok(None) => break,
                 Ok(Some(msg)) => {
-                    if let FlighthookEvent::ShotDetectionMode { mode } = msg.event {
-                        if std::mem::discriminant(&current_mode)
+                    if let FlighthookEvent::ShotDetectionMode { mode } = msg.event
+                        && std::mem::discriminant(&current_mode)
                             != std::mem::discriminant(&mode)
-                        {
-                            info!("mock: mode change: {current_mode:?} -> {mode:?}");
-                            current_mode = mode;
-                            mode_changed = true;
-                        }
+                    {
+                        info!("mock: mode change: {current_mode:?} -> {mode:?}");
+                        current_mode = mode;
+                        mode_changed = true;
                     }
                 }
             }

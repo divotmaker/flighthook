@@ -284,14 +284,14 @@ async fn apply_bus_event(
             }
         }
         FlighthookEvent::ShotFinished { key } => {
-            if let Some(acc) = accumulators.remove(&(msg.source.clone(), key.clone())) {
-                if let Some(shot) = acc.finish() {
-                    let mut shots = state.shots.write().await;
-                    if shots.len() >= MAX_SHOTS {
-                        shots.pop_front();
-                    }
-                    shots.push_back(shot);
+            if let Some(acc) = accumulators.remove(&(msg.source.clone(), key.clone()))
+                && let Some(shot) = acc.finish()
+            {
+                let mut shots = state.shots.write().await;
+                if shots.len() >= MAX_SHOTS {
+                    shots.pop_front();
                 }
+                shots.push_back(shot);
             }
         }
         FlighthookEvent::PlayerInfo { player_info } => {

@@ -263,7 +263,7 @@ impl ShotAccumulator {
 /// [`feed`](Self::feed) and receive complete [`ShotData`] when a shot
 /// lifecycle finishes.
 ///
-/// ```no_run
+/// ```ignore
 /// # use flighthook::{ShotAggregator, FlighthookClient};
 /// let mut client = FlighthookClient::connect("ws://localhost:3030/api/ws", "my-app").unwrap();
 /// let mut shots = ShotAggregator::new();

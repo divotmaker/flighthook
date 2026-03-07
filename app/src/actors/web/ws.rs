@@ -74,10 +74,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
             ball_detected: lm.ball_detected,
         })
         .source(id);
-        if let Ok(json) = serde_json::to_string(&msg) {
-            if ws_tx.send(Message::text(json)).await.is_err() {
-                return;
-            }
+        if let Ok(json) = serde_json::to_string(&msg)
+            && ws_tx.send(Message::text(json)).await.is_err()
+        {
+            return;
         }
     }
 
@@ -171,21 +171,18 @@ fn handle_ws_command(
         return;
     };
 
-    match msg.cmd.as_str() {
-        "mode" => {
-            let mode = match msg.mode.as_deref() {
-                Some("full") => Some(ShotDetectionMode::Full),
-                Some("putting") => Some(ShotDetectionMode::Putting),
-                Some("chipping") => Some(ShotDetectionMode::Chipping),
-                _ => None,
-            };
-            if let Some(m) = mode {
-                let _ = bus_tx.send(
-                    FlighthookMessage::new(FlighthookEvent::ShotDetectionMode { mode: m })
-                        .source(source),
-                );
-            }
+    if msg.cmd.as_str() == "mode" {
+        let mode = match msg.mode.as_deref() {
+            Some("full") => Some(ShotDetectionMode::Full),
+            Some("putting") => Some(ShotDetectionMode::Putting),
+            Some("chipping") => Some(ShotDetectionMode::Chipping),
+            _ => None,
+        };
+        if let Some(m) = mode {
+            let _ = bus_tx.send(
+                FlighthookMessage::new(FlighthookEvent::ShotDetectionMode { mode: m })
+                    .source(source),
+            );
         }
-        _ => {}
     }
 }

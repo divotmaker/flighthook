@@ -18,6 +18,7 @@ use config::SystemConfig;
 pub struct SystemState {
     pub system: SystemConfig,
     pub game: GameState,
+    #[allow(clippy::type_complexity)]
     actors: RwLock<HashMap<String, (Box<dyn Actor>, Arc<AtomicBool>)>>,
 }
 

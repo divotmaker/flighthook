@@ -559,7 +559,7 @@ fn connect_and_run(
                 if idle_count >= 3 {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                if idle_count == 1 || idle_count % 200 == 0 {
+                if idle_count == 1 || idle_count.is_multiple_of(200) {
                     debug!(
                         "poll -> None (idle={idle_count}, stale_in={:.1}s, armed={})",
                         STALE_TIMEOUT.saturating_sub(last_event_time.elapsed()).as_secs_f64(),

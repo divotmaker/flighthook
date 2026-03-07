@@ -64,8 +64,12 @@ publish:
 	cargo publish -p flighthook --dry-run
 	cargo publish -p flighthook
 
+lint:
+	cargo clippy --workspace
+	cargo test --workspace --doc
+
 clean:
 	cd app && cargo clean
 	rm -rf ui/dist
 
-.PHONY: build build-windows release ui test clippy run deploy stop clean buildtools publish
+.PHONY: build build-windows release ui test clippy lint run deploy stop clean buildtools publish

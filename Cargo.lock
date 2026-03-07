@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "clap",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-app"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-ui"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "console_error_panic_hook",

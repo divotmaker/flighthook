@@ -322,32 +322,22 @@ impl fmt::Display for Velocity {
 /// Controls whether estimated ball flights are forwarded to the integration.
 /// Estimated shots may lack full flight data but can still be usable in-game.
 /// Common for short chips and marginal shots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EstimatedMode {
     Never,
+    #[default]
     ChippingOnly,
     Always,
 }
 
-impl Default for EstimatedMode {
-    fn default() -> Self {
-        Self::ChippingOnly
-    }
-}
-
 /// Unit system for display. Imperial = yards/feet/inches/mph, Metric = meters/m/s.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitSystem {
+    #[default]
     Imperial,
     Metric,
-}
-
-impl Default for UnitSystem {
-    fn default() -> Self {
-        Self::Imperial
-    }
 }
 
 impl fmt::Display for UnitSystem {

@@ -337,11 +337,10 @@ fn connect_and_run(
                         if matches!(
                             status,
                             ActorStatus::Disconnected | ActorStatus::Reconnecting
-                        ) {
-                            if monitor_state.contains_key(&msg.source) {
-                                monitor_state.insert(msg.source.clone(), (false, false));
-                                readiness_changed = true;
-                            }
+                        ) && monitor_state.contains_key(&msg.source)
+                        {
+                            monitor_state.insert(msg.source.clone(), (false, false));
+                            readiness_changed = true;
                         }
                     }
                     _ => {}

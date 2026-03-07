@@ -65,12 +65,11 @@ impl GameState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let club_info = self
+        let club_info = *self
             .inner
             .club_info
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .unwrap_or_else(|e| e.into_inner());
         let mode = *self.inner.mode.read().unwrap_or_else(|e| e.into_inner());
         GameStateSnapshot {
             player_info,
