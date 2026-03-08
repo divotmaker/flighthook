@@ -31,7 +31,7 @@ All inter-component communication flows through a single
 
 | Type                | Description                                                                           |
 | ------------------- | ------------------------------------------------------------------------------------- |
-| `FlighthookMessage` | Bus message: source ID, optional device ID (FRP), optional `RawPayload`, typed `FlighthookEvent` |
+| `FlighthookMessage` | Bus message: actor ID, optional device ID (FRP), optional `RawPayload`, typed `FlighthookEvent` |
 | `RawPayload`        | `Binary(Vec<u8>)` (serializes as hex) or `Text(String)`                               |
 
 ### Event variants (`FlighthookEvent`)
@@ -45,11 +45,11 @@ All variants are flat struct variants with named fields (no wrapper types).
 | `ClubPath`           | Club path data (key, club data) — FRP                              |
 | `FaceImpact`         | Face impact location (key, impact data) — FRP                      |
 | `ShotFinished`       | Shot sequence complete (key) — FRP                                 |
-| `DeviceInfo`         | Device identification (manufacturer, model, firmware) — FRP        |
+| `DeviceTelemetry`    | Device telemetry (identity, readiness, battery, tilt, temp) — FRP  |
 | `Alert`              | User-visible warn/error/critical (severity + message) — FRP        |
-| `PlayerInfo`         | Player handedness update                                           |
+| `SetDetectionMode`   | Detection mode and/or handedness change (both optional, latched) — FRP |
+| `PlayerInfo`         | Player name update                                                 |
 | `ClubInfo`           | Club selection update                                              |
-| `SetDetectionMode`   | Detection mode change command (full/chipping/putting)              |
 | `ConfigCommand`      | Config mutation request (from POST handler)                        |
 | `ConfigOutcome`      | Mutation acknowledgment (from SystemActor)                         |
 | `ActorStatus`        | Actor lifecycle + telemetry                                        |
@@ -59,7 +59,7 @@ All variants are flat struct variants with named fields (no wrapper types).
 | Type              | Description                                                                                        |
 | ----------------- | -------------------------------------------------------------------------------------------------- |
 | `ShotKey`         | Shot correlation: UUID v4 `shot_id` (String) + `shot_number` (u32). Re-exported from `flightrelay` |
-| `ShotData`        | Complete shot: source, shot number, optional ball flight, optional club, optional face impact       |
+| `ShotData`        | Complete shot: actor, shot number, optional ball flight, optional club, optional face impact        |
 | `ShotAccumulator` | Low-level: collects individual shot lifecycle events into a `ShotData`                              |
 | `ShotAggregator`  | High-level: feed `FlighthookMessage`s, get complete `ShotData` back when shots finish               |
 | `BallFlight`      | All fields `Option`. Re-exported from `flightrelay`. Launch speed, elevation, azimuth, carry/total distance, max height, flight time, backspin/sidespin |
@@ -98,7 +98,7 @@ so UI/WASM builds are unaffected.
 
 ```toml
 [dependencies]
-flighthook = { version = "0.0.6", features = ["client"] }
+flighthook = { version = "0.1", features = ["client"] }
 ```
 
 | Type               | Description                                              |
@@ -111,7 +111,7 @@ flighthook = { version = "0.0.6", features = ["client"] }
 ```rust
 use flighthook::{FlighthookClient, ShotAggregator};
 
-let mut client = FlighthookClient::connect("ws://localhost:5880/api/ws", "my-app")?;
+let mut client = FlighthookClient::connect("ws://localhost:5880/frp", "my-app")?;
 let mut shots = ShotAggregator::new();
 
 loop {
@@ -127,7 +127,7 @@ loop {
 ```rust
 use flighthook::{FlighthookClient, ShotAggregator};
 
-let mut client = FlighthookClient::connect("ws://localhost:5880/api/ws", "my-sim")?;
+let mut client = FlighthookClient::connect("ws://localhost:5880/frp", "my-sim")?;
 client.set_nonblocking(true)?;
 let mut shots = ShotAggregator::new();
 
@@ -148,5 +148,6 @@ loop {
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `Club`              | 19-variant enum (Driver through Putter). Serializes to GSPro codes (`"DR"`, `"7I"`, `"PT"`). `mode()` maps to detection mode. |
 | `ClubInfo`          | Current club selection                                                                                                        |
-| `PlayerInfo`        | Player handedness                                                                                                             |
+| `PlayerInfo`        | Player name                                                                                                                   |
+| `Handedness`        | `Right` / `Left`. Re-exported from `flightrelay`                                                                              |
 | `GameStateSnapshot` | Immutable snapshot: player info, club info, current mode                                                                      |

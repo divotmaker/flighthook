@@ -13,7 +13,7 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "club_path",
     "face_impact",
     "shot_finished",
-    "device_info",
+    "device_telemetry",
     "actor_status",
     "player_info",
     "club_info",
@@ -24,7 +24,7 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
 
 /// Filter groups for the dropdown.
 const FILTER_GROUPS: &[(&str, &[&str])] = &[
-    ("Launch Monitor", &["shot_trigger", "ball_flight", "club_path", "face_impact", "shot_finished", "device_info"]),
+    ("Launch Monitor", &["shot_trigger", "ball_flight", "club_path", "face_impact", "shot_finished", "device_telemetry"]),
     ("Game", &["player_info", "club_info", "set_detection_mode"]),
     ("System", &["actor_status", "config_command", "config_outcome"]),
     ("Alert", &["alert_error", "alert_warn", "alert_critical"]),
@@ -38,7 +38,7 @@ pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
         FlighthookEvent::ClubPath { .. } => "club_path",
         FlighthookEvent::FaceImpact { .. } => "face_impact",
         FlighthookEvent::ShotFinished { .. } => "shot_finished",
-        FlighthookEvent::DeviceInfo { .. } => "device_info",
+        FlighthookEvent::DeviceTelemetry { .. } => "device_telemetry",
         FlighthookEvent::PlayerInfo { .. } => "player_info",
         FlighthookEvent::ClubInfo { .. } => "club_info",
         FlighthookEvent::SetDetectionMode { .. } => "set_detection_mode",
@@ -71,22 +71,28 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
         FlighthookEvent::ClubPath { key, .. } => format!("club #{}", key.shot_number),
         FlighthookEvent::FaceImpact { key, .. } => format!("impact #{}", key.shot_number),
         FlighthookEvent::ShotFinished { key } => format!("finished #{}", key.shot_number),
-        FlighthookEvent::DeviceInfo { manufacturer, model, telemetry, .. } => {
-            // Show readiness if telemetry has armed/ball_detected, otherwise show device identity
+        FlighthookEvent::DeviceTelemetry { manufacturer, model, telemetry, .. } => {
+            // Show readiness if telemetry has ready key, otherwise show device identity
             if let Some(tel) = telemetry
-                && (tel.contains_key("armed") || tel.contains_key("ball_detected"))
+                && tel.contains_key("ready")
             {
-                let armed = tel.get("armed").map(|v| v.as_str()).unwrap_or("?");
-                let ball = tel.get("ball_detected").map(|v| v.as_str()).unwrap_or("?");
-                return format!("armed={armed} ball={ball}");
+                let ready = tel.get("ready").map(|v| v.as_str()).unwrap_or("?");
+                return format!("ready={ready}");
             }
-            format!("device_info: {} {}", manufacturer.as_deref().unwrap_or("?"), model.as_deref().unwrap_or("?"))
+            format!("device: {} {}", manufacturer.as_deref().unwrap_or("?"), model.as_deref().unwrap_or("?"))
         }
         FlighthookEvent::PlayerInfo { player_info } => {
-            format!("handed={}", player_info.handed)
+            format!("name={}", player_info.name.as_deref().unwrap_or("?"))
         }
         FlighthookEvent::ClubInfo { club_info } => format!("club={}", club_info.club),
-        FlighthookEvent::SetDetectionMode { mode } => format!("{mode:?}"),
+        FlighthookEvent::SetDetectionMode { mode, handed } => {
+            match (mode, handed) {
+                (Some(m), Some(h)) => format!("{m:?} handed={h}"),
+                (Some(m), None) => format!("{m:?}"),
+                (None, Some(h)) => format!("handed={h}"),
+                (None, None) => "no-op".into(),
+            }
+        }
         FlighthookEvent::ActorStatus { status, .. } => format!("{status:?}"),
         FlighthookEvent::ConfigCommand { action, .. } => format!("{action:?}"),
         FlighthookEvent::ConfigOutcome { request_id, .. } => match request_id {
@@ -222,10 +228,10 @@ impl FlighthookApp {
                             None => None,
                         };
 
-                        // Row 1: timestamp | source name | event debug
+                        // Row 1: timestamp | actor name | event debug
                         ui.label(mono(11.0, &time_str));
                         ui.label(
-                            mono(11.0, &entry.source_name)
+                            mono(11.0, &entry.actor_name)
                                 .color(egui::Color32::from_rgb(180, 160, 220)),
                         );
                         let debug_label = mono(11.0, &entry.event_debug);
@@ -235,9 +241,9 @@ impl FlighthookApp {
                         });
                         ui.end_row();
 
-                        // Row 2: message type | source id | raw payload
+                        // Row 2: message type | actor id | raw payload
                         ui.label(mono(11.0, &entry.message_type).color(dim));
-                        ui.label(mono(11.0, &entry.source_id).color(dim));
+                        ui.label(mono(11.0, &entry.actor_id).color(dim));
                         if entry.raw.is_empty() {
                             ui.label(mono(11.0, "(no payload)").color(dim));
                         } else {

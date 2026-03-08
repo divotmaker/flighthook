@@ -38,6 +38,10 @@ pub struct WebState {
     pub bus_tx: broadcast::Sender<FlighthookMessage>,
     pub actors: RwLock<HashMap<String, ActorStatusResponse>>,
     pub shots: RwLock<VecDeque<ShotData>>,
+    /// Last `ActorStatus` message per actor — replayed to new WS clients.
+    pub cached_actor_status: RwLock<HashMap<String, FlighthookMessage>>,
+    /// Last `DeviceTelemetry` message per actor — replayed to new WS clients.
+    pub cached_device_telemetry: RwLock<HashMap<String, FlighthookMessage>>,
     pub addr: SocketAddr,
     pub actor_id: String,
     pub ws_count: AtomicU64,
@@ -65,7 +69,7 @@ fn emit_status(
         telemetry.insert("error".into(), "bind failed".into());
     }
     let _ = bus_tx
-        .send(FlighthookMessage::new(FlighthookEvent::ActorStatus { status, telemetry }).source(&state.actor_id));
+        .send(FlighthookMessage::new(FlighthookEvent::ActorStatus { status, telemetry }).actor(&state.actor_id));
 }
 
 /// Emit Connected telemetry (convenience for periodic emitter + ws handlers).
@@ -159,6 +163,8 @@ async fn run(
         bus_tx: bus_tx.clone(),
         actors: RwLock::new(actors),
         shots: RwLock::new(VecDeque::with_capacity(MAX_SHOTS)),
+        cached_actor_status: RwLock::new(HashMap::new()),
+        cached_device_telemetry: RwLock::new(HashMap::new()),
         addr,
         actor_id,
         ws_count: AtomicU64::new(0),
@@ -203,7 +209,7 @@ async fn run(
             "/api/settings",
             get(routes::get_settings).post(routes::post_settings),
         )
-        .route("/api/ws", get(ws::ws_upgrade))
+        .route(flighthook::FRP_PATH, get(ws::ws_upgrade))
         .layer(count_middleware)
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
@@ -260,20 +266,23 @@ async fn apply_bus_event(
         } => {
             let mut actors = state.actors.write().await;
             let actor = actors
-                .entry(msg.source.clone())
+                .entry(msg.actor.clone())
                 .or_insert_with(|| new_actor(String::new()));
             actor.status = *status;
             actor.telemetry = telemetry.clone();
+            // Cache the raw message for WS replay
+            state.cached_actor_status.write().await
+                .insert(msg.actor.clone(), msg.clone());
         }
         FlighthookEvent::ShotTrigger { key } => {
-            let acc = ShotAccumulator::new(msg.source.clone(), key.clone());
-            accumulators.insert((msg.source.clone(), key.clone()), acc);
+            let acc = ShotAccumulator::new(msg.actor.clone(), key.clone());
+            accumulators.insert((msg.actor.clone(), key.clone()), acc);
         }
         FlighthookEvent::BallFlight {
             key,
             ball,
         } => {
-            if let Some(acc) = accumulators.get_mut(&(msg.source.clone(), key.clone())) {
+            if let Some(acc) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
                 acc.set_ball(*ball.clone());
             }
         }
@@ -281,17 +290,17 @@ async fn apply_bus_event(
             key,
             impact,
         } => {
-            if let Some(acc) = accumulators.get_mut(&(msg.source.clone(), key.clone())) {
+            if let Some(acc) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
                 acc.set_impact(*impact.clone());
             }
         }
         FlighthookEvent::ClubPath { key, club } => {
-            if let Some(acc) = accumulators.get_mut(&(msg.source.clone(), key.clone())) {
+            if let Some(acc) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
                 acc.set_club(*club.clone());
             }
         }
         FlighthookEvent::ShotFinished { key } => {
-            if let Some(acc) = accumulators.remove(&(msg.source.clone(), key.clone()))
+            if let Some(acc) = accumulators.remove(&(msg.actor.clone(), key.clone()))
                 && let Some(shot) = acc.finish()
             {
                 let mut shots = state.shots.write().await;
@@ -302,16 +311,18 @@ async fn apply_bus_event(
             }
         }
         FlighthookEvent::PlayerInfo { player_info } => {
-            let mut actors = state.actors.write().await;
-            if let Some(actor) = actors.get_mut(&msg.source) {
-                actor
-                    .telemetry
-                    .insert("handed".into(), player_info.handed.clone());
+            if let Some(ref name) = player_info.name {
+                let mut actors = state.actors.write().await;
+                if let Some(actor) = actors.get_mut(&msg.actor) {
+                    actor
+                        .telemetry
+                        .insert("name".into(), name.clone());
+                }
             }
         }
         FlighthookEvent::ClubInfo { club_info } => {
             let mut actors = state.actors.write().await;
-            if let Some(actor) = actors.get_mut(&msg.source) {
+            if let Some(actor) = actors.get_mut(&msg.actor) {
                 actor
                     .telemetry
                     .insert("club".into(), club_info.club.to_string());
@@ -338,21 +349,37 @@ async fn apply_bus_event(
                         .or_insert_with(|| new_actor(name.clone()));
                     entry.name = name.clone();
                 }
-                // Remove stopped actors from cache
+                // Remove stopped actors
                 for id in stopped {
                     actors.remove(id);
                 }
+                drop(actors);
+                // Clean up cached messages for stopped actors
+                for id in stopped {
+                    state.cached_actor_status.write().await.remove(id);
+                    state.cached_device_telemetry.write().await.remove(id);
+                }
             }
         }
-        FlighthookEvent::DeviceInfo {
+        FlighthookEvent::DeviceTelemetry {
             telemetry: Some(tel), ..
         } => {
             let mut actors = state.actors.write().await;
-            if let Some(actor) = actors.get_mut(&msg.source) {
+            if let Some(actor) = actors.get_mut(&msg.actor) {
                 for (k, v) in tel {
                     actor.telemetry.insert(k.clone(), v.clone());
                 }
             }
+            // Cache the raw message for WS replay
+            state.cached_device_telemetry.write().await
+                .insert(msg.actor.clone(), msg.clone());
+        }
+        FlighthookEvent::DeviceTelemetry {
+            telemetry: None, ..
+        } => {
+            // Cache identity-only DeviceTelemetry too
+            state.cached_device_telemetry.write().await
+                .insert(msg.actor.clone(), msg.clone());
         }
         // Alert, SetDetectionMode, ConfigCommand — no web state update needed
         _ => {}

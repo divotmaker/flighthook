@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook"
-version = "0.0.11"
+version = "0.1.0"
 dependencies = [
  "clap",
  "flightrelay",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-app"
-version = "0.0.11"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-ui"
-version = "0.0.11"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
@@ -1086,9 +1086,9 @@ dependencies = [
 
 [[package]]
 name = "flightrelay"
-version = "0.1.0"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae1196a039b10b2e11aea6d1fcf06561b1009b3afb3a51cb6cef5e584a31fb7a"
+checksum = "a0074be0f495eee3a5f51ef1501c91370777e1c35ac8f137e5b767c7796c630a"
 dependencies = [
  "serde",
  "serde_json",

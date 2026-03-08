@@ -138,36 +138,39 @@ fn run(addr: SocketAddr, routing: GsProRouting, sender: BusSender, mut receiver:
 }
 
 /// Compute readiness from routing config, current mode, and per-monitor state.
+///
+/// Returns a single `ready` bool. `DeviceTelemetry.ready` is the unified
+/// readiness signal (all device conditions met). GSPro's
+/// `launch_monitor_is_ready` and `launch_monitor_ball_detected` are both
+/// set from this single value.
 fn readiness(
     routing: &GsProRouting,
     mode: ShotDetectionMode,
-    states: &HashMap<String, (bool, bool)>,
-) -> (bool, bool) {
+    states: &HashMap<String, bool>,
+) -> bool {
     let target = match mode {
         ShotDetectionMode::Full => &routing.full_monitor,
         ShotDetectionMode::Chipping => &routing.chipping_monitor,
         ShotDetectionMode::Putting => &routing.putting_monitor,
     };
     match target {
-        Some(id) => *states.get(id.as_str()).unwrap_or(&(false, false)),
+        Some(id) => *states.get(id.as_str()).unwrap_or(&false),
         None => {
             // "Any" — ready if any monitor is ready
-            let armed = states.values().any(|&(a, _)| a);
-            let ball = states.values().any(|&(_, b)| b);
-            (armed, ball)
+            states.values().any(|&r| r)
         }
     }
 }
 
-/// Check if a shot source matches the routing target for the current mode.
-fn shot_matches_routing(routing: &GsProRouting, mode: ShotDetectionMode, source: &str) -> bool {
+/// Check if a shot actor matches the routing target for the current mode.
+fn shot_matches_routing(routing: &GsProRouting, mode: ShotDetectionMode, actor: &str) -> bool {
     let target = match mode {
         ShotDetectionMode::Full => &routing.full_monitor,
         ShotDetectionMode::Chipping => &routing.chipping_monitor,
         ShotDetectionMode::Putting => &routing.putting_monitor,
     };
     match target {
-        Some(id) => source == id,
+        Some(id) => actor == id,
         None => true, // "Any" — accept from all
     }
 }
@@ -197,9 +200,9 @@ fn connect_and_run(
     // Backdate so the first heartbeat fires after ~1s instead of waiting the full 10s.
     let mut last_heartbeat = Instant::now() - Duration::from_secs(9);
     let mut read_buf = vec![0u8; 4096];
-    let mut monitor_state: HashMap<String, (bool, bool)> = HashMap::new();
-    let mut prev_readiness = (false, false);
-    // Per-source shot accumulators, keyed by (source, shot_key)
+    let mut monitor_state: HashMap<String, bool> = HashMap::new();
+    let mut prev_readiness = false;
+    // Per-actor shot accumulators, keyed by (actor, shot_key)
     let mut accumulators: HashMap<(String, ShotKey), ShotAccumulator> = HashMap::new();
 
     loop {
@@ -254,15 +257,15 @@ fn connect_and_run(
                 Ok(None) => break,
                 Ok(Some(msg)) => match msg.event {
                     FlighthookEvent::ShotTrigger { ref key } => {
-                        let acc = ShotAccumulator::new(msg.source.clone(), key.clone());
-                        accumulators.insert((msg.source.clone(), key.clone()), acc);
+                        let acc = ShotAccumulator::new(msg.actor.clone(), key.clone());
+                        accumulators.insert((msg.actor.clone(), key.clone()), acc);
                     }
                     FlighthookEvent::BallFlight {
                         ref key,
                         ref ball,
                     } => {
                         if let Some(acc) =
-                            accumulators.get_mut(&(msg.source.clone(), key.clone()))
+                            accumulators.get_mut(&(msg.actor.clone(), key.clone()))
                         {
                             acc.set_ball(*ball.clone());
                         }
@@ -272,27 +275,27 @@ fn connect_and_run(
                         ref impact,
                     } => {
                         if let Some(acc) =
-                            accumulators.get_mut(&(msg.source.clone(), key.clone()))
+                            accumulators.get_mut(&(msg.actor.clone(), key.clone()))
                         {
                             acc.set_impact(*impact.clone());
                         }
                     }
                     FlighthookEvent::ClubPath { ref key, ref club } => {
                         if let Some(acc) =
-                            accumulators.get_mut(&(msg.source.clone(), key.clone()))
+                            accumulators.get_mut(&(msg.actor.clone(), key.clone()))
                         {
                             acc.set_club(*club.clone());
                         }
                     }
                     FlighthookEvent::ShotFinished { ref key } => {
                         if let Some(acc) =
-                            accumulators.remove(&(msg.source.clone(), key.clone()))
+                            accumulators.remove(&(msg.actor.clone(), key.clone()))
                         {
-                            if !shot_matches_routing(routing, current_mode, &msg.source) {
+                            if !shot_matches_routing(routing, current_mode, &msg.actor) {
                                 tracing::debug!(
                                     "gspro bridge: skipping shot #{} from '{}' (routed to {:?} for mode {current_mode:?})",
                                     key.shot_number,
-                                    msg.source,
+                                    msg.actor,
                                     match current_mode {
                                         ShotDetectionMode::Full => &routing.full_monitor,
                                         ShotDetectionMode::Chipping => &routing.chipping_monitor,
@@ -304,25 +307,26 @@ fn connect_and_run(
                             }
                         }
                     }
-                    FlighthookEvent::DeviceInfo {
+                    FlighthookEvent::DeviceTelemetry {
                         telemetry: Some(ref tel), ..
-                    } if tel.contains_key("ready") || tel.contains_key("ball_detected") => {
+                    } if tel.contains_key("ready") => {
                         let ready = tel.get("ready").is_some_and(|v| v == "true");
-                        let ball = tel.get("ball_detected").is_some_and(|v| v == "true");
-                        monitor_state.insert(msg.source.clone(), (ready, ball));
+                        monitor_state.insert(msg.actor.clone(), ready);
                         readiness_changed = true;
                     }
-                    FlighthookEvent::SetDetectionMode { mode } => {
-                        current_mode = mode;
-                        readiness_changed = true;
+                    FlighthookEvent::SetDetectionMode { mode, .. } => {
+                        if let Some(m) = mode {
+                            current_mode = m;
+                            readiness_changed = true;
+                        }
                     }
                     FlighthookEvent::ActorStatus { status, .. } => {
                         if matches!(
                             status,
                             ActorStatus::Disconnected | ActorStatus::Reconnecting
-                        ) && monitor_state.contains_key(&msg.source)
+                        ) && monitor_state.contains_key(&msg.actor)
                         {
-                            monitor_state.insert(msg.source.clone(), (false, false));
+                            monitor_state.insert(msg.actor.clone(), false);
                             readiness_changed = true;
                         }
                     }
@@ -351,11 +355,10 @@ fn connect_and_run(
             if new_readiness != prev_readiness {
                 prev_readiness = new_readiness;
                 let msg =
-                    api::GsProMessage::heartbeat_with_readiness(new_readiness.0, new_readiness.1);
+                    api::GsProMessage::heartbeat_with_readiness(new_readiness, new_readiness);
                 tracing::debug!(
-                    "gspro -> heartbeat (readiness: armed={}, ball={})",
-                    new_readiness.0,
-                    new_readiness.1
+                    "gspro -> heartbeat (ready={})",
+                    new_readiness,
                 );
                 if let Ok(json_str) = serde_json::to_string(&msg) {
                     tracing::info!(
@@ -372,10 +375,10 @@ fn connect_and_run(
         // 5. Periodic heartbeat if due
         if last_heartbeat.elapsed() >= Duration::from_secs(10) {
             last_heartbeat = Instant::now();
-            let (armed, ball) = readiness(routing, current_mode, &monitor_state);
-            prev_readiness = (armed, ball);
-            let msg = api::GsProMessage::heartbeat_with_readiness(armed, ball);
-            tracing::debug!("gspro -> heartbeat (armed={armed}, ball={ball})");
+            let ready = readiness(routing, current_mode, &monitor_state);
+            prev_readiness = ready;
+            let msg = api::GsProMessage::heartbeat_with_readiness(ready, ready);
+            tracing::debug!("gspro -> heartbeat (ready={ready})");
             if let Ok(json_str) = serde_json::to_string(&msg) {
                 tracing::info!(
                     target: "audit",

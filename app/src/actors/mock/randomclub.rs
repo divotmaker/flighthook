@@ -13,10 +13,10 @@ use super::super::Actor;
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use flighthook::{
-    ActorStatus, Club, ClubInfo, FlighthookEvent, FlighthookMessage, PlayerInfo,
+    ActorStatus, Club, ClubInfo, FlighthookEvent, FlighthookMessage, Handedness,
 };
 
-const HANDEDNESS: &[&str] = &["RH", "LH"];
+const HANDEDNESS: &[Handedness] = &[Handedness::Right, Handedness::Left];
 
 /// Random club cycling integration actor.
 pub struct RandomClubActor;
@@ -46,7 +46,7 @@ fn next_rand(seed: &mut u64) -> usize {
     (*seed >> 33) as usize
 }
 
-fn emit_status(sender: &BusSender, club: Club, handed: &str) {
+fn emit_status(sender: &BusSender, club: Club, handed: Handedness) {
     let mut telemetry = HashMap::new();
     telemetry.insert("club".into(), club.to_string());
     telemetry.insert("handed".into(), handed.to_string());
@@ -63,18 +63,17 @@ fn run(sender: BusSender, mut receiver: BusReceiver) {
     let mut seed = now_ms();
 
     // Pick initial club and handedness
-    let mut handed = HANDEDNESS[next_rand(&mut seed) % HANDEDNESS.len()].to_string();
+    let mut handed = HANDEDNESS[next_rand(&mut seed) % HANDEDNESS.len()];
     let mut club = Club::ALL[next_rand(&mut seed) % Club::ALL.len()];
 
     // Report connected with telemetry + emit game state
-    emit_status(&sender, club, &handed);
-    sender.send(FlighthookMessage::new(FlighthookEvent::PlayerInfo {
-        player_info: PlayerInfo {
-            handed: handed.clone(),
-        },
-    }));
+    emit_status(&sender, club, handed);
     sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
         club_info: ClubInfo { club },
+    }));
+    sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+        mode: None,
+        handed: Some(handed),
     }));
 
     loop {
@@ -90,15 +89,14 @@ fn run(sender: BusSender, mut receiver: BusReceiver) {
                 // Cycle club/handedness on each completed shot
                 if let FlighthookEvent::ShotFinished { .. } = &msg.event {
                     club = Club::ALL[next_rand(&mut seed) % Club::ALL.len()];
-                    handed = HANDEDNESS[next_rand(&mut seed) % HANDEDNESS.len()].to_string();
-                    emit_status(&sender, club, &handed);
-                    sender.send(FlighthookMessage::new(FlighthookEvent::PlayerInfo {
-                        player_info: PlayerInfo {
-                            handed: handed.clone(),
-                        },
-                    }));
+                    handed = HANDEDNESS[next_rand(&mut seed) % HANDEDNESS.len()];
+                    emit_status(&sender, club, handed);
                     sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
                         club_info: ClubInfo { club },
+                    }));
+                    sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+                        mode: None,
+                        handed: Some(handed),
                     }));
                 }
             }

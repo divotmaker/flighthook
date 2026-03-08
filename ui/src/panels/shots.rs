@@ -73,9 +73,9 @@ impl FlighthookApp {
                             // Device display name (look up from actor key)
                             let dev_display = self
                                 .actors
-                                .get(&shot.source)
+                                .get(&shot.actor)
                                 .map(|a| a.name.as_str())
-                                .unwrap_or(&shot.source);
+                                .unwrap_or(&shot.actor);
                             if dev_display.is_empty() {
                                 ui.label("-");
                             } else {

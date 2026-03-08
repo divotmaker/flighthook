@@ -250,28 +250,13 @@ fn run(
                     let mode = state.system.snapshot().club_mode(club_info.club);
                     writer.set_mode(mode);
                     sender.send(FlighthookMessage::new(
-                        FlighthookEvent::SetDetectionMode { mode },
+                        FlighthookEvent::SetDetectionMode { mode: Some(mode), handed: None },
                     ));
                 }
-                FlighthookEvent::SetDetectionMode { mode } => {
-                    writer.set_mode(*mode);
-                }
-                FlighthookEvent::DeviceInfo {
-                    telemetry: Some(tel), ..
-                } if tel.contains_key("ready") || tel.contains_key("ball_detected") => {
-                    let ready = tel.get("ready").is_some_and(|v| v == "true");
-                    let ball = tel.get("ball_detected").is_some_and(|v| v == "true");
-                    writer.set_launch_monitor_state(
-                        msg.source.clone(),
-                        ready,
-                        ball,
-                    );
-                }
-                FlighthookEvent::ActorStatus {
-                    status: flighthook::ActorStatus::Disconnected,
-                    ..
-                } => {
-                    writer.remove_launch_monitor(&msg.source);
+                FlighthookEvent::SetDetectionMode { mode, .. } => {
+                    if let Some(m) = mode {
+                        writer.set_mode(*m);
+                    }
                 }
                 FlighthookEvent::ConfigCommand { .. } => {
                     handle_config_command(&msg.event, &state, &bus_tx, &sender);

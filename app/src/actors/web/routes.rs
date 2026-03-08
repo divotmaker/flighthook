@@ -141,7 +141,7 @@ pub async fn post_mode(
     let mode = body.mode;
     let _ = state
         .bus_tx
-        .send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode { mode }).source("web"));
+        .send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode { mode: Some(mode), handed: None }).actor("web"));
     StatusCode::ACCEPTED
 }
 
@@ -168,7 +168,7 @@ pub async fn post_settings(
             request_id: Some(request_id.clone()),
             action: Box::new(ConfigAction::ReplaceAll { config: new_config }),
         })
-        .source("web"),
+        .actor("web"),
     );
 
     // Wait for ConfigOutcome with matching request_id (10s timeout)

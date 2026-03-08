@@ -45,7 +45,7 @@ address = "127.0.0.1:921"
   (E8) ball flights are emitted when no full (D4) result arrives
 - Mock sections show only name (no address or radar fields)
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `gspro.0`)
-- WebSocket source IDs = `"ws.{8-hex-chars}"`
+- WebSocket actor IDs = `"ws.{8-hex-chars}"`
 
 ### Rust types
 
@@ -126,12 +126,17 @@ Producers create messages; consumers subscribe and filter by event kind.
 
 ```rust
 pub struct FlighthookMessage {
-    pub source: String,                   // actor framework ID (e.g. "mevo.0")
+    pub actor: String,                    // actor framework ID (e.g. "mevo.0")
     pub device: Option<String>,           // FRP physical device ID (e.g. Mevo SSID)
     pub raw_payload: Option<RawPayload>,
     pub event: FlighthookEvent,
 }
 ```
+
+All messages use the FRP envelope shape: `{ actor, device?, event: { kind, ... } }`.
+`actor` is a flighthook extension field (actor framework ID). FRP consumers
+ignore unknown fields and unknown `kind` values per spec, so flighthook
+extension kinds (`actor_status`, `player_info`, etc.) are transparent.
 
 ### RawPayload
 
@@ -159,13 +164,15 @@ pub enum FlighthookEvent {
     ShotFinished { key: ShotKey },
 
     // -- FRP: Device status --
-    DeviceInfo { manufacturer: Option<String>, model: Option<String>, firmware: Option<String>, telemetry: Option<HashMap<String, String>> },
+    DeviceTelemetry { manufacturer: Option<String>, model: Option<String>, firmware: Option<String>, telemetry: Option<HashMap<String, String>> },
     Alert { severity: Severity, message: String },
+
+    // -- FRP: Controller commands --
+    SetDetectionMode { mode: Option<ShotDetectionMode>, handed: Option<Handedness> },
 
     // -- Flighthook extensions --
     PlayerInfo { player_info: PlayerInfo },
     ClubInfo { club_info: ClubInfo },
-    SetDetectionMode { mode: ShotDetectionMode },
     ConfigCommand { request_id: Option<String>, action: ConfigAction },
     ConfigOutcome { request_id: Option<String>, restarted: Vec<String>, stopped: Vec<String>, started: Vec<String> },
     ActorStatus { status: ActorStatus, telemetry: HashMap<String, String> },
@@ -177,11 +184,11 @@ pub enum FlighthookEvent {
 ```rust
 pub struct ShotKey {
     pub shot_id: String,      // UUID v4 string, globally unique
-    pub shot_number: u32,     // session-level monotonic counter per-source
+    pub shot_number: u32,     // session-level monotonic counter per-actor
 }
 ```
 
-Shot data arrives as correlated events sharing a `ShotKey` and `source`:
+Shot data arrives as correlated events sharing a `ShotKey` and `actor`:
 `ShotTrigger` -> `BallFlight` / `ClubPath` / `FaceImpact` (any order) -> `ShotFinished`. Consumers
 use `ShotAccumulator` to collect events into a final `ShotData`.
 
@@ -189,40 +196,49 @@ use `ShotAccumulator` to collect events into a final `ShotData`.
 
 Game state is mutated via typed events on the bus:
 
-- `PlayerInfo { player_info }` -- player handedness
+- `PlayerInfo { player_info }` -- player name
 - `ClubInfo { club_info }` -- club selection
-- `SetDetectionMode { mode }` -- detection mode (full/chipping/putting)
+- `SetDetectionMode { mode?, handed? }` -- detection mode and/or handedness (both optional, latched)
 
 The `SystemActor` auto-derives detection mode from `ClubInfo` (using
 `config.club_mode()` to map club to detection mode via the configurable
 `chipping_clubs`/`putting_clubs` lists). Integrations only
 need to emit `ClubInfo`; the SystemActor handles mode derivation
 centrally. Launch monitor actors react to `SetDetectionMode` events to reconfigure
-the device. Mode is global state, not per-device.
+the device — they latch the mode and only re-arm when the mode actually changes.
+Handed-only updates (mode omitted) do not trigger re-arming. Mode is global
+state, not per-device.
 
-Launch monitor readiness (ready/ball_detected) is conveyed via `DeviceInfo`
-telemetry with `"ready"` and `"ball_detected"` keys, rather than a separate
-event variant.
+### DeviceTelemetry / ActorStatus split
 
-### ActorStatus -- generic actor lifecycle
+Device state and actor lifecycle are conveyed via two separate event variants
+with **no overlapping telemetry keys**:
 
-All actors emit `ActorStatus` events on the bus with a status + key/value
-telemetry map.
+- **`DeviceTelemetry`** (FRP-compliant) — what the device reports about itself.
+  Emitted any time a device-reported value changes. Carries identity
+  (manufacturer, model, firmware) and device telemetry. `ready` is the single
+  readiness signal (all device conditions met for a shot, including ball
+  detection where applicable).
+
+  Standard telemetry keys: `ready`, `battery_pct`, `tilt`, `roll`, `temp_c`,
+  `external_power`.
+
+- **`ActorStatus`** (flighthook extension) — what flighthook knows about the
+  actor/connection. Carries a typed status enum and actor-framework telemetry.
+  FRP-only consumers ignore this per spec (unknown `kind` value).
+
+  Standard telemetry keys: `detection_mode`, `radar_mode`, `device_info`.
+  Mock launch monitors add: `shot_count`, `tracking_mode`.
+  Integration actors: `club`, `handed`, `name`, `error`.
 
 ```rust
 pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
 ```
 
 `ActorStatusResponse` (in `lib/src/api.rs`) adds a `name` field and is used
-as the cached per-actor state in both the web layer and the UI.
-
-Launch monitor actors use telemetry keys:
-`mode`, `ready`, `shooting`, `battery_pct`, `tilt`, `roll`, `temp_c`,
-`external_power`, `device_info`. Mock launch monitors add `shot_count`
-and `tracking_mode`.
-
-Integration actors use telemetry keys:
-`club`, `handed`, `error`.
+as the cached per-actor state in both the web layer and the UI. The web layer
+merges telemetry from both `DeviceTelemetry` and `ActorStatus` events into
+a single per-actor telemetry map for API consumers.
 
 ### ConfigCommand / ConfigOutcome -- event-sourced config mutations
 
@@ -260,7 +276,7 @@ commands (where `request_id` is `None`).
 ## GameState
 
 `GameState` in `state/game.rs` -- read-only handle for the current round's
-`PlayerInfo` (handedness), `ClubInfo` (club selection), and
+`PlayerInfo` (player name), `ClubInfo` (club selection), and
 `ShotDetectionMode` (global detection mode). Lives inside `SystemState` as
 the `game` field. Only exposes `snapshot()`. All actors and the web layer
 can read via `state.game.snapshot()`.
@@ -308,16 +324,16 @@ Starting -> Connected -> (error) -> Reconnecting -> Connected -> ...
 **Mevo actor mapping** (from internal phases):
 
 - `Connecting | Handshaking | Configuring | Arming` -> `Starting`
-- `Armed` -> `Connected` with `telemetry["ready"] = "true"`
-- `Shooting` -> `Connected` with `telemetry["shooting"] = "true"`
+- `Armed` -> `Connected` with `telemetry["radar_mode"] = "armed"`
+- `Shooting` -> `Connected` with `telemetry["radar_mode"] = "idle"`
 - `Disconnected` -> `Disconnected`
 - `Reconnecting` -> `Reconnecting`
 
-Post-shot cycle: `Connected(shooting)` -> `Starting` (re-arm) -> `Connected(ready)`.
+Post-shot cycle: `Connected(radar_mode=idle)` -> `Starting` (re-arm) -> `Connected(radar_mode=armed)`.
 
 **Integration readiness**: the GSPro actor tracks device readiness from
-`DeviceInfo` telemetry (`"ready"` and `"ball_detected"` keys) and uses them to
-set `launch_monitor_is_ready` and `launch_monitor_ball_detected` in heartbeats
+`DeviceTelemetry` (`"ready"` key) and uses it to set both
+`launch_monitor_is_ready` and `launch_monitor_ball_detected` in heartbeats
 and shot messages.
 
 ## SystemActor
@@ -347,7 +363,7 @@ config-driven actors, registered with ID `"system"`. Skipped by
 function.
 
 The web layer's `state_updater` task does NOT update game state -- it only
-caches club/handed values in the per-actor telemetry map for the UI. It
+caches club and player name values in the per-actor telemetry map for the UI. It
 also handles `ConfigOutcome` events to refresh actor name caches.
 
 ## Component Identity
@@ -357,7 +373,7 @@ All components are identified by type-prefixed global IDs: `mevo.0`, `gspro.0`,
 actor has a fixed ID of `"system"`. The type prefix encodes the component type;
 the index is the key within that type's config section.
 
-`FlighthookMessage.source` carries the global ID of the message originator.
+`FlighthookMessage.actor` carries the global ID of the message originator.
 Inner event types no longer carry redundant ID or name fields.
 
 ## SystemState
@@ -397,14 +413,19 @@ to the `audit` tracing target (filtered by `RUST_LOG`, not shown by default).
 
 ## WebSocket Init Protocol
 
-Single WS connection (`/api/ws`), three-phase handshake:
+WS connection at `/frp`, three-phase handshake with version negotiation:
 
 1. Client sends: `{ "kind": "start", "version": ["0.1.0"], "name": "My Dashboard" }`
-2. Server responds: `{ "kind": "init", "version": "0.1.0", "source_id": "abc123", "global_state": { ... } }`
-3. Server streams `FlighthookMessage` events (serialized directly as JSON)
+2. Server negotiates version (highest mutually supported). If no compatible
+   version, sends a `critical` alert and closes the connection.
+3. Server responds: `{ "kind": "init", "version": "0.1.0", "actor_id": "ws.a1b2c3d4", "global_state": { ... } }`
+4. Server streams `FlighthookMessage` events (serialized directly as JSON)
 
-Bus events are serialized and forwarded as-is. The `kind` tag on
-`FlighthookEvent` identifies the event type. Consumers filter by `kind`.
+Currently supported FRP versions: `0.1.0`. Legacy clients without a `version`
+array default to the current FRP version.
+
+Bus events are serialized using the FRP envelope shape with `kind` inside
+`event`. Consumers filter by `event.kind`.
 
 Client -> server commands:
 
@@ -462,7 +483,7 @@ config-driven). Then each config section constructs an actor struct and calls
 `Arc<AtomicBool>` shutdown flag shared between the `BusReceiver` and the
 registry. Launch monitor actors (mevo, mock::launch) run event loops polling
 the bus. Integration actors (gspro, mock::randomclub) subscribe to the bus
-and emit `PlayerInfo`/`ClubInfo` (for club/player changes) and `ActorStatus`
+and emit `ClubInfo` (for club changes) and `ActorStatus`
 (for connection status) back onto the bus.
 
 **Drain subscriber**: a tokio task that consumes all bus messages to keep the
@@ -579,11 +600,10 @@ rendered one per row, sorted alphabetically, indented under the actor header.
 
   Local GSPro            [CONNECTED]
     club: 7I
-    handed: RH
 
   Random Club            [CONNECTED]
     club: DR
-    handed: LH
+    handed: rh
 ```
 
 Detection mode is **global state** (not per-device). The mode selector
@@ -593,9 +613,9 @@ Launch monitor actors react to `SetDetectionMode` events to reconfigure the devi
 
 Each actor shows a name and status badge (green=connected, yellow=starting,
 red=disconnected/reconnecting). Telemetry (battery, tilt, roll, temp)
-and club/handed are read from the actor's telemetry map.
+and club/handed/name are read from the actor's telemetry map.
 
-The web layer caches telemetry from `ActorStatus` events plus club/handed from
-`ClubInfo`/`PlayerInfo` events so reconnecting clients recover latest values
-immediately. If any actor has status `disconnected` or `reconnecting`, the
+The web layer caches telemetry from `ActorStatus` events plus club from
+`ClubInfo` and name from `PlayerInfo` events so reconnecting clients recover
+latest values immediately. If any actor has status `disconnected` or `reconnecting`, the
 Telemetry tab label turns red.

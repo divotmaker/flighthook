@@ -4,7 +4,7 @@ use std::net::TcpStream;
 use super::BridgeError;
 use super::api;
 use crate::bus::BusSender;
-use flighthook::{Club, ClubInfo, FlighthookEvent, FlighthookMessage, PlayerInfo, Severity};
+use flighthook::{Club, ClubInfo, FlighthookEvent, FlighthookMessage, Handedness, Severity};
 
 pub(crate) fn send_message(
     stream: &mut TcpStream,
@@ -74,14 +74,22 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
                     }));
                 }
 
-                // Emit player info if present
+                // Emit player/club info if present
                 if let Some(ref player) = resp.player {
                     if let Some(ref handed) = player.handed {
-                        sender.send(FlighthookMessage::new(FlighthookEvent::PlayerInfo {
-                            player_info: PlayerInfo {
-                                handed: handed.clone(),
-                            },
-                        }));
+                        let h = match handed.to_uppercase().as_str() {
+                            "RH" => Some(Handedness::Right),
+                            "LH" => Some(Handedness::Left),
+                            _ => None,
+                        };
+                        if h.is_some() {
+                            sender.send(FlighthookMessage::new(
+                                FlighthookEvent::SetDetectionMode {
+                                    mode: None,
+                                    handed: h,
+                                },
+                            ));
+                        }
                     }
                     if let Some(ref club_str) = player.club {
                         if let Some(club) = Club::from_code(club_str) {

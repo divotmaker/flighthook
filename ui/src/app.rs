@@ -197,9 +197,9 @@ impl FlighthookApp {
         {
             use crate::panels::log::{alert_severity, event_debug, message_type};
 
-            let source_name = self
+            let actor_name = self
                 .actors
-                .get(&msg.source)
+                .get(&msg.actor)
                 .map(|a| a.name.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -210,8 +210,8 @@ impl FlighthookApp {
                 .unwrap_or_default();
             self.log_entries.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                source_name,
-                source_id: msg.source.clone(),
+                actor_name,
+                actor_id: msg.actor.clone(),
                 message_type: message_type(&msg.event).to_string(),
                 event_debug: event_debug(&msg.event),
                 raw,
@@ -225,7 +225,7 @@ impl FlighthookApp {
         }
 
         // Route event to UI state
-        let source = msg.source.clone();
+        let actor = msg.actor.clone();
         match msg.event {
             FlighthookEvent::ActorStatus {
                 status,
@@ -233,14 +233,14 @@ impl FlighthookApp {
             } => {
                 let actor = self
                     .actors
-                    .entry(source)
+                    .entry(actor)
                     .or_insert_with(|| new_actor(String::new()));
                 actor.status = status;
                 actor.telemetry = telemetry;
             }
             FlighthookEvent::ShotTrigger { key } => {
                 self.shots.push(ShotRow {
-                    source: source.clone(),
+                    actor: actor.clone(),
                     shot_id: key.shot_id.clone(),
                     shot_number: key.shot_number,
                     ball: None,
@@ -262,21 +262,23 @@ impl FlighthookApp {
             }
             FlighthookEvent::ShotFinished { .. } => {}
             FlighthookEvent::PlayerInfo { player_info } => {
-                if let Some(actor) = self.actors.get_mut(&source) {
-                    actor
-                        .telemetry
-                        .insert("handed".into(), player_info.handed);
+                if let Some(ref name) = player_info.name {
+                    if let Some(actor) = self.actors.get_mut(&actor) {
+                        actor.telemetry.insert("name".into(), name.clone());
+                    }
                 }
             }
             FlighthookEvent::ClubInfo { club_info } => {
-                if let Some(actor) = self.actors.get_mut(&source) {
+                if let Some(actor) = self.actors.get_mut(&actor) {
                     actor
                         .telemetry
                         .insert("club".into(), club_info.club.to_string());
                 }
             }
-            FlighthookEvent::SetDetectionMode { mode } => {
-                self.current_mode = mode.to_string();
+            FlighthookEvent::SetDetectionMode { mode, .. } => {
+                if let Some(m) = mode {
+                    self.current_mode = m.to_string();
+                }
             }
             _ => {}
         }

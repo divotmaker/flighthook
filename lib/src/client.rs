@@ -9,10 +9,10 @@
 //! ```no_run
 //! use flighthook::FlighthookClient;
 //!
-//! let mut client = FlighthookClient::connect("ws://localhost:5880/api/ws", "my-app").unwrap();
+//! let mut client = FlighthookClient::connect("ws://localhost:5880/frp", "my-app").unwrap();
 //! loop {
 //!     match client.recv() {
-//!         Ok(msg) => println!("{}: {:?}", msg.source, msg.event),
+//!         Ok(msg) => println!("{}: {:?}", msg.actor, msg.event),
 //!         Err(e) => { eprintln!("{e}"); break; }
 //!     }
 //! }
@@ -23,13 +23,13 @@
 //! ```no_run
 //! use flighthook::FlighthookClient;
 //!
-//! let mut client = FlighthookClient::connect("ws://localhost:5880/api/ws", "my-sim").unwrap();
+//! let mut client = FlighthookClient::connect("ws://localhost:5880/frp", "my-sim").unwrap();
 //! client.set_nonblocking(true).unwrap();
 //!
 //! loop {
 //!     // Drain all pending messages
 //!     while let Ok(Some(msg)) = client.try_recv() {
-//!         println!("{}: {:?}", msg.source, msg.event);
+//!         println!("{}: {:?}", msg.actor, msg.event);
 //!     }
 //!     // ... render frame, sleep, etc.
 //! }
@@ -96,13 +96,13 @@ impl From<serde_json::Error> for ClientError {
 /// for game-loop integration, then use [`try_recv`](Self::try_recv) to poll.
 pub struct FlighthookClient {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
-    source_id: String,
+    actor_id: String,
 }
 
 impl FlighthookClient {
     /// Connect to a flighthook server and complete the init handshake.
     ///
-    /// `url` should be a WebSocket URL like `"ws://localhost:5880/api/ws"`.
+    /// `url` should be a WebSocket URL like `"ws://localhost:5880/frp"`.
     /// `name` is a human-readable client identifier sent during the handshake.
     pub fn connect(url: &str, name: &str) -> Result<Self, ClientError> {
         let (mut socket, _response) = tungstenite::connect(url)?;
@@ -111,9 +111,9 @@ impl FlighthookClient {
         socket.send(Message::text(start.to_string()))?;
 
         // Wait for init response (blocking — handshake always blocks)
-        let source_id = loop {
+        let actor_id = loop {
             match socket.read()? {
-                Message::Text(text) => match parse_init_source_id(&text) {
+                Message::Text(text) => match parse_init_actor_id(&text) {
                     Some(id) => break id,
                     None => continue,
                 },
@@ -122,12 +122,12 @@ impl FlighthookClient {
             }
         };
 
-        Ok(Self { socket, source_id })
+        Ok(Self { socket, actor_id })
     }
 
-    /// The unique source ID assigned by the server (e.g. `"ws.a1b2c3d4"`).
-    pub fn source_id(&self) -> &str {
-        &self.source_id
+    /// The unique actor ID assigned by the server (e.g. `"ws.a1b2c3d4"`).
+    pub fn actor_id(&self) -> &str {
+        &self.actor_id
     }
 
     /// Set the underlying TCP stream to non-blocking mode.
@@ -205,20 +205,17 @@ impl FlighthookClient {
 impl fmt::Debug for FlighthookClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlighthookClient")
-            .field("source_id", &self.source_id)
+            .field("actor_id", &self.actor_id)
             .finish_non_exhaustive()
     }
 }
 
-fn parse_init_source_id(text: &str) -> Option<String> {
+fn parse_init_actor_id(text: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct InitMsg {
-        kind: Option<String>,
-        #[serde(rename = "type")]
-        msg_type: Option<String>,
-        source_id: String,
+        kind: String,
+        actor_id: String,
     }
     let msg: InitMsg = serde_json::from_str(text).ok()?;
-    let is_init = msg.kind.as_deref() == Some("init") || msg.msg_type.as_deref() == Some("init");
-    is_init.then_some(msg.source_id)
+    (msg.kind == "init").then_some(msg.actor_id)
 }

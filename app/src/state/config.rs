@@ -18,7 +18,7 @@ pub fn global_id(prefix: &str, index: &str) -> String {
 }
 
 /// Generate a short unique ID (8 hex chars from system time).
-/// Used for WebSocket source IDs (`ws.{hex}`).
+/// Used for WebSocket actor IDs (`ws.{hex}`).
 pub fn generate_id() -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -4,24 +4,15 @@
 //! `GameState` runtime store stays here (it uses `RwLock` and is
 //! not part of the wire schema).
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub use flighthook::{ClubInfo, GameStateSnapshot, PlayerInfo, ShotDetectionMode};
-
-/// Per-launch-monitor ready/ball-detected state.
-#[derive(Debug, Clone, Copy)]
-pub struct LaunchMonitorSnapshot {
-    pub ready: bool,
-    pub ball_detected: bool,
-}
 
 /// Shared interior state backing both `GameState` (read) and `GameStateWriter` (write).
 struct GameStateInner {
     player_info: RwLock<Option<PlayerInfo>>,
     club_info: RwLock<Option<ClubInfo>>,
     mode: RwLock<Option<ShotDetectionMode>>,
-    launch_monitors: RwLock<HashMap<String, LaunchMonitorSnapshot>>,
 }
 
 /// Read-only game state — player info, club selection, and detection mode.
@@ -47,7 +38,6 @@ impl GameState {
             player_info: RwLock::new(None),
             club_info: RwLock::new(None),
             mode: RwLock::new(None),
-            launch_monitors: RwLock::new(HashMap::new()),
         });
         (
             Self {
@@ -78,14 +68,6 @@ impl GameState {
         }
     }
 
-    /// Current launch monitor states keyed by actor ID.
-    pub fn launch_monitor_states(&self) -> HashMap<String, LaunchMonitorSnapshot> {
-        self.inner
-            .launch_monitors
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
 }
 
 impl GameStateWriter {
@@ -109,19 +91,4 @@ impl GameStateWriter {
         *self.inner.mode.write().unwrap_or_else(|e| e.into_inner()) = Some(mode);
     }
 
-    pub fn set_launch_monitor_state(&self, id: String, ready: bool, ball_detected: bool) {
-        self.inner
-            .launch_monitors
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, LaunchMonitorSnapshot { ready, ball_detected });
-    }
-
-    pub fn remove_launch_monitor(&self, id: &str) {
-        self.inner
-            .launch_monitors
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
-    }
 }

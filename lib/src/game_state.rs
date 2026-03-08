@@ -142,10 +142,11 @@ impl fmt::Display for Club {
     }
 }
 
-/// Player info (handedness).
+/// Player info (name).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerInfo {
-    pub handed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Club selection.

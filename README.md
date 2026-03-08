@@ -6,7 +6,7 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 
 ## Status
 
-**Alpha (0.0.x)** — This project is in early development. The API, configuration format, and internal interfaces may change at any time. No semver compatibility guarantees are provided until a stable 1.0 release.
+**Beta (0.1.x)** — The API, configuration format, and WebSocket protocol are usable but may still change. Breaking changes will be noted in release notes.
 
 ## Features
 
@@ -37,7 +37,7 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 A single `broadcast<FlighthookMessage>` bus connects all components.
 Each message carries a typed event and an optional raw payload (for debugging).
 Session threads, integration bridges, and the web layer all subscribe to the same bus.
-This allows for third party software can connect with a websocket and interact with the bus the same way as any built-in native integration.
+Third-party software can connect via WebSocket and interact with the bus the same way as any built-in integration.
 
 ## Configuration
 
@@ -122,7 +122,7 @@ To run with a mock device, point `--config` at a TOML file with
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Multi-device config model,
   unified bus, threading, state machine, settings UI design.
 - **[docs/API.md](docs/API.md)** — REST and WebSocket API reference for the web
-  dashboard (`/api/status`, `/api/shots`, `/api/ws`, etc.).
+  dashboard (`/api/status`, `/api/shots`, `/frp`, etc.).
 
 ---
 

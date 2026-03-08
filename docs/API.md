@@ -2,7 +2,7 @@
 
 ## Quick-Start: Real-Time Shot Stream
 
-The fastest way to get shot data is the WebSocket at `/api/ws`. After a brief
+The fastest way to get shot data is the WebSocket at `/frp`. After a brief
 init handshake, you'll receive JSON messages for every shot lifecycle event as
 it happens -- no polling needed. This is ideal for video timestamp tagging,
 overlay triggers, stat trackers, or any integration that needs to react to
@@ -27,9 +27,9 @@ Angles are degrees, spin is RPM.
 
 Other useful events on the same connection:
 
-- `actor_status` -- device/integration lifecycle + state (battery, tilt, club, etc.)
-- `set_detection_mode` -- detection mode change command (full/chipping/putting)
-- `device_info` -- device identity + telemetry (ready/ball_detected readiness via telemetry keys)
+- `device_telemetry` -- device-reported state (ready, battery, tilt, temp, identity)
+- `actor_status` -- actor/connection lifecycle (status enum, mode, radar_mode)
+- `set_detection_mode` -- detection mode and/or handedness change (both optional, latched)
 
 ### Terminal
 
@@ -37,7 +37,7 @@ Other useful events on the same connection:
 # Stream shots with websocat + jq (install: cargo install websocat)
 # Send the init handshake, keep stdin open to hold the connection, filter for shot events
 (echo '{"kind":"start","version":["0.1.0"],"name":"cli"}'; cat) | \
-  websocat ws://localhost:5880/api/ws | \
+  websocat ws://localhost:5880/frp | \
   jq 'select(.event.kind == "shot_finished")'
 ```
 
@@ -54,31 +54,31 @@ curl -s -X POST 'http://localhost:5880/api/shots/convert?units=imperial' \
 import json, websockets, asyncio
 
 async def main():
-    async with websockets.connect("ws://localhost:5880/api/ws") as ws:
+    async with websockets.connect("ws://localhost:5880/frp") as ws:
         # Init handshake
         await ws.send(json.dumps({"kind": "start", "version": ["0.1.0"], "name": "my-dashboard"}))
         init = json.loads(await ws.recv())
-        print(f"Connected: source_id={init['source_id']}")
+        print(f"Connected: actor_id={init['actor_id']}")
 
         # Accumulate shot data
-        shots = {}  # key: (source, shot_id) -> {ball, club}
-        async for msg in ws:
-            event = json.loads(msg)
-            fh = event["event"]
-            kind = fh["kind"]
+        shots = {}  # key: (actor, shot_id) -> {ball, club}
+        async for raw in ws:
+            msg = json.loads(raw)
+            ev = msg["event"]
+            kind = ev["kind"]
 
             if kind == "ball_flight":
-                key = (event["source"], fh["key"]["shot_id"])
-                shots[key] = {"ball": fh["ball"]}
+                key = (msg["actor"], ev["key"]["shot_id"])
+                shots[key] = {"ball": ev["ball"]}
             elif kind == "club_path":
-                key = (event["source"], fh["key"]["shot_id"])
+                key = (msg["actor"], ev["key"]["shot_id"])
                 if key in shots:
-                    shots[key]["club"] = fh["club"]
+                    shots[key]["club"] = ev["club"]
             elif kind == "shot_finished":
-                key = (event["source"], fh["key"]["shot_id"])
+                key = (msg["actor"], ev["key"]["shot_id"])
                 shot = shots.pop(key, None)
                 if shot:
-                    print(f"Shot #{fh['key']['shot_number']}: "
+                    print(f"Shot #{ev['key']['shot_number']}: "
                           f"speed={shot['ball']['launch_speed']}")
 
 asyncio.run(main())
@@ -87,7 +87,7 @@ asyncio.run(main())
 ### JavaScript
 
 ```javascript
-const ws = new WebSocket("ws://localhost:5880/api/ws");
+const ws = new WebSocket("ws://localhost:5880/frp");
 const shots = new Map();
 
 ws.onopen = () => {
@@ -96,11 +96,11 @@ ws.onopen = () => {
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
   if (msg.kind === "init") {
-    console.log("Connected:", msg.source_id);
+    console.log("Connected:", msg.actor_id);
     return;
   }
-  const { event, source } = msg;
-  const key = event.key ? `${source}:${event.key.shot_id}` : null;
+  const { event, actor } = msg;
+  const key = event.key ? `${actor}:${event.key.shot_id}` : null;
 
   switch (event.kind) {
     case "ball_flight":
@@ -149,8 +149,7 @@ Comprehensive system state (all actors -- launch monitors and integrations).
       "name": "Local GSPro",
       "status": "connected",
       "telemetry": {
-        "club": "Driver",
-        "handed": "RH"
+        "club": "DR"
       }
     }
   }
@@ -161,10 +160,12 @@ Comprehensive system state (all actors -- launch monitors and integrations).
 - `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`
 - `telemetry`: actor-specific key/value pairs (all string values)
 
-Common telemetry keys for launch monitors: `ready`, `shooting`, `battery_pct`,
-`tilt`, `roll`, `temp_c`, `external_power`, `device_info`.
-
-Common telemetry keys for integrations: `club`, `handed`, `error`.
+Telemetry keys are merged from two sources with no overlap:
+- **Device-reported** (from `device_telemetry`): `ready`, `battery_pct`, `tilt`,
+  `roll`, `temp_c`, `external_power`
+- **Actor-framework** (from `actor_status`): `detection_mode`, `radar_mode`, `device_info`,
+  `shot_count`, `tracking_mode`
+- **Integration actors**: `club`, `handed`, `name`, `error`
 
 ---
 
@@ -185,7 +186,7 @@ Shot history (most recent N shots, FIFO, max 1000 stored).
 ```json
 [
   {
-    "source": "mevo.0",
+    "actor": "mevo.0",
     "shot_number": 42,
     "ball": {
       "launch_speed": "67.2mps",
@@ -255,7 +256,7 @@ unit-tagged strings and re-implement conversion math.
 
 ```json
 {
-  "source": "mevo.0",
+  "actor": "mevo.0",
   "shot_number": 42,
   "ball": {
     "launch_speed": "67.2mps",
@@ -294,7 +295,7 @@ unit-tagged strings and re-implement conversion math.
 }
 ```
 
-Angles (degrees) and spin (RPM) pass through unchanged. The `source` field
+Angles (degrees) and spin (RPM) pass through unchanged. The `actor` field
 is preserved as-is.
 
 **Errors**:
@@ -404,9 +405,18 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 
 ### Connection
 
-**Endpoint**: `GET /api/ws` (HTTP upgrade to WebSocket)
+**Endpoint**: `GET /frp` (HTTP upgrade to WebSocket)
 
 Text-frame JSON messages in both directions.
+
+### FRP Version Negotiation
+
+The server performs FRP version negotiation on the `start` handshake. The client
+sends an array of supported versions; the server selects the highest mutually
+supported version. If no compatible version exists, the server sends a `critical`
+alert and closes the connection.
+
+Currently supported versions: `0.1.0`.
 
 ### Init Handshake (FRP-compliant)
 
@@ -433,11 +443,11 @@ Before streaming begins, the client must complete a handshake:
 {
   "kind": "init",
   "version": "0.1.0",
-  "source_id": "a1b2c3d4",
+  "actor_id": "ws.a1b2c3d4",
   "global_state": {
     "player_info": null,
     "club_info": {
-      "club": "Driver"
+      "club": "DR"
     }
   }
 }
@@ -445,10 +455,10 @@ Before streaming begins, the client must complete a handshake:
 
 - `kind`: `"init"` — FRP handshake response
 - `version`: the FRP version selected by the server
-- `source_id`: unique identifier for this WebSocket session (`ws.{8-hex-chars}`)
+- `actor_id`: unique identifier for this WebSocket session (`ws.{8-hex-chars}`)
 - `global_state`: current snapshot of shared state
-  - `player_info`: `{ "handed": "RH" }` or `null`
-  - `club_info`: `{ "club": "Driver" }` or `null`
+  - `player_info`: `{ "name": "Player 1" }` or `null`
+  - `club_info`: `{ "club": "DR" }` or `null`
 
 3. **Server streams** `FlighthookMessage` events (described below).
 
@@ -459,31 +469,32 @@ Messages sent before the `start` handshake (except `close`) are ignored.
 ### Server -> Client: FlighthookMessage
 
 After the init handshake, the server streams `FlighthookMessage` events. All
-messages share this envelope:
+messages use the FRP envelope shape:
 
 ```json
 {
-  "source": "mevo.0",
+  "actor": "mevo.0",
   "device": "FS-M2-XXXXXX",
   "raw_payload": "0a1b2c...",
   "event": { "kind": "...", ... }
 }
 ```
 
-- `source`: global ID of the originator (e.g. `"mevo.0"`, `"gspro.0"`, `"ws.a1b2c3d4"`)
-- `device`: optional FRP device identifier (e.g. Mevo WiFi SSID). Present on
-  shot lifecycle and device info events; absent on system/config events.
-- `raw_payload`: optional, present on wire-level messages. Binary payloads are
-  lowercase hex strings (no spaces). Text payloads (e.g. GSPro JSON) are
-  included as-is. Omitted when not applicable.
-- `event`: a `FlighthookEvent` tagged by `"kind"` (see below)
+- `actor`: global ID of the originator (e.g. `"mevo.0"`, `"gspro.0"`, `"system"`).
+  Flighthook extension field (FRP consumers ignore unknown fields per spec).
+- `device`: FRP device identifier (e.g. Mevo WiFi SSID). Present on shot
+  lifecycle and device telemetry events; absent on system/config events.
+- `raw_payload`: optional. Binary payloads are lowercase hex strings (no spaces).
+  Text payloads (e.g. GSPro JSON) are included as-is. Omitted when not applicable.
+- `event`: the typed event, tagged by `"kind"`. FRP-only consumers silently
+  ignore unknown `kind` values per spec.
 
 ---
 
 #### Event Kinds
 
-Events are tagged by the `"kind"` field on the `event` object. All fields are
-directly on the event object (flat struct variants).
+Events are tagged by the `"kind"` field inside the `"event"` object. All fields
+are directly on the event object (flat struct variants).
 
 ---
 
@@ -493,7 +504,8 @@ Ball strike detected. Emitted immediately by the launch monitor -- no data yet.
 
 ```json
 {
-  "source": "mevo.0",
+  "actor": "mevo.0",
+  "device": "FS-M2-XXXXXX",
   "event": {
     "kind": "shot_trigger",
     "key": { "shot_id": "550e8400-e29b-41d4-a716-446655440000", "shot_number": 42 }
@@ -512,7 +524,8 @@ Ball flight data available. May arrive before or after `club_path`.
 
 ```json
 {
-  "source": "mevo.0",
+  "actor": "mevo.0",
+  "device": "FS-M2-XXXXXX",
   "event": {
     "kind": "ball_flight",
     "key": { "shot_id": "550e8400-...", "shot_number": 42 },
@@ -525,7 +538,7 @@ Ball flight data available. May arrive before or after `club_path`.
       "total_distance": "195.0m",
       "backspin_rpm": 3200,
       "sidespin_rpm": -450
-    },
+    }
   }
 }
 ```
@@ -540,7 +553,8 @@ Club path data available. May arrive before or after `ball_flight`.
 
 ```json
 {
-  "source": "mevo.0",
+  "actor": "mevo.0",
+  "device": "FS-M2-XXXXXX",
   "event": {
     "kind": "club_path",
     "key": { "shot_id": "550e8400-...", "shot_number": 42 },
@@ -564,7 +578,8 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
 
 ```json
 {
-  "source": "mevo.0",
+  "actor": "mevo.0",
+  "device": "FS-M2-XXXXXX",
   "event": {
     "kind": "shot_finished",
     "key": { "shot_id": "550e8400-...", "shot_number": 42 }
@@ -574,47 +589,57 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
 
 ---
 
-##### device_info
+##### device_telemetry
 
-Device identification and telemetry. Emitted after handshake with identity fields,
-and re-emitted with telemetry updates (e.g. readiness changes). Readiness state
-is conveyed via `"ready"` and `"ball_detected"` telemetry keys (replacing the
-former `launch_monitor_state` event).
+Device-reported state. Emitted any time a device-reported value changes: after
+handshake (with identity fields), on readiness transitions, and on periodic
+telemetry updates (battery, tilt, temperature).
+
+`ready` is the single readiness signal — all device conditions met for a shot
+(including ball detection where applicable). There is no separate
+`ball_detected` key.
+
+**Ownership split**: `device_telemetry` carries what the device reports about
+itself. Actor/connection lifecycle (status enum, mode, shooting) is conveyed
+separately via `actor_status`. The two event types have no overlapping
+telemetry keys.
 
 ```json
 {
-  "source": "mevo.0",
+  "actor": "mevo.0",
   "device": "FS-M2-XXXXXX",
   "event": {
-    "kind": "device_info",
+    "kind": "device_telemetry",
     "manufacturer": "FlightScope",
     "model": "XXXXXXXX, H/W: XXXX v1.0, F/W: 1.00",
     "telemetry": {
-      "ready": "true",
-      "ball_detected": "true"
+      "ready": "true"
     }
   }
 }
 ```
 
 - `manufacturer`, `model`, `firmware`: optional identity fields (present on first emission)
-- `telemetry`: optional key/value map. Standard keys: `"ready"`, `"ball_detected"`
+- `telemetry`: optional key/value map. Standard keys: `"ready"`, `"battery_pct"`,
+  `"tilt"`, `"roll"`, `"temp_c"`, `"external_power"`
 
 ---
 
 ##### player_info
 
-Player info update (handedness).
+Player info update (name). Flighthook extension event.
 
 ```json
 {
-  "source": "gspro.0",
+  "actor": "gspro.0",
   "event": {
     "kind": "player_info",
-    "player_info": { "handed": "RH" }
+    "player_info": { "name": "Player 1" }
   }
 }
 ```
+
+- `player_info.name`: optional player name string
 
 ---
 
@@ -624,7 +649,7 @@ Club selection update.
 
 ```json
 {
-  "source": "gspro.0",
+  "actor": "gspro.0",
   "event": {
     "kind": "club_info",
     "club_info": { "club": "7I" }
@@ -636,47 +661,57 @@ Club selection update.
 
 ##### set_detection_mode
 
-FRP controller command. Sets the shot detection mode on the device.
+FRP controller command. Sets the shot detection mode and/or player handedness.
+Both fields are optional and latched independently — the most recent value for
+each field is the active value. Omitting a field does not reset it.
 
 ```json
 {
-  "source": "system",
+  "actor": "system",
   "event": {
     "kind": "set_detection_mode",
-    "mode": "chipping"
+    "mode": "chipping",
+    "handed": "rh"
   }
 }
 ```
 
-- `mode`: `"full"` | `"putting"` | `"chipping"`
+- `mode` (optional): `"full"` | `"putting"` | `"chipping"`
+- `handed` (optional): `"rh"` | `"lh"`
 
 ---
 
 ##### actor_status
 
-Generic actor lifecycle and state update. Emitted by all actors (launch monitors
-and integrations) when their status or telemetry changes.
+Actor/connection lifecycle update. Emitted by all actors (launch monitors
+and integrations) when their connection status or actor-framework state changes.
+
+**Ownership split**: `actor_status` carries what flighthook knows about the
+actor (connection lifecycle, operational mode). Device-reported state (ready,
+battery, tilt, temp) is conveyed separately via `device_telemetry`. The two
+event types have no overlapping telemetry keys.
 
 ```json
 {
-  "source": "mevo.0",
+  "actor": "mevo.0",
   "event": {
     "kind": "actor_status",
     "status": "connected",
     "telemetry": {
-      "ready": "true",
-      "battery_pct": "85",
-      "tilt": "0.5",
-      "roll": "-0.2",
-      "temp_c": "28.5",
-      "external_power": "false"
+      "detection_mode": "full",
+      "radar_mode": "armed",
+      "device_info": "XXXXXXXX (Gen2)"
     }
   }
 }
 ```
 
 - `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`
-- `telemetry`: actor-specific key/value pairs (all string values)
+- `telemetry`: actor-framework key/value pairs (all string values)
+
+Common keys for launch monitors: `detection_mode`, `radar_mode`, `device_info`.
+Mock launch monitors add: `shot_count`, `tracking_mode`.
+Integration actors: `club`, `handed`, `name`, `error`.
 
 ---
 
@@ -687,7 +722,7 @@ External consumers can observe these to track config changes in flight.
 
 ```json
 {
-  "source": "web",
+  "actor": "web",
   "event": {
     "kind": "config_command",
     "request_id": "abc123",
@@ -705,7 +740,7 @@ emitted after a `config_command`, even for fire-and-forget commands.
 
 ```json
 {
-  "source": "system",
+  "actor": "system",
   "event": {
     "kind": "config_outcome",
     "request_id": "abc123",
@@ -729,7 +764,7 @@ stay in the tracing backend and are not emitted on the bus.
 
 ```json
 {
-  "source": "mevo.0",
+  "actor": "mevo.0",
   "event": {
     "kind": "alert",
     "severity": "warn",
@@ -782,6 +817,10 @@ Change the global detection mode. Emits `SetDetectionMode` on the bus.
 ### ShotDetectionMode
 
 `"full"` | `"putting"` | `"chipping"`
+
+### Handedness
+
+`"rh"` | `"lh"`
 
 ### Severity
 

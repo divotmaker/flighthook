@@ -24,6 +24,7 @@ pub use flighthook::{
     FlighthookEvent,
     FlighthookMessage,
     GameStateSnapshot,
+    Handedness,
     GsProSection,
     MevoSection,
     MockMonitorSection,
@@ -48,7 +49,7 @@ pub use flighthook::{
 /// then populated as `BallFlight` and `ClubPath` events arrive.
 #[derive(Debug, Clone)]
 pub struct ShotRow {
-    pub source: String,
+    pub actor: String,
     pub shot_id: String,
     pub shot_number: u32,
     pub ball: Option<BallFlight>,
@@ -60,7 +61,7 @@ impl ShotRow {
     pub fn to_unit_system(&self, system: UnitSystem) -> ShotRow {
         // Delegate to ShotData conversion for the populated fields
         let tmp = ShotData {
-            source: String::new(),
+            actor: String::new(),
             shot_number: 0,
             ball: self.ball.clone(),
             club: self.club.clone(),
@@ -68,7 +69,7 @@ impl ShotRow {
         };
         let converted = tmp.to_unit_system(system);
         ShotRow {
-            source: self.source.clone(),
+            actor: self.actor.clone(),
             shot_id: self.shot_id.clone(),
             shot_number: self.shot_number,
             ball: converted.ball,
@@ -80,7 +81,7 @@ impl ShotRow {
 impl From<ShotData> for ShotRow {
     fn from(shot: ShotData) -> Self {
         Self {
-            source: shot.source,
+            actor: shot.actor,
             shot_id: String::new(),
             shot_number: shot.shot_number,
             ball: shot.ball,
@@ -97,8 +98,8 @@ impl From<ShotData> for ShotRow {
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub timestamp: String,
-    pub source_name: String,
-    pub source_id: String,
+    pub actor_name: String,
+    pub actor_id: String,
     pub message_type: String,
     pub event_debug: String,
     pub raw: String,

@@ -23,7 +23,7 @@ pub enum PollError {
 // BusSender
 // ---------------------------------------------------------------------------
 
-/// Cloneable sender that auto-stamps `source` on every outbound message.
+/// Cloneable sender that auto-stamps `actor` on every outbound message.
 pub struct BusSender {
     actor_id: String,
     inner: broadcast::Sender<FlighthookMessage>,
@@ -52,10 +52,10 @@ impl BusSender {
         &self.inner
     }
 
-    /// Send a message, auto-stamping source from the actor ID.
+    /// Send a message, auto-stamping actor from the actor ID.
     /// The message's timestamp is already set by `FlighthookMessage::new()`.
     pub fn send(&self, mut msg: FlighthookMessage) {
-        msg.source = self.actor_id.clone();
+        msg.actor = self.actor_id.clone();
         let _ = self.inner.send(msg);
     }
 

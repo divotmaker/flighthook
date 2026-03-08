@@ -18,7 +18,7 @@ use crate::{ShotKey, UnitSystem};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShotData {
     #[serde(default)]
-    pub source: String,
+    pub actor: String,
     pub shot_number: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ball: Option<BallFlight>,
@@ -66,7 +66,7 @@ impl ShotData {
             club_height: c.club_height.map(|d| Distance::Inches(d.as_inches())),
         });
         ShotData {
-            source: self.source.clone(),
+            actor: self.actor.clone(),
             shot_number: self.shot_number,
             ball,
             club,
@@ -113,7 +113,7 @@ impl ShotData {
             club_height: c.club_height.map(|d| Distance::Meters(d.as_meters())),
         });
         ShotData {
-            source: self.source.clone(),
+            actor: self.actor.clone(),
             shot_number: self.shot_number,
             ball,
             club,
@@ -155,10 +155,10 @@ impl std::fmt::Display for ActorStatus {
 /// and produces a complete [`ShotData`] on `ShotFinished`.
 ///
 /// Used by consumers that need all shot fields together (GSPro bridge,
-/// web shot cache, UI shot grid). Keyed by `(source, ShotKey)`.
+/// web shot cache, UI shot grid). Keyed by `(actor, ShotKey)`.
 #[derive(Debug)]
 pub struct ShotAccumulator {
-    pub source: String,
+    pub actor: String,
     pub key: ShotKey,
     ball: Option<BallFlight>,
     club: Option<ClubData>,
@@ -167,9 +167,9 @@ pub struct ShotAccumulator {
 
 impl ShotAccumulator {
     /// Create a new accumulator for a shot trigger.
-    pub fn new(source: String, key: ShotKey) -> Self {
+    pub fn new(actor: String, key: ShotKey) -> Self {
         Self {
-            source,
+            actor,
             key,
             ball: None,
             club: None,
@@ -198,7 +198,7 @@ impl ShotAccumulator {
             return None;
         }
         Some(ShotData {
-            source: self.source,
+            actor: self.actor,
             shot_number: self.key.shot_number,
             ball: self.ball,
             club: self.club,
@@ -219,7 +219,7 @@ impl ShotAccumulator {
 ///
 /// ```ignore
 /// # use flighthook::{ShotAggregator, FlighthookClient};
-/// let mut client = FlighthookClient::connect("ws://localhost:5880/api/ws", "my-app").unwrap();
+/// let mut client = FlighthookClient::connect("ws://localhost:5880/frp", "my-app").unwrap();
 /// let mut shots = ShotAggregator::new();
 ///
 /// loop {
@@ -244,31 +244,31 @@ impl ShotAggregator {
     pub fn feed(&mut self, msg: &crate::FlighthookMessage) -> Option<ShotData> {
         match &msg.event {
             crate::FlighthookEvent::ShotTrigger { key } => {
-                let acc = ShotAccumulator::new(msg.source.clone(), key.clone());
-                self.pending.insert((msg.source.clone(), key.clone()), acc);
+                let acc = ShotAccumulator::new(msg.actor.clone(), key.clone());
+                self.pending.insert((msg.actor.clone(), key.clone()), acc);
                 None
             }
             crate::FlighthookEvent::BallFlight { key, ball } => {
-                if let Some(acc) = self.pending.get_mut(&(msg.source.clone(), key.clone())) {
+                if let Some(acc) = self.pending.get_mut(&(msg.actor.clone(), key.clone())) {
                     acc.set_ball(*ball.clone());
                 }
                 None
             }
             crate::FlighthookEvent::ClubPath { key, club } => {
-                if let Some(acc) = self.pending.get_mut(&(msg.source.clone(), key.clone())) {
+                if let Some(acc) = self.pending.get_mut(&(msg.actor.clone(), key.clone())) {
                     acc.set_club(*club.clone());
                 }
                 None
             }
             crate::FlighthookEvent::FaceImpact { key, impact } => {
-                if let Some(acc) = self.pending.get_mut(&(msg.source.clone(), key.clone())) {
+                if let Some(acc) = self.pending.get_mut(&(msg.actor.clone(), key.clone())) {
                     acc.set_impact(*impact.clone());
                 }
                 None
             }
             crate::FlighthookEvent::ShotFinished { key } => self
                 .pending
-                .remove(&(msg.source.clone(), key.clone()))
+                .remove(&(msg.actor.clone(), key.clone()))
                 .and_then(ShotAccumulator::finish),
             _ => None,
         }

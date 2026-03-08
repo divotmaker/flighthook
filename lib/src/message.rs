@@ -1,19 +1,29 @@
 //! Unified `FlighthookMessage` bus types.
 //!
 //! All events flow through a single `broadcast<FlighthookMessage>` channel.
-//! Each message has a source (actor ID), optional device (FRP physical unit ID),
+//! Each message has an actor ID, optional device (FRP physical unit ID),
 //! optional raw payload (hex-first policy), and a typed event.
 //!
-//! The shot lifecycle events (`ShotTrigger`, `BallFlight`, `ClubPath`,
-//! `FaceImpact`, `ShotFinished`, `DeviceInfo`, `Alert`) are FRP-compliant.
-//! All other variants are flighthook extensions. FRP-only consumers ignore
-//! unknown `kind` values per spec.
+//! ## Wire format (FRP envelope)
+//!
+//! All messages use the FRP envelope shape with `kind` inside `event`:
+//! ```json
+//! { "actor": "mevo.0", "device": "FS-M2-XXXXXX", "event": { "kind": "ball_flight", ... } }
+//! ```
+//!
+//! `actor` is a flighthook extension (actor framework ID). `device` is the
+//! FRP device identifier (present on device events, absent on extensions).
+//! FRP consumers silently ignore unknown `kind` values and extra fields per spec.
+//!
+//! FRP-compliant events: `ShotTrigger`, `BallFlight`, `ClubPath`, `FaceImpact`,
+//! `ShotFinished`, `DeviceTelemetry`, `Alert`, `SetDetectionMode`.
+//! Flighthook extensions: everything else.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::ShotDetectionMode;
+use crate::{Handedness, ShotDetectionMode};
 use std::collections::HashMap;
 
 use crate::{ActorStatus, BallFlight, ClubData, FaceImpact};
@@ -28,13 +38,17 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// A single event on the unified bus.
+///
+/// Uses the FRP envelope shape: `{ actor, device?, event: { kind, ... } }`.
+/// `actor` is a flighthook extension field. FRP consumers ignore unknown fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlighthookMessage {
     /// Actor ID of the originator (e.g. "mevo.0", "gspro.0", "system").
     #[serde(default)]
-    pub source: String,
+    pub actor: String,
     /// FRP device identifier for the physical unit (e.g. the Mevo SSID).
-    /// Present on shot lifecycle and device info events; absent on system/config events.
+    /// Present on shot lifecycle and device telemetry events; absent on
+    /// system/config/actor-status events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -44,19 +58,19 @@ pub struct FlighthookMessage {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl FlighthookMessage {
-    /// Create a new message. Use `.source()`, `.device()`, and
+    /// Create a new message. Use `.actor()`, `.device()`, and
     /// `.raw()` / `.raw_binary()` to attach metadata.
     pub fn new(event: impl Into<FlighthookEvent>) -> Self {
         Self {
-            source: String::new(),
+            actor: String::new(),
             device: None,
             raw_payload: None,
             event: event.into(),
         }
     }
 
-    pub fn source(mut self, source: impl Into<String>) -> Self {
-        self.source = source.into();
+    pub fn actor(mut self, actor: impl Into<String>) -> Self {
+        self.actor = actor.into();
         self
     }
 
@@ -133,7 +147,7 @@ pub use flightrelay::ShotKey;
 /// The typed event payload carried by a `FlighthookMessage`.
 ///
 /// FRP-compliant events: `ShotTrigger`, `BallFlight`, `ClubPath`, `FaceImpact`,
-/// `ShotFinished`, `DeviceInfo`, `Alert`.
+/// `ShotFinished`, `DeviceTelemetry`, `Alert`.
 ///
 /// Flighthook extensions: everything else. FRP-only consumers silently ignore
 /// unknown `kind` values per spec.
@@ -156,8 +170,15 @@ pub enum FlighthookEvent {
     ShotFinished { key: ShotKey },
 
     // -- FRP: Device status --
-    /// Device identification and telemetry.
-    DeviceInfo {
+    /// Device telemetry — emitted any time a device-reported value changes.
+    ///
+    /// Carries device-reported state: identity (manufacturer, model, firmware)
+    /// and telemetry (ready, battery_pct, tilt, roll, temp_c, external_power).
+    /// `ready` is the single readiness signal (all conditions met for a shot).
+    ///
+    /// Actor/connection lifecycle (status enum, mode, shooting) is conveyed
+    /// separately via `ActorStatus`. The two variants have no overlapping keys.
+    DeviceTelemetry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manufacturer: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,11 +195,20 @@ pub enum FlighthookEvent {
     },
 
     // -- FRP: Controller commands --
-    /// Set the shot detection mode on the device.
-    SetDetectionMode { mode: ShotDetectionMode },
+    /// Set the shot detection mode and/or handedness on the device.
+    ///
+    /// Both fields are optional and latched independently — the most recent
+    /// value for each field is the active value. Omitting a field does not
+    /// reset it.
+    SetDetectionMode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<ShotDetectionMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handed: Option<Handedness>,
+    },
 
     // -- Flighthook extensions --
-    /// Player info update (handedness).
+    /// Player info update (name).
     PlayerInfo { player_info: PlayerInfo },
     /// Club selection update.
     ClubInfo { club_info: ClubInfo },
@@ -200,7 +230,13 @@ pub enum FlighthookEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         started: Vec<String>,
     },
-    /// Generic actor status update (lifecycle + telemetry).
+    /// Actor/connection lifecycle update.
+    ///
+    /// Carries actor-framework state: connection status enum and actor-specific
+    /// telemetry (detection_mode, radar_mode, shot_count, tracking_mode, device_info label).
+    ///
+    /// Device-reported state (ready, battery, tilt, temp) is conveyed
+    /// separately via `DeviceTelemetry`. The two variants have no overlapping keys.
     ActorStatus {
         status: ActorStatus,
         #[serde(default)]
@@ -253,4 +289,87 @@ pub enum ConfigAction {
     Remove {
         id: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_event_envelope() {
+        let msg = FlighthookMessage {
+            actor: "mevo.0".into(),
+            device: Some("FS-M2-XXXXXX".into()),
+            raw_payload: None,
+            event: FlighthookEvent::DeviceTelemetry {
+                manufacturer: Some("FlightScope".into()),
+                model: None,
+                firmware: None,
+                telemetry: None,
+            },
+        };
+        let json: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["event"]["kind"], "device_telemetry");
+        assert_eq!(json["actor"], "mevo.0");
+        assert_eq!(json["device"], "FS-M2-XXXXXX");
+    }
+
+    #[test]
+    fn non_device_event_envelope() {
+        let msg = FlighthookMessage {
+            actor: "webserver.0".into(),
+            device: None,
+            raw_payload: None,
+            event: FlighthookEvent::ActorStatus {
+                status: crate::ActorStatus::Connected,
+                telemetry: HashMap::from([("bind".into(), "0.0.0.0:5880".into())]),
+            },
+        };
+        let json: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        // kind inside event even without device
+        assert_eq!(json["event"]["kind"], "actor_status");
+        assert_eq!(json["actor"], "webserver.0");
+        assert!(json.get("device").is_none());
+    }
+
+    #[test]
+    fn roundtrip_with_device() {
+        let msg = FlighthookMessage {
+            actor: "mevo.0".into(),
+            device: Some("FS-M2-XXXXXX".into()),
+            raw_payload: None,
+            event: FlighthookEvent::ShotFinished {
+                key: ShotKey {
+                    shot_id: "abc".into(),
+                    shot_number: 1,
+                },
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: FlighthookMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.actor, "mevo.0");
+        assert_eq!(back.device.as_deref(), Some("FS-M2-XXXXXX"));
+        assert!(matches!(back.event, FlighthookEvent::ShotFinished { .. }));
+    }
+
+    #[test]
+    fn roundtrip_without_device() {
+        let msg = FlighthookMessage {
+            actor: "system".into(),
+            device: None,
+            raw_payload: None,
+            event: FlighthookEvent::ActorStatus {
+                status: crate::ActorStatus::Connected,
+                telemetry: HashMap::new(),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: FlighthookMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.actor, "system");
+        assert!(back.device.is_none());
+        assert!(matches!(
+            back.event,
+            FlighthookEvent::ActorStatus { status: crate::ActorStatus::Connected, .. }
+        ));
+    }
 }
