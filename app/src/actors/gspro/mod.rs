@@ -314,11 +314,9 @@ fn connect_and_run(
                         monitor_state.insert(msg.actor.clone(), ready);
                         readiness_changed = true;
                     }
-                    FlighthookEvent::SetDetectionMode { mode, .. } => {
-                        if let Some(m) = mode {
-                            current_mode = m;
-                            readiness_changed = true;
-                        }
+                    FlighthookEvent::SetDetectionMode { mode: Some(m), .. } => {
+                        current_mode = m;
+                        readiness_changed = true;
                     }
                     FlighthookEvent::ActorStatus { status, .. } => {
                         if matches!(

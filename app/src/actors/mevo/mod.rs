@@ -292,34 +292,30 @@ fn connect_and_run(
                     return Ok(());
                 }
                 Ok(None) => break,
-                Ok(Some(msg)) => match msg.event {
-                    FlighthookEvent::SetDetectionMode { mode: Some(new_mode), .. } => {
-                        if !same_mode(current_mode, new_mode) {
-                            if client.is_armed() {
-                                let new_wire = SessionConfig::mode_label(&new_mode);
-                                info!(
-                                    "mode change: {:?} -> {:?} wire={new_wire}",
-                                    current_mode, new_mode
-                                );
-                                client.configure_avr(
-                                    SessionConfig::to_avr_settings_mode_only(&new_mode),
-                                );
-                                client.arm();
-                                current_mode = new_mode;
-                                telemetry.insert("radar_mode".into(), "arming".into());
-                                telemetry.insert("detection_mode".into(), new_wire.into());
-                                emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                                emit_device_readiness(sender, false, device_id.as_deref());
-                            } else {
-                                pending_reconfig = Some(new_mode);
-                                info!(
-                                    "deferred mode change to {:?} (operation in progress)",
-                                    new_mode
-                                );
-                            }
+                Ok(Some(msg)) => if let FlighthookEvent::SetDetectionMode { mode: Some(new_mode), .. } = msg.event
+                    && !same_mode(current_mode, new_mode) {
+                        if client.is_armed() {
+                            let new_wire = SessionConfig::mode_label(&new_mode);
+                            info!(
+                                "mode change: {:?} -> {:?} wire={new_wire}",
+                                current_mode, new_mode
+                            );
+                            client.configure_avr(
+                                SessionConfig::to_avr_settings_mode_only(&new_mode),
+                            );
+                            client.arm();
+                            current_mode = new_mode;
+                            telemetry.insert("radar_mode".into(), "arming".into());
+                            telemetry.insert("detection_mode".into(), new_wire.into());
+                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                            emit_device_readiness(sender, false, device_id.as_deref());
+                        } else {
+                            pending_reconfig = Some(new_mode);
+                            info!(
+                                "deferred mode change to {:?} (operation in progress)",
+                                new_mode
+                            );
                         }
-                    }
-                    _ => {}
                 },
             }
         }

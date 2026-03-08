@@ -262,10 +262,10 @@ impl FlighthookApp {
             }
             FlighthookEvent::ShotFinished { .. } => {}
             FlighthookEvent::PlayerInfo { player_info } => {
-                if let Some(ref name) = player_info.name {
-                    if let Some(actor) = self.actors.get_mut(&actor) {
-                        actor.telemetry.insert("name".into(), name.clone());
-                    }
+                if let Some(ref name) = player_info.name
+                    && let Some(actor) = self.actors.get_mut(&actor)
+                {
+                    actor.telemetry.insert("name".into(), name.clone());
                 }
             }
             FlighthookEvent::ClubInfo { club_info } => {
@@ -275,10 +275,8 @@ impl FlighthookApp {
                         .insert("club".into(), club_info.club.to_string());
                 }
             }
-            FlighthookEvent::SetDetectionMode { mode, .. } => {
-                if let Some(m) = mode {
-                    self.current_mode = m.to_string();
-                }
+            FlighthookEvent::SetDetectionMode { mode: Some(m), .. } => {
+                self.current_mode = m.to_string();
             }
             _ => {}
         }

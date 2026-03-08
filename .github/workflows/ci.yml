@@ -30,7 +30,7 @@ jobs:
         run: cd ui && trunk build --release
 
       - name: Clippy
-        run: cargo clippy --workspace
+        run: cargo clippy --workspace -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace
