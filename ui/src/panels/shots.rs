@@ -81,21 +81,12 @@ impl FlighthookApp {
                             } else {
                                 ui.label(dev_display);
                             }
-                            // Shot number with estimated indicator
-                            if shot.estimated {
-                                ui.label(
-                                    egui::RichText::new(format!("{} (est)", shot.shot_number))
-                                        .color(egui::Color32::from_rgb(180, 180, 100))
-                                        .size(11.0),
-                                );
-                            } else {
-                                ui.label(format!("{}", shot.shot_number));
-                            }
+                            ui.label(format!("{}", shot.shot_number));
 
                             if let Some(ref f) = converted.ball {
-                                ui.label(format!("{:.1}", f.launch_speed.value()));
-                                ui.label(format!("{:.1}", f.launch_elevation));
-                                ui.label(format!("{:.1}", f.launch_azimuth));
+                                ui.label(opt_f(f.launch_speed.map(|v| v.value()), 1));
+                                ui.label(opt_f(f.launch_elevation, 1));
+                                ui.label(opt_f(f.launch_azimuth, 1));
                                 ui.label(opt_f(f.carry_distance.map(|d| d.value()), 1));
                                 ui.label(opt_f(f.max_height.map(|d| d.value()), 1));
                                 ui.label(opt_i(f.backspin_rpm));
@@ -107,7 +98,7 @@ impl FlighthookApp {
                             }
 
                             if let Some(ref c) = converted.club {
-                                ui.label(format!("{:.1}", c.club_speed.value()));
+                                ui.label(opt_f(c.club_speed.map(|v| v.value()), 1));
                                 ui.label(opt_f(c.path, 1));
                                 ui.label(opt_f(c.attack_angle, 1));
                                 ui.label(opt_f(c.face_angle, 1));

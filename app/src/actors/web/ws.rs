@@ -1,9 +1,11 @@
-//! WebSocket handler — init handshake + unified bus event streaming.
+//! WebSocket handler — FRP-compliant init handshake + unified bus event streaming.
 //!
-//! Protocol:
-//!   1. Client sends:  `{ "type": "start", "name": "My Dashboard" }`
-//!   2. Server sends:  `{ "type": "init", "source_id": "ws.abc123", "global_state": { ... } }`
+//! Protocol (FRP-compliant with flighthook extensions):
+//!   1. Client sends:  `{ "kind": "start", "version": ["0.1.0"], "name": "My Dashboard" }`
+//!   2. Server sends:  `{ "kind": "init", "version": "0.1.0", "source_id": "ws.abc123", "global_state": { ... } }`
 //!   3. Server streams `FlighthookMessage` events
+//!
+//! For backward compatibility, the handshake also accepts `{ "type": "start", "name": "..." }`.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -16,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use super::{WebState, emit_telemetry};
 use crate::state::SystemState;
 use crate::state::config;
-use flighthook::{FlighthookEvent, FlighthookMessage, ShotDetectionMode};
+use flighthook::{FRP_VERSION, FlighthookEvent, FlighthookMessage, ShotDetectionMode};
 
 /// GET /api/ws — upgrade to WebSocket.
 pub async fn ws_upgrade(
@@ -55,7 +57,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
 
     let global_state = state.root.game.snapshot();
     let init_msg = serde_json::json!({
-        "type": "init",
+        "kind": "init",
+        "version": FRP_VERSION,
         "source_id": source_id,
         "global_state": global_state,
     });
@@ -69,9 +72,15 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
 
     // Send current launch monitor states so the client has a complete picture
     for (id, lm) in state.root.game.launch_monitor_states() {
-        let msg = FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
-            armed: lm.armed,
-            ball_detected: lm.ball_detected,
+        let telemetry = std::collections::HashMap::from([
+            ("armed".to_string(), lm.armed.to_string()),
+            ("ball_detected".to_string(), lm.ball_detected.to_string()),
+        ]);
+        let msg = FlighthookMessage::new(FlighthookEvent::DeviceInfo {
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            telemetry: Some(telemetry),
         })
         .source(id);
         if let Ok(json) = serde_json::to_string(&msg)
@@ -132,16 +141,23 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
 }
 
 /// Parse a "start" handshake message. Returns the client name if valid.
+///
+/// Accepts both FRP-compliant `{"kind": "start", "version": [...], "name": "..."}`
+/// and legacy `{"type": "start", "name": "..."}` formats.
 fn parse_start_message(text: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct StartMsg {
+        /// FRP-compliant field
+        kind: Option<String>,
+        /// Legacy field (backward compat)
         #[serde(rename = "type")]
-        msg_type: String,
+        msg_type: Option<String>,
         #[serde(default)]
         name: String,
     }
     let msg: StartMsg = serde_json::from_str(text).ok()?;
-    if msg.msg_type == "start" {
+    let is_start = msg.kind.as_deref() == Some("start") || msg.msg_type.as_deref() == Some("start");
+    if is_start {
         Some(if msg.name.is_empty() {
             "anonymous".to_string()
         } else {
@@ -180,7 +196,7 @@ fn handle_ws_command(
         };
         if let Some(m) = mode {
             let _ = bus_tx.send(
-                FlighthookMessage::new(FlighthookEvent::ShotDetectionMode { mode: m })
+                FlighthookMessage::new(FlighthookEvent::SetDetectionMode { mode: m })
                     .source(source),
             );
         }

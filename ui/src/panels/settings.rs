@@ -1,15 +1,9 @@
 use crate::app::FlighthookApp;
 use crate::net;
 use crate::types::{
-    Club, Distance, EstimatedMode, FlighthookConfig, GsProSection, MevoSection,
+    Club, Distance, DistanceExt, FlighthookConfig, GsProSection, MevoSection,
     MockMonitorSection, RandomClubSection, UnitSystem, WebserverSection,
 };
-
-const ESTIMATED_OPTIONS: &[(&str, &str)] = &[
-    ("never", "Never"),
-    ("chipping_only", "Chipping only"),
-    ("always", "Always"),
-];
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
     ("inches", "in"),
@@ -33,29 +27,6 @@ fn unit_suffix(key: &str) -> &str {
         .find(|(k, _)| *k == key)
         .map(|(_, suffix)| *suffix)
         .unwrap_or("in")
-}
-
-fn estimated_mode_to_str(m: EstimatedMode) -> &'static str {
-    match m {
-        EstimatedMode::Never => "never",
-        EstimatedMode::ChippingOnly => "chipping_only",
-        EstimatedMode::Always => "always",
-    }
-}
-
-fn str_to_estimated_mode(s: &str) -> EstimatedMode {
-    match s {
-        "never" => EstimatedMode::Never,
-        "always" => EstimatedMode::Always,
-        _ => EstimatedMode::ChippingOnly,
-    }
-}
-
-fn combo_label<'a>(opts: &[(&str, &'a str)], value: &str) -> &'a str {
-    opts.iter()
-        .find(|(v, _)| *v == value)
-        .map(|(_, label)| *label)
-        .unwrap_or(opts[0].1)
 }
 
 /// Find the lowest unused integer key (starting at "0") in a set of existing keys.
@@ -88,6 +59,7 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) surface_height_val: String,
     pub(crate) surface_height_unit: String,
     pub(crate) track_pct: String,
+    pub(crate) use_estimated: bool,
     pub(crate) dirty: bool,
 }
 
@@ -109,6 +81,7 @@ impl DeviceFormEntry {
             surface_height_val: format_distance_value(surf.value()),
             surface_height_unit: surf.unit_key().into(),
             track_pct: format!("{:.0}", s.track_pct.unwrap_or(80.0)),
+            use_estimated: s.use_estimated.unwrap_or(true),
             dirty: false,
         }
     }
@@ -127,6 +100,7 @@ impl DeviceFormEntry {
             surface_height_val: "0".into(),
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
+            use_estimated: true,
             dirty: false,
         }
     }
@@ -150,8 +124,6 @@ pub(crate) struct IntegrationFormEntry {
     pub(crate) chipping_monitor: String,
     /// Routing: actor ID for putting monitor, or empty = "Any".
     pub(crate) putting_monitor: String,
-    /// Whether to forward estimated ball flights.
-    pub(crate) use_estimated: String,
     pub(crate) dirty: bool,
 }
 
@@ -287,7 +259,6 @@ impl SettingsForm {
                     full_monitor: section.full_monitor.clone().unwrap_or_default(),
                     chipping_monitor: section.chipping_monitor.clone().unwrap_or_default(),
                     putting_monitor: section.putting_monitor.clone().unwrap_or_default(),
-                    use_estimated: estimated_mode_to_str(section.use_estimated.unwrap_or_default()).into(),
                     dirty: false,
                 }));
         }
@@ -301,7 +272,6 @@ impl SettingsForm {
                     full_monitor: String::new(),
                     chipping_monitor: String::new(),
                     putting_monitor: String::new(),
-                    use_estimated: String::new(),
                     dirty: false,
                 }));
             let _ = section;
@@ -316,7 +286,6 @@ impl SettingsForm {
                     full_monitor: String::new(),
                     chipping_monitor: String::new(),
                     putting_monitor: String::new(),
-                    use_estimated: String::new(),
                     dirty: false,
                 }));
         }
@@ -385,6 +354,7 @@ impl SettingsForm {
                                     |v| Distance::from_value_and_unit(v, &dev.surface_height_unit),
                                 ),
                                 track_pct: dev.track_pct.parse().ok(),
+                                use_estimated: Some(dev.use_estimated),
                             },
                         );
                     }
@@ -423,11 +393,6 @@ impl SettingsForm {
                                     None
                                 } else {
                                     Some(entry.putting_monitor.clone())
-                                },
-                                use_estimated: if entry.use_estimated.is_empty() {
-                                    None
-                                } else {
-                                    Some(str_to_estimated_mode(&entry.use_estimated))
                                 },
                             },
                         );
@@ -553,6 +518,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                                 Distance::from_value_and_unit(v, &dev.surface_height_unit)
                             }),
                             track_pct: dev.track_pct.parse().ok(),
+                            use_estimated: Some(dev.use_estimated),
                         },
                     );
                 }
@@ -595,11 +561,6 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                                 None
                             } else {
                                 Some(entry.putting_monitor.clone())
-                            },
-                            use_estimated: if entry.use_estimated.is_empty() {
-                                None
-                            } else {
-                                Some(str_to_estimated_mode(&entry.use_estimated))
                             },
                         },
                     );
@@ -936,6 +897,17 @@ impl FlighthookApp {
                                     ui.label("%");
                                 });
 
+                                // Use Estimated
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    if ui.checkbox(&mut dev.use_estimated, "Use Estimated Shots")
+                                        .on_hover_text("Include estimated (E8 fallback) shots.\nEstimated shots may lack sidespin and carry less data,\nbut are often the only result for short chips.")
+                                        .changed()
+                                    {
+                                        dev.dirty = true;
+                                    }
+                                });
+
                             }
                         }
                         ActorFormEntry::Integration(entry) => {
@@ -1011,25 +983,6 @@ impl FlighthookApp {
                                     });
                                 }
 
-                                // Estimated shots
-                                ui.horizontal(|ui| {
-                                    ui.add_space(16.0);
-                                    ui.label("Estimated:").on_hover_text("Forward estimated ball flights to this integration.\nEstimated shots may lack full flight data but can still be\nusable in-game. Common for short chips and marginal shots.\n\nNever: only forward full results.\nChipping only: forward estimated in chipping mode.\nAlways: forward estimated in any mode.");
-                                    egui::ComboBox::from_id_salt(format!("estimated_{}", entry.id))
-                                        .selected_text(combo_label(ESTIMATED_OPTIONS, &entry.use_estimated))
-                                        .width(field_width)
-                                        .show_ui(ui, |ui| {
-                                            for &(value, label) in ESTIMATED_OPTIONS {
-                                                if ui
-                                                    .selectable_label(entry.use_estimated == value, label)
-                                                    .clicked()
-                                                {
-                                                    entry.use_estimated = value.to_string();
-                                                    entry.dirty = true;
-                                                }
-                                            }
-                                        });
-                                });
                             }
                         }
                     }
@@ -1073,6 +1026,7 @@ impl FlighthookApp {
                                     surface_height_val: "0".into(),
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
+                                    use_estimated: true,
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
@@ -1093,7 +1047,6 @@ impl FlighthookApp {
                                     full_monitor: String::new(),
                                     chipping_monitor: String::new(),
                                     putting_monitor: String::new(),
-                                    use_estimated: "chipping_only".into(),
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
@@ -1110,11 +1063,10 @@ impl FlighthookApp {
                                     id,
                                     integration_type: "webserver".into(),
                                     name: "Web Server".into(),
-                                    address: "0.0.0.0:3030".into(),
+                                    address: "0.0.0.0:5880".into(),
                                     full_monitor: String::new(),
                                     chipping_monitor: String::new(),
                                     putting_monitor: String::new(),
-                                    use_estimated: String::new(),
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;

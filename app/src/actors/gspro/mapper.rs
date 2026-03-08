@@ -5,11 +5,23 @@ use flighthook::ShotData;
 
 /// Convert a decoded shot into a GSPro Open Connect V1 message.
 pub fn map_shot(shot: &ShotData) -> GsProMessage {
-    let b = &shot.ball;
+    let contains_ball = shot.ball.is_some();
 
-    // Derive total_spin and spin_axis from backspin + sidespin in BallFlight.
-    let bs = b.backspin_rpm.unwrap_or(0) as f64;
-    let ss = b.sidespin_rpm.unwrap_or(0) as f64;
+    // Ball data: extract from Option<BallFlight>, zero-fill missing fields.
+    let (speed, vla, hla, carry_distance, bs, ss) = if let Some(ref b) = shot.ball {
+        (
+            b.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
+            b.launch_elevation.unwrap_or(0.0),
+            b.launch_azimuth.unwrap_or(0.0),
+            b.carry_distance.map(|d| d.as_yards()),
+            b.backspin_rpm.unwrap_or(0) as f64,
+            b.sidespin_rpm.unwrap_or(0) as f64,
+        )
+    } else {
+        (0.0, 0.0, 0.0, None, 0.0, 0.0)
+    };
+
+    // Derive total_spin and spin_axis from backspin + sidespin.
     let total_spin = (bs * bs + ss * ss).sqrt();
     let spin_axis = ss.atan2(bs).to_degrees();
 
@@ -17,7 +29,7 @@ pub fn map_shot(shot: &ShotData) -> GsProMessage {
     let (club_data, contains_club) = if let Some(ref club) = shot.club {
         (
             ClubData {
-                speed: club.club_speed.as_mph(),
+                speed: club.club_speed.map(|v| v.as_mph()).unwrap_or(0.0),
                 angle_of_attack: club.attack_angle.unwrap_or(0.0),
                 face_to_target: club.face_angle.unwrap_or(0.0),
                 loft: club.dynamic_loft.unwrap_or(0.0),
@@ -44,18 +56,18 @@ pub fn map_shot(shot: &ShotData) -> GsProMessage {
         shot_number: shot.shot_number,
         api_version: "1".into(),
         ball_data: BallData {
-            speed: b.launch_speed.as_mph(),
+            speed,
             spin_axis,
             total_spin,
-            back_spin: b.backspin_rpm.unwrap_or(0) as f64,
-            side_spin: b.sidespin_rpm.unwrap_or(0) as f64,
-            hla: b.launch_azimuth,
-            vla: b.launch_elevation,
-            carry_distance: b.carry_distance.map(|d| d.as_yards()),
+            back_spin: bs,
+            side_spin: ss,
+            hla,
+            vla,
+            carry_distance,
         },
         club_data,
         shot_data_options: ShotDataOptions {
-            contains_ball_data: true,
+            contains_ball_data: contains_ball,
             contains_club_data: contains_club,
             // A shot proves the device was ready and detected a ball.
             launch_monitor_is_ready: true,

@@ -37,9 +37,34 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  publish:
+    name: Publish lib crate
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep '^version' lib/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag v${tag} does not match lib/Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+
+      - name: Publish to crates.io
+        run: cargo publish -p flighthook --all-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   version-bump:
     name: Version bump
-    needs: test
+    needs: [test, publish]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

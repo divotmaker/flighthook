@@ -141,7 +141,7 @@ pub async fn post_mode(
     let mode = body.mode;
     let _ = state
         .bus_tx
-        .send(FlighthookMessage::new(FlighthookEvent::ShotDetectionMode { mode }).source("web"));
+        .send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode { mode }).source("web"));
     StatusCode::ACCEPTED
 }
 

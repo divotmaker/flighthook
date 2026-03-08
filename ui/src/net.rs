@@ -38,7 +38,7 @@ fn api_base() -> String {
     let location = web_sys::window().unwrap().location();
     let origin = location.origin().unwrap_or_default();
     if origin.is_empty() || origin == "null" {
-        "http://127.0.0.1:3030".to_string()
+        "http://127.0.0.1:5880".to_string()
     } else {
         origin
     }
@@ -51,7 +51,7 @@ fn ws_url() -> String {
     let host = location.host().unwrap_or_default();
     let ws_proto = if protocol == "https:" { "wss:" } else { "ws:" };
     if host.is_empty() {
-        "ws://127.0.0.1:3030/api/ws".to_string()
+        "ws://127.0.0.1:5880/api/ws".to_string()
     } else {
         format!("{ws_proto}//{host}/api/ws")
     }
@@ -60,7 +60,7 @@ fn ws_url() -> String {
 #[cfg(not(target_arch = "wasm32"))]
 static NATIVE_BASE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Set the base URL for native builds (e.g. "http://127.0.0.1:3030").
+/// Set the base URL for native builds (e.g. "http://127.0.0.1:5880").
 /// Must be called before the app is created.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn set_base_url(url: String) {
@@ -72,7 +72,7 @@ fn api_base() -> String {
     NATIVE_BASE_URL
         .get()
         .cloned()
-        .unwrap_or_else(|| "http://127.0.0.1:3030".to_string())
+        .unwrap_or_else(|| "http://127.0.0.1:5880".to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -196,7 +196,7 @@ pub fn connect_ws() -> Option<(ewebsock::WsSender, ewebsock::WsReceiver)> {
 /// Send the init handshake after the WebSocket is confirmed open.
 pub fn send_ws_start(tx: &mut ewebsock::WsSender) {
     tx.send(ewebsock::WsMessage::Text(
-        r#"{"type":"start","name":"Flighthook Dashboard"}"#.into(),
+        r#"{"kind":"start","version":["0.1.0"],"name":"Flighthook Dashboard"}"#.into(),
     ));
 }
 
@@ -225,7 +225,7 @@ pub fn poll_ws(rx: &mut ewebsock::WsReceiver) -> (Vec<WsPollEvent>, u64) {
                 events.push(WsPollEvent::Opened);
             }
             ewebsock::WsEvent::Message(ewebsock::WsMessage::Text(text)) => {
-                // Try init response first (has "type" field)
+                // Try init response first (has "kind" field)
                 if let Some(init) = parse_init_response(&text) {
                     events.push(init);
                 } else if let Some(msg) = types::parse_ws_message(&text) {
@@ -247,16 +247,19 @@ pub fn poll_ws(rx: &mut ewebsock::WsReceiver) -> (Vec<WsPollEvent>, u64) {
     (events, raw_count)
 }
 
-/// Parse a WS init response: `{ "type": "init", "source_id": "..." }`
+/// Parse a WS init response: `{ "kind": "init", "version": "0.1.0", "source_id": "..." }`
+/// Also accepts legacy `{ "type": "init", ... }` for backward compatibility.
 fn parse_init_response(text: &str) -> Option<WsPollEvent> {
     #[derive(serde::Deserialize)]
     struct InitMsg {
+        kind: Option<String>,
         #[serde(rename = "type")]
-        msg_type: String,
+        msg_type: Option<String>,
         source_id: Option<String>,
     }
     let msg: InitMsg = serde_json::from_str(text).ok()?;
-    if msg.msg_type == "init" {
+    let is_init = msg.kind.as_deref() == Some("init") || msg.msg_type.as_deref() == Some("init");
+    if is_init {
         Some(WsPollEvent::Init {
             source_id: msg.source_id.unwrap_or_default(),
         })

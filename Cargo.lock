@@ -1028,10 +1028,10 @@ dependencies = [
 
 [[package]]
 name = "flighthook"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
- "chrono",
  "clap",
+ "flightrelay",
  "serde",
  "serde_json",
  "tungstenite 0.26.2",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-app"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "anyhow",
  "axum",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-ui"
-version = "0.0.9"
+version = "0.0.11"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
@@ -1082,6 +1082,17 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "flightrelay"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae1196a039b10b2e11aea6d1fcf06561b1009b3afb3a51cb6cef5e584a31fb7a"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1618,9 +1629,9 @@ dependencies = [
 
 [[package]]
 name = "ironsight"
-version = "0.0.9"
+version = "0.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd48f8526c17483cd84478652f6939e5b293e05db9d43a7b6fdce25d6e5608ad"
+checksum = "388c76124f79bcacb86049c15fe71258b6c3a5273f1784d8a4ba65fcaccea5b8"
 dependencies = [
  "serde",
  "thiserror 2.0.18",

@@ -9,7 +9,7 @@
 //! ```no_run
 //! use flighthook::FlighthookClient;
 //!
-//! let mut client = FlighthookClient::connect("ws://localhost:3030/api/ws", "my-app").unwrap();
+//! let mut client = FlighthookClient::connect("ws://localhost:5880/api/ws", "my-app").unwrap();
 //! loop {
 //!     match client.recv() {
 //!         Ok(msg) => println!("{}: {:?}", msg.source, msg.event),
@@ -23,7 +23,7 @@
 //! ```no_run
 //! use flighthook::FlighthookClient;
 //!
-//! let mut client = FlighthookClient::connect("ws://localhost:3030/api/ws", "my-sim").unwrap();
+//! let mut client = FlighthookClient::connect("ws://localhost:5880/api/ws", "my-sim").unwrap();
 //! client.set_nonblocking(true).unwrap();
 //!
 //! loop {
@@ -102,12 +102,12 @@ pub struct FlighthookClient {
 impl FlighthookClient {
     /// Connect to a flighthook server and complete the init handshake.
     ///
-    /// `url` should be a WebSocket URL like `"ws://localhost:3030/api/ws"`.
+    /// `url` should be a WebSocket URL like `"ws://localhost:5880/api/ws"`.
     /// `name` is a human-readable client identifier sent during the handshake.
     pub fn connect(url: &str, name: &str) -> Result<Self, ClientError> {
         let (mut socket, _response) = tungstenite::connect(url)?;
 
-        let start = serde_json::json!({ "type": "start", "name": name });
+        let start = serde_json::json!({ "kind": "start", "version": [crate::FRP_VERSION], "name": name });
         socket.send(Message::text(start.to_string()))?;
 
         // Wait for init response (blocking — handshake always blocks)
@@ -213,10 +213,12 @@ impl fmt::Debug for FlighthookClient {
 fn parse_init_source_id(text: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct InitMsg {
+        kind: Option<String>,
         #[serde(rename = "type")]
-        msg_type: String,
+        msg_type: Option<String>,
         source_id: String,
     }
     let msg: InitMsg = serde_json::from_str(text).ok()?;
-    (msg.msg_type == "init").then_some(msg.source_id)
+    let is_init = msg.kind.as_deref() == Some("init") || msg.msg_type.as_deref() == Some("init");
+    is_init.then_some(msg.source_id)
 }

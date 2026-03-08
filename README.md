@@ -35,7 +35,7 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 ## Architecture
 
 A single `broadcast<FlighthookMessage>` bus connects all components.
-Each message carries a UTC timestamp, a typed event, and an optional raw payload (for debugging).
+Each message carries a typed event and an optional raw payload (for debugging).
 Session threads, integration bridges, and the web layer all subscribe to the same bus.
 This allows for third party software can connect with a websocket and interact with the bus the same way as any built-in native integration.
 
@@ -52,7 +52,7 @@ TOML file auto-created on first run at the platform config directory:
 ```toml
 [webserver.0]
 name = "Web Server"
-bind = "0.0.0.0:3030"
+bind = "0.0.0.0:5880"
 
 [mevo.0]
 name = "My Mevo+"
@@ -66,7 +66,6 @@ track_pct = 80.0
 [gspro.0]
 name = "Local GSPro"
 address = "127.0.0.1:921"
-use_estimated = "chipping_only"  # never | chipping_only | always
 ```
 
 Section prefixes encode component type: `mevo`, `mock_monitor`, `gspro`,

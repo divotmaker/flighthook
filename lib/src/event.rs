@@ -1,75 +1,31 @@
 //! Shared domain types used by both the unified bus and the session thread.
 //!
-//! These are pure data structures with no channel affinity. The bus message
-//! types in `message.rs` reference them.
+//! Shot data types (`BallFlight`, `ClubData`, `FaceImpact`) are re-exported
+//! from the `flightrelay` crate. This module defines the composed `ShotData`
+//! and accumulator types built on top of them.
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Distance, ShotKey, UnitSystem, Velocity};
+use flightrelay::types::{BallFlight, ClubData, FaceImpact};
+use flightrelay::units::{Distance, Velocity};
+
+use crate::{ShotKey, UnitSystem};
 
 // ---------------------------------------------------------------------------
-// Shared types
+// Composed shot data
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BallFlight {
-    // Critical launch conditions — always present
-    pub launch_speed: Velocity,
-    pub launch_elevation: f64, // deg (VLA)
-    pub launch_azimuth: f64,   // deg (HLA)
-    // Flight results
-    #[serde(default)]
-    pub carry_distance: Option<Distance>,
-    #[serde(default)]
-    pub total_distance: Option<Distance>,
-    #[serde(default)]
-    pub max_height: Option<Distance>,
-    #[serde(default)]
-    pub flight_time: Option<f64>, // s
-    #[serde(default)]
-    pub roll_distance: Option<Distance>,
-    // Spin
-    #[serde(default)]
-    pub backspin_rpm: Option<i32>,
-    #[serde(default)]
-    pub sidespin_rpm: Option<i32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClubData {
-    pub club_speed: Velocity,
-    #[serde(default)]
-    pub path: Option<f64>, // deg (strike direction)
-    #[serde(default)]
-    pub attack_angle: Option<f64>, // deg
-    #[serde(default)]
-    pub face_angle: Option<f64>, // deg
-    #[serde(default)]
-    pub dynamic_loft: Option<f64>, // deg
-    #[serde(default)]
-    pub smash_factor: Option<f64>,
-    #[serde(default)]
-    pub club_speed_post: Option<Velocity>,
-    #[serde(default)]
-    pub swing_plane_horizontal: Option<f64>, // deg
-    #[serde(default)]
-    pub swing_plane_vertical: Option<f64>, // deg
-    #[serde(default)]
-    pub club_offset: Option<Distance>,
-    #[serde(default)]
-    pub club_height: Option<Distance>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShotData {
     #[serde(default)]
     pub source: String,
-    pub shot_number: i32,
-    pub ball: BallFlight,
-    #[serde(default)]
+    pub shot_number: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ball: Option<BallFlight>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club: Option<ClubData>,
-    #[serde(default)]
-    pub estimated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<FaceImpact>,
 }
 
 impl ShotData {
@@ -82,29 +38,20 @@ impl ShotData {
     }
 
     fn to_imperial(&self) -> ShotData {
-        let ball = BallFlight {
-            launch_speed: Velocity::MilesPerHour(self.ball.launch_speed.as_mph()),
-            launch_elevation: self.ball.launch_elevation,
-            launch_azimuth: self.ball.launch_azimuth,
-            carry_distance: self
-                .ball
-                .carry_distance
-                .map(|d| Distance::Yards(d.as_yards())),
-            total_distance: self
-                .ball
-                .total_distance
-                .map(|d| Distance::Yards(d.as_yards())),
-            max_height: self.ball.max_height.map(|d| Distance::Feet(d.as_feet())),
-            flight_time: self.ball.flight_time,
-            roll_distance: self
-                .ball
-                .roll_distance
-                .map(|d| Distance::Yards(d.as_yards())),
-            backspin_rpm: self.ball.backspin_rpm,
-            sidespin_rpm: self.ball.sidespin_rpm,
-        };
+        let ball = self.ball.as_ref().map(|b| BallFlight {
+            launch_speed: b.launch_speed.map(|v| Velocity::MilesPerHour(v.as_mph())),
+            launch_elevation: b.launch_elevation,
+            launch_azimuth: b.launch_azimuth,
+            carry_distance: b.carry_distance.map(|d| Distance::Yards(d.as_yards())),
+            total_distance: b.total_distance.map(|d| Distance::Yards(d.as_yards())),
+            max_height: b.max_height.map(|d| Distance::Feet(d.as_feet())),
+            flight_time: b.flight_time,
+            roll_distance: b.roll_distance.map(|d| Distance::Yards(d.as_yards())),
+            backspin_rpm: b.backspin_rpm,
+            sidespin_rpm: b.sidespin_rpm,
+        });
         let club = self.club.as_ref().map(|c| ClubData {
-            club_speed: Velocity::MilesPerHour(c.club_speed.as_mph()),
+            club_speed: c.club_speed.map(|v| Velocity::MilesPerHour(v.as_mph())),
             path: c.path,
             attack_angle: c.attack_angle,
             face_angle: c.face_angle,
@@ -123,37 +70,35 @@ impl ShotData {
             shot_number: self.shot_number,
             ball,
             club,
-            estimated: self.estimated,
+            impact: self.impact.clone(),
         }
     }
 
     fn to_metric(&self) -> ShotData {
-        let ball = BallFlight {
-            launch_speed: Velocity::MetersPerSecond(self.ball.launch_speed.as_mps()),
-            launch_elevation: self.ball.launch_elevation,
-            launch_azimuth: self.ball.launch_azimuth,
-            carry_distance: self
-                .ball
+        let ball = self.ball.as_ref().map(|b| BallFlight {
+            launch_speed: b
+                .launch_speed
+                .map(|v| Velocity::MetersPerSecond(v.as_mps())),
+            launch_elevation: b.launch_elevation,
+            launch_azimuth: b.launch_azimuth,
+            carry_distance: b
                 .carry_distance
                 .map(|d| Distance::Meters(d.as_meters())),
-            total_distance: self
-                .ball
+            total_distance: b
                 .total_distance
                 .map(|d| Distance::Meters(d.as_meters())),
-            max_height: self
-                .ball
-                .max_height
-                .map(|d| Distance::Meters(d.as_meters())),
-            flight_time: self.ball.flight_time,
-            roll_distance: self
-                .ball
+            max_height: b.max_height.map(|d| Distance::Meters(d.as_meters())),
+            flight_time: b.flight_time,
+            roll_distance: b
                 .roll_distance
                 .map(|d| Distance::Meters(d.as_meters())),
-            backspin_rpm: self.ball.backspin_rpm,
-            sidespin_rpm: self.ball.sidespin_rpm,
-        };
+            backspin_rpm: b.backspin_rpm,
+            sidespin_rpm: b.sidespin_rpm,
+        });
         let club = self.club.as_ref().map(|c| ClubData {
-            club_speed: Velocity::MetersPerSecond(c.club_speed.as_mps()),
+            club_speed: c
+                .club_speed
+                .map(|v| Velocity::MetersPerSecond(v.as_mps())),
             path: c.path,
             attack_angle: c.attack_angle,
             face_angle: c.face_angle,
@@ -172,7 +117,7 @@ impl ShotData {
             shot_number: self.shot_number,
             ball,
             club,
-            estimated: self.estimated,
+            impact: self.impact.clone(),
         }
     }
 }
@@ -206,8 +151,8 @@ impl std::fmt::Display for ActorStatus {
 // ShotAccumulator — consumer-side shot assembly
 // ---------------------------------------------------------------------------
 
-/// Collects shot lifecycle events (`BallFlight`, `ClubPath`) and produces a
-/// complete [`ShotData`] on `ShotFinished`.
+/// Collects shot lifecycle events (`BallFlight`, `ClubPath`, `FaceImpact`)
+/// and produces a complete [`ShotData`] on `ShotFinished`.
 ///
 /// Used by consumers that need all shot fields together (GSPro bridge,
 /// web shot cache, UI shot grid). Keyed by `(source, ShotKey)`.
@@ -215,8 +160,9 @@ impl std::fmt::Display for ActorStatus {
 pub struct ShotAccumulator {
     pub source: String,
     pub key: ShotKey,
-    ball: Option<(BallFlight, bool)>,
+    ball: Option<BallFlight>,
     club: Option<ClubData>,
+    impact: Option<FaceImpact>,
 }
 
 impl ShotAccumulator {
@@ -227,12 +173,13 @@ impl ShotAccumulator {
             key,
             ball: None,
             club: None,
+            impact: None,
         }
     }
 
     /// Record ball flight data.
-    pub fn set_ball(&mut self, ball: BallFlight, estimated: bool) {
-        self.ball = Some((ball, estimated));
+    pub fn set_ball(&mut self, ball: BallFlight) {
+        self.ball = Some(ball);
     }
 
     /// Record club path data.
@@ -240,15 +187,22 @@ impl ShotAccumulator {
         self.club = Some(club);
     }
 
-    /// Finalize into a `ShotData`. Returns `None` if no ball data arrived.
+    /// Record face impact data.
+    pub fn set_impact(&mut self, impact: FaceImpact) {
+        self.impact = Some(impact);
+    }
+
+    /// Finalize into a `ShotData`. Returns `None` if no data arrived at all.
     pub fn finish(self) -> Option<ShotData> {
-        let (ball, estimated) = self.ball?;
+        if self.ball.is_none() && self.club.is_none() && self.impact.is_none() {
+            return None;
+        }
         Some(ShotData {
             source: self.source,
             shot_number: self.key.shot_number,
-            ball,
+            ball: self.ball,
             club: self.club,
-            estimated,
+            impact: self.impact,
         })
     }
 }
@@ -265,13 +219,13 @@ impl ShotAccumulator {
 ///
 /// ```ignore
 /// # use flighthook::{ShotAggregator, FlighthookClient};
-/// let mut client = FlighthookClient::connect("ws://localhost:3030/api/ws", "my-app").unwrap();
+/// let mut client = FlighthookClient::connect("ws://localhost:5880/api/ws", "my-app").unwrap();
 /// let mut shots = ShotAggregator::new();
 ///
 /// loop {
 ///     let msg = client.recv().unwrap();
 ///     if let Some(shot) = shots.feed(&msg) {
-///         println!("shot #{}: {:?}", shot.shot_number, shot.ball.launch_speed);
+///         println!("shot #{}: {:?}", shot.shot_number, shot.ball);
 ///     }
 /// }
 /// ```
@@ -294,19 +248,21 @@ impl ShotAggregator {
                 self.pending.insert((msg.source.clone(), key.clone()), acc);
                 None
             }
-            crate::FlighthookEvent::BallFlight {
-                key,
-                ball,
-                estimated,
-            } => {
+            crate::FlighthookEvent::BallFlight { key, ball } => {
                 if let Some(acc) = self.pending.get_mut(&(msg.source.clone(), key.clone())) {
-                    acc.set_ball(*ball.clone(), *estimated);
+                    acc.set_ball(*ball.clone());
                 }
                 None
             }
             crate::FlighthookEvent::ClubPath { key, club } => {
                 if let Some(acc) = self.pending.get_mut(&(msg.source.clone(), key.clone())) {
                     acc.set_club(*club.clone());
+                }
+                None
+            }
+            crate::FlighthookEvent::FaceImpact { key, impact } => {
+                if let Some(acc) = self.pending.get_mut(&(msg.source.clone(), key.clone())) {
+                    acc.set_impact(*impact.clone());
                 }
                 None
             }

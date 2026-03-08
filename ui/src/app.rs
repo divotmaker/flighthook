@@ -9,7 +9,7 @@ use crate::types::{
     ActorStatus, ActorStatusResponse, FlighthookEvent, FlighthookMessage, LogEntry, ShotRow,
     UnitSystem,
 };
-use chrono::SecondsFormat;
+use chrono::{SecondsFormat, Utc};
 
 const API_DOCS_MD: &str = include_str!("../../docs/API.md");
 
@@ -195,7 +195,7 @@ impl FlighthookApp {
     fn handle_bus_event(&mut self, msg: FlighthookMessage) {
         // Buffer all events for the log panel
         {
-            use crate::panels::log::{alert_level, event_debug, message_type};
+            use crate::panels::log::{alert_severity, event_debug, message_type};
 
             let source_name = self
                 .actors
@@ -209,13 +209,13 @@ impl FlighthookApp {
                 .map(|r| r.to_string())
                 .unwrap_or_default();
             self.log_entries.push(LogEntry {
-                timestamp: msg.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
+                timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 source_name,
                 source_id: msg.source.clone(),
                 message_type: message_type(&msg.event).to_string(),
                 event_debug: event_debug(&msg.event),
                 raw,
-                alert_level: alert_level(&msg.event),
+                alert_severity: alert_severity(&msg.event),
             });
             const MAX_LOG_ENTRIES: usize = 500;
             if self.log_entries.len() > MAX_LOG_ENTRIES {
@@ -245,17 +245,14 @@ impl FlighthookApp {
                     shot_number: key.shot_number,
                     ball: None,
                     club: None,
-                    estimated: false,
                 });
             }
             FlighthookEvent::BallFlight {
                 key,
                 ball,
-                estimated,
             } => {
                 if let Some(row) = self.shots.iter_mut().rev().find(|r| r.shot_id == key.shot_id) {
                     row.ball = Some(*ball);
-                    row.estimated = estimated;
                 }
             }
             FlighthookEvent::ClubPath { key, club } => {
@@ -278,7 +275,7 @@ impl FlighthookApp {
                         .insert("club".into(), club_info.club.to_string());
                 }
             }
-            FlighthookEvent::ShotDetectionMode { mode } => {
+            FlighthookEvent::SetDetectionMode { mode } => {
                 self.current_mode = mode.to_string();
             }
             _ => {}

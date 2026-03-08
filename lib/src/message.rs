@@ -1,19 +1,22 @@
 //! Unified `FlighthookMessage` bus types.
 //!
 //! All events flow through a single `broadcast<FlighthookMessage>` channel.
-//! Each message has a source (global ID of the originator), timestamp,
+//! Each message has a source (actor ID), optional device (FRP physical unit ID),
 //! optional raw payload (hex-first policy), and a typed event.
-//! Producers create messages; consumers subscribe and filter.
+//!
+//! The shot lifecycle events (`ShotTrigger`, `BallFlight`, `ClubPath`,
+//! `FaceImpact`, `ShotFinished`, `DeviceInfo`, `Alert`) are FRP-compliant.
+//! All other variants are flighthook extensions. FRP-only consumers ignore
+//! unknown `kind` values per spec.
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::ShotDetectionMode;
 use std::collections::HashMap;
 
-use crate::{ActorStatus, BallFlight, ClubData};
+use crate::{ActorStatus, BallFlight, ClubData, FaceImpact};
 use crate::{ClubInfo, PlayerInfo};
 use crate::{
     FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, RandomClubSection,
@@ -27,9 +30,13 @@ use crate::{
 /// A single event on the unified bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlighthookMessage {
+    /// Actor ID of the originator (e.g. "mevo.0", "gspro.0", "system").
     #[serde(default)]
     pub source: String,
-    pub timestamp: DateTime<Utc>,
+    /// FRP device identifier for the physical unit (e.g. the Mevo SSID).
+    /// Present on shot lifecycle and device info events; absent on system/config events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_payload: Option<RawPayload>,
     pub event: FlighthookEvent,
@@ -37,12 +44,12 @@ pub struct FlighthookMessage {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl FlighthookMessage {
-    /// Create a new message with the current UTC timestamp. Use `.source()` and
+    /// Create a new message. Use `.source()`, `.device()`, and
     /// `.raw()` / `.raw_binary()` to attach metadata.
     pub fn new(event: impl Into<FlighthookEvent>) -> Self {
         Self {
             source: String::new(),
-            timestamp: Utc::now(),
+            device: None,
             raw_payload: None,
             event: event.into(),
         }
@@ -50,6 +57,11 @@ impl FlighthookMessage {
 
     pub fn source(mut self, source: impl Into<String>) -> Self {
         self.source = source.into();
+        self
+    }
+
+    pub fn device(mut self, device: impl Into<String>) -> Self {
+        self.device = Some(device.into());
         self
     }
 
@@ -112,54 +124,64 @@ impl fmt::Display for RawPayload {
 }
 
 // ---------------------------------------------------------------------------
-// ShotKey — correlates shot lifecycle events
-// ---------------------------------------------------------------------------
-
-/// Globally unique shot identifier. Generated once by the producer at trigger
-/// time, then carried on every event in the shot lifecycle.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ShotKey {
-    /// Unique shot ID (UUID v4 string). Survives across sessions, databases, replays.
-    pub shot_id: String,
-    /// Session-level shot number from the launch monitor (monotonic per-source).
-    pub shot_number: i32,
-}
-
-// ---------------------------------------------------------------------------
 // Event variants
 // ---------------------------------------------------------------------------
 
+/// Re-export flightrelay's ShotKey as the canonical shot correlation type.
+pub use flightrelay::ShotKey;
+
 /// The typed event payload carried by a `FlighthookMessage`.
+///
+/// FRP-compliant events: `ShotTrigger`, `BallFlight`, `ClubPath`, `FaceImpact`,
+/// `ShotFinished`, `DeviceInfo`, `Alert`.
+///
+/// Flighthook extensions: everything else. FRP-only consumers silently ignore
+/// unknown `kind` values per spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FlighthookEvent {
-    // -- Shot lifecycle (correlated by ShotKey + message source) --
+    // -- FRP: Shot lifecycle (correlated by ShotKey + device) --
     /// Ball strike detected. Emitted immediately — no data yet.
     ShotTrigger { key: ShotKey },
-    /// Ball flight data available. `estimated` = true means the shot may not have fully read, but could still be usable in-game.
-    BallFlight {
-        key: ShotKey,
-        ball: Box<BallFlight>,
-        estimated: bool,
-    },
+    /// Ball flight data available.
+    BallFlight { key: ShotKey, ball: Box<BallFlight> },
     /// Club path data available.
     ClubPath { key: ShotKey, club: Box<ClubData> },
+    /// Face impact location available.
+    FaceImpact {
+        key: ShotKey,
+        impact: Box<FaceImpact>,
+    },
     /// Shot sequence complete. Accumulators should finalize.
     ShotFinished { key: ShotKey },
 
-    // -- Launch monitor state --
-    /// Armed/ready/ball state from a launch monitor.
-    LaunchMonitorState { armed: bool, ball_detected: bool },
+    // -- FRP: Device status --
+    /// Device identification and telemetry.
+    DeviceInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manufacturer: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        firmware: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        telemetry: Option<HashMap<String, String>>,
+    },
+    /// Alert for warn/error/critical conditions.
+    Alert {
+        severity: flightrelay::Severity,
+        message: String,
+    },
 
-    // -- Game state --
+    // -- FRP: Controller commands --
+    /// Set the shot detection mode on the device.
+    SetDetectionMode { mode: ShotDetectionMode },
+
+    // -- Flighthook extensions --
     /// Player info update (handedness).
     PlayerInfo { player_info: PlayerInfo },
     /// Club selection update.
     ClubInfo { club_info: ClubInfo },
-    /// Shot detection mode update.
-    ShotDetectionMode { mode: ShotDetectionMode },
-
-    // -- Config --
     /// Config mutation request (emitted by POST handler, processed by SystemActor).
     ConfigCommand {
         /// Opaque correlation ID for request-reply pattern.
@@ -178,16 +200,12 @@ pub enum FlighthookEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         started: Vec<String>,
     },
-
-    // -- Infrastructure --
     /// Generic actor status update (lifecycle + telemetry).
     ActorStatus {
         status: ActorStatus,
         #[serde(default)]
         telemetry: HashMap<String, String>,
     },
-    /// Alert for user-visible warn/error conditions.
-    Alert { level: AlertLevel, message: String },
 }
 
 impl FlighthookEvent {
@@ -235,25 +253,4 @@ pub enum ConfigAction {
     Remove {
         id: String,
     },
-}
-
-// ---------------------------------------------------------------------------
-// AlertLevel
-// ---------------------------------------------------------------------------
-
-/// Severity level for alert messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AlertLevel {
-    Warn,
-    Error,
-}
-
-impl fmt::Display for AlertLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AlertLevel::Warn => write!(f, "warn"),
-            AlertLevel::Error => write!(f, "error"),
-        }
-    }
 }

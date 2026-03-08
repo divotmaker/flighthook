@@ -76,7 +76,7 @@ fn main() -> anyhow::Result<()> {
                     "0".into(),
                     flighthook::WebserverSection {
                         name: "Web Server".into(),
-                        bind: "127.0.0.1:3030".into(),
+                        bind: "127.0.0.1:5880".into(),
                     },
                 );
             });

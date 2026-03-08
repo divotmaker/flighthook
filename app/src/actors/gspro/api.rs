@@ -9,7 +9,7 @@ pub struct GsProMessage {
     #[serde(rename = "DeviceID")]
     pub device_id: String,
     pub units: String,
-    pub shot_number: i32,
+    pub shot_number: u32,
     #[serde(rename = "APIversion")]
     pub api_version: String,
     pub ball_data: BallData,

@@ -13,11 +13,11 @@ Shot data arrives as a sequence of correlated events sharing a `ShotKey`:
 1. `shot_trigger` -- ball strike detected (no data yet)
 2. `ball_flight` -- ball flight data (speed, angles, distances, spin)
 3. `club_path` -- club data (speed, path, attack angle, face angle, loft)
-4. `shot_finished` -- shot complete, accumulators should finalize
+4. `face_impact` -- face impact location
+5. `shot_finished` -- shot complete, accumulators should finalize
 
 Use the `ShotAccumulator` pattern (or wait for `shot_finished`) to collect the
-full shot. The `estimated` flag on `ball_flight` is `true` when the shot was
-synthesized from partial radar data.
+full shot. All `BallFlight` and `ClubData` fields are `Option` (matching FRP spec).
 
 Velocities and distances are unit-tagged strings (e.g. `"67.2mps"`,
 `"180.5m"`). To convert to a standard unit system without parsing suffixes
@@ -28,22 +28,22 @@ Angles are degrees, spin is RPM.
 Other useful events on the same connection:
 
 - `actor_status` -- device/integration lifecycle + state (battery, tilt, club, etc.)
-- `shot_detection_mode` -- global detection mode changed (full/chipping/putting)
-- `launch_monitor_state` -- device armed/ball-detected state changes
+- `set_detection_mode` -- detection mode change command (full/chipping/putting)
+- `device_info` -- device identity + telemetry (armed/ball_detected readiness via telemetry keys)
 
 ### Terminal
 
 ```bash
 # Stream shots with websocat + jq (install: cargo install websocat)
 # Send the init handshake, keep stdin open to hold the connection, filter for shot events
-(echo '{"type":"start","name":"cli"}'; cat) | \
-  websocat ws://localhost:3030/api/ws | \
+(echo '{"kind":"start","version":["0.1.0"],"name":"cli"}'; cat) | \
+  websocat ws://localhost:5880/api/ws | \
   jq 'select(.event.kind == "shot_finished")'
 ```
 
 ```bash
 # Convert a ShotData JSON blob to imperial units (yards, mph, feet, inches)
-curl -s -X POST 'http://localhost:3030/api/shots/convert?units=imperial' \
+curl -s -X POST 'http://localhost:5880/api/shots/convert?units=imperial' \
   -H 'Content-Type: application/json' \
   -d @shot.json | jq
 ```
@@ -54,9 +54,9 @@ curl -s -X POST 'http://localhost:3030/api/shots/convert?units=imperial' \
 import json, websockets, asyncio
 
 async def main():
-    async with websockets.connect("ws://localhost:3030/api/ws") as ws:
+    async with websockets.connect("ws://localhost:5880/api/ws") as ws:
         # Init handshake
-        await ws.send(json.dumps({"type": "start", "name": "my-dashboard"}))
+        await ws.send(json.dumps({"kind": "start", "version": ["0.1.0"], "name": "my-dashboard"}))
         init = json.loads(await ws.recv())
         print(f"Connected: source_id={init['source_id']}")
 
@@ -69,7 +69,7 @@ async def main():
 
             if kind == "ball_flight":
                 key = (event["source"], fh["key"]["shot_id"])
-                shots[key] = {"ball": fh["ball"], "estimated": fh["estimated"]}
+                shots[key] = {"ball": fh["ball"]}
             elif kind == "club_path":
                 key = (event["source"], fh["key"]["shot_id"])
                 if key in shots:
@@ -87,15 +87,15 @@ asyncio.run(main())
 ### JavaScript
 
 ```javascript
-const ws = new WebSocket("ws://localhost:3030/api/ws");
+const ws = new WebSocket("ws://localhost:5880/api/ws");
 const shots = new Map();
 
 ws.onopen = () => {
-  ws.send(JSON.stringify({ type: "start", name: "my-dashboard" }));
+  ws.send(JSON.stringify({ kind: "start", version: ["0.1.0"], name: "my-dashboard" }));
 };
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
-  if (msg.type === "init") {
+  if (msg.kind === "init") {
     console.log("Connected:", msg.source_id);
     return;
   }
@@ -104,7 +104,7 @@ ws.onmessage = (e) => {
 
   switch (event.kind) {
     case "ball_flight":
-      shots.set(key, { ball: event.ball, estimated: event.estimated });
+      shots.set(key, { ball: event.ball });
       break;
     case "club_path":
       if (shots.has(key)) shots.get(key).club = event.club;
@@ -208,7 +208,6 @@ Shot history (most recent N shots, FIFO, max 1000 stored).
       "club_offset": "0.005m",
       "club_height": "0.012m"
     },
-    "estimated": false
   }
 ]
 ```
@@ -231,11 +230,11 @@ With `?units=imperial`:
 }
 ```
 
-- `ball`: `BallFlight` -- launch conditions and distances. Always present.
+- `ball`: `BallFlight` or `null`. Launch conditions and distances. All fields are `Option`.
   Velocity fields are unit-tagged strings (`"67.2mps"`, `"150.3mph"`).
   Distance fields are unit-tagged strings (`"180.5m"`, `"197.4yd"`).
-- `club`: `ClubData` or `null`. Club head data.
-- `estimated`: `true` if synthesized from partial radar data.
+- `club`: `ClubData` or `null`. Club head data. All fields are `Option`.
+- `impact`: `FaceImpact` or `null`. Face impact location.
 
 ---
 
@@ -276,7 +275,6 @@ unit-tagged strings and re-implement conversion math.
     "dynamic_loft": 18.4,
     "smash_factor": 1.42
   },
-  "estimated": false
 }
 ```
 
@@ -296,8 +294,8 @@ unit-tagged strings and re-implement conversion math.
 }
 ```
 
-Angles (degrees) and spin (RPM) pass through unchanged. The `estimated` and
-`source` fields are preserved as-is.
+Angles (degrees) and spin (RPM) pass through unchanged. The `source` field
+is preserved as-is.
 
 **Errors**:
 
@@ -307,7 +305,7 @@ Angles (degrees) and spin (RPM) pass through unchanged. The `estimated` and
 
 ### POST /api/mode
 
-Change the global detection mode. Emits `ShotDetectionMode` on the bus;
+Change the global detection mode. Emits `SetDetectionMode` on the bus;
 all launch monitor actors react to the mode change.
 
 **Request**:
@@ -338,7 +336,7 @@ Full persisted config (mirrors `config.toml`).
   "webserver": {
     "0": {
       "name": "Web Server",
-      "bind": "0.0.0.0:3030"
+      "bind": "0.0.0.0:5880"
     }
   },
   "mevo": {
@@ -356,8 +354,7 @@ Full persisted config (mirrors `config.toml`).
   "gspro": {
     "0": {
       "name": "Local GSPro",
-      "address": "127.0.0.1:921",
-      "use_estimated": "chipping_only"
+      "address": "127.0.0.1:921"
     }
   },
   "random_club": {}
@@ -366,8 +363,8 @@ Full persisted config (mirrors `config.toml`).
 
 - Keys are type-prefixed global IDs: `mevo.0`, `mock_monitor.0`, `gspro.0`, `random_club.0`, `webserver.0`
 - All launch monitor config fields are optional (omitted = use defaults)
-- `use_estimated` on GSPro sections controls whether estimated ball flights are
-  forwarded to the integration: `"never"`, `"chipping_only"` (default), `"always"`
+- `use_estimated` on Mevo sections controls whether estimated (E8) ball flights
+  are emitted when no full (D4) result arrives (defaults to `true`)
 
 ---
 
@@ -411,7 +408,7 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 
 Text-frame JSON messages in both directions.
 
-### Init Handshake
+### Init Handshake (FRP-compliant)
 
 Before streaming begins, the client must complete a handshake:
 
@@ -419,12 +416,14 @@ Before streaming begins, the client must complete a handshake:
 
 ```json
 {
-  "type": "start",
+  "kind": "start",
+  "version": ["0.1.0"],
   "name": "My Dashboard"
 }
 ```
 
-- `type` (required): must be `"start"`
+- `kind` (required): must be `"start"`
+- `version` (required): array of supported FRP versions
 - `name` (optional): human-readable client identifier for server-side logging.
   Defaults to `"anonymous"` if empty or omitted.
 
@@ -432,7 +431,8 @@ Before streaming begins, the client must complete a handshake:
 
 ```json
 {
-  "type": "init",
+  "kind": "init",
+  "version": "0.1.0",
   "source_id": "a1b2c3d4",
   "global_state": {
     "player_info": null,
@@ -443,6 +443,8 @@ Before streaming begins, the client must complete a handshake:
 }
 ```
 
+- `kind`: `"init"` — FRP handshake response
+- `version`: the FRP version selected by the server
 - `source_id`: unique identifier for this WebSocket session (`ws.{8-hex-chars}`)
 - `global_state`: current snapshot of shared state
   - `player_info`: `{ "handed": "RH" }` or `null`
@@ -462,14 +464,15 @@ messages share this envelope:
 ```json
 {
   "source": "mevo.0",
-  "timestamp": "2026-02-27T12:34:56.789012345Z",
+  "device": "FS-M2-XXXXXX",
   "raw_payload": "0a1b2c...",
   "event": { "kind": "...", ... }
 }
 ```
 
 - `source`: global ID of the originator (e.g. `"mevo.0"`, `"gspro.0"`, `"ws.a1b2c3d4"`)
-- `timestamp`: ISO 8601 UTC timestamp
+- `device`: optional FRP device identifier (e.g. Mevo WiFi SSID). Present on
+  shot lifecycle and device info events; absent on system/config events.
 - `raw_payload`: optional, present on wire-level messages. Binary payloads are
   lowercase hex strings (no spaces). Text payloads (e.g. GSPro JSON) are
   included as-is. Omitted when not applicable.
@@ -491,7 +494,6 @@ Ball strike detected. Emitted immediately by the launch monitor -- no data yet.
 ```json
 {
   "source": "mevo.0",
-  "timestamp": "...",
   "event": {
     "kind": "shot_trigger",
     "key": { "shot_id": "550e8400-e29b-41d4-a716-446655440000", "shot_number": 42 }
@@ -511,7 +513,6 @@ Ball flight data available. May arrive before or after `club_path`.
 ```json
 {
   "source": "mevo.0",
-  "timestamp": "...",
   "event": {
     "kind": "ball_flight",
     "key": { "shot_id": "550e8400-...", "shot_number": 42 },
@@ -525,13 +526,11 @@ Ball flight data available. May arrive before or after `club_path`.
       "backspin_rpm": 3200,
       "sidespin_rpm": -450
     },
-    "estimated": false
   }
 }
 ```
 
-- `estimated`: `true` when synthesized from partial radar data.
-  Integrations decide whether to use estimated shots via `use_estimated` config.
+All `BallFlight` fields are `Option`. Missing fields are omitted from the JSON.
 
 ---
 
@@ -542,7 +541,6 @@ Club path data available. May arrive before or after `ball_flight`.
 ```json
 {
   "source": "mevo.0",
-  "timestamp": "...",
   "event": {
     "kind": "club_path",
     "key": { "shot_id": "550e8400-...", "shot_number": 42 },
@@ -567,7 +565,6 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
 ```json
 {
   "source": "mevo.0",
-  "timestamp": "...",
   "event": {
     "kind": "shot_finished",
     "key": { "shot_id": "550e8400-...", "shot_number": 42 }
@@ -577,21 +574,31 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
 
 ---
 
-##### launch_monitor_state
+##### device_info
 
-Armed/ready/ball state from a launch monitor.
+Device identification and telemetry. Emitted after handshake with identity fields,
+and re-emitted with telemetry updates (e.g. readiness changes). Readiness state
+is conveyed via `"armed"` and `"ball_detected"` telemetry keys (replacing the
+former `launch_monitor_state` event).
 
 ```json
 {
   "source": "mevo.0",
-  "timestamp": "...",
+  "device": "FS-M2-XXXXXX",
   "event": {
-    "kind": "launch_monitor_state",
-    "armed": true,
-    "ball_detected": true
+    "kind": "device_info",
+    "manufacturer": "FlightScope",
+    "model": "XXXXXXXX, H/W: XXXX v1.0, F/W: 1.00",
+    "telemetry": {
+      "armed": "true",
+      "ball_detected": "true"
+    }
   }
 }
 ```
+
+- `manufacturer`, `model`, `firmware`: optional identity fields (present on first emission)
+- `telemetry`: optional key/value map. Standard keys: `"armed"`, `"ball_detected"`
 
 ---
 
@@ -602,7 +609,6 @@ Player info update (handedness).
 ```json
 {
   "source": "gspro.0",
-  "timestamp": "...",
   "event": {
     "kind": "player_info",
     "player_info": { "handed": "RH" }
@@ -619,7 +625,6 @@ Club selection update.
 ```json
 {
   "source": "gspro.0",
-  "timestamp": "...",
   "event": {
     "kind": "club_info",
     "club_info": { "club": "7I" }
@@ -629,16 +634,15 @@ Club selection update.
 
 ---
 
-##### shot_detection_mode
+##### set_detection_mode
 
-Global detection mode changed.
+FRP controller command. Sets the shot detection mode on the device.
 
 ```json
 {
   "source": "system",
-  "timestamp": "...",
   "event": {
-    "kind": "shot_detection_mode",
+    "kind": "set_detection_mode",
     "mode": "chipping"
   }
 }
@@ -656,7 +660,6 @@ and integrations) when their status or telemetry changes.
 ```json
 {
   "source": "mevo.0",
-  "timestamp": "...",
   "event": {
     "kind": "actor_status",
     "status": "connected",
@@ -685,7 +688,6 @@ External consumers can observe these to track config changes in flight.
 ```json
 {
   "source": "web",
-  "timestamp": "...",
   "event": {
     "kind": "config_command",
     "request_id": "abc123",
@@ -704,7 +706,6 @@ emitted after a `config_command`, even for fire-and-forget commands.
 ```json
 {
   "source": "system",
-  "timestamp": "...",
   "event": {
     "kind": "config_outcome",
     "request_id": "abc123",
@@ -729,16 +730,15 @@ stay in the tracing backend and are not emitted on the bus.
 ```json
 {
   "source": "mevo.0",
-  "timestamp": "...",
   "event": {
     "kind": "alert",
-    "level": "warn",
+    "severity": "warn",
     "message": "Could not process message: Wire(ChecksumMismatch { ... })"
   }
 }
 ```
 
-- `level`: `"warn"` | `"error"`
+- `severity`: `"warn"` | `"error"` | `"critical"`
 - `message`: human-readable description of the condition
 
 ---
@@ -750,7 +750,7 @@ the init handshake -- they emit events on the unified bus.
 
 #### mode
 
-Change the global detection mode. Emits `ShotDetectionMode` on the bus.
+Change the global detection mode. Emits `SetDetectionMode` on the bus.
 
 ```json
 {
@@ -783,9 +783,9 @@ Change the global detection mode. Emits `ShotDetectionMode` on the bus.
 
 `"full"` | `"putting"` | `"chipping"`
 
-### EstimatedMode
+### Severity
 
-`"never"` | `"chipping_only"` | `"always"`
+`"warn"` | `"error"` | `"critical"`
 
 ### UnitSystem
 

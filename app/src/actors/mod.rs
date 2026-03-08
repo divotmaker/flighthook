@@ -82,6 +82,7 @@ pub fn resolve_actors(
         match addr_str.parse::<SocketAddr>() {
             Ok(addr) => {
                 let session_config = mevo::SessionConfig::from_mevo_section(section);
+                let use_estimated = section.use_estimated.unwrap_or(true);
                 actors.push(ResolvedActor {
                     id,
                     name: section.name.clone(),
@@ -89,6 +90,7 @@ pub fn resolve_actors(
                         addr,
                         initial_mode: mode,
                         session_config,
+                        use_estimated,
                     }),
                 });
             }
@@ -125,7 +127,6 @@ pub fn resolve_actors(
                     actor: Box::new(gspro::GsProActor {
                         addr,
                         routing,
-                        use_estimated: section.use_estimated.unwrap_or_default(),
                     }),
                 });
             }

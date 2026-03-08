@@ -5,7 +5,7 @@ use ironsight::protocol::config::{
 use ironsight::seq::AvrSettings;
 
 use crate::state::config::MevoSection;
-use flighthook::{Distance, ShotDetectionMode};
+use flighthook::{Distance, DistanceExt, ShotDetectionMode};
 
 /// Mutable session configuration. Distance fields carry both value and unit;
 /// wire-protocol conversions happen on demand in `to_avr_settings()`.
@@ -75,7 +75,7 @@ impl SessionConfig {
                 },
             ],
             radar_cal: Some(RadarCal {
-                range_mm: self.range.as_mm(),
+                range_mm: self.range.to_mm(),
                 height_mm: (self.surface_height.as_inches() * 25.4).floor() as u8,
             }),
         }

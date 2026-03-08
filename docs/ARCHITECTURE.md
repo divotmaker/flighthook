@@ -15,7 +15,7 @@ putting_clubs = ["PT"]
 
 [webserver.0]
 name = "Web Server"
-bind = "0.0.0.0:3030"
+bind = "0.0.0.0:5880"
 
 [mevo.0]
 name = "Mevo WiFi"
@@ -29,7 +29,6 @@ surface_height = "0in"
 [gspro.0]
 name = "Local GSPro"
 address = "127.0.0.1:921"
-use_estimated = "chipping_only"
 # full_monitor = "mevo.0"       # optional: route full-swing shots from specific monitor
 # chipping_monitor = "mevo.0"   # optional: route chipping shots
 # putting_monitor = "mevo.0"    # optional: route putting shots
@@ -42,8 +41,8 @@ use_estimated = "chipping_only"
 - `[webserver.<idx>]` -- web server instance
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
 - Radar settings (ball_type, tee_height, etc.) are per-mevo only
-- `use_estimated` is per-integration -- controls whether estimated ball flights
-  are forwarded (`never` / `chipping_only` / `always`)
+- `use_estimated` is per-mevo (defaults to `true`) -- controls whether estimated
+  (E8) ball flights are emitted when no full (D4) result arrives
 - Mock sections show only name (no address or radar fields)
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `gspro.0`)
 - WebSocket source IDs = `"ws.{8-hex-chars}"`
@@ -64,9 +63,9 @@ pub struct FlighthookConfig {
 }
 
 pub struct WebserverSection { pub name: String, pub bind: String }
-pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64> }
+pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool> }
 pub struct MockMonitorSection { pub name: String }
-pub struct GsProSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String>, pub use_estimated: Option<EstimatedMode> }
+pub struct GsProSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
 pub struct RandomClubSection { pub name: String }
 ```
 
@@ -116,19 +115,19 @@ Helper functions: `global_id(prefix, index) -> String` builds `"{prefix}.{index}
 MUST live in `flighthook`.** The UI crate never defines its own
 "response" mirror types. Both crates import the canonical type from schemas.
 This eliminates drift between serializer (app) and deserializer (UI) --
-e.g., `ActorStatus` enum vs string, `EstimatedMode` enum vs string.
+e.g., `ActorStatus` enum vs string, `Severity` enum vs string.
 
 ## Unified FlighthookMessage Bus
 
 All communication between components flows through a single
-`broadcast<FlighthookMessage>(1024)` channel. Every message carries a
-timestamp, optional raw payload (hex-first policy), and a typed event.
+`broadcast<FlighthookMessage>(1024)` channel. Every message carries an
+optional raw payload (hex-first policy) and a typed event.
 Producers create messages; consumers subscribe and filter by event kind.
 
 ```rust
 pub struct FlighthookMessage {
-    pub source: String,                   // global ID of originator
-    pub timestamp: DateTime<Utc>,
+    pub source: String,                   // actor framework ID (e.g. "mevo.0")
+    pub device: Option<String>,           // FRP physical device ID (e.g. Mevo SSID)
     pub raw_payload: Option<RawPayload>,
     pub event: FlighthookEvent,
 }
@@ -152,27 +151,24 @@ are flat struct variants with named fields (no wrapper types).
 
 ```rust
 pub enum FlighthookEvent {
-    // Shot lifecycle (correlated by ShotKey + message source)
+    // -- FRP-compliant shot lifecycle (correlated by ShotKey) --
     ShotTrigger { key: ShotKey },
-    BallFlight { key: ShotKey, ball: Box<BallFlight>, estimated: bool },
+    BallFlight { key: ShotKey, ball: Box<BallFlight> },
     ClubPath { key: ShotKey, club: Box<ClubData> },
+    FaceImpact { key: ShotKey, impact: Box<FaceImpact> },
     ShotFinished { key: ShotKey },
 
-    // Launch monitor state
-    LaunchMonitorState { armed: bool, ball_detected: bool },
+    // -- FRP: Device status --
+    DeviceInfo { manufacturer: Option<String>, model: Option<String>, firmware: Option<String>, telemetry: Option<HashMap<String, String>> },
+    Alert { severity: Severity, message: String },
 
-    // Game state
+    // -- Flighthook extensions --
     PlayerInfo { player_info: PlayerInfo },
     ClubInfo { club_info: ClubInfo },
-    ShotDetectionMode { mode: ShotDetectionMode },
-
-    // Config
+    SetDetectionMode { mode: ShotDetectionMode },
     ConfigCommand { request_id: Option<String>, action: ConfigAction },
     ConfigOutcome { request_id: Option<String>, restarted: Vec<String>, stopped: Vec<String>, started: Vec<String> },
-
-    // Infrastructure
     ActorStatus { status: ActorStatus, telemetry: HashMap<String, String> },
-    Alert { level: AlertLevel, message: String },
 }
 ```
 
@@ -181,12 +177,12 @@ pub enum FlighthookEvent {
 ```rust
 pub struct ShotKey {
     pub shot_id: String,      // UUID v4 string, globally unique
-    pub shot_number: i32,     // session-level monotonic counter per-source
+    pub shot_number: u32,     // session-level monotonic counter per-source
 }
 ```
 
 Shot data arrives as correlated events sharing a `ShotKey` and `source`:
-`ShotTrigger` -> `BallFlight` -> `ClubPath` -> `ShotFinished`. Consumers
+`ShotTrigger` -> `BallFlight` / `ClubPath` / `FaceImpact` (any order) -> `ShotFinished`. Consumers
 use `ShotAccumulator` to collect events into a final `ShotData`.
 
 ### Game state events
@@ -195,14 +191,18 @@ Game state is mutated via typed events on the bus:
 
 - `PlayerInfo { player_info }` -- player handedness
 - `ClubInfo { club_info }` -- club selection
-- `ShotDetectionMode { mode }` -- detection mode (full/chipping/putting)
+- `SetDetectionMode { mode }` -- detection mode (full/chipping/putting)
 
-The `SystemActor` auto-derives `ShotDetectionMode` from `ClubInfo` (using
+The `SystemActor` auto-derives detection mode from `ClubInfo` (using
 `config.club_mode()` to map club to detection mode via the configurable
 `chipping_clubs`/`putting_clubs` lists). Integrations only
 need to emit `ClubInfo`; the SystemActor handles mode derivation
-centrally. Launch monitor actors react to `ShotDetectionMode` to reconfigure
+centrally. Launch monitor actors react to `SetDetectionMode` events to reconfigure
 the device. Mode is global state, not per-device.
+
+Launch monitor readiness (armed/ball_detected) is conveyed via `DeviceInfo`
+telemetry with `"armed"` and `"ball_detected"` keys, rather than a separate
+event variant.
 
 ### ActorStatus -- generic actor lifecycle
 
@@ -315,8 +315,10 @@ Starting -> Connected -> (error) -> Reconnecting -> Connected -> ...
 
 Post-shot cycle: `Connected(shooting)` -> `Starting` (re-arm) -> `Connected(armed)`.
 
-**Integration readiness**: the GSPro actor always reports `launch_monitor_is_ready`
-and `launch_monitor_ball_detected` as `true` in both heartbeats and shot messages.
+**Integration readiness**: the GSPro actor tracks device readiness from
+`DeviceInfo` telemetry (`"armed"` and `"ball_detected"` keys) and uses them to
+set `launch_monitor_is_ready` and `launch_monitor_ball_detected` in heartbeats
+and shot messages.
 
 ## SystemActor
 
@@ -326,9 +328,9 @@ and `broadcast::Sender`, enforcing at the type level that only `SystemActor`
 can mutate game state and process config mutations. It handles:
 
 - **Game state**: subscribes to `PlayerInfo`, `ClubInfo`, and
-  `ShotDetectionMode` bus events, updates game state via the writer.
+  `SetDetectionMode` bus events, updates game state via the writer.
   **Auto-derives detection mode from club selection**: when `ClubInfo` is
-  received, calls `club_mode()` and emits `ShotDetectionMode` on the bus.
+  received, calls `club_mode()` and emits `SetDetectionMode` on the bus.
   This centralizes mode derivation so all integrations trigger mode changes.
 - **Config mutations**: subscribes to `ConfigCommand` bus events (from the
   REST API). Applies the mutation to `SystemConfig`, calls
@@ -397,8 +399,8 @@ to the `audit` tracing target (filtered by `RUST_LOG`, not shown by default).
 
 Single WS connection (`/api/ws`), three-phase handshake:
 
-1. Client sends: `{ "type": "start", "name": "My Dashboard" }`
-2. Server responds: `{ "type": "init", "source_id": "abc123", "global_state": { ... } }`
+1. Client sends: `{ "kind": "start", "version": ["0.1.0"], "name": "My Dashboard" }`
+2. Server responds: `{ "kind": "init", "version": "0.1.0", "source_id": "abc123", "global_state": { ... } }`
 3. Server streams `FlighthookMessage` events (serialized directly as JSON)
 
 Bus events are serialized and forwarded as-is. The `kind` tag on
@@ -410,7 +412,7 @@ Client -> server commands:
 { "cmd": "mode", "mode": "putting" }
 ```
 
-Mode commands emit `ShotDetectionMode` on the bus (mode is global,
+Mode commands emit `SetDetectionMode` on the bus (mode is global,
 not per-device). Config updates go through `POST /api/settings` ->
 `ConfigCommand` on the bus -> SystemActor processes -> `ConfigOutcome` reply.
 
@@ -435,8 +437,8 @@ main thread (eframe)       std::thread per actor              tokio runtime (bac
 ```
 
 **Bus-based command delivery**: actor threads poll the bus via `BusReceiver::poll()`
-in their event loop. They filter for `ShotDetectionMode` events (for mode
-changes). The `SystemActor` auto-derives `ShotDetectionMode` from `ClubInfo`
+in their event loop. They filter for `SetDetectionMode` events (for mode
+changes). The `SystemActor` auto-derives detection mode from `ClubInfo`
 using `club_mode()`, so integrations only need to emit `ClubInfo`. There is
 no per-device `mpsc` channel and no centralized router task.
 
@@ -516,7 +518,7 @@ Global
 
   Web Server             [Web]    [Remove] [Save]
     Name: [Web Server]
-    Address: [0.0.0.0:3030]
+    Address: [0.0.0.0:5880]
 
   Mevo WiFi              [Mevo]   [Remove] [Save]
     Name: [Mevo WiFi]
@@ -533,7 +535,6 @@ Global
     Full Monitor: [Any v]
     Chipping Monitor: [Any v]
     Putting Monitor: [Any v]
-    Estimated: [Chipping only v]
 
   [+ Add v]  (dropdown: Mevo, GSPro, Web Server)
 ```
@@ -542,8 +543,8 @@ Global
   updates the name cache in WebState, so subsequent status responses and shot
   data use the new name.
 - Type shown as a badge label next to the heading
-- `Estimated` is per-integration (GSPro only) -- controls whether estimated
-  ball flights are forwarded
+- `Use Estimated` is per-mevo (checkbox) -- controls whether estimated (E8)
+  ball flights are emitted when no full (D4) result arrives
 - Mock launch monitor and Random Club are developer-only types (must be added
   manually to the config TOML; they do not appear in the Add dropdown)
 - Add/remove modify the form Vec, save writes back to TOML
@@ -587,8 +588,8 @@ rendered one per row, sorted alphabetically, indented under the actor header.
 
 Detection mode is **global state** (not per-device). The mode selector
 buttons are in the tab bar, between the tab selectors and the title.
-Clicking a mode button emits `ShotDetectionMode` on the bus.
-Launch monitor actors react to `ShotDetectionMode` to reconfigure the device.
+Clicking a mode button emits `SetDetectionMode` on the bus.
+Launch monitor actors react to `SetDetectionMode` events to reconfigure the device.
 
 Each actor shows a name and status badge (green=connected, yellow=starting,
 red=disconnected/reconnecting). Telemetry (battery, tilt, roll, temp)

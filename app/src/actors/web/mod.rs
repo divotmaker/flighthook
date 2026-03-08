@@ -272,10 +272,17 @@ async fn apply_bus_event(
         FlighthookEvent::BallFlight {
             key,
             ball,
-            estimated,
         } => {
             if let Some(acc) = accumulators.get_mut(&(msg.source.clone(), key.clone())) {
-                acc.set_ball(*ball.clone(), *estimated);
+                acc.set_ball(*ball.clone());
+            }
+        }
+        FlighthookEvent::FaceImpact {
+            key,
+            impact,
+        } => {
+            if let Some(acc) = accumulators.get_mut(&(msg.source.clone(), key.clone())) {
+                acc.set_impact(*impact.clone());
             }
         }
         FlighthookEvent::ClubPath { key, club } => {
@@ -337,7 +344,7 @@ async fn apply_bus_event(
                 }
             }
         }
-        // Alert, LaunchMonitorState, ShotDetectionMode, ConfigCommand — no web state update needed
+        // Alert, DeviceInfo (readiness), SetDetectionMode, ConfigCommand — no web state update needed
         _ => {}
     }
 }

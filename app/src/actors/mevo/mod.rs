@@ -17,8 +17,8 @@ use crate::state::SystemState;
 use settings::cam_config;
 
 use flighthook::{
-    ActorStatus, AlertLevel, BallFlight, ClubData,
-    Distance, FlighthookEvent, FlighthookMessage, ShotDetectionMode, ShotKey, Velocity,
+    ActorStatus, BallFlight, ClubData,
+    Distance, FlighthookEvent, FlighthookMessage, Severity, ShotDetectionMode, ShotKey, Velocity,
 };
 
 /// No events for this long → treat as disconnected.
@@ -40,6 +40,7 @@ pub struct MevoActor {
     pub addr: SocketAddr,
     pub initial_mode: ShotDetectionMode,
     pub session_config: SessionConfig,
+    pub use_estimated: bool,
 }
 
 impl Actor for MevoActor {
@@ -47,12 +48,13 @@ impl Actor for MevoActor {
         let addr = self.addr;
         let initial_mode = self.initial_mode;
         let session_config = self.session_config.clone();
+        let use_estimated = self.use_estimated;
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                run(addr, initial_mode, session_config, sender, receiver);
+                run(addr, initial_mode, session_config, use_estimated, sender, receiver);
             })
             .expect("failed to spawn mevo thread");
     }
@@ -87,6 +89,12 @@ impl Actor for MevoActor {
             return ReconfigureOutcome::RestartRequired;
         }
 
+        // Check if use_estimated changed -> restart to apply
+        let new_use_estimated = section.use_estimated.unwrap_or(true);
+        if new_use_estimated != self.use_estimated {
+            return ReconfigureOutcome::RestartRequired;
+        }
+
         ReconfigureOutcome::Applied
     }
 }
@@ -106,18 +114,28 @@ fn emit_device_status(sender: &BusSender, status: ActorStatus, telemetry: HashMa
     }));
 }
 
-fn emit_alert(sender: &BusSender, level: AlertLevel, message: impl Into<String>) {
+fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>) {
     sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-        level,
+        severity,
         message: message.into(),
     }));
 }
 
-fn emit_ready_state(sender: &BusSender, armed: bool) {
-    sender.send(FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
-        armed,
-        ball_detected: armed, // Mevo has no ball sensor
-    }));
+fn emit_device_readiness(sender: &BusSender, armed: bool, device_id: Option<&str>) {
+    let telemetry = HashMap::from([
+        ("armed".into(), armed.to_string()),
+        ("ball_detected".into(), armed.to_string()), // Mevo has no ball sensor
+    ]);
+    let mut msg = FlighthookMessage::new(FlighthookEvent::DeviceInfo {
+        manufacturer: None,
+        model: None,
+        firmware: None,
+        telemetry: Some(telemetry),
+    });
+    if let Some(dev) = device_id {
+        msg = msg.device(dev);
+    }
+    sender.send(msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +146,7 @@ fn run(
     addr: SocketAddr,
     initial_mode: ShotDetectionMode,
     initial_session_config: SessionConfig,
+    use_estimated: bool,
     sender: BusSender,
     mut receiver: BusReceiver,
 ) {
@@ -145,6 +164,7 @@ fn run(
         match connect_and_run(
             &addr,
             initial_mode,
+            use_estimated,
             &sender,
             &mut receiver,
             &mut session_config,
@@ -155,7 +175,7 @@ fn run(
                 warn!("session error: {e}");
                 emit_alert(
                     &sender,
-                    AlertLevel::Warn,
+                    Severity::Warn,
                     format!("Device connection error: {e}"),
                 );
                 let backoff_status = if ever_connected {
@@ -164,7 +184,7 @@ fn run(
                     ActorStatus::Disconnected
                 };
                 emit_device_status(&sender, backoff_status, HashMap::new());
-                emit_ready_state(&sender, false);
+                emit_device_readiness(&sender, false, None);
 
                 let verb = if ever_connected {
                     "Reconnecting"
@@ -196,6 +216,7 @@ fn run(
 fn connect_and_run(
     addr: &SocketAddr,
     initial_mode: ShotDetectionMode,
+    use_estimated: bool,
     sender: &BusSender,
     receiver: &mut BusReceiver,
     session_config: &mut SessionConfig,
@@ -245,9 +266,10 @@ fn connect_and_run(
     // 4. Event loop state
     let mut current_mode = initial_mode;
     let mut pending_reconfig: Option<ShotDetectionMode> = None;
+    let mut device_id: Option<String> = None;
 
     // Shot lifecycle state
-    let mut shot_counter: i32 = 0;
+    let mut shot_counter: u32 = 0;
     let mut current_shot_key: Option<ShotKey> = None;
     let mut shot_had_d4 = false;
     let mut stashed_e8: Option<ironsight::protocol::shot::FlightResultV1> = None;
@@ -272,7 +294,7 @@ fn connect_and_run(
                 }
                 Ok(None) => break,
                 Ok(Some(msg)) => match msg.event {
-                    FlighthookEvent::ShotDetectionMode { mode: new_mode } => {
+                    FlighthookEvent::SetDetectionMode { mode: new_mode } => {
                         if !same_mode(current_mode, new_mode) {
                             if client.is_armed() {
                                 let new_wire = SessionConfig::mode_label(&new_mode);
@@ -288,7 +310,7 @@ fn connect_and_run(
                                 telemetry.insert("armed".into(), "false".into());
                                 telemetry.insert("mode".into(), new_wire.into());
                                 emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                                emit_ready_state(sender, false);
+                                emit_device_readiness(sender, false, device_id.as_deref());
                             } else {
                                 pending_reconfig = Some(new_mode);
                                 info!(
@@ -318,18 +340,37 @@ fn connect_and_run(
                 match event {
                     BinaryEvent::Handshake(h) => {
                         let gen_label = h.dsp.hw_info.device_gen().label();
-                        let device_info = format!("{} ({})", h.avr.dev_info.text, gen_label);
+                        let info_text = format!("{} ({})", h.avr.dev_info.text, gen_label);
                         let battery_pct = h.dsp.status.battery_percent();
                         let external_power = h.dsp.status.external_power();
                         let tilt = h.avr.status.tilt;
                         let roll = -h.avr.status.roll;
 
+                        // Capture SSID as FRP device identity
+                        let ssid = h.pi.ssid.clone();
+                        if !ssid.is_empty() {
+                            device_id = Some(ssid.clone());
+                            info!("device identity: {ssid}");
+                        }
+
                         info!(
-                            "handshake complete: {device_info} | battery {battery_pct}%{} | tilt {tilt:.1} roll {roll:.1}",
+                            "handshake complete: {info_text} | battery {battery_pct}%{} | tilt {tilt:.1} roll {roll:.1}",
                             if external_power { " (charging)" } else { "" },
                         );
 
-                        telemetry.insert("device_info".into(), device_info);
+                        // Emit DeviceInfo event
+                        let mut msg = FlighthookMessage::new(FlighthookEvent::DeviceInfo {
+                            manufacturer: Some("FlightScope".into()),
+                            model: Some(h.avr.dev_info.text.clone()),
+                            firmware: None,
+                            telemetry: None,
+                        });
+                        if let Some(ref dev) = device_id {
+                            msg = msg.device(dev);
+                        }
+                        sender.send(msg);
+
+                        telemetry.insert("device_info".into(), info_text);
                         telemetry.insert("battery_pct".into(), battery_pct.to_string());
                         telemetry.insert("tilt".into(), format!("{tilt:.1}"));
                         telemetry.insert("roll".into(), format!("{roll:.1}"));
@@ -338,7 +379,7 @@ fn connect_and_run(
                         telemetry.insert("armed".into(), "false".into());
                         telemetry.insert("shooting".into(), "false".into());
                         emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                        emit_ready_state(sender, false);
+                        emit_device_readiness(sender, false, device_id.as_deref());
                     }
 
                     BinaryEvent::Disarmed => {
@@ -358,7 +399,7 @@ fn connect_and_run(
                         telemetry.insert("shooting".into(), "false".into());
                         telemetry.insert("mode".into(), wire.into());
                         emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                        emit_ready_state(sender, true);
+                        emit_device_readiness(sender, true, device_id.as_deref());
 
                         // Apply pending reconfig now that we're idle
                         if let Some(target) = pending_reconfig.take() {
@@ -382,7 +423,7 @@ fn connect_and_run(
                             telemetry.insert("armed".into(), "false".into());
                             telemetry.insert("mode".into(), target_wire.into());
                             emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                            emit_ready_state(sender, false);
+                            emit_device_readiness(sender, false, device_id.as_deref());
                         }
                     }
 
@@ -393,15 +434,19 @@ fn connect_and_run(
                             shot_number: shot_counter,
                         };
                         debug!("ball trigger detected — shot_id={}", key.shot_id);
-                        sender.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
+                        let mut msg = FlighthookMessage::new(FlighthookEvent::ShotTrigger {
                             key: key.clone(),
-                        }));
+                        });
+                        if let Some(ref dev) = device_id {
+                            msg = msg.device(dev);
+                        }
+                        sender.send(msg);
                         current_shot_key = Some(key);
                         shot_had_d4 = false;
                         stashed_e8 = None;
                         telemetry.insert("shooting".into(), "true".into());
                         emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                        emit_ready_state(sender, false);
+                        emit_device_readiness(sender, false, device_id.as_deref());
                     }
 
                     BinaryEvent::ShotDatum(datum) => {
@@ -413,20 +458,23 @@ fn connect_and_run(
                                     info!(
                                         "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm",
                                         key.shot_number,
-                                        ball.launch_speed.as_mph(),
-                                        ball.launch_elevation,
-                                        ball.launch_azimuth,
+                                        ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
+                                        ball.launch_elevation.unwrap_or(0.0),
+                                        ball.launch_azimuth.unwrap_or(0.0),
                                         ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
                                         ball.backspin_rpm.unwrap_or(0),
                                         ball.sidespin_rpm.unwrap_or(0),
                                     );
-                                    sender.send(FlighthookMessage::new(
+                                    let mut msg = FlighthookMessage::new(
                                         FlighthookEvent::BallFlight {
                                             key: key.clone(),
                                             ball: Box::new(ball),
-                                            estimated: false,
                                         },
-                                    ));
+                                    );
+                                    if let Some(ref dev) = device_id {
+                                        msg = msg.device(dev);
+                                    }
+                                    sender.send(msg);
                                 }
                                 ShotDatum::FlightV1(e8) => {
                                     debug!("stashed E8 for fallback");
@@ -434,12 +482,16 @@ fn connect_and_run(
                                 }
                                 ShotDatum::Club(ed) => {
                                     let club = club_from_ed(&ed);
-                                    sender.send(FlighthookMessage::new(
+                                    let mut msg = FlighthookMessage::new(
                                         FlighthookEvent::ClubPath {
                                             key: key.clone(),
                                             club: Box::new(club),
                                         },
-                                    ));
+                                    );
+                                    if let Some(ref dev) = device_id {
+                                        msg = msg.device(dev);
+                                    }
+                                    sender.send(msg);
                                 }
                                 ShotDatum::Spin(_) => {
                                     // Spin axis / total spin are derived from
@@ -453,41 +505,55 @@ fn connect_and_run(
                         if let Some(key) = current_shot_key.take() {
                             // E8 fallback: emit BallFlight from stashed E8 if no D4
                             if !shot_had_d4 {
-                                if let Some(e8) = stashed_e8.take() {
-                                    let ball = ball_from_e8(&e8);
-                                    info!(
-                                        "shot #{} (E8): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd",
-                                        key.shot_number,
-                                        ball.launch_speed.as_mph(),
-                                        ball.launch_elevation,
-                                        ball.launch_azimuth,
-                                        ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
-                                    );
-                                    sender.send(FlighthookMessage::new(
-                                        FlighthookEvent::BallFlight {
-                                            key: key.clone(),
-                                            ball: Box::new(ball),
-                                            estimated: true,
-                                        },
-                                    ));
-                                } else {
-                                    warn!(
-                                        "shot #{} processed but no flight result (D4 or E8)",
-                                        key.shot_number,
-                                    );
-                                    emit_alert(
-                                        sender,
-                                        AlertLevel::Warn,
-                                        format!(
-                                            "Shot #{} triggered but no flight result produced",
+                                if use_estimated {
+                                    if let Some(e8) = stashed_e8.take() {
+                                        let ball = ball_from_e8(&e8);
+                                        info!(
+                                            "shot #{} (E8): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd",
                                             key.shot_number,
-                                        ),
+                                            ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
+                                            ball.launch_elevation.unwrap_or(0.0),
+                                            ball.launch_azimuth.unwrap_or(0.0),
+                                            ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
+                                        );
+                                        let mut msg = FlighthookMessage::new(
+                                            FlighthookEvent::BallFlight {
+                                                key: key.clone(),
+                                                ball: Box::new(ball),
+                                            },
+                                        );
+                                        if let Some(ref dev) = device_id {
+                                            msg = msg.device(dev);
+                                        }
+                                        sender.send(msg);
+                                    } else {
+                                        warn!(
+                                            "shot #{} processed but no flight result (D4 or E8)",
+                                            key.shot_number,
+                                        );
+                                        emit_alert(
+                                            sender,
+                                            Severity::Warn,
+                                            format!(
+                                                "Shot #{} triggered but no flight result produced",
+                                                key.shot_number,
+                                            ),
+                                        );
+                                    }
+                                } else {
+                                    info!(
+                                        "shot #{} had only E8 (estimated) — skipped (use_estimated=false)",
+                                        key.shot_number,
                                     );
                                 }
                             }
-                            sender.send(FlighthookMessage::new(
+                            let mut msg = FlighthookMessage::new(
                                 FlighthookEvent::ShotFinished { key },
-                            ));
+                            );
+                            if let Some(ref dev) = device_id {
+                                msg = msg.device(dev);
+                            }
+                            sender.send(msg);
                         }
                         stashed_e8 = None;
                         shot_had_d4 = false;
@@ -515,7 +581,7 @@ fn connect_and_run(
                             telemetry.insert("armed".into(), "false".into());
                             telemetry.insert("mode".into(), target_wire.into());
                             emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                            emit_ready_state(sender, false);
+                            emit_device_readiness(sender, false, device_id.as_deref());
                         }
                     }
 
@@ -579,7 +645,7 @@ fn connect_and_run(
             Err(ref e @ ConnError::Wire(_)) | Err(ref e @ ConnError::Protocol(_)) => {
                 warn!(message = "Could not process message", error = ?e);
                 sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    level: AlertLevel::Warn,
+                    severity: Severity::Warn,
                     message: format!("Could not process message: {e:?}"),
                 }));
             }
@@ -605,9 +671,9 @@ fn connect_and_run(
 
 fn ball_from_d4(d4: &ironsight::protocol::shot::FlightResult) -> BallFlight {
     BallFlight {
-        launch_speed: Velocity::MetersPerSecond(d4.launch_speed),
-        launch_elevation: d4.launch_elevation,
-        launch_azimuth: d4.launch_azimuth,
+        launch_speed: Some(Velocity::MetersPerSecond(d4.launch_speed)),
+        launch_elevation: Some(d4.launch_elevation),
+        launch_azimuth: Some(d4.launch_azimuth),
         carry_distance: Some(Distance::Meters(d4.carry_distance)),
         total_distance: None,
         max_height: Some(Distance::Meters(d4.max_height)),
@@ -620,9 +686,9 @@ fn ball_from_d4(d4: &ironsight::protocol::shot::FlightResult) -> BallFlight {
 
 fn ball_from_e8(e8: &ironsight::protocol::shot::FlightResultV1) -> BallFlight {
     BallFlight {
-        launch_speed: Velocity::MetersPerSecond(e8.ball_velocity),
-        launch_elevation: e8.elevation,
-        launch_azimuth: e8.azimuth,
+        launch_speed: Some(Velocity::MetersPerSecond(e8.ball_velocity)),
+        launch_elevation: Some(e8.elevation),
+        launch_azimuth: Some(e8.azimuth),
         carry_distance: Some(Distance::Meters(e8.distance)),
         total_distance: None,
         max_height: Some(Distance::Meters(e8.height)),
@@ -635,7 +701,7 @@ fn ball_from_e8(e8: &ironsight::protocol::shot::FlightResultV1) -> BallFlight {
 
 fn club_from_ed(ed: &ironsight::protocol::shot::ClubResult) -> ClubData {
     ClubData {
-        club_speed: Velocity::MetersPerSecond(ed.pre_club_speed),
+        club_speed: Some(Velocity::MetersPerSecond(ed.pre_club_speed)),
         path: Some(ed.strike_direction),
         attack_angle: Some(ed.attack_angle),
         face_angle: Some(ed.face_angle),

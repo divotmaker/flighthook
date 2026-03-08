@@ -1,5 +1,5 @@
 use crate::app::FlighthookApp;
-use crate::types::{AlertLevel, FlighthookEvent};
+use crate::types::{FlighthookEvent, Severity};
 
 use super::extract_time;
 
@@ -7,25 +7,27 @@ use super::extract_time;
 pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "alert_error",
     "alert_warn",
+    "alert_critical",
     "shot_trigger",
     "ball_flight",
     "club_path",
+    "face_impact",
     "shot_finished",
-    "ready_state",
+    "device_info",
     "actor_status",
     "player_info",
     "club_info",
-    "mode",
+    "set_detection_mode",
     "config_command",
     "config_outcome",
 ];
 
 /// Filter groups for the dropdown.
 const FILTER_GROUPS: &[(&str, &[&str])] = &[
-    ("Launch Monitor", &["shot_trigger", "ball_flight", "club_path", "shot_finished", "ready_state"]),
-    ("Game", &["player_info", "club_info", "mode"]),
+    ("Launch Monitor", &["shot_trigger", "ball_flight", "club_path", "face_impact", "shot_finished", "device_info"]),
+    ("Game", &["player_info", "club_info", "set_detection_mode"]),
     ("System", &["actor_status", "config_command", "config_outcome"]),
-    ("Alert", &["alert_error", "alert_warn"]),
+    ("Alert", &["alert_error", "alert_warn", "alert_critical"]),
 ];
 
 /// Return the root FlighthookEvent kind (the serde `kind` tag).
@@ -34,25 +36,27 @@ pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
         FlighthookEvent::ShotTrigger { .. } => "shot_trigger",
         FlighthookEvent::BallFlight { .. } => "ball_flight",
         FlighthookEvent::ClubPath { .. } => "club_path",
+        FlighthookEvent::FaceImpact { .. } => "face_impact",
         FlighthookEvent::ShotFinished { .. } => "shot_finished",
-        FlighthookEvent::LaunchMonitorState { .. } => "ready_state",
+        FlighthookEvent::DeviceInfo { .. } => "device_info",
         FlighthookEvent::PlayerInfo { .. } => "player_info",
         FlighthookEvent::ClubInfo { .. } => "club_info",
-        FlighthookEvent::ShotDetectionMode { .. } => "mode",
+        FlighthookEvent::SetDetectionMode { .. } => "set_detection_mode",
         FlighthookEvent::ActorStatus { .. } => "actor_status",
         FlighthookEvent::ConfigCommand { .. } => "config_command",
         FlighthookEvent::ConfigOutcome { .. } => "config_outcome",
-        FlighthookEvent::Alert { level, .. } => match level {
-            AlertLevel::Error => "alert_error",
-            AlertLevel::Warn => "alert_warn",
+        FlighthookEvent::Alert { severity, .. } => match severity {
+            Severity::Critical => "alert_critical",
+            Severity::Error => "alert_error",
+            Severity::Warn => "alert_warn",
         },
     }
 }
 
-/// Extract the alert level if this is an Alert event, otherwise None.
-pub(crate) fn alert_level(event: &FlighthookEvent) -> Option<AlertLevel> {
+/// Extract the alert severity if this is an Alert event, otherwise None.
+pub(crate) fn alert_severity(event: &FlighthookEvent) -> Option<Severity> {
     match event {
-        FlighthookEvent::Alert { level, .. } => Some(*level),
+        FlighthookEvent::Alert { severity, .. } => Some(*severity),
         _ => None,
     }
 }
@@ -61,31 +65,35 @@ pub(crate) fn alert_level(event: &FlighthookEvent) -> Option<AlertLevel> {
 pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
     match event {
         FlighthookEvent::ShotTrigger { key } => format!("trigger #{}", key.shot_number),
-        FlighthookEvent::BallFlight { key, estimated, .. } => {
-            format!(
-                "ball #{}{}",
-                key.shot_number,
-                if *estimated { " (estimated)" } else { "" }
-            )
+        FlighthookEvent::BallFlight { key, .. } => {
+            format!("ball #{}", key.shot_number)
         }
         FlighthookEvent::ClubPath { key, .. } => format!("club #{}", key.shot_number),
+        FlighthookEvent::FaceImpact { key, .. } => format!("impact #{}", key.shot_number),
         FlighthookEvent::ShotFinished { key } => format!("finished #{}", key.shot_number),
-        FlighthookEvent::LaunchMonitorState {
-            armed,
-            ball_detected,
-        } => format!("armed={armed} ball={ball_detected}"),
+        FlighthookEvent::DeviceInfo { manufacturer, model, telemetry, .. } => {
+            // Show readiness if telemetry has armed/ball_detected, otherwise show device identity
+            if let Some(tel) = telemetry
+                && (tel.contains_key("armed") || tel.contains_key("ball_detected"))
+            {
+                let armed = tel.get("armed").map(|v| v.as_str()).unwrap_or("?");
+                let ball = tel.get("ball_detected").map(|v| v.as_str()).unwrap_or("?");
+                return format!("armed={armed} ball={ball}");
+            }
+            format!("device_info: {} {}", manufacturer.as_deref().unwrap_or("?"), model.as_deref().unwrap_or("?"))
+        }
         FlighthookEvent::PlayerInfo { player_info } => {
             format!("handed={}", player_info.handed)
         }
         FlighthookEvent::ClubInfo { club_info } => format!("club={}", club_info.club),
-        FlighthookEvent::ShotDetectionMode { mode } => format!("{mode:?}"),
+        FlighthookEvent::SetDetectionMode { mode } => format!("{mode:?}"),
         FlighthookEvent::ActorStatus { status, .. } => format!("{status:?}"),
         FlighthookEvent::ConfigCommand { action, .. } => format!("{action:?}"),
         FlighthookEvent::ConfigOutcome { request_id, .. } => match request_id {
             Some(rid) => format!("outcome({rid})"),
             None => "outcome".into(),
         },
-        FlighthookEvent::Alert { level, message } => format!("[{level}] {message}"),
+        FlighthookEvent::Alert { severity, message } => format!("[{severity}] {message}"),
     }
 }
 
@@ -208,9 +216,9 @@ impl FlighthookApp {
                         let time_str = extract_time(&entry.timestamp);
 
                         // Pick text color for alerts
-                        let text_color = match entry.alert_level {
-                            Some(AlertLevel::Error) => Some(error_color),
-                            Some(AlertLevel::Warn) => Some(warn_color),
+                        let text_color = match entry.alert_severity {
+                            Some(Severity::Error | Severity::Critical) => Some(error_color),
+                            Some(Severity::Warn) => Some(warn_color),
                             None => None,
                         };
 

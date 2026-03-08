@@ -2,7 +2,7 @@
 //! housekeeping for updating `SystemState`.
 //!
 //! Subscribes to the bus and processes game state events (PlayerInfo,
-//! ClubInfo, ShotDetectionMode) to keep `GameState` in sync.
+//! ClubInfo, SetDetectionMode) to keep `GameState` in sync.
 //! Also processes `ConfigCommand` events for config mutations (from the
 //! REST API). This runs independently of the web server, so `SystemState`
 //! is always consistent even in headless mode.
@@ -250,20 +250,21 @@ fn run(
                     let mode = state.system.snapshot().club_mode(club_info.club);
                     writer.set_mode(mode);
                     sender.send(FlighthookMessage::new(
-                        FlighthookEvent::ShotDetectionMode { mode },
+                        FlighthookEvent::SetDetectionMode { mode },
                     ));
                 }
-                FlighthookEvent::ShotDetectionMode { mode } => {
+                FlighthookEvent::SetDetectionMode { mode } => {
                     writer.set_mode(*mode);
                 }
-                FlighthookEvent::LaunchMonitorState {
-                    armed,
-                    ball_detected,
-                } => {
+                FlighthookEvent::DeviceInfo {
+                    telemetry: Some(tel), ..
+                } if tel.contains_key("armed") || tel.contains_key("ball_detected") => {
+                    let armed = tel.get("armed").is_some_and(|v| v == "true");
+                    let ball = tel.get("ball_detected").is_some_and(|v| v == "true");
                     writer.set_launch_monitor_state(
                         msg.source.clone(),
-                        *armed,
-                        *ball_detected,
+                        armed,
+                        ball,
                     );
                 }
                 FlighthookEvent::ActorStatus {

@@ -61,7 +61,7 @@ fn mode_str(mode: ShotDetectionMode) -> &'static str {
     }
 }
 
-fn telemetry(shot_count: i32, mode: ShotDetectionMode) -> HashMap<String, String> {
+fn telemetry(shot_count: u32, mode: ShotDetectionMode) -> HashMap<String, String> {
     HashMap::from([
         (
             "device_info".into(),
@@ -74,7 +74,7 @@ fn telemetry(shot_count: i32, mode: ShotDetectionMode) -> HashMap<String, String
 
 fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusReceiver) {
     let mut current_mode = initial_mode;
-    let mut shot_count: i32 = 0;
+    let mut shot_count: u32 = 0;
     let mut phase = Phase::Idle {
         since: Instant::now(),
     };
@@ -83,9 +83,14 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
         status: ActorStatus::Connected,
         telemetry: telemetry(shot_count, current_mode),
     }));
-    sender.send(FlighthookMessage::new(FlighthookEvent::LaunchMonitorState {
-        armed: false,
-        ball_detected: false,
+    sender.send(FlighthookMessage::new(FlighthookEvent::DeviceInfo {
+        manufacturer: None,
+        model: None,
+        firmware: None,
+        telemetry: Some(HashMap::from([
+            ("armed".into(), "false".into()),
+            ("ball_detected".into(), "false".into()),
+        ])),
     }));
     info!("mock: connected -- arming in {ARM_DELAY:?}");
 
@@ -103,7 +108,7 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
                 }
                 Ok(None) => break,
                 Ok(Some(msg)) => {
-                    if let FlighthookEvent::ShotDetectionMode { mode } = msg.event
+                    if let FlighthookEvent::SetDetectionMode { mode } = msg.event
                         && std::mem::discriminant(&current_mode)
                             != std::mem::discriminant(&mode)
                     {
@@ -126,12 +131,15 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
         match phase {
             Phase::Idle { since } if since.elapsed() >= ARM_DELAY => {
                 info!("mock: armed -- waiting for ball");
-                sender.send(FlighthookMessage::new(
-                    FlighthookEvent::LaunchMonitorState {
-                        armed: true,
-                        ball_detected: false,
-                    },
-                ));
+                sender.send(FlighthookMessage::new(FlighthookEvent::DeviceInfo {
+                    manufacturer: None,
+                    model: None,
+                    firmware: None,
+                    telemetry: Some(HashMap::from([
+                        ("armed".into(), "true".into()),
+                        ("ball_detected".into(), "false".into()),
+                    ])),
+                }));
                 let mut t = telemetry(shot_count, current_mode);
                 t.insert("armed".into(), "true".into());
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
@@ -144,12 +152,15 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
             }
             Phase::Armed { since } if since.elapsed() >= BALL_READY_DELAY => {
                 info!("mock: ball detected -- ready to fire");
-                sender.send(FlighthookMessage::new(
-                    FlighthookEvent::LaunchMonitorState {
-                        armed: true,
-                        ball_detected: true,
-                    },
-                ));
+                sender.send(FlighthookMessage::new(FlighthookEvent::DeviceInfo {
+                    manufacturer: None,
+                    model: None,
+                    firmware: None,
+                    telemetry: Some(HashMap::from([
+                        ("armed".into(), "true".into()),
+                        ("ball_detected".into(), "true".into()),
+                    ])),
+                }));
                 phase = Phase::Ready {
                     since: Instant::now(),
                 };
@@ -163,23 +174,26 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
                 };
                 let (ball, club) = generate_shot(shot_count, current_mode);
 
-                let ball_mph = ball.launch_speed.as_mph();
+                let ball_mph = ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0);
                 let carry_yd = ball
                     .carry_distance
                     .map(|d| d.as_yards())
                     .unwrap_or(0.0);
                 info!(
                     "mock shot #{}: ball={:.1}mph VLA={:.1} carry={:.1}yd",
-                    shot_count, ball_mph, ball.launch_elevation, carry_yd,
+                    shot_count, ball_mph, ball.launch_elevation.unwrap_or(0.0), carry_yd,
                 );
 
                 // Disarm
-                sender.send(FlighthookMessage::new(
-                    FlighthookEvent::LaunchMonitorState {
-                        armed: false,
-                        ball_detected: false,
-                    },
-                ));
+                sender.send(FlighthookMessage::new(FlighthookEvent::DeviceInfo {
+                    manufacturer: None,
+                    model: None,
+                    firmware: None,
+                    telemetry: Some(HashMap::from([
+                        ("armed".into(), "false".into()),
+                        ("ball_detected".into(), "false".into()),
+                    ])),
+                }));
                 let mut shooting = telemetry(shot_count, current_mode);
                 shooting.insert("shooting".into(), "true".into());
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
@@ -194,7 +208,6 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
                 sender.send(FlighthookMessage::new(FlighthookEvent::BallFlight {
                     key: key.clone(),
                     ball: Box::new(ball),
-                    estimated: false,
                 }));
                 sender.send(FlighthookMessage::new(FlighthookEvent::ClubPath {
                     key: key.clone(),
@@ -226,7 +239,7 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
 }
 
 fn generate_shot(
-    n: i32,
+    n: u32,
     mode: ShotDetectionMode,
 ) -> (BallFlight, ClubData) {
     let v = (n as f64 * 0.7).sin(); // -1..1 variation seed
@@ -275,9 +288,9 @@ fn generate_shot(
     let path = hla * 0.4;
 
     let ball = BallFlight {
-        launch_speed: Velocity::MetersPerSecond(ball_speed),
-        launch_elevation: vla,
-        launch_azimuth: hla,
+        launch_speed: Some(Velocity::MetersPerSecond(ball_speed)),
+        launch_elevation: Some(vla),
+        launch_azimuth: Some(hla),
         carry_distance: Some(Distance::Meters(carry)),
         total_distance: Some(Distance::Meters(carry * 1.1)),
         max_height: Some(Distance::Meters(height)),
@@ -287,7 +300,7 @@ fn generate_shot(
         sidespin_rpm: Some(sidespin as i32),
     };
     let club = ClubData {
-        club_speed: Velocity::MetersPerSecond(club_speed),
+        club_speed: Some(Velocity::MetersPerSecond(club_speed)),
         path: Some(path),
         attack_angle: Some(aoa),
         face_angle: Some(face_angle),

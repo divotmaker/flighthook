@@ -4,7 +4,7 @@ use std::net::TcpStream;
 use super::BridgeError;
 use super::api;
 use crate::bus::BusSender;
-use flighthook::{AlertLevel, Club, ClubInfo, FlighthookEvent, FlighthookMessage, PlayerInfo};
+use flighthook::{Club, ClubInfo, FlighthookEvent, FlighthookMessage, PlayerInfo, Severity};
 
 pub(crate) fn send_message(
     stream: &mut TcpStream,
@@ -69,7 +69,7 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
                 } else {
                     tracing::warn!("gspro <- GSPro returned {}: {}", resp.code, resp.message);
                     sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                        level: AlertLevel::Warn,
+                        severity: Severity::Warn,
                         message: format!("GSPro returned {}: {}", resp.code, resp.message),
                     }));
                 }
@@ -91,7 +91,7 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
                         } else {
                             tracing::warn!("gspro: unknown club code '{club_str}', ignoring");
                             sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                                level: AlertLevel::Warn,
+                                severity: Severity::Warn,
                                 message: format!("GSPro: unknown club code '{club_str}'"),
                             }));
                         }
@@ -102,7 +102,7 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
                 if !parsed_any {
                     tracing::warn!("gspro <- parse error: {e}");
                     sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                        level: AlertLevel::Warn,
+                        severity: Severity::Warn,
                         message: format!("Could not parse GSPro response: {e}"),
                     }));
                 }

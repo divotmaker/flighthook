@@ -21,7 +21,7 @@ use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use flighthook::{
-    ActorStatus, AlertLevel, EstimatedMode, FlighthookEvent, FlighthookMessage,
+    ActorStatus, FlighthookEvent, FlighthookMessage, Severity,
     ShotAccumulator, ShotDetectionMode, ShotKey,
 };
 
@@ -40,15 +40,6 @@ impl fmt::Display for BridgeError {
     }
 }
 
-/// Decide whether an estimated ball flight should be forwarded.
-fn should_forward_estimated(mode: ShotDetectionMode, use_estimated: EstimatedMode) -> bool {
-    match use_estimated {
-        EstimatedMode::Always => true,
-        EstimatedMode::ChippingOnly => matches!(mode, ShotDetectionMode::Chipping),
-        EstimatedMode::Never => false,
-    }
-}
-
 /// Per-mode launch monitor routing configuration.
 #[derive(Debug, Clone, Default)]
 pub struct GsProRouting {
@@ -62,19 +53,17 @@ pub struct GsProRouting {
 pub struct GsProActor {
     pub addr: SocketAddr,
     pub routing: GsProRouting,
-    pub use_estimated: EstimatedMode,
 }
 
 impl Actor for GsProActor {
     fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let addr = self.addr;
         let routing = self.routing.clone();
-        let use_estimated = self.use_estimated;
         let thread_name = format!("gspro:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
-            .spawn(move || run(addr, routing, use_estimated, sender, receiver))
+            .spawn(move || run(addr, routing, sender, receiver))
             .expect("failed to spawn gspro thread");
     }
 
@@ -108,18 +97,12 @@ impl Actor for GsProActor {
             return ReconfigureOutcome::RestartRequired;
         }
 
-        // Check use_estimated changes
-        let new_estimated = section.use_estimated.unwrap_or_default();
-        if new_estimated != self.use_estimated {
-            return ReconfigureOutcome::RestartRequired;
-        }
-
         ReconfigureOutcome::Applied
     }
 }
 
 /// Main bridge loop. Reconnects forever until the bus closes.
-fn run(addr: SocketAddr, routing: GsProRouting, use_estimated: EstimatedMode, sender: BusSender, mut receiver: BusReceiver) {
+fn run(addr: SocketAddr, routing: GsProRouting, sender: BusSender, mut receiver: BusReceiver) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
 
@@ -128,7 +111,7 @@ fn run(addr: SocketAddr, routing: GsProRouting, use_estimated: EstimatedMode, se
             tracing::info!("gspro bridge: shutting down");
             return;
         }
-        match connect_and_run(addr, &routing, use_estimated, &sender, &mut receiver) {
+        match connect_and_run(addr, &routing, &sender, &mut receiver) {
             Ok(()) => {
                 tracing::info!("gspro bridge: shutting down");
                 return;
@@ -140,7 +123,7 @@ fn run(addr: SocketAddr, routing: GsProRouting, use_estimated: EstimatedMode, se
             Err(e) => {
                 tracing::info!("gspro bridge: {e}, reconnecting in {backoff:?}");
                 sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    level: AlertLevel::Error,
+                    severity: Severity::Error,
                     message: format!("GSPro connection failed: {e}"),
                 }));
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
@@ -192,7 +175,6 @@ fn shot_matches_routing(routing: &GsProRouting, mode: ShotDetectionMode, source:
 fn connect_and_run(
     addr: SocketAddr,
     routing: &GsProRouting,
-    use_estimated: EstimatedMode,
     sender: &BusSender,
     receiver: &mut BusReceiver,
 ) -> Result<(), BridgeError> {
@@ -231,7 +213,7 @@ fn connect_and_run(
             Ok(0) => {
                 tracing::warn!("gspro <- connection closed");
                 sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    level: AlertLevel::Warn,
+                    severity: Severity::Warn,
                     message: "GSPro closed the connection".into(),
                 }));
                 return Err(BridgeError::Io(std::io::Error::new(
@@ -256,7 +238,7 @@ fn connect_and_run(
             Err(e) => {
                 tracing::warn!("gspro <- read error: {e}");
                 sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    level: AlertLevel::Warn,
+                    severity: Severity::Warn,
                     message: format!("GSPro read error: {e}"),
                 }));
                 return Err(BridgeError::Io(e));
@@ -278,12 +260,21 @@ fn connect_and_run(
                     FlighthookEvent::BallFlight {
                         ref key,
                         ref ball,
-                        estimated,
                     } => {
                         if let Some(acc) =
                             accumulators.get_mut(&(msg.source.clone(), key.clone()))
                         {
-                            acc.set_ball(*ball.clone(), estimated);
+                            acc.set_ball(*ball.clone());
+                        }
+                    }
+                    FlighthookEvent::FaceImpact {
+                        ref key,
+                        ref impact,
+                    } => {
+                        if let Some(acc) =
+                            accumulators.get_mut(&(msg.source.clone(), key.clone()))
+                        {
+                            acc.set_impact(*impact.clone());
                         }
                     }
                     FlighthookEvent::ClubPath { ref key, ref club } => {
@@ -309,27 +300,19 @@ fn connect_and_run(
                                     },
                                 );
                             } else if let Some(shot) = acc.finish() {
-                                if shot.estimated
-                                    && !should_forward_estimated(current_mode, use_estimated)
-                                {
-                                    tracing::debug!(
-                                        "gspro bridge: skipping estimated shot #{} (mode={current_mode:?}, use_estimated={use_estimated:?})",
-                                        shot.shot_number,
-                                    );
-                                } else {
-                                    shot_to_send = Some(Box::new(shot));
-                                }
+                                shot_to_send = Some(Box::new(shot));
                             }
                         }
                     }
-                    FlighthookEvent::LaunchMonitorState {
-                        armed,
-                        ball_detected,
-                    } => {
-                        monitor_state.insert(msg.source.clone(), (armed, ball_detected));
+                    FlighthookEvent::DeviceInfo {
+                        telemetry: Some(ref tel), ..
+                    } if tel.contains_key("armed") || tel.contains_key("ball_detected") => {
+                        let armed = tel.get("armed").is_some_and(|v| v == "true");
+                        let ball = tel.get("ball_detected").is_some_and(|v| v == "true");
+                        monitor_state.insert(msg.source.clone(), (armed, ball));
                         readiness_changed = true;
                     }
-                    FlighthookEvent::ShotDetectionMode { mode } => {
+                    FlighthookEvent::SetDetectionMode { mode } => {
                         current_mode = mode;
                         readiness_changed = true;
                     }
