@@ -88,7 +88,7 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
         model: None,
         firmware: None,
         telemetry: Some(HashMap::from([
-            ("armed".into(), "false".into()),
+            ("ready".into(), "false".into()),
             ("ball_detected".into(), "false".into()),
         ])),
     }));
@@ -136,12 +136,12 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
                     model: None,
                     firmware: None,
                     telemetry: Some(HashMap::from([
-                        ("armed".into(), "true".into()),
+                        ("ready".into(), "true".into()),
                         ("ball_detected".into(), "false".into()),
                     ])),
                 }));
                 let mut t = telemetry(shot_count, current_mode);
-                t.insert("armed".into(), "true".into());
+                t.insert("ready".into(), "true".into());
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
                     status: ActorStatus::Connected,
                     telemetry: t,
@@ -157,7 +157,7 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
                     model: None,
                     firmware: None,
                     telemetry: Some(HashMap::from([
-                        ("armed".into(), "true".into()),
+                        ("ready".into(), "true".into()),
                         ("ball_detected".into(), "true".into()),
                     ])),
                 }));
@@ -190,7 +190,7 @@ fn run(initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRece
                     model: None,
                     firmware: None,
                     telemetry: Some(HashMap::from([
-                        ("armed".into(), "false".into()),
+                        ("ready".into(), "false".into()),
                         ("ball_detected".into(), "false".into()),
                     ])),
                 }));

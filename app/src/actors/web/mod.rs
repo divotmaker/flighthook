@@ -344,7 +344,17 @@ async fn apply_bus_event(
                 }
             }
         }
-        // Alert, DeviceInfo (readiness), SetDetectionMode, ConfigCommand — no web state update needed
+        FlighthookEvent::DeviceInfo {
+            telemetry: Some(tel), ..
+        } => {
+            let mut actors = state.actors.write().await;
+            if let Some(actor) = actors.get_mut(&msg.source) {
+                for (k, v) in tel {
+                    actor.telemetry.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        // Alert, SetDetectionMode, ConfigCommand — no web state update needed
         _ => {}
     }
 }

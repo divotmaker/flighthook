@@ -73,7 +73,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
     // Send current launch monitor states so the client has a complete picture
     for (id, lm) in state.root.game.launch_monitor_states() {
         let telemetry = std::collections::HashMap::from([
-            ("armed".to_string(), lm.armed.to_string()),
+            ("ready".to_string(), lm.ready.to_string()),
             ("ball_detected".to_string(), lm.ball_detected.to_string()),
         ]);
         let msg = FlighthookMessage::new(FlighthookEvent::DeviceInfo {

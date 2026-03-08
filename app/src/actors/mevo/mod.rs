@@ -121,10 +121,10 @@ fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>
     }));
 }
 
-fn emit_device_readiness(sender: &BusSender, armed: bool, device_id: Option<&str>) {
+fn emit_device_readiness(sender: &BusSender, ready: bool, device_id: Option<&str>) {
     let telemetry = HashMap::from([
-        ("armed".into(), armed.to_string()),
-        ("ball_detected".into(), armed.to_string()), // Mevo has no ball sensor
+        ("ready".into(), ready.to_string()),
+        ("ball_detected".into(), ready.to_string()), // Mevo has no ball sensor
     ]);
     let mut msg = FlighthookMessage::new(FlighthookEvent::DeviceInfo {
         manufacturer: None,
@@ -307,7 +307,7 @@ fn connect_and_run(
                                 );
                                 client.arm();
                                 current_mode = new_mode;
-                                telemetry.insert("armed".into(), "false".into());
+                                telemetry.insert("ready".into(), "false".into());
                                 telemetry.insert("mode".into(), new_wire.into());
                                 emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
                                 emit_device_readiness(sender, false, device_id.as_deref());
@@ -376,7 +376,7 @@ fn connect_and_run(
                         telemetry.insert("roll".into(), format!("{roll:.1}"));
                         telemetry.insert("temp_c".into(), "0.0".into());
                         telemetry.insert("external_power".into(), external_power.to_string());
-                        telemetry.insert("armed".into(), "false".into());
+                        telemetry.insert("ready".into(), "false".into());
                         telemetry.insert("shooting".into(), "false".into());
                         emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
                         emit_device_readiness(sender, false, device_id.as_deref());
@@ -395,7 +395,7 @@ fn connect_and_run(
                         let wire = SessionConfig::mode_label(&current_mode);
                         info!("armed -- mode={wire} -- waiting for shots");
 
-                        telemetry.insert("armed".into(), "true".into());
+                        telemetry.insert("ready".into(), "true".into());
                         telemetry.insert("shooting".into(), "false".into());
                         telemetry.insert("mode".into(), wire.into());
                         emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
@@ -420,7 +420,7 @@ fn connect_and_run(
                             };
                             client.configure_avr(avr);
                             client.arm();
-                            telemetry.insert("armed".into(), "false".into());
+                            telemetry.insert("ready".into(), "false".into());
                             telemetry.insert("mode".into(), target_wire.into());
                             emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
                             emit_device_readiness(sender, false, device_id.as_deref());
@@ -578,7 +578,7 @@ fn connect_and_run(
                             };
                             client.configure_avr(avr);
                             client.arm();
-                            telemetry.insert("armed".into(), "false".into());
+                            telemetry.insert("ready".into(), "false".into());
                             telemetry.insert("mode".into(), target_wire.into());
                             emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
                             emit_device_readiness(sender, false, device_id.as_deref());
@@ -595,7 +595,7 @@ fn connect_and_run(
                             telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
                             telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
                             telemetry.insert("external_power".into(), dsp.external_power().to_string());
-                            telemetry.insert("armed".into(), client.is_armed().to_string());
+                            telemetry.insert("ready".into(), client.is_armed().to_string());
                             emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
                         }
                     }
@@ -607,7 +607,7 @@ fn connect_and_run(
                                 telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
                                 telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
                                 telemetry.insert("external_power".into(), dsp.external_power().to_string());
-                                telemetry.insert("armed".into(), client.is_armed().to_string());
+                                telemetry.insert("ready".into(), client.is_armed().to_string());
                                 emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
                             }
                             Message::AvrStatus(avr) => {

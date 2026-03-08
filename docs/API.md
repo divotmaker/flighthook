@@ -29,7 +29,7 @@ Other useful events on the same connection:
 
 - `actor_status` -- device/integration lifecycle + state (battery, tilt, club, etc.)
 - `set_detection_mode` -- detection mode change command (full/chipping/putting)
-- `device_info` -- device identity + telemetry (armed/ball_detected readiness via telemetry keys)
+- `device_info` -- device identity + telemetry (ready/ball_detected readiness via telemetry keys)
 
 ### Terminal
 
@@ -136,7 +136,7 @@ Comprehensive system state (all actors -- launch monitors and integrations).
       "name": "Mevo WiFi",
       "status": "connected",
       "telemetry": {
-        "armed": "true",
+        "ready": "true",
         "battery_pct": "85",
         "tilt": "0.5",
         "roll": "-0.2",
@@ -161,7 +161,7 @@ Comprehensive system state (all actors -- launch monitors and integrations).
 - `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`
 - `telemetry`: actor-specific key/value pairs (all string values)
 
-Common telemetry keys for launch monitors: `armed`, `shooting`, `battery_pct`,
+Common telemetry keys for launch monitors: `ready`, `shooting`, `battery_pct`,
 `tilt`, `roll`, `temp_c`, `external_power`, `device_info`.
 
 Common telemetry keys for integrations: `club`, `handed`, `error`.
@@ -578,7 +578,7 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
 
 Device identification and telemetry. Emitted after handshake with identity fields,
 and re-emitted with telemetry updates (e.g. readiness changes). Readiness state
-is conveyed via `"armed"` and `"ball_detected"` telemetry keys (replacing the
+is conveyed via `"ready"` and `"ball_detected"` telemetry keys (replacing the
 former `launch_monitor_state` event).
 
 ```json
@@ -590,7 +590,7 @@ former `launch_monitor_state` event).
     "manufacturer": "FlightScope",
     "model": "XXXXXXXX, H/W: XXXX v1.0, F/W: 1.00",
     "telemetry": {
-      "armed": "true",
+      "ready": "true",
       "ball_detected": "true"
     }
   }
@@ -598,7 +598,7 @@ former `launch_monitor_state` event).
 ```
 
 - `manufacturer`, `model`, `firmware`: optional identity fields (present on first emission)
-- `telemetry`: optional key/value map. Standard keys: `"armed"`, `"ball_detected"`
+- `telemetry`: optional key/value map. Standard keys: `"ready"`, `"ball_detected"`
 
 ---
 
@@ -664,7 +664,7 @@ and integrations) when their status or telemetry changes.
     "kind": "actor_status",
     "status": "connected",
     "telemetry": {
-      "armed": "true",
+      "ready": "true",
       "battery_pct": "85",
       "tilt": "0.5",
       "roll": "-0.2",

@@ -306,10 +306,10 @@ fn connect_and_run(
                     }
                     FlighthookEvent::DeviceInfo {
                         telemetry: Some(ref tel), ..
-                    } if tel.contains_key("armed") || tel.contains_key("ball_detected") => {
-                        let armed = tel.get("armed").is_some_and(|v| v == "true");
+                    } if tel.contains_key("ready") || tel.contains_key("ball_detected") => {
+                        let ready = tel.get("ready").is_some_and(|v| v == "true");
                         let ball = tel.get("ball_detected").is_some_and(|v| v == "true");
-                        monitor_state.insert(msg.source.clone(), (armed, ball));
+                        monitor_state.insert(msg.source.clone(), (ready, ball));
                         readiness_changed = true;
                     }
                     FlighthookEvent::SetDetectionMode { mode } => {

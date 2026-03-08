@@ -200,8 +200,8 @@ need to emit `ClubInfo`; the SystemActor handles mode derivation
 centrally. Launch monitor actors react to `SetDetectionMode` events to reconfigure
 the device. Mode is global state, not per-device.
 
-Launch monitor readiness (armed/ball_detected) is conveyed via `DeviceInfo`
-telemetry with `"armed"` and `"ball_detected"` keys, rather than a separate
+Launch monitor readiness (ready/ball_detected) is conveyed via `DeviceInfo`
+telemetry with `"ready"` and `"ball_detected"` keys, rather than a separate
 event variant.
 
 ### ActorStatus -- generic actor lifecycle
@@ -217,7 +217,7 @@ pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
 as the cached per-actor state in both the web layer and the UI.
 
 Launch monitor actors use telemetry keys:
-`mode`, `armed`, `shooting`, `battery_pct`, `tilt`, `roll`, `temp_c`,
+`mode`, `ready`, `shooting`, `battery_pct`, `tilt`, `roll`, `temp_c`,
 `external_power`, `device_info`. Mock launch monitors add `shot_count`
 and `tracking_mode`.
 
@@ -308,15 +308,15 @@ Starting -> Connected -> (error) -> Reconnecting -> Connected -> ...
 **Mevo actor mapping** (from internal phases):
 
 - `Connecting | Handshaking | Configuring | Arming` -> `Starting`
-- `Armed` -> `Connected` with `telemetry["armed"] = "true"`
+- `Armed` -> `Connected` with `telemetry["ready"] = "true"`
 - `Shooting` -> `Connected` with `telemetry["shooting"] = "true"`
 - `Disconnected` -> `Disconnected`
 - `Reconnecting` -> `Reconnecting`
 
-Post-shot cycle: `Connected(shooting)` -> `Starting` (re-arm) -> `Connected(armed)`.
+Post-shot cycle: `Connected(shooting)` -> `Starting` (re-arm) -> `Connected(ready)`.
 
 **Integration readiness**: the GSPro actor tracks device readiness from
-`DeviceInfo` telemetry (`"armed"` and `"ball_detected"` keys) and uses them to
+`DeviceInfo` telemetry (`"ready"` and `"ball_detected"` keys) and uses them to
 set `launch_monitor_is_ready` and `launch_monitor_ball_detected` in heartbeats
 and shot messages.
 

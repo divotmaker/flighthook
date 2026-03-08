@@ -9,10 +9,10 @@ use std::sync::{Arc, RwLock};
 
 pub use flighthook::{ClubInfo, GameStateSnapshot, PlayerInfo, ShotDetectionMode};
 
-/// Per-launch-monitor armed/ball-detected state.
+/// Per-launch-monitor ready/ball-detected state.
 #[derive(Debug, Clone, Copy)]
 pub struct LaunchMonitorSnapshot {
-    pub armed: bool,
+    pub ready: bool,
     pub ball_detected: bool,
 }
 
@@ -109,12 +109,12 @@ impl GameStateWriter {
         *self.inner.mode.write().unwrap_or_else(|e| e.into_inner()) = Some(mode);
     }
 
-    pub fn set_launch_monitor_state(&self, id: String, armed: bool, ball_detected: bool) {
+    pub fn set_launch_monitor_state(&self, id: String, ready: bool, ball_detected: bool) {
         self.inner
             .launch_monitors
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id, LaunchMonitorSnapshot { armed, ball_detected });
+            .insert(id, LaunchMonitorSnapshot { ready, ball_detected });
     }
 
     pub fn remove_launch_monitor(&self, id: &str) {

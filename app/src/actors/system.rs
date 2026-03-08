@@ -258,12 +258,12 @@ fn run(
                 }
                 FlighthookEvent::DeviceInfo {
                     telemetry: Some(tel), ..
-                } if tel.contains_key("armed") || tel.contains_key("ball_detected") => {
-                    let armed = tel.get("armed").is_some_and(|v| v == "true");
+                } if tel.contains_key("ready") || tel.contains_key("ball_detected") => {
+                    let ready = tel.get("ready").is_some_and(|v| v == "true");
                     let ball = tel.get("ball_detected").is_some_and(|v| v == "true");
                     writer.set_launch_monitor_state(
                         msg.source.clone(),
-                        armed,
+                        ready,
                         ball,
                     );
                 }
