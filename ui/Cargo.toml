@@ -2,6 +2,7 @@
 name = "flighthook-ui"
 version = "0.1.1"
 edition = "2024"
+rust-version = "1.94"
 description = "egui dashboard for flighthook (WASM + native)"
 license = "MIT OR Apache-2.0"
 keywords = ["golf", "launch-monitor", "egui", "dashboard"]

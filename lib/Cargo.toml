@@ -2,6 +2,7 @@
 name = "flighthook"
 version = "0.1.1"
 edition = "2024"
+rust-version = "1.94"
 description = "flighthook event bus types and schemas"
 license = "MIT OR Apache-2.0"
 keywords = ["golf", "launch-monitor"]

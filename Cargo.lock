@@ -1629,9 +1629,9 @@ dependencies = [
 
 [[package]]
 name = "ironsight"
-version = "0.0.11"
+version = "0.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "388c76124f79bcacb86049c15fe71258b6c3a5273f1784d8a4ba65fcaccea5b8"
+checksum = "69185095b45506684c943decb499af5bf860176bf858fefda9c9069702f2c0fd"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
