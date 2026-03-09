@@ -269,7 +269,9 @@ async fn apply_bus_event(
                 .entry(msg.actor.clone())
                 .or_insert_with(|| new_actor(String::new()));
             actor.status = *status;
-            actor.telemetry = telemetry.clone();
+            for (k, v) in telemetry {
+                actor.telemetry.insert(k.clone(), v.clone());
+            }
             // Cache the raw message for WS replay
             state.cached_actor_status.write().await
                 .insert(msg.actor.clone(), msg.clone());

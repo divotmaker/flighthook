@@ -121,20 +121,28 @@ fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>
     }));
 }
 
-fn emit_device_readiness(sender: &BusSender, ready: bool, device_id: Option<&str>) {
-    let telemetry = HashMap::from([
-        ("ready".into(), ready.to_string()),
-    ]);
-    let mut msg = FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-        manufacturer: None,
-        model: None,
-        firmware: None,
-        telemetry: Some(telemetry),
-    });
-    if let Some(dev) = device_id {
-        msg = msg.device(dev);
+fn stamp_device(msg: FlighthookMessage, device_id: &Option<String>) -> FlighthookMessage {
+    match device_id {
+        Some(dev) => msg.device(dev),
+        None => msg,
     }
-    sender.send(msg);
+}
+
+fn try_emit_device_telemetry(
+    sender: &BusSender,
+    device_id: &Option<String>,
+    telemetry: &HashMap<String, String>,
+) {
+    let Some(dev) = device_id else { return };
+    sender.send(
+        FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            telemetry: Some(telemetry.clone()),
+        })
+        .device(dev),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +160,10 @@ fn run(
     let mut backoff = MIN_BACKOFF;
     let mut session_config = initial_session_config;
     let mut ever_connected = false;
+    // FRP device identity — set on first successful handshake (from SSID),
+    // persists across reconnects. None until handshake completes; no
+    // DeviceTelemetry is emitted before we have a device identity.
+    let mut device_id: Option<String> = None;
 
     loop {
         if receiver.poll().is_err() {
@@ -168,6 +180,7 @@ fn run(
             &mut receiver,
             &mut session_config,
             &mut ever_connected,
+            &mut device_id,
         ) {
             Ok(()) => break,
             Err(e) => {
@@ -183,7 +196,13 @@ fn run(
                     ActorStatus::Disconnected
                 };
                 emit_device_status(&sender, backoff_status, HashMap::new());
-                emit_device_readiness(&sender, false, None);
+                if device_id.is_some() {
+                    try_emit_device_telemetry(
+                        &sender,
+                        &device_id,
+                        &HashMap::from([("ready".into(), "false".into())]),
+                    );
+                }
 
                 let verb = if ever_connected {
                     "Reconnecting"
@@ -212,6 +231,7 @@ fn run(
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn connect_and_run(
     addr: &SocketAddr,
     initial_mode: ShotDetectionMode,
@@ -220,20 +240,19 @@ fn connect_and_run(
     receiver: &mut BusReceiver,
     session_config: &mut SessionConfig,
     ever_connected: &mut bool,
+    device_id: &mut Option<String>,
 ) -> Result<(), ConnError> {
-    let device_id = sender.actor_id();
-
     // 1. Connect
     info!("connecting to {addr}...");
     let mut conn = BinaryConnection::connect_timeout(addr, CONNECT_TIMEOUT)?;
     *ever_connected = true;
 
     // Set up send/recv audit logging callbacks
-    let send_id = device_id.to_string();
+    let send_id = sender.actor_id().to_string();
     conn.set_on_send(move |cmd, dest| {
         tracing::debug!("{send_id} send >> {dest:?} {:?} [{}]", cmd, cmd.debug_hex(dest));
     });
-    let audit_id = device_id.to_string();
+    let audit_id = sender.actor_id().to_string();
     conn.set_on_recv(move |env| {
         let hex: String =
             env.raw
@@ -265,7 +284,6 @@ fn connect_and_run(
     // 4. Event loop state
     let mut current_mode = initial_mode;
     let mut pending_reconfig: Option<ShotDetectionMode> = None;
-    let mut device_id: Option<String> = None;
 
     // Shot lifecycle state
     let mut shot_counter: u32 = 0;
@@ -277,9 +295,10 @@ fn connect_and_run(
     let mut last_event_time = Instant::now();
     let mut idle_count: u32 = 0;
 
-    // Persistent telemetry cache. Updated incrementally, always emitted
-    // in full so downstream consumers never lose fields.
-    let mut telemetry: HashMap<String, String> = HashMap::new();
+    // Device-reported telemetry cache (battery, tilt, roll, temp, ready, etc.).
+    // Updated incrementally, always emitted in full so downstream consumers
+    // never lose fields. Sent via DeviceTelemetry events.
+    let mut device_telemetry: HashMap<String, String> = HashMap::new();
 
     loop {
         // ==============================================================
@@ -305,10 +324,9 @@ fn connect_and_run(
                             );
                             client.arm();
                             current_mode = new_mode;
-                            telemetry.insert("radar_mode".into(), "arming".into());
-                            telemetry.insert("detection_mode".into(), new_wire.into());
-                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                            emit_device_readiness(sender, false, device_id.as_deref());
+                            emit_device_status(sender, ActorStatus::Connected, HashMap::new());
+                            device_telemetry.insert("ready".into(), "false".into());
+                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
                         } else {
                             pending_reconfig = Some(new_mode);
                             info!(
@@ -341,7 +359,7 @@ fn connect_and_run(
                         // Capture SSID as FRP device identity
                         let ssid = h.pi.ssid.clone();
                         if !ssid.is_empty() {
-                            device_id = Some(ssid.clone());
+                            *device_id = Some(ssid.clone());
                             info!("device identity: {ssid}");
                         }
 
@@ -350,27 +368,27 @@ fn connect_and_run(
                             if external_power { " (charging)" } else { "" },
                         );
 
-                        // Emit DeviceTelemetry event
-                        let mut msg = FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                            manufacturer: Some("FlightScope".into()),
-                            model: Some(h.avr.dev_info.text.clone()),
-                            firmware: None,
-                            telemetry: None,
-                        });
-                        if let Some(ref dev) = device_id {
-                            msg = msg.device(dev);
-                        }
-                        sender.send(msg);
+                        // Emit identity DeviceTelemetry + initial device state
+                        device_telemetry.insert("battery_pct".into(), battery_pct.to_string());
+                        device_telemetry.insert("tilt".into(), format!("{tilt:.1}"));
+                        device_telemetry.insert("roll".into(), format!("{roll:.1}"));
+                        device_telemetry.insert("temp_c".into(), "0.0".into());
+                        device_telemetry.insert("external_power".into(), external_power.to_string());
+                        device_telemetry.insert("ready".into(), "false".into());
 
-                        telemetry.insert("device_info".into(), info_text);
-                        telemetry.insert("battery_pct".into(), battery_pct.to_string());
-                        telemetry.insert("tilt".into(), format!("{tilt:.1}"));
-                        telemetry.insert("roll".into(), format!("{roll:.1}"));
-                        telemetry.insert("temp_c".into(), "0.0".into());
-                        telemetry.insert("external_power".into(), external_power.to_string());
-                        telemetry.insert("radar_mode".into(), "arming".into());
-                        emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                        emit_device_readiness(sender, false, device_id.as_deref());
+                        if let Some(dev) = device_id.as_deref() {
+                            sender.send(
+                                FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
+                                    manufacturer: Some("FlightScope".into()),
+                                    model: Some(h.avr.dev_info.text.clone()),
+                                    firmware: None,
+                                    telemetry: Some(device_telemetry.clone()),
+                                })
+                                .device(dev),
+                            );
+                        }
+
+                        emit_device_status(sender, ActorStatus::Connected, HashMap::new());
                     }
 
                     BinaryEvent::Disarmed => {
@@ -386,10 +404,9 @@ fn connect_and_run(
                         let wire = SessionConfig::mode_label(&current_mode);
                         info!("armed -- mode={wire} -- waiting for shots");
 
-                        telemetry.insert("radar_mode".into(), "armed".into());
-                        telemetry.insert("detection_mode".into(), wire.into());
-                        emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                        emit_device_readiness(sender, true, device_id.as_deref());
+                        emit_device_status(sender, ActorStatus::Connected, HashMap::new());
+                        device_telemetry.insert("ready".into(), "true".into());
+                        try_emit_device_telemetry(sender, device_id, &device_telemetry);
 
                         // Apply pending reconfig now that we're idle
                         if let Some(target) = pending_reconfig.take() {
@@ -410,10 +427,9 @@ fn connect_and_run(
                             };
                             client.configure_avr(avr);
                             client.arm();
-                            telemetry.insert("radar_mode".into(), "arming".into());
-                            telemetry.insert("detection_mode".into(), target_wire.into());
-                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                            emit_device_readiness(sender, false, device_id.as_deref());
+                            emit_device_status(sender, ActorStatus::Connected, HashMap::new());
+                            device_telemetry.insert("ready".into(), "false".into());
+                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
                         }
                     }
 
@@ -424,19 +440,16 @@ fn connect_and_run(
                             shot_number: shot_counter,
                         };
                         debug!("ball trigger detected — shot_id={}", key.shot_id);
-                        let mut msg = FlighthookMessage::new(FlighthookEvent::ShotTrigger {
+                        let msg = FlighthookMessage::new(FlighthookEvent::ShotTrigger {
                             key: key.clone(),
                         });
-                        if let Some(ref dev) = device_id {
-                            msg = msg.device(dev);
-                        }
-                        sender.send(msg);
+                        sender.send(stamp_device(msg, device_id));
                         current_shot_key = Some(key);
                         shot_had_d4 = false;
                         stashed_e8 = None;
-                        telemetry.insert("radar_mode".into(), "idle".into());
-                        emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                        emit_device_readiness(sender, false, device_id.as_deref());
+                        emit_device_status(sender, ActorStatus::Connected, HashMap::new());
+                        device_telemetry.insert("ready".into(), "false".into());
+                        try_emit_device_telemetry(sender, device_id, &device_telemetry);
                     }
 
                     BinaryEvent::ShotDatum(datum) => {
@@ -455,16 +468,13 @@ fn connect_and_run(
                                         ball.backspin_rpm.unwrap_or(0),
                                         ball.sidespin_rpm.unwrap_or(0),
                                     );
-                                    let mut msg = FlighthookMessage::new(
+                                    let msg = FlighthookMessage::new(
                                         FlighthookEvent::BallFlight {
                                             key: key.clone(),
                                             ball: Box::new(ball),
                                         },
                                     );
-                                    if let Some(ref dev) = device_id {
-                                        msg = msg.device(dev);
-                                    }
-                                    sender.send(msg);
+                                    sender.send(stamp_device(msg, device_id));
                                 }
                                 ShotDatum::FlightV1(e8) => {
                                     debug!("stashed E8 for fallback");
@@ -472,16 +482,13 @@ fn connect_and_run(
                                 }
                                 ShotDatum::Club(ed) => {
                                     let club = club_from_ed(&ed);
-                                    let mut msg = FlighthookMessage::new(
+                                    let msg = FlighthookMessage::new(
                                         FlighthookEvent::ClubPath {
                                             key: key.clone(),
                                             club: Box::new(club),
                                         },
                                     );
-                                    if let Some(ref dev) = device_id {
-                                        msg = msg.device(dev);
-                                    }
-                                    sender.send(msg);
+                                    sender.send(stamp_device(msg, device_id));
                                 }
                                 ShotDatum::Spin(_) => {
                                     // Spin axis / total spin are derived from
@@ -506,16 +513,13 @@ fn connect_and_run(
                                             ball.launch_azimuth.unwrap_or(0.0),
                                             ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
                                         );
-                                        let mut msg = FlighthookMessage::new(
+                                        let msg = FlighthookMessage::new(
                                             FlighthookEvent::BallFlight {
                                                 key: key.clone(),
                                                 ball: Box::new(ball),
                                             },
                                         );
-                                        if let Some(ref dev) = device_id {
-                                            msg = msg.device(dev);
-                                        }
-                                        sender.send(msg);
+                                        sender.send(stamp_device(msg, device_id));
                                     } else {
                                         warn!(
                                             "shot #{} processed but no flight result (D4 or E8)",
@@ -537,13 +541,10 @@ fn connect_and_run(
                                     );
                                 }
                             }
-                            let mut msg = FlighthookMessage::new(
-                                FlighthookEvent::ShotFinished { key },
-                            );
-                            if let Some(ref dev) = device_id {
-                                msg = msg.device(dev);
-                            }
-                            sender.send(msg);
+                            sender.send(stamp_device(
+                                FlighthookMessage::new(FlighthookEvent::ShotFinished { key }),
+                                device_id,
+                            ));
                         }
                         stashed_e8 = None;
                         shot_had_d4 = false;
@@ -568,38 +569,42 @@ fn connect_and_run(
                             };
                             client.configure_avr(avr);
                             client.arm();
-                            telemetry.insert("radar_mode".into(), "arming".into());
-                            telemetry.insert("detection_mode".into(), target_wire.into());
-                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
-                            emit_device_readiness(sender, false, device_id.as_deref());
+                            emit_device_status(sender, ActorStatus::Connected, HashMap::new());
+                            device_telemetry.insert("ready".into(), "false".into());
+                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
                         }
                     }
 
                     BinaryEvent::Keepalive(status) => {
+                        let mut changed = false;
                         if let Some(avr) = &status.avr {
-                            telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
-                            telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
+                            device_telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
+                            device_telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
+                            changed = true;
                         }
                         if let Some(dsp) = &status.dsp {
-                            telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
-                            telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
-                            telemetry.insert("external_power".into(), dsp.external_power().to_string());
-                            emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                            device_telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
+                            device_telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
+                            device_telemetry.insert("external_power".into(), dsp.external_power().to_string());
+                            changed = true;
+                        }
+                        if changed {
+                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
                         }
                     }
 
                     BinaryEvent::Message(env) => {
-                        // Update telemetry cache from status messages
                         match &env.message {
                             Message::DspStatus(dsp) => {
-                                telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
-                                telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
-                                telemetry.insert("external_power".into(), dsp.external_power().to_string());
-                                emit_device_status(sender, ActorStatus::Connected, telemetry.clone());
+                                device_telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
+                                device_telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
+                                device_telemetry.insert("external_power".into(), dsp.external_power().to_string());
+                                try_emit_device_telemetry(sender, device_id, &device_telemetry);
                             }
                             Message::AvrStatus(avr) => {
-                                telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
-                                telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
+                                device_telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
+                                device_telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
+                                try_emit_device_telemetry(sender, device_id, &device_telemetry);
                             }
                             _ => {}
                         }

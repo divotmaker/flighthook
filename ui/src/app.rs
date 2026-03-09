@@ -236,7 +236,19 @@ impl FlighthookApp {
                     .entry(actor)
                     .or_insert_with(|| new_actor(String::new()));
                 actor.status = status;
-                actor.telemetry = telemetry;
+                for (k, v) in telemetry {
+                    actor.telemetry.insert(k, v);
+                }
+            }
+            FlighthookEvent::DeviceTelemetry {
+                telemetry: Some(tel),
+                ..
+            } => {
+                if let Some(actor) = self.actors.get_mut(&actor) {
+                    for (k, v) in tel {
+                        actor.telemetry.insert(k, v);
+                    }
+                }
             }
             FlighthookEvent::ShotTrigger { key } => {
                 self.shots.push(ShotRow {
