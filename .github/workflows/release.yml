@@ -15,10 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy
+      - run: rustup target add wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
@@ -43,8 +40,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -110,9 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown,${{ matrix.target }}
+      - run: rustup target add wasm32-unknown-unknown ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
