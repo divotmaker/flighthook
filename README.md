@@ -115,7 +115,7 @@ flighthook [--config PATH] [--headless]
 
 | Flag         | Default                         | Description                          |
 | ------------ | ------------------------------- | ------------------------------------ |
-| `--config`   | platform config dir (see below) | Config file path                     |
+| `--config`   | platform config dir (see above) | Config file path                     |
 | `--headless` | off                             | Web dashboard only, no native window |
 
 To run with a mock device, point `--config` at a TOML file with
