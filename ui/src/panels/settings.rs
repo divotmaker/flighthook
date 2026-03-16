@@ -725,12 +725,12 @@ impl FlighthookApp {
 
                 // --- Club-to-mode mapping ---
                 ui.add_space(6.0);
-                for (label, mode_clubs, other_clubs) in [
-                    ("Chipping Clubs:", "chipping", "putting"),
-                    ("Putting Clubs:", "putting", "chipping"),
+                for (label, tooltip, mode_clubs, other_clubs) in [
+                    ("Chipping Clubs:", "When a game selects one of these clubs, the launch monitor will be set to chipping mode.", "chipping", "putting"),
+                    ("Putting Clubs:", "When a game selects one of these clubs, the launch monitor will be set to putting mode.", "putting", "chipping"),
                 ] {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(label);
+                        ui.label(label).on_hover_text(tooltip);
                         for &club in Club::ALL {
                             let in_this = match mode_clubs {
                                 "chipping" => self.settings.chipping_clubs.contains(&club),
