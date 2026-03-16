@@ -150,4 +150,4 @@ To run with a mock device, point `--config` at a TOML file with
 
 ---
 
-Mevo+ and FlightScope are trademarks of FlightScope (Pty) Ltd. ExPutt is a trademark of ExPutt Inc. GSPro is a trademark of GSPro LLC. flighthook is not affiliated with, endorsed by, or sponsored by any of these companies.
+Mevo+ and FlightScope are trademarks of FlightScope (Pty) Ltd. Garmin and Approach R10 are trademarks of Garmin Ltd. or its subsidiaries. ExPutt is a trademark of ExPutt Inc. GSPro is a trademark of GSPro LLC. flighthook is not affiliated with, endorsed by, or sponsored by any of these companies.
