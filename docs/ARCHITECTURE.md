@@ -26,6 +26,9 @@ tee_height = "1.5in"
 range = "8ft"
 surface_height = "0in"
 
+[r10.0]
+name = "Garmin R10"
+
 [gspro.0]
 name = "Local GSPro"
 address = "127.0.0.1:921"
@@ -35,6 +38,7 @@ address = "127.0.0.1:921"
 ```
 
 - `[mevo.<idx>]` -- Mevo/Mevo+ device instance
+- `[r10.<idx>]` -- Garmin R10 BLE device instance (auto-discovers via Bluetooth)
 - `[mock_monitor.<idx>]` -- mock launch monitor instance
 - `[gspro.<idx>]` -- GSPro integration instance
 - `[random_club.<idx>]` -- random club cycling integration instance
@@ -43,9 +47,23 @@ address = "127.0.0.1:921"
 - Radar settings (ball_type, tee_height, etc.) are per-mevo only
 - `use_estimated` is per-mevo (defaults to `true`) -- controls whether estimated
   (E8) ball flights are emitted when no full (D4) result arrives
+- R10 sections show only name (BLE auto-discovery, no address field)
 - Mock sections show only name (no address or radar fields)
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `gspro.0`)
 - WebSocket actor IDs = `"ws.{8-hex-chars}"`
+
+### Default config and setup wizard
+
+On first startup the default config contains only a webserver — no devices or
+integrations. The UI detects this (`FlighthookConfig::has_user_actors()`) and
+shows a setup wizard instead of the normal dashboard. The wizard presents
+checkboxes for available devices (Mevo, R10) and integrations (GSPro). On
+confirmation it builds a config with defaults for each selection, posts it via
+the existing settings save path, and dismisses. Users can also skip the wizard
+and configure manually via the Settings tab.
+
+`MevoSection`, `R10Section`, and `GsProSection` each implement `Default` with
+sensible values (e.g. Mevo at `192.168.2.1:5100`, GSPro at `127.0.0.1:921`).
 
 ### Rust types
 
@@ -57,6 +75,7 @@ pub struct FlighthookConfig {
     pub putting_clubs: Vec<Club>,
     pub webserver: HashMap<String, WebserverSection>,
     pub mevo: HashMap<String, MevoSection>,
+    pub r10: HashMap<String, R10Section>,
     pub mock_monitor: HashMap<String, MockMonitorSection>,
     pub gspro: HashMap<String, GsProSection>,
     pub random_club: HashMap<String, RandomClubSection>,
@@ -64,6 +83,7 @@ pub struct FlighthookConfig {
 
 pub struct WebserverSection { pub name: String, pub bind: String }
 pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool> }
+pub struct R10Section { pub name: String }
 pub struct MockMonitorSection { pub name: String }
 pub struct GsProSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
 pub struct RandomClubSection { pub name: String }
@@ -78,32 +98,18 @@ pub struct PostSettingsResponse { pub restarted: Vec<String>, pub stopped: Vec<S
 pub struct ModeRequest { pub mode: ShotDetectionMode }
 ```
 
-**app/src/state/config.rs** (TOML persistence + resolved runtime config):
+**app/src/actors/mod.rs** (actor resolution from config):
 
 ```rust
-// Resolved at startup
-pub enum ClientMode { Mevo { addr }, Mock { mode } }
-pub enum IntegrationMode { GsPro { addr }, RandomClub }
-
-pub struct ResolvedLaunchMonitorConfig {
-    pub id: String,                 // global ID (e.g. "mevo.0")
-    pub name: String,               // user-visible name
-    pub client_mode: ClientMode,
-    pub mode: ShotDetectionMode,
-    pub session_config: SessionConfig,
+pub struct ResolvedActor {
+    pub id: String,             // global ID (e.g. "mevo.0", "r10.0", "gspro.0")
+    pub name: String,           // user-visible name
+    pub actor: Box<dyn Actor>,  // concrete actor ready to start
 }
 
-pub struct ResolvedIntegrationConfig {
-    pub id: String,                 // global ID (e.g. "gspro.0")
-    pub name: String,               // user-visible name
-    pub mode: IntegrationMode,
-}
-
-pub struct ResolvedConfig {
-    pub launch_monitors: Vec<ResolvedLaunchMonitorConfig>,
-    pub integrations: Vec<ResolvedIntegrationConfig>,
-    pub webservers: Vec<(String, SocketAddr)>,
-}
+pub fn resolve_actors(config: &FlighthookConfig, current_mode: Option<ShotDetectionMode>) -> Vec<ResolvedActor>;
+pub fn start_actor(id: String, actor: Box<dyn Actor>, state: &Arc<SystemState>, bus_tx: &broadcast::Sender<FlighthookMessage>);
+pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String>;
 ```
 
 Helper functions: `global_id(prefix, index) -> String` builds `"{prefix}.{index}"`,
@@ -254,6 +260,7 @@ action: ConfigAction,
 pub enum ConfigAction {
     ReplaceAll { config: FlighthookConfig },        // POST /api/settings
     UpsertMevo { index: String, section: MevoSection },
+    UpsertR10 { index: String, section: R10Section },
     UpsertGsPro { index: String, section: GsProSection },
     UpsertWebserver { index: String, section: WebserverSection },
     UpsertMockMonitor { index: String, section: MockMonitorSection },
@@ -314,22 +321,35 @@ Starting -> Connected -> (error) -> Reconnecting -> Connected -> ...
    +-> Disconnected --------------------+
 ```
 
-| ActorStatus  | Meaning                                   |
-| ------------ | ----------------------------------------- |
-| Starting     | Actor spawned, not yet connected          |
-| Disconnected | No connection to device/service           |
-| Connected    | Active and operational                    |
-| Reconnecting | Lost connection, backing off before retry |
+| ActorStatus  | Meaning                                                    |
+| ------------ | ---------------------------------------------------------- |
+| Starting     | Attempting first connection (including retries before ever connecting) |
+| Connected    | Active and operational                                     |
+| Reconnecting | Lost a prior connection, retrying with backoff             |
+| Disconnected | Stopped/shutdown (terminal state)                          |
+
+All actors use linear backoff on connection failure: starts at 1s, adds 1s per
+attempt, capped at 15s.
 
 **Mevo actor mapping** (from internal phases):
 
 - `Connecting | Handshaking | Configuring | Arming` -> `Starting`
 - `Armed` -> `Connected` with `telemetry["radar_mode"] = "armed"`
 - `Shooting` -> `Connected` with `telemetry["radar_mode"] = "idle"`
-- `Disconnected` -> `Disconnected`
-- `Reconnecting` -> `Reconnecting`
+- Connection lost (never connected) -> `Starting` (retrying)
+- Connection lost (previously connected) -> `Reconnecting`
 
 Post-shot cycle: `Connected(radar_mode=idle)` -> `Starting` (re-arm) -> `Connected(radar_mode=armed)`.
+
+**R10 actor**: BLE auto-discovery via `tenover::BleTransport::auto_connect()`.
+Emits `Starting` while scanning/connecting, `Connected` after handshake
+completes. Emits `DeviceTelemetry` with `manufacturer: "Garmin"`,
+`model: "R10"`. Telemetry keys: `ready`, `tilt`, `roll`, `device_state`
+(`waiting` | `recording` | `processing`). Uses BLE address as FRP device ID.
+
+**GSPro actor**: emits `Starting` before first TCP connect attempt, `Connected`
+on success. Connection loss after a successful session emits `Reconnecting`;
+failure before ever connecting stays at `Starting`.
 
 **Integration readiness**: the GSPro actor tracks device readiness from
 `DeviceTelemetry` (`"ready"` key) and uses it to set both
@@ -368,8 +388,8 @@ also handles `ConfigOutcome` events to refresh actor name caches.
 
 ## Component Identity
 
-All components are identified by type-prefixed global IDs: `mevo.0`, `gspro.0`,
-`mock_monitor.0`, `random_club.0`, `webserver.0`, `ws.a1b2c3d4`. The `system`
+All components are identified by type-prefixed global IDs: `mevo.0`, `r10.0`,
+`gspro.0`, `mock_monitor.0`, `random_club.0`, `webserver.0`, `ws.a1b2c3d4`. The `system`
 actor has a fixed ID of `"system"`. The type prefix encodes the component type;
 the index is the key within that type's config section.
 
@@ -408,8 +428,10 @@ Actors are registered after construction and before `start()` is called.
 The Log tab in the UI streams all bus events in real-time with per-message-type
 filter checkboxes. Raw wire data is carried via `raw_payload` on bus messages.
 Binary payloads serialize as hex strings; GSPro JSON payloads serialize as-is.
-The log retains the last 500 events. Protocol-level tracing is always emitted
-to the `audit` tracing target (filtered by `RUST_LOG`, not shown by default).
+Events without a `raw_payload` (e.g. `actor_status`, `config_outcome`) display
+the event's JSON serialization as the payload instead. The log retains the last
+500 events. Protocol-level tracing is always emitted to the `audit` tracing
+target (filtered by `RUST_LOG`, not shown by default).
 
 ## WebSocket Init Protocol
 
@@ -445,7 +467,8 @@ main thread (eframe)       std::thread per actor              tokio runtime (bac
 | eframe::run_    |        | actors::system         |        | axum web server        |
 |   native() or   |        |   (GameState updates)  |        | state_updater task     |
 | ctrl-c (headless|        | actors::mevo           |        | drain subscriber       |
-+-----------------+        | actors::mock::launch   |        +------------------------+
++-----------------+        | actors::r10            |        +------------------------+
+                           | actors::mock::launch   |
   GUI --ehttp/ws---->      | polls bus via poll()    |            ^
   (to local web server)    +------------------------+            |
                                      ^                            |
@@ -481,7 +504,7 @@ start/stop/reconfigure.
 config-driven). Then each config section constructs an actor struct and calls
 `actor.start(state, sender, receiver)`. Each actor gets a per-actor
 `Arc<AtomicBool>` shutdown flag shared between the `BusReceiver` and the
-registry. Launch monitor actors (mevo, mock::launch) run event loops polling
+registry. Launch monitor actors (mevo, r10, mock::launch) run event loops polling
 the bus. Integration actors (gspro, mock::randomclub) subscribe to the bus
 and emit `ClubInfo` (for club changes) and `ActorStatus`
 (for connection status) back onto the bus.
@@ -550,6 +573,9 @@ Global
     Surface Height: [0.0] [in v]
     Track %: [80] %
 
+  Garmin R10             [R10]    [Remove] [Save]
+    Name: [Garmin R10]
+
   Local GSPro            [GSPro]  [Remove] [Save]
     Name: [Local GSPro]
     Address: [127.0.0.1:921]
@@ -557,15 +583,17 @@ Global
     Chipping Monitor: [Any v]
     Putting Monitor: [Any v]
 
-  [+ Add v]  (dropdown: Mevo, GSPro, Web Server)
+  [+ Add v]  (dropdown: Mevo, R10, GSPro, Web Server)
 ```
 
 - Name is **required** and serves as the rename mechanism. Changing a device name
   updates the name cache in WebState, so subsequent status responses and shot
   data use the new name.
-- Type shown as a badge label next to the heading
+- Type shown as a badge label next to the heading, with a hover tooltip
+  describing the device/integration type and connection method
 - `Use Estimated` is per-mevo (checkbox) -- controls whether estimated (E8)
   ball flights are emitted when no full (D4) result arrives
+- R10 sections show only name (BLE auto-discovery; no address or radar fields)
 - Mock launch monitor and Random Club are developer-only types (must be added
   manually to the config TOML; they do not appear in the Add dropdown)
 - Add/remove modify the form Vec, save writes back to TOML
@@ -598,6 +626,13 @@ rendered one per row, sorted alphabetically, indented under the actor header.
     temp_c: 32
     tilt: 0.5
 
+  Garmin R10             [CONNECTED]
+    device_state: waiting
+    ready: true
+    roll: ok
+    shot_count: 3
+    tilt: ok
+
   Local GSPro            [CONNECTED]
     club: 7I
 
@@ -617,5 +652,5 @@ and club/handed/name are read from the actor's telemetry map.
 
 The web layer caches telemetry from `ActorStatus` events plus club from
 `ClubInfo` and name from `PlayerInfo` events so reconnecting clients recover
-latest values immediately. If any actor has status `disconnected` or `reconnecting`, the
-Telemetry tab label turns red.
+latest values immediately. If any actor has status `starting`, `disconnected`,
+or `reconnecting`, the Telemetry tab label turns red.

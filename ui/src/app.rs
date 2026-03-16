@@ -6,8 +6,8 @@ use crate::net::{self, PendingHandle, WsPollEvent};
 use crate::panels::Tab;
 use crate::panels::settings::{PendingRemoval, SettingsForm};
 use crate::types::{
-    ActorStatus, ActorStatusResponse, FlighthookEvent, FlighthookMessage, LogEntry, ShotRow,
-    UnitSystem,
+    ActorStatus, ActorStatusResponse, FlighthookEvent, FlighthookMessage, GsProSection, LogEntry,
+    MevoSection, R10Section, ShotRow, UnitSystem,
 };
 use chrono::{SecondsFormat, Utc};
 
@@ -54,20 +54,32 @@ pub struct FlighthookApp {
     // Unit display
     pub(crate) units_toggle: UnitSystem,
 
+    // Deferred refresh
+    pub(crate) needs_status_refresh: bool,
+
     // Log state
     pub(crate) log_entries: Vec<LogEntry>,
     pub(crate) log_auto_scroll: bool,
     pub(crate) log_type_filters: HashMap<String, bool>,
     pub(crate) log_filter_open: bool,
+
+    // Setup wizard
+    pub(crate) wizard_checked: bool,
+    pub(crate) wizard_dismissed: bool,
+    pub(crate) wizard_mevo: bool,
+    pub(crate) wizard_r10: bool,
+    pub(crate) wizard_gspro: bool,
+    pub(crate) wizard_saving: bool,
 }
 
 impl FlighthookApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let pending = net::new_pending();
 
-        // Fire initial REST fetches
+        // Fire initial REST fetches (including settings for wizard detection)
         net::fetch_status(&cc.egui_ctx, &pending);
         net::fetch_shots(&cc.egui_ctx, &pending);
+        net::fetch_settings(&cc.egui_ctx, &pending);
 
         // Defer WebSocket connection to first update() — gives the page
         // time to stabilise on iOS Safari before opening a second connection.
@@ -85,6 +97,7 @@ impl FlighthookApp {
             active_tab: Tab::Telemetry,
             confirm_remove: None,
             units_toggle: UnitSystem::default(),
+            needs_status_refresh: false,
             show_api_docs: false,
             api_docs_cache: egui_commonmark::CommonMarkCache::default(),
             log_entries: Vec::new(),
@@ -94,6 +107,12 @@ impl FlighthookApp {
                 .map(|&k| (k.to_string(), true))
                 .collect(),
             log_filter_open: false,
+            wizard_checked: false,
+            wizard_dismissed: false,
+            wizard_mevo: false,
+            wizard_r10: false,
+            wizard_gspro: false,
+            wizard_saving: false,
         }
     }
 
@@ -120,6 +139,11 @@ impl FlighthookApp {
             && !self.settings.dirty
         {
             let first_load = !self.settings.loaded;
+            // Check if we need to show the setup wizard (no user actors)
+            if !self.wizard_checked {
+                self.wizard_checked = true;
+                self.wizard_dismissed = s.has_user_actors();
+            }
             self.settings.load_from(&s);
             if first_load {
                 self.units_toggle = s.default_units;
@@ -127,6 +151,13 @@ impl FlighthookApp {
         }
 
         if let Some(_resp) = p.settings_save.take() {
+            // Dismiss wizard on successful save and reload settings
+            if self.wizard_saving {
+                self.wizard_saving = false;
+                self.wizard_dismissed = true;
+                self.needs_status_refresh = true;
+                self.settings.loaded = false;
+            }
             self.settings.saving = false;
 
             // Clear dirty flag only for the saved section
@@ -207,7 +238,9 @@ impl FlighthookApp {
                 .raw_payload
                 .as_ref()
                 .map(|r| r.to_string())
-                .unwrap_or_default();
+                .unwrap_or_else(|| {
+                    serde_json::to_string(&msg.event).unwrap_or_default()
+                });
             self.log_entries.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 actor_name,
@@ -290,8 +323,128 @@ impl FlighthookApp {
             FlighthookEvent::SetDetectionMode { mode: Some(m), .. } => {
                 self.current_mode = m.to_string();
             }
+            FlighthookEvent::ConfigOutcome {
+                ref started,
+                ref restarted,
+                ..
+            } => {
+                // New or restarted actors won't have names in the UI-side
+                // actor map (WS events don't carry names). Re-fetch from
+                // REST so the telemetry panel picks up display names.
+                if !started.is_empty() || !restarted.is_empty() {
+                    self.needs_status_refresh = true;
+                }
+            }
             _ => {}
         }
+    }
+}
+
+impl FlighthookApp {
+    fn show_wizard(&self) -> bool {
+        self.settings.loaded && !self.wizard_dismissed && self.wizard_checked
+    }
+
+    fn render_wizard(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(25, 25, 30)))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.2);
+
+                    ui.label(
+                        egui::RichText::new("FLIGHTHOOK")
+                            .strong()
+                            .size(28.0)
+                            .color(egui::Color32::from_rgb(180, 200, 255)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("What do you have?")
+                            .size(16.0)
+                            .color(egui::Color32::from_rgb(160, 160, 160)),
+                    );
+                    ui.add_space(24.0);
+
+                    // Left-aligned checkbox group
+                    let checkbox_width = 260.0;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(checkbox_width, 0.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new("Launch Monitors")
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(120, 120, 120)),
+                            );
+                            ui.add_space(4.0);
+                            ui.checkbox(
+                                &mut self.wizard_mevo,
+                                egui::RichText::new("FlightScope Mevo / Mevo+").size(15.0),
+                            );
+                            ui.add_space(4.0);
+                            ui.checkbox(
+                                &mut self.wizard_r10,
+                                egui::RichText::new("Garmin R10").size(15.0),
+                            );
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new("Simulators")
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(120, 120, 120)),
+                            );
+                            ui.add_space(4.0);
+                            ui.checkbox(
+                                &mut self.wizard_gspro,
+                                egui::RichText::new("GSPro").size(15.0),
+                            );
+                        },
+                    );
+
+                    ui.add_space(24.0);
+
+                    let any_selected =
+                        self.wizard_mevo || self.wizard_r10 || self.wizard_gspro;
+                    let btn = egui::Button::new(
+                        egui::RichText::new("Get Started").size(15.0).strong(),
+                    )
+                    .min_size(egui::vec2(140.0, 36.0));
+
+                    if ui.add_enabled(any_selected && !self.wizard_saving, btn).clicked() {
+                        self.apply_wizard(ctx);
+                    }
+
+                    if !any_selected {
+                        ui.add_space(8.0);
+                        if ui
+                            .link(egui::RichText::new("Skip — configure manually").size(12.0))
+                            .clicked()
+                        {
+                            self.wizard_dismissed = true;
+                            self.active_tab = Tab::Settings;
+                        }
+                    }
+                });
+            });
+    }
+
+    fn apply_wizard(&mut self, ctx: &egui::Context) {
+        let mut config = self.settings.to_request();
+
+        if self.wizard_mevo {
+            config.mevo.insert("0".into(), MevoSection::default());
+        }
+        if self.wizard_r10 {
+            config.r10.insert("0".into(), R10Section::default());
+        }
+        if self.wizard_gspro {
+            config.gspro.insert("0".into(), GsProSection::default());
+        }
+
+        self.wizard_saving = true;
+        self.settings.saving = true;
+        self.settings.save_target = Some(crate::panels::settings::SaveTarget::Full);
+        net::post_settings(ctx, &self.pending, &config, None);
     }
 }
 
@@ -316,6 +469,11 @@ impl eframe::App for FlighthookApp {
 
         self.apply_pending();
         self.poll_ws();
+
+        if self.needs_status_refresh {
+            self.needs_status_refresh = false;
+            net::fetch_status(ctx, &self.pending);
+        }
 
         // Confirmation dialog for item removal
         if self.confirm_remove.is_some() {
@@ -372,6 +530,12 @@ impl eframe::App for FlighthookApp {
                 });
         }
 
+        // Setup wizard — shown when config has no user actors
+        if self.show_wizard() {
+            self.render_wizard(ctx);
+            return;
+        }
+
         // Dark overlay when backend WS is gone (no actors = not connected to backend)
         if !self.ws_connected && self.actors.is_empty() {
             egui::CentralPanel::default()
@@ -395,7 +559,9 @@ impl eframe::App for FlighthookApp {
             ui.horizontal(|ui| {
                 // Telemetry tab — red if any connection issue
                 let has_issue = self.actors.values().any(|a| {
-                    a.status == ActorStatus::Disconnected || a.status == ActorStatus::Reconnecting
+                    a.status == ActorStatus::Disconnected
+                        || a.status == ActorStatus::Reconnecting
+                        || a.status == ActorStatus::Starting
                 });
                 if has_issue && self.active_tab != Tab::Telemetry {
                     let text = egui::RichText::new("Telemetry")

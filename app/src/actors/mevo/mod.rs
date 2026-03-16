@@ -27,9 +27,9 @@ const STALE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Keepalive cadence for BinaryClient.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Reconnect backoff bounds.
+/// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_BACKOFF: Duration = Duration::from_secs(15);
 
 /// TCP connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -193,7 +193,7 @@ fn run(
                 let backoff_status = if ever_connected {
                     ActorStatus::Reconnecting
                 } else {
-                    ActorStatus::Disconnected
+                    ActorStatus::Starting
                 };
                 emit_device_status(&sender, backoff_status, HashMap::new());
                 if device_id.is_some() {
@@ -219,7 +219,7 @@ fn run(
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                backoff = (backoff + Duration::from_secs(1)).min(MAX_BACKOFF);
             }
         }
     }

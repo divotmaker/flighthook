@@ -26,9 +26,8 @@ jobs:
       - name: Build WASM UI
         run: cd ui && trunk build --release
 
-      # TODO: re-enable once clippy is available for the CI toolchain
-      # - name: Clippy
-      #   run: cargo clippy --workspace -- -D warnings
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
 
       - name: Run tests
         run: cargo test --workspace

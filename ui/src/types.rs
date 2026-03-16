@@ -28,6 +28,7 @@ pub use flighthook::{
     GsProSection,
     MevoSection,
     MockMonitorSection,
+    R10Section,
     PlayerInfo,
     PostSettingsResponse,
     RandomClubSection,

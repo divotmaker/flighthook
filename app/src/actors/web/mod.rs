@@ -267,7 +267,12 @@ async fn apply_bus_event(
             let mut actors = state.actors.write().await;
             let actor = actors
                 .entry(msg.actor.clone())
-                .or_insert_with(|| new_actor(String::new()));
+                .or_insert_with(|| {
+                    let snap = state.root.system.snapshot();
+                    let names = actor_names(&snap);
+                    let name = names.get(&msg.actor).cloned().unwrap_or_default();
+                    new_actor(name)
+                });
             actor.status = *status;
             for (k, v) in telemetry {
                 actor.telemetry.insert(k.clone(), v.clone());

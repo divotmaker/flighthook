@@ -2,7 +2,7 @@
 //!
 //! Subscribes to the unified bus for shot data and forwards to GSPro's TCP API
 //! (port 921). Emits PlayerInfo/ClubInfo for club/player changes and
-//! ActorStatus for connection status. Reconnects with exponential backoff on failure.
+//! ActorStatus for connection status. Reconnects with linear backoff on failure.
 
 pub mod api;
 pub mod mapper;
@@ -104,14 +104,26 @@ impl Actor for GsProActor {
 /// Main bridge loop. Reconnects forever until the bus closes.
 fn run(addr: SocketAddr, routing: GsProRouting, sender: BusSender, mut receiver: BusReceiver) {
     let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(30);
+    let max_backoff = Duration::from_secs(15);
+    let mut ever_connected = false;
 
     loop {
         if receiver.is_shutdown() {
             tracing::info!("gspro bridge: shutting down");
             return;
         }
-        match connect_and_run(addr, &routing, &sender, &mut receiver) {
+
+        let status = if ever_connected {
+            ActorStatus::Reconnecting
+        } else {
+            ActorStatus::Starting
+        };
+        sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+            status,
+            telemetry: HashMap::new(),
+        }));
+
+        match connect_and_run(addr, &routing, &sender, &mut receiver, &mut ever_connected) {
             Ok(()) => {
                 tracing::info!("gspro bridge: shutting down");
                 return;
@@ -121,17 +133,22 @@ fn run(addr: SocketAddr, routing: GsProRouting, sender: BusSender, mut receiver:
                 return;
             }
             Err(e) => {
-                tracing::info!("gspro bridge: {e}, reconnecting in {backoff:?}");
+                let backoff_status = if ever_connected {
+                    ActorStatus::Reconnecting
+                } else {
+                    ActorStatus::Starting
+                };
+                tracing::info!("gspro bridge: {e}, retrying in {backoff:?}");
                 sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                     severity: Severity::Error,
                     message: format!("GSPro connection failed: {e}"),
                 }));
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-                    status: ActorStatus::Reconnecting,
+                    status: backoff_status,
                     telemetry: HashMap::new(),
                 }));
                 std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(max_backoff);
+                backoff = (backoff + Duration::from_secs(1)).min(max_backoff);
             }
         }
     }
@@ -180,6 +197,7 @@ fn connect_and_run(
     routing: &GsProRouting,
     sender: &BusSender,
     receiver: &mut BusReceiver,
+    ever_connected: &mut bool,
 ) -> Result<(), BridgeError> {
     let name = sender.actor_id();
 
@@ -190,6 +208,7 @@ fn connect_and_run(
         .set_read_timeout(Some(Duration::from_millis(50)))
         .map_err(BridgeError::Io)?;
 
+    *ever_connected = true;
     tracing::info!("gspro bridge: connected to {addr}");
     sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
         status: ActorStatus::Connected,

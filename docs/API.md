@@ -351,6 +351,11 @@ Full persisted config (mirrors `config.toml`).
       "track_pct": 80.0
     }
   },
+  "r10": {
+    "0": {
+      "name": "Garmin R10"
+    }
+  },
   "mock_monitor": {},
   "gspro": {
     "0": {
@@ -362,8 +367,9 @@ Full persisted config (mirrors `config.toml`).
 }
 ```
 
-- Keys are type-prefixed global IDs: `mevo.0`, `mock_monitor.0`, `gspro.0`, `random_club.0`, `webserver.0`
+- Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `mock_monitor.0`, `gspro.0`, `random_club.0`, `webserver.0`
 - All launch monitor config fields are optional (omitted = use defaults)
+- R10 sections have only `name` (BLE auto-discovery; no address or radar settings)
 - `use_estimated` on Mevo sections controls whether estimated (E8) ball flights
   are emitted when no full (D4) result arrives (defaults to `true`)
 

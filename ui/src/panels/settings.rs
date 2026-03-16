@@ -2,7 +2,7 @@ use crate::app::FlighthookApp;
 use crate::net;
 use crate::types::{
     Club, Distance, DistanceExt, FlighthookConfig, GsProSection, MevoSection,
-    MockMonitorSection, RandomClubSection, UnitSystem, WebserverSection,
+    MockMonitorSection, R10Section, RandomClubSection, UnitSystem, WebserverSection,
 };
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
@@ -86,6 +86,25 @@ impl DeviceFormEntry {
         }
     }
 
+    pub(crate) fn from_r10(id: &str, s: &R10Section) -> Self {
+        Self {
+            id: id.into(),
+            monitor_type: "r10".into(),
+            name: s.name.clone(),
+            address: String::new(),
+            ball_type: 0,
+            tee_height_val: "1.5".into(),
+            tee_height_unit: "inches".into(),
+            range_val: "8".into(),
+            range_unit: "feet".into(),
+            surface_height_val: "0".into(),
+            surface_height_unit: "inches".into(),
+            track_pct: "80".into(),
+            use_estimated: true,
+            dirty: false,
+        }
+    }
+
     pub(crate) fn from_mock(id: &str, s: &MockMonitorSection) -> Self {
         Self {
             id: id.into(),
@@ -107,6 +126,16 @@ impl DeviceFormEntry {
 
     pub(crate) fn is_mock(&self) -> bool {
         self.monitor_type == "mock_monitor"
+    }
+
+    pub(crate) fn is_r10(&self) -> bool {
+        self.monitor_type == "r10"
+    }
+
+    /// Returns true if this device type has no configurable address
+    /// (BLE auto-discover or mock).
+    pub(crate) fn skip_address(&self) -> bool {
+        self.is_mock() || self.is_r10()
     }
 }
 
@@ -160,6 +189,7 @@ impl ActorFormEntry {
         match self {
             ActorFormEntry::Device(d) => match d.monitor_type.as_str() {
                 "mevo" => "Mevo",
+                "r10" => "R10",
                 "mock_monitor" => "Mock",
                 _ => &d.monitor_type,
             },
@@ -168,6 +198,23 @@ impl ActorFormEntry {
                 "random_club" => "Random Club",
                 "webserver" => "Web",
                 _ => &i.integration_type,
+            },
+        }
+    }
+
+    pub(crate) fn type_tooltip(&self) -> &str {
+        match self {
+            ActorFormEntry::Device(d) => match d.monitor_type.as_str() {
+                "mevo" => "FlightScope Mevo / Mevo+ — connects via WiFi (TCP)",
+                "r10" => "Garmin R10 — auto-detects from system connected Bluetooth devices",
+                "mock_monitor" => "Mock launch monitor — generates random shots for testing",
+                _ => "",
+            },
+            ActorFormEntry::Integration(i) => match i.integration_type.as_str() {
+                "gspro" => "GSPro simulator — connects via TCP (Open Connect API)",
+                "random_club" => "Cycles through clubs automatically on each shot",
+                "webserver" => "HTTP/WebSocket server for the dashboard UI and API",
+                _ => "",
             },
         }
     }
@@ -243,6 +290,12 @@ impl SettingsForm {
                     id, section,
                 )));
         }
+        for (id, section) in &s.r10 {
+            self.actors
+                .push(ActorFormEntry::Device(DeviceFormEntry::from_r10(
+                    id, section,
+                )));
+        }
         for (id, section) in &s.mock_monitor {
             self.actors
                 .push(ActorFormEntry::Device(DeviceFormEntry::from_mock(
@@ -302,7 +355,7 @@ impl SettingsForm {
                     if dev.name.is_empty() {
                         return false;
                     }
-                    if !dev.is_mock() && dev.address.parse::<std::net::SocketAddr>().is_err() {
+                    if !dev.skip_address() && dev.address.parse::<std::net::SocketAddr>().is_err() {
                         return false;
                     }
                 }
@@ -324,6 +377,7 @@ impl SettingsForm {
     pub(crate) fn to_request(&self) -> FlighthookConfig {
         let mut webserver = std::collections::HashMap::new();
         let mut mevo = std::collections::HashMap::new();
+        let mut r10 = std::collections::HashMap::new();
         let mut mock_monitor = std::collections::HashMap::new();
         let mut gspro = std::collections::HashMap::new();
         let mut random_club = std::collections::HashMap::new();
@@ -355,6 +409,14 @@ impl SettingsForm {
                                 ),
                                 track_pct: dev.track_pct.parse().ok(),
                                 use_estimated: Some(dev.use_estimated),
+                            },
+                        );
+                    }
+                    "r10" => {
+                        r10.insert(
+                            dev.id.clone(),
+                            R10Section {
+                                name: dev.name.clone(),
                             },
                         );
                     }
@@ -425,6 +487,7 @@ impl SettingsForm {
             putting_clubs: self.putting_clubs.clone(),
             webserver,
             mevo,
+            r10,
             mock_monitor,
             gspro,
             random_club,
@@ -519,6 +582,14 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             }),
                             track_pct: dev.track_pct.parse().ok(),
                             use_estimated: Some(dev.use_estimated),
+                        },
+                    );
+                }
+                "r10" => {
+                    config.r10.insert(
+                        dev.id.clone(),
+                        R10Section {
+                            name: dev.name.clone(),
                         },
                     );
                 }
@@ -720,6 +791,7 @@ impl FlighthookApp {
 
                 for (idx, actor) in self.settings.actors.iter_mut().enumerate() {
                     let type_label = actor.type_label().to_string();
+                    let type_tooltip = actor.type_tooltip().to_string();
                     let dirty = actor.dirty();
 
                     // Header: name + type badge + Remove + Save
@@ -728,7 +800,7 @@ impl FlighthookApp {
                             egui::RichText::new(actor.name())
                                 .strong()
                                 .color(egui::Color32::from_rgb(180, 200, 255)),
-                        );
+                        ).on_hover_text(&type_tooltip);
                         egui::Frame::new()
                             .fill(egui::Color32::from_rgb(60, 80, 120))
                             .corner_radius(4.0)
@@ -738,7 +810,7 @@ impl FlighthookApp {
                                     egui::RichText::new(&type_label)
                                         .size(11.0)
                                         .color(egui::Color32::from_rgb(200, 220, 255)),
-                                );
+                                ).on_hover_text(&type_tooltip);
                             });
                         if ui
                             .button(egui::RichText::new("Remove").size(11.0))
@@ -774,7 +846,7 @@ impl FlighthookApp {
                                 }
                             });
 
-                            if !dev.is_mock() {
+                            if !dev.skip_address() {
                                 // Address
                                 ui.horizontal(|ui| {
                                     ui.add_space(16.0);
@@ -1018,6 +1090,32 @@ impl FlighthookApp {
                                     monitor_type: "mevo".into(),
                                     name: "Mevo WiFi".into(),
                                     address: "192.168.2.1:5100".into(),
+                                    ball_type: 0,
+                                    tee_height_val: "1.5".into(),
+                                    tee_height_unit: "inches".into(),
+                                    range_val: "8".into(),
+                                    range_unit: "feet".into(),
+                                    surface_height_val: "0".into(),
+                                    surface_height_unit: "inches".into(),
+                                    track_pct: "80".into(),
+                                    use_estimated: true,
+                                    dirty: true,
+                                }));
+                                self.settings.dirty = true;
+                            }
+                            if ui.selectable_label(false, "R10").clicked() {
+                                let existing: Vec<&str> = self.settings.actors.iter()
+                                    .filter_map(|a| match a {
+                                        ActorFormEntry::Device(d) if d.monitor_type == "r10" => Some(d.id.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                let id = next_index(&existing);
+                                self.settings.actors.push(ActorFormEntry::Device(DeviceFormEntry {
+                                    id,
+                                    monitor_type: "r10".into(),
+                                    name: "Garmin R10".into(),
+                                    address: String::new(),
                                     ball_type: 0,
                                     tee_height_val: "1.5".into(),
                                     tee_height_unit: "inches".into(),

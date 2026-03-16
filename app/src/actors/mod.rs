@@ -3,6 +3,7 @@
 pub mod gspro;
 pub mod mevo;
 pub mod mock;
+pub mod r10;
 pub mod system;
 pub mod web;
 
@@ -100,6 +101,16 @@ pub fn resolve_actors(
         }
     }
 
+    // R10 devices
+    for (index, section) in &config.r10 {
+        let id = global_id("r10", index);
+        actors.push(ResolvedActor {
+            id,
+            name: section.name.clone(),
+            actor: Box::new(r10::R10Actor { initial_mode: mode }),
+        });
+    }
+
     // Mock monitors
     for (index, section) in &config.mock_monitor {
         let id = global_id("mock_monitor", index);
@@ -185,6 +196,9 @@ pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String> {
     let mut names = HashMap::new();
     for (index, section) in &config.mevo {
         names.insert(global_id("mevo", index), section.name.clone());
+    }
+    for (index, section) in &config.r10 {
+        names.insert(global_id("r10", index), section.name.clone());
     }
     for (index, section) in &config.mock_monitor {
         names.insert(global_id("mock_monitor", index), section.name.clone());

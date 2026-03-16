@@ -79,6 +79,7 @@ impl LegacyFlighthookConfig {
             putting_clubs: self.putting_clubs,
             webserver,
             mevo: self.mevo,
+            r10: HashMap::new(),
             mock_monitor: self.mock_monitor,
             gspro: self.gspro,
             random_club: self.random_club,

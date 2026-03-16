@@ -303,6 +303,13 @@ fn handle_config_command(
             });
             scope = Some(format!("mevo.{index}"));
         }
+        ConfigAction::UpsertR10 { index, section } => {
+            let idx = index.clone();
+            state.system.update(|p| {
+                p.r10.insert(idx, section.clone());
+            });
+            scope = Some(format!("r10.{index}"));
+        }
         ConfigAction::UpsertGsPro { index, section } => {
             let idx = index.clone();
             state.system.update(|p| {
@@ -330,6 +337,9 @@ fn handle_config_command(
                 state.system.update(|p| match prefix {
                     "mevo" => {
                         p.mevo.remove(&idx);
+                    }
+                    "r10" => {
+                        p.r10.remove(&idx);
                     }
                     "gspro" => {
                         p.gspro.remove(&idx);

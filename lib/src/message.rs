@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use crate::{ActorStatus, BallFlight, ClubData, FaceImpact};
 use crate::{ClubInfo, PlayerInfo};
 use crate::{
-    FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, RandomClubSection,
-    WebserverSection,
+    FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, R10Section,
+    RandomClubSection, WebserverSection,
 };
 
 // ---------------------------------------------------------------------------
@@ -272,6 +272,10 @@ pub enum ConfigAction {
     UpsertMevo {
         index: String,
         section: MevoSection,
+    },
+    UpsertR10 {
+        index: String,
+        section: R10Section,
     },
     UpsertGsPro {
         index: String,

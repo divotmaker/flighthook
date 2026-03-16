@@ -157,6 +157,8 @@ pub struct FlighthookConfig {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub mevo: std::collections::HashMap<String, MevoSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub r10: std::collections::HashMap<String, R10Section>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub mock_monitor: std::collections::HashMap<String, MockMonitorSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub gspro: std::collections::HashMap<String, GsProSection>,
@@ -187,6 +189,13 @@ pub struct MevoSection {
     /// and carry less data, but are often the only result for short chips.
     #[serde(default)]
     pub use_estimated: Option<bool>,
+}
+
+/// A Garmin R10 BLE device instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R10Section {
+    #[serde(default)]
+    pub name: String,
 }
 
 /// A mock launch monitor instance.
@@ -234,36 +243,22 @@ impl FlighthookConfig {
             ShotDetectionMode::Full
         }
     }
+
+    /// Returns true if any user-configured actors (devices or integrations)
+    /// exist. Webservers are infrastructure and don't count.
+    pub fn has_user_actors(&self) -> bool {
+        !self.mevo.is_empty()
+            || !self.r10.is_empty()
+            || !self.mock_monitor.is_empty()
+            || !self.gspro.is_empty()
+            || !self.random_club.is_empty()
+    }
 }
 
 impl Default for FlighthookConfig {
-    /// Known good defaults: a single Mevo device and a GSPro target.
+    /// Minimal empty config — webserver only, no devices or integrations.
+    /// The setup wizard will add devices on first startup.
     fn default() -> Self {
-        let mut mevo = std::collections::HashMap::new();
-        mevo.insert(
-            "0".into(),
-            MevoSection {
-                name: "Mevo WiFi".into(),
-                address: Some("192.168.2.1:5100".into()),
-                ball_type: Some(0),
-                tee_height: Some(Distance::Inches(1.5)),
-                range: Some(Distance::Feet(8.0)),
-                surface_height: Some(Distance::Inches(0.0)),
-                track_pct: Some(80.0),
-                use_estimated: None,
-            },
-        );
-        let mut gspro = std::collections::HashMap::new();
-        gspro.insert(
-            "0".into(),
-            GsProSection {
-                name: "Local GSPro".into(),
-                address: Some("127.0.0.1:921".into()),
-                full_monitor: None,
-                chipping_monitor: None,
-                putting_monitor: None,
-            },
-        );
         let mut webserver = std::collections::HashMap::new();
         webserver.insert(
             "0".into(),
@@ -277,10 +272,46 @@ impl Default for FlighthookConfig {
             chipping_clubs: default_chipping_clubs(),
             putting_clubs: default_putting_clubs(),
             webserver,
-            mevo,
+            mevo: std::collections::HashMap::new(),
+            r10: std::collections::HashMap::new(),
             mock_monitor: std::collections::HashMap::new(),
-            gspro,
+            gspro: std::collections::HashMap::new(),
             random_club: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for MevoSection {
+    fn default() -> Self {
+        Self {
+            name: "Mevo WiFi".into(),
+            address: Some("192.168.2.1:5100".into()),
+            ball_type: Some(0),
+            tee_height: Some(Distance::Inches(1.5)),
+            range: Some(Distance::Feet(8.0)),
+            surface_height: Some(Distance::Inches(0.0)),
+            track_pct: Some(80.0),
+            use_estimated: None,
+        }
+    }
+}
+
+impl Default for R10Section {
+    fn default() -> Self {
+        Self {
+            name: "Garmin R10".into(),
+        }
+    }
+}
+
+impl Default for GsProSection {
+    fn default() -> Self {
+        Self {
+            name: "Local GSPro".into(),
+            address: Some("127.0.0.1:921".into()),
+            full_monitor: None,
+            chipping_monitor: None,
+            putting_monitor: None,
         }
     }
 }
