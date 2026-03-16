@@ -1,5 +1,9 @@
 # flighthook
 
+[![CI](https://github.com/divotmaker/flighthook/actions/workflows/ci.yml/badge.svg)](https://github.com/divotmaker/flighthook/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/flighthook.svg)](https://crates.io/crates/flighthook)
+[![docs.rs](https://docs.rs/flighthook/badge.svg)](https://docs.rs/flighthook)
+
 Acts as a bridge between golf launch monitors and simulation software.
 Connects to launch monitors, decodes shot data, and forwards it to integrations like GSPro.
 Provides a REST and WebSocket API for custom integrations to participate on the central event bus.
