@@ -8,6 +8,26 @@ Acts as a bridge between golf launch monitors and simulation software.
 Connects to launch monitors, decodes shot data, and forwards it to integrations like GSPro.
 Provides a REST and WebSocket API for custom integrations to participate on the central event bus.
 
+## Supported Integrations
+
+### Launch Monitors
+
+| Device | Protocol | Status |
+| --- | --- | --- |
+| FlightScope Mevo+ | TCP (binary, port 5100) | Supported |
+| FlightScope Mevo+ Gen2 | TCP (binary, port 5100) | Supported |
+| Garmin R10 | BLE / GFDI / Protobuf | Alpha |
+
+### Simulation Software
+
+| Software | Protocol | Status |
+| --- | --- | --- |
+| GSPro | TCP (JSON, port 921) | Supported |
+
+### Custom Integrations
+
+flighthook exposes a REST + WebSocket API on the event bus, so any external software can subscribe to shot data, device telemetry, and raw audit events. See [docs/API.md](docs/API.md).
+
 ## Status
 
 **Beta (0.1.x)** — The API, configuration format, and WebSocket protocol are usable but may still change. Breaking changes will be noted in release notes.
