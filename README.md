@@ -12,17 +12,17 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 
 ### Launch Monitors
 
-| Device | Protocol | Status |
-| --- | --- | --- |
-| FlightScope Mevo+ | TCP (binary, port 5100) | Supported |
-| FlightScope Mevo+ Gen2 | TCP (binary, port 5100) | Supported |
-| Garmin R10 | BLE / GFDI / Protobuf | Alpha |
+| Device                | Protocol                | Status    |
+| --------------------- | ----------------------- | --------- |
+| FlightScope Mevo+     | TCP (binary, port 5100) | Supported |
+| FlightScope Mevo Gen2 | TCP (binary, port 5100) | Supported |
+| Garmin R10            | BLE / GFDI / Protobuf   | Alpha     |
 
 ### Simulation Software
 
-| Software | Protocol | Status |
-| --- | --- | --- |
-| GSPro | TCP (JSON, port 921) | Supported |
+| Software | Protocol             | Status    |
+| -------- | -------------------- | --------- |
+| GSPro    | TCP (JSON, port 921) | Supported |
 
 ### Custom Integrations
 
