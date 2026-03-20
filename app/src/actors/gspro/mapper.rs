@@ -1,21 +1,28 @@
 //! Shot data -> GSPro message conversion.
 
 use super::api::{BallData, ClubData, GsProMessage, ShotDataOptions};
-use flighthook::ShotData;
+use flighthook::{Handedness, ShotData};
 
 /// Convert a decoded shot into a GSPro Open Connect V1 message.
-pub fn map_shot(shot: &ShotData) -> GsProMessage {
+///
+/// FRP uses absolute physical signs (positive = right of target). GSPro uses
+/// golf-semantic signs (positive = in-to-out / open *for that player*). For
+/// left-handed players, lateral fields are negated so the sim sees the shot
+/// from the golfer's perspective.
+pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
     let contains_ball = shot.ball.is_some();
+    // LH flip: GSPro expects golf-semantic signs, FRP uses absolute physical.
+    let flip = if handed == Handedness::Left { -1.0 } else { 1.0 };
 
     // Ball data: extract from Option<BallFlight>, zero-fill missing fields.
     let (speed, vla, hla, carry_distance, bs, ss) = if let Some(ref b) = shot.ball {
         (
             b.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
             b.launch_elevation.unwrap_or(0.0),
-            b.launch_azimuth.unwrap_or(0.0),
+            b.launch_azimuth.unwrap_or(0.0) * flip,
             b.carry_distance.map(|d| d.as_yards()),
             b.backspin_rpm.unwrap_or(0) as f64,
-            b.sidespin_rpm.unwrap_or(0) as f64,
+            b.sidespin_rpm.unwrap_or(0) as f64 * flip,
         )
     } else {
         (0.0, 0.0, 0.0, None, 0.0, 0.0)
@@ -31,9 +38,9 @@ pub fn map_shot(shot: &ShotData) -> GsProMessage {
             ClubData {
                 speed: club.club_speed.map(|v| v.as_mph()).unwrap_or(0.0),
                 angle_of_attack: club.attack_angle.unwrap_or(0.0),
-                face_to_target: club.face_angle.unwrap_or(0.0),
+                face_to_target: club.face_angle.unwrap_or(0.0) * flip,
                 loft: club.dynamic_loft.unwrap_or(0.0),
-                path: club.path.unwrap_or(0.0),
+                path: club.path.unwrap_or(0.0) * flip,
             },
             true,
         )

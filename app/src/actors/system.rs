@@ -253,8 +253,13 @@ fn run(
                         FlighthookEvent::SetDetectionMode { mode: Some(mode), handed: None },
                     ));
                 }
-                FlighthookEvent::SetDetectionMode { mode: Some(m), .. } => {
-                    writer.set_mode(*m);
+                FlighthookEvent::SetDetectionMode { mode, handed } => {
+                    if let Some(m) = mode {
+                        writer.set_mode(*m);
+                    }
+                    if let Some(h) = handed {
+                        writer.set_handed(*h);
+                    }
                 }
                 FlighthookEvent::ConfigCommand { .. } => {
                     handle_config_command(&msg.event, &state, &bus_tx, &sender);

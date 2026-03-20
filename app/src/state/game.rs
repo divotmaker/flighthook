@@ -6,13 +6,14 @@
 
 use std::sync::{Arc, RwLock};
 
-pub use flighthook::{ClubInfo, GameStateSnapshot, PlayerInfo, ShotDetectionMode};
+pub use flighthook::{ClubInfo, GameStateSnapshot, Handedness, PlayerInfo, ShotDetectionMode};
 
 /// Shared interior state backing both `GameState` (read) and `GameStateWriter` (write).
 struct GameStateInner {
     player_info: RwLock<Option<PlayerInfo>>,
     club_info: RwLock<Option<ClubInfo>>,
     mode: RwLock<Option<ShotDetectionMode>>,
+    handed: RwLock<Option<Handedness>>,
 }
 
 /// Read-only game state — player info, club selection, and detection mode.
@@ -38,6 +39,7 @@ impl GameState {
             player_info: RwLock::new(None),
             club_info: RwLock::new(None),
             mode: RwLock::new(None),
+            handed: RwLock::new(None),
         });
         (
             Self {
@@ -61,10 +63,12 @@ impl GameState {
             .read()
             .unwrap_or_else(|e| e.into_inner());
         let mode = *self.inner.mode.read().unwrap_or_else(|e| e.into_inner());
+        let handed = *self.inner.handed.read().unwrap_or_else(|e| e.into_inner());
         GameStateSnapshot {
             player_info,
             club_info,
             mode,
+            handed,
         }
     }
 
@@ -91,4 +95,7 @@ impl GameStateWriter {
         *self.inner.mode.write().unwrap_or_else(|e| e.into_inner()) = Some(mode);
     }
 
+    pub fn set_handed(&self, handed: Handedness) {
+        *self.inner.handed.write().unwrap_or_else(|e| e.into_inner()) = Some(handed);
+    }
 }

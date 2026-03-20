@@ -662,25 +662,27 @@ fn connect_and_run(
 // ---------------------------------------------------------------------------
 
 fn ball_from_d4(d4: &ironsight::protocol::shot::FlightResult) -> BallFlight {
+    // DSP→PC negation: wire neg=right/slice, FRP pos=right/slice.
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(d4.launch_speed)),
         launch_elevation: Some(d4.launch_elevation),
-        launch_azimuth: Some(d4.launch_azimuth),
+        launch_azimuth: Some(-d4.launch_azimuth),
         carry_distance: Some(Distance::Meters(d4.carry_distance)),
         total_distance: None,
         max_height: Some(Distance::Meters(d4.max_height)),
         flight_time: Some(d4.flight_time),
         roll_distance: None,
         backspin_rpm: Some(d4.backspin_rpm),
-        sidespin_rpm: Some(d4.sidespin_rpm),
+        sidespin_rpm: Some(-d4.sidespin_rpm),
     }
 }
 
 fn ball_from_e8(e8: &ironsight::protocol::shot::FlightResultV1) -> BallFlight {
+    // DSP→PC negation: wire neg=right, FRP pos=right.
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(e8.ball_velocity)),
         launch_elevation: Some(e8.elevation),
-        launch_azimuth: Some(e8.azimuth),
+        launch_azimuth: Some(-e8.azimuth),
         carry_distance: Some(Distance::Meters(e8.distance)),
         total_distance: None,
         max_height: Some(Distance::Meters(e8.height)),
@@ -692,15 +694,16 @@ fn ball_from_e8(e8: &ironsight::protocol::shot::FlightResultV1) -> BallFlight {
 }
 
 fn club_from_ed(ed: &ironsight::protocol::shot::ClubResult) -> ClubData {
+    // DSP→PC negation: path, face_angle, swing_plane_horizontal.
     ClubData {
         club_speed: Some(Velocity::MetersPerSecond(ed.pre_club_speed)),
-        path: Some(ed.strike_direction),
+        path: Some(-ed.strike_direction),
         attack_angle: Some(ed.attack_angle),
-        face_angle: Some(ed.face_angle),
+        face_angle: Some(-ed.face_angle),
         dynamic_loft: Some(ed.dynamic_loft),
         smash_factor: Some(ed.smash_factor),
         club_speed_post: Some(Velocity::MetersPerSecond(ed.post_club_speed)),
-        swing_plane_horizontal: Some(ed.swing_plane_horizontal),
+        swing_plane_horizontal: Some(-ed.swing_plane_horizontal),
         swing_plane_vertical: Some(ed.swing_plane_vertical),
         club_offset: Some(Distance::Meters(ed.club_offset)),
         club_height: Some(Distance::Meters(ed.club_height)),

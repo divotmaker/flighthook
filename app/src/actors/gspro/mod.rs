@@ -21,7 +21,7 @@ use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use flighthook::{
-    ActorStatus, FlighthookEvent, FlighthookMessage, Severity,
+    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, Severity,
     ShotAccumulator, ShotDetectionMode, ShotKey,
 };
 
@@ -216,6 +216,7 @@ fn connect_and_run(
     }));
 
     let mut current_mode = ShotDetectionMode::Full;
+    let mut current_handed = Handedness::Right;
     // Backdate so the first heartbeat fires after ~1s instead of waiting the full 10s.
     let mut last_heartbeat = Instant::now() - Duration::from_secs(9);
     let mut read_buf = vec![0u8; 4096];
@@ -333,9 +334,14 @@ fn connect_and_run(
                         monitor_state.insert(msg.actor.clone(), ready);
                         readiness_changed = true;
                     }
-                    FlighthookEvent::SetDetectionMode { mode: Some(m), .. } => {
-                        current_mode = m;
-                        readiness_changed = true;
+                    FlighthookEvent::SetDetectionMode { mode, handed } => {
+                        if let Some(&m) = mode.as_ref() {
+                            current_mode = m;
+                            readiness_changed = true;
+                        }
+                        if let Some(&h) = handed.as_ref() {
+                            current_handed = h;
+                        }
                     }
                     FlighthookEvent::ActorStatus { status, .. } => {
                         if matches!(
@@ -354,7 +360,7 @@ fn connect_and_run(
 
         // 3. Send shot if queued
         if let Some(shot) = shot_to_send {
-            let msg = mapper::map_shot(&shot);
+            let msg = mapper::map_shot(&shot, current_handed);
             log_outbound(&msg);
             if let Ok(json_str) = serde_json::to_string(&msg) {
                 tracing::info!(

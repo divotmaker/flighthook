@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ShotDetectionMode;
+use crate::{Handedness, ShotDetectionMode};
 
 /// Golf club.
 ///
@@ -164,4 +164,6 @@ pub struct GameStateSnapshot {
     pub club_info: Option<ClubInfo>,
     #[serde(default)]
     pub mode: Option<ShotDetectionMode>,
+    #[serde(default)]
+    pub handed: Option<Handedness>,
 }
