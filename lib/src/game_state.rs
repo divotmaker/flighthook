@@ -78,27 +78,31 @@ impl Club {
     ];
 
     /// Parse a club code case-insensitively. Returns `None` for unknown codes.
+    ///
+    /// Accepts both digit-first (`"7I"`) and letter-first (`"I7"`) forms for
+    /// numbered clubs — GSPro uses letter-first (e.g. `"I7"`) on the wire.
+    /// Wedges also accept loft-based codes: 50/52 → GW, 54/56 → SW, 58/60 → LW.
     pub fn from_code(s: &str) -> Option<Club> {
         match s.to_uppercase().as_str() {
             "DR" => Some(Club::Driver),
-            "3W" => Some(Club::Wood3),
-            "5W" => Some(Club::Wood5),
-            "7W" => Some(Club::Wood7),
-            "3H" => Some(Club::Hybrid3),
-            "4H" => Some(Club::Hybrid4),
-            "5H" => Some(Club::Hybrid5),
-            "3I" => Some(Club::Iron3),
-            "4I" => Some(Club::Iron4),
-            "5I" => Some(Club::Iron5),
-            "6I" => Some(Club::Iron6),
-            "7I" => Some(Club::Iron7),
-            "8I" => Some(Club::Iron8),
-            "9I" => Some(Club::Iron9),
+            "3W" | "W3" => Some(Club::Wood3),
+            "5W" | "W5" => Some(Club::Wood5),
+            "7W" | "W7" => Some(Club::Wood7),
+            "3H" | "H3" => Some(Club::Hybrid3),
+            "4H" | "H4" => Some(Club::Hybrid4),
+            "5H" | "H5" => Some(Club::Hybrid5),
+            "3I" | "I3" => Some(Club::Iron3),
+            "4I" | "I4" => Some(Club::Iron4),
+            "5I" | "I5" => Some(Club::Iron5),
+            "6I" | "I6" => Some(Club::Iron6),
+            "7I" | "I7" => Some(Club::Iron7),
+            "8I" | "I8" => Some(Club::Iron8),
+            "9I" | "I9" => Some(Club::Iron9),
             "PW" => Some(Club::PitchingWedge),
-            "GW" => Some(Club::GapWedge),
-            "SW" => Some(Club::SandWedge),
-            "LW" => Some(Club::LobWedge),
-            "PT" => Some(Club::Putter),
+            "GW" | "50" | "52" => Some(Club::GapWedge),
+            "SW" | "54" | "56" => Some(Club::SandWedge),
+            "LW" | "58" | "60" => Some(Club::LobWedge),
+            "PT" | "P" => Some(Club::Putter),
             _ => None,
         }
     }

@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "clap",
  "flightrelay",
@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
@@ -2009,9 +2009,9 @@ dependencies = [
 
 [[package]]
 name = "ironsight"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1864d51bb103baddbd0df9371a5de773930fdab560c6bd45d8d1ca9f55a75b8f"
+checksum = "94450494c139ce76e0827353364f3b2001d2e7230bff1172e66ece2112653e34"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
