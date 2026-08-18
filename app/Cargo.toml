@@ -46,10 +46,10 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # allsquare's BLE backend is platform-specific: BlueZ on Linux, btleplug
 # elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
-allsquare = { version = "0.0.1", features = ["serde", "bluez"] }
+allsquare = { version = "0.0.2", features = ["serde", "bluez"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-allsquare = { version = "0.0.1", features = ["serde", "btleplug"] }
+allsquare = { version = "0.0.2", features = ["serde", "btleplug"] }
 
 # eframe backend is platform-specific: x11+wayland on Linux, Win32 on Windows.
 [target.'cfg(not(target_os = "windows"))'.dependencies]

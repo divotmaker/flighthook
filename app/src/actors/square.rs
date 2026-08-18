@@ -129,7 +129,11 @@ fn ball_from_square(b: &allsquare::BallMetrics) -> BallFlight {
         flight_time: None,
         roll_distance: None,
         backspin_rpm: Some(i32::from(b.back_spin)),
-        sidespin_rpm: Some(i32::from(b.side_spin)),
+        // Negated: the device reports negative sidespin for rightward curve,
+        // FRP defines positive as rightward. Without this, fades draw and
+        // draws fade in GSPro (which derives spin axis from these components).
+        // Same polarity the Mevo+ wire uses, and the same fix ironsight applies.
+        sidespin_rpm: Some(-i32::from(b.side_spin)),
     }
 }
 
@@ -527,5 +531,31 @@ fn connect_and_run(
                 emit_alert(sender, Severity::Warn, format!("Square Golf: {e}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The device reports negative sidespin for a rightward curve; FRP defines
+    /// positive as rightward. Getting this backwards makes fades draw and draws
+    /// fade in GSPro, which derives spin axis from the spin components.
+    #[test]
+    fn sidespin_polarity_is_inverted() {
+        let fade = allsquare::BallMetrics {
+            shot_type: 0x37,
+            speed: 3.30,
+            launch_angle: 32.51,
+            direction: 7.39,
+            total_spin: 627,
+            spin_axis: -8.00,
+            back_spin: 621,
+            side_spin: -87,
+        };
+        let bf = ball_from_square(&fade);
+        assert_eq!(bf.sidespin_rpm, Some(87), "device -87 (right) -> FRP +87");
+        assert_eq!(bf.backspin_rpm, Some(621), "backspin is not flipped");
+        assert_eq!(bf.launch_azimuth, Some(7.39), "azimuth is not flipped");
     }
 }
