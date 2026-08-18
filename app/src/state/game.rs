@@ -71,7 +71,6 @@ impl GameState {
             handed,
         }
     }
-
 }
 
 impl GameStateWriter {

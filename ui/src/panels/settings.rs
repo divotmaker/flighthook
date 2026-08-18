@@ -1,8 +1,8 @@
 use crate::app::FlighthookApp;
 use crate::net;
 use crate::types::{
-    Club, Distance, DistanceExt, FlighthookConfig, GsProSection, MevoSection,
-    MockMonitorSection, R10Section, RandomClubSection, UnitSystem, WebserverSection,
+    Club, Distance, DistanceExt, FlighthookConfig, GsProSection, MevoSection, MockMonitorSection,
+    R10Section, RandomClubSection, UnitSystem, WebserverSection,
 };
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
@@ -63,6 +63,18 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) dirty: bool,
 }
 
+/// Whether a string looks like a BLE address (`AA:BB:CC:DD:EE:FF`).
+///
+/// Blank is handled by callers — for devices that auto-discover, an empty
+/// address is valid.
+pub(crate) fn is_ble_address(s: &str) -> bool {
+    let s = s.trim();
+    s.len() == 17
+        && s.split(':').count() == 6
+        && s.split(':')
+            .all(|o| o.len() == 2 && o.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 impl DeviceFormEntry {
     pub(crate) fn from_mevo(id: &str, s: &MevoSection) -> Self {
         let tee = s.tee_height.unwrap_or(Distance::Inches(1.5));
@@ -105,6 +117,25 @@ impl DeviceFormEntry {
         }
     }
 
+    pub(crate) fn from_square(id: &str, s: &flighthook::SquareSection) -> Self {
+        Self {
+            id: id.into(),
+            monitor_type: "square".into(),
+            name: s.name.clone(),
+            address: s.address.clone().unwrap_or_default(),
+            ball_type: 0,
+            tee_height_val: "1.5".into(),
+            tee_height_unit: "inches".into(),
+            range_val: "8".into(),
+            range_unit: "feet".into(),
+            surface_height_val: "0".into(),
+            surface_height_unit: "inches".into(),
+            track_pct: "80".into(),
+            use_estimated: true,
+            dirty: false,
+        }
+    }
+
     pub(crate) fn from_mock(id: &str, s: &MockMonitorSection) -> Self {
         Self {
             id: id.into(),
@@ -124,18 +155,30 @@ impl DeviceFormEntry {
         }
     }
 
-    pub(crate) fn is_mock(&self) -> bool {
-        self.monitor_type == "mock_monitor"
+    pub(crate) fn is_mevo(&self) -> bool {
+        self.monitor_type == "mevo"
     }
 
-    pub(crate) fn is_r10(&self) -> bool {
-        self.monitor_type == "r10"
+    pub(crate) fn is_square(&self) -> bool {
+        self.monitor_type == "square"
     }
 
-    /// Returns true if this device type has no configurable address
-    /// (BLE auto-discover or mock).
-    pub(crate) fn skip_address(&self) -> bool {
-        self.is_mock() || self.is_r10()
+    /// Whether this device takes a TCP `ip:port` address (validated as such).
+    pub(crate) fn has_network_address(&self) -> bool {
+        self.is_mevo()
+    }
+
+    /// Whether this device takes an optional BLE address. Blank means
+    /// auto-discover by name prefix, so blank is valid.
+    pub(crate) fn has_ble_address(&self) -> bool {
+        self.is_square()
+    }
+
+    /// Whether the Mevo tuning block applies — ball type, tee height, range,
+    /// surface height, track percentage, estimated shots. These are all
+    /// FlightScope radar settings with no meaning on any other device.
+    pub(crate) fn has_mevo_tuning(&self) -> bool {
+        self.is_mevo()
     }
 }
 
@@ -190,6 +233,7 @@ impl ActorFormEntry {
             ActorFormEntry::Device(d) => match d.monitor_type.as_str() {
                 "mevo" => "Mevo",
                 "r10" => "R10",
+                "square" => "Square Golf Omni",
                 "mock_monitor" => "Mock",
                 _ => &d.monitor_type,
             },
@@ -207,6 +251,9 @@ impl ActorFormEntry {
             ActorFormEntry::Device(d) => match d.monitor_type.as_str() {
                 "mevo" => "FlightScope Mevo / Mevo+ — connects via WiFi (TCP)",
                 "r10" => "Garmin R10 — auto-detects from system connected Bluetooth devices",
+                "square" => {
+                    "Square Golf Omni — BLE, no pairing required; leave address blank to auto-discover"
+                }
                 "mock_monitor" => "Mock launch monitor — generates random shots for testing",
                 _ => "",
             },
@@ -290,6 +337,12 @@ impl SettingsForm {
                     id, section,
                 )));
         }
+        for (id, section) in &s.square {
+            self.actors
+                .push(ActorFormEntry::Device(DeviceFormEntry::from_square(
+                    id, section,
+                )));
+        }
         for (id, section) in &s.r10 {
             self.actors
                 .push(ActorFormEntry::Device(DeviceFormEntry::from_r10(
@@ -355,8 +408,17 @@ impl SettingsForm {
                     if dev.name.is_empty() {
                         return false;
                     }
-                    if !dev.skip_address() && dev.address.parse::<std::net::SocketAddr>().is_err() {
+                    if dev.has_network_address()
+                        && dev.address.parse::<std::net::SocketAddr>().is_err()
+                    {
                         return false;
+                    }
+                    // A BLE address is optional — blank means auto-discover.
+                    if dev.has_ble_address() {
+                        let a = dev.address.trim();
+                        if !a.is_empty() && !is_ble_address(a) {
+                            return false;
+                        }
                     }
                 }
                 ActorFormEntry::Integration(entry) => {
@@ -378,6 +440,7 @@ impl SettingsForm {
         let mut webserver = std::collections::HashMap::new();
         let mut mevo = std::collections::HashMap::new();
         let mut r10 = std::collections::HashMap::new();
+        let mut square = std::collections::HashMap::new();
         let mut mock_monitor = std::collections::HashMap::new();
         let mut gspro = std::collections::HashMap::new();
         let mut random_club = std::collections::HashMap::new();
@@ -409,6 +472,23 @@ impl SettingsForm {
                                 ),
                                 track_pct: dev.track_pct.parse().ok(),
                                 use_estimated: Some(dev.use_estimated),
+                            },
+                        );
+                    }
+                    "square" => {
+                        square.insert(
+                            dev.id.clone(),
+                            flighthook::SquareSection {
+                                name: dev.name.clone(),
+                                address: if dev.address.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(dev.address.trim().to_string())
+                                },
+                                // Not surfaced in the UI yet; preserved from
+                                // the on-disk config below.
+                                club: None,
+                                advanced_spin: None,
                             },
                         );
                     }
@@ -488,6 +568,7 @@ impl SettingsForm {
             webserver,
             mevo,
             r10,
+            square,
             mock_monitor,
             gspro,
             random_club,
@@ -582,6 +663,21 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             }),
                             track_pct: dev.track_pct.parse().ok(),
                             use_estimated: Some(dev.use_estimated),
+                        },
+                    );
+                }
+                "square" => {
+                    config.square.insert(
+                        dev.id.clone(),
+                        flighthook::SquareSection {
+                            name: dev.name.clone(),
+                            address: if dev.address.trim().is_empty() {
+                                None
+                            } else {
+                                Some(dev.address.trim().to_string())
+                            },
+                            club: None,
+                            advanced_spin: None,
                         },
                     );
                 }
@@ -846,7 +942,7 @@ impl FlighthookApp {
                                 }
                             });
 
-                            if !dev.skip_address() {
+                            if dev.has_network_address() {
                                 // Address
                                 ui.horizontal(|ui| {
                                     ui.add_space(16.0);
@@ -866,6 +962,32 @@ impl FlighthookApp {
                                         );
                                     }
                                 });
+                            }
+
+                            if dev.has_ble_address() {
+                                // BLE address — optional; blank auto-discovers.
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label("BLE Address:").on_hover_text("Bluetooth address of the device. Leave blank to auto-discover by name.");
+                                    if ui
+                                        .add(egui::TextEdit::singleline(&mut dev.address).desired_width(field_width))
+                                        .on_hover_text("optional, e.g. DC:0D:30:62:54:E4")
+                                        .changed()
+                                    {
+                                        dev.dirty = true;
+                                    }
+                                    let a = dev.address.trim();
+                                    if !a.is_empty() && !is_ble_address(a) {
+                                        ui.label(
+                                            egui::RichText::new("Invalid BLE address")
+                                                .color(egui::Color32::from_rgb(255, 80, 80))
+                                                .size(11.0),
+                                        );
+                                    }
+                                });
+                            }
+
+                            if dev.has_mevo_tuning() {
 
                                 // Ball Type
                                 ui.horizontal(|ui| {
@@ -1090,6 +1212,33 @@ impl FlighthookApp {
                                     monitor_type: "mevo".into(),
                                     name: "Mevo WiFi".into(),
                                     address: "192.168.2.1:5100".into(),
+                                    ball_type: 0,
+                                    tee_height_val: "1.5".into(),
+                                    tee_height_unit: "inches".into(),
+                                    range_val: "8".into(),
+                                    range_unit: "feet".into(),
+                                    surface_height_val: "0".into(),
+                                    surface_height_unit: "inches".into(),
+                                    track_pct: "80".into(),
+                                    use_estimated: true,
+                                    dirty: true,
+                                }));
+                                self.settings.dirty = true;
+                            }
+                            if ui.selectable_label(false, "Square Golf Omni").clicked() {
+                                let existing: Vec<&str> = self.settings.actors.iter()
+                                    .filter_map(|a| match a {
+                                        ActorFormEntry::Device(d) if d.monitor_type == "square" => Some(d.id.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                let id = next_index(&existing);
+                                self.settings.actors.push(ActorFormEntry::Device(DeviceFormEntry {
+                                    id,
+                                    monitor_type: "square".into(),
+                                    name: "Square Golf Omni".into(),
+                                    // Blank address = auto-discover by name prefix.
+                                    address: String::new(),
                                     ball_type: 0,
                                     tee_height_val: "1.5".into(),
                                     tee_height_unit: "inches".into(),

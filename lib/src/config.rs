@@ -159,6 +159,8 @@ pub struct FlighthookConfig {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub r10: std::collections::HashMap<String, R10Section>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub square: std::collections::HashMap<String, SquareSection>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub mock_monitor: std::collections::HashMap<String, MockMonitorSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub gspro: std::collections::HashMap<String, GsProSection>,
@@ -196,6 +198,28 @@ pub struct MevoSection {
 pub struct R10Section {
     #[serde(default)]
     pub name: String,
+}
+
+/// A Square Golf BLE device instance (Omni or Home).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SquareSection {
+    #[serde(default)]
+    pub name: String,
+    /// BLE address to connect to. When absent, the first device advertising the
+    /// `SquareGolf` name prefix is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// Club selected on connect, e.g. `"7i"`, `"driver"`, `"putter"`.
+    ///
+    /// The device is told which club is in play — it affects how the shot is
+    /// classified. When GSPro reports a club change, the actor follows it and
+    /// this is only the starting value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub club: Option<String>,
+    /// Use the device's advanced spin measurement. Defaults to true, matching
+    /// the vendor app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advanced_spin: Option<bool>,
 }
 
 /// A mock launch monitor instance.
@@ -249,6 +273,7 @@ impl FlighthookConfig {
     pub fn has_user_actors(&self) -> bool {
         !self.mevo.is_empty()
             || !self.r10.is_empty()
+            || !self.square.is_empty()
             || !self.mock_monitor.is_empty()
             || !self.gspro.is_empty()
             || !self.random_club.is_empty()
@@ -274,6 +299,7 @@ impl Default for FlighthookConfig {
             webserver,
             mevo: std::collections::HashMap::new(),
             r10: std::collections::HashMap::new(),
+            square: std::collections::HashMap::new(),
             mock_monitor: std::collections::HashMap::new(),
             gspro: std::collections::HashMap::new(),
             random_club: std::collections::HashMap::new(),
@@ -300,6 +326,18 @@ impl Default for R10Section {
     fn default() -> Self {
         Self {
             name: "Garmin R10".into(),
+        }
+    }
+}
+
+impl Default for SquareSection {
+    fn default() -> Self {
+        Self {
+            name: "Square Golf Omni".into(),
+            // Auto-discover by name prefix.
+            address: None,
+            club: None,
+            advanced_spin: None,
         }
     }
 }

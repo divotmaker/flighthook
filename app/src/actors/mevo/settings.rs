@@ -99,7 +99,6 @@ impl SessionConfig {
             ShotDetectionMode::Chipping => MODE_CHIPPING,
         }
     }
-
 }
 
 /// Default camera configuration for Mevo+ sessions.

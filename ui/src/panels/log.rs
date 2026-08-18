@@ -24,9 +24,22 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
 
 /// Filter groups for the dropdown.
 const FILTER_GROUPS: &[(&str, &[&str])] = &[
-    ("Launch Monitor", &["shot_trigger", "ball_flight", "club_path", "face_impact", "shot_finished", "device_telemetry"]),
+    (
+        "Launch Monitor",
+        &[
+            "shot_trigger",
+            "ball_flight",
+            "club_path",
+            "face_impact",
+            "shot_finished",
+            "device_telemetry",
+        ],
+    ),
     ("Game", &["player_info", "club_info", "set_detection_mode"]),
-    ("System", &["actor_status", "config_command", "config_outcome"]),
+    (
+        "System",
+        &["actor_status", "config_command", "config_outcome"],
+    ),
     ("Alert", &["alert_error", "alert_warn", "alert_critical"]),
 ];
 
@@ -71,7 +84,12 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
         FlighthookEvent::ClubPath { key, .. } => format!("club #{}", key.shot_number),
         FlighthookEvent::FaceImpact { key, .. } => format!("impact #{}", key.shot_number),
         FlighthookEvent::ShotFinished { key } => format!("finished #{}", key.shot_number),
-        FlighthookEvent::DeviceTelemetry { manufacturer, model, telemetry, .. } => {
+        FlighthookEvent::DeviceTelemetry {
+            manufacturer,
+            model,
+            telemetry,
+            ..
+        } => {
             // Show readiness if telemetry has ready key, otherwise show device identity
             if let Some(tel) = telemetry
                 && tel.contains_key("ready")
@@ -79,20 +97,22 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
                 let ready = tel.get("ready").map(|v| v.as_str()).unwrap_or("?");
                 return format!("ready={ready}");
             }
-            format!("device: {} {}", manufacturer.as_deref().unwrap_or("?"), model.as_deref().unwrap_or("?"))
+            format!(
+                "device: {} {}",
+                manufacturer.as_deref().unwrap_or("?"),
+                model.as_deref().unwrap_or("?")
+            )
         }
         FlighthookEvent::PlayerInfo { player_info } => {
             format!("name={}", player_info.name.as_deref().unwrap_or("?"))
         }
         FlighthookEvent::ClubInfo { club_info } => format!("club={}", club_info.club),
-        FlighthookEvent::SetDetectionMode { mode, handed } => {
-            match (mode, handed) {
-                (Some(m), Some(h)) => format!("{m:?} handed={h}"),
-                (Some(m), None) => format!("{m:?}"),
-                (None, Some(h)) => format!("handed={h}"),
-                (None, None) => "no-op".into(),
-            }
-        }
+        FlighthookEvent::SetDetectionMode { mode, handed } => match (mode, handed) {
+            (Some(m), Some(h)) => format!("{m:?} handed={h}"),
+            (Some(m), None) => format!("{m:?}"),
+            (None, Some(h)) => format!("handed={h}"),
+            (None, None) => "no-op".into(),
+        },
         FlighthookEvent::ActorStatus { status, .. } => format!("{status:?}"),
         FlighthookEvent::ConfigCommand { action, .. } => format!("{action:?}"),
         FlighthookEvent::ConfigOutcome { request_id, .. } => match request_id {
@@ -132,8 +152,7 @@ impl FlighthookApp {
                     .show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
                             // Toggle all
-                            let all_checked =
-                                self.log_type_filters.iter().all(|(_, v)| *v);
+                            let all_checked = self.log_type_filters.iter().all(|(_, v)| *v);
                             let mut toggle_all = all_checked;
                             if ui.checkbox(&mut toggle_all, "All").clicked() {
                                 for v in self.log_type_filters.values_mut() {
@@ -145,27 +164,20 @@ impl FlighthookApp {
                             for &(group_name, keys) in FILTER_GROUPS {
                                 // Group heading with toggle-all checkbox
                                 let group_all = keys.iter().all(|k| {
-                                    self.log_type_filters
-                                        .get(*k)
-                                        .copied()
-                                        .unwrap_or(true)
+                                    self.log_type_filters.get(*k).copied().unwrap_or(true)
                                 });
                                 let mut group_toggle = group_all;
                                 let heading = egui::RichText::new(group_name).strong();
                                 if ui.checkbox(&mut group_toggle, heading).clicked() {
                                     for &k in keys {
-                                        if let Some(v) =
-                                            self.log_type_filters.get_mut(k)
-                                        {
+                                        if let Some(v) = self.log_type_filters.get_mut(k) {
                                             *v = group_toggle;
                                         }
                                     }
                                 }
 
                                 for &key in keys {
-                                    if let Some(checked) =
-                                        self.log_type_filters.get_mut(key)
-                                    {
+                                    if let Some(checked) = self.log_type_filters.get_mut(key) {
                                         ui.horizontal(|ui| {
                                             ui.add_space(16.0);
                                             ui.checkbox(checked, key);

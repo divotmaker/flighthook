@@ -80,6 +80,7 @@ impl LegacyFlighthookConfig {
             webserver,
             mevo: self.mevo,
             r10: HashMap::new(),
+            square: HashMap::new(),
             mock_monitor: self.mock_monitor,
             gspro: self.gspro,
             random_club: self.random_club,

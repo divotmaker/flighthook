@@ -4,6 +4,7 @@ pub mod gspro;
 pub mod mevo;
 pub mod mock;
 pub mod r10;
+pub mod square;
 pub mod system;
 pub mod web;
 
@@ -17,6 +18,7 @@ use tokio::sync::broadcast;
 use crate::bus::{BusReceiver, BusSender};
 use crate::state::SystemState;
 use crate::state::config::{FlighthookConfig, global_id};
+use flighthook::Club;
 
 // ---------------------------------------------------------------------------
 // Actor trait
@@ -111,6 +113,25 @@ pub fn resolve_actors(
         });
     }
 
+    // Square Golf devices
+    for (index, section) in &config.square {
+        let id = global_id("square", index);
+        let club = section
+            .club
+            .as_deref()
+            .and_then(Club::from_code)
+            .unwrap_or(Club::Iron7);
+        actors.push(ResolvedActor {
+            id,
+            name: section.name.clone(),
+            actor: Box::new(square::SquareActor {
+                address: section.address.clone(),
+                club,
+                advanced_spin: section.advanced_spin.unwrap_or(true),
+            }),
+        });
+    }
+
     // Mock monitors
     for (index, section) in &config.mock_monitor {
         let id = global_id("mock_monitor", index);
@@ -135,10 +156,7 @@ pub fn resolve_actors(
                 actors.push(ResolvedActor {
                     id,
                     name: section.name.clone(),
-                    actor: Box::new(gspro::GsProActor {
-                        addr,
-                        routing,
-                    }),
+                    actor: Box::new(gspro::GsProActor { addr, routing }),
                 });
             }
             Err(e) => {
@@ -199,6 +217,9 @@ pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String> {
     }
     for (index, section) in &config.r10 {
         names.insert(global_id("r10", index), section.name.clone());
+    }
+    for (index, section) in &config.square {
+        names.insert(global_id("square", index), section.name.clone());
     }
     for (index, section) in &config.mock_monitor {
         names.insert(global_id("mock_monitor", index), section.name.clone());

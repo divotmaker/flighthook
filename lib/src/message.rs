@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use crate::{ActorStatus, BallFlight, ClubData, FaceImpact};
 use crate::{ClubInfo, PlayerInfo};
 use crate::{
-    FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, R10Section,
-    RandomClubSection, WebserverSection,
+    FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, R10Section, RandomClubSection,
+    SquareSection, WebserverSection,
 };
 
 // ---------------------------------------------------------------------------
@@ -277,6 +277,10 @@ pub enum ConfigAction {
         index: String,
         section: R10Section,
     },
+    UpsertSquare {
+        index: String,
+        section: SquareSection,
+    },
     UpsertGsPro {
         index: String,
         section: GsProSection,
@@ -373,7 +377,10 @@ mod tests {
         assert!(back.device.is_none());
         assert!(matches!(
             back.event,
-            FlighthookEvent::ActorStatus { status: crate::ActorStatus::Connected, .. }
+            FlighthookEvent::ActorStatus {
+                status: crate::ActorStatus::Connected,
+                ..
+            }
         ));
     }
 }

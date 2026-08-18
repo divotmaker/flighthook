@@ -12,9 +12,7 @@ use std::collections::HashMap;
 use super::super::Actor;
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
-use flighthook::{
-    ActorStatus, Club, ClubInfo, FlighthookEvent, FlighthookMessage, Handedness,
-};
+use flighthook::{ActorStatus, Club, ClubInfo, FlighthookEvent, FlighthookMessage, Handedness};
 
 const HANDEDNESS: &[Handedness] = &[Handedness::Right, Handedness::Left];
 

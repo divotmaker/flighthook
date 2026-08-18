@@ -139,9 +139,13 @@ pub async fn post_mode(
     Json(body): Json<ModeRequest>,
 ) -> StatusCode {
     let mode = body.mode;
-    let _ = state
-        .bus_tx
-        .send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode { mode: Some(mode), handed: None }).actor("web"));
+    let _ = state.bus_tx.send(
+        FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+            mode: Some(mode),
+            handed: None,
+        })
+        .actor("web"),
+    );
     StatusCode::ACCEPTED
 }
 
@@ -195,10 +199,7 @@ pub async fn post_settings(
     .await;
 
     match result {
-        Ok(Some((restarted, stopped))) => Json(PostSettingsResponse {
-            restarted,
-            stopped,
-        }),
+        Ok(Some((restarted, stopped))) => Json(PostSettingsResponse { restarted, stopped }),
         _ => {
             tracing::warn!("config update: timed out waiting for ConfigOutcome");
             Json(PostSettingsResponse {

@@ -17,6 +17,13 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 | FlightScope Mevo+     | TCP (binary, port 5100) | Supported |
 | FlightScope Mevo Gen2 | TCP (binary, port 5100) | Supported |
 | Garmin R10            | BLE / GFDI / Protobuf   | Alpha     |
+| Square Golf Omni      | BLE (GATT)              | Alpha     |
+
+The Square Golf Omni is the first supported device to report **face impact
+location** on the wire, so it is currently the only one that forwards
+`VerticalFaceImpact` / `HorizontalFaceImpact` to GSPro. It also reports dynamic
+loft and smash factor. The original Square / Square Home is not supported — it
+uses a different club-code scheme.
 
 ### Simulation Software
 
@@ -36,6 +43,8 @@ flighthook exposes a REST + WebSocket API on the event bus, so any external soft
 
 - Multi-device support
 - Automatic detection mode switching based on club selection (full / chipping / putting)
+- Club selection is forwarded to devices that use it — the Square Golf Omni has no
+  separate putting mode, so selecting a putter in the sim puts it in putting mode
 - Dual UI: native desktop window (eframe/egui) and browser dashboard (WASM, same codebase)
 - Configurable via TOML file with live settings updates
 - REST + WebSocket API for external consumers — subscribe to shot data, device telemetry, and raw audit events in real time. Build custom shot triggers, data loggers, or alternative integrations without touching the core.
@@ -87,14 +96,24 @@ range = "8ft"
 surface_height = "0in"
 track_pct = 80.0
 
+[square.0]
+name = "Square Golf Omni"
+# address is optional — omit it to auto-discover by name. No pairing required.
+address = "DC:0D:30:62:54:E4"
+club = "7i"                    # club selected on connect
+advanced_spin = true           # device's advanced spin measurement
+
+[r10.0]
+name = "Garmin R10"
+
 [gspro.0]
 name = "Local GSPro"
 address = "127.0.0.1:921"
 ```
 
-Section prefixes encode component type: `mevo`, `mock_monitor`, `gspro`,
-`random_club`. The index after the dot (`0`, `1`, ...) identifies the
-instance. Settings can also be edited live from the Settings tab in the UI.
+Section prefixes encode component type: `mevo`, `r10`, `square`,
+`mock_monitor`, `gspro`, `random_club`. The index after the dot (`0`, `1`, ...)
+identifies the instance. Settings can also be edited live from the Settings tab in the UI.
 
 ## Developer Quick Start
 

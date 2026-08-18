@@ -17,8 +17,8 @@ use crate::state::SystemState;
 use settings::cam_config;
 
 use flighthook::{
-    ActorStatus, BallFlight, ClubData,
-    Distance, FlighthookEvent, FlighthookMessage, Severity, ShotDetectionMode, ShotKey, Velocity,
+    ActorStatus, BallFlight, ClubData, Distance, FlighthookEvent, FlighthookMessage, Severity,
+    ShotDetectionMode, ShotKey, Velocity,
 };
 
 /// No events for this long → treat as disconnected.
@@ -54,7 +54,14 @@ impl Actor for MevoActor {
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                run(addr, initial_mode, session_config, use_estimated, sender, receiver);
+                run(
+                    addr,
+                    initial_mode,
+                    session_config,
+                    use_estimated,
+                    sender,
+                    receiver,
+                );
             })
             .expect("failed to spawn mevo thread");
     }
@@ -250,7 +257,11 @@ fn connect_and_run(
     // Set up send/recv audit logging callbacks
     let send_id = sender.actor_id().to_string();
     conn.set_on_send(move |cmd, dest| {
-        tracing::debug!("{send_id} send >> {dest:?} {:?} [{}]", cmd, cmd.debug_hex(dest));
+        tracing::debug!(
+            "{send_id} send >> {dest:?} {:?} [{}]",
+            cmd,
+            cmd.debug_hex(dest)
+        );
     });
     let audit_id = sender.actor_id().to_string();
     conn.set_on_recv(move |env| {
@@ -311,17 +322,21 @@ fn connect_and_run(
                     return Ok(());
                 }
                 Ok(None) => break,
-                Ok(Some(msg)) => if let FlighthookEvent::SetDetectionMode { mode: Some(new_mode), .. } = msg.event
-                    && !same_mode(current_mode, new_mode) {
+                Ok(Some(msg)) => {
+                    if let FlighthookEvent::SetDetectionMode {
+                        mode: Some(new_mode),
+                        ..
+                    } = msg.event
+                        && !same_mode(current_mode, new_mode)
+                    {
                         if client.is_armed() {
                             let new_wire = SessionConfig::mode_label(&new_mode);
                             info!(
                                 "mode change: {:?} -> {:?} wire={new_wire}",
                                 current_mode, new_mode
                             );
-                            client.configure_avr(
-                                SessionConfig::to_avr_settings_mode_only(&new_mode),
-                            );
+                            client
+                                .configure_avr(SessionConfig::to_avr_settings_mode_only(&new_mode));
                             client.arm();
                             current_mode = new_mode;
                             emit_device_status(sender, ActorStatus::Connected, HashMap::new());
@@ -334,7 +349,8 @@ fn connect_and_run(
                                 new_mode
                             );
                         }
-                },
+                    }
+                }
             }
         }
 
@@ -373,7 +389,8 @@ fn connect_and_run(
                         device_telemetry.insert("tilt".into(), format!("{tilt:.1}"));
                         device_telemetry.insert("roll".into(), format!("{roll:.1}"));
                         device_telemetry.insert("temp_c".into(), "0.0".into());
-                        device_telemetry.insert("external_power".into(), external_power.to_string());
+                        device_telemetry
+                            .insert("external_power".into(), external_power.to_string());
                         device_telemetry.insert("ready".into(), "false".into());
 
                         if let Some(dev) = device_id.as_deref() {
@@ -468,12 +485,10 @@ fn connect_and_run(
                                         ball.backspin_rpm.unwrap_or(0),
                                         ball.sidespin_rpm.unwrap_or(0),
                                     );
-                                    let msg = FlighthookMessage::new(
-                                        FlighthookEvent::BallFlight {
-                                            key: key.clone(),
-                                            ball: Box::new(ball),
-                                        },
-                                    );
+                                    let msg = FlighthookMessage::new(FlighthookEvent::BallFlight {
+                                        key: key.clone(),
+                                        ball: Box::new(ball),
+                                    });
                                     sender.send(stamp_device(msg, device_id));
                                 }
                                 ShotDatum::FlightV1(e8) => {
@@ -482,12 +497,10 @@ fn connect_and_run(
                                 }
                                 ShotDatum::Club(ed) => {
                                     let club = club_from_ed(&ed);
-                                    let msg = FlighthookMessage::new(
-                                        FlighthookEvent::ClubPath {
-                                            key: key.clone(),
-                                            club: Box::new(club),
-                                        },
-                                    );
+                                    let msg = FlighthookMessage::new(FlighthookEvent::ClubPath {
+                                        key: key.clone(),
+                                        club: Box::new(club),
+                                    });
                                     sender.send(stamp_device(msg, device_id));
                                 }
                                 ShotDatum::Spin(_) => {
@@ -511,14 +524,15 @@ fn connect_and_run(
                                             ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
                                             ball.launch_elevation.unwrap_or(0.0),
                                             ball.launch_azimuth.unwrap_or(0.0),
-                                            ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
+                                            ball.carry_distance
+                                                .map(|d| d.as_yards())
+                                                .unwrap_or(0.0),
                                         );
-                                        let msg = FlighthookMessage::new(
-                                            FlighthookEvent::BallFlight {
+                                        let msg =
+                                            FlighthookMessage::new(FlighthookEvent::BallFlight {
                                                 key: key.clone(),
                                                 ball: Box::new(ball),
-                                            },
-                                        );
+                                            });
                                         sender.send(stamp_device(msg, device_id));
                                     } else {
                                         warn!(
@@ -583,9 +597,12 @@ fn connect_and_run(
                             changed = true;
                         }
                         if let Some(dsp) = &status.dsp {
-                            device_telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
-                            device_telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
-                            device_telemetry.insert("external_power".into(), dsp.external_power().to_string());
+                            device_telemetry
+                                .insert("battery_pct".into(), dsp.battery_percent().to_string());
+                            device_telemetry
+                                .insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
+                            device_telemetry
+                                .insert("external_power".into(), dsp.external_power().to_string());
                             changed = true;
                         }
                         if changed {
@@ -593,22 +610,23 @@ fn connect_and_run(
                         }
                     }
 
-                    BinaryEvent::Message(env) => {
-                        match &env.message {
-                            Message::DspStatus(dsp) => {
-                                device_telemetry.insert("battery_pct".into(), dsp.battery_percent().to_string());
-                                device_telemetry.insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
-                                device_telemetry.insert("external_power".into(), dsp.external_power().to_string());
-                                try_emit_device_telemetry(sender, device_id, &device_telemetry);
-                            }
-                            Message::AvrStatus(avr) => {
-                                device_telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
-                                device_telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
-                                try_emit_device_telemetry(sender, device_id, &device_telemetry);
-                            }
-                            _ => {}
+                    BinaryEvent::Message(env) => match &env.message {
+                        Message::DspStatus(dsp) => {
+                            device_telemetry
+                                .insert("battery_pct".into(), dsp.battery_percent().to_string());
+                            device_telemetry
+                                .insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
+                            device_telemetry
+                                .insert("external_power".into(), dsp.external_power().to_string());
+                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
                         }
-                    }
+                        Message::AvrStatus(avr) => {
+                            device_telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
+                            device_telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
+                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
+                        }
+                        _ => {}
+                    },
                 }
             }
 
@@ -620,7 +638,9 @@ fn connect_and_run(
                 if idle_count == 1 || idle_count.is_multiple_of(200) {
                     debug!(
                         "poll -> None (idle={idle_count}, stale_in={:.1}s, armed={})",
-                        STALE_TIMEOUT.saturating_sub(last_event_time.elapsed()).as_secs_f64(),
+                        STALE_TIMEOUT
+                            .saturating_sub(last_event_time.elapsed())
+                            .as_secs_f64(),
                         client.is_armed(),
                     );
                 }

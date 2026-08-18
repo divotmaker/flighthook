@@ -81,24 +81,16 @@ impl ShotData {
                 .map(|v| Velocity::MetersPerSecond(v.as_mps())),
             launch_elevation: b.launch_elevation,
             launch_azimuth: b.launch_azimuth,
-            carry_distance: b
-                .carry_distance
-                .map(|d| Distance::Meters(d.as_meters())),
-            total_distance: b
-                .total_distance
-                .map(|d| Distance::Meters(d.as_meters())),
+            carry_distance: b.carry_distance.map(|d| Distance::Meters(d.as_meters())),
+            total_distance: b.total_distance.map(|d| Distance::Meters(d.as_meters())),
             max_height: b.max_height.map(|d| Distance::Meters(d.as_meters())),
             flight_time: b.flight_time,
-            roll_distance: b
-                .roll_distance
-                .map(|d| Distance::Meters(d.as_meters())),
+            roll_distance: b.roll_distance.map(|d| Distance::Meters(d.as_meters())),
             backspin_rpm: b.backspin_rpm,
             sidespin_rpm: b.sidespin_rpm,
         });
         let club = self.club.as_ref().map(|c| ClubData {
-            club_speed: c
-                .club_speed
-                .map(|v| Velocity::MetersPerSecond(v.as_mps())),
+            club_speed: c.club_speed.map(|v| Velocity::MetersPerSecond(v.as_mps())),
             path: c.path,
             attack_angle: c.attack_angle,
             face_angle: c.face_angle,

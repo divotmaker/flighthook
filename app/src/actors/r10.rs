@@ -112,11 +112,7 @@ fn club_from_r10(c: &tenover::proto::ClubData) -> ClubData {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::needless_pass_by_value)]
-fn run(
-    _initial_mode: ShotDetectionMode,
-    sender: BusSender,
-    mut receiver: BusReceiver,
-) {
+fn run(_initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusReceiver) {
     let mut backoff = MIN_BACKOFF;
     let mut ever_connected = false;
     let mut device_id: Option<String> = None;
@@ -128,12 +124,7 @@ fn run(
 
         emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
 
-        match connect_and_run(
-            &sender,
-            &mut receiver,
-            &mut ever_connected,
-            &mut device_id,
-        ) {
+        match connect_and_run(&sender, &mut receiver, &mut ever_connected, &mut device_id) {
             Ok(()) => break,
             Err(e) => {
                 warn!("session error: {e}");
@@ -154,9 +145,7 @@ fn run(
                             manufacturer: None,
                             model: None,
                             firmware: None,
-                            telemetry: Some(HashMap::from([
-                                ("ready".into(), "false".into()),
-                            ])),
+                            telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
                         })
                         .device(dev),
                     );
@@ -230,7 +219,11 @@ fn connect_and_run(
                 Ok(None) => break,
                 Ok(Some(msg)) => {
                     // R10 doesn't support mode switching — just log
-                    if let FlighthookEvent::SetDetectionMode { mode: Some(new_mode), .. } = msg.event {
+                    if let FlighthookEvent::SetDetectionMode {
+                        mode: Some(new_mode),
+                        ..
+                    } = msg.event
+                    {
                         debug!("mode change to {new_mode:?} (ignored — R10 has no mode control)");
                     }
                 }
@@ -303,9 +296,7 @@ fn connect_and_run(
                         emit_device_status(
                             sender,
                             ActorStatus::Connected,
-                            HashMap::from([
-                                ("shot_count".into(), shot_counter.to_string()),
-                            ]),
+                            HashMap::from([("shot_count".into(), shot_counter.to_string())]),
                         );
 
                         // Emit ShotTrigger
@@ -357,10 +348,8 @@ fn connect_and_run(
 
                         // Emit ShotFinished
                         sender.send(
-                            FlighthookMessage::new(FlighthookEvent::ShotFinished {
-                                key,
-                            })
-                            .device(&addr),
+                            FlighthookMessage::new(FlighthookEvent::ShotFinished { key })
+                                .device(&addr),
                         );
 
                         // R10 auto-returns to WAITING after processing
@@ -444,11 +433,7 @@ fn connect_and_run(
             }
             Err(e) => {
                 warn!("protocol error: {e}");
-                emit_alert(
-                    sender,
-                    Severity::Warn,
-                    format!("R10 protocol error: {e}"),
-                );
+                emit_alert(sender, Severity::Warn, format!("R10 protocol error: {e}"));
             }
         }
     }

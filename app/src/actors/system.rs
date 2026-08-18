@@ -249,9 +249,10 @@ fn run(
                     // Auto-derive detection mode from club selection
                     let mode = state.system.snapshot().club_mode(club_info.club);
                     writer.set_mode(mode);
-                    sender.send(FlighthookMessage::new(
-                        FlighthookEvent::SetDetectionMode { mode: Some(mode), handed: None },
-                    ));
+                    sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+                        mode: Some(mode),
+                        handed: None,
+                    }));
                 }
                 FlighthookEvent::SetDetectionMode { mode, handed } => {
                     if let Some(m) = mode {
@@ -315,6 +316,13 @@ fn handle_config_command(
             });
             scope = Some(format!("r10.{index}"));
         }
+        ConfigAction::UpsertSquare { index, section } => {
+            let idx = index.clone();
+            state.system.update(|p| {
+                p.square.insert(idx, section.clone());
+            });
+            scope = Some(format!("square.{index}"));
+        }
         ConfigAction::UpsertGsPro { index, section } => {
             let idx = index.clone();
             state.system.update(|p| {
@@ -345,6 +353,9 @@ fn handle_config_command(
                     }
                     "r10" => {
                         p.r10.remove(&idx);
+                    }
+                    "square" => {
+                        p.square.remove(&idx);
                     }
                     "gspro" => {
                         p.gspro.remove(&idx);

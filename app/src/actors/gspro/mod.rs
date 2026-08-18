@@ -21,8 +21,8 @@ use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use flighthook::{
-    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, Severity,
-    ShotAccumulator, ShotDetectionMode, ShotKey,
+    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, Severity, ShotAccumulator,
+    ShotDetectionMode, ShotKey,
 };
 
 /// Bridge-internal error type.
@@ -280,13 +280,8 @@ fn connect_and_run(
                         let acc = ShotAccumulator::new(msg.actor.clone(), key.clone());
                         accumulators.insert((msg.actor.clone(), key.clone()), acc);
                     }
-                    FlighthookEvent::BallFlight {
-                        ref key,
-                        ref ball,
-                    } => {
-                        if let Some(acc) =
-                            accumulators.get_mut(&(msg.actor.clone(), key.clone()))
-                        {
+                    FlighthookEvent::BallFlight { ref key, ref ball } => {
+                        if let Some(acc) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
                             acc.set_ball(*ball.clone());
                         }
                     }
@@ -294,23 +289,17 @@ fn connect_and_run(
                         ref key,
                         ref impact,
                     } => {
-                        if let Some(acc) =
-                            accumulators.get_mut(&(msg.actor.clone(), key.clone()))
-                        {
+                        if let Some(acc) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
                             acc.set_impact(*impact.clone());
                         }
                     }
                     FlighthookEvent::ClubPath { ref key, ref club } => {
-                        if let Some(acc) =
-                            accumulators.get_mut(&(msg.actor.clone(), key.clone()))
-                        {
+                        if let Some(acc) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
                             acc.set_club(*club.clone());
                         }
                     }
                     FlighthookEvent::ShotFinished { ref key } => {
-                        if let Some(acc) =
-                            accumulators.remove(&(msg.actor.clone(), key.clone()))
-                        {
+                        if let Some(acc) = accumulators.remove(&(msg.actor.clone(), key.clone())) {
                             if !shot_matches_routing(routing, current_mode, &msg.actor) {
                                 tracing::debug!(
                                     "gspro bridge: skipping shot #{} from '{}' (routed to {:?} for mode {current_mode:?})",
@@ -328,7 +317,8 @@ fn connect_and_run(
                         }
                     }
                     FlighthookEvent::DeviceTelemetry {
-                        telemetry: Some(ref tel), ..
+                        telemetry: Some(ref tel),
+                        ..
                     } if tel.contains_key("ready") => {
                         let ready = tel.get("ready").is_some_and(|v| v == "true");
                         monitor_state.insert(msg.actor.clone(), ready);
@@ -377,12 +367,8 @@ fn connect_and_run(
             let new_readiness = readiness(routing, current_mode, &monitor_state);
             if new_readiness != prev_readiness {
                 prev_readiness = new_readiness;
-                let msg =
-                    api::GsProMessage::heartbeat_with_readiness(new_readiness, new_readiness);
-                tracing::debug!(
-                    "gspro -> heartbeat (ready={})",
-                    new_readiness,
-                );
+                let msg = api::GsProMessage::heartbeat_with_readiness(new_readiness, new_readiness);
+                tracing::debug!("gspro -> heartbeat (ready={})", new_readiness,);
                 if let Ok(json_str) = serde_json::to_string(&msg) {
                     tracing::info!(
                         target: "audit",

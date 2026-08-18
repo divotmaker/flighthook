@@ -38,9 +38,9 @@
 use std::fmt;
 use std::net::TcpStream;
 
+use tungstenite::Message;
 use tungstenite::protocol::WebSocket;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::Message;
 
 use crate::FlighthookMessage;
 
@@ -107,7 +107,8 @@ impl FlighthookClient {
     pub fn connect(url: &str, name: &str) -> Result<Self, ClientError> {
         let (mut socket, _response) = tungstenite::connect(url)?;
 
-        let start = serde_json::json!({ "kind": "start", "version": [crate::FRP_VERSION], "name": name });
+        let start =
+            serde_json::json!({ "kind": "start", "version": [crate::FRP_VERSION], "name": name });
         socket.send(Message::text(start.to_string()))?;
 
         // Wait for init response (blocking — handshake always blocks)

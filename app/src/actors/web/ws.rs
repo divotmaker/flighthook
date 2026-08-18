@@ -234,8 +234,11 @@ fn handle_ws_command(
         };
         if let Some(m) = mode {
             let _ = bus_tx.send(
-                FlighthookMessage::new(FlighthookEvent::SetDetectionMode { mode: Some(m), handed: None })
-                    .actor(actor),
+                FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+                    mode: Some(m),
+                    handed: None,
+                })
+                .actor(actor),
             );
         }
     }

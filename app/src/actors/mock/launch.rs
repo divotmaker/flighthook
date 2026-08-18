@@ -62,7 +62,11 @@ fn mode_str(mode: ShotDetectionMode) -> &'static str {
     }
 }
 
-fn telemetry(shot_count: u32, mode: ShotDetectionMode, radar_mode: &str) -> HashMap<String, String> {
+fn telemetry(
+    shot_count: u32,
+    mode: ShotDetectionMode,
+    radar_mode: &str,
+) -> HashMap<String, String> {
     HashMap::from([
         (
             "device_info".into(),
@@ -74,7 +78,12 @@ fn telemetry(shot_count: u32, mode: ShotDetectionMode, radar_mode: &str) -> Hash
     ])
 }
 
-fn run(initial_mode: ShotDetectionMode, device_id: String, sender: BusSender, mut receiver: BusReceiver) {
+fn run(
+    initial_mode: ShotDetectionMode,
+    device_id: String,
+    sender: BusSender,
+    mut receiver: BusReceiver,
+) {
     let mut current_mode = initial_mode;
     let mut shot_count: u32 = 0;
     let mut phase = Phase::Idle {
@@ -110,9 +119,10 @@ fn run(initial_mode: ShotDetectionMode, device_id: String, sender: BusSender, mu
                 }
                 Ok(None) => break,
                 Ok(Some(msg)) => {
-                    if let FlighthookEvent::SetDetectionMode { mode: Some(mode), .. } = msg.event
-                        && std::mem::discriminant(&current_mode)
-                            != std::mem::discriminant(&mode)
+                    if let FlighthookEvent::SetDetectionMode {
+                        mode: Some(mode), ..
+                    } = msg.event
+                        && std::mem::discriminant(&current_mode) != std::mem::discriminant(&mode)
                     {
                         info!("mock: mode change: {current_mode:?} -> {mode:?}");
                         current_mode = mode;
@@ -138,9 +148,7 @@ fn run(initial_mode: ShotDetectionMode, device_id: String, sender: BusSender, mu
                         manufacturer: None,
                         model: None,
                         firmware: None,
-                        telemetry: Some(HashMap::from([
-                            ("ready".into(), "false".into()),
-                        ])),
+                        telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
                     })
                     .device(device_id.as_str()),
                 );
@@ -159,9 +167,7 @@ fn run(initial_mode: ShotDetectionMode, device_id: String, sender: BusSender, mu
                         manufacturer: None,
                         model: None,
                         firmware: None,
-                        telemetry: Some(HashMap::from([
-                            ("ready".into(), "true".into()),
-                        ])),
+                        telemetry: Some(HashMap::from([("ready".into(), "true".into())])),
                     })
                     .device(device_id.as_str()),
                 );
@@ -179,13 +185,13 @@ fn run(initial_mode: ShotDetectionMode, device_id: String, sender: BusSender, mu
                 let (ball, club) = generate_shot(shot_count, current_mode);
 
                 let ball_mph = ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0);
-                let carry_yd = ball
-                    .carry_distance
-                    .map(|d| d.as_yards())
-                    .unwrap_or(0.0);
+                let carry_yd = ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0);
                 info!(
                     "mock shot #{}: ball={:.1}mph VLA={:.1} carry={:.1}yd",
-                    shot_count, ball_mph, ball.launch_elevation.unwrap_or(0.0), carry_yd,
+                    shot_count,
+                    ball_mph,
+                    ball.launch_elevation.unwrap_or(0.0),
+                    carry_yd,
                 );
 
                 // Disarm
@@ -194,9 +200,7 @@ fn run(initial_mode: ShotDetectionMode, device_id: String, sender: BusSender, mu
                         manufacturer: None,
                         model: None,
                         firmware: None,
-                        telemetry: Some(HashMap::from([
-                            ("ready".into(), "false".into()),
-                        ])),
+                        telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
                     })
                     .device(device_id.as_str()),
                 );
@@ -207,10 +211,8 @@ fn run(initial_mode: ShotDetectionMode, device_id: String, sender: BusSender, mu
 
                 // Shot lifecycle
                 sender.send(
-                    FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-                        key: key.clone(),
-                    })
-                    .device(device_id.as_str()),
+                    FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() })
+                        .device(device_id.as_str()),
                 );
                 sender.send(
                     FlighthookMessage::new(FlighthookEvent::BallFlight {
@@ -252,10 +254,7 @@ fn run(initial_mode: ShotDetectionMode, device_id: String, sender: BusSender, mu
     }
 }
 
-fn generate_shot(
-    n: u32,
-    mode: ShotDetectionMode,
-) -> (BallFlight, ClubData) {
+fn generate_shot(n: u32, mode: ShotDetectionMode) -> (BallFlight, ClubData) {
     let v = (n as f64 * 0.7).sin(); // -1..1 variation seed
 
     let (ball_speed, vla, hla, carry, height, backspin, sidespin, club_speed, aoa, loft) =
