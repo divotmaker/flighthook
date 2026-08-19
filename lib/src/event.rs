@@ -1,4 +1,4 @@
-//! Shared domain types used by both the unified bus and the session thread.
+//! Shared domain types used across the unified bus, the actors, and the UI.
 //!
 //! Shot data types (`BallFlight`, `ClubData`, `FaceImpact`) are re-exported
 //! from the `flightrelay` crate. This module defines the composed `ShotData`

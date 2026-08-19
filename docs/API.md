@@ -356,6 +356,14 @@ Full persisted config (mirrors `config.toml`).
       "name": "Garmin R10"
     }
   },
+  "square": {
+    "0": {
+      "name": "Square Golf Omni",
+      "club": "7i",
+      "advanced_spin": true,
+      "discard_non_putting_zero_spin": true
+    }
+  },
   "mock_monitor": {},
   "openconnect_server": {
     "0": {
@@ -391,10 +399,21 @@ Full persisted config (mirrors `config.toml`).
 
 ### POST /api/settings
 
-Full config replacement via event-sourced bus pattern. Emits a `ConfigCommand`
+Config update via event-sourced bus pattern. Emits a `ConfigCommand`
 on the bus, waits for `ConfigOutcome` from SystemActor, then returns the response.
 
 **Request**: complete `FlighthookConfig` JSON (same shape as GET response)
+
+**Query parameters**:
+
+- `scope` (optional): a global actor ID (`mevo.0`, `gspro.1`, `webserver.0`).
+  Narrows the save to that one actor — only its section is written to the
+  config, and only that actor is reconciled. Every other section of the live
+  config is left as-is, whatever the request body carries for it. A `scope`
+  naming a section the body omits removes that actor. An unparseable ID or
+  unknown type prefix is rejected: nothing is saved and the response lists no
+  changes. Without `scope`, the body replaces the whole config and every actor
+  is reconciled.
 
 **Response** `200 OK`:
 
@@ -411,7 +430,9 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 
 **Side effects**:
 
-- Emits `ConfigCommand` (action: `ReplaceAll`) on the bus (processed by SystemActor)
+- Emits `ConfigCommand` on the bus, processed by SystemActor. Without `scope`
+  the action is `ReplaceAll`; with it, the matching `Upsert*` variant for that
+  section (or `Remove` when the body omits it)
 - SystemActor persists the new config to disk and reconciles actors:
   - Address/routing/settings changes trigger actor restart (shutdown + recreate)
   - Removed config sections stop the corresponding actor
@@ -585,6 +606,35 @@ Club path data available. May arrive before or after `ball_flight`.
       "face_angle": 1.2,
       "dynamic_loft": 18.4,
       "smash_factor": 1.42
+    }
+  }
+}
+```
+
+---
+
+##### face_impact
+
+Face impact location, in millimetres from the centre of the club face.
+Positive `lateral` is toward the toe, positive `vertical` is above centre.
+Neither axis is flipped for a left-handed player — toe/heel and high/low are
+already golfer-relative.
+
+Emitted only by devices whose reading is referenced to the face centre. The
+Square Golf Omni measures impact but does not emit this event: its reading
+needs a calibration flighthook does not have (see
+[docs/devices/square-golf.md](devices/square-golf.md)).
+
+```json
+{
+  "actor": "openconnect_server.0",
+  "device": "Uneekor EYE XO",
+  "event": {
+    "kind": "face_impact",
+    "key": { "shot_id": "550e8400-...", "shot_number": 42 },
+    "impact": {
+      "lateral": "-6.5mm",
+      "vertical": "3.0mm"
     }
   }
 }

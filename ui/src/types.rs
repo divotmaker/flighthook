@@ -1,10 +1,10 @@
 //! API response types and bus message types.
 //!
-//! Bus message types are re-exported from `flighthook` (the shared
-//! schema crate). REST response types are also shared via schemas.
+//! Both are re-exported from the `flighthook` lib crate, which holds the types
+//! shared between the app and the UI.
 
 // ---------------------------------------------------------------------------
-// Re-exports from schemas — shared with the app crate
+// Re-exports from the lib crate — shared with the app crate
 // ---------------------------------------------------------------------------
 
 pub use flighthook::{

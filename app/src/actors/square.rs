@@ -10,8 +10,8 @@ use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 
 use flighthook::{
-    ActorStatus, BallFlight, Club, ClubData, FaceImpact, FlighthookEvent, FlighthookMessage,
-    Severity, ShotKey, Velocity,
+    ActorStatus, BallFlight, Club, ClubData, FlighthookEvent, FlighthookMessage, Severity, ShotKey,
+    Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
@@ -129,11 +129,11 @@ fn to_allsquare_club(club: Club) -> allsquare::Club {
 
 /// Whether a shot is a spin misread and should be dropped rather than forwarded.
 ///
-/// The device occasionally returns a shot with no spin at all — seen with a ball
+/// The device occasionally returns a shot with no spin at all, typically a ball
 /// struck at the very front of the detection zone. A real strike always imparts
 /// spin, and a spinless shot handed to a sim carries much further than it should
-/// (a zero-spin 8 iron ran ~30 yards long), so it is better to lose the shot than
-/// to record a wrong one.
+/// — a zero-spin 8 iron flies roughly 30 yards long — so it is better to lose the
+/// shot than to record a wrong one.
 ///
 /// The putter is exempt, and it is the only exemption that makes sense. A putt
 /// has no airborne flight for the device to measure spin over, so it reads zero
@@ -178,28 +178,11 @@ fn club_from_square(c: &allsquare::ClubMetrics) -> ClubData {
         smash_factor: c.smash_factor,
         swing_plane_horizontal: None,
         swing_plane_vertical: None,
-        // Impact location is reported via FaceImpact, which is its proper home.
+        // Impact location belongs in FaceImpact, not here, and is currently
+        // not published at all — see the shot handler.
         club_offset: None,
         club_height: None,
     }
-}
-
-/// Impact location, if the device measured it.
-///
-/// **The lateral sign is inverted.** FRP defines `lateral` as positive toward
-/// the toe; the device reports negative toward the toe. `vertical` agrees on
-/// both sides (positive is above centre). Units are millimetres — the best
-/// current reading of the device's scale, not yet checked against a reference
-/// launch monitor.
-fn impact_from_square(c: &allsquare::ClubMetrics) -> Option<FaceImpact> {
-    use flighthook::Distance;
-    if c.impact_horizontal.is_none() && c.impact_vertical.is_none() {
-        return None;
-    }
-    Some(FaceImpact {
-        lateral: c.impact_horizontal.map(|v| Distance::Millimeters(-v)),
-        vertical: c.impact_vertical.map(Distance::Millimeters),
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -553,13 +536,17 @@ fn connect_and_run(
                                 .device(&name),
                             );
 
-                            if let Some(impact) = impact_from_square(c) {
-                                sender.send(
-                                    FlighthookMessage::new(FlighthookEvent::FaceImpact {
-                                        key: key.clone(),
-                                        impact: Box::new(impact),
-                                    })
-                                    .device(&name),
+                            // Face impact is read but deliberately not
+                            // published. The wire values are not a straight
+                            // passthrough — sent as measured, a centred strike
+                            // lands off the face — and the calibration that
+                            // would correct them is still being worked out in
+                            // allsquare. Logged only, to feed that work.
+                            if c.impact_horizontal.is_some() || c.impact_vertical.is_some() {
+                                info!(
+                                    "  impact (uncalibrated, not sent): raw H={:.2} V={:.2}",
+                                    c.impact_horizontal.unwrap_or(f64::NAN),
+                                    c.impact_vertical.unwrap_or(f64::NAN),
                                 );
                             }
                         } else {
@@ -639,9 +626,9 @@ mod tests {
         }
     }
 
-    /// The shipped default, so these tests fail if it moves somewhere that
-    /// The case that prompted this: an 8 iron struck at the front of the
-    /// detection zone read zero spin and flew ~30 yards long in the sim.
+    /// A full-swing club reading zero spin is a misread, whatever the ball
+    /// speed: a struck ball always spins, and a spinless shot flies far too
+    /// long in the sim.
     #[test]
     fn rejects_zero_spin_shot() {
         assert!(is_zero_spin_misread(

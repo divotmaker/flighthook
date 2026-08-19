@@ -7,16 +7,31 @@ required.
 The original **Square / Square Home is not supported** — it uses a different
 club-code scheme.
 
-## Face impact
+## Face impact — measured but not reported
 
-The Omni is the first supported device to report **face impact location** on the
-wire, so it is currently the only one that forwards `VerticalFaceImpact` /
-`HorizontalFaceImpact` to GSPro. It also reports dynamic loft and smash factor.
+The Omni measures face impact location and sends it on the wire, but flighthook
+**does not forward it**. `VerticalFaceImpact` / `HorizontalFaceImpact` go to
+GSPro as zero.
 
-Polarity is verified device-side only: negative is toe / low, confirmed against
-the launch monitor's own impact display. GSPro renders these as bare numeric
-stats with no face diagram, so its interpretation of the sign could not be
-confirmed.
+Testing shows the wire values are not a straight passthrough. Fed to GSPro
+unchanged, a flush centre strike draws well off the club face, so what the device
+reports is referenced to something other than the middle of the face and needs a
+calibration step before it means anything. Sending it anyway would fill the
+face-impact diagram with numbers that look like measurements and are not, so the
+field is left empty instead.
+
+[allsquare](https://crates.io/crates/allsquare) is working through that
+calibration. Once it can hand back a corrected reading, flighthook will publish
+it — nothing here needs to change but the source of the number.
+
+The raw pair is written to the log for each tracked shot, so it is available
+for that work:
+
+```
+  impact (uncalibrated, not sent): raw H=-31.19 V=-28.88
+```
+
+Dynamic loft and smash factor are unaffected and are reported normally.
 
 ## Zero-spin rejection
 

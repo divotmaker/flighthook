@@ -202,7 +202,10 @@ pub struct R10Section {
     pub name: String,
 }
 
-/// A Square Golf BLE device instance (Omni or Home).
+/// A Square Golf Omni BLE device instance.
+///
+/// The original Square / Square Home is not supported: it uses a different
+/// club-code scheme.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SquareSection {
     #[serde(default)]

@@ -45,9 +45,11 @@ pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
     // No handedness flip: toe/heel and high/low are already golfer-relative,
     // unlike the target-relative fields above.
     //
-    // Polarity is device-verified (negative = toe / low) but not GSPro-verified:
-    // GSPro shows these as numeric stats with no face diagram. If a toe strike
-    // ever reads heel-side, negate impact_h here.
+    // GSPro renders a face-impact diagram, so polarity is checkable end to end.
+    // The Square Omni deliberately emits no FaceImpact: its readings need a
+    // calibration allsquare is still working out (docs/devices/square-golf.md).
+    // That is a device-side problem, not a mapping error; do not try to correct
+    // it by negating here.
     let (impact_v, impact_h) = shot.impact.as_ref().map_or((0.0, 0.0), |i| {
         (
             i.vertical.map_or(0.0, |d| d.as_millimeters()),

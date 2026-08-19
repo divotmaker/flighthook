@@ -39,6 +39,8 @@ address = "127.0.0.1:921"
 
 - `[mevo.<idx>]` -- Mevo/Mevo+ device instance
 - `[r10.<idx>]` -- Garmin R10 BLE device instance (auto-discovers via Bluetooth)
+- `[square.<idx>]` -- Square Golf Omni BLE device instance
+- `[openconnect_server.<idx>]` -- GSPro Open Connect ingest listener (Uneekor)
 - `[mock_monitor.<idx>]` -- mock launch monitor instance
 - `[gspro.<idx>]` -- GSPro integration instance
 - `[random_club.<idx>]` -- random club cycling integration instance
@@ -57,7 +59,8 @@ address = "127.0.0.1:921"
 On first startup the default config contains only a webserver — no devices or
 integrations. The UI detects this (`FlighthookConfig::has_user_actors()`) and
 shows a setup wizard instead of the normal dashboard. The wizard presents
-checkboxes for available devices (Mevo, R10) and integrations (GSPro). On
+checkboxes for available devices (Mevo, Square Golf Omni, R10, Uneekor
+(OpenConnect)) and integrations (GSPro). On
 confirmation it builds a config with defaults for each selection, posts it via
 the existing settings save path, and dismisses. Users can also skip the wizard
 and configure manually via the Settings tab.
@@ -71,12 +74,15 @@ sensible values (e.g. Mevo at `192.168.2.1:5100`, GSPro at `127.0.0.1:921`).
 
 ```rust
 pub struct FlighthookConfig {
+    pub default_units: UnitSystem,
     pub chipping_clubs: Vec<Club>,
     pub putting_clubs: Vec<Club>,
     pub webserver: HashMap<String, WebserverSection>,
     pub mevo: HashMap<String, MevoSection>,
     pub r10: HashMap<String, R10Section>,
+    pub square: HashMap<String, SquareSection>,
     pub mock_monitor: HashMap<String, MockMonitorSection>,
+    pub openconnect_server: HashMap<String, OpenConnectServerSection>,
     pub gspro: HashMap<String, GsProSection>,
     pub random_club: HashMap<String, RandomClubSection>,
 }
@@ -84,7 +90,9 @@ pub struct FlighthookConfig {
 pub struct WebserverSection { pub name: String, pub bind: String }
 pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool> }
 pub struct R10Section { pub name: String }
+pub struct SquareSection { pub name: String, pub address: Option<String>, pub club: Option<Club>, pub advanced_spin: Option<bool>, pub discard_non_putting_zero_spin: Option<bool> }
 pub struct MockMonitorSection { pub name: String }
+pub struct OpenConnectServerSection { pub name: String, pub bind: Option<String> }
 pub struct GsProSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
 pub struct RandomClubSection { pub name: String }
 ```
@@ -394,7 +402,8 @@ actor has a fixed ID of `"system"`. The type prefix encodes the component type;
 the index is the key within that type's config section.
 
 `FlighthookMessage.actor` carries the global ID of the message originator.
-Inner event types no longer carry redundant ID or name fields.
+Inner event types carry no ID or name fields; identity lives on the
+`FlighthookMessage` envelope.
 
 ## SystemState
 
@@ -443,8 +452,9 @@ WS connection at `/frp`, three-phase handshake with version negotiation:
 3. Server responds: `{ "kind": "init", "version": "0.1.0", "actor_id": "ws.a1b2c3d4", "global_state": { ... } }`
 4. Server streams `FlighthookMessage` events (serialized directly as JSON)
 
-Currently supported FRP versions: `0.1.0`. Legacy clients without a `version`
-array default to the current FRP version.
+Supported FRP versions: `0.1.0`. A client that offers no mutually supported
+version — including one that sends no `version` array — receives a `critical`
+alert and is disconnected.
 
 Bus events are serialized using the FRP envelope shape with `kind` inside
 `event`. Consumers filter by `event.kind`.
@@ -521,7 +531,9 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
   `ReplaceAll`) on the bus with a `request_id`, then awaits the matching
   `ConfigOutcome` (request-reply pattern, 10s timeout).
 - **Per-section upserts** -- `POST /api/settings?scope=<id>` emits a scoped
-  `ConfigAction` variant (e.g. `UpsertMevo`).
+  `ConfigAction` variant (e.g. `UpsertMevo`), writing only that section and
+  reconciling only that actor. A scope naming a section the body omits emits
+  `Remove`; an unknown scope is rejected without saving anything.
 
 `SystemActor::handle_config_command()`:
 
@@ -583,7 +595,8 @@ Global
     Chipping Monitor: [Any v]
     Putting Monitor: [Any v]
 
-  [+ Add v]  (dropdown: Mevo, R10, GSPro, Web Server)
+  [+ Add v]  (dropdown: Mevo, Square Golf Omni, R10, Uneekor (OpenConnect),
+              GSPro, Web Server)
 ```
 
 - Name is **required** and serves as the rename mechanism. Changing a device name

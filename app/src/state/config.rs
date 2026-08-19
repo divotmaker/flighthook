@@ -151,7 +151,7 @@ pub fn save_to(path: &Path, config: &FlighthookConfig) {
 }
 
 // ---------------------------------------------------------------------------
-// Cached config (replaces Mutex<()> + load/save on every access)
+// Cached config — RwLock-backed, no external lock
 // ---------------------------------------------------------------------------
 
 /// Cached configuration backed by a TOML file.

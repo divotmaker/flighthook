@@ -134,7 +134,7 @@ name = "Local GSPro"
 address = "127.0.0.1:921"
 ```
 
-Section prefixes encode component type: `mevo`, `r10`, `square`,
+Section prefixes encode component type: `webserver`, `mevo`, `r10`, `square`,
 `openconnect_server`, `mock_monitor`, `gspro`, `random_club`. The index after
 the dot (`0`, `1`, ...) identifies the instance. Per-device options are covered
 in the [device docs](#launch-monitors). Settings can also be edited live from

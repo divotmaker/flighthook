@@ -154,15 +154,83 @@ pub async fn get_settings(State(state): State<Arc<WebState>>) -> Json<Flighthook
     Json(state.root.system.snapshot())
 }
 
+#[derive(Deserialize)]
+pub struct SettingsQuery {
+    /// Restrict the save to one actor, by global ID (`"mevo.0"`).
+    pub scope: Option<String>,
+}
+
+/// Build the scoped `ConfigAction` for a `?scope=<global_id>` save.
+///
+/// The body carries the whole config, but a scoped save means only the named
+/// section: it becomes an `Upsert*` for that section alone, leaving every other
+/// section of the live config untouched. A scope naming a section the body does
+/// not carry is a removal.
+///
+/// Returns `None` for a malformed ID or an unknown type prefix.
+fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction> {
+    let (prefix, index) = scope.split_once('.')?;
+    let idx = index.to_string();
+    let id = scope.to_string();
+
+    // Each arm moves `idx`/`id`, which is fine — only one arm ever runs.
+    macro_rules! upsert {
+        ($section:ident, $variant:ident) => {
+            config
+                .$section
+                .get(index)
+                .map_or(ConfigAction::Remove { id }, |section| {
+                    ConfigAction::$variant {
+                        index: idx,
+                        section: section.clone(),
+                    }
+                })
+        };
+    }
+
+    Some(match prefix {
+        "webserver" => upsert!(webserver, UpsertWebserver),
+        "mevo" => upsert!(mevo, UpsertMevo),
+        "r10" => upsert!(r10, UpsertR10),
+        "square" => upsert!(square, UpsertSquare),
+        "openconnect_server" => upsert!(openconnect_server, UpsertOpenConnectServer),
+        "gspro" => upsert!(gspro, UpsertGsPro),
+        "mock_monitor" => upsert!(mock_monitor, UpsertMockMonitor),
+        "random_club" => upsert!(random_club, UpsertRandomClub),
+        _ => return None,
+    })
+}
+
 /// POST /api/settings — config replacement via bus request-reply.
 ///
 /// Emits a `ConfigCommand` on the bus, waits for `ConfigOutcome` with a
 /// matching `request_id`, then returns the response. SystemActor handles
 /// persistence and actor reconciliation.
+///
+/// `?scope=<global_id>` narrows the save to one actor: only that section is
+/// written and only that actor is reconciled. Without it the whole config is
+/// replaced and every actor is reconciled.
 pub async fn post_settings(
     State(state): State<Arc<WebState>>,
+    Query(query): Query<SettingsQuery>,
     Json(new_config): Json<FlighthookConfig>,
 ) -> Json<PostSettingsResponse> {
+    let action = match query.scope.as_deref() {
+        None => ConfigAction::ReplaceAll { config: new_config },
+        Some(scope) => match scoped_action(scope, &new_config) {
+            Some(action) => action,
+            // Applying the body wholesale here would save far more than the
+            // caller asked for, so reject instead.
+            None => {
+                tracing::warn!("config update: unknown scope '{scope}', ignoring request");
+                return Json(PostSettingsResponse {
+                    restarted: Vec::new(),
+                    stopped: Vec::new(),
+                });
+            }
+        },
+    };
+
     let request_id = crate::state::config::generate_id();
     let mut bus_rx = state.bus_tx.subscribe();
 
@@ -170,7 +238,7 @@ pub async fn post_settings(
     let _ = state.bus_tx.send(
         FlighthookMessage::new(FlighthookEvent::ConfigCommand {
             request_id: Some(request_id.clone()),
-            action: Box::new(ConfigAction::ReplaceAll { config: new_config }),
+            action: Box::new(action),
         })
         .actor("web"),
     );
@@ -207,5 +275,55 @@ pub async fn post_settings(
                 stopped: Vec::new(),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flighthook::MevoSection;
+
+    fn config() -> FlighthookConfig {
+        serde_json::from_str("{}").expect("empty config")
+    }
+
+    fn mevo_section(name: &str) -> MevoSection {
+        let mut s: MevoSection = serde_json::from_str("{}").expect("empty section");
+        s.name = name.to_string();
+        s
+    }
+
+    #[test]
+    fn scope_upserts_only_the_named_section() {
+        let mut c = config();
+        c.mevo.insert("0".into(), mevo_section("Mevo WiFi"));
+        c.gspro.insert(
+            "0".into(),
+            serde_json::from_str("{}").expect("empty section"),
+        );
+
+        let action = scoped_action("mevo.0", &c).expect("known scope");
+        match action {
+            ConfigAction::UpsertMevo { index, section } => {
+                assert_eq!(index, "0");
+                assert_eq!(section.name, "Mevo WiFi");
+            }
+            other => panic!("expected UpsertMevo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_naming_an_absent_section_is_a_removal() {
+        let action = scoped_action("mevo.0", &config()).expect("known scope");
+        match action {
+            ConfigAction::Remove { id } => assert_eq!(id, "mevo.0"),
+            other => panic!("expected Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_and_unknown_scopes_are_rejected() {
+        assert!(scoped_action("mevo", &config()).is_none());
+        assert!(scoped_action("nosuchtype.0", &config()).is_none());
     }
 }
