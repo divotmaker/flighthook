@@ -28,6 +28,7 @@ pub use flighthook::{
     Handedness,
     MevoSection,
     MockMonitorSection,
+    OpenConnectServerSection,
     PlayerInfo,
     PostSettingsResponse,
     R10Section,

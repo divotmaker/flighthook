@@ -154,6 +154,28 @@ impl DeviceFormEntry {
         }
     }
 
+    pub(crate) fn from_openconnect(id: &str, s: &flighthook::OpenConnectServerSection) -> Self {
+        Self {
+            id: id.into(),
+            monitor_type: "openconnect_server".into(),
+            name: s.name.clone(),
+            address: s.bind.clone().unwrap_or_default(),
+            ball_type: 0,
+            tee_height_val: "1.5".into(),
+            tee_height_unit: "inches".into(),
+            range_val: "8".into(),
+            range_unit: "feet".into(),
+            surface_height_val: "0".into(),
+            surface_height_unit: "inches".into(),
+            track_pct: "80".into(),
+            use_estimated: true,
+            zero_spin_cutoff: String::new(),
+            square_club: None,
+            square_advanced_spin: None,
+            dirty: false,
+        }
+    }
+
     pub(crate) fn from_mock(id: &str, s: &MockMonitorSection) -> Self {
         Self {
             id: id.into(),
@@ -255,6 +277,7 @@ impl ActorFormEntry {
                 "mevo" => "Mevo",
                 "r10" => "R10",
                 "square" => "Square Golf Omni",
+                "openconnect_server" => "OpenConnect Server",
                 "mock_monitor" => "Mock",
                 _ => &d.monitor_type,
             },
@@ -274,6 +297,9 @@ impl ActorFormEntry {
                 "r10" => "Garmin R10 — auto-detects from system connected Bluetooth devices",
                 "square" => {
                     "Square Golf Omni — BLE, no pairing required; leave address blank to auto-discover"
+                }
+                "openconnect_server" => {
+                    "Accepts inbound shots from any launch monitor that speaks GSPro Open Connect (Uneekor, Foresight, SkyTrak). Bind address, default 0.0.0.0:921 — to share a host with GSPro, move GSPConnect to 922 via OpenAPIUseAltPort"
                 }
                 "mock_monitor" => "Mock launch monitor — generates random shots for testing",
                 _ => "",
@@ -367,6 +393,12 @@ impl SettingsForm {
         for (id, section) in &s.r10 {
             self.actors
                 .push(ActorFormEntry::Device(DeviceFormEntry::from_r10(
+                    id, section,
+                )));
+        }
+        for (id, section) in &s.openconnect_server {
+            self.actors
+                .push(ActorFormEntry::Device(DeviceFormEntry::from_openconnect(
                     id, section,
                 )));
         }
@@ -470,6 +502,7 @@ impl SettingsForm {
         let mut r10 = std::collections::HashMap::new();
         let mut square = std::collections::HashMap::new();
         let mut mock_monitor = std::collections::HashMap::new();
+        let mut openconnect_server = std::collections::HashMap::new();
         let mut gspro = std::collections::HashMap::new();
         let mut random_club = std::collections::HashMap::new();
 
@@ -530,6 +563,19 @@ impl SettingsForm {
                             dev.id.clone(),
                             R10Section {
                                 name: dev.name.clone(),
+                            },
+                        );
+                    }
+                    "openconnect_server" => {
+                        openconnect_server.insert(
+                            dev.id.clone(),
+                            flighthook::OpenConnectServerSection {
+                                name: dev.name.clone(),
+                                bind: if dev.address.is_empty() {
+                                    None
+                                } else {
+                                    Some(dev.address.clone())
+                                },
                             },
                         );
                     }
@@ -603,6 +649,7 @@ impl SettingsForm {
             r10,
             square,
             mock_monitor,
+            openconnect_server,
             gspro,
             random_club,
         }
@@ -724,6 +771,19 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         R10Section {
                             name: dev.name.clone(),
+                        },
+                    );
+                }
+                "openconnect_server" => {
+                    config.openconnect_server.insert(
+                        dev.id.clone(),
+                        flighthook::OpenConnectServerSection {
+                            name: dev.name.clone(),
+                            bind: if dev.address.is_empty() {
+                                None
+                            } else {
+                                Some(dev.address.clone())
+                            },
                         },
                     );
                 }
@@ -1345,6 +1405,35 @@ impl FlighthookApp {
                                     monitor_type: "r10".into(),
                                     name: "Garmin R10".into(),
                                     address: String::new(),
+                                    ball_type: 0,
+                                    tee_height_val: "1.5".into(),
+                                    tee_height_unit: "inches".into(),
+                                    range_val: "8".into(),
+                                    range_unit: "feet".into(),
+                                    surface_height_val: "0".into(),
+                                    surface_height_unit: "inches".into(),
+                                    track_pct: "80".into(),
+                                    use_estimated: true,
+                                    zero_spin_cutoff: String::new(),
+                                    square_club: None,
+                                    square_advanced_spin: None,
+                                    dirty: true,
+                                }));
+                                self.settings.dirty = true;
+                            }
+                            if ui.selectable_label(false, "Uneekor (OpenConnect)").clicked() {
+                                let existing: Vec<&str> = self.settings.actors.iter()
+                                    .filter_map(|a| match a {
+                                        ActorFormEntry::Device(d) if d.monitor_type == "openconnect_server" => Some(d.id.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                let id = next_index(&existing);
+                                self.settings.actors.push(ActorFormEntry::Device(DeviceFormEntry {
+                                    id,
+                                    monitor_type: "openconnect_server".into(),
+                                    name: "OpenConnect Server".into(),
+                                    address: "0.0.0.0:921".into(),
                                     ball_type: 0,
                                     tee_height_val: "1.5".into(),
                                     tee_height_unit: "inches".into(),

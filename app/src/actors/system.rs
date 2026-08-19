@@ -323,6 +323,13 @@ fn handle_config_command(
             });
             scope = Some(format!("square.{index}"));
         }
+        ConfigAction::UpsertOpenConnectServer { index, section } => {
+            let idx = index.clone();
+            state.system.update(|p| {
+                p.openconnect_server.insert(idx, section.clone());
+            });
+            scope = Some(format!("openconnect_server.{index}"));
+        }
         ConfigAction::UpsertGsPro { index, section } => {
             let idx = index.clone();
             state.system.update(|p| {
@@ -356,6 +363,9 @@ fn handle_config_command(
                     }
                     "square" => {
                         p.square.remove(&idx);
+                    }
+                    "openconnect_server" => {
+                        p.openconnect_server.remove(&idx);
                     }
                     "gspro" => {
                         p.gspro.remove(&idx);

@@ -12,17 +12,56 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 
 ### Launch Monitors
 
-| Device                | Protocol                | Driver                                          | Status    |
-| --------------------- | ----------------------- | ----------------------------------------------- | --------- |
-| FlightScope Mevo+     | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported |
-| FlightScope Mevo Gen2 | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported |
-| Garmin R10            | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha     |
-| Square Golf Omni      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Alpha     |
+| Device                | Protocol                | Driver                                          | Status           |
+| --------------------- | ----------------------- | ----------------------------------------------- | ---------------- |
+| FlightScope Mevo+     | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
+| FlightScope Mevo Gen2 | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
+| Uneekor               | TCP (JSON, port 921)    | built-in (OpenConnect)                          | Alpha (untested) |
+| Garmin R10            | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
+| Square Golf Omni      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Alpha            |
 
-Each device is decoded by a standalone protocol crate, usable independently of
-flighthook: [ironsight](https://github.com/divotmaker/ironsight),
-[tenover](https://github.com/divotmaker/10over),
-[allsquare](https://github.com/divotmaker/allsquare).
+#### OpenConnect monitors
+
+Uneekor is supported through the **OpenConnect server** actor rather than a
+native driver. Uneekor's own software already pushes shots as a GSPro Open
+Connect V1 client, so flighthook listens and accepts them. The same actor works
+for any monitor that emits Open Connect — Foresight, SkyTrak, MLM2PRO and
+others.
+
+Marked **untested**: the actor is exercised end to end against a simulated
+Open Connect client, but has not yet been run against real Uneekor hardware.
+
+This is a bridge, not a driver. Uneekor's PC software has to be running, and
+you get ball and club data only — no imagery, no device telemetry beyond
+readiness, and no device control. Third-party output is also licensed
+separately by Uneekor: the EYE MINI family needs the Pro subscription, while
+many legacy QED and EYE XO units carry a perpetual third-party license tied to
+the serial number. Check what your unit has before buying anything.
+
+#### Sharing port 921 with GSPro
+
+GSPro listens on 921 too, but its port is movable. Edit
+`C:\GSPro\GSPC\GSPconnect.exe.config` and set
+`<OpenAPIUseAltPort>true</OpenAPIUseAltPort>` to start GSPConnect on **922**,
+which frees 921 for flighthook and lets everything run on one machine:
+
+```text
+  Uneekor software  --:921-->  flighthook  --:922-->  GSPro     (all one host)
+```
+
+```toml
+[openconnect_server.0]
+name = "Uneekor"
+bind = "0.0.0.0:921"
+
+[gspro.0]
+name = "Local GSPro"
+address = "127.0.0.1:922"   # GSPro moved aside via OpenAPIUseAltPort
+```
+
+Splitting across two hosts also works, but only if your monitor's connector lets
+you aim it at a non-localhost address — Open Connect's own documentation
+specifies `127.0.0.1`, and not every connector exposes the setting.
 
 The Square Golf Omni is the first supported device to report **face impact
 location** on the wire, so it is currently the only one that forwards

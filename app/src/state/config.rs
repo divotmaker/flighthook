@@ -82,6 +82,7 @@ impl LegacyFlighthookConfig {
             r10: HashMap::new(),
             square: HashMap::new(),
             mock_monitor: self.mock_monitor,
+            openconnect_server: HashMap::new(),
             gspro: self.gspro,
             random_club: self.random_club,
         }

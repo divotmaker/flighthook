@@ -357,6 +357,12 @@ Full persisted config (mirrors `config.toml`).
     }
   },
   "mock_monitor": {},
+  "openconnect_server": {
+    "0": {
+      "name": "OpenConnect Server",
+      "bind": "0.0.0.0:921"
+    }
+  },
   "gspro": {
     "0": {
       "name": "Local GSPro",
@@ -367,11 +373,19 @@ Full persisted config (mirrors `config.toml`).
 }
 ```
 
-- Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `mock_monitor.0`, `gspro.0`, `random_club.0`, `webserver.0`
+- Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `square.0`, `mock_monitor.0`,
+  `openconnect_server.0`, `gspro.0`, `random_club.0`, `webserver.0`
 - All launch monitor config fields are optional (omitted = use defaults)
 - R10 sections have only `name` (BLE auto-discovery; no address or radar settings)
 - `use_estimated` on Mevo sections controls whether estimated (E8) ball flights
   are emitted when no full (D4) result arrives (defaults to `true`)
+- `openconnect_server` sections are **launch monitors**, not integrations: they
+  listen (`bind`, default `0.0.0.0:921`) and accept inbound shots from any
+  monitor that speaks GSPro Open Connect V1 as a client — Uneekor, Foresight,
+  SkyTrak, MLM2PRO. This is the inverse of `gspro`, which dials GSPro. GSPro
+  listens on 921 too, but moving GSPConnect to 922 (set
+  `<OpenAPIUseAltPort>true</OpenAPIUseAltPort>` in
+  `C:\GSPro\GSPC\GSPconnect.exe.config`) frees 921 so both can share one host
 
 ---
 

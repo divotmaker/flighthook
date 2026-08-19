@@ -3,6 +3,7 @@
 pub mod gspro;
 pub mod mevo;
 pub mod mock;
+pub mod openconnect;
 pub mod r10;
 pub mod square;
 pub mod system;
@@ -143,6 +144,24 @@ pub fn resolve_actors(
             name: section.name.clone(),
             actor: Box::new(mock::launch::MockLaunchActor { initial_mode: mode }),
         });
+    }
+
+    // OpenConnect servers (inbound launch monitors: Uneekor, Foresight, ...)
+    for (index, section) in &config.openconnect_server {
+        let id = global_id("openconnect_server", index);
+        let bind_str = section.bind.as_deref().unwrap_or("0.0.0.0:921");
+        match bind_str.parse::<SocketAddr>() {
+            Ok(bind) => {
+                actors.push(ResolvedActor {
+                    id,
+                    name: section.name.clone(),
+                    actor: Box::new(openconnect::OpenConnectServerActor { bind }),
+                });
+            }
+            Err(e) => {
+                tracing::warn!("device '{id}': invalid bind address '{bind_str}': {e}");
+            }
+        }
     }
 
     // GSPro integrations

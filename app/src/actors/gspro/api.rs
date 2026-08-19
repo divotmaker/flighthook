@@ -1,25 +1,40 @@
 //! GSPro Open Connect V1 JSON types.
+//!
+//! These types are used in both directions. The `gspro` actor is a *client*:
+//! it sends [`GsProMessage`] and receives [`GsProResponse`]. The
+//! `openconnect` actor is a *server*: it receives [`GsProMessage`] from a
+//! launch monitor and sends [`GsProResponse`] back. Every type therefore
+//! derives both `Serialize` and `Deserialize`.
+//!
+//! Inbound messages come from third-party launch monitors that populate the
+//! schema unevenly, so the optional sub-objects default rather than failing
+//! the parse. Only `DeviceID` and `ShotNumber` are treated as required.
 
 use serde::{Deserialize, Serialize};
 
-/// Top-level outbound message to GSPro.
-#[derive(Debug, Clone, Serialize)]
+/// Top-level Open Connect message: flighthook -> GSPro, or launch monitor ->
+/// flighthook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct GsProMessage {
     #[serde(rename = "DeviceID")]
     pub device_id: String,
+    #[serde(default)]
     pub units: String,
     pub shot_number: u32,
-    #[serde(rename = "APIversion")]
+    #[serde(rename = "APIversion", default)]
     pub api_version: String,
+    #[serde(default)]
     pub ball_data: BallData,
+    #[serde(default)]
     pub club_data: ClubData,
+    #[serde(default)]
     pub shot_data_options: ShotDataOptions,
 }
 
 /// Ball launch and flight data.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct BallData {
     pub speed: f64,
     pub spin_axis: f64,
@@ -37,8 +52,8 @@ pub struct BallData {
 }
 
 /// Club head data.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
 ///
 /// Complete GSPro Open Connect V1 field set. Fields no launch monitor in this
 /// project measures are still sent as `0.0`, matching GSPro's own example
@@ -79,8 +94,8 @@ impl Default for ClubData {
 }
 
 /// Flags controlling what GSPro should expect.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct ShotDataOptions {
     pub contains_ball_data: bool,
     pub contains_club_data: bool,
@@ -89,20 +104,35 @@ pub struct ShotDataOptions {
     pub is_heart_beat: bool,
 }
 
-/// Inbound response from GSPro.
-#[derive(Debug, Clone, Deserialize)]
+/// Open Connect response: GSPro -> flighthook, or flighthook -> launch monitor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct GsProResponse {
     pub code: i32,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player: Option<PlayerInfo>,
 }
 
-/// Player info from GSPro response.
-#[derive(Debug, Clone, Deserialize)]
+impl GsProResponse {
+    /// A bare `200 OK` acknowledgement. Open Connect clients wait for this
+    /// after each message and will stall or disconnect without it.
+    pub fn ok(message: &str) -> Self {
+        Self {
+            code: 200,
+            message: message.into(),
+            player: None,
+        }
+    }
+}
+
+/// Player info carried on an Open Connect response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlayerInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club: Option<String>,
 }
 

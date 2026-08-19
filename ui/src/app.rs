@@ -7,7 +7,7 @@ use crate::panels::Tab;
 use crate::panels::settings::{PendingRemoval, SettingsForm};
 use crate::types::{
     ActorStatus, ActorStatusResponse, FlighthookEvent, FlighthookMessage, GsProSection, LogEntry,
-    MevoSection, R10Section, ShotRow, SquareSection, UnitSystem,
+    MevoSection, OpenConnectServerSection, R10Section, ShotRow, SquareSection, UnitSystem,
 };
 use chrono::{SecondsFormat, Utc};
 
@@ -69,6 +69,7 @@ pub struct FlighthookApp {
     pub(crate) wizard_mevo: bool,
     pub(crate) wizard_r10: bool,
     pub(crate) wizard_square: bool,
+    pub(crate) wizard_uneekor: bool,
     pub(crate) wizard_gspro: bool,
     pub(crate) wizard_saving: bool,
 }
@@ -113,6 +114,7 @@ impl FlighthookApp {
             wizard_mevo: false,
             wizard_r10: false,
             wizard_square: false,
+            wizard_uneekor: false,
             wizard_gspro: false,
             wizard_saving: false,
         }
@@ -396,6 +398,17 @@ impl FlighthookApp {
                                 &mut self.wizard_square,
                                 egui::RichText::new("Square Golf Omni").size(15.0),
                             );
+                            ui.add_space(4.0);
+                            ui.checkbox(
+                                &mut self.wizard_uneekor,
+                                egui::RichText::new("Uneekor (OpenConnect)").size(15.0),
+                            )
+                            .on_hover_text(
+                                "Uneekor's own software pushes shots to flighthook over GSPro \
+                                 Open Connect. Needs a Uneekor third-party licence, and \
+                                 flighthook binds port 921 — to run GSPro on the same host, \
+                                 move it to 922 with OpenAPIUseAltPort.",
+                            );
                             ui.add_space(12.0);
                             ui.label(
                                 egui::RichText::new("Simulators")
@@ -415,6 +428,7 @@ impl FlighthookApp {
                     let any_selected = self.wizard_mevo
                         || self.wizard_r10
                         || self.wizard_square
+                        || self.wizard_uneekor
                         || self.wizard_gspro;
                     let btn =
                         egui::Button::new(egui::RichText::new("Get Started").size(15.0).strong())
@@ -452,6 +466,11 @@ impl FlighthookApp {
         }
         if self.wizard_square {
             config.square.insert("0".into(), SquareSection::default());
+        }
+        if self.wizard_uneekor {
+            config
+                .openconnect_server
+                .insert("0".into(), OpenConnectServerSection::default());
         }
         if self.wizard_gspro {
             config.gspro.insert("0".into(), GsProSection::default());

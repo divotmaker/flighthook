@@ -163,6 +163,8 @@ pub struct FlighthookConfig {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub mock_monitor: std::collections::HashMap<String, MockMonitorSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub openconnect_server: std::collections::HashMap<String, OpenConnectServerSection>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub gspro: std::collections::HashMap<String, GsProSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub random_club: std::collections::HashMap<String, RandomClubSection>,
@@ -246,6 +248,24 @@ pub struct MockMonitorSection {
     pub name: String,
 }
 
+/// An OpenConnect server instance — a *launch monitor*, not an integration.
+///
+/// Accepts inbound shot data from monitors that speak GSPro Open Connect V1 as
+/// a client (Uneekor, Foresight, SkyTrak, MLM2PRO, …). This is the inverse of
+/// [`GsProSection`], which dials GSPro as a client.
+///
+/// GSPro listens on 921 as well, but its port is movable: set
+/// `<OpenAPIUseAltPort>true</OpenAPIUseAltPort>` in
+/// `C:\GSPro\GSPC\GSPconnect.exe.config` to move GSPConnect to 922 and free
+/// 921 for this actor, so both can share one host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenConnectServerSection {
+    #[serde(default)]
+    pub name: String,
+    /// Bind address. Defaults to `0.0.0.0:921`.
+    pub bind: Option<String>,
+}
+
 /// A GSPro integration instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GsProSection {
@@ -292,6 +312,7 @@ impl FlighthookConfig {
             || !self.r10.is_empty()
             || !self.square.is_empty()
             || !self.mock_monitor.is_empty()
+            || !self.openconnect_server.is_empty()
             || !self.gspro.is_empty()
             || !self.random_club.is_empty()
     }
@@ -318,6 +339,7 @@ impl Default for FlighthookConfig {
             r10: std::collections::HashMap::new(),
             square: std::collections::HashMap::new(),
             mock_monitor: std::collections::HashMap::new(),
+            openconnect_server: std::collections::HashMap::new(),
             gspro: std::collections::HashMap::new(),
             random_club: std::collections::HashMap::new(),
         }
@@ -357,6 +379,15 @@ impl Default for SquareSection {
             advanced_spin: None,
             // None means the DEFAULT_ZERO_SPIN_CUTOFF_MPH default applies.
             reject_zero_spin_above_mph: None,
+        }
+    }
+}
+
+impl Default for OpenConnectServerSection {
+    fn default() -> Self {
+        Self {
+            name: "OpenConnect Server".into(),
+            bind: Some("0.0.0.0:921".into()),
         }
     }
 }
