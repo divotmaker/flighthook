@@ -563,7 +563,14 @@ fn connect_and_run(
                         stashed_e8 = None;
                         shot_had_d4 = false;
 
-                        // Device is auto-re-armed by BinaryClient's ShotSequencer.
+                        // Device is auto-re-armed by BinaryClient's ShotSequencer,
+                        // which reports the completed shot rather than an Armed
+                        // event, so readiness is restored here. Without this the
+                        // device reads not-ready for the rest of the session, from
+                        // the first trigger onwards.
+                        device_telemetry.insert("ready".into(), "true".into());
+                        try_emit_device_telemetry(sender, device_id, &device_telemetry);
+
                         // Apply pending reconfig if any.
                         if let Some(target) = pending_reconfig.take() {
                             let target_wire = SessionConfig::mode_label(&target);
