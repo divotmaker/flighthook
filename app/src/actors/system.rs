@@ -292,7 +292,7 @@ fn handle_config_command(
 
     match action.as_ref() {
         ConfigAction::ReplaceAll { config } => {
-            state.system.replace(config.clone());
+            state.system.replace((**config).clone());
             scope = None;
         }
         ConfigAction::UpsertWebserver { index, section } => {

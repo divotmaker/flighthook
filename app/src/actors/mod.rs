@@ -110,7 +110,12 @@ pub fn resolve_actors(
         actors.push(ResolvedActor {
             id,
             name: section.name.clone(),
-            actor: Box::new(r10::R10Actor { initial_mode: mode }),
+            actor: Box::new(r10::R10Actor {
+                initial_mode: mode,
+                // The R10 protocol carries tee distance in yards.
+                #[allow(clippy::cast_possible_truncation)]
+                tee_range_yards: section.range.map(|d| d.as_yards() as f32),
+            }),
         });
     }
 

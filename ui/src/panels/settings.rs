@@ -116,8 +116,12 @@ impl DeviceFormEntry {
             ball_type: 0,
             tee_height_val: "1.5".into(),
             tee_height_unit: "inches".into(),
-            range_val: "8".into(),
-            range_unit: "feet".into(),
+            // Blank means "unset" — the device keeps its own tee distance.
+            range_val: s
+                .range
+                .map(|d| format_distance_value(d.value()))
+                .unwrap_or_default(),
+            range_unit: s.range.map_or("feet".into(), |d| d.unit_key().to_string()),
             surface_height_val: "0".into(),
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
@@ -201,6 +205,10 @@ impl DeviceFormEntry {
 
     pub(crate) fn is_square(&self) -> bool {
         self.monitor_type == "square"
+    }
+
+    pub(crate) fn is_r10(&self) -> bool {
+        self.monitor_type == "r10"
     }
 
     /// Whether this device takes a TCP `ip:port` address (validated as such).
@@ -549,6 +557,11 @@ impl SettingsForm {
                             dev.id.clone(),
                             R10Section {
                                 name: dev.name.clone(),
+                                range: dev
+                                    .range_val
+                                    .parse::<f64>()
+                                    .ok()
+                                    .map(|v| Distance::from_value_and_unit(v, &dev.range_unit)),
                             },
                         );
                     }
@@ -753,6 +766,11 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         R10Section {
                             name: dev.name.clone(),
+                            range: dev
+                                .range_val
+                                .parse::<f64>()
+                                .ok()
+                                .map(|v| Distance::from_value_and_unit(v, &dev.range_unit)),
                         },
                     );
                 }
@@ -1089,6 +1107,31 @@ impl FlighthookApp {
                                     {
                                         dev.dirty = true;
                                     }
+                                });
+                            }
+
+                            if dev.is_r10() {
+                                // Tee distance, pushed to the device on wake-up.
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label("Monitor-to-Ball:").on_hover_text("Distance from the R10 to the ball, sent to the device as its tee distance.\nGarmin recommends 6-8 ft behind the ball.\n\nLeave blank to keep whatever distance is already set on the device.");
+                                    if ui
+                                        .add(egui::TextEdit::singleline(&mut dev.range_val).desired_width(field_width))
+                                        .changed()
+                                    {
+                                        dev.dirty = true;
+                                    }
+                                    egui::ComboBox::from_id_salt(format!("range_unit_{}", dev.id))
+                                        .selected_text(unit_suffix(&dev.range_unit))
+                                        .width(50.0)
+                                        .show_ui(ui, |ui| {
+                                            for &(key, label) in DISTANCE_UNITS {
+                                                if ui.selectable_label(dev.range_unit == key, label).clicked() {
+                                                    dev.range_unit = key.to_string();
+                                                    dev.dirty = true;
+                                                }
+                                            }
+                                        });
                                 });
                             }
 

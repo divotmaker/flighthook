@@ -128,6 +128,7 @@ discard_non_putting_zero_spin = true   # drop 0-spin misreads (putts exempt)
 
 [r10.0]
 name = "Garmin R10"
+range = "7ft"                  # device-to-ball distance, sent as tee distance
 
 [gspro.0]
 name = "Local GSPro"

@@ -261,8 +261,13 @@ impl FlighthookEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConfigAction {
     /// Replace the entire config. Used by POST /api/settings.
+    ///
+    /// Boxed so this variant does not set the size of every `ConfigAction`:
+    /// the per-section upserts are an order of magnitude smaller and far more
+    /// frequent. `Box` is transparent to serde, so the wire format is a plain
+    /// config object either way.
     ReplaceAll {
-        config: FlighthookConfig,
+        config: Box<FlighthookConfig>,
     },
     /// Per-section upserts.
     UpsertWebserver {

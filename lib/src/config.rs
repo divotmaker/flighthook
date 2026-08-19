@@ -196,10 +196,18 @@ pub struct MevoSection {
 }
 
 /// A Garmin R10 BLE device instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct R10Section {
     #[serde(default)]
     pub name: String,
+    /// Distance from the device to the tee, sent to the R10 as `tee_range`
+    /// once it wakes up. Garmin recommends placing the R10 6-8 ft behind the
+    /// ball.
+    ///
+    /// When absent, no shot config is sent and the device keeps whatever tee
+    /// distance was last set on it (e.g. by the Garmin Golf app).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<Distance>,
 }
 
 /// A Square Golf Omni BLE device instance.
@@ -364,6 +372,8 @@ impl Default for R10Section {
     fn default() -> Self {
         Self {
             name: "Garmin R10".into(),
+            // Absent: leave the device's own tee distance untouched.
+            range: None,
         }
     }
 }

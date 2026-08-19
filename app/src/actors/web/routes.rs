@@ -216,7 +216,9 @@ pub async fn post_settings(
     Json(new_config): Json<FlighthookConfig>,
 ) -> Json<PostSettingsResponse> {
     let action = match query.scope.as_deref() {
-        None => ConfigAction::ReplaceAll { config: new_config },
+        None => ConfigAction::ReplaceAll {
+            config: Box::new(new_config),
+        },
         Some(scope) => match scoped_action(scope, &new_config) {
             Some(action) => action,
             // Applying the body wholesale here would save far more than the

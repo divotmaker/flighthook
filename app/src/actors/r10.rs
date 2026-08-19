@@ -23,17 +23,21 @@ const MAX_BACKOFF: Duration = Duration::from_secs(15);
 /// MultiLink/GFDI/protobuf handshake, and processes shots.
 pub struct R10Actor {
     pub initial_mode: ShotDetectionMode,
+    /// Tee distance to push to the device after wake-up, in yards — the unit
+    /// the R10 protocol expects. `None` leaves the device's own setting alone.
+    pub tee_range_yards: Option<f32>,
 }
 
 impl Actor for R10Actor {
     fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let initial_mode = self.initial_mode;
+        let tee_range_yards = self.tee_range_yards;
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                run(initial_mode, sender, receiver);
+                run(initial_mode, tee_range_yards, sender, receiver);
             })
             .expect("failed to spawn r10 thread");
     }
@@ -46,7 +50,17 @@ impl Actor for R10Actor {
 
         let snap = state.system.snapshot();
         match snap.r10.get(index) {
-            Some(_) => ReconfigureOutcome::Applied, // no configurable params
+            // Tee distance is pushed once, right after the device wakes up, so
+            // a change only takes effect on the next connection.
+            Some(section) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let yards = section.range.map(|d| d.as_yards() as f32);
+                if yards == self.tee_range_yards {
+                    ReconfigureOutcome::Applied
+                } else {
+                    ReconfigureOutcome::RestartRequired
+                }
+            }
             None => ReconfigureOutcome::RestartRequired, // section removed
         }
     }
@@ -112,7 +126,12 @@ fn club_from_r10(c: &tenover::proto::ClubData) -> ClubData {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::needless_pass_by_value)]
-fn run(_initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusReceiver) {
+fn run(
+    _initial_mode: ShotDetectionMode,
+    tee_range_yards: Option<f32>,
+    sender: BusSender,
+    mut receiver: BusReceiver,
+) {
     let mut backoff = MIN_BACKOFF;
     let mut ever_connected = false;
     let mut device_id: Option<String> = None;
@@ -124,7 +143,13 @@ fn run(_initial_mode: ShotDetectionMode, sender: BusSender, mut receiver: BusRec
 
         emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
 
-        match connect_and_run(&sender, &mut receiver, &mut ever_connected, &mut device_id) {
+        match connect_and_run(
+            &sender,
+            &mut receiver,
+            &mut ever_connected,
+            &mut device_id,
+            tee_range_yards,
+        ) {
             Ok(()) => break,
             Err(e) => {
                 warn!("session error: {e}");
@@ -184,6 +209,7 @@ fn connect_and_run(
     receiver: &mut BusReceiver,
     ever_connected: &mut bool,
     device_id: &mut Option<String>,
+    tee_range_yards: Option<f32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. BLE connect
     info!("searching for Garmin R10...");
@@ -416,7 +442,36 @@ fn connect_and_run(
                         );
                     }
 
-                    Event::Subscribed { .. } | Event::WakeUpResponse { .. } => {}
+                    // The device is awake, so it will accept shot config
+                    // (SEQUENCE.md step 15). Skipped entirely when unset, which
+                    // leaves whatever tee distance the device already had.
+                    Event::WakeUpResponse { .. } => {
+                        if let Some(yards) = tee_range_yards {
+                            let config = tenover::proto::ShotConfig {
+                                tee_range: Some(yards),
+                                ..tenover::proto::ShotConfig::default()
+                            };
+                            if let Err(e) = client.send_shot_config(&config) {
+                                warn!("failed to send tee distance: {e}");
+                            } else {
+                                debug!("sent tee distance {yards:.1} yd");
+                            }
+                        }
+                    }
+
+                    Event::ShotConfigResponse { success } => {
+                        if success {
+                            info!(
+                                "device accepted tee distance {:.1} yd",
+                                tee_range_yards.unwrap_or_default()
+                            );
+                        } else {
+                            warn!("device rejected the tee distance");
+                        }
+                    }
+
+                    // Protocol ack with nothing for the bus to carry.
+                    Event::Subscribed { .. } => {}
                 }
             }
 
