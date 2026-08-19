@@ -5,7 +5,7 @@ use ironsight::protocol::config::{
 use ironsight::seq::AvrSettings;
 
 use crate::state::config::MevoSection;
-use flighthook::{Distance, DistanceExt, ShotDetectionMode};
+use flighthook::{CameraMode, Distance, DistanceExt, ShotDetectionMode};
 
 /// Mutable session configuration. Distance fields carry both value and unit;
 /// wire-protocol conversions happen on demand in `to_avr_settings()`.
@@ -101,13 +101,15 @@ impl SessionConfig {
     }
 }
 
-/// Default camera configuration for Mevo+ sessions.
+/// Camera configuration for the warmup phase of a Mevo+ session.
 ///
-/// Uses standard resolution (1024×768) with conservative buffer settings.
-/// The `standard_preset()` values from ironsight use -1 sentinel values
-/// for unused raw-camera fields, which is correct for the wire protocol.
-/// We keep our own explicit config to control ringbuffer timing and
-/// sub-sampling independently.
+/// Standard resolution (1024x768) with conservative buffer settings. The Pi
+/// camera subsystem boots in this mode; a Fusion config is only accepted once
+/// warmup has finished.
+///
+/// Unused raw-camera fields carry `-1`, matching the native app's wire
+/// encoding. A `0` there reads as a real value to the Pi and disturbs SHM
+/// buffer allocation, which is what Fusion capture depends on.
 pub(crate) fn cam_config() -> CamConfig {
     CamConfig {
         dynamic_config: true,
@@ -123,18 +125,29 @@ pub(crate) fn cam_config() -> CamConfig {
         raw_camera_mode: 0,
         fusion_camera_mode: false,
         raw_shutter_speed_max: 0.0,
-        raw_ev_roi_x: 0,
-        raw_ev_roi_y: 0,
-        raw_ev_roi_width: 0,
-        raw_ev_roi_height: 0,
-        raw_x_offset: 0,
+        raw_ev_roi_x: -1,
+        raw_ev_roi_y: -1,
+        raw_ev_roi_width: -1,
+        raw_ev_roi_height: -1,
+        raw_x_offset: -1,
         raw_bin44: false,
-        raw_live_preview_write_interval_ms: 0,
-        raw_y_offset: 0,
-        buffer_sub_sampling_pre_trigger_div: 1,
-        buffer_sub_sampling_post_trigger_div: 1,
-        buffer_sub_sampling_switch_time_offset: 0.0,
-        buffer_sub_sampling_total_buffer_size: 0,
-        buffer_sub_sampling_pre_trigger_buffer_size: 0,
+        raw_live_preview_write_interval_ms: -1,
+        raw_y_offset: -1,
+        buffer_sub_sampling_pre_trigger_div: -1,
+        buffer_sub_sampling_post_trigger_div: -1,
+        buffer_sub_sampling_switch_time_offset: -1.0,
+        buffer_sub_sampling_total_buffer_size: -1,
+        buffer_sub_sampling_pre_trigger_buffer_size: -1,
+    }
+}
+
+/// The camera configuration to apply once warmup has finished, for a mode that
+/// asks for Fusion processing. `Standard` keeps the warmup config and needs no
+/// second phase.
+pub(crate) fn fusion_cam_config(mode: CameraMode) -> Option<CamConfig> {
+    match mode {
+        CameraMode::Standard => None,
+        CameraMode::Fusion => Some(CamConfig::fusion_preset()),
+        CameraMode::RawFusion => Some(CamConfig::raw_fusion_preset()),
     }
 }

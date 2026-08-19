@@ -11,7 +11,8 @@ Types for the TOML config file and unit-aware value handling.
 | -------------------- | ------------------------------------------------------------------------------------------------ |
 | `FlighthookConfig`   | Top-level config with per-section `HashMap`s (webserver, mevo, r10, square, openconnect_server, mock_monitor, gspro, random_club) |
 | `WebserverSection`   | Web server instance (name + bind address)                                                        |
-| `MevoSection`        | Mevo device instance (address, ball type, tee height, range, surface height, track %)            |
+| `MevoSection`        | Mevo device instance (address, ball type, tee height, range, surface height, track %, camera mode) |
+| `CameraMode`         | `Standard` / `Fusion` / `RawFusion` — Fusion modes request club data from a Mevo                 |
 | `R10Section`         | Garmin R10 device instance (BLE auto-discovery, name only)                                       |
 | `SquareSection`      | Square Golf Omni device instance (address, club, advanced spin, zero-spin rejection)             |
 | `OpenConnectServerSection` | GSPro Open Connect ingest listener (bind address)                                          |

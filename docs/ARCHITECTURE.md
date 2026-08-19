@@ -49,6 +49,8 @@ address = "127.0.0.1:921"
 - Radar settings (ball_type, tee_height, etc.) are per-mevo only
 - `use_estimated` is per-mevo (defaults to `true`) -- controls whether estimated
   (E8) ball flights are emitted when no full (D4) result arrives
+- `camera_mode` is per-mevo (`standard` default / `fusion` / `raw_fusion`) --
+  the Fusion modes request club data, applied after a camera warmup delay
 - R10 sections show only name (BLE auto-discovery, no address field)
 - Mock sections show only name (no address or radar fields)
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `gspro.0`)
@@ -88,7 +90,8 @@ pub struct FlighthookConfig {
 }
 
 pub struct WebserverSection { pub name: String, pub bind: String }
-pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool> }
+pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool>, pub camera_mode: Option<CameraMode> }
+pub enum CameraMode { Standard, Fusion, RawFusion }
 pub struct R10Section { pub name: String }
 pub struct SquareSection { pub name: String, pub address: Option<String>, pub club: Option<Club>, pub advanced_spin: Option<bool>, pub discard_non_putting_zero_spin: Option<bool> }
 pub struct MockMonitorSection { pub name: String }
@@ -606,6 +609,8 @@ Global
   describing the device/integration type and connection method
 - `Use Estimated` is per-mevo (checkbox) -- controls whether estimated (E8)
   ball flights are emitted when no full (D4) result arrives
+- `Camera Mode` is per-mevo (dropdown: Standard / Fusion / Raw Fusion) --
+  the Fusion modes request club data from the device
 - R10 sections show only name (BLE auto-discovery; no address or radar fields)
 - Mock launch monitor and Random Club are developer-only types (must be added
   manually to the config TOML; they do not appear in the Add dropdown)

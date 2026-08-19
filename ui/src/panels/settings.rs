@@ -1,8 +1,8 @@
 use crate::app::FlighthookApp;
 use crate::net;
 use crate::types::{
-    Club, Distance, DistanceExt, FlighthookConfig, GsProSection, MevoSection, MockMonitorSection,
-    R10Section, RandomClubSection, UnitSystem, WebserverSection,
+    CameraMode, Club, Distance, DistanceExt, FlighthookConfig, GsProSection, MevoSection,
+    MockMonitorSection, R10Section, RandomClubSection, UnitSystem, WebserverSection,
 };
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
@@ -60,6 +60,8 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) surface_height_unit: String,
     pub(crate) track_pct: String,
     pub(crate) use_estimated: bool,
+    /// Mevo: camera mode. Fusion modes are what produce club data.
+    pub(crate) camera_mode: CameraMode,
     /// Square Golf: discard zero-spin reads, except when putting.
     pub(crate) discard_zero_spin: bool,
     /// Square Golf fields the form does not surface. Carried verbatim so that
@@ -100,6 +102,7 @@ impl DeviceFormEntry {
             surface_height_unit: surf.unit_key().into(),
             track_pct: format!("{:.0}", s.track_pct.unwrap_or(80.0)),
             use_estimated: s.use_estimated.unwrap_or(true),
+            camera_mode: s.camera_mode.unwrap_or_default(),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -126,6 +129,7 @@ impl DeviceFormEntry {
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
             use_estimated: true,
+            camera_mode: CameraMode::default(),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -151,6 +155,7 @@ impl DeviceFormEntry {
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
             use_estimated: true,
+            camera_mode: CameraMode::default(),
             dirty: false,
         }
     }
@@ -170,6 +175,7 @@ impl DeviceFormEntry {
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
             use_estimated: true,
+            camera_mode: CameraMode::default(),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -192,6 +198,7 @@ impl DeviceFormEntry {
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
             use_estimated: true,
+            camera_mode: CameraMode::default(),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -531,6 +538,7 @@ impl SettingsForm {
                                 ),
                                 track_pct: dev.track_pct.parse().ok(),
                                 use_estimated: Some(dev.use_estimated),
+                                camera_mode: Some(dev.camera_mode),
                             },
                         );
                     }
@@ -742,6 +750,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             }),
                             track_pct: dev.track_pct.parse().ok(),
                             use_estimated: Some(dev.use_estimated),
+                            camera_mode: Some(dev.camera_mode),
                         },
                     );
                 }
@@ -1250,6 +1259,31 @@ impl FlighthookApp {
                                     }
                                 });
 
+                                // Camera Mode
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label("Camera Mode:").on_hover_text(
+                                        "Standard reports ball flight only.\nFusion modes add club data (path, face angle, attack angle,\ndynamic loft, smash factor, swing planes) and need the\nPro Package enabled on the device.\n\nWhich Fusion mode depends on firmware: Raw Fusion for\nBM17.04 and newer, Fusion for older. The wrong one yields\nno club data. Fusion is applied after a 15s camera warmup.",
+                                    );
+                                    egui::ComboBox::from_id_salt(format!("cam_mode_{}", dev.id))
+                                        .selected_text(dev.camera_mode.label())
+                                        .width(field_width * 2.0)
+                                        .show_ui(ui, |ui| {
+                                            for mode in CameraMode::all() {
+                                                if ui
+                                                    .selectable_label(
+                                                        dev.camera_mode == mode,
+                                                        mode.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    dev.camera_mode = mode;
+                                                    dev.dirty = true;
+                                                }
+                                            }
+                                        });
+                                });
+
                             }
                         }
                         ActorFormEntry::Integration(entry) => {
@@ -1369,6 +1403,7 @@ impl FlighthookApp {
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
                                     use_estimated: true,
+                                    camera_mode: CameraMode::default(),
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
@@ -1399,6 +1434,7 @@ impl FlighthookApp {
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
                                     use_estimated: true,
+                                    camera_mode: CameraMode::default(),
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
@@ -1428,6 +1464,7 @@ impl FlighthookApp {
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
                                     use_estimated: true,
+                                    camera_mode: CameraMode::default(),
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
@@ -1457,6 +1494,7 @@ impl FlighthookApp {
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
                                     use_estimated: true,
+                                    camera_mode: CameraMode::default(),
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,

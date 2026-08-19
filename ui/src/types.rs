@@ -13,6 +13,7 @@ pub use flighthook::{
     // API types
     ActorStatusResponse,
     BallFlight,
+    CameraMode,
     // Global state types
     Club,
     ClubData,

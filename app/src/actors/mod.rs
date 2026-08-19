@@ -87,6 +87,7 @@ pub fn resolve_actors(
             Ok(addr) => {
                 let session_config = mevo::SessionConfig::from_mevo_section(section);
                 let use_estimated = section.use_estimated.unwrap_or(true);
+                let camera_mode = section.camera_mode.unwrap_or_default();
                 actors.push(ResolvedActor {
                     id,
                     name: section.name.clone(),
@@ -95,6 +96,7 @@ pub fn resolve_actors(
                         initial_mode: mode,
                         session_config,
                         use_estimated,
+                        camera_mode,
                     }),
                 });
             }

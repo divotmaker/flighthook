@@ -177,6 +177,60 @@ pub struct WebserverSection {
     pub bind: String,
 }
 
+/// Camera mode requested from the device at session start.
+///
+/// Fusion processing is what produces club data (path, face angle, attack
+/// angle, dynamic loft, smash factor, swing planes). It needs the Pro Package
+/// enabled on the device; without it the device reports ball flight only,
+/// whatever this is set to. The two Fusion variants are firmware-dependent —
+/// picking the wrong one yields no club data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[serde(rename_all = "snake_case")]
+pub enum CameraMode {
+    /// Ball flight only, no Fusion processing. The default.
+    #[default]
+    Standard,
+    /// High-resolution JPEG Fusion (1640x1232), older firmware.
+    Fusion,
+    /// Raw Fusion (640x480 @ 180fps), firmware BM17.04 and newer.
+    RawFusion,
+}
+
+impl CameraMode {
+    /// Whether this mode asks the device for Fusion processing.
+    #[must_use]
+    pub fn is_fusion(self) -> bool {
+        !matches!(self, Self::Standard)
+    }
+
+    /// Stable key used by the settings UI and config file.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Fusion => "fusion",
+            Self::RawFusion => "raw_fusion",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard (ball flight only)",
+            Self::Fusion => "Fusion — older firmware",
+            Self::RawFusion => "Raw Fusion — BM17.04+",
+        }
+    }
+
+    /// Every mode, in display order.
+    #[must_use]
+    pub fn all() -> [Self; 3] {
+        [Self::Standard, Self::Fusion, Self::RawFusion]
+    }
+}
+
 /// A Mevo/Mevo+ device instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MevoSection {
@@ -193,6 +247,10 @@ pub struct MevoSection {
     /// and carry less data, but are often the only result for short chips.
     #[serde(default)]
     pub use_estimated: Option<bool>,
+    /// Camera mode. Defaults to `Standard` (ball flight only) when absent.
+    /// Fusion modes additionally require the Pro Package on the device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_mode: Option<CameraMode>,
 }
 
 /// A Garmin R10 BLE device instance.
@@ -364,6 +422,7 @@ impl Default for MevoSection {
             surface_height: Some(Distance::Inches(0.0)),
             track_pct: Some(80.0),
             use_estimated: None,
+            camera_mode: None,
         }
     }
 }
@@ -409,5 +468,41 @@ impl Default for GsProSection {
             chipping_monitor: None,
             putting_monitor: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod camera_mode_tests {
+    use super::*;
+
+    #[test]
+    fn absent_camera_mode_defaults_to_standard() {
+        let s: MevoSection = serde_json::from_str(r#"{"name":"Mevo"}"#).expect("parse");
+        assert_eq!(s.camera_mode, None);
+        assert_eq!(s.camera_mode.unwrap_or_default(), CameraMode::Standard);
+    }
+
+    #[test]
+    fn camera_mode_round_trips_by_key() {
+        for mode in CameraMode::all() {
+            let json = format!(r#"{{"name":"Mevo","camera_mode":"{}"}}"#, mode.key());
+            let s: MevoSection = serde_json::from_str(&json).expect("parse");
+            assert_eq!(s.camera_mode, Some(mode), "{}", mode.key());
+        }
+    }
+
+    #[test]
+    fn standard_camera_mode_is_not_written_back() {
+        // `skip_serializing_if` keeps an untouched config file unchanged.
+        let s = MevoSection::default();
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(!json.contains("camera_mode"), "{json}");
+    }
+
+    #[test]
+    fn only_standard_skips_fusion() {
+        assert!(!CameraMode::Standard.is_fusion());
+        assert!(CameraMode::Fusion.is_fusion());
+        assert!(CameraMode::RawFusion.is_fusion());
     }
 }

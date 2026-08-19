@@ -14,11 +14,11 @@ use tracing::{debug, info, warn};
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
-use settings::cam_config;
+use settings::{cam_config, fusion_cam_config};
 
 use flighthook::{
-    ActorStatus, BallFlight, ClubData, Distance, FlighthookEvent, FlighthookMessage, Severity,
-    ShotDetectionMode, ShotKey, Velocity,
+    ActorStatus, BallFlight, CameraMode, ClubData, Distance, FlighthookEvent, FlighthookMessage,
+    Severity, ShotDetectionMode, ShotKey, Velocity,
 };
 
 /// No events for this long → treat as disconnected.
@@ -34,6 +34,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(15);
 /// TCP connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the Pi camera subsystem needs in standard mode before it will
+/// accept a Fusion config. Applying one earlier leaves the SHM buffer
+/// unallocated and no club data arrives.
+const CAMERA_WARMUP: Duration = Duration::from_secs(15);
+
 /// Mevo session actor. Connects to a Mevo/Mevo+ device, runs the handshake,
 /// arms, and processes shots in a reconnecting event loop.
 pub struct MevoActor {
@@ -41,6 +46,7 @@ pub struct MevoActor {
     pub initial_mode: ShotDetectionMode,
     pub session_config: SessionConfig,
     pub use_estimated: bool,
+    pub camera_mode: CameraMode,
 }
 
 impl Actor for MevoActor {
@@ -49,6 +55,7 @@ impl Actor for MevoActor {
         let initial_mode = self.initial_mode;
         let session_config = self.session_config.clone();
         let use_estimated = self.use_estimated;
+        let camera_mode = self.camera_mode;
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
@@ -59,6 +66,7 @@ impl Actor for MevoActor {
                     initial_mode,
                     session_config,
                     use_estimated,
+                    camera_mode,
                     sender,
                     receiver,
                 );
@@ -99,6 +107,11 @@ impl Actor for MevoActor {
         // Check if use_estimated changed -> restart to apply
         let new_use_estimated = section.use_estimated.unwrap_or(true);
         if new_use_estimated != self.use_estimated {
+            return ReconfigureOutcome::RestartRequired;
+        }
+
+        // Camera mode is sent once per session -> restart to apply
+        if section.camera_mode.unwrap_or_default() != self.camera_mode {
             return ReconfigureOutcome::RestartRequired;
         }
 
@@ -161,6 +174,7 @@ fn run(
     initial_mode: ShotDetectionMode,
     initial_session_config: SessionConfig,
     use_estimated: bool,
+    camera_mode: CameraMode,
     sender: BusSender,
     mut receiver: BusReceiver,
 ) {
@@ -183,6 +197,7 @@ fn run(
             &addr,
             initial_mode,
             use_estimated,
+            camera_mode,
             &sender,
             &mut receiver,
             &mut session_config,
@@ -243,6 +258,7 @@ fn connect_and_run(
     addr: &SocketAddr,
     initial_mode: ShotDetectionMode,
     use_estimated: bool,
+    camera_mode: CameraMode,
     sender: &BusSender,
     receiver: &mut BusReceiver,
     session_config: &mut SessionConfig,
@@ -302,6 +318,11 @@ fn connect_and_run(
     let mut shot_had_d4 = false;
     let mut stashed_e8: Option<ironsight::protocol::shot::FlightResultV1> = None;
 
+    // Fusion camera config, applied once warmup has elapsed. None for
+    // Standard, which keeps the warmup config for the whole session.
+    let mut pending_fusion_cam = fusion_cam_config(camera_mode);
+    let session_start = Instant::now();
+
     // Staleness + poll backoff
     let mut last_event_time = Instant::now();
     let mut idle_count: u32 = 0;
@@ -352,6 +373,28 @@ fn connect_and_run(
                     }
                 }
             }
+        }
+
+        // ==============================================================
+        // Phase 1b: Apply the Fusion camera config after warmup
+        // ==============================================================
+        // The device boots the camera in standard mode; only then will it
+        // accept a Fusion config. Held back until the shot in progress (if
+        // any) has finished so the reconfigure cannot interrupt it.
+        if pending_fusion_cam.is_some()
+            && current_shot_key.is_none()
+            && session_start.elapsed() >= CAMERA_WARMUP
+            && let Some(cam) = pending_fusion_cam.take()
+        {
+            info!(
+                "camera warmup complete -- applying {} config",
+                camera_mode.key()
+            );
+            client.configure_cam(cam);
+            client.arm();
+            emit_device_status(sender, ActorStatus::Connected, HashMap::new());
+            device_telemetry.insert("ready".into(), "false".into());
+            try_emit_device_telemetry(sender, device_id, &device_telemetry);
         }
 
         // ==============================================================

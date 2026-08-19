@@ -348,7 +348,8 @@ Full persisted config (mirrors `config.toml`).
       "tee_height": "1.5in",
       "range": "9ft",
       "surface_height": "0in",
-      "track_pct": 80.0
+      "track_pct": 80.0,
+      "camera_mode": "standard"
     }
   },
   "r10": {
@@ -387,6 +388,9 @@ Full persisted config (mirrors `config.toml`).
 - R10 sections have only `name` (BLE auto-discovery; no address or radar settings)
 - `use_estimated` on Mevo sections controls whether estimated (E8) ball flights
   are emitted when no full (D4) result arrives (defaults to `true`)
+- `camera_mode` on Mevo sections is `standard` (default), `fusion`, or
+  `raw_fusion`. The Fusion modes request the device's club-data processing and
+  are omitted from the response when unset
 - `openconnect_server` sections are **launch monitors**, not integrations: they
   listen (`bind`, default `0.0.0.0:921`) and accept inbound shots from any
   monitor that speaks GSPro Open Connect V1 as a client — Uneekor, Foresight,
