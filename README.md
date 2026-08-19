@@ -12,69 +12,19 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 
 ### Launch Monitors
 
-| Device                | Protocol                | Driver                                          | Status           |
-| --------------------- | ----------------------- | ----------------------------------------------- | ---------------- |
-| FlightScope Mevo+     | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
-| FlightScope Mevo Gen2 | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
-| Uneekor               | TCP (JSON, port 921)    | built-in (OpenConnect)                          | Alpha (untested) |
-| Garmin R10            | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
-| Square Golf Omni      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Alpha            |
+Each device links to its setup notes, quirks, and config reference.
 
-#### OpenConnect monitors
+| Device                                               | Protocol                | Driver                                          | Status           |
+| ---------------------------------------------------- | ----------------------- | ----------------------------------------------- | ---------------- |
+| [FlightScope Mevo+](docs/devices/flightscope.md)     | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
+| [FlightScope Mevo Gen2](docs/devices/flightscope.md) | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
+| [Square Golf Omni](docs/devices/square-golf.md)      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Beta             |
+| [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
+| [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (OpenConnect)                          | Alpha (untested) |
 
-Uneekor is supported through the **OpenConnect server** actor rather than a
-native driver. Uneekor's own software already pushes shots as a GSPro Open
-Connect V1 client, so flighthook listens and accepts them. The same actor works
-for any monitor that emits Open Connect — Foresight, SkyTrak, MLM2PRO and
-others.
-
-Marked **untested**: the actor is exercised end to end against a simulated
-Open Connect client, but has not yet been run against real Uneekor hardware.
-
-This is a bridge, not a driver. Uneekor's PC software has to be running, and
-you get ball and club data only — no imagery, no device telemetry beyond
-readiness, and no device control. Third-party output is also licensed
-separately by Uneekor: the EYE MINI family needs the Pro subscription, while
-many legacy QED and EYE XO units carry a perpetual third-party license tied to
-the serial number. Check what your unit has before buying anything.
-
-#### Sharing port 921 with GSPro
-
-GSPro listens on 921 too, but its port is movable. Edit
-`C:\GSPro\GSPC\GSPconnect.exe.config` and set
-`<OpenAPIUseAltPort>true</OpenAPIUseAltPort>` to start GSPConnect on **922**,
-which frees 921 for flighthook and lets everything run on one machine:
-
-```text
-  Uneekor software  --:921-->  flighthook  --:922-->  GSPro     (all one host)
-```
-
-```toml
-[openconnect_server.0]
-name = "Uneekor"
-bind = "0.0.0.0:921"
-
-[gspro.0]
-name = "Local GSPro"
-address = "127.0.0.1:922"   # GSPro moved aside via OpenAPIUseAltPort
-```
-
-Splitting across two hosts also works, but only if your monitor's connector lets
-you aim it at a non-localhost address — Open Connect's own documentation
-specifies `127.0.0.1`, and not every connector exposes the setting.
-
-The Square Golf Omni is the first supported device to report **face impact
-location** on the wire, so it is currently the only one that forwards
-`VerticalFaceImpact` / `HorizontalFaceImpact` to GSPro. It also reports dynamic
-loft and smash factor. The original Square / Square Home is not supported — it
-uses a different club-code scheme.
-
-A ball struck near the front edge of the Omni's detection zone can come back with
-zero spin. A spinless shot flies far too long in the sim, so flighthook discards
-any zero-spin reading at or above `reject_zero_spin_above_mph` (default 60 mph)
-and warns instead — re-hit the shot. Slower shots are still forwarded, since
-putts and soft chips can legitimately read zero. Set the value to `0` to forward
-every shot.
+Uneekor connects through the **OpenConnect server** actor, which accepts shots
+from any launch monitor that speaks GSPro Open Connect as a client — Foresight,
+SkyTrak and MLM2PRO also emit it.
 
 ### Simulation Software
 
@@ -85,6 +35,27 @@ every shot.
 ### Custom Integrations
 
 flighthook exposes a REST + WebSocket API on the event bus, so any external software can subscribe to shot data, device telemetry, and raw audit events. See [docs/API.md](docs/API.md).
+
+#### Flight Relay Protocol
+
+The WebSocket API speaks the [Flight Relay Protocol](https://github.com/flightrelay/spec)
+(FRP) — an open, vendor-neutral protocol for launch monitor shot data. flighthook
+serves it at `ws://<host>:5880/frp` and negotiates the spec version on connect,
+currently `0.1.0`.
+
+Whatever the monitor is — a Mevo+ over its binary TCP protocol, an R10 over BLE,
+a Uneekor over OpenConnect — it is normalised into the same FRP event stream, so
+a consumer is written once rather than per device.
+
+The shot lifecycle events (`shot_trigger`, `ball_flight`, `club_path`,
+`face_impact`, `shot_finished`) and the device events (`device_telemetry`,
+`alert`) are FRP-compliant and use the spec's own field shapes; the types come
+from the [`flightrelay`](https://crates.io/crates/flightrelay) crate. flighthook
+adds its own event kinds alongside them (player/club info, config commands, actor
+status), which FRP-only consumers ignore per spec.
+
+The spec is CC0 and the Rust SDK is Apache-2.0/MIT, so consumers need not depend
+on flighthook itself.
 
 ## Status
 
@@ -164,8 +135,10 @@ address = "127.0.0.1:921"
 ```
 
 Section prefixes encode component type: `mevo`, `r10`, `square`,
-`mock_monitor`, `gspro`, `random_club`. The index after the dot (`0`, `1`, ...)
-identifies the instance. Settings can also be edited live from the Settings tab in the UI.
+`openconnect_server`, `mock_monitor`, `gspro`, `random_club`. The index after
+the dot (`0`, `1`, ...) identifies the instance. Per-device options are covered
+in the [device docs](#launch-monitors). Settings can also be edited live from
+the Settings tab in the UI.
 
 ## Developer Quick Start
 
@@ -221,4 +194,4 @@ To run with a mock device, point `--config` at a TOML file with
 
 ---
 
-Mevo+ and FlightScope are trademarks of FlightScope (Pty) Ltd. Garmin and Approach R10 are trademarks of Garmin Ltd. or its subsidiaries. ExPutt, Square Golf and Square Omni are trademarks of Invant Inc. GSPro is a trademark of GSP Golf AB. flighthook is not affiliated with, endorsed by, or sponsored by any of these companies.
+Mevo+ and FlightScope are trademarks of FlightScope (Pty) Ltd. Garmin and Approach R10 are trademarks of Garmin Ltd. or its subsidiaries. ExPutt, Square Golf and Square Omni are trademarks of Invant Inc. Uneekor, EYE MINI, EYE XO and QED are trademarks of Uneekor, Inc. GSPro is a trademark of GSP Golf AB. Foresight Sports, SkyTrak and MLM2PRO are trademarks of their respective owners. flighthook is not affiliated with, endorsed by, or sponsored by any of these companies.
