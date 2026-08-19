@@ -129,9 +129,10 @@ pub fn resolve_actors(
                 address: section.address.clone(),
                 club,
                 advanced_spin: section.advanced_spin.unwrap_or(true),
-                reject_zero_spin_above_mph: section
-                    .reject_zero_spin_above_mph
-                    .unwrap_or(flighthook::DEFAULT_ZERO_SPIN_CUTOFF_MPH),
+                // Passed through as-is: absent disables the check, and a cutoff
+                // of 0 is a real setting (exempt nothing), not a disable. The
+                // 60 mph default is written into config at device creation.
+                reject_zero_spin_above_mph: section.reject_zero_spin_above_mph,
             }),
         });
     }

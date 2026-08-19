@@ -22,11 +22,24 @@ confirmed.
 
 A ball struck near the front edge of the Omni's detection zone can come back
 with zero spin. A spinless shot flies far too long in the sim, so flighthook
-discards any zero-spin reading at or above `reject_zero_spin_above_mph`
-(default 60 mph) and warns instead — re-hit the shot.
+discards any zero-spin reading at or above `reject_zero_spin_above_mph` and
+warns instead — re-hit the shot.
 
 Slower shots are still forwarded, since putts and soft chips can legitimately
-read zero. Set the value to `0` to forward every shot.
+read zero.
+
+The setting has three distinct states:
+
+| `reject_zero_spin_above_mph` | Behaviour |
+|---|---|
+| absent (key removed / field blank) | Check is **off** — no shot is examined |
+| `0` | Nothing is exempt — **every** zero-spin read is discarded, however slow |
+| `60.0` | Zero-spin reads at or above 60 mph are discarded |
+
+New devices are created with `reject_zero_spin_above_mph = 60.0` written into
+the config, so the cutoff in force is always visible rather than implied by a
+fallback in code. Note that `0` is a real cutoff, not an off switch — remove the
+key to disable the check.
 
 ## Putting mode
 

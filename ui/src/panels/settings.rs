@@ -61,7 +61,8 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) track_pct: String,
     pub(crate) use_estimated: bool,
     /// Square Golf: ball speed (mph) above which a zero-spin read is discarded.
-    /// Blank means "use the built-in default".
+    /// Blank switches the check off; `0` exempts nothing and discards every
+    /// zero-spin read.
     pub(crate) zero_spin_cutoff: String,
     /// Square Golf fields the form does not surface. Carried verbatim so that
     /// saving settings does not wipe them from the config file.
@@ -758,11 +759,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             },
                             club: dev.square_club.clone(),
                             advanced_spin: dev.square_advanced_spin,
-                            reject_zero_spin_above_mph: dev
-                                .zero_spin_cutoff
-                                .trim()
-                                .parse()
-                                .ok(),
+                            reject_zero_spin_above_mph: dev.zero_spin_cutoff.trim().parse().ok(),
                         },
                     );
                 }
@@ -1096,12 +1093,14 @@ impl FlighthookApp {
                                          in the sim, so they are discarded and you re-hit.\n\n\
                                          Slow putts and soft chips can legitimately read zero, so \
                                          anything below the cutoff is still sent.\n\n\
-                                         Leave blank for the default (60 mph). Set 0 to send every \
-                                         shot.",
+                                         Leave blank to switch the check off and send every shot. \
+                                         Set 0 to exempt nothing, discarding any zero-spin read \
+                                         however slow. New devices start at 60 mph.",
                                     );
                                     if ui
                                         .add(
                                             egui::TextEdit::singleline(&mut dev.zero_spin_cutoff)
+                                                .hint_text("off")
                                                 .desired_width(field_width),
                                         )
                                         .on_hover_text("ball speed in mph, e.g. 60")
@@ -1115,6 +1114,16 @@ impl FlighthookApp {
                                         ui.label(
                                             egui::RichText::new("Not a number")
                                                 .color(egui::Color32::from_rgb(255, 80, 80))
+                                                .size(11.0),
+                                        );
+                                    } else if c.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("(check off)").weak().size(11.0),
+                                        );
+                                    } else if c.parse::<f64>() == Ok(0.0) {
+                                        ui.label(
+                                            egui::RichText::new("(discards all zero-spin)")
+                                                .weak()
                                                 .size(11.0),
                                         );
                                     }
@@ -1385,7 +1394,11 @@ impl FlighthookApp {
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
                                     use_estimated: true,
-                                    zero_spin_cutoff: String::new(),
+                                    // Written explicitly: blank means no rejection.
+                                    zero_spin_cutoff: format!(
+                                        "{:.0}",
+                                        flighthook::DEFAULT_ZERO_SPIN_CUTOFF_MPH
+                                    ),
                                     square_club: None,
                                     square_advanced_spin: None,
                                     dirty: true,

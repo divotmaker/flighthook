@@ -28,8 +28,9 @@ pub struct SquareActor {
     pub club: Club,
     pub advanced_spin: bool,
     /// Ball speed (mph) at or above which a zero-spin reading is treated as a
-    /// failed read and the shot discarded. Zero disables the check.
-    pub reject_zero_spin_above_mph: f64,
+    /// failed read and the shot discarded. `None` disables the check entirely;
+    /// `Some(0.0)` exempts nothing and discards every zero-spin read.
+    pub reject_zero_spin_above_mph: Option<f64>,
 }
 
 impl Actor for SquareActor {
@@ -43,7 +44,14 @@ impl Actor for SquareActor {
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                run(address, club, advanced_spin, zero_spin_cutoff, sender, receiver);
+                run(
+                    address,
+                    club,
+                    advanced_spin,
+                    zero_spin_cutoff,
+                    sender,
+                    receiver,
+                );
             })
             .expect("failed to spawn square thread");
     }
@@ -130,14 +138,19 @@ fn to_allsquare_club(club: Club) -> allsquare::Club {
 /// to record a wrong one.
 ///
 /// Slow shots are exempt: putts and soft chips can legitimately read zero, and
-/// the consequence of a spinless putt is negligible. `cutoff_mph` of zero
-/// disables the check entirely.
-fn is_zero_spin_misread(b: &allsquare::BallMetrics, cutoff_mph: f64) -> bool {
-    if cutoff_mph <= 0.0 {
+/// the consequence of a spinless putt is negligible.
+///
+/// `cutoff_mph` has three distinct states:
+///
+/// - `None` — the check is disabled; every shot passes through unexamined.
+/// - `Some(0.0)` — no shot is exempt; any zero-spin read is discarded.
+/// - `Some(x)` — zero-spin reads at or above `x` mph are discarded.
+fn is_zero_spin_misread(b: &allsquare::BallMetrics, cutoff_mph: Option<f64>) -> bool {
+    let Some(cutoff) = cutoff_mph else {
         return false;
-    }
+    };
     let no_spin = b.total_spin == 0 && b.back_spin == 0 && b.side_spin == 0;
-    no_spin && Velocity::MetersPerSecond(b.speed).as_mph() >= cutoff_mph
+    no_spin && Velocity::MetersPerSecond(b.speed).as_mph() >= cutoff
 }
 
 fn ball_from_square(b: &allsquare::BallMetrics) -> BallFlight {
@@ -204,7 +217,7 @@ fn run(
     address: Option<String>,
     club: Club,
     advanced_spin: bool,
-    reject_zero_spin_above_mph: f64,
+    reject_zero_spin_above_mph: Option<f64>,
     sender: BusSender,
     mut receiver: BusReceiver,
 ) {
@@ -286,7 +299,7 @@ fn connect_and_run(
     address: Option<&str>,
     current_club: &mut Club,
     advanced_spin: bool,
-    reject_zero_spin_above_mph: f64,
+    reject_zero_spin_above_mph: Option<f64>,
     sender: &BusSender,
     receiver: &mut BusReceiver,
     ever_connected: &mut bool,
@@ -638,7 +651,7 @@ mod tests {
     #[test]
     fn rejects_fast_zero_spin_shot() {
         // 49 m/s ~= 110 mph, a normal 8 iron.
-        assert!(is_zero_spin_misread(&ball(49.0, 0, 0, 0), 60.0));
+        assert!(is_zero_spin_misread(&ball(49.0, 0, 0, 0), Some(60.0)));
     }
 
     /// Slow shots are exempt — a putt or soft chip can genuinely read zero, and
@@ -646,22 +659,39 @@ mod tests {
     #[test]
     fn allows_slow_zero_spin_shot() {
         // 3.3 m/s ~= 7 mph, a putt.
-        assert!(!is_zero_spin_misread(&ball(3.3, 0, 0, 0), 60.0));
+        assert!(!is_zero_spin_misread(&ball(3.3, 0, 0, 0), Some(60.0)));
         // 22 m/s ~= 49 mph, a chip — still under the cutoff.
-        assert!(!is_zero_spin_misread(&ball(22.0, 0, 0, 0), 60.0));
+        assert!(!is_zero_spin_misread(&ball(22.0, 0, 0, 0), Some(60.0)));
     }
 
     /// Any measured spin means the read succeeded, however fast the ball.
     #[test]
     fn allows_fast_shot_with_spin() {
-        assert!(!is_zero_spin_misread(&ball(70.0, 2400, 2400, 0), 60.0));
+        assert!(!is_zero_spin_misread(
+            &ball(70.0, 2400, 2400, 0),
+            Some(60.0)
+        ));
         // Sidespin alone still counts as a successful read.
-        assert!(!is_zero_spin_misread(&ball(70.0, 0, 0, -87), 60.0));
+        assert!(!is_zero_spin_misread(&ball(70.0, 0, 0, -87), Some(60.0)));
     }
 
-    /// A zero cutoff disables the check, so nothing is ever discarded.
+    /// `None` switches the feature off: nothing is examined, nothing discarded,
+    /// however fast a zero-spin shot is.
     #[test]
-    fn zero_cutoff_disables_rejection() {
-        assert!(!is_zero_spin_misread(&ball(80.0, 0, 0, 0), 0.0));
+    fn none_disables_the_check_entirely() {
+        assert!(!is_zero_spin_misread(&ball(80.0, 0, 0, 0), None));
+        assert!(!is_zero_spin_misread(&ball(3.3, 0, 0, 0), None));
+    }
+
+    /// A zero cutoff is not "off" — it exempts nothing, so every zero-spin read
+    /// is discarded no matter how slow. This is the distinction that makes
+    /// `None` and `Some(0.0)` different states.
+    #[test]
+    fn zero_cutoff_rejects_every_zero_spin_shot() {
+        assert!(is_zero_spin_misread(&ball(80.0, 0, 0, 0), Some(0.0)));
+        // Even a putt, which a 60 mph cutoff would have let through.
+        assert!(is_zero_spin_misread(&ball(3.3, 0, 0, 0), Some(0.0)));
+        // A shot with spin is still fine.
+        assert!(!is_zero_spin_misread(&ball(3.3, 627, 621, -87), Some(0.0)));
     }
 }
