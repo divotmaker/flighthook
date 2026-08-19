@@ -200,8 +200,13 @@ pub struct R10Section {
     pub name: String,
 }
 
+/// Default ball speed (mph) above which a zero-spin reading is treated as a
+/// failed read rather than a real shot. Chosen to sit above putts and chips —
+/// which can legitimately read zero — and below any full swing.
+pub const DEFAULT_ZERO_SPIN_CUTOFF_MPH: f64 = 60.0;
+
 /// A Square Golf BLE device instance (Omni or Home).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SquareSection {
     #[serde(default)]
     pub name: String,
@@ -220,6 +225,18 @@ pub struct SquareSection {
     /// the vendor app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advanced_spin: Option<bool>,
+    /// Discard shots that report zero spin at or above this ball speed, in mph.
+    ///
+    /// A struck ball always spins, so zero spin above chipping pace is a failed
+    /// read — typically a ball near the edge of the detection zone. Passing it
+    /// through sends a spinless shot to the sim, which flies far too long.
+    ///
+    /// Below the cutoff, zero spin is plausible: slow putts and soft chips can
+    /// genuinely read zero, so those are still forwarded. Defaults to 60.0 mph,
+    /// which sits above putts and chips but below any full swing. Set to `0` to
+    /// forward every shot regardless of spin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_zero_spin_above_mph: Option<f64>,
 }
 
 /// A mock launch monitor instance.
@@ -338,6 +355,8 @@ impl Default for SquareSection {
             address: None,
             club: None,
             advanced_spin: None,
+            // None means the DEFAULT_ZERO_SPIN_CUTOFF_MPH default applies.
+            reject_zero_spin_above_mph: None,
         }
     }
 }

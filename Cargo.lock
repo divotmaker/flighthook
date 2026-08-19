@@ -48,9 +48,9 @@ dependencies = [
 
 [[package]]
 name = "allsquare"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7df94b9ad4a154a39db02b008d5b7630d9467aa13559d6f13f3eb8e27025aeb"
+checksum = "05a602358cf8d2b6a366f69fe2217bfc45992259fb60f0602c4c4a2420274b1c"
 dependencies = [
  "btleplug",
  "futures",

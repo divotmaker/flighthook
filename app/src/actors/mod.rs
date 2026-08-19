@@ -128,6 +128,9 @@ pub fn resolve_actors(
                 address: section.address.clone(),
                 club,
                 advanced_spin: section.advanced_spin.unwrap_or(true),
+                reject_zero_spin_above_mph: section
+                    .reject_zero_spin_above_mph
+                    .unwrap_or(flighthook::DEFAULT_ZERO_SPIN_CUTOFF_MPH),
             }),
         });
     }

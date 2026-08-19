@@ -12,18 +12,30 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 
 ### Launch Monitors
 
-| Device                | Protocol                | Status    |
-| --------------------- | ----------------------- | --------- |
-| FlightScope Mevo+     | TCP (binary, port 5100) | Supported |
-| FlightScope Mevo Gen2 | TCP (binary, port 5100) | Supported |
-| Garmin R10            | BLE / GFDI / Protobuf   | Alpha     |
-| Square Golf Omni      | BLE (GATT)              | Alpha     |
+| Device                | Protocol                | Driver                                          | Status    |
+| --------------------- | ----------------------- | ----------------------------------------------- | --------- |
+| FlightScope Mevo+     | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported |
+| FlightScope Mevo Gen2 | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported |
+| Garmin R10            | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha     |
+| Square Golf Omni      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Alpha     |
+
+Each device is decoded by a standalone protocol crate, usable independently of
+flighthook: [ironsight](https://github.com/divotmaker/ironsight),
+[tenover](https://github.com/divotmaker/10over),
+[allsquare](https://github.com/divotmaker/allsquare).
 
 The Square Golf Omni is the first supported device to report **face impact
 location** on the wire, so it is currently the only one that forwards
 `VerticalFaceImpact` / `HorizontalFaceImpact` to GSPro. It also reports dynamic
 loft and smash factor. The original Square / Square Home is not supported — it
 uses a different club-code scheme.
+
+A ball struck near the front edge of the Omni's detection zone can come back with
+zero spin. A spinless shot flies far too long in the sim, so flighthook discards
+any zero-spin reading at or above `reject_zero_spin_above_mph` (default 60 mph)
+and warns instead — re-hit the shot. Slower shots are still forwarded, since
+putts and soft chips can legitimately read zero. Set the value to `0` to forward
+every shot.
 
 ### Simulation Software
 
@@ -102,6 +114,7 @@ name = "Square Golf Omni"
 address = "DC:0D:30:62:54:E4"
 club = "7i"                    # club selected on connect
 advanced_spin = true           # device's advanced spin measurement
+reject_zero_spin_above_mph = 60.0   # discard 0-spin reads above this ball speed
 
 [r10.0]
 name = "Garmin R10"

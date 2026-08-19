@@ -27,6 +27,9 @@ pub struct SquareActor {
     pub address: Option<String>,
     pub club: Club,
     pub advanced_spin: bool,
+    /// Ball speed (mph) at or above which a zero-spin reading is treated as a
+    /// failed read and the shot discarded. Zero disables the check.
+    pub reject_zero_spin_above_mph: f64,
 }
 
 impl Actor for SquareActor {
@@ -34,12 +37,13 @@ impl Actor for SquareActor {
         let address = self.address.clone();
         let club = self.club;
         let advanced_spin = self.advanced_spin;
+        let zero_spin_cutoff = self.reject_zero_spin_above_mph;
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                run(address, club, advanced_spin, sender, receiver);
+                run(address, club, advanced_spin, zero_spin_cutoff, sender, receiver);
             })
             .expect("failed to spawn square thread");
     }
@@ -117,6 +121,25 @@ fn to_allsquare_club(club: Club) -> allsquare::Club {
 // Protocol type -> bus type conversion helpers
 // ---------------------------------------------------------------------------
 
+/// Whether a shot is a spin misread and should be dropped rather than forwarded.
+///
+/// The device occasionally returns a shot with no spin at all — seen with a ball
+/// struck at the very front of the detection zone. A real strike always imparts
+/// spin, and a spinless shot handed to a sim carries much further than it should
+/// (a zero-spin 8 iron ran ~30 yards long), so it is better to lose the shot than
+/// to record a wrong one.
+///
+/// Slow shots are exempt: putts and soft chips can legitimately read zero, and
+/// the consequence of a spinless putt is negligible. `cutoff_mph` of zero
+/// disables the check entirely.
+fn is_zero_spin_misread(b: &allsquare::BallMetrics, cutoff_mph: f64) -> bool {
+    if cutoff_mph <= 0.0 {
+        return false;
+    }
+    let no_spin = b.total_spin == 0 && b.back_spin == 0 && b.side_spin == 0;
+    no_spin && Velocity::MetersPerSecond(b.speed).as_mph() >= cutoff_mph
+}
+
 fn ball_from_square(b: &allsquare::BallMetrics) -> BallFlight {
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(b.speed)),
@@ -181,6 +204,7 @@ fn run(
     address: Option<String>,
     club: Club,
     advanced_spin: bool,
+    reject_zero_spin_above_mph: f64,
     sender: BusSender,
     mut receiver: BusReceiver,
 ) {
@@ -201,6 +225,7 @@ fn run(
             address.as_deref(),
             &mut current_club,
             advanced_spin,
+            reject_zero_spin_above_mph,
             &sender,
             &mut receiver,
             &mut ever_connected,
@@ -261,6 +286,7 @@ fn connect_and_run(
     address: Option<&str>,
     current_club: &mut Club,
     advanced_spin: bool,
+    reject_zero_spin_above_mph: f64,
     sender: &BusSender,
     receiver: &mut BusReceiver,
     ever_connected: &mut bool,
@@ -286,6 +312,7 @@ fn connect_and_run(
     };
 
     let mut shot_counter: u32 = 0;
+    let mut discarded_counter: u32 = 0;
     let mut idle_count: u32 = 0;
     let mut device_telemetry: HashMap<String, String> = HashMap::new();
 
@@ -429,6 +456,40 @@ fn connect_and_run(
                     }
 
                     Event::Shot { ball, club } => {
+                        // Drop before the counter advances, so a discarded shot
+                        // leaves no gap in the numbering and no half-shot on the
+                        // bus — nothing downstream ever learns it happened.
+                        if is_zero_spin_misread(&ball, reject_zero_spin_above_mph) {
+                            let mph = Velocity::MetersPerSecond(ball.speed).as_mph();
+                            discarded_counter += 1;
+                            warn!("discarded shot: {mph:.1}mph with zero spin (misread)");
+                            emit_alert(
+                                sender,
+                                Severity::Warn,
+                                format!(
+                                    "Square Golf: discarded a {mph:.0} mph shot that read zero \
+                                     spin — the ball was likely too far forward in the hitting \
+                                     zone. Re-hit it."
+                                ),
+                            );
+                            // Also surface a running count as telemetry. The log
+                            // line says one shot was lost; this says whether it
+                            // is a one-off or a ball-position problem worth
+                            // fixing on the mat.
+                            device_telemetry
+                                .insert("zero_spin_discards".into(), discarded_counter.to_string());
+                            sender.send(
+                                FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
+                                    manufacturer: None,
+                                    model: None,
+                                    firmware: None,
+                                    telemetry: Some(device_telemetry.clone()),
+                                })
+                                .device(&name),
+                            );
+                            continue;
+                        }
+
                         shot_counter += 1;
                         let key = ShotKey {
                             shot_id: uuid::Uuid::new_v4().to_string(),
@@ -557,5 +618,50 @@ mod tests {
         assert_eq!(bf.sidespin_rpm, Some(87), "device -87 (right) -> FRP +87");
         assert_eq!(bf.backspin_rpm, Some(621), "backspin is not flipped");
         assert_eq!(bf.launch_azimuth, Some(7.39), "azimuth is not flipped");
+    }
+
+    fn ball(speed_ms: f64, total: i16, back: i16, side: i16) -> allsquare::BallMetrics {
+        allsquare::BallMetrics {
+            shot_type: 0x37,
+            speed: speed_ms,
+            launch_angle: 18.0,
+            direction: 0.0,
+            total_spin: total,
+            spin_axis: 0.0,
+            back_spin: back,
+            side_spin: side,
+        }
+    }
+
+    /// The case that prompted this: an 8 iron struck at the front of the
+    /// detection zone read zero spin and flew ~30 yards long in the sim.
+    #[test]
+    fn rejects_fast_zero_spin_shot() {
+        // 49 m/s ~= 110 mph, a normal 8 iron.
+        assert!(is_zero_spin_misread(&ball(49.0, 0, 0, 0), 60.0));
+    }
+
+    /// Slow shots are exempt — a putt or soft chip can genuinely read zero, and
+    /// a spinless putt does no harm.
+    #[test]
+    fn allows_slow_zero_spin_shot() {
+        // 3.3 m/s ~= 7 mph, a putt.
+        assert!(!is_zero_spin_misread(&ball(3.3, 0, 0, 0), 60.0));
+        // 22 m/s ~= 49 mph, a chip — still under the cutoff.
+        assert!(!is_zero_spin_misread(&ball(22.0, 0, 0, 0), 60.0));
+    }
+
+    /// Any measured spin means the read succeeded, however fast the ball.
+    #[test]
+    fn allows_fast_shot_with_spin() {
+        assert!(!is_zero_spin_misread(&ball(70.0, 2400, 2400, 0), 60.0));
+        // Sidespin alone still counts as a successful read.
+        assert!(!is_zero_spin_misread(&ball(70.0, 0, 0, -87), 60.0));
+    }
+
+    /// A zero cutoff disables the check, so nothing is ever discarded.
+    #[test]
+    fn zero_cutoff_disables_rejection() {
+        assert!(!is_zero_spin_misread(&ball(80.0, 0, 0, 0), 0.0));
     }
 }

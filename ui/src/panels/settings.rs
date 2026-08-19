@@ -60,6 +60,13 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) surface_height_unit: String,
     pub(crate) track_pct: String,
     pub(crate) use_estimated: bool,
+    /// Square Golf: ball speed (mph) above which a zero-spin read is discarded.
+    /// Blank means "use the built-in default".
+    pub(crate) zero_spin_cutoff: String,
+    /// Square Golf fields the form does not surface. Carried verbatim so that
+    /// saving settings does not wipe them from the config file.
+    pub(crate) square_club: Option<String>,
+    pub(crate) square_advanced_spin: Option<bool>,
     pub(crate) dirty: bool,
 }
 
@@ -94,6 +101,9 @@ impl DeviceFormEntry {
             surface_height_unit: surf.unit_key().into(),
             track_pct: format!("{:.0}", s.track_pct.unwrap_or(80.0)),
             use_estimated: s.use_estimated.unwrap_or(true),
+            zero_spin_cutoff: String::new(),
+            square_club: None,
+            square_advanced_spin: None,
             dirty: false,
         }
     }
@@ -113,6 +123,9 @@ impl DeviceFormEntry {
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
             use_estimated: true,
+            zero_spin_cutoff: String::new(),
+            square_club: None,
+            square_advanced_spin: None,
             dirty: false,
         }
     }
@@ -123,6 +136,11 @@ impl DeviceFormEntry {
             monitor_type: "square".into(),
             name: s.name.clone(),
             address: s.address.clone().unwrap_or_default(),
+            zero_spin_cutoff: s
+                .reject_zero_spin_above_mph
+                .map_or_else(String::new, |v| format!("{v:.0}")),
+            square_club: s.club.clone(),
+            square_advanced_spin: s.advanced_spin,
             ball_type: 0,
             tee_height_val: "1.5".into(),
             tee_height_unit: "inches".into(),
@@ -151,6 +169,9 @@ impl DeviceFormEntry {
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
             use_estimated: true,
+            zero_spin_cutoff: String::new(),
+            square_club: None,
+            square_advanced_spin: None,
             dirty: false,
         }
     }
@@ -420,6 +441,13 @@ impl SettingsForm {
                             return false;
                         }
                     }
+                    if dev.is_square() {
+                        // Blank is valid (means "use the default"); garbage is not.
+                        let c = dev.zero_spin_cutoff.trim();
+                        if !c.is_empty() && c.parse::<f64>().is_err() {
+                            return false;
+                        }
+                    }
                 }
                 ActorFormEntry::Integration(entry) => {
                     if entry.name.is_empty() {
@@ -485,10 +513,15 @@ impl SettingsForm {
                                 } else {
                                     Some(dev.address.trim().to_string())
                                 },
-                                // Not surfaced in the UI yet; preserved from
-                                // the on-disk config below.
-                                club: None,
-                                advanced_spin: None,
+                                // Carried through the form so a save does
+                                // not wipe values the UI does not surface.
+                                club: dev.square_club.clone(),
+                                advanced_spin: dev.square_advanced_spin,
+                                reject_zero_spin_above_mph: dev
+                                    .zero_spin_cutoff
+                                    .trim()
+                                    .parse()
+                                    .ok(),
                             },
                         );
                     }
@@ -676,8 +709,13 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             } else {
                                 Some(dev.address.trim().to_string())
                             },
-                            club: None,
-                            advanced_spin: None,
+                            club: dev.square_club.clone(),
+                            advanced_spin: dev.square_advanced_spin,
+                            reject_zero_spin_above_mph: dev
+                                .zero_spin_cutoff
+                                .trim()
+                                .parse()
+                                .ok(),
                         },
                     );
                 }
@@ -987,6 +1025,42 @@ impl FlighthookApp {
                                 });
                             }
 
+                            if dev.is_square() {
+                                // Zero-spin rejection cutoff.
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label("Discard 0-spin above:").on_hover_text(
+                                        "A struck ball always spins, so a zero-spin reading above \
+                                         chipping pace is a failed read — usually a ball too far \
+                                         forward in the hitting zone. Such shots fly far too long \
+                                         in the sim, so they are discarded and you re-hit.\n\n\
+                                         Slow putts and soft chips can legitimately read zero, so \
+                                         anything below the cutoff is still sent.\n\n\
+                                         Leave blank for the default (60 mph). Set 0 to send every \
+                                         shot.",
+                                    );
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut dev.zero_spin_cutoff)
+                                                .desired_width(field_width),
+                                        )
+                                        .on_hover_text("ball speed in mph, e.g. 60")
+                                        .changed()
+                                    {
+                                        dev.dirty = true;
+                                    }
+                                    ui.label("mph");
+                                    let c = dev.zero_spin_cutoff.trim();
+                                    if !c.is_empty() && c.parse::<f64>().is_err() {
+                                        ui.label(
+                                            egui::RichText::new("Not a number")
+                                                .color(egui::Color32::from_rgb(255, 80, 80))
+                                                .size(11.0),
+                                        );
+                                    }
+                                });
+                            }
+
                             if dev.has_mevo_tuning() {
 
                                 // Ball Type
@@ -1221,6 +1295,9 @@ impl FlighthookApp {
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
                                     use_estimated: true,
+                                    zero_spin_cutoff: String::new(),
+                                    square_club: None,
+                                    square_advanced_spin: None,
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
@@ -1248,6 +1325,9 @@ impl FlighthookApp {
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
                                     use_estimated: true,
+                                    zero_spin_cutoff: String::new(),
+                                    square_club: None,
+                                    square_advanced_spin: None,
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
@@ -1274,6 +1354,9 @@ impl FlighthookApp {
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
                                     use_estimated: true,
+                                    zero_spin_cutoff: String::new(),
+                                    square_club: None,
+                                    square_advanced_spin: None,
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
