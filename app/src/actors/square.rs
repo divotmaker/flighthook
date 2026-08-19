@@ -27,10 +27,8 @@ pub struct SquareActor {
     pub address: Option<String>,
     pub club: Club,
     pub advanced_spin: bool,
-    /// Ball speed (mph) at or above which a zero-spin reading is treated as a
-    /// failed read and the shot discarded. `None` disables the check entirely;
-    /// `Some(0.0)` exempts nothing and discards every zero-spin read.
-    pub reject_zero_spin_above_mph: Option<f64>,
+    /// Discard shots that read zero spin, unless the putter is selected.
+    pub discard_non_putting_zero_spin: bool,
 }
 
 impl Actor for SquareActor {
@@ -38,7 +36,7 @@ impl Actor for SquareActor {
         let address = self.address.clone();
         let club = self.club;
         let advanced_spin = self.advanced_spin;
-        let zero_spin_cutoff = self.reject_zero_spin_above_mph;
+        let discard_zero_spin = self.discard_non_putting_zero_spin;
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
@@ -48,7 +46,7 @@ impl Actor for SquareActor {
                     address,
                     club,
                     advanced_spin,
-                    zero_spin_cutoff,
+                    discard_zero_spin,
                     sender,
                     receiver,
                 );
@@ -137,20 +135,15 @@ fn to_allsquare_club(club: Club) -> allsquare::Club {
 /// (a zero-spin 8 iron ran ~30 yards long), so it is better to lose the shot than
 /// to record a wrong one.
 ///
-/// Slow shots are exempt: putts and soft chips can legitimately read zero, and
-/// the consequence of a spinless putt is negligible.
-///
-/// `cutoff_mph` has three distinct states:
-///
-/// - `None` — the check is disabled; every shot passes through unexamined.
-/// - `Some(0.0)` — no shot is exempt; any zero-spin read is discarded.
-/// - `Some(x)` — zero-spin reads at or above `x` mph are discarded.
-fn is_zero_spin_misread(b: &allsquare::BallMetrics, cutoff_mph: Option<f64>) -> bool {
-    let Some(cutoff) = cutoff_mph else {
+/// The putter is exempt, and it is the only exemption that makes sense. A putt
+/// has no airborne flight for the device to measure spin over, so it reads zero
+/// every time; discarding those would make putting impossible. Every other club
+/// is a struck shot that should show spin, whatever the distance.
+fn is_zero_spin_misread(b: &allsquare::BallMetrics, club: Club, enabled: bool) -> bool {
+    if !enabled || club == Club::Putter {
         return false;
-    };
-    let no_spin = b.total_spin == 0 && b.back_spin == 0 && b.side_spin == 0;
-    no_spin && Velocity::MetersPerSecond(b.speed).as_mph() >= cutoff
+    }
+    b.total_spin == 0 && b.back_spin == 0 && b.side_spin == 0
 }
 
 fn ball_from_square(b: &allsquare::BallMetrics) -> BallFlight {
@@ -217,7 +210,7 @@ fn run(
     address: Option<String>,
     club: Club,
     advanced_spin: bool,
-    reject_zero_spin_above_mph: Option<f64>,
+    discard_zero_spin: bool,
     sender: BusSender,
     mut receiver: BusReceiver,
 ) {
@@ -238,7 +231,7 @@ fn run(
             address.as_deref(),
             &mut current_club,
             advanced_spin,
-            reject_zero_spin_above_mph,
+            discard_zero_spin,
             &sender,
             &mut receiver,
             &mut ever_connected,
@@ -299,7 +292,7 @@ fn connect_and_run(
     address: Option<&str>,
     current_club: &mut Club,
     advanced_spin: bool,
-    reject_zero_spin_above_mph: Option<f64>,
+    discard_zero_spin: bool,
     sender: &BusSender,
     receiver: &mut BusReceiver,
     ever_connected: &mut bool,
@@ -472,7 +465,7 @@ fn connect_and_run(
                         // Drop before the counter advances, so a discarded shot
                         // leaves no gap in the numbering and no half-shot on the
                         // bus — nothing downstream ever learns it happened.
-                        if is_zero_spin_misread(&ball, reject_zero_spin_above_mph) {
+                        if is_zero_spin_misread(&ball, *current_club, discard_zero_spin) {
                             let mph = Velocity::MetersPerSecond(ball.speed).as_mph();
                             discarded_counter += 1;
                             warn!("discarded shot: {mph:.1}mph with zero spin (misread)");
@@ -646,52 +639,77 @@ mod tests {
         }
     }
 
+    /// The shipped default, so these tests fail if it moves somewhere that
     /// The case that prompted this: an 8 iron struck at the front of the
     /// detection zone read zero spin and flew ~30 yards long in the sim.
     #[test]
-    fn rejects_fast_zero_spin_shot() {
-        // 49 m/s ~= 110 mph, a normal 8 iron.
-        assert!(is_zero_spin_misread(&ball(49.0, 0, 0, 0), Some(60.0)));
+    fn rejects_zero_spin_shot() {
+        assert!(is_zero_spin_misread(
+            &ball(49.0, 0, 0, 0),
+            Club::Iron8,
+            true
+        ));
     }
 
-    /// Slow shots are exempt — a putt or soft chip can genuinely read zero, and
-    /// a spinless putt does no harm.
+    /// Distance is irrelevant: a chip is a struck shot and should show spin, so
+    /// a zero-spin chip is a misread like any other.
     #[test]
-    fn allows_slow_zero_spin_shot() {
-        // 3.3 m/s ~= 7 mph, a putt.
-        assert!(!is_zero_spin_misread(&ball(3.3, 0, 0, 0), Some(60.0)));
-        // 22 m/s ~= 49 mph, a chip — still under the cutoff.
-        assert!(!is_zero_spin_misread(&ball(22.0, 0, 0, 0), Some(60.0)));
+    fn rejects_zero_spin_chip() {
+        // 8 m/s ~= 18 mph, a 10-yard chip.
+        assert!(is_zero_spin_misread(
+            &ball(8.0, 0, 0, 0),
+            Club::LobWedge,
+            true
+        ));
+    }
+
+    /// The putter is the one real exemption: there is no airborne flight to
+    /// measure spin over, so a putt reads zero every time and discarding those
+    /// would make putting impossible.
+    #[test]
+    fn never_discards_a_putt() {
+        // 3.3 m/s ~= 7 mph, a normal putt.
+        assert!(!is_zero_spin_misread(
+            &ball(3.3, 0, 0, 0),
+            Club::Putter,
+            true
+        ));
+        // Even a rammed one.
+        assert!(!is_zero_spin_misread(
+            &ball(9.0, 0, 0, 0),
+            Club::Putter,
+            true
+        ));
     }
 
     /// Any measured spin means the read succeeded, however fast the ball.
     #[test]
-    fn allows_fast_shot_with_spin() {
+    fn allows_shot_with_spin() {
         assert!(!is_zero_spin_misread(
             &ball(70.0, 2400, 2400, 0),
-            Some(60.0)
+            Club::Driver,
+            true
         ));
         // Sidespin alone still counts as a successful read.
-        assert!(!is_zero_spin_misread(&ball(70.0, 0, 0, -87), Some(60.0)));
+        assert!(!is_zero_spin_misread(
+            &ball(70.0, 0, 0, -87),
+            Club::Driver,
+            true
+        ));
     }
 
-    /// `None` switches the feature off: nothing is examined, nothing discarded,
-    /// however fast a zero-spin shot is.
+    /// Disabled means disabled — nothing is examined, whatever the club.
     #[test]
-    fn none_disables_the_check_entirely() {
-        assert!(!is_zero_spin_misread(&ball(80.0, 0, 0, 0), None));
-        assert!(!is_zero_spin_misread(&ball(3.3, 0, 0, 0), None));
-    }
-
-    /// A zero cutoff is not "off" — it exempts nothing, so every zero-spin read
-    /// is discarded no matter how slow. This is the distinction that makes
-    /// `None` and `Some(0.0)` different states.
-    #[test]
-    fn zero_cutoff_rejects_every_zero_spin_shot() {
-        assert!(is_zero_spin_misread(&ball(80.0, 0, 0, 0), Some(0.0)));
-        // Even a putt, which a 60 mph cutoff would have let through.
-        assert!(is_zero_spin_misread(&ball(3.3, 0, 0, 0), Some(0.0)));
-        // A shot with spin is still fine.
-        assert!(!is_zero_spin_misread(&ball(3.3, 627, 621, -87), Some(0.0)));
+    fn disabled_forwards_everything() {
+        assert!(!is_zero_spin_misread(
+            &ball(80.0, 0, 0, 0),
+            Club::Driver,
+            false
+        ));
+        assert!(!is_zero_spin_misread(
+            &ball(3.3, 0, 0, 0),
+            Club::Putter,
+            false
+        ));
     }
 }

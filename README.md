@@ -124,7 +124,7 @@ name = "Square Golf Omni"
 address = "DC:0D:30:62:54:E4"
 club = "7i"                    # club selected on connect
 advanced_spin = true           # device's advanced spin measurement
-reject_zero_spin_above_mph = 60.0   # discard 0-spin reads above this ball speed
+discard_non_putting_zero_spin = true   # drop 0-spin misreads (putts exempt)
 
 [r10.0]
 name = "Garmin R10"

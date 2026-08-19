@@ -202,16 +202,6 @@ pub struct R10Section {
     pub name: String,
 }
 
-/// Ball speed (mph) above which a zero-spin reading is treated as a failed read
-/// rather than a real shot. Chosen to sit above putts and chips — which can
-/// legitimately read zero — and below any full swing.
-///
-/// This is the value written into a newly created [`SquareSection`], not a
-/// fallback applied at runtime: an absent `reject_zero_spin_above_mph` means no
-/// rejection. Keeping the default explicit in config means the effective cutoff
-/// is always visible rather than hidden in code.
-pub const DEFAULT_ZERO_SPIN_CUTOFF_MPH: f64 = 60.0;
-
 /// A Square Golf BLE device instance (Omni or Home).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SquareSection {
@@ -232,25 +222,19 @@ pub struct SquareSection {
     /// the vendor app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advanced_spin: Option<bool>,
-    /// Discard shots that report zero spin at or above this ball speed, in mph.
+    /// Discard shots that report zero spin, unless the putter is selected.
     ///
-    /// A struck ball always spins, so zero spin above chipping pace is a failed
-    /// read — typically a ball near the edge of the detection zone. Passing it
-    /// through sends a spinless shot to the sim, which flies far too long.
+    /// A struck ball always spins, so a zero-spin read is a failed read —
+    /// typically a ball near the edge of the detection zone. Passing it through
+    /// sends a spinless shot to the sim, which flies far too long.
     ///
-    /// Below the cutoff, zero spin is plausible: slow putts and soft chips can
-    /// genuinely read zero, so those are still forwarded.
+    /// Putts are always exempt: there is no airborne flight for the device to
+    /// measure spin over, so a putt reads zero every time and discarding those
+    /// would make putting impossible.
     ///
-    /// Three distinct states:
-    ///
-    /// - **absent** — the check is off; no shot is examined or discarded.
-    /// - **`0`** — nothing is exempt; every zero-spin read is discarded.
-    /// - **`x`** — zero-spin reads at or above `x` mph are discarded.
-    ///
-    /// New devices are created with [`DEFAULT_ZERO_SPIN_CUTOFF_MPH`] written
-    /// explicitly, so absence only occurs when a user clears the field.
+    /// Defaults to true when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reject_zero_spin_above_mph: Option<f64>,
+    pub discard_non_putting_zero_spin: Option<bool>,
 }
 
 /// A mock launch monitor instance.
@@ -389,9 +373,7 @@ impl Default for SquareSection {
             address: None,
             club: None,
             advanced_spin: None,
-            // Written explicitly so the effective cutoff is always visible in
-            // config.toml and in the UI. Absent means no rejection at all.
-            reject_zero_spin_above_mph: Some(DEFAULT_ZERO_SPIN_CUTOFF_MPH),
+            discard_non_putting_zero_spin: Some(true),
         }
     }
 }

@@ -21,25 +21,21 @@ confirmed.
 ## Zero-spin rejection
 
 A ball struck near the front edge of the Omni's detection zone can come back
-with zero spin. A spinless shot flies far too long in the sim, so flighthook
-discards any zero-spin reading at or above `reject_zero_spin_above_mph` and
-warns instead — re-hit the shot.
+with zero spin. A struck ball always spins, so that is a failed read, and a
+spinless shot flies far too long in the sim. With
+`discard_non_putting_zero_spin` enabled (the default) such a shot is discarded
+with a warning — re-hit it.
 
-Slower shots are still forwarded, since putts and soft chips can legitimately
-read zero.
+**Putts are never discarded.** A putt has no airborne flight for the device to
+measure spin over, so it reads zero every time; discarding those would make
+putting impossible. Every other club is a struck shot that should show spin,
+whatever the distance.
 
-The setting has three distinct states:
+```toml
+discard_non_putting_zero_spin = true    # default; written when a device is added
+```
 
-| `reject_zero_spin_above_mph` | Behaviour |
-|---|---|
-| absent (key removed / field blank) | Check is **off** — no shot is examined |
-| `0` | Nothing is exempt — **every** zero-spin read is discarded, however slow |
-| `60.0` | Zero-spin reads at or above 60 mph are discarded |
-
-New devices are created with `reject_zero_spin_above_mph = 60.0` written into
-the config, so the cutoff in force is always visible rather than implied by a
-fallback in code. Note that `0` is a real cutoff, not an off switch — remove the
-key to disable the check.
+Set it to `false` to forward every shot, spin or not.
 
 ## Putting mode
 
@@ -55,5 +51,5 @@ name = "Square Golf Omni"
 address = "DC:0D:30:62:54:E4"
 club = "7i"                          # club selected on connect
 advanced_spin = true                 # device's advanced spin measurement
-reject_zero_spin_above_mph = 60.0    # discard 0-spin reads above this ball speed
+discard_non_putting_zero_spin = true # drop 0-spin misreads (putts exempt)
 ```
