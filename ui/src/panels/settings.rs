@@ -71,16 +71,23 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) dirty: bool,
 }
 
-/// Whether a string looks like a BLE address (`AA:BB:CC:DD:EE:FF`).
+/// Whether a string looks like a BLE device identifier: a MAC address
+/// (`AA:BB:CC:DD:EE:FF`), or on macOS, which hides MAC addresses, a peripheral
+/// UUID (`8-4-4-4-12` hex groups).
 ///
 /// Blank is handled by callers — for devices that auto-discover, an empty
 /// address is valid.
 pub(crate) fn is_ble_address(s: &str) -> bool {
+    fn hex_groups(s: &str, sep: char, lens: &[usize]) -> bool {
+        let groups: Vec<&str> = s.split(sep).collect();
+        groups.len() == lens.len()
+            && groups
+                .iter()
+                .zip(lens)
+                .all(|(g, &n)| g.len() == n && g.chars().all(|c| c.is_ascii_hexdigit()))
+    }
     let s = s.trim();
-    s.len() == 17
-        && s.split(':').count() == 6
-        && s.split(':')
-            .all(|o| o.len() == 2 && o.chars().all(|c| c.is_ascii_hexdigit()))
+    hex_groups(s, ':', &[2; 6]) || hex_groups(s, '-', &[8, 4, 4, 4, 12])
 }
 
 impl DeviceFormEntry {
@@ -1075,7 +1082,7 @@ impl FlighthookApp {
                                 // BLE address — optional; blank auto-discovers.
                                 ui.horizontal(|ui| {
                                     ui.add_space(16.0);
-                                    ui.label("BLE Address:").on_hover_text("Bluetooth address of the device. Leave blank to auto-discover by name.");
+                                    ui.label("BLE Address:").on_hover_text("Bluetooth address of the device (a UUID on macOS). Leave blank to auto-discover by name.");
                                     if ui
                                         .add(egui::TextEdit::singleline(&mut dev.address).desired_width(field_width))
                                         .on_hover_text("optional, e.g. DC:0D:30:62:54:E4")
@@ -1554,5 +1561,26 @@ impl FlighthookApp {
                     });
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ble_address;
+
+    #[test]
+    fn ble_address_accepts_mac_and_uuid() {
+        assert!(is_ble_address("DC:0D:30:62:54:E4"));
+        assert!(is_ble_address(" dc:0d:30:62:54:e4 "));
+        assert!(is_ble_address("5F2A9C1E-3B7D-4E8A-9C0F-1A2B3C4D5E6F"));
+    }
+
+    #[test]
+    fn ble_address_rejects_malformed() {
+        assert!(!is_ble_address(""));
+        assert!(!is_ble_address("DC:0D:30:62:54"));
+        assert!(!is_ble_address("DC:0D:30:62:54:G4"));
+        assert!(!is_ble_address("5F2A9C1E-3B7D-4E8A-9C0F"));
+        assert!(!is_ble_address("192.168.2.1:5100"));
     }
 }

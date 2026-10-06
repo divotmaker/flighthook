@@ -63,6 +63,7 @@ device into putting mode via the normal club-forwarding path.
 [square.0]
 name = "Square Golf Omni"
 # address is optional — omit it to auto-discover by name. No pairing required.
+# On macOS use the peripheral UUID flighthook logs on connect (macOS hides MACs).
 address = "DC:0D:30:62:54:E4"
 club = "7i"                          # club selected on connect
 advanced_spin = true                 # device's advanced spin measurement
