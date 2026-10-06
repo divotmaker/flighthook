@@ -72,8 +72,11 @@ pub(crate) struct DeviceFormEntry {
 }
 
 /// Whether a string looks like a BLE device identifier: a MAC address
-/// (`AA:BB:CC:DD:EE:FF`), or on macOS, which hides MAC addresses, a peripheral
-/// UUID (`8-4-4-4-12` hex groups).
+/// (`AA:BB:CC:DD:EE:FF`), on macOS, which hides MAC addresses, a peripheral
+/// UUID (`8-4-4-4-12` hex groups), or an advertised Square Golf name such as
+/// `SquareGolf(54E4)`, which is the same on every OS. The all-zero MAC is
+/// the placeholder macOS reports in place of a hidden address, so it is
+/// rejected.
 ///
 /// Blank is handled by callers — for devices that auto-discover, an empty
 /// address is valid.
@@ -86,8 +89,13 @@ pub(crate) fn is_ble_address(s: &str) -> bool {
                 .zip(lens)
                 .all(|(g, &n)| g.len() == n && g.chars().all(|c| c.is_ascii_hexdigit()))
     }
+    const NAME_PREFIX: &str = "SquareGolf";
     let s = s.trim();
-    hex_groups(s, ':', &[2; 6]) || hex_groups(s, '-', &[8, 4, 4, 4, 12])
+    let advertised_name = s.len() > NAME_PREFIX.len()
+        && s.get(..NAME_PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(NAME_PREFIX));
+    let mac = hex_groups(s, ':', &[2; 6]) && s != "00:00:00:00:00:00";
+    mac || hex_groups(s, '-', &[8, 4, 4, 4, 12]) || advertised_name
 }
 
 impl DeviceFormEntry {
@@ -1082,10 +1090,10 @@ impl FlighthookApp {
                                 // BLE address — optional; blank auto-discovers.
                                 ui.horizontal(|ui| {
                                     ui.add_space(16.0);
-                                    ui.label("BLE Address:").on_hover_text("Bluetooth address of the device (a UUID on macOS). Leave blank to auto-discover by name.");
+                                    ui.label("BLE Address:").on_hover_text("Advertised name of the device, e.g. SquareGolf(54E4) — the same on every OS. A Bluetooth address (a UUID on macOS) also works. Leave blank to auto-discover.");
                                     if ui
                                         .add(egui::TextEdit::singleline(&mut dev.address).desired_width(field_width))
-                                        .on_hover_text("optional, e.g. DC:0D:30:62:54:E4")
+                                        .on_hover_text("optional, e.g. SquareGolf(54E4)")
                                         .changed()
                                     {
                                         dev.dirty = true;
@@ -1576,11 +1584,25 @@ mod tests {
     }
 
     #[test]
+    fn ble_address_accepts_advertised_name() {
+        assert!(is_ble_address("SquareGolf(54E4)"));
+        assert!(is_ble_address(" squaregolf(54e4) "));
+    }
+
+    #[test]
     fn ble_address_rejects_malformed() {
         assert!(!is_ble_address(""));
         assert!(!is_ble_address("DC:0D:30:62:54"));
         assert!(!is_ble_address("DC:0D:30:62:54:G4"));
         assert!(!is_ble_address("5F2A9C1E-3B7D-4E8A-9C0F"));
         assert!(!is_ble_address("192.168.2.1:5100"));
+        assert!(!is_ble_address("SquareGolf"));
+        assert!(!is_ble_address("SGO300A"));
+    }
+
+    #[test]
+    fn ble_address_rejects_zero_mac() {
+        assert!(!is_ble_address("00:00:00:00:00:00"));
+        assert!(!is_ble_address(" 00:00:00:00:00:00 "));
     }
 }

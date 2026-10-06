@@ -79,6 +79,12 @@ impl Actor for SquareActor {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Whether `address` is the all-zero placeholder macOS reports in place of a
+/// hidden BLE address. It identifies no device.
+fn is_zero_address(address: &str) -> bool {
+    address.trim().eq_ignore_ascii_case("00:00:00:00:00:00")
+}
+
 fn emit_device_status(sender: &BusSender, status: ActorStatus, telemetry: HashMap<String, String>) {
     sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
         status,
@@ -197,6 +203,16 @@ fn run(
     sender: BusSender,
     mut receiver: BusReceiver,
 ) {
+    let address = address.filter(|a| {
+        let zero = is_zero_address(a);
+        if zero {
+            warn!(
+                "ignoring configured address {a}: it is the placeholder macOS reports \
+                 for a hidden BLE address, not a device address; auto-discovering instead"
+            );
+        }
+        !zero
+    });
     let mut backoff = MIN_BACKOFF;
     let mut ever_connected = false;
     let mut device_id: Option<String> = None;
@@ -698,5 +714,13 @@ mod tests {
             Club::Putter,
             false
         ));
+    }
+
+    #[test]
+    fn zero_address_is_detected() {
+        assert!(is_zero_address("00:00:00:00:00:00"));
+        assert!(is_zero_address(" 00:00:00:00:00:00\n"));
+        assert!(!is_zero_address("DC:0D:30:62:54:E4"));
+        assert!(!is_zero_address("SquareGolf(54E4)"));
     }
 }
