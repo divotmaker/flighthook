@@ -93,18 +93,25 @@ jobs:
   build:
     name: Build (${{ matrix.name }})
     needs: test
-    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - name: linux
+            os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: flighthook
             asset_name: flighthook-linux-x86_64
           - name: windows
+            os: ubuntu-latest
             target: x86_64-pc-windows-gnu
             artifact: flighthook.exe
             asset_name: flighthook-windows-x86_64.exe
+          - name: macos
+            os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: flighthook
+            asset_name: flighthook-macos-aarch64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -118,9 +125,14 @@ jobs:
         uses: jetli/trunk-action@v0.5.0
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxdo-dev libatk1.0-dev libglib2.0-dev protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
 
       - name: Install mingw-w64
         if: matrix.target == 'x86_64-pc-windows-gnu'
@@ -150,7 +162,9 @@ jobs:
           mkdir -p dist
           cp flighthook-linux-x86_64/flighthook dist/flighthook-linux-x86_64
           cp flighthook-windows-x86_64.exe/flighthook.exe dist/flighthook-windows-x86_64.exe
+          cp flighthook-macos-aarch64/flighthook dist/flighthook-macos-aarch64
           chmod +x dist/flighthook-linux-x86_64
+          chmod +x dist/flighthook-macos-aarch64
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -159,3 +173,4 @@ jobs:
           files: |
             dist/flighthook-windows-x86_64.exe
             dist/flighthook-linux-x86_64
+            dist/flighthook-macos-aarch64
