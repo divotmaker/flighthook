@@ -344,7 +344,7 @@ Full persisted config (mirrors `config.toml`).
     "0": {
       "name": "Mevo WiFi",
       "address": "192.168.2.1:5100",
-      "ball_type": 0,
+      "ball_type": 1,
       "tee_height": "1.5in",
       "range": "9ft",
       "surface_height": "0in",

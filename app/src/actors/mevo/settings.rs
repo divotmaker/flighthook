@@ -11,7 +11,7 @@ use flighthook::{CameraMode, Distance, DistanceExt, ShotDetectionMode};
 /// wire-protocol conversions happen on demand in `to_avr_settings()`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionConfig {
-    pub ball_type: u8, // 0 = RCT, 1 = Standard
+    pub ball_type: u8, // 0 = Standard, 1 = RCT
     pub tee_height: Distance,
     pub range: Distance,
     pub surface_height: Distance,
@@ -21,7 +21,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            ball_type: 0,
+            ball_type: 1,
             tee_height: Distance::Inches(1.5),
             range: Distance::Feet(8.0),
             surface_height: Distance::Inches(0.0),

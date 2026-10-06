@@ -20,7 +20,7 @@ bind = "0.0.0.0:5880"
 [mevo.0]
 name = "Mevo WiFi"
 address = "192.168.2.1:5100"
-ball_type = 0
+ball_type = 1
 track_pct = 80.0
 tee_height = "1.5in"
 range = "8ft"

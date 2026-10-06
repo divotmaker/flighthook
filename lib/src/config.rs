@@ -416,7 +416,7 @@ impl Default for MevoSection {
         Self {
             name: "Mevo WiFi".into(),
             address: Some("192.168.2.1:5100".into()),
-            ball_type: Some(0),
+            ball_type: Some(1),
             tee_height: Some(Distance::Inches(1.5)),
             range: Some(Distance::Feet(8.0)),
             surface_height: Some(Distance::Inches(0.0)),

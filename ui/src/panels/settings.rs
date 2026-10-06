@@ -93,7 +93,7 @@ impl DeviceFormEntry {
             monitor_type: "mevo".into(),
             name: s.name.clone(),
             address: s.address.clone().unwrap_or_default(),
-            ball_type: s.ball_type.unwrap_or(0),
+            ball_type: s.ball_type.unwrap_or(1),
             tee_height_val: format_distance_value(tee.value()),
             tee_height_unit: tee.unit_key().into(),
             range_val: format_distance_value(rng.value()),
@@ -1150,17 +1150,17 @@ impl FlighthookApp {
                                 ui.horizontal(|ui| {
                                     ui.add_space(16.0);
                                     ui.label("Ball Type:").on_hover_text("RCT = Radar Capture Technology.\nStandard = any regular golf ball.");
-                                    let ball_text = if dev.ball_type == 0 { "RCT" } else { "Standard" };
+                                    let ball_text = if dev.ball_type == 1 { "RCT" } else { "Standard" };
                                     egui::ComboBox::from_id_salt(format!("ball_type_{}", dev.id))
                                         .selected_text(ball_text)
                                         .width(field_width)
                                         .show_ui(ui, |ui| {
-                                            if ui.selectable_label(dev.ball_type == 0, "RCT").clicked() {
-                                                dev.ball_type = 0;
+                                            if ui.selectable_label(dev.ball_type == 1, "RCT").clicked() {
+                                                dev.ball_type = 1;
                                                 dev.dirty = true;
                                             }
-                                            if ui.selectable_label(dev.ball_type == 1, "Standard").clicked() {
-                                                dev.ball_type = 1;
+                                            if ui.selectable_label(dev.ball_type == 0, "Standard").clicked() {
+                                                dev.ball_type = 0;
                                                 dev.dirty = true;
                                             }
                                         });
@@ -1394,7 +1394,7 @@ impl FlighthookApp {
                                     monitor_type: "mevo".into(),
                                     name: "Mevo WiFi".into(),
                                     address: "192.168.2.1:5100".into(),
-                                    ball_type: 0,
+                                    ball_type: 1,
                                     tee_height_val: "1.5".into(),
                                     tee_height_unit: "inches".into(),
                                     range_val: "8".into(),

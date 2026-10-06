@@ -112,7 +112,7 @@ bind = "0.0.0.0:5880"
 [mevo.0]
 name = "My Mevo+"
 address = "192.168.2.1:5100"
-ball_type = 0                  # 0 = RCT, 1 = Standard
+ball_type = 1                  # 0 = Standard, 1 = RCT
 tee_height = "1.5in"
 range = "8ft"
 surface_height = "0in"
