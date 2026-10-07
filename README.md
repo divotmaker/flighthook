@@ -61,6 +61,36 @@ on flighthook itself.
 
 **Beta (0.1.x)** — The API, configuration format, and WebSocket protocol are usable but may still change. Breaking changes will be noted in release notes.
 
+## Install
+
+Download the binary for your platform from the
+[latest release](https://github.com/divotmaker/flighthook/releases/latest):
+`flighthook-linux-x86_64`, `flighthook-windows-x86_64.exe`, or
+`flighthook-macos-aarch64` (Apple Silicon).
+
+### macOS
+
+The macOS binary is not signed, so a copy downloaded with a browser is
+quarantined and Gatekeeper refuses to open it. Download it with `curl`
+instead, which does not quarantine it:
+
+```sh
+curl -LO https://github.com/divotmaker/flighthook/releases/latest/download/flighthook-macos-aarch64
+chmod +x flighthook-macos-aarch64
+./flighthook-macos-aarch64
+```
+
+If you already downloaded it with a browser, remove the quarantine flag first:
+
+```sh
+xattr -d com.apple.quarantine flighthook-macos-aarch64
+chmod +x flighthook-macos-aarch64
+```
+
+The first time flighthook connects to a Bluetooth device (e.g. Square Golf),
+macOS asks for Bluetooth permission for the app that launched it, such as
+Terminal. Allow it.
+
 ## Features
 
 - Multi-device support
