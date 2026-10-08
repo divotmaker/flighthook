@@ -30,7 +30,7 @@ jobs:
         run: cargo fmt --check --all
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
