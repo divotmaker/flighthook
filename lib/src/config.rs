@@ -304,6 +304,19 @@ pub struct SquareSection {
     /// Defaults to true when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discard_non_putting_zero_spin: Option<bool>,
+    /// Per-club override for face impact calibration: distance from the bottom
+    /// edge of the club sticker's dot down to face centre, in millimetres.
+    /// Measure with the sticker in its normal spot.
+    ///
+    /// Keyed the same way `club` is (e.g. `"DR"`, `"7i"`, `"pw"`). Clubs not
+    /// listed use allsquare's built-in defaults; the putter has no built-in
+    /// default and reports no vertical impact unless given one here.
+    #[serde(default, skip_serializing_if = "is_none_or_empty_map")]
+    pub dot_bottom_to_face_centre_mm: Option<std::collections::BTreeMap<String, f64>>,
+}
+
+fn is_none_or_empty_map(m: &Option<std::collections::BTreeMap<String, f64>>) -> bool {
+    m.as_ref().is_none_or(std::collections::BTreeMap::is_empty)
 }
 
 /// A mock launch monitor instance.
@@ -446,6 +459,7 @@ impl Default for SquareSection {
             club: None,
             advanced_spin: None,
             discard_non_putting_zero_spin: Some(true),
+            dot_bottom_to_face_centre_mm: None,
         }
     }
 }
@@ -504,5 +518,46 @@ mod camera_mode_tests {
         assert!(!CameraMode::Standard.is_fusion());
         assert!(CameraMode::Fusion.is_fusion());
         assert!(CameraMode::RawFusion.is_fusion());
+    }
+}
+
+#[cfg(test)]
+mod square_impact_calibration_tests {
+    use super::*;
+
+    #[test]
+    fn absent_map_is_not_written_back() {
+        let s = SquareSection::default();
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(!json.contains("dot_bottom_to_face_centre_mm"), "{json}");
+    }
+
+    #[test]
+    fn empty_map_is_not_written_back() {
+        let s = SquareSection {
+            dot_bottom_to_face_centre_mm: Some(std::collections::BTreeMap::new()),
+            ..SquareSection::default()
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(!json.contains("dot_bottom_to_face_centre_mm"), "{json}");
+    }
+
+    #[test]
+    fn map_round_trips() {
+        let mut s = SquareSection::default();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("driver".to_string(), 19.0);
+        overrides.insert("7i".to_string(), 23.0);
+        s.dot_bottom_to_face_centre_mm = Some(overrides.clone());
+
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: SquareSection = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.dot_bottom_to_face_centre_mm, Some(overrides));
+    }
+
+    #[test]
+    fn absent_map_parses_as_none() {
+        let s: SquareSection = serde_json::from_str(r#"{"name":"Square"}"#).expect("parse");
+        assert_eq!(s.dot_bottom_to_face_centre_mm, None);
     }
 }

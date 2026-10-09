@@ -7,31 +7,51 @@ required.
 The original **Square / Square Home is not supported** — it uses a different
 club-code scheme.
 
-## Face impact — measured but not reported
+## Face impact (beta)
 
-The Omni measures face impact location and sends it on the wire, but flighthook
-**does not forward it**. `VerticalFaceImpact` / `HorizontalFaceImpact` go to
-GSPro as zero.
+flighthook forwards the Omni's face impact location to GSPro as
+`HorizontalFaceImpact` / `VerticalFaceImpact`, in millimetres from face centre.
 
-Testing shows the wire values are not a straight passthrough. Fed to GSPro
-unchanged, a flush centre strike draws well off the club face, so what the device
-reports is referenced to something other than the middle of the face and needs a
-calibration step before it means anything. Sending it anyway would fill the
-face-impact diagram with numbers that look like measurements and are not, so the
-field is left empty instead.
+The calibration comes from [allsquare](https://crates.io/crates/allsquare) and
+is in beta. The Omni measures vertical impact from the bottom edge of the club
+sticker's dot, so allsquare adds the selected club's distance from the bottom of
+the dot down to face centre. The defaults assume the sticker is in its recommended spot, with the dot centre about 5 mm
+below the top of the club. A sticker placed higher or lower shifts vertical
+impact by the same amount. See allsquare's README for the default table and
+caveats, and [divotmaker/allsquare#1](https://github.com/divotmaker/allsquare/issues/1)
+to help tune it.
 
-[allsquare](https://crates.io/crates/allsquare) is working through that
-calibration. Once it can hand back a corrected reading, flighthook will publish
-it — nothing here needs to change but the source of the number.
+Keep the club selected in the simulator in sync with the club in hand: the
+vertical offset follows it. The putter has no vertical estimate, so only
+horizontal impact is sent for putts.
 
-The raw pair is written to the log for each tracked shot, so it is available
-for that work:
+Each tracked shot logs the reading:
 
 ```
-  impact (uncalibrated, not sent): raw H=-31.19 V=-28.88
+  impact (beta): toe=3.2mm up=-1.5mm
 ```
 
-Dynamic loft and smash factor are unaffected and are reported normally.
+Dynamic loft and smash factor are reported normally.
+
+### Per-club calibration
+
+The defaults assume a sticker in its recommended spot. Measuring your own clubs
+— from the bottom edge of the sticker's dot straight down to face centre, in
+millimetres — gives better results than the defaults, and is the only way to
+get a vertical estimate for the putter, which has none built in.
+
+Set overrides in config, keyed the same way the `club` field is:
+
+```toml
+[square.0.dot_bottom_to_face_centre_mm]
+DR = 15.0
+7i = 18.5
+```
+
+Or from the Settings tab: each Square Golf device has a collapsible "Face
+impact calibration (beta)" section with one field per club. Leave a field
+blank to use the default for that club; a value overrides it. Changing a
+calibration restarts the device actor.
 
 ## Zero-spin rejection
 

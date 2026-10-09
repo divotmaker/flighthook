@@ -362,7 +362,11 @@ Full persisted config (mirrors `config.toml`).
       "name": "Square Golf Omni",
       "club": "7i",
       "advanced_spin": true,
-      "discard_non_putting_zero_spin": true
+      "discard_non_putting_zero_spin": true,
+      "dot_bottom_to_face_centre_mm": {
+        "DR": 15.0,
+        "7I": 18.5
+      }
     }
   },
   "mock_monitor": {},
@@ -391,6 +395,10 @@ Full persisted config (mirrors `config.toml`).
 - `camera_mode` on Mevo sections is `standard` (default), `fusion`, or
   `raw_fusion`. The Fusion modes request the device's club-data processing and
   are omitted from the response when unset
+- `dot_bottom_to_face_centre_mm` on Square sections overrides allsquare's built-in
+  per-club face impact calibration (distance from the bottom edge of the
+  sticker's dot down to face centre, in mm). Keyed the same way `club` is. Omitted when no
+  overrides are set
 - `openconnect_server` sections are **launch monitors**, not integrations: they
   listen (`bind`, default `0.0.0.0:921`) and accept inbound shots from any
   monitor that speaks GSPro Open Connect V1 as a client — Uneekor, Foresight,
@@ -625,9 +633,11 @@ Neither axis is flipped for a left-handed player — toe/heel and high/low are
 already golfer-relative.
 
 Emitted only by devices whose reading is referenced to the face centre. The
-Square Golf Omni measures impact but does not emit this event: its reading
-needs a calibration flighthook does not have (see
-[docs/devices/square-golf.md](devices/square-golf.md)).
+Square Golf Omni emits this event (beta): horizontal as the device measures
+it, vertical with a per-club calibration (built-in defaults, overridable per
+club in config or the Settings UI — see
+[docs/devices/square-golf.md](devices/square-golf.md)). The putter has no
+vertical calibration by default, so only horizontal impact is sent for putts.
 
 ```json
 {

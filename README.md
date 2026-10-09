@@ -156,6 +156,10 @@ club = "7i"                    # club selected on connect
 advanced_spin = true           # device's advanced spin measurement
 discard_non_putting_zero_spin = true   # drop 0-spin misreads (putts exempt)
 
+# optional per-club face impact calibration, in mm (bottom of sticker dot to face centre)
+[square.0.dot_bottom_to_face_centre_mm]
+DR = 15.0
+
 [r10.0]
 name = "Garmin R10"
 range = "7ft"                  # device-to-ball distance, sent as tee distance

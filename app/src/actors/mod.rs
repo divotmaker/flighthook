@@ -129,6 +129,8 @@ pub fn resolve_actors(
             .as_deref()
             .and_then(Club::from_code)
             .unwrap_or(Club::Iron7);
+        let impact_calibration =
+            square::build_impact_calibration(section.dot_bottom_to_face_centre_mm.as_ref());
         actors.push(ResolvedActor {
             id,
             name: section.name.clone(),
@@ -139,6 +141,7 @@ pub fn resolve_actors(
                 discard_non_putting_zero_spin: section
                     .discard_non_putting_zero_spin
                     .unwrap_or(true),
+                impact_calibration,
             }),
         });
     }

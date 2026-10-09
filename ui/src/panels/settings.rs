@@ -68,6 +68,11 @@ pub(crate) struct DeviceFormEntry {
     /// saving settings does not wipe them from the config file.
     pub(crate) square_club: Option<String>,
     pub(crate) square_advanced_spin: Option<bool>,
+    /// Square Golf: per-club face impact calibration override, in mm from
+    /// the bottom of the sticker dot down to face centre. Keyed by club; blank means "use
+    /// allsquare's default" for that club. The putter is excluded — it has
+    /// no vertical impact estimate.
+    pub(crate) square_impact_mm: std::collections::HashMap<Club, String>,
     pub(crate) dirty: bool,
 }
 
@@ -98,6 +103,49 @@ pub(crate) fn is_ble_address(s: &str) -> bool {
     mac || hex_groups(s, '-', &[8, 4, 4, 4, 12]) || advertised_name
 }
 
+/// Build the face-impact-calibration form map from config overrides. A club
+/// with no entry renders blank, meaning "use allsquare's default".
+fn impact_mm_form(
+    overrides: Option<&std::collections::BTreeMap<String, f64>>,
+) -> std::collections::HashMap<Club, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(overrides) = overrides {
+        for (key, &mm) in overrides {
+            if let Some(club) = Club::from_code(key)
+                && club != Club::Putter
+            {
+                map.insert(club, format_distance_value(mm));
+            }
+        }
+    }
+    map
+}
+
+/// Whether a face-impact-calibration field is acceptable: blank (use the
+/// default) or a finite, non-negative mm value.
+fn is_valid_impact_mm(s: &str) -> bool {
+    let s = s.trim();
+    s.is_empty() || s.parse::<f64>().is_ok_and(|v| v.is_finite() && v >= 0.0)
+}
+
+/// Build the `dot_bottom_to_face_centre_mm` config map from the form: non-blank
+/// entries only, keyed by club code. Returns `None` when no overrides are set.
+fn impact_mm_to_config(
+    form: &std::collections::HashMap<Club, String>,
+) -> Option<std::collections::BTreeMap<String, f64>> {
+    let mut map = std::collections::BTreeMap::new();
+    for (club, s) in form {
+        let s = s.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if let Ok(v) = s.parse::<f64>() {
+            map.insert(club.to_string(), v);
+        }
+    }
+    if map.is_empty() { None } else { Some(map) }
+}
+
 impl DeviceFormEntry {
     pub(crate) fn from_mevo(id: &str, s: &MevoSection) -> Self {
         let tee = s.tee_height.unwrap_or(Distance::Inches(1.5));
@@ -121,6 +169,7 @@ impl DeviceFormEntry {
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
+            square_impact_mm: std::collections::HashMap::new(),
             dirty: false,
         }
     }
@@ -148,6 +197,7 @@ impl DeviceFormEntry {
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
+            square_impact_mm: std::collections::HashMap::new(),
             dirty: false,
         }
     }
@@ -161,6 +211,7 @@ impl DeviceFormEntry {
             discard_zero_spin: s.discard_non_putting_zero_spin.unwrap_or(true),
             square_club: s.club.clone(),
             square_advanced_spin: s.advanced_spin,
+            square_impact_mm: impact_mm_form(s.dot_bottom_to_face_centre_mm.as_ref()),
             ball_type: 0,
             tee_height_val: "1.5".into(),
             tee_height_unit: "inches".into(),
@@ -194,6 +245,7 @@ impl DeviceFormEntry {
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
+            square_impact_mm: std::collections::HashMap::new(),
             dirty: false,
         }
     }
@@ -217,6 +269,7 @@ impl DeviceFormEntry {
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
+            square_impact_mm: std::collections::HashMap::new(),
             dirty: false,
         }
     }
@@ -500,6 +553,16 @@ impl SettingsForm {
                             return false;
                         }
                     }
+                    // Face impact calibration: blank means "use the default",
+                    // anything else must be a finite, non-negative mm value.
+                    if dev.is_square()
+                        && dev
+                            .square_impact_mm
+                            .values()
+                            .any(|v| !is_valid_impact_mm(v))
+                    {
+                        return false;
+                    }
                 }
                 ActorFormEntry::Integration(entry) => {
                     if entry.name.is_empty() {
@@ -572,6 +635,9 @@ impl SettingsForm {
                                 club: dev.square_club.clone(),
                                 advanced_spin: dev.square_advanced_spin,
                                 discard_non_putting_zero_spin: Some(dev.discard_zero_spin),
+                                dot_bottom_to_face_centre_mm: impact_mm_to_config(
+                                    &dev.square_impact_mm,
+                                ),
                             },
                         );
                     }
@@ -782,6 +848,9 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             club: dev.square_club.clone(),
                             advanced_spin: dev.square_advanced_spin,
                             discard_non_putting_zero_spin: Some(dev.discard_zero_spin),
+                            dot_bottom_to_face_centre_mm: impact_mm_to_config(
+                                &dev.square_impact_mm,
+                            ),
                         },
                     );
                 }
@@ -1132,6 +1201,59 @@ impl FlighthookApp {
                                         dev.dirty = true;
                                     }
                                 });
+
+                                // Per-club face impact calibration override.
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    egui::CollapsingHeader::new("Face impact calibration (beta)")
+                                        .id_salt(format!("impact_cal_{}", dev.id))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Distance from the bottom edge of the club \
+                                                     sticker's dot down to face centre, in mm. \
+                                                     Blank uses the built-in default for that club.",
+                                                )
+                                                .size(11.0)
+                                                .weak(),
+                                            );
+                                            for &club in Club::ALL {
+                                                if club == Club::Putter {
+                                                    continue;
+                                                }
+                                                let mut val = dev
+                                                    .square_impact_mm
+                                                    .get(&club)
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                ui.horizontal(|ui| {
+                                                    ui.label(format!("{club}:"));
+                                                    let response = ui.add(
+                                                        egui::TextEdit::singleline(&mut val)
+                                                            .desired_width(80.0)
+                                                            .hint_text("default"),
+                                                    );
+                                                    let invalid = !is_valid_impact_mm(&val);
+                                                    if response.changed() {
+                                                        dev.square_impact_mm.insert(club, val);
+                                                        dev.dirty = true;
+                                                    }
+                                                    ui.label(
+                                                        egui::RichText::new("mm").size(11.0).weak(),
+                                                    );
+                                                    if invalid {
+                                                        ui.label(
+                                                            egui::RichText::new("Invalid")
+                                                                .color(egui::Color32::from_rgb(
+                                                                    255, 80, 80,
+                                                                ))
+                                                                .size(11.0),
+                                                        );
+                                                    }
+                                                });
+                                            }
+                                        });
+                                });
                             }
 
                             if dev.is_r10() {
@@ -1422,6 +1544,7 @@ impl FlighthookApp {
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
+                                    square_impact_mm: std::collections::HashMap::new(),
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
@@ -1453,6 +1576,7 @@ impl FlighthookApp {
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
+                                    square_impact_mm: std::collections::HashMap::new(),
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
@@ -1483,6 +1607,7 @@ impl FlighthookApp {
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
+                                    square_impact_mm: std::collections::HashMap::new(),
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;
@@ -1513,6 +1638,7 @@ impl FlighthookApp {
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
+                                    square_impact_mm: std::collections::HashMap::new(),
                                     dirty: true,
                                 }));
                                 self.settings.dirty = true;

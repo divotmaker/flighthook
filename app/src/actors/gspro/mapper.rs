@@ -46,10 +46,8 @@ pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
     // unlike the target-relative fields above.
     //
     // GSPro renders a face-impact diagram, so polarity is checkable end to end.
-    // The Square Omni deliberately emits no FaceImpact: its readings need a
-    // calibration allsquare is still working out (docs/devices/square-golf.md).
-    // That is a device-side problem, not a mapping error; do not try to correct
-    // it by negating here.
+    // Any device-specific correction (e.g. the Square Omni's per-club vertical
+    // offset) belongs in the device driver, not here.
     let (impact_v, impact_h) = shot.impact.as_ref().map_or((0.0, 0.0), |i| {
         (
             i.vertical.map_or(0.0, |d| d.as_millimeters()),

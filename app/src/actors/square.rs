@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,8 +10,8 @@ use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 
 use flighthook::{
-    ActorStatus, BallFlight, Club, ClubData, FlighthookEvent, FlighthookMessage, Severity, ShotKey,
-    Velocity,
+    ActorStatus, BallFlight, Club, ClubData, Distance, FaceImpact, FlighthookEvent,
+    FlighthookMessage, Severity, ShotKey, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
@@ -29,6 +29,9 @@ pub struct SquareActor {
     pub advanced_spin: bool,
     /// Discard shots that read zero spin, unless the putter is selected.
     pub discard_non_putting_zero_spin: bool,
+    /// Per-club face impact calibration, built from allsquare's defaults plus
+    /// any configured overrides.
+    pub impact_calibration: allsquare::ImpactCalibration,
 }
 
 impl Actor for SquareActor {
@@ -37,6 +40,7 @@ impl Actor for SquareActor {
         let club = self.club;
         let advanced_spin = self.advanced_spin;
         let discard_zero_spin = self.discard_non_putting_zero_spin;
+        let impact_calibration = self.impact_calibration.clone();
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
@@ -47,6 +51,7 @@ impl Actor for SquareActor {
                     club,
                     advanced_spin,
                     discard_zero_spin,
+                    impact_calibration,
                     sender,
                     receiver,
                 );
@@ -64,7 +69,10 @@ impl Actor for SquareActor {
         match snap.square.get(index) {
             // Address, club and spin mode are applied at connect time.
             Some(section) => {
-                if section.address == self.address {
+                let impact_calibration =
+                    build_impact_calibration(section.dot_bottom_to_face_centre_mm.as_ref());
+                if section.address == self.address && impact_calibration == self.impact_calibration
+                {
                     ReconfigureOutcome::Applied
                 } else {
                     ReconfigureOutcome::RestartRequired
@@ -73,6 +81,32 @@ impl Actor for SquareActor {
             None => ReconfigureOutcome::RestartRequired, // section removed
         }
     }
+}
+
+/// Build the per-club face impact calibration from config overrides.
+///
+/// Starts from allsquare's built-in defaults and applies each override.
+/// Unknown club keys and non-finite or negative values are warned about and
+/// skipped, leaving that club at its built-in default.
+pub(crate) fn build_impact_calibration(
+    overrides: Option<&BTreeMap<String, f64>>,
+) -> allsquare::ImpactCalibration {
+    let mut cal = allsquare::ImpactCalibration::default();
+    let Some(overrides) = overrides else {
+        return cal;
+    };
+    for (key, &mm) in overrides {
+        let Some(club) = Club::from_code(key) else {
+            warn!("square: unknown club '{key}' in dot_bottom_to_face_centre_mm, ignoring");
+            continue;
+        };
+        if !mm.is_finite() || mm < 0.0 {
+            warn!("square: invalid dot_bottom_to_face_centre_mm for '{key}': {mm}, ignoring");
+            continue;
+        }
+        cal.set_dot_bottom_to_face_centre_mm(to_allsquare_club(club), Some(mm));
+    }
+    cal
 }
 
 // ---------------------------------------------------------------------------
@@ -184,11 +218,25 @@ fn club_from_square(c: &allsquare::ClubMetrics) -> ClubData {
         smash_factor: c.smash_factor,
         swing_plane_horizontal: None,
         swing_plane_vertical: None,
-        // Impact location belongs in FaceImpact, not here, and is currently
-        // not published at all — see the shot handler.
+        // Impact location belongs in FaceImpact, not here.
         club_offset: None,
         club_height: None,
     }
+}
+
+/// Impact location as millimetres from face centre, if the device measured it.
+///
+/// allsquare reports both axes from face centre (beta calibration, with the
+/// vertical offset taken from the armed club). Lateral is negated: the device
+/// reports negative toward the toe, FRP defines positive toward the toe.
+fn face_impact_from_square(c: &allsquare::ClubMetrics) -> Option<FaceImpact> {
+    if c.impact_horizontal.is_none() && c.impact_vertical.is_none() {
+        return None;
+    }
+    Some(FaceImpact {
+        lateral: c.impact_horizontal.map(|v| Distance::Millimeters(-v)),
+        vertical: c.impact_vertical.map(Distance::Millimeters),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +248,7 @@ fn run(
     club: Club,
     advanced_spin: bool,
     discard_zero_spin: bool,
+    impact_calibration: allsquare::ImpactCalibration,
     sender: BusSender,
     mut receiver: BusReceiver,
 ) {
@@ -231,6 +280,7 @@ fn run(
             &mut current_club,
             advanced_spin,
             discard_zero_spin,
+            &impact_calibration,
             &sender,
             &mut receiver,
             &mut ever_connected,
@@ -292,6 +342,7 @@ fn connect_and_run(
     current_club: &mut Club,
     advanced_spin: bool,
     discard_zero_spin: bool,
+    impact_calibration: &allsquare::ImpactCalibration,
     sender: &BusSender,
     receiver: &mut BusReceiver,
     ever_connected: &mut bool,
@@ -310,6 +361,7 @@ fn connect_and_run(
     *device_id = Some(name.clone());
 
     let mut client = Client::new(transport);
+    client.set_impact_calibration(impact_calibration.clone());
     let spin = if advanced_spin {
         SpinMode::Advanced
     } else {
@@ -552,17 +604,18 @@ fn connect_and_run(
                                 .device(&name),
                             );
 
-                            // Face impact is read but deliberately not
-                            // published. The wire values are not a straight
-                            // passthrough — sent as measured, a centred strike
-                            // lands off the face — and the calibration that
-                            // would correct them is still being worked out in
-                            // allsquare. Logged only, to feed that work.
-                            if c.impact_horizontal.is_some() || c.impact_vertical.is_some() {
+                            if let Some(impact) = face_impact_from_square(c) {
                                 info!(
-                                    "  impact (uncalibrated, not sent): raw H={:.2} V={:.2}",
-                                    c.impact_horizontal.unwrap_or(f64::NAN),
-                                    c.impact_vertical.unwrap_or(f64::NAN),
+                                    "  impact (beta): toe={:.1}mm up={:.1}mm",
+                                    impact.lateral.map_or(f64::NAN, |d| d.as_millimeters()),
+                                    impact.vertical.map_or(f64::NAN, |d| d.as_millimeters()),
+                                );
+                                sender.send(
+                                    FlighthookMessage::new(FlighthookEvent::FaceImpact {
+                                        key: key.clone(),
+                                        impact: Box::new(impact),
+                                    })
+                                    .device(&name),
                                 );
                             }
                         } else {
@@ -607,6 +660,33 @@ fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device reports negative toward the toe; FRP's lateral is positive
+    /// toward the toe. Vertical passes through.
+    #[test]
+    fn face_impact_flips_lateral_to_frp() {
+        let c = allsquare::ClubMetrics {
+            impact_horizontal: Some(-12.5),
+            impact_vertical: Some(3.0),
+            ..Default::default()
+        };
+        let impact = face_impact_from_square(&c).expect("impact");
+        assert_eq!(impact.lateral, Some(Distance::Millimeters(12.5)));
+        assert_eq!(impact.vertical, Some(Distance::Millimeters(3.0)));
+    }
+
+    /// No vertical estimate (e.g. the putter) still reports lateral.
+    #[test]
+    fn face_impact_without_vertical_keeps_lateral() {
+        let c = allsquare::ClubMetrics {
+            impact_horizontal: Some(4.0),
+            ..Default::default()
+        };
+        let impact = face_impact_from_square(&c).expect("impact");
+        assert_eq!(impact.lateral, Some(Distance::Millimeters(-4.0)));
+        assert_eq!(impact.vertical, None);
+        assert!(face_impact_from_square(&allsquare::ClubMetrics::default()).is_none());
+    }
 
     /// The device reports negative sidespin for a rightward curve; FRP defines
     /// positive as rightward. Getting this backwards makes fades draw and draws
@@ -722,5 +802,65 @@ mod tests {
         assert!(is_zero_address(" 00:00:00:00:00:00\n"));
         assert!(!is_zero_address("DC:0D:30:62:54:E4"));
         assert!(!is_zero_address("SquareGolf(54E4)"));
+    }
+
+    #[test]
+    fn no_overrides_matches_allsquare_default() {
+        assert_eq!(
+            build_impact_calibration(None),
+            allsquare::ImpactCalibration::default()
+        );
+    }
+
+    #[test]
+    fn valid_override_is_applied() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("DR".to_string(), 30.0);
+        let cal = build_impact_calibration(Some(&overrides));
+        assert_eq!(
+            cal.dot_bottom_to_face_centre_mm(allsquare::Club::Driver),
+            Some(30.0)
+        );
+    }
+
+    /// An unknown club key is warned about and skipped — every other club
+    /// still gets allsquare's built-in default.
+    #[test]
+    fn unknown_club_key_is_skipped() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("bogus".to_string(), 30.0);
+        let cal = build_impact_calibration(Some(&overrides));
+        assert_eq!(cal, allsquare::ImpactCalibration::default());
+    }
+
+    /// A negative value is nonsensical (it is a distance) and is skipped —
+    /// the club keeps its built-in default rather than taking a bad value.
+    #[test]
+    fn negative_value_is_skipped() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("DR".to_string(), -5.0);
+        let cal = build_impact_calibration(Some(&overrides));
+        assert_eq!(
+            cal.dot_bottom_to_face_centre_mm(allsquare::Club::Driver),
+            allsquare::ImpactCalibration::default()
+                .dot_bottom_to_face_centre_mm(allsquare::Club::Driver)
+        );
+    }
+
+    /// `reconfigure()` restarts the actor exactly when the built calibration
+    /// changes — this is the equality check it relies on.
+    #[test]
+    fn calibration_changes_are_detected() {
+        let mut overrides_a = BTreeMap::new();
+        overrides_a.insert("DR".to_string(), 19.0);
+        let mut overrides_b = overrides_a.clone();
+        overrides_b.insert("DR".to_string(), 25.0);
+
+        let cal_a = build_impact_calibration(Some(&overrides_a));
+        let cal_a_again = build_impact_calibration(Some(&overrides_a));
+        let cal_b = build_impact_calibration(Some(&overrides_b));
+
+        assert_eq!(cal_a, cal_a_again, "same overrides must compare equal");
+        assert_ne!(cal_a, cal_b, "changed overrides must compare unequal");
     }
 }
