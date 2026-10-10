@@ -1,6 +1,6 @@
 headless ?= false
 
-# Deploy target: `make deploy host=gamingpc dir=Code/flighthook`
+# Deploy target: `make deploy host=gamingpc` (dir defaults to the remote user's home directory)
 # Falls back to env vars, then defaults.
 host ?= $(or $(GOLF_SIMULATOR_REMOTE_HOST),localhost)
 dir  ?= $(or $(GOLF_SIMULATOR_REMOTE_DIR),.)
@@ -36,9 +36,10 @@ run: build
 # headless=false (default): builds with native GUI, deploys only.
 # headless=true: builds without GUI, deploys and runs via SSH.
 # Usage:
-#   make deploy host=golfpc dir=Code/flighthook                # GUI binary, deploy only
-#   make deploy host=golfpc dir=Code/flighthook headless=true  # headless, deploy + run over ssh in terminal
-#   make deploy                                                # deploy to {GOLF_SIMULATOR_REMOTE_HOST}:{GOLF_SIMULATOR_REMOTE_DIR}
+#   make deploy host=golfpc                    # GUI binary, deploy to the home directory
+#   make deploy host=golfpc dir=Documents      # GUI binary, deploy to another directory
+#   make deploy host=golfpc headless=true      # headless, deploy + run over ssh in terminal
+#   make deploy                                # deploy to {GOLF_SIMULATOR_REMOTE_HOST}:{GOLF_SIMULATOR_REMOTE_DIR}
 deploy: ui
 	cd app && cargo build --release --target $(WIN_TARGET) $(DEPLOY_CARGO_FLAGS)
 	@echo "==> deploying to $(host):$(dir)"

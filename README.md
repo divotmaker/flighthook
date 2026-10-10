@@ -203,7 +203,8 @@ make run headless=true
 ### Cross-Compile and Deploy to Windows
 
 ```bash
-make deploy host=golfpc dir=Documents
+make deploy host=golfpc                # copies flighthook.exe to the remote user's home directory
+make deploy host=golfpc dir=Documents  # or to another directory
 ```
 
 ### CLI
