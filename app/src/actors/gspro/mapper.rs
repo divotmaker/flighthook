@@ -56,34 +56,19 @@ pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
     });
 
     // Club data: use ClubData when present, otherwise zero-fill.
-    let (club_data, contains_club) = if let Some(ref club) = shot.club {
-        (
-            ClubData {
-                speed: club.club_speed.map(|v| v.as_mph()).unwrap_or(0.0),
-                angle_of_attack: club.attack_angle.unwrap_or(0.0),
-                face_to_target: club.face_angle.unwrap_or(0.0) * flip,
-                loft: club.dynamic_loft.unwrap_or(0.0),
-                path: club.path.unwrap_or(0.0) * flip,
-                speed_at_impact: club.club_speed_post.map_or(0.0, |v| v.as_mph()),
-                vertical_face_impact: impact_v,
-                horizontal_face_impact: impact_h,
-                ..ClubData::default()
-            },
-            true,
-        )
-    } else {
-        (
-            ClubData {
-                speed: 0.0,
-                angle_of_attack: 0.0,
-                face_to_target: 0.0,
-                vertical_face_impact: impact_v,
-                horizontal_face_impact: impact_h,
-                ..ClubData::default()
-            },
-            // Impact without club data still counts as club data for GSPro.
-            shot.impact.is_some(),
-        )
+    let club = shot.club.as_ref();
+    let club_data = ClubData {
+        speed: club.and_then(|c| c.club_speed).map_or(0.0, |v| v.as_mph()),
+        angle_of_attack: club.and_then(|c| c.attack_angle).unwrap_or(0.0),
+        face_to_target: club.and_then(|c| c.face_angle).unwrap_or(0.0) * flip,
+        loft: club.and_then(|c| c.dynamic_loft).unwrap_or(0.0),
+        path: club.and_then(|c| c.path).unwrap_or(0.0) * flip,
+        speed_at_impact: club
+            .and_then(|c| c.club_speed_post)
+            .map_or(0.0, |v| v.as_mph()),
+        vertical_face_impact: impact_v,
+        horizontal_face_impact: impact_h,
+        ..ClubData::default()
     };
 
     GsProMessage {
@@ -104,7 +89,12 @@ pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
         club_data,
         shot_data_options: ShotDataOptions {
             contains_ball_data: contains_ball,
-            contains_club_data: contains_club,
+            // Always set, even when the shot carries no club data. GSPro keeps
+            // showing the previous shot's club data and face impact when this
+            // is false, so a shot without club tracking (e.g. a club with no
+            // sticker on a Square Golf) would display the last tracked club's
+            // numbers. Sending the zero-filled block clears them.
+            contains_club_data: true,
             // A shot proves the device was ready and detected a ball.
             launch_monitor_is_ready: true,
             launch_monitor_ball_detected: true,
@@ -164,6 +154,24 @@ mod tests {
         assert!((msg.club_data.horizontal_face_impact - -32.19).abs() < 1e-9);
         assert!((msg.club_data.vertical_face_impact - -17.43).abs() < 1e-9);
         assert!(msg.shot_data_options.contains_club_data);
+    }
+
+    #[test]
+    fn shot_without_club_data_clears_gspro_club_display() {
+        // A ball-only shot (no club tracking). GSPro holds the previous shot's
+        // club data and face impact unless ContainsClubData is set, so the
+        // zero-filled block must still be flagged as present.
+        let mut shot = shot_with_impact(-32.19, -17.43);
+        shot.club = None;
+        shot.impact = None;
+        let msg = map_shot(&shot, Handedness::Right);
+        assert!(msg.shot_data_options.contains_ball_data);
+        assert!(msg.shot_data_options.contains_club_data);
+        assert_eq!(msg.club_data.speed, 0.0);
+        assert_eq!(msg.club_data.path, 0.0);
+        assert_eq!(msg.club_data.face_to_target, 0.0);
+        assert_eq!(msg.club_data.vertical_face_impact, 0.0);
+        assert_eq!(msg.club_data.horizontal_face_impact, 0.0);
     }
 
     #[test]
