@@ -1,6 +1,6 @@
 # Square Golf Omni
 
-**Status: Beta** — decoded by
+**Status: Supported** — decoded by
 [allsquare](https://crates.io/crates/allsquare) over BLE (GATT). No pairing
 required.
 
