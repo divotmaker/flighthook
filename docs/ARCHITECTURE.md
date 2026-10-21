@@ -79,6 +79,7 @@ pub struct FlighthookConfig {
     pub default_units: UnitSystem,
     pub chipping_clubs: Vec<Club>,
     pub putting_clubs: Vec<Club>,
+    pub simulation: SimulationSection,     // [simulation], omitted at defaults
     pub webserver: HashMap<String, WebserverSection>,
     pub mevo: HashMap<String, MevoSection>,
     pub r10: HashMap<String, R10Section>,
@@ -89,6 +90,8 @@ pub struct FlighthookConfig {
     pub random_club: HashMap<String, RandomClubSection>,
 }
 
+pub struct SimulationSection { pub enabled: bool, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface }
+pub enum SimSurface { Fairway, Green, FirmGreen }
 pub struct WebserverSection { pub name: String, pub bind: String }
 pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool>, pub camera_mode: Option<CameraMode> }
 pub enum CameraMode { Standard, Fusion, RawFusion }
@@ -175,7 +178,7 @@ are flat struct variants with named fields (no wrapper types).
 pub enum FlighthookEvent {
     // -- FRP-compliant shot lifecycle (correlated by ShotKey) --
     ShotTrigger { key: ShotKey },
-    BallFlight { key: ShotKey, ball: Box<BallFlight> },
+    BallFlight { key: ShotKey, ball: Box<BallFlight>, derived: Option<Box<DerivedFlight>> },
     ClubPath { key: ShotKey, club: Box<ClubData> },
     FaceImpact { key: ShotKey, impact: Box<FaceImpact> },
     ShotFinished { key: ShotKey },
@@ -196,6 +199,10 @@ pub enum FlighthookEvent {
 }
 ```
 
+Match variants with `..` (e.g. `FlighthookEvent::BallFlight { key, ball, .. }`)
+unless every field is needed, so a field added to a variant does not break the
+pattern.
+
 ### ShotKey -- shot lifecycle correlation
 
 ```rust
@@ -207,7 +214,44 @@ pub struct ShotKey {
 
 Shot data arrives as correlated events sharing a `ShotKey` and `actor`:
 `ShotTrigger` -> `BallFlight` / `ClubPath` / `FaceImpact` (any order) -> `ShotFinished`. Consumers
-use `ShotAccumulator` to collect events into a final `ShotData`.
+use `ShotAccumulator` to collect events into a final `ShotData`
+(`set_ball` for the measured `BallFlight`, `set_derived` for its `derived` block).
+
+### Simulated values (beta)
+
+The `BallFlight` event's `derived` field carries values flighthook simulated
+for fields the device did not report: carry, apex, flight time, descent angle,
+carry/roll/total offline, roll and total (`DerivedFlight`, lib crate). `ball`
+is never modified, so a field's location says where it came from: under
+`ball` it was measured, under `derived` it was simulated. `ShotData.derived`
+carries the same block after accumulation.
+
+The simulation runs in `app/src/sim.rs` with the
+[dimple](https://crates.io/crates/dimple) crate, an app-only dependency (the
+lib crate and the WASM UI never link it). Every device actor builds its
+`BallFlight` event through `sim::ball_flight_event`, on the device thread, so
+the event already carries `derived` when it reaches the bus, before
+`ShotFinished`. It costs a few milliseconds per shot. A shot is simulated only
+when:
+
+- `[simulation] enabled` is true and the detection mode is not `Putting`;
+- the altitude (0 to 5000 m) and temperature (-30 to 50 °C) are in range;
+- all five launch values (speed, launch angle, launch direction, backspin,
+  sidespin) are present and finite, speed is at least 5 mph, launch angle is
+  between 0 and 90°, and launch direction is within ±90°;
+- the shot is not a putt by speed and angle (under 15 mph and under 5°);
+- the simulated flight is valid (positive flight time, finite results).
+
+Otherwise `derived` is absent. Roll, total and the roll/total offlines also
+need the ground phase to reach rest. Where the device measures carry, total is
+the measured carry plus the simulated roll.
+
+The device actor reads the `[simulation]` section from `SystemConfig` for every
+shot, so settings changes apply on the next shot with no actor restart. The
+GSPro mapper reads `shot.ball` only, so GSPro output does not change. The
+console gets one `sim (estimated, beta): ...` line under the device's ball
+line; it is a derived summary, not wire data, so the hex-first audit rules do
+not apply to it.
 
 ### Game state events
 
@@ -574,6 +618,12 @@ with unsaved changes keep their dirty state.
 ```
 Global
   Default Units: [Imperial v]                     [Save] [API Docs]
+  Chipping Clubs / Putting Clubs: [club toggles]
+  Simulated values (beta)
+    [x] Simulate values the device doesn't report
+    Altitude: [0] [ft v]
+    Temperature: [77] °F            (°C when Default Units is Metric)
+    Surface: [Fairway v]
 
   Web Server             [Web]    [Remove] [Save]
     Name: [Web Server]
@@ -620,6 +670,9 @@ Global
   only that section's changes) and passes `?scope=<actor_id>` to the backend.
   The backend only reconfigures the target actor. The UI stores the original
   config from the last load/save and updates it per-section on successful save.
+- Simulated values are global settings saved with the Global Save button. The
+  form rejects altitudes outside 0 to 5000 m and temperatures outside -30 to
+  50 °C; temperature is edited in the display unit and stored in °C
 - Config changes auto-reconfigure actors (all changes trigger restart)
 - Webserver bind changes trigger a restart (same as address changes for other actors)
 

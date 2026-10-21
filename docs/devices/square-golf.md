@@ -53,6 +53,27 @@ impact calibration (beta)" section with one field per club. Leave a field
 blank to use the default for that club; a value overrides it. Changing a
 calibration restarts the device actor.
 
+## Carry and total (beta, simulated)
+
+The Omni measures launch only: ball speed, launch angle, launch direction,
+backspin and sidespin. flighthook simulates the rest — carry, apex, flight
+time, descent angle, offline, roll and total — from that launch (see the
+README's [Simulated values](../../README.md#simulated-values-beta) section).
+They show in *italics* in the Shots tab, appear as `derived` in the API, and
+are logged under the ball line:
+
+```
+  ball: 119.9mph VLA=17.0 HLA=-1.2 back=6500rpm side=-300rpm
+  sim (estimated, beta): carry=170.0yd offline=-7.1yd apex=96.1ft time=5.9s descent=50.1deg roll=+9.5yd roll_offline=-0.9yd total=179.5yd total_offline=-8.0yd
+```
+
+GSPro still receives the launch data only and simulates the flight itself.
+
+Putts are not simulated. The Omni reports a putt like any other shot, so
+flighthook skips it in putting mode (select the putter in the sim) and, in any
+other mode, whenever the ball is slower than 15 mph and launched below 5°,
+which catches putts when no club has been selected.
+
 ## Zero-spin rejection
 
 A ball struck near the front edge of the Omni's detection zone can come back

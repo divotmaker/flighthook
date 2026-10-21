@@ -329,3 +329,83 @@ mod tests {
         assert!(scoped_action("nosuchtype.0", &config()).is_none());
     }
 }
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+    use flighthook::{BallFlight, DerivedFlight, Distance, ShotData, Velocity};
+
+    fn shot() -> ShotData {
+        let mut derived = DerivedFlight::default();
+        derived.carry_distance = Some(Distance::Meters(150.9));
+        derived.carry_offline = Some(Distance::Meters(-5.5));
+        derived.max_height = Some(Distance::Meters(26.0));
+        derived.flight_time = Some(6.1);
+        derived.descent_angle = Some(50.2);
+        derived.roll_distance = Some(Distance::Meters(-1.2));
+        derived.total_distance = Some(Distance::Meters(149.7));
+        ShotData {
+            actor: "square.0".into(),
+            shot_number: 3,
+            ball: Some(BallFlight {
+                launch_speed: Some(Velocity::MetersPerSecond(53.6)),
+                launch_elevation: Some(17.0),
+                launch_azimuth: Some(-1.2),
+                carry_distance: None,
+                total_distance: None,
+                roll_distance: None,
+                max_height: None,
+                flight_time: None,
+                backspin_rpm: Some(6500),
+                sidespin_rpm: Some(-300),
+            }),
+            club: None,
+            impact: None,
+            derived: Some(derived),
+        }
+    }
+
+    async fn convert(shot: ShotData, units: &str) -> ShotData {
+        // Through JSON both ways, as a WS consumer would send it.
+        let body: ShotData =
+            serde_json::from_str(&serde_json::to_string(&shot).expect("ser")).expect("de");
+        let Json(out) = post_convert_shot(
+            Query(ConvertQuery {
+                units: units.into(),
+            }),
+            Json(body),
+        )
+        .await
+        .expect("converts");
+        serde_json::from_str(&serde_json::to_string(&out).expect("ser")).expect("de")
+    }
+
+    #[tokio::test]
+    async fn convert_round_trips_derived_values() {
+        let original = shot();
+        let imperial = convert(original.clone(), "imperial").await;
+        let d = imperial.derived.clone().expect("derived kept");
+        assert!(matches!(d.carry_distance, Some(Distance::Yards(_))));
+        assert!(matches!(d.carry_offline, Some(Distance::Yards(_))));
+        assert!(matches!(d.max_height, Some(Distance::Feet(_))));
+        assert!(matches!(d.roll_distance, Some(Distance::Yards(v)) if v < 0.0));
+        assert_eq!(d.flight_time, Some(6.1));
+        assert_eq!(d.descent_angle, Some(50.2));
+
+        let back = convert(imperial, "metric")
+            .await
+            .derived
+            .expect("derived kept");
+        let want = original.derived.expect("derived");
+        let close = |a: Option<Distance>, b: Option<Distance>| {
+            (a.expect("a").as_meters() - b.expect("b").as_meters()).abs() < 1e-9
+        };
+        assert!(close(back.carry_distance, want.carry_distance));
+        assert!(close(back.carry_offline, want.carry_offline));
+        assert!(close(back.max_height, want.max_height));
+        assert!(close(back.roll_distance, want.roll_distance));
+        assert!(close(back.total_distance, want.total_distance));
+        assert_eq!(back.roll_offline, None);
+        assert_eq!(back.total_offline, None);
+    }
+}

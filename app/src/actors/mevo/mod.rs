@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::sim;
 use crate::state::SystemState;
 use settings::{cam_config, fusion_cam_config};
 
@@ -50,7 +51,7 @@ pub struct MevoActor {
 }
 
 impl Actor for MevoActor {
-    fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let addr = self.addr;
         let initial_mode = self.initial_mode;
         let session_config = self.session_config.clone();
@@ -62,6 +63,7 @@ impl Actor for MevoActor {
             .name(thread_name)
             .spawn(move || {
                 run(
+                    &state,
                     addr,
                     initial_mode,
                     session_config,
@@ -169,7 +171,9 @@ fn try_emit_device_telemetry(
 // Run loop
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run(
+    state: &SystemState,
     addr: SocketAddr,
     initial_mode: ShotDetectionMode,
     initial_session_config: SessionConfig,
@@ -194,6 +198,7 @@ fn run(
         emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
 
         match connect_and_run(
+            state,
             &addr,
             initial_mode,
             use_estimated,
@@ -255,6 +260,7 @@ fn run(
 
 #[allow(clippy::too_many_arguments)]
 fn connect_and_run(
+    state: &SystemState,
     addr: &SocketAddr,
     initial_mode: ShotDetectionMode,
     use_estimated: bool,
@@ -528,10 +534,11 @@ fn connect_and_run(
                                         ball.backspin_rpm.unwrap_or(0),
                                         ball.sidespin_rpm.unwrap_or(0),
                                     );
-                                    let msg = FlighthookMessage::new(FlighthookEvent::BallFlight {
-                                        key: key.clone(),
-                                        ball: Box::new(ball),
-                                    });
+                                    let msg = FlighthookMessage::new(sim::ball_flight_event(
+                                        state,
+                                        key.clone(),
+                                        ball,
+                                    ));
                                     sender.send(stamp_device(msg, device_id));
                                 }
                                 ShotDatum::FlightV1(e8) => {
@@ -571,11 +578,11 @@ fn connect_and_run(
                                                 .map(|d| d.as_yards())
                                                 .unwrap_or(0.0),
                                         );
-                                        let msg =
-                                            FlighthookMessage::new(FlighthookEvent::BallFlight {
-                                                key: key.clone(),
-                                                ball: Box::new(ball),
-                                            });
+                                        let msg = FlighthookMessage::new(sim::ball_flight_event(
+                                            state,
+                                            key.clone(),
+                                            ball,
+                                        ));
                                         sender.send(stamp_device(msg, device_id));
                                     } else {
                                         warn!(

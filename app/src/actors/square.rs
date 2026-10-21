@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::sim;
 use crate::state::SystemState;
 
 use flighthook::{
@@ -35,7 +36,7 @@ pub struct SquareActor {
 }
 
 impl Actor for SquareActor {
-    fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let address = self.address.clone();
         let club = self.club;
         let advanced_spin = self.advanced_spin;
@@ -47,6 +48,7 @@ impl Actor for SquareActor {
             .name(thread_name)
             .spawn(move || {
                 run(
+                    &state,
                     address,
                     club,
                     advanced_spin,
@@ -243,7 +245,9 @@ fn face_impact_from_square(c: &allsquare::ClubMetrics) -> Option<FaceImpact> {
 // Run loop
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run(
+    state: &SystemState,
     address: Option<String>,
     club: Club,
     advanced_spin: bool,
@@ -276,6 +280,7 @@ fn run(
         emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
 
         match connect_and_run(
+            state,
             address.as_deref(),
             &mut current_club,
             advanced_spin,
@@ -338,6 +343,7 @@ fn run(
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn connect_and_run(
+    state: &SystemState,
     address: Option<&str>,
     current_club: &mut Club,
     advanced_spin: bool,
@@ -577,11 +583,8 @@ fn connect_and_run(
                             bf.sidespin_rpm.unwrap_or(0),
                         );
                         sender.send(
-                            FlighthookMessage::new(FlighthookEvent::BallFlight {
-                                key: key.clone(),
-                                ball: Box::new(bf),
-                            })
-                            .device(&name),
+                            FlighthookMessage::new(sim::ball_flight_event(state, key.clone(), bf))
+                                .device(&name),
                         );
 
                         // Club data is absent when the device could not track
@@ -707,6 +710,40 @@ mod tests {
         assert_eq!(bf.sidespin_rpm, Some(87), "device -87 (right) -> FRP +87");
         assert_eq!(bf.backspin_rpm, Some(621), "backspin is not flipped");
         assert_eq!(bf.launch_azimuth, Some(7.39), "azimuth is not flipped");
+    }
+
+    /// Device sidespin polarity carries through FRP into the simulation: the
+    /// device's negative (rightward) sidespin must land the ball right.
+    #[test]
+    fn device_fade_lands_right_in_the_simulation() {
+        let fade = allsquare::BallMetrics {
+            shot_type: 0x37,
+            speed: 3.30,
+            launch_angle: 32.51,
+            direction: 7.39,
+            total_spin: 627,
+            spin_axis: -8.00,
+            back_spin: 621,
+            side_spin: -87,
+        };
+        let cfg = flighthook::SimulationSection::default();
+        let d = sim::derive(&ball_from_square(&fade), &cfg).expect("simulated");
+        let off = d.carry_offline.expect("offline").as_meters();
+        assert!(off > 0.0, "{off}");
+
+        // The same fade at full speed and launched straight, so only the
+        // sidespin can move it right.
+        let straight = allsquare::BallMetrics {
+            speed: 60.0,
+            launch_angle: 14.0,
+            direction: 0.0,
+            back_spin: 3000,
+            side_spin: -600,
+            ..fade
+        };
+        let d = sim::derive(&ball_from_square(&straight), &cfg).expect("simulated");
+        let off = d.carry_offline.expect("offline").as_meters();
+        assert!(off > 0.0, "{off}");
     }
 
     fn ball(speed_ms: f64, total: i16, back: i16, side: i16) -> allsquare::BallMetrics {

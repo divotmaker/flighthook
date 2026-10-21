@@ -18,6 +18,7 @@ pub use flighthook::{
     Club,
     ClubData,
     ClubInfo,
+    DerivedFlight,
     // Config types
     Distance,
     DistanceExt,
@@ -38,6 +39,8 @@ pub use flighthook::{
     ShotData,
     ShotDetectionMode,
     ShotKey,
+    SimSurface,
+    SimulationSection,
     SquareSection,
     StatusResponse,
     UnitSystem,
@@ -58,6 +61,8 @@ pub struct ShotRow {
     pub shot_number: u32,
     pub ball: Option<BallFlight>,
     pub club: Option<ClubData>,
+    /// Simulated values for fields the device did not report (beta).
+    pub derived: Option<DerivedFlight>,
 }
 
 impl ShotRow {
@@ -70,6 +75,7 @@ impl ShotRow {
             ball: self.ball.clone(),
             club: self.club.clone(),
             impact: None,
+            derived: self.derived.clone(),
         };
         let converted = tmp.to_unit_system(system);
         ShotRow {
@@ -78,6 +84,7 @@ impl ShotRow {
             shot_number: self.shot_number,
             ball: converted.ball,
             club: converted.club,
+            derived: converted.derived,
         }
     }
 }
@@ -90,6 +97,7 @@ impl From<ShotData> for ShotRow {
             shot_number: shot.shot_number,
             ball: shot.ball,
             club: shot.club,
+            derived: shot.derived,
         }
     }
 }

@@ -11,7 +11,9 @@ shots in real time.
 Shot data arrives as a sequence of correlated events sharing a `ShotKey`:
 
 1. `shot_trigger` -- ball strike detected (no data yet)
-2. `ball_flight` -- ball flight data (speed, angles, distances, spin)
+2. `ball_flight` -- ball flight data (speed, angles, distances, spin), plus
+   `derived` values flighthook simulated for fields the device didn't report
+   (beta; see [ball_flight](#ball_flight))
 3. `club_path` -- club data (speed, path, attack angle, face angle, loft)
 4. `face_impact` -- face impact location
 5. `shot_finished` -- shot complete, accumulators should finalize
@@ -194,9 +196,17 @@ Shot history (most recent N shots, FIFO, max 1000 stored).
       "launch_elevation": 14.2,
       "carry_distance": "180.5m",
       "max_height": "28.3m",
-      "total_distance": "195.0m",
+      "flight_time": 6.4,
       "backspin_rpm": 3200,
       "sidespin_rpm": -450
+    },
+    "derived": {
+      "carry_offline": "-19.9m",
+      "descent_angle": 48.2,
+      "roll_distance": "20.3m",
+      "roll_offline": "-3.7m",
+      "total_distance": "200.8m",
+      "total_offline": "-23.6m"
     },
     "club": {
       "club_speed": "42.1mps",
@@ -220,8 +230,14 @@ With `?units=imperial`:
   "ball": {
     "launch_speed": "150.3mph",
     "carry_distance": "197.4yd",
-    "max_height": "92.8ft",
-    "total_distance": "213.3yd"
+    "max_height": "92.8ft"
+  },
+  "derived": {
+    "carry_offline": "-21.8yd",
+    "roll_distance": "22.2yd",
+    "roll_offline": "-4.1yd",
+    "total_distance": "219.6yd",
+    "total_offline": "-25.8yd"
   },
   "club": {
     "club_speed": "94.2mph",
@@ -231,9 +247,14 @@ With `?units=imperial`:
 }
 ```
 
-- `ball`: `BallFlight` or `null`. Launch conditions and distances. All fields are `Option`.
+- `ball`: `BallFlight` or `null`. Launch conditions and distances, exactly as
+  the device measured them. All fields are `Option`.
   Velocity fields are unit-tagged strings (`"67.2mps"`, `"150.3mph"`).
   Distance fields are unit-tagged strings (`"180.5m"`, `"197.4yd"`).
+- `derived`: `DerivedFlight` or absent. Values simulated for fields the device
+  didn't report (beta); see [ball_flight](#ball_flight) for the fields.
+  Converted by `?units=` like `ball` (distances to yards/meters, `max_height`
+  to feet/meters).
 - `club`: `ClubData` or `null`. Club head data. All fields are `Option`.
 - `impact`: `FaceImpact` or `null`. Face impact location.
 
@@ -296,7 +317,9 @@ unit-tagged strings and re-implement conversion math.
 ```
 
 Angles (degrees) and spin (RPM) pass through unchanged. The `actor` field
-is preserved as-is.
+is preserved as-is. A `derived` block, when present, is converted the same way
+(distances and offlines to yards or meters, `max_height` to feet or meters;
+`flight_time` and `descent_angle` unchanged).
 
 **Errors**:
 
@@ -334,6 +357,12 @@ Full persisted config (mirrors `config.toml`).
   "default_units": "imperial",
   "chipping_clubs": ["GW", "SW", "LW"],
   "putting_clubs": ["PT"],
+  "simulation": {
+    "enabled": true,
+    "altitude": "5280ft",
+    "temperature_c": 30.0,
+    "surface": "fairway"
+  },
   "webserver": {
     "0": {
       "name": "Web Server",
@@ -388,6 +417,14 @@ Full persisted config (mirrors `config.toml`).
 
 - Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `square.0`, `mock_monitor.0`,
   `openconnect_server.0`, `gspro.0`, `random_club.0`, `webserver.0`
+- `simulation` (beta) holds the settings for simulated values: `enabled`
+  (default `true`), `altitude` (unit-tagged distance, default `"0ft"`, valid
+  0 to 5000 m), `temperature_c` (default `25.0`, valid -30 to 50) and `surface`
+  ([`SimSurface`](#simsurface), default `"fairway"`). It is **omitted while every
+  setting is at its default**; an absent `simulation` means the defaults. Every
+  key is optional when posting. An out-of-range altitude or temperature turns
+  simulation off until it is fixed. Changes apply from the next shot without
+  restarting any actor
 - All launch monitor config fields are optional (omitted = use defaults)
 - R10 sections have only `name` (BLE auto-discovery; no address or radar settings)
 - `use_estimated` on Mevo sections controls whether estimated (E8) ball flights
@@ -588,15 +625,74 @@ Ball flight data available. May arrive before or after `club_path`.
       "launch_elevation": 14.2,
       "carry_distance": "180.5m",
       "max_height": "28.3m",
-      "total_distance": "195.0m",
+      "flight_time": 6.4,
       "backspin_rpm": 3200,
       "sidespin_rpm": -450
+    },
+    "derived": {
+      "carry_offline": "-19.9m",
+      "descent_angle": 48.2,
+      "roll_distance": "20.3m",
+      "roll_offline": "-3.7m",
+      "total_distance": "200.8m",
+      "total_offline": "-23.6m"
     }
   }
 }
 ```
 
 All `BallFlight` fields are `Option`. Missing fields are omitted from the JSON.
+
+**`derived` (beta)** is a flighthook extension: values simulated from the
+measured launch with the [dimple](https://crates.io/crates/dimple) ball-flight
+model, for fields the device did not report. Every field under `ball` is
+measured; every field under `derived` is simulated; a field is never in both.
+FRP consumers ignore it as an unknown field. It is absent when simulation is
+off, in putting mode, or when the launch can't be simulated — including a
+shot with no spin reading (back and side both 0) — see the README's
+"Simulated values" section for the rules. It is never sent to GSPro.
+
+A launch-monitor-only device such as the Square Golf Omni gets the full set:
+
+```json
+"ball": {
+  "launch_speed": "53.6mps",
+  "launch_azimuth": -1.2,
+  "launch_elevation": 17.0,
+  "backspin_rpm": 6500,
+  "sidespin_rpm": -300
+},
+"derived": {
+  "carry_distance": "155.4m",
+  "carry_offline": "-6.5m",
+  "max_height": "29.3m",
+  "flight_time": 5.9,
+  "descent_angle": 50.1,
+  "roll_distance": "8.7m",
+  "roll_offline": "-0.8m",
+  "total_distance": "164.1m",
+  "total_offline": "-7.3m"
+}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `carry_distance` | Distance | Tee to landing, horizontal. Only when the device didn't report carry |
+| `carry_offline` | Distance | Landing point right (+) or left (−) of the target line |
+| `max_height` | Distance | Apex above the tee. Only when the device didn't report it |
+| `flight_time` | number (s) | Launch to landing. Only when the device didn't report it |
+| `descent_angle` | number (deg) | Angle below horizontal at landing |
+| `roll_distance` | Distance | Landing to rest. Negative when the ball spins back. Only when the device didn't report roll |
+| `roll_offline` | Distance | Sideways movement from landing to rest, + right |
+| `total_distance` | Distance | Tee to rest. Only when the device didn't report total |
+| `total_offline` | Distance | Rest position right (+) or left (−) of the target line |
+
+Every field is optional. Offline values are absolute: + is right of the target
+line for every golfer, as in `launch_azimuth`. Where the device measures carry
+(or roll), `total_distance` is that measured carry plus the simulated roll, so
+carry + roll = total holds for the values a consumer displays. Roll, roll
+offline, total and total offline are omitted if the ground simulation does
+not reach rest.
 
 ---
 
@@ -913,6 +1009,11 @@ Change the global detection mode. Emits `SetDetectionMode` on the bus.
 ### UnitSystem
 
 `"imperial"` | `"metric"`
+
+### SimSurface
+
+`"fairway"` | `"green"` | `"firm_green"` -- flat ground for simulated landing
+and roll (beta).
 
 ### Velocity (unit-tagged string)
 

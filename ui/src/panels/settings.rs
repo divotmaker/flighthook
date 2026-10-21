@@ -2,7 +2,8 @@ use crate::app::FlighthookApp;
 use crate::net;
 use crate::types::{
     CameraMode, Club, Distance, DistanceExt, FlighthookConfig, GsProSection, MevoSection,
-    MockMonitorSection, R10Section, RandomClubSection, UnitSystem, WebserverSection,
+    MockMonitorSection, R10Section, RandomClubSection, SimSurface, SimulationSection, UnitSystem,
+    WebserverSection,
 };
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
@@ -416,12 +417,141 @@ pub(crate) enum SaveTarget {
     Full,
 }
 
+/// Altitude units offered for the simulation.
+const ALTITUDE_UNITS: &[(&str, &str)] = &[("feet", "ft"), ("meters", "m")];
+
+fn celsius_to_fahrenheit(c: f64) -> f64 {
+    c * 9.0 / 5.0 + 32.0
+}
+
+fn fahrenheit_to_celsius(f: f64) -> f64 {
+    (f - 32.0) * 5.0 / 9.0
+}
+
+/// Form state for the `[simulation]` section (beta).
+///
+/// Temperature is edited in °F when `fahrenheit` is set (imperial default
+/// units), °C otherwise, and stored as °C rounded to 0.1. Fields left as
+/// loaded save their loaded value exactly.
+#[derive(Clone)]
+pub(crate) struct SimulationForm {
+    pub(crate) enabled: bool,
+    pub(crate) altitude_val: String,
+    pub(crate) altitude_unit: String,
+    pub(crate) temperature_val: String,
+    pub(crate) fahrenheit: bool,
+    pub(crate) surface: SimSurface,
+    loaded: SimulationSection,
+}
+
+impl Default for SimulationForm {
+    fn default() -> Self {
+        Self::from_section(&SimulationSection::default(), UnitSystem::default())
+    }
+}
+
+impl SimulationForm {
+    pub(crate) fn from_section(s: &SimulationSection, units: UnitSystem) -> Self {
+        let fahrenheit = units == UnitSystem::Imperial;
+        // A zero altitude carries no unit of its own, so show it in the
+        // user's default unit system rather than whatever unit it happened
+        // to be stored in.
+        let altitude_unit = if units == UnitSystem::Metric && s.altitude.as_meters() == 0.0 {
+            "meters"
+        } else {
+            s.altitude.unit_key()
+        };
+        Self {
+            enabled: s.enabled,
+            altitude_val: format_distance_value(s.altitude.value()),
+            altitude_unit: altitude_unit.to_string(),
+            temperature_val: Self::temperature_text(s.temperature_c, fahrenheit),
+            fahrenheit,
+            surface: s.surface,
+            loaded: s.clone(),
+        }
+    }
+
+    fn temperature_text(c: f64, fahrenheit: bool) -> String {
+        format_distance_value(if fahrenheit {
+            celsius_to_fahrenheit(c)
+        } else {
+            c
+        })
+    }
+
+    /// Switch the temperature display unit, converting the typed value.
+    pub(crate) fn set_fahrenheit(&mut self, fahrenheit: bool) {
+        if fahrenheit == self.fahrenheit {
+            return;
+        }
+        if let Some(c) = self.temperature_c() {
+            self.temperature_val = Self::temperature_text(c, fahrenheit);
+        }
+        self.fahrenheit = fahrenheit;
+    }
+
+    pub(crate) fn temperature_unit(&self) -> &'static str {
+        if self.fahrenheit { "°F" } else { "°C" }
+    }
+
+    fn altitude(&self) -> Option<Distance> {
+        let loaded = &self.loaded.altitude;
+        if self.altitude_val == format_distance_value(loaded.value())
+            && self.altitude_unit == loaded.unit_key()
+        {
+            return Some(*loaded);
+        }
+        let v: f64 = self.altitude_val.trim().parse().ok()?;
+        // Zero is zero regardless of unit: an untouched zero altitude shown
+        // in a different unit than it was loaded in (see `from_section`) is
+        // still unchanged, and must save as the exact value loaded.
+        if v == 0.0 && loaded.as_meters() == 0.0 {
+            return Some(*loaded);
+        }
+        Some(Distance::from_value_and_unit(v, &self.altitude_unit))
+    }
+
+    fn temperature_c(&self) -> Option<f64> {
+        if self.temperature_val
+            == Self::temperature_text(self.loaded.temperature_c, self.fahrenheit)
+        {
+            return Some(self.loaded.temperature_c);
+        }
+        let v: f64 = self.temperature_val.trim().parse().ok()?;
+        let c = if self.fahrenheit {
+            fahrenheit_to_celsius(v)
+        } else {
+            v
+        };
+        Some((c * 10.0).round() / 10.0)
+    }
+
+    /// The section to save, or `None` while a field is unparsable or out of
+    /// range.
+    pub(crate) fn to_section(&self) -> Option<SimulationSection> {
+        let s = SimulationSection {
+            enabled: self.enabled,
+            altitude: self.altitude()?,
+            temperature_c: self.temperature_c()?,
+            surface: self.surface,
+        };
+        s.environment_error().is_none().then_some(s)
+    }
+
+    /// The section to save, falling back to the loaded one while invalid.
+    fn to_section_or_loaded(&self) -> SimulationSection {
+        self.to_section().unwrap_or_else(|| self.loaded.clone())
+    }
+}
+
 /// Settings form state.
 #[derive(Clone)]
 pub(crate) struct SettingsForm {
     pub(crate) default_units: UnitSystem,
     pub(crate) chipping_clubs: Vec<Club>,
     pub(crate) putting_clubs: Vec<Club>,
+    pub(crate) simulation: SimulationForm,
     pub(crate) global_dirty: bool,
     pub(crate) actors: Vec<ActorFormEntry>,
     pub(crate) loaded: bool,
@@ -438,6 +568,7 @@ impl Default for SettingsForm {
             default_units: UnitSystem::default(),
             chipping_clubs: flighthook::default_chipping_clubs(),
             putting_clubs: flighthook::default_putting_clubs(),
+            simulation: SimulationForm::default(),
             global_dirty: false,
             actors: Vec::new(),
             loaded: false,
@@ -455,6 +586,7 @@ impl SettingsForm {
         self.default_units = s.default_units;
         self.chipping_clubs = s.chipping_clubs.clone();
         self.putting_clubs = s.putting_clubs.clone();
+        self.simulation = SimulationForm::from_section(&s.simulation, s.default_units);
         self.global_dirty = false;
 
         self.actors.clear();
@@ -535,6 +667,9 @@ impl SettingsForm {
     }
 
     pub(crate) fn is_valid(&self) -> bool {
+        if self.simulation.to_section().is_none() {
+            return false;
+        }
         for actor in &self.actors {
             match actor {
                 ActorFormEntry::Device(dev) => {
@@ -732,6 +867,7 @@ impl SettingsForm {
             default_units: self.default_units,
             chipping_clubs: self.chipping_clubs.clone(),
             putting_clubs: self.putting_clubs.clone(),
+            simulation: self.simulation.to_section_or_loaded(),
             webserver,
             mevo,
             r10,
@@ -753,6 +889,7 @@ impl SettingsForm {
         config.default_units = self.default_units;
         config.chipping_clubs = self.chipping_clubs.clone();
         config.putting_clubs = self.putting_clubs.clone();
+        config.simulation = self.simulation.to_section_or_loaded();
         config
     }
 
@@ -777,6 +914,8 @@ impl SettingsForm {
                     orig.default_units = self.default_units;
                     orig.chipping_clubs = self.chipping_clubs.clone();
                     orig.putting_clubs = self.putting_clubs.clone();
+                    orig.simulation = self.simulation.to_section_or_loaded();
+                    self.simulation.loaded = orig.simulation.clone();
                 }
             }
             SaveTarget::Actor(idx) => {
@@ -997,12 +1136,14 @@ impl FlighthookApp {
                         .show_ui(ui, |ui| {
                             if ui.selectable_label(self.settings.default_units == UnitSystem::Imperial, "Imperial").clicked() {
                                 self.settings.default_units = UnitSystem::Imperial;
+                                self.settings.simulation.set_fahrenheit(true);
                                 self.settings.global_dirty = true;
                                 self.settings.dirty = true;
                                 self.units_toggle = UnitSystem::Imperial;
                             }
                             if ui.selectable_label(self.settings.default_units == UnitSystem::Metric, "Metric").clicked() {
                                 self.settings.default_units = UnitSystem::Metric;
+                                self.settings.simulation.set_fahrenheit(false);
                                 self.settings.global_dirty = true;
                                 self.settings.dirty = true;
                                 self.units_toggle = UnitSystem::Metric;
@@ -1054,6 +1195,76 @@ impl FlighthookApp {
                             }
                         }
                     });
+                }
+
+                // --- Simulated values (beta) ---
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Simulated values (beta)").strong().size(12.0))
+                    .on_hover_text("When a launch monitor doesn't report carry, apex, flight time, descent, offline, roll or total, flighthook simulates them from the measured launch. Shown in italics in the Shots tab. Never sent to GSPro, which simulates the flight itself.");
+                let sim = &mut self.settings.simulation;
+                let mut sim_changed = false;
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    sim_changed |= ui
+                        .checkbox(&mut sim.enabled, "Simulate values the device doesn't report")
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label("Altitude:").on_hover_text("Altitude above sea level, 0 to 5000 m (16,404 ft).");
+                    sim_changed |= ui
+                        .add(egui::TextEdit::singleline(&mut sim.altitude_val).desired_width(field_width))
+                        .changed();
+                    egui::ComboBox::from_id_salt("sim_altitude_unit")
+                        .selected_text(unit_suffix(&sim.altitude_unit))
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            for &(key, label) in ALTITUDE_UNITS {
+                                if ui.selectable_label(sim.altitude_unit == key, label).clicked() {
+                                    sim.altitude_unit = key.to_string();
+                                    sim_changed = true;
+                                }
+                            }
+                        });
+                    if sim.altitude().is_none_or(|a| {
+                        let m = a.as_meters();
+                        !(m.is_finite() && (0.0..=SimulationSection::MAX_ALTITUDE_M).contains(&m))
+                    }) {
+                        ui.label(egui::RichText::new("0 to 5000 m").color(egui::Color32::from_rgb(255, 80, 80)).size(11.0));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label("Temperature:").on_hover_text("Air temperature, -30 to 50 °C (-22 to 122 °F). Defaults to 25 °C (77 °F).");
+                    sim_changed |= ui
+                        .add(egui::TextEdit::singleline(&mut sim.temperature_val).desired_width(field_width))
+                        .changed();
+                    ui.label(sim.temperature_unit());
+                    if sim.temperature_c().is_none_or(|c| {
+                        !(SimulationSection::MIN_TEMPERATURE_C..=SimulationSection::MAX_TEMPERATURE_C).contains(&c)
+                    }) {
+                        let range = if sim.fahrenheit { "-22 to 122 °F" } else { "-30 to 50 °C" };
+                        ui.label(egui::RichText::new(range).color(egui::Color32::from_rgb(255, 80, 80)).size(11.0));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label("Surface:").on_hover_text("Flat ground the ball lands and rolls on.");
+                    egui::ComboBox::from_id_salt("sim_surface")
+                        .selected_text(sim.surface.label())
+                        .width(field_width)
+                        .show_ui(ui, |ui| {
+                            for surface in SimSurface::all() {
+                                if ui.selectable_label(sim.surface == surface, surface.label()).clicked() {
+                                    sim.surface = surface;
+                                    sim_changed = true;
+                                }
+                            }
+                        });
+                });
+                if sim_changed {
+                    self.settings.global_dirty = true;
+                    self.settings.dirty = true;
                 }
 
                 ui.add_space(8.0);
@@ -1701,6 +1912,98 @@ impl FlighthookApp {
 #[cfg(test)]
 mod tests {
     use super::is_ble_address;
+    use super::{SettingsForm, SimulationForm};
+    use crate::types::{Distance, FlighthookConfig, SimSurface, SimulationSection, UnitSystem};
+
+    #[test]
+    fn simulation_form_round_trips_defaults_exactly() {
+        for units in [UnitSystem::Imperial, UnitSystem::Metric] {
+            let form = SimulationForm::from_section(&SimulationSection::default(), units);
+            assert_eq!(form.to_section(), Some(SimulationSection::default()));
+        }
+        let imperial =
+            SimulationForm::from_section(&SimulationSection::default(), UnitSystem::Imperial);
+        assert_eq!(imperial.temperature_val, "77");
+        assert_eq!(imperial.temperature_unit(), "°F");
+    }
+
+    #[test]
+    fn untouched_odd_values_save_unchanged() {
+        let s = SimulationSection {
+            altitude: Distance::Yards(12.345),
+            temperature_c: 21.37,
+            ..SimulationSection::default()
+        };
+        let form = SimulationForm::from_section(&s, UnitSystem::Imperial);
+        assert_eq!(form.to_section(), Some(s));
+    }
+
+    #[test]
+    fn metric_units_show_a_zero_altitude_in_meters() {
+        let form = SimulationForm::from_section(&SimulationSection::default(), UnitSystem::Metric);
+        assert_eq!(form.altitude_unit, "meters");
+        // Untouched, it still saves as the exact loaded (imperial) default.
+        assert_eq!(form.to_section(), Some(SimulationSection::default()));
+
+        let imperial =
+            SimulationForm::from_section(&SimulationSection::default(), UnitSystem::Imperial);
+        assert_eq!(imperial.altitude_unit, "feet");
+    }
+
+    #[test]
+    fn fahrenheit_is_stored_as_celsius() {
+        let mut form =
+            SimulationForm::from_section(&SimulationSection::default(), UnitSystem::Imperial);
+        form.temperature_val = "86".into();
+        assert_eq!(form.to_section().map(|s| s.temperature_c), Some(30.0));
+        form.temperature_val = "50.5".into();
+        assert_eq!(form.to_section().map(|s| s.temperature_c), Some(10.3));
+        form.set_fahrenheit(false);
+        assert_eq!(form.temperature_val, "10.3");
+        assert_eq!(form.to_section().map(|s| s.temperature_c), Some(10.3));
+    }
+
+    #[test]
+    fn out_of_range_or_unparsable_values_are_invalid() {
+        let base = SimulationForm::from_section(&SimulationSection::default(), UnitSystem::Metric);
+        for (alt, unit, temp) in [
+            ("5001", "meters", "25"),
+            ("16500", "feet", "25"),
+            ("-1", "meters", "25"),
+            ("abc", "meters", "25"),
+            ("0", "meters", "50.2"),
+            ("0", "meters", "-31"),
+            ("0", "meters", "warm"),
+            ("NaN", "meters", "25"),
+        ] {
+            let mut f = base.clone();
+            f.altitude_val = alt.into();
+            f.altitude_unit = unit.into();
+            f.temperature_val = temp.into();
+            assert_eq!(f.to_section(), None, "{alt} {unit} {temp}");
+            let form = SettingsForm {
+                simulation: f,
+                ..SettingsForm::default()
+            };
+            assert!(!form.is_valid(), "{alt} {unit} {temp}");
+        }
+        let mut f = base;
+        f.altitude_val = "5280".into();
+        f.altitude_unit = "feet".into();
+        f.surface = SimSurface::Green;
+        let s = f.to_section().expect("valid");
+        assert!((s.altitude.as_meters() - 1609.344).abs() < 1e-9);
+        assert_eq!(s.surface, SimSurface::Green);
+    }
+
+    #[test]
+    fn loading_a_default_config_keeps_simulation_off_the_wire() {
+        let mut form = SettingsForm::default();
+        form.load_from(&FlighthookConfig::default());
+        let json = serde_json::to_string(&form.build_global_request()).expect("ser");
+        assert!(!json.contains("simulation"), "{json}");
+        assert!(form.is_valid());
+    }
 
     #[test]
     fn ble_address_accepts_mac_and_uuid() {

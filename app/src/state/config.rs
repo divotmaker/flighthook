@@ -53,6 +53,8 @@ struct LegacyFlighthookConfig {
     chipping_clubs: Vec<flighthook::Club>,
     #[serde(default = "flighthook::default_putting_clubs")]
     putting_clubs: Vec<flighthook::Club>,
+    #[serde(default)]
+    simulation: flighthook::SimulationSection,
     webserver: Option<flighthook::WebserverSection>,
     #[serde(default)]
     mevo: HashMap<String, flighthook::MevoSection>,
@@ -77,6 +79,7 @@ impl LegacyFlighthookConfig {
             default_units: self.default_units,
             chipping_clubs: self.chipping_clubs,
             putting_clubs: self.putting_clubs,
+            simulation: self.simulation,
             webserver,
             mevo: self.mevo,
             r10: HashMap::new(),
@@ -181,6 +184,16 @@ impl SystemConfig {
         self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Clone just the `[simulation]` section. Device threads read it once per
+    /// shot, so changes apply on the next shot without restarting actors.
+    pub fn simulation(&self) -> flighthook::SimulationSection {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .simulation
+            .clone()
+    }
+
     /// Mutate the cached config in place, then persist to disk.
     pub fn update(&self, f: impl FnOnce(&mut FlighthookConfig)) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
@@ -193,5 +206,104 @@ impl SystemConfig {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         *guard = new;
         save_to(&self.path, &guard);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `FlighthookConfig::default()` as written to disk, with no
+    /// `[simulation]` table. An untouched config must not gain one.
+    const GOLDEN_DEFAULT_TOML: &str = r#"default_units = "imperial"
+chipping_clubs = [
+    "GW",
+    "SW",
+    "LW",
+]
+putting_clubs = ["PT"]
+
+[webserver.0]
+name = "Web Server"
+bind = "0.0.0.0:5880"
+"#;
+
+    #[test]
+    fn default_config_file_is_unchanged() {
+        let toml = toml::to_string_pretty(&FlighthookConfig::default()).expect("ser");
+        assert_eq!(toml, GOLDEN_DEFAULT_TOML);
+    }
+
+    #[test]
+    fn file_without_simulation_parses_to_defaults() {
+        let c: FlighthookConfig = toml::from_str(GOLDEN_DEFAULT_TOML).expect("parses");
+        assert_eq!(c.simulation, flighthook::SimulationSection::default());
+    }
+
+    #[test]
+    fn simulation_table_round_trips() {
+        let src = "[simulation]\nenabled = false\naltitude = \"5280ft\"\ntemperature_c = 30.0\nsurface = \"green\"\n";
+        let file =
+            format!("{src}\n[webserver.0]\nname = \"Web Server\"\nbind = \"0.0.0.0:5880\"\n");
+        let c: FlighthookConfig = toml::from_str(&file).expect("parses");
+        assert!(!c.simulation.enabled);
+        assert_eq!(c.simulation.surface, flighthook::SimSurface::Green);
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(out.contains(src), "{out}");
+        // The table sits before the per-actor tables.
+        let sim = out.find("[simulation]").expect("simulation table");
+        let web = out.find("[webserver.0]").expect("webserver table");
+        assert!(sim < web, "{out}");
+    }
+
+    #[test]
+    fn legacy_migration_carries_simulation_through() {
+        let src = r#"
+[simulation]
+enabled = false
+altitude = "5280ft"
+temperature_c = 30.0
+surface = "green"
+
+[webserver]
+name = "Web Server"
+bind = "0.0.0.0:5880"
+"#;
+        let legacy: LegacyFlighthookConfig = toml::from_str(src).expect("parses");
+        let config = legacy.into_current();
+        assert!(!config.simulation.enabled);
+        assert_eq!(config.simulation.surface, flighthook::SimSurface::Green);
+        assert!((config.simulation.temperature_c - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn legacy_config_without_simulation_migrates_to_defaults() {
+        let src = r#"
+[webserver]
+name = "Web Server"
+bind = "0.0.0.0:5880"
+"#;
+        let legacy: LegacyFlighthookConfig = toml::from_str(src).expect("parses");
+        let config = legacy.into_current();
+        assert_eq!(config.simulation, flighthook::SimulationSection::default());
+    }
+
+    /// Removes the directory on drop, so a failing assertion doesn't leak it.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn simulation_reads_the_live_section() {
+        let dir =
+            TempDir(std::env::temp_dir().join(format!("flighthook-config-test-{}", generate_id())));
+        let cfg = SystemConfig::new(dir.0.join("config.toml"));
+        assert!(cfg.simulation().enabled);
+        cfg.update(|c| c.simulation.enabled = false);
+        assert!(!cfg.simulation().enabled);
     }
 }

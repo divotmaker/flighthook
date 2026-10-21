@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::sim;
 use crate::state::SystemState;
 
 use flighthook::{
@@ -29,7 +30,7 @@ pub struct R10Actor {
 }
 
 impl Actor for R10Actor {
-    fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let initial_mode = self.initial_mode;
         let tee_range_yards = self.tee_range_yards;
         let thread_name = format!("device:{}", sender.actor_id());
@@ -37,7 +38,7 @@ impl Actor for R10Actor {
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                run(initial_mode, tee_range_yards, sender, receiver);
+                run(&state, initial_mode, tee_range_yards, sender, receiver);
             })
             .expect("failed to spawn r10 thread");
     }
@@ -127,6 +128,7 @@ fn club_from_r10(c: &tenover::proto::ClubData) -> ClubData {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run(
+    state: &SystemState,
     _initial_mode: ShotDetectionMode,
     tee_range_yards: Option<f32>,
     sender: BusSender,
@@ -144,6 +146,7 @@ fn run(
         emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
 
         match connect_and_run(
+            state,
             &sender,
             &mut receiver,
             &mut ever_connected,
@@ -205,6 +208,7 @@ fn run(
 
 #[allow(clippy::too_many_lines)]
 fn connect_and_run(
+    state: &SystemState,
     sender: &BusSender,
     receiver: &mut BusReceiver,
     ever_connected: &mut bool,
@@ -345,10 +349,11 @@ fn connect_and_run(
                                 bf.sidespin_rpm.unwrap_or(0),
                             );
                             sender.send(
-                                FlighthookMessage::new(FlighthookEvent::BallFlight {
-                                    key: key.clone(),
-                                    ball: Box::new(bf),
-                                })
+                                FlighthookMessage::new(sim::ball_flight_event(
+                                    state,
+                                    key.clone(),
+                                    bf,
+                                ))
                                 .device(&addr),
                             );
                         }

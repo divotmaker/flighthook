@@ -13,6 +13,7 @@ use tracing::info;
 
 use crate::actors::Actor;
 use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::sim;
 use crate::state::SystemState;
 use flighthook::{
     ActorStatus, BallFlight, ClubData, Distance, FlighthookEvent, FlighthookMessage,
@@ -42,14 +43,14 @@ pub struct MockLaunchActor {
 }
 
 impl Actor for MockLaunchActor {
-    fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let initial_mode = self.initial_mode;
         let device_id = format!("mock-{}", sender.actor_id());
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
-            .spawn(move || run(initial_mode, device_id, sender, receiver))
+            .spawn(move || run(&state, initial_mode, device_id, sender, receiver))
             .expect("failed to spawn mock launch thread");
     }
 }
@@ -79,6 +80,7 @@ fn telemetry(
 }
 
 fn run(
+    state: &SystemState,
     initial_mode: ShotDetectionMode,
     device_id: String,
     sender: BusSender,
@@ -215,11 +217,8 @@ fn run(
                         .device(device_id.as_str()),
                 );
                 sender.send(
-                    FlighthookMessage::new(FlighthookEvent::BallFlight {
-                        key: key.clone(),
-                        ball: Box::new(ball),
-                    })
-                    .device(device_id.as_str()),
+                    FlighthookMessage::new(sim::ball_flight_event(state, key.clone(), ball))
+                        .device(device_id.as_str()),
                 );
                 sender.send(
                     FlighthookMessage::new(FlighthookEvent::ClubPath {

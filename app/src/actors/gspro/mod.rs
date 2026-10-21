@@ -280,7 +280,10 @@ fn connect_and_run(
                         let acc = ShotAccumulator::new(msg.actor.clone(), key.clone());
                         accumulators.insert((msg.actor.clone(), key.clone()), acc);
                     }
-                    FlighthookEvent::BallFlight { ref key, ref ball } => {
+                    // `derived` is ignored: GSPro simulates the flight itself.
+                    FlighthookEvent::BallFlight {
+                        ref key, ref ball, ..
+                    } => {
                         if let Some(acc) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
                             acc.set_ball(*ball.clone());
                         }

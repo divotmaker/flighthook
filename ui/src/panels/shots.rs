@@ -1,11 +1,42 @@
 use crate::app::FlighthookApp;
-use crate::types::UnitSystem;
+use crate::types::{Distance, UnitSystem};
 
 /// Format an optional f64 with the given precision, or "-" if None.
 fn opt_f(v: Option<f64>, prec: usize) -> String {
     match v {
         Some(v) => format!("{v:.prec$}"),
         None => "-".into(),
+    }
+}
+
+/// Hover text on every simulated cell.
+const SIMULATED_HINT: &str = "Simulated (beta), not measured by the device";
+
+/// Number of ball columns: launch, results and spin.
+const BALL_COLUMNS: usize = 12;
+
+/// Render a value that is either measured or simulated: the measured value
+/// plainly, else the simulated one in italics, else "-". `signed` prints an
+/// explicit `+` (offlines, roll).
+fn cell(ui: &mut egui::Ui, measured: Option<f64>, derived: Option<f64>, prec: usize, signed: bool) {
+    let fmt = |v: f64| {
+        if signed {
+            format!("{v:+.prec$}")
+        } else {
+            format!("{v:.prec$}")
+        }
+    };
+    match (measured, derived) {
+        (Some(v), _) => {
+            ui.label(fmt(v));
+        }
+        (None, Some(v)) => {
+            ui.label(egui::RichText::new(fmt(v)).italics())
+                .on_hover_text(SIMULATED_HINT);
+        }
+        (None, None) => {
+            ui.label("-");
+        }
     }
 }
 
@@ -35,6 +66,17 @@ impl FlighthookApp {
             if ui.selectable_label(!imperial, "Metric").clicked() && imperial {
                 self.units_toggle = UnitSystem::Metric;
             }
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new("italic = simulated (beta)")
+                    .italics()
+                    .weak()
+                    .size(11.0),
+            )
+            .on_hover_text(
+                "Values the launch monitor did not report, simulated from the measured launch. \
+                 Offline is + right of the target line.",
+            );
         });
 
         let units = self.units_toggle;
@@ -58,6 +100,11 @@ impl FlighthookApp {
                         hdr(ui, "HLA\ndeg");
                         hdr(ui, &format!("Carry\n{dist_label}"));
                         hdr(ui, &format!("Height\n{height_label}"));
+                        hdr(ui, &format!("Offline\n{dist_label}"));
+                        hdr(ui, "Desc\ndeg");
+                        hdr(ui, &format!("Roll\n{dist_label}"));
+                        hdr(ui, &format!("Total\n{dist_label}"));
+                        hdr(ui, &format!("T.Offline\n{dist_label}"));
                         hdr(ui, "Back\nrpm");
                         hdr(ui, "Side\nrpm");
                         hdr(ui, &format!("Club\n{speed_label}"));
@@ -84,15 +131,22 @@ impl FlighthookApp {
                             ui.label(format!("{}", shot.shot_number));
 
                             if let Some(ref f) = converted.ball {
+                                let d = converted.derived.clone().unwrap_or_default();
+                                let v = |x: Option<Distance>| x.map(|x| x.value());
                                 ui.label(opt_f(f.launch_speed.map(|v| v.value()), 1));
                                 ui.label(opt_f(f.launch_elevation, 1));
                                 ui.label(opt_f(f.launch_azimuth, 1));
-                                ui.label(opt_f(f.carry_distance.map(|d| d.value()), 1));
-                                ui.label(opt_f(f.max_height.map(|d| d.value()), 1));
+                                cell(ui, v(f.carry_distance), v(d.carry_distance), 1, false);
+                                cell(ui, v(f.max_height), v(d.max_height), 1, false);
+                                cell(ui, None, v(d.carry_offline), 1, true);
+                                cell(ui, None, d.descent_angle, 1, false);
+                                cell(ui, v(f.roll_distance), v(d.roll_distance), 1, true);
+                                cell(ui, v(f.total_distance), v(d.total_distance), 1, false);
+                                cell(ui, None, v(d.total_offline), 1, true);
                                 ui.label(opt_i(f.backspin_rpm));
                                 ui.label(opt_i(f.sidespin_rpm));
                             } else {
-                                for _ in 0..7 {
+                                for _ in 0..BALL_COLUMNS {
                                     ui.label("-");
                                 }
                             }

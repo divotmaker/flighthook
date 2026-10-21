@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 mod actors;
 mod bus;
+mod sim;
 mod state;
 
 use actors::Actor;

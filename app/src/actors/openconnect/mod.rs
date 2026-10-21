@@ -34,6 +34,7 @@ use std::time::Duration;
 use super::gspro::api;
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender};
+use crate::sim;
 use crate::state::SystemState;
 use flighthook::{ActorStatus, FlighthookEvent, FlighthookMessage, RawPayload, Severity, ShotKey};
 
@@ -49,13 +50,13 @@ pub struct OpenConnectServerActor {
 }
 
 impl Actor for OpenConnectServerActor {
-    fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let bind = self.bind;
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
-            .spawn(move || run(bind, sender, receiver))
+            .spawn(move || run(&state, bind, sender, receiver))
             .expect("failed to spawn openconnect thread");
     }
 
@@ -81,7 +82,7 @@ impl Actor for OpenConnectServerActor {
 /// Listener loop. Rebinds with linear backoff if the bind fails (typically
 /// because GSPro or another instance already holds the port — see the module
 /// docs for moving GSPConnect to 922).
-fn run(bind: SocketAddr, sender: BusSender, mut receiver: BusReceiver) {
+fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: BusReceiver) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(15);
 
@@ -132,7 +133,7 @@ fn run(bind: SocketAddr, sender: BusSender, mut receiver: BusReceiver) {
             match listener.accept() {
                 Ok((stream, peer)) => {
                     tracing::info!("openconnect server: {peer} connected");
-                    serve(stream, peer, &sender, &mut receiver);
+                    serve(state, stream, peer, &sender, &mut receiver);
                     if receiver.is_shutdown() {
                         return;
                     }
@@ -163,6 +164,7 @@ struct Peer {
 
 /// Serve a single connected monitor until it disconnects or we shut down.
 fn serve(
+    state: &SystemState,
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     sender: &BusSender,
@@ -213,7 +215,7 @@ fn serve(
                     }));
                     return;
                 }
-                if !drain(&mut buf, &mut stream, &mut peer, sender, name) {
+                if !drain(state, &mut buf, &mut stream, &mut peer, sender, name) {
                     return;
                 }
             }
@@ -240,6 +242,7 @@ fn serve(
 ///
 /// Returns false if the connection should be dropped.
 fn drain(
+    state: &SystemState,
     buf: &mut Vec<u8>,
     stream: &mut TcpStream,
     peer: &mut Peer,
@@ -257,7 +260,7 @@ fn drain(
                 let consumed = iter.byte_offset();
                 let raw = String::from_utf8_lossy(&buf[..consumed]).into_owned();
                 buf.drain(..consumed);
-                if !handle(msg, raw, stream, peer, sender, name) {
+                if !handle(state, msg, raw, stream, peer, sender, name) {
                     return false;
                 }
             }
@@ -279,6 +282,7 @@ fn drain(
 ///
 /// Returns false if the connection should be dropped.
 fn handle(
+    state: &SystemState,
     msg: api::GsProMessage,
     raw: String,
     stream: &mut TcpStream,
@@ -331,7 +335,7 @@ fn handle(
 
     let is_shot = !msg.shot_data_options.is_heart_beat && msg.shot_data_options.contains_ball_data;
     if is_shot {
-        emit_shot(&msg, &payload, sender);
+        emit_shot(state, &msg, &payload, sender);
     }
 
     let reply = api::GsProResponse::ok(if is_shot {
@@ -355,7 +359,12 @@ fn handle(
 }
 
 /// Publish the standard shot lifecycle for one Open Connect shot message.
-fn emit_shot(msg: &api::GsProMessage, payload: &RawPayload, sender: &BusSender) {
+fn emit_shot(
+    state: &SystemState,
+    msg: &api::GsProMessage,
+    payload: &RawPayload,
+    sender: &BusSender,
+) {
     let device = msg.device_id.as_str();
     let key = ShotKey {
         shot_id: uuid::Uuid::new_v4().to_string(),
@@ -379,12 +388,9 @@ fn emit_shot(msg: &api::GsProMessage, payload: &RawPayload, sender: &BusSender) 
             .device(device),
     );
     sender.send(
-        FlighthookMessage::new(FlighthookEvent::BallFlight {
-            key: key.clone(),
-            ball: Box::new(ball),
-        })
-        .raw(payload.clone())
-        .device(device),
+        FlighthookMessage::new(sim::ball_flight_event(state, key.clone(), ball))
+            .raw(payload.clone())
+            .device(device),
     );
 
     if msg.shot_data_options.contains_club_data {

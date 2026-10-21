@@ -26,6 +26,14 @@ Spin arrives one of two ways depending on the monitor: explicit back/side
 components, or a total plus a spin axis. Both are handled — a total-and-axis
 reading is decomposed into back/side on the way onto the bus.
 
+Values the monitor doesn't send (apex, flight time, descent, offline, roll,
+total, and carry when absent) are simulated from the launch, as for every
+device, and marked as simulated; see the README's
+[Simulated values](../../README.md#simulated-values-beta) section. When the
+monitor sends carry, total is that carry plus the simulated roll. Launch
+direction and sidespin are put on the bus as the monitor sends them, so the
+simulated offlines follow the monitor's sign convention.
+
 ## Licensing
 
 Third-party output is licensed separately by Uneekor and it varies by model:

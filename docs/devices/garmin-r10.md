@@ -9,6 +9,15 @@ The R10 is auto-detected from the system's connected Bluetooth devices, so the
 config section carries no address field. Pair the R10 with the host operating
 system first, then start flighthook.
 
+## Carry and total (beta, simulated)
+
+The R10 reports launch data, not carry. flighthook simulates carry, apex,
+flight time, descent angle, offline, roll and total from the measured launch
+and shows them in *italics*, as `derived` in the API, and in a
+`sim (estimated, beta)` log line; see the README's
+[Simulated values](../../README.md#simulated-values-beta) section. GSPro still
+receives the launch data only.
+
 ## Configuration
 
 ```toml

@@ -97,9 +97,55 @@ Terminal. Allow it.
 - Automatic detection mode switching based on club selection (full / chipping / putting)
 - Club selection is forwarded to devices that use it — the Square Golf Omni has no
   separate putting mode, so selecting a putter in the sim puts it in putting mode
+- Simulated carry, apex, descent, offline, roll and total for launch monitors that
+  measure launch only (beta) — see [Simulated values](#simulated-values-beta)
 - Dual UI: native desktop window (eframe/egui) and browser dashboard (WASM, same codebase)
 - Configurable via TOML file with live settings updates
 - REST + WebSocket API for external consumers — subscribe to shot data, device telemetry, and raw audit events in real time. Build custom shot triggers, data loggers, or alternative integrations without touching the core.
+
+### Simulated values (beta)
+
+When a launch monitor doesn't report carry, apex, flight time, descent angle,
+offline, roll or total, flighthook simulates them from the measured launch (ball
+speed, launch angle, launch direction, backspin, sidespin) with the
+[dimple](https://crates.io/crates/dimple) ball-flight model: modern tour ball,
+flat fairway, sea level and 25 °C by default. A measured value always wins;
+flighthook only fills gaps and never changes what the device sent.
+
+- Simulated values are marked `derived` in the API, shown in *italics* in the
+  dashboard, and logged as `sim (estimated, beta)` under the device's ball line.
+- They are **never sent to GSPro**, which simulates the flight itself.
+- Offline is the distance right (+) or left (−) of the target line. Roll is
+  negative when the ball spins back toward the tee.
+- When the device measures carry, total is that measured carry plus the
+  simulated roll.
+- A shot is simulated only when the device reports all five launch values, the
+  ball speed is at least 5 mph, the launch angle is between 0° and 90°, and the
+  launch direction is within ±90°. A shot with no spin reading (back and side
+  both 0) is not simulated.
+- Putts are not simulated: not in putting mode, and not for any shot slower than
+  15 mph launched below 5° (this catches putts when no club has been selected).
+
+Carry is fitted to Trackman PGA Tour averages (about 3 yd RMSE); roll and total
+are beta in dimple and not yet validated against measured data, so treat them
+as estimates. Known model limits are listed in dimple's
+[AERO.md](https://github.com/divotmaker/dimple/blob/main/docs/AERO.md). When
+comparing against another launch monitor, set altitude and temperature to its
+normalization conditions.
+
+Settings live under `[simulation]` (all keys optional) or in Settings → Global:
+
+```toml
+[simulation]
+enabled = true            # false turns simulated values off
+altitude = "0ft"          # any distance unit, 0 to 5000 m
+temperature_c = 25.0      # -30 to 50
+surface = "fairway"       # fairway | green | firm_green
+```
+
+An altitude or temperature outside its range turns simulation off (with a
+warning in the log) until it is fixed. Changes apply from the next shot,
+without a restart.
 
 ### Shot Tracking
 
@@ -135,6 +181,13 @@ TOML file auto-created on first run at the platform config directory:
 - **macOS**: `~/Library/Application Support/flighthook/config.toml`
 
 ```toml
+# optional; simulated values (beta), shown at their defaults
+[simulation]
+enabled = true
+altitude = "0ft"
+temperature_c = 25.0
+surface = "fairway"
+
 [webserver.0]
 name = "Web Server"
 bind = "0.0.0.0:5880"
@@ -169,7 +222,8 @@ name = "Local GSPro"
 address = "127.0.0.1:921"
 ```
 
-Section prefixes encode component type: `webserver`, `mevo`, `r10`, `square`,
+`[simulation]` is a single global table. Section prefixes encode component
+type: `webserver`, `mevo`, `r10`, `square`,
 `openconnect_server`, `mock_monitor`, `gspro`, `random_club`. The index after
 the dot (`0`, `1`, ...) identifies the instance. Per-device options are covered
 in the [device docs](#launch-monitors). Settings can also be edited live from

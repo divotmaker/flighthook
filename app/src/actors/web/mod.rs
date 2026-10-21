@@ -285,9 +285,10 @@ async fn apply_bus_event(
             let acc = ShotAccumulator::new(msg.actor.clone(), key.clone());
             accumulators.insert((msg.actor.clone(), key.clone()), acc);
         }
-        FlighthookEvent::BallFlight { key, ball } => {
+        FlighthookEvent::BallFlight { key, ball, derived } => {
             if let Some(acc) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
                 acc.set_ball(*ball.clone());
+                acc.set_derived(derived.as_deref().cloned());
             }
         }
         FlighthookEvent::FaceImpact { key, impact } => {
@@ -386,5 +387,64 @@ async fn apply_bus_event(
         }
         // Alert, SetDetectionMode, ConfigCommand — no web state update needed
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flighthook::{BallFlight, DerivedFlight, Distance};
+
+    /// Removes the directory on drop, so a failing assertion doesn't leak it.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn shot_history_keeps_derived_values() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-web-test-{}",
+            crate::state::config::generate_id()
+        )));
+        let (root, _writer) = SystemState::new(dir.0.join("config.toml"));
+        let (bus_tx, _) = broadcast::channel(16);
+        let state = WebState {
+            root: Arc::new(root),
+            bus_tx,
+            actors: RwLock::new(HashMap::new()),
+            shots: RwLock::new(VecDeque::new()),
+            cached_actor_status: RwLock::new(HashMap::new()),
+            cached_device_telemetry: RwLock::new(HashMap::new()),
+            addr: "127.0.0.1:0".parse().expect("addr"),
+            actor_id: "webserver.0".into(),
+            ws_count: AtomicU64::new(0),
+            request_count: AtomicU64::new(0),
+        };
+        let key = ShotKey {
+            shot_id: "abc".into(),
+            shot_number: 1,
+        };
+        let mut derived = DerivedFlight::default();
+        derived.carry_distance = Some(Distance::Meters(150.9));
+        let mut acc = HashMap::new();
+        for event in [
+            FlighthookEvent::ShotTrigger { key: key.clone() },
+            FlighthookEvent::BallFlight {
+                key: key.clone(),
+                ball: Box::new(BallFlight::default()),
+                derived: Some(Box::new(derived.clone())),
+            },
+            FlighthookEvent::ShotFinished { key },
+        ] {
+            let msg = FlighthookMessage::new(event).actor("square.0");
+            apply_bus_event(&state, &msg, &mut acc).await;
+        }
+        let shots = state.shots.read().await;
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].derived, Some(derived));
     }
 }

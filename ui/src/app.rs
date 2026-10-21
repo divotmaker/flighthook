@@ -289,9 +289,10 @@ impl FlighthookApp {
                     shot_number: key.shot_number,
                     ball: None,
                     club: None,
+                    derived: None,
                 });
             }
-            FlighthookEvent::BallFlight { key, ball } => {
+            FlighthookEvent::BallFlight { key, ball, derived } => {
                 if let Some(row) = self
                     .shots
                     .iter_mut()
@@ -299,6 +300,7 @@ impl FlighthookApp {
                     .find(|r| r.shot_id == key.shot_id)
                 {
                     row.ball = Some(*ball);
+                    row.derived = derived.map(|d| *d);
                 }
             }
             FlighthookEvent::ClubPath { key, club } => {

@@ -107,7 +107,7 @@ pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
 mod tests {
     use super::*;
     use flighthook::{
-        BallFlight, ClubData as FhClubData, Distance, FaceImpact, ShotData, Velocity,
+        BallFlight, ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, ShotData, Velocity,
     };
 
     fn shot_with_impact(lateral_mm: f64, vertical_mm: f64) -> ShotData {
@@ -143,6 +143,55 @@ mod tests {
             }),
             actor: "square.0".into(),
             shot_number: 1,
+            derived: None,
+        }
+    }
+
+    /// A Square-like full swing: launch data only, no carry, no club data.
+    fn square_like_shot(derived: Option<DerivedFlight>) -> ShotData {
+        ShotData {
+            actor: "square.0".into(),
+            shot_number: 12,
+            ball: Some(BallFlight {
+                launch_speed: Some(Velocity::MetersPerSecond(53.6)),
+                launch_elevation: Some(17.0),
+                launch_azimuth: Some(-1.2),
+                carry_distance: None,
+                total_distance: None,
+                roll_distance: None,
+                max_height: None,
+                flight_time: None,
+                backspin_rpm: Some(6500),
+                sidespin_rpm: Some(-300),
+            }),
+            club: None,
+            impact: None,
+            derived,
+        }
+    }
+
+    /// GSPro output for a launch-only shot; `derived` must not change it: no
+    /// `CarryDistance` appears.
+    const GOLDEN_RH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89998400000002,"SpinAxis":-2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":-300.0,"HLA":-1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Lie":0.0,"Loft":0.0,"Path":0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
+    const GOLDEN_LH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89998400000002,"SpinAxis":2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":300.0,"HLA":1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":-0.0,"Lie":0.0,"Loft":0.0,"Path":-0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
+
+    #[test]
+    fn gspro_output_ignores_derived_values() {
+        let mut derived = DerivedFlight::default();
+        derived.carry_distance = Some(Distance::Meters(150.9));
+        derived.carry_offline = Some(Distance::Meters(-5.5));
+        derived.total_distance = Some(Distance::Meters(154.6));
+        for (handed, golden) in [
+            (Handedness::Right, GOLDEN_RH),
+            (Handedness::Left, GOLDEN_LH),
+        ] {
+            let without = serde_json::to_string(&map_shot(&square_like_shot(None), handed))
+                .expect("serializes");
+            let with =
+                serde_json::to_string(&map_shot(&square_like_shot(Some(derived.clone())), handed))
+                    .expect("serializes");
+            assert_eq!(without, golden, "{handed:?}");
+            assert_eq!(with, golden, "{handed:?}");
         }
     }
 

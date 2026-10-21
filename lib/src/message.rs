@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::{Handedness, ShotDetectionMode};
 use std::collections::HashMap;
 
-use crate::{ActorStatus, BallFlight, ClubData, FaceImpact};
+use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact};
 use crate::{ClubInfo, PlayerInfo};
 use crate::{
     FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, OpenConnectServerSection,
@@ -158,7 +158,16 @@ pub enum FlighthookEvent {
     /// Ball strike detected. Emitted immediately — no data yet.
     ShotTrigger { key: ShotKey },
     /// Ball flight data available.
-    BallFlight { key: ShotKey, ball: Box<BallFlight> },
+    ///
+    /// `ball` is exactly what the device measured. `derived` carries values
+    /// flighthook simulated for fields the device did not report (beta); it
+    /// is a flighthook extension field, which FRP consumers ignore.
+    BallFlight {
+        key: ShotKey,
+        ball: Box<BallFlight>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        derived: Option<Box<DerivedFlight>>,
+    },
     /// Club path data available.
     ClubPath { key: ShotKey, club: Box<ClubData> },
     /// Face impact location available.

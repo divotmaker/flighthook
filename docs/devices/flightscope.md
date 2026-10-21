@@ -20,6 +20,15 @@ estimated flight result (`E8`).
 
 Estimated shots may be missing club data and sidespin.
 
+## Simulated values (beta)
+
+Carry, apex and flight time come from the device. flighthook simulates what it
+doesn't report — offline, descent angle, roll and total — and marks them as
+simulated (italics, `derived` in the API); total is the measured carry plus the
+simulated roll. Estimated (`E8`) shots carry no sidespin, so they are not
+simulated. See the README's
+[Simulated values](../../README.md#simulated-values-beta) section.
+
 ## Club data and camera mode
 
 Ball flight needs nothing beyond the defaults. **Club data — path, face angle,

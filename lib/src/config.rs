@@ -152,6 +152,10 @@ pub struct FlighthookConfig {
     /// Clubs that trigger Putting mode on selection.
     #[serde(default = "default_putting_clubs")]
     pub putting_clubs: Vec<Club>,
+    /// Simulated flight and roll (beta). Omitted from the file and the API
+    /// while it is at its defaults.
+    #[serde(default, skip_serializing_if = "SimulationSection::is_default")]
+    pub simulation: SimulationSection,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub webserver: std::collections::HashMap<String, WebserverSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -168,6 +172,137 @@ pub struct FlighthookConfig {
     pub gspro: std::collections::HashMap<String, GsProSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub random_club: std::collections::HashMap<String, RandomClubSection>,
+}
+
+/// Settings for simulated flight and roll (beta).
+///
+/// When a launch monitor does not report carry, apex, flight time, descent,
+/// offline, roll or total, flighthook simulates them from the measured launch
+/// under these conditions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimulationSection {
+    /// Simulate missing values. Defaults to true.
+    #[serde(default = "default_sim_enabled")]
+    pub enabled: bool,
+    /// Altitude above sea level, any distance unit. Defaults to `"0ft"`.
+    /// Valid range: 0 to 5000 m.
+    #[serde(default = "default_sim_altitude")]
+    pub altitude: Distance,
+    /// Air temperature, degrees Celsius. Defaults to 25. Valid range: -30
+    /// to 50.
+    #[serde(default = "default_sim_temperature_c")]
+    pub temperature_c: f64,
+    /// Ground the ball lands and rolls on. Defaults to `fairway`.
+    #[serde(default)]
+    pub surface: SimSurface,
+}
+
+fn default_sim_enabled() -> bool {
+    true
+}
+
+fn default_sim_altitude() -> Distance {
+    Distance::Feet(0.0)
+}
+
+fn default_sim_temperature_c() -> f64 {
+    SimulationSection::DEFAULT_TEMPERATURE_C
+}
+
+impl Default for SimulationSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_sim_enabled(),
+            altitude: default_sim_altitude(),
+            temperature_c: default_sim_temperature_c(),
+            surface: SimSurface::default(),
+        }
+    }
+}
+
+impl SimulationSection {
+    /// Default air temperature (°C): the ball model's calibration point.
+    pub const DEFAULT_TEMPERATURE_C: f64 = 25.0;
+    /// Highest accepted altitude (m).
+    pub const MAX_ALTITUDE_M: f64 = 5000.0;
+    /// Lowest accepted temperature (°C).
+    pub const MIN_TEMPERATURE_C: f64 = -30.0;
+    /// Highest accepted temperature (°C).
+    pub const MAX_TEMPERATURE_C: f64 = 50.0;
+
+    /// True when every setting is at its default. Altitude compares by
+    /// length, so `"0m"` and `"0ft"` are both default.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.enabled
+            && self.altitude.as_meters() == 0.0
+            && self.temperature_c == Self::DEFAULT_TEMPERATURE_C
+            && self.surface == SimSurface::default()
+    }
+
+    /// Why the altitude or temperature is out of range, or `None` when both
+    /// are valid. Shots are not simulated while this is `Some`.
+    #[must_use]
+    pub fn environment_error(&self) -> Option<String> {
+        let alt = self.altitude.as_meters();
+        if !alt.is_finite() || !(0.0..=Self::MAX_ALTITUDE_M).contains(&alt) {
+            return Some(format!(
+                "altitude {} is outside 0 to {} m",
+                self.altitude,
+                Self::MAX_ALTITUDE_M
+            ));
+        }
+        let t = self.temperature_c;
+        if !t.is_finite() || !(Self::MIN_TEMPERATURE_C..=Self::MAX_TEMPERATURE_C).contains(&t) {
+            return Some(format!(
+                "temperature {t} C is outside {} to {} C",
+                Self::MIN_TEMPERATURE_C,
+                Self::MAX_TEMPERATURE_C
+            ));
+        }
+        None
+    }
+}
+
+/// Ground for simulated landing and roll.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimSurface {
+    /// Flat fairway. The default.
+    #[default]
+    Fairway,
+    /// Flat green at normal speed.
+    Green,
+    /// Flat firm, fast green.
+    FirmGreen,
+}
+
+impl SimSurface {
+    /// Stable key used by the settings UI and config file.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Fairway => "fairway",
+            Self::Green => "green",
+            Self::FirmGreen => "firm_green",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fairway => "Fairway",
+            Self::Green => "Green",
+            Self::FirmGreen => "Firm green",
+        }
+    }
+
+    /// Every surface, in display order.
+    #[must_use]
+    pub fn all() -> [Self; 3] {
+        [Self::Fairway, Self::Green, Self::FirmGreen]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,6 +547,7 @@ impl Default for FlighthookConfig {
             default_units: UnitSystem::default(),
             chipping_clubs: default_chipping_clubs(),
             putting_clubs: default_putting_clubs(),
+            simulation: SimulationSection::default(),
             webserver,
             mevo: std::collections::HashMap::new(),
             r10: std::collections::HashMap::new(),
@@ -559,5 +695,102 @@ mod square_impact_calibration_tests {
     fn absent_map_parses_as_none() {
         let s: SquareSection = serde_json::from_str(r#"{"name":"Square"}"#).expect("parse");
         assert_eq!(s.dot_bottom_to_face_centre_mm, None);
+    }
+}
+
+#[cfg(test)]
+mod simulation_tests {
+    use super::*;
+
+    /// `FlighthookConfig::default()` as JSON (`GET /api/settings`), with no
+    /// `[simulation]` key. A default config must not emit one.
+    const GOLDEN_DEFAULT_JSON: &str = r#"{"default_units":"imperial","chipping_clubs":["GW","SW","LW"],"putting_clubs":["PT"],"webserver":{"0":{"name":"Web Server","bind":"0.0.0.0:5880"}}}"#;
+
+    #[test]
+    fn default_config_json_is_unchanged() {
+        let json = serde_json::to_string(&FlighthookConfig::default()).expect("ser");
+        assert_eq!(json, GOLDEN_DEFAULT_JSON);
+        assert!(!json.contains("simulation"));
+    }
+
+    #[test]
+    fn absent_section_parses_to_defaults() {
+        let c: FlighthookConfig = serde_json::from_str(GOLDEN_DEFAULT_JSON).expect("parses");
+        assert_eq!(c.simulation, SimulationSection::default());
+        assert!(c.simulation.enabled);
+        assert_eq!(c.simulation.altitude.as_meters(), 0.0);
+        assert_eq!(c.simulation.temperature_c, 25.0);
+        assert_eq!(c.simulation.surface, SimSurface::Fairway);
+        assert_eq!(c, FlighthookConfig::default());
+    }
+
+    #[test]
+    fn partial_section_fills_defaults() {
+        let s: SimulationSection = serde_json::from_str(r#"{"enabled":false}"#).expect("parses");
+        assert!(!s.enabled);
+        assert_eq!(s.temperature_c, 25.0);
+        let s: SimulationSection =
+            serde_json::from_str(r#"{"altitude":"5280ft","surface":"firm_green"}"#)
+                .expect("parses");
+        assert!(s.enabled);
+        assert!((s.altitude.as_meters() - 1609.344).abs() < 1e-9);
+        assert_eq!(s.surface, SimSurface::FirmGreen);
+    }
+
+    #[test]
+    fn zero_altitude_in_any_unit_is_default() {
+        for altitude in [
+            Distance::Feet(0.0),
+            Distance::Meters(0.0),
+            Distance::Yards(0.0),
+        ] {
+            let s = SimulationSection {
+                altitude,
+                ..SimulationSection::default()
+            };
+            assert!(s.is_default(), "{altitude:?}");
+        }
+        let changed = SimulationSection {
+            temperature_c: 30.0,
+            ..SimulationSection::default()
+        };
+        assert!(!changed.is_default());
+        let json = serde_json::to_string(&FlighthookConfig {
+            simulation: changed,
+            ..FlighthookConfig::default()
+        })
+        .expect("ser");
+        assert!(json.contains(r#""simulation":{"enabled":true,"altitude":"0ft","temperature_c":30.0,"surface":"fairway"}"#), "{json}");
+    }
+
+    #[test]
+    fn environment_bounds() {
+        let ok = |altitude, temperature_c| {
+            SimulationSection {
+                altitude,
+                temperature_c,
+                ..SimulationSection::default()
+            }
+            .environment_error()
+            .is_none()
+        };
+        assert!(ok(Distance::Meters(0.0), 25.0));
+        assert!(ok(Distance::Meters(5000.0), -30.0));
+        assert!(ok(Distance::Feet(16_000.0), 50.0));
+        assert!(!ok(Distance::Feet(16_500.0), 25.0));
+        assert!(!ok(Distance::Meters(-0.1), 25.0));
+        assert!(!ok(Distance::Meters(f64::NAN), 25.0));
+        assert!(!ok(Distance::Meters(f64::INFINITY), 25.0));
+        assert!(!ok(Distance::Meters(0.0), -30.1));
+        assert!(!ok(Distance::Meters(0.0), 50.1));
+        assert!(!ok(Distance::Meters(0.0), f64::NAN));
+    }
+
+    #[test]
+    fn surface_keys_match_serde() {
+        for s in SimSurface::all() {
+            let json = serde_json::to_string(&s).expect("ser");
+            assert_eq!(json, format!("\"{}\"", s.key()));
+        }
     }
 }
