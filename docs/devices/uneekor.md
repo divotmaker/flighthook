@@ -31,8 +31,11 @@ total, and carry when absent) are simulated from the launch, as for every
 device, and marked as simulated; see the README's
 [Simulated values](../../README.md#simulated-values-beta) section. When the
 monitor sends carry, total is that carry plus the simulated roll. Launch
-direction and sidespin are put on the bus as the monitor sends them, so the
-simulated offlines follow the monitor's sign convention.
+direction and sidespin arrive golf-semantically (golfer-relative, like GSPro)
+and are converted to flighthook's absolute sign convention using the
+handedness GSPro reports, so the simulated offlines follow the same
+convention as every other device. Set handedness the same in both Uneekor's
+software and GSPro, since flighthook takes handedness from GSPro.
 
 ## Licensing
 

@@ -36,7 +36,9 @@ use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender};
 use crate::sim;
 use crate::state::SystemState;
-use flighthook::{ActorStatus, FlighthookEvent, FlighthookMessage, RawPayload, Severity, ShotKey};
+use flighthook::{
+    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, RawPayload, Severity, ShotKey,
+};
 
 /// Cap on buffered bytes from a single peer before the connection is dropped.
 /// A well-behaved client never approaches this; it exists so a peer that opens
@@ -371,7 +373,8 @@ fn emit_shot(
         shot_number: msg.shot_number,
     };
 
-    let ball = mapper::map_ball(msg);
+    let handed = state.game.snapshot().handed.unwrap_or(Handedness::Right);
+    let ball = mapper::map_ball(msg, handed);
     tracing::info!(
         "openconnect <- shot #{}: {:.1}mph VLA={:.1} HLA={:.1} spin={:?}/{:?}",
         msg.shot_number,
@@ -397,7 +400,7 @@ fn emit_shot(
         sender.send(
             FlighthookMessage::new(FlighthookEvent::ClubPath {
                 key: key.clone(),
-                club: Box::new(mapper::map_club(msg)),
+                club: Box::new(mapper::map_club(msg, handed)),
             })
             .raw(payload.clone())
             .device(device),
