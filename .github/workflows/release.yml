@@ -11,7 +11,8 @@ permissions:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # Pinned: jetli/trunk-action fails on the Ubuntu 26 ubuntu-latest image (EXDEV on install).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +41,7 @@ jobs:
   publish:
     name: Publish lib crate
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -63,7 +64,7 @@ jobs:
   version-bump:
     name: Version bump
     needs: [test, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -98,12 +99,12 @@ jobs:
       matrix:
         include:
           - name: linux
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: flighthook
             asset_name: flighthook-linux-x86_64
           - name: windows
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-pc-windows-gnu
             artifact: flighthook.exe
             asset_name: flighthook-windows-x86_64.exe
@@ -154,7 +155,7 @@ jobs:
   release:
     name: Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
 

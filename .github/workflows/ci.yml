@@ -9,7 +9,8 @@ on:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # Pinned: jetli/trunk-action fails on the Ubuntu 26 ubuntu-latest image (EXDEV on install).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
