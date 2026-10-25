@@ -37,7 +37,7 @@ address = "127.0.0.1:921"
 # putting_monitor = "mevo.0"    # optional: route putting shots
 ```
 
-- `[mevo.<idx>]` -- Mevo/Mevo+ device instance
+- `[mevo.<idx>]` -- FlightScope device instance (Mevo/Mevo+, or Xi — detected at connect)
 - `[r10.<idx>]` -- Garmin R10 BLE device instance (auto-discovers via Bluetooth)
 - `[square.<idx>]` -- Square Golf Omni BLE device instance
 - `[openconnect_server.<idx>]` -- GSPro Open Connect ingest listener (Uneekor)
@@ -46,11 +46,16 @@ address = "127.0.0.1:921"
 - `[random_club.<idx>]` -- random club cycling integration instance
 - `[webserver.<idx>]` -- web server instance
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
-- Radar settings (ball_type, tee_height, etc.) are per-mevo only
-- `use_estimated` is per-mevo (defaults to `true`) -- controls whether estimated
-  (E8) ball flights are emitted when no full (D4) result arrives
+- Radar settings (ball_type, tee_height, etc.) are per-mevo only (not applied to an Xi)
+- `use_estimated` is per-mevo (defaults to `false`) -- controls whether estimated
+  (E8) ball flights are emitted when no full (D4) result arrives; with it off,
+  estimated-only shots (a flight too short to read in Outdoor mode, very short
+  chips) are skipped
+- `environment` is per-mevo (`limited_flight` default / `outdoor`) -- picks the
+  full-swing detection mode (9 / 8); on an Xi it is the only mode sent
 - `camera_mode` is per-mevo (`standard` default / `fusion` / `raw_fusion`) --
-  the Fusion modes request club data, applied after a camera warmup delay
+  the Fusion modes request the full club data set (radar club data arrives in
+  every mode), applied after a camera warmup delay
 - R10 sections show only name (BLE auto-discovery, no address field)
 - Mock sections show only name (no address or radar fields)
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `gspro.0`)
@@ -93,8 +98,9 @@ pub struct FlighthookConfig {
 pub struct SimulationSection { pub enabled: bool, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface }
 pub enum SimSurface { Fairway, Green, FirmGreen }
 pub struct WebserverSection { pub name: String, pub bind: String }
-pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool>, pub camera_mode: Option<CameraMode> }
+pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool>, pub camera_mode: Option<CameraMode>, pub environment: Option<FlightScopeEnvironment> }
 pub enum CameraMode { Standard, Fusion, RawFusion }
+pub enum FlightScopeEnvironment { LimitedFlight, Outdoor }
 pub struct R10Section { pub name: String }
 pub struct SquareSection { pub name: String, pub address: Option<String>, pub club: Option<Club>, pub advanced_spin: Option<bool>, pub discard_non_putting_zero_spin: Option<bool> }
 pub struct MockMonitorSection { pub name: String }
@@ -181,7 +187,7 @@ pub enum FlighthookEvent {
     BallFlight { key: ShotKey, ball: Box<BallFlight>, derived: Option<Box<DerivedFlight>> },
     ClubPath { key: ShotKey, club: Box<ClubData> },
     FaceImpact { key: ShotKey, impact: Box<FaceImpact> },
-    ShotFinished { key: ShotKey },
+    ShotFinished { key: ShotKey, raw: Option<Box<ShotRaw>> },
 
     // -- FRP: Device status --
     DeviceTelemetry { manufacturer: Option<String>, model: Option<String>, firmware: Option<String>, telemetry: Option<HashMap<String, String>> },
@@ -252,6 +258,53 @@ GSPro mapper reads `shot.ball` only, so GSPro output does not change. The
 console gets one `sim (estimated, beta): ...` line under the device's ball
 line; it is a derived summary, not wire data, so the hex-first audit rules do
 not apply to it.
+
+### Raw capture and shot export
+
+`ShotFinished.raw` (a flighthook extension, omitted when `None`) carries the
+device frames behind the shot as a `ShotRaw` (lib `export.rs`): a transport
+label, the `RawRecord`s (`t_ms` relative to the trigger, direction, type,
+bus addresses or channel, lowercase hex or JSON text), a `dropped` count and
+an `unavailable` reason.
+
+Each device actor captures on its own thread with `RawCapture`
+(`app/src/raw_capture.rs`). Frames are pushed as they cross the transport.
+Outside a shot they go to a pre-roll ring; `mark_trigger()` (right before the
+actor emits `ShotTrigger`) opens the shot window with the ring as its head,
+and `take()` closes it for `ShotFinished`. Excluded frames are dropped before
+the ring and every cap.
+
+| Device | Hook | Window | Excluded | Pre-roll | Max frames | Max bulk bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| FlightScope | ironsight `set_on_recv` / `set_on_send` (the same hooks log hex and keep the last D4) | BALL TRIGGER to the device re-armed, both directions | status/keepalive, device and product info, DSP query, network config, WiFi scan, calibration, time sync, AVR config query | 8 | 256 | 128 KiB (PRC, club PRC, speed profile) |
+| Square Golf | `Tap<T>` around the allsquare transport; characteristic reads are never recorded | pre-roll through the shot event; enabled after the identity exchange | heartbeats and acks, query reply | 64 | 64 | 0 |
+| R10 | `Tap<T>` around the tenover transport; a per-direction `FrameFilter` holds each chunk until the GFDI frames it carries are complete and classified | pre-roll through the shot event; enabled at `HandshakeComplete` | every chunk carrying part of a device information (5024), FIT/file transfer (5003, 5004, 5011, 5012) or authentication (5101-5112) frame, an ACK of one, or a frame that does not decode | 256 | 256 | 0 |
+| Open Connect | the inbound JSON text and our reply | the one message | none | - | - | - |
+| Mock | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
+
+The web layer keeps each shot as a `StoredShot` (`app/src/actors/web/mod.rs`):
+when `shot_trigger` arrived, a `ShotContext` snapshot taken then (device kind,
+maker, model and firmware; club, mode and handedness from game state; the
+device's config section without `name`/`address`/`bind`; the `[simulation]`
+section; identity strings to scrub), the `ShotData`, and the `ShotRaw`. A
+shot with raw frames but no decoded data is stored too; `/api/shots` serialises
+`data` only and leaves those out, so its JSON is unchanged. Raw frames share
+a 16 MiB session memory budget across the 1000-shot history, each frame
+charged its hex (two characters per payload byte) or text length plus 256
+bytes for the record and its metadata: past it, the oldest shots lose their
+frames first (`unavailable = "evicted: session raw budget"`),
+and decoded data stays until the shot leaves the history.
+
+`GET /api/shots/export` (`web/export.rs`, see docs/API.md) streams one JSONL
+`ShotExport` or CSV row per stored shot. It never serialises the FRP `device`
+ID, actor names, telemetry or configured addresses, and replaces identity
+strings in text payloads and device labels with `<redacted>`; hex is never
+rewritten, which is why identity frames are excluded at capture.
+
+Every bus subscriber gets its own clone of `shot_finished`, so a heavy shot
+(a few hundred KiB for FlightScope Fusion with PRC data) is copied once per
+consumer. Acceptable on a LAN; WebSocket consumers can use `shot_trigger` for
+timing.
 
 ### Game state events
 
@@ -657,10 +710,13 @@ Global
   data use the new name.
 - Type shown as a badge label next to the heading, with a hover tooltip
   describing the device/integration type and connection method
-- `Use Estimated` is per-mevo (checkbox) -- controls whether estimated (E8)
-  ball flights are emitted when no full (D4) result arrives
+- `Use Estimated` is per-mevo (checkbox, off by default) -- controls whether
+  estimated (E8) ball flights are emitted when no full (D4) result arrives
+- `Environment` is per-mevo (dropdown: Limited flight (sim/indoor) / Outdoor
+  (full flight)) -- the full-swing detection mode; a change restarts the actor
 - `Camera Mode` is per-mevo (dropdown: Standard / Fusion / Raw Fusion) --
-  the Fusion modes request club data from the device
+  the Fusion modes request the full club data set from the device (radar club
+  data arrives in every mode)
 - R10 sections show only name (BLE auto-discovery; no address or radar fields)
 - Mock launch monitor and Random Club are developer-only types (must be added
   manually to the config TOML; they do not appear in the Add dropdown)

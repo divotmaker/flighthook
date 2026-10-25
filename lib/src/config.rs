@@ -314,16 +314,18 @@ pub struct WebserverSection {
 
 /// Camera mode requested from the device at session start.
 ///
-/// Fusion processing is what produces club data (path, face angle, attack
-/// angle, dynamic loft, smash factor, swing planes). It needs the Pro Package
-/// enabled on the device; without it the device reports ball flight only,
-/// whatever this is set to. The two Fusion variants are firmware-dependent —
-/// picking the wrong one yields no club data.
+/// Every mode reports ball flight and the device's radar club data (club
+/// speed, attack angle, path, and face and loft where the device provides
+/// them). Fusion processing adds the full club data set (path, face angle,
+/// attack angle, dynamic loft, smash factor, swing planes). It needs the Pro
+/// Package enabled on the device; without it the device reports ball flight
+/// and radar club data only, whatever this is set to. The two Fusion variants
+/// are firmware-dependent — picking the wrong one yields no Fusion club data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum CameraMode {
-    /// Ball flight only, no Fusion processing. The default.
+    /// Ball flight and radar club data, no Fusion processing. The default.
     #[default]
     Standard,
     /// High-resolution JPEG Fusion (1640x1232), older firmware.
@@ -353,7 +355,7 @@ impl CameraMode {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Standard => "Standard (ball flight only)",
+            Self::Standard => "Standard (radar only)",
             Self::Fusion => "Fusion — older firmware",
             Self::RawFusion => "Raw Fusion — BM17.04+",
         }
@@ -363,6 +365,48 @@ impl CameraMode {
     #[must_use]
     pub fn all() -> [Self; 3] {
         [Self::Standard, Self::Fusion, Self::RawFusion]
+    }
+}
+
+/// Where a FlightScope device is used, which picks its full-swing detection
+/// mode.
+///
+/// FlightScope's own app calls these "Limited flight" and "Outdoor".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlightScopeEnvironment {
+    /// Nets and simulator screens, where the ball's flight is cut short. The
+    /// default.
+    #[default]
+    LimitedFlight,
+    /// Full ball flight outdoors. Needs about 40 yd of unobstructed flight;
+    /// shots into a net or screen do not read.
+    Outdoor,
+}
+
+impl FlightScopeEnvironment {
+    /// Stable key used by the settings UI and config file.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::LimitedFlight => "limited_flight",
+            Self::Outdoor => "outdoor",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LimitedFlight => "Limited flight (sim/indoor)",
+            Self::Outdoor => "Outdoor (full flight)",
+        }
+    }
+
+    /// Every environment, in display order.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::LimitedFlight, Self::Outdoor]
     }
 }
 
@@ -377,15 +421,22 @@ pub struct MevoSection {
     pub range: Option<Distance>,
     pub surface_height: Option<Distance>,
     pub track_pct: Option<f64>,
-    /// Whether to use estimated (E8 fallback) shots. Defaults to true when
-    /// absent for backwards compatibility. Estimated shots may lack sidespin
-    /// and carry less data, but are often the only result for short chips.
+    /// Whether to use estimated (E8 fallback) shots when no full result
+    /// arrives. Defaults to false when absent: a shot with only an estimate
+    /// (e.g. a flight too short to read in Outdoor mode, or a very short
+    /// chip) is skipped. Estimated shots may lack sidespin and carry less
+    /// data.
     #[serde(default)]
     pub use_estimated: Option<bool>,
-    /// Camera mode. Defaults to `Standard` (ball flight only) when absent.
+    /// Camera mode. Defaults to `Standard` (no Fusion processing) when absent.
     /// Fusion modes additionally require the Pro Package on the device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera_mode: Option<CameraMode>,
+    /// Environment: limited flight (nets, sim screens) or full-flight
+    /// outdoor. Sets the full-swing detection mode. Defaults to
+    /// `LimitedFlight` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<FlightScopeEnvironment>,
 }
 
 /// A Garmin R10 BLE device instance.
@@ -572,6 +623,7 @@ impl Default for MevoSection {
             track_pct: Some(80.0),
             use_estimated: None,
             camera_mode: None,
+            environment: None,
         }
     }
 }
@@ -654,6 +706,42 @@ mod camera_mode_tests {
         assert!(!CameraMode::Standard.is_fusion());
         assert!(CameraMode::Fusion.is_fusion());
         assert!(CameraMode::RawFusion.is_fusion());
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn absent_environment_defaults_to_limited_flight() {
+        let s: MevoSection = serde_json::from_str(r#"{"name":"Mevo"}"#).expect("parse");
+        assert_eq!(s.environment, None);
+        assert_eq!(
+            s.environment.unwrap_or_default(),
+            FlightScopeEnvironment::LimitedFlight
+        );
+    }
+
+    #[test]
+    fn environment_round_trips_by_key() {
+        for env in FlightScopeEnvironment::all() {
+            let json = format!(r#"{{"name":"Mevo","environment":"{}"}}"#, env.key());
+            let s: MevoSection = serde_json::from_str(&json).expect("parse");
+            assert_eq!(s.environment, Some(env), "{}", env.key());
+            let back = serde_json::to_string(&s).expect("serialize");
+            assert!(
+                back.contains(&format!(r#""environment":"{}""#, env.key())),
+                "{back}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_environment_is_not_written_back() {
+        let s = MevoSection::default();
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(!json.contains("environment"), "{json}");
     }
 }
 

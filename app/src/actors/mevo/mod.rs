@@ -2,24 +2,39 @@ pub mod settings;
 
 pub use settings::SessionConfig;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::f64::consts::FRAC_PI_2;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ironsight::protocol::handshake::{DeviceGen, DeviceModel};
+use ironsight::protocol::shot::{FlightResult, FlightResultV1};
+use ironsight::protocol::status::DspStatus;
+use ironsight::protocol::{
+    TYPE_AVR_CONFIG_QUERY, TYPE_AVR_CONFIG_RESP, TYPE_CAL_DATA_REQ, TYPE_CAL_DATA_RESP,
+    TYPE_CAL_PARAM_REQ, TYPE_CAL_PARAM_RESP, TYPE_CLUB_PRC, TYPE_DEV_INFO_REQ, TYPE_DEV_INFO_RESP,
+    TYPE_DSP_QUERY, TYPE_DSP_QUERY_RESP, TYPE_FLIGHT_RESULT, TYPE_NET_CONFIG, TYPE_PRC_DATA,
+    TYPE_PROD_INFO, TYPE_SENSOR_ACT, TYPE_SENSOR_ACT_RESP, TYPE_SPEED_PROFILE, TYPE_STATUS,
+    TYPE_TIME_SYNC, TYPE_WIFI_SCAN,
+};
 use ironsight::seq::ShotDatum;
 use ironsight::{BinaryClient, BinaryConnection, BinaryEvent, ConnError, Message};
 use tracing::{debug, info, warn};
 
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::raw_capture::{self, RawCapture, RawCaptureConfig};
 use crate::sim;
 use crate::state::SystemState;
 use settings::{cam_config, fusion_cam_config};
 
 use flighthook::{
     ActorStatus, BallFlight, CameraMode, ClubData, Distance, FlighthookEvent, FlighthookMessage,
-    Severity, ShotDetectionMode, ShotKey, Velocity,
+    RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, Velocity, hex_lower,
 };
 
 /// No events for this long → treat as disconnected.
@@ -40,8 +55,44 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// unallocated and no club data arrives.
 const CAMERA_WARMUP: Duration = Duration::from_secs(15);
 
-/// Mevo session actor. Connects to a Mevo/Mevo+ device, runs the handshake,
-/// arms, and processes shots in a reconnecting event loop.
+/// Message types never captured for the shot export, in either direction.
+/// They carry device identity (status: hardware and application IDs; device
+/// and product info: serial numbers; DSP query: hardware info), network
+/// details (network config: SSID and password; WiFi scan: nearby networks),
+/// unit-specific factory calibration, the sensor activation exchange (a
+/// per-device certificate), or handshake housekeeping (time sync, AVR config
+/// query). Status is also the keepalive, which has no shot content.
+const EXPORT_DENYLIST: [u8; 17] = [
+    TYPE_STATUS,
+    TYPE_DEV_INFO_REQ,
+    TYPE_DEV_INFO_RESP,
+    TYPE_PROD_INFO,
+    TYPE_DSP_QUERY,
+    TYPE_DSP_QUERY_RESP,
+    TYPE_NET_CONFIG,
+    TYPE_WIFI_SCAN,
+    TYPE_CAL_PARAM_REQ,
+    TYPE_CAL_PARAM_RESP,
+    TYPE_CAL_DATA_REQ,
+    TYPE_CAL_DATA_RESP,
+    TYPE_TIME_SYNC,
+    TYPE_AVR_CONFIG_QUERY,
+    TYPE_AVR_CONFIG_RESP,
+    TYPE_SENSOR_ACT,
+    TYPE_SENSOR_ACT_RESP,
+];
+
+/// Bulk per-shot message types (PRC paging, club PRC, speed profile),
+/// charged to the per-shot byte budget instead of the frame cap.
+const EXPORT_BULK: [u8; 3] = [TYPE_PRC_DATA, TYPE_CLUB_PRC, TYPE_SPEED_PROFILE];
+
+/// FlightScope session actor. Connects to a Mevo/Mevo+ or Xi, runs the
+/// handshake, arms, and processes shots in a reconnecting event loop.
+///
+/// The model is detected by ironsight during the handshake. The Xi has no
+/// camera, so camera modes do not apply to it, and it runs with fixed
+/// settings: the environment's detection mode and the radar parameters
+/// stored on the device.
 pub struct MevoActor {
     pub addr: SocketAddr,
     pub initial_mode: ShotDetectionMode,
@@ -107,7 +158,7 @@ impl Actor for MevoActor {
         }
 
         // Check if use_estimated changed -> restart to apply
-        let new_use_estimated = section.use_estimated.unwrap_or(true);
+        let new_use_estimated = section.use_estimated.unwrap_or(false);
         if new_use_estimated != self.use_estimated {
             return ReconfigureOutcome::RestartRequired;
         }
@@ -129,6 +180,157 @@ fn same_mode(a: ShotDetectionMode, b: ShotDetectionMode) -> bool {
     std::mem::discriminant(&a) == std::mem::discriminant(&b)
 }
 
+/// Detection mode label as sent to the device.
+fn wire_label(
+    model: DeviceModel,
+    session_config: &SessionConfig,
+    mode: &ShotDetectionMode,
+) -> &'static str {
+    if model == DeviceModel::Xi {
+        session_config.environment_label()
+    } else {
+        session_config.mode_label(mode)
+    }
+}
+
+/// Whether a D4 is the device's "distance model failed" result: launch speed
+/// 0 (or not a number). This happens in full-flight outdoor mode when the
+/// ball hits a net or screen; the E8 that came before it is still valid.
+fn d4_model_failed(d4: &FlightResult) -> bool {
+    d4.launch_speed.is_nan() || d4.launch_speed <= 0.0
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02X}");
+            s
+        })
+}
+
+/// Product name and firmware for display and the shot export.
+///
+/// The name comes from the detected model and, for a Mevo, the DSP hardware
+/// generation: `"Mevo+"`, `"Mevo Gen2"`, `"Mevo"` when the generation is
+/// unknown, or `"Xi"`. `avr_info` is the AVR device info text: a version, an
+/// internal hardware code, then the build date and time, e.g.
+/// `"1.23   AB CD 01 Feb  3 2024 10:00:00"`. Firmware is the version and the
+/// build date, `"1.23 (Feb 3 2024)"`; either part is left out when it is not
+/// found. The hardware code and build time are not used.
+fn product_and_firmware(
+    model: DeviceModel,
+    device_gen: Option<DeviceGen>,
+    avr_info: &str,
+) -> (String, Option<String>) {
+    let product = match (model, device_gen) {
+        (DeviceModel::Xi, _) => "Xi",
+        (DeviceModel::Mevo, Some(g @ (DeviceGen::MevoPlus | DeviceGen::Gen2))) => g.label(),
+        _ => model.label(),
+    };
+
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let tokens: Vec<&str> = avr_info.split_whitespace().collect();
+    let version = tokens.first().copied().filter(|t| {
+        t.starts_with(|c: char| c.is_ascii_digit())
+            && t.chars().all(|c| c.is_ascii_digit() || c == '.')
+    });
+    let date = tokens.windows(3).find_map(|w| {
+        let day_ok = w[1].len() <= 2 && w[1].parse::<u8>().is_ok_and(|d| (1..=31).contains(&d));
+        let year_ok = w[2].len() == 4 && w[2].chars().all(|c| c.is_ascii_digit());
+        (MONTHS.contains(&w[0]) && day_ok && year_ok).then(|| format!("{} {} {}", w[0], w[1], w[2]))
+    });
+    let firmware = match (version, date) {
+        (Some(v), Some(d)) => Some(format!("{v} ({d})")),
+        (Some(v), None) => Some(v.to_string()),
+        (None, Some(d)) => Some(format!("built {d}")),
+        (None, None) => None,
+    };
+    (product.to_string(), firmware)
+}
+
+fn export_excluded(rec: &RawRecord) -> bool {
+    raw_capture::type_byte(rec).is_none_or(|t| EXPORT_DENYLIST.contains(&t))
+}
+
+fn export_bulk(rec: &RawRecord) -> bool {
+    raw_capture::type_byte(rec).is_some_and(|t| EXPORT_BULK.contains(&t))
+}
+
+/// Raw capture for one FlightScope connection: the shot window runs from
+/// BALL TRIGGER to the device re-armed, both directions.
+fn raw_capture_config() -> RawCaptureConfig {
+    RawCaptureConfig {
+        transport: "flightscope-tcp",
+        pre_roll_frames: 8,
+        max_frames: 256,
+        max_bulk_bytes: 128 * 1024,
+        exclude: export_excluded,
+        is_bulk: export_bulk,
+    }
+}
+
+/// Install the send/receive hooks: hex audit logging, raw capture for the
+/// shot export, and the latest D4 payload (for logging a D4 that is dropped).
+fn attach_raw_capture<S: Read + Write>(
+    conn: &mut BinaryConnection<S>,
+    actor_id: &str,
+    capture: &Rc<RefCell<RawCapture>>,
+) -> Rc<RefCell<Vec<u8>>> {
+    let send_id = actor_id.to_string();
+    let send_capture = Rc::clone(capture);
+    conn.set_on_send(move |cmd, dest| {
+        tracing::debug!(
+            "{send_id} send >> {dest:?} {:?} [{}]",
+            cmd,
+            cmd.debug_hex(dest)
+        );
+        let frame = cmd.encode(dest);
+        if EXPORT_DENYLIST.contains(&frame.type_id) {
+            return;
+        }
+        send_capture.borrow_mut().push(RawRecord {
+            r#type: Some(raw_capture::type_label(frame.type_id)),
+            src: Some(frame.src.to_string()),
+            dst: Some(dest.to_string()),
+            ..RawRecord::binary(RawDir::Tx, &frame.payload)
+        });
+    });
+
+    let audit_id = actor_id.to_string();
+    let last_d4_raw: Rc<RefCell<Vec<u8>>> = Rc::default();
+    let d4_raw_sink = Rc::clone(&last_d4_raw);
+    let recv_capture = Rc::clone(capture);
+    conn.set_on_recv(move |env| {
+        if env.type_id == TYPE_FLIGHT_RESULT {
+            d4_raw_sink.replace(env.raw.clone());
+        }
+        tracing::debug!(
+            "{audit_id} recv << 0x{:02X} {} | {:?}",
+            env.type_id,
+            hex_string(&env.raw),
+            env.message,
+        );
+        if EXPORT_DENYLIST.contains(&env.type_id) {
+            return;
+        }
+        recv_capture.borrow_mut().push(RawRecord {
+            t_ms: 0,
+            dir: RawDir::Rx,
+            r#type: Some(raw_capture::type_label(env.type_id)),
+            src: Some(env.src.to_string()),
+            dst: Some("APP".into()),
+            channel: None,
+            hex: Some(hex_lower(&env.raw)),
+            text: None,
+        });
+    });
+    last_d4_raw
+}
+
 fn emit_device_status(sender: &BusSender, status: ActorStatus, telemetry: HashMap<String, String>) {
     sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
         status,
@@ -147,6 +349,28 @@ fn stamp_device(msg: FlighthookMessage, device_id: &Option<String>) -> Flighthoo
     match device_id {
         Some(dev) => msg.device(dev),
         None => msg,
+    }
+}
+
+/// Battery level from a DSP status, or `None` when the status layout has no
+/// decoded battery field (the raw variant used by the Mevo Gen2 and the Xi).
+fn dsp_battery_pct(dsp: &DspStatus) -> Option<u8> {
+    match dsp {
+        DspStatus::V80(_) => Some(dsp.battery_percent()),
+        DspStatus::V46(_) => None,
+    }
+}
+
+/// Set `battery_pct` from a DSP status, removing the key when the battery
+/// level is unknown so it is never reported as 0 %.
+fn set_battery_telemetry(telemetry: &mut HashMap<String, String>, dsp: &DspStatus) {
+    match dsp_battery_pct(dsp) {
+        Some(pct) => {
+            telemetry.insert("battery_pct".into(), pct.to_string());
+        }
+        None => {
+            telemetry.remove("battery_pct");
+        }
     }
 }
 
@@ -276,45 +500,20 @@ fn connect_and_run(
     let mut conn = BinaryConnection::connect_timeout(addr, CONNECT_TIMEOUT)?;
     *ever_connected = true;
 
-    // Set up send/recv audit logging callbacks
-    let send_id = sender.actor_id().to_string();
-    conn.set_on_send(move |cmd, dest| {
-        tracing::debug!(
-            "{send_id} send >> {dest:?} {:?} [{}]",
-            cmd,
-            cmd.debug_hex(dest)
-        );
-    });
-    let audit_id = sender.actor_id().to_string();
-    conn.set_on_recv(move |env| {
-        let hex: String =
-            env.raw
-                .iter()
-                .fold(String::with_capacity(env.raw.len() * 2), |mut s, b| {
-                    use std::fmt::Write;
-                    let _ = write!(s, "{b:02X}");
-                    s
-                });
-        tracing::debug!(
-            "{audit_id} recv << 0x{:02X} {hex} | {:?}",
-            env.type_id,
-            env.message,
-        );
-    });
+    // Audit logging, raw capture for the shot export, and the latest D4.
+    let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
+    let last_d4_raw = attach_raw_capture(&mut conn, sender.actor_id(), &capture);
 
     // 2. Create non-blocking client
     let mut client = BinaryClient::from_tcp(conn)?;
     client.set_keepalive_interval(KEEPALIVE_INTERVAL);
 
-    // 3. Enqueue startup operations
-    let avr = session_config.to_avr_settings(&initial_mode);
-    let cam = cam_config();
+    // 3. Enqueue the handshake. Configuration depends on the model it
+    //    detects, so it is enqueued when the handshake completes.
     client.handshake();
-    client.configure_avr(avr);
-    client.configure_cam(cam);
-    client.arm();
 
     // 4. Event loop state
+    let mut model = DeviceModel::Mevo;
     let mut current_mode = initial_mode;
     let mut pending_reconfig: Option<ShotDetectionMode> = None;
 
@@ -322,7 +521,7 @@ fn connect_and_run(
     let mut shot_counter: u32 = 0;
     let mut current_shot_key: Option<ShotKey> = None;
     let mut shot_had_d4 = false;
-    let mut stashed_e8: Option<ironsight::protocol::shot::FlightResultV1> = None;
+    let mut stashed_e8: Option<FlightResultV1> = None;
 
     // Fusion camera config, applied once warmup has elapsed. None for
     // Standard, which keeps the warmup config for the whole session.
@@ -356,14 +555,22 @@ fn connect_and_run(
                     } = msg.event
                         && !same_mode(current_mode, new_mode)
                     {
-                        if client.is_armed() {
-                            let new_wire = SessionConfig::mode_label(&new_mode);
+                        if model == DeviceModel::Xi {
+                            info!(
+                                "mode change: {:?} -> {:?} not applied -- FlightScope Xi stays in {}",
+                                current_mode,
+                                new_mode,
+                                session_config.environment_label()
+                            );
+                            current_mode = new_mode;
+                        } else if client.is_armed() {
+                            let new_wire = session_config.mode_label(&new_mode);
                             info!(
                                 "mode change: {:?} -> {:?} wire={new_wire}",
                                 current_mode, new_mode
                             );
                             client
-                                .configure_avr(SessionConfig::to_avr_settings_mode_only(&new_mode));
+                                .configure_avr(session_config.to_avr_settings_mode_only(&new_mode));
                             client.arm();
                             current_mode = new_mode;
                             emit_device_status(sender, ActorStatus::Connected, HashMap::new());
@@ -414,27 +621,42 @@ fn connect_and_run(
 
                 match event {
                     BinaryEvent::Handshake(h) => {
-                        let gen_label = h.dsp.hw_info.device_gen().label();
+                        model = h.model;
+                        let gen_label = match h.model {
+                            DeviceModel::Xi => h.model.to_string(),
+                            _ => h
+                                .dsp
+                                .hw_info
+                                .as_ref()
+                                .map_or("Unknown", |hw| hw.device_gen().label())
+                                .to_string(),
+                        };
                         let info_text = format!("{} ({})", h.avr.dev_info.text, gen_label);
-                        let battery_pct = h.dsp.status.battery_percent();
+                        let battery = dsp_battery_pct(&h.dsp.status)
+                            .map_or_else(|| "unknown".to_string(), |pct| format!("{pct}%"));
                         let external_power = h.dsp.status.external_power();
                         let tilt = h.avr.status.tilt;
                         let roll = -h.avr.status.roll;
 
-                        // Capture SSID as FRP device identity
-                        let ssid = h.pi.ssid.clone();
-                        if !ssid.is_empty() {
-                            *device_id = Some(ssid.clone());
-                            info!("device identity: {ssid}");
+                        // FRP device identity: the WiFi SSID reported by the
+                        // camera Pi. The Xi has no Pi, so it is identified by
+                        // model and address.
+                        let identity = match h.pi {
+                            Some(ref pi) => pi.ssid.clone(),
+                            None => format!("{} ({addr})", h.model),
+                        };
+                        if !identity.is_empty() {
+                            *device_id = Some(identity.clone());
+                            info!("device identity: {identity}");
                         }
 
                         info!(
-                            "handshake complete: {info_text} | battery {battery_pct}%{} | tilt {tilt:.1} roll {roll:.1}",
+                            "handshake complete: {info_text} | battery {battery}{} | tilt {tilt:.1} roll {roll:.1}",
                             if external_power { " (charging)" } else { "" },
                         );
 
                         // Emit identity DeviceTelemetry + initial device state
-                        device_telemetry.insert("battery_pct".into(), battery_pct.to_string());
+                        set_battery_telemetry(&mut device_telemetry, &h.dsp.status);
                         device_telemetry.insert("tilt".into(), format!("{tilt:.1}"));
                         device_telemetry.insert("roll".into(), format!("{roll:.1}"));
                         device_telemetry.insert("temp_c".into(), "0.0".into());
@@ -442,19 +664,48 @@ fn connect_and_run(
                             .insert("external_power".into(), external_power.to_string());
                         device_telemetry.insert("ready".into(), "false".into());
 
+                        // Product name and AVR firmware. Never the DSP
+                        // device info: it carries the serial, and these
+                        // values are published in shot exports.
+                        let (device_model, firmware) = product_and_firmware(
+                            h.model,
+                            h.dsp.hw_info.as_ref().map(|hw| hw.device_gen()),
+                            &h.avr.dev_info.text,
+                        );
                         if let Some(dev) = device_id.as_deref() {
                             sender.send(
                                 FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
                                     manufacturer: Some("FlightScope".into()),
-                                    model: Some(h.avr.dev_info.text.clone()),
-                                    firmware: None,
+                                    model: Some(device_model),
+                                    firmware,
                                     telemetry: Some(device_telemetry.clone()),
                                 })
                                 .device(dev),
                             );
                         }
 
-                        emit_device_status(sender, ActorStatus::Connected, HashMap::new());
+                        let status_telemetry = match h.model {
+                            DeviceModel::Xi => {
+                                HashMap::from([("device_info".into(), h.model.to_string())])
+                            }
+                            _ => HashMap::new(),
+                        };
+                        emit_device_status(sender, ActorStatus::Connected, status_telemetry);
+
+                        // Configure and arm for the detected model.
+                        if h.model == DeviceModel::Xi {
+                            info!(
+                                "FlightScope Xi (alpha): detection mode fixed to {} (environment); \
+                                 radar settings and camera mode are not applied",
+                                session_config.environment_label()
+                            );
+                            pending_fusion_cam = None;
+                            client.configure_avr(session_config.to_xi_avr_settings());
+                        } else {
+                            client.configure_avr(session_config.to_avr_settings(&current_mode));
+                            client.configure_cam(cam_config());
+                        }
+                        client.arm();
                     }
 
                     BinaryEvent::Disarmed => {
@@ -462,12 +713,12 @@ fn connect_and_run(
                     }
 
                     BinaryEvent::Configured => {
-                        let wire = SessionConfig::mode_label(&current_mode);
+                        let wire = wire_label(model, session_config, &current_mode);
                         info!("device configured (mode={wire})");
                     }
 
                     BinaryEvent::Armed => {
-                        let wire = SessionConfig::mode_label(&current_mode);
+                        let wire = wire_label(model, session_config, &current_mode);
                         info!("armed -- mode={wire} -- waiting for shots");
 
                         emit_device_status(sender, ActorStatus::Connected, HashMap::new());
@@ -475,8 +726,16 @@ fn connect_and_run(
                         try_emit_device_telemetry(sender, device_id, &device_telemetry);
 
                         // Apply pending reconfig now that we're idle
-                        if let Some(target) = pending_reconfig.take() {
-                            let target_wire = SessionConfig::mode_label(&target);
+                        if model == DeviceModel::Xi
+                            && let Some(target) = pending_reconfig.take()
+                        {
+                            info!(
+                                "deferred mode change to {target:?} not applied -- FlightScope Xi stays in {}",
+                                session_config.environment_label()
+                            );
+                            current_mode = target;
+                        } else if let Some(target) = pending_reconfig.take() {
+                            let target_wire = session_config.mode_label(&target);
                             let is_mode_change = !same_mode(current_mode, target);
                             if is_mode_change {
                                 info!(
@@ -487,7 +746,7 @@ fn connect_and_run(
                             }
                             current_mode = target;
                             let avr = if is_mode_change {
-                                SessionConfig::to_avr_settings_mode_only(&target)
+                                session_config.to_avr_settings_mode_only(&target)
                             } else {
                                 session_config.to_avr_settings(&target)
                             };
@@ -506,6 +765,7 @@ fn connect_and_run(
                             shot_number: shot_counter,
                         };
                         debug!("ball trigger detected — shot_id={}", key.shot_id);
+                        capture.borrow_mut().mark_trigger();
                         let msg = FlighthookMessage::new(FlighthookEvent::ShotTrigger {
                             key: key.clone(),
                         });
@@ -521,11 +781,37 @@ fn connect_and_run(
                     BinaryEvent::ShotDatum(datum) => {
                         if let Some(ref key) = current_shot_key {
                             match datum {
+                                ShotDatum::Flight(d4) if d4_model_failed(&d4) => {
+                                    // The device's distance model failed (e.g.
+                                    // full-flight outdoor mode into a screen).
+                                    // Treat the shot as having no D4 so the E8
+                                    // fallback applies.
+                                    warn!(
+                                        "shot #{} D4 dropped: launch speed {} (distance model failed) -- 0x{:02X} {}",
+                                        key.shot_number,
+                                        d4.launch_speed,
+                                        TYPE_FLIGHT_RESULT,
+                                        hex_string(&last_d4_raw.borrow()),
+                                    );
+                                }
                                 ShotDatum::Flight(d4) => {
                                     shot_had_d4 = true;
-                                    let ball = ball_from_d4(&d4);
+                                    let mut ball = ball_from_d4(&d4);
+                                    let mut spin_source = "D4";
+                                    if model == DeviceModel::Xi
+                                        && let Some(ref e8) = stashed_e8
+                                        && let Some((back, side)) = xi_spin(&d4, e8)
+                                    {
+                                        ball.backspin_rpm = Some(back);
+                                        ball.sidespin_rpm = Some(side);
+                                        spin_source = if side == 0 {
+                                            "E8 total, axis 0"
+                                        } else {
+                                            "E8 total, D4 axis"
+                                        };
+                                    }
                                     info!(
-                                        "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm",
+                                        "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm spin={spin_source}",
                                         key.shot_number,
                                         ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
                                         ball.launch_elevation.unwrap_or(0.0),
@@ -562,6 +848,7 @@ fn connect_and_run(
                     }
 
                     BinaryEvent::ShotComplete(_shot_data) => {
+                        let raw = capture.borrow_mut().take();
                         if let Some(key) = current_shot_key.take() {
                             // E8 fallback: emit BallFlight from stashed E8 if no D4
                             if !shot_had_d4 {
@@ -606,7 +893,10 @@ fn connect_and_run(
                                 }
                             }
                             sender.send(stamp_device(
-                                FlighthookMessage::new(FlighthookEvent::ShotFinished { key }),
+                                FlighthookMessage::new(FlighthookEvent::ShotFinished {
+                                    key,
+                                    raw: Some(Box::new(raw)),
+                                }),
                                 device_id,
                             ));
                         }
@@ -622,8 +912,16 @@ fn connect_and_run(
                         try_emit_device_telemetry(sender, device_id, &device_telemetry);
 
                         // Apply pending reconfig if any.
-                        if let Some(target) = pending_reconfig.take() {
-                            let target_wire = SessionConfig::mode_label(&target);
+                        if model == DeviceModel::Xi
+                            && let Some(target) = pending_reconfig.take()
+                        {
+                            info!(
+                                "deferred mode change to {target:?} not applied -- FlightScope Xi stays in {}",
+                                session_config.environment_label()
+                            );
+                            current_mode = target;
+                        } else if let Some(target) = pending_reconfig.take() {
+                            let target_wire = session_config.mode_label(&target);
                             let is_mode_change = !same_mode(current_mode, target);
                             if is_mode_change {
                                 info!(
@@ -634,7 +932,7 @@ fn connect_and_run(
                             }
                             current_mode = target;
                             let avr = if is_mode_change {
-                                SessionConfig::to_avr_settings_mode_only(&target)
+                                session_config.to_avr_settings_mode_only(&target)
                             } else {
                                 session_config.to_avr_settings(&target)
                             };
@@ -654,8 +952,7 @@ fn connect_and_run(
                             changed = true;
                         }
                         if let Some(dsp) = &status.dsp {
-                            device_telemetry
-                                .insert("battery_pct".into(), dsp.battery_percent().to_string());
+                            set_battery_telemetry(&mut device_telemetry, dsp);
                             device_telemetry
                                 .insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
                             device_telemetry
@@ -669,8 +966,7 @@ fn connect_and_run(
 
                     BinaryEvent::Message(env) => match &env.message {
                         Message::DspStatus(dsp) => {
-                            device_telemetry
-                                .insert("battery_pct".into(), dsp.battery_percent().to_string());
+                            set_battery_telemetry(&mut device_telemetry, dsp);
                             device_telemetry
                                 .insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
                             device_telemetry
@@ -738,7 +1034,7 @@ fn connect_and_run(
 // Protocol type → bus type conversion helpers
 // ---------------------------------------------------------------------------
 
-fn ball_from_d4(d4: &ironsight::protocol::shot::FlightResult) -> BallFlight {
+fn ball_from_d4(d4: &FlightResult) -> BallFlight {
     // DSP→PC negation: wire neg=right/slice, FRP pos=right/slice.
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(d4.launch_speed)),
@@ -754,7 +1050,33 @@ fn ball_from_d4(d4: &ironsight::protocol::shot::FlightResult) -> BallFlight {
     }
 }
 
-fn ball_from_e8(e8: &ironsight::protocol::shot::FlightResultV1) -> BallFlight {
+/// Xi spin as wire-signed (backspin, FRP sidespin), or `None` to keep D4's.
+///
+/// Total spin is the E8 backspin. The spin axis comes from D4 only when the
+/// shot carries club data (club speed plus attack angle or path) and D4's
+/// backspin is positive; D4's axis then follows face-to-path. Otherwise the
+/// axis is 0. The axis is clamped to ±90° so backspin never turns negative.
+/// Sidespin keeps the DSP→PC negation of [`ball_from_d4`].
+fn xi_spin(d4: &FlightResult, e8: &FlightResultV1) -> Option<(i32, i32)> {
+    if e8.backspin_rpm <= 0 {
+        return None;
+    }
+    let total = f64::from(e8.backspin_rpm);
+    let has_club_data =
+        d4.clubhead_speed > 0.0 && (d4.club_attack_angle != 0.0 || d4.club_strike_direction != 0.0);
+    let axis = if has_club_data && d4.backspin_rpm > 0 {
+        f64::from(d4.sidespin_rpm)
+            .atan2(f64::from(d4.backspin_rpm))
+            .clamp(-FRAC_PI_2, FRAC_PI_2)
+    } else {
+        0.0
+    };
+    let back = (total * axis.cos()).round() as i32;
+    let side = -(total * axis.sin()).round() as i32;
+    Some((back, side))
+}
+
+fn ball_from_e8(e8: &FlightResultV1) -> BallFlight {
     // DSP→PC negation: wire neg=right, FRP pos=right.
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(e8.ball_velocity)),
@@ -784,5 +1106,423 @@ fn club_from_ed(ed: &ironsight::protocol::shot::ClubResult) -> ClubData {
         swing_plane_vertical: Some(ed.swing_plane_vertical),
         club_offset: Some(Distance::Meters(ed.club_offset)),
         club_height: Some(Distance::Meters(ed.club_height)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Xi shot with club data: D4 back/side 7127/-652 rpm, E8 backspin 7157 rpm.
+    fn shot_with_club_data() -> (FlightResult, FlightResultV1) {
+        let d4 = hex(
+            "9c00000400005600000000002700020a008a28001fcd005209014ca2000ff30034e30149f8000000002a04\
+             001bd7fffd740000000003e9fffefbffe76d003c1affce900006f70000000000000000000000000000000\
+             06c96002c8fffc66e004e9500d43600571500975a00197701df710000003d08ebf5cc2b019bbcffe3fd000\
+             00017c8affb5496ff6c7f00126500000008b809fe35a1004bd6fffab0",
+        );
+        let e8 = hex(
+            "5d000004000000008a28000ff5014c9f0034ef002f1b005209001fcd000000000000001bf500000000005600\
+             000001e00f0000003d08e0f5d3a3019570ffe4ea00000017ccdefb5b2eff69290012cb00000008bc60fe8a\
+             0e003a8afffc10",
+        );
+        (
+            FlightResult::decode(&d4).unwrap(),
+            FlightResultV1::decode(&e8).unwrap(),
+        )
+    }
+
+    /// Xi shot without club data: D4 back/side 2756/1464 rpm, E8 backspin 6897 rpm.
+    fn shot_without_club_data() -> (FlightResult, FlightResultV1) {
+        let d4 = hex(
+            "9c00000600005800000000000d00021a009424000c48005d7e018a1600113700434201877e000000002d1c\
+             000ac40005b8000000ffffa6000262fff32a00433bffc671000a9000000000000000000000000000000000\
+             79fc000000000000005c5000000000000000000000000001c55f0000003d08edf75422014102ffeb5b0000\
+             001b82defa4676ffadd3000bd50000000373af00b838ffd83c000317",
+        );
+        let e8 = hex(
+            "5d00000600000000942400128d0178410049d60014a4005d7e000c48000000000000001af100000000005800\
+             000001c6220000003d08f2f57fd4018863ffe88b0000001b5f02fb475bff7f2a000f4f000000035a4eff6c\
+             7b00157efffeb8",
+        );
+        (
+            FlightResult::decode(&d4).unwrap(),
+            FlightResultV1::decode(&e8).unwrap(),
+        )
+    }
+
+    #[test]
+    fn xi_spin_uses_d4_axis_with_club_data() {
+        let (d4, e8) = shot_with_club_data();
+        assert_eq!((d4.backspin_rpm, d4.sidespin_rpm), (7127, -652));
+        assert_eq!(e8.backspin_rpm, 7157);
+        let (back, side) = xi_spin(&d4, &e8).unwrap();
+        // Same axis as D4 (sidespin negated for FRP), total from E8.
+        assert_eq!((back, side), (7127, 652));
+        let total = f64::from(back).hypot(f64::from(side));
+        assert!((total - 7157.0).abs() < 1.0);
+        let axis = f64::from(side).atan2(f64::from(back)).to_degrees();
+        assert!((axis - 5.2).abs() < 0.05, "axis {axis}");
+    }
+
+    #[test]
+    fn xi_spin_axis_zero_without_club_data() {
+        let (d4, e8) = shot_without_club_data();
+        assert_eq!((d4.backspin_rpm, d4.sidespin_rpm), (2756, 1464));
+        assert_eq!(xi_spin(&d4, &e8), Some((6897, 0)));
+    }
+
+    #[test]
+    fn product_and_firmware_from_device_info() {
+        assert_eq!(
+            product_and_firmware(
+                DeviceModel::Mevo,
+                Some(DeviceGen::MevoPlus),
+                "0.37   M2 TR 03 Jan 21 2026 11:29:54"
+            ),
+            ("Mevo+".into(), Some("0.37 (Jan 21 2026)".into()))
+        );
+        assert_eq!(
+            product_and_firmware(DeviceModel::Mevo, Some(DeviceGen::Gen2), "0.37   M2 TR 03"),
+            ("Mevo Gen2".into(), Some("0.37".into()))
+        );
+        assert_eq!(
+            product_and_firmware(
+                DeviceModel::Mevo,
+                Some(DeviceGen::Unknown(0x01)),
+                "1.02 XY 7 Dec  9 2025 08:00:00"
+            ),
+            ("Mevo".into(), Some("1.02 (Dec 9 2025)".into()))
+        );
+        assert_eq!(
+            product_and_firmware(
+                DeviceModel::Xi,
+                None,
+                "2.07    FSCOPE  Apr  2 2018 12:00:00"
+            ),
+            ("Xi".into(), Some("2.07 (Apr 2 2018)".into()))
+        );
+        assert_eq!(
+            product_and_firmware(DeviceModel::Mevo, None, ""),
+            ("Mevo".into(), None)
+        );
+        // The hardware code never reaches the model or firmware.
+        let (model, firmware) = product_and_firmware(
+            DeviceModel::Mevo,
+            None,
+            "0.37   M2 TR 03 Jan 21 2026 11:29:54",
+        );
+        assert!(!format!("{model} {firmware:?}").contains("M2"));
+    }
+
+    #[test]
+    fn zero_speed_d4_is_a_failed_model() {
+        let (mut d4, _) = shot_with_club_data();
+        assert!(!d4_model_failed(&d4));
+        d4.launch_speed = 0.0;
+        d4.launch_elevation = 0.0;
+        assert!(d4_model_failed(&d4));
+        d4.launch_speed = -0.1;
+        assert!(d4_model_failed(&d4));
+        d4.launch_speed = f64::NAN;
+        assert!(d4_model_failed(&d4));
+    }
+
+    #[test]
+    fn zero_speed_d4_decoded_from_wire_is_a_failed_model() {
+        // The shot-with-club-data D4 with launch speed (INT24 at offset 16)
+        // and elevation (INT24 at offset 22) zeroed, as the device sends when
+        // its distance model fails.
+        let mut raw = hex(
+            "9c00000400005600000000002700020a008a28001fcd005209014ca2000ff30034e30149f8000000002a04\
+             001bd7fffd740000000003e9fffefbffe76d003c1affce900006f70000000000000000000000000000000\
+             06c96002c8fffc66e004e9500d43600571500975a00197701df710000003d08ebf5cc2b019bbcffe3fd000\
+             00017c8affb5496ff6c7f00126500000008b809fe35a1004bd6fffab0",
+        );
+        assert!(!d4_model_failed(&FlightResult::decode(&raw).unwrap()));
+        raw[16..19].fill(0);
+        raw[22..25].fill(0);
+        let failed = FlightResult::decode(&raw).unwrap();
+        assert_eq!(failed.launch_speed, 0.0);
+        assert_eq!(failed.launch_elevation, 0.0);
+        assert!(d4_model_failed(&failed));
+    }
+
+    /// Scripted FlightScope on an in-memory stream: serves the queued frames
+    /// and answers the shot-completion requests (0x6D, ARM) the way the device
+    /// does.
+    mod fake_device {
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        use std::io;
+        use std::rc::Rc;
+
+        use ironsight::{BusAddr, FrameSplitter, RawFrame};
+
+        #[derive(Default)]
+        pub struct State {
+            splitter: FrameSplitter,
+            outbox: VecDeque<u8>,
+            /// ED returned for the ShotResultReq.
+            pub shot_ed: Vec<u8>,
+        }
+
+        impl State {
+            pub fn push(&mut self, src: BusAddr, type_id: u8, payload: Vec<u8>) {
+                let frame = RawFrame {
+                    dest: BusAddr::App,
+                    src,
+                    type_id,
+                    payload,
+                };
+                self.outbox.extend(frame.encode());
+            }
+
+            fn respond(&mut self, f: &RawFrame) {
+                match f.type_id {
+                    0x6D => {
+                        let ed = self.shot_ed.clone();
+                        self.push(BusAddr::Avr, 0xED, ed);
+                    }
+                    0xB0 => {
+                        self.push(BusAddr::Avr, 0x95, vec![0x02, 0x30, 0x30]);
+                        self.push(BusAddr::Avr, 0xE3, b"\n\rARMED\0".to_vec());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        pub struct Stream(pub Rc<RefCell<State>>);
+
+        impl io::Read for Stream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let mut st = self.0.borrow_mut();
+                if st.outbox.is_empty() {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                let n = buf.len().min(st.outbox.len());
+                for (b, v) in buf.iter_mut().zip(st.outbox.drain(..n)) {
+                    *b = v;
+                }
+                Ok(n)
+            }
+        }
+
+        impl io::Write for Stream {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let mut st = self.0.borrow_mut();
+                for wire in st.splitter.feed(buf) {
+                    let frame = RawFrame::parse(&wire).expect("valid frame");
+                    st.respond(&frame);
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+    }
+
+    const SHOT_ED: &str = "a62f002040000adb0007db000474fffa3f00028b000f220004f80002240008b50015380003f2fffed00002\
+        1f0000040028460000000000030000020009ea000000045a3bfffcf203ec210e3ea8fffcf203ebe9e12e7a\
+        000030ff23313d086c000030ff233a2a9ca70015de00f05d3531680015df00f041146dc2ffff02fffa6f00\
+        1f47ffff02fffa6f001f470016bb000dd80019820016bb000dd8001982fff3a0001080000102";
+
+    const SHOT_EF: &str = "8930040003520008266a000251000643e00001a500052eb000016c0005216300016600054b0800\
+        0164000521e900028800072c0f000264000732e00001b600062ed500027900093329000223000\
+        821cb000220000800000000000000000000000000000000000000000011111bf500741bf50000\
+        000000000000030000051bf503691111000000000000";
+
+    /// Made-up AVR status: hardware ID bytes 0x12, 0x34 at offsets 2 and 5.
+    fn avr_status() -> Vec<u8> {
+        let mut p = vec![0u8; 25];
+        p[0] = 0x18;
+        p[2] = 0x12;
+        p[5] = 0x34;
+        p
+    }
+
+    /// Made-up AVR device info carrying a serial in its text slots.
+    fn avr_dev_info() -> Vec<u8> {
+        let mut p = vec![0u8; 75];
+        p[0] = 0x4A;
+        p[27..52].copy_from_slice(b"FS Mevo 2 BM17.04 SERIAL9");
+        p
+    }
+
+    #[test]
+    fn raw_capture_holds_the_shot_window_without_identity_frames() {
+        use ironsight::BusAddr;
+
+        let (d4, e8) = (
+            hex(
+                "9c00000400005600000000002700020a008a28001fcd005209014ca2000ff30034e30149f8000000002a04\
+                 001bd7fffd740000000003e9fffefbffe76d003c1affce900006f70000000000000000000000000000000\
+                 06c96002c8fffc66e004e9500d43600571500975a00197701df710000003d08ebf5cc2b019bbcffe3fd000\
+                 00017c8affb5496ff6c7f00126500000008b809fe35a1004bd6fffab0",
+            ),
+            hex(
+                "5d000004000000008a28000ff5014c9f0034ef002f1b005209001fcd000000000000001bf500000000005600\
+                 000001e00f0000003d08e0f5d3a3019570ffe4ea00000017ccdefb5b2eff69290012cb00000008bc60fe8a\
+                 0e003a8afffc10",
+            ),
+        );
+        let state = Rc::new(RefCell::new(fake_device::State::default()));
+        {
+            let mut st = state.borrow_mut();
+            st.shot_ed = hex(SHOT_ED);
+            st.push(BusAddr::Avr, 0xAA, avr_status());
+            st.push(BusAddr::Avr, 0xE7, avr_dev_info());
+            st.push(BusAddr::Avr, 0xE5, b"\x0cBALL TRIGGER\0".to_vec());
+            st.push(BusAddr::Dsp, 0xE8, e8);
+            st.push(BusAddr::Avr, 0xAA, avr_status());
+            st.push(BusAddr::Dsp, 0xD4, d4);
+            st.push(BusAddr::Dsp, 0xED, hex(SHOT_ED));
+            st.push(BusAddr::Dsp, 0xEF, hex(SHOT_EF));
+            st.push(BusAddr::Avr, 0xE5, b"\x0aPROCESSED\0".to_vec());
+            st.push(BusAddr::Avr, 0xE5, b"\x05IDLE\0".to_vec());
+            st.push(BusAddr::Avr, 0xB1, vec![0x02, 0x00, 0x00]);
+        }
+
+        let mut conn = BinaryConnection::new(fake_device::Stream(Rc::clone(&state)));
+        let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
+        let last_d4 = attach_raw_capture(&mut conn, "mevo.0", &capture);
+        let mut client = BinaryClient::new(conn);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let raw = loop {
+            assert!(Instant::now() < deadline, "shot never completed");
+            match client.poll().expect("poll") {
+                Some(BinaryEvent::Trigger) => capture.borrow_mut().mark_trigger(),
+                Some(BinaryEvent::ShotComplete(_)) => break capture.borrow_mut().take(),
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+        };
+
+        let seq: Vec<(RawDir, &str)> = raw
+            .frames
+            .iter()
+            .map(|r| (r.dir, r.r#type.as_deref().unwrap_or("")))
+            .collect();
+        use RawDir::{Rx, Tx};
+        assert_eq!(
+            seq,
+            [
+                (Rx, "0xE5"),
+                (Rx, "0xE8"),
+                (Rx, "0xD4"),
+                (Rx, "0xED"),
+                (Rx, "0xEF"),
+                (Rx, "0xE5"),
+                (Tx, "0x69"),
+                (Tx, "0x69"),
+                (Rx, "0xE5"),
+                (Tx, "0x6D"),
+                (Rx, "0xB1"),
+                (Rx, "0xED"),
+                (Tx, "0xB0"),
+                (Rx, "0x95"),
+                (Rx, "0xE3"),
+            ]
+        );
+        assert_eq!(raw.transport, "flightscope-tcp");
+        assert_eq!(raw.dropped, 0);
+        // The E5 is pre-roll, every later frame arrived after the trigger.
+        assert!(raw.frames[0].t_ms <= 0);
+        assert!(raw.frames[1..].iter().all(|r| r.t_ms >= 0));
+        assert_eq!(raw.frames[0].src.as_deref(), Some("AVR"));
+        assert_eq!(raw.frames[0].dst.as_deref(), Some("APP"));
+        assert_eq!(raw.frames[12].src.as_deref(), Some("APP"));
+        assert_eq!(raw.frames[12].dst.as_deref(), Some("AVR"));
+        assert_eq!(raw.frames[12].hex.as_deref(), Some("0101"));
+        assert!(!last_d4.borrow().is_empty());
+
+        // No identity: the status and device info frames, the serial text,
+        // and the status frame's hardware ID bytes are all absent.
+        let json = serde_json::to_string(&raw).expect("ser");
+        assert!(!json.contains("0xAA") && !json.contains("0xE7"));
+        assert!(!json.contains(&hex_lower(b"SERIAL9")));
+        assert!(!json.contains(&hex_lower(&avr_status())));
+        assert!(
+            raw.frames
+                .iter()
+                .filter_map(|r| r.hex.as_deref())
+                .all(|h| !h.starts_with("1800120000340000"))
+        );
+    }
+
+    #[test]
+    fn export_denylist_covers_identity_types() {
+        let rec = |t: u8| RawRecord {
+            r#type: Some(raw_capture::type_label(t)),
+            ..RawRecord::binary(RawDir::Rx, &[])
+        };
+        for t in [
+            0xAA, 0x67, 0xE7, 0xFD, 0x48, 0xC8, 0xDE, 0x87, 0xD0, 0xD1, 0xD2, 0xD3, 0x9B, 0x23,
+            0xA2, 0x90, 0x89,
+        ] {
+            assert!(export_excluded(&rec(t)), "0x{t:02X} must be excluded");
+        }
+        for t in [
+            0xD4, 0xE8, 0xED, 0xEF, 0xE5, 0xE3, 0x36, 0xBA, 0xDF, 0xE0, 0xE1,
+        ] {
+            assert!(!export_excluded(&rec(t)), "0x{t:02X} must be kept");
+        }
+        for t in [0xEC, 0xEE, 0xD9] {
+            assert!(export_bulk(&rec(t)));
+        }
+        assert!(!export_bulk(&rec(0xD4)));
+    }
+
+    /// The sensor activation exchange (0x90 out, 0x89 back) carries a
+    /// per-device certificate and never reaches a shot export.
+    #[test]
+    fn export_skips_sensor_activation() {
+        let rec = |dir: RawDir, t: u8| RawRecord {
+            r#type: Some(raw_capture::type_label(t)),
+            ..RawRecord::binary(dir, &[t; 8])
+        };
+        let mut capture = RawCapture::new(raw_capture_config());
+        capture.push(rec(RawDir::Tx, 0x90));
+        capture.push(rec(RawDir::Rx, 0x89));
+        capture.mark_trigger();
+        capture.push(rec(RawDir::Tx, 0x90));
+        capture.push(rec(RawDir::Rx, 0x89));
+        capture.push(rec(RawDir::Rx, 0xD4));
+        let raw = capture.take();
+        let types: Vec<u8> = raw
+            .frames
+            .iter()
+            .filter_map(raw_capture::type_byte)
+            .collect();
+        assert_eq!(types, [0xD4]);
+        assert_eq!(raw.dropped, 0);
+    }
+
+    #[test]
+    fn xi_spin_axis_zero_without_d4_backspin() {
+        let (mut d4, e8) = shot_with_club_data();
+        assert!(d4.clubhead_speed > 0.0);
+        for back in [0, -1200] {
+            d4.backspin_rpm = back;
+            assert_eq!(xi_spin(&d4, &e8), Some((7157, 0)), "D4 backspin {back}");
+        }
+    }
+
+    #[test]
+    fn xi_spin_keeps_d4_without_e8_spin() {
+        let (d4, mut e8) = shot_with_club_data();
+        e8.backspin_rpm = 0;
+        assert_eq!(xi_spin(&d4, &e8), None);
     }
 }

@@ -1,9 +1,9 @@
 use crate::app::FlighthookApp;
 use crate::net;
 use crate::types::{
-    CameraMode, Club, Distance, DistanceExt, FlighthookConfig, GsProSection, MevoSection,
-    MockMonitorSection, R10Section, RandomClubSection, SimSurface, SimulationSection, UnitSystem,
-    WebserverSection,
+    CameraMode, Club, Distance, DistanceExt, FlightScopeEnvironment, FlighthookConfig,
+    GsProSection, MevoSection, MockMonitorSection, R10Section, RandomClubSection, SimSurface,
+    SimulationSection, UnitSystem, WebserverSection,
 };
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
@@ -63,6 +63,9 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) use_estimated: bool,
     /// Mevo: camera mode. Fusion modes are what produce club data.
     pub(crate) camera_mode: CameraMode,
+    /// FlightScope: environment (limited flight or outdoor), which picks the
+    /// full-swing detection mode.
+    pub(crate) environment: FlightScopeEnvironment,
     /// Square Golf: discard zero-spin reads, except when putting.
     pub(crate) discard_zero_spin: bool,
     /// Square Golf fields the form does not surface. Carried verbatim so that
@@ -80,7 +83,7 @@ pub(crate) struct DeviceFormEntry {
 /// Whether a string looks like a BLE device identifier: a MAC address
 /// (`AA:BB:CC:DD:EE:FF`), on macOS, which hides MAC addresses, a peripheral
 /// UUID (`8-4-4-4-12` hex groups), or an advertised Square Golf name such as
-/// `SquareGolf(54E4)`, which is the same on every OS. The all-zero MAC is
+/// `SquareGolf(CD01)`, which is the same on every OS. The all-zero MAC is
 /// the placeholder macOS reports in place of a hidden address, so it is
 /// rejected.
 ///
@@ -165,8 +168,9 @@ impl DeviceFormEntry {
             surface_height_val: format_distance_value(surf.value()),
             surface_height_unit: surf.unit_key().into(),
             track_pct: format!("{:.0}", s.track_pct.unwrap_or(80.0)),
-            use_estimated: s.use_estimated.unwrap_or(true),
+            use_estimated: s.use_estimated.unwrap_or(false),
             camera_mode: s.camera_mode.unwrap_or_default(),
+            environment: s.environment.unwrap_or_default(),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -193,8 +197,9 @@ impl DeviceFormEntry {
             surface_height_val: "0".into(),
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
-            use_estimated: true,
+            use_estimated: false,
             camera_mode: CameraMode::default(),
+            environment: FlightScopeEnvironment::default(),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -221,8 +226,9 @@ impl DeviceFormEntry {
             surface_height_val: "0".into(),
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
-            use_estimated: true,
+            use_estimated: false,
             camera_mode: CameraMode::default(),
+            environment: FlightScopeEnvironment::default(),
             dirty: false,
         }
     }
@@ -241,8 +247,9 @@ impl DeviceFormEntry {
             surface_height_val: "0".into(),
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
-            use_estimated: true,
+            use_estimated: false,
             camera_mode: CameraMode::default(),
+            environment: FlightScopeEnvironment::default(),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -265,8 +272,9 @@ impl DeviceFormEntry {
             surface_height_val: "0".into(),
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
-            use_estimated: true,
+            use_estimated: false,
             camera_mode: CameraMode::default(),
+            environment: FlightScopeEnvironment::default(),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -374,7 +382,7 @@ impl ActorFormEntry {
     pub(crate) fn type_tooltip(&self) -> &str {
         match self {
             ActorFormEntry::Device(d) => match d.monitor_type.as_str() {
-                "mevo" => "FlightScope Mevo / Mevo+ — connects via WiFi (TCP)",
+                "mevo" => "FlightScope Mevo / Mevo+ / Xi — connects via WiFi (TCP)",
                 "r10" => "Garmin R10 — auto-detects from system connected Bluetooth devices",
                 "square" => {
                     "Square Golf Omni — BLE, no pairing required; leave address blank to auto-discover"
@@ -752,6 +760,7 @@ impl SettingsForm {
                                 track_pct: dev.track_pct.parse().ok(),
                                 use_estimated: Some(dev.use_estimated),
                                 camera_mode: Some(dev.camera_mode),
+                                environment: Some(dev.environment),
                             },
                         );
                     }
@@ -971,6 +980,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             track_pct: dev.track_pct.parse().ok(),
                             use_estimated: Some(dev.use_estimated),
                             camera_mode: Some(dev.camera_mode),
+                            environment: Some(dev.environment),
                         },
                     );
                 }
@@ -1370,10 +1380,10 @@ impl FlighthookApp {
                                 // BLE address — optional; blank auto-discovers.
                                 ui.horizontal(|ui| {
                                     ui.add_space(16.0);
-                                    ui.label("BLE Address:").on_hover_text("Advertised name of the device, e.g. SquareGolf(54E4) — the same on every OS. A Bluetooth address (a UUID on macOS) also works. Leave blank to auto-discover.");
+                                    ui.label("BLE Address:").on_hover_text("Advertised name of the device, e.g. SquareGolf(CD01) — the same on every OS. A Bluetooth address (a UUID on macOS) also works. Leave blank to auto-discover.");
                                     if ui
                                         .add(egui::TextEdit::singleline(&mut dev.address).desired_width(field_width))
-                                        .on_hover_text("optional, e.g. SquareGolf(54E4)")
+                                        .on_hover_text("optional, e.g. SquareGolf(CD01)")
                                         .changed()
                                     {
                                         dev.dirty = true;
@@ -1600,18 +1610,43 @@ impl FlighthookApp {
                                 ui.horizontal(|ui| {
                                     ui.add_space(16.0);
                                     if ui.checkbox(&mut dev.use_estimated, "Use Estimated Shots")
-                                        .on_hover_text("Include estimated (E8 fallback) shots.\nEstimated shots may lack sidespin and carry less data,\nbut are often the only result for short chips.")
+                                        .on_hover_text("Include estimated (E8 fallback) shots. Off by default.\nWith it off, a shot the device only estimated (a flight too short\nto read in Outdoor mode, a very short chip) is skipped.\nEstimated shots may lack sidespin and carry less data.")
                                         .changed()
                                     {
                                         dev.dirty = true;
                                     }
                                 });
 
+                                // Environment
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label("Environment:").on_hover_text(
+                                        "Limited flight is for nets and sim screens.\nOutdoor needs about 40 yd of unobstructed flight;\nshots into a screen won't read.",
+                                    );
+                                    egui::ComboBox::from_id_salt(format!("environment_{}", dev.id))
+                                        .selected_text(dev.environment.label())
+                                        .width(field_width * 2.0)
+                                        .show_ui(ui, |ui| {
+                                            for env in FlightScopeEnvironment::all() {
+                                                if ui
+                                                    .selectable_label(
+                                                        dev.environment == env,
+                                                        env.label(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    dev.environment = env;
+                                                    dev.dirty = true;
+                                                }
+                                            }
+                                        });
+                                });
+
                                 // Camera Mode
                                 ui.horizontal(|ui| {
                                     ui.add_space(16.0);
                                     ui.label("Camera Mode:").on_hover_text(
-                                        "Standard reports ball flight only.\nFusion modes add club data (path, face angle, attack angle,\ndynamic loft, smash factor, swing planes) and need the\nPro Package enabled on the device.\n\nWhich Fusion mode depends on firmware: Raw Fusion for\nBM17.04 and newer, Fusion for older. The wrong one yields\nno club data. Fusion is applied after a 15s camera warmup.",
+                                        "Standard reports ball flight and radar club data.\nFusion modes add the full club data set (path, face angle,\nattack angle, dynamic loft, smash factor, swing planes) and\nneed the Pro Package enabled on the device.\n\nWhich Fusion mode depends on firmware: Raw Fusion for\nBM17.04 and newer, Fusion for older. The wrong one yields\nno Fusion club data. Fusion is applied after a 15s camera warmup.",
                                     );
                                     egui::ComboBox::from_id_salt(format!("cam_mode_{}", dev.id))
                                         .selected_text(dev.camera_mode.label())
@@ -1750,8 +1785,9 @@ impl FlighthookApp {
                                     surface_height_val: "0".into(),
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
-                                    use_estimated: true,
+                                    use_estimated: false,
                                     camera_mode: CameraMode::default(),
+                                    environment: FlightScopeEnvironment::default(),
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
@@ -1782,8 +1818,9 @@ impl FlighthookApp {
                                     surface_height_val: "0".into(),
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
-                                    use_estimated: true,
+                                    use_estimated: false,
                                     camera_mode: CameraMode::default(),
+                                    environment: FlightScopeEnvironment::default(),
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
@@ -1813,8 +1850,9 @@ impl FlighthookApp {
                                     surface_height_val: "0".into(),
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
-                                    use_estimated: true,
+                                    use_estimated: false,
                                     camera_mode: CameraMode::default(),
+                                    environment: FlightScopeEnvironment::default(),
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
@@ -1844,8 +1882,9 @@ impl FlighthookApp {
                                     surface_height_val: "0".into(),
                                     surface_height_unit: "inches".into(),
                                     track_pct: "80".into(),
-                                    use_estimated: true,
+                                    use_estimated: false,
                                     camera_mode: CameraMode::default(),
+                                    environment: FlightScopeEnvironment::default(),
                                     discard_zero_spin: true,
                                     square_club: None,
                                     square_advanced_spin: None,
@@ -2007,22 +2046,22 @@ mod tests {
 
     #[test]
     fn ble_address_accepts_mac_and_uuid() {
-        assert!(is_ble_address("DC:0D:30:62:54:E4"));
-        assert!(is_ble_address(" dc:0d:30:62:54:e4 "));
+        assert!(is_ble_address("02:00:00:AB:CD:01"));
+        assert!(is_ble_address(" 02:00:00:ab:cd:01 "));
         assert!(is_ble_address("5F2A9C1E-3B7D-4E8A-9C0F-1A2B3C4D5E6F"));
     }
 
     #[test]
     fn ble_address_accepts_advertised_name() {
-        assert!(is_ble_address("SquareGolf(54E4)"));
-        assert!(is_ble_address(" squaregolf(54e4) "));
+        assert!(is_ble_address("SquareGolf(CD01)"));
+        assert!(is_ble_address(" squaregolf(cd01) "));
     }
 
     #[test]
     fn ble_address_rejects_malformed() {
         assert!(!is_ble_address(""));
-        assert!(!is_ble_address("DC:0D:30:62:54"));
-        assert!(!is_ble_address("DC:0D:30:62:54:G4"));
+        assert!(!is_ble_address("02:00:00:AB:CD"));
+        assert!(!is_ble_address("02:00:00:AB:CD:G1"));
         assert!(!is_ble_address("5F2A9C1E-3B7D-4E8A-9C0F"));
         assert!(!is_ble_address("192.168.2.1:5100"));
         assert!(!is_ble_address("SquareGolf"));

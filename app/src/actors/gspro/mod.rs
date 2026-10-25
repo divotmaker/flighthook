@@ -301,7 +301,7 @@ fn connect_and_run(
                             acc.set_club(*club.clone());
                         }
                     }
-                    FlighthookEvent::ShotFinished { ref key } => {
+                    FlighthookEvent::ShotFinished { ref key, .. } => {
                         if let Some(acc) = accumulators.remove(&(msg.actor.clone(), key.clone())) {
                             if !shot_matches_routing(routing, current_mode, &msg.actor) {
                                 tracing::debug!(

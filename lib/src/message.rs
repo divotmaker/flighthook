@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::{Handedness, ShotDetectionMode};
 use std::collections::HashMap;
 
-use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact};
+use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRaw};
 use crate::{ClubInfo, PlayerInfo};
 use crate::{
     FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, OpenConnectServerSection,
@@ -176,7 +176,15 @@ pub enum FlighthookEvent {
         impact: Box<FaceImpact>,
     },
     /// Shot sequence complete. Accumulators should finalize.
-    ShotFinished { key: ShotKey },
+    ///
+    /// `raw` is a flighthook extension: the device frames captured for this
+    /// shot, when the actor captures them. Omitted on the wire when absent, so
+    /// the FRP shape is unchanged.
+    ShotFinished {
+        key: ShotKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<Box<ShotRaw>>,
+    },
 
     // -- FRP: Device status --
     /// Device telemetry — emitted any time a device-reported value changes.
@@ -369,6 +377,7 @@ mod tests {
                     shot_id: "abc".into(),
                     shot_number: 1,
                 },
+                raw: None,
             },
         };
         let json = serde_json::to_string(&msg).unwrap();

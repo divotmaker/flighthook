@@ -37,7 +37,8 @@ use crate::bus::{BusReceiver, BusSender};
 use crate::sim;
 use crate::state::SystemState;
 use flighthook::{
-    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, RawPayload, Severity, ShotKey,
+    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, RawDir, RawPayload, RawRecord,
+    Severity, ShotKey, ShotRaw,
 };
 
 /// Cap on buffered bytes from a single peer before the connection is dropped.
@@ -336,28 +337,60 @@ fn handle(
     }
 
     let is_shot = !msg.shot_data_options.is_heart_beat && msg.shot_data_options.contains_ball_data;
-    if is_shot {
-        emit_shot(state, &msg, &payload, sender);
-    }
 
     let reply = api::GsProResponse::ok(if is_shot {
         "Shot received"
     } else {
         "Heartbeat received"
     });
-    match serde_json::to_vec(&reply) {
-        Ok(bytes) => {
-            if let Ok(text) = std::str::from_utf8(&bytes) {
-                tracing::info!(target: "audit", "{name} sent {text} | {reply:?}");
-            }
-            if let Err(e) = stream.write_all(&bytes).and_then(|()| stream.flush()) {
-                tracing::warn!("openconnect server: write failed: {e}");
-                return false;
-            }
+    let reply_text = match serde_json::to_string(&reply) {
+        Ok(text) => Some(text),
+        Err(e) => {
+            tracing::warn!("openconnect server: could not encode response: {e}");
+            None
         }
-        Err(e) => tracing::warn!("openconnect server: could not encode response: {e}"),
+    };
+
+    if is_shot {
+        emit_shot(
+            state,
+            &msg,
+            &payload,
+            shot_raw(&raw, reply_text.as_deref()),
+            sender,
+        );
+    }
+
+    if let Some(text) = reply_text {
+        tracing::info!(target: "audit", "{name} sent {text} | {reply:?}");
+        if let Err(e) = stream
+            .write_all(text.as_bytes())
+            .and_then(|()| stream.flush())
+        {
+            tracing::warn!("openconnect server: write failed: {e}");
+            return false;
+        }
     }
     true
+}
+
+/// The raw frames behind one shot: the monitor's message and our reply.
+fn shot_raw(request: &str, reply: Option<&str>) -> ShotRaw {
+    let mut frames = vec![RawRecord {
+        channel: Some("tcp".into()),
+        ..RawRecord::text(RawDir::Rx, request)
+    }];
+    if let Some(reply) = reply {
+        frames.push(RawRecord {
+            channel: Some("tcp".into()),
+            ..RawRecord::text(RawDir::Tx, reply)
+        });
+    }
+    ShotRaw {
+        transport: "openconnect-json".into(),
+        frames,
+        ..ShotRaw::default()
+    }
 }
 
 /// Publish the standard shot lifecycle for one Open Connect shot message.
@@ -365,6 +398,7 @@ fn emit_shot(
     state: &SystemState,
     msg: &api::GsProMessage,
     payload: &RawPayload,
+    raw: ShotRaw,
     sender: &BusSender,
 ) {
     let device = msg.device_id.as_str();
@@ -418,8 +452,66 @@ fn emit_shot(
     }
 
     sender.send(
-        FlighthookMessage::new(FlighthookEvent::ShotFinished { key })
-            .raw(payload.clone())
-            .device(device),
+        FlighthookMessage::new(FlighthookEvent::ShotFinished {
+            key,
+            raw: Some(Box::new(raw)),
+        })
+        .raw(payload.clone())
+        .device(device),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use tokio::sync::broadcast;
+
+    use super::*;
+
+    #[test]
+    fn shot_finished_carries_request_and_reply() {
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-oc-test-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, _writer) = SystemState::new(dir.join("config.toml"));
+        let (tx, mut rx) = broadcast::channel(16);
+        let sender = BusSender::new(
+            "openconnect_server.0".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let request = r#"{"DeviceID":"TestLM","Units":"Yards","ShotNumber":4,"APIversion":"1","BallData":{"Speed":100.0},"ShotDataOptions":{"ContainsBallData":true}}"#;
+        let msg: api::GsProMessage = serde_json::from_str(request).expect("parses");
+        let reply = r#"{"Code":200,"Message":"Shot received"}"#;
+        emit_shot(
+            &state,
+            &msg,
+            &RawPayload::Text(request.into()),
+            shot_raw(request, Some(reply)),
+            &sender,
+        );
+
+        let mut finished = None;
+        while let Ok(m) = rx.try_recv() {
+            if let FlighthookEvent::ShotFinished { raw, .. } = m.event {
+                finished = raw;
+            }
+        }
+        let raw = finished.expect("shot_finished with raw");
+        assert_eq!(raw.transport, "openconnect-json");
+        assert_eq!(raw.frames.len(), 2);
+        assert_eq!(raw.frames[0].dir, RawDir::Rx);
+        assert_eq!(raw.frames[0].text.as_deref(), Some(request));
+        assert_eq!(raw.frames[1].dir, RawDir::Tx);
+        assert_eq!(raw.frames[1].text.as_deref(), Some(reply));
+        assert!(
+            raw.frames
+                .iter()
+                .all(|f| f.channel.as_deref() == Some("tcp"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

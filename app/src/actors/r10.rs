@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,12 +9,13 @@ use tracing::{debug, info, warn};
 
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::raw_capture::{self, RawCapture, RawCaptureConfig};
 use crate::sim;
 use crate::state::SystemState;
 
 use flighthook::{
-    ActorStatus, BallFlight, ClubData, FlighthookEvent, FlighthookMessage, Severity,
-    ShotDetectionMode, ShotKey, Velocity,
+    ActorStatus, BallFlight, ClubData, FlighthookEvent, FlighthookMessage, RawDir, RawRecord,
+    Severity, ShotDetectionMode, ShotKey, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
@@ -64,6 +66,193 @@ impl Actor for R10Actor {
             }
             None => ReconfigureOutcome::RestartRequired, // section removed
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw capture
+// ---------------------------------------------------------------------------
+
+/// Raw capture for one R10 connection. Chunks are recorded as they cross the
+/// transport, MultiLink handle byte included. The pre-roll holds the shot
+/// message and the device's replays of it at any MTU.
+fn raw_capture_config() -> RawCaptureConfig {
+    RawCaptureConfig {
+        transport: "r10-ble",
+        pre_roll_frames: 256,
+        max_frames: 256,
+        max_bulk_bytes: 0,
+        exclude: raw_capture::exclude_none,
+        is_bulk: raw_capture::no_bulk,
+    }
+}
+
+/// GFDI ACK. Its payload starts with the type it acknowledges.
+const GFDI_ACK: u16 = 5000;
+
+/// GFDI message types never captured, nor ACKs of them: file transfer and
+/// FIT messages (FIT files carry the device serial), device information
+/// (unit ID, Bluetooth name, MAC addresses) and authentication (keys).
+const GFDI_EXCLUDED: [u16; 5] = [5003, 5004, 5011, 5012, 5024];
+const GFDI_AUTH: std::ops::RangeInclusive<u16> = 5101..=5112;
+
+/// Longest COBS-encoded GFDI frame the filter classifies. Longer frames are
+/// excluded.
+const MAX_FRAME_BYTES: usize = 8 * 1024;
+
+/// Most chunks held for one frame. A frame spread over more is excluded.
+const MAX_HELD_CHUNKS: usize = 256;
+
+fn gfdi_type_excluded(msg_type: u16) -> bool {
+    GFDI_EXCLUDED.contains(&msg_type) || GFDI_AUTH.contains(&msg_type)
+}
+
+/// Whether a GFDI frame (COBS-encoded, delimiters stripped) stays out of the
+/// capture. A frame that does not decode or fails its CRC cannot be
+/// classified and is excluded.
+fn gfdi_frame_excluded(cobs: &[u8]) -> bool {
+    let Ok(frame) = tenover::cobs::decode(cobs) else {
+        return true;
+    };
+    let n = frame.len();
+    if n < 6
+        || tenover::crc::crc16(&frame[..n - 2]) != u16::from_le_bytes([frame[n - 2], frame[n - 1]])
+    {
+        return true;
+    }
+    // Header: [length u16] then the type, either u16 LE or (with a
+    // transaction ID, high bit of byte 3 set) one byte offset from 5000.
+    let msg_type = if frame[3] & 0x80 == 0 {
+        u16::from_le_bytes([frame[2], frame[3]])
+    } else {
+        5000 + u16::from(frame[2])
+    };
+    if gfdi_type_excluded(msg_type) {
+        return true;
+    }
+    msg_type == GFDI_ACK
+        && frame
+            .get(4..6)
+            .is_none_or(|t| gfdi_type_excluded(u16::from_le_bytes([t[0], t[1]])))
+}
+
+/// Holds one direction's chunks until every GFDI frame they carry is
+/// complete and classified, so no chunk holding any byte of an excluded
+/// frame is recorded. Frames are `0x00`-delimited COBS on the wire, split
+/// across chunks that each start with the MultiLink handle byte.
+#[derive(Default)]
+struct FrameFilter {
+    /// COBS bytes of the frame in progress.
+    frame: Vec<u8>,
+    /// The frame in progress is excluded whatever its type.
+    tainted: bool,
+    /// Chunks carrying part of the frame in progress.
+    held: Vec<(Instant, RawRecord)>,
+}
+
+impl FrameFilter {
+    /// Feed one chunk. Returns the chunks cleared for capture, oldest first.
+    fn feed(&mut self, at: Instant, rec: RawRecord, chunk: &[u8]) -> Vec<(Instant, RawRecord)> {
+        let mut out = Vec::new();
+        let mut keep = true;
+        for &b in chunk.get(1..).unwrap_or_default() {
+            if b != 0 {
+                if self.frame.len() < MAX_FRAME_BYTES {
+                    self.frame.push(b);
+                } else {
+                    self.tainted = true;
+                }
+                continue;
+            }
+            if self.frame.is_empty() && !self.tainted {
+                continue;
+            }
+            if self.tainted || gfdi_frame_excluded(&self.frame) {
+                self.held.clear();
+                keep = false;
+            } else {
+                out.append(&mut self.held);
+            }
+            self.frame.clear();
+            self.tainted = false;
+        }
+        if self.held.len() >= MAX_HELD_CHUNKS {
+            self.held.clear();
+            self.tainted = true;
+        }
+        if keep && !self.tainted {
+            if self.frame.is_empty() {
+                out.push((at, rec));
+            } else {
+                self.held.push((at, rec));
+            }
+        }
+        out
+    }
+}
+
+/// Transport wrapper that records chunks for the shot export. The capture
+/// starts disabled and is enabled once the handshake (which carries the
+/// device's unit ID) is complete; after that, chunks of identity-bearing
+/// GFDI messages are filtered out by type.
+struct Tap<T> {
+    inner: T,
+    capture: RawCapture,
+    rx: FrameFilter,
+    tx: FrameFilter,
+}
+
+impl<T> Tap<T> {
+    fn new(inner: T) -> Self {
+        let mut capture = RawCapture::new(raw_capture_config());
+        capture.set_enabled(false);
+        Self {
+            inner,
+            capture,
+            rx: FrameFilter::default(),
+            tx: FrameFilter::default(),
+        }
+    }
+
+    /// Record a GFDI data chunk once its frames are classified.
+    fn record(&mut self, dir: RawDir, channel: &str, data: &[u8]) {
+        let rec = RawRecord {
+            channel: Some(channel.into()),
+            ..RawRecord::binary(dir, data)
+        };
+        let filter = match dir {
+            RawDir::Rx => &mut self.rx,
+            RawDir::Tx => &mut self.tx,
+        };
+        for (at, rec) in filter.feed(Instant::now(), rec, data) {
+            self.capture.push_at(rec, at);
+        }
+    }
+}
+
+impl<T: tenover::Transport> tenover::Transport for Tap<T> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.record(RawDir::Rx, "notify", &buf[..n]);
+        }
+        Ok(n)
+    }
+
+    fn write(&mut self, data: &[u8]) -> Result<(), io::Error> {
+        self.inner.write(data)?;
+        self.record(RawDir::Tx, "write", data);
+        Ok(())
+    }
+
+    /// MultiLink control plane (service registration): no GFDI frames.
+    fn write_register(&mut self, data: &[u8]) -> Result<(), io::Error> {
+        self.inner.write_register(data)?;
+        self.capture.push(RawRecord {
+            channel: Some("register".into()),
+            ..RawRecord::binary(RawDir::Tx, data)
+        });
+        Ok(())
     }
 }
 
@@ -228,7 +417,7 @@ fn connect_and_run(
     *device_id = Some(addr.clone());
 
     // 2. Create client and start registration
-    let mut client = Client::new(transport, mtu.into());
+    let mut client = Client::new(Tap::new(transport), mtu.into());
     client.start()?;
 
     // 3. Event loop state
@@ -274,6 +463,9 @@ fn connect_and_run(
 
                     Event::HandshakeComplete => {
                         info!("handshake complete");
+                        // The unit ID travelled in the handshake; capture
+                        // from here on.
+                        client.transport_mut().capture.set_enabled(true);
                         emit_device_status(
                             sender,
                             ActorStatus::Connected,
@@ -322,6 +514,7 @@ fn connect_and_run(
                             shot_number: shot_counter,
                         };
                         info!("shot #{} (device_id={})", key.shot_number, shot.shot_id);
+                        client.transport_mut().capture.mark_trigger();
 
                         emit_device_status(
                             sender,
@@ -378,9 +571,13 @@ fn connect_and_run(
                         }
 
                         // Emit ShotFinished
+                        let raw = client.transport_mut().capture.take();
                         sender.send(
-                            FlighthookMessage::new(FlighthookEvent::ShotFinished { key })
-                                .device(&addr),
+                            FlighthookMessage::new(FlighthookEvent::ShotFinished {
+                                key,
+                                raw: Some(Box::new(raw)),
+                            })
+                            .device(&addr),
                         );
 
                         // R10 auto-returns to WAITING after processing
@@ -495,6 +692,239 @@ fn connect_and_run(
                 warn!("protocol error: {e}");
                 emit_alert(sender, Severity::Warn, format!("R10 protocol error: {e}"));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tenover::Transport;
+
+    /// MultiLink handle the fake device uses.
+    const HANDLE: u8 = 0x05;
+
+    /// Transport that serves queued chunks and accepts every write.
+    #[derive(Default)]
+    struct FakeTransport {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl Transport for FakeTransport {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
+            let Some(c) = self.chunks.pop_front() else {
+                return Err(io::ErrorKind::WouldBlock.into());
+            };
+            buf[..c.len()].copy_from_slice(&c);
+            Ok(c.len())
+        }
+
+        fn write(&mut self, _data: &[u8]) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn write_register(&mut self, _data: &[u8]) -> Result<(), io::Error> {
+            Ok(())
+        }
+    }
+
+    /// A GFDI frame as it crosses the wire: `[0x00] COBS(frame) [0x00]`.
+    fn wire(msg_type: u16, payload: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(6 + payload.len()).expect("short");
+        let mut frame = len.to_le_bytes().to_vec();
+        frame.extend_from_slice(&msg_type.to_le_bytes());
+        frame.extend_from_slice(payload);
+        let crc = tenover::crc::crc16(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        let mut out = vec![0];
+        out.extend(tenover::cobs::encode(&frame));
+        out.push(0);
+        out
+    }
+
+    /// `bytes` split into MTU-sized chunks, each led by the handle byte.
+    fn chunks(bytes: &[u8], mtu: usize) -> Vec<Vec<u8>> {
+        bytes
+            .chunks(mtu - 1)
+            .map(|c| [&[HANDLE][..], c].concat())
+            .collect()
+    }
+
+    fn tap_with(rx: Vec<Vec<u8>>) -> Tap<FakeTransport> {
+        let mut tap = Tap::new(FakeTransport {
+            chunks: rx.into_iter().collect(),
+        });
+        tap.capture.set_enabled(true);
+        tap
+    }
+
+    fn read_all(tap: &mut Tap<FakeTransport>) {
+        let mut buf = [0u8; 256];
+        while tap.read(&mut buf).is_ok() {}
+    }
+
+    /// A made-up 5024 payload: product 119, unit ID 0x5EED1D01, three names.
+    fn device_info() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&150u16.to_le_bytes());
+        p.extend_from_slice(&119u16.to_le_bytes());
+        p.extend_from_slice(&0x5EED_1D01u32.to_le_bytes());
+        p.extend_from_slice(&1u16.to_le_bytes());
+        p.extend_from_slice(&512u16.to_le_bytes());
+        for name in [&b"Approach R10 SYNTH"[..], b"R10", b"Approach R10"] {
+            p.push(u8::try_from(name.len()).expect("short"));
+            p.extend_from_slice(name);
+        }
+        p
+    }
+
+    #[test]
+    fn chunks_before_enable_are_dropped() {
+        let mut tap = Tap::new(FakeTransport {
+            chunks: chunks(&wire(5044, b"shot"), 64).into_iter().collect(),
+        });
+        read_all(&mut tap);
+        tap.write(&chunks(&wire(5043, b"req"), 64)[0])
+            .expect("write");
+        tap.write_register(&[0x00, 0x01]).expect("register");
+        tap.capture.mark_trigger();
+        assert!(tap.capture.take().frames.is_empty());
+    }
+
+    #[test]
+    fn channels_are_labelled() {
+        let rx = [&[HANDLE][..], &wire(5044, &[0x10, 0x20])].concat();
+        let tx = [&[HANDLE][..], &wire(5043, &[0x30])].concat();
+        let mut tap = tap_with(vec![rx.clone()]);
+        read_all(&mut tap);
+        tap.write(&tx).expect("write");
+        tap.write_register(&[0x00, 0x04]).expect("register");
+        tap.capture.mark_trigger();
+        let raw = tap.capture.take();
+        let got: Vec<(RawDir, &str, &str)> = raw
+            .frames
+            .iter()
+            .map(|r| {
+                (
+                    r.dir,
+                    r.channel.as_deref().unwrap_or(""),
+                    r.hex.as_deref().unwrap_or(""),
+                )
+            })
+            .collect();
+        let (rx, tx) = (flighthook::hex_lower(&rx), flighthook::hex_lower(&tx));
+        assert_eq!(
+            got,
+            [
+                (RawDir::Rx, "notify", rx.as_str()),
+                (RawDir::Tx, "write", tx.as_str()),
+                (RawDir::Tx, "register", "0004"),
+            ]
+        );
+        assert!(raw.frames.iter().all(|r| r.r#type.is_none()));
+        assert_eq!(raw.transport, "r10-ble");
+    }
+
+    #[test]
+    fn pre_roll_is_bounded() {
+        let rx = (0..300u16)
+            .map(|i| [&[HANDLE][..], &wire(5044, &i.to_be_bytes())].concat())
+            .collect();
+        let mut tap = tap_with(rx);
+        read_all(&mut tap);
+        tap.capture.mark_trigger();
+        let raw = tap.capture.take();
+        assert_eq!(raw.frames.len(), 256);
+        let first = [&[HANDLE][..], &wire(5044, &44u16.to_be_bytes())].concat();
+        assert_eq!(raw.frames[0].hex, Some(flighthook::hex_lower(&first)));
+    }
+
+    #[test]
+    fn device_info_after_the_handshake_is_never_captured() {
+        // A shot message, a repeated 5024 and another shot message, packed
+        // back to back and split at MTU 20 so chunks straddle frames.
+        let (shot1, info, shot2) = (
+            wire(5044, &[0x11; 30]),
+            wire(5024, &device_info()),
+            wire(5044, &[0x22; 30]),
+        );
+        let stream = [shot1.clone(), info.clone(), shot2].concat();
+        let rx = chunks(&stream, 20);
+        let mut tap = tap_with(rx.clone());
+        read_all(&mut tap);
+        // Our reply to it, and the ACK of a shot message.
+        let mut ack = 5024u16.to_le_bytes().to_vec();
+        ack.extend_from_slice(&[0x00, 0xAA, 0xBB]);
+        for chunk in chunks(&wire(GFDI_ACK, &ack), 20) {
+            tap.write(&chunk).expect("write");
+        }
+        let shot_ack = [&[HANDLE][..], &wire(GFDI_ACK, &[0xB4, 0x13, 0x00])].concat();
+        tap.write(&shot_ack).expect("write");
+        tap.capture.mark_trigger();
+        let raw = tap.capture.take();
+
+        // Exactly the chunks holding no byte of the 5024 frame (its COBS
+        // bytes and closing delimiter) are kept, in order.
+        let info_bytes = shot1.len() + 1..shot1.len() + info.len();
+        let expected: Vec<String> = rx
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| {
+                let (lo, hi) = (k * 19, (k + 1) * 19);
+                hi <= info_bytes.start || lo >= info_bytes.end
+            })
+            .map(|(_, c)| flighthook::hex_lower(c))
+            .collect();
+        assert!(expected.len() >= 4 && expected.len() < rx.len());
+        let got: Vec<String> = raw
+            .frames
+            .iter()
+            .filter(|r| r.dir == RawDir::Rx)
+            .filter_map(|r| r.hex.clone())
+            .collect();
+        assert_eq!(got, expected);
+        let tx: Vec<String> = raw
+            .frames
+            .iter()
+            .filter(|r| r.dir == RawDir::Tx)
+            .filter_map(|r| r.hex.clone())
+            .collect();
+        assert_eq!(
+            tx,
+            [flighthook::hex_lower(&shot_ack)],
+            "ACK of 5024 dropped"
+        );
+
+        let all = raw
+            .frames
+            .iter()
+            .filter_map(|r| r.hex.as_deref())
+            .collect::<String>();
+        assert!(!all.contains("011ded5e"), "unit ID leaked");
+        assert!(
+            !all.contains(&flighthook::hex_lower(b"SYNTH")),
+            "name leaked"
+        );
+    }
+
+    #[test]
+    fn unclassifiable_frames_are_excluded() {
+        let mut bad = wire(5044, b"shot");
+        let n = bad.len();
+        bad[n - 2] ^= 0x01; // corrupt the CRC
+        let mut tap = tap_with(vec![[&[HANDLE][..], &bad].concat()]);
+        read_all(&mut tap);
+        tap.capture.mark_trigger();
+        assert!(tap.capture.take().frames.is_empty());
+    }
+
+    #[test]
+    fn identity_types_are_excluded() {
+        for t in [5003, 5004, 5011, 5012, 5024, 5101, 5112] {
+            assert!(gfdi_type_excluded(t), "{t}");
+        }
+        for t in [5000, 5043, 5044, 5050, 5100, 5113] {
+            assert!(!gfdi_type_excluded(t), "{t}");
         }
     }
 }

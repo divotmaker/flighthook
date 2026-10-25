@@ -11,8 +11,8 @@ use axum::response::Response;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
-use super::WebState;
 use super::types::{ModeRequest, PostSettingsResponse, StatusResponse};
+use super::{MAX_SHOTS, StoredShot, WebState, export};
 use crate::state::config::FlighthookConfig;
 use flighthook::{ConfigAction, FlighthookEvent, FlighthookMessage, ShotData, UnitSystem};
 
@@ -85,26 +85,137 @@ pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusRespon
 }
 
 /// GET /api/shots?limit=50&units=imperial|metric
+///
+/// Shots the device produced no data for are kept for the export but not
+/// listed here.
 pub async fn get_shots(
     State(state): State<Arc<WebState>>,
     Query(query): Query<ShotsQuery>,
 ) -> Json<Vec<ShotData>> {
     let shots = state.shots.read().await;
-    let start = shots.len().saturating_sub(query.limit);
-    let unit_system = query.units.as_deref().and_then(|u| match u {
+    let unit_system = query.units.as_deref().and_then(parse_units);
+    let mut result: Vec<ShotData> = shots
+        .iter()
+        .rev()
+        .filter(|s| s.data.has_data())
+        .take(query.limit)
+        .map(|s| match unit_system {
+            Some(system) => s.data.to_unit_system(system),
+            None => s.data.clone(),
+        })
+        .collect();
+    result.reverse();
+    Json(result)
+}
+
+fn parse_units(u: &str) -> Option<UnitSystem> {
+    match u {
         "imperial" => Some(UnitSystem::Imperial),
         "metric" => Some(UnitSystem::Metric),
         _ => None,
-    });
-    let result: Vec<ShotData> = shots
-        .iter()
-        .skip(start)
-        .map(|s| match unit_system {
-            Some(system) => s.to_unit_system(system),
-            None => s.clone(),
-        })
-        .collect();
-    Json(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shot export
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct ExportQuery {
+    /// `jsonl` (default) or `csv`.
+    pub format: Option<String>,
+    /// `imperial` or `metric`. JSONL defaults to native units, CSV to the
+    /// configured `default_units`.
+    pub units: Option<String>,
+    /// Most recent N shots, 1..=1000. Default: all stored.
+    pub limit: Option<usize>,
+    /// JSONL only: include raw frames. Default true.
+    pub raw: Option<bool>,
+}
+
+fn bad_request(msg: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )
+        .body(Body::from(msg))
+        .unwrap()
+}
+
+/// GET /api/shots/export?format=jsonl|csv&units=imperial|metric&limit=N&raw=true|false
+///
+/// Downloads the session's shots: JSONL with the raw device frames behind
+/// each shot, or CSV without them. One shot per line, streamed.
+pub async fn get_shots_export(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<ExportQuery>,
+) -> Response {
+    let csv = match query.format.as_deref().unwrap_or("jsonl") {
+        "jsonl" => false,
+        "csv" => true,
+        _ => return bad_request("format must be jsonl or csv"),
+    };
+    let units = match query.units.as_deref() {
+        None => None,
+        Some(u) => match parse_units(u) {
+            Some(units) => Some(units),
+            None => return bad_request("units must be imperial or metric"),
+        },
+    };
+    if query.limit.is_some_and(|n| n == 0 || n > MAX_SHOTS) {
+        return bad_request("limit must be 1..=1000");
+    }
+    let include_raw = query.raw.unwrap_or(true);
+
+    let shots: Vec<StoredShot> = {
+        let shots = state.shots.read().await;
+        let start = shots
+            .len()
+            .saturating_sub(query.limit.unwrap_or(shots.len()));
+        shots.iter().skip(start).cloned().collect()
+    };
+
+    let now = chrono::Utc::now();
+    let exported_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let ext = if csv { "csv" } else { "jsonl" };
+    let filename = format!("flighthook-shots-{}.{ext}", now.format("%Y%m%d-%H%M%S"));
+
+    let (content_type, body) = if csv {
+        let system = units.unwrap_or(state.root.system.snapshot().default_units);
+        let rows = std::iter::once(export::csv_header(system)).chain(
+            shots
+                .into_iter()
+                .map(move |s| export::to_csv_row(&s, system)),
+        );
+        (
+            "text/csv; charset=utf-8",
+            Body::from_stream(futures_util::stream::iter(
+                rows.map(Ok::<_, std::convert::Infallible>),
+            )),
+        )
+    } else {
+        let lines = shots
+            .into_iter()
+            .map(move |s| export::jsonl_line(&s, &exported_at, units, include_raw));
+        (
+            "application/x-ndjson",
+            Body::from_stream(futures_util::stream::iter(
+                lines.map(Ok::<_, std::convert::Infallible>),
+            )),
+        )
+    };
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, HeaderValue::from_static(content_type))
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
+        .body(body)
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------

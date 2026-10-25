@@ -1,11 +1,12 @@
 use ironsight::protocol::camera::CamConfig;
 use ironsight::protocol::config::{
-    MODE_CHIPPING, MODE_OUTDOOR, MODE_PUTTING, ParamData, ParamValue, RadarCal,
+    MODE_CHIPPING, MODE_FULL_OUTDOOR, MODE_LIMITED_FLIGHT, MODE_PUTTING, ParamData, ParamValue,
+    RadarCal,
 };
 use ironsight::seq::AvrSettings;
 
 use crate::state::config::MevoSection;
-use flighthook::{CameraMode, Distance, DistanceExt, ShotDetectionMode};
+use flighthook::{CameraMode, Distance, DistanceExt, FlightScopeEnvironment, ShotDetectionMode};
 
 /// Mutable session configuration. Distance fields carry both value and unit;
 /// wire-protocol conversions happen on demand in `to_avr_settings()`.
@@ -16,6 +17,8 @@ pub struct SessionConfig {
     pub range: Distance,
     pub surface_height: Distance,
     pub track_pct: f64, // 0-100 (user units)
+    /// Picks the full-swing detection mode (and the Xi's only mode).
+    pub environment: FlightScopeEnvironment,
 }
 
 impl Default for SessionConfig {
@@ -26,6 +29,7 @@ impl Default for SessionConfig {
             range: Distance::Feet(8.0),
             surface_height: Distance::Inches(0.0),
             track_pct: 80.0,
+            environment: FlightScopeEnvironment::LimitedFlight,
         }
     }
 }
@@ -41,22 +45,40 @@ impl SessionConfig {
             range: s.range.unwrap_or(defaults.range),
             surface_height: s.surface_height.unwrap_or(defaults.surface_height),
             track_pct: s.track_pct.unwrap_or(defaults.track_pct),
+            environment: s.environment.unwrap_or(defaults.environment),
         }
     }
 
     /// Human-readable label for the detection mode wire value.
-    /// Includes both the schema enum name and the commsIndex sent to the device.
-    pub fn mode_label(mode: &ShotDetectionMode) -> &'static str {
+    /// Includes both the mode name and the commsIndex sent to the device.
+    pub fn mode_label(&self, mode: &ShotDetectionMode) -> &'static str {
         match mode {
-            ShotDetectionMode::Full => "outdoor(9)",
+            ShotDetectionMode::Full => self.environment_label(),
             ShotDetectionMode::Putting => "putting(3)",
             ShotDetectionMode::Chipping => "chipping(5)",
         }
     }
 
+    /// Label for the environment's detection mode, with its commsIndex.
+    pub fn environment_label(&self) -> &'static str {
+        match self.environment {
+            FlightScopeEnvironment::LimitedFlight => "limited-flight(9)",
+            FlightScopeEnvironment::Outdoor => "outdoor(8)",
+        }
+    }
+
+    /// Detection mode commsIndex for the environment: the Mevo's full-swing
+    /// mode and the Xi's only mode.
+    pub fn environment_mode(&self) -> u8 {
+        match self.environment {
+            FlightScopeEnvironment::LimitedFlight => MODE_LIMITED_FLIGHT,
+            FlightScopeEnvironment::Outdoor => MODE_FULL_OUTDOOR,
+        }
+    }
+
     /// Full AVR settings for initial configuration: params + RadarCal.
     pub(crate) fn to_avr_settings(&self, mode: &ShotDetectionMode) -> AvrSettings {
-        let comms_index = Self::comms_index(mode);
+        let comms_index = self.comms_index(mode);
 
         AvrSettings {
             mode: comms_index,
@@ -84,17 +106,23 @@ impl SessionConfig {
     /// Minimal AVR settings for mode changes: ModeSet only, no params or
     /// RadarCal. Full params trigger ~29s of ConfigNack retries on ARM;
     /// mode-only significantly reduces (but does not eliminate) retries.
-    pub(crate) fn to_avr_settings_mode_only(mode: &ShotDetectionMode) -> AvrSettings {
+    pub(crate) fn to_avr_settings_mode_only(&self, mode: &ShotDetectionMode) -> AvrSettings {
         AvrSettings {
-            mode: Self::comms_index(mode),
+            mode: self.comms_index(mode),
             params: vec![],
             radar_cal: None,
         }
     }
 
-    fn comms_index(mode: &ShotDetectionMode) -> u8 {
+    /// AVR settings for the Xi: the environment's mode only, with the radar
+    /// parameters stored on the device.
+    pub(crate) fn to_xi_avr_settings(&self) -> AvrSettings {
+        AvrSettings::xi_with_mode(self.environment_mode())
+    }
+
+    fn comms_index(&self, mode: &ShotDetectionMode) -> u8 {
         match mode {
-            ShotDetectionMode::Full => MODE_OUTDOOR,
+            ShotDetectionMode::Full => self.environment_mode(),
             ShotDetectionMode::Putting => MODE_PUTTING,
             ShotDetectionMode::Chipping => MODE_CHIPPING,
         }
@@ -149,5 +177,76 @@ pub(crate) fn fusion_cam_config(mode: CameraMode) -> Option<CamConfig> {
         CameraMode::Standard => None,
         CameraMode::Fusion => Some(CamConfig::fusion_preset()),
         CameraMode::RawFusion => Some(CamConfig::raw_fusion_preset()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(environment: FlightScopeEnvironment) -> SessionConfig {
+        SessionConfig {
+            environment,
+            ..SessionConfig::default()
+        }
+    }
+
+    #[test]
+    fn environment_sets_full_swing_mode_only() {
+        let limited = session(FlightScopeEnvironment::LimitedFlight);
+        let outdoor = session(FlightScopeEnvironment::Outdoor);
+        assert_eq!(limited.to_avr_settings(&ShotDetectionMode::Full).mode, 9);
+        assert_eq!(outdoor.to_avr_settings(&ShotDetectionMode::Full).mode, 8);
+        for s in [&limited, &outdoor] {
+            assert_eq!(
+                s.to_avr_settings_mode_only(&ShotDetectionMode::Chipping)
+                    .mode,
+                5
+            );
+            assert_eq!(
+                s.to_avr_settings_mode_only(&ShotDetectionMode::Putting)
+                    .mode,
+                3
+            );
+            assert_eq!(s.to_avr_settings(&ShotDetectionMode::Chipping).mode, 5);
+            assert_eq!(s.to_avr_settings(&ShotDetectionMode::Putting).mode, 3);
+        }
+        assert_eq!(
+            outdoor
+                .to_avr_settings_mode_only(&ShotDetectionMode::Full)
+                .mode,
+            8
+        );
+        assert_eq!(
+            limited.mode_label(&ShotDetectionMode::Full),
+            "limited-flight(9)"
+        );
+        assert_eq!(outdoor.mode_label(&ShotDetectionMode::Full), "outdoor(8)");
+        assert_eq!(
+            outdoor.mode_label(&ShotDetectionMode::Chipping),
+            "chipping(5)"
+        );
+    }
+
+    #[test]
+    fn xi_settings_follow_environment() {
+        for (env, mode) in [
+            (FlightScopeEnvironment::LimitedFlight, 9),
+            (FlightScopeEnvironment::Outdoor, 8),
+        ] {
+            let avr = session(env).to_xi_avr_settings();
+            assert_eq!(avr.mode, mode);
+            assert!(avr.params.is_empty());
+            assert!(avr.radar_cal.is_none());
+        }
+    }
+
+    #[test]
+    fn absent_environment_is_limited_flight() {
+        let section = MevoSection::default();
+        assert_eq!(section.environment, None);
+        let s = SessionConfig::from_mevo_section(&section);
+        assert_eq!(s.environment, FlightScopeEnvironment::LimitedFlight);
+        assert_eq!(s, SessionConfig::default());
     }
 }

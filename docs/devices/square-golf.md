@@ -98,6 +98,20 @@ Set it to `false` to forward every shot, spin or not.
 The Omni has no separate putting mode. Selecting a putter in the sim puts the
 device into putting mode via the normal club-forwarding path.
 
+## Shot export
+
+`GET /api/shots/export` (the **JSONL (with raw)** link on the Shots tab) saves
+each shot with the BLE traffic behind it: the notifications the Omni sent for
+the shot (ball, club, and anything else in between, including the duplicate
+copies the device sends), and the commands flighthook wrote, such as the club
+metrics request. Each frame is hex with its first byte as `type`.
+
+Never captured: the identity characteristics (serial, firmware, hardware and
+model are read once at connect, not through the capture), anything before the
+connection is set up, heartbeats and their acks, and the reply to the status
+query. Zero-spin shots that are discarded are not exported. The device's BLE
+name and address are not in the file.
+
 ## Configuration
 
 ```toml
@@ -107,7 +121,7 @@ name = "Square Golf Omni"
 # Pin by the advertised name flighthook logs on connect: it is the same on
 # every OS. A MAC address also works, or on macOS (which hides MACs) the
 # peripheral UUID.
-address = "SquareGolf(54E4)"
+address = "SquareGolf(CD01)"
 club = "7i"                          # club selected on connect
 advanced_spin = true                 # device's advanced spin measurement
 discard_non_putting_zero_spin = true # drop 0-spin misreads (putts exempt)

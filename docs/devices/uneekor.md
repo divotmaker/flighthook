@@ -58,6 +58,16 @@ bind = "0.0.0.0:921"
 The actor accepts one monitor at a time — Open Connect is a single-peer
 protocol. A second monitor should be a second actor on its own port.
 
+## Shot export
+
+`GET /api/shots/export` (the **JSONL (with raw)** link on the Shots tab) saves
+each shot with the Open Connect JSON behind it: the message the monitor sent
+and flighthook's reply, verbatim apart from the peer and listen addresses,
+which are replaced with `<redacted>`. The monitor's `DeviceID` is a product
+label (e.g. `"Uneekor EYE XO"`) and is kept, as the device model. A monitor
+could in principle put a serial number in a JSON field, so check the file
+before posting it publicly.
+
 ## Sharing port 921 with GSPro
 
 GSPro listens on 921 too, but its port is movable. Edit

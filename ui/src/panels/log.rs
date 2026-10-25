@@ -83,7 +83,14 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
         }
         FlighthookEvent::ClubPath { key, .. } => format!("club #{}", key.shot_number),
         FlighthookEvent::FaceImpact { key, .. } => format!("impact #{}", key.shot_number),
-        FlighthookEvent::ShotFinished { key } => format!("finished #{}", key.shot_number),
+        FlighthookEvent::ShotFinished { key, raw } => match raw {
+            Some(r) => format!(
+                "finished #{} ({} raw frames)",
+                key.shot_number,
+                r.frames.len()
+            ),
+            None => format!("finished #{}", key.shot_number),
+        },
         FlighthookEvent::DeviceTelemetry {
             manufacturer,
             model,

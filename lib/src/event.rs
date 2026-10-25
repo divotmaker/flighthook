@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use flightrelay::types::{BallFlight, ClubData, FaceImpact};
 use flightrelay::units::{Distance, Velocity};
 
-use crate::{ShotKey, UnitSystem};
+use crate::{ShotKey, ShotRaw, UnitSystem};
 
 // ---------------------------------------------------------------------------
 // Derived (simulated) flight values
@@ -106,7 +106,7 @@ impl DerivedFlight {
 // Composed shot data
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShotData {
     #[serde(default)]
     pub actor: String,
@@ -123,6 +123,12 @@ pub struct ShotData {
 }
 
 impl ShotData {
+    /// True when the device reported ball, club or impact data.
+    #[must_use]
+    pub fn has_data(&self) -> bool {
+        self.ball.is_some() || self.club.is_some() || self.impact.is_some()
+    }
+
     /// Convert all distance and velocity fields to the given unit system.
     pub fn to_unit_system(&self, system: UnitSystem) -> ShotData {
         match system {
@@ -240,7 +246,8 @@ impl std::fmt::Display for ActorStatus {
 // ---------------------------------------------------------------------------
 
 /// Collects shot lifecycle events (`BallFlight`, `ClubPath`, `FaceImpact`)
-/// and produces a complete [`ShotData`] on `ShotFinished`.
+/// and produces a complete [`ShotData`] on `ShotFinished`, plus the raw
+/// device frames that came with it.
 ///
 /// Used by consumers that need all shot fields together (GSPro bridge,
 /// web shot cache, UI shot grid). Keyed by `(actor, ShotKey)`.
@@ -252,6 +259,7 @@ pub struct ShotAccumulator {
     club: Option<ClubData>,
     impact: Option<FaceImpact>,
     derived: Option<DerivedFlight>,
+    raw: Option<ShotRaw>,
 }
 
 impl ShotAccumulator {
@@ -264,6 +272,7 @@ impl ShotAccumulator {
             club: None,
             impact: None,
             derived: None,
+            raw: None,
         }
     }
 
@@ -287,19 +296,31 @@ impl ShotAccumulator {
         self.impact = Some(impact);
     }
 
+    /// Record the raw device frames that came with `ShotFinished`.
+    pub fn set_raw(&mut self, raw: Option<ShotRaw>) {
+        self.raw = raw;
+    }
+
     /// Finalize into a `ShotData`. Returns `None` if no data arrived at all.
     pub fn finish(self) -> Option<ShotData> {
+        self.into_parts().0
+    }
+
+    /// Finalize into the decoded shot and its raw frames. The shot is `None`
+    /// if no data arrived at all; the raw frames are kept either way.
+    pub fn into_parts(self) -> (Option<ShotData>, Option<ShotRaw>) {
         if self.ball.is_none() && self.club.is_none() && self.impact.is_none() {
-            return None;
+            return (None, self.raw);
         }
-        Some(ShotData {
+        let shot = ShotData {
             actor: self.actor,
             shot_number: self.key.shot_number,
             ball: self.ball,
             club: self.club,
             impact: self.impact,
             derived: self.derived,
-        })
+        };
+        (Some(shot), self.raw)
     }
 }
 
@@ -367,10 +388,10 @@ impl ShotAggregator {
                 }
                 None
             }
-            crate::FlighthookEvent::ShotFinished { key } => self
+            crate::FlighthookEvent::ShotFinished { key, .. } => self
                 .pending
-                .remove(&(msg.actor.clone(), key.clone()))
-                .and_then(ShotAccumulator::finish),
+                .remove(&(msg.actor.clone(), key.clone()))?
+                .finish(),
             _ => None,
         }
     }
@@ -468,6 +489,113 @@ mod tests {
     const GOLDEN_BALL_FLIGHT: &str = r#"{"actor":"square.0","device":"SquareGolf-A1B2","raw_payload":"1102002aff","event":{"kind":"ball_flight","key":{"shot_id":"7f8e2d1c","shot_number":12},"ball":{"launch_speed":"53.6mps","launch_azimuth":-1.2,"launch_elevation":17.0,"backspin_rpm":6500,"sidespin_rpm":-300}}}"#;
     const GOLDEN_SHOT: &str = r#"{"actor":"mevo.0","shot_number":7,"ball":{"launch_speed":"53.6mps","launch_azimuth":-1.2,"launch_elevation":17.0,"carry_distance":"220.4m","max_height":"31.2m","flight_time":6.4,"backspin_rpm":6500,"sidespin_rpm":-300},"club":{"club_speed":"44.7mps","path":1.5,"attack_angle":-2.0,"face_angle":0.5,"dynamic_loft":18.0,"smash_factor":1.2},"impact":{"lateral":"-4mm","vertical":"2.5mm"}}"#;
     const GOLDEN_SHOT_IMPERIAL: &str = r#"{"actor":"mevo.0","shot_number":7,"ball":{"launch_speed":"119.89998400000002mph","launch_azimuth":-1.2,"launch_elevation":17.0,"carry_distance":"241.03237095363082yd","max_height":"102.36220472440944ft","flight_time":6.4,"backspin_rpm":6500,"sidespin_rpm":-300},"club":{"club_speed":"99.99121800000002mph","path":1.5,"attack_angle":-2.0,"face_angle":0.5,"dynamic_loft":18.0,"smash_factor":1.2},"impact":{"lateral":"-4mm","vertical":"2.5mm"}}"#;
+
+    const GOLDEN_SHOT_FINISHED: &str = r#"{"actor":"square.0","device":"SquareGolf-A1B2","event":{"kind":"shot_finished","key":{"shot_id":"7f8e2d1c","shot_number":12}}}"#;
+
+    fn raw() -> ShotRaw {
+        ShotRaw {
+            transport: "square-ble".into(),
+            frames: vec![crate::RawRecord::binary(
+                crate::RawDir::Rx,
+                &[0x11, 0x02, 0x00],
+            )],
+            ..ShotRaw::default()
+        }
+    }
+
+    #[test]
+    fn shot_finished_without_raw_is_unchanged_on_the_wire() {
+        let msg = FlighthookMessage {
+            actor: "square.0".into(),
+            device: Some("SquareGolf-A1B2".into()),
+            raw_payload: None,
+            event: FlighthookEvent::ShotFinished {
+                key: key(),
+                raw: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&msg).expect("ser"),
+            GOLDEN_SHOT_FINISHED
+        );
+        let back: FlighthookMessage = serde_json::from_str(GOLDEN_SHOT_FINISHED).expect("de");
+        assert!(matches!(
+            back.event,
+            FlighthookEvent::ShotFinished { raw: None, .. }
+        ));
+    }
+
+    #[test]
+    fn shot_finished_raw_round_trips() {
+        let msg = FlighthookMessage {
+            actor: "square.0".into(),
+            device: None,
+            raw_payload: None,
+            event: FlighthookEvent::ShotFinished {
+                key: key(),
+                raw: Some(Box::new(raw())),
+            },
+        };
+        let json = serde_json::to_value(&msg).expect("ser");
+        assert_eq!(json["event"]["raw"]["frames"][0]["hex"], "110200");
+        let back: FlighthookMessage = serde_json::from_value(json).expect("de");
+        let FlighthookEvent::ShotFinished { raw: r, .. } = back.event else {
+            panic!("not shot_finished");
+        };
+        assert_eq!(r.as_deref(), Some(&raw()));
+    }
+
+    #[test]
+    fn into_parts_keeps_raw_with_and_without_data() {
+        let mut acc = ShotAccumulator::new("square.0".into(), key());
+        acc.set_ball(ball());
+        acc.set_raw(Some(raw()));
+        let (shot, r) = acc.into_parts();
+        assert_eq!(shot.expect("data").ball, Some(ball()));
+        assert_eq!(r, Some(raw()));
+
+        let mut acc = ShotAccumulator::new("square.0".into(), key());
+        acc.set_raw(Some(raw()));
+        let (shot, r) = acc.into_parts();
+        assert!(shot.is_none());
+        assert_eq!(r, Some(raw()));
+    }
+
+    #[test]
+    fn aggregator_returns_shot_data_when_raw_is_present() {
+        let mut agg = ShotAggregator::new();
+        let msg = |event| FlighthookMessage {
+            actor: "square.0".into(),
+            device: None,
+            raw_payload: None,
+            event,
+        };
+        agg.feed(&msg(FlighthookEvent::ShotTrigger { key: key() }));
+        agg.feed(&msg(FlighthookEvent::BallFlight {
+            key: key(),
+            ball: Box::new(ball()),
+            derived: None,
+        }));
+        let shot = agg
+            .feed(&msg(FlighthookEvent::ShotFinished {
+                key: key(),
+                raw: Some(Box::new(raw())),
+            }))
+            .expect("finished");
+        assert_eq!(shot.ball, Some(ball()));
+        assert_eq!(agg.pending_count(), 0);
+    }
+
+    #[test]
+    fn has_data_needs_ball_club_or_impact() {
+        let mut s = shot(None);
+        assert!(s.has_data());
+        s.ball = None;
+        s.club = None;
+        assert!(s.has_data());
+        s.impact = None;
+        assert!(!s.has_data());
+    }
 
     #[test]
     fn ball_flight_without_derived_is_unchanged_on_the_wire() {
@@ -582,7 +710,10 @@ mod tests {
             .is_none()
         );
         let shot = agg
-            .feed(&msg(FlighthookEvent::ShotFinished { key: key() }))
+            .feed(&msg(FlighthookEvent::ShotFinished {
+                key: key(),
+                raw: None,
+            }))
             .expect("finished");
         assert_eq!(shot.ball, Some(ball()));
         assert_eq!(shot.derived, Some(derived()));

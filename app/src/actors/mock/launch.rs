@@ -17,7 +17,7 @@ use crate::sim;
 use crate::state::SystemState;
 use flighthook::{
     ActorStatus, BallFlight, ClubData, Distance, FlighthookEvent, FlighthookMessage,
-    ShotDetectionMode, ShotKey, Velocity,
+    ShotDetectionMode, ShotKey, ShotRaw, Velocity,
 };
 
 const SHOT_INTERVAL: Duration = Duration::from_secs(30);
@@ -228,8 +228,15 @@ fn run(
                     .device(device_id.as_str()),
                 );
                 sender.send(
-                    FlighthookMessage::new(FlighthookEvent::ShotFinished { key })
-                        .device(device_id.as_str()),
+                    FlighthookMessage::new(FlighthookEvent::ShotFinished {
+                        key,
+                        raw: Some(Box::new(ShotRaw {
+                            transport: "none".into(),
+                            unavailable: Some("mock device has no wire protocol".into()),
+                            ..ShotRaw::default()
+                        })),
+                    })
+                    .device(device_id.as_str()),
                 );
 
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {

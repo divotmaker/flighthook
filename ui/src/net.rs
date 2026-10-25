@@ -84,6 +84,18 @@ fn ws_url() -> String {
     format!("{ws_base}/frp")
 }
 
+/// Download URL for the session export (`format`: `"jsonl"` or `"csv"`).
+pub(crate) fn export_url(format: &str, units: types::UnitSystem) -> String {
+    let units = match units {
+        types::UnitSystem::Imperial => "imperial",
+        types::UnitSystem::Metric => "metric",
+    };
+    format!(
+        "{}/api/shots/export?format={format}&units={units}",
+        api_base()
+    )
+}
+
 // ---------------------------------------------------------------------------
 // REST fetches — results go into the Pending queue
 // ---------------------------------------------------------------------------

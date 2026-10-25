@@ -1,4 +1,5 @@
 use crate::app::FlighthookApp;
+use crate::net;
 use crate::types::{Distance, UnitSystem};
 
 /// Format an optional f64 with the given precision, or "-" if None.
@@ -11,6 +12,11 @@ fn opt_f(v: Option<f64>, prec: usize) -> String {
 
 /// Hover text on every simulated cell.
 const SIMULATED_HINT: &str = "Simulated (beta), not measured by the device";
+
+/// Hover text on the JSONL export link.
+const EXPORT_HINT: &str = "Every shot this session (the last 1000), including shots the device \
+     sent no data for, with the raw device frames behind each one. \
+     Contains no serial numbers, addresses or network names.";
 
 /// Number of ball columns: launch, results and spin.
 const BALL_COLUMNS: usize = 12;
@@ -77,6 +83,15 @@ impl FlighthookApp {
                 "Values the launch monitor did not report, simulated from the measured launch. \
                  Offline is + right of the target line.",
             );
+
+            let units = self.units_toggle;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.hyperlink_to("CSV", net::export_url("csv", units))
+                    .on_hover_text("Decoded shots, one row each. No raw frames.");
+                ui.hyperlink_to("JSONL (with raw)", net::export_url("jsonl", units))
+                    .on_hover_text(EXPORT_HINT);
+                ui.label(egui::RichText::new("Export session:").strong().size(11.0));
+            });
         });
 
         let units = self.units_toggle;

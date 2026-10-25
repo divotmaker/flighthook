@@ -173,7 +173,9 @@ Telemetry keys are merged from two sources with no overlap:
 
 ### GET /api/shots
 
-Shot history (most recent N shots, FIFO, max 1000 stored).
+Shot history (most recent N shots, FIFO, max 1000 stored). Shots the device
+produced no data for (no ball, club or impact) are kept for the
+[export](#get-apishotsexport) but not listed here.
 
 **Query params**:
 
@@ -257,6 +259,116 @@ With `?units=imperial`:
   to feet/meters).
 - `club`: `ClubData` or `null`. Club head data. All fields are `Option`.
 - `impact`: `FaceImpact` or `null`. Face impact location.
+
+---
+
+### GET /api/shots/export
+
+Download the session's shots for sharing or analysis: JSONL with the raw
+device frames behind each shot, or CSV without them. Shots live in memory for
+the session (the same 1000-shot history as `/api/shots`); nothing is written to
+disk.
+
+**Query params**:
+
+| Param    | Values                  | Default                                                   | Notes |
+| -------- | ----------------------- | --------------------------------------------------------- | ----- |
+| `format` | `jsonl` \| `csv`        | `jsonl`                                                   | anything else → `400` |
+| `units`  | `imperial` \| `metric`  | JSONL: native units (as `/api/shots`); CSV: `default_units` | converts `data` / the CSV columns; anything else → `400` |
+| `limit`  | 1..=1000                | all stored                                                | most recent N; out of range → `400` |
+| `raw`    | `true` \| `false`       | `true`                                                    | JSONL only; `false` leaves out `raw` for a small file |
+
+**Response** `200 OK`, streamed one shot per line:
+
+- `Content-Type: application/x-ndjson` (JSONL) or `text/csv; charset=utf-8`
+- `Content-Disposition: attachment; filename="flighthook-shots-YYYYMMDD-HHMMSS.jsonl"` (or `.csv`)
+- `Cache-Control: no-store`
+
+With no shots stored, the body is empty (CSV: the header row only). Shots the
+device produced no data for are included: their `data` has only `actor` and
+`shot_number`, and `raw` shows what the device sent.
+
+**JSONL**: one `ShotExport` object per line (pretty-printed here):
+
+```json
+{
+  "schema": 1,
+  "flighthook_version": "0.1.13",
+  "exported_at": "2026-10-25T21:04:11.123Z",
+  "time": "2026-10-25T20:58:03.412Z",
+  "actor": "mevo.0",
+  "shot_id": "550e8400-e29b-41d4-a716-446655440000",
+  "shot_number": 7,
+  "device": { "kind": "flightscope", "manufacturer": "FlightScope", "model": "Xi", "firmware": "1.23 (Feb 3 2024)" },
+  "club_selected": "8I",
+  "settings": {
+    "device": { "ball_type": 1, "track_pct": 80.0, "environment": "limited_flight" },
+    "simulation": { "enabled": true, "altitude": "0ft", "temperature_c": 25.0, "surface": "fairway" },
+    "detection_mode": "full",
+    "handed": "rh"
+  },
+  "data": {
+    "actor": "mevo.0",
+    "shot_number": 7,
+    "ball": { "launch_speed": "37.9mps", "launch_azimuth": -3.1, "launch_elevation": 23.9, "carry_distance": "95.2m", "backspin_rpm": 6897, "sidespin_rpm": 0 },
+    "club": { "club_speed": "31.2mps", "path": 1.1, "attack_angle": -9.8, "face_angle": 0.4 }
+  },
+  "raw": {
+    "transport": "flightscope-tcp",
+    "frames": [
+      { "t_ms": 0, "dir": "rx", "type": "0xE5", "src": "AVR", "dst": "APP", "hex": "0c42414c4c2054524947474552000000" },
+      { "t_ms": 612, "dir": "rx", "type": "0xE8", "src": "DSP", "dst": "APP", "hex": "5d0000040000..." },
+      { "t_ms": 640, "dir": "rx", "type": "0xD4", "src": "DSP", "dst": "APP", "hex": "9c0000040000..." },
+      { "t_ms": 703, "dir": "tx", "type": "0x69", "src": "APP", "dst": "AVR", "hex": "" },
+      { "t_ms": 760, "dir": "tx", "type": "0xB0", "src": "APP", "dst": "AVR", "hex": "0101" }
+    ]
+  }
+}
+```
+
+- `schema`: export format version (`1`). Bumped when a field changes meaning.
+- `time`: when `shot_trigger` reached the web layer (host clock, RFC 3339 UTC).
+- `device`: `kind` (`flightscope`, `square_golf`, `garmin_r10`, `openconnect`,
+  `mock`) plus manufacturer, model and firmware as the device reported them.
+  FlightScope: `model` is the product (`Mevo+`, `Mevo Gen2`, `Mevo` when the
+  generation is unknown, or `Xi`) and `firmware` the device's version and
+  build date, e.g. `"1.23 (Feb 3 2024)"`.
+- `club_selected`, `settings.detection_mode`, `settings.handed`: game state
+  when the shot was triggered (e.g. the club GSPro had selected); absent when
+  unknown.
+- `settings.device`: the device's config section with `name`, `address`,
+  `bind` and unset fields removed. `settings.simulation`: the `[simulation]`
+  section.
+- `data`: exactly the `/api/shots` element for this shot (`ShotData`).
+- `raw`: `ShotRaw` (see [shot_finished](#shot_finished)).
+
+**CSV**: one header row, one row per shot, RFC 4180 quoting, empty cell for a
+missing value. Units are fixed per column and named in the header (imperial:
+mph, yd, ft for heights, in for club offset/height; metric: mps, m). Face
+impact is always mm. `environment` is the FlightScope environment in effect
+(configured value, else the default). `sim_*` columns are the `derived` block.
+
+```
+time,actor,device_kind,manufacturer,model,firmware,shot_number,shot_id,
+club_selected,handed,detection_mode,environment,
+ball_speed_mph,launch_elevation_deg,launch_azimuth_deg,backspin_rpm,sidespin_rpm,
+carry_yd,total_yd,roll_yd,max_height_ft,flight_time_s,
+sim_carry_yd,sim_carry_offline_yd,sim_max_height_ft,sim_flight_time_s,
+sim_descent_angle_deg,sim_roll_yd,sim_roll_offline_yd,sim_total_yd,sim_total_offline_yd,
+club_speed_mph,club_speed_post_mph,path_deg,attack_angle_deg,face_angle_deg,
+dynamic_loft_deg,smash_factor,swing_plane_horizontal_deg,swing_plane_vertical_deg,
+club_offset_in,club_height_in,impact_lateral_mm,impact_vertical_mm
+```
+
+(One line in the file; wrapped here.)
+
+**Privacy**: the export never contains the FRP `device` ID (network name, BLE
+name or address), actor display names, telemetry, or configured addresses.
+Device frames that carry identity or network details are never captured (see
+the per-device notes under [docs/devices](devices/)), and identity strings
+are replaced with `<redacted>` in text payloads and device labels. Open
+Connect payloads are kept verbatim apart from that; check the file before
+posting it publicly.
 
 ---
 
@@ -378,7 +490,8 @@ Full persisted config (mirrors `config.toml`).
       "range": "9ft",
       "surface_height": "0in",
       "track_pct": 80.0,
-      "camera_mode": "standard"
+      "camera_mode": "standard",
+      "environment": "limited_flight"
     }
   },
   "r10": {
@@ -428,10 +541,16 @@ Full persisted config (mirrors `config.toml`).
 - All launch monitor config fields are optional (omitted = use defaults)
 - R10 sections have only `name` (BLE auto-discovery; no address or radar settings)
 - `use_estimated` on Mevo sections controls whether estimated (E8) ball flights
-  are emitted when no full (D4) result arrives (defaults to `true`)
+  are emitted when no full (D4) result arrives (defaults to `false`). With it
+  off, a shot the device only estimated (e.g. a flight too short to read in
+  Outdoor mode, or a very short chip) is skipped
 - `camera_mode` on Mevo sections is `standard` (default), `fusion`, or
   `raw_fusion`. The Fusion modes request the device's club-data processing and
   are omitted from the response when unset
+- `environment` on Mevo sections is `limited_flight` (default; detection mode 9,
+  for nets and simulator screens) or `outdoor` (mode 8, full flight). It sets
+  the full-swing detection mode, and the only mode on an Xi. Omitted from the
+  response when unset
 - `dot_bottom_to_face_centre_mm` on Square sections overrides allsquare's built-in
   per-club face impact calibration (distance from the bottom edge of the
   sticker's dot down to face centre, in mm). Keyed the same way `club` is. Omitted when no
@@ -762,10 +881,37 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
   "device": "FS-M2-XXXXXX",
   "event": {
     "kind": "shot_finished",
-    "key": { "shot_id": "550e8400-...", "shot_number": 42 }
+    "key": { "shot_id": "550e8400-...", "shot_number": 42 },
+    "raw": {
+      "transport": "flightscope-tcp",
+      "frames": [
+        { "t_ms": 0, "dir": "rx", "type": "0xE5", "src": "AVR", "dst": "APP", "hex": "0c42414c4c..." }
+      ]
+    }
   }
 }
 ```
+
+- `raw` (flighthook extension, omitted when absent): `ShotRaw`, the device
+  frames captured for this shot. FRP consumers ignore it.
+  - `transport`: `flightscope-tcp`, `square-ble`, `r10-ble`,
+    `openconnect-json`, or `none` (mock).
+  - `frames`: `RawRecord[]`, in arrival order:
+    - `t_ms`: milliseconds relative to the shot trigger (negative = before it)
+    - `dir`: `rx` (device → flighthook) or `tx` (flighthook → device)
+    - `type`: message type, e.g. `"0xD4"` (FlightScope) or the first byte of
+      a BLE notification or command type; absent for R10 chunks and JSON
+    - `src` / `dst`: FlightScope bus addresses (`APP`, `AVR`, `DSP`, `PI`)
+    - `channel`: `notify`, `cmd`, `write`, `register` (BLE) or `tcp`
+    - `hex`: payload as lowercase hex (binary protocols; FlightScope: the
+      unstuffed payload without header or checksum)
+    - `text`: payload text (JSON protocols)
+  - `dropped`: frames over the per-shot cap that were not kept (omitted when 0)
+  - `unavailable`: why `frames` is empty or incomplete, e.g. `"mock device
+    has no wire protocol"`, `"evicted: session raw budget"`
+- `shot_finished` can be large: up to a few hundred KiB for a FlightScope
+  Fusion shot with its PRC data. Consumers that only need timing can use
+  `shot_trigger`.
 
 ---
 

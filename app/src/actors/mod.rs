@@ -86,7 +86,7 @@ pub fn resolve_actors(
         match addr_str.parse::<SocketAddr>() {
             Ok(addr) => {
                 let session_config = mevo::SessionConfig::from_mevo_section(section);
-                let use_estimated = section.use_estimated.unwrap_or(true);
+                let use_estimated = section.use_estimated.unwrap_or(false);
                 let camera_mode = section.camera_mode.unwrap_or_default();
                 actors.push(ResolvedActor {
                     id,

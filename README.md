@@ -18,6 +18,7 @@ Each device links to its setup notes, quirks, and config reference.
 | ---------------------------------------------------- | ----------------------- | ----------------------------------------------- | ---------------- |
 | [FlightScope Mevo+](docs/devices/flightscope.md)     | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
 | [FlightScope Mevo Gen2](docs/devices/flightscope.md) | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
+| [FlightScope Xi](docs/devices/flightscope.md)        | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Alpha            |
 | [Square Golf Omni](docs/devices/square-golf.md)      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Supported        |
 | [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
 | [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (OpenConnect)                          | Alpha (untested) |
@@ -99,6 +100,7 @@ Terminal. Allow it.
   separate putting mode, so selecting a putter in the sim puts it in putting mode
 - Simulated carry, apex, descent, offline, roll and total for launch monitors that
   measure launch only (beta) — see [Simulated values](#simulated-values-beta)
+- Export the session as JSONL with the raw device frames behind each shot, or CSV
 - Dual UI: native desktop window (eframe/egui) and browser dashboard (WASM, same codebase)
 - Configurable via TOML file with live settings updates
 - REST + WebSocket API for external consumers — subscribe to shot data, device telemetry, and raw audit events in real time. Build custom shot triggers, data loggers, or alternative integrations without touching the core.
@@ -146,6 +148,28 @@ surface = "fairway"       # fairway | green | firm_green
 An altitude or temperature outside its range turns simulation off (with a
 warning in the log) until it is fixed. Changes apply from the next shot,
 without a restart.
+
+### Sharing shot data
+
+The Shots tab has two export links for the current session (also available as
+`GET /api/shots/export`, see [docs/API.md](docs/API.md#get-apishotsexport)):
+
+- **JSONL (with raw)** — one line per shot: the decoded shot exactly as the
+  dashboard shows it, the settings in effect (device settings, simulation,
+  club and mode), and the raw device frames behind it as hex (or JSON text for
+  Open Connect). Shots the device read nothing usable for are included.
+- **CSV** — one row per shot with the decoded values in fixed-unit columns.
+  No raw frames.
+
+The file deliberately leaves out serial numbers, network names, BLE and IP
+addresses and device names: frames that carry identity are never captured,
+and identity strings are redacted from text. To report a device problem,
+reproduce it, download the JSONL export and attach it to the GitHub issue.
+Open Connect monitors' JSON is kept as sent, so check the file before
+posting it publicly.
+
+The export covers the session held in memory (the last 1000 shots); nothing
+is written to disk.
 
 ### Shot Tracking
 
@@ -200,11 +224,13 @@ tee_height = "1.5in"
 range = "8ft"
 surface_height = "0in"
 track_pct = 80.0
+environment = "limited_flight" # limited_flight (nets/sim screens) | outdoor (full flight)
+use_estimated = false          # true keeps estimated-only shots (e.g. very short chips)
 
 [square.0]
 name = "Square Golf Omni"
 # address is optional — omit it to auto-discover by name. No pairing required.
-address = "DC:0D:30:62:54:E4"
+address = "02:00:00:AB:CD:01"
 club = "7i"                    # club selected on connect
 advanced_spin = true           # device's advanced spin measurement
 discard_non_putting_zero_spin = true   # drop 0-spin misreads (putts exempt)

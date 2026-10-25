@@ -18,6 +18,20 @@ and shows them in *italics*, as `derived` in the API, and in a
 [Simulated values](../../README.md#simulated-values-beta) section. GSPro still
 receives the launch data only.
 
+## Shot export
+
+`GET /api/shots/export` (the **JSONL (with raw)** link on the Shots tab) saves
+each shot with the BLE chunks behind it: up to 256 chunks before the shot
+event (the shot message and its replays), as hex with the MultiLink handle
+byte, labelled `notify`, `write` or `register`. Chunks are recorded as they
+arrived, not reassembled.
+
+Never captured: anything before the handshake completes, which is where the
+device's unit ID travels; after it, any chunk carrying part of a device
+information, FIT, file transfer or authentication message (or an ACK of one),
+or of a frame that does not decode. The device's BLE address is not in the
+file.
+
 ## Configuration
 
 ```toml

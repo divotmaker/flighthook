@@ -3,6 +3,7 @@ mod api;
 mod client;
 mod config;
 mod event;
+mod export;
 mod game_state;
 mod message;
 
@@ -11,6 +12,7 @@ pub use api::*;
 pub use client::*;
 pub use config::*;
 pub use event::*;
+pub use export::*;
 pub use game_state::*;
 pub use message::*;
 

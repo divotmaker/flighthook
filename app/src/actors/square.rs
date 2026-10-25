@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,12 +8,13 @@ use tracing::{debug, info, warn};
 
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::raw_capture::{self, RawCapture, RawCaptureConfig};
 use crate::sim;
 use crate::state::SystemState;
 
 use flighthook::{
     ActorStatus, BallFlight, Club, ClubData, Distance, FaceImpact, FlighthookEvent,
-    FlighthookMessage, Severity, ShotKey, Velocity,
+    FlighthookMessage, RawDir, RawRecord, Severity, ShotKey, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
@@ -109,6 +111,95 @@ pub(crate) fn build_impact_calibration(
         cal.set_dot_bottom_to_face_centre_mm(to_allsquare_club(club), Some(mm));
     }
     cal
+}
+
+// ---------------------------------------------------------------------------
+// Raw capture
+// ---------------------------------------------------------------------------
+
+/// Notification family byte and kind byte of a heartbeat ack and of the
+/// reply to the status query. Neither is shot data; the query reply's
+/// contents are uncharacterised.
+const NOTIFY_FAMILY: u8 = 0x11;
+const NOTIFY_HEARTBEAT_ACK: u8 = 0x03;
+const NOTIFY_QUERY_RESPONSE: u8 = 0x06;
+
+/// Frames never captured: heartbeat acks, query replies and our heartbeats.
+fn export_excluded(rec: &RawRecord) -> bool {
+    match rec.dir {
+        RawDir::Rx => {
+            raw_capture::byte_at(rec, 0) == Some(NOTIFY_FAMILY)
+                && matches!(
+                    raw_capture::byte_at(rec, 1),
+                    Some(NOTIFY_HEARTBEAT_ACK | NOTIFY_QUERY_RESPONSE)
+                )
+        }
+        RawDir::Tx => {
+            raw_capture::byte_at(rec, 1) == Some(allsquare::Command::Heartbeat.type_byte())
+        }
+    }
+}
+
+/// Raw capture for one Square Golf connection. The pre-roll holds the ball
+/// notification, our club metrics request and the club notification, which
+/// all precede allsquare's shot event.
+fn raw_capture_config() -> RawCaptureConfig {
+    RawCaptureConfig {
+        transport: "square-ble",
+        pre_roll_frames: 64,
+        max_frames: 64,
+        max_bulk_bytes: 0,
+        exclude: export_excluded,
+        is_bulk: raw_capture::no_bulk,
+    }
+}
+
+/// Transport wrapper that records notifications and commands for the shot
+/// export. Characteristic reads, where identity lives, are never recorded,
+/// and the capture starts disabled until the identity exchange is done.
+struct Tap<T> {
+    inner: T,
+    capture: RawCapture,
+}
+
+impl<T> Tap<T> {
+    fn new(inner: T) -> Self {
+        let mut capture = RawCapture::new(raw_capture_config());
+        capture.set_enabled(false);
+        Self { inner, capture }
+    }
+}
+
+impl<T: allsquare::Transport> allsquare::Transport for Tap<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.capture.push(RawRecord {
+                r#type: Some(raw_capture::type_label(buf[0])),
+                channel: Some("notify".into()),
+                ..RawRecord::binary(RawDir::Rx, &buf[..n])
+            });
+        }
+        Ok(n)
+    }
+
+    fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        self.inner.write(data)?;
+        self.capture.push(RawRecord {
+            r#type: data.get(1).map(|&t| raw_capture::type_label(t)),
+            channel: Some("cmd".into()),
+            ..RawRecord::binary(RawDir::Tx, data)
+        });
+        Ok(())
+    }
+
+    fn read_characteristic(&mut self, uuid: u128) -> io::Result<Vec<u8>> {
+        self.inner.read_characteristic(uuid)
+    }
+
+    fn model_hint(&self) -> Option<String> {
+        self.inner.model_hint()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +457,7 @@ fn connect_and_run(
     info!("connected to {name} at {ble_address}");
     *device_id = Some(name.clone());
 
-    let mut client = Client::new(transport);
+    let mut client = Client::new(Tap::new(transport));
     client.set_impact_calibration(impact_calibration.clone());
     let spin = if advanced_spin {
         SpinMode::Advanced
@@ -437,6 +528,8 @@ fn connect_and_run(
                             "model {model}, firmware lm {} (mmi {}), hw {hardware}, id {serial}",
                             firmware.lm, firmware.mmi
                         );
+                        // Identity has been read; capture from here on.
+                        client.transport_mut().capture.set_enabled(true);
                         emit_device_status(
                             sender,
                             ActorStatus::Connected,
@@ -550,6 +643,7 @@ fn connect_and_run(
                                 })
                                 .device(&name),
                             );
+                            client.transport_mut().capture.discard();
                             continue;
                         }
 
@@ -559,6 +653,7 @@ fn connect_and_run(
                             shot_number: shot_counter,
                         };
                         info!("shot #{}", key.shot_number);
+                        client.transport_mut().capture.mark_trigger();
 
                         emit_device_status(
                             sender,
@@ -625,9 +720,13 @@ fn connect_and_run(
                             debug!("  no club data (sticker not tracked)");
                         }
 
+                        let raw = client.transport_mut().capture.take();
                         sender.send(
-                            FlighthookMessage::new(FlighthookEvent::ShotFinished { key })
-                                .device(&name),
+                            FlighthookMessage::new(FlighthookEvent::ShotFinished {
+                                key,
+                                raw: Some(Box::new(raw)),
+                            })
+                            .device(&name),
                         );
                     }
 
@@ -837,8 +936,8 @@ mod tests {
     fn zero_address_is_detected() {
         assert!(is_zero_address("00:00:00:00:00:00"));
         assert!(is_zero_address(" 00:00:00:00:00:00\n"));
-        assert!(!is_zero_address("DC:0D:30:62:54:E4"));
-        assert!(!is_zero_address("SquareGolf(54E4)"));
+        assert!(!is_zero_address("02:00:00:AB:CD:01"));
+        assert!(!is_zero_address("SquareGolf(CD01)"));
     }
 
     #[test]
@@ -899,5 +998,130 @@ mod tests {
 
         assert_eq!(cal_a, cal_a_again, "same overrides must compare equal");
         assert_ne!(cal_a, cal_b, "changed overrides must compare unequal");
+    }
+
+    /// Scripted Omni: queued notifications, identity characteristics, and a
+    /// log of every command written.
+    struct FakeTransport {
+        notifications: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl allsquare::Transport for FakeTransport {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(n) = self.notifications.pop_front() else {
+                return Err(io::ErrorKind::WouldBlock.into());
+            };
+            buf[..n.len()].copy_from_slice(&n);
+            Ok(n.len())
+        }
+
+        fn write(&mut self, _data: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn read_characteristic(&mut self, uuid: u128) -> io::Result<Vec<u8>> {
+            use allsquare::protocol::uuid;
+            match uuid {
+                uuid::DEVICE_ID => Ok(b"SQ-123456".to_vec()),
+                uuid::FW_VERSION => Ok(br#"{"lm":"1.0","mmi":"1.0","launcher":"1.0"}"#.to_vec()),
+                uuid::HW_VERSION => Ok(b"1".to_vec()),
+                _ => Err(io::ErrorKind::NotFound.into()),
+            }
+        }
+    }
+
+    /// Synthetic ball notification: 40 m/s, 15 deg, 1 deg right, 5000 rpm.
+    const BALL: [u8; 17] = [
+        0x11, 0x02, 0x01, 0xa0, 0x0f, 0xdc, 0x05, 0x64, 0x00, 0x88, 0x13, 0xc8, 0x00, 0x7e, 0x13,
+        0x2c, 0x01,
+    ];
+
+    #[test]
+    fn tap_captures_the_shot_without_identity_or_housekeeping() {
+        let notifications = [
+            vec![0x11, 0x06, 0xaa, 0xbb],
+            vec![0x11, 0x03, 0x00, 0x01],
+            vec![0x11, 0x03, 0x00, 0x02],
+            BALL.to_vec(),
+            BALL.to_vec(),
+            vec![0x11, 0x07, 0x00],
+        ];
+        let fake = FakeTransport {
+            notifications: notifications.into_iter().collect(),
+        };
+        let mut client = Client::new(Tap::new(fake));
+
+        let mut shot = false;
+        for _ in 0..32 {
+            match client.poll().expect("poll") {
+                Some(Event::Connected { device_id, .. }) => {
+                    assert_eq!(device_id, "SQ-123456");
+                    client.transport_mut().capture.set_enabled(true);
+                }
+                Some(Event::Shot { .. }) => {
+                    shot = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(shot, "no shot event");
+        client.transport_mut().capture.mark_trigger();
+        let raw = client.transport_mut().capture.take();
+
+        let seq: Vec<(RawDir, Option<&str>, Option<&str>)> = raw
+            .frames
+            .iter()
+            .map(|r| (r.dir, r.channel.as_deref(), r.r#type.as_deref()))
+            .collect();
+        assert_eq!(
+            seq,
+            [
+                (RawDir::Rx, Some("notify"), Some("0x11")),
+                (RawDir::Tx, Some("cmd"), Some("0x87")),
+                (RawDir::Rx, Some("notify"), Some("0x11")),
+                (RawDir::Rx, Some("notify"), Some("0x11")),
+            ]
+        );
+        assert_eq!(raw.transport, "square-ble");
+        assert_eq!(
+            raw.frames[0].hex.as_deref(),
+            Some(flighthook::hex_lower(&BALL).as_str())
+        );
+        assert_eq!(raw.frames[3].hex.as_deref(), Some("110700"));
+        // The query and heartbeat sent during the identity exchange happened
+        // before the capture was enabled; the identity itself is never read
+        // through the tap.
+        let json = serde_json::to_string(&raw).expect("ser");
+        assert!(!json.contains(&flighthook::hex_lower(b"SQ-123456")));
+        assert!(!json.contains("1106aabb") && !json.contains("110300"));
+    }
+
+    #[test]
+    fn tap_records_nothing_until_enabled() {
+        let fake = FakeTransport {
+            notifications: [BALL.to_vec()].into_iter().collect(),
+        };
+        let mut tap = Tap::new(fake);
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            allsquare::Transport::read(&mut tap, &mut buf).expect("read"),
+            17
+        );
+        allsquare::Transport::write(&mut tap, &[0x00, 0x87, 0x01]).expect("write");
+        tap.capture.mark_trigger();
+        assert!(tap.capture.take().frames.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_command_is_excluded() {
+        let hb = RawRecord::binary(RawDir::Tx, &allsquare::Command::Heartbeat.encode(7));
+        assert!(export_excluded(&hb));
+        let req = RawRecord::binary(
+            RawDir::Tx,
+            &allsquare::Command::RequestClubMetrics.encode(7),
+        );
+        assert!(!export_excluded(&req));
+        assert!(!export_excluded(&RawRecord::binary(RawDir::Rx, &BALL)));
     }
 }

@@ -238,11 +238,15 @@ impl FlighthookApp {
                 .map(|a| a.name.as_str())
                 .unwrap_or("")
                 .to_string();
-            let raw = msg
-                .raw_payload
-                .as_ref()
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| serde_json::to_string(&msg.event).unwrap_or_default());
+            // A finished shot's raw frames can run to hundreds of KiB; the
+            // log keeps a count, and the export has the frames.
+            let raw = match (&msg.raw_payload, &msg.event) {
+                (Some(r), _) => r.to_string(),
+                (None, FlighthookEvent::ShotFinished { raw: Some(r), .. }) => {
+                    format!("{} raw frames", r.frames.len())
+                }
+                (None, event) => serde_json::to_string(event).unwrap_or_default(),
+            };
             self.log_entries.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 actor_name,
@@ -388,7 +392,7 @@ impl FlighthookApp {
                             ui.add_space(4.0);
                             ui.checkbox(
                                 &mut self.wizard_mevo,
-                                egui::RichText::new("FlightScope Mevo / Mevo+").size(15.0),
+                                egui::RichText::new("FlightScope Mevo / Mevo+ / Xi").size(15.0),
                             );
                             ui.add_space(4.0);
                             ui.checkbox(

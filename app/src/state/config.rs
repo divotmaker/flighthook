@@ -288,6 +288,24 @@ bind = "0.0.0.0:5880"
         assert_eq!(config.simulation, flighthook::SimulationSection::default());
     }
 
+    #[test]
+    fn mevo_environment_is_optional_in_toml() {
+        let without = "[mevo.0]\nname = \"Mevo\"\naddress = \"192.168.2.1:5100\"\n";
+        let c: FlighthookConfig = toml::from_str(without).expect("parses");
+        assert_eq!(c.mevo["0"].environment, None);
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(!out.contains("environment"), "{out}");
+
+        let with = format!("{without}environment = \"outdoor\"\n");
+        let c: FlighthookConfig = toml::from_str(&with).expect("parses");
+        assert_eq!(
+            c.mevo["0"].environment,
+            Some(flighthook::FlightScopeEnvironment::Outdoor)
+        );
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(out.contains("environment = \"outdoor\""), "{out}");
+    }
+
     /// Removes the directory on drop, so a failing assertion doesn't leak it.
     struct TempDir(PathBuf);
 

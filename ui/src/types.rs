@@ -22,6 +22,7 @@ pub use flighthook::{
     // Config types
     Distance,
     DistanceExt,
+    FlightScopeEnvironment,
     FlighthookConfig,
     FlighthookEvent,
     FlighthookMessage,
