@@ -1,4 +1,5 @@
 use crate::app::FlighthookApp;
+use crate::theme;
 use crate::types::{FlighthookEvent, Severity};
 
 use super::extract_time;
@@ -18,6 +19,10 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "player_info",
     "club_info",
     "set_detection_mode",
+    "new_shot_group",
+    "new_shot_session",
+    "clear_shot_history",
+    "shot_group",
     "config_command",
     "config_outcome",
 ];
@@ -35,7 +40,18 @@ const FILTER_GROUPS: &[(&str, &[&str])] = &[
             "device_telemetry",
         ],
     ),
-    ("Game", &["player_info", "club_info", "set_detection_mode"]),
+    (
+        "Game",
+        &[
+            "player_info",
+            "club_info",
+            "set_detection_mode",
+            "new_shot_group",
+            "new_shot_session",
+            "clear_shot_history",
+            "shot_group",
+        ],
+    ),
     (
         "System",
         &["actor_status", "config_command", "config_outcome"],
@@ -58,6 +74,10 @@ pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
         FlighthookEvent::ActorStatus { .. } => "actor_status",
         FlighthookEvent::ConfigCommand { .. } => "config_command",
         FlighthookEvent::ConfigOutcome { .. } => "config_outcome",
+        FlighthookEvent::NewShotGroup => "new_shot_group",
+        FlighthookEvent::NewShotSession => "new_shot_session",
+        FlighthookEvent::ClearShotHistory => "clear_shot_history",
+        FlighthookEvent::ShotGroup { .. } => "shot_group",
         FlighthookEvent::Alert { severity, .. } => match severity {
             Severity::Critical => "alert_critical",
             Severity::Error => "alert_error",
@@ -126,6 +146,25 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
             Some(rid) => format!("outcome({rid})"),
             None => "outcome".into(),
         },
+        FlighthookEvent::NewShotGroup => "new set".into(),
+        FlighthookEvent::NewShotSession => "new session".into(),
+        FlighthookEvent::ClearShotHistory => "clear history".into(),
+        FlighthookEvent::ShotGroup { group, shot } => {
+            let club = group
+                .club
+                .map_or_else(|| "no club".to_owned(), |c| c.to_string());
+            let state = if group.open { "open" } else { "closed" };
+            match shot {
+                Some(s) => format!(
+                    "set {} {club}: {} #{} joined ({} shots, {state})",
+                    group.number, s.actor, s.key.shot_number, group.shots
+                ),
+                None => format!(
+                    "set {} {club} ({} shots, {state})",
+                    group.number, group.shots
+                ),
+            }
+        }
         FlighthookEvent::Alert { severity, message } => format!("[{severity}] {message}"),
     }
 }
@@ -214,13 +253,15 @@ impl FlighthookApp {
             .stick_to_bottom(self.log_auto_scroll)
             .auto_shrink(false);
         scroll.show(ui, |ui| {
+            // Dense rows: the log is a wall of monospace, not a form.
+            ui.spacing_mut().interact_size.y = 14.0;
             let mono = |size: f32, text: &str| -> egui::RichText {
                 egui::RichText::new(text).monospace().size(size)
             };
 
-            let dim = egui::Color32::from_rgb(140, 140, 140);
-            let warn_color = egui::Color32::from_rgb(255, 200, 60);
-            let error_color = egui::Color32::from_rgb(255, 80, 80);
+            let dim = theme::TEXT_MUTED;
+            let warn_color = theme::GOLD;
+            let error_color = theme::DANGER;
 
             egui::Grid::new("log_grid")
                 .num_columns(3)
@@ -249,10 +290,7 @@ impl FlighthookApp {
 
                         // Row 1: timestamp | actor name | event debug
                         ui.label(mono(11.0, &time_str));
-                        ui.label(
-                            mono(11.0, &entry.actor_name)
-                                .color(egui::Color32::from_rgb(180, 160, 220)),
-                        );
+                        ui.label(mono(11.0, &entry.actor_name).color(theme::LOG_ACTOR));
                         let debug_label = mono(11.0, &entry.event_debug);
                         ui.label(match text_color {
                             Some(c) => debug_label.color(c),
@@ -278,5 +316,77 @@ impl FlighthookApp {
                     }
                 });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_kind_is_in_exactly_one_filter_group() {
+        for kind in MESSAGE_TYPES {
+            let groups = FILTER_GROUPS
+                .iter()
+                .filter(|(_, keys)| keys.contains(kind))
+                .count();
+            assert_eq!(groups, 1, "{kind}");
+        }
+        let grouped: usize = FILTER_GROUPS.iter().map(|(_, keys)| keys.len()).sum();
+        assert_eq!(grouped, MESSAGE_TYPES.len());
+        let game = FILTER_GROUPS
+            .iter()
+            .find(|(name, _)| *name == "Game")
+            .unwrap();
+        for kind in [
+            "new_shot_group",
+            "new_shot_session",
+            "clear_shot_history",
+            "shot_group",
+        ] {
+            assert!(game.1.contains(&kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn group_summaries_say_set() {
+        use crate::types::{Club, ShotGroupInfo, ShotKey};
+        use flighthook::GroupedShot;
+        let group = ShotGroupInfo {
+            id: "a".into(),
+            number: 3,
+            session: 0,
+            golfer: None,
+            club: Some(Club::Iron7),
+            started_at: "2026-10-26T15:41:28.300Z".into(),
+            manual: false,
+            open: true,
+            shots: 4,
+        };
+        assert_eq!(event_debug(&FlighthookEvent::NewShotGroup), "new set");
+        assert_eq!(
+            event_debug(&FlighthookEvent::ClearShotHistory),
+            "clear history"
+        );
+        assert_eq!(
+            message_type(&FlighthookEvent::ClearShotHistory),
+            "clear_shot_history"
+        );
+        let joined = FlighthookEvent::ShotGroup {
+            group: group.clone(),
+            shot: Some(GroupedShot {
+                actor: "mevo.0".into(),
+                key: ShotKey {
+                    shot_id: "s9".into(),
+                    shot_number: 9,
+                },
+            }),
+        };
+        assert_eq!(
+            event_debug(&joined),
+            "set 3 7I: mevo.0 #9 joined (4 shots, open)"
+        );
+        let changed = FlighthookEvent::ShotGroup { group, shot: None };
+        assert_eq!(event_debug(&changed), "set 3 7I (4 shots, open)");
     }
 }

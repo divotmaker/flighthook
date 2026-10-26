@@ -119,3 +119,44 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::broadcast;
+
+    use super::*;
+
+    /// GSPro sends club codes letter-first; every club in its index is
+    /// recognised and forwarded as a club change.
+    #[test]
+    fn letter_first_club_codes_become_club_info() {
+        let cases = [
+            ("W2", Club::Wood2),
+            ("W4", Club::Wood4),
+            ("W6", Club::Wood6),
+            ("W9", Club::Wood9),
+            ("H2", Club::Hybrid2),
+            ("H6", Club::Hybrid6),
+            ("H7", Club::Hybrid7),
+            ("I1", Club::Iron1),
+            ("I2", Club::Iron2),
+            ("I7", Club::Iron7),
+        ];
+        for (code, club) in cases {
+            let (bus_tx, mut rx) = broadcast::channel(16);
+            let sender = BusSender::new("gspro.0".into(), bus_tx, Arc::default());
+            let buf = format!(
+                r#"{{"Code":201,"Message":"GSPro Player Information","Player":{{"Club":"{code}"}}}}"#
+            );
+            handle_response(buf.as_bytes(), &sender);
+            let msg = rx.try_recv().expect("club info");
+            let FlighthookEvent::ClubInfo { club_info } = msg.event else {
+                panic!("{code}: expected ClubInfo, got {:?}", msg.event);
+            };
+            assert_eq!(club_info.club, club, "{code}");
+            assert!(rx.try_recv().is_err(), "{code}: no alert expected");
+        }
+    }
+}

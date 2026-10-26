@@ -107,7 +107,8 @@ pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
 mod tests {
     use super::*;
     use flighthook::{
-        BallFlight, ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, ShotData, Velocity,
+        BallFlight, ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, FlightPath,
+        ShotData, Velocity,
     };
 
     fn shot_with_impact(lateral_mm: f64, vertical_mm: f64) -> ShotData {
@@ -144,6 +145,7 @@ mod tests {
             actor: "square.0".into(),
             shot_number: 1,
             derived: None,
+            ..ShotData::default()
         }
     }
 
@@ -167,6 +169,7 @@ mod tests {
             club: None,
             impact: None,
             derived,
+            ..ShotData::default()
         }
     }
 
@@ -181,6 +184,10 @@ mod tests {
         derived.carry_distance = Some(Distance::Meters(150.9));
         derived.carry_offline = Some(Distance::Meters(-5.5));
         derived.total_distance = Some(Distance::Meters(154.6));
+        derived.path = Some(FlightPath {
+            flight: vec![[0.0, 0.0, 0.0, 0.0], [2.4, 150.9, 28.0, -5.5]],
+            ground: vec![[2.4, 150.9, 0.0, -5.5], [3.1, 154.6, 0.0, -5.9]],
+        });
         for (handed, golden) in [
             (Handedness::Right, GOLDEN_RH),
             (Handedness::Left, GOLDEN_LH),
@@ -192,6 +199,31 @@ mod tests {
                     .expect("serializes");
             assert_eq!(without, golden, "{handed:?}");
             assert_eq!(with, golden, "{handed:?}");
+        }
+    }
+
+    #[test]
+    fn gspro_output_ignores_replacing_derived_values() {
+        let mut derived = DerivedFlight::default();
+        derived.carry_distance = Some(Distance::Meters(150.9));
+        derived.total_distance = Some(Distance::Meters(154.6));
+        derived.replaces_measured = true;
+        let mut measured = square_like_shot(None);
+        if let Some(b) = measured.ball.as_mut() {
+            b.carry_distance = Some(Distance::Yards(171.0));
+        }
+        let replacing = ShotData {
+            derived: Some(derived),
+            ..measured.clone()
+        };
+        for handed in [Handedness::Right, Handedness::Left] {
+            let without = serde_json::to_string(&map_shot(&measured, handed)).expect("ser");
+            let with = serde_json::to_string(&map_shot(&replacing, handed)).expect("ser");
+            assert_eq!(with, without, "{handed:?}");
+            assert_eq!(
+                map_shot(&replacing, handed).ball_data.carry_distance,
+                Some(171.0)
+            );
         }
     }
 

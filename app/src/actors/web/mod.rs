@@ -1,6 +1,7 @@
 //! Axum web server — REST endpoints + WebSocket event streaming.
 
 pub mod export;
+pub mod groups;
 pub mod routes;
 pub mod types;
 pub mod ws;
@@ -22,9 +23,10 @@ use crate::bus::{BusReceiver, BusSender};
 use crate::state::SystemState;
 use flighthook::{
     ActorStatus, ActorStatusResponse, Club, ExportDevice, FlighthookConfig, FlighthookEvent,
-    FlighthookMessage, Handedness, ShotAccumulator, ShotData, ShotDetectionMode, ShotKey, ShotRaw,
-    SimulationSection,
+    FlighthookMessage, GroupKey, GroupedShot, Handedness, ShotAccumulator, ShotData,
+    ShotDetectionMode, ShotGroupInfo, ShotKey, ShotRaw, SimulationSection,
 };
+use groups::GroupState;
 
 /// Shots kept in the session history.
 pub const MAX_SHOTS: usize = 1000;
@@ -79,7 +81,7 @@ impl StoredShot {
 pub struct ShotContext {
     /// Kind, maker, model and firmware only.
     pub device: ExportDevice,
-    /// Club in play from game state.
+    /// The last club seen on the bus (`club_info`) when the shot triggered.
     pub club_selected: Option<Club>,
     pub handed: Option<Handedness>,
     pub detection_mode: Option<ShotDetectionMode>,
@@ -96,6 +98,8 @@ pub(crate) struct PendingShot {
     acc: ShotAccumulator,
     received_at: DateTime<Utc>,
     context: ShotContext,
+    /// Set assigned at the trigger.
+    group: String,
 }
 
 pub(crate) type PendingShots = HashMap<(String, ShotKey), PendingShot>;
@@ -114,6 +118,9 @@ pub struct WebState {
     pub bus_tx: broadcast::Sender<FlighthookMessage>,
     pub actors: RwLock<HashMap<String, ActorStatusResponse>>,
     pub shots: RwLock<VecDeque<StoredShot>>,
+    /// Shot sets over `shots`. Lock order where both are held: `groups`,
+    /// then `shots`.
+    pub groups: RwLock<GroupState>,
     /// Raw frame memory held in `shots`, as counted by [`raw_held_bytes`].
     pub raw_bytes: AtomicUsize,
     /// Device identity per actor, merged from `DeviceTelemetry` (which sends
@@ -153,6 +160,25 @@ fn emit_status(
         FlighthookMessage::new(FlighthookEvent::ActorStatus { status, telemetry })
             .actor(&state.actor_id),
     );
+}
+
+/// Emit a `shot_group` event for a changed group record, as this webserver.
+fn emit_group(state: &WebState, group: ShotGroupInfo, shot: Option<GroupedShot>) {
+    let _ = state.bus_tx.send(
+        FlighthookMessage::new(FlighthookEvent::ShotGroup { group, shot }).actor(&state.actor_id),
+    );
+}
+
+/// Host-clock RFC 3339 UTC timestamp for a group's `started_at`.
+fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// A `GroupState` for the club in play.
+fn initial_groups(root: &SystemState) -> GroupState {
+    let mut groups = GroupState::new();
+    groups.select(root.game.snapshot().club_info.map(|c| c.club));
+    groups
 }
 
 /// Emit Connected telemetry (convenience for periodic emitter + ws handlers).
@@ -241,11 +267,13 @@ async fn run(
         actors.insert(id.clone(), new_actor(name.clone()));
     }
 
+    let groups = initial_groups(&root);
     let state = Arc::new(WebState {
         root,
         bus_tx: bus_tx.clone(),
         actors: RwLock::new(actors),
         shots: RwLock::new(VecDeque::with_capacity(MAX_SHOTS)),
+        groups: RwLock::new(groups),
         raw_bytes: AtomicUsize::new(0),
         device_identity: RwLock::new(HashMap::new()),
         cached_actor_status: RwLock::new(HashMap::new()),
@@ -290,6 +318,14 @@ async fn run(
         .route("/api/shots", get(routes::get_shots))
         .route("/api/shots/export", get(routes::get_shots_export))
         .route("/api/shots/convert", post(routes::post_convert_shot))
+        .route(
+            "/api/shots/groups",
+            get(routes::get_shot_groups).post(routes::post_new_shot_group),
+        )
+        .route("/api/shots/session", post(routes::post_new_shot_session))
+        .route("/api/shots/clear", post(routes::post_clear_shot_history))
+        .route("/api/shots/grouping", post(routes::post_shot_grouping))
+        .route("/api/club", post(routes::post_club))
         .route("/api/mode", post(routes::post_mode))
         .route(
             "/api/settings",
@@ -385,8 +421,13 @@ fn device_section(
     (section, removed)
 }
 
-/// Snapshot the settings and identity in effect for a shot from `msg.actor`.
-async fn shot_context(state: &WebState, msg: &FlighthookMessage) -> ShotContext {
+/// Snapshot the settings and identity in effect for a shot from `msg.actor`,
+/// hit with `club_selected`.
+async fn shot_context(
+    state: &WebState,
+    msg: &FlighthookMessage,
+    club_selected: Option<Club>,
+) -> ShotContext {
     let game = state.root.game.snapshot();
     let config = state.root.system.snapshot();
     let (prefix, index) = msg
@@ -432,7 +473,7 @@ async fn shot_context(state: &WebState, msg: &FlighthookMessage) -> ShotContext 
 
     ShotContext {
         device,
-        club_selected: game.club_info.map(|c| c.club),
+        club_selected,
         handed: game.handed,
         detection_mode: game.mode,
         device_section,
@@ -443,17 +484,21 @@ async fn shot_context(state: &WebState, msg: &FlighthookMessage) -> ShotContext 
 
 /// Append a shot to the history, keeping it within [`MAX_SHOTS`] and the
 /// raw byte `budget`. Over budget, the oldest shots lose their raw frames
-/// first; their decoded data is kept.
+/// first; their decoded data is kept. Returns the shot that fell out of the
+/// history, if any.
 fn store_shot(
     shots: &mut VecDeque<StoredShot>,
     raw_bytes: &AtomicUsize,
     shot: StoredShot,
     budget: usize,
-) {
+) -> Option<StoredShot> {
     let mut total = raw_bytes.load(Ordering::Relaxed);
-    if shots.len() >= MAX_SHOTS
-        && let Some(old) = shots.pop_front()
-    {
+    let evicted = if shots.len() >= MAX_SHOTS {
+        shots.pop_front()
+    } else {
+        None
+    };
+    if let Some(old) = &evicted {
         total = total.saturating_sub(old.raw_len());
     }
     total += shot.raw_len();
@@ -471,6 +516,29 @@ fn store_shot(
         }
     }
     raw_bytes.store(total, Ordering::Relaxed);
+    evicted
+}
+
+/// End `actor`'s pending shots uncounted, emitting the group records that
+/// changed.
+async fn drop_pending(state: &WebState, accumulators: &mut PendingShots, actor: &str) {
+    let groups: Vec<String> = accumulators
+        .extract_if(|(a, _), _| a == actor)
+        .map(|(_, p)| p.group)
+        .collect();
+    if groups.is_empty() {
+        return;
+    }
+    let changes: Vec<ShotGroupInfo> = {
+        let mut state_groups = state.groups.write().await;
+        groups
+            .iter()
+            .filter_map(|id| state_groups.finish(id, false))
+            .collect()
+    };
+    for group in changes {
+        emit_group(state, group, None);
+    }
 }
 
 async fn apply_bus_event(
@@ -497,14 +565,36 @@ async fn apply_bus_event(
                 .write()
                 .await
                 .insert(msg.actor.clone(), msg.clone());
+            drop(actors);
+            // Out of session, the device finishes none of its pending shots.
+            if *status != ActorStatus::Connected {
+                drop_pending(state, accumulators, &msg.actor).await;
+            }
         }
         FlighthookEvent::ShotTrigger { key } => {
+            // A device runs one shot at a time: a new trigger (or a repeat of
+            // the same one) ends its earlier unfinished shots uncounted.
+            drop_pending(state, accumulators, &msg.actor).await;
+            // The set and the stored shot's club are decided now, from the
+            // club the sets last saw on the bus, so commands and club
+            // changes during the flight apply to the next shot.
+            let (club, (group, changes)) = {
+                let mut groups = state.groups.write().await;
+                let club = groups.selected_club();
+                let key_for_group = GroupKey { golfer: None, club };
+                (club, groups.assign(key_for_group, &now_rfc3339()))
+            };
+            let context = shot_context(state, msg, club).await;
             let pending = PendingShot {
                 acc: ShotAccumulator::new(msg.actor.clone(), key.clone()),
                 received_at: Utc::now(),
-                context: shot_context(state, msg).await,
+                context,
+                group,
             };
             accumulators.insert((msg.actor.clone(), key.clone()), pending);
+            for group in changes {
+                emit_group(state, group, None);
+            }
         }
         FlighthookEvent::BallFlight {
             key, ball, derived, ..
@@ -529,6 +619,7 @@ async fn apply_bus_event(
                 mut acc,
                 received_at,
                 context,
+                group,
             }) = accumulators.remove(&(msg.actor.clone(), key.clone()))
             else {
                 return;
@@ -537,18 +628,26 @@ async fn apply_bus_event(
             let (data, raw) = acc.into_parts();
             // A shot the device read nothing for is kept for the export when
             // its raw frames are; `/api/shots` leaves it out.
-            let data = match (data, &raw) {
+            let mut data = match (data, &raw) {
                 (Some(data), _) => data,
                 (None, Some(_)) => ShotData {
                     actor: msg.actor.clone(),
                     shot_number: key.shot_number,
-                    ball: None,
-                    club: None,
-                    impact: None,
-                    derived: None,
+                    ..ShotData::default()
                 },
-                (None, None) => return,
+                (None, None) => {
+                    if let Some(dropped) = state.groups.write().await.finish(&group, false) {
+                        emit_group(state, dropped, None);
+                    }
+                    return;
+                }
             };
+            let counted = data.has_data();
+            data.shot_id = Some(key.shot_id.clone());
+            data.club_selected = context.club_selected;
+            if counted {
+                data.group = Some(group.clone());
+            }
             let shot = StoredShot {
                 received_at,
                 key: key.clone(),
@@ -556,8 +655,28 @@ async fn apply_bus_event(
                 data,
                 raw,
             };
-            let mut shots = state.shots.write().await;
-            store_shot(&mut shots, &state.raw_bytes, shot, RAW_BUDGET_BYTES);
+
+            let mut changes = Vec::new();
+            {
+                let mut groups = state.groups.write().await;
+                if let Some(change) = groups.finish(&group, counted) {
+                    let joined = counted.then(|| GroupedShot {
+                        actor: msg.actor.clone(),
+                        key: key.clone(),
+                    });
+                    changes.push((change, joined));
+                }
+                let mut shots = state.shots.write().await;
+                let evicted = store_shot(&mut shots, &state.raw_bytes, shot, RAW_BUDGET_BYTES);
+                if let Some(id) = evicted.and_then(|old| old.data.group)
+                    && let Some(change) = groups.release(&id)
+                {
+                    changes.push((change, None));
+                }
+            }
+            for (group, shot) in changes {
+                emit_group(state, group, shot);
+            }
         }
         FlighthookEvent::PlayerInfo { player_info } => {
             if let Some(ref name) = player_info.name {
@@ -568,12 +687,36 @@ async fn apply_bus_event(
             }
         }
         FlighthookEvent::ClubInfo { club_info } => {
+            state.groups.write().await.select(Some(club_info.club));
             let mut actors = state.actors.write().await;
             if let Some(actor) = actors.get_mut(&msg.actor) {
                 actor
                     .telemetry
                     .insert("club".into(), club_info.club.to_string());
             }
+        }
+        FlighthookEvent::NewShotGroup => {
+            let changes = state.groups.write().await.new_group(&now_rfc3339());
+            for group in changes {
+                emit_group(state, group, None);
+            }
+        }
+        FlighthookEvent::NewShotSession => {
+            let changes = state.groups.write().await.new_session();
+            for group in changes {
+                emit_group(state, group, None);
+            }
+        }
+        FlighthookEvent::ClearShotHistory => {
+            // Shots in flight belong to the history being cleared: they end
+            // here, so a late `shot_finished` finds nothing to store. No
+            // `shot_group` is emitted; UIs clear on this event.
+            accumulators.clear();
+            let mut groups = state.groups.write().await;
+            groups.clear();
+            let mut shots = state.shots.write().await;
+            shots.clear();
+            state.raw_bytes.store(0, Ordering::Relaxed);
         }
         FlighthookEvent::ConfigOutcome {
             started,
@@ -666,7 +809,8 @@ async fn apply_bus_event(
                 .await
                 .insert(msg.actor.clone(), msg.clone());
         }
-        // Alert, SetDetectionMode, ConfigCommand — no web state update needed
+        // Alert, SetDetectionMode, ConfigCommand, ShotGroup — no web state
+        // update needed
         _ => {}
     }
 }
@@ -676,7 +820,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::state::GameStateWriter;
     use flighthook::{
-        BallFlight, ClubInfo, DerivedFlight, Distance, MevoSection, RawDir, RawRecord, Velocity,
+        BallFlight, ClubInfo, DerivedFlight, Distance, MevoSection, RawDir, RawRecord,
+        ShotGrouping, Velocity,
     };
 
     /// Removes the directory on drop, so a failing assertion doesn't leak it.
@@ -688,27 +833,38 @@ pub(crate) mod tests {
         }
     }
 
+    /// A webserver's state over `root`, on `bus_tx`, as `actor_id`.
+    pub(crate) fn web_state(
+        root: Arc<SystemState>,
+        bus_tx: broadcast::Sender<FlighthookMessage>,
+        actor_id: &str,
+    ) -> WebState {
+        let groups = initial_groups(&root);
+        WebState {
+            root,
+            bus_tx,
+            actors: RwLock::new(HashMap::new()),
+            shots: RwLock::new(VecDeque::new()),
+            groups: RwLock::new(groups),
+            raw_bytes: AtomicUsize::new(0),
+            device_identity: RwLock::new(HashMap::new()),
+            cached_actor_status: RwLock::new(HashMap::new()),
+            cached_device_telemetry: RwLock::new(HashMap::new()),
+            addr: "127.0.0.1:0".parse().expect("addr"),
+            actor_id: actor_id.into(),
+            ws_count: AtomicU64::new(0),
+            request_count: AtomicU64::new(0),
+        }
+    }
+
     pub(crate) fn test_state() -> (WebState, GameStateWriter, TempDir) {
         let dir = TempDir(std::env::temp_dir().join(format!(
             "flighthook-web-test-{}",
             crate::state::config::generate_id()
         )));
         let (root, writer) = SystemState::new(dir.0.join("config.toml"));
-        let (bus_tx, _) = broadcast::channel(16);
-        let state = WebState {
-            root: Arc::new(root),
-            bus_tx,
-            actors: RwLock::new(HashMap::new()),
-            shots: RwLock::new(VecDeque::new()),
-            raw_bytes: AtomicUsize::new(0),
-            device_identity: RwLock::new(HashMap::new()),
-            cached_actor_status: RwLock::new(HashMap::new()),
-            cached_device_telemetry: RwLock::new(HashMap::new()),
-            addr: "127.0.0.1:0".parse().expect("addr"),
-            actor_id: "webserver.0".into(),
-            ws_count: AtomicU64::new(0),
-            request_count: AtomicU64::new(0),
-        };
+        let (bus_tx, _) = broadcast::channel(1024);
+        let state = web_state(Arc::new(root), bus_tx, "webserver.0");
         (state, writer, dir)
     }
 
@@ -798,6 +954,7 @@ pub(crate) mod tests {
                     use_estimated: None,
                     camera_mode: None,
                     environment: None,
+                    spin_source: flighthook::SpinSource::D4,
                 },
             );
         });
@@ -820,6 +977,13 @@ pub(crate) mod tests {
                 .actor("mevo.0")
                 .device("FS M2-000001")
         };
+        let club = |club| {
+            FlighthookMessage::new(FlighthookEvent::ClubInfo {
+                club_info: ClubInfo { club },
+            })
+            .actor("gspro.0")
+        };
+        apply_bus_event(&state, &club(Club::Iron8), &mut acc).await;
         apply_bus_event(
             &state,
             &msg(FlighthookEvent::ShotTrigger { key: key(1) }),
@@ -828,6 +992,7 @@ pub(crate) mod tests {
         .await;
         // A club change after the trigger does not change the shot's club.
         writer.set_club_info(ClubInfo { club: Club::Driver });
+        apply_bus_event(&state, &club(Club::Driver), &mut acc).await;
         for event in [
             FlighthookEvent::BallFlight {
                 key: key(1),
@@ -964,6 +1129,7 @@ pub(crate) mod tests {
                 club: None,
                 impact: None,
                 derived: None,
+                ..ShotData::default()
             },
             raw,
         }
@@ -1000,19 +1166,1046 @@ pub(crate) mod tests {
     fn shot_cap_releases_raw_bytes() {
         let mut shots = VecDeque::new();
         let bytes = AtomicUsize::new(0);
+        let mut evicted = Vec::new();
         for n in 0..=u32::try_from(MAX_SHOTS).expect("fits") {
-            store_shot(
+            evicted.extend(store_shot(
                 &mut shots,
                 &bytes,
                 stored(n, Some(raw(1, 1))),
                 RAW_BUDGET_BYTES,
-            );
+            ));
         }
         assert_eq!(shots.len(), MAX_SHOTS);
         assert_eq!(shots[0].key.shot_number, 1);
+        assert_eq!(evicted.len(), 1, "the shot that fell out is returned");
+        assert_eq!(evicted[0].key.shot_number, 0);
         assert_eq!(
             bytes.load(Ordering::Relaxed),
             MAX_SHOTS * (2 + RAW_RECORD_OVERHEAD)
         );
+    }
+
+    // -- Shot groups ---------------------------------------------------------
+
+    /// Feeds bus messages through one shared set of pending shots, so a
+    /// shot's trigger and finish can be split around other events.
+    struct Updater<'a> {
+        state: &'a WebState,
+        pending: PendingShots,
+    }
+
+    impl<'a> Updater<'a> {
+        fn new(state: &'a WebState) -> Self {
+            Self {
+                state,
+                pending: PendingShots::new(),
+            }
+        }
+
+        async fn send(&mut self, actor: &str, event: FlighthookEvent) {
+            let msg = FlighthookMessage::new(event).actor(actor);
+            apply_bus_event(self.state, &msg, &mut self.pending).await;
+        }
+
+        async fn trigger(&mut self, n: u32) {
+            self.trigger_as("mevo.0", key(n)).await;
+        }
+
+        async fn finish(&mut self, n: u32) {
+            self.finish_as("mevo.0", key(n)).await;
+        }
+
+        async fn shot(&mut self, n: u32) {
+            self.trigger(n).await;
+            self.finish(n).await;
+        }
+
+        async fn trigger_as(&mut self, actor: &str, key: ShotKey) {
+            self.send(actor, FlighthookEvent::ShotTrigger { key }).await;
+        }
+
+        /// Ball data, then the finish.
+        async fn finish_as(&mut self, actor: &str, key: ShotKey) {
+            self.send(
+                actor,
+                FlighthookEvent::BallFlight {
+                    key: key.clone(),
+                    ball: Box::new(ball()),
+                    derived: None,
+                },
+            )
+            .await;
+            self.send(actor, FlighthookEvent::ShotFinished { key, raw: None })
+                .await;
+        }
+
+        async fn shot_as(&mut self, actor: &str, key: ShotKey) {
+            self.trigger_as(actor, key.clone()).await;
+            self.finish_as(actor, key).await;
+        }
+
+        async fn status(&mut self, actor: &str, status: ActorStatus) {
+            self.send(
+                actor,
+                FlighthookEvent::ActorStatus {
+                    status,
+                    telemetry: HashMap::new(),
+                },
+            )
+            .await;
+        }
+
+        /// The statuses a device actor reports as its connection drops and
+        /// comes back.
+        async fn reconnect(&mut self, actor: &str) {
+            for status in [
+                ActorStatus::Disconnected,
+                ActorStatus::Reconnecting,
+                ActorStatus::Starting,
+                ActorStatus::Connected,
+            ] {
+                self.status(actor, status).await;
+            }
+        }
+
+        /// A club change as the bus carries it: game state (the system
+        /// actor's write) and the `club_info` message.
+        async fn club(&mut self, writer: &GameStateWriter, club: Club) {
+            writer.set_club_info(ClubInfo { club });
+            self.send(
+                "web",
+                FlighthookEvent::ClubInfo {
+                    club_info: ClubInfo { club },
+                },
+            )
+            .await;
+        }
+
+        /// A persisted grouping change, as the system actor applies it.
+        async fn grouping(&mut self, mode: ShotGrouping) {
+            self.state.root.system.update(|c| c.shot_grouping = mode);
+            self.send(
+                "system",
+                FlighthookEvent::ConfigOutcome {
+                    request_id: None,
+                    restarted: Vec::new(),
+                    stopped: Vec::new(),
+                    started: Vec::new(),
+                },
+            )
+            .await;
+        }
+    }
+
+    /// `shot_group` events on the bus so far, as `(actor, group, shot)`.
+    fn group_events(
+        rx: &mut broadcast::Receiver<FlighthookMessage>,
+    ) -> Vec<(String, ShotGroupInfo, Option<GroupedShot>)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let FlighthookEvent::ShotGroup { group, shot } = msg.event {
+                out.push((msg.actor, group, shot));
+            }
+        }
+        out
+    }
+
+    async fn group_of(state: &WebState, n: u32) -> Option<String> {
+        state
+            .shots
+            .read()
+            .await
+            .iter()
+            .find(|s| s.key.shot_number == n)
+            .expect("stored")
+            .data
+            .group
+            .clone()
+    }
+
+    async fn group_info(state: &WebState, id: &str) -> ShotGroupInfo {
+        state
+            .groups
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .find(|g| g.id == id)
+            .expect("group kept")
+    }
+
+    #[tokio::test]
+    async fn stored_shot_is_stamped_with_id_club_and_group() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::ByClub).await;
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
+        // Dataless, raw only: stored for the export, never counted.
+        up.trigger(2).await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ShotFinished {
+                key: key(2),
+                raw: Some(Box::new(raw(1, 2))),
+            },
+        )
+        .await;
+
+        let shots = state.shots.read().await.clone();
+        let current = state.groups.read().await.current().cloned().expect("open");
+        let s1 = &shots[0].data;
+        assert_eq!(s1.shot_id.as_deref(), Some("shot-1"));
+        assert_eq!(s1.club_selected, Some(Club::Iron7));
+        assert_eq!(s1.group.as_deref(), Some(current.id.as_str()));
+        let s2 = &shots[1].data;
+        assert_eq!(s2.shot_id.as_deref(), Some("shot-2"));
+        assert_eq!(s2.club_selected, Some(Club::Iron7));
+        assert_eq!(s2.group, None);
+        assert_eq!(current.shots, 1, "the dataless shot is not counted");
+
+        let listed = routes::get_shots(
+            axum::extract::State(Arc::new(state)),
+            axum::extract::Query(routes::ShotsQuery {
+                limit: 50,
+                units: Some("metric".into()),
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(listed.len(), 1);
+        let v = serde_json::to_value(&listed[0]).expect("ser");
+        assert_eq!(v["shot_id"], "shot-1");
+        assert_eq!(v["club_selected"], "7I");
+        assert_eq!(v["group"], current.id.as_str());
+    }
+
+    #[tokio::test]
+    async fn mode_none_still_records_sets() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::None).await;
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
+        up.send("web", FlighthookEvent::NewShotGroup).await;
+        up.shot(2).await;
+        up.club(&writer, Club::Driver).await;
+        up.shot(3).await;
+        up.send("web", FlighthookEvent::NewShotSession).await;
+        up.shot(4).await;
+
+        let mut ids = Vec::new();
+        for n in 1..=4 {
+            ids.push(group_of(&state, n).await.expect("grouped"));
+        }
+        // New set, a club change and New session each start a set.
+        for pair in ids.windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+        let list = state.groups.read().await.list();
+        assert_eq!(list.len(), 4);
+        assert_eq!(
+            list.iter().map(|g| g.session).collect::<Vec<_>>(),
+            [0, 0, 0, 1]
+        );
+        assert!(!group_events(&mut rx).is_empty(), "shot_group events flow");
+
+        // `/api/shots` carries the set.
+        let listed = routes::get_shots(
+            axum::extract::State(Arc::new(state)),
+            axum::extract::Query(routes::ShotsQuery {
+                limit: 50,
+                units: None,
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(listed.len(), 4);
+        for (shot, id) in listed.iter().zip(&ids) {
+            assert_eq!(shot.group.as_deref(), Some(id.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_history_empties_the_shots_and_sets_and_starts_a_new_session() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
+        up.send("web", FlighthookEvent::NewShotGroup).await;
+        up.trigger(2).await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ShotFinished {
+                key: key(2),
+                raw: Some(Box::new(raw(3, 64))),
+            },
+        )
+        .await;
+        up.club(&writer, Club::Driver).await;
+        up.shot(3).await;
+        assert_eq!(state.shots.read().await.len(), 3);
+        assert!(state.raw_bytes.load(Ordering::Relaxed) > 0);
+        assert_eq!(state.groups.read().await.list().len(), 2);
+        let _ = group_events(&mut rx);
+
+        up.send("web", FlighthookEvent::ClearShotHistory).await;
+        assert!(state.shots.read().await.is_empty());
+        assert_eq!(state.raw_bytes.load(Ordering::Relaxed), 0);
+        {
+            let groups = state.groups.read().await;
+            assert!(groups.list().is_empty());
+            assert!(groups.current().is_none());
+            assert_eq!(groups.session(), 1);
+        }
+        assert!(group_events(&mut rx).is_empty(), "UIs clear on the command");
+
+        // The next shot starts set 1 in the new session, with the club in
+        // play kept.
+        up.shot(4).await;
+        let shots = state.shots.read().await.clone();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].data.club_selected, Some(Club::Driver));
+        let id = shots[0].data.group.clone().expect("grouped");
+        let info = group_info(&state, &id).await;
+        assert_eq!((info.number, info.session, info.shots), (1, 1, 1));
+        assert_eq!(info.club, Some(Club::Driver));
+    }
+
+    #[tokio::test]
+    async fn a_shot_in_flight_at_clear_history_stays_cleared() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
+        up.trigger(2).await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::BallFlight {
+                key: key(2),
+                ball: Box::new(ball()),
+                derived: None,
+            },
+        )
+        .await;
+        let _ = group_events(&mut rx);
+
+        up.send("web", FlighthookEvent::ClearShotHistory).await;
+        // The device finishes the shot it triggered before the clear.
+        up.finish(2).await;
+        assert!(state.shots.read().await.is_empty(), "nothing stored");
+        assert!(state.groups.read().await.list().is_empty());
+        assert!(group_events(&mut rx).is_empty(), "no set comes back");
+        // A dropout afterwards has nothing to end.
+        up.reconnect("mevo.0").await;
+        assert!(group_events(&mut rx).is_empty());
+
+        // The next trigger is a fresh shot in a fresh set.
+        up.shot(3).await;
+        let shots = state.shots.read().await.clone();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].key.shot_number, 3);
+        let id = shots[0].data.group.clone().expect("grouped");
+        assert_eq!(group_info(&state, &id).await.number, 1);
+    }
+
+    #[tokio::test]
+    async fn exported_lines_carry_the_set_in_every_view() {
+        for view in [
+            ShotGrouping::BySet,
+            ShotGrouping::ByClub,
+            ShotGrouping::None,
+        ] {
+            let (state, writer, _dir) = test_state();
+            let mut up = Updater::new(&state);
+            up.grouping(view).await;
+            up.club(&writer, Club::Iron7).await;
+            up.shot(1).await;
+            let stored = state.shots.read().await[0].clone();
+            let id = stored.data.group.clone().expect("grouped");
+            let line: serde_json::Value =
+                serde_json::from_str(&export::jsonl_line(&stored, "t", None, false)).expect("json");
+            assert_eq!(line["group"], id.as_str(), "{view:?}");
+            assert_eq!(line["data"]["group"], id.as_str(), "{view:?}");
+            let row = export::to_csv_row(&stored, flighthook::UnitSystem::Imperial);
+            assert!(row.split(',').any(|cell| cell == id), "{view:?}: {row}");
+        }
+    }
+
+    #[tokio::test]
+    async fn new_group_during_a_flight_applies_to_the_next_shot() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        up.trigger(1).await;
+        up.send("web", FlighthookEvent::NewShotGroup).await;
+        up.finish(1).await;
+
+        let old = group_of(&state, 1).await.expect("grouped");
+        let old_info = group_info(&state, &old).await;
+        assert_eq!(old_info.shots, 1);
+        assert!(!old_info.open, "New group closed it");
+        let new = state.groups.read().await.current().cloned().expect("open");
+        assert_ne!(new.id, old);
+        assert!(new.manual);
+        assert_eq!(new.shots, 0, "the new group is still empty");
+
+        up.shot(2).await;
+        assert_eq!(group_of(&state, 2).await, Some(new.id));
+    }
+
+    #[tokio::test]
+    async fn club_change_during_a_flight_applies_to_the_next_shot() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        up.trigger(1).await;
+        up.club(&writer, Club::Driver).await;
+        up.finish(1).await;
+        let first = group_of(&state, 1).await.expect("grouped");
+        let info = group_info(&state, &first).await;
+        assert_eq!(info.club, Some(Club::Iron7));
+        assert_eq!(
+            state.shots.read().await[0].data.club_selected,
+            Some(Club::Iron7)
+        );
+
+        up.shot(2).await;
+        let second = group_of(&state, 2).await.expect("grouped");
+        assert_ne!(second, first);
+        assert_eq!(group_info(&state, &second).await.club, Some(Club::Driver));
+        assert!(!group_info(&state, &first).await.open);
+    }
+
+    /// 7I, 7I, DR, 7I with the default view switched to `views[n]` before
+    /// each shot; returns each shot's set.
+    async fn sets_for(views: [ShotGrouping; 4]) -> Vec<String> {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        let clubs = [Club::Iron7, Club::Iron7, Club::Driver, Club::Iron7];
+        let mut out = Vec::new();
+        for (n, (club, view)) in (1..).zip(clubs.into_iter().zip(views)) {
+            up.grouping(view).await;
+            up.club(&writer, club).await;
+            up.shot(n).await;
+            out.push(group_of(&state, n).await.expect("grouped"));
+        }
+        assert_eq!(state.groups.read().await.list().len(), 3);
+        out
+    }
+
+    #[tokio::test]
+    async fn club_change_starts_a_new_set_in_every_view() {
+        use ShotGrouping::{ByClub, BySet, None as LastShot};
+        for views in [
+            [BySet; 4],
+            [ByClub; 4],
+            [LastShot; 4],
+            [BySet, ByClub, LastShot, ByClub],
+            [LastShot, BySet, ByClub, BySet],
+        ] {
+            let sets = sets_for(views).await;
+            assert_eq!(sets[0], sets[1], "{views:?}: same club continues");
+            assert_ne!(sets[1], sets[2], "{views:?}: DR starts a set");
+            assert_ne!(sets[2], sets[3], "{views:?}: back to 7I starts a set");
+            assert_ne!(
+                sets[0], sets[3],
+                "{views:?}: the earlier 7I set stays closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_the_default_view_closes_and_creates_nothing() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
+        let set = state.groups.read().await.current().cloned().expect("open");
+        group_events(&mut rx);
+        for view in [
+            ShotGrouping::None,
+            ShotGrouping::ByClub,
+            ShotGrouping::BySet,
+        ] {
+            up.grouping(view).await;
+            assert!(group_events(&mut rx).is_empty(), "{view:?}");
+            let current = state.groups.read().await.current().cloned();
+            assert_eq!(current.as_ref(), Some(&set), "{view:?}");
+        }
+        up.shot(2).await;
+        assert_eq!(group_of(&state, 2).await, Some(set.id));
+    }
+
+    #[tokio::test]
+    async fn shot_group_events_on_create_join_and_session() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::ByClub).await;
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
+
+        let events = group_events(&mut rx);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let (actor, created, shot) = &events[0];
+        assert_eq!(actor, "webserver.0");
+        assert_eq!(created.shots, 0);
+        assert!(created.open);
+        assert_eq!(created.number, 1);
+        assert_eq!(*shot, None, "create carries no shot");
+        let (actor, joined, shot) = &events[1];
+        assert_eq!(actor, "webserver.0");
+        assert_eq!(joined.id, created.id);
+        assert_eq!(joined.shots, 1);
+        assert_eq!(
+            *shot,
+            Some(GroupedShot {
+                actor: "mevo.0".into(),
+                key: key(1),
+            })
+        );
+
+        // DR closes the 7-iron set and starts set 2.
+        up.club(&writer, Club::Driver).await;
+        up.shot(2).await;
+        let events = group_events(&mut rx);
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[0].1.number, 1);
+        assert!(!events[0].1.open);
+        assert_eq!((events[1].1.number, events[1].1.open), (2, true));
+        assert_eq!(events[2].1.shots, 1);
+        up.send("web", FlighthookEvent::NewShotSession).await;
+        let closed = group_events(&mut rx);
+        assert_eq!(closed.len(), 1, "the open set");
+        let (a, g, s) = &closed[0];
+        assert_eq!(a, "webserver.0");
+        assert!(!g.open && s.is_none());
+        assert_eq!(g.number, 2);
+        assert_eq!(g.session, 0, "closed in the session it belongs to");
+        // The next shot starts set 3 in session 1.
+        up.shot(3).await;
+        let created = &group_events(&mut rx)[0].1;
+        assert_eq!((created.number, created.session), (3, 1));
+    }
+
+    #[tokio::test]
+    async fn club_info_selects_the_club_for_new_group() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::ByClub).await;
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
+        let i7 = group_of(&state, 1).await.expect("grouped");
+        // The bus message alone moves the selection; game state is not read.
+        up.send(
+            "gspro.0",
+            FlighthookEvent::ClubInfo {
+                club_info: ClubInfo { club: Club::Driver },
+            },
+        )
+        .await;
+        group_events(&mut rx);
+        up.send("web", FlighthookEvent::NewShotGroup).await;
+        let events = group_events(&mut rx);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].1.id, i7);
+        assert!(!events[0].1.open, "the 7-iron set closes");
+        assert_eq!(events[1].1.club, Some(Club::Driver));
+        assert!(events[1].1.manual && events[1].1.open);
+    }
+
+    #[tokio::test]
+    async fn every_webserver_groups_independently_under_its_own_actor_id() {
+        let (one, writer, _dir) = test_state();
+        let two = web_state(Arc::clone(&one.root), one.bus_tx.clone(), "webserver.1");
+        let mut rx = one.bus_tx.subscribe();
+        writer.set_club_info(ClubInfo { club: Club::Iron7 });
+        one.root
+            .system
+            .update(|c| c.shot_grouping = ShotGrouping::BySet);
+        let outcome = FlighthookEvent::ConfigOutcome {
+            request_id: None,
+            restarted: Vec::new(),
+            stopped: Vec::new(),
+            started: Vec::new(),
+        };
+        let mut a = Updater::new(&one);
+        let mut b = Updater::new(&two);
+        a.send("system", outcome.clone()).await;
+        b.send("system", outcome).await;
+        a.shot(1).await;
+        b.shot(1).await;
+
+        let events = group_events(&mut rx);
+        let by = |actor: &str| -> Vec<ShotGroupInfo> {
+            events
+                .iter()
+                .filter(|(a, _, _)| a == actor)
+                .map(|(_, g, _)| g.clone())
+                .collect()
+        };
+        let (e1, e2) = (by("webserver.0"), by("webserver.1"));
+        assert_eq!(e1.len(), 2);
+        assert_eq!(e2.len(), 2);
+        assert_eq!(e1.len() + e2.len(), events.len());
+        assert_ne!(e1[0].id, e2[0].id, "each server has its own ids");
+        assert_eq!(group_of(&one, 1).await.as_deref(), Some(e1[0].id.as_str()));
+        assert_eq!(group_of(&two, 1).await.as_deref(), Some(e2[0].id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn eviction_releases_the_oldest_shots_group() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        up.shot(0).await;
+        up.club(&writer, Club::Driver).await;
+        for n in 1..u32::try_from(MAX_SHOTS).expect("fits") {
+            up.shot(n).await;
+        }
+        let first = group_of(&state, 0).await.expect("grouped");
+        let second = group_of(&state, 1).await.expect("grouped");
+        assert_eq!(state.shots.read().await.len(), MAX_SHOTS);
+
+        let mut rx = state.bus_tx.subscribe();
+        up.shot(5000).await;
+        let events = group_events(&mut rx);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].1.id, second);
+        assert!(events[0].2.is_some(), "join");
+        let (_, released, shot) = &events[1];
+        assert_eq!(released.id, first);
+        assert_eq!(*shot, None);
+        assert!(!released.open);
+        assert_eq!(released.shots, 0, "dropped");
+        assert!(
+            state
+                .groups
+                .read()
+                .await
+                .list()
+                .iter()
+                .all(|g| g.id != first)
+        );
+    }
+
+    #[tokio::test]
+    async fn evicting_a_dataless_shot_releases_nothing() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        up.trigger(0).await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ShotFinished {
+                key: key(0),
+                raw: Some(Box::new(raw(1, 1))),
+            },
+        )
+        .await;
+        for n in 1..u32::try_from(MAX_SHOTS).expect("fits") {
+            up.shot(n).await;
+        }
+        let group = group_of(&state, 1).await.expect("grouped");
+        let mut rx = state.bus_tx.subscribe();
+        up.shot(5000).await;
+        let events = group_events(&mut rx);
+        assert_eq!(events.len(), 1, "the join only: {events:?}");
+        assert_eq!(events[0].1.id, group);
+        assert_eq!(events[0].1.shots, u32::try_from(MAX_SHOTS).expect("fits"));
+    }
+
+    #[tokio::test]
+    async fn a_new_trigger_ends_the_devices_unfinished_shot() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        up.send("web", FlighthookEvent::NewShotGroup).await;
+        let set = state.groups.read().await.current().cloned().expect("open");
+        // Shot 1 never finishes; shot 2 does.
+        up.trigger(1).await;
+        up.shot(2).await;
+        // Another device's shot in flight is not this device's to end.
+        up.send("square.0", FlighthookEvent::ShotTrigger { key: key(7) })
+            .await;
+        up.trigger(3).await;
+        up.send(
+            "square.0",
+            FlighthookEvent::ShotFinished {
+                key: key(7),
+                raw: Some(Box::new(raw(1, 1))),
+            },
+        )
+        .await;
+        up.finish(3).await;
+        assert_eq!(group_info(&state, &set.id).await.shots, 2);
+        assert_eq!(group_of(&state, 2).await.as_deref(), Some(set.id.as_str()));
+        assert!(up.pending.is_empty(), "nothing is left pending");
+        assert_eq!(state.shots.read().await.len(), 3);
+
+        // Re-triggering the same shot ends its first assignment too.
+        up.send("web", FlighthookEvent::NewShotGroup).await;
+        let fresh = state.groups.read().await.current().cloned().expect("open");
+        up.trigger(4).await;
+        up.trigger(4).await;
+        up.finish(4).await;
+        assert_eq!(group_info(&state, &fresh.id).await.shots, 1);
+        assert!(up.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_device_dropping_out_ends_its_unfinished_shots() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
+        up.send("web", FlighthookEvent::NewShotGroup).await;
+        let set = state.groups.read().await.current().cloned().expect("open");
+        for status in [
+            ActorStatus::Reconnecting,
+            ActorStatus::Disconnected,
+            ActorStatus::Starting,
+        ] {
+            up.trigger(2).await;
+            up.send(
+                "mevo.0",
+                FlighthookEvent::ActorStatus {
+                    status,
+                    telemetry: HashMap::new(),
+                },
+            )
+            .await;
+            assert!(up.pending.is_empty(), "{status:?}");
+            // The set is empty again: New set is a no-op...
+            group_events(&mut rx);
+            up.send("web", FlighthookEvent::NewShotGroup).await;
+            assert!(group_events(&mut rx).is_empty(), "{status:?}");
+            let current = state.groups.read().await.current().cloned();
+            assert_eq!(current.map(|g| g.id), Some(set.id.clone()), "{status:?}");
+        }
+        // ...and it still takes the next shot's club.
+        up.club(&writer, Club::Driver).await;
+        up.shot(3).await;
+        assert_eq!(group_of(&state, 3).await.as_deref(), Some(set.id.as_str()));
+        let info = group_info(&state, &set.id).await;
+        assert_eq!(info.club, Some(Club::Driver));
+        assert_eq!(info.shots, 1);
+        // A Connected status (heartbeat or telemetry) leaves a flight alone.
+        up.trigger(4).await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ActorStatus {
+                status: ActorStatus::Connected,
+                telemetry: HashMap::new(),
+            },
+        )
+        .await;
+        up.finish(4).await;
+        assert_eq!(group_info(&state, &set.id).await.shots, 2);
+    }
+
+    #[tokio::test]
+    async fn trigger_takes_the_club_from_the_bus_not_game_state() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Driver).await;
+        up.shot(1).await;
+        // 7I as the bus carries it before the system actor writes game state.
+        up.send(
+            "web",
+            FlighthookEvent::ClubInfo {
+                club_info: ClubInfo { club: Club::Iron7 },
+            },
+        )
+        .await;
+        assert_eq!(
+            state.root.game.snapshot().club_info.map(|c| c.club),
+            Some(Club::Driver),
+            "game state still lags"
+        );
+        up.send("web", FlighthookEvent::NewShotGroup).await;
+        let set = state.groups.read().await.current().cloned().expect("open");
+        assert_eq!(set.club, Some(Club::Iron7));
+        up.shot(2).await;
+        let stored = state.shots.read().await[1].data.clone();
+        assert_eq!(stored.club_selected, Some(Club::Iron7));
+        assert_eq!(stored.group.as_deref(), Some(set.id.as_str()));
+        let info = group_info(&state, &set.id).await;
+        assert_eq!(info.club, Some(Club::Iron7), "not re-keyed to DR");
+        assert_eq!(info.shots, 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_trigger_finishes_its_assignment_uncounted() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        // No data and no raw: nothing is stored.
+        up.trigger(1).await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ShotFinished {
+                key: key(1),
+                raw: None,
+            },
+        )
+        .await;
+        assert!(state.shots.read().await.is_empty());
+        let current = state.groups.read().await.current().cloned().expect("open");
+        assert_eq!(current.shots, 0);
+        // Nothing pending: a different club adopts the empty group.
+        up.club(&writer, Club::Driver).await;
+        up.shot(2).await;
+        assert_eq!(group_of(&state, 2).await, Some(current.id));
+    }
+
+    // -- A device reconnecting keeps its set ---------------------------------
+
+    fn key_id(n: u32, id: &str) -> ShotKey {
+        ShotKey {
+            shot_id: id.into(),
+            shot_number: n,
+        }
+    }
+
+    async fn group_of_id(state: &WebState, shot_id: &str) -> Option<String> {
+        state
+            .shots
+            .read()
+            .await
+            .iter()
+            .find(|s| s.key.shot_id == shot_id)
+            .expect("stored")
+            .data
+            .group
+            .clone()
+    }
+
+    async fn selected_club(state: &WebState) -> Option<Club> {
+        state.groups.read().await.selected_club()
+    }
+
+    #[tokio::test]
+    async fn reconnect_between_shots_keeps_the_set() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        for n in 1..=3 {
+            up.shot(n).await;
+        }
+        let set = state.groups.read().await.current().cloned().expect("open");
+        assert_eq!(set.shots, 3);
+        group_events(&mut rx);
+
+        up.reconnect("mevo.0").await;
+        assert!(
+            group_events(&mut rx).is_empty(),
+            "no set is closed, rotated or created"
+        );
+        assert_eq!(selected_club(&state).await, Some(Club::Iron7));
+        let current = state.groups.read().await.current().cloned();
+        assert_eq!(current.map(|g| g.id), Some(set.id.clone()));
+
+        up.shot(4).await;
+        assert_eq!(group_of(&state, 4).await.as_deref(), Some(set.id.as_str()));
+        let info = group_info(&state, &set.id).await;
+        assert_eq!(info.shots, 4);
+        assert!(info.open);
+        assert_eq!(state.groups.read().await.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_mid_shot_drops_only_the_unfinished_shot() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
+        up.shot(2).await;
+        let set = state.groups.read().await.current().cloned().expect("open");
+        // Shot 3 is in flight when the connection drops.
+        up.trigger(3).await;
+        group_events(&mut rx);
+        up.status("mevo.0", ActorStatus::Disconnected).await;
+        assert!(up.pending.is_empty(), "the unfinished shot is dropped");
+        assert!(group_events(&mut rx).is_empty(), "the set is untouched");
+        up.reconnect("mevo.0").await;
+        // Data for the dropped shot after the reconnect is not its finish.
+        up.finish(3).await;
+        up.shot(4).await;
+
+        assert_eq!(group_of(&state, 4).await.as_deref(), Some(set.id.as_str()));
+        let info = group_info(&state, &set.id).await;
+        assert_eq!(info.shots, 3, "shots 1, 2 and 4");
+        assert!(info.open);
+        let numbers: Vec<u32> = state
+            .shots
+            .read()
+            .await
+            .iter()
+            .map(|s| s.key.shot_number)
+            .collect();
+        assert_eq!(numbers, [1, 2, 4]);
+        assert_eq!(state.groups.read().await.list().len(), 1);
+        assert_eq!(selected_club(&state).await, Some(Club::Iron7));
+
+        // A set opened by the dropped shot's own trigger stays open, and the
+        // next shot joins it.
+        up.send("web", FlighthookEvent::NewShotSession).await;
+        up.trigger(5).await;
+        let opened = state.groups.read().await.current().cloned().expect("open");
+        assert_ne!(opened.id, set.id);
+        up.reconnect("mevo.0").await;
+        let current = state.groups.read().await.current().cloned();
+        assert_eq!(current.map(|g| g.id), Some(opened.id.clone()));
+        up.shot(6).await;
+        assert_eq!(group_of(&state, 6).await, Some(opened.id.clone()));
+        let info = group_info(&state, &opened.id).await;
+        assert_eq!(info.shots, 1);
+        assert!(info.open);
+        assert!(up.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_keeps_the_set_in_every_view() {
+        for view in [
+            ShotGrouping::BySet,
+            ShotGrouping::ByClub,
+            ShotGrouping::None,
+        ] {
+            let (state, writer, _dir) = test_state();
+            let mut rx = state.bus_tx.subscribe();
+            let mut up = Updater::new(&state);
+            up.grouping(view).await;
+            up.club(&writer, Club::Iron7).await;
+            up.shot_as("mevo.0", key_id(1, "m1")).await;
+            up.club(&writer, Club::Driver).await;
+            up.shot_as("square.0", key_id(1, "s1")).await;
+            let iron = group_of_id(&state, "m1").await.expect("grouped");
+            let driver = group_of_id(&state, "s1").await.expect("grouped");
+            assert_ne!(iron, driver, "{view:?}");
+            group_events(&mut rx);
+
+            up.reconnect("square.0").await;
+            up.reconnect("mevo.0").await;
+            assert!(group_events(&mut rx).is_empty(), "{view:?}");
+            assert_eq!(selected_club(&state).await, Some(Club::Driver));
+
+            up.shot_as("square.0", key_id(1, "s2")).await;
+            up.shot_as("mevo.0", key_id(1, "m2")).await;
+            assert_eq!(group_of_id(&state, "s2").await, Some(driver.clone()));
+            assert_eq!(group_of_id(&state, "m2").await, Some(driver.clone()));
+            let info = group_info(&state, &driver).await;
+            assert_eq!((info.shots, info.open), (3, true), "{view:?}");
+            assert_eq!(state.groups.read().await.list().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn shot_numbers_restarting_after_a_reconnect_stay_distinct() {
+        let (state, writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        up.shot_as("mevo.0", key_id(1, "a1")).await;
+        up.shot_as("mevo.0", key_id(2, "a2")).await;
+        // In flight when the connection drops: dropped, not finished by the
+        // next connection's shot of the same number.
+        up.trigger_as("mevo.0", key_id(3, "a3")).await;
+        let first = group_of_id(&state, "a1").await.expect("grouped");
+        up.reconnect("mevo.0").await;
+        // The new connection counts from 1 again.
+        up.shot_as("mevo.0", key_id(1, "b1")).await;
+        up.club(&writer, Club::Driver).await;
+        group_events(&mut rx);
+        up.shot_as("mevo.0", key_id(2, "b2")).await;
+        up.shot_as("mevo.0", key_id(3, "b3")).await;
+
+        assert_eq!(group_of_id(&state, "b1").await, Some(first.clone()));
+        assert_eq!(group_of_id(&state, "a1").await, Some(first.clone()));
+        let second = group_of_id(&state, "b2").await.expect("grouped");
+        assert_ne!(second, first, "DR starts a new set");
+        assert_eq!(group_of_id(&state, "b3").await, Some(second.clone()));
+        assert_eq!(group_of_id(&state, "a2").await, Some(first.clone()));
+
+        let shots = state.shots.read().await;
+        let ids: Vec<(u32, &str)> = shots
+            .iter()
+            .map(|s| (s.key.shot_number, s.key.shot_id.as_str()))
+            .collect();
+        assert_eq!(ids, [(1, "a1"), (2, "a2"), (1, "b1"), (2, "b2"), (3, "b3")]);
+        for s in shots.iter() {
+            assert_eq!(s.data.shot_id.as_deref(), Some(s.key.shot_id.as_str()));
+        }
+        drop(shots);
+        let first = group_info(&state, &first).await;
+        assert_eq!((first.shots, first.open), (3, false));
+        let second = group_info(&state, &second).await;
+        assert_eq!((second.shots, second.open), (2, true));
+        // Each join names the shot by its own id.
+        let joined: Vec<String> = group_events(&mut rx)
+            .into_iter()
+            .filter_map(|(_, _, shot)| shot.map(|s| s.key.shot_id))
+            .collect();
+        assert_eq!(joined, ["b2", "b3"]);
+        assert!(up.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_device_dropping_mid_shot_leaves_anothers_shot_alone() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.grouping(ShotGrouping::BySet).await;
+        up.club(&writer, Club::Iron7).await;
+        up.shot_as("mevo.0", key_id(1, "a1")).await;
+        let set = state.groups.read().await.current().cloned().expect("open");
+        // Both in flight; A drops before its finish, B finishes.
+        up.trigger_as("mevo.0", key_id(2, "a2")).await;
+        up.trigger_as("square.0", key_id(1, "b1")).await;
+        up.status("mevo.0", ActorStatus::Disconnected).await;
+        let left: Vec<&str> = up.pending.keys().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(left, ["square.0"], "only A's shot is dropped");
+        up.finish_as("square.0", key_id(1, "b1")).await;
+        // B's next trigger lands while A is still away.
+        up.status("mevo.0", ActorStatus::Reconnecting).await;
+        up.shot_as("square.0", key_id(2, "b2")).await;
+        up.status("mevo.0", ActorStatus::Connected).await;
+        up.shot_as("mevo.0", key_id(1, "a3")).await;
+
+        for id in ["a1", "b1", "b2", "a3"] {
+            assert_eq!(
+                group_of_id(&state, id).await.as_deref(),
+                Some(set.id.as_str()),
+                "{id}"
+            );
+        }
+        let info = group_info(&state, &set.id).await;
+        assert_eq!(info.shots, 4);
+        assert!(info.open);
+        assert_eq!(
+            state.shots.read().await.len(),
+            4,
+            "A's dropped shot is not stored"
+        );
+        assert!(up.pending.is_empty());
     }
 }

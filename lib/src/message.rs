@@ -27,7 +27,7 @@ use crate::{Handedness, ShotDetectionMode};
 use std::collections::HashMap;
 
 use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRaw};
-use crate::{ClubInfo, PlayerInfo};
+use crate::{ClubInfo, GroupedShot, PlayerInfo, ShotGroupInfo, ShotGrouping};
 use crate::{
     FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, OpenConnectServerSection,
     R10Section, RandomClubSection, SquareSection, WebserverSection,
@@ -247,6 +247,24 @@ pub enum FlighthookEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         started: Vec<String>,
     },
+    /// Command: start a new set (shot group); the next shot joins it. The
+    /// web layer acts on it.
+    NewShotGroup,
+    /// Command: close every open set and start a new session; the next shot
+    /// starts a new set. The web layer acts on it.
+    NewShotSession,
+    /// Command: delete the shot history and every set, and start a new
+    /// session. Every web layer clears its history, and every UI that sees
+    /// it clears its shot list.
+    ClearShotHistory,
+    /// A shot group record changed: created, a shot joined, closed, or a shot
+    /// left the history. Emitted by the web layer.
+    ShotGroup {
+        group: ShotGroupInfo,
+        /// The shot that joined, when the change is a join.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shot: Option<GroupedShot>,
+    },
     /// Actor/connection lifecycle update.
     ///
     /// Carries actor-framework state: connection status enum and actor-specific
@@ -286,6 +304,13 @@ pub enum ConfigAction {
     ReplaceAll {
         config: Box<FlighthookConfig>,
     },
+    /// Replace the global settings (everything but the actor sections:
+    /// units, chipping and putting clubs, default shot view, simulation)
+    /// with `config`'s, keeping every actor section of the live config.
+    /// Used by POST /api/settings?scope=global.
+    ReplaceGlobal {
+        config: Box<FlighthookConfig>,
+    },
     /// Per-section upserts.
     UpsertWebserver {
         index: String,
@@ -322,6 +347,11 @@ pub enum ConfigAction {
     /// Remove a section by global ID ("mevo.0", "gspro.1", "webserver.0").
     Remove {
         id: String,
+    },
+    /// Set the default shot view (`shot_grouping`, persisted). Sets are
+    /// assigned the same way in every view.
+    SetShotGrouping {
+        mode: ShotGrouping,
     },
 }
 
@@ -407,6 +437,129 @@ mod tests {
             FlighthookEvent::ActorStatus {
                 status: crate::ActorStatus::Connected,
                 ..
+            }
+        ));
+    }
+
+    fn envelope(event: FlighthookEvent) -> FlighthookMessage {
+        FlighthookMessage {
+            actor: "web".into(),
+            device: None,
+            raw_payload: None,
+            event,
+        }
+    }
+
+    #[test]
+    fn group_commands_are_bare_tags() {
+        for (event, kind) in [
+            (FlighthookEvent::NewShotGroup, "new_shot_group"),
+            (FlighthookEvent::NewShotSession, "new_shot_session"),
+            (FlighthookEvent::ClearShotHistory, "clear_shot_history"),
+        ] {
+            let json = serde_json::to_string(&envelope(event)).unwrap();
+            assert_eq!(
+                json,
+                format!(r#"{{"actor":"web","event":{{"kind":"{kind}"}}}}"#)
+            );
+            let back: FlighthookMessage = serde_json::from_str(&json).unwrap();
+            let again = serde_json::to_string(&back).unwrap();
+            assert_eq!(again, json);
+        }
+        let back: FlighthookMessage =
+            serde_json::from_str(r#"{"actor":"web","event":{"kind":"new_shot_group"}}"#).unwrap();
+        assert!(matches!(back.event, FlighthookEvent::NewShotGroup));
+        let back: FlighthookMessage =
+            serde_json::from_str(r#"{"actor":"web","event":{"kind":"new_shot_session"}}"#).unwrap();
+        assert!(matches!(back.event, FlighthookEvent::NewShotSession));
+        let back: FlighthookMessage =
+            serde_json::from_str(r#"{"actor":"web","event":{"kind":"clear_shot_history"}}"#)
+                .unwrap();
+        assert!(matches!(back.event, FlighthookEvent::ClearShotHistory));
+    }
+
+    fn group_info() -> ShotGroupInfo {
+        ShotGroupInfo {
+            id: "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7".into(),
+            number: 3,
+            session: 0,
+            golfer: None,
+            club: Some(crate::Club::Iron7),
+            started_at: "2026-10-26T13:58:02.117Z".into(),
+            manual: false,
+            open: true,
+            shots: 10,
+        }
+    }
+
+    #[test]
+    fn shot_group_without_shot_round_trips() {
+        let msg = FlighthookMessage {
+            actor: "webserver.0".into(),
+            ..envelope(FlighthookEvent::ShotGroup {
+                group: group_info(),
+                shot: None,
+            })
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"actor":"webserver.0","event":{"kind":"shot_group","group":{"id":"6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7","number":3,"club":"7I","started_at":"2026-10-26T13:58:02.117Z","open":true,"shots":10}}}"#
+        );
+        let back: FlighthookMessage = serde_json::from_str(&json).unwrap();
+        let FlighthookEvent::ShotGroup { group, shot } = back.event else {
+            panic!("not shot_group");
+        };
+        assert_eq!(group, group_info());
+        assert_eq!(shot, None);
+    }
+
+    #[test]
+    fn shot_group_with_shot_round_trips() {
+        let joined = GroupedShot {
+            actor: "mevo.0".into(),
+            key: ShotKey {
+                shot_id: "550e8400".into(),
+                shot_number: 12,
+            },
+        };
+        let msg = envelope(FlighthookEvent::ShotGroup {
+            group: group_info(),
+            shot: Some(joined.clone()),
+        });
+        let json: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["event"]["kind"], "shot_group");
+        assert_eq!(json["event"]["shot"]["actor"], "mevo.0");
+        assert_eq!(json["event"]["shot"]["key"]["shot_number"], 12);
+        let back: FlighthookMessage = serde_json::from_value(json).unwrap();
+        let FlighthookEvent::ShotGroup { group, shot } = back.event else {
+            panic!("not shot_group");
+        };
+        assert_eq!(group, group_info());
+        assert_eq!(shot, Some(joined));
+    }
+
+    #[test]
+    fn set_shot_grouping_command_round_trips() {
+        let msg = envelope(FlighthookEvent::ConfigCommand {
+            request_id: None,
+            action: Box::new(ConfigAction::SetShotGrouping {
+                mode: ShotGrouping::ByClub,
+            }),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"actor":"web","event":{"kind":"config_command","action":{"type":"set_shot_grouping","mode":"by_club"}}}"#
+        );
+        let back: FlighthookMessage = serde_json::from_str(&json).unwrap();
+        let FlighthookEvent::ConfigCommand { action, .. } = back.event else {
+            panic!("not config_command");
+        };
+        assert!(matches!(
+            *action,
+            ConfigAction::SetShotGrouping {
+                mode: ShotGrouping::ByClub
             }
         ));
     }

@@ -22,6 +22,7 @@ pub use flighthook::{
     // Config types
     Distance,
     DistanceExt,
+    FlightPath,
     FlightScopeEnvironment,
     FlighthookConfig,
     FlighthookEvent,
@@ -39,10 +40,15 @@ pub use flighthook::{
     Severity,
     ShotData,
     ShotDetectionMode,
+    ShotGroupInfo,
+    ShotGrouping,
+    ShotGroupsResponse,
     ShotKey,
     SimSurface,
     SimulationSection,
+    SpinSource,
     SquareSection,
+    Stats,
     StatusResponse,
     UnitSystem,
     Velocity,
@@ -64,6 +70,10 @@ pub struct ShotRow {
     pub club: Option<ClubData>,
     /// Simulated values for fields the device did not report (beta).
     pub derived: Option<DerivedFlight>,
+    /// Club in play when the shot was triggered.
+    pub club_selected: Option<Club>,
+    /// Id of the shot group the shot joined (`ShotGroupInfo::id`).
+    pub group: Option<String>,
 }
 
 impl ShotRow {
@@ -71,12 +81,10 @@ impl ShotRow {
     pub fn to_unit_system(&self, system: UnitSystem) -> ShotRow {
         // Delegate to ShotData conversion for the populated fields
         let tmp = ShotData {
-            actor: String::new(),
-            shot_number: 0,
             ball: self.ball.clone(),
             club: self.club.clone(),
-            impact: None,
             derived: self.derived.clone(),
+            ..ShotData::default()
         };
         let converted = tmp.to_unit_system(system);
         ShotRow {
@@ -86,6 +94,8 @@ impl ShotRow {
             ball: converted.ball,
             club: converted.club,
             derived: converted.derived,
+            club_selected: self.club_selected,
+            group: self.group.clone(),
         }
     }
 }
@@ -94,11 +104,13 @@ impl From<ShotData> for ShotRow {
     fn from(shot: ShotData) -> Self {
         Self {
             actor: shot.actor,
-            shot_id: String::new(),
+            shot_id: shot.shot_id.unwrap_or_default(),
             shot_number: shot.shot_number,
             ball: shot.ball,
             club: shot.club,
             derived: shot.derived,
+            club_selected: shot.club_selected,
+            group: shot.group,
         }
     }
 }

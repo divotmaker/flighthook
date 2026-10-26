@@ -1,11 +1,11 @@
 # FlightScope Mevo+ / Mevo Gen2 / Xi
 
-**Status: Supported** (Mevo+, Mevo Gen2) / **Alpha** (Xi) — decoded by
+**Status: Supported** (Mevo+, Mevo Gen2, Xi) — decoded by
 [ironsight](https://crates.io/crates/ironsight) over the device's binary TCP
 protocol on port 5100.
 
 All three use the same `[mevo.N]` device. flighthook detects which one it is
-talking to when it connects. See [FlightScope Xi](#flightscope-xi-alpha) for
+talking to when it connects. See [FlightScope Xi](#flightscope-xi) for
 how the Xi differs.
 
 Connect over the launch monitor's WiFi network. A Mevo+ or Mevo Gen2 reports
@@ -20,9 +20,8 @@ For anyone updating from flighthook 0.1.x with a Mevo+ or Mevo Gen2:
   estimate (`E8`), so GSPro and FRP consumers receive the device's spin and
   sidespin, plus its radar club data (see
   [Club data and camera mode](#club-data-and-camera-mode)), on every shot.
-  Speed, launch angles and carry are unchanged; spin and spin axis will differ
-  from earlier releases, which sent the estimate with zero sidespin and no
-  club data.
+  Speed, launch angles and carry match the estimate; spin and spin axis are
+  the full result's, sidespin included.
 - **`use_estimated` defaults to `false`.** A shot with only an estimate is
   skipped unless you set it to `true` (see [Estimated shots](#estimated-shots)).
 - **New `environment` setting** (see [Environment](#environment)); the default,
@@ -75,11 +74,17 @@ in the settings UI) to keep them.
 
 ## Simulated values (beta)
 
-Carry, apex and flight time come from the device. flighthook simulates what it
-doesn't report — offline, descent angle, roll and total — and marks them as
-simulated (italics, `derived` in the API); total is the measured carry plus the
-simulated roll. Estimated (`E8`) shots carry no sidespin, so they are not
-simulated. See the README's
+Carry, apex and flight time come from the device, except that a carry or
+flight time of 0 on a shot that flies is not a reading and is simulated like a
+missing value. flighthook simulates what the device doesn't report — offline,
+descent angle, roll and total — and marks them as simulated (italics,
+`derived` in the API); total is the measured carry plus the simulated roll. A
+shot with an apex of 0 (a putt, or any bladed shot) is a ground ball: carry,
+apex and flight time are 0 and the roll is simulated from the tee, on a green
+when the shot was triggered in Putting mode (a mode change before its result
+arrives doesn't count). Estimated (`E8`) shots carry no sidespin, so they are
+not flown; one with an apex of 0 is still rolled as a ground ball. See the
+README's
 [Simulated values](../../README.md#simulated-values-beta) section.
 
 ## Club data and camera mode
@@ -131,17 +136,19 @@ track_pct = 80.0
 environment = "limited_flight" # limited_flight | outdoor
 camera_mode = "standard"       # standard | fusion | raw_fusion
 use_estimated = false          # true keeps estimated-only (E8) shots
+spin_source = "d4"             # d4 | e8 | auto (FlightScope Xi only)
 ```
 
 Distances accept a unit suffix — `in`, `ft`, `m`, `cm`, `yd`, `mm` — and are
 converted to the wire format on demand. `track_pct` is 0–100.
 
 Changing the address, the environment, the camera mode, or any session
-setting restarts the actor.
+setting restarts the actor. `spin_source` applies from the next shot without a
+restart.
 
 ## Shot export
 
-`GET /api/shots/export` (the **JSONL (with raw)** link on the Shots tab) saves
+`GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
 each shot with the device frames behind it: every frame from just before the
 BALL TRIGGER through the device re-armed, in both directions, as hex with its
 type and bus addresses — the shot texts, `E8`, `D4`, `ED`, `EF`, PRC and speed
@@ -160,9 +167,9 @@ shot.
 
 See [docs/API.md](../API.md#get-apishotsexport) for the format.
 
-## FlightScope Xi (alpha)
+## FlightScope Xi
 
-**Status: Alpha** — connects and reports shots. Feedback welcome on
+Connects and reports shots. Feedback welcome on
 [issue #5](https://github.com/divotmaker/flighthook/issues/5).
 
 Add it as a normal `[mevo.N]` device; the Xi uses the same address and port
@@ -183,11 +190,47 @@ What differs from the Mevo+:
 - **No camera.** `camera_mode` does not apply.
 - **No battery level.** The Xi's status does not carry a decoded battery
   level, so `battery_pct` is not reported.
-- **Spin uses the Xi's estimated spin** (from its `E8` result) as total spin.
-  When the shot also has club data (club speed plus attack angle or path), the
-  spin axis comes from the full result; otherwise the axis is 0 and all of the
-  spin is backspin. If the estimate is missing, the full result's spin is used.
+- **Two spin values.** The Xi sends two backspin values per shot, and
+  `spin_source` picks which one flighthook reports. The default is `d4`, the
+  value FS Golf displays. See [Spin on the Xi](#spin-on-the-xi).
 
 Launch data (speed, VLA, HLA, carry, apex, flight time) and club data come
 from the device as for the Mevo+. Estimated-only shots follow `use_estimated`
 as above.
+
+### Spin on the Xi
+
+The Xi sends two backspin values for every shot:
+
+- **D4**, its final spin. This is the spin FlightScope's FS Golf app displays.
+- **E8**, a second value, often much higher than D4 on full swings.
+
+On chips and pitches E8 isn't measured; it scales with ball speed instead, so
+choosing `e8` there means choosing that value knowingly.
+
+`spin_source` on the device picks which one flighthook reports:
+
+| Value | Total spin | Spin axis |
+| --- | --- | --- |
+| `d4` (default) | D4's backspin, as reported | As reported |
+| `e8` | E8's backspin; D4's when the shot has no E8 spin | From D4 when the shot has club data (club speed plus attack angle or path), otherwise 0; D4's when the shot has no E8 spin |
+| `auto` | E8 when flighthook is in Full mode, D4 otherwise | Same as whichever of the above applies |
+
+`d4` matches FS Golf. `e8` is steadier on full swings. `auto` gets `e8`'s
+behaviour on full swings and `d4`'s elsewhere, without having to switch the
+setting by hand.
+
+**Caveat for `auto`:** flighthook decides E8 vs. D4 from its own detection
+mode, not the shot itself. A chip hit while flighthook is still in Full mode
+gets E8's speed-scaled value, same as choosing `e8` directly on that shot. Set
+chipping clubs (so the mode switches automatically) or switch the mode by hand
+before chipping.
+
+A change applies from the next shot, without reconnecting. In the settings UI
+this is the **Spin source (Xi)** dropdown on the device. The setting has no
+effect on a Mevo+ or Mevo Gen2, which report a single spin value.
+
+**Comparing short shots with FS Golf:** use FS Golf's **Pitching** mode for
+chips and pitches. flighthook keeps the Xi in the limited-flight mode, the
+same mode FS Golf's Pitching uses, so the two compare directly, and chips and
+pitches read with the default settings.

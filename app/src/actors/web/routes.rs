@@ -7,14 +7,19 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
-use super::types::{ModeRequest, PostSettingsResponse, StatusResponse};
+use super::types::{
+    ClubRequest, GroupingRequest, ModeRequest, PostSettingsResponse, ShotGroupsResponse,
+    StatusResponse,
+};
 use super::{MAX_SHOTS, StoredShot, WebState, export};
 use crate::state::config::FlighthookConfig;
-use flighthook::{ConfigAction, FlighthookEvent, FlighthookMessage, ShotData, UnitSystem};
+use flighthook::{
+    Club, ClubInfo, ConfigAction, FlighthookEvent, FlighthookMessage, ShotData, UnitSystem,
+};
 
 // ---------------------------------------------------------------------------
 // Embedded UI assets (built by `make ui` in flighthook/ui/)
@@ -80,8 +85,12 @@ pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusRespon
         .map(|(id, a)| (id.clone(), a.clone()))
         .collect();
 
-    let mode = state.root.game.snapshot().mode;
-    Json(StatusResponse { actors, mode })
+    let game = state.root.game.snapshot();
+    Json(StatusResponse {
+        actors,
+        mode: game.mode,
+        club: game.club_info.map(|c| c.club),
+    })
 }
 
 /// GET /api/shots?limit=50&units=imperial|metric
@@ -133,14 +142,14 @@ pub struct ExportQuery {
     pub raw: Option<bool>,
 }
 
-fn bad_request(msg: &'static str) -> Response {
+fn bad_request(msg: impl Into<Body>) -> Response {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
         .header(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),
         )
-        .body(Body::from(msg))
+        .body(msg.into())
         .unwrap()
 }
 
@@ -260,6 +269,95 @@ pub async fn post_mode(
     StatusCode::ACCEPTED
 }
 
+/// POST /api/club — select the club in play.
+///
+/// Emits `club_info` on the bus (actor `web`); the system actor stores it and
+/// derives the detection mode from it, as for a club from GSPro. A connected
+/// GSPro replaces the selection with its next player message.
+pub async fn post_club(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<ClubRequest>,
+) -> Response {
+    let Some(club) = Club::from_code(&body.club) else {
+        let codes: Vec<String> = Club::ALL.iter().map(ToString::to_string).collect();
+        return bad_request(format!("club must be one of {}", codes.join(", ")));
+    };
+    let _ = state.bus_tx.send(
+        FlighthookMessage::new(FlighthookEvent::ClubInfo {
+            club_info: ClubInfo { club },
+        })
+        .actor("web"),
+    );
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// GET /api/shots/groups — this webserver's shot sets, the current session
+/// and the default view.
+pub async fn get_shot_groups(State(state): State<Arc<WebState>>) -> Json<ShotGroupsResponse> {
+    let mode = state.root.system.snapshot().shot_grouping;
+    let groups = state.groups.read().await;
+    Json(ShotGroupsResponse {
+        server: state.actor_id.clone(),
+        mode,
+        session: groups.session(),
+        current: groups.current().map(|g| g.id.clone()),
+        groups: groups.list(),
+    })
+}
+
+/// POST /api/shots/groups — start a new set for the selected club.
+pub async fn post_new_shot_group(State(state): State<Arc<WebState>>) -> StatusCode {
+    let _ = state
+        .bus_tx
+        .send(FlighthookMessage::new(FlighthookEvent::NewShotGroup).actor("web"));
+    StatusCode::ACCEPTED
+}
+
+/// POST /api/shots/session — close the open set and start a new session.
+pub async fn post_new_shot_session(State(state): State<Arc<WebState>>) -> StatusCode {
+    let _ = state
+        .bus_tx
+        .send(FlighthookMessage::new(FlighthookEvent::NewShotSession).actor("web"));
+    StatusCode::ACCEPTED
+}
+
+/// POST /api/shots/clear — delete the shot history and every set, and start
+/// a new session.
+pub async fn post_clear_shot_history(State(state): State<Arc<WebState>>) -> StatusCode {
+    let _ = state
+        .bus_tx
+        .send(FlighthookMessage::new(FlighthookEvent::ClearShotHistory).actor("web"));
+    StatusCode::ACCEPTED
+}
+
+/// POST /api/shots/grouping — persist the default shot view. Sets are
+/// assigned the same way in every view.
+///
+/// Rides the same `ConfigCommand` path as a Settings save and answers once
+/// the system actor has applied it; `504` when it does not within 10 s.
+pub async fn post_shot_grouping(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<GroupingRequest>,
+) -> Result<Json<GroupingRequest>, StatusCode> {
+    set_shot_grouping(&state, body, CONFIG_TIMEOUT).await
+}
+
+/// Persist `body.mode`, waiting up to `timeout` for the system actor.
+async fn set_shot_grouping(
+    state: &WebState,
+    body: GroupingRequest,
+    timeout: Duration,
+) -> Result<Json<GroupingRequest>, StatusCode> {
+    let action = ConfigAction::SetShotGrouping { mode: body.mode };
+    match send_config_command_within(state, action, timeout).await {
+        Some(_) => Ok(Json(body)),
+        None => {
+            tracing::warn!("shot grouping: timed out waiting for ConfigOutcome");
+            Err(StatusCode::GATEWAY_TIMEOUT)
+        }
+    }
+}
+
 /// GET /api/settings — returns the full persisted config.
 pub async fn get_settings(State(state): State<Arc<WebState>>) -> Json<FlighthookConfig> {
     Json(state.root.system.snapshot())
@@ -319,15 +417,41 @@ fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction>
 /// persistence and actor reconciliation.
 ///
 /// `?scope=<global_id>` narrows the save to one actor: only that section is
-/// written and only that actor is reconciled. Without it the whole config is
-/// replaced and every actor is reconciled.
+/// written and only that actor is reconciled. `?scope=global` writes only the
+/// global settings, keeping every actor section of the live config. Without
+/// a scope the whole config is replaced and every actor is reconciled.
+///
+/// An unknown scope is `400` and a missing `ConfigOutcome` `504`, each with a
+/// JSON `{"error": "..."}` body; nothing is reported as saved.
 pub async fn post_settings(
     State(state): State<Arc<WebState>>,
     Query(query): Query<SettingsQuery>,
     Json(new_config): Json<FlighthookConfig>,
-) -> Json<PostSettingsResponse> {
-    let action = match query.scope.as_deref() {
+) -> Result<Json<PostSettingsResponse>, SettingsError> {
+    save_settings(&state, query.scope.as_deref(), new_config, CONFIG_TIMEOUT).await
+}
+
+/// A failed `POST /api/settings`: its status and a JSON `{"error": "..."}`
+/// body.
+pub type SettingsError = (StatusCode, Json<serde_json::Value>);
+
+fn settings_error(status: StatusCode, message: &str) -> SettingsError {
+    (status, Json(serde_json::json!({ "error": message })))
+}
+
+/// Apply `new_config` under `scope`, waiting up to `timeout` for the system
+/// actor.
+async fn save_settings(
+    state: &WebState,
+    scope: Option<&str>,
+    new_config: FlighthookConfig,
+    timeout: Duration,
+) -> Result<Json<PostSettingsResponse>, SettingsError> {
+    let action = match scope {
         None => ConfigAction::ReplaceAll {
+            config: Box::new(new_config),
+        },
+        Some("global") => ConfigAction::ReplaceGlobal {
             config: Box::new(new_config),
         },
         Some(scope) => match scoped_action(scope, &new_config) {
@@ -336,18 +460,40 @@ pub async fn post_settings(
             // caller asked for, so reject instead.
             None => {
                 tracing::warn!("config update: unknown scope '{scope}', ignoring request");
-                return Json(PostSettingsResponse {
-                    restarted: Vec::new(),
-                    stopped: Vec::new(),
-                });
+                return Err(settings_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("unknown scope '{scope}'"),
+                ));
             }
         },
     };
 
+    match send_config_command_within(state, action, timeout).await {
+        Some((restarted, stopped)) => Ok(Json(PostSettingsResponse { restarted, stopped })),
+        None => {
+            tracing::warn!("config update: timed out waiting for ConfigOutcome");
+            Err(settings_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "the settings were not applied in time",
+            ))
+        }
+    }
+}
+
+/// How long a config command waits for its `ConfigOutcome`.
+const CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Emit a `ConfigCommand` for `action` and wait up to `timeout` for the
+/// system actor's matching `ConfigOutcome`. Returns its `(restarted,
+/// stopped)` actor IDs, or `None` on timeout or a closed bus.
+async fn send_config_command_within(
+    state: &WebState,
+    action: ConfigAction,
+    timeout: Duration,
+) -> Option<(Vec<String>, Vec<String>)> {
     let request_id = crate::state::config::generate_id();
     let mut bus_rx = state.bus_tx.subscribe();
 
-    // Emit ConfigCommand on the bus
     let _ = state.bus_tx.send(
         FlighthookMessage::new(FlighthookEvent::ConfigCommand {
             request_id: Some(request_id.clone()),
@@ -356,8 +502,7 @@ pub async fn post_settings(
         .actor("web"),
     );
 
-    // Wait for ConfigOutcome with matching request_id (10s timeout)
-    let result = tokio::time::timeout(Duration::from_secs(10), async {
+    let result = tokio::time::timeout(timeout, async {
         loop {
             match bus_rx.recv().await {
                 Ok(msg) => {
@@ -378,17 +523,7 @@ pub async fn post_settings(
         }
     })
     .await;
-
-    match result {
-        Ok(Some((restarted, stopped))) => Json(PostSettingsResponse { restarted, stopped }),
-        _ => {
-            tracing::warn!("config update: timed out waiting for ConfigOutcome");
-            Json(PostSettingsResponse {
-                restarted: Vec::new(),
-                stopped: Vec::new(),
-            })
-        }
-    }
+    result.ok().flatten()
 }
 
 #[cfg(test)]
@@ -473,6 +608,7 @@ mod convert_tests {
             club: None,
             impact: None,
             derived: Some(derived),
+            ..ShotData::default()
         }
     }
 
@@ -518,5 +654,391 @@ mod convert_tests {
         assert!(close(back.total_distance, want.total_distance));
         assert_eq!(back.roll_offline, None);
         assert_eq!(back.total_offline, None);
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::super::tests::{feed, test_state};
+    use super::*;
+    use flighthook::{BallFlight, ShotGrouping, ShotKey, Velocity};
+
+    fn next_event(rx: &mut broadcast::Receiver<FlighthookMessage>) -> FlighthookMessage {
+        rx.try_recv().expect("a bus message")
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body");
+        String::from_utf8(bytes.to_vec()).expect("utf-8")
+    }
+
+    #[tokio::test]
+    async fn post_club_emits_club_info_as_web() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        let resp = post_club(
+            State(Arc::clone(&state)),
+            Json(ClubRequest { club: "i7".into() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let msg = next_event(&mut rx);
+        assert_eq!(msg.actor, "web");
+        assert!(matches!(
+            msg.event,
+            FlighthookEvent::ClubInfo {
+                club_info: ClubInfo { club: Club::Iron7 }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_club_rejects_an_unknown_code() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        let resp = post_club(
+            State(Arc::clone(&state)),
+            Json(ClubRequest {
+                club: "banana".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(
+            text.starts_with("club must be one of DR, MD, 2W, "),
+            "{text}"
+        );
+        assert!(text.ends_with(", LW, PT"), "{text}");
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+    }
+
+    #[tokio::test]
+    async fn new_group_and_session_endpoints_emit_their_commands() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        assert_eq!(
+            post_new_shot_group(State(Arc::clone(&state))).await,
+            StatusCode::ACCEPTED
+        );
+        let msg = next_event(&mut rx);
+        assert_eq!(msg.actor, "web");
+        assert!(matches!(msg.event, FlighthookEvent::NewShotGroup));
+        assert_eq!(
+            post_new_shot_session(State(Arc::clone(&state))).await,
+            StatusCode::ACCEPTED
+        );
+        let msg = next_event(&mut rx);
+        assert_eq!(msg.actor, "web");
+        assert!(matches!(msg.event, FlighthookEvent::NewShotSession));
+    }
+
+    #[tokio::test]
+    async fn post_grouping_answers_after_the_outcome() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        // Stand-in for the system actor: apply and answer.
+        let mut rx = state.bus_tx.subscribe();
+        let responder = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                loop {
+                    let msg = rx.recv().await.expect("bus");
+                    if let FlighthookEvent::ConfigCommand { request_id, action } = msg.event {
+                        let ConfigAction::SetShotGrouping { mode } = *action else {
+                            panic!("unexpected action {action:?}");
+                        };
+                        state.root.system.update(|c| c.shot_grouping = mode);
+                        let _ = state.bus_tx.send(
+                            FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
+                                request_id,
+                                restarted: Vec::new(),
+                                stopped: Vec::new(),
+                                started: Vec::new(),
+                            })
+                            .actor("system"),
+                        );
+                        return;
+                    }
+                }
+            })
+        };
+        let Json(body) = post_shot_grouping(
+            State(Arc::clone(&state)),
+            Json(GroupingRequest {
+                mode: ShotGrouping::ByClub,
+            }),
+        )
+        .await
+        .expect("applied");
+        responder.await.expect("responder");
+        assert_eq!(body.mode, ShotGrouping::ByClub);
+        assert_eq!(
+            state.root.system.snapshot().shot_grouping,
+            ShotGrouping::ByClub
+        );
+    }
+
+    #[tokio::test]
+    async fn get_shot_groups_lists_ascending_with_server_mode_and_current() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let empty = get_shot_groups(State(Arc::clone(&state))).await.0;
+        assert_eq!(empty.server, "webserver.0");
+        assert_eq!(empty.mode, ShotGrouping::BySet);
+        assert_eq!(empty.current, None);
+        assert_eq!(empty.session, 0);
+        assert!(empty.groups.is_empty());
+
+        let mut events = Vec::new();
+        let shot = |n: u32| {
+            let key = ShotKey {
+                shot_id: format!("s{n}"),
+                shot_number: n,
+            };
+            vec![
+                FlighthookEvent::ShotTrigger { key: key.clone() },
+                FlighthookEvent::BallFlight {
+                    key: key.clone(),
+                    ball: Box::new(BallFlight {
+                        launch_speed: Some(Velocity::MetersPerSecond(40.0)),
+                        ..BallFlight::default()
+                    }),
+                    derived: None,
+                },
+                FlighthookEvent::ShotFinished { key, raw: None },
+            ]
+        };
+        events.extend(shot(1));
+        feed(&state, "mevo.0", events).await;
+        let driver = FlighthookEvent::ClubInfo {
+            club_info: ClubInfo { club: Club::Driver },
+        };
+        feed(&state, "gspro.0", vec![driver]).await;
+        feed(&state, "mevo.0", shot(2)).await;
+
+        let listed = get_shot_groups(State(Arc::clone(&state))).await.0;
+        assert_eq!(listed.mode, ShotGrouping::BySet);
+        assert_eq!(listed.groups.len(), 2);
+        assert_eq!(
+            listed.groups.iter().map(|g| g.number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!listed.groups[0].open);
+        assert_eq!(listed.groups[1].club, Some(Club::Driver));
+        assert_eq!(
+            listed.current.as_deref(),
+            Some(listed.groups[1].id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn post_grouping_times_out_with_504() {
+        let (state, _writer, _dir) = test_state();
+        // No system actor answers the command.
+        let res = set_shot_grouping(
+            &state,
+            GroupingRequest {
+                mode: ShotGrouping::ByClub,
+            },
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(res.err(), Some(StatusCode::GATEWAY_TIMEOUT));
+        assert_eq!(
+            state.root.system.snapshot().shot_grouping,
+            ShotGrouping::BySet
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_save_with_an_unknown_scope_is_400_with_a_json_error() {
+        let (state, _writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let body = state.root.system.snapshot();
+        let (status, Json(error)) = save_settings(
+            &state,
+            Some("nosuchtype.0"),
+            body,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"], "unknown scope 'nosuchtype.0'");
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+    }
+
+    #[tokio::test]
+    async fn settings_save_without_an_outcome_is_504_with_a_json_error() {
+        let (state, _writer, _dir) = test_state();
+        // No system actor answers the command.
+        let body = state.root.system.snapshot();
+        for scope in [None, Some("global"), Some("webserver.0")] {
+            let (status, Json(error)) =
+                save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                    .await
+                    .expect_err("timed out");
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{scope:?}");
+            assert!(error["error"].is_string(), "{scope:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_save_with_the_global_scope_sends_replace_global() {
+        let (state, _writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let body = state.root.system.snapshot();
+        let _ = save_settings(&state, Some("global"), body, Duration::from_millis(10)).await;
+        let msg = next_event(&mut rx);
+        let FlighthookEvent::ConfigCommand { action, .. } = msg.event else {
+            panic!("not a config command: {:?}", msg.event);
+        };
+        assert!(matches!(*action, ConfigAction::ReplaceGlobal { .. }));
+    }
+
+    #[tokio::test]
+    async fn clear_endpoint_emits_its_command_and_the_history_and_export_empty() {
+        let (state, writer, _dir) = test_state();
+        let state = Arc::new(state);
+        writer.set_club_info(ClubInfo { club: Club::Iron7 });
+        let key = ShotKey {
+            shot_id: "s1".into(),
+            shot_number: 1,
+        };
+        feed(
+            &state,
+            "mevo.0",
+            vec![
+                FlighthookEvent::ClubInfo {
+                    club_info: ClubInfo { club: Club::Iron7 },
+                },
+                FlighthookEvent::ShotTrigger { key: key.clone() },
+                FlighthookEvent::BallFlight {
+                    key: key.clone(),
+                    ball: Box::new(BallFlight {
+                        launch_speed: Some(Velocity::MetersPerSecond(40.0)),
+                        ..BallFlight::default()
+                    }),
+                    derived: None,
+                },
+                FlighthookEvent::ShotFinished { key, raw: None },
+            ],
+        )
+        .await;
+        let export = |format: &str| {
+            get_shots_export(
+                State(Arc::clone(&state)),
+                Query(ExportQuery {
+                    format: Some(format.into()),
+                    units: None,
+                    limit: None,
+                    raw: None,
+                }),
+            )
+        };
+        assert_eq!(body_text(export("jsonl").await).await.lines().count(), 1);
+
+        let mut rx = state.bus_tx.subscribe();
+        assert_eq!(
+            post_clear_shot_history(State(Arc::clone(&state))).await,
+            StatusCode::ACCEPTED
+        );
+        let msg = next_event(&mut rx);
+        assert_eq!(msg.actor, "web");
+        assert!(matches!(msg.event, FlighthookEvent::ClearShotHistory));
+        assert_eq!(
+            serde_json::to_string(&msg).expect("ser"),
+            r#"{"actor":"web","event":{"kind":"clear_shot_history"}}"#
+        );
+        assert!(rx.try_recv().is_err(), "one event");
+
+        // The web layer applies the command it put on the bus.
+        feed(&state, "web", vec![msg.event]).await;
+        let shots = get_shots(
+            State(Arc::clone(&state)),
+            Query(ShotsQuery {
+                limit: 50,
+                units: None,
+            }),
+        )
+        .await
+        .0;
+        assert!(shots.is_empty());
+        let groups = get_shot_groups(State(Arc::clone(&state))).await.0;
+        assert!(groups.groups.is_empty());
+        assert_eq!(groups.current, None);
+        assert_eq!(groups.session, 1);
+        assert_eq!(body_text(export("jsonl").await).await, "");
+        let csv = body_text(export("csv").await).await;
+        assert_eq!(csv.lines().count(), 1, "the header only: {csv}");
+    }
+
+    #[tokio::test]
+    async fn get_shot_groups_reports_the_default_view_and_session_and_changes_no_set() {
+        let (state, writer, _dir) = test_state();
+        let state = Arc::new(state);
+        writer.set_club_info(ClubInfo { club: Club::Iron7 });
+        let key = ShotKey {
+            shot_id: "s1".into(),
+            shot_number: 1,
+        };
+        feed(
+            &state,
+            "mevo.0",
+            vec![
+                FlighthookEvent::ClubInfo {
+                    club_info: ClubInfo { club: Club::Iron7 },
+                },
+                FlighthookEvent::ShotTrigger { key: key.clone() },
+                FlighthookEvent::BallFlight {
+                    key: key.clone(),
+                    ball: Box::new(BallFlight {
+                        launch_speed: Some(Velocity::MetersPerSecond(40.0)),
+                        ..BallFlight::default()
+                    }),
+                    derived: None,
+                },
+                FlighthookEvent::ShotFinished { key, raw: None },
+            ],
+        )
+        .await;
+        let before = get_shot_groups(State(Arc::clone(&state))).await.0;
+        assert_eq!(before.session, 0);
+        assert_eq!(before.groups.len(), 1);
+
+        // The default view is read from config; the open set is untouched.
+        let mut rx = state.bus_tx.subscribe();
+        for mode in [ShotGrouping::ByClub, ShotGrouping::None] {
+            state.root.system.update(|c| c.shot_grouping = mode);
+            let listed = get_shot_groups(State(Arc::clone(&state))).await.0;
+            assert_eq!(listed.mode, mode);
+            assert_eq!(listed.groups, before.groups);
+            assert_eq!(listed.current, before.current);
+        }
+        assert!(rx.try_recv().is_err(), "no set closed or created");
+
+        feed(&state, "web", vec![FlighthookEvent::NewShotSession]).await;
+        let after = get_shot_groups(State(Arc::clone(&state))).await.0;
+        assert_eq!(after.session, 1);
+        assert_eq!(after.current, None);
+        assert!(after.groups.iter().all(|g| !g.open && g.session == 0));
+    }
+
+    #[tokio::test]
+    async fn get_status_carries_the_club() {
+        let (state, writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let none = get_status(State(Arc::clone(&state))).await.0;
+        assert_eq!(none.club, None);
+        assert!(!serde_json::to_string(&none).expect("ser").contains("club"));
+        writer.set_club_info(ClubInfo { club: Club::Iron7 });
+        let set = get_status(State(Arc::clone(&state))).await.0;
+        assert_eq!(set.club, Some(Club::Iron7));
     }
 }

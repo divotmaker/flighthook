@@ -25,6 +25,12 @@ Keep the club selected in the simulator in sync with the club in hand: the
 vertical offset follows it. The putter has no vertical estimate, so only
 horizontal impact is sent for putts.
 
+The Omni has no code for MD, 2W, 4W, 6W, 8W, 9W, 1H, 2H, 6H, 7H, 8H, 9H, 1I or
+2I. When the simulator selects one of these, flighthook sets the device to the
+nearest club of the same kind it does have (MD as DR, 2W and 4W as 3W, 6W as
+5W, 8W and 9W as 7W, 1H and 2H as 3H, 6H, 7H, 8H and 9H as 5H, 1I and 2I as
+3I), and that club's calibration applies.
+
 Each tracked shot logs the reading:
 
 ```
@@ -48,8 +54,8 @@ DR = 15.0
 7i = 18.5
 ```
 
-Or from the Settings tab: each Square Golf device has a collapsible "Face
-impact calibration (beta)" section with one field per club. Leave a field
+Or on the Devices tab: flip a Square Golf card to Settings; it has a
+collapsible "Face impact calibration (beta)" section with one field per club. Leave a field
 blank to use the default for that club; a value overrides it. Changing a
 calibration restarts the device actor.
 
@@ -69,10 +75,11 @@ are logged under the ball line:
 
 GSPro still receives the launch data only and simulates the flight itself.
 
-Putts are not simulated. The Omni reports a putt like any other shot, so
-flighthook skips it in putting mode (select the putter in the sim) and, in any
-other mode, whenever the ball is slower than 15 mph and launched below 5°,
-which catches putts when no club has been selected.
+The Omni reports no apex, so a shot launched at 0.5° or less (a putt, or any
+bladed shot) is a ground ball: carry, apex and flight time are 0 and the roll
+is simulated from the tee, from the ball speed and direction alone, on a
+green in Putting mode and on the configured surface otherwise. A shot
+launched higher is flown and needs a spin reading like every other flight.
 
 ## Zero-spin rejection
 
@@ -100,7 +107,7 @@ device into putting mode via the normal club-forwarding path.
 
 ## Shot export
 
-`GET /api/shots/export` (the **JSONL (with raw)** link on the Shots tab) saves
+`GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
 each shot with the BLE traffic behind it: the notifications the Omni sent for
 the shot (ball, club, and anything else in between, including the duplicate
 copies the device sends), and the commands flighthook wrote, such as the club

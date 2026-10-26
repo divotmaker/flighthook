@@ -38,6 +38,9 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 # Ball-flight physics for simulated (derived) shot values.
 dimple = "0.0.6"
+# dimple's vector type, for a ground ball's starting `BallState`; must match the
+# glam version dimple uses (already in the tree through it).
+glam = "0.32"
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.

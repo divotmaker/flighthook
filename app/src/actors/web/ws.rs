@@ -17,7 +17,10 @@ use futures_util::{SinkExt, StreamExt};
 use super::{WebState, emit_telemetry};
 use crate::state::SystemState;
 use crate::state::config;
-use flighthook::{FRP_VERSION, FlighthookEvent, FlighthookMessage, ShotDetectionMode};
+use flighthook::{
+    Club, ClubInfo, ConfigAction, FRP_VERSION, FlighthookEvent, FlighthookMessage,
+    ShotDetectionMode, ShotGrouping,
+};
 
 /// GET /frp — upgrade to WebSocket.
 pub async fn ws_upgrade(
@@ -206,9 +209,15 @@ fn parse_start_message(text: &str) -> Option<StartResult> {
     })
 }
 
-/// Parse a client command and emit on the bus.
+/// Parse a client command and emit on the bus, as `actor`.
 /// Expected formats:
-///   `{ "cmd": "mode", "mode": "putting", "device": "mevo.0" }`
+///   `{ "cmd": "mode", "mode": "putting" }`
+///   `{ "cmd": "club", "club": "7I" }`
+///   `{ "cmd": "new_group" }`
+///   `{ "cmd": "new_session" }`
+///   `{ "cmd": "clear_history" }`
+///   `{ "cmd": "grouping", "mode": "by_club" }`
+/// Unknown commands and invalid values are ignored.
 fn handle_ws_command(
     text: &str,
     actor: &str,
@@ -219,27 +228,128 @@ fn handle_ws_command(
     struct WsCmd {
         cmd: String,
         mode: Option<String>,
+        club: Option<String>,
     }
 
     let Ok(msg) = serde_json::from_str::<WsCmd>(text) else {
         return;
     };
 
-    if msg.cmd.as_str() == "mode" {
-        let mode = match msg.mode.as_deref() {
-            Some("full") => Some(ShotDetectionMode::Full),
-            Some("putting") => Some(ShotDetectionMode::Putting),
-            Some("chipping") => Some(ShotDetectionMode::Chipping),
-            _ => None,
-        };
-        if let Some(m) = mode {
-            let _ = bus_tx.send(
-                FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
-                    mode: Some(m),
-                    handed: None,
-                })
-                .actor(actor),
-            );
+    let event = match msg.cmd.as_str() {
+        "mode" => {
+            let mode = match msg.mode.as_deref() {
+                Some("full") => ShotDetectionMode::Full,
+                Some("putting") => ShotDetectionMode::Putting,
+                Some("chipping") => ShotDetectionMode::Chipping,
+                _ => return,
+            };
+            FlighthookEvent::SetDetectionMode {
+                mode: Some(mode),
+                handed: None,
+            }
         }
+        "club" => {
+            let Some(club) = msg.club.as_deref().and_then(Club::from_code) else {
+                return;
+            };
+            FlighthookEvent::ClubInfo {
+                club_info: ClubInfo { club },
+            }
+        }
+        "new_group" => FlighthookEvent::NewShotGroup,
+        "new_session" => FlighthookEvent::NewShotSession,
+        "clear_history" => FlighthookEvent::ClearShotHistory,
+        "grouping" => {
+            let Some(mode) = msg
+                .mode
+                .and_then(|m| serde_json::from_value::<ShotGrouping>(m.into()).ok())
+            else {
+                return;
+            };
+            FlighthookEvent::ConfigCommand {
+                request_id: None,
+                action: Box::new(ConfigAction::SetShotGrouping { mode }),
+            }
+        }
+        _ => return,
+    };
+    let _ = bus_tx.send(FlighthookMessage::new(event).actor(actor));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::test_state;
+    use super::*;
+    use tokio::sync::broadcast;
+
+    /// Run one command as `ws.test`; returns what it put on the bus.
+    fn run(text: &str) -> Option<FlighthookMessage> {
+        let (state, _writer, _dir) = test_state();
+        let mut rx: broadcast::Receiver<FlighthookMessage> = state.bus_tx.subscribe();
+        handle_ws_command(text, "ws.test", &state.bus_tx, &state.root);
+        let msg = rx.try_recv().ok();
+        if let Some(m) = &msg {
+            assert_eq!(m.actor, "ws.test");
+        }
+        msg
+    }
+
+    #[test]
+    fn club_command_emits_club_info() {
+        let msg = run(r#"{"cmd":"club","club":"7I"}"#).expect("emitted");
+        assert!(matches!(
+            msg.event,
+            FlighthookEvent::ClubInfo {
+                club_info: ClubInfo { club: Club::Iron7 }
+            }
+        ));
+        assert!(run(r#"{"cmd":"club","club":"banana"}"#).is_none());
+        assert!(run(r#"{"cmd":"club"}"#).is_none());
+    }
+
+    #[test]
+    fn new_group_and_session_commands() {
+        let msg = run(r#"{"cmd":"new_group"}"#).expect("emitted");
+        assert!(matches!(msg.event, FlighthookEvent::NewShotGroup));
+        let msg = run(r#"{"cmd":"new_session"}"#).expect("emitted");
+        assert!(matches!(msg.event, FlighthookEvent::NewShotSession));
+    }
+
+    #[test]
+    fn clear_history_command_emits_clear_shot_history() {
+        let msg = run(r#"{"cmd":"clear_history"}"#).expect("emitted");
+        assert!(matches!(msg.event, FlighthookEvent::ClearShotHistory));
+    }
+
+    #[test]
+    fn grouping_command_emits_a_config_command() {
+        let msg = run(r#"{"cmd":"grouping","mode":"by_club"}"#).expect("emitted");
+        let FlighthookEvent::ConfigCommand { request_id, action } = msg.event else {
+            panic!("not a config command");
+        };
+        assert_eq!(request_id, None, "fire and forget");
+        assert!(matches!(
+            *action,
+            ConfigAction::SetShotGrouping {
+                mode: ShotGrouping::ByClub
+            }
+        ));
+        assert!(run(r#"{"cmd":"grouping","mode":"by_golfer"}"#).is_none());
+        assert!(run(r#"{"cmd":"grouping"}"#).is_none());
+    }
+
+    #[test]
+    fn mode_command_still_works_and_unknown_commands_are_ignored() {
+        let msg = run(r#"{"cmd":"mode","mode":"putting"}"#).expect("emitted");
+        assert!(matches!(
+            msg.event,
+            FlighthookEvent::SetDetectionMode {
+                mode: Some(ShotDetectionMode::Putting),
+                handed: None
+            }
+        ));
+        assert!(run(r#"{"cmd":"mode","mode":"by_club"}"#).is_none());
+        assert!(run(r#"{"cmd":"nope"}"#).is_none());
+        assert!(run("not json").is_none());
     }
 }

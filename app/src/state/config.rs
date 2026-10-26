@@ -79,6 +79,7 @@ impl LegacyFlighthookConfig {
             default_units: self.default_units,
             chipping_clubs: self.chipping_clubs,
             putting_clubs: self.putting_clubs,
+            shot_grouping: flighthook::ShotGrouping::default(),
             simulation: self.simulation,
             webserver,
             mevo: self.mevo,
@@ -194,6 +195,18 @@ impl SystemConfig {
             .clone()
     }
 
+    /// The spin source of the `[mevo.<index>]` section, or `None` when that
+    /// section is absent. Device threads read it once per shot, so a change
+    /// applies on the next shot without reconnecting.
+    pub fn mevo_spin_source(&self, index: &str) -> Option<flighthook::SpinSource> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .mevo
+            .get(index)
+            .map(|m| m.spin_source)
+    }
+
     /// Mutate the cached config in place, then persist to disk.
     pub fn update(&self, f: impl FnOnce(&mut FlighthookConfig)) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
@@ -212,6 +225,7 @@ impl SystemConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flighthook::SimMode;
 
     /// `FlighthookConfig::default()` as written to disk, with no
     /// `[simulation]` table. An untouched config must not gain one.
@@ -241,12 +255,26 @@ bind = "0.0.0.0:5880"
     }
 
     #[test]
+    fn shot_grouping_parses_from_toml_and_writes_back() {
+        let c: FlighthookConfig = toml::from_str(GOLDEN_DEFAULT_TOML).expect("parses");
+        assert_eq!(c.shot_grouping, flighthook::ShotGrouping::BySet);
+
+        let file = format!("shot_grouping = \"by_club\"\n{GOLDEN_DEFAULT_TOML}");
+        let c: FlighthookConfig = toml::from_str(&file).expect("parses");
+        assert_eq!(c.shot_grouping, flighthook::ShotGrouping::ByClub);
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(out.contains("shot_grouping = \"by_club\"\n"), "{out}");
+        let back: FlighthookConfig = toml::from_str(&out).expect("parses");
+        assert_eq!(back, c);
+    }
+
+    #[test]
     fn simulation_table_round_trips() {
-        let src = "[simulation]\nenabled = false\naltitude = \"5280ft\"\ntemperature_c = 30.0\nsurface = \"green\"\n";
+        let src = "[simulation]\nmode = \"off\"\naltitude = \"5280ft\"\ntemperature_c = 30.0\nsurface = \"green\"\n";
         let file =
             format!("{src}\n[webserver.0]\nname = \"Web Server\"\nbind = \"0.0.0.0:5880\"\n");
         let c: FlighthookConfig = toml::from_str(&file).expect("parses");
-        assert!(!c.simulation.enabled);
+        assert_eq!(c.simulation.mode, SimMode::Off);
         assert_eq!(c.simulation.surface, flighthook::SimSurface::Green);
         let out = toml::to_string_pretty(&c).expect("ser");
         assert!(out.contains(src), "{out}");
@@ -256,11 +284,47 @@ bind = "0.0.0.0:5880"
         assert!(sim < web, "{out}");
     }
 
+    /// A `[simulation]` table carrying unknown keys (e.g. `enabled`) loads,
+    /// ignoring them and keeping the default mode.
+    #[test]
+    fn unknown_simulation_keys_are_ignored_in_toml() {
+        let src = "[simulation]\nenabled = false\ntemperature_c = 30.0\n";
+        let c: FlighthookConfig = toml::from_str(src).expect("parses");
+        assert_eq!(c.simulation.mode, SimMode::On);
+        assert!((c.simulation.temperature_c - 30.0).abs() < 1e-9);
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(!out.contains("enabled"), "{out}");
+        let back: FlighthookConfig = toml::from_str(&out).expect("parses");
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn simulation_mode_round_trips_and_is_omitted_at_default() {
+        for mode in SimMode::all() {
+            let c = FlighthookConfig {
+                simulation: flighthook::SimulationSection {
+                    mode,
+                    ..flighthook::SimulationSection::default()
+                },
+                ..FlighthookConfig::default()
+            };
+            let out = toml::to_string_pretty(&c).expect("ser");
+            if mode == SimMode::On {
+                assert!(!out.contains("[simulation]"), "{out}");
+            } else {
+                let want = format!("[simulation]\nmode = \"{}\"\n", mode.key());
+                assert!(out.contains(&want), "{out}");
+            }
+            let back: FlighthookConfig = toml::from_str(&out).expect("parses");
+            assert_eq!(back, c);
+        }
+    }
+
     #[test]
     fn legacy_migration_carries_simulation_through() {
         let src = r#"
 [simulation]
-enabled = false
+mode = "off"
 altitude = "5280ft"
 temperature_c = 30.0
 surface = "green"
@@ -271,7 +335,7 @@ bind = "0.0.0.0:5880"
 "#;
         let legacy: LegacyFlighthookConfig = toml::from_str(src).expect("parses");
         let config = legacy.into_current();
-        assert!(!config.simulation.enabled);
+        assert_eq!(config.simulation.mode, SimMode::Off);
         assert_eq!(config.simulation.surface, flighthook::SimSurface::Green);
         assert!((config.simulation.temperature_c - 30.0).abs() < 1e-9);
     }
@@ -306,6 +370,23 @@ bind = "0.0.0.0:5880"
         assert!(out.contains("environment = \"outdoor\""), "{out}");
     }
 
+    #[test]
+    fn mevo_spin_source_is_omitted_at_default_in_toml() {
+        let without = "[mevo.0]\nname = \"Xi\"\naddress = \"192.168.2.1:5100\"\n";
+        let c: FlighthookConfig = toml::from_str(without).expect("parses");
+        assert_eq!(c.mevo["0"].spin_source, flighthook::SpinSource::D4);
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(!out.contains("spin_source"), "{out}");
+
+        let with = format!("{without}spin_source = \"e8\"\n");
+        let c: FlighthookConfig = toml::from_str(&with).expect("parses");
+        assert_eq!(c.mevo["0"].spin_source, flighthook::SpinSource::E8);
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(out.contains("spin_source = \"e8\"\n"), "{out}");
+        let back: FlighthookConfig = toml::from_str(&out).expect("parses");
+        assert_eq!(back, c);
+    }
+
     /// Removes the directory on drop, so a failing assertion doesn't leak it.
     struct TempDir(PathBuf);
 
@@ -320,8 +401,27 @@ bind = "0.0.0.0:5880"
         let dir =
             TempDir(std::env::temp_dir().join(format!("flighthook-config-test-{}", generate_id())));
         let cfg = SystemConfig::new(dir.0.join("config.toml"));
-        assert!(cfg.simulation().enabled);
-        cfg.update(|c| c.simulation.enabled = false);
-        assert!(!cfg.simulation().enabled);
+        assert_eq!(cfg.simulation().mode, SimMode::On);
+        cfg.update(|c| c.simulation.mode = SimMode::Off);
+        assert_eq!(cfg.simulation().mode, SimMode::Off);
+    }
+
+    #[test]
+    fn mevo_spin_source_reads_the_live_section() {
+        let dir =
+            TempDir(std::env::temp_dir().join(format!("flighthook-config-test-{}", generate_id())));
+        let cfg = SystemConfig::new(dir.0.join("config.toml"));
+        assert_eq!(cfg.mevo_spin_source("0"), None);
+        cfg.update(|c| {
+            c.mevo
+                .insert("0".into(), flighthook::MevoSection::default());
+        });
+        assert_eq!(cfg.mevo_spin_source("0"), Some(flighthook::SpinSource::D4));
+        cfg.update(|c| {
+            if let Some(m) = c.mevo.get_mut("0") {
+                m.spin_source = flighthook::SpinSource::E8;
+            }
+        });
+        assert_eq!(cfg.mevo_spin_source("0"), Some(flighthook::SpinSource::E8));
     }
 }

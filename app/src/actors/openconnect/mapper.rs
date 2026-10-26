@@ -278,6 +278,7 @@ mod tests {
                 club: Some(club),
                 impact: None,
                 derived: None,
+                ..ShotData::default()
             };
             let out = super::super::super::gspro::mapper::map_shot(&shot, handed);
             let eps = 1e-9;

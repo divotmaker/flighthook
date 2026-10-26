@@ -4,6 +4,7 @@ use flightrelay::units::{Distance, Velocity};
 use serde::{Deserialize, Serialize};
 
 use crate::game_state::Club;
+use crate::group::ShotGrouping;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
@@ -135,6 +136,21 @@ pub fn default_putting_clubs() -> Vec<Club> {
     vec![Club::Putter]
 }
 
+/// Clubs offered by the Settings screen's Chipping Clubs picker.
+pub fn chipping_club_options() -> &'static [Club] {
+    &[
+        Club::PitchingWedge,
+        Club::GapWedge,
+        Club::SandWedge,
+        Club::LobWedge,
+    ]
+}
+
+/// Clubs offered by the Settings screen's Putting Clubs picker.
+pub fn putting_club_options() -> &'static [Club] {
+    &[Club::Putter]
+}
+
 // ---------------------------------------------------------------------------
 // Persisted config types (shared between app and UI)
 // ---------------------------------------------------------------------------
@@ -152,6 +168,11 @@ pub struct FlighthookConfig {
     /// Clubs that trigger Putting mode on selection.
     #[serde(default = "default_putting_clubs")]
     pub putting_clubs: Vec<Club>,
+    /// Default shot view (by set, by club, none). Sets are assigned the same
+    /// way in every view. Omitted from the file and the API while it is at
+    /// its default (`by_set`).
+    #[serde(default, skip_serializing_if = "ShotGrouping::is_default")]
+    pub shot_grouping: ShotGrouping,
     /// Simulated flight and roll (beta). Omitted from the file and the API
     /// while it is at its defaults.
     #[serde(default, skip_serializing_if = "SimulationSection::is_default")]
@@ -176,14 +197,15 @@ pub struct FlighthookConfig {
 
 /// Settings for simulated flight and roll (beta).
 ///
-/// When a launch monitor does not report carry, apex, flight time, descent,
-/// offline, roll or total, flighthook simulates them from the measured launch
-/// under these conditions.
+/// [`mode`](Self::mode) picks what is simulated: nothing, the result values
+/// the launch monitor does not report, or every result value. The rest sets
+/// the conditions the shot is simulated under.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulationSection {
-    /// Simulate missing values. Defaults to true.
-    #[serde(default = "default_sim_enabled")]
-    pub enabled: bool,
+    /// What is simulated. Defaults to [`SimMode::On`]; omitted from the file
+    /// and the API while at the default.
+    #[serde(default, skip_serializing_if = "SimMode::is_default")]
+    pub mode: SimMode,
     /// Altitude above sea level, any distance unit. Defaults to `"0ft"`.
     /// Valid range: 0 to 5000 m.
     #[serde(default = "default_sim_altitude")]
@@ -197,8 +219,54 @@ pub struct SimulationSection {
     pub surface: SimSurface,
 }
 
-fn default_sim_enabled() -> bool {
-    true
+/// What flighthook simulates for each shot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimMode {
+    /// No simulation: only what the launch monitor reports.
+    Off,
+    /// Simulate the result values (carry, apex, flight time, descent,
+    /// offline, roll, total) the launch monitor does not report. The default.
+    #[default]
+    On,
+    /// Simulate every result value from the measured launch, for every
+    /// device. The device's own results are kept but not shown. Launch values
+    /// (ball speed, launch angles, spin, club data) are never replaced.
+    Force,
+}
+
+impl SimMode {
+    /// True for the default mode ([`SimMode::On`]).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Stable key used by the settings UI and config file.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Force => "force",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::On => "On",
+            Self::Force => "Force",
+        }
+    }
+
+    /// Every mode, in display order.
+    #[must_use]
+    pub fn all() -> [Self; 3] {
+        [Self::Off, Self::On, Self::Force]
+    }
 }
 
 fn default_sim_altitude() -> Distance {
@@ -212,7 +280,7 @@ fn default_sim_temperature_c() -> f64 {
 impl Default for SimulationSection {
     fn default() -> Self {
         Self {
-            enabled: default_sim_enabled(),
+            mode: SimMode::default(),
             altitude: default_sim_altitude(),
             temperature_c: default_sim_temperature_c(),
             surface: SimSurface::default(),
@@ -234,7 +302,7 @@ impl SimulationSection {
     /// length, so `"0m"` and `"0ft"` are both default.
     #[must_use]
     pub fn is_default(&self) -> bool {
-        self.enabled
+        self.mode.is_default()
             && self.altitude.as_meters() == 0.0
             && self.temperature_c == Self::DEFAULT_TEMPERATURE_C
             && self.surface == SimSurface::default()
@@ -264,7 +332,8 @@ impl SimulationSection {
     }
 }
 
-/// Ground for simulated landing and roll.
+/// Ground for simulated landing and roll. A ground ball taken in Putting
+/// mode rolls on `Green` when this is `Fairway`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SimSurface {
@@ -410,6 +479,51 @@ impl FlightScopeEnvironment {
     }
 }
 
+/// Which backspin and sidespin a FlightScope Xi shot reports.
+///
+/// The Xi sends two backspin values per shot: `D4`, its final spin (the one
+/// FlightScope's own app displays), and `E8`, a second value. On a Mevo+ or
+/// Gen2 there is no `E8` value, so all three sources give the same result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpinSource {
+    /// Backspin and sidespin from the D4 result, exactly as reported. The
+    /// default.
+    #[default]
+    D4,
+    /// Total spin from the E8 result, with the spin axis from D4 when the
+    /// shot has club data and 0 otherwise.
+    E8,
+    /// The `E8` rule when flighthook's detection mode is Full at shot time,
+    /// otherwise `D4` exactly as reported.
+    Auto,
+}
+
+impl SpinSource {
+    /// Whether this is the default (`D4`). Used to keep the field out of
+    /// the config file when it is unset.
+    #[must_use]
+    pub fn is_d4(&self) -> bool {
+        matches!(self, Self::D4)
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::D4 => "D4 (matches FS Golf)",
+            Self::E8 => "E8",
+            Self::Auto => "Auto (E8 on full swings)",
+        }
+    }
+
+    /// Every source, in display order.
+    #[must_use]
+    pub fn all() -> [Self; 3] {
+        [Self::D4, Self::E8, Self::Auto]
+    }
+}
+
 /// A Mevo/Mevo+ device instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MevoSection {
@@ -437,6 +551,11 @@ pub struct MevoSection {
     /// `LimitedFlight` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<FlightScopeEnvironment>,
+    /// FlightScope Xi only: which spin the shot reports (`d4`, `e8`, or
+    /// `auto`). Defaults to `D4`, and is left out of the config file at the
+    /// default.
+    #[serde(default, skip_serializing_if = "SpinSource::is_d4")]
+    pub spin_source: SpinSource,
 }
 
 /// A Garmin R10 BLE device instance.
@@ -466,7 +585,7 @@ pub struct SquareSection {
     /// `SquareGolf` name prefix is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    /// Club selected on connect, e.g. `"7i"`, `"driver"`, `"putter"`.
+    /// Club selected on connect, e.g. `"7i"`, `"DR"`, `"PT"`.
     ///
     /// The device is told which club is in play — it affects how the shot is
     /// classified. When GSPro reports a club change, the actor follows it and
@@ -598,6 +717,7 @@ impl Default for FlighthookConfig {
             default_units: UnitSystem::default(),
             chipping_clubs: default_chipping_clubs(),
             putting_clubs: default_putting_clubs(),
+            shot_grouping: ShotGrouping::default(),
             simulation: SimulationSection::default(),
             webserver,
             mevo: std::collections::HashMap::new(),
@@ -624,6 +744,7 @@ impl Default for MevoSection {
             use_estimated: None,
             camera_mode: None,
             environment: None,
+            spin_source: SpinSource::D4,
         }
     }
 }
@@ -746,6 +867,48 @@ mod environment_tests {
 }
 
 #[cfg(test)]
+mod spin_source_tests {
+    use super::*;
+
+    #[test]
+    fn absent_spin_source_defaults_to_d4() {
+        let s: MevoSection = serde_json::from_str(r#"{"name":"Mevo"}"#).expect("parse");
+        assert_eq!(s.spin_source, SpinSource::D4);
+    }
+
+    #[test]
+    fn d4_spin_source_is_not_written_back() {
+        let mut s = MevoSection::default();
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(!json.contains("spin_source"), "{json}");
+        // An explicit `d4` in the file is dropped on the next save.
+        s = serde_json::from_str(r#"{"name":"Mevo","spin_source":"d4"}"#).expect("parse");
+        assert_eq!(s.spin_source, SpinSource::D4);
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(!json.contains("spin_source"), "{json}");
+    }
+
+    #[test]
+    fn spin_source_round_trips_by_key() {
+        let keys = [
+            (SpinSource::D4, "d4"),
+            (SpinSource::E8, "e8"),
+            (SpinSource::Auto, "auto"),
+        ];
+        assert_eq!(SpinSource::all().len(), keys.len());
+        for (src, key) in keys {
+            let json = format!(r#"{{"name":"Mevo","spin_source":"{key}"}}"#);
+            let s: MevoSection = serde_json::from_str(&json).expect("parse");
+            assert_eq!(s.spin_source, src, "{key}");
+            let back: MevoSection =
+                serde_json::from_str(&serde_json::to_string(&s).expect("serialize"))
+                    .expect("parse");
+            assert_eq!(back, s);
+        }
+    }
+}
+
+#[cfg(test)]
 mod square_impact_calibration_tests {
     use super::*;
 
@@ -802,10 +965,48 @@ mod simulation_tests {
     }
 
     #[test]
+    fn shot_grouping_is_omitted_at_default() {
+        let c: FlighthookConfig = serde_json::from_str(GOLDEN_DEFAULT_JSON).expect("parses");
+        assert_eq!(c.shot_grouping, ShotGrouping::BySet);
+        let json = serde_json::to_string(&c).expect("ser");
+        assert!(!json.contains("shot_grouping"), "{json}");
+    }
+
+    #[test]
+    fn shot_grouping_round_trips() {
+        for (mode, name) in [
+            (ShotGrouping::None, "none"),
+            (ShotGrouping::ByClub, "by_club"),
+        ] {
+            let c = FlighthookConfig {
+                shot_grouping: mode,
+                ..FlighthookConfig::default()
+            };
+            let v = serde_json::to_value(&c).expect("ser");
+            assert_eq!(v["shot_grouping"], name);
+            let back: FlighthookConfig = serde_json::from_value(v).expect("de");
+            assert_eq!(back.shot_grouping, mode);
+        }
+        // The default mode is omitted even when set explicitly.
+        let c = FlighthookConfig {
+            shot_grouping: ShotGrouping::BySet,
+            ..FlighthookConfig::default()
+        };
+        let json = serde_json::to_string(&c).expect("ser");
+        assert!(!json.contains("shot_grouping"), "{json}");
+        let back: FlighthookConfig = serde_json::from_str(&json).expect("de");
+        assert_eq!(back.shot_grouping, ShotGrouping::BySet);
+        // An explicit `none` round-trips.
+        let c: FlighthookConfig =
+            serde_json::from_str(r#"{"shot_grouping":"none"}"#).expect("parses");
+        assert_eq!(c.shot_grouping, ShotGrouping::None);
+    }
+
+    #[test]
     fn absent_section_parses_to_defaults() {
         let c: FlighthookConfig = serde_json::from_str(GOLDEN_DEFAULT_JSON).expect("parses");
         assert_eq!(c.simulation, SimulationSection::default());
-        assert!(c.simulation.enabled);
+        assert_eq!(c.simulation.mode, SimMode::On);
         assert_eq!(c.simulation.altitude.as_meters(), 0.0);
         assert_eq!(c.simulation.temperature_c, 25.0);
         assert_eq!(c.simulation.surface, SimSurface::Fairway);
@@ -814,13 +1015,13 @@ mod simulation_tests {
 
     #[test]
     fn partial_section_fills_defaults() {
-        let s: SimulationSection = serde_json::from_str(r#"{"enabled":false}"#).expect("parses");
-        assert!(!s.enabled);
+        let s: SimulationSection = serde_json::from_str(r#"{"mode":"off"}"#).expect("parses");
+        assert_eq!(s.mode, SimMode::Off);
         assert_eq!(s.temperature_c, 25.0);
         let s: SimulationSection =
             serde_json::from_str(r#"{"altitude":"5280ft","surface":"firm_green"}"#)
                 .expect("parses");
-        assert!(s.enabled);
+        assert_eq!(s.mode, SimMode::On);
         assert!((s.altitude.as_meters() - 1609.344).abs() < 1e-9);
         assert_eq!(s.surface, SimSurface::FirmGreen);
     }
@@ -848,7 +1049,12 @@ mod simulation_tests {
             ..FlighthookConfig::default()
         })
         .expect("ser");
-        assert!(json.contains(r#""simulation":{"enabled":true,"altitude":"0ft","temperature_c":30.0,"surface":"fairway"}"#), "{json}");
+        assert!(
+            json.contains(
+                r#""simulation":{"altitude":"0ft","temperature_c":30.0,"surface":"fairway"}"#
+            ),
+            "{json}"
+        );
     }
 
     #[test]
@@ -872,6 +1078,60 @@ mod simulation_tests {
         assert!(!ok(Distance::Meters(0.0), -30.1));
         assert!(!ok(Distance::Meters(0.0), 50.1));
         assert!(!ok(Distance::Meters(0.0), f64::NAN));
+    }
+
+    /// A `simulation` object carrying unknown keys (e.g. `enabled`) loads,
+    /// ignoring them and keeping the default mode.
+    #[test]
+    fn unknown_simulation_keys_are_ignored_in_json() {
+        let s: SimulationSection =
+            serde_json::from_str(r#"{"enabled":false,"unknown":true}"#).expect("parses");
+        assert_eq!(s.mode, SimMode::On);
+        assert_eq!(s.temperature_c, SimulationSection::DEFAULT_TEMPERATURE_C);
+        let wrapped = r#"{"simulation":{"enabled":false,"unknown":true}}"#;
+        let c: FlighthookConfig = serde_json::from_str(wrapped).expect("parses");
+        assert_eq!(c.simulation.mode, SimMode::On);
+    }
+
+    #[test]
+    fn mode_round_trips_and_is_omitted_at_default() {
+        for mode in SimMode::all() {
+            let c = FlighthookConfig {
+                simulation: SimulationSection {
+                    mode,
+                    ..SimulationSection::default()
+                },
+                ..FlighthookConfig::default()
+            };
+            assert_eq!(c.simulation.is_default(), mode == SimMode::On);
+
+            let json = serde_json::to_string(&c).expect("ser");
+            assert!(!json.contains("enabled"), "{json}");
+            if mode == SimMode::On {
+                assert!(!json.contains("simulation"), "{json}");
+            } else {
+                let want = format!(r#""simulation":{{"mode":"{}","#, mode.key());
+                assert!(json.contains(&want), "{json}");
+            }
+            let back: FlighthookConfig = serde_json::from_str(&json).expect("de");
+            assert_eq!(back, c);
+        }
+        // Any other non-default setting writes the section without `mode`.
+        let warm = SimulationSection {
+            temperature_c: 30.0,
+            ..SimulationSection::default()
+        };
+        let json = serde_json::to_string(&warm).expect("ser");
+        assert!(!json.contains("mode"), "{json}");
+    }
+
+    #[test]
+    fn mode_keys_match_serde() {
+        for m in SimMode::all() {
+            let json = serde_json::to_string(&m).expect("ser");
+            assert_eq!(json, format!("\"{}\"", m.key()));
+        }
+        assert_eq!(SimMode::default(), SimMode::On);
     }
 
     #[test]

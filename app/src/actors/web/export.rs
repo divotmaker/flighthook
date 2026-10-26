@@ -55,6 +55,7 @@ pub fn build_export_line(
         shot_number: shot.key.shot_number,
         device,
         club_selected: ctx.club_selected,
+        group: shot.data.group.clone(),
         settings: ExportSettings {
             device: ctx.device_section.clone(),
             simulation: ctx.simulation.clone(),
@@ -130,6 +131,7 @@ pub fn csv_header(system: UnitSystem) -> String {
         "shot_number".into(),
         "shot_id".into(),
         "club_selected".into(),
+        "group".into(),
         "handed".into(),
         "detection_mode".into(),
         "environment".into(),
@@ -239,6 +241,7 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
         Some(line.shot_number.to_string()),
         Some(line.shot_id.clone()),
         line.club_selected.map(|c| c.to_string()),
+        line.group.clone(),
         label(line.settings.handed.as_ref()),
         line.settings.detection_mode.map(|m| m.to_string()),
         environment(shot),
@@ -342,6 +345,7 @@ mod tests {
                 use_estimated: None,
                 camera_mode: None,
                 environment: None,
+                spin_source: flighthook::SpinSource::D4,
             },
         );
         config
@@ -375,6 +379,7 @@ mod tests {
                 club: None,
                 impact: None,
                 derived: None,
+                ..ShotData::default()
             },
             raw: Some(ShotRaw {
                 transport: "flightscope-tcp".into(),
@@ -454,8 +459,8 @@ mod tests {
         for col in ["ball_speed_mps", "carry_m", "max_height_m", "club_offset_m"] {
             assert!(met.contains(col), "{col}");
         }
-        assert_eq!(imp.split(',').count(), 44);
-        assert_eq!(met.split(',').count(), 44);
+        assert_eq!(imp.split(',').count(), 45);
+        assert_eq!(met.split(',').count(), 45);
     }
 
     #[test]
@@ -463,21 +468,76 @@ mod tests {
         let shot = private_shot();
         let row = to_csv_row(&shot, UnitSystem::Metric);
         let cells: Vec<&str> = row.trim_end().split(',').collect();
-        assert_eq!(cells.len(), 44);
+        assert_eq!(cells.len(), 45);
         assert_eq!(cells[1], "mevo.0");
         assert_eq!(cells[2], "flightscope");
         assert_eq!(cells[4], "<redacted> v1");
         assert_eq!(cells[5], "", "firmware");
-        assert_eq!(cells[11], "limited_flight");
-        assert_eq!(cells[12], "40");
-        assert_eq!(cells[16], "", "sidespin");
-        assert_eq!(cells[17], "100");
+        assert_eq!(cells[9], "", "group");
+        assert_eq!(cells[12], "limited_flight");
+        assert_eq!(cells[13], "40");
+        assert_eq!(cells[17], "", "sidespin");
+        assert_eq!(cells[18], "100");
         assert!(!row.contains(SSID) && !row.contains(ADDR));
 
         let imp = to_csv_row(&shot, UnitSystem::Imperial);
         let cells: Vec<&str> = imp.trim_end().split(',').collect();
-        assert_eq!(cells[12], num(Velocity::MetersPerSecond(40.0).as_mph()));
-        assert_eq!(cells[17], num(Distance::Meters(100.0).as_yards()));
+        assert_eq!(cells[13], num(Velocity::MetersPerSecond(40.0).as_mph()));
+        assert_eq!(cells[18], num(Distance::Meters(100.0).as_yards()));
+    }
+
+    #[test]
+    fn simulated_shot_exports_its_path_in_jsonl_only() {
+        let mut shot = private_shot();
+        let mut b = ball();
+        b.sidespin_rpm = Some(-200);
+        shot.data.ball = Some(b.clone());
+        shot.data.derived = crate::sim::derive(&b, &flighthook::SimulationSection::default());
+        assert!(shot.data.derived.as_ref().is_some_and(|d| d.path.is_some()));
+
+        let line: serde_json::Value =
+            serde_json::from_str(&jsonl_line(&shot, "t", Some(UnitSystem::Imperial), false))
+                .expect("parses");
+        let flight = &line["data"]["derived"]["path"]["flight"];
+        assert_eq!(flight[0], serde_json::json!([0.0, 0.0, 0.0, 0.0]));
+        assert!(flight.as_array().is_some_and(|f| f.len() > 2), "{line}");
+
+        let row = to_csv_row(&shot, UnitSystem::Metric);
+        assert_eq!(row.trim_end().split(',').count(), 45);
+    }
+
+    #[test]
+    fn forced_shot_exports_the_flag_and_both_values() {
+        let replacing = flighthook::SimulationSection {
+            mode: flighthook::SimMode::Force,
+            ..flighthook::SimulationSection::default()
+        };
+        let mut shot = private_shot();
+        let mut b = ball();
+        b.sidespin_rpm = Some(-200);
+        shot.data.ball = Some(b.clone());
+        shot.data.derived = crate::sim::derive(&b, &replacing);
+        shot.context.simulation = replacing;
+        let sim_carry = shot
+            .data
+            .derived
+            .as_ref()
+            .and_then(|d| d.carry_distance)
+            .expect("simulated carry");
+
+        let line: serde_json::Value =
+            serde_json::from_str(&jsonl_line(&shot, "t", None, false)).expect("parses");
+        assert_eq!(line["data"]["derived"]["replaces_measured"], true, "{line}");
+        assert_eq!(line["settings"]["simulation"]["mode"], "force", "{line}");
+        assert!(line["settings"]["simulation"].get("enabled").is_none());
+        assert_eq!(line["data"]["ball"]["carry_distance"], "100m", "{line}");
+
+        // CSV keeps its columns: the device's carry and the simulated carry.
+        let row = to_csv_row(&shot, UnitSystem::Metric);
+        let cells: Vec<&str> = row.trim_end().split(',').collect();
+        assert_eq!(cells.len(), 45);
+        assert_eq!(cells[18], "100");
+        assert_eq!(cells[23], num(sim_carry.as_meters()));
     }
 
     #[test]
@@ -560,5 +620,55 @@ mod tests {
         assert_eq!(line.shot_id, "rt");
         assert_eq!(line.shot_number, 9);
         assert_eq!(line.raw.expect("raw").frames.len(), 2);
+    }
+
+    const GROUP: &str = "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7";
+
+    fn grouped_shot() -> StoredShot {
+        let mut shot = private_shot();
+        shot.context.club_selected = Some(flighthook::Club::Iron7);
+        shot.data.shot_id = Some(shot.key.shot_id.clone());
+        shot.data.club_selected = Some(flighthook::Club::Iron7);
+        shot.data.group = Some(GROUP.into());
+        shot
+    }
+
+    #[test]
+    fn csv_group_column_follows_club_selected() {
+        let header: Vec<String> = csv_header(UnitSystem::Imperial)
+            .trim_end()
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let at = |name: &str| header.iter().position(|h| h == name).expect(name);
+        assert_eq!(at("group"), at("club_selected") + 1);
+        assert_eq!(at("handed"), at("group") + 1);
+
+        let row = to_csv_row(&grouped_shot(), UnitSystem::Imperial);
+        let cells: Vec<&str> = row.trim_end().split(',').collect();
+        assert_eq!(cells.len(), header.len());
+        assert_eq!(cells[at("club_selected")], "7I");
+        assert_eq!(cells[at("group")], GROUP);
+    }
+
+    #[test]
+    fn jsonl_line_carries_the_group() {
+        let shot = grouped_shot();
+        let line = jsonl_line(&shot, "t", None, false);
+        let v: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(v["group"], GROUP);
+        assert_eq!(v["data"]["group"], GROUP);
+        assert_eq!(v["data"]["shot_id"], v["shot_id"]);
+        assert_eq!(v["data"]["club_selected"], v["club_selected"]);
+        for absent in ["number", "mode", "session"] {
+            assert!(v.get(absent).is_none(), "{absent}");
+        }
+        // Top level: `group` right after `club_selected`, before `settings`.
+        let pair = format!(r#""club_selected":"7I","group":"{GROUP}","settings""#);
+        assert!(line.contains(&pair), "{line}");
+
+        let ungrouped = jsonl_line(&private_shot(), "t", None, false);
+        let v: serde_json::Value = serde_json::from_str(&ungrouped).expect("json");
+        assert!(v.get("group").is_none());
     }
 }

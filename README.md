@@ -18,7 +18,7 @@ Each device links to its setup notes, quirks, and config reference.
 | ---------------------------------------------------- | ----------------------- | ----------------------------------------------- | ---------------- |
 | [FlightScope Mevo+](docs/devices/flightscope.md)     | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
 | [FlightScope Mevo Gen2](docs/devices/flightscope.md) | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
-| [FlightScope Xi](docs/devices/flightscope.md)        | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Alpha            |
+| [FlightScope Xi](docs/devices/flightscope.md)        | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
 | [Square Golf Omni](docs/devices/square-golf.md)      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Supported        |
 | [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
 | [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (OpenConnect)                          | Alpha (untested) |
@@ -53,7 +53,7 @@ The shot lifecycle events (`shot_trigger`, `ball_flight`, `club_path`,
 `alert`) are FRP-compliant and use the spec's own field shapes; the types come
 from the [`flightrelay`](https://crates.io/crates/flightrelay) crate. flighthook
 adds its own event kinds alongside them (player/club info, config commands, actor
-status), which FRP-only consumers ignore per spec.
+status, shot groups), which FRP-only consumers ignore per spec.
 
 The spec is CC0 and the Rust SDK is Apache-2.0/MIT, so consumers need not depend
 on flighthook itself.
@@ -100,6 +100,15 @@ Terminal. Allow it.
   separate putting mode, so selecting a putter in the sim puts it in putting mode
 - Simulated carry, apex, descent, offline, roll and total for launch monitors that
   measure launch only (beta) — see [Simulated values](#simulated-values-beta)
+- Shot sets: every shot joins a set, and a club change or **+ New set** starts
+  a new one — see [Shot Tracking](#shot-tracking)
+- Flight chart: a side view of the simulated ball flights of the shown shot's
+  set or club, drawn as smooth curves, with the rest of the session faint
+  behind (beta)
+- Dispersion chart: a top-down view of where those shots came to rest or
+  landed, with a 2σ or 95 % dispersion ellipse (beta)
+- One fixed Shots layout with both charts always on screen, sized from the
+  window
 - Export the session as JSONL with the raw device frames behind each shot, or CSV
 - Dual UI: native desktop window (eframe/egui) and browser dashboard (WASM, same codebase)
 - Configurable via TOML file with live settings updates
@@ -111,22 +120,51 @@ When a launch monitor doesn't report carry, apex, flight time, descent angle,
 offline, roll or total, flighthook simulates them from the measured launch (ball
 speed, launch angle, launch direction, backspin, sidespin) with the
 [dimple](https://crates.io/crates/dimple) ball-flight model: modern tour ball,
-flat fairway, sea level and 25 °C by default. A measured value always wins;
-flighthook only fills gaps and never changes what the device sent.
+flat fairway, sea level and 25 °C by default.
 
-- Simulated values are marked `derived` in the API, shown in *italics* in the
-  dashboard, and logged as `sim (estimated, beta)` under the device's ball line.
+`[simulation] mode` (Devices tab → General → Simulation card) picks what is simulated:
+
+- `off`: nothing; flighthook shows only what the launch monitor reports.
+- `on` (the default): flighthook fills what the device didn't report, plus
+  the ground-ball and zero-reading cases below, and never changes what the
+  device sent.
+- `force`: every simulated shot gets all its results (carry, apex, flight
+  time, descent, offline, roll, total) from the simulation of its measured
+  launch, for every device; `derived` carries all of them, flagged
+  `replaces_measured`, and they take precedence over the device's. The
+  device's own results are kept, unchanged, under `ball` and in the export,
+  and GSPro still receives the device's data. Launch values (ball speed,
+  launch angles, spin, club data) are never replaced. A shot that can't be
+  simulated keeps the device's results.
+
+- Simulated values are marked `derived` in the API, shown with a `SIM` tag on
+  the dashboard's cards and in *italics* in its table, and logged as
+  `sim (estimated, beta)` under the device's ball line.
+- The dashboard (cards, shot list, table, range bars and their stats, both
+  charts) shows the simulated value when there is one, still marked as
+  simulated, else the device's. flighthook simulates a value the device
+  reported only when the simulated one is the one to show: a ground ball's 0
+  carry, apex and flight time (and its roll, which is its total), a 0 carry or
+  flight time on a shot that flies, and every result on a `force` shot.
 - They are **never sent to GSPro**, which simulates the flight itself.
 - Offline is the distance right (+) or left (−) of the target line. Roll is
   negative when the ball spins back toward the tee.
 - When the device measures carry, total is that measured carry plus the
-  simulated roll.
-- A shot is simulated only when the device reports all five launch values, the
-  ball speed is at least 5 mph, the launch angle is between 0° and 90°, and the
+  simulated roll; when it measures carry and total but not roll, roll is the
+  total minus the carry.
+- A shot is flown only when the device reports all five launch values, the
+  ball speed is above 0, the launch angle is between 0° and 90°, and the
   launch direction is within ±90°. A shot with no spin reading (back and side
-  both 0) is not simulated.
-- Putts are not simulated: not in putting mode, and not for any shot slower than
-  15 mph launched below 5° (this catches putts when no club has been selected).
+  both 0) is not flown. A slow, low chip with some lift flies.
+- A ground ball is rolled, not flown: a shot whose measured apex is 0, or,
+  from a device that reports no apex, one launched at 0.5° or less. Putts and
+  bladed shots alike, whatever the club or detection mode. Carry, apex and
+  flight time are 0, and roll and total come from a roll from the tee, from
+  the ball speed and direction (a measured total wins). In Putting mode the
+  ball rolls on a green (the configured surface if it is a green); in any
+  other mode on the configured surface (fairway by default).
+- On a shot that flies, a measured carry or flight time of 0 is not a
+  reading: flighthook simulates it like a missing value.
 
 Carry is fitted to Trackman PGA Tour averages (about 3 yd RMSE); roll and total
 are beta in dimple and not yet validated against measured data, so treat them
@@ -135,26 +173,26 @@ as estimates. Known model limits are listed in dimple's
 comparing against another launch monitor, set altitude and temperature to its
 normalization conditions.
 
-Settings live under `[simulation]` (all keys optional) or in Settings → Global:
+Settings live under `[simulation]` (all keys optional) or in the Devices tab's Simulation card:
 
 ```toml
 [simulation]
-enabled = true            # false turns simulated values off
+mode = "on"               # off | on | force
 altitude = "0ft"          # any distance unit, 0 to 5000 m
 temperature_c = 25.0      # -30 to 50
 surface = "fairway"       # fairway | green | firm_green
 ```
 
-An altitude or temperature outside its range turns simulation off (with a
-warning in the log) until it is fixed. Changes apply from the next shot,
-without a restart.
+The mode applies per shot: changing it affects new shots only. An altitude or
+temperature outside its range turns simulation off (with a warning in the
+log) until it is fixed. Changes apply from the next shot, without a restart.
 
 ### Sharing shot data
 
 The Shots tab has two export links for the current session (also available as
 `GET /api/shots/export`, see [docs/API.md](docs/API.md#get-apishotsexport)):
 
-- **JSONL (with raw)** — one line per shot: the decoded shot exactly as the
+- **JSONL** — one line per shot: the decoded shot exactly as the
   dashboard shows it, the settings in effect (device settings, simulation,
   club and mode), and the raw device frames behind it as hex (or JSON text for
   Open Connect). Shots the device read nothing usable for are included.
@@ -175,13 +213,68 @@ is written to disk.
 
 ![Shots](./screens/shots.png "Shots")
 
-### Monitoring
+Shots are recorded in **sets**: a shot joins the current set unless the club
+in play changed (going back to an earlier club starts a new set too) or you
+pressed **+ New set**. **New session** closes the set and starts a fresh
+session. Sets are recorded the same way whatever you look at; the Shots tab
+offers three views of them (By set unless the Global card's Default shot view says otherwise):
 
-![Telemetry](./screens/telemetry.png "Telemetry")
+- **By set** — the shot list in sections per set, with range bars (total,
+  carry, lateral) for the shown shot's set.
+- **By club** — one section per club, combining every set with that club
+  since the last **New session**, and range bars over that club. + New set
+  doesn't reset a club's numbers here; only New session does.
+- **None** — the last shot only: no sections, range bars or set buttons.
 
-### Centralized Configuration
++ New set and New session sit at the foot of the shot list. With shots from
+more than one device, a device filter picks one device or splits the bars by
+device. The export carries each shot's set.
 
-![Settings](./screens/settings.png "Settings")
+The dashboard loads the whole session the server keeps (the last 1000
+shots), so the views, range bars and charts cover all of it; **Table** lists
+every one of them, a row per shot.
+
+The trash icon after the export links (**Clear history**) deletes every shot
+and set and starts a new session, after a confirmation, in every open
+dashboard. Export first if you want to keep them.
+
+The charts are always on screen, in one layout sized from the window: on a
+window at least 1200 px wide, **Dispersion** fills a column on the right and
+**Flight** runs under the cards; on a narrower one the two share the row
+under the cards, and in **Table** Dispersion sits under the table. The cards
+shrink to fit above Flight, so on common screen sizes every card is on
+screen without scrolling.
+
+The **Flight** chart (beta) draws the simulated ball flights side on, as
+smooth curves through the simulated path that keep each bounce's corner: the
+shown shot in gold with its apex,
+carry and total marked, the rest of its set (By set) or club (By club)
+bright, and the session's other shots faint behind them; None draws the
+shown shot alone. With two or more devices and the filter on All, the paths
+are coloured by device. A ground ball is drawn as its roll along the ground
+from the tee to rest; a set of only ground balls gets a short distance axis.
+Shots without a simulated path get ticks at their carry and total. Hover a path for its numbers; click it to show that shot.
+
+The **Dispersion** chart (beta) shows the same shots from above, on equal scales with the tee at the
+bottom: where each came to rest (**Total**, the default) or landed
+(**Carry**), the shown shot in gold with its roll, and a dispersion ellipse
+over the bright shots, one per device when they are coloured by device.
+The ellipse holds about 86 % of a normal pattern (**2σ**, the default) or
+95 % (**95 %**); hover it for its size. The lateral is simulated, so shots
+without a simulated offline are left out.
+
+### Devices
+
+![Devices](./screens/devices.png "Devices")
+
+The Devices tab, where the app opens, has a card for every launch monitor and
+output, and the Global and Simulation settings. A card's **Telemetry |
+Settings** toggle flips it between the device's live status and its settings.
+Edit a card and **Save** or **Cancel** it before moving on; the rest of the
+dashboard waits until you do. The **+** after Launch monitors or Outputs adds
+one.
+
+![Device settings](./screens/devices-settings.png "Device settings")
 
 ### Multi-Monitor Routing
 
@@ -207,7 +300,7 @@ TOML file auto-created on first run at the platform config directory:
 ```toml
 # optional; simulated values (beta), shown at their defaults
 [simulation]
-enabled = true
+mode = "on"
 altitude = "0ft"
 temperature_c = 25.0
 surface = "fairway"
@@ -252,8 +345,32 @@ address = "127.0.0.1:921"
 type: `webserver`, `mevo`, `r10`, `square`,
 `openconnect_server`, `mock_monitor`, `gspro`, `random_club`. The index after
 the dot (`0`, `1`, ...) identifies the instance. Per-device options are covered
-in the [device docs](#launch-monitors). Settings can also be edited live from
-the Settings tab in the UI.
+in the [device docs](#launch-monitors). Settings can also be edited live on
+the Devices tab in the UI.
+
+### Second screen on a tablet or phone
+
+The web server binds `0.0.0.0:5880` by default, so the dashboard is already
+reachable from other devices on the same network — handy for running your sim
+software (GSPro etc.) full-screen on the main display while a tablet or phone
+shows the browser dashboard (the same WASM UI as the native window) with
+shots, flight and dispersion alongside it.
+
+1. On the flighthook PC, allow inbound connections on port 5880:
+   - **Windows**: the first time flighthook listens, Windows Defender
+     Firewall may prompt — choose **Private networks**. If it doesn't
+     prompt, add an inbound rule for TCP port 5880 scoped to Private
+     networks in Windows Defender Firewall.
+   - **macOS/Linux**: allow inbound TCP on port 5880 in the system firewall
+     if one is enabled.
+2. Find the flighthook PC's LAN address: `ipconfig` on Windows (the IPv4
+   address), or System Settings → Network on macOS.
+3. On the tablet or phone, browse to `http://<that address>:5880` (e.g.
+   `http://192.168.1.50:5880`).
+
+The dashboard has no login, so anyone on that network can view shots, change
+settings or clear shot history. Only open it on a trusted home network —
+never on public Wi-Fi, and never by forwarding the port to the internet.
 
 ## Developer Quick Start
 
@@ -307,6 +424,13 @@ To run with a mock device, point `--config` at a TOML file with
   unified bus, threading, state machine, settings UI design.
 - **[docs/API.md](docs/API.md)** — REST and WebSocket API reference for the web
   dashboard (`/api/status`, `/api/shots`, `/frp`, etc.).
+
+## Third-party
+
+- Icons: [Codicons](https://github.com/microsoft/vscode-codicons) by Microsoft,
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The font ships
+  unmodified as `ui/assets/fonts/codicon.ttf`; version, source and licence
+  text are in `ui/assets/fonts/codicon-LICENSE.txt`.
 
 ---
 

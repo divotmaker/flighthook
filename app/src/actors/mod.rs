@@ -97,6 +97,7 @@ pub fn resolve_actors(
                         session_config,
                         use_estimated,
                         camera_mode,
+                        spin_source: section.spin_source,
                     }),
                 });
             }
@@ -265,5 +266,96 @@ pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String> {
     for (index, ws) in &config.webserver {
         names.insert(global_id("webserver", index), ws.name.clone());
     }
+    names.extend(openconnect_names(&config.openconnect_server));
     names
+}
+
+/// Display names of the Open Connect servers, keyed by actor id: each one's
+/// configured name, or "Open Connect" when that is blank. Servers that end
+/// up sharing a name are numbered in index order ("Open Connect 1",
+/// "Open Connect 2"), so each one reads distinctly in the device filter and
+/// legend.
+fn openconnect_names(
+    sections: &HashMap<String, flighthook::OpenConnectServerSection>,
+) -> Vec<(String, String)> {
+    let mut indices: Vec<&String> = sections.keys().collect();
+    indices.sort_by(|a, b| match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        _ => a.cmp(b),
+    });
+    let base: Vec<&str> = indices
+        .iter()
+        .map(|i| {
+            let name = sections[*i].name.trim();
+            if name.is_empty() {
+                "Open Connect"
+            } else {
+                name
+            }
+        })
+        .collect();
+    indices
+        .iter()
+        .zip(&base)
+        .enumerate()
+        .map(|(k, (index, name))| {
+            let shared = base.iter().filter(|b| *b == name).count() > 1;
+            let name = if shared {
+                let n = base[..=k].iter().filter(|b| *b == name).count();
+                format!("{name} {n}")
+            } else {
+                (*name).to_owned()
+            };
+            (global_id("openconnect_server", index), name)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_openconnect(names: &[(&str, &str)]) -> FlighthookConfig {
+        let mut config = FlighthookConfig::default();
+        for (index, name) in names {
+            config.openconnect_server.insert(
+                (*index).to_owned(),
+                flighthook::OpenConnectServerSection {
+                    name: (*name).to_owned(),
+                    bind: None,
+                },
+            );
+        }
+        config
+    }
+
+    #[test]
+    fn openconnect_servers_are_named_from_config() {
+        let names = actor_names(&with_openconnect(&[("0", "Uneekor"), ("1", "Omni Bridge")]));
+        assert_eq!(names["openconnect_server.0"], "Uneekor");
+        assert_eq!(names["openconnect_server.1"], "Omni Bridge");
+    }
+
+    #[test]
+    fn blank_openconnect_names_read_open_connect() {
+        let names = actor_names(&with_openconnect(&[("0", "")]));
+        assert_eq!(names["openconnect_server.0"], "Open Connect");
+        let names = actor_names(&with_openconnect(&[("0", " "), ("1", "Omni Bridge")]));
+        assert_eq!(names["openconnect_server.0"], "Open Connect");
+        assert_eq!(names["openconnect_server.1"], "Omni Bridge");
+    }
+
+    #[test]
+    fn shared_openconnect_names_are_numbered_in_index_order() {
+        let names = actor_names(&with_openconnect(&[("10", ""), ("2", ""), ("3", "Bay")]));
+        assert_eq!(names["openconnect_server.2"], "Open Connect 1");
+        assert_eq!(names["openconnect_server.10"], "Open Connect 2");
+        assert_eq!(names["openconnect_server.3"], "Bay");
+        let names = actor_names(&with_openconnect(&[
+            ("0", "OpenConnect Server"),
+            ("1", "OpenConnect Server"),
+        ]));
+        assert_eq!(names["openconnect_server.0"], "OpenConnect Server 1");
+        assert_eq!(names["openconnect_server.1"], "OpenConnect Server 2");
+    }
 }

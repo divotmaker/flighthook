@@ -90,8 +90,9 @@ impl Actor for SquareActor {
 /// Build the per-club face impact calibration from config overrides.
 ///
 /// Starts from allsquare's built-in defaults and applies each override.
-/// Unknown club keys and non-finite or negative values are warned about and
-/// skipped, leaving that club at its built-in default.
+/// Unknown club keys, clubs Square Golf has no code for, and non-finite or
+/// negative values are warned about and skipped, leaving that club at its
+/// built-in default.
 pub(crate) fn build_impact_calibration(
     overrides: Option<&BTreeMap<String, f64>>,
 ) -> allsquare::ImpactCalibration {
@@ -104,11 +105,19 @@ pub(crate) fn build_impact_calibration(
             warn!("square: unknown club '{key}' in dot_bottom_to_face_centre_mm, ignoring");
             continue;
         };
+        let Some(club) = allsquare_club(club) else {
+            warn!(
+                "square: Square Golf has no code for '{key}'; it is armed as {}, whose \
+                 calibration applies; ignoring its dot_bottom_to_face_centre_mm",
+                to_allsquare_club(club).to_string().to_uppercase()
+            );
+            continue;
+        };
         if !mm.is_finite() || mm < 0.0 {
             warn!("square: invalid dot_bottom_to_face_centre_mm for '{key}': {mm}, ignoring");
             continue;
         }
-        cal.set_dot_bottom_to_face_centre_mm(to_allsquare_club(club), Some(mm));
+        cal.set_dot_bottom_to_face_centre_mm(club, Some(mm));
     }
     cal
 }
@@ -226,22 +235,26 @@ fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>
     }));
 }
 
-/// Map a flighthook club to the allsquare equivalent.
+/// Map a flighthook club to the allsquare club the device is set to.
 ///
-/// The two enums line up one-for-one, so a club change coming from GSPro can be
-/// pushed straight to the device. This matters more here than on other monitors:
-/// Square Golf uses the selected club to classify the shot, and putting mode is
-/// nothing more than "the putter is selected".
+/// A club change coming from GSPro is pushed straight to the device. This
+/// matters more here than on other monitors: Square Golf uses the selected
+/// club to classify the shot, and putting mode is nothing more than "the putter
+/// is selected". A club the device has no code for (see [`allsquare_club`]) is
+/// sent as the nearest club of the same kind it does have, taking the stronger
+/// loft on a tie.
 fn to_allsquare_club(club: Club) -> allsquare::Club {
     match club {
-        Club::Driver => allsquare::Club::Driver,
-        Club::Wood3 => allsquare::Club::Wood3,
-        Club::Wood5 => allsquare::Club::Wood5,
-        Club::Wood7 => allsquare::Club::Wood7,
-        Club::Hybrid3 => allsquare::Club::Hybrid3,
+        Club::Driver | Club::MiniDriver => allsquare::Club::Driver,
+        Club::Wood2 | Club::Wood3 | Club::Wood4 => allsquare::Club::Wood3,
+        Club::Wood5 | Club::Wood6 => allsquare::Club::Wood5,
+        Club::Wood7 | Club::Wood8 | Club::Wood9 => allsquare::Club::Wood7,
+        Club::Hybrid1 | Club::Hybrid2 | Club::Hybrid3 => allsquare::Club::Hybrid3,
         Club::Hybrid4 => allsquare::Club::Hybrid4,
-        Club::Hybrid5 => allsquare::Club::Hybrid5,
-        Club::Iron3 => allsquare::Club::Iron3,
+        Club::Hybrid5 | Club::Hybrid6 | Club::Hybrid7 | Club::Hybrid8 | Club::Hybrid9 => {
+            allsquare::Club::Hybrid5
+        }
+        Club::Iron1 | Club::Iron2 | Club::Iron3 => allsquare::Club::Iron3,
         Club::Iron4 => allsquare::Club::Iron4,
         Club::Iron5 => allsquare::Club::Iron5,
         Club::Iron6 => allsquare::Club::Iron6,
@@ -253,6 +266,28 @@ fn to_allsquare_club(club: Club) -> allsquare::Club {
         Club::SandWedge => allsquare::Club::SandWedge,
         Club::LobWedge => allsquare::Club::LobWedge,
         Club::Putter => allsquare::Club::Putter,
+    }
+}
+
+/// The allsquare club with the same code, or `None` for a club Square Golf has
+/// no code for (MD, 2W, 4W, 6W, 8W, 9W, 1H, 2H, 6H, 7H, 8H, 9H, 1I, 2I).
+fn allsquare_club(club: Club) -> Option<allsquare::Club> {
+    match club {
+        Club::MiniDriver
+        | Club::Wood2
+        | Club::Wood4
+        | Club::Wood6
+        | Club::Wood8
+        | Club::Wood9
+        | Club::Hybrid1
+        | Club::Hybrid2
+        | Club::Hybrid6
+        | Club::Hybrid7
+        | Club::Hybrid8
+        | Club::Hybrid9
+        | Club::Iron1
+        | Club::Iron2 => None,
+        _ => Some(to_allsquare_club(club)),
     }
 }
 
@@ -967,6 +1002,46 @@ mod tests {
         overrides.insert("bogus".to_string(), 30.0);
         let cal = build_impact_calibration(Some(&overrides));
         assert_eq!(cal, allsquare::ImpactCalibration::default());
+    }
+
+    /// A club the device has no code for has no calibration of its own; its
+    /// key is skipped rather than overriding the club it is armed as.
+    #[test]
+    fn club_without_device_code_is_skipped() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("6H".to_string(), 30.0);
+        let cal = build_impact_calibration(Some(&overrides));
+        assert_eq!(cal, allsquare::ImpactCalibration::default());
+    }
+
+    /// Every club the device has no code for is armed as its nearest club.
+    #[test]
+    fn clubs_without_device_code_map_to_nearest() {
+        let cases = [
+            (Club::MiniDriver, allsquare::Club::Driver),
+            (Club::Wood2, allsquare::Club::Wood3),
+            (Club::Wood4, allsquare::Club::Wood3),
+            (Club::Wood6, allsquare::Club::Wood5),
+            (Club::Wood8, allsquare::Club::Wood7),
+            (Club::Wood9, allsquare::Club::Wood7),
+            (Club::Hybrid1, allsquare::Club::Hybrid3),
+            (Club::Hybrid2, allsquare::Club::Hybrid3),
+            (Club::Hybrid6, allsquare::Club::Hybrid5),
+            (Club::Hybrid7, allsquare::Club::Hybrid5),
+            (Club::Hybrid8, allsquare::Club::Hybrid5),
+            (Club::Hybrid9, allsquare::Club::Hybrid5),
+            (Club::Iron1, allsquare::Club::Iron3),
+            (Club::Iron2, allsquare::Club::Iron3),
+        ];
+        for (club, expected) in cases {
+            assert_eq!(allsquare_club(club), None, "{club}");
+            assert_eq!(to_allsquare_club(club), expected, "{club}");
+        }
+        let exact = Club::ALL
+            .iter()
+            .filter(|&&c| allsquare_club(c).is_some())
+            .count();
+        assert_eq!(exact, 19);
     }
 
     /// A negative value is nonsensical (it is a distance) and is skipped —

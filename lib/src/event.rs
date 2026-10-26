@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use flightrelay::types::{BallFlight, ClubData, FaceImpact};
 use flightrelay::units::{Distance, Velocity};
 
-use crate::{ShotKey, ShotRaw, UnitSystem};
+use crate::{Club, ShotKey, ShotRaw, UnitSystem};
 
 // ---------------------------------------------------------------------------
 // Derived (simulated) flight values
@@ -17,13 +17,28 @@ use crate::{ShotKey, ShotRaw, UnitSystem};
 
 /// Values flighthook simulated from the measured launch (beta).
 ///
-/// Present only for fields the device did not report: a value under
-/// [`BallFlight`] is measured, a value here is simulated, and at most one of
-/// the two is set for any field. Lateral values (`*_offline`) are absolute:
-/// positive = right of the target line, as in FRP's `launch_azimuth`.
+/// By default present only for fields the device did not report: a value
+/// under [`BallFlight`] is measured and a value here is simulated. A field
+/// set in both is shown with the value here: on a shot that flies, a
+/// measured carry or flight time of exactly 0 is not a reading, so it is
+/// simulated next to the untouched 0. A ground ball (a measured apex of 0,
+/// or no measured apex and a launch angle of at most 0.5 deg) is rolled,
+/// not flown: carry, apex and flight time are 0 (here when the device
+/// measured something else) and there is no descent angle. Lateral
+/// values (`*_offline`) are absolute: positive = right of the target line,
+/// as in FRP's `launch_azimuth`.
 ///
 /// Where the device reports carry, `total_distance` is that measured carry
-/// plus the simulated roll, so carry + roll = total always holds.
+/// plus the simulated roll; where it reports carry and total but not roll,
+/// `roll_distance` is the total minus the carry. A ground ball's roll is its
+/// total (its carry is 0), replacing a device roll that differs. So the
+/// carry + roll = total shown holds.
+///
+/// When [`replaces_measured`](Self::replaces_measured) is set (the
+/// `[simulation] mode = "force"` setting), every result field is the
+/// simulation's, whether or not the device measured it, and these values
+/// take precedence over the measured ones in [`BallFlight`], which are kept
+/// unchanged.
 ///
 /// Non-exhaustive so fields can be added; build one with
 /// `DerivedFlight::default()` and assign the fields.
@@ -58,6 +73,36 @@ pub struct DerivedFlight {
     /// Lateral offset of the rest position. Positive = right.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_offline: Option<Distance>,
+    /// Simulated ball path from the tee to rest, fitted to the measured
+    /// values (the raw simulation when `replaces_measured` is set) and
+    /// decimated to a few dozen points. Present only when the shot was
+    /// simulated, same conditions as the rest of `DerivedFlight`. Always
+    /// metres and seconds, regardless of the unit system of the other
+    /// fields: `to_imperial`/`to_metric` leave it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<FlightPath>,
+    /// True when these values replace the device's results: every result
+    /// field above is simulated and takes precedence over the measured
+    /// value in [`BallFlight`]. Set per shot when the `[simulation] mode`
+    /// in effect when the shot was simulated is `force`.
+    /// Omitted on the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replaces_measured: bool,
+}
+
+/// A simulated ball path from the tee to rest.
+///
+/// Points are `[t, x, y, z]`: seconds since launch, metres downrange, metres
+/// up, metres right of the target line, origin at the tee. Always metres and
+/// seconds, independent of the unit system of the rest of the shot.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FlightPath {
+    /// Launch (the tee, `[0, 0, 0, 0]`) to landing (last point, on the ground).
+    pub flight: Vec<[f64; 4]>,
+    /// Landing (first point equals `flight`'s last) to rest. Empty when the
+    /// ground phase did not reach rest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ground: Vec<[f64; 4]>,
 }
 
 impl DerivedFlight {
@@ -68,6 +113,7 @@ impl DerivedFlight {
     }
 
     /// Convert distances to yards (heights to feet, as for [`BallFlight`]).
+    /// `path` is always metres/seconds and is carried over unchanged.
     #[must_use]
     pub fn to_imperial(&self) -> DerivedFlight {
         let yd = |d: Option<Distance>| d.map(|d| Distance::Yards(d.as_yards()));
@@ -81,10 +127,13 @@ impl DerivedFlight {
             roll_offline: yd(self.roll_offline),
             total_distance: yd(self.total_distance),
             total_offline: yd(self.total_offline),
+            path: self.path.clone(),
+            replaces_measured: self.replaces_measured,
         }
     }
 
-    /// Convert all distances to meters.
+    /// Convert all distances to meters. `path` is always metres/seconds and
+    /// is carried over unchanged.
     #[must_use]
     pub fn to_metric(&self) -> DerivedFlight {
         let m = |d: Option<Distance>| d.map(|d| Distance::Meters(d.as_meters()));
@@ -98,6 +147,8 @@ impl DerivedFlight {
             roll_offline: m(self.roll_offline),
             total_distance: m(self.total_distance),
             total_offline: m(self.total_offline),
+            path: self.path.clone(),
+            replaces_measured: self.replaces_measured,
         }
     }
 }
@@ -106,7 +157,12 @@ impl DerivedFlight {
 // Composed shot data
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One shot as stored and served by the web layer (`/api/shots`).
+///
+/// `shot_id`, `club_selected` and `group` are set by the web layer on stored
+/// shots and are omitted on the wire when absent. Build one with
+/// `ShotData::default()` and struct-update syntax.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShotData {
     #[serde(default)]
     pub actor: String,
@@ -120,6 +176,18 @@ pub struct ShotData {
     /// Simulated values for fields the device did not report (beta).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived: Option<DerivedFlight>,
+    /// Shot id from the device actor's `ShotKey`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shot_id: Option<String>,
+    /// Club in play when the shot was triggered: the last `club_info` on the
+    /// bus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub club_selected: Option<Club>,
+    /// Id of the shot group the shot belongs to (see
+    /// [`ShotGroupInfo`](crate::ShotGroupInfo)); absent for shots that were
+    /// not grouped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl ShotData {
@@ -172,6 +240,9 @@ impl ShotData {
             club,
             impact: self.impact.clone(),
             derived: self.derived.as_ref().map(DerivedFlight::to_imperial),
+            shot_id: self.shot_id.clone(),
+            club_selected: self.club_selected,
+            group: self.group.clone(),
         }
     }
 
@@ -212,6 +283,9 @@ impl ShotData {
             club,
             impact: self.impact.clone(),
             derived: self.derived.as_ref().map(DerivedFlight::to_metric),
+            shot_id: self.shot_id.clone(),
+            club_selected: self.club_selected,
+            group: self.group.clone(),
         }
     }
 }
@@ -319,6 +393,7 @@ impl ShotAccumulator {
             club: self.club,
             impact: self.impact,
             derived: self.derived,
+            ..ShotData::default()
         };
         (Some(shot), self.raw)
     }
@@ -470,6 +545,7 @@ mod tests {
                 vertical: Some(Distance::Millimeters(2.5)),
             }),
             derived,
+            ..ShotData::default()
         }
     }
 
@@ -662,6 +738,32 @@ mod tests {
     }
 
     #[test]
+    fn replaces_measured_is_omitted_when_false_and_round_trips_when_true() {
+        let json = serde_json::to_value(shot(Some(derived()))).expect("ser");
+        assert!(json["derived"].get("replaces_measured").is_none(), "{json}");
+
+        let mut d = derived();
+        d.replaces_measured = true;
+        let text = serde_json::to_string(&d).expect("ser");
+        assert!(text.ends_with(r#","replaces_measured":true}"#), "{text}");
+        let back: DerivedFlight = serde_json::from_str(&text).expect("de");
+        assert_eq!(back, d);
+        // Older JSON without the key parses as false.
+        let old: DerivedFlight = serde_json::from_str(r#"{"descent_angle":41.3}"#).expect("de");
+        assert!(!old.replaces_measured);
+        // Unit conversion keeps the flag.
+        assert!(d.to_imperial().replaces_measured);
+        assert!(d.to_metric().replaces_measured);
+
+        let msg = ball_flight_message(Some(d));
+        let json = serde_json::to_value(&msg).expect("ser");
+        assert_eq!(json["event"]["derived"]["replaces_measured"], true);
+        // The measured block is unchanged.
+        let golden: serde_json::Value = serde_json::from_str(GOLDEN_BALL_FLIGHT).expect("golden");
+        assert_eq!(json["event"]["ball"], golden["event"]["ball"]);
+    }
+
+    #[test]
     fn unit_conversion_covers_derived() {
         let s = shot(Some(derived()));
         let imp = s
@@ -725,5 +827,176 @@ mod tests {
         acc.set_ball(ball());
         let shot = acc.finish().expect("finished");
         assert_eq!(shot.derived, None);
+    }
+
+    fn flight_path() -> FlightPath {
+        FlightPath {
+            flight: vec![
+                [0.0, 0.0, 0.0, 0.0],
+                [0.42, 30.1, 15.8, -8.3],
+                [1.9, 155.4, 0.0, -6.5],
+            ],
+            ground: vec![[1.9, 155.4, 0.0, -6.5], [2.6, 164.1, 0.0, -7.3]],
+        }
+    }
+
+    #[test]
+    fn flight_path_round_trips() {
+        let json = serde_json::to_string(&flight_path()).expect("ser");
+        let back: FlightPath = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, flight_path());
+    }
+
+    #[test]
+    fn flight_path_omits_empty_ground() {
+        let p = FlightPath {
+            flight: vec![[0.0, 0.0, 0.0, 0.0]],
+            ground: vec![],
+        };
+        let json = serde_json::to_value(&p).expect("ser");
+        assert!(json.get("ground").is_none());
+        let back: FlightPath = serde_json::from_value(json).expect("de");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn shot_without_path_is_unchanged_on_the_wire() {
+        // A shot whose `derived` has no path omits the key entirely, and a
+        // shot with no `derived` at all still matches the pre-path golden
+        // shape byte-for-byte.
+        let json = serde_json::to_value(shot(Some(derived()))).expect("ser");
+        assert!(json["derived"].get("path").is_none());
+        assert_eq!(
+            serde_json::to_string(&shot(None)).expect("ser"),
+            GOLDEN_SHOT
+        );
+    }
+
+    #[test]
+    fn derived_path_round_trips() {
+        let mut d = derived();
+        d.path = Some(flight_path());
+
+        let json = serde_json::to_value(&d).expect("ser");
+        assert_eq!(
+            json["path"]["flight"][0],
+            serde_json::json!([0.0, 0.0, 0.0, 0.0])
+        );
+        assert_eq!(json["path"]["ground"][1][3], -7.3);
+
+        let back: DerivedFlight = serde_json::from_value(json).expect("de");
+        assert_eq!(back, d);
+
+        // Nested under a ball_flight bus message (the FRP output path):
+        // `path` rides along as a sibling of the other derived fields.
+        let msg = ball_flight_message(Some(d.clone()));
+        let back: FlighthookMessage =
+            serde_json::from_str(&serde_json::to_string(&msg).expect("ser")).expect("de");
+        let FlighthookEvent::BallFlight { derived: got, .. } = back.event else {
+            panic!("not a ball flight");
+        };
+        assert_eq!(got.as_deref(), Some(&d));
+
+        // Nested under a full ShotData (the `/api/shots` shape):
+        let s = shot(Some(d.clone()));
+        let back: ShotData =
+            serde_json::from_str(&serde_json::to_string(&s).expect("ser")).expect("de");
+        assert_eq!(
+            back.derived.as_ref().and_then(|d| d.path.as_ref()),
+            Some(&flight_path())
+        );
+    }
+
+    #[test]
+    fn to_imperial_and_to_metric_leave_path_unchanged() {
+        let mut d = derived();
+        d.path = Some(flight_path());
+
+        let imp = d.to_imperial();
+        assert_eq!(imp.path, Some(flight_path()));
+        let met = d.to_metric();
+        assert_eq!(met.path, Some(flight_path()));
+
+        // The rest of the struct still converts normally.
+        assert!(matches!(imp.carry_offline, Some(Distance::Yards(_))));
+        assert!(matches!(met.total_distance, Some(Distance::Meters(_))));
+    }
+
+    const GROUP_ID: &str = "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7";
+
+    fn stamped() -> ShotData {
+        ShotData {
+            shot_id: Some("abc".into()),
+            club_selected: Some(Club::Iron7),
+            group: Some(GROUP_ID.into()),
+            ..shot(None)
+        }
+    }
+
+    #[test]
+    fn stamped_fields_round_trip() {
+        let json = serde_json::to_string(&stamped()).expect("ser");
+        let want_tail = format!(r#","shot_id":"abc","club_selected":"7I","group":"{GROUP_ID}"}}"#);
+        assert!(json.ends_with(&want_tail), "{json}");
+        // Everything before the new fields is the unstamped wire shape.
+        assert_eq!(
+            &json[..json.len() - want_tail.len()],
+            &GOLDEN_SHOT[..GOLDEN_SHOT.len() - 1]
+        );
+        let back: ShotData = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, stamped());
+
+        let minimal: ShotData = serde_json::from_str(&format!(
+            r#"{{"shot_number":1,"shot_id":"abc","club_selected":"7I","group":"{GROUP_ID}"}}"#
+        ))
+        .expect("de");
+        assert_eq!(minimal.shot_id.as_deref(), Some("abc"));
+        assert_eq!(minimal.club_selected, Some(Club::Iron7));
+        assert_eq!(minimal.group.as_deref(), Some(GROUP_ID));
+    }
+
+    #[test]
+    fn json_without_stamped_fields_parses_as_none() {
+        let s: ShotData = serde_json::from_str(GOLDEN_SHOT).expect("parses");
+        assert_eq!(s.shot_id, None);
+        assert_eq!(s.club_selected, None);
+        assert_eq!(s.group, None);
+        assert_eq!(s, shot(None));
+    }
+
+    #[test]
+    fn unit_conversion_keeps_stamped_fields() {
+        for system in [UnitSystem::Imperial, UnitSystem::Metric] {
+            let c = stamped().to_unit_system(system);
+            assert_eq!(c.shot_id.as_deref(), Some("abc"));
+            assert_eq!(c.club_selected, Some(Club::Iron7));
+            assert_eq!(c.group.as_deref(), Some(GROUP_ID));
+        }
+    }
+
+    #[test]
+    fn default_shot_data_is_empty() {
+        let d = ShotData::default();
+        assert_eq!(d.actor, "");
+        assert_eq!(d.shot_number, 0);
+        assert!(!d.has_data());
+        assert_eq!(d.derived, None);
+        assert_eq!(d.shot_id, None);
+        assert_eq!(d.club_selected, None);
+        assert_eq!(d.group, None);
+        assert_eq!(
+            serde_json::to_string(&d).expect("ser"),
+            r#"{"actor":"","shot_number":0}"#
+        );
+    }
+
+    #[test]
+    fn accumulator_leaves_stamped_fields_unset() {
+        let mut acc = ShotAccumulator::new("mevo.0".into(), key());
+        acc.set_ball(ball());
+        let shot = acc.finish().expect("finished");
+        assert_eq!(shot.shot_id, None);
+        assert_eq!(shot.club_selected, None);
+        assert_eq!(shot.group, None);
     }
 }

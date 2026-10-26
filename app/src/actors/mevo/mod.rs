@@ -34,7 +34,7 @@ use settings::{cam_config, fusion_cam_config};
 
 use flighthook::{
     ActorStatus, BallFlight, CameraMode, ClubData, Distance, FlighthookEvent, FlighthookMessage,
-    RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, Velocity, hex_lower,
+    RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, SpinSource, Velocity, hex_lower,
 };
 
 /// No events for this long → treat as disconnected.
@@ -93,12 +93,17 @@ const EXPORT_BULK: [u8; 3] = [TYPE_PRC_DATA, TYPE_CLUB_PRC, TYPE_SPEED_PROFILE];
 /// camera, so camera modes do not apply to it, and it runs with fixed
 /// settings: the environment's detection mode and the radar parameters
 /// stored on the device.
+///
+/// `spin_source` picks the Xi's spin. The run loop reads it from the live
+/// config on every shot; the field is the value at start, used if the
+/// section cannot be read.
 pub struct MevoActor {
     pub addr: SocketAddr,
     pub initial_mode: ShotDetectionMode,
     pub session_config: SessionConfig,
     pub use_estimated: bool,
     pub camera_mode: CameraMode,
+    pub spin_source: SpinSource,
 }
 
 impl Actor for MevoActor {
@@ -108,6 +113,7 @@ impl Actor for MevoActor {
         let session_config = self.session_config.clone();
         let use_estimated = self.use_estimated;
         let camera_mode = self.camera_mode;
+        let spin_source = self.spin_source;
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
@@ -120,6 +126,7 @@ impl Actor for MevoActor {
                     session_config,
                     use_estimated,
                     camera_mode,
+                    spin_source,
                     sender,
                     receiver,
                 );
@@ -168,6 +175,8 @@ impl Actor for MevoActor {
             return ReconfigureOutcome::RestartRequired;
         }
 
+        // Spin source is read from the live config on every shot, so a
+        // change applies on the next shot without a restart.
         ReconfigureOutcome::Applied
     }
 }
@@ -403,6 +412,7 @@ fn run(
     initial_session_config: SessionConfig,
     use_estimated: bool,
     camera_mode: CameraMode,
+    spin_source: SpinSource,
     sender: BusSender,
     mut receiver: BusReceiver,
 ) {
@@ -427,6 +437,7 @@ fn run(
             initial_mode,
             use_estimated,
             camera_mode,
+            spin_source,
             &sender,
             &mut receiver,
             &mut session_config,
@@ -489,6 +500,7 @@ fn connect_and_run(
     initial_mode: ShotDetectionMode,
     use_estimated: bool,
     camera_mode: CameraMode,
+    initial_spin_source: SpinSource,
     sender: &BusSender,
     receiver: &mut BusReceiver,
     session_config: &mut SessionConfig,
@@ -522,6 +534,10 @@ fn connect_and_run(
     let mut current_shot_key: Option<ShotKey> = None;
     let mut shot_had_d4 = false;
     let mut stashed_e8: Option<FlightResultV1> = None;
+    // Detection mode in effect when the current shot's trigger fired, for
+    // the `Auto` spin source and the ground-ball surface. `current_mode` can
+    // change mid-shot; this doesn't.
+    let mut shot_detection_mode: Option<ShotDetectionMode> = None;
 
     // Fusion camera config, applied once warmup has elapsed. None for
     // Standard, which keeps the warmup config for the whole session.
@@ -773,6 +789,7 @@ fn connect_and_run(
                         current_shot_key = Some(key);
                         shot_had_d4 = false;
                         stashed_e8 = None;
+                        shot_detection_mode = Some(current_mode);
                         emit_device_status(sender, ActorStatus::Connected, HashMap::new());
                         device_telemetry.insert("ready".into(), "false".into());
                         try_emit_device_telemetry(sender, device_id, &device_telemetry);
@@ -798,17 +815,17 @@ fn connect_and_run(
                                     shot_had_d4 = true;
                                     let mut ball = ball_from_d4(&d4);
                                     let mut spin_source = "D4";
-                                    if model == DeviceModel::Xi
-                                        && let Some(ref e8) = stashed_e8
-                                        && let Some((back, side)) = xi_spin(&d4, e8)
-                                    {
-                                        ball.backspin_rpm = Some(back);
-                                        ball.sidespin_rpm = Some(side);
-                                        spin_source = if side == 0 {
-                                            "E8 total, axis 0"
-                                        } else {
-                                            "E8 total, D4 axis"
-                                        };
+                                    let mode = shot_mode(shot_detection_mode, current_mode);
+                                    if model == DeviceModel::Xi {
+                                        let source = live_spin_source(state, sender.actor_id())
+                                            .unwrap_or(initial_spin_source);
+                                        let (spin, label) =
+                                            xi_spin(source, mode, &d4, stashed_e8.as_ref());
+                                        if let Some((back, side)) = spin {
+                                            ball.backspin_rpm = Some(back);
+                                            ball.sidespin_rpm = Some(side);
+                                        }
+                                        spin_source = label;
                                     }
                                     info!(
                                         "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm spin={spin_source}",
@@ -820,11 +837,13 @@ fn connect_and_run(
                                         ball.backspin_rpm.unwrap_or(0),
                                         ball.sidespin_rpm.unwrap_or(0),
                                     );
-                                    let msg = FlighthookMessage::new(sim::ball_flight_event(
-                                        state,
-                                        key.clone(),
-                                        ball,
-                                    ));
+                                    let msg =
+                                        FlighthookMessage::new(sim::ball_flight_event_in_mode(
+                                            state,
+                                            key.clone(),
+                                            ball,
+                                            Some(mode),
+                                        ));
                                     sender.send(stamp_device(msg, device_id));
                                 }
                                 ShotDatum::FlightV1(e8) => {
@@ -865,11 +884,14 @@ fn connect_and_run(
                                                 .map(|d| d.as_yards())
                                                 .unwrap_or(0.0),
                                         );
-                                        let msg = FlighthookMessage::new(sim::ball_flight_event(
-                                            state,
-                                            key.clone(),
-                                            ball,
-                                        ));
+                                        let mode = shot_mode(shot_detection_mode, current_mode);
+                                        let msg =
+                                            FlighthookMessage::new(sim::ball_flight_event_in_mode(
+                                                state,
+                                                key.clone(),
+                                                ball,
+                                                Some(mode),
+                                            ));
                                         sender.send(stamp_device(msg, device_id));
                                     } else {
                                         warn!(
@@ -1050,17 +1072,66 @@ fn ball_from_d4(d4: &FlightResult) -> BallFlight {
     }
 }
 
-/// Xi spin as wire-signed (backspin, FRP sidespin), or `None` to keep D4's.
+/// The `[mevo.N]` spin source for the actor `actor_id` (`"mevo.N"`), from
+/// the live config.
+fn live_spin_source(state: &SystemState, actor_id: &str) -> Option<SpinSource> {
+    let (_, index) = actor_id.split_once('.')?;
+    state.system.mevo_spin_source(index)
+}
+
+/// Xi spin for `source`: the wire-signed (backspin, FRP sidespin) to use
+/// instead of D4's, or `None` to keep D4's, plus a label naming the source
+/// for the shot log.
 ///
-/// Total spin is the E8 backspin. The spin axis comes from D4 only when the
-/// shot carries club data (club speed plus attack angle or path) and D4's
-/// backspin is positive; D4's axis then follows face-to-path. Otherwise the
-/// axis is 0. The axis is clamped to ±90° so backspin never turns negative.
-/// Sidespin keeps the DSP→PC negation of [`ball_from_d4`].
-fn xi_spin(d4: &FlightResult, e8: &FlightResultV1) -> Option<(i32, i32)> {
-    if e8.backspin_rpm <= 0 {
-        return None;
+/// `D4` keeps D4. `E8` takes the total spin from the E8 backspin. The spin
+/// axis comes from D4 only when the shot carries club data (club speed plus
+/// attack angle or path) and D4's backspin is positive; D4's axis then
+/// follows face-to-path. Otherwise the axis is 0. The axis is clamped to ±90°
+/// so backspin never turns negative. `E8` keeps D4 when there is no E8
+/// backspin, since that is a missing value, not a measurement. Sidespin keeps
+/// the DSP→PC negation of [`ball_from_d4`].
+///
+/// `Auto` applies the `E8` rule when `mode` (flighthook's detection mode at
+/// shot time) is `Full`, and otherwise keeps D4 exactly like `D4`. Either
+/// way, the label is the one the underlying rule would have used, with
+/// " (auto)" appended.
+fn xi_spin(
+    source: SpinSource,
+    mode: ShotDetectionMode,
+    d4: &FlightResult,
+    e8: Option<&FlightResultV1>,
+) -> (Option<(i32, i32)>, &'static str) {
+    match source {
+        SpinSource::D4 => (None, "D4"),
+        SpinSource::E8 => xi_spin_e8(d4, e8),
+        SpinSource::Auto if mode == ShotDetectionMode::Full => {
+            let (spin, label) = xi_spin_e8(d4, e8);
+            (spin, auto_label(label))
+        }
+        SpinSource::Auto => (None, "D4 (auto)"),
     }
+}
+
+/// Detection mode in effect for a shot: the mode captured at its trigger,
+/// else the current one. It picks the Xi `Auto` spin source and the
+/// surface a ground ball rolls on.
+fn shot_mode(
+    at_trigger: Option<ShotDetectionMode>,
+    current: ShotDetectionMode,
+) -> ShotDetectionMode {
+    at_trigger.unwrap_or(current)
+}
+
+/// The `E8` rule: total spin from the E8 backspin, with the spin axis from
+/// D4 when the shot has club data, falling back to D4 when there is no E8
+/// backspin.
+fn xi_spin_e8(
+    d4: &FlightResult,
+    e8: Option<&FlightResultV1>,
+) -> (Option<(i32, i32)>, &'static str) {
+    let Some(e8) = e8.filter(|e8| e8.backspin_rpm > 0) else {
+        return (None, "D4 (no E8 spin)");
+    };
     let total = f64::from(e8.backspin_rpm);
     let has_club_data =
         d4.clubhead_speed > 0.0 && (d4.club_attack_angle != 0.0 || d4.club_strike_direction != 0.0);
@@ -1073,7 +1144,23 @@ fn xi_spin(d4: &FlightResult, e8: &FlightResultV1) -> Option<(i32, i32)> {
     };
     let back = (total * axis.cos()).round() as i32;
     let side = -(total * axis.sin()).round() as i32;
-    Some((back, side))
+    let label = if side == 0 {
+        "E8 total, axis 0"
+    } else {
+        "E8 total, D4 axis"
+    };
+    (Some((back, side)), label)
+}
+
+/// Appends " (auto)" to one of [`xi_spin_e8`]'s labels, for the `Auto` source
+/// in `Full` mode.
+fn auto_label(label: &'static str) -> &'static str {
+    match label {
+        "D4 (no E8 spin)" => "D4 (no E8 spin) (auto)",
+        "E8 total, axis 0" => "E8 total, axis 0 (auto)",
+        "E8 total, D4 axis" => "E8 total, D4 axis (auto)",
+        _ => "D4 (auto)",
+    }
 }
 
 fn ball_from_e8(e8: &FlightResultV1) -> BallFlight {
@@ -1163,7 +1250,9 @@ mod tests {
         let (d4, e8) = shot_with_club_data();
         assert_eq!((d4.backspin_rpm, d4.sidespin_rpm), (7127, -652));
         assert_eq!(e8.backspin_rpm, 7157);
-        let (back, side) = xi_spin(&d4, &e8).unwrap();
+        let (spin, label) = xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8));
+        let (back, side) = spin.unwrap();
+        assert_eq!(label, "E8 total, D4 axis");
         // Same axis as D4 (sidespin negated for FRP), total from E8.
         assert_eq!((back, side), (7127, 652));
         let total = f64::from(back).hypot(f64::from(side));
@@ -1176,7 +1265,92 @@ mod tests {
     fn xi_spin_axis_zero_without_club_data() {
         let (d4, e8) = shot_without_club_data();
         assert_eq!((d4.backspin_rpm, d4.sidespin_rpm), (2756, 1464));
-        assert_eq!(xi_spin(&d4, &e8), Some((6897, 0)));
+        assert_eq!(
+            xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)),
+            (Some((6897, 0)), "E8 total, axis 0")
+        );
+    }
+
+    #[test]
+    fn xi_spin_d4_keeps_d4() {
+        for (d4, e8) in [shot_with_club_data(), shot_without_club_data()] {
+            assert_eq!(
+                xi_spin(SpinSource::D4, ShotDetectionMode::Full, &d4, Some(&e8)),
+                (None, "D4")
+            );
+            assert_eq!(
+                xi_spin(SpinSource::D4, ShotDetectionMode::Full, &d4, None),
+                (None, "D4")
+            );
+            // The shot then carries D4's spin exactly (sidespin negated for FRP).
+            let ball = ball_from_d4(&d4);
+            assert_eq!(ball.backspin_rpm, Some(d4.backspin_rpm));
+            assert_eq!(ball.sidespin_rpm, Some(-d4.sidespin_rpm));
+        }
+    }
+
+    #[test]
+    fn xi_spin_e8_has_no_placeholder_guard() {
+        // A short pitch: the E8 value is used as reported, even below D4's;
+        // `e8` has no placeholder guard.
+        let (mut d4, mut e8) = shot_without_club_data();
+        d4.backspin_rpm = 4000;
+        e8.backspin_rpm = 2500;
+        assert_eq!(
+            xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)).0,
+            Some((2500, 0))
+        );
+    }
+
+    #[test]
+    fn xi_spin_auto_uses_the_mode_at_trigger() {
+        let (d4, e8) = shot_with_club_data();
+        // Triggered in Full, switched to Chipping before the D4 arrived.
+        let mode = shot_mode(Some(ShotDetectionMode::Full), ShotDetectionMode::Chipping);
+        assert_eq!(mode, ShotDetectionMode::Full);
+        assert_eq!(
+            xi_spin(SpinSource::Auto, mode, &d4, Some(&e8)),
+            (Some((7127, 652)), "E8 total, D4 axis (auto)")
+        );
+        // Triggered in Chipping, switched to Full mid-shot: D4 stays.
+        let mode = shot_mode(Some(ShotDetectionMode::Chipping), ShotDetectionMode::Full);
+        assert_eq!(
+            xi_spin(SpinSource::Auto, mode, &d4, Some(&e8)),
+            (None, "D4 (auto)")
+        );
+        // No trigger seen: the current mode applies.
+        assert_eq!(
+            shot_mode(None, ShotDetectionMode::Putting),
+            ShotDetectionMode::Putting
+        );
+    }
+
+    #[test]
+    fn xi_spin_auto_full_applies_e8_rule() {
+        let (d4, e8) = shot_with_club_data();
+        assert_eq!(
+            xi_spin(SpinSource::Auto, ShotDetectionMode::Full, &d4, Some(&e8)),
+            (Some((7127, 652)), "E8 total, D4 axis (auto)")
+        );
+    }
+
+    #[test]
+    fn xi_spin_auto_chipping_keeps_d4() {
+        let (d4, e8) = shot_with_club_data();
+        assert_eq!(
+            xi_spin(
+                SpinSource::Auto,
+                ShotDetectionMode::Chipping,
+                &d4,
+                Some(&e8)
+            ),
+            (None, "D4 (auto)")
+        );
+        // Also with no E8 at all -- still a plain D4 passthrough.
+        assert_eq!(
+            xi_spin(SpinSource::Auto, ShotDetectionMode::Chipping, &d4, None),
+            (None, "D4 (auto)")
+        );
     }
 
     #[test]
@@ -1515,14 +1689,25 @@ mod tests {
         assert!(d4.clubhead_speed > 0.0);
         for back in [0, -1200] {
             d4.backspin_rpm = back;
-            assert_eq!(xi_spin(&d4, &e8), Some((7157, 0)), "D4 backspin {back}");
+            assert_eq!(
+                xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)),
+                (Some((7157, 0)), "E8 total, axis 0"),
+                "D4 backspin {back}"
+            );
         }
     }
 
     #[test]
     fn xi_spin_keeps_d4_without_e8_spin() {
         let (d4, mut e8) = shot_with_club_data();
+        assert_eq!(
+            xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, None),
+            (None, "D4 (no E8 spin)")
+        );
         e8.backspin_rpm = 0;
-        assert_eq!(xi_spin(&d4, &e8), None);
+        assert_eq!(
+            xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)),
+            (None, "D4 (no E8 spin)")
+        );
     }
 }

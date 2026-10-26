@@ -295,6 +295,16 @@ fn handle_config_command(
             state.system.replace((**config).clone());
             scope = None;
         }
+        ConfigAction::ReplaceGlobal { config } => {
+            state.system.update(|p| {
+                p.default_units = config.default_units;
+                p.chipping_clubs.clone_from(&config.chipping_clubs);
+                p.putting_clubs.clone_from(&config.putting_clubs);
+                p.shot_grouping = config.shot_grouping;
+                p.simulation = config.simulation.clone();
+            });
+            scope = None;
+        }
         ConfigAction::UpsertWebserver { index, section } => {
             let idx = index.clone();
             state.system.update(|p| {
@@ -387,6 +397,19 @@ fn handle_config_command(
                 return;
             }
         }
+        ConfigAction::SetShotGrouping { mode } => {
+            // No actor reads the default view: persist it and reconcile
+            // nothing.
+            let mode = *mode;
+            state.system.update(|p| p.shot_grouping = mode);
+            sender.send(FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
+                request_id: request_id.clone(),
+                restarted: Vec::new(),
+                stopped: Vec::new(),
+                started: Vec::new(),
+            }));
+            return;
+        }
     }
 
     // Reconcile actors (webserver included — its reconfigure() handles bind changes)
@@ -398,4 +421,118 @@ fn handle_config_command(
         stopped: result.stopped,
         started: result.started,
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actors::web::tests::TempDir;
+    use flighthook::{ConfigAction, ShotGrouping};
+
+    #[test]
+    fn set_shot_grouping_persists_and_emits_the_outcome() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-system-test-{}",
+            crate::state::config::generate_id()
+        )));
+        let path = dir.0.join("config.toml");
+        let (state, _writer) = SystemState::new(path.clone());
+        let state = Arc::new(state);
+        // Configured but not running: a reconcile would start it.
+        state.system.update(|c| {
+            c.webserver.clear();
+            c.mock_monitor.insert(
+                "0".into(),
+                flighthook::MockMonitorSection {
+                    name: "Mock".into(),
+                },
+            );
+        });
+        let running = state.actor_ids();
+        let (bus_tx, mut rx) = broadcast::channel(16);
+        let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
+
+        handle_config_command(
+            &FlighthookEvent::ConfigCommand {
+                request_id: Some("req-1".into()),
+                action: Box::new(ConfigAction::SetShotGrouping {
+                    mode: ShotGrouping::ByClub,
+                }),
+            },
+            &state,
+            &bus_tx,
+            &sender,
+        );
+
+        assert_eq!(state.system.snapshot().shot_grouping, ShotGrouping::ByClub);
+        let toml = std::fs::read_to_string(&path).expect("written");
+        assert!(toml.contains(r#"shot_grouping = "by_club""#), "{toml}");
+        let msg = rx.try_recv().expect("outcome");
+        assert_eq!(msg.actor, "system");
+        let FlighthookEvent::ConfigOutcome {
+            request_id,
+            restarted,
+            stopped,
+            started,
+        } = msg.event
+        else {
+            panic!("not an outcome: {:?}", msg.event);
+        };
+        assert_eq!(request_id.as_deref(), Some("req-1"));
+        assert!(restarted.is_empty() && stopped.is_empty() && started.is_empty());
+        // A view change reconciles no actor.
+        assert_eq!(state.actor_ids(), running);
+        assert!(!state.actor_ids().contains(&"mock_monitor.0".to_owned()));
+    }
+
+    #[test]
+    fn replace_global_keeps_every_actor_section() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-system-test-{}",
+            crate::state::config::generate_id()
+        )));
+        let (state, _writer) = SystemState::new(dir.0.join("config.toml"));
+        let state = Arc::new(state);
+        // An address no actor can start on, so the reconcile starts nothing.
+        let live_gspro = flighthook::GsProSection {
+            name: "Saved elsewhere".into(),
+            address: Some("not an address".into()),
+            full_monitor: None,
+            chipping_monitor: None,
+            putting_monitor: None,
+        };
+        state.system.update(|c| {
+            c.webserver.clear();
+            c.gspro.insert("0".into(), live_gspro.clone());
+        });
+        // A body from a stale snapshot: other units, no gspro.0, a gspro.1.
+        let mut body = state.system.snapshot();
+        body.default_units = flighthook::UnitSystem::Metric;
+        body.chipping_clubs = vec![flighthook::Club::SandWedge];
+        body.gspro.clear();
+        body.gspro.insert("1".into(), live_gspro.clone());
+        let (bus_tx, mut rx) = broadcast::channel(16);
+        let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
+
+        handle_config_command(
+            &FlighthookEvent::ConfigCommand {
+                request_id: Some("req-2".into()),
+                action: Box::new(ConfigAction::ReplaceGlobal {
+                    config: Box::new(body),
+                }),
+            },
+            &state,
+            &bus_tx,
+            &sender,
+        );
+
+        let saved = state.system.snapshot();
+        assert_eq!(saved.default_units, flighthook::UnitSystem::Metric);
+        assert_eq!(saved.chipping_clubs, vec![flighthook::Club::SandWedge]);
+        assert_eq!(saved.gspro.len(), 1);
+        assert_eq!(saved.gspro.get("0"), Some(&live_gspro));
+        let outcome = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|m| matches!(m.event, FlighthookEvent::ConfigOutcome { .. }));
+        assert!(outcome.is_some(), "the outcome is emitted");
+    }
 }

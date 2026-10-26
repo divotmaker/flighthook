@@ -1,6 +1,9 @@
 pub mod app;
+pub(crate) mod chart;
+pub(crate) mod groups;
 pub mod net;
 pub(crate) mod panels;
+pub(crate) mod theme;
 pub mod types;
 
 #[cfg(target_arch = "wasm32")]

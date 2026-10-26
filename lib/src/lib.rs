@@ -5,7 +5,9 @@ mod config;
 mod event;
 mod export;
 mod game_state;
+mod group;
 mod message;
+mod stats;
 
 pub use api::*;
 #[cfg(feature = "client")]
@@ -14,7 +16,9 @@ pub use config::*;
 pub use event::*;
 pub use export::*;
 pub use game_state::*;
+pub use group::*;
 pub use message::*;
+pub use stats::*;
 
 // Re-export flightrelay types used throughout flighthook.
 pub use flightrelay::types::{BallFlight, ClubData, FaceImpact};

@@ -168,13 +168,18 @@ pub struct ShotExport {
     pub shot_id: String,
     pub shot_number: u32,
     pub device: ExportDevice,
-    /// Club in play from game state (the simulator's selection), if known.
+    /// Club in play when the shot was triggered (the last `club_info` on the
+    /// bus, e.g. the simulator's selection), if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club_selected: Option<Club>,
+    /// Shot group id (UUID v4), when the shot was grouped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub settings: ExportSettings,
-    /// Exactly the `/api/shots` element for this shot (same serde shape).
-    /// Shots the device produced no data for have only `actor` and
-    /// `shot_number`.
+    /// Exactly the `/api/shots` element for this shot (same serde shape), so
+    /// `data.shot_id`, `data.club_selected` and `data.group`, when set, equal
+    /// the top-level fields. Shots the device produced no data for carry no
+    /// ball, club, impact or derived block.
     pub data: ShotData,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<ShotRaw>,
@@ -214,6 +219,7 @@ mod tests {
                 firmware: None,
             },
             club_selected: Some(Club::Iron7),
+            group: None,
             settings: ExportSettings {
                 device: serde_json::json!({"ball_type": 1}),
                 simulation: SimulationSection::default(),
@@ -227,9 +233,7 @@ mod tests {
                     launch_speed: Some(Velocity::MetersPerSecond(40.0)),
                     ..BallFlight::default()
                 }),
-                club: None,
-                impact: None,
-                derived: None,
+                ..ShotData::default()
             },
             raw,
         }
@@ -308,6 +312,35 @@ mod tests {
             assert_eq!(v["club_selected"], "7I");
             assert!(v["device"].get("model").is_none());
             assert!(v["settings"].get("handed").is_none());
+            assert!(v.get("group").is_none());
         }
+    }
+
+    #[test]
+    fn shot_export_group_round_trips() {
+        let id = "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7";
+        let mut line = export(None);
+        line.group = Some(id.into());
+        line.data.shot_id = Some(line.shot_id.clone());
+        line.data.club_selected = line.club_selected;
+        line.data.group = line.group.clone();
+        let json = serde_json::to_string(&line).expect("ser");
+        // `group` sits right after `club_selected`.
+        assert!(
+            json.contains(&format!(
+                r#""club_selected":"7I","group":"{id}","settings""#
+            )),
+            "{json}"
+        );
+        let back: ShotExport = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, line);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("value");
+        assert_eq!(v["group"], id);
+        assert_eq!(v["data"]["group"], id);
+        assert_eq!(v["data"]["shot_id"], v["shot_id"]);
+        assert_eq!(v["data"]["club_selected"], v["club_selected"]);
+        assert!(v.get("number").is_none());
+        assert!(v.get("mode").is_none());
+        assert!(v.get("session").is_none());
     }
 }

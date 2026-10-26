@@ -60,7 +60,7 @@ protocol. A second monitor should be a second actor on its own port.
 
 ## Shot export
 
-`GET /api/shots/export` (the **JSONL (with raw)** link on the Shots tab) saves
+`GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
 each shot with the Open Connect JSON behind it: the message the monitor sent
 and flighthook's reply, verbatim apart from the peer and listen addresses,
 which are replaced with `<redacted>`. The monitor's `DeviceID` is a product
