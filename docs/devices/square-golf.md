@@ -59,6 +59,14 @@ collapsible "Face impact calibration (beta)" section with one field per club. Le
 blank to use the default for that club; a value overrides it. Changing a
 calibration restarts the device actor.
 
+## Spin
+
+The Omni reports total spin and spin axis alongside backspin and sidespin.
+flighthook sends all four, as FRP `backspin_rpm`, `sidespin_rpm`,
+`total_spin_rpm` and `spin_axis`. The device's sidespin and axis are
+positive for a ball curving left; both are negated, so in FRP a positive
+sidespin and axis curve the ball right. A total of 0 has no axis.
+
 ## Carry and total (beta, simulated)
 
 The Omni measures launch only: ball speed, launch angle, launch direction,
@@ -70,7 +78,7 @@ are logged under the ball line:
 
 ```
   ball: 119.9mph VLA=17.0 HLA=-1.2 back=6500rpm side=-300rpm
-  sim (estimated, beta): carry=170.0yd offline=-7.1yd apex=96.1ft time=5.9s descent=50.1deg roll=+9.5yd roll_offline=-0.9yd total=179.5yd total_offline=-8.0yd
+  sim (estimated, beta): carry=170.0yd offline=-7.1yd apex=96.1ft time=5.9s descent=50.1deg roll=+5.4yd roll_offline=-0.5yd total=175.4yd total_offline=-7.7yd
 ```
 
 GSPro still receives the launch data only and simulates the flight itself.

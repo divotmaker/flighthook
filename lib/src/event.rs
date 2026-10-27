@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use flightrelay::types::{BallFlight, ClubData, FaceImpact};
 use flightrelay::units::{Distance, Velocity};
 
-use crate::{Club, ShotKey, ShotRaw, UnitSystem};
+use crate::{Club, ShotKey, ShotMetrics, ShotRaw, UnitSystem};
 
 // ---------------------------------------------------------------------------
 // Derived (simulated) flight values
@@ -176,6 +176,11 @@ pub struct ShotData {
     /// Simulated values for fields the device did not report (beta).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived: Option<DerivedFlight>,
+    /// Values computed from the measured `ball` and `club` (spin total and
+    /// axis, face to path, spin loft, curve). Set when the shot is
+    /// assembled ([`ShotAccumulator`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<ShotMetrics>,
     /// Shot id from the device actor's `ShotKey`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shot_id: Option<String>,
@@ -211,12 +216,17 @@ impl ShotData {
             launch_elevation: b.launch_elevation,
             launch_azimuth: b.launch_azimuth,
             carry_distance: b.carry_distance.map(|d| Distance::Yards(d.as_yards())),
+            carry_offline: b.carry_offline.map(|d| Distance::Yards(d.as_yards())),
             total_distance: b.total_distance.map(|d| Distance::Yards(d.as_yards())),
+            total_offline: b.total_offline.map(|d| Distance::Yards(d.as_yards())),
             max_height: b.max_height.map(|d| Distance::Feet(d.as_feet())),
             flight_time: b.flight_time,
+            descent_angle: b.descent_angle,
             roll_distance: b.roll_distance.map(|d| Distance::Yards(d.as_yards())),
             backspin_rpm: b.backspin_rpm,
             sidespin_rpm: b.sidespin_rpm,
+            total_spin_rpm: b.total_spin_rpm,
+            spin_axis: b.spin_axis,
         });
         let club = self.club.as_ref().map(|c| ClubData {
             club_speed: c.club_speed.map(|v| Velocity::MilesPerHour(v.as_mph())),
@@ -232,6 +242,10 @@ impl ShotData {
             swing_plane_vertical: c.swing_plane_vertical,
             club_offset: c.club_offset.map(|d| Distance::Inches(d.as_inches())),
             club_height: c.club_height.map(|d| Distance::Inches(d.as_inches())),
+            spin_loft: c.spin_loft,
+            low_point_distance: c
+                .low_point_distance
+                .map(|d| Distance::Inches(d.as_inches())),
         });
         ShotData {
             actor: self.actor.clone(),
@@ -240,6 +254,7 @@ impl ShotData {
             club,
             impact: self.impact.clone(),
             derived: self.derived.as_ref().map(DerivedFlight::to_imperial),
+            metrics: self.metrics.as_ref().map(ShotMetrics::to_imperial),
             shot_id: self.shot_id.clone(),
             club_selected: self.club_selected,
             group: self.group.clone(),
@@ -254,12 +269,17 @@ impl ShotData {
             launch_elevation: b.launch_elevation,
             launch_azimuth: b.launch_azimuth,
             carry_distance: b.carry_distance.map(|d| Distance::Meters(d.as_meters())),
+            carry_offline: b.carry_offline.map(|d| Distance::Meters(d.as_meters())),
             total_distance: b.total_distance.map(|d| Distance::Meters(d.as_meters())),
+            total_offline: b.total_offline.map(|d| Distance::Meters(d.as_meters())),
             max_height: b.max_height.map(|d| Distance::Meters(d.as_meters())),
             flight_time: b.flight_time,
+            descent_angle: b.descent_angle,
             roll_distance: b.roll_distance.map(|d| Distance::Meters(d.as_meters())),
             backspin_rpm: b.backspin_rpm,
             sidespin_rpm: b.sidespin_rpm,
+            total_spin_rpm: b.total_spin_rpm,
+            spin_axis: b.spin_axis,
         });
         let club = self.club.as_ref().map(|c| ClubData {
             club_speed: c.club_speed.map(|v| Velocity::MetersPerSecond(v.as_mps())),
@@ -275,6 +295,10 @@ impl ShotData {
             swing_plane_vertical: c.swing_plane_vertical,
             club_offset: c.club_offset.map(|d| Distance::Meters(d.as_meters())),
             club_height: c.club_height.map(|d| Distance::Meters(d.as_meters())),
+            spin_loft: c.spin_loft,
+            low_point_distance: c
+                .low_point_distance
+                .map(|d| Distance::Meters(d.as_meters())),
         });
         ShotData {
             actor: self.actor.clone(),
@@ -283,6 +307,7 @@ impl ShotData {
             club,
             impact: self.impact.clone(),
             derived: self.derived.as_ref().map(DerivedFlight::to_metric),
+            metrics: self.metrics.as_ref().map(ShotMetrics::to_metric),
             shot_id: self.shot_id.clone(),
             club_selected: self.club_selected,
             group: self.group.clone(),
@@ -381,11 +406,14 @@ impl ShotAccumulator {
     }
 
     /// Finalize into the decoded shot and its raw frames. The shot is `None`
-    /// if no data arrived at all; the raw frames are kept either way.
+    /// if no data arrived at all; the raw frames are kept either way. The
+    /// shot's [`metrics`](ShotData::metrics) are computed from its ball and
+    /// club data.
     pub fn into_parts(self) -> (Option<ShotData>, Option<ShotRaw>) {
         if self.ball.is_none() && self.club.is_none() && self.impact.is_none() {
             return (None, self.raw);
         }
+        let metrics = ShotMetrics::compute(self.ball.as_ref(), self.club.as_ref());
         let shot = ShotData {
             actor: self.actor,
             shot_number: self.key.shot_number,
@@ -393,6 +421,7 @@ impl ShotAccumulator {
             club: self.club,
             impact: self.impact,
             derived: self.derived,
+            metrics,
             ..ShotData::default()
         };
         (Some(shot), self.raw)
@@ -494,6 +523,7 @@ mod tests {
             flight_time: None,
             backspin_rpm: Some(6500),
             sidespin_rpm: Some(-300),
+            ..BallFlight::default()
         }
     }
 
@@ -539,6 +569,7 @@ mod tests {
                 swing_plane_vertical: None,
                 club_offset: None,
                 club_height: None,
+                ..ClubData::default()
             }),
             impact: Some(FaceImpact {
                 lateral: Some(Distance::Millimeters(-4.0)),
@@ -660,6 +691,80 @@ mod tests {
             .expect("finished");
         assert_eq!(shot.ball, Some(ball()));
         assert_eq!(agg.pending_count(), 0);
+    }
+
+    #[test]
+    fn finished_shot_carries_its_metrics() {
+        let mut acc = ShotAccumulator::new("mevo.0".into(), key());
+        acc.set_ball(ball());
+        acc.set_club(ClubData {
+            face_angle: Some(0.5),
+            path: Some(1.5),
+            ..ClubData::default()
+        });
+        let shot = acc.finish().expect("data");
+        let m = shot.metrics.expect("metrics");
+        // √(6500² + 300²); sidespin -300 tilts the axis left.
+        assert_eq!(m.total_spin_rpm, Some(6507));
+        assert!(m.spin_axis.expect("axis") < 0.0);
+        assert_eq!(m.face_to_path, Some(-1.0));
+        assert_eq!(m.curve, None);
+
+        // Only impact data: nothing to compute from.
+        let mut acc = ShotAccumulator::new("mevo.0".into(), key());
+        acc.set_impact(FaceImpact {
+            lateral: Some(Distance::Millimeters(1.0)),
+            vertical: None,
+        });
+        assert_eq!(acc.finish().expect("data").metrics, None);
+    }
+
+    #[test]
+    fn unit_conversion_covers_the_new_shot_fields() {
+        let mut s = shot(None);
+        s.ball = Some(BallFlight {
+            carry_offline: Some(Distance::Meters(-9.144)),
+            total_offline: Some(Distance::Meters(9.144)),
+            descent_angle: Some(44.0),
+            total_spin_rpm: Some(6507),
+            spin_axis: Some(-2.6),
+            ..ball()
+        });
+        s.club = Some(ClubData {
+            spin_loft: Some(20.0),
+            low_point_distance: Some(Distance::Meters(0.0254)),
+            ..ClubData::default()
+        });
+        s.metrics = Some(ShotMetrics {
+            curve: Some(Distance::Meters(9.144)),
+            ..ShotMetrics::default()
+        });
+        let close = |d: Option<Distance>, v: f64| (d.expect("present").value() - v).abs() < 1e-9;
+
+        let imp = s.to_unit_system(UnitSystem::Imperial);
+        let b = imp.ball.as_ref().expect("ball");
+        assert!(matches!(b.carry_offline, Some(Distance::Yards(_))));
+        assert!(close(b.carry_offline, -10.0) && close(b.total_offline, 10.0));
+        assert_eq!(
+            (b.descent_angle, b.total_spin_rpm, b.spin_axis),
+            (Some(44.0), Some(6507), Some(-2.6))
+        );
+        let c = imp.club.as_ref().expect("club");
+        assert!(matches!(c.low_point_distance, Some(Distance::Inches(_))));
+        assert!(close(c.low_point_distance, 1.0));
+        assert_eq!(c.spin_loft, Some(20.0));
+        let curve = imp.metrics.as_ref().and_then(|m| m.curve);
+        assert!(matches!(curve, Some(Distance::Yards(_))) && close(curve, 10.0));
+
+        let met = imp.to_unit_system(UnitSystem::Metric);
+        let b = met.ball.as_ref().expect("ball");
+        assert!(matches!(b.total_offline, Some(Distance::Meters(_))));
+        assert!(close(b.carry_offline, -9.144));
+        assert!(close(
+            met.club.as_ref().expect("club").low_point_distance,
+            0.0254
+        ));
+        assert!(close(met.metrics.as_ref().and_then(|m| m.curve), 9.144));
     }
 
     #[test]

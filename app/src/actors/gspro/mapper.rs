@@ -124,6 +124,7 @@ mod tests {
                 flight_time: None,
                 backspin_rpm: Some(621),
                 sidespin_rpm: Some(-87),
+                ..BallFlight::default()
             }),
             club: Some(FhClubData {
                 club_speed: Some(Velocity::MetersPerSecond(3.26)),
@@ -137,6 +138,7 @@ mod tests {
                 swing_plane_vertical: None,
                 club_offset: None,
                 club_height: None,
+                ..FhClubData::default()
             }),
             impact: Some(FaceImpact {
                 lateral: Some(Distance::Millimeters(lateral_mm)),
@@ -165,6 +167,7 @@ mod tests {
                 flight_time: None,
                 backspin_rpm: Some(6500),
                 sidespin_rpm: Some(-300),
+                ..BallFlight::default()
             }),
             club: None,
             impact: None,

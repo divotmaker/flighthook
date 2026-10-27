@@ -100,6 +100,8 @@ Terminal. Allow it.
   separate putting mode, so selecting a putter in the sim puts it in putting mode
 - Simulated carry, apex, descent, offline, roll and total for launch monitors that
   measure launch only (beta) — see [Simulated values](#simulated-values-beta)
+- Shot metrics computed from the measured values: total spin and spin axis,
+  face to path, spin loft and curve — see [Shot metrics](#shot-metrics)
 - Shot sets: every shot joins a set, and a club change or **+ New set** starts
   a new one — see [Shot Tracking](#shot-tracking)
 - Flight chart: a side view of the simulated ball flights of the shown shot's
@@ -165,10 +167,17 @@ flat fairway, sea level and 25 °C by default.
   other mode on the configured surface (fairway by default).
 - On a shot that flies, a measured carry or flight time of 0 is not a
   reading: flighthook simulates it like a missing value.
+- A measured carry offline or descent angle (FlightScope full results) is
+  kept. The simulated path still leaves the tee on the measured launch
+  direction and is fitted to land on the measured offline, by scaling its
+  curve off that start line.
 
-Carry is fitted to Trackman PGA Tour averages (about 3 yd RMSE); roll and total
-are beta in dimple and not yet validated against measured data, so treat them
-as estimates. Known model limits are listed in dimple's
+Carry is fitted to Trackman PGA Tour averages (about 3 yd RMSE). Roll and
+total are beta in dimple: only a drive's run is compared with measured
+fairway data (a tour-average drive runs about 18 yd, between the USGA/R&A
+proposed bounce model and the ShotLink median for its landing angle), and no
+published wedge, pitch or chip run on a fairway exists to compare against,
+so treat them as estimates. Known model limits are listed in dimple's
 [AERO.md](https://github.com/divotmaker/dimple/blob/main/docs/AERO.md). When
 comparing against another launch monitor, set altitude and temperature to its
 normalization conditions.
@@ -186,6 +195,26 @@ surface = "fairway"       # fairway | green | firm_green
 The mode applies per shot: changing it affects new shots only. An altitude or
 temperature outside its range turns simulation off (with a warning in the
 log) until it is fixed. Changes apply from the next shot, without a restart.
+
+### Shot metrics
+
+A finished shot carries `metrics`: values computed from what the device
+measured, with the formulas of the Flight Relay Protocol's "Derived Values":
+
+| Metric | Formula | Sign |
+| --- | --- | --- |
+| Total spin, spin axis | `√(back² + side²)`, `atan2(side, back)` | axis + = tilted right (curves right) |
+| Face to path | `face_angle − path` | + = face right of the path |
+| Spin loft | `dynamic_loft − attack_angle` (approximation) | — |
+| Curve | `carry_offline − carry × tan(launch_azimuth)` | + = curved right |
+
+Each is present only when its inputs were measured; total spin, spin axis
+and spin loft only when the device did not report them itself (then they are
+in the shot's `ball` or `club`, read those first). They are computed from
+the values the device actor sent under `ball` and `club` (the device's
+readings, or for Open Connect the spin pair completed from the one the
+monitor sent), never from the simulation. They are in the API
+(`metrics` on [`/api/shots`](docs/API.md#get-apishots)) and the export.
 
 ### Sharing shot data
 
@@ -260,8 +289,9 @@ bottom: where each came to rest (**Total**, the default) or landed
 (**Carry**), the shown shot in gold with its roll, and a dispersion ellipse
 over the bright shots, one per device when they are coloured by device.
 The ellipse holds about 86 % of a normal pattern (**2σ**, the default) or
-95 % (**95 %**); hover it for its size. The lateral is simulated, so shots
-without a simulated offline are left out.
+95 % (**95 %**); hover it for its size. A shot is placed by its simulated
+path, else by its carry or total and offline (measured or simulated); shots
+without an offline are left out.
 
 ### Devices
 

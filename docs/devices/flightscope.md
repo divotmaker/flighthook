@@ -72,13 +72,32 @@ Estimated shots may be missing club data and sidespin. Set
 `use_estimated = true` in the device section (or tick **Use Estimated Shots**
 in the settings UI) to keep them.
 
+## Landing offline and descent angle
+
+Both flight results report where the ball landed (the estimate's landing is
+an early estimate, and can differ from the full result's), and flighthook
+sends it as FRP `carry_offline`: the landing point's distance right (+) or left (−) of
+the target line, absolute (the same sense as `launch_azimuth`, for both
+hands). A full result (`D4`) also reports the ball's velocity at landing,
+which gives `descent_angle`, the angle below horizontal at landing. An
+estimate (`E8`) has no landing velocity, so no descent angle. Neither is sent
+for a ball that did not fly (a carry, flight time or apex of 0). With the
+carry offline flighthook computes the shot's curve (see
+[Shot metrics](../API.md#shot-metrics)).
+
+The Mevo reports spin as backspin and sidespin. flighthook computes total
+spin and spin axis from them in the shot metrics.
+
 ## Simulated values (beta)
 
 Carry, apex and flight time come from the device, except that a carry or
 flight time of 0 on a shot that flies is not a reading and is simulated like a
-missing value. flighthook simulates what the device doesn't report — offline,
-descent angle, roll and total — and marks them as simulated (italics,
-`derived` in the API); total is the measured carry plus the simulated roll. A
+missing value. So do the carry offline and descent angle above. flighthook
+simulates what the device doesn't report — roll and total, their offlines,
+and the descent angle of an estimated shot — and marks them as simulated
+(italics, `derived` in the API); total is the measured carry plus the
+simulated roll, and the simulated path lands on the measured carry and
+offline. A
 shot with an apex of 0 (a putt, or any bladed shot) is a ground ball: carry,
 apex and flight time are 0 and the roll is simulated from the tee, on a green
 when the shot was triggered in Putting mode (a mode change before its result

@@ -9,6 +9,13 @@ The R10 is auto-detected from the system's connected Bluetooth devices, so the
 config section carries no address field. Pair the R10 with the host operating
 system first, then start flighthook.
 
+## Spin
+
+The R10 measures total spin and spin axis. flighthook sends both, as FRP
+`total_spin_rpm` and `spin_axis` (+ = tilted right, curves the ball right),
+along with the backspin and sidespin components computed from them. A total
+of 0 has no axis.
+
 ## Carry and total (beta, simulated)
 
 The R10 reports launch data, not carry. flighthook simulates carry, apex,

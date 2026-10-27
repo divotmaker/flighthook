@@ -898,9 +898,9 @@ dependencies = [
 
 [[package]]
 name = "dimple"
-version = "0.0.6"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f56cdce5439fd5eccaa13c934eb85aa82d57ae47e7eb8114a86242f6e105c875"
+checksum = "b1195a165709bf909d272e0beab13b34edfda2f6131d2def9f41457e89d6dfa1"
 dependencies = [
  "glam",
 ]
@@ -1406,9 +1406,9 @@ dependencies = [
 
 [[package]]
 name = "flightrelay"
-version = "0.2.1"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f250f3a64629c15c61fd1da5bb314524b31927e69c87e9c6595be92c5673f2f0"
+checksum = "b99c1bf0d65f30ec43f01223fcfa501c35bbcf4bd8707cca24cef34af6f5676d"
 dependencies = [
  "serde",
  "serde_json",

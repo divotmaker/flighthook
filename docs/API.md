@@ -218,21 +218,21 @@ produced no data for (no ball, club or impact) are kept for the
       "launch_azimuth": -1.3,
       "launch_elevation": 14.2,
       "carry_distance": "180.5m",
+      "carry_offline": "-7.6m",
       "max_height": "28.3m",
       "flight_time": 6.4,
+      "descent_angle": 48.2,
       "backspin_rpm": 3200,
       "sidespin_rpm": -450
     },
     "derived": {
-      "carry_offline": "-19.9m",
-      "descent_angle": 48.2,
-      "roll_distance": "20.3m",
-      "roll_offline": "-3.7m",
-      "total_distance": "200.8m",
-      "total_offline": "-23.6m",
+      "roll_distance": "11.2m",
+      "roll_offline": "-0.9m",
+      "total_distance": "191.7m",
+      "total_offline": "-8.5m",
       "path": {
-        "flight": [[0, 0, 0, 0], [0.42, 30.1, 15.8, -8.3], ...],
-        "ground": [[6.4, 180.5, 0, -19.9], ...]
+        "flight": [[0, 0, 0, 0], [0.464, 25.37, 6.46, -0.63], ...],
+        "ground": [[6.4, 180.34, 0, -7.6], ...]
       }
     },
     "club": {
@@ -246,6 +246,13 @@ produced no data for (no ball, club or impact) are kept for the
       "club_offset": "0.005m",
       "club_height": "0.012m"
     },
+    "metrics": {
+      "total_spin_rpm": 3231,
+      "spin_axis": -8.0,
+      "face_to_path": 3.3,
+      "spin_loft": 21.9,
+      "curve": "-3.5m"
+    }
   }
 ]
 ```
@@ -257,23 +264,26 @@ With `?units=imperial`:
   "ball": {
     "launch_speed": "150.3mph",
     "carry_distance": "197.4yd",
+    "carry_offline": "-8.3yd",
     "max_height": "92.8ft"
   },
   "derived": {
-    "carry_offline": "-21.8yd",
-    "roll_distance": "22.2yd",
-    "roll_offline": "-4.1yd",
-    "total_distance": "219.6yd",
-    "total_offline": "-25.8yd",
+    "roll_distance": "12.2yd",
+    "roll_offline": "-1.0yd",
+    "total_distance": "209.6yd",
+    "total_offline": "-9.3yd",
     "path": {
-      "flight": [[0, 0, 0, 0], [0.42, 30.1, 15.8, -8.3], ...],
-      "ground": [[6.4, 180.5, 0, -19.9], ...]
+      "flight": [[0, 0, 0, 0], [0.464, 25.37, 6.46, -0.63], ...],
+      "ground": [[6.4, 180.34, 0, -7.6], ...]
     }
   },
   "club": {
     "club_speed": "94.2mph",
     "club_offset": "0.2in",
     "club_height": "0.47in"
+  },
+  "metrics": {
+    "curve": "-3.8yd"
   }
 }
 ```
@@ -289,6 +299,9 @@ With `?units=imperial`:
   never converted.
 - `club`: `ClubData` or `null`. Club head data. All fields are `Option`.
 - `impact`: `FaceImpact` or `null`. Face impact location.
+- `metrics`: `ShotMetrics` or absent. Values computed from the measured
+  `ball` and `club` when the shot finished (see [Shot metrics](#shot-metrics)).
+  `curve` is converted by `?units=` like `ball`.
 - `shot_id`: the shot's `key.shot_id` from its lifecycle events.
 - `club_selected`: club in play when the shot was triggered; absent when none
   was selected.
@@ -297,6 +310,36 @@ With `?units=imperial`:
 
 `POST /api/shots/convert` passes `shot_id`, `club_selected` and `group`
 through unchanged.
+
+#### Shot metrics
+
+`metrics` holds values flighthook computes from the shot's measured `ball`
+and `club` when the shot finishes, so consumers don't each compute them. The
+formulas and signs are the Flight Relay Protocol's spin relations and
+"Derived Values":
+
+| Field | Type | Formula | Present when |
+| --- | --- | --- | --- |
+| `total_spin_rpm` | integer | `√(backspin_rpm² + sidespin_rpm²)`, rounded | the device sent both components and neither `total_spin_rpm` nor `spin_axis` |
+| `spin_axis` | number (deg) | `atan2(sidespin_rpm, backspin_rpm)`; + = tilted right, curves the ball right | as `total_spin_rpm`, and the total is not 0 |
+| `face_to_path` | number (deg) | `face_angle − path`; + = face right of the club path | the device sent both |
+| `spin_loft` | number (deg) | `dynamic_loft − attack_angle`, an approximation of the measured 3D spin loft | the device sent both and no `spin_loft` of its own |
+| `curve` | Distance | `carry_offline − carry_distance × tan(launch_azimuth)`, in a common unit; + = curved right | the device sent all three |
+
+Each field is absent when an input is missing (or not a finite number), and
+`metrics` is absent when no field is present. Every input is a measured
+value: `derived` (the simulation) is never used, so a shot without a measured
+`carry_offline` has no `curve`. When the device reports total spin and axis
+itself (R10, Square Golf, Open Connect), they are under `ball`, not here; the
+same goes for a measured `spin_loft` under `club`. To show total spin and
+spin axis for any device, read `ball.total_spin_rpm` and `ball.spin_axis`
+first, else `metrics.total_spin_rpm` and `metrics.spin_axis`; likewise
+`club.spin_loft`, else `metrics.spin_loft`. Lateral values are
+absolute: + is right of the target line for every golfer. `metrics` is on
+`/api/shots` and in the [export](#get-apishotsexport). The WebSocket carries
+the device's events, which hold no `metrics`: the `flighthook` crate's
+`ShotAggregator` computes them when it assembles a shot, and other WebSocket
+consumers can use the formulas above or read the shot from `/api/shots`.
 
 ---
 
@@ -543,17 +586,20 @@ device produced no data for are included: their `data` has no `ball`, `club`,
   section, with the same shape as in [GET /api/settings](#get-apisettings)
   (`mode` present unless `"on"`). `data.derived.replaces_measured` marks a
   shot whose simulated results replace the device's.
-- `data`: exactly the `/api/shots` element for this shot (`ShotData`).
+- `data`: exactly the `/api/shots` element for this shot (`ShotData`),
+  including `metrics`.
   `data.shot_id`, `data.club_selected` and `data.group`, when set, equal the
   top-level fields.
 - `raw`: `ShotRaw` (see [shot_finished](#shot_finished)).
 
 **CSV**: one header row, one row per shot, RFC 4180 quoting, empty cell for a
 missing value. Units are fixed per column and named in the header (imperial:
-mph, yd, ft for heights, in for club offset/height; metric: mps, m). Face
-impact is always mm. `environment` is the FlightScope environment in effect
-(configured value, else the default). `group` is the set id (empty when the shot
-has no data). `sim_*` columns are the `derived` block. With `[simulation]
+mph, yd, ft for heights, in for club offset/height/low point; metric: mps,
+m). Face impact is always mm. `environment` is the FlightScope environment in
+effect (configured value, else the default). `group` is the set id (empty when
+the shot has no data). Unprefixed columns are the device's measured values
+(`ball`, `club`, `impact`); `sim_*` columns are the `derived` block and
+`metrics_*` columns the [shot metrics](#shot-metrics). With `[simulation]
 mode = "force"`, a shot can have both a device column (`carry_*`) and its
 `sim_*` column filled; the CSV does not say which one takes precedence (the
 JSONL's `data.derived.replaces_measured` does). Read columns by header name:
@@ -563,12 +609,17 @@ columns are added over time.
 time,actor,device_kind,manufacturer,model,firmware,shot_number,shot_id,
 club_selected,group,handed,detection_mode,environment,
 ball_speed_mph,launch_elevation_deg,launch_azimuth_deg,backspin_rpm,sidespin_rpm,
-carry_yd,total_yd,roll_yd,max_height_ft,flight_time_s,
+total_spin_rpm,spin_axis_deg,
+carry_yd,carry_offline_yd,total_yd,total_offline_yd,roll_yd,max_height_ft,
+flight_time_s,descent_angle_deg,
 sim_carry_yd,sim_carry_offline_yd,sim_max_height_ft,sim_flight_time_s,
 sim_descent_angle_deg,sim_roll_yd,sim_roll_offline_yd,sim_total_yd,sim_total_offline_yd,
 club_speed_mph,club_speed_post_mph,path_deg,attack_angle_deg,face_angle_deg,
 dynamic_loft_deg,smash_factor,swing_plane_horizontal_deg,swing_plane_vertical_deg,
-club_offset_in,club_height_in,impact_lateral_mm,impact_vertical_mm
+club_offset_in,club_height_in,spin_loft_deg,low_point_distance_in,
+impact_lateral_mm,impact_vertical_mm,
+metrics_total_spin_rpm,metrics_spin_axis_deg,metrics_face_to_path_deg,
+metrics_spin_loft_deg,metrics_curve_yd
 ```
 
 (One line in the file; wrapped here.)
@@ -999,29 +1050,67 @@ Ball flight data available. May arrive before or after `club_path`.
       "launch_azimuth": -1.3,
       "launch_elevation": 14.2,
       "carry_distance": "180.5m",
+      "carry_offline": "-7.6m",
       "max_height": "28.3m",
       "flight_time": 6.4,
+      "descent_angle": 48.2,
       "backspin_rpm": 3200,
       "sidespin_rpm": -450
     },
     "derived": {
-      "carry_offline": "-19.9m",
-      "descent_angle": 48.2,
-      "roll_distance": "20.3m",
-      "roll_offline": "-3.7m",
-      "total_distance": "200.8m",
-      "total_offline": "-23.6m"
+      "roll_distance": "11.2m",
+      "roll_offline": "-0.9m",
+      "total_distance": "191.7m",
+      "total_offline": "-8.5m"
     }
   }
 }
 ```
 
 All `BallFlight` fields are `Option`. Missing fields are omitted from the JSON.
+`ball` is FRP's `BallFlight`, as the device measured it:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `launch_speed` | Velocity | Ball speed at launch |
+| `launch_azimuth` | number (deg) | Horizontal launch angle, + right of the target line |
+| `launch_elevation` | number (deg) | Vertical launch angle |
+| `carry_distance` | Distance | Tee to landing |
+| `carry_offline` | Distance | Landing point right (+) or left (−) of the target line |
+| `total_distance` | Distance | Tee to rest |
+| `total_offline` | Distance | Rest position right (+) or left (−) of the target line |
+| `roll_distance` | Distance | Landing to rest |
+| `max_height` | Distance | Apex |
+| `flight_time` | number (s) | Launch to landing |
+| `descent_angle` | number (deg) | Angle below horizontal at landing |
+| `backspin_rpm` | integer | Backspin, + = backspin, − = topspin |
+| `sidespin_rpm` | integer | Sidespin, + = curves the ball right |
+| `total_spin_rpm` | integer | Total spin, never negative |
+| `spin_axis` | number (deg) | Spin axis tilt, + = tilted right (curves the ball right); absent when the total is 0 |
+
+Lateral values are absolute: + is right of the target line for every golfer.
+`carry_offline` and `descent_angle` are absent for a ball that did not fly.
+Which fields each device sends:
+
+| Device | `carry_offline` | `descent_angle` | `total_spin_rpm` + `spin_axis` |
+| --- | --- | --- | --- |
+| FlightScope full result (`D4`) | yes (landing position) | yes (landing velocity) | no (components only) |
+| FlightScope estimate (`E8`) | yes | no | no (backspin only) |
+| Garmin R10 | no | no | yes, with the components |
+| Square Golf Omni | no | no | yes, with the components |
+| Open Connect | no | no | yes: the pair the monitor sent, the other computed from it |
+
+`total_offline`, `club_path.spin_loft` and `club_path.low_point_distance` are
+passed through by flighthook but no supported device reports them. Values a
+device doesn't send, flighthook may compute from the ones it does: see
+[Shot metrics](#shot-metrics), on the finished shot.
 
 **`derived` (beta)** is a flighthook extension: values simulated from the
 measured launch with the [dimple](https://crates.io/crates/dimple) ball-flight
 model, for fields the device did not report. Every field under `ball` is
-measured; every field under `derived` is simulated. A field is in both only
+measured; every field under `derived` is simulated. A measured
+`carry_offline` or `descent_angle` keeps the field out of `derived` (except
+under `force`). A field is in both only
 when the `derived` value is the one to show: a measured carry or flight time
 of exactly 0 on a shot that flies is not a reading, so `derived` carries the
 simulated value next to the untouched 0, and a ground ball (below) shows 0
@@ -1062,22 +1151,22 @@ A launch-monitor-only device such as the Square Golf Omni gets the full set:
   "max_height": "29.3m",
   "flight_time": 5.9,
   "descent_angle": 50.1,
-  "roll_distance": "8.7m",
-  "roll_offline": "-0.8m",
-  "total_distance": "164.1m",
-  "total_offline": "-7.3m"
+  "roll_distance": "4.9m",
+  "roll_offline": "-0.5m",
+  "total_distance": "160.4m",
+  "total_offline": "-7.0m"
 }
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `carry_distance` | Distance | Tee to landing, horizontal. Only when the device didn't report carry (or reported 0 on a shot that flies, or other than exactly 0 on a ground ball), or `replaces_measured` |
-| `carry_offline` | Distance | Landing point right (+) or left (−) of the target line |
+| `carry_offline` | Distance | Landing point right (+) or left (−) of the target line. Only when the device didn't report it (or reported a ground ball's as other than exactly 0), or `replaces_measured` |
 | `max_height` | Distance | Apex above the tee. Only when the device didn't report it (or reported a ground ball's apex as not exactly 0), or `replaces_measured` |
 | `flight_time` | number (s) | Launch to landing. Only when the device didn't report it (or reported 0 on a shot that flies, or other than exactly 0 on a ground ball), or `replaces_measured` |
-| `descent_angle` | number (deg) | Angle below horizontal at landing. Absent for a ground ball |
+| `descent_angle` | number (deg) | Angle below horizontal at landing. Only when the device didn't report it, or `replaces_measured`. Absent for a ground ball |
 | `roll_distance` | Distance | Landing to rest. Negative when the ball spins back. Only when the device didn't report roll (or reported a ground ball's roll other than its total), or `replaces_measured` |
-| `roll_offline` | Distance | Sideways movement from landing to rest, + right |
+| `roll_offline` | Distance | Sideways movement from the displayed landing (the measured `carry_offline` when there is one) to rest, + right |
 | `total_distance` | Distance | Tee to rest. Only when the device didn't report total, or `replaces_measured` |
 | `total_offline` | Distance | Rest position right (+) or left (−) of the target line |
 | `path` | FlightPath | Simulated ball path, tee to rest (see below) |
@@ -1091,7 +1180,10 @@ minus the carry. Either way carry + roll = total holds for the values a
 consumer displays. With
 `replaces_measured`, carry, roll and total are all simulated. Roll, roll
 offline, total and total offline are omitted if the ground simulation does
-not reach rest.
+not reach rest. Roll offline and total offline are also omitted when the
+device measured a carry offline that the path cannot be fitted to (for
+example one not inside the carry), since there is then no rest point that
+lands on it.
 
 **`path`** is the simulated ball's trajectory: an object with `flight` (tee to
 landing) and `ground` (landing to rest, empty when the ground phase doesn't
@@ -1101,7 +1193,13 @@ tee. Always metres and seconds, unaffected by `?units=`. Present only on
 shots the server simulated, same conditions as the rest of `derived`. The
 path is fitted to the displayed values: the landing is at the carry (measured
 or simulated), the highest point at the apex, the landing time at the flight
-time and the rest point at the total. With `replaces_measured` every displayed
+time and the rest point at the total. When the device measured the carry
+offline, the path still leaves the tee along the measured `launch_azimuth`
+and lands on that offline: the curve (the sideways deviation from the start
+line) is scaled to fit, or, when the simulation barely curves, the missing
+sideways distance is added, growing with the square of the distance
+downrange. The roll then continues from the landing in the direction the
+fitted flight arrives. With `replaces_measured` every displayed
 value is simulated, so the path is the simulation unchanged. `ground[0]` equals the last `flight`
 point. A ground ball's `flight` is the tee alone (`[[0, 0, 0, 0]]`) and its
 `ground` the roll from the tee. The offline values are the `z` of the landing and rest points. A few
@@ -1131,6 +1229,17 @@ Club path data available. May arrive before or after `ball_flight`.
   }
 }
 ```
+
+`club` is FRP's `ClubData`, all fields optional: `club_speed`,
+`club_speed_post` (Velocity), `path`, `attack_angle`, `face_angle`,
+`dynamic_loft`, `swing_plane_horizontal`, `swing_plane_vertical`,
+`spin_loft` (deg), `smash_factor`, `club_offset`, `club_height`,
+`low_point_distance` (Distance). `path`, `face_angle` and
+`swing_plane_horizontal` are + right of the target line for every golfer.
+`spin_loft` is only ever a measured value (no supported device measures it);
+the `dynamic_loft − attack_angle` approximation is in
+[Shot metrics](#shot-metrics). `low_point_distance` is + on the target side
+of the ball, − behind it.
 
 ---
 

@@ -170,8 +170,8 @@ impl Ends {
 /// gives its last flight point (landing) and last ground point (rest).
 /// Without one, the displayed carry or total (picked like the cards: the
 /// simulated value when there is one, else the measured one) is the
-/// distance from the tee and the simulated offline the lateral; an end with
-/// neither is unknown.
+/// distance from the tee and the offline, picked the same way, the lateral;
+/// an end without both is unknown.
 fn ends(shot: &ShotRow, units: UnitSystem) -> Ends {
     let k = flight::per_metre(units).0;
     if let Some(p) = flight::path(shot) {
@@ -199,9 +199,10 @@ fn ends(shot: &ShotRow, units: UnitSystem) -> Ends {
     };
     let ball = shot.ball.as_ref();
     let derived = shot.derived.as_ref();
-    let spot = |measured: Option<Distance>, sim: Option<Distance>, offline: Option<Distance>| {
-        let (radius, _) = pick(measured, sim)?;
-        let (lateral, _) = pick(None, offline)?;
+    let spot = |measured: (Option<Distance>, Option<Distance>),
+                sim: (Option<Distance>, Option<Distance>)| {
+        let (radius, _) = pick(measured.0, sim.0)?;
+        let (lateral, _) = pick(measured.1, sim.1)?;
         let (radius, lateral) = (to(radius), to(lateral));
         if !radius.is_finite() || !lateral.is_finite() {
             return None;
@@ -213,14 +214,24 @@ fn ends(shot: &ShotRow, units: UnitSystem) -> Ends {
         })
     };
     let landing = spot(
-        ball.and_then(|b| b.carry_distance),
-        derived.and_then(|d| d.carry_distance),
-        derived.and_then(|d| d.carry_offline),
+        (
+            ball.and_then(|b| b.carry_distance),
+            ball.and_then(|b| b.carry_offline),
+        ),
+        (
+            derived.and_then(|d| d.carry_distance),
+            derived.and_then(|d| d.carry_offline),
+        ),
     );
     let rest = spot(
-        ball.and_then(|b| b.total_distance),
-        derived.and_then(|d| d.total_distance),
-        derived.and_then(|d| d.total_offline),
+        (
+            ball.and_then(|b| b.total_distance),
+            ball.and_then(|b| b.total_offline),
+        ),
+        (
+            derived.and_then(|d| d.total_distance),
+            derived.and_then(|d| d.total_offline),
+        ),
     );
     Ends {
         landing,

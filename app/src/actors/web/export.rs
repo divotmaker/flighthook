@@ -140,11 +140,16 @@ pub fn csv_header(system: UnitSystem) -> String {
         "launch_azimuth_deg".into(),
         "backspin_rpm".into(),
         "sidespin_rpm".into(),
+        "total_spin_rpm".into(),
+        "spin_axis_deg".into(),
         format!("carry_{}", u.dist),
+        format!("carry_offline_{}", u.dist),
         format!("total_{}", u.dist),
+        format!("total_offline_{}", u.dist),
         format!("roll_{}", u.dist),
         format!("max_height_{}", u.height),
         "flight_time_s".into(),
+        "descent_angle_deg".into(),
         format!("sim_carry_{}", u.dist),
         format!("sim_carry_offline_{}", u.dist),
         format!("sim_max_height_{}", u.height),
@@ -165,8 +170,15 @@ pub fn csv_header(system: UnitSystem) -> String {
         "swing_plane_vertical_deg".into(),
         format!("club_offset_{}", u.small),
         format!("club_height_{}", u.small),
+        "spin_loft_deg".into(),
+        format!("low_point_distance_{}", u.small),
         "impact_lateral_mm".into(),
         "impact_vertical_mm".into(),
+        "metrics_total_spin_rpm".into(),
+        "metrics_spin_axis_deg".into(),
+        "metrics_face_to_path_deg".into(),
+        "metrics_spin_loft_deg".into(),
+        format!("metrics_curve_{}", u.dist),
     ];
     let cells: Vec<Option<String>> = cols.into_iter().map(Some).collect();
     csv_row(&cells)
@@ -231,6 +243,7 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
     let d = data.derived.clone().unwrap_or_default();
     let c = data.club.clone().unwrap_or_default();
     let m = data.impact.clone().unwrap_or_default();
+    let x = data.metrics.clone().unwrap_or_default();
     let cells = [
         Some(line.time.clone()),
         Some(line.actor.clone()),
@@ -250,11 +263,16 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
         f(b.launch_azimuth),
         i(b.backspin_rpm),
         i(b.sidespin_rpm),
+        i(b.total_spin_rpm),
+        f(b.spin_axis),
         dist(b.carry_distance),
+        dist(b.carry_offline),
         dist(b.total_distance),
+        dist(b.total_offline),
         dist(b.roll_distance),
         height(b.max_height),
         f(b.flight_time),
+        f(b.descent_angle),
         dist(d.carry_distance),
         dist(d.carry_offline),
         height(d.max_height),
@@ -275,8 +293,15 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
         f(c.swing_plane_vertical),
         small(c.club_offset),
         small(c.club_height),
+        f(c.spin_loft),
+        small(c.low_point_distance),
         m.lateral.map(|v| num(v.as_millimeters())),
         m.vertical.map(|v| num(v.as_millimeters())),
+        i(x.total_spin_rpm),
+        f(x.spin_axis),
+        f(x.face_to_path),
+        f(x.spin_loft),
+        dist(x.curve),
     ];
     csv_row(&cells)
 }
@@ -311,7 +336,7 @@ mod tests {
     use super::*;
     use flighthook::{
         BallFlight, ClubData, FaceImpact, FlighthookConfig, FlighthookEvent, MevoSection, RawDir,
-        RawRecord, ShotData, ShotKey, ShotRaw,
+        RawRecord, ShotData, ShotKey, ShotMetrics, ShotRaw,
     };
 
     const SSID: &str = "FS M2-123456";
@@ -447,7 +472,9 @@ mod tests {
         let imp = csv_header(UnitSystem::Imperial);
         let met = csv_header(UnitSystem::Metric);
         assert!(imp.starts_with("time,actor,device_kind,manufacturer,model,firmware,"));
-        assert!(imp.ends_with("impact_lateral_mm,impact_vertical_mm\r\n"));
+        assert!(imp.contains(",impact_lateral_mm,impact_vertical_mm,"));
+        assert!(imp.ends_with(",metrics_curve_yd\r\n"));
+        assert!(met.ends_with(",metrics_curve_m\r\n"));
         for col in [
             "ball_speed_mph",
             "carry_yd",
@@ -459,8 +486,8 @@ mod tests {
         for col in ["ball_speed_mps", "carry_m", "max_height_m", "club_offset_m"] {
             assert!(met.contains(col), "{col}");
         }
-        assert_eq!(imp.split(',').count(), 45);
-        assert_eq!(met.split(',').count(), 45);
+        assert_eq!(imp.split(',').count(), 57);
+        assert_eq!(met.split(',').count(), 57);
     }
 
     #[test]
@@ -468,7 +495,7 @@ mod tests {
         let shot = private_shot();
         let row = to_csv_row(&shot, UnitSystem::Metric);
         let cells: Vec<&str> = row.trim_end().split(',').collect();
-        assert_eq!(cells.len(), 45);
+        assert_eq!(cells.len(), 57);
         assert_eq!(cells[1], "mevo.0");
         assert_eq!(cells[2], "flightscope");
         assert_eq!(cells[4], "<redacted> v1");
@@ -477,13 +504,13 @@ mod tests {
         assert_eq!(cells[12], "limited_flight");
         assert_eq!(cells[13], "40");
         assert_eq!(cells[17], "", "sidespin");
-        assert_eq!(cells[18], "100");
+        assert_eq!(cells[20], "100");
         assert!(!row.contains(SSID) && !row.contains(ADDR));
 
         let imp = to_csv_row(&shot, UnitSystem::Imperial);
         let cells: Vec<&str> = imp.trim_end().split(',').collect();
         assert_eq!(cells[13], num(Velocity::MetersPerSecond(40.0).as_mph()));
-        assert_eq!(cells[18], num(Distance::Meters(100.0).as_yards()));
+        assert_eq!(cells[20], num(Distance::Meters(100.0).as_yards()));
     }
 
     #[test]
@@ -503,7 +530,7 @@ mod tests {
         assert!(flight.as_array().is_some_and(|f| f.len() > 2), "{line}");
 
         let row = to_csv_row(&shot, UnitSystem::Metric);
-        assert_eq!(row.trim_end().split(',').count(), 45);
+        assert_eq!(row.trim_end().split(',').count(), 57);
     }
 
     #[test]
@@ -535,9 +562,9 @@ mod tests {
         // CSV keeps its columns: the device's carry and the simulated carry.
         let row = to_csv_row(&shot, UnitSystem::Metric);
         let cells: Vec<&str> = row.trim_end().split(',').collect();
-        assert_eq!(cells.len(), 45);
-        assert_eq!(cells[18], "100");
-        assert_eq!(cells[23], num(sim_carry.as_meters()));
+        assert_eq!(cells.len(), 57);
+        assert_eq!(cells[20], "100");
+        assert_eq!(cells[28], num(sim_carry.as_meters()));
     }
 
     #[test]
@@ -575,6 +602,101 @@ mod tests {
         assert_eq!(col("club_offset_m"), "0.01");
         assert_eq!(col("impact_lateral_mm"), "-4");
         assert_eq!(col("impact_vertical_mm"), "2.5");
+    }
+
+    #[test]
+    fn csv_has_new_shot_field_and_metrics_columns() {
+        let mut shot = private_shot();
+        shot.data.ball = Some(BallFlight {
+            carry_offline: Some(Distance::Meters(-2.5)),
+            total_offline: Some(Distance::Meters(-3.0)),
+            descent_angle: Some(44.5),
+            total_spin_rpm: Some(6100),
+            spin_axis: Some(-4.0),
+            ..ball()
+        });
+        shot.data.club = Some(ClubData {
+            spin_loft: Some(23.5),
+            low_point_distance: Some(Distance::Meters(0.0254)),
+            ..ClubData::default()
+        });
+        let mut metrics = ShotMetrics::default();
+        metrics.face_to_path = Some(-1.25);
+        metrics.spin_loft = Some(21.0);
+        metrics.curve = Some(Distance::Meters(9.144));
+        metrics.total_spin_rpm = Some(3231);
+        metrics.spin_axis = Some(8.0);
+        shot.data.metrics = Some(metrics);
+        for (system, offline, total_offline, curve, low_point) in [
+            (UnitSystem::Metric, "-2.5", "-3", "9.144", "0.0254"),
+            (UnitSystem::Imperial, "-2.734", "-3.2808", "10", "1"),
+        ] {
+            let header: Vec<String> = csv_header(system)
+                .trim_end()
+                .split(',')
+                .map(str::to_string)
+                .collect();
+            let row = to_csv_row(&shot, system);
+            let cells: Vec<&str> = row.trim_end().split(',').collect();
+            assert_eq!(cells.len(), header.len());
+            let (d, s) = if system == UnitSystem::Imperial {
+                ("yd", "in")
+            } else {
+                ("m", "m")
+            };
+            let col = |name: &str| cells[header.iter().position(|h| h == name).expect(name)];
+            assert_eq!(col(&format!("carry_offline_{d}")), offline);
+            assert_eq!(col(&format!("total_offline_{d}")), total_offline);
+            assert_eq!(col("descent_angle_deg"), "44.5");
+            assert_eq!(col("total_spin_rpm"), "6100");
+            assert_eq!(col("spin_axis_deg"), "-4");
+            assert_eq!(col("spin_loft_deg"), "23.5");
+            assert_eq!(col(&format!("low_point_distance_{s}")), low_point);
+            assert_eq!(col("metrics_total_spin_rpm"), "3231");
+            assert_eq!(col("metrics_spin_axis_deg"), "8");
+            assert_eq!(col("metrics_face_to_path_deg"), "-1.25");
+            assert_eq!(col("metrics_spin_loft_deg"), "21");
+            assert_eq!(col(&format!("metrics_curve_{d}")), curve);
+        }
+    }
+
+    /// The export's `data` carries the metrics the web layer computed when
+    /// the shot finished.
+    #[tokio::test]
+    async fn exported_shot_carries_its_metrics() {
+        let (state, _writer, _dir) = test_state();
+        let key = ShotKey {
+            shot_id: "m".into(),
+            shot_number: 2,
+        };
+        feed(
+            &state,
+            "mevo.0",
+            vec![
+                FlighthookEvent::ShotTrigger { key: key.clone() },
+                FlighthookEvent::ClubPath {
+                    key: key.clone(),
+                    club: Box::new(ClubData {
+                        face_angle: Some(1.0),
+                        path: Some(-2.0),
+                        ..ClubData::default()
+                    }),
+                },
+                FlighthookEvent::ShotFinished { key, raw: None },
+            ],
+        )
+        .await;
+        let stored = state.shots.read().await[0].clone();
+        let line = build_export_line(&stored, "t", None, false);
+        assert_eq!(line.data.metrics.and_then(|m| m.face_to_path), Some(3.0));
+        let row = to_csv_row(&stored, UnitSystem::Metric);
+        let header = csv_header(UnitSystem::Metric);
+        let at = header
+            .trim_end()
+            .split(',')
+            .position(|h| h == "metrics_face_to_path_deg")
+            .expect("column");
+        assert_eq!(row.trim_end().split(',').nth(at), Some("3"));
     }
 
     #[tokio::test]

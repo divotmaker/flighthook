@@ -671,8 +671,20 @@ fn card_metrics(shot: &ShotRow, imperial: bool) -> (Vec<Metric>, [MetricGroup; 3
                     1,
                     false,
                 ),
-                Metric::new("Offline", dist, pick(None, v(d.carry_offline)), 1, true),
-                Metric::new("Descent", "\u{b0}", pick(None, d.descent_angle), 1, false),
+                Metric::new(
+                    "Offline",
+                    dist,
+                    pick(v(ball.carry_offline), v(d.carry_offline)),
+                    1,
+                    true,
+                ),
+                Metric::new(
+                    "Descent",
+                    "\u{b0}",
+                    pick(ball.descent_angle, d.descent_angle),
+                    1,
+                    false,
+                ),
                 Metric::new(
                     "Roll",
                     dist,
@@ -1610,8 +1622,8 @@ impl BarKind {
     }
 
     /// This bar's value for `shot` in display units: total and carry are
-    /// picked by [`pick`]; lateral is the simulated carry offline (+ = right
-    /// of the target line).
+    /// picked by [`pick`]; lateral is the carry offline, picked the same way
+    /// (+ = right of the target line).
     fn value(self, shot: &ShotRow, imperial: bool) -> Option<f64> {
         let ball = shot.ball.as_ref();
         let derived = shot.derived.as_ref();
@@ -1624,7 +1636,10 @@ impl BarKind {
                 ball.and_then(|b| b.carry_distance),
                 derived.and_then(|d| d.carry_distance),
             ),
-            BarKind::Lateral => (None, derived.and_then(|d| d.carry_offline)),
+            BarKind::Lateral => (
+                ball.and_then(|b| b.carry_offline),
+                derived.and_then(|d| d.carry_offline),
+            ),
         };
         let shown = |d: Distance| {
             if imperial {
@@ -3926,11 +3941,11 @@ fn table_cells(
             Text(opt_f(f.launch_azimuth, 1)),
             Picked(pick(v(f.carry_distance), v(d.carry_distance)), false),
             Picked(pick(v(f.max_height), v(d.max_height)), false),
-            Picked(pick(None, v(d.carry_offline)), true),
-            Picked(pick(None, d.descent_angle), false),
+            Picked(pick(v(f.carry_offline), v(d.carry_offline)), true),
+            Picked(pick(f.descent_angle, d.descent_angle), false),
             Picked(pick(v(f.roll_distance), v(d.roll_distance)), true),
             Picked(pick(v(f.total_distance), v(d.total_distance)), false),
-            Picked(pick(None, v(d.total_offline)), true),
+            Picked(pick(v(f.total_offline), v(d.total_offline)), true),
             Text(opt_i(f.backspin_rpm)),
             Text(opt_i(f.sidespin_rpm)),
         ]),
@@ -6112,6 +6127,54 @@ mod tests {
         let (_, groups) = card_metrics(&metric, false);
         let apex = groups[1].1.iter().find(|m| m.label == "Apex").unwrap();
         assert_eq!(apex.unit, "m");
+    }
+
+    /// A device's measured carry offline, descent angle and total offline
+    /// fill the existing Offline and Descent cards, Table columns and the
+    /// Lateral bar, as measured values; a simulated one still wins when both
+    /// are there.
+    #[test]
+    fn measured_offline_and_descent_feed_cards_table_and_bars() {
+        let mut shot = row(1, true);
+        let ball = shot.ball.as_mut().unwrap();
+        ball.carry_offline = Some(Distance::Yards(-4.2));
+        ball.total_offline = Some(Distance::Yards(-5.0));
+        ball.descent_angle = Some(43.1);
+
+        let (_, groups) = card_metrics(&shot, true);
+        let card = |label: &str| {
+            groups[1]
+                .1
+                .iter()
+                .find(|m| m.label == label)
+                .map(|m| (m.text.clone(), m.source == Source::Measured))
+                .unwrap()
+        };
+        assert_eq!(card("Offline"), (fmt_num(-4.2, 1, true), true));
+        assert_eq!(card("Descent"), (fmt_num(43.1, 1, false), true));
+
+        let columns = table_columns(false, true);
+        let name = |n: &str| columns.iter().position(|c| c.name == n).expect(n);
+        let cells = table_cells(&shot, None, None, false);
+        assert_eq!(
+            cells[name("Offline")],
+            TableCell::Picked(Some((-4.2, false)), true)
+        );
+        assert_eq!(
+            cells[name("Desc")],
+            TableCell::Picked(Some((43.1, false)), false)
+        );
+        assert_eq!(
+            cells[name("T.Offline")],
+            TableCell::Picked(Some((-5.0, false)), true)
+        );
+
+        assert_eq!(BarKind::Lateral.value(&shot, true), Some(-4.2));
+
+        let mut d = DerivedFlight::default();
+        d.carry_offline = Some(Distance::Yards(-3.0));
+        shot.derived = Some(d);
+        assert_eq!(BarKind::Lateral.value(&shot, true), Some(-3.0));
     }
 
     #[test]

@@ -237,12 +237,36 @@ Shot data arrives as correlated events sharing a `ShotKey` and `actor`:
 `ShotTrigger` -> `BallFlight` / `ClubPath` / `FaceImpact` (any order) -> `ShotFinished`. Consumers
 use `ShotAccumulator` to collect events into a final `ShotData`
 (`set_ball` for the measured `BallFlight`, `set_derived` for its `derived` block).
+When it finishes the shot, the accumulator computes `ShotData.metrics`
+(`ShotMetrics`, lib `metrics.rs`) from the measured ball and club data.
+
+### Shot metrics
+
+`ShotMetrics::compute` implements the Flight Relay Protocol's spin relations
+and "Derived Values" once, for every consumer that assembles shots (the web
+layer's history and export, the GSPro bridge, `ShotAggregator` users):
+
+- total spin and spin axis from backspin and sidespin, via the SDK's
+  `BallFlight::complete_spin`, only when the device sent both components and
+  neither total nor axis (a total of 0 has no axis);
+- face to path, `face_angle − path`;
+- spin loft, the `dynamic_loft − attack_angle` approximation, only when the
+  device sent no `spin_loft`;
+- curve, `carry_offline − carry_distance × tan(launch_azimuth)`, in metres.
+
+Each field needs every input measured and finite; `metrics` is `None` when no
+field is set. `derived` is never an input: the metrics describe the device's
+shot, the simulation stays in `DerivedFlight`. Lateral values are absolute,
++ right of the target line. `ShotMetrics` is `#[non_exhaustive]`; `curve`
+converts with the unit system like the rest of `ShotData`.
 
 ### Simulated values (beta)
 
 The `BallFlight` event's `derived` field carries values flighthook simulated
 for fields the device did not report: carry, apex, flight time, descent angle,
-carry/roll/total offline, roll and total (`DerivedFlight`, lib crate). `ball`
+carry/roll/total offline, roll and total (`DerivedFlight`, lib crate). A
+measured `carry_offline` or `descent_angle` (FlightScope) is not simulated
+over, except under `force`. `ball`
 is never modified, so a field's location says where it came from: under
 `ball` it was measured, under `derived` it was simulated. A field set in both
 (a measured 0 carry or flight time on a shot that flies, a ground ball's 0
@@ -295,7 +319,8 @@ because its apex is 0, not because it is a putt, and a putting-mode shot
 with an apex above 0 flies like any other. A ground ball never leaves the ground: carry, apex
 and flight time are 0 (in `derived` unless the device measured exactly 0
 for that field, so a measured carry or flight time above 0 shows as 0),
-there is no descent angle, and the carry offline is 0. Its roll comes from
+there is no descent angle, and the carry offline is 0 (in `derived` unless the
+device measured exactly 0). Its roll comes from
 dimple's ground model (`GroundModel::settle`), started at the tee with the
 launch speed along the launch direction and no spin, so the ball skids,
 then rolls to rest; launch angle and spin are not used. The detection
@@ -341,6 +366,20 @@ values the cards display before anything is read from it:
   ratio is outside 0.25 to 4, or a fitted distance would be negative, the
   ground segment is a straight run from the landing to the displayed total
   on the landing's bearing.
+- Offline: with a measured carry offline `O`, the fitted path is then made
+  to land on it while leaving the tee on the measured launch direction `az`.
+  The landing moves to `(X', O)`, `X' = √(C² − O²)`, so it stays at the
+  displayed carry `C`; `x` scales by `X' / X` and the lateral becomes
+  `z' = x'·tan(az) + s·(z − x·tan(az))`, the curve off the start line scaled
+  by `s = (O − X'·tan(az)) / (Z − X·tan(az))` (`(X, Z)` the landing before
+  this step). When the simulated curve at the landing is under 0.3 m, or `s`
+  is not finite or beyond ±4, the curve is kept and the missing lateral is
+  added as `(O − Z')·(x / X)²` instead, which leaves the tee on the same
+  line. The ground segment is turned about the landing by the change in the
+  flight's arrival heading, so the roll continues in the direction the
+  fitted flight arrives, and its run from the landing is scaled to keep the
+  rest at the displayed total. An offline that is not inside the carry gives
+  no path, and then no roll or total offline either.
 - A ground ball's roll is fitted the same way after a landing at the tee
   (radius 0); its straight run keeps the simulated rest's bearing.
 - A measured carry, apex or flight time that is negative or not finite, or
@@ -352,7 +391,8 @@ values the cards display before anything is read from it:
 The carry, roll and total offlines are read from the fitted path: the
 landing's and the rest point's `z`. Where the device measures carry they are
 the offlines at the measured landing, so the path, the offlines and the
-measured distances agree (beta). The path is then decimated: the tee, apex,
+measured distances agree (beta). A measured carry offline is the displayed
+one (not repeated in `derived`), and the roll offline runs from it. The path is then decimated: the tee, apex,
 landing, rest and the contacts and peaks of hops over 5 cm are kept and the
 rest thinned by Ramer-Douglas-Peucker at 0.25 m, while the segment fits under
 its cap (40 flight and 24 ground points); above the cap the segment is
@@ -1275,8 +1315,8 @@ at 0; L and R at the ends) out to 1.2× the widest value, and at least ±6
 units. A single shot draws a 16 px pip, wide enough that it still peeks out
 past the ring and dot. Total and Carry are picked like the cards' values
 (below), and the stats run over the picked values;
-Lateral is the simulated carry offline (+ right of the target line, for both
-hands). The bars carry no simulated marks; that distinction is the cards'
+Lateral is the carry offline, picked the same way (+ right of the target
+line, for both hands). The bars carry no simulated marks; that distinction is the cards'
 `SIM` tags and Table's italics. A stats column shows `avg · med`, then `sd` (two or
 more values) and `k/n` when some of the set's shots lack the value, or
 `no data`. Hovering a track lists n, min, max, avg, median and sd. The stats
@@ -1365,8 +1405,9 @@ axis with room to spare shows more.
 A point is the shot's simulated path's landing (last flight point) or rest
 (last ground point), lateral = `z` (a ground ball lands at the tee, and its
 roll runs from there); without a path, the displayed carry or
-total (picked like the cards) is the distance from the tee and the simulated carry or total offline the
-lateral. A shot with neither is left out.
+total (picked like the cards) is the distance from the tee and the carry or
+total offline (picked the same way) the lateral. A shot without both is left
+out.
 
 The drawn sets are Flight's (`flight::drawn_sets`): **gold** is the shown
 shot when it is a member, a 5 px dot over a halo with its roll drawn as a

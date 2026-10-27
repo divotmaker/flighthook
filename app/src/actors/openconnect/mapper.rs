@@ -23,30 +23,40 @@ fn distance(units: &str, value: f64) -> Distance {
     }
 }
 
-/// Resolve back/side spin components.
+/// The spin pair the monitor populated, golf-semantic: `(backspin,
+/// sidespin)` components or `(total, axis)`.
+enum Spin {
+    Components(i32, i32),
+    TotalAndAxis(f64, f64),
+}
+
+/// Pick the spin pair the message carries.
 ///
 /// Monitors populate spin one of two ways: explicit `BackSpin`/`SideSpin`, or
-/// `TotalSpin` plus a `SpinAxis` tilt in degrees. When the explicit components
-/// are both absent (zero) but a total is present, decompose the total about the
-/// axis. Positive `SpinAxis` tilts to the right, matching GSPro's convention
-/// for a fade from a right-handed player.
-fn spin(ball: &api::BallData) -> (i32, i32) {
+/// `TotalSpin` plus a `SpinAxis` tilt in degrees. Open Connect has no
+/// optional fields, so an unpopulated pair reads 0: the components are used
+/// when either is non-zero or the total is 0, else the total and axis.
+/// Positive `SpinAxis` tilts to the right, matching GSPro's convention for a
+/// fade from a right-handed player.
+fn spin(ball: &api::BallData) -> Spin {
     if ball.back_spin != 0.0 || ball.side_spin != 0.0 || ball.total_spin == 0.0 {
-        return (ball.back_spin.round() as i32, ball.side_spin.round() as i32);
+        Spin::Components(ball.back_spin.round() as i32, ball.side_spin.round() as i32)
+    } else {
+        Spin::TotalAndAxis(ball.total_spin, ball.spin_axis)
     }
-    let axis = ball.spin_axis.to_radians();
-    (
-        (ball.total_spin * axis.cos()).round() as i32,
-        (ball.total_spin * axis.sin()).round() as i32,
-    )
 }
 
 /// Map the ball half of an Open Connect message.
 ///
-/// Open Connect reports HLA and SideSpin golf-semantically (golfer-relative),
-/// like GSPro. For a left-handed player, flip them to FRP's absolute physical
-/// signs (positive = right of target) — the inverse of the flip
-/// `gspro::mapper::map_shot` applies on the way out.
+/// Open Connect reports HLA, SideSpin and SpinAxis golf-semantically
+/// (golfer-relative), like GSPro. For a left-handed player, flip them to
+/// FRP's absolute physical signs (positive = right of target) — the inverse
+/// of the flip `gspro::mapper::map_shot` applies on the way out.
+///
+/// Both FRP spin pairs are sent: the pair the monitor populated, and the
+/// other one computed from it. A total and axis are decomposed from the
+/// unrounded total; components are completed with
+/// [`BallFlight::complete_spin`].
 pub fn map_ball(msg: &api::GsProMessage, handed: Handedness) -> BallFlight {
     let flip = if handed == Handedness::Left {
         -1.0
@@ -54,20 +64,30 @@ pub fn map_ball(msg: &api::GsProMessage, handed: Handedness) -> BallFlight {
         1.0
     };
     let b = &msg.ball_data;
-    let (backspin, sidespin) = spin(b);
-    BallFlight {
+    let mut ball = BallFlight {
         launch_speed: Some(Velocity::MilesPerHour(b.speed)),
         launch_elevation: Some(b.vla),
         launch_azimuth: Some(b.hla * flip),
         carry_distance: b.carry_distance.map(|c| distance(&msg.units, c)),
         // Open Connect carries no total/apex/flight-time/roll fields.
-        total_distance: None,
-        max_height: None,
-        flight_time: None,
-        roll_distance: None,
-        backspin_rpm: Some(backspin),
-        sidespin_rpm: Some((sidespin as f64 * flip).round() as i32),
+        ..BallFlight::default()
+    };
+    match spin(b) {
+        Spin::Components(back, side) => {
+            ball.backspin_rpm = Some(back);
+            ball.sidespin_rpm = Some((side as f64 * flip).round() as i32);
+            ball.complete_spin();
+        }
+        Spin::TotalAndAxis(total, axis) => {
+            let rad = axis.to_radians();
+            let side = (total * rad.sin()).round() as i32;
+            ball.backspin_rpm = Some((total * rad.cos()).round() as i32);
+            ball.sidespin_rpm = Some((side as f64 * flip).round() as i32);
+            ball.total_spin_rpm = Some(total.round() as i32);
+            ball.spin_axis = Some(axis * flip);
+        }
     }
+    ball
 }
 
 /// Map the club half of an Open Connect message.
@@ -98,6 +118,7 @@ pub fn map_club(msg: &api::GsProMessage, handed: Handedness) -> ClubData {
         swing_plane_vertical: None,
         club_offset: None,
         club_height: None,
+        ..ClubData::default()
     }
 }
 
@@ -150,6 +171,10 @@ mod tests {
         let ball = map_ball(&m, Handedness::Right);
         assert_eq!(ball.backspin_rpm, Some(3000));
         assert_eq!(ball.sidespin_rpm, Some(-450));
+        // Total and axis are completed from the components.
+        assert_eq!(ball.total_spin_rpm, Some(3034)); // √(3000² + 450²)
+        let axis = ball.spin_axis.expect("axis");
+        assert!((axis - -8.53).abs() < 0.01, "{axis}"); // atan2(-450, 3000)
     }
 
     #[test]
@@ -160,6 +185,8 @@ mod tests {
         let ball = map_ball(&m, Handedness::Right);
         assert_eq!(ball.backspin_rpm, Some(4330)); // 5000 * cos(30°)
         assert_eq!(ball.sidespin_rpm, Some(2500)); // 5000 * sin(30°)
+        assert_eq!(ball.total_spin_rpm, Some(5000));
+        assert_eq!(ball.spin_axis, Some(30.0));
     }
 
     #[test]
@@ -167,6 +194,8 @@ mod tests {
         let ball = map_ball(&msg(), Handedness::Right);
         assert_eq!(ball.backspin_rpm, Some(0));
         assert_eq!(ball.sidespin_rpm, Some(0));
+        assert_eq!(ball.total_spin_rpm, Some(0));
+        assert_eq!(ball.spin_axis, None);
     }
 
     #[test]
@@ -260,6 +289,58 @@ mod tests {
         let lh = map_ball(&m, Handedness::Left);
         assert_eq!(lh.backspin_rpm, rh.backspin_rpm);
         assert_eq!(lh.sidespin_rpm, rh.sidespin_rpm.map(|v| -v));
+        assert_eq!(lh.total_spin_rpm, rh.total_spin_rpm);
+        assert_eq!(lh.spin_axis, rh.spin_axis.map(|v| -v));
+        assert_eq!(rh.spin_axis, Some(30.0));
+    }
+
+    #[test]
+    fn left_handed_ingest_flips_the_completed_axis() {
+        let m = lateral_msg();
+        let rh = map_ball(&m, Handedness::Right);
+        let lh = map_ball(&m, Handedness::Left);
+        assert_eq!(lh.total_spin_rpm, rh.total_spin_rpm);
+        assert!(rh.spin_axis.expect("axis") < 0.0);
+        assert_eq!(lh.spin_axis, rh.spin_axis.map(|v| -v));
+    }
+
+    /// A fractional total is decomposed unrounded, so the components and
+    /// the GSPro bridge's output match a decomposition of the f64 total.
+    #[test]
+    fn fractional_total_decomposes_unrounded() {
+        let mut m = msg();
+        m.ball_data.total_spin = 3250.5;
+        m.ball_data.spin_axis = 10.0;
+        for (handed, flip) in [(Handedness::Right, 1), (Handedness::Left, -1)] {
+            let ball = map_ball(&m, handed);
+            // 3250.5·cos(10°) = 3201.12, 3250.5·sin(10°) = 564.45.
+            assert_eq!(ball.backspin_rpm, Some(3201), "{handed:?}");
+            assert_eq!(ball.sidespin_rpm, Some(564 * flip), "{handed:?}");
+            assert_eq!(ball.total_spin_rpm, Some(3251), "{handed:?}");
+            assert_eq!(ball.spin_axis, Some(10.0 * f64::from(flip)), "{handed:?}");
+
+            let shot = ShotData {
+                actor: "openconnect_server.0".into(),
+                ball: Some(ball),
+                ..ShotData::default()
+            };
+            let out = super::super::super::gspro::mapper::map_shot(&shot, handed);
+            let (bs, ss) = (3201.0_f64, 564.0_f64);
+            assert_eq!(out.ball_data.back_spin, bs, "{handed:?}");
+            assert_eq!(out.ball_data.side_spin, ss, "{handed:?}");
+            assert_eq!(
+                out.ball_data.total_spin,
+                (bs * bs + ss * ss).sqrt(),
+                "{handed:?}"
+            );
+            assert_eq!(
+                out.ball_data.spin_axis,
+                ss.atan2(bs).to_degrees(),
+                "{handed:?}"
+            );
+            assert!((out.ball_data.total_spin - 3250.31).abs() < 0.01);
+            assert!((out.ball_data.spin_axis - 9.9927).abs() < 1e-4);
+        }
     }
 
     /// Ingest (`map_ball`/`map_club`) is the exact inverse of

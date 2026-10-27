@@ -7,6 +7,7 @@ mod export;
 mod game_state;
 mod group;
 mod message;
+mod metrics;
 mod stats;
 
 pub use api::*;
@@ -18,6 +19,7 @@ pub use export::*;
 pub use game_state::*;
 pub use group::*;
 pub use message::*;
+pub use metrics::*;
 pub use stats::*;
 
 // Re-export flightrelay types used throughout flighthook.

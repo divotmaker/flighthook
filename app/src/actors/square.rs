@@ -320,17 +320,18 @@ fn ball_from_square(b: &allsquare::BallMetrics) -> BallFlight {
         launch_elevation: Some(b.launch_angle),
         launch_azimuth: Some(b.direction),
         // The device measures launch only; the vendor app computes flight.
-        carry_distance: None,
-        total_distance: None,
-        max_height: None,
-        flight_time: None,
-        roll_distance: None,
         backspin_rpm: Some(i32::from(b.back_spin)),
         // Negated: the device reports negative sidespin for rightward curve,
         // FRP defines positive as rightward. Without this, fades draw and
         // draws fade in GSPro (which derives spin axis from these components).
         // Same polarity the Mevo+ wire uses, and the same fix ironsight applies.
         sidespin_rpm: Some(-i32::from(b.side_spin)),
+        // The device reports total spin and axis alongside the components.
+        // The axis has the device's sidespin polarity (negative = right), so
+        // it is negated too. A total of 0 has no axis.
+        total_spin_rpm: Some(i32::from(b.total_spin)),
+        spin_axis: (b.total_spin != 0).then_some(-b.spin_axis),
+        ..BallFlight::default()
     }
 }
 
@@ -349,6 +350,7 @@ fn club_from_square(c: &allsquare::ClubMetrics) -> ClubData {
         // Impact location belongs in FaceImpact, not here.
         club_offset: None,
         club_height: None,
+        ..ClubData::default()
     }
 }
 
@@ -1198,5 +1200,40 @@ mod tests {
         );
         assert!(!export_excluded(&req));
         assert!(!export_excluded(&RawRecord::binary(RawDir::Rx, &BALL)));
+    }
+
+    /// The device's total spin passes through; its axis is negated like its
+    /// sidespin (device negative = right, FRP positive = right), so the two
+    /// FRP spin pairs agree.
+    #[test]
+    fn total_spin_and_axis_follow_frp_signs() {
+        let fade = allsquare::BallMetrics {
+            shot_type: 0x37,
+            speed: 3.30,
+            launch_angle: 32.51,
+            direction: 7.39,
+            total_spin: 627,
+            spin_axis: -8.00,
+            back_spin: 621,
+            side_spin: -87,
+        };
+        let bf = ball_from_square(&fade);
+        assert_eq!(bf.total_spin_rpm, Some(627));
+        assert_eq!(bf.spin_axis, Some(8.0), "device -8 (right) -> FRP +8");
+        let mut components = BallFlight {
+            backspin_rpm: bf.backspin_rpm,
+            sidespin_rpm: bf.sidespin_rpm,
+            ..BallFlight::default()
+        };
+        components.complete_spin();
+        assert_eq!(components.total_spin_rpm, Some(627));
+        assert!((components.spin_axis.unwrap() - 8.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn zero_total_spin_has_no_axis() {
+        let bf = ball_from_square(&ball(1.5, 0, 0, 0));
+        assert_eq!(bf.total_spin_rpm, Some(0));
+        assert_eq!(bf.spin_axis, None);
     }
 }

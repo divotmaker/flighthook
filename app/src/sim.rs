@@ -220,19 +220,26 @@ fn derive_with_error(
         d.carry_distance = Some(Distance::Meters(f.carry_m));
     }
     // Offlines are read from the anchored path, so they sit at the displayed
-    // landing and rest; without a path they are the raw simulation's.
-    let carry_offline = anchored
-        .as_ref()
-        .and_then(|p| p.flight.last())
-        .map_or(f.lateral_m, |l| l[3]);
-    d.carry_offline = Some(Distance::Meters(carry_offline));
+    // landing and rest; without a path they are the raw simulation's. A
+    // measured carry offline is the displayed one (the path lands on it).
+    let carry_offline = measured.offline.unwrap_or_else(|| {
+        anchored
+            .as_ref()
+            .and_then(|p| p.flight.last())
+            .map_or(f.lateral_m, |l| l[3])
+    });
+    if measured.offline.is_none() {
+        d.carry_offline = Some(Distance::Meters(carry_offline));
+    }
     if measured.apex.is_none() {
         d.max_height = Some(Distance::Meters(f.apex_m));
     }
     if measured.flight_time.is_none() {
         d.flight_time = Some(f.flight_time);
     }
-    d.descent_angle = Some(descent);
+    if measured.descent.is_none() {
+        d.descent_angle = Some(descent);
+    }
 
     if rest {
         let carry = measured.carry.unwrap_or(f.carry_m);
@@ -252,12 +259,17 @@ fn derive_with_error(
                 d.total_distance = Some(Distance::Meters(total));
             }
         }
-        let total_offline = anchored
-            .as_ref()
-            .and_then(|p| p.ground.last())
-            .map_or(shot.final_pos.z, |r| r[3]);
-        d.roll_offline = Some(Distance::Meters(total_offline - carry_offline));
-        d.total_offline = Some(Distance::Meters(total_offline));
+        // Without a path the raw simulation's rest is in another frame from
+        // a measured landing, so neither offline is shown.
+        let total_offline = match anchored.as_ref().and_then(|p| p.ground.last()) {
+            Some(r) => Some(r[3]),
+            None if measured.offline.is_none() => Some(shot.final_pos.z),
+            None => None,
+        };
+        if let Some(total_offline) = total_offline {
+            d.roll_offline = Some(Distance::Meters(total_offline - carry_offline));
+            d.total_offline = Some(Distance::Meters(total_offline));
+        }
     }
     d.path = anchored.map(|p| p.decimated());
 
@@ -360,7 +372,9 @@ fn derive_ground_ball(
     if !measured_zero(measured.carry) {
         d.carry_distance = Some(Distance::Meters(0.0));
     }
-    d.carry_offline = Some(Distance::Meters(0.0));
+    if !measured_zero(measured.offline) {
+        d.carry_offline = Some(Distance::Meters(0.0));
+    }
     if !measured_zero(measured.apex) {
         d.max_height = Some(Distance::Meters(0.0));
     }
@@ -487,8 +501,14 @@ fn nearest_time(points: &[[f64; 4]], t: f64) -> Option<usize> {
 #[derive(Debug, Clone, Copy, Default)]
 struct Measured {
     carry: Option<f64>,
+    /// Carry offline: landing point right (+) of the target line.
+    offline: Option<f64>,
+    /// Launch direction (deg, + = right): the start line a fit to a
+    /// measured offline keeps.
+    azimuth: Option<f64>,
     apex: Option<f64>,
     flight_time: Option<f64>,
+    descent: Option<f64>,
     total: Option<f64>,
     roll: Option<f64>,
 }
@@ -497,8 +517,14 @@ impl Measured {
     fn from_ball(ball: &BallFlight) -> Self {
         Self {
             carry: ball.carry_distance.map(Distance::as_meters),
+            offline: ball
+                .carry_offline
+                .map(Distance::as_meters)
+                .filter(|v| v.is_finite()),
+            azimuth: ball.launch_azimuth,
             apex: ball.max_height.map(Distance::as_meters),
             flight_time: ball.flight_time,
+            descent: ball.descent_angle.filter(|v| v.is_finite()),
             total: ball.total_distance.map(Distance::as_meters),
             roll: ball.roll_distance.map(Distance::as_meters),
         }
@@ -539,6 +565,10 @@ const LARGE_FIT: f64 = 0.3;
 ///   `k = C / C_sim`, `k_y` and `k_t` the measured-to-simulated apex and
 ///   flight time (1 when not measured). The landing keeps its bearing from
 ///   the tee and lands at radius `C`; the curve keeps its shape.
+/// - Offline: with a measured carry offline `O`, the path is then fitted to
+///   land on it while leaving the tee on the measured launch direction
+///   ([`fit_offline`]): the start line is kept and the curve, the lateral
+///   deviation from it, is scaled.
 /// - Ground: a polar fit about the tee. A point at radius `rho` keeps its
 ///   bearing and height and moves to `C + r*(rho - C_sim)`, with
 ///   `r = (T - C) / roll_sim` when the device measured total or roll and 1
@@ -552,8 +582,9 @@ const LARGE_FIT: f64 = 0.3;
 ///
 /// With nothing measured the path is the simulation, unchanged. A measured
 /// carry, apex, flight time or total that is not finite and positive, a
-/// non-finite measured roll or a displayed total that is not positive
-/// gives no path. A measured 0 apex never gets here (a ground ball,
+/// non-finite measured roll, a measured offline that is not inside the
+/// carry (`|O| < C`) or comes without a launch direction, or a displayed
+/// total that is not positive gives no path. A measured 0 apex never gets here (a ground ball,
 /// [`derive_ground_ball`]), and [`derive`] treats a measured 0 carry or
 /// flight time as not measured ([`Measured::without_zero_flight`]).
 fn anchor_path(raw: &FullPath, m: &Measured) -> Result<FullPath, &'static str> {
@@ -608,7 +639,7 @@ fn anchor_path(raw: &FullPath, m: &Measured) -> Result<FullPath, &'static str> {
         flight[last][0] = t;
     }
     let fitted = flight[last];
-    let (ground, contacts) = fit_ground(
+    let (mut ground, contacts) = fit_ground(
         raw,
         m,
         &Landing {
@@ -620,11 +651,133 @@ fn anchor_path(raw: &FullPath, m: &Measured) -> Result<FullPath, &'static str> {
             bearing: landing[3].atan2(landing[1]),
         },
     )?;
+    if let Some(offline) = m.offline {
+        let Some(azimuth) = m.azimuth else {
+            return Err("measured offline without a launch direction");
+        };
+        fit_offline(&mut flight, &mut ground, offline, azimuth)?;
+    }
     Ok(FullPath {
         flight,
         ground,
         contacts,
     })
+}
+
+/// A simulated curve (m) below which [`fit_offline`] adds the missing
+/// lateral instead of scaling the curve: the ratio would be dominated by
+/// noise.
+const MIN_FIT_CURVE_M: f64 = 0.3;
+/// Largest curve scale [`fit_offline`] applies; beyond it the missing
+/// lateral is added instead.
+const MAX_CURVE_SCALE: f64 = 4.0;
+
+/// Fit a flight landing at radius `C` (and its ground segment) to land at
+/// the measured carry offline `O` while leaving the tee on the measured
+/// launch direction `az` (deg).
+///
+/// The landing moves to `(X', O)` with `X' = sqrt(C² - O²)`, so it stays at
+/// radius `C`. A point's downrange `x` scales by `X' / X` and its lateral
+/// becomes `z' = x'·tan(az) + s·(z - x·tan(az))`: the start line is kept and
+/// the deviation from it (the curve) is scaled by
+/// `s = (O - X'·tan(az)) / (Z - X·tan(az))`, `(X, Z)` the landing before
+/// the fit. When the simulated curve at the landing is under
+/// [`MIN_FIT_CURVE_M`], or `s` is not finite or beyond
+/// [`MAX_CURVE_SCALE`], the curve is kept and the missing lateral is added
+/// as `(O - Z')·(x / X)²`, `Z'` the landing's lateral with the curve kept;
+/// that leaves the tee on the same line. Either way the tee does not move.
+///
+/// The ground segment is turned about the landing by the change in the
+/// flight's arrival heading, so the roll continues in the direction the
+/// fitted flight arrives, and its run from the landing is then scaled so
+/// the rest keeps its radius from the tee (the displayed total).
+///
+/// An offline that is not inside the carry (`|O| < C`), a landing that is
+/// not downrange or a launch direction outside ±90° fails.
+fn fit_offline(
+    flight: &mut [[f64; 4]],
+    ground: &mut [[f64; 4]],
+    offline: f64,
+    azimuth: f64,
+) -> Result<(), &'static str> {
+    let n = flight.len();
+    let Some(&[_, x_l, _, z_l]) = flight.last() else {
+        return Err("empty flight");
+    };
+    let carry = x_l.hypot(z_l);
+    if !(offline.is_finite() && offline.abs() < carry) {
+        return Err("measured offline not finite and inside the carry");
+    }
+    if !(azimuth.is_finite() && azimuth.abs() < 90.0) {
+        return Err("launch direction outside -90 to 90 deg");
+    }
+    if x_l <= 0.0 {
+        return Err("landing not downrange");
+    }
+    let x_fit = (carry * carry - offline * offline).sqrt();
+    let q = x_fit / x_l;
+    let tan = azimuth.to_radians().tan();
+    let curve_sim = z_l - x_l * tan;
+    let curve = offline - x_fit * tan;
+    let scale = curve / curve_sim;
+    let scaled =
+        curve_sim.abs() >= MIN_FIT_CURVE_M && scale.is_finite() && scale.abs() <= MAX_CURVE_SCALE;
+    if !scaled {
+        debug!("sim path: offline fitted by adding the lateral (simulated curve {curve_sim:.2} m)");
+    }
+    let lateral = |x: f64, z: f64| {
+        let deviation = z - x * tan;
+        let fitted = if scaled {
+            scale * deviation
+        } else {
+            deviation + (curve - curve_sim) * (x / x_l).powi(2)
+        };
+        q * x * tan + fitted
+    };
+    let heading = |a: [f64; 4], b: [f64; 4]| (b[3] - a[3]).atan2(b[1] - a[1]);
+    let arrival_sim = (n >= 2).then(|| heading(flight[n - 2], flight[n - 1]));
+    for p in flight.iter_mut() {
+        p[3] = lateral(p[1], p[3]);
+        p[1] *= q;
+    }
+    flight[n - 1][3] = offline;
+    let turn = arrival_sim.map_or(0.0, |a| heading(flight[n - 2], flight[n - 1]) - a);
+
+    let (Some(&first), Some(&rest)) = (ground.first(), ground.last()) else {
+        return Ok(());
+    };
+    let (sin, cos) = turn.sin_cos();
+    let run = |p: [f64; 4]| {
+        let (dx, dz) = (p[1] - first[1], p[3] - first[3]);
+        (dx * cos - dz * sin, dx * sin + dz * cos)
+    };
+    // The run scale `u` that keeps the rest at its radius `T`:
+    // |L + u·w| = T, the root nearest 1.
+    let total = rest[1].hypot(rest[3]);
+    let (wx, wz) = run(rest);
+    let (a, b, c) = (
+        wx * wx + wz * wz,
+        x_fit * wx + offline * wz,
+        carry * carry - total * total,
+    );
+    let disc = b * b - a * c;
+    let u = if a > 0.0 && disc >= 0.0 {
+        let root = disc.sqrt();
+        let (u1, u2) = ((-b + root) / a, (-b - root) / a);
+        if (u1 - 1.0).abs() <= (u2 - 1.0).abs() {
+            u1
+        } else {
+            u2
+        }
+    } else {
+        1.0
+    };
+    for p in ground.iter_mut() {
+        let (dx, dz) = run(*p);
+        *p = [p[0], x_fit + u * dx, p[2], offline + u * dz];
+    }
+    ground[0] = flight[n - 1];
+    Ok(())
 }
 
 /// Fit a ground ball's roll to the measured values: the path's flight is
@@ -1055,6 +1208,7 @@ mod tests {
             flight_time: None,
             backspin_rpm: Some(back),
             sidespin_rpm: Some(side),
+            ..BallFlight::default()
         }
     }
 
@@ -2175,6 +2329,7 @@ mod tests {
             flight_time: Some(0.0),
             backspin_rpm: Some(0),
             sidespin_rpm: Some(0),
+            ..BallFlight::default()
         }
     }
 
@@ -2627,5 +2782,321 @@ mod tests {
             ]
         );
         assert!(out[1][2].is_sign_positive());
+    }
+
+    /// A measured carry offline and descent angle are not simulated over:
+    /// they stay out of `derived`, the path lands on the measured offline
+    /// at the measured carry and the roll offline is measured from that
+    /// landing.
+    #[test]
+    fn measured_offline_and_descent_are_not_derived() {
+        for offline in [-6.0, 4.5] {
+            let mut b = fully_measured();
+            b.carry_offline = Some(Distance::Meters(offline));
+            b.descent_angle = Some(41.0);
+            let d = derive(&b, &cfg()).expect("simulated");
+            assert_eq!(d.carry_offline, None, "{offline}");
+            assert_eq!(d.descent_angle, None, "{offline}");
+            let p = d.path.as_ref().expect("path");
+            let landing = p.flight.last().expect("landing");
+            assert!(
+                (landing[3] - offline).abs() < 0.01,
+                "{offline}: {landing:?}"
+            );
+            let carry = Distance::Yards(241.0).as_meters();
+            assert!(
+                (landing[1].hypot(landing[3]) - carry).abs() < 0.02,
+                "{landing:?}"
+            );
+            let rest = p.ground.last().expect("rest");
+            assert!((m(d.total_offline) - rest[3]).abs() < 0.01);
+            assert!((m(d.roll_offline) - (m(d.total_offline) - offline)).abs() < 1e-9);
+            assert_pinned(
+                &p.flight,
+                &p.ground,
+                carry,
+                Some(Distance::Yards(265.0).as_meters()),
+                0.01,
+            );
+        }
+    }
+
+    /// Without a measured carry the path lands on the measured offline at
+    /// the simulated carry.
+    #[test]
+    fn measured_offline_lands_at_the_simulated_carry() {
+        let mut b = ball(150.0, 12.0, 0.8, 2900, -350);
+        let plain = derive(&b, &cfg()).expect("simulated");
+        b.carry_offline = Some(Distance::Meters(-3.0));
+        let d = derive(&b, &cfg()).expect("simulated");
+        assert_eq!(d.carry_offline, None);
+        let landing = *d
+            .path
+            .as_ref()
+            .expect("path")
+            .flight
+            .last()
+            .expect("landing");
+        assert!((landing[3] - -3.0).abs() < 0.01, "{landing:?}");
+        let carry = m(d.carry_distance);
+        assert!((carry - m(plain.carry_distance)).abs() < 1e-9);
+        assert!(
+            (landing[1].hypot(landing[3]) - carry).abs() < 0.02,
+            "{landing:?}"
+        );
+    }
+
+    /// An offline the carry can't reach gives no path; the measured value
+    /// still is not overridden, and with no path to read them from there
+    /// are no roll or total offlines (the raw simulation's rest is not in
+    /// the measured landing's frame).
+    #[test]
+    fn offline_beyond_the_carry_gives_no_path() {
+        let mut b = fully_measured();
+        b.carry_offline = Some(Distance::Yards(300.0));
+        let d = derive(&b, &cfg()).expect("simulated");
+        assert_eq!(d.carry_offline, None);
+        assert!(d.path.is_none());
+        assert_eq!(d.roll_offline, None);
+        assert_eq!(d.total_offline, None);
+        assert!(d.roll_distance.is_none() && d.total_distance.is_none());
+        assert!(d.descent_angle.is_some());
+    }
+
+    /// A non-finite measured offline or descent is not a reading: both are
+    /// simulated, and every offline is finite.
+    #[test]
+    fn non_finite_offline_and_descent_are_not_measured() {
+        let mut b = fully_measured();
+        b.carry_offline = Some(Distance::Meters(f64::NAN));
+        b.descent_angle = Some(f64::INFINITY);
+        let m = Measured::from_ball(&b);
+        assert!(m.offline.is_none() && m.descent.is_none());
+        let d = derive(&b, &cfg()).expect("simulated");
+        let plain = derive(&fully_measured(), &cfg()).expect("simulated");
+        assert_eq!(d, plain);
+        for v in [d.carry_offline, d.roll_offline, d.total_offline] {
+            assert!(v.expect("present").as_meters().is_finite());
+        }
+    }
+
+    /// The raw path for `b` and its fit to `b`'s measured values.
+    fn fitted(b: &BallFlight) -> (FullPath, FullPath) {
+        let raw = raw_path(b);
+        let fit = anchor_path(&raw, &Measured::from_ball(b)).expect("path");
+        (raw, fit)
+    }
+
+    /// The displayed total for `b` without its offline: the rest radius of
+    /// the path fitted to everything else.
+    fn total_without_offline(raw: &FullPath, b: &BallFlight) -> f64 {
+        let m = Measured {
+            offline: None,
+            ..Measured::from_ball(b)
+        };
+        sim_total(&anchor_path(raw, &m).expect("path"))
+    }
+
+    /// Launch bearing (deg): the path's tangent at the tee, extrapolated
+    /// from the bearings of its first two samples (`z/x = a + b·x` for a
+    /// lateral `a·x + b·x²`), so a curve's own bend is not counted.
+    fn launch_bearing(p: &FullPath) -> f64 {
+        let ([_, x1, _, z1], [_, x2, _, z2]) = (p.flight[1], p.flight[2]);
+        let slope = (x2 * (z1 / x1) - x1 * (z2 / x2)) / (x2 - x1);
+        slope.atan().to_degrees()
+    }
+
+    /// The simulated curve at the landing: the lateral off the start line.
+    fn sim_curve(raw: &FullPath, azimuth: f64) -> f64 {
+        let l = raw.flight.last().expect("landing");
+        l[3] - l[1] * azimuth.to_radians().tan()
+    }
+
+    /// Heading (rad) of the step from `a` to `b`.
+    fn step_heading(a: [f64; 4], b: [f64; 4]) -> f64 {
+        (b[3] - a[3]).atan2(b[1] - a[1])
+    }
+
+    /// The fit's invariants: the tee on the measured start line, the
+    /// landing at the carry and the measured offline, the rest at the
+    /// displayed total, and the roll leaving the landing at the same angle
+    /// to the arrival heading as in the simulation.
+    fn assert_offline_fit(
+        raw: &FullPath,
+        fit: &FullPath,
+        azimuth: f64,
+        carry: f64,
+        offline: f64,
+        total: Option<f64>,
+    ) {
+        assert!(fit.is_finite());
+        let start = launch_bearing(fit);
+        assert!((start - azimuth).abs() < 0.01, "start {start} vs {azimuth}");
+        let landing = *fit.flight.last().expect("landing");
+        assert!((landing[3] - offline).abs() < 1e-9, "{landing:?}");
+        assert_pinned(&fit.flight, &fit.ground, carry, total, 1e-6);
+        if total.is_some() {
+            let n = fit.flight.len();
+            let roll_turn = |p: &FullPath| {
+                step_heading(p.ground[0], p.ground[1])
+                    - step_heading(p.flight[n - 2], p.flight[n - 1])
+            };
+            let (r, f) = (roll_turn(raw), roll_turn(fit));
+            assert!((r - f).abs() < 0.02, "roll turn {r} vs {f}");
+        }
+    }
+
+    /// The fit keeps the measured launch direction and lands on the
+    /// measured offline (the shape probed in review: a 4° start with a hook
+    /// back to 6 m left).
+    #[test]
+    fn offline_fit_keeps_the_launch_direction() {
+        for (azimuth, offline) in [(4.0, -6.0), (0.8, -3.0), (0.8, 12.0), (-2.5, 5.0)] {
+            let mut b = fully_measured();
+            b.launch_azimuth = Some(azimuth);
+            b.carry_offline = Some(Distance::Meters(offline));
+            let (raw, fit) = fitted(&b);
+            let start = launch_bearing(&raw);
+            assert!((start - azimuth).abs() < 0.01, "raw start {start}");
+            assert!(sim_curve(&raw, azimuth).abs() >= MIN_FIT_CURVE_M);
+            assert_offline_fit(
+                &raw,
+                &fit,
+                azimuth,
+                Distance::Yards(241.0).as_meters(),
+                offline,
+                Some(Distance::Yards(265.0).as_meters()),
+            );
+        }
+    }
+
+    /// Through `derive`: the decimated path's landing and rest are the
+    /// offlines it reports.
+    #[test]
+    fn offline_fit_offlines_are_the_paths() {
+        let mut b = fully_measured();
+        b.launch_azimuth = Some(4.0);
+        b.carry_offline = Some(Distance::Meters(-6.0));
+        let d = derive(&b, &cfg()).expect("simulated");
+        let p = d.path.as_ref().expect("path");
+        let landing = p.flight.last().expect("landing");
+        let rest = p.ground.last().expect("rest");
+        assert!((landing[3] - -6.0).abs() < 0.005, "{landing:?}");
+        assert!((m(d.total_offline) - rest[3]).abs() < 0.005);
+        assert!((m(d.roll_offline) - (m(d.total_offline) + 6.0)).abs() < 1e-9);
+    }
+
+    /// A shot with almost no simulated curve (no sidespin) gets the missing
+    /// lateral added, still leaving on the measured line.
+    #[test]
+    fn offline_fit_adds_the_lateral_without_a_curve() {
+        let mut b = straight_shot();
+        b.carry_distance = Some(Distance::Meters(200.0));
+        b.carry_offline = Some(Distance::Meters(14.0));
+        let (raw, fit) = fitted(&b);
+        assert!(sim_curve(&raw, 3.0).abs() < MIN_FIT_CURVE_M);
+        let total = total_without_offline(&raw, &b);
+        assert_offline_fit(&raw, &fit, 3.0, 200.0, 14.0, Some(total));
+        // The lateral added grows with the square of the distance: halfway
+        // downrange a quarter of it.
+        let l = *fit.flight.last().expect("landing");
+        let mid = fit
+            .flight
+            .iter()
+            .min_by(|a, b| {
+                (a[1] - l[1] / 2.0)
+                    .abs()
+                    .total_cmp(&(b[1] - l[1] / 2.0).abs())
+            })
+            .expect("mid");
+        let tan = 3.0_f64.to_radians().tan();
+        let added = |p: [f64; 4]| p[3] - p[1] * tan;
+        let ratio = added(*mid) / added(l);
+        assert!((ratio - 0.25).abs() < 0.02, "{ratio}");
+    }
+
+    /// A straight shot measured straight stays on the target line.
+    #[test]
+    fn offline_fit_straight_shot_stays_straight() {
+        let mut b = ball(150.0, 12.5, 0.0, 3200, 0);
+        b.carry_distance = Some(Distance::Meters(200.0));
+        b.carry_offline = Some(Distance::Meters(0.0));
+        let (raw, fit) = fitted(&b);
+        let total = total_without_offline(&raw, &b);
+        assert_offline_fit(&raw, &fit, 0.0, 200.0, 0.0, Some(total));
+        for p in fit.flight.iter().chain(&fit.ground) {
+            assert!(p[3].abs() < 1e-9, "{p:?}");
+        }
+    }
+
+    /// A measured curve far beyond the simulation's (scale over
+    /// [`MAX_CURVE_SCALE`]) is added rather than scaled; the fit holds.
+    #[test]
+    fn offline_fit_absurd_scale_adds_the_lateral() {
+        let mut b = fully_measured();
+        let azimuth = 0.8;
+        let raw = raw_path(&b);
+        let carry = Distance::Yards(241.0).as_meters();
+        let k = carry / sim_carry(&raw);
+        let curve = sim_curve(&raw, azimuth) * k;
+        // Ten times the simulated curve, on the same side.
+        let offline = carry * azimuth.to_radians().sin() + 10.0 * curve;
+        let x_fit = (carry * carry - offline * offline).sqrt();
+        let scale = (offline - x_fit * azimuth.to_radians().tan()) / curve;
+        assert!(scale > MAX_CURVE_SCALE, "{scale}");
+        b.carry_offline = Some(Distance::Meters(offline));
+        let fit = anchor_path(&raw, &Measured::from_ball(&b)).expect("path");
+        assert_offline_fit(
+            &raw,
+            &fit,
+            azimuth,
+            carry,
+            offline,
+            Some(Distance::Yards(265.0).as_meters()),
+        );
+    }
+
+    /// Large launch directions (up to 75° either way) keep their start line
+    /// and land on the measured offline, with every point finite.
+    #[test]
+    fn offline_fit_huge_launch_directions() {
+        for azimuth in [-75.0, -40.0, 40.0, 75.0_f64] {
+            let mut b = ball(150.0, 12.0, azimuth, 2900, -350);
+            b.carry_distance = Some(Distance::Meters(200.0));
+            let offline = 200.0 * azimuth.to_radians().sin() - 4.0;
+            b.carry_offline = Some(Distance::Meters(offline));
+            let (raw, fit) = fitted(&b);
+            let start = launch_bearing(&raw);
+            assert!((start - azimuth).abs() < 0.01, "raw start {start}");
+            let total = total_without_offline(&raw, &b);
+            assert_offline_fit(&raw, &fit, azimuth, 200.0, offline, Some(total));
+        }
+    }
+
+    /// Under `force` the measured offline and descent are simulated over,
+    /// like every other result field.
+    #[test]
+    fn force_derives_offline_and_descent_over_measured() {
+        let mut b = fully_measured();
+        b.carry_offline = Some(Distance::Meters(-6.0));
+        b.descent_angle = Some(41.0);
+        let d = derive(&b, &forced()).expect("simulated");
+        assert!(d.carry_offline.is_some() && d.descent_angle.is_some());
+        let plain = derive(&fully_measured(), &forced()).expect("simulated");
+        assert_eq!(d, plain);
+    }
+
+    /// A ground ball shows a carry offline of 0, unless the device measured
+    /// exactly 0.
+    #[test]
+    fn ground_ball_offline_is_zero_unless_measured_zero() {
+        let mut b = ball(8.0, 0.0, 1.0, 0, 0);
+        b.max_height = Some(Distance::Meters(0.0));
+        b.carry_offline = Some(Distance::Meters(0.4));
+        let d = derive(&b, &cfg()).expect("rolled");
+        assert_eq!(d.carry_offline, Some(Distance::Meters(0.0)));
+        b.carry_offline = Some(Distance::Meters(0.0));
+        let d = derive(&b, &cfg()).expect("rolled");
+        assert_eq!(d.carry_offline, None);
     }
 }

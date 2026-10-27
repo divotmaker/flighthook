@@ -317,6 +317,7 @@ fn generate_shot(n: u32, mode: ShotDetectionMode) -> (BallFlight, ClubData) {
         roll_distance: Some(Distance::Meters(carry * 0.1)),
         backspin_rpm: Some(backspin as i32),
         sidespin_rpm: Some(sidespin as i32),
+        ..BallFlight::default()
     };
     let club = ClubData {
         club_speed: Some(Velocity::MetersPerSecond(club_speed)),
@@ -330,6 +331,7 @@ fn generate_shot(n: u32, mode: ShotDetectionMode) -> (BallFlight, ClubData) {
         swing_plane_vertical: Some(45.0),
         club_offset: None,
         club_height: None,
+        ..ClubData::default()
     };
 
     (ball, club)

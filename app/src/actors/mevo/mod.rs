@@ -1058,18 +1058,45 @@ fn connect_and_run(
 
 fn ball_from_d4(d4: &FlightResult) -> BallFlight {
     // DSP→PC negation: wire neg=right/slice, FRP pos=right/slice.
+    let flew = flew(d4.carry_distance, d4.flight_time, d4.max_height);
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(d4.launch_speed)),
         launch_elevation: Some(d4.launch_elevation),
         launch_azimuth: Some(-d4.launch_azimuth),
         carry_distance: Some(Distance::Meters(d4.carry_distance)),
-        total_distance: None,
+        carry_offline: flew
+            .then(|| finite(-d4.landing_position[2]))
+            .flatten()
+            .map(Distance::Meters),
         max_height: Some(Distance::Meters(d4.max_height)),
         flight_time: Some(d4.flight_time),
-        roll_distance: None,
+        descent_angle: flew.then(|| descent_angle(d4.landing_velocity)).flatten(),
         backspin_rpm: Some(d4.backspin_rpm),
         sidespin_rpm: Some(-d4.sidespin_rpm),
+        ..BallFlight::default()
     }
+}
+
+/// Whether a flight result describes a ball in flight: positive, finite
+/// carry, flight time and apex. A ball that stayed on the ground has no
+/// landing, so no landing offline or descent angle.
+fn flew(carry: f64, flight_time: f64, apex: f64) -> bool {
+    [carry, flight_time, apex]
+        .iter()
+        .all(|v| v.is_finite() && *v > 0.0)
+}
+
+fn finite(v: f64) -> Option<f64> {
+    v.is_finite().then_some(v)
+}
+
+/// Angle below horizontal (deg) of the D4 landing velocity
+/// `[forward, vertical, lateral]`, or `None` when the ball is not descending.
+fn descent_angle(v: [f64; 3]) -> Option<f64> {
+    let [forward, vertical, lateral] = v;
+    let horizontal = forward.hypot(lateral);
+    let angle = (-vertical).atan2(horizontal).to_degrees();
+    (vertical < 0.0 && angle.is_finite()).then_some(angle)
 }
 
 /// The `[mevo.N]` spin source for the actor `actor_id` (`"mevo.N"`), from
@@ -1165,17 +1192,21 @@ fn auto_label(label: &'static str) -> &'static str {
 
 fn ball_from_e8(e8: &FlightResultV1) -> BallFlight {
     // DSP→PC negation: wire neg=right, FRP pos=right.
+    let flew = flew(e8.distance, e8.flight_time, e8.height);
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(e8.ball_velocity)),
         launch_elevation: Some(e8.elevation),
         launch_azimuth: Some(-e8.azimuth),
         carry_distance: Some(Distance::Meters(e8.distance)),
-        total_distance: None,
+        carry_offline: flew
+            .then(|| finite(-e8.lateral))
+            .flatten()
+            .map(Distance::Meters),
         max_height: Some(Distance::Meters(e8.height)),
         flight_time: Some(e8.flight_time),
-        roll_distance: None,
         backspin_rpm: Some(e8.backspin_rpm),
         sidespin_rpm: None, // always zero in E8 — None, not Some(0)
+        ..BallFlight::default()
     }
 }
 
@@ -1193,6 +1224,7 @@ fn club_from_ed(ed: &ironsight::protocol::shot::ClubResult) -> ClubData {
         swing_plane_vertical: Some(ed.swing_plane_vertical),
         club_offset: Some(Distance::Meters(ed.club_offset)),
         club_height: Some(Distance::Meters(ed.club_height)),
+        ..ClubData::default()
     }
 }
 
@@ -1709,5 +1741,91 @@ mod tests {
             xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)),
             (None, "D4 (no E8 spin)")
         );
+    }
+
+    /// D4 landing lateral and E8 lateral are wire-signed like the azimuth
+    /// (negative = right), so FRP's carry offline is their negation. This Xi
+    /// shot launched left (FRP azimuth -8.14) and landed left.
+    #[test]
+    fn carry_offline_is_the_negated_wire_lateral() {
+        let (d4, e8) = shot_with_club_data();
+        let ball = ball_from_d4(&d4);
+        assert_eq!(ball.launch_azimuth, Some(-d4.launch_azimuth));
+        assert!(ball.launch_azimuth.unwrap() < 0.0);
+        let offline = ball.carry_offline.expect("offline").as_meters();
+        assert!((offline - -d4.landing_position[2]).abs() < 1e-12);
+        assert!(offline < 0.0, "{offline}");
+
+        let ball = ball_from_e8(&e8);
+        let offline = ball.carry_offline.expect("offline").as_meters();
+        assert!((offline - -e8.lateral).abs() < 1e-12);
+        assert!(offline < 0.0, "{offline}");
+    }
+
+    #[test]
+    fn d4_carry_offline_follows_the_wire_sign() {
+        let (mut d4, mut e8) = shot_with_club_data();
+        d4.landing_position[2] = -4.25;
+        e8.lateral = -3.5;
+        let d4_offline = ball_from_d4(&d4).carry_offline;
+        let e8_offline = ball_from_e8(&e8).carry_offline;
+        assert_eq!(d4_offline, Some(Distance::Meters(4.25)));
+        assert_eq!(e8_offline, Some(Distance::Meters(3.5)));
+    }
+
+    /// Descent angle from the D4 landing velocity: angle below horizontal of
+    /// `[forward, vertical, lateral]`.
+    #[test]
+    fn d4_descent_angle_from_landing_velocity() {
+        let (d4, _) = shot_with_club_data();
+        let [fwd, up, side] = d4.landing_velocity;
+        assert!(up < 0.0);
+        let want = (-up).atan2(fwd.hypot(side)).to_degrees();
+        let got = ball_from_d4(&d4).descent_angle.expect("descent");
+        assert!((got - want).abs() < 1e-12);
+        assert!((got - 39.25).abs() < 0.01, "{got}");
+
+        let steep = descent_angle([20.0, -20.0, 0.0]).expect("descending");
+        assert!((steep - 45.0).abs() < 1e-12, "{steep}");
+        let sideways = descent_angle([0.0, -10.0, 10.0]).expect("descending");
+        assert!((sideways - 45.0).abs() < 1e-12, "{sideways}");
+        // Still rising, level, or not a number: no descent.
+        assert_eq!(descent_angle([20.0, 1.0, 0.0]), None);
+        assert_eq!(descent_angle([20.0, 0.0, 0.0]), None);
+        assert_eq!(descent_angle([f64::NAN, -1.0, 0.0]), None);
+    }
+
+    /// A ball that did not fly has no landing: no offline or descent.
+    #[test]
+    fn no_landing_fields_without_a_flight() {
+        let (d4, e8) = shot_with_club_data();
+        for (carry, time, apex) in [(0.0, 4.0, 13.0), (85.0, 0.0, 13.0), (85.0, 4.0, 0.0)] {
+            let mut d = d4.clone();
+            (d.carry_distance, d.flight_time, d.max_height) = (carry, time, apex);
+            let ball = ball_from_d4(&d);
+            assert_eq!(ball.carry_offline, None, "{carry} {time} {apex}");
+            assert_eq!(ball.descent_angle, None, "{carry} {time} {apex}");
+
+            let mut e = e8.clone();
+            (e.distance, e.flight_time, e.height) = (carry, time, apex);
+            assert_eq!(
+                ball_from_e8(&e).carry_offline,
+                None,
+                "{carry} {time} {apex}"
+            );
+        }
+        // E8 has no landing velocity, so never a descent angle.
+        assert_eq!(ball_from_e8(&e8).descent_angle, None);
+    }
+
+    /// The Mevo reports spin components only; total and axis are left to the
+    /// shot metrics.
+    #[test]
+    fn mevo_sends_spin_components_only() {
+        let (d4, e8) = shot_with_club_data();
+        for ball in [ball_from_d4(&d4), ball_from_e8(&e8)] {
+            assert_eq!(ball.total_spin_rpm, None);
+            assert_eq!(ball.spin_axis, None);
+        }
     }
 }

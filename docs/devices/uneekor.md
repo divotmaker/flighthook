@@ -23,8 +23,10 @@ This is a bridge, not a driver. Uneekor's PC software has to be running.
 | **Not** available | Club Optix imagery, device telemetry beyond readiness, any device control (no arm/disarm, no detection-mode setting) |
 
 Spin arrives one of two ways depending on the monitor: explicit back/side
-components, or a total plus a spin axis. Both are handled — a total-and-axis
-reading is decomposed into back/side on the way onto the bus.
+components, or a total plus a spin axis. Both are handled, and both FRP pairs
+go onto the bus: the one the monitor sent, and the other computed from it (a
+total and axis decomposed into back/side, or back/side combined into a total
+and axis). Spin axis follows the same handedness conversion as sidespin.
 
 Values the monitor doesn't send (apex, flight time, descent, offline, roll,
 total, and carry when absent) are simulated from the launch, as for every

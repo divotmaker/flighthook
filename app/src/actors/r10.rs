@@ -278,20 +278,24 @@ fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>
 // Protocol type -> bus type conversion helpers
 // ---------------------------------------------------------------------------
 
+/// The R10 measures total spin and spin axis; tenover also hands back the
+/// back/side components computed from them, so both FRP spin pairs are sent.
+/// A total of 0 has no axis.
 fn ball_from_r10(b: &tenover::proto::BallData) -> BallFlight {
+    #[allow(clippy::cast_possible_truncation)]
+    let total_spin = b.total_spin.round() as i32;
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(f64::from(b.ball_speed))),
         launch_elevation: Some(f64::from(b.launch_angle)),
         launch_azimuth: Some(f64::from(b.launch_direction)),
-        carry_distance: None, // R10 doesn't compute carry
-        total_distance: None,
-        max_height: None,
-        flight_time: None,
-        roll_distance: None,
+        // R10 doesn't compute carry, apex, flight time or roll.
         #[allow(clippy::cast_possible_truncation)]
         backspin_rpm: Some(b.backspin.round() as i32),
         #[allow(clippy::cast_possible_truncation)]
         sidespin_rpm: Some(b.sidespin.round() as i32),
+        total_spin_rpm: Some(total_spin),
+        spin_axis: (total_spin != 0).then_some(f64::from(b.spin_axis)),
+        ..BallFlight::default()
     }
 }
 
@@ -308,6 +312,7 @@ fn club_from_r10(c: &tenover::proto::ClubData) -> ClubData {
         swing_plane_vertical: None,
         club_offset: None,
         club_height: None,
+        ..ClubData::default()
     }
 }
 
@@ -926,5 +931,48 @@ mod tests {
         for t in [5000, 5043, 5044, 5050, 5100, 5113] {
             assert!(!gfdi_type_excluded(t), "{t}");
         }
+    }
+
+    fn r10_ball(total_spin: f32, spin_axis: f32) -> tenover::proto::BallData {
+        let axis = spin_axis.to_radians();
+        tenover::proto::BallData {
+            launch_angle: 14.0,
+            launch_direction: 1.5,
+            ball_speed: 60.0,
+            spin_axis,
+            total_spin,
+            backspin: total_spin * axis.cos(),
+            sidespin: total_spin * axis.sin(),
+            spin_calc_type: tenover::proto::SpinCalcType::Measured,
+        }
+    }
+
+    /// The R10's measured total spin and axis pass through with the
+    /// components, and the two pairs agree. Positive axis = curves right,
+    /// with positive sidespin.
+    #[test]
+    fn r10_sends_total_spin_and_axis() {
+        for axis in [8.0_f32, -8.0] {
+            let bf = ball_from_r10(&r10_ball(3231.0, axis));
+            assert_eq!(bf.total_spin_rpm, Some(3231));
+            assert_eq!(bf.spin_axis, Some(f64::from(axis)));
+            let side = bf.sidespin_rpm.expect("side");
+            assert_eq!(side.signum(), axis.signum() as i32, "{axis}: {side}");
+            let mut components = BallFlight {
+                backspin_rpm: bf.backspin_rpm,
+                sidespin_rpm: bf.sidespin_rpm,
+                ..BallFlight::default()
+            };
+            components.complete_spin();
+            assert_eq!(components.total_spin_rpm, bf.total_spin_rpm);
+            assert!((components.spin_axis.unwrap() - f64::from(axis)).abs() < 0.05);
+        }
+    }
+
+    #[test]
+    fn r10_zero_spin_has_no_axis() {
+        let bf = ball_from_r10(&r10_ball(0.0, 12.0));
+        assert_eq!(bf.total_spin_rpm, Some(0));
+        assert_eq!(bf.spin_axis, None);
     }
 }
