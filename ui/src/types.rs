@@ -74,6 +74,9 @@ pub struct ShotRow {
     pub club_selected: Option<Club>,
     /// Id of the shot group the shot joined (`ShotGroupInfo::id`).
     pub group: Option<String>,
+    /// The shot's `shot_finished` arrived. Always true for a row loaded
+    /// from `/api/shots`.
+    pub finished: bool,
 }
 
 impl ShotRow {
@@ -96,6 +99,7 @@ impl ShotRow {
             derived: converted.derived,
             club_selected: self.club_selected,
             group: self.group.clone(),
+            finished: self.finished,
         }
     }
 }
@@ -111,6 +115,7 @@ impl From<ShotData> for ShotRow {
             derived: shot.derived,
             club_selected: shot.club_selected,
             group: shot.group,
+            finished: true,
         }
     }
 }

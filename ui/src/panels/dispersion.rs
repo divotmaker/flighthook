@@ -1135,6 +1135,7 @@ mod tests {
             derived: Some(d),
             club_selected: Some(Club::Iron7),
             group: Some(group.into()),
+            finished: true,
         }
     }
 

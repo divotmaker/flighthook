@@ -1175,7 +1175,10 @@ device it is left out everywhere a device name would otherwise appear
 shows (these, the device filter and the chart tooltips) it is the actor's
 configured name, or its actor id when the name is empty or the actor is
 unknown (`chart::device_label`). Shots with no
-data are listed dimmed. Clicking an entry shows that
+data are listed dimmed; once such a shot has finished (`shot_finished`)
+with no ball or club data, its entry reads **No read** in place of carry
+and total. That is a device non-read, or an estimated-only shot skipped by
+`use_estimated = false`. Clicking an entry shows that
 shot; the entry on show has an accent outline and stripe. The view follows
 the latest shot, the newest one with data: when a new one arrives it is
 selected, scrolled into view and glows with the cards, even if an older shot

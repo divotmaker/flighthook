@@ -1084,6 +1084,7 @@ pub(super) mod tests {
             )),
             club_selected: Some(Club::Iron7),
             group: Some(group.into()),
+            finished: true,
         }
     }
 

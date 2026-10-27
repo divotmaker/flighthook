@@ -17,9 +17,9 @@ use ironsight::protocol::status::DspStatus;
 use ironsight::protocol::{
     TYPE_AVR_CONFIG_QUERY, TYPE_AVR_CONFIG_RESP, TYPE_CAL_DATA_REQ, TYPE_CAL_DATA_RESP,
     TYPE_CAL_PARAM_REQ, TYPE_CAL_PARAM_RESP, TYPE_CLUB_PRC, TYPE_DEV_INFO_REQ, TYPE_DEV_INFO_RESP,
-    TYPE_DSP_QUERY, TYPE_DSP_QUERY_RESP, TYPE_FLIGHT_RESULT, TYPE_NET_CONFIG, TYPE_PRC_DATA,
-    TYPE_PROD_INFO, TYPE_SENSOR_ACT, TYPE_SENSOR_ACT_RESP, TYPE_SPEED_PROFILE, TYPE_STATUS,
-    TYPE_TIME_SYNC, TYPE_WIFI_SCAN,
+    TYPE_DSP_QUERY, TYPE_DSP_QUERY_RESP, TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1,
+    TYPE_NET_CONFIG, TYPE_PRC_DATA, TYPE_PROD_INFO, TYPE_SENSOR_ACT, TYPE_SENSOR_ACT_RESP,
+    TYPE_SPEED_PROFILE, TYPE_STATUS, TYPE_TIME_SYNC, TYPE_WIFI_SCAN,
 };
 use ironsight::seq::ShotDatum;
 use ironsight::{BinaryClient, BinaryConnection, BinaryEvent, ConnError, Message};
@@ -34,7 +34,8 @@ use settings::{cam_config, fusion_cam_config};
 
 use flighthook::{
     ActorStatus, BallFlight, CameraMode, ClubData, Distance, FlighthookEvent, FlighthookMessage,
-    RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, SpinSource, Velocity, hex_lower,
+    RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw, SpinSource, Velocity,
+    hex_lower,
 };
 
 /// No events for this long → treat as disconnected.
@@ -209,6 +210,85 @@ fn d4_model_failed(d4: &FlightResult) -> bool {
     d4.launch_speed.is_nan() || d4.launch_speed <= 0.0
 }
 
+/// Whether an E8 is the device's "no read" result: ball speed 0 (or not a
+/// number). The device sends it when it triggered but tracked no ball; its
+/// other fields are zero too.
+fn e8_no_read(e8: &FlightResultV1) -> bool {
+    e8.ball_velocity.is_nan() || e8.ball_velocity <= 0.0
+}
+
+/// Flight and club results of the shot in progress.
+///
+/// Club data waits here until the shot has a ball result: it is sent right
+/// after an accepted D4, or when the shot completes, so a shot the device
+/// did not read sends no club data.
+#[derive(Default)]
+struct ShotResults {
+    /// A D4 with a launch speed arrived and its ball flight was sent.
+    had_d4: bool,
+    /// Latest E8, for the spin source and the E8 fallback.
+    e8: Option<FlightResultV1>,
+    /// Club data not sent yet.
+    club: Option<ClubData>,
+}
+
+/// What a completed shot still sends, from [`ShotResults::finish`].
+#[derive(Debug)]
+enum ShotOutcome {
+    /// The D4 ball flight was sent.
+    Measured,
+    /// No D4: the ball flight comes from the E8.
+    Estimated(FlightResultV1),
+    /// No D4, and estimated shots are off.
+    Skipped,
+    /// No D4 and no E8.
+    NoFlight,
+    /// The device triggered but did not read the ball: its E8 is empty and
+    /// there is no D4. Nothing is sent for the shot but the alert.
+    NoRead(FlightResultV1),
+}
+
+impl ShotResults {
+    /// Record an accepted D4. Returns the club data to send after its ball
+    /// flight.
+    fn accept_d4(&mut self) -> Option<ClubData> {
+        self.had_d4 = true;
+        self.club.take()
+    }
+
+    /// Record club data. Returns it when it can be sent now (the ball
+    /// flight is already out); otherwise it waits for the ball result.
+    fn club(&mut self, club: ClubData) -> Option<ClubData> {
+        if self.had_d4 {
+            Some(club)
+        } else {
+            self.club = Some(club);
+            None
+        }
+    }
+
+    /// The shot's outcome and the club data it still sends.
+    fn finish(self, use_estimated: bool) -> (ShotOutcome, Option<ClubData>) {
+        if self.had_d4 {
+            return (ShotOutcome::Measured, self.club);
+        }
+        match self.e8 {
+            Some(e8) if e8_no_read(&e8) => (ShotOutcome::NoRead(e8), None),
+            _ if !use_estimated => (ShotOutcome::Skipped, self.club),
+            Some(e8) => (ShotOutcome::Estimated(e8), self.club),
+            None => (ShotOutcome::NoFlight, self.club),
+        }
+    }
+}
+
+/// Latest raw payload of each shot result type, for the log lines that
+/// report a dropped result.
+#[derive(Default)]
+struct ResultRaw {
+    d4: Vec<u8>,
+    e8: Vec<u8>,
+}
+
 fn hex_string(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -283,12 +363,13 @@ fn raw_capture_config() -> RawCaptureConfig {
 }
 
 /// Install the send/receive hooks: hex audit logging, raw capture for the
-/// shot export, and the latest D4 payload (for logging a D4 that is dropped).
+/// shot export, and the latest D4, E8 and ED payloads (for logging a result
+/// that is dropped).
 fn attach_raw_capture<S: Read + Write>(
     conn: &mut BinaryConnection<S>,
     actor_id: &str,
     capture: &Rc<RefCell<RawCapture>>,
-) -> Rc<RefCell<Vec<u8>>> {
+) -> Rc<RefCell<ResultRaw>> {
     let send_id = actor_id.to_string();
     let send_capture = Rc::clone(capture);
     conn.set_on_send(move |cmd, dest| {
@@ -310,13 +391,17 @@ fn attach_raw_capture<S: Read + Write>(
     });
 
     let audit_id = actor_id.to_string();
-    let last_d4_raw: Rc<RefCell<Vec<u8>>> = Rc::default();
-    let d4_raw_sink = Rc::clone(&last_d4_raw);
+    let result_raw: Rc<RefCell<ResultRaw>> = Rc::default();
+    let raw_sink = Rc::clone(&result_raw);
     let recv_capture = Rc::clone(capture);
     conn.set_on_recv(move |env| {
-        if env.type_id == TYPE_FLIGHT_RESULT {
-            d4_raw_sink.replace(env.raw.clone());
+        let mut sink = raw_sink.borrow_mut();
+        match env.type_id {
+            TYPE_FLIGHT_RESULT => sink.d4.clone_from(&env.raw),
+            TYPE_FLIGHT_RESULT_V1 => sink.e8.clone_from(&env.raw),
+            _ => {}
         }
+        drop(sink);
         tracing::debug!(
             "{audit_id} recv << 0x{:02X} {} | {:?}",
             env.type_id,
@@ -337,7 +422,7 @@ fn attach_raw_capture<S: Read + Write>(
             text: None,
         });
     });
-    last_d4_raw
+    result_raw
 }
 
 fn emit_device_status(sender: &BusSender, status: ActorStatus, telemetry: HashMap<String, String>) {
@@ -359,6 +444,202 @@ fn stamp_device(msg: FlighthookMessage, device_id: &Option<String>) -> Flighthoo
         Some(dev) => msg.device(dev),
         None => msg,
     }
+}
+
+/// What the shot handlers need from the connection.
+#[derive(Clone, Copy)]
+struct ShotContext<'a> {
+    state: &'a SystemState,
+    sender: &'a BusSender,
+    device_id: &'a Option<String>,
+    model: DeviceModel,
+    /// Xi spin source when the live config has none for this actor.
+    spin_source: SpinSource,
+    result_raw: &'a RefCell<ResultRaw>,
+}
+
+/// Handle one result of the shot in progress: send a D4 ball flight, keep
+/// the E8 for the fallback, and send or hold club data.
+fn on_shot_datum(
+    ctx: &ShotContext<'_>,
+    results: &mut ShotResults,
+    key: &ShotKey,
+    mode: ShotDetectionMode,
+    datum: ShotDatum,
+) {
+    let ShotContext {
+        state,
+        sender,
+        device_id,
+        model,
+        result_raw,
+        ..
+    } = *ctx;
+    match datum {
+        ShotDatum::Flight(d4) if d4_model_failed(&d4) => {
+            // The device's distance model failed (e.g. full-flight outdoor
+            // mode into a screen). Treat the shot as having no D4 so the E8
+            // fallback applies.
+            warn!(
+                "shot #{} D4 dropped: launch speed {} (distance model failed) -- 0x{:02X} {}",
+                key.shot_number,
+                d4.launch_speed,
+                TYPE_FLIGHT_RESULT,
+                hex_string(&result_raw.borrow().d4),
+            );
+        }
+        ShotDatum::Flight(d4) => {
+            let held_club = results.accept_d4();
+            let mut ball = ball_from_d4(&d4);
+            let mut spin_source = "D4";
+            if model == DeviceModel::Xi {
+                let source = live_spin_source(state, sender.actor_id()).unwrap_or(ctx.spin_source);
+                let (spin, label) = xi_spin(source, mode, &d4, results.e8.as_ref());
+                if let Some((back, side)) = spin {
+                    ball.backspin_rpm = Some(back);
+                    ball.sidespin_rpm = Some(side);
+                }
+                spin_source = label;
+            }
+            info!(
+                "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm spin={spin_source}",
+                key.shot_number,
+                ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
+                ball.launch_elevation.unwrap_or(0.0),
+                ball.launch_azimuth.unwrap_or(0.0),
+                ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
+                ball.backspin_rpm.unwrap_or(0),
+                ball.sidespin_rpm.unwrap_or(0),
+            );
+            let msg = FlighthookMessage::new(sim::ball_flight_event_in_mode(
+                state,
+                key.clone(),
+                ball,
+                Some(mode),
+            ));
+            sender.send(stamp_device(msg, device_id));
+            if let Some(club) = held_club {
+                send_club(sender, device_id, key, club);
+            }
+        }
+        ShotDatum::FlightV1(e8) => {
+            debug!("stashed E8 for fallback");
+            results.e8 = Some(e8);
+        }
+        ShotDatum::Club(ed) => {
+            if let Some(club) = results.club(club_from_ed(&ed)) {
+                send_club(sender, device_id, key, club);
+            }
+        }
+        ShotDatum::Spin(_) => {
+            // Spin axis / total spin are derived from backspin + sidespin in
+            // BallFlight; EF is redundant.
+        }
+    }
+}
+
+fn send_club(sender: &BusSender, device_id: &Option<String>, key: &ShotKey, club: ClubData) {
+    let msg = FlighthookMessage::new(FlighthookEvent::ClubPath {
+        key: key.clone(),
+        club: Box::new(club),
+    });
+    sender.send(stamp_device(msg, device_id));
+}
+
+/// A shot the device has finished: its key, the detection mode captured at
+/// its trigger, and its raw frames.
+struct CompletedShot {
+    key: ShotKey,
+    mode: ShotDetectionMode,
+    raw: ShotRaw,
+}
+
+/// Send what a completed shot still sends (the E8 ball flight, the club
+/// data held back, or an alert), then its `ShotFinished` with the raw
+/// frames.
+fn finish_shot(
+    ctx: &ShotContext<'_>,
+    shot: CompletedShot,
+    (outcome, club): (ShotOutcome, Option<ClubData>),
+) {
+    let ShotContext {
+        state,
+        sender,
+        device_id,
+        model,
+        result_raw,
+        ..
+    } = *ctx;
+    let CompletedShot { key, mode, raw } = shot;
+    match outcome {
+        ShotOutcome::Measured => {}
+        ShotOutcome::Estimated(e8) => {
+            let ball = ball_from_e8(&e8);
+            info!(
+                "shot #{} (E8): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd",
+                key.shot_number,
+                ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
+                ball.launch_elevation.unwrap_or(0.0),
+                ball.launch_azimuth.unwrap_or(0.0),
+                ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
+            );
+            let msg = FlighthookMessage::new(sim::ball_flight_event_in_mode(
+                state,
+                key.clone(),
+                ball,
+                Some(mode),
+            ));
+            sender.send(stamp_device(msg, device_id));
+        }
+        ShotOutcome::Skipped => {
+            info!(
+                "shot #{} had only E8 (estimated) — skipped (use_estimated=false)",
+                key.shot_number,
+            );
+        }
+        ShotOutcome::NoFlight => {
+            warn!(
+                "shot #{} processed but no flight result (D4 or E8)",
+                key.shot_number,
+            );
+            emit_alert(
+                sender,
+                Severity::Warn,
+                format!(
+                    "Shot #{} triggered but no flight result produced",
+                    key.shot_number,
+                ),
+            );
+        }
+        ShotOutcome::NoRead(e8) => {
+            warn!(
+                "shot #{} not read: E8 ball speed {} and no D4 -- 0x{:02X} {}",
+                key.shot_number,
+                e8.ball_velocity,
+                TYPE_FLIGHT_RESULT_V1,
+                hex_string(&result_raw.borrow().e8),
+            );
+            emit_alert(
+                sender,
+                Severity::Warn,
+                format!(
+                    "Shot #{}: {} didn't track the ball (no read)",
+                    key.shot_number,
+                    model.label(),
+                ),
+            );
+        }
+    }
+    if let Some(club) = club {
+        send_club(sender, device_id, &key, club);
+    }
+    sender.send(stamp_device(
+        FlighthookMessage::new(FlighthookEvent::ShotFinished {
+            key,
+            raw: Some(Box::new(raw)),
+        }),
+        device_id,
+    ));
 }
 
 /// Battery level from a DSP status, or `None` when the status layout has no
@@ -512,9 +793,10 @@ fn connect_and_run(
     let mut conn = BinaryConnection::connect_timeout(addr, CONNECT_TIMEOUT)?;
     *ever_connected = true;
 
-    // Audit logging, raw capture for the shot export, and the latest D4.
+    // Audit logging, raw capture for the shot export, and the latest
+    // D4/E8/ED payloads.
     let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
-    let last_d4_raw = attach_raw_capture(&mut conn, sender.actor_id(), &capture);
+    let result_raw = attach_raw_capture(&mut conn, sender.actor_id(), &capture);
 
     // 2. Create non-blocking client
     let mut client = BinaryClient::from_tcp(conn)?;
@@ -532,8 +814,7 @@ fn connect_and_run(
     // Shot lifecycle state
     let mut shot_counter: u32 = 0;
     let mut current_shot_key: Option<ShotKey> = None;
-    let mut shot_had_d4 = false;
-    let mut stashed_e8: Option<FlightResultV1> = None;
+    let mut shot_results = ShotResults::default();
     // Detection mode in effect when the current shot's trigger fired, for
     // the `Auto` spin source and the ground-ball surface. `current_mode` can
     // change mid-shot; this doesn't.
@@ -787,8 +1068,7 @@ fn connect_and_run(
                         });
                         sender.send(stamp_device(msg, device_id));
                         current_shot_key = Some(key);
-                        shot_had_d4 = false;
-                        stashed_e8 = None;
+                        shot_results = ShotResults::default();
                         shot_detection_mode = Some(current_mode);
                         emit_device_status(sender, ActorStatus::Connected, HashMap::new());
                         device_telemetry.insert("ready".into(), "false".into());
@@ -797,133 +1077,38 @@ fn connect_and_run(
 
                     BinaryEvent::ShotDatum(datum) => {
                         if let Some(ref key) = current_shot_key {
-                            match datum {
-                                ShotDatum::Flight(d4) if d4_model_failed(&d4) => {
-                                    // The device's distance model failed (e.g.
-                                    // full-flight outdoor mode into a screen).
-                                    // Treat the shot as having no D4 so the E8
-                                    // fallback applies.
-                                    warn!(
-                                        "shot #{} D4 dropped: launch speed {} (distance model failed) -- 0x{:02X} {}",
-                                        key.shot_number,
-                                        d4.launch_speed,
-                                        TYPE_FLIGHT_RESULT,
-                                        hex_string(&last_d4_raw.borrow()),
-                                    );
-                                }
-                                ShotDatum::Flight(d4) => {
-                                    shot_had_d4 = true;
-                                    let mut ball = ball_from_d4(&d4);
-                                    let mut spin_source = "D4";
-                                    let mode = shot_mode(shot_detection_mode, current_mode);
-                                    if model == DeviceModel::Xi {
-                                        let source = live_spin_source(state, sender.actor_id())
-                                            .unwrap_or(initial_spin_source);
-                                        let (spin, label) =
-                                            xi_spin(source, mode, &d4, stashed_e8.as_ref());
-                                        if let Some((back, side)) = spin {
-                                            ball.backspin_rpm = Some(back);
-                                            ball.sidespin_rpm = Some(side);
-                                        }
-                                        spin_source = label;
-                                    }
-                                    info!(
-                                        "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm spin={spin_source}",
-                                        key.shot_number,
-                                        ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
-                                        ball.launch_elevation.unwrap_or(0.0),
-                                        ball.launch_azimuth.unwrap_or(0.0),
-                                        ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
-                                        ball.backspin_rpm.unwrap_or(0),
-                                        ball.sidespin_rpm.unwrap_or(0),
-                                    );
-                                    let msg =
-                                        FlighthookMessage::new(sim::ball_flight_event_in_mode(
-                                            state,
-                                            key.clone(),
-                                            ball,
-                                            Some(mode),
-                                        ));
-                                    sender.send(stamp_device(msg, device_id));
-                                }
-                                ShotDatum::FlightV1(e8) => {
-                                    debug!("stashed E8 for fallback");
-                                    stashed_e8 = Some(e8);
-                                }
-                                ShotDatum::Club(ed) => {
-                                    let club = club_from_ed(&ed);
-                                    let msg = FlighthookMessage::new(FlighthookEvent::ClubPath {
-                                        key: key.clone(),
-                                        club: Box::new(club),
-                                    });
-                                    sender.send(stamp_device(msg, device_id));
-                                }
-                                ShotDatum::Spin(_) => {
-                                    // Spin axis / total spin are derived from
-                                    // backspin + sidespin in BallFlight; EF is redundant.
-                                }
-                            }
+                            let ctx = ShotContext {
+                                state,
+                                sender,
+                                device_id,
+                                model,
+                                spin_source: initial_spin_source,
+                                result_raw: &result_raw,
+                            };
+                            let mode = shot_mode(shot_detection_mode, current_mode);
+                            on_shot_datum(&ctx, &mut shot_results, key, mode, datum);
                         }
                     }
 
                     BinaryEvent::ShotComplete(_shot_data) => {
                         let raw = capture.borrow_mut().take();
+                        let results = std::mem::take(&mut shot_results);
                         if let Some(key) = current_shot_key.take() {
-                            // E8 fallback: emit BallFlight from stashed E8 if no D4
-                            if !shot_had_d4 {
-                                if use_estimated {
-                                    if let Some(e8) = stashed_e8.take() {
-                                        let ball = ball_from_e8(&e8);
-                                        info!(
-                                            "shot #{} (E8): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd",
-                                            key.shot_number,
-                                            ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
-                                            ball.launch_elevation.unwrap_or(0.0),
-                                            ball.launch_azimuth.unwrap_or(0.0),
-                                            ball.carry_distance
-                                                .map(|d| d.as_yards())
-                                                .unwrap_or(0.0),
-                                        );
-                                        let mode = shot_mode(shot_detection_mode, current_mode);
-                                        let msg =
-                                            FlighthookMessage::new(sim::ball_flight_event_in_mode(
-                                                state,
-                                                key.clone(),
-                                                ball,
-                                                Some(mode),
-                                            ));
-                                        sender.send(stamp_device(msg, device_id));
-                                    } else {
-                                        warn!(
-                                            "shot #{} processed but no flight result (D4 or E8)",
-                                            key.shot_number,
-                                        );
-                                        emit_alert(
-                                            sender,
-                                            Severity::Warn,
-                                            format!(
-                                                "Shot #{} triggered but no flight result produced",
-                                                key.shot_number,
-                                            ),
-                                        );
-                                    }
-                                } else {
-                                    info!(
-                                        "shot #{} had only E8 (estimated) — skipped (use_estimated=false)",
-                                        key.shot_number,
-                                    );
-                                }
-                            }
-                            sender.send(stamp_device(
-                                FlighthookMessage::new(FlighthookEvent::ShotFinished {
-                                    key,
-                                    raw: Some(Box::new(raw)),
-                                }),
+                            let ctx = ShotContext {
+                                state,
+                                sender,
                                 device_id,
-                            ));
+                                model,
+                                spin_source: initial_spin_source,
+                                result_raw: &result_raw,
+                            };
+                            let shot = CompletedShot {
+                                key,
+                                mode: shot_mode(shot_detection_mode, current_mode),
+                                raw,
+                            };
+                            finish_shot(&ctx, shot, results.finish(use_estimated));
                         }
-                        stashed_e8 = None;
-                        shot_had_d4 = false;
 
                         // Device is auto-re-armed by BinaryClient's ShotSequencer,
                         // which reports the completed shot rather than an Armed
@@ -1231,6 +1416,8 @@ fn club_from_ed(ed: &ironsight::protocol::shot::ClubResult) -> ClubData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironsight::protocol::TYPE_CLUB_RESULT;
+    use ironsight::protocol::shot::ClubResult;
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -1239,14 +1426,15 @@ mod tests {
             .collect()
     }
 
+    /// D4 of an Xi shot with club data: back/side 7127/-652 rpm.
+    const CLUB_SHOT_D4: &str = "9c00000400005600000000002700020a008a28001fcd005209014ca2000ff30034e30149f8000000002a04\
+        001bd7fffd740000000003e9fffefbffe76d003c1affce900006f70000000000000000000000000000000\
+        06c96002c8fffc66e004e9500d43600571500975a00197701df710000003d08ebf5cc2b019bbcffe3fd000\
+        00017c8affb5496ff6c7f00126500000008b809fe35a1004bd6fffab0";
+
     /// Xi shot with club data: D4 back/side 7127/-652 rpm, E8 backspin 7157 rpm.
     fn shot_with_club_data() -> (FlightResult, FlightResultV1) {
-        let d4 = hex(
-            "9c00000400005600000000002700020a008a28001fcd005209014ca2000ff30034e30149f8000000002a04\
-             001bd7fffd740000000003e9fffefbffe76d003c1affce900006f70000000000000000000000000000000\
-             06c96002c8fffc66e004e9500d43600571500975a00197701df710000003d08ebf5cc2b019bbcffe3fd000\
-             00017c8affb5496ff6c7f00126500000008b809fe35a1004bd6fffab0",
-        );
+        let d4 = hex(CLUB_SHOT_D4);
         let e8 = hex(
             "5d000004000000008a28000ff5014c9f0034ef002f1b005209001fcd000000000000001bf500000000005600\
              000001e00f0000003d08e0f5d3a3019570ffe4ea00000017ccdefb5b2eff69290012cb00000008bc60fe8a\
@@ -1601,7 +1789,7 @@ mod tests {
 
         let mut conn = BinaryConnection::new(fake_device::Stream(Rc::clone(&state)));
         let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
-        let last_d4 = attach_raw_capture(&mut conn, "mevo.0", &capture);
+        let result_raw = attach_raw_capture(&mut conn, "mevo.0", &capture);
         let mut client = BinaryClient::new(conn);
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1651,7 +1839,8 @@ mod tests {
         assert_eq!(raw.frames[12].src.as_deref(), Some("APP"));
         assert_eq!(raw.frames[12].dst.as_deref(), Some("AVR"));
         assert_eq!(raw.frames[12].hex.as_deref(), Some("0101"));
-        assert!(!last_d4.borrow().is_empty());
+        assert!(!result_raw.borrow().d4.is_empty());
+        assert!(!result_raw.borrow().e8.is_empty());
 
         // No identity: the status and device info frames, the serial text,
         // and the status frame's hardware ID bytes are all absent.
@@ -1826,6 +2015,545 @@ mod tests {
         for ball in [ball_from_d4(&d4), ball_from_e8(&e8)] {
             assert_eq!(ball.total_spin_rpm, None);
             assert_eq!(ball.spin_axis, None);
+        }
+    }
+
+    // Xi limited-flight chips. A chip the device did not read: BALL
+    // TRIGGER, then an empty E8 and an empty ED (the ED is also its reply to
+    // the 0x6D request).
+    const XI_NO_READ_TRIGGER: &str = "1542414c4c20545249474745523a20313837206d7300";
+    const XI_NO_READ_E8: &str = "5d000009000000000000000000000000000000000000000000000000000000000000000000000000000000\
+        0000003d090000000000000000000000000000000000000000000000000000000000000000000000000000\
+        0000000000000000";
+    const XI_NO_READ_ED: &str = "a6000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+        000000003d0900000000000000000000000000000000000000000000000000000000000000000000000000\
+        00000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+        0000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+    // A chip the device read: E8 only, no D4.
+    const XI_CHIP_TRIGGER: &str = "1542414c4c20545249474745523a20313233206d7300";
+    const XI_CHIP_E8: &str = "5d00000c003652004619000879006e040012f20008610078e4000f76000000019640000fc50002040000df\
+        00000003fac40000003d08faf913c6017639ffdd7300000024a1b0eec81bffddb40021d9000000043815ff\
+        d4c300034200009b";
+    const XI_CHIP_ED: &str = "a60700000000056e00000000000000000000025000121700050a0000000000000000000000000000000000\
+        000000000463970000000000ce0005ab0000000000003d08f4000000000000000000000000000000000000\
+        00000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+        00000000000000000000000000000000000000000000000000000000000000000000000003f1";
+
+    /// The frames that end a shot: E5 PROCESSED, E5 IDLE, then the B1.
+    const SHOT_PROCESSED: &str = "0a50524f43455353454400";
+    const SHOT_IDLE: &str = "0549444c4500";
+    const SHOT_B1: &str = "020000";
+
+    /// One shot as the device sends it: its frames from the BALL TRIGGER to
+    /// the B1, and the ED it sends in reply to the 0x6D request.
+    struct DeviceShot {
+        number: u32,
+        frames: Vec<(u8, Vec<u8>)>,
+        reply_ed: Vec<u8>,
+    }
+
+    impl DeviceShot {
+        /// Shot `number`: the BALL TRIGGER `trigger`, `results` in order, then
+        /// PROCESSED, IDLE and the B1.
+        fn new(number: u32, trigger: &str, results: Vec<(u8, Vec<u8>)>, reply_ed: Vec<u8>) -> Self {
+            let mut frames = vec![(0xE5, hex(trigger))];
+            frames.extend(results);
+            frames.extend([
+                (0xE5, hex(SHOT_PROCESSED)),
+                (0xE5, hex(SHOT_IDLE)),
+                (0xB1, hex(SHOT_B1)),
+            ]);
+            Self {
+                number,
+                frames,
+                reply_ed,
+            }
+        }
+
+        /// An Xi chip the device did not read.
+        fn xi_no_read(number: u32) -> Self {
+            Self::new(
+                number,
+                XI_NO_READ_TRIGGER,
+                vec![
+                    (TYPE_FLIGHT_RESULT_V1, hex(XI_NO_READ_E8)),
+                    (TYPE_CLUB_RESULT, hex(XI_NO_READ_ED)),
+                ],
+                hex(XI_NO_READ_ED),
+            )
+        }
+
+        /// An Xi chip the device read (E8 only).
+        fn xi_chip(number: u32) -> Self {
+            Self::new(
+                number,
+                XI_CHIP_TRIGGER,
+                vec![
+                    (TYPE_FLIGHT_RESULT_V1, hex(XI_CHIP_E8)),
+                    (TYPE_CLUB_RESULT, hex(XI_CHIP_ED)),
+                ],
+                hex(XI_CHIP_ED),
+            )
+        }
+    }
+
+    /// Three Xi chips: a non-read, a read, then a non-read.
+    fn xi_chips() -> Vec<DeviceShot> {
+        vec![
+            DeviceShot::xi_no_read(1),
+            DeviceShot::xi_chip(2),
+            DeviceShot::xi_no_read(3),
+        ]
+    }
+
+    /// Replay `shots` from a fake `model` through the client and the actor's
+    /// shot handlers, as the run loop drives them, and return every bus
+    /// message.
+    fn replay(
+        state: &SystemState,
+        model: DeviceModel,
+        shots: &[DeviceShot],
+        use_estimated: bool,
+    ) -> Vec<FlighthookMessage> {
+        let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel(1024);
+        let sender = BusSender::new("mevo.0".into(), bus_tx, Arc::default());
+        let device = Rc::new(RefCell::new(fake_device::State::default()));
+        let mut conn = BinaryConnection::new(fake_device::Stream(Rc::clone(&device)));
+        let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
+        let result_raw = attach_raw_capture(&mut conn, "mevo.0", &capture);
+        let mut client = BinaryClient::new(conn);
+        let device_id = Some(format!("{} (test)", model.label()));
+        let ctx = ShotContext {
+            state,
+            sender: &sender,
+            device_id: &device_id,
+            model,
+            spin_source: SpinSource::E8,
+            result_raw: &result_raw,
+        };
+        let mode = ShotDetectionMode::Chipping;
+
+        for (i, shot) in shots.iter().enumerate() {
+            {
+                let mut st = device.borrow_mut();
+                st.shot_ed.clone_from(&shot.reply_ed);
+                for (ty, payload) in &shot.frames {
+                    st.push(ironsight::BusAddr::Avr, *ty, payload.clone());
+                }
+            }
+            let mut current: Option<(ShotKey, ShotResults)> = None;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(Instant::now() < deadline, "shot {i} never completed");
+                match client.poll().expect("poll") {
+                    Some(BinaryEvent::Trigger) => {
+                        capture.borrow_mut().mark_trigger();
+                        let key = ShotKey {
+                            shot_id: format!("chip-{i}"),
+                            shot_number: shot.number,
+                        };
+                        sender.send(stamp_device(
+                            FlighthookMessage::new(FlighthookEvent::ShotTrigger {
+                                key: key.clone(),
+                            }),
+                            &device_id,
+                        ));
+                        current = Some((key, ShotResults::default()));
+                    }
+                    Some(BinaryEvent::ShotDatum(datum)) => {
+                        let (key, results) = current.as_mut().expect("datum before trigger");
+                        on_shot_datum(&ctx, results, key, mode, datum);
+                    }
+                    Some(BinaryEvent::ShotComplete(_)) => {
+                        let raw = capture.borrow_mut().take();
+                        let (key, results) = current.take().expect("complete before trigger");
+                        let shot = CompletedShot { key, mode, raw };
+                        finish_shot(&ctx, shot, results.finish(use_estimated));
+                        break;
+                    }
+                    Some(_) => {}
+                    None => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        while let Ok(msg) = bus_rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    /// Event kinds of `messages`, one string per shot (`|`-separated).
+    fn kinds_by_shot(messages: &[FlighthookMessage]) -> Vec<String> {
+        let mut shots: Vec<Vec<&str>> = Vec::new();
+        for msg in messages {
+            let kind = match &msg.event {
+                FlighthookEvent::ShotTrigger { .. } => {
+                    shots.push(Vec::new());
+                    "trigger"
+                }
+                FlighthookEvent::BallFlight { .. } => "ball",
+                FlighthookEvent::ClubPath { .. } => "club",
+                FlighthookEvent::Alert { .. } => "alert",
+                FlighthookEvent::ShotFinished { .. } => "finished",
+                other => panic!("unexpected {other:?}"),
+            };
+            shots.last_mut().expect("trigger first").push(kind);
+        }
+        shots.into_iter().map(|k| k.join("|")).collect()
+    }
+
+    /// The alert texts in `messages`, all warnings.
+    fn warnings(messages: &[FlighthookMessage]) -> Vec<&str> {
+        messages
+            .iter()
+            .filter_map(|m| match &m.event {
+                FlighthookEvent::Alert { severity, message } => {
+                    assert_eq!(*severity, Severity::Warn);
+                    Some(message.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The club data sent in `messages`.
+    fn club_paths(messages: &[FlighthookMessage]) -> Vec<ClubData> {
+        messages
+            .iter()
+            .filter_map(|m| match &m.event {
+                FlighthookEvent::ClubPath { club, .. } => Some(club.as_ref().clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// [`replay`] on a fresh system state.
+    fn replay_fresh(
+        model: DeviceModel,
+        shots: &[DeviceShot],
+        use_estimated: bool,
+    ) -> Vec<FlighthookMessage> {
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-mevo-test-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, _writer) = SystemState::new(dir.join("config.toml"));
+        let messages = replay(&state, model, shots, use_estimated);
+        let _ = std::fs::remove_dir_all(&dir);
+        messages
+    }
+
+    /// The shots `messages` complete, as GSPro's accumulator builds them.
+    fn completed_shots(messages: &[FlighthookMessage]) -> Vec<flighthook::ShotData> {
+        use flighthook::ShotAccumulator;
+
+        let mut sent = Vec::new();
+        let mut acc: Option<ShotAccumulator> = None;
+        for msg in messages {
+            match &msg.event {
+                FlighthookEvent::ShotTrigger { key } => {
+                    acc = Some(ShotAccumulator::new(msg.actor.clone(), key.clone()));
+                }
+                FlighthookEvent::BallFlight { ball, .. } => {
+                    acc.as_mut().expect("acc").set_ball(*ball.clone());
+                }
+                FlighthookEvent::ClubPath { club, .. } => {
+                    acc.as_mut().expect("acc").set_club(*club.clone());
+                }
+                FlighthookEvent::ShotFinished { .. } => {
+                    if let Some(shot) = acc.take().expect("acc").finish() {
+                        sent.push(shot);
+                    }
+                }
+                _ => {}
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn xi_empty_e8_is_a_no_read() {
+        let e8 = |h| FlightResultV1::decode(&hex(h)).unwrap();
+        assert!(e8_no_read(&e8(XI_NO_READ_E8)));
+        assert!(!e8_no_read(&e8(XI_CHIP_E8)));
+        let mut read = e8(XI_CHIP_E8);
+        read.ball_velocity = f64::NAN;
+        assert!(e8_no_read(&read));
+    }
+
+    #[test]
+    fn shot_results_hold_club_data_until_the_ball_result() {
+        let (d4, e8) = shot_with_club_data();
+        let club =
+            club_from_ed(&ironsight::protocol::shot::ClubResult::decode(&hex(SHOT_ED)).unwrap());
+        let empty_e8 = FlightResultV1::decode(&hex(XI_NO_READ_E8)).unwrap();
+
+        // ED before D4: held, then sent after the D4's ball flight.
+        let mut r = ShotResults {
+            e8: Some(e8.clone()),
+            ..ShotResults::default()
+        };
+        assert!(r.club(club.clone()).is_none());
+        assert!(!d4_model_failed(&d4));
+        assert!(r.accept_d4().is_some());
+        let (outcome, held) = r.finish(false);
+        assert!(matches!(outcome, ShotOutcome::Measured));
+        assert!(held.is_none());
+
+        // ED after D4: sent at once.
+        let mut r = ShotResults::default();
+        assert!(r.accept_d4().is_none());
+        assert!(r.club(club.clone()).is_some());
+
+        // No D4: club data goes out with the E8 fallback, or alone when
+        // estimated shots are off.
+        let mut r = ShotResults {
+            e8: Some(e8.clone()),
+            ..ShotResults::default()
+        };
+        assert!(r.club(club.clone()).is_none());
+        let (outcome, held) = r.finish(true);
+        assert!(matches!(outcome, ShotOutcome::Estimated(_)));
+        assert!(held.is_some());
+        let mut r = ShotResults {
+            e8: Some(e8),
+            ..ShotResults::default()
+        };
+        r.club(club.clone());
+        let (outcome, held) = r.finish(false);
+        assert!(matches!(outcome, ShotOutcome::Skipped));
+        assert!(held.is_some());
+        let mut r = ShotResults::default();
+        r.club(club.clone());
+        let (outcome, held) = r.finish(true);
+        assert!(matches!(outcome, ShotOutcome::NoFlight));
+        assert!(held.is_some());
+
+        // Empty E8 and no D4: no read, and the club data is dropped,
+        // whether estimated shots are on or off.
+        for use_estimated in [true, false] {
+            let mut r = ShotResults {
+                e8: Some(empty_e8.clone()),
+                ..ShotResults::default()
+            };
+            r.club(club.clone());
+            let (outcome, held) = r.finish(use_estimated);
+            assert!(matches!(outcome, ShotOutcome::NoRead(_)));
+            assert!(held.is_none());
+        }
+
+        // Empty E8 but a D4 with a launch speed: the D4 stands.
+        let mut r = ShotResults {
+            e8: Some(empty_e8),
+            ..ShotResults::default()
+        };
+        r.accept_d4();
+        assert!(matches!(r.finish(true).0, ShotOutcome::Measured));
+    }
+
+    /// Xi chips replayed end to end: the non-reads send no ball flight or
+    /// club data, only an alert, and stay out of `/api/shots` and GSPro but
+    /// in the export; the read (shot 2) decodes to the device's values.
+    #[tokio::test]
+    async fn xi_non_reads_replayed_end_to_end() {
+        use crate::actors::gspro::mapper::map_shot;
+        use crate::actors::web::export::build_export_line;
+        use crate::actors::web::{routes, tests as web};
+        use flighthook::Handedness;
+
+        let (web_state, _writer, _dir) = web::test_state();
+        let shots = xi_chips();
+        let messages = replay(&web_state.root, DeviceModel::Xi, &shots, true);
+
+        assert_eq!(
+            kinds_by_shot(&messages),
+            [
+                "trigger|alert|finished",
+                "trigger|ball|club|finished",
+                "trigger|alert|finished",
+            ]
+        );
+        assert_eq!(
+            warnings(&messages),
+            [
+                "Shot #1: Xi didn't track the ball (no read)",
+                "Shot #3: Xi didn't track the ball (no read)",
+            ]
+        );
+        // Every shot keeps its raw frames, E8 and ED included.
+        for msg in &messages {
+            if let FlighthookEvent::ShotFinished { raw, .. } = &msg.event {
+                let raw = raw.as_deref().expect("raw");
+                for ty in ["0xE8", "0xED"] {
+                    assert!(raw.frames.iter().any(|r| r.r#type.as_deref() == Some(ty)));
+                }
+            }
+        }
+
+        // GSPro: only shot 2 completes a shot.
+        let sent = completed_shots(&messages);
+        assert_eq!(sent.len(), 1);
+        let shot = &sent[0];
+        assert_eq!(shot.shot_number, 2);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let ball = shot.ball.as_ref().expect("ball");
+        assert!(close(ball.launch_speed.unwrap().as_mph(), 40.141_888_3));
+        assert!(close(ball.launch_elevation.unwrap(), 30.948));
+        assert!(close(ball.launch_azimuth.unwrap(), -3.958));
+        assert!(close(
+            ball.carry_distance.unwrap().as_yards(),
+            30.800_524_934
+        ));
+        assert!(close(
+            ball.carry_offline.unwrap().as_yards(),
+            -2.345_800_525
+        ));
+        assert!(close(ball.max_height.unwrap().as_feet(), 15.912_073_491));
+        assert!(close(ball.flight_time.unwrap(), 2.169));
+        assert_eq!(ball.backspin_rpm, Some(4037));
+        assert_eq!(ball.sidespin_rpm, None);
+        let club = shot.club.as_ref().expect("club");
+        assert!(close(club.club_speed.unwrap().as_mph(), 31.093_466));
+        assert!(close(club.face_angle.unwrap(), -5.92));
+        assert!(close(club.dynamic_loft.unwrap(), 46.31));
+        assert!(close(club.smash_factor.unwrap(), 1.29));
+        let gspro = map_shot(shot, Handedness::Right);
+        assert!(gspro.shot_data_options.contains_ball_data);
+        assert!(close(gspro.ball_data.speed, 40.141_888_3));
+        assert!(close(gspro.club_data.speed, 31.093_466));
+
+        // Web: all three stored for the export, only shot 2 in /api/shots.
+        let events = messages.into_iter().map(|m| m.event).collect();
+        web::feed(&web_state, "mevo.0", events).await;
+        {
+            let stored = web_state.shots.read().await;
+            assert_eq!(stored.len(), 3);
+            for s in stored.iter() {
+                assert_eq!(s.data.has_data(), s.key.shot_number == 2);
+                let line = build_export_line(s, "", None, true);
+                assert!(line.raw.is_some_and(|r| !r.frames.is_empty()));
+                let data = serde_json::to_value(&line.data).expect("json");
+                if s.key.shot_number != 2 {
+                    assert!(data.get("ball").is_none() && data.get("club").is_none());
+                }
+            }
+        }
+        let api = routes::get_shots(
+            axum::extract::State(Arc::new(web_state)),
+            axum::extract::Query(routes::ShotsQuery {
+                limit: 50,
+                units: None,
+            }),
+        )
+        .await;
+        let numbers: Vec<u32> = api.0.iter().map(|s| s.shot_number).collect();
+        assert_eq!(numbers, [2]);
+    }
+
+    /// With estimated shots off the non-reads still alert, and the read
+    /// (E8 only) sends its club data alone.
+    #[test]
+    fn xi_non_reads_alert_with_estimated_shots_off() {
+        let messages = replay_fresh(DeviceModel::Xi, &xi_chips(), false);
+        assert_eq!(
+            kinds_by_shot(&messages),
+            [
+                "trigger|alert|finished",
+                "trigger|club|finished",
+                "trigger|alert|finished",
+            ]
+        );
+    }
+
+    /// A Mevo shot with a full result and club data with zero club speed
+    /// but a face angle, attack angle, loft and path: the club data is sent
+    /// as decoded, after the ball flight, and reaches GSPro.
+    #[test]
+    fn zero_club_speed_beside_a_d4_sends_the_club_data() {
+        use crate::actors::gspro::mapper::map_shot;
+        use flighthook::Handedness;
+
+        let mut ed = hex(SHOT_ED);
+        ed[5..8].fill(0);
+        let decoded = ClubResult::decode(&ed).unwrap();
+        assert_eq!(decoded.pre_club_speed, 0.0);
+        for v in [
+            decoded.face_angle,
+            decoded.attack_angle,
+            decoded.dynamic_loft,
+            decoded.strike_direction,
+        ] {
+            assert_ne!(v, 0.0);
+        }
+        // The BALL TRIGGER text is the same on every model.
+        let shot = || {
+            DeviceShot::new(
+                1,
+                XI_CHIP_TRIGGER,
+                vec![
+                    (TYPE_FLIGHT_RESULT, hex(CLUB_SHOT_D4)),
+                    (TYPE_CLUB_RESULT, ed.clone()),
+                ],
+                ed.clone(),
+            )
+        };
+        for use_estimated in [false, true] {
+            let messages = replay_fresh(DeviceModel::Mevo, &[shot()], use_estimated);
+            assert_eq!(kinds_by_shot(&messages), ["trigger|ball|club|finished"]);
+            assert_eq!(club_paths(&messages), [club_from_ed(&decoded)]);
+
+            let sent = completed_shots(&messages);
+            assert_eq!(sent.len(), 1);
+            let gspro = map_shot(&sent[0], Handedness::Right);
+            assert!(gspro.shot_data_options.contains_club_data);
+            assert_eq!(gspro.club_data.speed, 0.0);
+            assert_eq!(gspro.club_data.face_to_target, -decoded.face_angle);
+            assert_eq!(gspro.club_data.angle_of_attack, decoded.attack_angle);
+            assert_eq!(gspro.club_data.loft, decoded.dynamic_loft);
+            assert_eq!(gspro.club_data.path, -decoded.strike_direction);
+        }
+    }
+
+    /// Club data the device sends before the full result goes out right
+    /// after the ball flight, as when it follows it, and GSPro gets both.
+    #[test]
+    fn club_data_before_the_d4_follows_the_ball_flight() {
+        let ed = hex(SHOT_ED);
+        let club = club_from_ed(&ClubResult::decode(&ed).unwrap());
+        let d4 = (TYPE_FLIGHT_RESULT, hex(CLUB_SHOT_D4));
+        let ed_frame = (TYPE_CLUB_RESULT, ed.clone());
+        for results in [
+            vec![ed_frame.clone(), d4.clone()],
+            vec![d4.clone(), ed_frame.clone()],
+        ] {
+            let shot = DeviceShot::new(1, XI_CHIP_TRIGGER, results, ed.clone());
+            let messages = replay_fresh(DeviceModel::Xi, &[shot], false);
+            assert_eq!(kinds_by_shot(&messages), ["trigger|ball|club|finished"]);
+            assert_eq!(club_paths(&messages), std::slice::from_ref(&club));
+            let sent = completed_shots(&messages);
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].ball.is_some());
+            assert_eq!(sent[0].club.as_ref(), Some(&club));
+        }
+    }
+
+    /// On a Mevo+ or Mevo Gen2 the no-read alert names the Mevo.
+    #[test]
+    fn no_read_alert_names_the_mevo() {
+        for use_estimated in [false, true] {
+            let messages = replay_fresh(
+                DeviceModel::Mevo,
+                &[DeviceShot::xi_no_read(1)],
+                use_estimated,
+            );
+            assert_eq!(kinds_by_shot(&messages), ["trigger|alert|finished"]);
+            assert_eq!(
+                warnings(&messages),
+                ["Shot #1: Mevo didn't track the ball (no read)"]
+            );
         }
     }
 }

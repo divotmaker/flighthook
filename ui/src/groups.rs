@@ -413,6 +413,7 @@ mod tests {
             derived: None,
             club_selected: None,
             group: None,
+            finished: true,
         }
     }
 

@@ -403,6 +403,7 @@ impl FlighthookApp {
                     derived: None,
                     club_selected: self.selected_club,
                     group: None,
+                    finished: false,
                 });
                 self.shots_rev += 1;
             }
@@ -420,7 +421,12 @@ impl FlighthookApp {
                     self.shots_rev += 1;
                 }
             }
-            FlighthookEvent::ShotFinished { .. } => {}
+            FlighthookEvent::ShotFinished { key, .. } => {
+                if let Some(i) = groups::find_row(&self.shots, &actor, &key) {
+                    self.shots[i].finished = true;
+                    self.shots_rev += 1;
+                }
+            }
             FlighthookEvent::PlayerInfo { player_info } => {
                 if let Some(ref name) = player_info.name
                     && let Some(actor) = self.actors.get_mut(&actor)

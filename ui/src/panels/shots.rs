@@ -2706,6 +2706,9 @@ struct ListEntry {
     total: Metric,
     /// The shot has ball or club data.
     has_data: bool,
+    /// The shot finished without ball or club data: the device did not read
+    /// it.
+    no_read: bool,
 }
 
 impl ListEntry {
@@ -2734,6 +2737,7 @@ impl ListEntry {
                 false,
             ),
             has_data: shot.ball.is_some() || shot.club.is_some(),
+            no_read: shot.finished && shot.ball.is_none() && shot.club.is_none(),
         }
     }
 }
@@ -2830,8 +2834,17 @@ fn list_entry(ui: &egui::Ui, rect: egui::Rect, e: &ListEntry, state: EntryState)
         painter.galley(pos, galley, theme::TEXT_MUTED);
     }
 
-    let half = (right - left) / 2.0;
     let label_y = top + number_height + 3.0;
+    if e.no_read {
+        let text = painter.layout_no_wrap(
+            "No read".to_owned(),
+            FontId::proportional(11.5),
+            theme::TEXT_DIM,
+        );
+        painter.galley(pos2(left, label_y), text, theme::TEXT_DIM);
+        return;
+    }
+    let half = (right - left) / 2.0;
     for (k, m) in [&e.carry, &e.total].into_iter().enumerate() {
         let x = left + half * k as f32;
         let label = painter.layout_job(LayoutJob::single_section(
@@ -4079,7 +4092,27 @@ mod tests {
             derived: None,
             club_selected: None,
             group: None,
+            finished: true,
         }
+    }
+
+    #[test]
+    fn a_finished_shot_without_data_is_a_no_read() {
+        let entry = |shot: &ShotRow| ListEntry::new(shot, None, true);
+        assert!(entry(&row(1, false)).no_read);
+        assert!(!entry(&row(1, true)).no_read);
+        let club_only = ShotRow {
+            club: Some(ClubData::default()),
+            ..row(1, false)
+        };
+        assert!(!entry(&club_only).no_read);
+        // Still in flight: no data yet, but not a no-read.
+        let in_flight = ShotRow {
+            finished: false,
+            ..row(1, false)
+        };
+        assert!(!entry(&in_flight).no_read);
+        assert!(!entry(&in_flight).has_data);
     }
 
     #[test]
