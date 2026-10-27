@@ -64,13 +64,34 @@ logged with its hex, and the shot is handled as if no full result arrived.
 
 - `false` (default) — skip estimated-only shots. A shot with only an estimate,
   such as a flight too short to read in `outdoor` mode or a very short chip,
-  does not reach GSPro or the shot list. It is still in the
-  [shot export](#shot-export) with its raw frames.
+  sends no ball flight. With no club data either, it does not reach GSPro or
+  `/api/shots`, and the dashboard's shot list shows it as a dimmed entry
+  reading **No read**, the same as a
+  [shot the device didn't read](#shots-the-device-didnt-read). It is still in
+  the [shot export](#shot-export) with its raw frames.
 - `true` — emit the estimated flight as `BallFlight`.
 
 Estimated shots may be missing club data and sidespin. Set
 `use_estimated = true` in the device section (or tick **Use Estimated Shots**
 in the settings UI) to keep them.
+
+### Shots the device didn't read
+
+Sometimes the device triggers but tracks no ball. It then sends an estimate
+with zero ball speed and no full result, and club data with zero club speed.
+flighthook treats that as a missed read, not a 0 mph shot:
+
+- No ball flight and no club data are sent for the shot, so it does not
+  reach GSPro, FRP consumers get no `ball_flight` or `club_path` for it, and
+  it is left out of `/api/shots` and the shot sets.
+- A warning alert is raised, e.g. `Shot #3: Xi didn't track the ball (no
+  read)` (`Mevo` on a Mevo+ or Mevo Gen2), and the estimate is logged with
+  its hex.
+- The dashboard's shot list shows the shot as a dimmed entry reading
+  **No read**.
+- The shot is in the [shot export](#shot-export) with its raw frames.
+
+This applies whatever `use_estimated` is set to.
 
 ## Landing offline and descent angle
 
@@ -249,7 +270,13 @@ A change applies from the next shot, without reconnecting. In the settings UI
 this is the **Spin source (Xi)** dropdown on the device. The setting has no
 effect on a Mevo+ or Mevo Gen2, which report a single spin value.
 
-**Comparing short shots with FS Golf:** use FS Golf's **Pitching** mode for
-chips and pitches. flighthook keeps the Xi in the limited-flight mode, the
-same mode FS Golf's Pitching uses, so the two compare directly, and chips and
-pitches read with the default settings.
+**Chips and pitches:** FS Golf's **Pitching** mode uses the limited-flight
+detection mode, the one flighthook selects, together with short-game setup:
+the distance from the Xi to the ball, the surface height, and a trigger
+setting for short shots. flighthook sends only the detection mode, not that
+setup (its `range` and `surface_height` are not sent either), so the Xi uses
+the setup it has stored. The Xi may keep the setup an app sends until it is
+switched off; this is not confirmed yet. If chips don't read, it may help to
+run FS Golf in **Pitching** first, close it without switching the Xi off,
+then start flighthook. To compare short shots with FS Golf, use its Pitching
+mode.
