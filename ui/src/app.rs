@@ -986,6 +986,12 @@ impl eframe::App for FlighthookApp {
                     let title_size = egui::vec2(ui.available_width(), row_height);
                     ui.allocate_ui_with_layout(title_size, title, |ui| {
                         ui.label(
+                            egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
                             egui::RichText::new("FLIGHTHOOK")
                                 .strong()
                                 .size(15.0)
