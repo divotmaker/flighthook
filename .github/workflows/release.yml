@@ -138,7 +138,7 @@ jobs:
 
       - name: Install mingw-w64
         if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: sudo apt-get install -y mingw-w64
+        run: sudo apt-get install -y gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix
 
       - name: Build WASM UI
         run: cd ui && trunk build --release
