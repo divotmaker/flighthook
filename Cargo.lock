@@ -48,9 +48,9 @@ dependencies = [
 
 [[package]]
 name = "allsquare"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d443903c28e434a2959dcdc8e7640eb6621ca09850b842b87cfbc1402047d92e"
+checksum = "d23ab470c3b836f0e5acaff8482d3fd1ccae6e51ab8322ffa7995337286faba3"
 dependencies = [
  "btleplug",
  "futures",
@@ -1998,9 +1998,9 @@ dependencies = [
 
 [[package]]
 name = "ironsight"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4963d7f94650169d37425652b1161e51be1bd8108a5eb3239e623591866a3cdb"
+checksum = "f15abaedc1a510a2c4cac6362983e8e845c2941cb65056008f8701efaf37b43c"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3716,9 +3716,9 @@ dependencies = [
 
 [[package]]
 name = "tenover"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f138db44b017d7205b502c811a5f281183034f778d9ec05b1c5c44518f28ade"
+checksum = "4d93de8f7117c8d2e23c90d53566c56d23b76ed1eeaa6520632b7d239515000d"
 dependencies = [
  "btleplug",
  "libc",
