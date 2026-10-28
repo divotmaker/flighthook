@@ -654,7 +654,10 @@ Starting -> Connected -> (error) -> Reconnecting -> Connected -> ...
 | Disconnected | Stopped/shutdown (terminal state)                          |
 
 All actors use linear backoff on connection failure: starts at 1s, adds 1s per
-attempt, capped at 15s.
+failed attempt, capped at 15s (3s for the GSPro bridge, a loopback/LAN TCP
+connect). The GSPro and Square Golf actors restart at 1s after a successful
+connection; the Mevo and R10 actors keep the grown delay. Backoff waits poll
+the actor's shutdown flag, so stopping an actor never waits out the delay.
 
 **Mevo actor mapping** (from internal phases):
 
@@ -674,7 +677,20 @@ completes. Emits `DeviceTelemetry` with `manufacturer: "Garmin"`,
 
 **GSPro actor**: emits `Starting` before first TCP connect attempt, `Connected`
 on success. Connection loss after a successful session emits `Reconnecting`;
-failure before ever connecting stays at `Starting`.
+failure before ever connecting stays at `Starting`. A connection failure raises
+one `Error` alert per outage, plus one whenever the error changes, not one per
+retry.
+
+**GSPro shot delivery**: the bridge drains the bus the whole time it runs,
+connected or not, so nothing queues up while GSPro is away. Every shot that
+finishes while GSPro is connected is sent, in order, including several that
+finish together. A shot that finishes while GSPro is not connected (stopped,
+starting up, or between reconnects) is dropped, as is a connected shot that
+is more than 5s old by the time the bridge can send it (e.g. the connection
+dropped and came back slowly). Dropped shots are logged at debug level only,
+with no alert: GSPro not running is normal when another simulator is in use.
+A shot whose write fails is not retried. The JSON sent for a shot is the same
+whatever happened to the connection before it.
 
 **Integration readiness**: the GSPro actor tracks device readiness from
 `DeviceTelemetry` (`"ready"` key) and uses it to set both

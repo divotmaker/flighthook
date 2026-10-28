@@ -104,7 +104,7 @@ pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use flighthook::{
         BallFlight, ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, FlightPath,
@@ -152,7 +152,7 @@ mod tests {
     }
 
     /// A Square-like full swing: launch data only, no carry, no club data.
-    fn square_like_shot(derived: Option<DerivedFlight>) -> ShotData {
+    pub(in crate::actors::gspro) fn square_like_shot(derived: Option<DerivedFlight>) -> ShotData {
         ShotData {
             actor: "square.0".into(),
             shot_number: 12,
@@ -178,7 +178,7 @@ mod tests {
 
     /// GSPro output for a launch-only shot; `derived` must not change it: no
     /// `CarryDistance` appears.
-    const GOLDEN_RH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89998400000002,"SpinAxis":-2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":-300.0,"HLA":-1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Lie":0.0,"Loft":0.0,"Path":0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
+    pub(in crate::actors::gspro) const GOLDEN_RH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89998400000002,"SpinAxis":-2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":-300.0,"HLA":-1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Lie":0.0,"Loft":0.0,"Path":0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
     const GOLDEN_LH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89998400000002,"SpinAxis":2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":300.0,"HLA":1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":-0.0,"Lie":0.0,"Loft":0.0,"Path":-0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
 
     #[test]
