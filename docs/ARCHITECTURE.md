@@ -655,9 +655,14 @@ Starting -> Connected -> (error) -> Reconnecting -> Connected -> ...
 
 All actors use linear backoff on connection failure: starts at 1s, adds 1s per
 failed attempt, capped at 15s (3s for the GSPro bridge, a loopback/LAN TCP
-connect). The GSPro and Square Golf actors restart at 1s after a successful
-connection; the Mevo and R10 actors keep the grown delay. Backoff waits poll
-the actor's shutdown flag, so stopping an actor never waits out the delay.
+connect). The GSPro and Square Golf actors restart at 1s after a connection
+that lasted at least 10s; one that drops sooner counts as a failed attempt, so
+a link that keeps connecting and dropping still backs off to the cap. The
+OpenConnect server restarts at 1s after a successful bind. The Mevo and R10
+actors keep the grown delay. The GSPro, Square Golf, Mevo and R10 actors poll
+their shutdown flag during the backoff wait, so stopping one never waits out
+the delay; the OpenConnect server sleeps through its bind retry delay, and the
+GSPro bridge's TCP connect attempt (up to 5s) is not interrupted by a stop.
 
 **Mevo actor mapping** (from internal phases):
 
@@ -685,12 +690,16 @@ GSPro not running is normal when another simulator is in use.
 connected or not, so nothing queues up while GSPro is away. Every shot that
 finishes while GSPro is connected is sent, in order, including several that
 finish together. A shot that finishes while GSPro is not connected (stopped,
-starting up, or between reconnects) is dropped, as is a connected shot that
-is more than 5s old by the time the bridge can send it (e.g. the connection
-dropped and came back slowly). Dropped shots are logged at debug level only,
-with no alert: GSPro not running is normal when another simulator is in use.
-A shot whose write fails is not retried. The JSON sent for a shot is the same
-whatever happened to the connection before it.
+starting up, or between reconnects) is dropped. A shot is also dropped if it
+is more than 5s old when the bridge can send it, its age counted from when the
+bridge took the finished shot off the bus. A connected bridge sends a shot in
+the same loop pass that takes it off the bus, so in practice this only drops
+shots left queued behind a failed write when the reconnect takes longer than
+5s. Dropped shots are logged at debug level only, with no alert: GSPro not
+running is normal when another simulator is in use. A shot whose write fails
+is not retried. A write to GSPro that blocks for more than 2s fails like any
+other, ending the connection and starting a reconnect, with no alert. The JSON
+sent for a shot is the same whatever happened to the connection before it.
 
 **Integration readiness**: the GSPro actor tracks device readiness from
 `DeviceTelemetry` (`"ready"` key) and uses it to set both
