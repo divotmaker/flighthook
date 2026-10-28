@@ -1132,10 +1132,10 @@ values immediately.
   SHOTS 42             Shot #42  LATEST          (older shot: [^ Back to latest])
   [By set|By club|None][ Ball speed ] [ Carry ] [ Total ] [ Launch ] [ Backspin ]
   SET 3 · 7I · 10 ---                         DEVICE [All|Mevo+|Omni] (2+ devices)
-  [#42      ]          SET 3 · 7I · 10 SHOTS ------  range | avg ○ median ● this shot
-  [carry tot]          TOTAL      148 |  [====○====●====|]   217  avg 192 · med 191
-  [#41      ]          CARRY      148 [==●=○==|]             217  avg 174 · med 174
-  SET 2 · DR · 4 ----  LATERAL    L     [=====○=●===|]        R  avg -1.1 · med -0.5
+  [#42      ]          SET 3 · 7I · 10 SHOTS ------  range ● avg ○ median | this shot
+  [carry tot]          TOTAL      148 |  [====○====|====●]   217  avg 192 · med 191
+  [#41      ]          CARRY      148 [==|=○==●]             217  avg 174 · med 174
+  SET 2 · DR · 4 ----  LATERAL    L     [=====○=|===●]        R  avg -1.1 · med -0.5
   [#40      ]          BALL --------  FLIGHT --------------  CLUB ----------------------
   (list scrolls)       [Direction]    [Apex]    [Offline]    [Club speed] [Smash] [Path]
   ------------------   [Sidespin]     [Descent] [Roll]       [AoA]        [Face]  [Loft]
@@ -1332,10 +1332,10 @@ revisions, view, device filter, shown shot, club in play). Each bar is
 drawn on a track, painted in this order: the set's range as a translucent
 accent band with its min and max beside it; the median as a hollow white
 ring sitting on the track's centre line, its radius just inside the track's
-height; the shown shot as a filled gold dot (full-strength `theme::GOLD`),
+height; the average as a filled gold dot (full-strength `theme::GOLD`),
 sized to sit inside the ring (filling it when the two coincide), with a thin
 dark halo so it reads against the band; and, on top of everything, the
-average as a thin gold line (`theme::GOLD`, with a thin dark halo of its
+shown shot as a thin gold line (`theme::GOLD`, with a thin dark halo of its
 own) that sticks out past the track, top and bottom. A value shared by
 every marker therefore reads as a white ring filled with a gold dot, with a
 gold line through it poking out above and below. Total and Carry share one

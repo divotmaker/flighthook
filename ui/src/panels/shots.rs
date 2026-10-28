@@ -1577,20 +1577,21 @@ const GUTTER: f32 = 36.0;
 /// that the pip still peeks out past the median ring when every marker lands
 /// on the same value.
 const PIP_W: f32 = 16.0;
-/// How far the average line reaches past the track, top and bottom.
+/// How far the "this shot" line reaches past the track, top and bottom.
 const MARKER_OVERHANG: f32 = 3.0;
 /// Radius of the median ring, drawn just inside the track's half height.
 const MEDIAN_RING_RADIUS: f32 = TRACK_H / 2.0 - 1.0;
 /// Stroke width of the median ring.
 const MEDIAN_RING_STROKE: f32 = 2.0;
-/// Radius of the "this shot" dot: smaller than the median ring's inner
-/// radius, so it fits inside the ring and fills it when the two coincide.
-const SHOT_DOT_RADIUS: f32 = 4.0;
-/// Width of the dark halo stroke around the "this shot" dot.
-const SHOT_DOT_HALO: f32 = 1.0;
-/// Width of the dark halo drawn behind the average line on each side, so
-/// the white line still reads where it crosses the white median ring.
-const AVG_LINE_HALO: f32 = 1.0;
+/// Radius of the average dot: smaller than the median ring's inner radius,
+/// so it fits inside the ring and fills it when the two coincide.
+const AVG_DOT_RADIUS: f32 = 4.0;
+/// Width of the dark halo stroke around the average dot.
+const AVG_DOT_HALO: f32 = 1.0;
+/// Width of the dark halo drawn behind the "this shot" line on each side,
+/// so the gold line still reads where it crosses the median ring and the
+/// average dot.
+const SHOT_LINE_HALO: f32 = 1.0;
 /// Padding around the distance domain, as a share of its range.
 const DISTANCE_PAD: f64 = 0.15;
 /// Least padding around the distance domain, in yards and in metres.
@@ -2024,13 +2025,16 @@ fn bars_legend(
         let (top, bottom) = (mid - 6.0, mid + 6.0);
         match i {
             0 => {
-                painter.circle(
-                    pos2(x - SHOT_DOT_RADIUS, mid),
-                    SHOT_DOT_RADIUS,
-                    theme::GOLD,
-                    Stroke::new(SHOT_DOT_HALO, theme::BG_DEEP),
+                let lx = x - 1.0;
+                painter.line_segment(
+                    [pos2(lx, top), pos2(lx, bottom)],
+                    Stroke::new(1.5 + 2.0 * SHOT_LINE_HALO, theme::BG_DEEP),
                 );
-                x -= 2.0 * SHOT_DOT_RADIUS;
+                painter.line_segment(
+                    [pos2(lx, top), pos2(lx, bottom)],
+                    Stroke::new(1.5, theme::GOLD),
+                );
+                x -= 2.0;
             }
             1 => {
                 painter.circle_stroke(
@@ -2041,16 +2045,13 @@ fn bars_legend(
                 x -= 2.0 * MEDIAN_RING_RADIUS;
             }
             2 => {
-                let lx = x - 1.0;
-                painter.line_segment(
-                    [pos2(lx, top), pos2(lx, bottom)],
-                    Stroke::new(1.5 + 2.0 * AVG_LINE_HALO, theme::BG_DEEP),
+                painter.circle(
+                    pos2(x - AVG_DOT_RADIUS, mid),
+                    AVG_DOT_RADIUS,
+                    theme::GOLD,
+                    Stroke::new(AVG_DOT_HALO, theme::BG_DEEP),
                 );
-                painter.line_segment(
-                    [pos2(lx, top), pos2(lx, bottom)],
-                    Stroke::new(1.5, theme::GOLD),
-                );
-                x -= 2.0;
+                x -= 2.0 * AVG_DOT_RADIUS;
             }
             _ => {
                 let swatch =
@@ -2235,9 +2236,9 @@ fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
             painter.galley(pos2(x, y(&before)), before, theme::TEXT_MUTED);
         }
 
-        // Median ring, this-shot dot, then the average line on top, in that
-        // order: a value shared by all three still reads as a white ring
-        // filled with a gold dot, with a gold line (haloed so it still
+        // Median ring, average dot, then the this-shot line on top, in
+        // that order: a value shared by all three still reads as a white
+        // ring filled with a gold dot, with a gold line (haloed so it still
         // reads against the dot) through it.
         let median = bar_x(domain, plot, s.median);
         painter.circle_stroke(
@@ -2246,28 +2247,28 @@ fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
             Stroke::new(MEDIAN_RING_STROKE, theme::TEXT),
         );
 
+        painter.circle(
+            pos2(bar_x(domain, plot, s.mean), track.center().y),
+            AVG_DOT_RADIUS,
+            theme::GOLD,
+            Stroke::new(AVG_DOT_HALO, theme::BG_DEEP),
+        );
+
         if let Some(v) = bar.this {
-            painter.circle(
-                pos2(bar_x(domain, plot, v), track.center().y),
-                SHOT_DOT_RADIUS,
-                theme::GOLD,
-                Stroke::new(SHOT_DOT_HALO, theme::BG_DEEP),
+            let (top, bottom) = (
+                track.top() - MARKER_OVERHANG,
+                track.bottom() + MARKER_OVERHANG,
+            );
+            let shot = bar_x(domain, plot, v);
+            painter.line_segment(
+                [pos2(shot, top), pos2(shot, bottom)],
+                Stroke::new(1.5 + 2.0 * SHOT_LINE_HALO, theme::BG_DEEP),
+            );
+            painter.line_segment(
+                [pos2(shot, top), pos2(shot, bottom)],
+                Stroke::new(1.5, theme::GOLD),
             );
         }
-
-        let (top, bottom) = (
-            track.top() - MARKER_OVERHANG,
-            track.bottom() + MARKER_OVERHANG,
-        );
-        let avg = bar_x(domain, plot, s.mean);
-        painter.line_segment(
-            [pos2(avg, top), pos2(avg, bottom)],
-            Stroke::new(1.5 + 2.0 * AVG_LINE_HALO, theme::BG_DEEP),
-        );
-        painter.line_segment(
-            [pos2(avg, top), pos2(avg, bottom)],
-            Stroke::new(1.5, theme::GOLD),
-        );
     }
     for (galley, centre) in gutter {
         let rect = egui::Rect::from_center_size(pos2(centre, track.center().y), galley.size());
@@ -5112,13 +5113,13 @@ mod tests {
 
     #[test]
     fn coincident_markers_nest_with_expected_sizes() {
-        // The shot dot fits inside the median ring's hollow centre, so a
+        // The average dot fits inside the median ring's hollow centre, so a
         // value shared by every marker reads as a ring filled by the dot,
-        // with the average line drawn through both.
+        // with the this-shot line drawn through both.
         let ring_inner_radius = MEDIAN_RING_RADIUS - MEDIAN_RING_STROKE / 2.0;
-        assert!(SHOT_DOT_RADIUS < ring_inner_radius);
+        assert!(AVG_DOT_RADIUS < ring_inner_radius);
         // The ring sits just inside the track, not poking out of it; only
-        // the average line sticks out past the bar. Both hold by
+        // the this-shot line sticks out past the bar. Both hold by
         // construction, so the compiler checks them as a build-time
         // invariant rather than a runtime assertion on constants.
         const { assert!(MEDIAN_RING_RADIUS < TRACK_H / 2.0) };
