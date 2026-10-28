@@ -10,6 +10,7 @@ pub(crate) mod shots;
 use std::collections::HashMap;
 
 use crate::app::FlighthookApp;
+use crate::panels::cards::{CardGroup, group_of, split_actor_id};
 use crate::theme;
 use crate::types::{ActorStatus, ActorStatusResponse};
 
@@ -28,13 +29,16 @@ pub(crate) const TABS: [(Tab, &str); 3] = [
 ];
 
 /// The tab that carries the red notification dot, as an index into
-/// [`TABS`]: Devices, while any connection has an issue.
+/// [`TABS`]: Devices, while any connection has an issue. An output that is
+/// starting or reconnecting is not an issue: a simulator that is not running
+/// is normal, since users run one at a time.
 pub(crate) fn tab_alert(actors: &HashMap<String, ActorStatusResponse>) -> Option<usize> {
-    let issue = actors.values().any(|a| {
-        matches!(
-            a.status,
-            ActorStatus::Disconnected | ActorStatus::Reconnecting | ActorStatus::Starting
-        )
+    let issue = actors.iter().any(|(id, a)| match a.status {
+        ActorStatus::Disconnected => true,
+        ActorStatus::Reconnecting | ActorStatus::Starting => {
+            group_of(split_actor_id(id).0) != CardGroup::Outputs
+        }
+        ActorStatus::Connected => false,
     });
     if !issue {
         return None;

@@ -503,10 +503,21 @@ mod tests {
             ActorStatus::Reconnecting,
             ActorStatus::Starting,
         ] {
-            app.actors.get_mut("gspro.1").unwrap().status = status;
+            app.actors.get_mut("mevo.0").unwrap().status = status;
             assert_eq!(tab_alert(&app.actors), Some(0), "{status:?}");
             assert_eq!(TABS[0].0, Tab::Devices);
         }
+    }
+
+    #[test]
+    fn the_alert_dot_stays_off_while_gspro_is_not_running() {
+        let mut app = app();
+        for status in [ActorStatus::Reconnecting, ActorStatus::Starting] {
+            app.actors.get_mut("gspro.1").unwrap().status = status;
+            assert_eq!(tab_alert(&app.actors), None, "{status:?}");
+        }
+        app.actors.get_mut("gspro.1").unwrap().status = ActorStatus::Disconnected;
+        assert_eq!(tab_alert(&app.actors), Some(0));
     }
 
     #[test]

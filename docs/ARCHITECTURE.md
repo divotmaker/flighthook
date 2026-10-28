@@ -1090,9 +1090,12 @@ the hover text "Set by GSPro": GSPro replaces the club on its next player
 message, so its telemetry `club` and the pill agree.
 
 The tab bar is a segmented control, the same look as the mode selector beside
-it (`theme::segmented`). If any actor has status `starting`, `disconnected`,
-or `reconnecting`, the Devices segment carries a small red notification dot at
-the top centre, overlapping its top edge, whatever its selection state. The
+it (`theme::segmented`). If any actor has status `disconnected`, or any
+launch monitor has status `starting` or `reconnecting`, the Devices segment
+carries a small red notification dot at the top centre, overlapping its top
+edge, whatever its selection state. An output (GSPro) that is starting or
+reconnecting does not light the dot: a simulator that is not running is normal,
+and its card's status shows the state. The
 web layer caches telemetry from `ActorStatus` events plus club from `ClubInfo`
 and name from `PlayerInfo` events so reconnecting clients recover latest
 values immediately.
