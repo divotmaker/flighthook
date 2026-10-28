@@ -1,5 +1,6 @@
 //! Actor infrastructure — shared trait, bus helpers, and actor resolution.
 
+pub(crate) mod backoff;
 pub mod gspro;
 pub mod mevo;
 pub mod mock;

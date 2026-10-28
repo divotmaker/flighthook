@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use allsquare::{Client, Event, SpinMode, ble};
 use tracing::{debug, info, warn};
 
+use super::backoff::Backoff;
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::raw_capture::{self, RawCapture, RawCaptureConfig};
@@ -17,7 +18,8 @@ use flighthook::{
     FlighthookMessage, RawDir, RawRecord, Severity, ShotKey, Velocity,
 };
 
-/// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
+/// Reconnect backoff bounds (linear: +1s per failed attempt, capped at 15s,
+/// back to the minimum after a connection).
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
 
@@ -394,7 +396,7 @@ fn run(
         }
         !zero
     });
-    let mut backoff = MIN_BACKOFF;
+    let mut backoff = Backoff::new(MIN_BACKOFF, MAX_BACKOFF);
     let mut ever_connected = false;
     let mut device_id: Option<String> = None;
     // Latched across reconnects so the device comes back with the right club.
@@ -407,6 +409,7 @@ fn run(
 
         emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
 
+        let mut connected = false;
         match connect_and_run(
             state,
             address.as_deref(),
@@ -416,11 +419,12 @@ fn run(
             &impact_calibration,
             &sender,
             &mut receiver,
-            &mut ever_connected,
+            &mut connected,
             &mut device_id,
         ) {
             Ok(()) => break,
             Err(e) => {
+                ever_connected |= connected;
                 warn!("session error: {e}");
                 emit_alert(&sender, Severity::Warn, format!("Square Golf error: {e}"));
 
@@ -447,9 +451,10 @@ fn run(
                 } else {
                     "retrying"
                 };
-                info!("{verb} in {}s", backoff.as_secs());
+                let delay = backoff.delay(connected);
+                info!("{verb} in {}s", delay.as_secs());
 
-                let deadline = Instant::now() + backoff;
+                let deadline = Instant::now() + delay;
                 while Instant::now() < deadline {
                     if receiver.poll().is_err() {
                         emit_device_status(&sender, ActorStatus::Disconnected, HashMap::new());
@@ -457,7 +462,6 @@ fn run(
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
-                backoff = (backoff + Duration::from_secs(1)).min(MAX_BACKOFF);
             }
         }
     }
@@ -479,12 +483,12 @@ fn connect_and_run(
     impact_calibration: &allsquare::ImpactCalibration,
     sender: &BusSender,
     receiver: &mut BusReceiver,
-    ever_connected: &mut bool,
+    connected: &mut bool,
     device_id: &mut Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("searching for Square Golf device...");
     let transport = ble::connect(address)?;
-    *ever_connected = true;
+    *connected = true;
 
     let name = transport.name().to_string();
     let ble_address = transport.address().to_string();
