@@ -19,7 +19,7 @@ use flighthook::{
 };
 
 /// Reconnect backoff bounds (linear: +1s per failed attempt, capped at 15s,
-/// back to the minimum after a connection).
+/// back to the minimum after a session that lasted 10s).
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
 
@@ -409,7 +409,7 @@ fn run(
 
         emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
 
-        let mut connected = false;
+        let mut connected_at = None;
         match connect_and_run(
             state,
             address.as_deref(),
@@ -419,12 +419,13 @@ fn run(
             &impact_calibration,
             &sender,
             &mut receiver,
-            &mut connected,
+            &mut connected_at,
             &mut device_id,
         ) {
             Ok(()) => break,
             Err(e) => {
-                ever_connected |= connected;
+                let session = connected_at.map(|at| at.elapsed());
+                ever_connected |= session.is_some();
                 warn!("session error: {e}");
                 emit_alert(&sender, Severity::Warn, format!("Square Golf error: {e}"));
 
@@ -451,7 +452,7 @@ fn run(
                 } else {
                     "retrying"
                 };
-                let delay = backoff.delay(connected);
+                let delay = backoff.delay(session);
                 info!("{verb} in {}s", delay.as_secs());
 
                 let deadline = Instant::now() + delay;
@@ -483,12 +484,12 @@ fn connect_and_run(
     impact_calibration: &allsquare::ImpactCalibration,
     sender: &BusSender,
     receiver: &mut BusReceiver,
-    connected: &mut bool,
+    connected_at: &mut Option<Instant>,
     device_id: &mut Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("searching for Square Golf device...");
     let transport = ble::connect(address)?;
-    *connected = true;
+    *connected_at = Some(Instant::now());
 
     let name = transport.name().to_string();
     let ble_address = transport.address().to_string();

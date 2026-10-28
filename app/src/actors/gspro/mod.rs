@@ -17,7 +17,7 @@ use proto::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -109,22 +109,29 @@ impl Actor for GsProActor {
 }
 
 /// Reconnect backoff: 1 s, +1 s per failed attempt, capped at 3 s, back to
-/// 1 s after a connection. GSPro is on loopback or the LAN, so retrying a
-/// refused connect costs nothing, and a short cap means the bridge is back
-/// within a few seconds of GSPro starting.
+/// 1 s after a session that lasted 10 s
+/// ([`STABLE_SESSION`](super::backoff::STABLE_SESSION)). GSPro is on loopback
+/// or the LAN, so retrying a refused connect costs nothing, and a short cap
+/// means the bridge is back within a few seconds of GSPro starting.
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(3);
 
-/// Oldest a finished shot may be when the bridge sends it; older shots are
-/// dropped. A connected bridge sends a shot within one loop pass (~150 ms),
-/// and a dropped connection is back within ~1.5 s (read timeout + 1 s
-/// backoff + connect), so a shot caught by a brief blip still goes through.
+/// Oldest a finished shot may be when the bridge sends it, counted from when
+/// the bridge took it off the bus; older shots are dropped. A connected bridge sends a shot within one loop pass (~150 ms),
+/// and a connection that drops after being up 10 s or more is back within
+/// ~1.5 s (read timeout + 1 s backoff + connect), so a shot caught by a
+/// brief blip still goes through.
 /// 5 s is well short of the time a golfer needs to set up the next ball, so
 /// GSPro only ever plays the shot the golfer has just hit.
 const STALE_SHOT: Duration = Duration::from_secs(5);
 
 /// How often the loops poll the bus and the shutdown flag while idle.
 const IDLE_POLL: Duration = Duration::from_millis(100);
+
+/// Longest a write to GSPro may block. A write that times out ends the
+/// connection like any other I/O error, so a GSPro that stops reading cannot
+/// stall the bridge and leave the bus undrained.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Main bridge loop. Reconnects forever until the bus closes.
 fn run(addr: SocketAddr, routing: GsProRouting, sender: BusSender, receiver: BusReceiver) {
@@ -164,8 +171,8 @@ fn run_with(
         }));
 
         let result = connect_and_run(addr, &mut relay, sender, &mut receiver);
-        let connected = std::mem::replace(&mut relay.connected, false);
-        ever_connected |= connected;
+        let session = relay.disconnect();
+        ever_connected |= session.is_some();
         match result {
             Ok(()) | Err(BridgeError::Shutdown) => {
                 tracing::info!("gspro bridge: shutting down");
@@ -177,7 +184,7 @@ fn run_with(
                 } else {
                     ActorStatus::Starting
                 };
-                let delay = backoff.delay(connected);
+                let delay = backoff.delay(session);
                 let text = e.to_string();
                 // GSPro not running is normal (one simulator at a time), so a
                 // lost or refused connection is a status, not an alert.
@@ -214,9 +221,9 @@ struct PendingShot {
 /// whole time the actor runs, connected or not.
 struct Relay {
     routing: GsProRouting,
-    /// Whether GSPro is connected. Shots that finish while it is not are
-    /// dropped.
-    connected: bool,
+    /// When GSPro connected, `None` while it is not. Shots that finish while
+    /// it is not are dropped.
+    connected_at: Option<Instant>,
     mode: ShotDetectionMode,
     handed: Handedness,
     monitor_state: HashMap<String, bool>,
@@ -231,7 +238,7 @@ impl Relay {
     fn new(routing: GsProRouting) -> Self {
         Self {
             routing,
-            connected: false,
+            connected_at: None,
             mode: ShotDetectionMode::Full,
             handed: Handedness::Right,
             monitor_state: HashMap::new(),
@@ -239,6 +246,17 @@ impl Relay {
             accumulators: HashMap::new(),
             outbox: VecDeque::new(),
         }
+    }
+
+    /// Mark GSPro connected at `now`.
+    fn connect(&mut self, now: Instant) {
+        self.connected_at = Some(now);
+    }
+
+    /// Mark GSPro not connected. Returns how long the connection lasted,
+    /// `None` if it was not connected.
+    fn disconnect(&mut self) -> Option<Duration> {
+        self.connected_at.take().map(|at| at.elapsed())
     }
 
     /// Process every message waiting on the bus.
@@ -295,7 +313,7 @@ impl Relay {
                             self.mode,
                         );
                     } else if let Some(shot) = acc.finish() {
-                        if self.connected {
+                        if self.connected_at.is_some() {
                             self.outbox.push_back(PendingShot {
                                 shot,
                                 finished_at: now,
@@ -416,11 +434,14 @@ fn connect_and_run(
     stream
         .set_read_timeout(Some(Duration::from_millis(50)))
         .map_err(BridgeError::Io)?;
+    stream
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .map_err(BridgeError::Io)?;
 
     // Shots that finished during the connect attempt finished while GSPro
     // was not connected.
     relay.drain(receiver)?;
-    relay.connected = true;
+    relay.connect(Instant::now());
     tracing::info!("gspro bridge: connected to {addr}");
     sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
         status: ActorStatus::Connected,
@@ -471,22 +492,7 @@ fn connect_and_run(
         relay.drain(receiver)?;
 
         // 3. Send every finished shot, oldest first
-        while let Some(shot) = relay.next_shot(Instant::now()) {
-            let msg = mapper::map_shot(&shot, relay.handed);
-            log_outbound(&msg);
-            if let Ok(json_str) = serde_json::to_string(&msg) {
-                tracing::info!(
-                    target: "audit",
-                    "{name} sent shot {json_str} | {msg:?}",
-                );
-            }
-            if let Err(e) = send_message(&mut stream, &msg) {
-                tracing::debug!(
-                    "gspro bridge: sending shot #{} failed, not retried",
-                    shot.shot_number,
-                );
-                return Err(e);
-            }
+        if send_shots(relay, &mut stream, Instant::now(), name)? {
             activity = true;
         }
 
@@ -530,6 +536,37 @@ fn connect_and_run(
             std::thread::sleep(IDLE_POLL);
         }
     }
+}
+
+/// Send every shot in the outbox that is not stale at `now`, oldest first.
+/// Returns whether any was sent. A failed write is returned as the
+/// connection's error; the shot it was writing is not retried.
+fn send_shots(
+    relay: &mut Relay,
+    stream: &mut impl Write,
+    now: Instant,
+    name: &str,
+) -> Result<bool, BridgeError> {
+    let mut sent = false;
+    while let Some(shot) = relay.next_shot(now) {
+        let msg = mapper::map_shot(&shot, relay.handed);
+        log_outbound(&msg);
+        if let Ok(json_str) = serde_json::to_string(&msg) {
+            tracing::info!(
+                target: "audit",
+                "{name} sent shot {json_str} | {msg:?}",
+            );
+        }
+        if let Err(e) = send_message(stream, &msg) {
+            tracing::debug!(
+                "gspro bridge: sending shot #{} failed, not retried",
+                shot.shot_number,
+            );
+            return Err(e);
+        }
+        sent = true;
+    }
+    Ok(sent)
 }
 
 #[cfg(test)]
@@ -596,7 +633,7 @@ mod tests {
     #[test]
     fn shots_finished_in_one_drain_are_all_queued_in_order() {
         let (mut relay, monitor, mut receiver) = relay_with_bus();
-        relay.connected = true;
+        relay.connect(Instant::now());
         for n in 1..=3 {
             emit_shot(&monitor, n);
         }
@@ -609,7 +646,7 @@ mod tests {
         let (mut relay, monitor, mut receiver) = relay_with_bus();
         emit_shot(&monitor, 1);
         relay.drain(&mut receiver).expect("bus open");
-        relay.connected = true;
+        relay.connect(Instant::now());
         emit_shot(&monitor, 2);
         relay.drain(&mut receiver).expect("bus open");
         assert_eq!(sent_numbers(&mut relay, Instant::now()), [2]);
@@ -618,7 +655,7 @@ mod tests {
     #[test]
     fn a_shot_older_than_the_stale_limit_is_dropped() {
         let (mut relay, monitor, mut receiver) = relay_with_bus();
-        relay.connected = true;
+        relay.connect(Instant::now());
         emit_shot(&monitor, 1);
         emit_shot(&monitor, 2);
         relay.drain(&mut receiver).expect("bus open");
@@ -632,11 +669,83 @@ mod tests {
     #[test]
     fn a_shot_at_the_stale_limit_is_sent() {
         let (mut relay, monitor, mut receiver) = relay_with_bus();
-        relay.connected = true;
+        relay.connect(Instant::now());
         emit_shot(&monitor, 1);
         relay.drain(&mut receiver).expect("bus open");
         let now = relay.outbox[0].finished_at + STALE_SHOT;
         assert_eq!(sent_numbers(&mut relay, now), [1]);
+    }
+
+    /// A socket whose every write times out.
+    struct TimedOutSocket;
+
+    impl Write for TimedOutSocket {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(ErrorKind::TimedOut.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Split the bytes the bridge wrote into its JSON messages.
+    fn messages(wire: &[u8]) -> Vec<String> {
+        let mut it = serde_json::Deserializer::from_slice(wire).into_iter::<serde_json::Value>();
+        let mut out = Vec::new();
+        let mut start = 0;
+        while let Some(value) = it.next() {
+            value.expect("valid JSON");
+            out.push(String::from_utf8(wire[start..it.byte_offset()].to_vec()).expect("utf-8"));
+            start = it.byte_offset();
+        }
+        out
+    }
+
+    /// Shots 1-3 finish while connected and the write of shot 1 times out;
+    /// shot 4 finishes during the outage; GSPro is back `reconnect_after`
+    /// the shots finished. Returns what the bridge writes on the new
+    /// connection.
+    fn sent_after_failed_write(reconnect_after: Duration) -> Vec<String> {
+        let (mut relay, monitor, mut receiver) = relay_with_bus();
+        relay.connect(Instant::now());
+        for n in 1..=3 {
+            emit_shot(&monitor, n);
+        }
+        relay.drain(&mut receiver).expect("bus open");
+        let finished = relay.outbox[0].finished_at;
+        for pending in &mut relay.outbox {
+            pending.finished_at = finished;
+        }
+
+        let failed = send_shots(&mut relay, &mut TimedOutSocket, finished, "gspro.0");
+        assert!(
+            matches!(failed, Err(BridgeError::Io(ref e)) if e.kind() == ErrorKind::TimedOut),
+            "a timed-out write ends the connection: {failed:?}"
+        );
+        assert!(relay.disconnect().is_some());
+
+        emit_shot(&monitor, 4);
+        relay.drain(&mut receiver).expect("bus open");
+
+        let back = finished + reconnect_after;
+        relay.connect(back);
+        let mut wire = Vec::new();
+        send_shots(&mut relay, &mut wire, back, "gspro.0").expect("writes to a Vec succeed");
+        assert!(relay.outbox.is_empty());
+        messages(&wire)
+    }
+
+    #[test]
+    fn after_a_failed_write_a_quick_reconnect_sends_the_queued_shots() {
+        let sent = sent_after_failed_write(STALE_SHOT - Duration::from_millis(100));
+        assert_eq!(sent, [golden(2), golden(3)]);
+    }
+
+    #[test]
+    fn after_a_failed_write_a_slow_reconnect_drops_the_queued_shots() {
+        let sent = sent_after_failed_write(STALE_SHOT + Duration::from_millis(100));
+        assert!(sent.is_empty(), "{sent:?}");
     }
 
     // -- Bridge against a fake GSPro ---------------------------------------

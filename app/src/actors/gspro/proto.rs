@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::net::TcpStream;
 
 use super::BridgeError;
 use super::api;
@@ -7,7 +6,7 @@ use crate::bus::BusSender;
 use flighthook::{Club, ClubInfo, FlighthookEvent, FlighthookMessage, Handedness, Severity};
 
 pub(crate) fn send_message(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     msg: &api::GsProMessage,
 ) -> Result<(), BridgeError> {
     let json = serde_json::to_vec(msg)
