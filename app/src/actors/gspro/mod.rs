@@ -27,8 +27,8 @@ use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use flighthook::{
-    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, Severity, ShotAccumulator,
-    ShotData, ShotDetectionMode, ShotKey,
+    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, ShotAccumulator, ShotData,
+    ShotDetectionMode, ShotKey,
 };
 
 /// Bridge-internal error type.
@@ -146,9 +146,6 @@ fn run_with(
 ) {
     let mut relay = Relay::new(routing);
     let mut ever_connected = false;
-    // Error text of the last failed attempt, so a GSPro that stays closed
-    // raises one alert instead of one per retry.
-    let mut last_error: Option<String> = None;
 
     loop {
         if relay.drain(&mut receiver).is_err() {
@@ -182,14 +179,9 @@ fn run_with(
                 };
                 let delay = backoff.delay(connected);
                 let text = e.to_string();
+                // GSPro not running is normal (one simulator at a time), so a
+                // lost or refused connection is a status, not an alert.
                 tracing::info!("gspro bridge: {text}, retrying in {delay:?}");
-                if connected || last_error.as_deref() != Some(text.as_str()) {
-                    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                        severity: Severity::Error,
-                        message: format!("GSPro connection failed: {text}"),
-                    }));
-                }
-                last_error = Some(text);
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
                     status: backoff_status,
                     telemetry: HashMap::new(),
@@ -449,11 +441,7 @@ fn connect_and_run(
         // 1. Read any data from GSPro
         match stream.read(&mut read_buf) {
             Ok(0) => {
-                tracing::warn!("gspro <- connection closed");
-                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    severity: Severity::Warn,
-                    message: "GSPro closed the connection".into(),
-                }));
+                tracing::info!("gspro <- connection closed");
                 return Err(BridgeError::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionReset,
                     "connection closed by GSPro",
@@ -474,11 +462,7 @@ fn connect_and_run(
                 if e.kind() == std::io::ErrorKind::TimedOut
                     || e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
-                tracing::warn!("gspro <- read error: {e}");
-                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    severity: Severity::Warn,
-                    message: format!("GSPro read error: {e}"),
-                }));
+                tracing::info!("gspro <- read error: {e}");
                 return Err(BridgeError::Io(e));
             }
         }

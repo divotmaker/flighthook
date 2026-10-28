@@ -677,9 +677,9 @@ completes. Emits `DeviceTelemetry` with `manufacturer: "Garmin"`,
 
 **GSPro actor**: emits `Starting` before first TCP connect attempt, `Connected`
 on success. Connection loss after a successful session emits `Reconnecting`;
-failure before ever connecting stays at `Starting`. A connection failure raises
-one `Error` alert per outage, plus one whenever the error changes, not one per
-retry.
+failure before ever connecting stays at `Starting`. A refused, failed or
+closed connection is shown only through this status and the log, with no alert:
+GSPro not running is normal when another simulator is in use.
 
 **GSPro shot delivery**: the bridge drains the bus the whole time it runs,
 connected or not, so nothing queues up while GSPro is away. Every shot that
