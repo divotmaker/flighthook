@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
-use egui::{Color32, Pos2, Rect, Stroke, pos2, vec2};
+use egui::{Color32, Pos2, Rect, Stroke, pos2};
 
 use crate::chart;
 use crate::theme;
@@ -685,15 +685,11 @@ const DOT_HALO_R: f32 = 3.6;
 /// Radius of the shown shot's dot, and its halo.
 const SHOWN_R: f32 = 5.0;
 const SHOWN_HALO_R: f32 = 6.5;
-/// Half-length of the mean cross's arms.
-const MEAN_ARM: f32 = 5.0;
 /// How near the pointer must come to a dot to hit it.
 const DOT_HIT: f32 = 8.0;
 /// The crosshair stops this far inside the face's edges (mm).
 const CROSS_INSET_X: f32 = 5.0;
 const CROSS_INSET_Y: f32 = 4.0;
-/// Least members with both axes for the mean cross.
-const MEAN_MIN: usize = 3;
 
 /// One member's mark.
 #[derive(Debug, Clone, PartialEq)]
@@ -719,9 +715,6 @@ pub(crate) struct FacePanel {
     pub(crate) shown_hover: String,
     /// The other members with both axes.
     pub(crate) dots: Vec<Dot>,
-    /// Mean of the members with both axes (the shown shot among them when
-    /// it is a member), when there are at least [`MEAN_MIN`].
-    pub(crate) mean: Option<(f64, f64)>,
     pub(crate) readout: String,
 }
 
@@ -772,14 +765,12 @@ impl FacePanel {
                 impact_hover(lat, vert)
             )
         };
-        let mut both = Vec::new();
         let mut dots = Vec::new();
         for &i in members {
             let Some(r) = shots.get(i) else { continue };
             let (Some(a), Some(b)) = read(r) else {
                 continue;
             };
-            both.push((a, b));
             if i != shown {
                 dots.push(Dot {
                     index: i,
@@ -790,14 +781,6 @@ impl FacePanel {
                 });
             }
         }
-        #[allow(clippy::cast_precision_loss)]
-        let mean = (both.len() >= MEAN_MIN).then(|| {
-            let n = both.len() as f64;
-            let (a, b) = both
-                .iter()
-                .fold((0.0, 0.0), |acc, p| (acc.0 + p.0, acc.1 + p.1));
-            (a / n, b / n)
-        });
         let has = lat.is_some() || vert.is_some();
         Self {
             family,
@@ -805,7 +788,6 @@ impl FacePanel {
             shown: (row.is_some() && has).then_some((shown, lat, vert)),
             shown_hover: row.map(|r| hover(r, lat, vert)).unwrap_or_default(),
             dots,
-            mean,
             readout: readout(lat, vert),
         }
     }
@@ -965,22 +947,14 @@ fn paint_face(painter: &egui::Painter, rect: Rect, view: FaceView) {
     );
 }
 
-/// Paint `panel`'s marks in `view`: the members, the mean, then the shown
-/// shot on top. A mark off the plot is pulled in.
+/// Paint `panel`'s marks in `view`: the members, then the shown shot on
+/// top. A mark off the plot is pulled in.
 fn paint_marks(painter: &egui::Painter, view: FaceView, plot: Rect, panel: &FacePanel) {
     let (heel, toe) = view.family.geometry().across;
     let (bottom, top) = view.family.geometry().up;
     for d in &panel.dots {
         let (at, on) = mark_at(view, plot, d.lat, d.vert);
         paint_dot(painter, at, DOT_R, DOT_HALO_R, d.colour, on);
-    }
-    if let Some((lat, vert)) = panel.mean {
-        let (at, _) = mark_at(view, plot, lat, vert);
-        for (width, colour) in [(3.4, theme::BG_DEEP), (1.6, theme::GOLD)] {
-            let stroke = Stroke::new(width, colour);
-            painter.line_segment([at - vec2(MEAN_ARM, 0.0), at + vec2(MEAN_ARM, 0.0)], stroke);
-            painter.line_segment([at - vec2(0.0, MEAN_ARM), at + vec2(0.0, MEAN_ARM)], stroke);
-        }
     }
     if let Some((_, lat, vert)) = panel.shown {
         let line = match (lat, vert) {
@@ -1061,6 +1035,7 @@ pub(crate) fn paint_face_panel(ui: &egui::Ui, rect: Rect, panel: &FacePanel) -> 
 mod tests {
     use super::*;
     use crate::types::Distance;
+    use egui::vec2;
 
     /// Lie angle (degrees from the ground) of each head family's shaft line.
     fn lie(family: FaceFamily) -> Option<f32> {
@@ -1400,13 +1375,8 @@ mod tests {
         assert_eq!(p.readout, "4 toe \u{b7} 2 low");
         assert_eq!(p.shown, Some((4, Some(4.4), Some(-2.2))));
         assert_eq!(p.shown_hover, "#5 \u{b7} 7I\n4 mm toe \u{b7} 2 mm low");
-        // Lateral-only and empty members are left out of the dots and mean.
+        // Lateral-only and empty members are left out of the dots.
         assert_eq!(p.dots.iter().map(|d| d.index).collect::<Vec<_>>(), [0, 1]);
-        let (a, b) = p.mean.unwrap();
-        assert!((a - (-6.0 + 9.0 + 4.4) / 3.0).abs() < 1e-9);
-        assert!((b - (1.0 - 4.0 - 2.2) / 3.0).abs() < 1e-9);
-        // Under three with both axes: no mean.
-        assert!(panel(&shots[..2], 1, None).mean.is_none());
         // A lateral-only read is shown as one axis.
         let p = panel(&shots, 2, None);
         assert_eq!(p.shown, Some((2, Some(2.0), None)));
@@ -1523,13 +1493,11 @@ mod tests {
         assert!(p.dots.iter().all(|d| d.colour == theme::ACCENT));
         assert_eq!(p.shown, Some((3, Some(4.0), Some(-4.0))));
         // The shown shot filtered out: no gold mark and no reading, as on
-        // the bars; the mean is over the members alone.
+        // the bars; the members still show as dots.
         let p = build(Some("mevo.0"), 4);
         assert_eq!(p.shown, None);
         assert_eq!(p.readout, "-");
         assert_eq!(p.dots.len(), 3);
-        let (a, b) = p.mean.expect("three members");
-        assert!((a - 4.0).abs() < 1e-9 && (b + 4.0).abs() < 1e-9);
     }
 
     #[test]

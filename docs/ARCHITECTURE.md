@@ -1638,10 +1638,9 @@ is filled with a triangle mesh (ear clipping, built once per family and
 scale, since egui fills only convex paths) with the outline stroked over it.
 Inside: a dashed crosshair at the face centre; the view's other members
 (the bars' members, after the device filter) as small dots, accent or in
-device colours by the same rule as the Flight and Dispersion charts; a
-gold `+` at the mean of the members with both axes (three or more, the
-shown shot among them when it is a member); the shown shot as a gold dot,
-or a gold line across the face when only one axis was read. The shown shot
+device colours by the same rule as the Flight and Dispersion charts; the
+shown shot as a gold dot, or a gold line across the face when only one
+axis was read. The shown shot
 is marked only when it is a member, as on the bars and the charts: when the
 device filter leaves it out, there is no gold mark and the readout is `-`.
 A mark off the face is drawn as a ring, pulled into the panel when it is
