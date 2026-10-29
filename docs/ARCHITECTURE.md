@@ -504,7 +504,8 @@ timing.
 
 Each stored `ShotData` is stamped by the web layer at `shot_finished`:
 `shot_id` (the `ShotKey`'s), `club_selected` (the trigger-time club from the
-`ShotContext`) and `group` (below). FRP events are untouched; these fields
+`ShotContext`), `handed` (the trigger-time handedness from the same
+context) and `group` (below). FRP events are untouched; these fields
 exist only on `/api/shots`, the export and `/api/shots/convert`, and are
 omitted when unset, so their JSON is unchanged without them.
 
@@ -1324,11 +1325,13 @@ values immediately.
   Cards (default), wide
   SHOTS 42             Shot #42  LATEST          (older shot: [^ Back to latest])
   [By set|By club|None][ Ball speed ] [ Carry ] [ Total ] [ Launch ] [ Backspin ]
-  SET 3 · 7I · 10 ---                         DEVICE [All|Mevo+|Omni] (2+ devices)
-  [#42      ]          SET 3 · 7I · 10 SHOTS ------  range ● avg ○ median | this shot
-  [carry tot]          TOTAL      148 |  [====○====|====●]   217  avg 192 · med 191
-  [#41      ]          CARRY      148 [==|=○==●]             217  avg 174 · med 174
-  SET 2 · DR · 4 ----  LATERAL    L     [=====○=|===●]        R  avg -1.1 · med -0.5
+  SET 3 · 7I · 10 ---               DEVICE [All|Mevo+|Omni] +-------------+
+  [#42      ]          SET 3 · 7I · 10 -- ●avg ○med |shot   |4 toe · 2 low|
+  [carry tot]          TOTAL   148 |[==○|=●] 217 avg 192    |  .--------. |
+  [#41      ]          CARRY   148 [|○●]     217 avg 174    | ( · ●+ ·  / |
+  SET 2 · DR · 4 ----  LATERAL L  [=○|●]       R avg 1.1 L  |  '------'   |
+                       (face panel: any shot has impact)    |TOE  mm HEEL |
+                                                            +-------------+
   [#40      ]          BALL --------  FLIGHT --------------  CLUB ----------------------
   (list scrolls)       [Direction]    [Apex]    [Offline]    [Club speed] [Smash] [Path]
   ------------------   [Sidespin]     [Descent] [Roll]       [AoA]        [Face]  [Loft]
@@ -1539,14 +1542,61 @@ at 0; L and R at the ends) out to 1.2× the widest value, and at least ±6
 units. A single shot draws a 16 px pip, wide enough that it still peeks out
 past the ring and dot. Total and Carry are picked like the cards' values
 (below), and the stats run over the picked values;
-Lateral is the carry offline, picked the same way (+ right of the target
-line, for both hands). The bars carry no simulated marks; that distinction is the cards'
+Lateral is the carry offline, picked the same way, and prints with its
+side: `3.2 L`, `1.4 R` (`0.0` on the line; L and R are the same for both
+hands). The bars carry no simulated marks; that distinction is the cards'
 `SIM` tags and Table's italics. A stats column shows `avg · med`, then `sd` (two or
 more values) and `k/n` when some of the set's shots lack the value, or
 `no data`. Hovering a track lists n, min, max, avg, median and sd. The stats
 come from `flighthook::Stats` over the rows the UI holds (the server's whole
 history, up to the last 1000 shots, plus live ones), so for a session longer
 than that they can cover fewer shots than the header's count.
+
+**Face impact** (`ui/src/panels/impact.rs`) is a panel right of the range
+bars, 16 pt from them, under the rightmost headline card and as wide as it.
+It runs from the headline cards to the hairline of the first detail
+section's label, with the same 12 pt gap as between the cards at both
+ends. The bars, their filter and their legend narrow to make room, and no
+height changes. It shows while any shot in the history has face impact on
+either axis, and only with the range bars (not in the view None); otherwise
+the bars take the full width. When the headline column would leave the
+bars' plot narrower than 170 pt, the panel narrows to a square as tall as
+the bars' title line to their last bar; narrower than that still, it is
+left out. Beside the panel the
+legend goes on its own row when the narrowed line can't hold it; when that
+row would leave the bars too narrow for the panel, the panel is left out
+and the legend is placed in the full width (`settle_legend`). It draws the shown
+shot's club face, face-on as the ball sees it: a right-hander's toe on the
+left and hosel on the right, a left-hander's mirrored (the shot's
+handedness, else the game state's, else right). Face impact itself is
+golfer-relative and never mirrored. The outline is one of six generic
+families by club (driver and mini driver; fairway woods; hybrids; irons
+1I-9I, PW and an unknown club; wedges GW, SW, LW; putter), each a closed
+chain of cubic Béziers in face millimetres with the origin at the face
+centre (the midpoint of both chords through it). Each family is scaled on
+its own to fill the panel (`FaceView::fit`, the one place the scale is set:
+the whole silhouette, hosel included, as large as fits 94 % of the plot's
+width and 86 % of its height, centred), so the families are not drawn to
+one scale: a wood and a hybrid look about the same size. The cubics are
+flattened in screen space by Wang's formula to within 0.1 pt, and the face
+is filled with a triangle mesh (ear clipping, built once per family and
+scale, since egui fills only convex paths) with the outline stroked over it.
+Inside: a dashed crosshair at the face centre; the view's other members
+(the bars' members, after the device filter) as small dots, accent or in
+device colours by the same rule as the Flight and Dispersion charts; a
+gold `+` at the mean of the members with both axes (three or more, the
+shown shot among them when it is a member); the shown shot as a gold dot,
+or a gold line across the face when only one axis was read. The shown shot
+is marked only when it is a member, as on the bars and the charts: when the
+device filter leaves it out, there is no gold mark and the readout is `-`.
+A mark off the face is drawn as a ring, pulled into the panel when it is
+off it. The readout above the face reads `4 toe · 2 low` in whole
+millimetres (`-` when the shown shot has no reading), 12.5 pt, shrinking to
+10 pt in a narrow panel and cut short with an ellipsis only if it is still
+too wide there; TOE, HEEL and mm sit under
+the face's ends. Hovering a dot shows its shot (`#5282 · 7I`, the device
+with two or more) and `4 mm toe · 2 mm low`; a click shows that shot, as
+on the charts.
 
 **Flight** (beta, `ui/src/panels/flight.rs`) is a side view of the ball
 flights in the Cards view's bottom row (see the layout above). The chart is
@@ -1575,10 +1625,17 @@ and a bounce keeps its corner. The curves are built with the scene, not per
 frame:
 
 - **Gold**: the shown shot, over a dark halo, with a tick and label at its
-  apex, dots at its landing and rest, and its carry and total under the
-  ground line in place of the distance labels they would overlap. It is
-  drawn only when it is a member, as on the bars. The header repeats its
-  apex, carry and total.
+  apex and dots at its landing and rest. Its apex (gold, with its unit),
+  carry and total are labelled at 14 pt on a background box, each centred
+  above the point it labels (`flight::place_marks`): carry and total 7 pt
+  above the ground line, the apex over its tick. When the carry and total
+  boxes would come within 6 pt of each other (a short roll, or a wedge that
+  spins back), total stays on its dot and carry lifts one row; an apex box
+  that would meet either lifts above the higher of them; each box stays
+  inside the plot's width. The height axis keeps 35 pt above the gold apex
+  for its label, raised past the nice domain only when needed, its ticks
+  still on the step. It is drawn only when it is a member, as on the bars.
+  The header repeats its apex, carry and total.
 - **Bright**: the view's other members (By set: the shown shot's set; By
   club: that club's shots in its session), in accent, or coloured by device
   (`theme::DEVICE_COLOURS`) when the filter is on All and there are two or
@@ -1675,11 +1732,26 @@ or cell seen; a change of units or of the Device column sizes them afresh.
 Its first column (Device when
 it shows, else `#`) is inset so the latest row's gold stripe on the left edge
 never covers its text. The Club column is the club selected when the
-shot was triggered (`-` when none), with the shot's set number on hover (`Set 3`). Both views show a "waiting for the first shot" message
+shot was triggered (`-` when none), with the shot's set number on hover (`Set 3`).
+After Smash, **Impact H** and **Impact V** give face impact in whole
+millimetres with a side word (`4 toe`, `6 heel`, `2 high`, `5 low`; `0`
+under half a millimetre; `-` without a reading), the same in both unit
+systems. Both views show a "waiting for the first shot" message
 until there is one.
 
 A metric card shows the simulated value upright with a `SIM` tag and hover,
-else the measured one upright, else a dash. A table cell shows the simulated
+else the measured one upright, else a dash. Directional cards show the
+value's magnitude with a word for its sign after the unit
+(`ui/src/panels/signs.rs`): Direction and Offline `L` / `R`; Sidespin
+`Draw` / `Fade`; Path `In-to-out` / `Out-to-in`; AoA `Up` / `Down`; Face
+`Open` / `Closed`. Lateral values are absolute (+ right of the target line
+for every golfer), so the shape words follow the shot's handedness: + face
+is open and + path in-to-out for a right-hander, closed and out-to-in for a
+left-hander; + sidespin curves the ball right, a right-hander's fade and a
+left-hander's draw. A value shown as 0 has no word. Roll keeps its sign.
+The word starts at the unit's size and shrinks (to 9 pt) to fit its card;
+only when that is not enough does that card's numeral shrink. The Table
+keeps signed numbers. A table cell shows the simulated
 value in italics with the same hover, else the measured one plainly, else a
 dash. Derived wins when both are present: the server sets a field in both
 only when the simulated value is the one to show (a `force` shot's

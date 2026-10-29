@@ -2,10 +2,12 @@ pub(crate) mod cards;
 pub(crate) mod devices;
 pub(crate) mod dispersion;
 pub(crate) mod flight;
+pub(crate) mod impact;
 pub(crate) mod log;
 pub(crate) mod monitoring;
 pub(crate) mod settings;
 pub(crate) mod shots;
+pub(crate) mod signs;
 
 use std::collections::HashMap;
 

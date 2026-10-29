@@ -12,9 +12,9 @@ use crate::panels::shots::{ShotFocus, ShotsView};
 use crate::panels::{Tab, flight};
 use crate::theme;
 use crate::types::{
-    ActorStatus, ActorStatusResponse, Club, FlighthookEvent, FlighthookMessage, LogEntry,
-    MevoSection, OpenConnectClientSection, OpenConnectServerSection, R10Section, ShotDetectionMode,
-    ShotRow, SquareSection, UnitSystem,
+    ActorStatus, ActorStatusResponse, Club, FlighthookEvent, FlighthookMessage, GameStateSnapshot,
+    Handedness, LogEntry, MevoSection, OpenConnectClientSection, OpenConnectServerSection,
+    R10Section, ShotDetectionMode, ShotRow, SquareSection, UnitSystem,
 };
 use chrono::{SecondsFormat, Utc};
 
@@ -46,6 +46,9 @@ pub struct FlighthookApp {
     /// A club picked over REST that no `/api/status` reply has carried yet.
     pub(crate) club_pick: Option<Club>,
     pub(crate) club_picker_open: bool,
+    /// Player handedness in game state (`None` until the server reports
+    /// one). Stamped on shots as they trigger, like the club.
+    pub(crate) handed: Option<Handedness>,
 
     // Shot groups of the webserver the UI talks to
     pub(crate) groups: ShotGroups,
@@ -161,6 +164,7 @@ impl FlighthookApp {
             selected_club: None,
             club_pick: None,
             club_picker_open: false,
+            handed: None,
             groups: ShotGroups::default(),
             groups_out_of_step: false,
             settings: SettingsForm::default(),
@@ -314,8 +318,7 @@ impl FlighthookApp {
                 }
                 WsPollEvent::Init { global_state, .. } => {
                     if let Some(state) = global_state {
-                        self.selected_club = state.club_info.map(|c| c.club);
-                        self.club_pick = None;
+                        self.apply_global_state(&state);
                     }
                 }
                 WsPollEvent::Message(msg) => self.handle_bus_event(msg),
@@ -333,6 +336,14 @@ impl FlighthookApp {
             self.ws_receiver = None;
             self.ws_connected = false;
         }
+    }
+
+    /// Take the club and handedness from the game state the server sends
+    /// at the WebSocket handshake.
+    pub(crate) fn apply_global_state(&mut self, state: &GameStateSnapshot) {
+        self.selected_club = state.club_info.map(|c| c.club);
+        self.club_pick = None;
+        self.handed = state.handed;
     }
 
     pub(crate) fn handle_bus_event(&mut self, msg: FlighthookMessage) {
@@ -408,8 +419,10 @@ impl FlighthookApp {
                     shot_number: key.shot_number,
                     ball: None,
                     club: None,
+                    impact: None,
                     derived: None,
                     club_selected: self.selected_club,
+                    handed: self.handed,
                     group: None,
                     finished: false,
                 });
@@ -426,6 +439,12 @@ impl FlighthookApp {
             FlighthookEvent::ClubPath { key, club } => {
                 if let Some(i) = groups::find_row(&self.shots, &actor, &key) {
                     self.shots[i].club = Some(*club);
+                    self.shots_rev += 1;
+                }
+            }
+            FlighthookEvent::FaceImpact { key, impact } => {
+                if let Some(i) = groups::find_row(&self.shots, &actor, &key) {
+                    self.shots[i].impact = Some(*impact);
                     self.shots_rev += 1;
                 }
             }
@@ -451,8 +470,13 @@ impl FlighthookApp {
                         .insert("club".into(), club_info.club.to_string());
                 }
             }
-            FlighthookEvent::SetDetectionMode { mode: Some(m), .. } => {
-                self.current_mode = m.to_string();
+            FlighthookEvent::SetDetectionMode { mode, handed } => {
+                if let Some(m) = mode {
+                    self.current_mode = m.to_string();
+                }
+                if handed.is_some() {
+                    self.handed = handed;
+                }
             }
             FlighthookEvent::ConfigOutcome {
                 ref restarted,
@@ -1875,5 +1899,79 @@ mod tests {
         app.apply_pending();
         app.refresh_shot_caches();
         assert_eq!(app.device_filter, None);
+    }
+
+    #[test]
+    fn face_impact_and_handedness_reach_the_rows() {
+        use crate::types::{ClubInfo, Distance, FaceImpact, Handedness};
+        use flighthook::{ShotData, ShotKey};
+
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        // Handedness from the WebSocket handshake, then from the bus; a
+        // mode-only change keeps it.
+        app.apply_global_state(&GameStateSnapshot {
+            player_info: None,
+            club_info: Some(ClubInfo { club: Club::Iron7 }),
+            mode: None,
+            handed: Some(Handedness::Left),
+        });
+        assert_eq!(app.handed, Some(Handedness::Left));
+        assert_eq!(app.selected_club, Some(Club::Iron7));
+        let set = |app: &mut FlighthookApp, mode, handed| {
+            app.handle_bus_event(
+                FlighthookMessage::new(FlighthookEvent::SetDetectionMode { mode, handed })
+                    .actor("system"),
+            );
+        };
+        set(&mut app, None, Some(Handedness::Right));
+        assert_eq!(app.handed, Some(Handedness::Right));
+        set(&mut app, Some(ShotDetectionMode::Chipping), None);
+        assert_eq!(app.handed, Some(Handedness::Right));
+        assert_eq!(app.current_mode, ShotDetectionMode::Chipping.to_string());
+        set(&mut app, None, Some(Handedness::Left));
+
+        // A live shot is stamped with the handedness at its trigger, and
+        // its face impact fills the row.
+        let key = ShotKey {
+            shot_id: "s1".into(),
+            shot_number: 1,
+        };
+        let device = |app: &mut FlighthookApp, event| {
+            app.handle_bus_event(FlighthookMessage::new(event).actor("square.0"));
+        };
+        device(&mut app, FlighthookEvent::ShotTrigger { key: key.clone() });
+        assert_eq!(app.shots[0].handed, Some(Handedness::Left));
+        let rev = app.shots_rev;
+        let impact = FaceImpact {
+            lateral: Some(Distance::Inches(0.31)),
+            vertical: Some(Distance::Millimeters(-2.0)),
+        };
+        device(
+            &mut app,
+            FlighthookEvent::FaceImpact {
+                key,
+                impact: Box::new(impact.clone()),
+            },
+        );
+        assert!(app.shots_rev > rev);
+        assert_eq!(app.shots[0].impact, Some(impact.clone()));
+
+        // Rows from `/api/shots` keep both, and a unit change leaves the
+        // impact as sent (it is read in millimetres everywhere).
+        let row = ShotRow::from(ShotData {
+            actor: "square.0".into(),
+            shot_number: 2,
+            impact: Some(impact.clone()),
+            handed: Some(Handedness::Left),
+            ..ShotData::default()
+        });
+        assert_eq!(row.handed, Some(Handedness::Left));
+        for units in [UnitSystem::Imperial, UnitSystem::Metric] {
+            let converted = row.to_unit_system(units);
+            assert_eq!(converted.impact, Some(impact.clone()));
+            assert_eq!(converted.handed, Some(Handedness::Left));
+            let lateral = converted.impact.unwrap().lateral.unwrap();
+            assert!((lateral.as_millimeters() - 7.874).abs() < 1e-9);
+        }
     }
 }

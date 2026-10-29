@@ -765,6 +765,26 @@ pub(crate) fn device_colour(ids: &[String], id: &str) -> Color32 {
         .unwrap_or(theme::TEXT_MUTED)
 }
 
+/// Whether a chart over `devices` with the device filter `filter` colours
+/// its shots by device: every device shown, and two or more of them.
+#[must_use]
+pub(crate) fn by_device(devices: &[String], filter: Option<&str>) -> bool {
+    filter.is_none() && devices.len() >= 2
+}
+
+/// Colour of a shot from `actor` in a chart over `devices` with the device
+/// filter `filter`: its device's colour when the chart colours by device
+/// ([`by_device`]), else the accent. The Flight and Dispersion charts and
+/// the face impact panel all colour their shots by this rule.
+#[must_use]
+pub(crate) fn shot_colour(devices: &[String], filter: Option<&str>, actor: &str) -> Color32 {
+    if by_device(devices, filter) {
+        device_colour(devices, actor)
+    } else {
+        theme::ACCENT
+    }
+}
+
 /// Label of a device: its name, or its actor id when the name is missing
 /// or empty.
 #[must_use]
@@ -1685,8 +1705,10 @@ mod tests {
             shot_number: 1,
             ball: None,
             club: None,
+            impact: None,
             derived: None,
             club_selected: None,
+            handed: None,
             group: None,
             finished: true,
         }
@@ -1719,6 +1741,21 @@ mod tests {
             assert_ne!(c, theme::GOLD);
             assert_ne!(c, theme::DANGER);
         }
+    }
+
+    #[test]
+    fn shots_take_device_colours_only_with_every_device_of_several_shown() {
+        let two: Vec<String> = ["a", "b"].map(String::from).to_vec();
+        assert!(by_device(&two, None));
+        assert_eq!(shot_colour(&two, None, "a"), theme::DEVICE_COLOURS[0]);
+        assert_eq!(shot_colour(&two, None, "b"), theme::DEVICE_COLOURS[1]);
+        // A device filter, or one device: the accent, whatever the device's
+        // own colour.
+        assert!(!by_device(&two, Some("b")));
+        assert_eq!(shot_colour(&two, Some("b"), "b"), theme::ACCENT);
+        let one = vec!["b".to_owned()];
+        assert!(!by_device(&one, None));
+        assert_eq!(shot_colour(&one, None, "b"), theme::ACCENT);
     }
 
     #[test]

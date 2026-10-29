@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use flightrelay::types::{BallFlight, ClubData, FaceImpact};
 use flightrelay::units::{Distance, Velocity};
 
-use crate::{Club, ShotKey, ShotMetrics, ShotRaw, UnitSystem};
+use crate::{Club, Handedness, ShotKey, ShotMetrics, ShotRaw, UnitSystem};
 
 // ---------------------------------------------------------------------------
 // Derived (simulated) flight values
@@ -159,8 +159,8 @@ impl DerivedFlight {
 
 /// One shot as stored and served by the web layer (`/api/shots`).
 ///
-/// `shot_id`, `club_selected` and `group` are set by the web layer on stored
-/// shots and are omitted on the wire when absent. Build one with
+/// `shot_id`, `club_selected`, `group` and `handed` are set by the web layer
+/// on stored shots and are omitted on the wire when absent. Build one with
 /// `ShotData::default()` and struct-update syntax.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShotData {
@@ -193,6 +193,9 @@ pub struct ShotData {
     /// not grouped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Player handedness in game state when the shot was triggered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed: Option<Handedness>,
 }
 
 impl ShotData {
@@ -258,6 +261,7 @@ impl ShotData {
             shot_id: self.shot_id.clone(),
             club_selected: self.club_selected,
             group: self.group.clone(),
+            handed: self.handed,
         }
     }
 
@@ -311,6 +315,7 @@ impl ShotData {
             shot_id: self.shot_id.clone(),
             club_selected: self.club_selected,
             group: self.group.clone(),
+            handed: self.handed,
         }
     }
 }

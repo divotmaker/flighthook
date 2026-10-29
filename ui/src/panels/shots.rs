@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::dispersion;
+use super::{dispersion, impact, signs};
 use crate::app::FlighthookApp;
 use crate::chart::{self, MembersKey};
 use crate::groups::{
@@ -10,8 +10,8 @@ use crate::groups::{
 use crate::net;
 use crate::theme;
 use crate::types::{
-    ActorStatusResponse, BallFlight, Club, ClubData, DerivedFlight, Distance, ShotGroupInfo,
-    ShotGrouping, ShotRow, Stats, UnitSystem, Velocity,
+    ActorStatusResponse, BallFlight, Club, ClubData, DerivedFlight, Distance, Handedness,
+    ShotGroupInfo, ShotGrouping, ShotRow, Stats, UnitSystem, Velocity,
 };
 
 /// Format an optional f64 with the given precision, or "-" if None.
@@ -61,8 +61,11 @@ fn clear_confirm_title(n: usize) -> String {
 const BALL_COLUMNS: usize = 12;
 /// Number of club columns: speed, path, attack, face, loft and smash.
 const CLUB_COLUMNS: usize = 6;
-/// Table columns besides Device: `#`, Club, then the ball and club columns.
-const TABLE_COLUMNS: usize = 2 + BALL_COLUMNS + CLUB_COLUMNS;
+/// Number of face impact columns: lateral and vertical.
+const IMPACT_COLUMNS: usize = 2;
+/// Table columns besides Device: `#`, Club, then the ball, club and face
+/// impact columns.
+const TABLE_COLUMNS: usize = 2 + BALL_COLUMNS + CLUB_COLUMNS + IMPACT_COLUMNS;
 /// Narrowest a table column gets.
 const TABLE_MIN_COLUMN: f32 = 48.0;
 /// Table row height beyond the body text's.
@@ -150,6 +153,12 @@ fn fmt_num(v: f64, prec: usize, signed: bool) -> String {
     } else {
         format!("{v:.prec$}")
     }
+}
+
+/// `v` rounded to `prec` decimals, as [`fmt_num`] shows it.
+fn round_to(v: f64, prec: usize) -> f64 {
+    let scale = 10_f64.powi(i32::try_from(prec).unwrap_or(0));
+    (v * scale).round() / scale
 }
 
 /// Smash factor for display: the device's own, else ball speed over club
@@ -560,6 +569,9 @@ struct Metric {
     /// A typically wide value of this metric, used to size the numerals.
     sample: &'static str,
     source: Source,
+    /// The word for the value's sign (`Open`, `L`), shown after the unit
+    /// when the value is its magnitude.
+    word: Option<&'static str>,
 }
 
 impl Metric {
@@ -591,15 +603,33 @@ impl Metric {
             text,
             sample,
             source,
+            word: None,
         }
+    }
+
+    /// A signed value shown as its magnitude with the word `words` gives
+    /// its sign (none at 0), at the precision it is shown with.
+    fn worded(
+        label: &'static str,
+        unit: &'static str,
+        value: Option<(f64, bool)>,
+        prec: usize,
+        words: impl Fn(f64) -> Option<&'static str>,
+    ) -> Self {
+        let value = value.map(|(v, simulated)| (round_to(v, prec), simulated));
+        let mut m = Self::new(
+            label,
+            unit,
+            value.map(|(v, simulated)| (v.abs(), simulated)),
+            prec,
+            false,
+        );
+        m.word = value.and_then(|(v, _)| words(v));
+        m
     }
 
     fn measured(label: &'static str, unit: &'static str, v: Option<f64>, prec: usize) -> Self {
         Self::new(label, unit, v.map(|v| (v, false)), prec, false)
-    }
-
-    fn signed(label: &'static str, unit: &'static str, v: Option<f64>, prec: usize) -> Self {
-        Self::new(label, unit, v.map(|v| (v, false)), prec, true)
     }
 }
 
@@ -619,7 +649,15 @@ fn table_header_units(imperial: bool) -> (&'static str, &'static str, &'static s
 
 /// The Cards view's metrics for a shot already converted to the display unit
 /// system: the headline row, then the Ball, Flight and Club groups.
-fn card_metrics(shot: &ShotRow, imperial: bool) -> (Vec<Metric>, [MetricGroup; 3]) {
+///
+/// Directional values show their magnitude with a word for the sign
+/// ([`signs`]), read for a `handed` golfer.
+#[allow(clippy::too_many_lines)] // one table of every card
+fn card_metrics(
+    shot: &ShotRow,
+    imperial: bool,
+    handed: Handedness,
+) -> (Vec<Metric>, [MetricGroup; 3]) {
     let (speed, dist) = if imperial {
         ("mph", "yd")
     } else {
@@ -633,6 +671,7 @@ fn card_metrics(shot: &ShotRow, imperial: bool) -> (Vec<Metric>, [MetricGroup; 3
     let d: &DerivedFlight = shot.derived.as_ref().unwrap_or(&no_derived);
     let v = |x: Option<Distance>| x.map(|x| x.value());
     let rpm = |x: Option<i32>| x.map(f64::from);
+    let measured = |x: Option<f64>| x.map(|x| (x, false));
 
     let headline = vec![
         Metric::measured("Ball speed", speed, ball.launch_speed.map(|v| v.value()), 1),
@@ -657,8 +696,20 @@ fn card_metrics(shot: &ShotRow, imperial: bool) -> (Vec<Metric>, [MetricGroup; 3
         (
             "Ball",
             vec![
-                Metric::signed("Direction", "\u{b0}", ball.launch_azimuth, 1),
-                Metric::signed("Sidespin", "rpm", rpm(ball.sidespin_rpm), 0),
+                Metric::worded(
+                    "Direction",
+                    "\u{b0}",
+                    measured(ball.launch_azimuth),
+                    1,
+                    signs::side,
+                ),
+                Metric::worded(
+                    "Sidespin",
+                    "rpm",
+                    measured(rpm(ball.sidespin_rpm)),
+                    0,
+                    |v| signs::sidespin(v, handed),
+                ),
             ],
         ),
         (
@@ -671,12 +722,12 @@ fn card_metrics(shot: &ShotRow, imperial: bool) -> (Vec<Metric>, [MetricGroup; 3
                     1,
                     false,
                 ),
-                Metric::new(
+                Metric::worded(
                     "Offline",
                     dist,
                     pick(v(ball.carry_offline), v(d.carry_offline)),
                     1,
-                    true,
+                    signs::side,
                 ),
                 Metric::new(
                     "Descent",
@@ -704,9 +755,19 @@ fn card_metrics(shot: &ShotRow, imperial: bool) -> (Vec<Metric>, [MetricGroup; 3
                     smash(club.smash_factor, ball.launch_speed, club.club_speed),
                     2,
                 ),
-                Metric::signed("Path", "\u{b0}", club.path, 1),
-                Metric::signed("AoA", "\u{b0}", club.attack_angle, 1),
-                Metric::signed("Face", "\u{b0}", club.face_angle, 1),
+                Metric::worded("Path", "\u{b0}", measured(club.path), 1, |v| {
+                    signs::path(v, handed)
+                }),
+                Metric::worded(
+                    "AoA",
+                    "\u{b0}",
+                    measured(club.attack_angle),
+                    1,
+                    signs::attack,
+                ),
+                Metric::worded("Face", "\u{b0}", measured(club.face_angle), 1, |v| {
+                    signs::face(v, handed)
+                }),
                 Metric::measured("Loft", "\u{b0}", club.dynamic_loft, 1),
             ],
         ),
@@ -843,6 +904,10 @@ struct CardsLayout {
     headline: Vec<egui::Rect>,
     /// The range bar section under the headline row.
     bars: Option<BarsLayout>,
+    /// The face impact panel right of the range bars, under the rightmost
+    /// headline column, CARD_GAP from the headline cards and from the
+    /// detail section's hairline.
+    face: Option<egui::Rect>,
     /// Per detail group: its label line, then its cards.
     groups: Vec<(egui::Rect, Vec<egui::Rect>)>,
     /// Bottom of the last card.
@@ -998,10 +1063,65 @@ fn detail_columns(w: f32, counts: &[usize]) -> (Vec<DetailColumn>, f32) {
     (stacked, stacked_w)
 }
 
+/// Gap between the range bars and the face impact panel.
+const FACE_GAP: f32 = 16.0;
+/// Least width of a range bar's plot (its track inside the gutters) beside
+/// the face impact panel; narrower than this, the panel is left out.
+const FACE_MIN_PLOT: f32 = 170.0;
+
+/// The Cards layout `width` wide with the range bars' legend placed where
+/// it fits the bars as laid out. `place(w)` is where the legend goes in a
+/// bar section `w` wide (monotone: a wider section never moves it below),
+/// and `at(legend, face)` lays the view out with it, with the face impact
+/// panel when `face`.
+///
+/// Without the panel the bars take the full width and the legend is placed
+/// in it. Beside the panel the bars are narrower, so the legend may need
+/// its own row there; a legend on its own row always fits, so that layout
+/// is kept while the panel still fits beside it. When the extra row would
+/// leave the bars too narrow for the panel, the panel is left out and the
+/// legend goes where it fits the full width. At most three layouts are
+/// tried, and the result never shows a legend beside the title that does
+/// not fit there.
+fn settle_legend(
+    width: f32,
+    face: bool,
+    place: impl Fn(f32) -> Legend,
+    at: impl Fn(Legend, bool) -> CardsLayout,
+) -> CardsLayout {
+    let full = place(width);
+    let layout = at(full, face);
+    let Some(bars) = layout.bars.filter(|_| layout.face.is_some()) else {
+        return layout;
+    };
+    if place(bars.label.width()) == full {
+        return layout;
+    }
+    let below = at(Legend::Below, true);
+    if below.face.is_some() {
+        below
+    } else {
+        at(full, false)
+    }
+}
+
+/// Width of a range bar's plot in a bar section `width` wide.
+fn bar_plot_width(width: f32) -> f32 {
+    width - BAR_LABEL_W - BAR_STATS_W - 2.0 * BAR_COL_GAP - 2.0 * GUTTER
+}
+
 /// Lay out the Cards view in `size`: the shot header, `headline` cards in
 /// balanced rows, the range bar section when `bars` (with its legend placed
-/// as given), then detail groups of `groups[i]` cards arranged by
-/// `detail_columns`.
+/// as given) and the face impact panel right of it when `face`, then detail
+/// groups of `groups[i]` cards arranged by `detail_columns`.
+///
+/// The face panel sits flush right under the rightmost headline column and
+/// as wide as it, from [`CARD_GAP`] under the headline cards to
+/// [`CARD_GAP`] above the hairline of the first detail section's label.
+/// When the column would leave the bars' plot narrower than
+/// [`FACE_MIN_PLOT`], the panel narrows to a square of the bar section's
+/// label-to-last-bar height; when that is still too wide, it is left out.
+/// The bars narrow to make room, and no height changes.
 ///
 /// Everything fits the height whenever it can. With room to spare, the
 /// sizes are [`ROOMY`], the cards grow with the height up to a limit, and
@@ -1014,6 +1134,7 @@ fn cards_layout(
     headline: usize,
     groups: &[usize],
     bars: Option<Legend>,
+    face: bool,
 ) -> CardsLayout {
     use egui::{Rect, pos2, vec2};
 
@@ -1125,21 +1246,37 @@ fn cards_layout(
         .collect();
     let head_bottom = y0 + span(head_rows, head_h, r.row_gap);
     let bars_top = head_bottom + r.controls_gap;
+    // The face panel sits under the rightmost headline column, as wide as
+    // it, and runs from CARD_GAP under the headline cards to CARD_GAP above
+    // the detail section's hairline. Where that column leaves the bars too
+    // narrow, it narrows to a square of the bar section's label-to-last-bar
+    // height.
+    let face = bars.filter(|_| face).and_then(|legend| {
+        let top = head_bottom + CARD_GAP;
+        let bottom =
+            head_bottom + r.controls_gap + r.bars(legend) + r.group_gap + GROUP_RULE_Y - CARD_GAP;
+        let square = r.bars(legend) - r.controls;
+        [head_w, square]
+            .into_iter()
+            .find(|&side| bar_plot_width(w - side - FACE_GAP) >= FACE_MIN_PLOT)
+            .map(|side| Rect::from_min_max(pos2(w - side, top), pos2(w, bottom)))
+    });
+    let bars_w = face.map_or(w, |panel| panel.left() - FACE_GAP);
     let bars = bars.map(|place| {
-        let controls = Rect::from_min_size(pos2(0.0, bars_top), vec2(w, r.controls));
-        let label = Rect::from_min_size(pos2(0.0, controls.bottom()), vec2(w, r.label));
+        let controls = Rect::from_min_size(pos2(0.0, bars_top), vec2(bars_w, r.controls));
+        let label = Rect::from_min_size(pos2(0.0, controls.bottom()), vec2(bars_w, r.label));
         let legend = match place {
             Legend::Beside => label,
             Legend::Below => Rect::from_min_size(
                 pos2(0.0, label.bottom() - r.legend_overlap),
-                vec2(w, r.label),
+                vec2(bars_w, r.label),
             ),
         };
         let top = legend.bottom().max(label.bottom());
         let rows = std::array::from_fn(|i| {
             Rect::from_min_size(
                 pos2(0.0, top + i as f32 * (r.bar_row + r.bar_gap)),
-                vec2(w, r.bar_row),
+                vec2(bars_w, r.bar_row),
             )
         });
         BarsLayout {
@@ -1185,6 +1322,7 @@ fn cards_layout(
         header,
         headline,
         bars,
+        face,
         groups: out,
         height,
         scrolls,
@@ -1245,21 +1383,30 @@ impl CardLook {
         metrics: impl IntoIterator<Item = &'a Metric>,
         width: f32,
     ) -> Self {
-        // Readings scale with their font size, so measure once at a
-        // reference size.
+        let metrics: Vec<&Metric> = metrics.into_iter().collect();
+        let widest = |size: f32| {
+            metrics
+                .iter()
+                .map(|m| {
+                    let sample = Reading::new(painter, m, m.sample, None, size, true).width();
+                    Reading::new(painter, m, &m.text, None, size, true)
+                        .width()
+                        .max(sample)
+                })
+                .fold(0.0, f32::max)
+        };
+        let room = width - 2.0 * self.pad;
+        // Numerals scale with their font size, so measure once at a
+        // reference size; word units have a floor size, so check the result
+        // and step down while anything is still too wide. Sign words are
+        // fitted per card (`fitted_reading`).
         const REFERENCE: f32 = 100.0;
-        let widest = metrics
-            .into_iter()
-            .map(|m| {
-                let sample = Reading::new(painter, m, m.sample, REFERENCE, true).width();
-                Reading::new(painter, m, &m.text, REFERENCE, true)
-                    .width()
-                    .max(sample)
-            })
-            .fold(0.0, f32::max);
-        if widest > 0.0 {
-            let room = width - 2.0 * self.pad;
-            self.value = self.value.min((REFERENCE * room / widest).floor());
+        let at_reference = widest(REFERENCE);
+        if at_reference > 0.0 {
+            self.value = self.value.min((REFERENCE * room / at_reference).floor());
+            while self.value > NUMERAL_FLOOR && widest(self.value) > room {
+                self.value -= 1.0;
+            }
         }
         self
     }
@@ -1270,12 +1417,53 @@ const DESCENT: f32 = 0.2;
 /// Approximate height of a numeral, as a fraction of the font size.
 const DIGIT_HEIGHT: f32 = 0.7;
 
-/// A card's numeral and unit, laid out at one font size. The unit offset is
-/// from the numeral's top-left corner.
+/// A card's numeral, unit and sign word, laid out at one font size. The
+/// unit and word offsets are from the numeral's top-left corner.
 struct Reading {
     value: std::sync::Arc<egui::Galley>,
     unit: Option<(std::sync::Arc<egui::Galley>, egui::Vec2)>,
+    word: Option<(std::sync::Arc<egui::Galley>, egui::Vec2)>,
     color: egui::Color32,
+}
+
+/// Font size of a card's word unit or sign word next to a `size` numeral.
+fn small_size(size: f32) -> f32 {
+    (size * 0.36).max(12.0)
+}
+
+/// The smallest a card's numeral shrinks to when fitting its width.
+const NUMERAL_FLOOR: f32 = 8.0;
+/// The smallest a sign word shrinks to before the numeral gives way.
+const WORD_MIN: f32 = 9.0;
+
+/// `m`'s reading at numeral size `size` within `room`: the sign word starts
+/// at the word unit's size and shrinks towards [`WORD_MIN`] to fit; only
+/// when it still doesn't fit does this card's numeral shrink. Returns the
+/// reading and its numeral size.
+fn fitted_reading(painter: &egui::Painter, m: &Metric, size: f32, room: f32) -> (Reading, f32) {
+    let mut size = size;
+    loop {
+        let mut word_size = small_size(size);
+        loop {
+            let reading = Reading::new(
+                painter,
+                m,
+                &m.text,
+                m.word.map(|w| (w, word_size)),
+                size,
+                true,
+            );
+            let fits = reading.width() <= room;
+            if fits || m.word.is_none() || (word_size <= WORD_MIN && size <= NUMERAL_FLOOR) {
+                return (reading, size);
+            }
+            if word_size <= WORD_MIN {
+                break;
+            }
+            word_size = (word_size - 0.5).max(WORD_MIN);
+        }
+        size = (size - 1.0).max(NUMERAL_FLOOR);
+    }
 }
 
 impl Reading {
@@ -1287,6 +1475,7 @@ impl Reading {
         painter: &egui::Painter,
         m: &Metric,
         text: &str,
+        word: Option<(&str, f32)>,
         size: f32,
         distinguish_source: bool,
     ) -> Self {
@@ -1318,11 +1507,7 @@ impl Reading {
             // The degree sign sits high like a superscript; word units share
             // the numeral's baseline.
             let degree = m.unit == "\u{b0}";
-            let unit_size = if degree {
-                size * 0.7
-            } else {
-                (size * 0.36).max(12.0)
-            };
+            let unit_size = if degree { size * 0.7 } else { small_size(size) };
             let galley = painter.layout_no_wrap(
                 m.unit.to_string(),
                 FontId::proportional(unit_size),
@@ -1339,13 +1524,43 @@ impl Reading {
             };
             (galley, offset)
         });
-        Self { value, unit, color }
+
+        // The sign word follows the unit on the numeral's baseline.
+        let word = word
+            .filter(|_| m.source != Source::Missing)
+            .map(|(w, word_size)| {
+                let galley = painter.layout_no_wrap(
+                    w.to_owned(),
+                    FontId::proportional(word_size),
+                    theme::TEXT,
+                );
+                let end = unit
+                    .as_ref()
+                    .map_or(value.size().x, |(g, off)| off.x + g.size().x);
+                let baseline_gap = DESCENT * (size - word_size);
+                let offset = vec2(
+                    end + size * 0.16,
+                    value.size().y - baseline_gap - galley.size().y,
+                );
+                (galley, offset)
+            });
+        Self {
+            value,
+            unit,
+            word,
+            color,
+        }
     }
 
     fn width(&self) -> f32 {
-        self.unit
-            .as_ref()
-            .map_or(self.value.size().x, |(g, off)| off.x + g.size().x)
+        let end = |part: &Option<(std::sync::Arc<egui::Galley>, egui::Vec2)>| {
+            part.as_ref().map_or(0.0, |(g, off)| off.x + g.size().x)
+        };
+        self.value
+            .size()
+            .x
+            .max(end(&self.unit))
+            .max(end(&self.word))
     }
 }
 
@@ -1432,13 +1647,13 @@ fn card(ui: &egui::Ui, rect: egui::Rect, m: &Metric, look: CardLook, pulse: f32)
     }
 
     // Centre the numeral's digits in the space under the label.
-    let reading = Reading::new(painter, m, &m.text, look.value, true);
+    let (reading, size) = fitted_reading(painter, m, look.value, rect.width() - 2.0 * pad);
     let middle = (label_bottom + rect.bottom()) / 2.0;
-    let digits_middle = reading.value.size().y - (DESCENT + DIGIT_HEIGHT / 2.0) * look.value;
+    let digits_middle = reading.value.size().y - (DESCENT + DIGIT_HEIGHT / 2.0) * size;
     let pos = pos2(rect.left() + pad, (middle - digits_middle).round());
     // Drawn three times, a fraction of a pixel apart, for a heavier numeral
     // than the default light face.
-    let weight = (look.value / 56.0).clamp(0.5, 1.4);
+    let weight = (size / 56.0).clamp(0.5, 1.4);
     for offset in [
         vec2(0.0, 0.0),
         vec2(weight, 0.0),
@@ -1448,6 +1663,9 @@ fn card(ui: &egui::Ui, rect: egui::Rect, m: &Metric, look: CardLook, pulse: f32)
     }
     if let Some((unit, offset)) = reading.unit {
         painter.galley(pos + offset, unit, theme::TEXT_MUTED);
+    }
+    if let Some((word, offset)) = reading.word {
+        painter.galley(pos + offset, word, theme::TEXT);
     }
 
     if m.source == Source::Simulated {
@@ -1508,13 +1726,16 @@ fn group_label_width(painter: &egui::Painter, title: &str) -> f32 {
 
 /// Left of a label line's title: its bar and the gap after it.
 const GROUP_TITLE_LEFT: f32 = 3.0 + 8.0;
+/// Height of a section label's title and hairline under the top of its
+/// label line.
+const GROUP_RULE_Y: f32 = 9.0;
 
 /// Paint a section's label line in `color`: a bar, the caps title and a
 /// hairline out to the section's right edge.
 fn group_label(painter: &egui::Painter, rect: egui::Rect, title: &str, color: egui::Color32) {
     use egui::{pos2, vec2};
 
-    let mid = rect.top() + 9.0;
+    let mid = rect.top() + GROUP_RULE_Y;
     let bar = egui::Rect::from_center_size(pos2(rect.left() + 1.5, mid), vec2(3.0, 16.0));
     painter.rect_filled(bar, egui::CornerRadius::same(2), color);
     let text = group_title(painter, title, color);
@@ -1653,10 +1874,16 @@ impl BarKind {
     }
 
     /// `v` as the bar prints it: distances with `prec` decimals, lateral
-    /// signed with one.
+    /// with one and its side, `3.2 L` / `1.4 R` (`0.0` on the line).
     fn format(self, v: f64, prec: usize) -> String {
         match self {
-            BarKind::Lateral => format!("{v:+.1}"),
+            BarKind::Lateral => {
+                let v = round_to(v, 1);
+                match signs::side(v) {
+                    Some(side) => format!("{:.1} {side}", v.abs()),
+                    None => "0.0".to_owned(),
+                }
+            }
             _ => format!("{v:.prec$}"),
         }
     }
@@ -1990,9 +2217,6 @@ fn bar_tooltip(bar: &Bar) -> String {
     );
     if let Some(sd) = s.std_dev {
         text.push_str(&format!(" \u{b7} sd {sd:.1}"));
-    }
-    if bar.kind == BarKind::Lateral {
-        text.push_str("\n+ is right of the target line.");
     }
     text
 }
@@ -2859,7 +3083,7 @@ fn list_entry(ui: &egui::Ui, rect: egui::Rect, e: &ListEntry, state: EntryState)
         ));
         let label_height = label.size().y;
         painter.galley(pos2(x, label_y), label, theme::TEXT_DIM);
-        let reading = Reading::new(painter, m, &m.text, 16.0, false);
+        let reading = Reading::new(painter, m, &m.text, None, 16.0, false);
         let pos = pos2(x, label_y + label_height);
         painter.galley(pos, reading.value.clone(), reading.color);
         if let Some((unit, offset)) = reading.unit {
@@ -3518,7 +3742,8 @@ impl FlighthookApp {
         if pulse > 0.0 {
             ui.ctx().request_repaint();
         }
-        let (headline, groups) = card_metrics(&shot, imperial);
+        let handed = shot.handed.or(self.handed).unwrap_or(Handedness::Right);
+        let (headline, groups) = card_metrics(&shot, imperial, handed);
         let counts: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
         let height = ui.available_height();
         // The range bars over the view's members around the shown shot,
@@ -3530,7 +3755,7 @@ impl FlighthookApp {
         let key = self.members_key(i);
         // A handful of ids, copied so the borrow of `self` ends here.
         let devices = self.devices().into_owned();
-        let (bars, title) = {
+        let (face_panel, bars, title) = {
             let members = self.view_members.get(key, || {
                 chart::members_for(
                     &self.shots,
@@ -3547,7 +3772,28 @@ impl FlighthookApp {
             } else {
                 &[]
             };
+            // The face panel shows while any shot in the history has face
+            // impact, over the bars' members.
+            let face_panel = (show_bars && self.shots.iter().any(impact::has_impact)).then(|| {
+                let several = devices.len() >= 2;
+                let filter = self.device_filter.as_deref();
+                impact::FacePanel::new(
+                    &self.shots,
+                    members,
+                    i,
+                    set.and_then(|g| g.club).or(self.selected_club),
+                    self.handed,
+                    |s| chart::shot_colour(&devices, filter, &s.actor),
+                    |s| {
+                        several.then(|| {
+                            let name = self.actors.get(&s.actor).map(|a| a.name.as_str());
+                            chart::device_label(&s.actor, name).to_owned()
+                        })
+                    },
+                )
+            });
             (
+                face_panel,
                 bars_for(&self.shots, members, Some(i), split, imperial),
                 bars_title(
                     view,
@@ -3584,18 +3830,25 @@ impl FlighthookApp {
         // Room for the glow on the outermost cards.
         let inset = f32::from(GLOW_WIDTH);
         let lay_out = |width: f32| {
-            let legend = legend_place(
-                ui.painter(),
-                width,
-                title.as_ref().map(|(t, _)| t.as_str()),
-                &chips,
-            );
-            cards_layout(
-                egui::vec2(width, height - 2.0 * inset - CARDS_FOOT),
-                headline.len(),
-                &counts,
-                show_bars.then_some(legend),
-            )
+            let place = |width: f32| {
+                legend_place(
+                    ui.painter(),
+                    width,
+                    title.as_ref().map(|(t, _)| t.as_str()),
+                    &chips,
+                )
+            };
+            let size = egui::vec2(width, height - 2.0 * inset - CARDS_FOOT);
+            let at = |legend: Legend, face: bool| {
+                cards_layout(
+                    size,
+                    headline.len(),
+                    &counts,
+                    show_bars.then_some(legend),
+                    face,
+                )
+            };
+            settle_legend(width, face_panel.is_some(), place, at)
         };
         let mut layout = lay_out(ui.available_width() - 2.0 * inset);
         // Too short for everything: a solid scroll bar, always shown, with
@@ -3613,6 +3866,7 @@ impl FlighthookApp {
 
         let mut back = false;
         let mut picked_device = None;
+        let mut picked_shot = None;
         ui.scope(|ui| {
             ui.spacing_mut().scroll = scroll;
             egui::ScrollArea::vertical()
@@ -3659,6 +3913,9 @@ impl FlighthookApp {
                         }
                         range_bars(ui, &at, title.as_ref(), &bars, &chips, bars_note);
                     }
+                    if let (Some(rect), Some(panel)) = (layout.face, &face_panel) {
+                        picked_shot = impact::paint_face_panel(ui, rect.translate(origin), panel);
+                    }
                     let detail_cards = layout.groups.iter().flat_map(|(_, cards)| cards);
                     if let Some(first) = detail_cards.clone().next() {
                         let all = groups.iter().flat_map(|(_, m)| m);
@@ -3684,6 +3941,10 @@ impl FlighthookApp {
         }
         if let Some(d) = picked_device {
             self.device_filter = d.checked_sub(1).and_then(|p| devices.get(p).cloned());
+        }
+        if let Some(shot) = picked_shot {
+            self.shot_focus.select(&self.shots, shot);
+            self.shot_focus.reveal();
         }
     }
 
@@ -3767,7 +4028,8 @@ struct TableColumn {
 }
 
 /// The Table view's columns: Device (when `show_device`), `#`, Club, the
-/// ball columns, then the club columns.
+/// ball columns, the club columns, then face impact (millimetres in both
+/// unit systems).
 fn table_columns(show_device: bool, imperial: bool) -> Vec<TableColumn> {
     let (speed, dist, height) = table_header_units(imperial);
     let column = |name, unit| TableColumn {
@@ -3806,6 +4068,8 @@ fn table_columns(show_device: bool, imperial: bool) -> Vec<TableColumn> {
         column("Face", "deg"),
         column("Loft", "deg"),
         column("Smash", ""),
+        column("Impact H", "mm"),
+        column("Impact V", "mm"),
     ]);
     columns
 }
@@ -3979,6 +4243,9 @@ fn table_cells(
         }
         None => cells.extend((0..CLUB_COLUMNS).map(|_| Text("-".to_owned()))),
     }
+    let (lat, vert) = impact::impact_mm(shot.impact.as_ref());
+    let (h, v) = impact::impact_words(lat, vert);
+    cells.extend([Text(h), Text(v)]);
     cells
 }
 
@@ -4090,8 +4357,10 @@ mod tests {
             shot_number: n,
             ball: with_ball.then(BallFlight::default),
             club: None,
+            impact: None,
             derived: None,
             club_selected: None,
+            handed: None,
             group: None,
             finished: true,
         }
@@ -4976,7 +5245,7 @@ mod tests {
     #[test]
     fn cards_sit_side_by_side_when_wide() {
         let size = egui::vec2(1560.0, 760.0);
-        let layout = cards_layout(size, 5, &[2, 4, 6], None);
+        let layout = cards_layout(size, 5, &[2, 4, 6], None, false);
         assert_fits(&layout, size.x);
         // One headline row, and all group labels on one line.
         assert!(
@@ -4995,7 +5264,7 @@ mod tests {
     #[test]
     fn cards_stack_and_wrap_when_narrow() {
         let size = egui::vec2(420.0, 700.0);
-        let layout = cards_layout(size, 5, &[2, 4, 6], None);
+        let layout = cards_layout(size, 5, &[2, 4, 6], None, false);
         assert_fits(&layout, size.x);
         // Headline wraps into balanced rows (3 + 2).
         let first_row = layout.headline[0].top();
@@ -5011,7 +5280,7 @@ mod tests {
             assert!(pair[1].0.top() > prev_bottom);
         }
         // Too short to fit: cards keep their compact height and scroll.
-        let short = cards_layout(egui::vec2(420.0, 300.0), 5, &[2, 4, 6], None);
+        let short = cards_layout(egui::vec2(420.0, 300.0), 5, &[2, 4, 6], None, false);
         assert_fits(&short, 420.0);
         assert!(short.height > 300.0 && short.scrolls);
         assert_eq!(short.headline[0].height(), COMPACT.headline);
@@ -5023,7 +5292,7 @@ mod tests {
         // Too narrow for six cards side by side, wide enough for five
         // headline cards in a row.
         let size = egui::vec2(660.0, 620.0);
-        let layout = cards_layout(size, 5, &[2, 4, 6], None);
+        let layout = cards_layout(size, 5, &[2, 4, 6], None, false);
         assert_fits(&layout, size.x);
         assert!(layout.height <= size.y);
         // One headline row of five.
@@ -5209,7 +5478,7 @@ mod tests {
         assert_eq!(
             bar_stats_text(&lateral),
             (
-                "avg +1.5 \u{b7} med +1.5".to_owned(),
+                "avg 1.5 R \u{b7} med 1.5 R".to_owned(),
                 "sd 0.0 \u{b7} 3/4".to_owned()
             )
         );
@@ -5275,9 +5544,9 @@ mod tests {
     #[test]
     fn bars_sit_between_headline_and_details() {
         let size = egui::vec2(1560.0, 760.0);
-        let plain = cards_layout(size, 5, &[2, 4, 6], None);
+        let plain = cards_layout(size, 5, &[2, 4, 6], None, false);
         assert!(plain.bars.is_none());
-        let layout = cards_layout(size, 5, &[2, 4, 6], Some(Legend::Beside));
+        let layout = cards_layout(size, 5, &[2, 4, 6], Some(Legend::Beside), false);
         assert_fits(&layout, size.x);
         assert!(layout.height <= size.y + 1e-3, "{}", layout.height);
         let BarsLayout {
@@ -5338,7 +5607,13 @@ mod tests {
                         .frame(egui::Frame::new())
                         .show(ctx, |ui| {
                             let legend = legend_place(ui.painter(), width, Some(&title.0), &chips);
-                            let at = cards_layout(vec2(width, height), 5, &[2, 4, 6], Some(legend));
+                            let at = cards_layout(
+                                vec2(width, height),
+                                5,
+                                &[2, 4, 6],
+                                Some(legend),
+                                false,
+                            );
                             let bars_at = at.bars.expect("bars");
                             range_bars(ui, &bars_at, Some(&title), &bars, &chips, "");
                             place = Some(legend);
@@ -5495,7 +5770,7 @@ mod tests {
         for (i, &(w, h, narrow)) in FIT_AREAS[..FIT_WINDOWS.len()].iter().enumerate() {
             for width in [w, narrow] {
                 for legend in [None, Some(Legend::Beside), Some(Legend::Below)] {
-                    let layout = cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], legend);
+                    let layout = cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], legend, false);
                     let at = format!("{:?} {width}x{h} {legend:?}", FIT_WINDOWS[i]);
                     assert!(!layout.scrolls, "{at}");
                     assert!(layout.height <= h + 0.01, "{at}: {}", layout.height);
@@ -5531,13 +5806,18 @@ mod tests {
             dynamic_loft: Some(48.8),
             ..Default::default()
         });
-        let (headline, groups) = card_metrics(&shot, true);
+        let (headline, groups) = card_metrics(&shot, true, Handedness::Right);
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             let painter = ctx.layer_painter(egui::LayerId::background());
             for &(w, h, narrow) in &FIT_AREAS {
                 for width in [w, narrow] {
-                    let layout =
-                        cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(Legend::Below));
+                    let layout = cards_layout(
+                        egui::vec2(width, h),
+                        5,
+                        &[2, 4, 6],
+                        Some(Legend::Below),
+                        false,
+                    );
                     let head = layout.headline[0];
                     let look =
                         CardLook::headline(head.size()).fit(&painter, &headline, head.width());
@@ -5596,8 +5876,14 @@ mod tests {
         }
         // Halfway: the bar rows, the label lines and the cards all shrank.
         let (w, h, _) = FIT_AREAS[1];
-        let roomy = cards_layout(egui::vec2(w, 900.0), 5, &[2, 4, 6], Some(Legend::Beside));
-        let fit = cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], Some(Legend::Beside));
+        let roomy = cards_layout(
+            egui::vec2(w, 900.0),
+            5,
+            &[2, 4, 6],
+            Some(Legend::Beside),
+            false,
+        );
+        let fit = cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], Some(Legend::Beside), false);
         let (a, b) = (roomy.bars.expect("bars"), fit.bars.expect("bars"));
         assert!(b.rows[0].height() < a.rows[0].height());
         assert!(b.rows[0].height() > COMPACT.bar_row);
@@ -5621,6 +5907,7 @@ mod tests {
                     5,
                     &[2, 4, 6],
                     Some(Legend::Beside),
+                    false,
                 );
                 if let Some(prev) = &last {
                     let moved = |a: egui::Rect, b: egui::Rect| {
@@ -5643,8 +5930,8 @@ mod tests {
         for (w, _, _) in FIT_AREAS {
             for legend in [Some(Legend::Beside), Some(Legend::Below)] {
                 // The compact height: what the cards need at their smallest.
-                let least = cards_layout(egui::vec2(w, 1.0), 5, &[2, 4, 6], legend).height;
-                let at = |h: f32| cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], legend);
+                let least = cards_layout(egui::vec2(w, 1.0), 5, &[2, 4, 6], legend, false).height;
+                let at = |h: f32| cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], legend, false);
                 assert!(!at(least).scrolls, "{w}: {least}");
                 assert!(at(least).height <= least + 0.01);
                 let short = at(least - 2.0);
@@ -5657,7 +5944,7 @@ mod tests {
         }
         // 900×700 is below it, the listed windows are not.
         let (w, h, _) = FIT_AREAS[5];
-        assert!(cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], Some(Legend::Beside)).scrolls);
+        assert!(cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], Some(Legend::Beside), false).scrolls);
     }
 
     #[test]
@@ -5993,7 +6280,7 @@ mod tests {
 
     /// The text of the Cards metric `label` and whether it is simulated.
     fn card_text(shot: &ShotRow, label: &str) -> (String, bool) {
-        let (headline, groups) = card_metrics(shot, true);
+        let (headline, groups) = card_metrics(shot, true, Handedness::Right);
         let m = headline
             .into_iter()
             .chain(groups.into_iter().flat_map(|(_, g)| g))
@@ -6150,12 +6437,12 @@ mod tests {
         shot.ball.as_mut().unwrap().max_height = Some(Distance::Meters(31.2));
 
         let imperial = shot.to_unit_system(UnitSystem::Imperial);
-        let (_, groups) = card_metrics(&imperial, true);
+        let (_, groups) = card_metrics(&imperial, true, Handedness::Right);
         let apex = groups[1].1.iter().find(|m| m.label == "Apex").unwrap();
         assert_eq!(apex.unit, "ft");
 
         let metric = shot.to_unit_system(UnitSystem::Metric);
-        let (_, groups) = card_metrics(&metric, false);
+        let (_, groups) = card_metrics(&metric, false, Handedness::Right);
         let apex = groups[1].1.iter().find(|m| m.label == "Apex").unwrap();
         assert_eq!(apex.unit, "m");
     }
@@ -6172,7 +6459,7 @@ mod tests {
         ball.total_offline = Some(Distance::Yards(-5.0));
         ball.descent_angle = Some(43.1);
 
-        let (_, groups) = card_metrics(&shot, true);
+        let (_, groups) = card_metrics(&shot, true, Handedness::Right);
         let card = |label: &str| {
             groups[1]
                 .1
@@ -6181,7 +6468,10 @@ mod tests {
                 .map(|m| (m.text.clone(), m.source == Source::Measured))
                 .unwrap()
         };
-        assert_eq!(card("Offline"), (fmt_num(-4.2, 1, true), true));
+        // Offline shows its magnitude and side.
+        assert_eq!(card("Offline"), (fmt_num(4.2, 1, false), true));
+        let offline = groups[1].1.iter().find(|m| m.label == "Offline").unwrap();
+        assert_eq!(offline.word, Some("L"));
         assert_eq!(card("Descent"), (fmt_num(43.1, 1, false), true));
 
         let columns = table_columns(false, true);
@@ -6772,7 +7062,7 @@ mod tests {
         assert_eq!(table_row_fill(2, 4, latest, stripe), None);
         assert_eq!(table_row_fill(3, 4, latest, stripe), Some(stripe));
         assert_eq!(table_row_fill(4, 4, latest, stripe), Some(latest));
-        assert_eq!(TABLE_COLUMNS, 20);
+        assert_eq!(TABLE_COLUMNS, 22);
     }
 
     /// Mean frame time of the Table view with 1000 shots (and the Dispersion
@@ -6835,5 +7125,455 @@ mod tests {
     fn clear_confirm_counts_the_shots() {
         assert_eq!(clear_confirm_title(12), "Delete all 12 shots and sets?");
         assert_eq!(clear_confirm_title(1), "Delete the 1 shot and its set?");
+    }
+
+    fn card<'a>(groups: &'a [MetricGroup; 3], label: &str) -> &'a Metric {
+        groups
+            .iter()
+            .flat_map(|(_, g)| g)
+            .find(|m| m.label == label)
+            .expect(label)
+    }
+
+    /// A shot with every directional value set to `sign` × a value.
+    fn signed_shot(sign: f64) -> ShotRow {
+        let mut shot = row(1, true);
+        let ball = shot.ball.as_mut().unwrap();
+        ball.launch_azimuth = Some(2.4 * sign);
+        // Rounds to 0 for the near-zero signs.
+        #[allow(clippy::cast_possible_truncation)]
+        let sidespin = (644.0 * sign).round() as i32;
+        ball.sidespin_rpm = Some(sidespin);
+        ball.carry_offline = Some(Distance::Yards(22.4 * sign));
+        shot.club = Some(ClubData {
+            path: Some(1.2 * sign),
+            attack_angle: Some(0.9 * sign),
+            face_angle: Some(1.8 * sign),
+            ..Default::default()
+        });
+        shot
+    }
+
+    #[test]
+    fn directional_tiles_show_a_magnitude_and_a_word() {
+        use Handedness::{Left, Right};
+        let words = |sign: f64, handed| {
+            let (_, groups) = card_metrics(&signed_shot(sign), true, handed);
+            ["Direction", "Sidespin", "Offline", "Path", "AoA", "Face"].map(|l| {
+                let m = card(&groups, l);
+                (m.text.clone(), m.word)
+            })
+        };
+        let text = |w: [(String, Option<&str>); 6]| w.map(|(t, _)| t);
+        let word = |w: [(String, Option<&'static str>); 6]| w.map(|(_, w)| w);
+        // Values are magnitudes, the same for both signs and both hands.
+        let magnitudes = ["2.4", "644", "22.4", "1.2", "0.9", "1.8"].map(String::from);
+        for sign in [1.0, -1.0] {
+            for handed in [Right, Left] {
+                assert_eq!(text(words(sign, handed)), magnitudes);
+            }
+        }
+        assert_eq!(
+            word(words(1.0, Right)),
+            [
+                Some("R"),
+                Some("Fade"),
+                Some("R"),
+                Some("In-to-out"),
+                Some("Up"),
+                Some("Open")
+            ]
+        );
+        assert_eq!(
+            word(words(-1.0, Right)),
+            [
+                Some("L"),
+                Some("Draw"),
+                Some("L"),
+                Some("Out-to-in"),
+                Some("Down"),
+                Some("Closed")
+            ]
+        );
+        assert_eq!(
+            word(words(1.0, Left)),
+            [
+                Some("R"),
+                Some("Draw"),
+                Some("R"),
+                Some("Out-to-in"),
+                Some("Up"),
+                Some("Closed")
+            ]
+        );
+        assert_eq!(
+            word(words(-1.0, Left)),
+            [
+                Some("L"),
+                Some("Fade"),
+                Some("L"),
+                Some("In-to-out"),
+                Some("Down"),
+                Some("Open")
+            ]
+        );
+        // Zero, or a value shown as zero, has no word.
+        for sign in [0.0, 0.0005, -0.0005] {
+            let w = words(sign, Right);
+            assert!(w.iter().all(|(_, w)| w.is_none()), "{sign}: {w:?}");
+            assert_eq!(w[0].0, "0.0");
+        }
+        // Roll keeps its sign: it is not a direction.
+        let (_, groups) = card_metrics(&signed_shot(-1.0), true, Right);
+        assert_eq!(card(&groups, "Roll").word, None);
+    }
+
+    #[test]
+    fn sign_words_fit_their_tiles_at_1024x768() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        // The widest realistic readings with the longest words.
+        let mut shot = signed_shot(-1.0);
+        shot.club.as_mut().unwrap().path = Some(-10.8);
+        shot.club.as_mut().unwrap().face_angle = Some(-10.8);
+        shot.club.as_mut().unwrap().attack_angle = Some(-10.8);
+        shot.ball.as_mut().unwrap().sidespin_rpm = Some(-1644);
+        let (_, groups) = card_metrics(&shot, true, Handedness::Right);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            for (i, &(w, h, narrow)) in FIT_AREAS.iter().enumerate() {
+                for width in [w, narrow] {
+                    let layout = cards_layout(
+                        egui::vec2(width, h),
+                        5,
+                        &[2, 4, 6],
+                        Some(Legend::Beside),
+                        false,
+                    );
+                    let detail = layout.groups[0].1[0];
+                    let all = groups.iter().flat_map(|(_, m)| m);
+                    let look = CardLook::detail(detail.size()).fit(&painter, all, detail.width());
+                    let room = detail.width() - 2.0 * look.pad;
+                    for m in groups.iter().flat_map(|(_, m)| m) {
+                        let (reading, size) = fitted_reading(&painter, m, look.value, room);
+                        let at = format!("{width}x{h} {}", m.label);
+                        assert!(reading.width() <= room + 0.01, "{at} overflows");
+                        assert!(m.word.is_none() || reading.word.is_some(), "{at}");
+                        if FIT_WINDOWS.get(i) == Some(&(1024.0, 768.0)) {
+                            // At 1024x768 no numeral gives way to its word.
+                            assert_eq!(size, look.value, "{at}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn the_lateral_bar_reads_left_and_right() {
+        let k = BarKind::Lateral;
+        assert_eq!(k.format(-3.24, 0), "3.2 L");
+        assert_eq!(k.format(11.9, 0), "11.9 R");
+        assert_eq!(k.format(0.04, 0), "0.0");
+        assert_eq!(k.format(-0.04, 0), "0.0");
+        assert_eq!(BarKind::Total.format(201.4, 0), "201");
+    }
+
+    #[test]
+    fn the_table_shows_face_impact_in_words() {
+        use crate::types::FaceImpact;
+        let mut shot = row(7, true);
+        shot.impact = Some(FaceImpact {
+            lateral: Some(Distance::Millimeters(4.4)),
+            vertical: Some(Distance::Millimeters(-2.2)),
+        });
+        let columns = table_columns(false, true);
+        let at = |n: &str| columns.iter().position(|c| c.name == n).expect(n);
+        assert_eq!(at("Impact H"), at("Smash") + 1);
+        assert_eq!(at("Impact V"), at("Smash") + 2);
+        assert_eq!(columns[at("Impact H")].unit, "mm");
+        let cells = table_cells(&shot, None, None, false);
+        assert_eq!(cells.len(), columns.len());
+        assert_eq!(cells[at("Impact H")], TableCell::Text("4 toe".into()));
+        assert_eq!(cells[at("Impact V")], TableCell::Text("2 low".into()));
+        // No reading: dashes; and the same with the device column.
+        let cells = table_cells(&row(8, true), Some("Omni"), None, false);
+        let columns = table_columns(true, true);
+        assert_eq!(cells.len(), columns.len());
+        assert_eq!(cells[columns.len() - 1], TableCell::Text("-".into()));
+    }
+
+    #[test]
+    fn the_face_panel_sits_right_of_the_bars_without_changing_a_height() {
+        for (i, &(w, h, narrow)) in FIT_AREAS[..FIT_WINDOWS.len()].iter().enumerate() {
+            for width in [w, narrow] {
+                for legend in [Legend::Beside, Legend::Below] {
+                    let at = format!("{:?} {width}x{h} {legend:?}", FIT_WINDOWS[i]);
+                    let plain =
+                        cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(legend), false);
+                    let layout =
+                        cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(legend), true);
+                    assert!(plain.face.is_none());
+                    let face = layout.face.expect(&at);
+                    let bars = layout.bars.expect("bars");
+                    let plain_bars = plain.bars.expect("bars");
+                    // Under the rightmost headline column, as wide as it,
+                    // CARD_GAP from the headline cards and from the detail
+                    // section's hairline.
+                    let column = layout
+                        .headline
+                        .iter()
+                        .map(|c| c.right())
+                        .fold(0.0, f32::max);
+                    let tile = layout
+                        .headline
+                        .iter()
+                        .find(|c| (c.right() - column).abs() < 0.01)
+                        .expect("a headline card");
+                    let head_bottom = layout
+                        .headline
+                        .iter()
+                        .map(|c| c.bottom())
+                        .fold(0.0, f32::max);
+                    let rule = layout.groups[0].0.top() + GROUP_RULE_Y;
+                    assert!((face.top() - (head_bottom + CARD_GAP)).abs() < 0.01, "{at}");
+                    assert!((face.bottom() - (rule - CARD_GAP)).abs() < 0.01, "{at}");
+                    assert!((face.right() - width).abs() < 0.01, "{at}");
+                    assert!((face.left() - tile.left()).abs() < 0.01, "{at}");
+                    assert!(!face.intersects(bars.controls), "{at}");
+                    assert!(layout.headline.iter().all(|c| !c.intersects(face)), "{at}");
+                    // The bars end FACE_GAP short of it.
+                    for r in [bars.controls, bars.label, bars.legend]
+                        .into_iter()
+                        .chain(bars.rows)
+                    {
+                        assert!((r.right() + FACE_GAP - face.left()).abs() < 0.01, "{at}");
+                        assert!(!r.intersects(face), "{at}");
+                    }
+                    assert!(
+                        bar_plot_width(bars.rows[0].width()) >= FACE_MIN_PLOT,
+                        "{at}"
+                    );
+                    // Nothing else moves.
+                    assert_eq!(layout.height, plain.height, "{at}");
+                    assert_eq!(layout.scrolls, plain.scrolls, "{at}");
+                    assert!(!layout.scrolls, "{at}");
+                    assert_eq!(layout.headline, plain.headline, "{at}");
+                    assert_eq!(layout.groups, plain.groups, "{at}");
+                    assert_eq!(
+                        bars.rows.map(|r| r.y_range()),
+                        plain_bars.rows.map(|r| r.y_range())
+                    );
+                    for (label, cards) in &layout.groups {
+                        assert!(!label.intersects(face), "{at}");
+                        assert!(cards.iter().all(|c| !c.intersects(face)), "{at}");
+                    }
+                }
+            }
+        }
+        // Too narrow for the bars beside the square: no panel.
+        let narrow = cards_layout(
+            egui::vec2(560.0, 476.0),
+            5,
+            &[2, 4, 6],
+            Some(Legend::Below),
+            true,
+        );
+        assert!(narrow.face.is_none());
+        assert_eq!(narrow.bars.unwrap().rows[0].width(), 560.0);
+        // No bars, no panel.
+        assert!(
+            cards_layout(egui::vec2(962.0, 476.0), 5, &[2, 4, 6], None, true)
+                .face
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_legend_settles_where_it_fits_beside_the_face_panel() {
+        let mut dropped = 0;
+        let mut kept_below = 0;
+        for &(_, h, _) in &FIT_AREAS {
+            let mut width = 560.0;
+            while width <= 1300.0 {
+                let at = |legend: Legend, face: bool| {
+                    cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(legend), face)
+                };
+                // The legend fits beside the title from `fits` up: the full
+                // width, and a sweep below it.
+                for fits in [width, width - 40.0, width - 120.0, width - 240.0] {
+                    let place = |w: f32| {
+                        if w >= fits {
+                            Legend::Beside
+                        } else {
+                            Legend::Below
+                        }
+                    };
+                    let layout = settle_legend(width, true, place, at);
+                    let bars = layout.bars.expect("bars");
+                    let legend = if bars.legend == bars.label {
+                        Legend::Beside
+                    } else {
+                        Legend::Below
+                    };
+                    let at_ = format!("{width}x{h}, beside from {fits}");
+                    // Never beside the title where it does not fit.
+                    if legend == Legend::Beside {
+                        assert!(bars.label.width() >= fits, "{at_}");
+                    }
+                    match layout.face {
+                        Some(face) => {
+                            assert!(bar_plot_width(face.left() - FACE_GAP) >= FACE_MIN_PLOT);
+                        }
+                        // No panel: the full-width layout, legend and all.
+                        None => {
+                            assert_eq!(legend, place(width), "{at_}");
+                            assert_eq!(
+                                format!("{layout:?}"),
+                                format!("{:?}", at(place(width), false)),
+                                "{at_}"
+                            );
+                        }
+                    }
+                    // The case two passes got wrong: beside fits the full
+                    // width, the panel narrows the bars past it, and the
+                    // legend's own row leaves no room for the panel.
+                    let narrowed = at(Legend::Beside, true);
+                    if place(width) == Legend::Beside
+                        && narrowed.face.is_some()
+                        && place(narrowed.bars.expect("bars").label.width()) == Legend::Below
+                    {
+                        if at(Legend::Below, true).face.is_none() {
+                            dropped += 1;
+                            assert!(layout.face.is_none(), "{at_}");
+                            assert_eq!(legend, Legend::Beside, "{at_}");
+                        } else {
+                            kept_below += 1;
+                            assert!(layout.face.is_some(), "{at_}");
+                            assert_eq!(legend, Legend::Below, "{at_}");
+                        }
+                    }
+                }
+                width += 2.0;
+            }
+        }
+        assert!(dropped > 0, "the panel-dropping case is exercised");
+        assert!(kept_below > 0, "the legend-below case is exercised");
+        // Without the panel the legend is placed in the full width.
+        let layout = settle_legend(
+            900.0,
+            false,
+            |_| Legend::Below,
+            |legend, face| {
+                cards_layout(egui::vec2(900.0, 476.0), 5, &[2, 4, 6], Some(legend), face)
+            },
+        );
+        assert!(layout.face.is_none());
+        let bars = layout.bars.expect("bars");
+        assert_ne!(bars.legend, bars.label);
+    }
+
+    #[test]
+    fn the_face_readout_fits_the_smallest_panel() {
+        use crate::types::FaceImpact;
+        use egui::{Pos2, Rect, vec2};
+        // The smallest panel: a square as tall as the shortest span.
+        let side = COMPACT.bars(Legend::Beside) - COMPACT.controls;
+        let rect = Rect::from_min_size(Pos2::new(20.0, 20.0), vec2(side, side));
+        let mut shot = row(1, true);
+        shot.impact = Some(FaceImpact {
+            lateral: Some(Distance::Millimeters(-30.0)),
+            vertical: Some(Distance::Millimeters(30.0)),
+        });
+        let shots = [shot];
+        let panel =
+            impact::FacePanel::new(&shots, &[0], 0, None, None, |_| theme::ACCENT, |_| None);
+        assert_eq!(panel.readout, "30 heel \u{b7} 30 high");
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 400.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new())
+                    .show(ctx, |ui| {
+                        let _ = impact::paint_face_panel(ui, rect, &panel);
+                    });
+            },
+        );
+        let (_, _, at) = painted_text_rects(&out.shapes)
+            .into_iter()
+            .find(|(t, _, _)| *t == panel.readout)
+            .expect("the readout, whole");
+        assert!(
+            rect.shrink(impact::PAD).x_range().contains(at.left())
+                && rect.shrink(impact::PAD).x_range().contains(at.right()),
+            "{at:?} in {rect:?}"
+        );
+    }
+
+    /// The Cards app with face impact on some of its shots.
+    fn impact_app() -> FlighthookApp {
+        use crate::types::FaceImpact;
+        let mut app = cards_app();
+        for (n, shot) in (0_u32..).zip(app.shots.iter_mut()) {
+            let skip = n % 3 == 1;
+            let n = f64::from(n);
+            shot.impact = (!skip).then(|| FaceImpact {
+                lateral: Some(Distance::Millimeters(n - 5.0)),
+                vertical: Some(Distance::Millimeters(2.0 - n / 3.0)),
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn the_face_panel_shows_while_any_shot_has_impact() {
+        for (w, h) in FIT_WINDOWS {
+            let window = egui::vec2(w, h);
+            for (with_impact, mut app) in [(true, impact_app()), (false, cards_app())] {
+                let ctx = egui::Context::default();
+                theme::install(&ctx);
+                for _ in 0..3 {
+                    shots_frame(&ctx, &mut app, window);
+                }
+                let out = shots_frame(&ctx, &mut app, window);
+                let texts = painted_texts(&out.shapes);
+                let painted = |t: &str| texts.iter().any(|(x, _)| x == t);
+                assert_eq!(painted("TOE") && painted("HEEL"), with_impact, "{w}x{h}");
+                let right = w
+                    - f32::from(TAB_MARGIN.right)
+                    - chart_slots(ShotsView::Cards, window).right.unwrap_or(0.0);
+                assert_eq!(scroll_bars(&out, right), 0, "{w}x{h}: a scroll bar");
+            }
+        }
+        // History-wide: the shown shot without impact still shows it, with
+        // a dash for its reading.
+        let mut app = impact_app();
+        let last = app.shots.len() - 1;
+        app.shots[last].impact = None;
+        app.shots_rev += 1;
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let window = egui::vec2(1600.0, 900.0);
+        for _ in 0..3 {
+            shots_frame(&ctx, &mut app, window);
+        }
+        let texts = painted_texts(&shots_frame(&ctx, &mut app, window).shapes);
+        assert!(texts.iter().any(|(t, _)| t == "TOE"));
+        assert!(texts.iter().any(|(t, _)| t == "-"));
+        // Gone once no shot has any.
+        for shot in &mut app.shots {
+            shot.impact = None;
+        }
+        app.shots_rev += 1;
+        for _ in 0..3 {
+            shots_frame(&ctx, &mut app, window);
+        }
+        let texts = painted_texts(&shots_frame(&ctx, &mut app, window).shapes);
+        assert!(!texts.iter().any(|(t, _)| t == "TOE"));
     }
 }

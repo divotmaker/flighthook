@@ -700,6 +700,7 @@ async fn apply_bus_event(
             let counted = data.has_data();
             data.shot_id = Some(key.shot_id.clone());
             data.club_selected = context.club_selected;
+            data.handed = context.handed;
             if counted {
                 data.group = Some(group.clone());
             }
@@ -1318,6 +1319,8 @@ pub(crate) mod tests {
         assert_eq!(s.context.club_selected, Some(Club::Iron8));
         assert_eq!(s.context.detection_mode, Some(ShotDetectionMode::Full));
         assert_eq!(s.context.handed, Some(Handedness::Right));
+        // `/api/shots` carries it on the shot itself.
+        assert_eq!(s.data.handed, Some(Handedness::Right));
         assert_eq!(s.context.device.kind, "flightscope");
         assert_eq!(
             s.context.device.manufacturer.as_deref(),

@@ -263,15 +263,75 @@ struct Tick {
     total: bool,
 }
 
-/// The gold shot's labels and the times its draw-on reveals them at.
+/// The gold shot's labels: the point each one labels, its text and the
+/// time its draw-on reveals it at.
 #[derive(Debug, Default)]
 struct Marks {
-    /// Apex point, its label and the time the path reaches it.
+    /// The apex, and the time the path reaches it.
     apex: Option<(Pos2, String, f64)>,
-    /// Carry label under the landing, and the landing time.
-    carry: Option<(f32, String, f64)>,
-    /// Total label under the rest, and the time the ball stops.
-    total: Option<(f32, String, f64)>,
+    /// The landing on the ground line, and the landing time.
+    carry: Option<(Pos2, String, f64)>,
+    /// The rest on the ground line, and the time the ball stops.
+    total: Option<(Pos2, String, f64)>,
+}
+
+/// Font size of the gold shot's apex, carry and total labels.
+const MARK_FONT: f32 = 14.0;
+/// Padding of a label's background box.
+const MARK_PAD: Vec2 = vec2(3.0, 1.0);
+/// A carry or total box's bottom sits this far above its point.
+const MARK_RISE: f32 = 7.0;
+/// The apex box's bottom sits this far above the apex, over its tick.
+const APEX_RISE: f32 = 13.0;
+/// Least gap between the carry and total boxes on one row.
+const MARK_GAP: f32 = 6.0;
+/// Gap under a label lifted over another.
+const LIFT_GAP: f32 = 5.0;
+/// Height of a label's box: a [`MARK_FONT`] line (16 pt) and its padding.
+const MARK_BOX_H: f32 = 16.0 + 2.0 * MARK_PAD.y;
+/// Gap between the apex label's box and the plot's top.
+const MARK_MARGIN: f32 = 4.0;
+/// Room the gold apex keeps under the plot's top: its label's rise, its box
+/// and a margin.
+const MARK_ROOM: f32 = APEX_RISE + MARK_BOX_H + MARK_MARGIN;
+
+/// Where the gold shot's apex, carry and total labels go, as their boxes
+/// (padding included), given the points they label and their text sizes.
+///
+/// Each box is centred on its point's x, its bottom [`MARK_RISE`] above a
+/// carry or total point and [`APEX_RISE`] above the apex. When the carry
+/// and total boxes would come closer than [`MARK_GAP`], total stays and
+/// carry lifts one row. An apex box that would meet either lifts above the
+/// higher of them. Every box is then kept inside the plot's width.
+fn place_marks(points: [Option<Pos2>; 3], sizes: [Vec2; 3], plot: Rect) -> [Option<Rect>; 3] {
+    let [apex, carry, total] = points;
+    let boxed = |at: Option<Pos2>, size: Vec2, rise: f32| {
+        at.map(|p| {
+            let size = size + 2.0 * MARK_PAD;
+            Rect::from_center_size(pos2(p.x, p.y - rise - size.y / 2.0), size)
+        })
+    };
+    let x_in = |r: Rect| {
+        let shift = (plot.left() - r.left()).max(0.0) + (plot.right() - r.right()).min(0.0);
+        r.translate(vec2(shift, 0.0))
+    };
+    let mut carry = boxed(carry, sizes[1], MARK_RISE).map(x_in);
+    let total = boxed(total, sizes[2], MARK_RISE).map(x_in);
+    if let (Some(c), Some(t)) = (carry.as_mut(), total)
+        && c.expand2(vec2(MARK_GAP / 2.0, 0.0))
+            .intersects(t.expand2(vec2(MARK_GAP / 2.0, 0.0)))
+    {
+        *c = c.translate(vec2(0.0, -(c.height() + LIFT_GAP)));
+    }
+    let mut apex = boxed(apex, sizes[0], APEX_RISE).map(x_in);
+    if let Some(a) = apex.as_mut() {
+        let below = [carry, total].into_iter().flatten();
+        if below.clone().any(|b| b.intersects(*a)) {
+            let top = below.map(|b| b.top()).fold(f32::INFINITY, f32::min);
+            *a = a.translate(vec2(0.0, top - LIFT_GAP - a.bottom()));
+        }
+    }
+    [apex, carry, total]
 }
 
 /// Everything the panel paints, in panel-local points (origin at the
@@ -382,11 +442,15 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         chart::SIDE_DISTANCE
     };
     let height_axis = chart::side_height(units);
+    let plot = plot_rect(size);
     let domain = (
         distance_axis.domain_max(x_data),
-        height_axis.domain_max(y_data),
+        headroom(
+            height_axis.domain_max(y_data),
+            gold_top(drawn.gold.and_then(|i| shots.get(i)), k),
+            plot.height(),
+        ),
     );
-    let plot = plot_rect(size);
     let proj = Projection::fit(plot, (0.0, domain.0), (0.0, domain.1));
 
     let tick_labels = |scale: &chart::Scale, step: f64, min_px: f32, hi: f64| {
@@ -399,14 +463,7 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
     let x_ticks = tick_labels(&proj.x, distance_axis.step, X_TICK_MIN_PX, domain.0);
     let y_ticks = tick_labels(&proj.y, height_axis.step, Y_TICK_MIN_PX, domain.1);
 
-    let by_device = device.is_none() && devices.len() >= 2;
-    let colour_of = |s: &ShotRow| {
-        if by_device {
-            chart::device_colour(devices, &s.actor)
-        } else {
-            theme::ACCENT
-        }
-    };
+    let colour_of = |s: &ShotRow| chart::shot_colour(devices, device, &s.actor);
     let ground_y = proj.y.map(0.0);
     let mut traces = Vec::new();
     let mut ticks = Vec::new();
@@ -468,7 +525,9 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
                 tick(r.carry, false);
                 tick(r.total, true);
                 if level == Level::Gold {
-                    let label = |v: Option<f64>| v.map(|v| (proj.x.map(v), format!("{v:.0}"), 0.0));
+                    let label = |v: Option<f64>| {
+                        v.map(|v| (pos2(proj.x.map(v), ground_y), format!("{v:.0}"), 0.0))
+                    };
                     marks.carry = label(r.carry);
                     marks.total = label(r.total);
                 }
@@ -492,6 +551,31 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
             .map(|s| readings(s, units))
             .unwrap_or_default(),
         members: members.len(),
+    }
+}
+
+/// Height of the gold `shot`'s apex on its drawn path, in display units
+/// (`k` per metre); none for a shot without a flight drawn.
+fn gold_top(shot: Option<&ShotRow>, k: (f64, f64)) -> Option<f64> {
+    let p = path(shot?)?;
+    if rolls(p) {
+        return None;
+    }
+    p.flight
+        .iter()
+        .map(|q| side_point(q, k)[1])
+        .filter(|h| chart::plausible(*h))
+        .reduce(f64::max)
+}
+
+/// The height domain's top: `nice`, raised just enough that an apex at
+/// `top` sits [`MARK_ROOM`] under the top of a plot `plot_h` tall, so its
+/// label fits above it.
+fn headroom(nice: f64, top: Option<f64>, plot_h: f32) -> f64 {
+    let room = f64::from(plot_h - MARK_ROOM);
+    match top {
+        Some(top) if top > 0.0 && room > 0.0 => nice.max(top * f64::from(plot_h) / room),
+        _ => nice,
     }
 }
 
@@ -521,19 +605,21 @@ fn gold_marks(
         let v = r.apex.unwrap_or(q[2] * k.1);
         (to_screen(q), format!("{v:.0} {height}"), q[0])
     });
+    let ground_y = proj.y.map(0.0);
+    let on_ground = |x: f32| pos2(x, ground_y);
     let landing = p.flight.last();
     let carry = landing.filter(|_| !rolled).map(|q| {
         let v = r.carry.unwrap_or(side_point(q, k)[0]);
-        (to_screen(q).x, format!("{v:.0}"), q[0])
+        (on_ground(to_screen(q).x), format!("{v:.0}"), q[0])
     });
     let total = match p.ground.last() {
         Some(q) => {
             let v = r.total.unwrap_or(side_point(q, k)[0]);
-            Some((to_screen(q).x, format!("{v:.0}"), q[0]))
+            Some((on_ground(to_screen(q).x), format!("{v:.0}"), q[0]))
         }
         None => r.total.map(|v| {
             let t = landing.map_or(0.0, |q| q[0]);
-            (proj.x.map(v), format!("{v:.0}"), t)
+            (on_ground(proj.x.map(v)), format!("{v:.0}"), t)
         }),
     };
     Marks { apex, carry, total }
@@ -636,33 +722,7 @@ fn paint(
     let plot = scene.plot.translate(origin);
     let grid = Stroke::new(1.0, theme::BORDER.gamma_multiply(0.5));
     let label_font = egui::FontId::proportional(10.0);
-    let mark_font = egui::FontId::proportional(11.0);
-
-    // The gold labels under the ground line, placed first so the distance
-    // labels they would overlap are skipped.
     let shown_t = draw_on.map_or(f64::INFINITY, |d| d.t);
-    let mut taken: Vec<Rect> = Vec::new();
-    let mut gold_labels = Vec::new();
-    for (x, text, t) in [&scene.marks.carry, &scene.marks.total]
-        .into_iter()
-        .flatten()
-    {
-        if *t > shown_t {
-            continue;
-        }
-        let galley = painter.layout_no_wrap(text.clone(), mark_font.clone(), theme::TEXT);
-        let mut rect = Rect::from_center_size(
-            pos2(origin.x + x, plot.bottom() + 3.0 + galley.size().y / 2.0),
-            galley.size(),
-        );
-        if let Some(prev) = taken.last()
-            && rect.left() < prev.right() + 6.0
-        {
-            rect = rect.translate(vec2(prev.right() + 6.0 - rect.left(), 0.0));
-        }
-        taken.push(rect);
-        gold_labels.push((rect, galley));
-    }
 
     for (x, text) in &scene.x_ticks {
         let x = origin.x + x;
@@ -672,9 +732,7 @@ fn paint(
             pos2(x, plot.bottom() + 3.0 + galley.size().y / 2.0),
             galley.size(),
         );
-        if !taken.iter().any(|t| t.expand(3.0).intersects(rect)) {
-            painter.galley(rect.min, galley, theme::TEXT_DIM);
-        }
+        painter.galley(rect.min, galley, theme::TEXT_DIM);
     }
     for (y, text) in &scene.y_ticks {
         let y = origin.y + y;
@@ -784,7 +842,26 @@ fn paint(
             }
         }
     }
-    if let Some((at, text, t)) = &scene.marks.apex
+
+    // The gold shot's labels, placed together whether or not the draw-on
+    // has reached them yet, so none moves when another appears.
+    let marks = [&scene.marks.apex, &scene.marks.carry, &scene.marks.total];
+    let colours = [theme::GOLD, theme::TEXT, theme::TEXT];
+    let galleys = std::array::from_fn::<_, 3, _>(|i| {
+        marks[i].as_ref().map(|(_, text, _)| {
+            painter.layout_no_wrap(
+                text.clone(),
+                egui::FontId::proportional(MARK_FONT),
+                colours[i],
+            )
+        })
+    });
+    let boxes = place_marks(
+        marks.map(|m| m.as_ref().map(|(at, _, _)| *at + origin)),
+        std::array::from_fn(|i| galleys[i].as_ref().map_or(Vec2::ZERO, |g| g.size())),
+        plot,
+    );
+    if let Some((at, _, t)) = &scene.marks.apex
         && *t <= shown_t
     {
         let at = *at + origin;
@@ -793,17 +870,15 @@ fn paint(
             (at.y - 10.0)..=(at.y - 4.0),
             Stroke::new(1.5, theme::GOLD),
         );
-        let galley = painter.layout_no_wrap(text.clone(), mark_font, theme::GOLD);
-        let rect = Rect::from_min_size(
-            pos2(at.x + 5.0, at.y - 7.0 - galley.size().y / 2.0),
-            galley.size(),
-        );
-        painter.rect_filled(rect.expand(2.0), 2.0, theme::BG);
-        painter.galley(rect.min, galley, theme::GOLD);
     }
-    for (rect, galley) in gold_labels {
-        painter.rect_filled(rect.expand(2.0), 2.0, theme::BG);
-        painter.galley(rect.min, galley, theme::TEXT);
+    for ((mark, galley), (rect, colour)) in marks.iter().zip(galleys).zip(boxes.iter().zip(colours))
+    {
+        if let (Some((_, _, t)), Some(galley), Some(rect)) = (mark, galley, rect)
+            && *t <= shown_t
+        {
+            painter.rect_filled(*rect, 3.0, theme::BG);
+            painter.galley(rect.min + MARK_PAD, galley, colour);
+        }
     }
 }
 
@@ -1076,6 +1151,7 @@ pub(super) mod tests {
             shot_number: n,
             ball: Some(BallFlight::default()),
             club: None,
+            impact: None,
             derived: Some(derived(
                 Some(flight_path(140.0, 30.0, 150.0)),
                 140.0,
@@ -1083,6 +1159,7 @@ pub(super) mod tests {
                 30.0,
             )),
             club_selected: Some(Club::Iron7),
+            handed: None,
             group: Some(group.into()),
             finished: true,
         }
@@ -1581,9 +1658,10 @@ pub(super) mod tests {
         assert_eq!(trace(2).level, Level::Faint);
         // The gold shot is labelled with its total only.
         assert!(scene.marks.apex.is_none() && scene.marks.carry.is_none());
-        let (x, text, t) = scene.marks.total.as_ref().unwrap();
+        let (at, text, t) = scene.marks.total.as_ref().unwrap();
         assert_eq!((text.as_str(), *t), ("5", 4.0));
-        assert!((x - rest).abs() < 1e-3);
+        assert!((at.x - rest).abs() < 1e-3);
+        assert_eq!(at.y, ground_y);
         // The header: 0 apex and carry, the total.
         assert_eq!(
             scene.shown,
@@ -1890,5 +1968,121 @@ pub(super) mod tests {
              Flight scene rebuild {rebuild:?}; {bright} bright + {faint} faint paths, \
              {points} curve points"
         );
+    }
+
+    /// Text sizes for the label tests: a 14 pt "88 ft", "112", "115".
+    const SIZES: [Vec2; 3] = [vec2(38.0, 17.0), vec2(24.0, 17.0), vec2(24.0, 17.0)];
+
+    fn label_plot() -> Rect {
+        Rect::from_min_max(pos2(34.0, 28.0), pos2(600.0, 200.0))
+    }
+
+    #[test]
+    fn labels_sit_centred_above_their_marks() {
+        let plot = label_plot();
+        let (apex, carry, total) = (pos2(300.0, 60.0), pos2(400.0, 200.0), pos2(470.0, 200.0));
+        let [a, c, t] = place_marks([Some(apex), Some(carry), Some(total)], SIZES, plot);
+        for (r, at, rise, size) in [
+            (a.unwrap(), apex, APEX_RISE, SIZES[0]),
+            (c.unwrap(), carry, MARK_RISE, SIZES[1]),
+            (t.unwrap(), total, MARK_RISE, SIZES[2]),
+        ] {
+            assert!((r.center().x - at.x).abs() < 1e-3, "{r:?}");
+            assert!((r.bottom() - (at.y - rise)).abs() < 1e-3, "{r:?}");
+            assert_eq!(r.size(), size + 2.0 * MARK_PAD);
+        }
+    }
+
+    #[test]
+    fn carry_lifts_when_it_would_meet_total() {
+        let plot = label_plot();
+        // A PW: carry 112, total 115, a few points apart.
+        for (carry_x, total_x) in [(500.0, 512.0), (512.0, 500.0), (500.0, 500.0)] {
+            let points = [None, Some(pos2(carry_x, 200.0)), Some(pos2(total_x, 200.0))];
+            let [_, c, t] = place_marks(points, SIZES, plot);
+            let (c, t) = (c.unwrap(), t.unwrap());
+            // Total stays on its dot; carry is a row up, still centred.
+            assert!((t.bottom() - (200.0 - MARK_RISE)).abs() < 1e-3);
+            assert!((c.bottom() - (t.top() - LIFT_GAP)).abs() < 1e-3);
+            assert!((c.center().x - carry_x).abs() < 1e-3);
+            assert!(!c.intersects(t), "{carry_x} {total_x}");
+        }
+        // Far enough apart: one row.
+        let points = [None, Some(pos2(400.0, 200.0)), Some(pos2(470.0, 200.0))];
+        let [_, c, t] = place_marks(points, SIZES, plot);
+        assert_eq!(c.unwrap().bottom(), t.unwrap().bottom());
+    }
+
+    #[test]
+    fn labels_stay_inside_the_plot_and_apex_clears_the_others() {
+        let plot = label_plot();
+        // Near the right edge.
+        let points = [None, Some(pos2(560.0, 200.0)), Some(pos2(598.0, 200.0))];
+        let [_, c, t] = place_marks(points, SIZES, plot);
+        for r in [c.unwrap(), t.unwrap()] {
+            assert!(
+                r.left() >= plot.left() && r.right() <= plot.right() + 1e-3,
+                "{r:?}"
+            );
+        }
+        assert!(!c.unwrap().intersects(t.unwrap()));
+        // A flat shot: the apex just above the ground among both labels.
+        let points = [
+            Some(pos2(450.0, 190.0)),
+            Some(pos2(440.0, 200.0)),
+            Some(pos2(462.0, 200.0)),
+        ];
+        let [a, c, t] = place_marks(points, SIZES, plot);
+        let (a, c, t) = (a.unwrap(), c.unwrap(), t.unwrap());
+        assert!(!a.intersects(c) && !a.intersects(t));
+        assert!(a.bottom() <= c.top().min(t.top()));
+        // A ground ball: the total alone.
+        let [a, c, t] = place_marks([None, None, Some(pos2(60.0, 200.0))], SIZES, plot);
+        assert!(a.is_none() && c.is_none());
+        assert!(t.unwrap().left() >= plot.left());
+    }
+
+    #[test]
+    fn the_plot_keeps_room_above_the_apex_for_its_label() {
+        // A nice domain already roomy enough is kept.
+        assert_eq!(headroom(120.0, Some(88.0), 172.0), 120.0);
+        assert_eq!(headroom(120.0, None, 172.0), 120.0);
+        // An apex near the top raises it just enough.
+        for plot_h in [136.0_f32, 172.0, 260.0] {
+            let top = 0.97 * 100.0;
+            let hi = headroom(100.0, Some(top), plot_h);
+            let room = f64::from(plot_h) * (1.0 - top / hi);
+            assert!(room >= f64::from(MARK_ROOM) - 1e-6, "{plot_h}: {room}");
+        }
+        // In a scene: the gold apex sits MARK_ROOM under the top at least.
+        let (mut shots, g) = history();
+        shots[7].derived.as_mut().unwrap().path = Some(flight_path(140.0, 39.5, 150.0));
+        let m = members(&shots, &g, ShotGrouping::BySet, 7, None);
+        let scene = build_scene(&input(&shots, &g, &m, 7, &[], UnitSystem::Metric));
+        let (apex, _, _) = scene.marks.apex.as_ref().unwrap();
+        assert!(
+            apex.y - scene.plot.top() >= MARK_ROOM - 0.01,
+            "{apex:?} {:?}",
+            scene.plot
+        );
+        // The axis ticks keep their step.
+        let steps: Vec<f32> = scene.y_ticks.windows(2).map(|w| w[0].0 - w[1].0).collect();
+        assert!(steps.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01));
+        // A label's box is no taller than MARK_BOX_H, so the margin above
+        // the apex label is real.
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            for text in ["31 yd", "163", "Apex 104 ft"] {
+                let galley = painter.layout_no_wrap(
+                    text.to_owned(),
+                    egui::FontId::proportional(MARK_FONT),
+                    theme::GOLD,
+                );
+                let box_h = galley.size().y + 2.0 * MARK_PAD.y;
+                assert!(box_h <= MARK_BOX_H + 1e-3, "{text}: {box_h}");
+            }
+        });
     }
 }

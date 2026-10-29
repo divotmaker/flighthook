@@ -410,8 +410,10 @@ mod tests {
             shot_number: n,
             ball: Some(BallFlight::default()),
             club: None,
+            impact: None,
             derived: None,
             club_selected: None,
+            handed: None,
             group: None,
             finished: true,
         }

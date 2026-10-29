@@ -458,15 +458,11 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         .map(|v| (proj.x.map(v), format!("{:.0}", v.abs())))
         .collect();
 
-    let by_device = device.is_none() && devices.len() >= 2;
+    let by_device = chart::by_device(devices, device);
     let colour_of = |i: usize| {
-        if by_device {
-            shots
-                .get(i)
-                .map_or(theme::ACCENT, |s| chart::device_colour(devices, &s.actor))
-        } else {
-            theme::ACCENT
-        }
+        shots.get(i).map_or(theme::ACCENT, |s| {
+            chart::shot_colour(devices, device, &s.actor)
+        })
     };
     let to_screen = |s: Spot| proj.to_screen(s.lateral, s.down);
     let dot = |level: Level| {
@@ -1132,8 +1128,10 @@ mod tests {
             shot_number: n,
             ball: Some(BallFlight::default()),
             club: None,
+            impact: None,
             derived: Some(d),
             club_selected: Some(Club::Iron7),
+            handed: None,
             group: Some(group.into()),
             finished: true,
         }

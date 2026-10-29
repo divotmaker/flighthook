@@ -267,6 +267,17 @@ offers three views of them (By set unless the Global card's Default shot view sa
 more than one device, a device filter picks one device or splits the bars by
 device. The export carries each shot's set.
 
+When any shot in the history has a face impact reading (Square Golf Omni,
+Open Connect monitors that send it), a **face impact** panel (beta) sits beside the
+range bars: the club face of the shown shot's club, drawn as the ball sees
+it (toe on the left for a right-hander, mirrored for a left-hander), with
+the shown shot as a gold dot, the rest of its set or club as dots, their
+mean, and a readout such as `4 toe · 2 low` in millimetres. The **Table**
+has Impact H and Impact V columns in the same words. Directional cards show
+the size of the value with a word for its side: L / R, Draw / Fade,
+In-to-out / Out-to-in, Up / Down, Open / Closed, read for the golfer's
+hand.
+
 The dashboard loads the whole session the server keeps (the last 1000
 shots), so the views, range bars and charts cover all of it; **Table** lists
 every one of them, a row per shot.
@@ -285,7 +296,7 @@ screen without scrolling.
 The **Flight** chart (beta) draws the simulated ball flights side on, as
 smooth curves through the simulated path that keep each bounce's corner: the
 shown shot in gold with its apex,
-carry and total marked, the rest of its set (By set) or club (By club)
+carry and total labelled above their marks, the rest of its set (By set) or club (By club)
 bright, and the session's other shots faint behind them; None draws the
 shown shot alone. With two or more devices and the filter on All, the paths
 are coloured by device. A ground ball is drawn as its roll along the ground

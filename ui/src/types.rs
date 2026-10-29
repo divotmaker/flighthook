@@ -23,6 +23,7 @@ pub use flighthook::{
     // Config types
     Distance,
     DistanceExt,
+    FaceImpact,
     FlightPath,
     FlightScopeEnvironment,
     FlighthookConfig,
@@ -62,7 +63,8 @@ pub use flighthook::{
 // ---------------------------------------------------------------------------
 
 /// A shot row in the UI grid. Created on `ShotTrigger` with just the key,
-/// then populated as `BallFlight` and `ClubPath` events arrive.
+/// then populated as `BallFlight`, `ClubPath` and `FaceImpact` events
+/// arrive.
 #[derive(Debug, Clone)]
 pub struct ShotRow {
     pub actor: String,
@@ -70,10 +72,14 @@ pub struct ShotRow {
     pub shot_number: u32,
     pub ball: Option<BallFlight>,
     pub club: Option<ClubData>,
+    /// Where the ball met the club face (golfer-relative, never mirrored).
+    pub impact: Option<FaceImpact>,
     /// Simulated values for fields the device did not report (beta).
     pub derived: Option<DerivedFlight>,
     /// Club in play when the shot was triggered.
     pub club_selected: Option<Club>,
+    /// Player handedness when the shot was triggered.
+    pub handed: Option<Handedness>,
     /// Id of the shot group the shot joined (`ShotGroupInfo::id`).
     pub group: Option<String>,
     /// The shot's `shot_finished` arrived. Always true for a row loaded
@@ -84,7 +90,8 @@ pub struct ShotRow {
 impl ShotRow {
     /// Convert all distance and velocity fields to the given unit system.
     pub fn to_unit_system(&self, system: UnitSystem) -> ShotRow {
-        // Delegate to ShotData conversion for the populated fields
+        // Delegate to ShotData conversion for the populated fields. Face
+        // impact is millimetres in every unit system and is kept as it is.
         let tmp = ShotData {
             ball: self.ball.clone(),
             club: self.club.clone(),
@@ -98,8 +105,10 @@ impl ShotRow {
             shot_number: self.shot_number,
             ball: converted.ball,
             club: converted.club,
+            impact: self.impact.clone(),
             derived: converted.derived,
             club_selected: self.club_selected,
+            handed: self.handed,
             group: self.group.clone(),
             finished: self.finished,
         }
@@ -114,8 +123,10 @@ impl From<ShotData> for ShotRow {
             shot_number: shot.shot_number,
             ball: shot.ball,
             club: shot.club,
+            impact: shot.impact,
             derived: shot.derived,
             club_selected: shot.club_selected,
+            handed: shot.handed,
             group: shot.group,
             finished: true,
         }

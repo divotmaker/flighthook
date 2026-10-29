@@ -243,6 +243,7 @@ produced no data for (no ball, club or impact) are kept for the
     "shot_id": "550e8400-e29b-41d4-a716-446655440000",
     "club_selected": "7I",
     "group": "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
+    "handed": "rh",
     "ball": {
       "launch_speed": "67.2mps",
       "launch_azimuth": -1.3,
@@ -337,9 +338,13 @@ With `?units=imperial`:
   was selected.
 - `group`: id of the [set](#get-apishotsgroups) the shot joined. Every shot
   with data has one, whatever the default view (`shot_grouping`).
+- `handed`: the player's handedness (`"rh"` | `"lh"`) when the shot was
+  triggered; absent when unknown. Face impact is the same for either hand;
+  a face-on drawing of it puts a right-hander's toe on the left and a
+  left-hander's on the right.
 
-`POST /api/shots/convert` passes `shot_id`, `club_selected` and `group`
-through unchanged.
+`POST /api/shots/convert` passes `shot_id`, `club_selected`, `group` and
+`handed` through unchanged.
 
 #### Shot metrics
 
@@ -582,6 +587,7 @@ device produced no data for are included: their `data` has no `ball`, `club`,
     "shot_id": "550e8400-e29b-41d4-a716-446655440000",
     "club_selected": "8I",
     "group": "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
+    "handed": "rh",
     "ball": { "launch_speed": "37.9mps", "launch_azimuth": -3.1, "launch_elevation": 23.9, "carry_distance": "95.2m", "backspin_rpm": 6897, "sidespin_rpm": 0 },
     "club": { "club_speed": "31.2mps", "path": 1.1, "attack_angle": -9.8, "face_angle": 0.4 }
   },
@@ -620,7 +626,7 @@ device produced no data for are included: their `data` has no `ball`, `club`,
 - `data`: exactly the `/api/shots` element for this shot (`ShotData`),
   including `metrics`.
   `data.shot_id`, `data.club_selected` and `data.group`, when set, equal the
-  top-level fields.
+  top-level fields, and `data.handed` equals `settings.handed`.
 - `raw`: `ShotRaw` (see [shot_finished](#shot_finished)).
 
 **CSV**: one header row, one row per shot, RFC 4180 quoting, empty cell for a
