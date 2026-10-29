@@ -7,8 +7,8 @@
 use std::sync::{Arc, Mutex};
 
 use crate::types::{
-    self, Club, FlighthookConfig, FlighthookMessage, GameStateSnapshot, PostSettingsResponse,
-    ShotData, ShotGrouping, ShotGroupsResponse, StatusResponse,
+    self, AutoChipRequest, Club, FlighthookConfig, FlighthookMessage, GameStateSnapshot,
+    PostSettingsResponse, ShotData, ShotGrouping, ShotGroupsResponse, StatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,6 +32,8 @@ pub struct Pending {
     /// A New set or New session sent over REST has been answered: the sets
     /// are fetched again.
     pub groups_posted: bool,
+    /// The reply to a `POST /api/auto-chip`: sent, or why not.
+    pub auto_chip: Option<Result<(), String>>,
 }
 
 pub type PendingHandle = Arc<Mutex<Pending>>;
@@ -217,20 +219,60 @@ pub(crate) fn save_reply(
 ) -> Result<PostSettingsResponse, String> {
     let resp = result?;
     if !resp.ok {
-        let json_error = serde_json::from_slice::<serde_json::Value>(&resp.bytes)
-            .ok()
-            .and_then(|v| v.get("error")?.as_str().map(str::to_owned));
-        let text = json_error
-            .or_else(|| resp.text().map(|t| t.trim().to_owned()))
-            .filter(|t| !t.is_empty())
-            .map(|t| t.chars().take(SAVE_ERROR_MAX_CHARS).collect::<String>());
-        return Err(match text {
-            Some(text) => format!("{} {}", resp.status, text),
-            None => format!("{} {}", resp.status, resp.status_text),
-        });
+        return Err(error_reason(&resp));
     }
     serde_json::from_slice::<PostSettingsResponse>(&resp.bytes)
         .map_err(|_| "unexpected reply from the server".to_owned())
+}
+
+/// A short reason for a non-2xx reply: the status and its JSON `error`, else
+/// its text, else the status text.
+fn error_reason(resp: &ehttp::Response) -> String {
+    let json_error = serde_json::from_slice::<serde_json::Value>(&resp.bytes)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(str::to_owned));
+    let text = json_error
+        .or_else(|| resp.text().map(|t| t.trim().to_owned()))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().take(SAVE_ERROR_MAX_CHARS).collect::<String>());
+    match text {
+        Some(text) => format!("{} {}", resp.status, text),
+        None => format!("{} {}", resp.status, resp.status_text),
+    }
+}
+
+/// A `POST /api/auto-chip` reply as sent (`Ok`) or not (`Err` with a short
+/// reason: a network error or a non-2xx status).
+pub(crate) fn auto_chip_reply(result: Result<ehttp::Response, String>) -> Result<(), String> {
+    let resp = result?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(error_reason(&resp))
+    }
+}
+
+/// The `POST /api/auto-chip` request for a chip of `yards`.
+pub(crate) fn auto_chip_request(yards: u32) -> ehttp::Request {
+    let url = format!("{}/api/auto-chip", api_base());
+    let body = serde_json::to_vec(&AutoChipRequest { yards }).unwrap_or_default();
+    ehttp::Request {
+        headers: ehttp::Headers::new(&[("Accept", "*/*"), ("Content-Type", "application/json")]),
+        ..ehttp::Request::post(&url, body)
+    }
+}
+
+/// Send an Auto-chip of `yards` (`POST /api/auto-chip`); the reply lands in
+/// `auto_chip`.
+pub fn post_auto_chip(ctx: &egui::Context, pending: &PendingHandle, yards: u32) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    ehttp::fetch(auto_chip_request(yards), move |result| {
+        if let Ok(mut p) = pending.lock() {
+            p.auto_chip = Some(auto_chip_reply(result));
+        }
+        ctx.request_repaint();
+    });
 }
 
 pub fn post_mode(ctx: &egui::Context, mode: &str) {
@@ -467,5 +509,45 @@ mod tests {
         let long = "x".repeat(500);
         let reply = save_reply(Ok(response(500, "Internal Server Error", &long)));
         assert_eq!(reply.err().map(|e| e.len()), Some("500 ".len() + 120));
+    }
+
+    #[test]
+    fn an_auto_chip_posts_its_yards_as_json() {
+        for yards in [1, 3, 5] {
+            let req = auto_chip_request(yards);
+            assert_eq!(req.method, "POST");
+            assert!(req.url.ends_with("/api/auto-chip"), "{}", req.url);
+            assert_eq!(
+                req.headers.get("Content-Type"),
+                Some("application/json"),
+                "{:?}",
+                req.headers
+            );
+            let body: AutoChipRequest = serde_json::from_slice(&req.body).expect("json");
+            assert_eq!(body, AutoChipRequest { yards });
+        }
+    }
+
+    #[test]
+    fn an_auto_chip_reply_fails_on_a_network_error_or_a_non_2xx_status() {
+        assert_eq!(
+            auto_chip_reply(Ok(response(200, "OK", r#"{"shot_number":1}"#))),
+            Ok(())
+        );
+        assert_eq!(
+            auto_chip_reply(Err("Failed to fetch".into())),
+            Err("Failed to fetch".to_owned())
+        );
+        assert_eq!(
+            auto_chip_reply(Ok(response(
+                409,
+                "Conflict",
+                r#"{"error":"simulation environment invalid: temperature 99 C is outside -30 to 50 C"}"#,
+            ))),
+            Err(
+                "409 simulation environment invalid: temperature 99 C is outside -30 to 50 C"
+                    .to_owned()
+            )
+        );
     }
 }

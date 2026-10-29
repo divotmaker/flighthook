@@ -85,24 +85,30 @@ pub(crate) fn telemetry_body(ui: &mut egui::Ui, id: &str, actor: &ActorStatusRes
 }
 
 impl FlighthookApp {
+    /// One banner per actor reporting an `error`, then one for a failed
+    /// Auto-chip.
     pub(crate) fn render_error_banner(&self, ui: &mut egui::Ui) {
         for actor in self.actors.values() {
             if let Some(err) = actor.telemetry.get("error").filter(|e| !e.is_empty()) {
-                egui::Frame::new()
-                    .fill(theme::DANGER.gamma_multiply(0.22))
-                    .stroke(egui::Stroke::new(1.0, theme::DANGER))
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::symmetric(12, 8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            egui::RichText::new(format!("{}: {err}", actor.name))
-                                .color(theme::TEXT)
-                                .strong(),
-                        );
-                    });
-                ui.add_space(8.0);
+                error_banner(ui, &format!("{}: {err}", actor.name));
             }
         }
+        if let Some(err) = &self.auto_chip_error {
+            error_banner(ui, &format!("{}: {err}", flighthook::AUTO_CHIP_NAME));
+        }
     }
+}
+
+/// A full-width red banner with `text`.
+fn error_banner(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::new()
+        .fill(theme::DANGER.gamma_multiply(0.22))
+        .stroke(egui::Stroke::new(1.0, theme::DANGER))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(text).color(theme::TEXT).strong());
+        });
+    ui.add_space(8.0);
 }

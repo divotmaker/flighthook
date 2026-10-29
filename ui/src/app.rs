@@ -46,6 +46,11 @@ pub struct FlighthookApp {
     /// A club picked over REST that no `/api/status` reply has carried yet.
     pub(crate) club_pick: Option<Club>,
     pub(crate) club_picker_open: bool,
+    /// The Auto-chip distance (yards) sent and not answered yet.
+    pub(crate) auto_chip_in_flight: Option<u32>,
+    /// Why the last Auto-chip was not sent, shown in the error banner until
+    /// the next one.
+    pub(crate) auto_chip_error: Option<String>,
     /// Player handedness in game state (`None` until the server reports
     /// one). Stamped on shots as they trigger, like the club.
     pub(crate) handed: Option<Handedness>,
@@ -164,6 +169,8 @@ impl FlighthookApp {
             selected_club: None,
             club_pick: None,
             club_picker_open: false,
+            auto_chip_in_flight: None,
+            auto_chip_error: None,
             handed: None,
             groups: ShotGroups::default(),
             groups_out_of_step: false,
@@ -263,6 +270,11 @@ impl FlighthookApp {
 
         if std::mem::take(&mut p.groups_posted) {
             self.needs_groups_refresh = true;
+        }
+
+        if let Some(reply) = p.auto_chip.take() {
+            self.auto_chip_in_flight = None;
+            self.auto_chip_error = reply.err();
         }
 
         // Unsaved edits survive a reload; one the server already holds

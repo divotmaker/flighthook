@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::{dispersion, impact, signs};
+use super::{devices, dispersion, impact, signs};
 use crate::app::FlighthookApp;
 use crate::chart::{self, MembersKey};
 use crate::groups::{
@@ -23,7 +23,7 @@ fn opt_f(v: Option<f64>, prec: usize) -> String {
 }
 
 /// Hover text on every simulated cell.
-const SIMULATED_HINT: &str = "Simulated, not measured by the device";
+const SIMULATED_HINT: &str = "Simulated or estimated by flighthook, not measured by the device";
 
 /// Hover text on the JSONL export link.
 const EXPORT_HINT: &str = "Every shot this session (the last 1000), including shots the device \
@@ -32,6 +32,31 @@ const EXPORT_HINT: &str = "Every shot this session (the last 1000), including sh
 
 /// Hover text on the Clear history icon.
 const CLEAR_HINT: &str = "Clear history";
+
+/// Hover text on the Auto-chip button.
+const AUTO_CHIP_HINT: &str =
+    "Send a short straight chip to the sim, for chips your launch monitor can't read.";
+
+/// The Auto-chip menu's items, in order: label and total distance (yards).
+fn auto_chip_items() -> [(String, u32); 3] {
+    flighthook::AUTO_CHIP_YARDS.map(|yards| (format!("{yards} Yard"), yards))
+}
+
+/// Why the Auto-chip button is disabled, or `None` when it is enabled: a
+/// chip is on its way, or no output that forwards shots (an Open Connect
+/// client) is connected.
+fn auto_chip_blocked(
+    actors: &HashMap<String, ActorStatusResponse>,
+    in_flight: Option<u32>,
+) -> Option<&'static str> {
+    if in_flight.is_some() {
+        Some("Sending the chip\u{2026}")
+    } else if !crate::app::club_set_by_simulator(actors) {
+        Some("Auto-chip: no simulator connected. Connect an OpenConnect Client output first.")
+    } else {
+        None
+    }
+}
 
 /// Width of the Clear history confirmation's text.
 const CLEAR_CONFIRM_WIDTH: f32 = 440.0;
@@ -129,6 +154,14 @@ pub(super) fn pick<T>(measured: Option<T>, derived: Option<T>) -> Option<(T, boo
         .or_else(|| measured.map(|v| (v, false)))
 }
 
+/// A ball's spin `rpm` (backspin or sidespin) like a value picked by
+/// [`pick`]: shown as simulated when flighthook estimated it
+/// ([`DerivedFlight::spin_estimated`]). The value itself is always the
+/// ball's.
+fn spin(rpm: Option<i32>, d: &DerivedFlight) -> Option<(f64, bool)> {
+    rpm.map(|v| (f64::from(v), d.spin_estimated))
+}
+
 /// Render a value picked by [`pick`]: a measured value plainly, a simulated
 /// one in italics, else "-". `signed` prints an explicit `+` (offlines,
 /// roll).
@@ -168,14 +201,6 @@ fn smash(reported: Option<f64>, ball: Option<Velocity>, club: Option<Velocity>) 
         let (ball, club) = (ball?.as_mph(), club?.as_mph());
         (club > 0.0).then(|| ball / club)
     })
-}
-
-/// Format an optional i32, or "-" if None.
-fn opt_i(v: Option<i32>) -> String {
-    match v {
-        Some(v) => format!("{v}"),
-        None => "-".into(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +695,6 @@ fn card_metrics(
     let club: &ClubData = shot.club.as_ref().unwrap_or(&no_club);
     let d: &DerivedFlight = shot.derived.as_ref().unwrap_or(&no_derived);
     let v = |x: Option<Distance>| x.map(|x| x.value());
-    let rpm = |x: Option<i32>| x.map(f64::from);
     let measured = |x: Option<f64>| x.map(|x| (x, false));
 
     let headline = vec![
@@ -690,7 +714,7 @@ fn card_metrics(
             false,
         ),
         Metric::measured("Launch", "\u{b0}", ball.launch_elevation, 1),
-        Metric::measured("Backspin", "rpm", rpm(ball.backspin_rpm), 0),
+        Metric::new("Backspin", "rpm", spin(ball.backspin_rpm, d), 0, false),
     ];
     let groups = [
         (
@@ -703,13 +727,9 @@ fn card_metrics(
                     1,
                     signs::side,
                 ),
-                Metric::worded(
-                    "Sidespin",
-                    "rpm",
-                    measured(rpm(ball.sidespin_rpm)),
-                    0,
-                    |v| signs::sidespin(v, handed),
-                ),
+                Metric::worded("Sidespin", "rpm", spin(ball.sidespin_rpm, d), 0, |v| {
+                    signs::sidespin(v, handed)
+                }),
             ],
         ),
         (
@@ -1792,7 +1812,8 @@ const BAR_COL_GAP: f32 = 14.0;
 const TRACK_H: f32 = 14.0;
 /// Least height of a device's sub-band in the track.
 const SUB_BAND_MIN_H: f32 = 2.0;
-/// Room at both ends of a track, outside the domain.
+/// Room at both ends of a track, outside the domain, for the labels beside
+/// a band that reaches its ends.
 const GUTTER: f32 = 36.0;
 /// Narrowest range band; a single value draws a pip this wide. Wide enough
 /// that the pip still peeks out past the median ring when every marker lands
@@ -2086,8 +2107,9 @@ fn shot_count(n: usize) -> String {
 /// Title and colour of the range bar section in `view`, around the set
 /// `set`, over `members` of `shots`; `session` is the current session.
 ///
-/// - By set: the set's header. Its count is the set's own unless a device
-///   filter (`filtered`) narrows it to the members.
+/// - By set: the set's header. Its count is the set's own without its
+///   Auto-chip shots ([`chart::set_shot_count`]) unless a device filter
+///   (`filtered`) narrows it to the members.
 /// - By club: the club's section header, counted over the members.
 ///
 /// `None` when there is no set to show, which shows a note instead, and in
@@ -2131,15 +2153,13 @@ fn bars_title(
                 (false, true) => theme::ACCENT,
                 (false, false) => theme::TEXT_MUTED,
             };
-            let title = if filtered && !next {
-                let narrowed = ShotGroupInfo {
-                    shots: u32::try_from(with_data.len()).unwrap_or(u32::MAX),
-                    ..g.clone()
-                };
-                set_title(&narrowed, next)
+            let shots = if filtered {
+                u32::try_from(with_data.len()).unwrap_or(u32::MAX)
             } else {
-                set_title(g, next)
+                chart::set_shot_count(g, shots)
             };
+            let counted = ShotGroupInfo { shots, ..g.clone() };
+            let title = set_title(&counted, next);
             Some((title, color))
         }
     }
@@ -2394,21 +2414,6 @@ fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
     let radius = egui::CornerRadius::same((TRACK_H / 2.0) as u8);
     painter.rect_filled(track, radius, theme::VEIL);
     let plot = egui::Rangef::new(track.left() + GUTTER, track.right() - GUTTER);
-    let small =
-        |text: String, color| painter.layout_no_wrap(text, FontId::proportional(10.0), color);
-    // Gutter labels: the domain's ends, or L and R for lateral. Each is
-    // dropped when a value numeral needs its room.
-    let mut gutter = Vec::new();
-    if let Some(domain) = bar.domain {
-        let (lo, hi) = match bar.kind {
-            BarKind::Lateral => ("L".to_owned(), "R".to_owned()),
-            k => (k.format(domain.0, 0), k.format(domain.1, 0)),
-        };
-        gutter.push((small(lo, theme::TEXT_DIM), track.left() + GUTTER / 2.0));
-        gutter.push((small(hi, theme::TEXT_DIM), track.right() - GUTTER / 2.0));
-    }
-
-    let mut numerals: Vec<egui::Rect> = Vec::new();
     if let (Some(s), Some(domain)) = (&bar.stats, bar.domain) {
         let band = band_x(domain, plot, s.min, s.max);
         let paint_band = |x: egui::Rangef, y: egui::Rangef, colour: egui::Color32| {
@@ -2448,15 +2453,10 @@ fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
         let y = |g: &std::sync::Arc<egui::Galley>| track.center().y - g.size().y / 2.0;
         let after = numeral(bar.kind.format(s.max, 0));
         let x = (band.max + 6.0).min(track.right() - after.size().x - 4.0);
-        numerals.push(egui::Rect::from_min_size(pos2(x, y(&after)), after.size()));
         painter.galley(pos2(x, y(&after)), after, theme::TEXT_MUTED);
         if s.count > 1 {
             let before = numeral(bar.kind.format(s.min, 0));
             let x = (band.min - 6.0 - before.size().x).max(track.left() + 4.0);
-            numerals.push(egui::Rect::from_min_size(
-                pos2(x, y(&before)),
-                before.size(),
-            ));
             painter.galley(pos2(x, y(&before)), before, theme::TEXT_MUTED);
         }
 
@@ -2492,12 +2492,6 @@ fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
                 [pos2(shot, top), pos2(shot, bottom)],
                 Stroke::new(1.5, theme::GOLD),
             );
-        }
-    }
-    for (galley, centre) in gutter {
-        let rect = egui::Rect::from_center_size(pos2(centre, track.center().y), galley.size());
-        if numerals.iter().all(|n| !n.expand(2.0).intersects(rect)) {
-            painter.galley(rect.min, galley, theme::TEXT_DIM);
         }
     }
     ui.interact(
@@ -3257,6 +3251,10 @@ impl FlighthookApp {
                 Some(_) => self.units_toggle = UnitSystem::Metric,
                 None => {}
             }
+            ui.add_space(12.0);
+            if let Some(yards) = self.render_auto_chip(ui) {
+                self.send_auto_chip(ui.ctx(), yards);
+            }
             if self.shots_view.shows_simulated_legend() {
                 ui.add_space(12.0);
                 ui.label(
@@ -3266,7 +3264,8 @@ impl FlighthookApp {
                         .size(12.0),
                 )
                 .on_hover_text(
-                    "Values simulated from the measured launch, not measured by the device. \
+                    "Values simulated from the measured launch, or spin estimated by \
+                     flighthook, not measured by the device. \
                      Offline is + right of the target line.",
                 );
             }
@@ -3290,6 +3289,38 @@ impl FlighthookApp {
         if self.confirm_clear {
             self.render_clear_confirm(ui.ctx());
         }
+    }
+
+    /// The Auto-chip button and its menu ([`auto_chip_items`]). Returns the
+    /// distance picked this frame.
+    fn render_auto_chip(&self, ui: &mut egui::Ui) -> Option<u32> {
+        let blocked = auto_chip_blocked(&self.actors, self.auto_chip_in_flight);
+        let button = theme::menu_chip(ui, "Auto-chip", blocked.is_none(), egui::vec2(0.0, 26.0));
+        devices::mark(ui, || "auto-chip".to_owned(), &button);
+        let button = button.on_hover_text(blocked.unwrap_or(AUTO_CHIP_HINT));
+        let mut picked = None;
+        egui::Popup::menu(&button).show(|ui| {
+            for (label, yards) in auto_chip_items() {
+                let item = ui.button(label.as_str());
+                devices::mark(ui, || format!("auto-chip:{label}"), &item);
+                if item.clicked() {
+                    picked = Some(yards);
+                }
+            }
+        });
+        picked
+    }
+
+    /// Send an Auto-chip of `yards`: the button waits for the reply, and a
+    /// failure shows in the error banner.
+    pub(crate) fn send_auto_chip(&mut self, ctx: &egui::Context, yards: u32) {
+        self.auto_chip_error = None;
+        self.auto_chip_in_flight = Some(yards);
+        // The UI tests pick from the menu with no server behind them.
+        #[cfg(not(test))]
+        net::post_auto_chip(ctx, &self.pending, yards);
+        #[cfg(test)]
+        let _ = ctx;
     }
 
     /// The Clear history confirmation, over everything. Delete sends the
@@ -3646,6 +3677,11 @@ impl FlighthookApp {
         let Some(group) = self.groups.get(id) else {
             return;
         };
+        // Counted without its Auto-chip shots, which still list under it.
+        let counted = ShotGroupInfo {
+            shots: chart::set_shot_count(group, &self.shots),
+            ..group.clone()
+        };
         let color = match (next, group.open) {
             (true, _) => theme::GOLD,
             (false, true) => theme::ACCENT,
@@ -3656,7 +3692,7 @@ impl FlighthookApp {
             list_header(
                 ui.painter(),
                 rect,
-                &set_title(group, next),
+                &set_title(&counted, next),
                 time.as_deref(),
                 color,
             );
@@ -3685,8 +3721,13 @@ impl FlighthookApp {
             .iter_sets()
             .filter(|g| g.session == session && g.club == club)
             .collect();
-        let counted = sets.iter().filter(|g| g.shots > 0).count();
-        let shots: u32 = sets.iter().map(|g| g.shots).sum();
+        // Counted without Auto-chip shots, which still list in the section.
+        let per_set: Vec<u32> = sets
+            .iter()
+            .map(|g| chart::set_shot_count(g, &self.shots))
+            .collect();
+        let counted = per_set.iter().filter(|&&n| n > 0).count();
+        let shots: u32 = per_set.iter().sum();
         let earlier = session < self.groups.session();
         let tally = (!next).then_some((counted, shots as usize));
         let color = match (next, earlier) {
@@ -4156,6 +4197,8 @@ enum TableCell {
     /// A value picked by [`pick`] (italics when simulated), with an explicit
     /// sign when `signed`.
     Picked(Option<(f64, bool)>, bool),
+    /// A spin in rpm from [`spin`] (italics when estimated).
+    Spin(Option<(f64, bool)>),
 }
 
 impl TableCell {
@@ -4179,6 +4222,7 @@ impl TableCell {
                 });
             }
             Self::Picked(value, signed) => cell(ui, *value, 1, *signed),
+            Self::Spin(value) => cell(ui, *value, 0, false),
         }
     }
 }
@@ -4193,7 +4237,7 @@ fn table_cells(
     set: Option<u32>,
     latest: bool,
 ) -> Vec<TableCell> {
-    use TableCell::{Muted, Number, Picked, Text};
+    use TableCell::{Muted, Number, Picked, Spin, Text};
 
     let mut cells = Vec::with_capacity(TABLE_COLUMNS + 1);
     if let Some(device) = device {
@@ -4224,8 +4268,8 @@ fn table_cells(
             Picked(pick(v(f.roll_distance), v(d.roll_distance)), true),
             Picked(pick(v(f.total_distance), v(d.total_distance)), false),
             Picked(pick(v(f.total_offline), v(d.total_offline)), true),
-            Text(opt_i(f.backspin_rpm)),
-            Text(opt_i(f.sidespin_rpm)),
+            Spin(spin(f.backspin_rpm, d)),
+            Spin(spin(f.sidespin_rpm, d)),
         ]),
         None => cells.extend((0..BALL_COLUMNS).map(|_| Text("-".to_owned()))),
     }
@@ -5575,6 +5619,53 @@ mod tests {
     }
 
     #[test]
+    fn bars_label_only_the_band_ends() {
+        use egui::{Pos2, Rect, vec2};
+
+        // Totals 163..181, carries 153..171: the shared domain is 143..191
+        // (10 yd of padding), lateral -10.04..4.9 (domain +-12.05).
+        let rows = vec![
+            device_shot(1, "mevo.0", "a", 163.0, -10.04),
+            device_shot(2, "mevo.0", "a", 181.0, 4.9),
+        ];
+        let bars = bars_for(&rows, &[0, 1], Some(1), &[], true);
+        assert_eq!(bars[0].domain, Some((143.0, 191.0)));
+        let title = ("Set 1 \u{b7} 7I \u{b7} 2 shots".to_owned(), theme::ACCENT);
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let width = 1000.0;
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 900.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new())
+                    .show(ctx, |ui| {
+                        let legend = legend_place(ui.painter(), width, Some(&title.0), &[]);
+                        let at =
+                            cards_layout(vec2(width, 760.0), 5, &[2, 4, 6], Some(legend), false);
+                        let at = at.bars.expect("bars");
+                        range_bars(ui, &at, Some(&title), &bars, &[], "");
+                    });
+            },
+        );
+        let texts: Vec<String> = painted_texts(&out.shapes)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        // The band ends are labelled ...
+        for label in ["163", "181", "153", "171", "10.0 L", "4.9 R"] {
+            assert!(texts.iter().any(|t| t == label), "{label} in {texts:?}");
+        }
+        // ... and the track ends carry no axis extent or direction letters.
+        for label in ["143", "191", "L", "R"] {
+            assert!(!texts.iter().any(|t| t == label), "{label} in {texts:?}");
+        }
+    }
+
+    #[test]
     fn bars_legend_wraps_below_a_title_it_would_overlap() {
         use egui::{Pos2, Rect, vec2};
 
@@ -6333,6 +6424,111 @@ mod tests {
         );
     }
 
+    /// A launch-only chip whose spin flighthook estimated, simulated from
+    /// it: 15.7 mph, 1570 rpm backspin, no sidespin, a simulated carry.
+    fn estimated_spin_chip(n: u32) -> ShotRow {
+        let mut derived = DerivedFlight::default();
+        derived.carry_distance = Some(Distance::Yards(3.9));
+        derived.spin_estimated = true;
+        ShotRow {
+            ball: Some(BallFlight {
+                launch_speed: Some(Velocity::MilesPerHour(15.7)),
+                launch_elevation: Some(22.8),
+                launch_azimuth: Some(-0.9),
+                backspin_rpm: Some(1570),
+                sidespin_rpm: Some(0),
+                ..Default::default()
+            }),
+            derived: Some(derived),
+            ..row(n, true)
+        }
+    }
+
+    #[test]
+    fn estimated_spin_styles_as_simulated_on_the_cards_and_in_the_table() {
+        use TableCell::Spin;
+
+        let columns = table_columns(false, true);
+        let name = |n: &str| columns.iter().position(|c| c.name == n).expect(n);
+
+        let chip = estimated_spin_chip(1);
+        assert_eq!(card_text(&chip, "Backspin"), ("1570".into(), true));
+        assert_eq!(card_text(&chip, "Sidespin"), ("0".into(), true));
+        let cells = table_cells(&chip, None, None, false);
+        assert_eq!(cells[name("Back")], Spin(Some((1570.0, true))));
+        assert_eq!(cells[name("Side")], Spin(Some((0.0, true))));
+
+        // The device's spin, simulated shot or not: plain.
+        let measured = thousand_rows().remove(4);
+        let mut unsimulated = measured.clone();
+        unsimulated.derived = None;
+        for shot in [&measured, &unsimulated] {
+            assert_eq!(card_text(shot, "Backspin"), ("6200".into(), false));
+            assert_eq!(card_text(shot, "Sidespin"), ("300".into(), false));
+            let cells = table_cells(shot, None, None, false);
+            assert_eq!(cells[name("Back")], Spin(Some((6200.0, false))));
+            assert_eq!(cells[name("Side")], Spin(Some((-300.0, false))));
+        }
+        // No spin reading: missing, as before.
+        let mut none = measured.clone();
+        none.ball.as_mut().unwrap().backspin_rpm = None;
+        assert!(card_metrics(&none, true, Handedness::Right).0[4].source == Source::Missing);
+        assert_eq!(
+            table_cells(&none, None, None, false)[name("Back")],
+            Spin(None)
+        );
+    }
+
+    /// The painted Cards view tags the estimated spin `SIM`, and the
+    /// painted Table view sets it in italics.
+    #[test]
+    fn estimated_spin_is_painted_as_simulated() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let window = egui::vec2(1600.0, 900.0);
+        let paint = |app: &mut FlighthookApp| {
+            let mut out = shots_frame(&ctx, app, window);
+            for _ in 0..3 {
+                out = shots_frame(&ctx, app, window);
+            }
+            painted_texts(&out.shapes)
+        };
+        let sim_tags = |texts: &[(String, bool)]| texts.iter().filter(|(t, _)| t == "SIM").count();
+
+        // The latest shot (the one the cards show) becomes the chip, with
+        // and without the flag.
+        let app = |spin_estimated: bool| {
+            let mut app = cards_app();
+            let chip = estimated_spin_chip(0);
+            let latest = app.shots.last_mut().expect("shots");
+            latest.ball = chip.ball;
+            latest.derived = chip.derived;
+            latest.derived.as_mut().expect("derived").spin_estimated = spin_estimated;
+            app
+        };
+        let (mut flagged, mut unflagged) = (app(true), app(false));
+
+        // Backspin and Sidespin add a tag each; Carry is simulated in both.
+        let with = paint(&mut flagged);
+        let without = paint(&mut unflagged);
+        assert!(with.iter().any(|(t, _)| t == "1570"), "{with:?}");
+        assert_eq!(sim_tags(&with), sim_tags(&without) + 2);
+
+        flagged.shots_view = ShotsView::Table;
+        unflagged.shots_view = ShotsView::Table;
+        let with = paint(&mut flagged);
+        let without = paint(&mut unflagged);
+        assert!(with.iter().any(|(t, i)| t == "1570" && *i), "{with:?}");
+        assert!(
+            without.iter().any(|(t, i)| t == "1570" && !*i),
+            "{without:?}"
+        );
+        assert!(!without.iter().any(|(t, i)| t == "1570" && *i));
+        // The measured rows' spin stays upright.
+        assert!(with.iter().any(|(t, i)| t == "6200" && !*i));
+        assert!(!with.iter().any(|(t, i)| t == "6200" && *i));
+    }
+
     #[test]
     fn simulated_legend_only_in_table() {
         assert!(ShotsView::Table.shows_simulated_legend());
@@ -6648,6 +6844,138 @@ mod tests {
         assert_eq!(device_options(&chart::device_ids(&rows), &actors), None);
     }
 
+    /// 8 seven-iron shots, and the same 8 with an Auto-chip hit among them
+    /// (the server counts it in the set: 9 shots).
+    fn irons_with_and_without_a_chip() -> (Vec<ShotRow>, ShotGroups, Vec<ShotRow>, ShotGroups) {
+        let i7 = |n: u32| ShotRow {
+            club_selected: Some(Club::Iron7),
+            ..device_shot(
+                n,
+                "mevo.0",
+                "a",
+                150.0 + 4.0 * f64::from(n),
+                f64::from(n % 3) * 3.0 - 3.0,
+            )
+        };
+        let irons: Vec<ShotRow> = (1..=8).map(i7).collect();
+        let mut with_chip = irons.clone();
+        with_chip.insert(
+            4,
+            ShotRow {
+                club_selected: Some(Club::Iron7),
+                ..device_shot(50, flighthook::AUTO_CHIP_ACTOR, "a", 3.0, 0.0)
+            },
+        );
+        let g = |shots| {
+            groups(
+                ShotGrouping::BySet,
+                vec![group("a", 1, Club::Iron7, true, shots)],
+            )
+        };
+        (irons, g(8), with_chip, g(9))
+    }
+
+    /// A set of 8 iron shots plus 1 Auto-chip has the same range bars,
+    /// title and device filter as the 8 alone, in either view, whether an
+    /// iron or the chip is shown; a shown chip gets no "this shot" mark.
+    #[test]
+    fn an_auto_chip_leaves_the_set_stats_unchanged() {
+        let (irons, g8, with_chip, g9) = irons_with_and_without_a_chip();
+        let actors = HashMap::new();
+        let summary = |rows: &[ShotRow], g: &ShotGroups, view, shown: usize| {
+            let set = bar_group(g, Some(&rows[shown]), Some(Club::Iron7));
+            let m = chart::members_for(rows, g, view, set, Some(shown), None);
+            let devices = chart::device_ids(rows);
+            let bars = bars_for(rows, &m, Some(shown), &devices, true);
+            let stats: Vec<_> = bars.iter().map(|b| (b.stats, b.values.rows)).collect();
+            let texts: Vec<_> = bars.iter().map(bar_stats_text).collect();
+            let this: Vec<_> = bars.iter().map(|b| b.this).collect();
+            let title = bars_title(view, set, g.session(), rows, &m, false).map(|t| t.0);
+            (stats, texts, title, device_options(&devices, &actors), this)
+        };
+        for view in [ShotGrouping::BySet, ShotGrouping::ByClub] {
+            let alone = summary(&irons, &g8, view, 7);
+            assert_eq!(alone.0[0].0.map(|s| s.count), Some(8), "{view:?}");
+            assert_eq!(alone.3, None, "one device: no filter");
+            assert_eq!(summary(&with_chip, &g9, view, 8), alone, "{view:?}");
+            // The chip shown: same set, same stats, no mark.
+            let chip = summary(&with_chip, &g9, view, 4);
+            assert_eq!(chip.0, alone.0, "{view:?}");
+            assert_eq!((&chip.1, &chip.2, &chip.3), (&alone.1, &alone.2, &alone.3));
+            assert_eq!(chip.4, vec![None; 3], "{view:?}");
+        }
+        assert_eq!(
+            summary(&with_chip, &g9, ShotGrouping::BySet, 8)
+                .2
+                .as_deref(),
+            Some("Set 1 \u{b7} 7I \u{b7} 8 shots")
+        );
+        assert_eq!(
+            summary(&with_chip, &g9, ShotGrouping::ByClub, 8)
+                .2
+                .as_deref(),
+            Some("7 Iron \u{b7} 8 shots")
+        );
+        // With a second device, the filter lists it but not Auto-chip.
+        let mut two = with_chip.clone();
+        two[0].actor = "square.0".into();
+        assert_eq!(
+            device_options(&chart::device_ids(&two), &actors),
+            Some(vec!["All".into(), "mevo.0".into(), "square.0".into()])
+        );
+    }
+
+    /// Painted, the Cards view of that set shows the same range bars, set
+    /// header and shot count with the chip as without it, and no device
+    /// filter; the chip is still in the shot list.
+    #[test]
+    fn an_auto_chip_leaves_the_painted_set_stats_unchanged() {
+        let (irons, g8, with_chip, g9) = irons_with_and_without_a_chip();
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let window = egui::vec2(1600.0, 900.0);
+        let paint = |shots: Vec<ShotRow>, g: ShotGroups| {
+            let mut app = FlighthookApp::with_pending(crate::net::new_pending());
+            app.shots = shots;
+            app.groups = g;
+            app.shots_rev = 1;
+            app.shots_view = ShotsView::Cards;
+            let mut out = shots_frame(&ctx, &mut app, window);
+            for _ in 0..3 {
+                out = shots_frame(&ctx, &mut app, window);
+            }
+            painted_texts(&out.shapes)
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect::<Vec<String>>()
+        };
+        let stat_texts = |texts: &[String]| -> Vec<String> {
+            texts
+                .iter()
+                .filter(|t| {
+                    t.starts_with("avg ")
+                        || t.starts_with("sd ")
+                        || t.to_uppercase().contains("SHOT")
+                })
+                .cloned()
+                .collect()
+        };
+        let alone = paint(irons, g8);
+        let chip = paint(with_chip, g9);
+        let stats = stat_texts(&alone);
+        assert!(stats.iter().any(|t| t.starts_with("avg ")), "{alone:?}");
+        assert!(
+            stats.iter().any(|t| t.to_uppercase().contains("8 SHOTS")),
+            "{alone:?}"
+        );
+        assert_eq!(stat_texts(&chip), stats);
+        assert!(!chip.iter().any(|t| t == "All"), "no device filter");
+        assert!(
+            chip.iter().any(|t| t == flighthook::AUTO_CHIP_NAME),
+            "the chip is listed: {chip:?}"
+        );
+    }
+
     #[test]
     fn the_view_sets_the_bars_and_titles_them() {
         let i7 = |n, g: &str, total| ShotRow {
@@ -6825,6 +7153,112 @@ mod tests {
         app.shots.clear();
         frame(&mut app, Vec::new());
         assert!(!app.confirm_clear);
+    }
+
+    /// The Auto-chip button opens a menu of 1, 3 and 5 Yard, in that order;
+    /// picking one sends that chip and holds the button until the reply. It
+    /// is disabled while no simulator is connected.
+    #[test]
+    fn auto_chip_menu_lists_three_distances_and_sends_the_pick() {
+        use super::devices::Marks;
+        use egui::{Event, Modifiers, PointerButton, Pos2, Rect, vec2};
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut app = FlighthookApp::with_pending(crate::net::new_pending());
+        let frame = |app: &mut FlighthookApp, events: Vec<Event>| -> Marks {
+            ctx.data_mut(|d| d.remove::<Marks>(egui::Id::NULL));
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| app.render_shots_toolbar(ui));
+            });
+            ctx.data(|d| d.get_temp::<Marks>(egui::Id::NULL))
+                .unwrap_or_default()
+        };
+        let click = |app: &mut FlighthookApp, at: Pos2| -> Marks {
+            let button = |pressed| Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            frame(app, vec![Event::PointerMoved(at)]);
+            frame(app, vec![button(true)]);
+            frame(app, vec![button(false)]);
+            frame(app, Vec::new())
+        };
+        let items = |marks: &Marks| -> Vec<(String, f32)> {
+            let mut items: Vec<(String, f32)> = marks
+                .iter()
+                .filter_map(|(k, (rect, _))| {
+                    k.strip_prefix("auto-chip:")
+                        .map(|l| (l.to_owned(), rect.top()))
+                })
+                .collect();
+            items.sort_by(|a, b| a.1.total_cmp(&b.1));
+            items
+        };
+
+        // No simulator connected: disabled, and a click opens nothing.
+        let button = frame(&mut app, Vec::new())["auto-chip"].0;
+        assert!(items(&click(&mut app, button.center())).is_empty());
+        assert_eq!(app.auto_chip_in_flight, None);
+
+        // GSPro connected: the menu opens with the three distances in order.
+        app.actors.insert(
+            "openconnect_client.0".into(),
+            ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Connected),
+        );
+        let marks = click(&mut app, button.center());
+        let labels: Vec<String> = items(&marks).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(labels, ["1 Yard", "3 Yard", "5 Yard"]);
+
+        // Picking 3 Yard sends it and closes the menu.
+        let three = marks["auto-chip:3 Yard"].0.center();
+        let marks = click(&mut app, three);
+        assert_eq!(app.auto_chip_in_flight, Some(3));
+        assert!(items(&marks).is_empty(), "menu closed");
+        let marks = click(&mut app, button.center());
+        assert!(items(&marks).is_empty(), "held until the reply");
+
+        // A failed reply frees the button and shows in the error banner.
+        app.pending.lock().expect("pending").auto_chip = Some(Err("409 no".into()));
+        app.apply_pending();
+        assert_eq!(app.auto_chip_in_flight, None);
+        assert_eq!(app.auto_chip_error.as_deref(), Some("409 no"));
+        let marks = click(&mut app, button.center());
+        assert_eq!(items(&marks).len(), 3, "free again");
+
+        // The next pick clears it; a good reply leaves it clear.
+        app.send_auto_chip(&ctx, 1);
+        assert_eq!(app.auto_chip_error, None);
+        assert_eq!(app.auto_chip_in_flight, Some(1));
+        app.pending.lock().expect("pending").auto_chip = Some(Ok(()));
+        app.apply_pending();
+        assert_eq!((app.auto_chip_in_flight, app.auto_chip_error), (None, None));
+    }
+
+    #[test]
+    fn auto_chip_hover_says_why_it_is_disabled() {
+        let mut actors = HashMap::new();
+        assert!(auto_chip_blocked(&actors, None).is_some_and(|w| w.contains("no simulator")));
+        actors.insert(
+            "openconnect_client.0".into(),
+            ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Reconnecting),
+        );
+        assert!(auto_chip_blocked(&actors, None).is_some());
+        actors.insert(
+            "openconnect_client.1".into(),
+            ActorStatusResponse::new("Muni Golf", crate::types::ActorStatus::Connected),
+        );
+        assert_eq!(auto_chip_blocked(&actors, None), None);
+        assert!(auto_chip_blocked(&actors, Some(5)).is_some_and(|w| w.starts_with("Sending")));
     }
 
     /// 1000 simulated shots from two devices, each with every table field.

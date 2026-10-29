@@ -3,6 +3,6 @@
 //! All types live in the `flighthook` lib so the UI crate can share them.
 
 pub use flighthook::{
-    ClubRequest, GroupingRequest, ModeRequest, PostSettingsResponse, ShotGroupsResponse,
-    StatusResponse,
+    AutoChipRequest, AutoChipResponse, ClubRequest, GroupingRequest, ModeRequest,
+    PostSettingsResponse, ShotGroupsResponse, StatusResponse,
 };

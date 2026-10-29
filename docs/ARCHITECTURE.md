@@ -69,6 +69,18 @@ address = "127.0.0.1:921"
   while flighthook is still in Full mode gets `e8`'s speed-scaled value. Read
   on every shot, so a change applies without a restart; omitted from the
   config at the default
+- `launch_only_spin` is per-mevo (rpm per mph, default `100`, `0` = off,
+  valid `0..=MevoSection::MAX_LAUNCH_ONLY_SPIN` (1000); a value outside that
+  in the file is treated as `0` with a warning at actor start, and
+  `POST /api/settings` rejects one with `400`) -- for a D4 with launch data
+  but no spin and no flight (carry, apex and flight time all absent),
+  launched at 5° or more (`launch_only`), `estimate_launch_only_spin` runs
+  after the Xi spin source: when the setting is above 0, the mode is not
+  Putting and the spin is still 0/0, it sets backspin to `launch_only_spin` ×
+  ball speed (mph), sidespin 0, and unsets carry, apex and flight time before
+  the simulation runs. Otherwise the D4 keeps its zeros and is a ground ball.
+  Read on every shot, so a change applies without a restart; omitted from
+  the config at the default
 - R10 sections show name and Monitor-to-Ball (`range`, sent to the device as
   its tee distance; BLE auto-discovery, no address field)
 - Mock sections show only name (no address or radar fields)
@@ -145,7 +157,7 @@ pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub te
 pub enum SimMode { Off, On, Force }                 // default On
 pub enum SimSurface { Fairway, Green, FirmGreen }
 pub struct WebserverSection { pub name: String, pub bind: String }
-pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool>, pub camera_mode: Option<CameraMode>, pub environment: Option<FlightScopeEnvironment>, pub spin_source: SpinSource }
+pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool>, pub camera_mode: Option<CameraMode>, pub environment: Option<FlightScopeEnvironment>, pub spin_source: SpinSource, pub launch_only_spin: f64 }
 pub enum CameraMode { Standard, Fusion, RawFusion }
 pub enum FlightScopeEnvironment { LimitedFlight, Outdoor }
 pub enum SpinSource { D4, E8, Auto }
@@ -330,6 +342,10 @@ results stay on the wire, in `/api/shots` and in the export. The flag is per
 shot, set from the settings in effect when the shot was simulated; a shot
 that can't be simulated gets no `derived` and shows the device's values.
 Launch values (speed, angles, spin, club data) are never replaced.
+`DerivedFlight::spin_estimated` marks the spin in `ball` as flighthook's
+estimate (the mevo actor's launch-only chips); the actor sets it after the
+simulation, on a `derived` that holds only the flag when the shot was not
+simulated, so `derive` never sees it.
 
 The simulation runs in `app/src/sim.rs` with the
 [dimple](https://crates.io/crates/dimple) crate, an app-only dependency (the
@@ -859,7 +875,9 @@ also handles `ConfigOutcome` events to refresh actor name caches.
 All components are identified by type-prefixed global IDs: `mevo.0`, `r10.0`,
 `openconnect_client.0`, `mock_monitor.0`, `random_club.0`, `webserver.0`, `ws.a1b2c3d4`. The `system`
 actor has a fixed ID of `"system"`. The type prefix encodes the component type;
-the index is the key within that type's config section.
+the index is the key within that type's config section. `autochip` is the
+one id with no index and no config section: the virtual source of Auto-chip
+shots (`POST /api/auto-chip`).
 
 `FlighthookMessage.actor` carries the global ID of the message originator.
 Inner event types carry no ID or name fields; identity lives on the
@@ -1297,7 +1315,7 @@ values immediately.
 ## Shots Tab
 
 ```
-  VIEW [Cards|Table]  UNITS [Imperial|Metric]               EXPORT SESSION JSONL CSV [trash]
+  VIEW [Cards|Table]  UNITS [Imperial|Metric]  (Auto-chip v)  EXPORT SESSION JSONL CSV [trash]
 
   Layout: the charts are always shown, sized from the window (not resizable)
 
@@ -1362,8 +1380,8 @@ values immediately.
   +--------------------------------------------+
 ```
 
-A toolbar (view toggle, units, export links and Clear history) sits above
-both views. Only
+A toolbar (view toggle, units, the Auto-chip menu, export links and Clear
+history) sits above both views. Only
 Table adds the "italic = simulated" legend, since only Table draws simulated
 values in italics (`ShotsView::shows_simulated_legend`). The chosen view
 (`ShotsView` in `panels/shots.rs`) lasts for the session and is not saved.
@@ -1474,6 +1492,43 @@ dashboard that sees `clear_shot_history` on the WebSocket clears at once
 the shown shot, the device filter, the caches and an open confirmation. The
 Shots tab then shows its empty state.
 
+**Auto-chip** (beta) is a menu chip (`theme::menu_chip`: a `chip_button`
+with a drawn chevron) after the units toggle. Its menu (`egui::Popup::menu`)
+lists `1 Yard`, `3 Yard`, `5 Yard` (`flighthook::AUTO_CHIP_YARDS`); a pick
+sends `POST /api/auto-chip` (`net::post_auto_chip`). The button is disabled,
+with the reason on hover, while no `openconnect_client.*` actor is Connected
+(`app::club_set_by_simulator`) and while a chip is waiting for its reply
+(`auto_chip_in_flight`). A failed reply shows in the error banner above the
+tabs (`Auto-chip: <status> <error>`) until the next pick.
+
+On the server (`app/src/autochip.rs`), `solve_speed` bisects the ball speed
+(0.1-60 mph, to 1e-4 mph) at which dimple, with the `[simulation]`
+environment and surface and `BallModel::TOUR`, rests at the chosen total
+for a straight 28° launch with backspin `round(DEFAULT_LAUNCH_ONLY_SPIN ×
+mph)` and no sidespin; the total rises with speed. `send` emits
+`ShotTrigger`, `sim::simulated_ball_flight_event(.., Some(Chipping))`
+(simulated whatever `[simulation] mode`, `off` included) and `ShotFinished`
+as actor `autochip` (`flighthook::AUTO_CHIP_ACTOR`), keyed by a fresh UUID
+and the next `WebState::auto_chip_shots`, from `spawn_blocking`; the counter
+moves only once the solve has succeeded. `shot_context` stamps an Auto-chip's
+`detection_mode` Chipping, whatever the game mode. The UI labels the actor
+`Auto-chip` (`chart::device_label`); it has no config section and sends no
+status, so it gets no Devices card. The Open Connect client's routing check
+(`shot_matches_routing`) takes `autochip` shots in every mode whatever
+monitor is routed: the chip stands in for a read the routed monitor missed.
+The client's `Relay::next_shot` sends `max(shot_number, last sent + 1)` as
+the `ShotNumber`, so device and Auto-chip numbers never repeat.
+
+The server sets count an Auto-chip like any shot. The UI keeps it out of
+every statistic through one predicate, `chart::is_auto_chip`: it is never a
+view member (`chart::members_for`), so the range bars, face panel,
+dispersion ellipse and flight set overlay leave it out; it is not in
+`chart::device_ids`, so it has no device filter option, band or colour; and
+list and range-bar headers count a set as `chart::set_shot_count` (the
+set's `shots` less its Auto-chip rows). It stays in the shot list under its
+set, in the Table and on the Cards; shown, it is the charts' gold shot
+(`flight::drawn_sets`) but not part of the ellipse.
+
 The UI loads the shots with `GET /api/shots?limit=1000` (`net::SHOTS_LIMIT`,
 the server's whole history) and the sets with `GET /api/shots/groups`, on
 connect and whenever the sets fall out of step. Each fetch is tagged with
@@ -1536,9 +1591,9 @@ own) that sticks out past the track, top and bottom. A value shared by
 every marker therefore reads as a white ring filled with a gold dot, with a
 gold line through it poking out above and below. Total and Carry share one
 domain, the set's extent padded by 15 % of its range and at least 10 yd (9 m) a side,
-so roll reads as the offset between the bands; the domain's ends are printed
-dimly at the track ends. Lateral is symmetric about the target line (a tick
-at 0; L and R at the ends) out to 1.2× the widest value, and at least ±6
+so roll reads as the offset between the bands; the track's ends carry no
+numbers (only the band's own min and max are labelled). Lateral is symmetric
+about the target line (a tick at 0) out to 1.2× the widest value, and at least ±6
 units. A single shot draws a 16 px pip, wide enough that it still peeks out
 past the ring and dot. Total and Carry are picked like the cards' values
 (below), and the stats run over the picked values;
@@ -1753,7 +1808,9 @@ The word starts at the unit's size and shrinks (to 9 pt) to fit its card;
 only when that is not enough does that card's numeral shrink. The Table
 keeps signed numbers. A table cell shows the simulated
 value in italics with the same hover, else the measured one plainly, else a
-dash. Derived wins when both are present: the server sets a field in both
+dash. Backspin and Sidespin (card and column) always show the `ball` value,
+styled as simulated (`SIM` tag, italics) when `derived.spin_estimated` is
+set. Derived wins when both are present: the server sets a field in both
 only when the simulated value is the one to show (a `force` shot's
 `replaces_measured`, a measured 0 carry or flight time on a shot that flies,
 a ground ball's 0 carry, apex and flight time). One helper, `pick` in

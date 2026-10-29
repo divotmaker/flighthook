@@ -320,7 +320,9 @@ With `?units=imperial`:
 ```
 
 - `ball`: `BallFlight` or `null`. Launch conditions and distances, exactly as
-  the device measured them. All fields are `Option`.
+  the device measured them, except on a shot flagged `derived.spin_estimated`:
+  its spin is flighthook's estimate, and the device's 0 carry, apex and flight
+  time are left out. All fields are `Option`.
   Velocity fields are unit-tagged strings (`"67.2mps"`, `"150.3mph"`).
   Distance fields are unit-tagged strings (`"180.5m"`, `"197.4yd"`).
 - `derived`: `DerivedFlight` or absent. Values simulated for fields the device
@@ -535,6 +537,69 @@ simulator (e.g. GSPro) is the club authority while it runs.
 
 ---
 
+### POST /api/auto-chip
+
+Send an Auto-chip (beta): a short, straight chip of a chosen total distance,
+for chips the launch monitor can't read.
+
+**Request**:
+
+```json
+{ "yards": 3 }
+```
+
+- `yards`: the chip's total distance (carry + roll) in yards: `1`, `3` or
+  `5`.
+
+**Response**: `200 OK` with the shot that was sent:
+
+```json
+{
+  "actor": "autochip",
+  "shot_id": "0b8f1c52-7a0e-4d61-9a43-5f2f2b7c9e10",
+  "shot_number": 1,
+  "ball_speed_mph": 7.809,
+  "launch_elevation": 28.0,
+  "backspin_rpm": 781
+}
+```
+
+`400 Bad Request` with a JSON `{"error": "yards must be one of 1, 3, 5"}`
+body for any other distance. `409 Conflict` with a JSON `{"error"}` body when
+the `[simulation]` altitude or temperature is out of range. A body that is not
+`{"yards": <non-negative integer>}` is `422 Unprocessable Entity`, and a
+missing `Content-Type: application/json` `415 Unsupported Media Type`.
+
+The chip is launched with `launch_azimuth` 0, `launch_elevation` 28°,
+`backspin_rpm` = round(100 × ball speed in mph) and `sidespin_rpm` 0, and no
+club data. Its ball speed is the one at which flighthook's simulation, with
+the `[simulation]` altitude, temperature and surface, comes to rest at
+`yards` (within 0.1 yd), whatever the simulation `mode`. On the default
+settings that is about 4.4 mph for 1 yd, 7.8 mph for 3 yd and 10.4 mph for
+5 yd. The simulator runs its own physics on the launch, so the distance it
+shows depends on its own ground (e.g. its green speed).
+
+The shot goes on the bus as actor `autochip` (no `device`), numbered from 1
+in this run of flighthook (a request that fails takes no number), with the
+shot lifecycle a launch monitor emits: [`shot_trigger`](#shot_trigger),
+[`ball_flight`](#ball_flight) with `derived` simulated as for a shot in
+chipping mode (also with `[simulation] mode = "off"`: the simulated carry and
+total are the chip's only results), and [`shot_finished`](#shot_finished)
+(its `raw` has `transport` `"none"`). So it appears in
+[`GET /api/shots`](#get-apishots), the shot sets and the
+[export](#get-apishotsexport) (device kind `autochip`, `settings.detection_mode`
+`"chipping"`), and every
+OpenConnect client sends it to its simulator: Auto-chip shots are taken
+whatever monitor `full_monitor`, `chipping_monitor` and `putting_monitor`
+route to.
+
+An Auto-chip joins the set in play like any shot, and counts in that set's
+`shots`. The dashboard lists it under that set but leaves it out of the
+set's shot count and of every set or club statistic (range bars, dispersion,
+the flight chart's set), and it is not a device of the device filter.
+
+---
+
 ### GET /api/shots/export
 
 Download the session's shots for sharing or analysis: JSONL with the raw
@@ -622,7 +687,8 @@ device produced no data for are included: their `data` has no `ball`, `club`,
   `bind` and unset fields removed. `settings.simulation`: the `[simulation]`
   section, with the same shape as in [GET /api/settings](#get-apisettings)
   (`mode` present unless `"on"`). `data.derived.replaces_measured` marks a
-  shot whose simulated results replace the device's.
+  shot whose simulated results replace the device's, and
+  `data.derived.spin_estimated` one whose spin flighthook estimated.
 - `data`: exactly the `/api/shots` element for this shot (`ShotData`),
   including `metrics`.
   `data.shot_id`, `data.club_selected` and `data.group`, when set, equal the
@@ -639,7 +705,9 @@ the shot has no data). Unprefixed columns are the device's measured values
 `metrics_*` columns the [shot metrics](#shot-metrics). With `[simulation]
 mode = "force"`, a shot can have both a device column (`carry_*`) and its
 `sim_*` column filled; the CSV does not say which one takes precedence (the
-JSONL's `data.derived.replaces_measured` does). Read columns by header name:
+JSONL's `data.derived.replaces_measured` does). `spin_estimated` is `true`
+when `backspin_rpm` and `sidespin_rpm` are flighthook's estimate
+(`derived.spin_estimated`), else empty. Read columns by header name:
 columns are added over time.
 
 ```
@@ -656,7 +724,7 @@ dynamic_loft_deg,smash_factor,swing_plane_horizontal_deg,swing_plane_vertical_de
 club_offset_in,club_height_in,spin_loft_deg,low_point_distance_in,
 impact_lateral_mm,impact_vertical_mm,
 metrics_total_spin_rpm,metrics_spin_axis_deg,metrics_face_to_path_deg,
-metrics_spin_loft_deg,metrics_curve_yd
+metrics_spin_loft_deg,metrics_curve_yd,spin_estimated
 ```
 
 (One line in the file; wrapped here.)
@@ -872,6 +940,17 @@ Full persisted config (mirrors `config.toml`).
   is still in Full mode gets `e8`'s speed-scaled value. See
   [Spin on the Xi](devices/flightscope.md#spin-on-the-xi). Omitted while at the
   default. Changes apply from the next shot without restarting the actor
+- `launch_only_spin` on Mevo sections is the backspin, in rpm per mph of ball
+  speed, given to a full result with launch data but no spin and no flight
+  (very short chips on the Xi), with sidespin 0. Default `100`, from `0` to
+  `1000`; `0` turns it off, and such a shot is then sent as the device
+  reported it (spin 0, carry, apex and flight time 0, rolled as a ground
+  ball), as it also is in Putting mode. A save with a value below 0, above
+  1000 or not finite is rejected with `400`; one outside that range in the
+  config file is treated as `0`. See
+  [Launch-only chips](devices/flightscope.md#launch-only-chips-beta). Omitted
+  while at the default. Changes apply from the next shot without restarting
+  the actor
 - `dot_bottom_to_face_centre_mm` on Square sections overrides allsquare's built-in
   per-club face impact calibration (distance from the bottom edge of the
   sticker's dot down to face centre, in mm). Keyed the same way `club` is. Omitted when no
@@ -887,7 +966,11 @@ Full persisted config (mirrors `config.toml`).
   `127.0.0.1:921`), a simulator that accepts GSPro Open Connect V1 — GSPro on
   921, Muni Golf on 9210 — and sends it every shot. `full_monitor`,
   `chipping_monitor` and `putting_monitor` take a launch monitor's actor ID
-  and accept shots in that mode from it alone; absent accepts any monitor
+  and accept shots in that mode from it alone; absent accepts any monitor.
+  [Auto-chip](#post-apiauto-chip) shots are accepted whatever they name.
+  Each shot's `ShotNumber` is its `shot_number`, raised when needed to one
+  more than the last one the client sent, so the numbers a simulator gets
+  always increase, across devices, Auto-chip shots and device reconnects
 - `gspro` sections are also accepted when posting and read as
   `openconnect_client` sections with the same index; when both name an index,
   the `openconnect_client` one is used. Responses carry only
@@ -946,6 +1029,7 @@ as applied.
 |---|---|
 | `400 Bad Request` | `scope` is not `global` and not a known actor ID |
 | `400 Bad Request` | the save removes the web server (`"the web server can't be removed"`) or adds a second one (`"flighthook runs one web server; edit the existing one"`) |
+| `400 Bad Request` | a Mevo section it writes has a `launch_only_spin` below 0, above 1000 or not finite (`"mevo.0: launch_only_spin must be 0 to 1000 rpm per mph, not -5"`) |
 | `504 Gateway Timeout` | SystemActor did not answer within 10 s |
 
 A body that is not a valid `FlighthookConfig` is rejected by the JSON
@@ -1175,7 +1259,15 @@ the measured ones, which stay unchanged under `ball`. FRP consumers ignore
 `derived` as an unknown field. It is absent when `[simulation] mode` is
 `"off"` or when the launch can't be simulated — including a shot with no
 spin reading (back and side both 0) — see the README's "Simulated values"
-section for the rules. It is never sent to GSPro.
+section for the rules, except that a shot whose spin flighthook estimated
+always has one: `"derived": {"spin_estimated": true}` when it was not
+simulated. It is never sent to GSPro.
+
+`"spin_estimated": true` marks the spin under `ball` (`backspin_rpm`,
+`sidespin_rpm`) as flighthook's estimate rather than the device's reading:
+a FlightScope result with launch data but no spin
+([Launch-only chips](devices/flightscope.md#launch-only-chips-beta)). The
+spin stays under `ball` and is sent to GSPro like a measured one.
 
 A ground ball is rolled, not flown: a shot whose measured apex is 0, or,
 from a device that reports no apex, whose launch angle is at most 0.5°,
@@ -1224,6 +1316,7 @@ A launch-monitor-only device such as the Square Golf Omni gets the full set:
 | `total_offline` | Distance | Rest position right (+) or left (−) of the target line |
 | `path` | FlightPath | Simulated ball path, tee to rest (see below) |
 | `replaces_measured` | bool | `true` when these values replace the device's results (`[simulation] mode` was `"force"` when the shot was simulated): every result field is simulated and takes precedence over `ball`. Omitted when false |
+| `spin_estimated` | bool | `true` when `ball.backspin_rpm` and `ball.sidespin_rpm` are flighthook's estimate, not measured. Set with or without the simulation. Omitted when false |
 
 Every field is optional. Offline values are absolute: + is right of the target
 line for every golfer, as in `launch_azimuth`. Where the device measures carry

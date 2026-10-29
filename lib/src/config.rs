@@ -603,6 +603,56 @@ pub struct MevoSection {
     /// default.
     #[serde(default, skip_serializing_if = "SpinSource::is_d4")]
     pub spin_source: SpinSource,
+    /// Backspin to use, in rpm per mph of ball speed, for a shot whose result
+    /// has launch data but no spin and no flight (very short chips on the
+    /// Xi). Sidespin is 0. `0` turns it off: such a shot keeps its 0 carry,
+    /// apex and flight time and is rolled as a ground ball. Not used in
+    /// Putting mode. Defaults to [`MevoSection::DEFAULT_LAUNCH_ONLY_SPIN`],
+    /// and is left out of the config file at the default. A value outside
+    /// 0 to [`MevoSection::MAX_LAUNCH_ONLY_SPIN`] (or non-finite) is treated
+    /// as `0`.
+    #[serde(
+        default = "default_launch_only_spin",
+        skip_serializing_if = "is_default_launch_only_spin"
+    )]
+    pub launch_only_spin: f64,
+}
+
+fn default_launch_only_spin() -> f64 {
+    MevoSection::DEFAULT_LAUNCH_ONLY_SPIN
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_default_launch_only_spin(v: &f64) -> bool {
+    *v == MevoSection::DEFAULT_LAUNCH_ONLY_SPIN
+}
+
+impl MevoSection {
+    /// Default `launch_only_spin`, rpm per mph: about 1500 rpm for a 15 mph
+    /// chip.
+    pub const DEFAULT_LAUNCH_ONLY_SPIN: f64 = 100.0;
+
+    /// Highest acceptable `launch_only_spin`, rpm per mph.
+    pub const MAX_LAUNCH_ONLY_SPIN: f64 = 1000.0;
+
+    /// Whether `v` is an acceptable `launch_only_spin`: finite, from 0 to
+    /// [`MevoSection::MAX_LAUNCH_ONLY_SPIN`].
+    #[must_use]
+    pub fn launch_only_spin_valid(v: f64) -> bool {
+        v.is_finite() && (0.0..=Self::MAX_LAUNCH_ONLY_SPIN).contains(&v)
+    }
+
+    /// The `launch_only_spin` in effect, rpm per mph: the configured value
+    /// when it is valid ([`MevoSection::launch_only_spin_valid`]), else `0`
+    /// (off).
+    #[must_use]
+    pub fn launch_only_spin_rpm_per_mph(&self) -> f64 {
+        if Self::launch_only_spin_valid(self.launch_only_spin) {
+            self.launch_only_spin
+        } else {
+            0.0
+        }
+    }
 }
 
 /// A Garmin R10 BLE device instance.
@@ -801,6 +851,7 @@ impl Default for MevoSection {
             camera_mode: None,
             environment: None,
             spin_source: SpinSource::D4,
+            launch_only_spin: Self::DEFAULT_LAUNCH_ONLY_SPIN,
         }
     }
 }
@@ -961,6 +1012,65 @@ mod spin_source_tests {
                     .expect("parse");
             assert_eq!(back, s);
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_only_spin_tests {
+    use super::*;
+
+    #[test]
+    fn absent_launch_only_spin_defaults_to_100() {
+        let s: MevoSection = serde_json::from_str(r#"{"name":"Mevo"}"#).expect("parse");
+        assert_eq!(s.launch_only_spin, 100.0);
+        assert_eq!(s.launch_only_spin_rpm_per_mph(), 100.0);
+        assert_eq!(MevoSection::default().launch_only_spin, 100.0);
+    }
+
+    #[test]
+    fn default_launch_only_spin_is_not_written_back() {
+        let json = serde_json::to_string(&MevoSection::default()).expect("serialize");
+        assert!(!json.contains("launch_only_spin"), "{json}");
+        let s: MevoSection =
+            serde_json::from_str(r#"{"name":"Mevo","launch_only_spin":100}"#).expect("parse");
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(!json.contains("launch_only_spin"), "{json}");
+    }
+
+    #[test]
+    fn zero_and_other_values_round_trip() {
+        for v in [0.0, 80.0, 125.5] {
+            let json = format!(r#"{{"name":"Mevo","launch_only_spin":{v}}}"#);
+            let s: MevoSection = serde_json::from_str(&json).expect("parse");
+            assert_eq!(s.launch_only_spin, v);
+            let out = serde_json::to_string(&s).expect("serialize");
+            assert!(out.contains("launch_only_spin"), "{out}");
+            let back: MevoSection = serde_json::from_str(&out).expect("parse");
+            assert_eq!(back, s);
+            assert_eq!(back.launch_only_spin_rpm_per_mph(), v);
+        }
+    }
+
+    #[test]
+    fn negative_non_finite_or_above_1000_is_off() {
+        for v in [
+            -1.0,
+            1000.001,
+            1e12,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(!MevoSection::launch_only_spin_valid(v), "{v}");
+            let s = MevoSection {
+                launch_only_spin: v,
+                ..MevoSection::default()
+            };
+            assert_eq!(s.launch_only_spin_rpm_per_mph(), 0.0, "{v}");
+        }
+        assert!(MevoSection::launch_only_spin_valid(0.0));
+        assert!(MevoSection::launch_only_spin_valid(1000.0));
+        assert_eq!(MevoSection::MAX_LAUNCH_ONLY_SPIN, 1000.0);
     }
 }
 

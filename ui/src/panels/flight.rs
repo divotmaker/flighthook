@@ -158,7 +158,7 @@ fn drawable(shot: &ShotRow) -> bool {
 /// The shots a chart panel draws, as indices into the shot list.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Drawn {
-    /// The shown shot, when it is a member of the view.
+    /// The shown shot, when it is a member of the view or an Auto-chip.
     pub(super) gold: Option<usize>,
     /// The view's other members with something to draw, oldest first.
     pub(super) bright: Vec<usize>,
@@ -171,7 +171,9 @@ pub(super) struct Drawn {
 /// indices, after the device filter) around the shown shot `shown`. Faint
 /// shots are those from `device` (every device when `None`) whose set is in
 /// the current session. Bright and faint shots are those `drawable` accepts;
-/// the Flight panel's rule is [`drawable`].
+/// the Flight panel's rule is [`drawable`]. An Auto-chip
+/// ([`chart::is_auto_chip`]) is never a member: it is gold when it is the
+/// shown shot, and never bright or faint.
 pub(super) fn drawn_sets(
     shots: &[ShotRow],
     groups: &ShotGroups,
@@ -182,7 +184,10 @@ pub(super) fn drawn_sets(
     drawable: impl Fn(&ShotRow) -> bool,
 ) -> Drawn {
     let member = |i: usize| members.binary_search(&i).is_ok();
-    let gold = member(shown).then_some(shown);
+    let shown_chip = shots
+        .get(shown)
+        .is_some_and(|s| chart::is_auto_chip(&s.actor));
+    let gold = (member(shown) || shown_chip).then_some(shown);
     let bright = members
         .iter()
         .copied()
@@ -204,6 +209,7 @@ pub(super) fn drawn_sets(
                 i != shown
                     && !member(i)
                     && device.is_none_or(|d| r.actor == d)
+                    && !chart::is_auto_chip(&r.actor)
                     && in_session(r)
                     && drawable(r)
             })
@@ -1064,8 +1070,9 @@ impl FlighthookApp {
         let clicked = match hovered {
             Some(i) => {
                 let devices = self.devices();
-                let device = (devices.len() >= 2).then(|| {
-                    let id = self.shots[i].actor.as_str();
+                let id = self.shots[i].actor.as_str();
+                // An Auto-chip is always named: it is never one of the devices.
+                let device = (devices.len() >= 2 || chart::is_auto_chip(id)).then(|| {
                     let name = self.actors.get(id).map(|a| a.name.as_str());
                     chart::device_label(id, name)
                 });
@@ -1266,6 +1273,37 @@ pub(super) mod tests {
             .chain(ticks)
             .find(|(_, level)| *level == Level::Gold)
             .map(|(i, _)| i)
+    }
+
+    /// An Auto-chip is never bright or faint: it draws only when it is the
+    /// shown shot, in gold over the set's own members.
+    #[test]
+    fn an_auto_chip_draws_only_as_the_shown_shot() {
+        let (mut shots, g) = history();
+        let chip = |n, group| ShotRow {
+            actor: flighthook::AUTO_CHIP_ACTOR.into(),
+            ..shot(n, flighthook::AUTO_CHIP_ACTOR, group)
+        };
+        // One in set a (faint for set b), one in set b.
+        shots.insert(4, chip(40, "a"));
+        shots.insert(7, chip(70, "b"));
+        // Shown #8 of set b: the same bright and faint shots as without them.
+        let m = members(&shots, &g, ShotGrouping::BySet, 9, None);
+        assert_eq!(m, vec![6, 8, 9]);
+        let d = drawn_sets(&shots, &g, ShotGrouping::BySet, &m, 9, None, drawable);
+        assert_eq!(d.gold, Some(9));
+        assert_eq!(d.bright, vec![6, 8]);
+        assert_eq!(d.faint, vec![2, 3, 5]);
+        // Shown, the chip is gold; the set stays bright, the chip in set a
+        // stays out.
+        let m = members(&shots, &g, ShotGrouping::BySet, 7, None);
+        assert_eq!(m, vec![6, 8, 9]);
+        let d = drawn_sets(&shots, &g, ShotGrouping::BySet, &m, 7, None, drawable);
+        assert_eq!(d.gold, Some(7));
+        assert_eq!(d.bright, vec![6, 8, 9]);
+        assert_eq!(d.faint, vec![2, 3, 5]);
+        // The charts' devices leave it out.
+        assert_eq!(chart::device_ids(&shots), vec!["mevo.0", "square.0"]);
     }
 
     #[test]

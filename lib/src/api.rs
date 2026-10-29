@@ -131,6 +131,35 @@ pub struct ClubRequest {
     pub club: String,
 }
 
+/// Actor id of the Auto-chip source: shots sent with `POST /api/auto-chip`
+/// come from this id, a virtual device with no config section.
+pub const AUTO_CHIP_ACTOR: &str = "autochip";
+
+/// Display name of the Auto-chip source.
+pub const AUTO_CHIP_NAME: &str = "Auto-chip";
+
+/// The total distances, in yards, `POST /api/auto-chip` takes, in menu order.
+pub const AUTO_CHIP_YARDS: [u32; 3] = [1, 3, 5];
+
+/// POST /api/auto-chip request body: the chip's total distance in yards,
+/// one of [`AUTO_CHIP_YARDS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AutoChipRequest {
+    pub yards: u32,
+}
+
+/// POST /api/auto-chip response: the shot that was sent.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AutoChipResponse {
+    /// Always [`AUTO_CHIP_ACTOR`].
+    pub actor: String,
+    pub shot_id: String,
+    pub shot_number: u32,
+    pub ball_speed_mph: f64,
+    pub launch_elevation: f64,
+    pub backspin_rpm: i32,
+}
+
 /// POST /api/shots/grouping request body and response: the default view.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GroupingRequest {
@@ -207,6 +236,27 @@ mod tests {
         old.received(0);
         assert_eq!(old.state(), ConnectionState::Connected);
         assert_eq!(old.red_for_ms, 0);
+    }
+
+    #[test]
+    fn auto_chip_request_and_response() {
+        let r: AutoChipRequest = serde_json::from_str(r#"{"yards":3}"#).unwrap();
+        assert_eq!(r, AutoChipRequest { yards: 3 });
+        assert!(serde_json::from_str::<AutoChipRequest>(r#"{"yards":"3"}"#).is_err());
+        assert!(serde_json::from_str::<AutoChipRequest>(r#"{"yards":-1}"#).is_err());
+        assert_eq!(AUTO_CHIP_YARDS, [1, 3, 5]);
+        let resp = AutoChipResponse {
+            actor: AUTO_CHIP_ACTOR.into(),
+            shot_id: "id".into(),
+            shot_number: 2,
+            ball_speed_mph: 7.5,
+            launch_elevation: 28.0,
+            backspin_rpm: 750,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["actor"], "autochip");
+        assert_eq!(v["backspin_rpm"], 750);
+        assert_eq!(serde_json::from_value::<AutoChipResponse>(v).unwrap(), resp);
     }
 
     #[test]

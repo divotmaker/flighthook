@@ -8,7 +8,7 @@ pub mod ws;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -163,6 +163,8 @@ pub struct WebState {
     pub actor_id: String,
     pub ws_count: AtomicU64,
     pub request_count: AtomicU64,
+    /// Auto-chip shots sent so far: the last Auto-chip shot number.
+    pub auto_chip_shots: AtomicU32,
 }
 
 impl WebState {
@@ -328,6 +330,7 @@ async fn run(
         actor_id,
         ws_count: AtomicU64::new(0),
         request_count: AtomicU64::new(0),
+        auto_chip_shots: AtomicU32::new(0),
     });
 
     // Background task: keep web state current from the bus
@@ -372,6 +375,7 @@ async fn run(
         .route("/api/shots/grouping", post(routes::post_shot_grouping))
         .route("/api/club", post(routes::post_club))
         .route("/api/mode", post(routes::post_mode))
+        .route("/api/auto-chip", post(routes::post_auto_chip))
         .route(
             "/api/settings",
             get(routes::get_settings).post(routes::post_settings),
@@ -520,7 +524,12 @@ async fn shot_context(
         device,
         club_selected,
         handed: game.handed,
-        detection_mode: game.mode,
+        // An Auto-chip is simulated as a chip whatever the game mode.
+        detection_mode: if msg.actor == flighthook::AUTO_CHIP_ACTOR {
+            Some(ShotDetectionMode::Chipping)
+        } else {
+            game.mode
+        },
         device_section,
         simulation: config.simulation,
         scrub,
@@ -1159,6 +1168,7 @@ pub(crate) mod tests {
             actor_id: actor_id.into(),
             ws_count: AtomicU64::new(0),
             request_count: AtomicU64::new(0),
+            auto_chip_shots: AtomicU32::new(0),
         }
     }
 
@@ -1260,6 +1270,7 @@ pub(crate) mod tests {
                     camera_mode: None,
                     environment: None,
                     spin_source: flighthook::SpinSource::D4,
+                    launch_only_spin: MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
                 },
             );
         });

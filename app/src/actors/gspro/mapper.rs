@@ -296,4 +296,45 @@ pub(super) mod tests {
             assert!(json.contains(field), "ClubData missing {field} in {json}");
         }
     }
+
+    /// A launch-only chip with the estimated backspin goes out as that total
+    /// spin with axis 0 and no `CarryDistance`; a chip whose spin is 0 or
+    /// absent goes out with 0.
+    #[test]
+    fn launch_only_chip_sends_its_backspin_with_axis_zero() {
+        let chip = |back: Option<i32>, side: Option<i32>| ShotData {
+            actor: "mevo.0".into(),
+            shot_number: 3,
+            ball: Some(BallFlight {
+                launch_speed: Some(Velocity::MetersPerSecond(7.019)),
+                launch_elevation: Some(22.8),
+                launch_azimuth: Some(-0.856),
+                backspin_rpm: back,
+                sidespin_rpm: side,
+                ..BallFlight::default()
+            }),
+            ..ShotData::default()
+        };
+        for handed in [Handedness::Right, Handedness::Left] {
+            let b = map_shot(&chip(Some(1570), Some(0)), handed).ball_data;
+            assert_eq!(
+                (b.total_spin, b.back_spin, b.side_spin),
+                (1570.0, 1570.0, 0.0)
+            );
+            assert_eq!(b.spin_axis, 0.0);
+            assert_eq!(b.carry_distance, None);
+            for (back, side) in [(Some(0), Some(0)), (None, None)] {
+                let b = map_shot(&chip(back, side), handed).ball_data;
+                assert_eq!((b.total_spin, b.back_spin, b.side_spin), (0.0, 0.0, 0.0));
+                assert_eq!(b.spin_axis, 0.0);
+            }
+        }
+        let json = serde_json::to_string(&map_shot(&chip(Some(1570), Some(0)), Handedness::Right))
+            .expect("serialize");
+        assert!(
+            json.contains(r#""SpinAxis":0.0,"TotalSpin":1570.0,"BackSpin":1570.0,"SideSpin":0.0"#),
+            "{json}"
+        );
+        assert!(!json.contains("CarryDistance"), "{json}");
+    }
 }

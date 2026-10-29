@@ -95,9 +95,10 @@ const EXPORT_BULK: [u8; 3] = [TYPE_PRC_DATA, TYPE_CLUB_PRC, TYPE_SPEED_PROFILE];
 /// settings: the environment's detection mode and the radar parameters
 /// stored on the device.
 ///
-/// `spin_source` picks the Xi's spin. The run loop reads it from the live
-/// config on every shot; the field is the value at start, used if the
-/// section cannot be read.
+/// `spin_source` picks the Xi's spin, and `launch_only_spin` (rpm per mph,
+/// `0` = off) the backspin of a result with launch data but no spin and no
+/// flight. The run loop reads both from the live config on every shot; the
+/// fields are the values at start, used if the section cannot be read.
 pub struct MevoActor {
     pub addr: SocketAddr,
     pub initial_mode: ShotDetectionMode,
@@ -105,6 +106,7 @@ pub struct MevoActor {
     pub use_estimated: bool,
     pub camera_mode: CameraMode,
     pub spin_source: SpinSource,
+    pub launch_only_spin: f64,
 }
 
 impl Actor for MevoActor {
@@ -115,6 +117,7 @@ impl Actor for MevoActor {
         let use_estimated = self.use_estimated;
         let camera_mode = self.camera_mode;
         let spin_source = self.spin_source;
+        let launch_only_spin = self.launch_only_spin;
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
@@ -128,6 +131,7 @@ impl Actor for MevoActor {
                     use_estimated,
                     camera_mode,
                     spin_source,
+                    launch_only_spin,
                     sender,
                     receiver,
                 );
@@ -176,8 +180,8 @@ impl Actor for MevoActor {
             return ReconfigureOutcome::RestartRequired;
         }
 
-        // Spin source is read from the live config on every shot, so a
-        // change applies on the next shot without a restart.
+        // Spin source and launch-only spin are read from the live config on
+        // every shot, so a change applies on the next shot without a restart.
         ReconfigureOutcome::Applied
     }
 }
@@ -455,6 +459,9 @@ struct ShotContext<'a> {
     model: DeviceModel,
     /// Xi spin source when the live config has none for this actor.
     spin_source: SpinSource,
+    /// Launch-only spin (rpm per mph) when the live config has none for
+    /// this actor.
+    launch_only_spin: f64,
     result_raw: &'a RefCell<ResultRaw>,
 }
 
@@ -501,6 +508,12 @@ fn on_shot_datum(
                 }
                 spin_source = label;
             }
+            let rpm_per_mph =
+                live_launch_only_spin(state, sender.actor_id()).unwrap_or(ctx.launch_only_spin);
+            let estimated = estimate_launch_only_spin(&mut ball, &d4, rpm_per_mph, mode);
+            if estimated {
+                spin_source = "estimate";
+            }
             info!(
                 "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm spin={spin_source}",
                 key.shot_number,
@@ -511,12 +524,11 @@ fn on_shot_datum(
                 ball.backspin_rpm.unwrap_or(0),
                 ball.sidespin_rpm.unwrap_or(0),
             );
-            let msg = FlighthookMessage::new(sim::ball_flight_event_in_mode(
-                state,
-                key.clone(),
-                ball,
-                Some(mode),
-            ));
+            let mut event = sim::ball_flight_event_in_mode(state, key.clone(), ball, Some(mode));
+            if estimated {
+                mark_spin_estimated(&mut event);
+            }
+            let msg = FlighthookMessage::new(event);
             sender.send(stamp_device(msg, device_id));
             if let Some(club) = held_club {
                 send_club(sender, device_id, key, club);
@@ -694,6 +706,7 @@ fn run(
     use_estimated: bool,
     camera_mode: CameraMode,
     spin_source: SpinSource,
+    launch_only_spin: f64,
     sender: BusSender,
     mut receiver: BusReceiver,
 ) {
@@ -719,6 +732,7 @@ fn run(
             use_estimated,
             camera_mode,
             spin_source,
+            launch_only_spin,
             &sender,
             &mut receiver,
             &mut session_config,
@@ -782,6 +796,7 @@ fn connect_and_run(
     use_estimated: bool,
     camera_mode: CameraMode,
     initial_spin_source: SpinSource,
+    initial_launch_only_spin: f64,
     sender: &BusSender,
     receiver: &mut BusReceiver,
     session_config: &mut SessionConfig,
@@ -1083,6 +1098,7 @@ fn connect_and_run(
                                 device_id,
                                 model,
                                 spin_source: initial_spin_source,
+                                launch_only_spin: initial_launch_only_spin,
                                 result_raw: &result_raw,
                             };
                             let mode = shot_mode(shot_detection_mode, current_mode);
@@ -1100,6 +1116,7 @@ fn connect_and_run(
                                 device_id,
                                 model,
                                 spin_source: initial_spin_source,
+                                launch_only_spin: initial_launch_only_spin,
                                 result_raw: &result_raw,
                             };
                             let shot = CompletedShot {
@@ -1271,6 +1288,91 @@ fn flew(carry: f64, flight_time: f64, apex: f64) -> bool {
         .all(|v| v.is_finite() && *v > 0.0)
 }
 
+/// Lowest launch angle (deg) of a launch-only D4. Below it (putts, bladed
+/// shots) a D4 with no spin and no flight keeps its apex of 0 and is a
+/// ground ball.
+const LAUNCH_ONLY_MIN_LAUNCH_DEG: f64 = 5.0;
+
+/// Whether a D4 is launch-only: it has launch data but no spin (backspin and
+/// sidespin 0) and no flight at all (carry, flight time and apex each 0,
+/// negative or non-finite), and was launched at
+/// [`LAUNCH_ONLY_MIN_LAUNCH_DEG`] or more. The Xi sends these on very short
+/// chips. A D4 with any one of carry, flight time or apex is not.
+fn launch_only(d4: &FlightResult) -> bool {
+    let absent = |v: f64| !(v.is_finite() && v > 0.0);
+    absent(d4.carry_distance)
+        && absent(d4.flight_time)
+        && absent(d4.max_height)
+        && d4.backspin_rpm == 0
+        && d4.sidespin_rpm == 0
+        && d4.launch_elevation >= LAUNCH_ONLY_MIN_LAUNCH_DEG
+}
+
+/// Backspin (rpm) for a ball with launch data but no spin: `rpm_per_mph`
+/// times the ball speed in mph, rounded. `None` (keep the ball's spin) when
+/// `rpm_per_mph` is not above 0 or not a valid `launch_only_spin`
+/// ([`MevoSection::launch_only_spin_valid`](flighthook::MevoSection::launch_only_spin_valid)),
+/// in Putting mode, when the ball has backspin or sidespin, or when its speed
+/// is not positive or the product is out of range for an rpm.
+fn launch_only_spin(ball: &BallFlight, rpm_per_mph: f64, mode: ShotDetectionMode) -> Option<i32> {
+    if !(flighthook::MevoSection::launch_only_spin_valid(rpm_per_mph) && rpm_per_mph > 0.0)
+        || mode == ShotDetectionMode::Putting
+    {
+        return None;
+    }
+    if ball.backspin_rpm.unwrap_or(0) != 0 || ball.sidespin_rpm.unwrap_or(0) != 0 {
+        return None;
+    }
+    let mph = ball.launch_speed?.as_mph();
+    if !(mph.is_finite() && mph > 0.0) {
+        return None;
+    }
+    let rpm = (rpm_per_mph * mph).round();
+    if rpm > f64::from(i32::MAX) {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)] // 0 to i32::MAX, checked above
+    Some(rpm as i32)
+}
+
+/// Give `ball`, from the launch-only `d4` ([`launch_only`]), the estimated
+/// backspin [`launch_only_spin`] and no sidespin, and unset its carry, apex
+/// and flight time: the device computed none, so the simulation flies the
+/// shot from its launch and that spin. Returns whether the estimate was
+/// applied. When it is not (`d4` is not launch-only, the estimate is off or
+/// declines, or the spin, after the Xi's spin source, is not 0/0), `ball` is
+/// left as it is: a D4 with no flight keeps its 0 carry, apex and flight time
+/// and is rolled as a ground ball.
+fn estimate_launch_only_spin(
+    ball: &mut BallFlight,
+    d4: &FlightResult,
+    rpm_per_mph: f64,
+    mode: ShotDetectionMode,
+) -> bool {
+    if !launch_only(d4) {
+        return false;
+    }
+    let Some(back) = launch_only_spin(ball, rpm_per_mph, mode) else {
+        return false;
+    };
+    ball.backspin_rpm = Some(back);
+    ball.sidespin_rpm = Some(0);
+    ball.carry_distance = None;
+    ball.max_height = None;
+    ball.flight_time = None;
+    true
+}
+
+/// Mark a `BallFlight` event's spin as flighthook's estimate
+/// ([`DerivedFlight::spin_estimated`](flighthook::DerivedFlight::spin_estimated)),
+/// adding a derived block that holds only the flag when the shot was not
+/// simulated.
+fn mark_spin_estimated(event: &mut FlighthookEvent) {
+    if let FlighthookEvent::BallFlight { derived, .. } = event {
+        derived.get_or_insert_with(Box::default).spin_estimated = true;
+    }
+}
+
 fn finite(v: f64) -> Option<f64> {
     v.is_finite().then_some(v)
 }
@@ -1289,6 +1391,13 @@ fn descent_angle(v: [f64; 3]) -> Option<f64> {
 fn live_spin_source(state: &SystemState, actor_id: &str) -> Option<SpinSource> {
     let (_, index) = actor_id.split_once('.')?;
     state.system.mevo_spin_source(index)
+}
+
+/// The `[mevo.N]` launch-only spin (rpm per mph, `0` = off) for the actor
+/// `actor_id` (`"mevo.N"`), from the live config.
+fn live_launch_only_spin(state: &SystemState, actor_id: &str) -> Option<f64> {
+    let (_, index) = actor_id.split_once('.')?;
+    state.system.mevo_launch_only_spin(index)
 }
 
 /// Xi spin for `source`: the wire-signed (backspin, FRP sidespin) to use
@@ -2130,6 +2239,7 @@ mod tests {
             device_id: &device_id,
             model,
             spin_source: SpinSource::E8,
+            launch_only_spin: flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
             result_raw: &result_raw,
         };
         let mode = ShotDetectionMode::Chipping;
@@ -2554,6 +2664,466 @@ mod tests {
                 warnings(&messages),
                 ["Shot #1: Mevo didn't track the ball (no read)"]
             );
+        }
+    }
+
+    /// A synthetic launch-only D4, as the Xi sends on a very short chip:
+    /// 7.019 m/s (15.7 mph) at 22.8 deg, 0.856 deg left, no spin, no carry,
+    /// apex or flight time.
+    fn launch_only_d4() -> FlightResult {
+        FlightResult {
+            total: 1,
+            track_time: 0.0,
+            start_position: [0.0; 3],
+            launch_speed: 7.019,
+            // Wire sign: positive = left.
+            launch_azimuth: 0.856,
+            launch_elevation: 22.8,
+            carry_distance: 0.0,
+            flight_time: 0.0,
+            max_height: 0.0,
+            landing_position: [0.0; 3],
+            backspin_rpm: 0,
+            sidespin_rpm: 0,
+            riflespin_rpm: 0,
+            landing_spin_rpm: [0; 3],
+            landing_velocity: [0.0; 3],
+            total_distance: 0.0,
+            roll_distance: 0.0,
+            final_position: [0.0; 3],
+            clubhead_speed: 0.0,
+            club_strike_direction: 0.0,
+            club_attack_angle: 0.0,
+            clubhead_speed_post: 0.0,
+            club_swing_plane_tilt: 0.0,
+            club_swing_plane_rotation: 0.0,
+            club_effective_loft: 0.0,
+            club_face_angle: 0.0,
+            poly_scale: 0,
+            poly_x: [0.0; 5],
+            poly_y: [0.0; 5],
+            poly_z: [0.0; 5],
+        }
+    }
+
+    /// A ball with launch data only: `mph` at 22.8 deg, spin `back`/`side`.
+    fn launch_only_ball(mph: f64, back: i32, side: i32) -> BallFlight {
+        BallFlight {
+            launch_speed: Some(Velocity::MilesPerHour(mph)),
+            launch_elevation: Some(22.8),
+            launch_azimuth: Some(-0.856),
+            backspin_rpm: Some(back),
+            sidespin_rpm: Some(side),
+            ..BallFlight::default()
+        }
+    }
+
+    #[test]
+    fn launch_only_spin_scales_with_ball_speed() {
+        let b = launch_only_ball(15.7, 0, 0);
+        assert_eq!(
+            launch_only_spin(&b, 100.0, ShotDetectionMode::Chipping),
+            Some(1570)
+        );
+        assert_eq!(
+            launch_only_spin(&b, 100.0, ShotDetectionMode::Full),
+            Some(1570)
+        );
+        assert_eq!(
+            launch_only_spin(&b, 80.0, ShotDetectionMode::Chipping),
+            Some(1256)
+        );
+        // Rounded to the nearest rpm.
+        let b = launch_only_ball(12.345, 0, 0);
+        assert_eq!(
+            launch_only_spin(&b, 100.0, ShotDetectionMode::Full),
+            Some(1235)
+        );
+        let b = launch_only_ball(12.344, 0, 0);
+        assert_eq!(
+            launch_only_spin(&b, 100.0, ShotDetectionMode::Full),
+            Some(1234)
+        );
+        // The D4 speed in m/s: 7.019 m/s is 15.70 mph.
+        let ball = ball_from_d4(&launch_only_d4());
+        assert_eq!(
+            launch_only_spin(&ball, 100.0, ShotDetectionMode::Chipping),
+            Some(1570)
+        );
+        // Absent spin is no spin reading too.
+        let b = BallFlight {
+            backspin_rpm: None,
+            sidespin_rpm: None,
+            ..launch_only_ball(15.7, 0, 0)
+        };
+        assert_eq!(
+            launch_only_spin(&b, 100.0, ShotDetectionMode::Full),
+            Some(1570)
+        );
+    }
+
+    #[test]
+    fn launch_only_spin_is_skipped_when_off_putting_or_spinning() {
+        let b = launch_only_ball(15.7, 0, 0);
+        for k in [0.0, -100.0, 1000.5, 1e12, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                launch_only_spin(&b, k, ShotDetectionMode::Chipping),
+                None,
+                "{k}"
+            );
+        }
+        assert_eq!(
+            launch_only_spin(&b, 100.0, ShotDetectionMode::Putting),
+            None
+        );
+        for (back, side) in [(900, 0), (0, -150), (900, -150)] {
+            let b = launch_only_ball(15.7, back, side);
+            assert_eq!(
+                launch_only_spin(&b, 100.0, ShotDetectionMode::Chipping),
+                None,
+                "{back} {side}"
+            );
+        }
+        for speed in [0.0, -1.0, f64::NAN] {
+            let b = launch_only_ball(speed, 0, 0);
+            assert_eq!(
+                launch_only_spin(&b, 100.0, ShotDetectionMode::Chipping),
+                None,
+                "{speed}"
+            );
+        }
+        let b = BallFlight {
+            launch_speed: None,
+            ..launch_only_ball(15.7, 0, 0)
+        };
+        assert_eq!(
+            launch_only_spin(&b, 100.0, ShotDetectionMode::Chipping),
+            None
+        );
+    }
+
+    /// The highest setting gives a large but in-range spin; a product past
+    /// `i32::MAX` is declined, never saturated.
+    #[test]
+    fn launch_only_spin_never_saturates() {
+        let b = launch_only_ball(15.7, 0, 0);
+        assert_eq!(
+            launch_only_spin(&b, 1000.0, ShotDetectionMode::Chipping),
+            Some(15_700)
+        );
+        let b = launch_only_ball(1e7, 0, 0);
+        assert_eq!(
+            launch_only_spin(&b, 1000.0, ShotDetectionMode::Chipping),
+            None
+        );
+    }
+
+    /// A D4 with any one of carry, flight time or apex is not launch-only,
+    /// even when the others are 0.
+    #[test]
+    fn launch_only_needs_carry_apex_and_flight_time_all_absent() {
+        assert!(launch_only(&launch_only_d4()));
+        let mut absent = launch_only_d4();
+        absent.carry_distance = -1.0;
+        absent.flight_time = f64::NAN;
+        absent.max_height = f64::NEG_INFINITY;
+        assert!(launch_only(&absent));
+        for (carry, time, apex) in [(12.0, 0.0, 0.0), (0.0, 0.9, 0.0), (0.0, 0.0, 0.4)] {
+            let mut d4 = launch_only_d4();
+            d4.carry_distance = carry;
+            d4.flight_time = time;
+            d4.max_height = apex;
+            assert!(!launch_only(&d4), "{carry} {time} {apex}");
+        }
+    }
+
+    /// The estimate unsets the launch-only D4's 0 carry, apex and flight
+    /// time; when it is not applied, the ball keeps them and its spin.
+    #[test]
+    fn estimate_unsets_the_zeros_only_when_applied() {
+        let d4 = launch_only_d4();
+        let mut ball = ball_from_d4(&d4);
+        assert_eq!(ball.carry_distance, Some(Distance::Meters(0.0)));
+        assert!(estimate_launch_only_spin(
+            &mut ball,
+            &d4,
+            100.0,
+            ShotDetectionMode::Chipping
+        ));
+        assert_eq!(ball.carry_distance, None);
+        assert_eq!(ball.max_height, None);
+        assert_eq!(ball.flight_time, None);
+        assert_eq!(ball.carry_offline, None);
+        assert_eq!(ball.descent_angle, None);
+        assert_eq!(ball.backspin_rpm, Some(1570));
+        assert_eq!(ball.sidespin_rpm, Some(0));
+        assert_eq!(ball.launch_elevation, Some(22.8));
+        assert_eq!(ball.launch_azimuth, Some(-0.856));
+
+        // Off, Putting, or a spin the Xi's spin source supplied.
+        let mut spun = ball_from_d4(&d4);
+        spun.backspin_rpm = Some(900);
+        for (mut ball, k, mode) in [
+            (ball_from_d4(&d4), 0.0, ShotDetectionMode::Chipping),
+            (ball_from_d4(&d4), 100.0, ShotDetectionMode::Putting),
+            (spun, 100.0, ShotDetectionMode::Chipping),
+        ] {
+            let before = ball.clone();
+            assert!(
+                !estimate_launch_only_spin(&mut ball, &d4, k, mode),
+                "{k} {mode:?}"
+            );
+            assert_eq!(ball, before, "{k} {mode:?}");
+            assert_eq!(ball.max_height, Some(Distance::Meters(0.0)));
+        }
+    }
+
+    /// A low launch with no spin and no flight (a putt, a bladed shot), or
+    /// any D4 with spin, keeps the reported 0 carry, apex and flight time,
+    /// so the simulation rolls it as a ground ball.
+    #[test]
+    fn d4_without_flight_keeps_its_zeros_below_the_launch_only_angle_or_with_spin() {
+        let mut low = launch_only_d4();
+        low.launch_elevation = 2.0;
+        let mut spinning = launch_only_d4();
+        spinning.backspin_rpm = 900;
+        let mut sidespin = launch_only_d4();
+        sidespin.sidespin_rpm = 120;
+        for d4 in [low, spinning, sidespin] {
+            assert!(!launch_only(&d4));
+            let ball = ball_from_d4(&d4);
+            assert_eq!(ball.carry_distance, Some(Distance::Meters(0.0)));
+            assert_eq!(ball.max_height, Some(Distance::Meters(0.0)));
+            assert_eq!(ball.flight_time, Some(0.0));
+        }
+        let mut edge = launch_only_d4();
+        edge.launch_elevation = LAUNCH_ONLY_MIN_LAUNCH_DEG;
+        assert!(launch_only(&edge));
+        edge.launch_elevation = f64::NAN;
+        assert!(!launch_only(&edge));
+    }
+
+    #[test]
+    fn flown_d4_keeps_its_flight() {
+        let (d4, _) = shot_with_club_data();
+        assert!(!launch_only(&d4));
+        let ball = ball_from_d4(&d4);
+        assert_eq!(
+            ball.carry_distance,
+            Some(Distance::Meters(d4.carry_distance))
+        );
+        assert_eq!(ball.max_height, Some(Distance::Meters(d4.max_height)));
+        assert_eq!(ball.flight_time, Some(d4.flight_time));
+        assert!(ball.carry_offline.is_some());
+        assert!(ball.descent_angle.is_some());
+        assert_eq!(ball.backspin_rpm, Some(d4.backspin_rpm));
+        assert_eq!(ball.sidespin_rpm, Some(-d4.sidespin_rpm));
+    }
+
+    /// Hand `d4` to the D4 handler of a `model` actor whose shot was taken
+    /// in `mode`, and return the ball flight it sends with its simulated
+    /// values. `section` is the live `[mevo.0]`, if any.
+    fn handle_d4(
+        model: DeviceModel,
+        mode: ShotDetectionMode,
+        section: Option<flighthook::MevoSection>,
+        d4: FlightResult,
+    ) -> (BallFlight, Option<flighthook::DerivedFlight>) {
+        handle_d4_with(model, mode, section, flighthook::SimMode::On, d4)
+    }
+
+    /// [`handle_d4`] with `[simulation] mode = sim`.
+    fn handle_d4_with(
+        model: DeviceModel,
+        mode: ShotDetectionMode,
+        section: Option<flighthook::MevoSection>,
+        sim: flighthook::SimMode,
+        d4: FlightResult,
+    ) -> (BallFlight, Option<flighthook::DerivedFlight>) {
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-mevo-test-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, _writer) = SystemState::new(dir.join("config.toml"));
+        state.system.update(|c| {
+            c.simulation.mode = sim;
+            if let Some(section) = section {
+                c.mevo.insert("0".into(), section);
+            }
+        });
+        let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel(16);
+        let sender = BusSender::new("mevo.0".into(), bus_tx, Arc::default());
+        let device_id = None;
+        let result_raw = RefCell::new(ResultRaw::default());
+        let ctx = ShotContext {
+            state: &state,
+            sender: &sender,
+            device_id: &device_id,
+            model,
+            spin_source: SpinSource::D4,
+            launch_only_spin: flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
+            result_raw: &result_raw,
+        };
+        let key = ShotKey {
+            shot_id: "chip".into(),
+            shot_number: 1,
+        };
+        let mut results = ShotResults::default();
+        on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::Flight(d4));
+        let _ = std::fs::remove_dir_all(&dir);
+        while let Ok(msg) = bus_rx.try_recv() {
+            if let FlighthookEvent::BallFlight { ball, derived, .. } = msg.event {
+                return (*ball, derived.map(|d| *d));
+            }
+        }
+        panic!("no ball flight sent");
+    }
+
+    /// The Xi's launch-only chip gets the default 100 rpm per mph of
+    /// backspin, no carry, and with the simulation on (the default) flies:
+    /// not a ground ball, with carry, apex, flight time and descent derived.
+    #[test]
+    fn xi_launch_only_chip_flies_with_the_estimated_spin() {
+        for mode in [ShotDetectionMode::Chipping, ShotDetectionMode::Full] {
+            let (ball, derived) = handle_d4(DeviceModel::Xi, mode, None, launch_only_d4());
+            assert_eq!(ball.backspin_rpm, Some(1570));
+            assert_eq!(ball.sidespin_rpm, Some(0));
+            assert_eq!(ball.carry_distance, None);
+            assert_eq!(ball.max_height, None);
+            assert_eq!(ball.flight_time, None);
+            let d = derived.expect("simulated");
+            assert!(d.spin_estimated, "{mode:?}");
+            // 15.7 mph at 22.8 deg with 1570 rpm: about 3.9 yd carry
+            // (3.57 m), 0.38 m apex, 0.56 s, 23 deg descent, 10 yd total.
+            let carry_yd = d.carry_distance.expect("carry").as_yards();
+            assert!((3.5..4.5).contains(&carry_yd), "{carry_yd}");
+            let apex_m = d.max_height.expect("apex").as_meters();
+            assert!((0.3..0.5).contains(&apex_m), "{apex_m}");
+            let time = d.flight_time.expect("flight time");
+            assert!((0.45..0.7).contains(&time), "{time}");
+            let descent = d.descent_angle.expect("descent");
+            assert!((18.0..30.0).contains(&descent), "{descent}");
+            assert!(d.total_distance.expect("total").as_meters() > 3.57);
+            // A flight, not a ground ball's lone tee point.
+            let path = d.path.expect("path");
+            assert!(path.flight.len() >= 2, "{:?}", path.flight);
+            assert!(path.flight.iter().any(|p| p[2] > 0.3), "{:?}", path.flight);
+        }
+    }
+
+    /// Any FlightScope model gets the estimate, and the live section's
+    /// value is used.
+    #[test]
+    fn launch_only_spin_follows_the_live_section() {
+        let section = |k| flighthook::MevoSection {
+            launch_only_spin: k,
+            ..flighthook::MevoSection::default()
+        };
+        let (ball, _) = handle_d4(
+            DeviceModel::Mevo,
+            ShotDetectionMode::Chipping,
+            Some(section(80.0)),
+            launch_only_d4(),
+        );
+        assert_eq!(ball.backspin_rpm, Some(1256));
+        assert_eq!(ball.sidespin_rpm, Some(0));
+    }
+
+    /// With the estimate off, or in Putting mode, a launch-only chip goes out
+    /// as the device sent it: spin 0, carry, apex and flight time 0, rolled
+    /// by the simulation as a ground ball, and not flagged.
+    #[test]
+    fn launch_only_chip_without_the_estimate_is_a_ground_ball() {
+        let off = flighthook::MevoSection {
+            launch_only_spin: 0.0,
+            ..flighthook::MevoSection::default()
+        };
+        for (mode, section) in [
+            (ShotDetectionMode::Chipping, Some(off)),
+            (ShotDetectionMode::Putting, None),
+        ] {
+            let (ball, derived) = handle_d4(DeviceModel::Xi, mode, section, launch_only_d4());
+            assert_eq!(ball.backspin_rpm, Some(0), "{mode:?}");
+            assert_eq!(ball.sidespin_rpm, Some(0), "{mode:?}");
+            assert_eq!(ball.carry_distance, Some(Distance::Meters(0.0)), "{mode:?}");
+            assert_eq!(ball.max_height, Some(Distance::Meters(0.0)), "{mode:?}");
+            assert_eq!(ball.flight_time, Some(0.0), "{mode:?}");
+            let d = derived.expect("rolled");
+            assert!(!d.spin_estimated, "{mode:?}");
+            let path = d.path.expect("path");
+            assert_eq!(path.flight, vec![[0.0; 4]], "{mode:?}");
+            assert!(d.total_distance.expect("total").as_meters() > 0.0);
+        }
+    }
+
+    /// A D4 with a measured carry but apex 0 keeps its carry and gets no
+    /// estimate.
+    #[test]
+    fn d4_with_carry_but_no_apex_keeps_its_carry() {
+        let mut d4 = launch_only_d4();
+        d4.carry_distance = 12.0;
+        d4.flight_time = 0.9;
+        let (ball, derived) = handle_d4(DeviceModel::Xi, ShotDetectionMode::Chipping, None, d4);
+        assert_eq!(ball.carry_distance, Some(Distance::Meters(12.0)));
+        assert_eq!(ball.flight_time, Some(0.9));
+        assert_eq!(ball.max_height, Some(Distance::Meters(0.0)));
+        assert_eq!(ball.backspin_rpm, Some(0));
+        assert!(derived.is_none_or(|d| !d.spin_estimated));
+    }
+
+    /// A low launch with no spin and no flight (a putt) is still rolled as a
+    /// ground ball, in any mode, with no spin added.
+    #[test]
+    fn low_launch_without_flight_is_still_a_ground_ball() {
+        let mut putt = launch_only_d4();
+        putt.launch_speed = 3.0;
+        putt.launch_elevation = 2.0;
+        for mode in [ShotDetectionMode::Putting, ShotDetectionMode::Chipping] {
+            let (ball, derived) = handle_d4(DeviceModel::Xi, mode, None, putt.clone());
+            assert_eq!(ball.backspin_rpm, Some(0), "{mode:?}");
+            assert_eq!(ball.max_height, Some(Distance::Meters(0.0)), "{mode:?}");
+            let d = derived.expect("rolled");
+            assert!(!d.spin_estimated, "{mode:?}");
+            let path = d.path.expect("path");
+            assert_eq!(path.flight, vec![[0.0; 4]], "{mode:?}");
+            assert!(d.total_distance.expect("total").as_meters() > 0.0);
+        }
+    }
+
+    /// With the simulation off, the estimated spin still goes out flagged:
+    /// a derived block that holds only `spin_estimated`.
+    #[test]
+    fn launch_only_chip_flags_its_spin_with_the_simulation_off() {
+        let (ball, derived) = handle_d4_with(
+            DeviceModel::Xi,
+            ShotDetectionMode::Chipping,
+            None,
+            flighthook::SimMode::Off,
+            launch_only_d4(),
+        );
+        assert_eq!(ball.backspin_rpm, Some(1570));
+        let mut only_the_flag = flighthook::DerivedFlight::default();
+        only_the_flag.spin_estimated = true;
+        assert_eq!(derived, Some(only_the_flag));
+    }
+
+    /// A shot with the device's own spin is not flagged, simulated or not.
+    #[test]
+    fn measured_spin_is_not_flagged_as_estimated() {
+        let (d4, _) = shot_with_club_data();
+        for model in [DeviceModel::Xi, DeviceModel::Mevo] {
+            let (ball, derived) = handle_d4(model, ShotDetectionMode::Full, None, d4.clone());
+            assert_eq!(ball.backspin_rpm, Some(d4.backspin_rpm), "{model:?}");
+            let d = derived.expect("simulated");
+            assert!(!d.spin_estimated, "{model:?}");
+            let (_, derived) = handle_d4_with(
+                model,
+                ShotDetectionMode::Full,
+                None,
+                flighthook::SimMode::Off,
+                d4.clone(),
+            );
+            assert_eq!(derived, None, "{model:?}");
         }
     }
 }

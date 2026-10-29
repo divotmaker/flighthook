@@ -40,6 +40,9 @@ use crate::{Club, Handedness, ShotKey, ShotMetrics, ShotRaw, UnitSystem};
 /// take precedence over the measured ones in [`BallFlight`], which are kept
 /// unchanged.
 ///
+/// [`spin_estimated`](Self::spin_estimated) marks a spin in [`BallFlight`]
+/// that flighthook estimated rather than the device measured.
+///
 /// Non-exhaustive so fields can be added; build one with
 /// `DerivedFlight::default()` and assign the fields.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -88,6 +91,14 @@ pub struct DerivedFlight {
     /// Omitted on the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replaces_measured: bool,
+    /// True when the spin in [`BallFlight`] (`backspin_rpm`, `sidespin_rpm`)
+    /// is flighthook's estimate, not the device's reading: a FlightScope
+    /// result with launch data but no spin and no flight. The spin stays in
+    /// `BallFlight`, where outputs read it; this flag only marks its source.
+    /// Set on its own (every other field empty) when the shot was not
+    /// simulated. Omitted on the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spin_estimated: bool,
 }
 
 /// A simulated ball path from the tee to rest.
@@ -129,6 +140,7 @@ impl DerivedFlight {
             total_offline: yd(self.total_offline),
             path: self.path.clone(),
             replaces_measured: self.replaces_measured,
+            spin_estimated: self.spin_estimated,
         }
     }
 
@@ -149,6 +161,7 @@ impl DerivedFlight {
             total_offline: m(self.total_offline),
             path: self.path.clone(),
             replaces_measured: self.replaces_measured,
+            spin_estimated: self.spin_estimated,
         }
     }
 }
@@ -845,6 +858,65 @@ mod tests {
         let back: ShotData =
             serde_json::from_str(&serde_json::to_string(&s).expect("ser")).expect("de");
         assert_eq!(back.derived, Some(derived()));
+    }
+
+    #[test]
+    fn spin_estimated_is_omitted_when_false_and_round_trips_when_true() {
+        let json = serde_json::to_value(shot(Some(derived()))).expect("ser");
+        assert!(json["derived"].get("spin_estimated").is_none(), "{json}");
+        // Older JSON without the key parses as false.
+        let old: DerivedFlight = serde_json::from_str(r#"{"descent_angle":41.3}"#).expect("de");
+        assert!(!old.spin_estimated);
+
+        let mut d = derived();
+        d.spin_estimated = true;
+        let text = serde_json::to_string(&d).expect("ser");
+        assert!(text.ends_with(r#","spin_estimated":true}"#), "{text}");
+        let back: DerivedFlight = serde_json::from_str(&text).expect("de");
+        assert_eq!(back, d);
+        assert!(d.to_imperial().spin_estimated);
+        assert!(d.to_metric().spin_estimated);
+
+        // On its own, for a shot that was not simulated.
+        let alone = DerivedFlight {
+            spin_estimated: true,
+            ..DerivedFlight::default()
+        };
+        assert!(!alone.is_empty());
+        let msg = ball_flight_message(Some(alone.clone()));
+        let json = serde_json::to_value(&msg).expect("ser");
+        assert_eq!(
+            json["event"]["derived"],
+            serde_json::json!({"spin_estimated": true})
+        );
+        let golden: serde_json::Value = serde_json::from_str(GOLDEN_BALL_FLIGHT).expect("golden");
+        assert_eq!(json["event"]["ball"], golden["event"]["ball"]);
+        let back: FlighthookMessage = serde_json::from_value(json).expect("de");
+        let FlighthookEvent::BallFlight { derived: back, .. } = back.event else {
+            panic!("not a ball flight");
+        };
+        assert_eq!(back.as_deref(), Some(&alone));
+
+        // The assembled shot keeps it, in either unit system.
+        let mut acc = ShotAccumulator::new(
+            "mevo.0".into(),
+            ShotKey {
+                shot_id: "chip".into(),
+                shot_number: 1,
+            },
+        );
+        acc.set_ball(BallFlight {
+            backspin_rpm: Some(1570),
+            sidespin_rpm: Some(0),
+            ..BallFlight::default()
+        });
+        acc.set_derived(Some(alone));
+        let shot = acc.finish().expect("shot");
+        assert!(shot.derived.as_ref().is_some_and(|d| d.spin_estimated));
+        for system in [UnitSystem::Imperial, UnitSystem::Metric] {
+            let converted = shot.to_unit_system(system);
+            assert!(converted.derived.is_some_and(|d| d.spin_estimated));
+        }
     }
 
     #[test]

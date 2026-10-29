@@ -12,6 +12,7 @@ use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
 mod actors;
+mod autochip;
 mod bus;
 mod raw_capture;
 mod sim;

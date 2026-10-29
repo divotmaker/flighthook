@@ -80,7 +80,7 @@ fn is_ground_ball(ball: &BallFlight) -> bool {
 }
 
 /// The dimple surface preset for a configured surface.
-fn surface(s: SimSurface) -> Surface {
+pub(crate) fn surface(s: SimSurface) -> Surface {
     match s {
         SimSurface::Fairway => Surface::FAIRWAY,
         SimSurface::Green => Surface::GREEN,
@@ -281,7 +281,7 @@ fn derive_with_error(
 /// The `dimple` environment for `cfg`. Not `Environment::SEA_LEVEL` (15 C):
 /// the default is the ball model's 25 C calibration point, carried in the
 /// config default.
-fn environment(cfg: &SimulationSection) -> Environment {
+pub(crate) fn environment(cfg: &SimulationSection) -> Environment {
     Environment {
         altitude_m: cfg.altitude.as_meters(),
         temperature_c: cfg.temperature_c,
@@ -1174,13 +1174,29 @@ pub(crate) fn ball_flight_event_in_mode(
     mode: Option<ShotDetectionMode>,
 ) -> FlighthookEvent {
     let cfg = state.system.simulation();
-    let derived = if should_simulate(&cfg) {
-        let env_err = cfg.environment_error();
-        warn_invalid_environment(&cfg, env_err.as_deref());
-        derive_with_error(&ball, &cfg, mode, env_err.as_deref())
+    if should_simulate(&cfg) {
+        simulated_ball_flight_event(&cfg, key, ball, mode)
     } else {
-        None
-    };
+        FlighthookEvent::BallFlight {
+            key,
+            ball: Box::new(ball),
+            derived: None,
+        }
+    }
+}
+
+/// Like [`ball_flight_event_in_mode`] under `cfg`, but simulated whatever
+/// `cfg.mode` (`off` included): for a shot that is wholly flighthook's own,
+/// such as an Auto-chip, whose results exist only as simulated values.
+pub(crate) fn simulated_ball_flight_event(
+    cfg: &SimulationSection,
+    key: ShotKey,
+    ball: BallFlight,
+    mode: Option<ShotDetectionMode>,
+) -> FlighthookEvent {
+    let env_err = cfg.environment_error();
+    warn_invalid_environment(cfg, env_err.as_deref());
+    let derived = derive_with_error(&ball, cfg, mode, env_err.as_deref());
     if let Some(ref d) = derived {
         info!("  {}", log_line(d));
     }

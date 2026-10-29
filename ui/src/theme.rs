@@ -509,6 +509,65 @@ pub(crate) fn chip_button(
     }
 }
 
+/// A [`chip_button`] with a down chevron after the label, for a button that
+/// opens a menu. At least `min_size` big; disabled, it is dimmed and takes no
+/// clicks.
+pub(crate) fn menu_chip(
+    ui: &mut egui::Ui,
+    text: &str,
+    enabled: bool,
+    min_size: egui::Vec2,
+) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::proportional(12.0),
+        Color32::PLACEHOLDER,
+    );
+    let chevron = 8.0;
+    let size = (galley.size() + egui::vec2(chevron + 30.0, 8.0)).max(min_size);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    if ui.is_rect_visible(rect) {
+        let (fill, color) = match (enabled, response.hovered()) {
+            (false, _) => (Color32::TRANSPARENT, TEXT_DIM),
+            (true, false) => (VEIL, ACCENT),
+            (true, true) => (VEIL_HOVER, ACCENT_BRIGHT),
+        };
+        let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            radius,
+            fill,
+            Stroke::new(1.0, color),
+            egui::StrokeKind::Inside,
+        );
+        let label_width = galley.size().x;
+        let left = rect.center().x - (label_width + 6.0 + chevron) / 2.0;
+        let pos = egui::pos2(left, rect.center().y - galley.size().y / 2.0);
+        painter.galley(pos, galley, color);
+        let x = left + label_width + 6.0 + chevron / 2.0;
+        let y = rect.center().y;
+        painter.line(
+            vec![
+                egui::pos2(x - chevron / 2.0, y - chevron / 4.0),
+                egui::pos2(x, y + chevron / 4.0),
+                egui::pos2(x + chevron / 2.0, y - chevron / 4.0),
+            ],
+            Stroke::new(1.5, color),
+        );
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Icons
 // ---------------------------------------------------------------------------

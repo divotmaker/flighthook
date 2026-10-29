@@ -13,8 +13,9 @@
 //!   [`flight::FAINT_CAP`], for context. The view `none` draws the shown
 //!   shot alone.
 //!
-//! One covariance ellipse (2σ or 95 %) over the bright points, or one per
-//! device in its colour, with a gold cross at each mean. A point is the
+//! One covariance ellipse (2σ or 95 %) over the view's members (bright and
+//! gold), or one per device in its colour, with a gold cross at each mean.
+//! A shown Auto-chip is drawn gold but is never a member. A point is the
 //! path's landing or rest when the shot has a simulated path, else its
 //! carry or total with the simulated offline; shots with neither are left
 //! out. The projected geometry is cached and rebuilt only when the members,
@@ -490,8 +491,13 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         .and_then(flight::path)
         .map(|p| chart::smooth_path(p, |q| proj.to_screen(q[3] * k, q[1] * k)));
 
-    // One ellipse over the bright points, or one per device.
-    let lit: Vec<(usize, Spot)> = bright.iter().copied().chain(gold).collect();
+    // One ellipse over the bright points and the gold one, or one per
+    // device. A shown Auto-chip is drawn but is not one of the view's shots.
+    let lit: Vec<(usize, Spot)> = bright
+        .iter()
+        .copied()
+        .chain(gold.filter(|(i, _)| members.binary_search(i).is_ok()))
+        .collect();
     let clusters: Vec<(Option<String>, Color32, Vec<[f64; 2]>)> = if by_device {
         devices
             .iter()
@@ -1022,8 +1028,10 @@ impl FlighthookApp {
         let mut clicked = None;
         match hover {
             Some(Hover::Shot(i)) => {
-                let several = self.devices().len() >= 2;
-                let device = several.then(|| device_name(&self.shots[i].actor));
+                // An Auto-chip is always named: it is never one of the devices.
+                let actor = &self.shots[i].actor;
+                let several = self.devices().len() >= 2 || chart::is_auto_chip(actor);
+                let device = several.then(|| device_name(actor));
                 let lateral = scene.dots.iter().find(|d| d.index == i).map(|d| d.lateral);
                 let text = tooltip(&self.shots[i], device.as_deref(), units, lateral);
                 let response = if table {
@@ -1434,6 +1442,47 @@ mod tests {
         for x in &xs {
             assert!(xs.iter().any(|y| (centre - x - (y - centre)).abs() < 1e-3));
         }
+    }
+
+    /// A set of 8 iron shots plus an Auto-chip has the same ellipse as the
+    /// 8 shots alone, whichever of them is shown; a shown chip is gold.
+    #[test]
+    fn an_auto_chip_leaves_the_ellipse_alone() {
+        let g = groups(vec![set("b", 1, Club::Iron7, 0)]);
+        let irons: Vec<ShotRow> = (0..8)
+            .map(|n| {
+                shot(
+                    n,
+                    "mevo.0",
+                    "b",
+                    140.0 + 3.0 * f64::from(n),
+                    f64::from(n % 3) * 2.0 - 2.0,
+                )
+            })
+            .collect();
+        let mut with_chip = irons.clone();
+        with_chip.insert(4, shot(99, flighthook::AUTO_CHIP_ACTOR, "b", 2.0, 0.0));
+        let ellipses = |shots: &[ShotRow], shown: usize| {
+            let devices = chart::device_ids(shots);
+            assert_eq!(devices, vec!["mevo.0"]);
+            let m = members(shots, &g, ShotGrouping::BySet, shown, None);
+            let s = build_scene(&input(shots, &g, &m, shown, &devices));
+            let ovals: Vec<chart::Ellipse> = s.ovals.iter().map(|o| o.ellipse).collect();
+            (ovals, s.members, gold(&s))
+        };
+        let (alone, n, _) = ellipses(&irons, 7);
+        assert_eq!((alone.len(), n), (1, 8));
+        assert_eq!(alone[0].n, 8);
+        assert_eq!(ellipses(&with_chip, 8), (alone.clone(), 8, Some(8)));
+        assert_eq!(ellipses(&with_chip, 4), (alone, 8, Some(4)));
+        let s = {
+            let m = members(&with_chip, &g, ShotGrouping::BySet, 8, None);
+            build_scene(&input(&with_chip, &g, &m, 8, &[]))
+        };
+        assert!(
+            !s.dots.iter().any(|d| d.index == 4),
+            "the chip is not drawn"
+        );
     }
 
     #[test]

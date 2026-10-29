@@ -74,6 +74,9 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) environment: FlightScopeEnvironment,
     /// FlightScope Xi: which of its two spin values a shot reports.
     pub(crate) spin_source: SpinSource,
+    /// FlightScope: backspin per mph of ball speed for a result with launch
+    /// data but no spin, as typed. Blank means the default.
+    pub(crate) launch_only_spin: String,
     /// Square Golf: discard zero-spin reads, except when putting.
     pub(crate) discard_zero_spin: bool,
     /// Square Golf fields the form does not surface. Carried verbatim so that
@@ -164,6 +167,18 @@ fn is_valid_impact_mm(s: &str) -> bool {
     s.is_empty() || s.parse::<f64>().is_ok_and(|v| v.is_finite() && v >= 0.0)
 }
 
+/// The `launch_only_spin` a form field holds: blank is the default, else a
+/// number from 0 to 1000. `None` when it is neither.
+fn launch_only_spin_value(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN);
+    }
+    s.parse::<f64>()
+        .ok()
+        .filter(|v| MevoSection::launch_only_spin_valid(*v))
+}
+
 /// Build the `dot_bottom_to_face_centre_mm` config map from the form: non-blank
 /// entries only, keyed by club code. Returns `None` when no overrides are set.
 fn impact_mm_to_config(
@@ -204,6 +219,7 @@ impl DeviceFormEntry {
             camera_mode: s.camera_mode.unwrap_or_default(),
             environment: s.environment.unwrap_or_default(),
             spin_source: s.spin_source,
+            launch_only_spin: format_distance_value(s.launch_only_spin),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -234,6 +250,7 @@ impl DeviceFormEntry {
             camera_mode: CameraMode::default(),
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
+            launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -264,6 +281,7 @@ impl DeviceFormEntry {
             camera_mode: CameraMode::default(),
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
+            launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             dirty: false,
         }
     }
@@ -286,6 +304,7 @@ impl DeviceFormEntry {
             camera_mode: CameraMode::default(),
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
+            launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -312,6 +331,7 @@ impl DeviceFormEntry {
             camera_mode: CameraMode::default(),
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
+            launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -509,6 +529,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             camera_mode: CameraMode::default(),
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
+            launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -1331,6 +1352,9 @@ pub(crate) fn actor_valid(actor: &ActorFormEntry) -> bool {
             if dev.has_ble_address() && !ble.is_empty() && !is_ble_address(ble) {
                 return false;
             }
+            if dev.is_mevo() && launch_only_spin_value(&dev.launch_only_spin).is_none() {
+                return false;
+            }
             // Face impact calibration: blank means "use the default",
             // anything else must be a finite, non-negative mm value.
             !(dev.is_square()
@@ -1383,6 +1407,8 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             camera_mode: Some(dev.camera_mode),
                             environment: Some(dev.environment),
                             spin_source: dev.spin_source,
+                            launch_only_spin: launch_only_spin_value(&dev.launch_only_spin)
+                                .unwrap_or(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
                         },
                     );
                 }
@@ -2088,6 +2114,35 @@ pub(crate) fn actor_fields(
                             }
                         });
                 });
+
+                // Launch-only spin
+                ui.horizontal(|ui| {
+                    let hint = "When the device measures launch but no spin (very short chips on the Xi), use this many rpm of backspin per mph of ball speed, 0 to 1000. 0 sends the shot as the device read it.";
+                    field_label(ui, "Launch-only spin:").on_hover_text(hint);
+                    let unit = "rpm per mph";
+                    let unit_width = ui
+                        .painter()
+                        .layout_no_wrap(
+                            unit.into(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            egui::Color32::PLACEHOLDER,
+                        )
+                        .size()
+                        .x;
+                    let gap = ui.spacing().item_spacing.x;
+                    let edit_width = (wide_width - gap - unit_width - TEXT_EDIT_MARGIN).max(40.0);
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut dev.launch_only_spin).desired_width(edit_width))
+                        .on_hover_text(hint)
+                        .changed()
+                    {
+                        dev.dirty = true;
+                    }
+                    ui.label(unit);
+                });
+                if launch_only_spin_value(&dev.launch_only_spin).is_none() {
+                    field_error(ui, "Must be a number, 0 to 1000");
+                }
 
                 // Camera Mode
                 ui.horizontal(|ui| {
@@ -2958,6 +3013,50 @@ mod tests {
         let json = serde_json::to_string(&form.build_global_request()).expect("ser");
         assert!(!json.contains("simulation"), "{json}");
         assert!(form.general_valid());
+    }
+
+    #[test]
+    fn launch_only_spin_survives_a_settings_save() {
+        for k in [100.0, 0.0, 87.5] {
+            let mut cfg = FlighthookConfig::default();
+            cfg.mevo.insert(
+                "0".into(),
+                MevoSection {
+                    launch_only_spin: k,
+                    ..MevoSection::default()
+                },
+            );
+            let mut form = SettingsForm::default();
+            form.load_from(&cfg);
+            assert_eq!(form.to_request().mevo["0"].launch_only_spin, k);
+            assert!(super::actor_valid(&form.actors[0]), "{k}");
+
+            let actor = form.actors[0].clone();
+            let mut orig = FlighthookConfig::default();
+            super::apply_actor_to_config(&mut orig, &actor);
+            assert_eq!(orig.mevo["0"].launch_only_spin, k);
+        }
+    }
+
+    #[test]
+    fn launch_only_spin_field_is_validated() {
+        assert_eq!(super::launch_only_spin_value(""), Some(100.0));
+        assert_eq!(super::launch_only_spin_value(" 0 "), Some(0.0));
+        assert_eq!(super::launch_only_spin_value("120"), Some(120.0));
+        assert_eq!(super::launch_only_spin_value("1000"), Some(1000.0));
+        for bad in ["-1", "1000.5", "5000", "abc", "NaN", "inf"] {
+            assert_eq!(super::launch_only_spin_value(bad), None, "{bad}");
+        }
+        let mut cfg = FlighthookConfig::default();
+        cfg.mevo.insert("0".into(), MevoSection::default());
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert_eq!(dev.launch_only_spin, "100");
+        dev.launch_only_spin = "-5".into();
+        assert!(!super::actor_valid(&form.actors[0]));
     }
 
     #[test]

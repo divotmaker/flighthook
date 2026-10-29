@@ -12,6 +12,7 @@ pub use flighthook::{
     ActorStatus,
     // API types
     ActorStatusResponse,
+    AutoChipRequest,
     BallFlight,
     CameraMode,
     // Global state types

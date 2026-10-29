@@ -175,6 +175,9 @@ flat fairway, sea level and 25 °C by default.
   other mode on the configured surface (fairway by default).
 - On a shot that flies, a measured carry or flight time of 0 is not a
   reading: flighthook simulates it like a missing value.
+- A FlightScope chip reported with launch data but no spin and no carry gets
+  an estimated backspin and is flown; see
+  [Launch-only chips](docs/devices/flightscope.md#launch-only-chips-beta).
 - A measured carry offline or descent angle (FlightScope full results) is
   kept. The simulated path still leaves the tee on the measured launch
   direction and is fitted to land on the measured offline, by scaling its
@@ -311,6 +314,31 @@ The ellipse holds about 86 % of a normal pattern (**2σ**, the default) or
 95 % (**95 %**); hover it for its size. A shot is placed by its simulated
 path, else by its carry or total and offline (measured or simulated); shots
 without an offline are left out.
+
+#### Auto-chip (beta)
+
+Some launch monitors can't read a very short chip. The **Auto-chip** button
+in the Shots toolbar opens a menu of **1 Yard**, **3 Yard** and **5 Yard**:
+pick one to send a short, straight chip of that total distance to the
+simulator, so the ball gets onto the green and the simulator's auto-putt can
+finish the hole.
+
+- The chip is launched straight at 28° with 100 rpm of backspin per mph of
+  ball speed, no sidespin and no club data. The distance is flighthook's own
+  estimate: flighthook picks the ball speed so that its
+  [simulation](#simulated-values-beta), in the configured environment and on
+  the configured surface, comes to rest at the chosen distance (carry plus
+  roll). The simulator runs its own physics on that launch, so its green
+  speed changes the actual roll.
+- It goes to every connected OpenConnect Client output, whatever launch
+  monitor each detection mode is routed to. The button is disabled until one
+  is connected.
+- The shot list, the Cards and Table views and the export show it as its own
+  device, **Auto-chip**. It stays out of your shot statistics: it is listed
+  under the set it was hit in, but the set's shot count, the range bars, the
+  dispersion ellipse and the flight chart's set leave it out, and the device
+  filter does not offer it. Shown on its own, its flight is drawn over the
+  set's shots.
 
 ### Devices
 

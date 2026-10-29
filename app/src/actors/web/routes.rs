@@ -12,8 +12,8 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use super::types::{
-    ClubRequest, GroupingRequest, ModeRequest, PostSettingsResponse, ShotGroupsResponse,
-    StatusResponse,
+    AutoChipRequest, AutoChipResponse, ClubRequest, GroupingRequest, ModeRequest,
+    PostSettingsResponse, ShotGroupsResponse, StatusResponse,
 };
 use super::{MAX_SHOTS, StoredShot, WebState, export};
 use crate::actors::actor_names;
@@ -305,6 +305,53 @@ pub async fn get_shot_groups(State(state): State<Arc<WebState>>) -> Json<ShotGro
     })
 }
 
+/// POST /api/auto-chip — send a short, straight chip of `yards` total
+/// (one of [`flighthook::AUTO_CHIP_YARDS`]) as the next Auto-chip shot.
+///
+/// The ball speed is solved against the live `[simulation]` environment and
+/// surface ([`crate::autochip`]); the shot goes on the bus as actor
+/// [`flighthook::AUTO_CHIP_ACTOR`], so every output forwards it and it is
+/// stored like a device's shot. 400 for any other distance, 409 when the
+/// simulation environment is invalid; both with a JSON `{"error"}` body.
+pub async fn post_auto_chip(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<AutoChipRequest>,
+) -> Result<Json<AutoChipResponse>, SettingsError> {
+    let yards = body.yards;
+    if !flighthook::AUTO_CHIP_YARDS.contains(&yards) {
+        let allowed: Vec<String> = flighthook::AUTO_CHIP_YARDS
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        return Err(settings_error(
+            StatusCode::BAD_REQUEST,
+            &format!("yards must be one of {}", allowed.join(", ")),
+        ));
+    }
+    let chip_state = Arc::clone(&state);
+    let sent = tokio::task::spawn_blocking(move || {
+        crate::autochip::send(
+            &chip_state.root,
+            &chip_state.bus_tx,
+            yards,
+            &chip_state.auto_chip_shots,
+        )
+    })
+    .await
+    .map_err(|_| settings_error(StatusCode::INTERNAL_SERVER_ERROR, "auto-chip failed"))?;
+    match sent {
+        Ok((key, ball)) => Ok(Json(AutoChipResponse {
+            actor: flighthook::AUTO_CHIP_ACTOR.to_owned(),
+            shot_id: key.shot_id,
+            shot_number: key.shot_number,
+            ball_speed_mph: ball.launch_speed.map_or(0.0, |v| v.as_mph()),
+            launch_elevation: ball.launch_elevation.unwrap_or_default(),
+            backspin_rpm: ball.backspin_rpm.unwrap_or_default(),
+        })),
+        Err(e) => Err(settings_error(StatusCode::CONFLICT, &e.to_string())),
+    }
+}
+
 /// POST /api/shots/groups — start a new set for the selected club.
 pub async fn post_new_shot_group(State(state): State<Arc<WebState>>) -> StatusCode {
     let _ = state
@@ -443,6 +490,27 @@ fn webserver_violation(live: &FlighthookConfig, action: &ConfigAction) -> Option
     }
 }
 
+/// Why `action` would save an invalid device setting, or `None`: a
+/// `launch_only_spin` outside 0 to
+/// [`MevoSection::MAX_LAUNCH_ONLY_SPIN`](flighthook::MevoSection::MAX_LAUNCH_ONLY_SPIN)
+/// in a Mevo section the action writes.
+fn invalid_setting(action: &ConfigAction) -> Option<String> {
+    let mevo: Vec<(&String, &flighthook::MevoSection)> = match action {
+        ConfigAction::ReplaceAll { config } => config.mevo.iter().collect(),
+        ConfigAction::UpsertMevo { index, section } => vec![(index, section)],
+        _ => Vec::new(),
+    };
+    mevo.into_iter()
+        .find(|(_, s)| !flighthook::MevoSection::launch_only_spin_valid(s.launch_only_spin))
+        .map(|(index, s)| {
+            format!(
+                "mevo.{index}: launch_only_spin must be 0 to {} rpm per mph, not {}",
+                flighthook::MevoSection::MAX_LAUNCH_ONLY_SPIN,
+                s.launch_only_spin
+            )
+        })
+}
+
 /// POST /api/settings — config replacement via bus request-reply.
 ///
 /// Emits a `ConfigCommand` on the bus, waits for `ConfigOutcome` with a
@@ -454,8 +522,8 @@ fn webserver_violation(live: &FlighthookConfig, action: &ConfigAction) -> Option
 /// global settings, keeping every actor section of the live config. Without
 /// a scope the whole config is replaced and every actor is reconciled.
 ///
-/// An unknown scope, a removed web server or a second web server is `400`
-/// and a missing `ConfigOutcome` `504`, each with a JSON `{"error": "..."}`
+/// An unknown scope, a removed web server, a second web server or an
+/// invalid device setting ([`invalid_setting`]) is `400` and a missing `ConfigOutcome` `504`, each with a JSON `{"error": "..."}`
 /// body; nothing is reported as saved.
 pub async fn post_settings(
     State(state): State<Arc<WebState>>,
@@ -506,6 +574,10 @@ async fn save_settings(
     if let Some(reason) = webserver_violation(&state.root.system.snapshot(), &action) {
         tracing::warn!("config update: {reason}, ignoring request");
         return Err(settings_error(StatusCode::BAD_REQUEST, reason));
+    }
+    if let Some(reason) = invalid_setting(&action) {
+        tracing::warn!("config update: {reason}, ignoring request");
+        return Err(settings_error(StatusCode::BAD_REQUEST, &reason));
     }
 
     match send_config_command_within(state, action, timeout).await {
@@ -976,6 +1048,118 @@ mod group_tests {
         assert!(rx.try_recv().is_err(), "nothing emitted");
     }
 
+    /// Every message on `rx` so far.
+    fn drain(rx: &mut broadcast::Receiver<FlighthookMessage>) -> Vec<FlighthookMessage> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// 1, 3 and 5 yd are sent as Auto-chip shots numbered 1, 2, 3: the
+    /// reply describes the shot put on the bus, and the web layer stores it
+    /// under the Auto-chip actor with its simulated total.
+    #[tokio::test]
+    async fn auto_chip_sends_1_3_and_5_yards() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        for (n, yards) in (1..).zip(flighthook::AUTO_CHIP_YARDS) {
+            let Json(resp) =
+                post_auto_chip(State(Arc::clone(&state)), Json(AutoChipRequest { yards }))
+                    .await
+                    .expect("accepted");
+            assert_eq!(resp.actor, flighthook::AUTO_CHIP_ACTOR);
+            assert_eq!(resp.shot_number, n);
+            assert_eq!(resp.launch_elevation, 28.0);
+            #[allow(clippy::cast_possible_truncation)]
+            let spin = (100.0 * resp.ball_speed_mph).round() as i32;
+            assert_eq!(resp.backspin_rpm, spin);
+
+            // The web layer's own shot_group events are left out.
+            let msgs: Vec<_> = drain(&mut rx)
+                .into_iter()
+                .filter(|m| m.actor != state.actor_id)
+                .collect();
+            assert_eq!(msgs.len(), 3, "{msgs:?}");
+            let mut pending = super::super::PendingShots::new();
+            for msg in &msgs {
+                assert_eq!(msg.actor, flighthook::AUTO_CHIP_ACTOR);
+                super::super::apply_bus_event(&state, msg, &mut pending).await;
+            }
+            let shots = state.shots.read().await;
+            let stored = shots.back().expect("stored");
+            assert_eq!(stored.data.actor, flighthook::AUTO_CHIP_ACTOR);
+            assert_eq!(stored.data.shot_id.as_deref(), Some(resp.shot_id.as_str()));
+            assert!(stored.data.club.is_none());
+            let total = stored
+                .data
+                .derived
+                .as_ref()
+                .and_then(|d| d.total_distance)
+                .expect("total")
+                .as_yards();
+            assert!((total - f64::from(yards)).abs() <= 0.1, "{yards}: {total}");
+        }
+        assert_eq!(state.shots.read().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn auto_chip_rejects_any_other_distance() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        for yards in [0, 2, 4, 6, 10, 100, u32::MAX] {
+            let (status, Json(body)) =
+                post_auto_chip(State(Arc::clone(&state)), Json(AutoChipRequest { yards }))
+                    .await
+                    .expect_err("rejected");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{yards}");
+            assert_eq!(body["error"], "yards must be one of 1, 3, 5");
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+    }
+
+    #[tokio::test]
+    async fn auto_chip_needs_a_valid_simulation_environment() {
+        let (state, _writer, _dir) = test_state();
+        state
+            .root
+            .system
+            .update(|c| c.simulation.temperature_c = 99.0);
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        let (status, Json(body)) = post_auto_chip(
+            State(Arc::clone(&state)),
+            Json(AutoChipRequest { yards: 3 }),
+        )
+        .await
+        .expect_err("rejected");
+        assert_eq!(status, StatusCode::CONFLICT);
+        let error = body["error"].as_str().expect("error");
+        assert!(
+            error.starts_with("simulation environment invalid"),
+            "{error}"
+        );
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+
+        // The refused chip took no number: the next one sent is #1.
+        assert_eq!(
+            state
+                .auto_chip_shots
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        state
+            .root
+            .system
+            .update(|c| c.simulation.temperature_c = 25.0);
+        let Json(resp) = post_auto_chip(
+            State(Arc::clone(&state)),
+            Json(AutoChipRequest { yards: 3 }),
+        )
+        .await
+        .expect("accepted");
+        assert_eq!(resp.shot_number, 1);
+    }
+
     #[tokio::test]
     async fn new_group_and_session_endpoints_emit_their_commands() {
         let (state, _writer, _dir) = test_state();
@@ -1176,6 +1360,61 @@ mod group_tests {
         }
         assert!(rx.try_recv().is_err(), "nothing emitted");
         assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+    }
+
+    /// A whole-config or `mevo.N`-scoped save with a `launch_only_spin` below
+    /// 0, above 1000 or non-finite is 400 and saves nothing; a global save
+    /// does not write Mevo sections, so it is not checked.
+    #[tokio::test]
+    async fn settings_save_with_an_invalid_launch_only_spin_is_400() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.mevo
+                .insert("0".into(), flighthook::MevoSection::default());
+        });
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        for bad in [-1.0, 1000.5, f64::NAN, f64::INFINITY] {
+            let mut body = live.clone();
+            if let Some(m) = body.mevo.get_mut("0") {
+                m.launch_only_spin = bad;
+            }
+            for scope in [None, Some("mevo.0")] {
+                let (status, Json(error)) =
+                    save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                        .await
+                        .expect_err("rejected");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {scope:?}");
+                let error = error["error"].as_str().expect("error");
+                assert!(
+                    error.starts_with("mevo.0: launch_only_spin must be 0 to 1000 rpm per mph"),
+                    "{error}"
+                );
+            }
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+
+        // In range, including both ends, it goes through to the system actor.
+        for ok in [0.0, 100.0, 1000.0] {
+            let mut section = live.mevo["0"].clone();
+            section.launch_only_spin = ok;
+            let action = ConfigAction::UpsertMevo {
+                index: "0".into(),
+                section,
+            };
+            assert_eq!(invalid_setting(&action), None, "{ok}");
+        }
+        let mut body = live.clone();
+        if let Some(m) = body.mevo.get_mut("0") {
+            m.launch_only_spin = -1.0;
+        }
+        assert_eq!(
+            invalid_setting(&ConfigAction::ReplaceGlobal {
+                config: Box::new(body)
+            }),
+            None
+        );
     }
 
     #[tokio::test]

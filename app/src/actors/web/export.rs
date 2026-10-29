@@ -179,6 +179,7 @@ pub fn csv_header(system: UnitSystem) -> String {
         "metrics_face_to_path_deg".into(),
         "metrics_spin_loft_deg".into(),
         format!("metrics_curve_{}", u.dist),
+        "spin_estimated".into(),
     ];
     let cells: Vec<Option<String>> = cols.into_iter().map(Some).collect();
     csv_row(&cells)
@@ -302,6 +303,7 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
         f(x.face_to_path),
         f(x.spin_loft),
         dist(x.curve),
+        d.spin_estimated.then(|| "true".to_owned()),
     ];
     csv_row(&cells)
 }
@@ -335,8 +337,8 @@ mod tests {
     use super::super::{ShotContext, StoredShot, device_section};
     use super::*;
     use flighthook::{
-        BallFlight, ClubData, FaceImpact, FlighthookConfig, FlighthookEvent, MevoSection, RawDir,
-        RawRecord, ShotData, ShotKey, ShotMetrics, ShotRaw,
+        BallFlight, ClubData, DerivedFlight, FaceImpact, FlighthookConfig, FlighthookEvent,
+        MevoSection, RawDir, RawRecord, ShotData, ShotKey, ShotMetrics, ShotRaw,
     };
 
     const SSID: &str = "FS M2-123456";
@@ -371,6 +373,7 @@ mod tests {
                 camera_mode: None,
                 environment: None,
                 spin_source: flighthook::SpinSource::D4,
+                launch_only_spin: MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
             },
         );
         config
@@ -473,8 +476,8 @@ mod tests {
         let met = csv_header(UnitSystem::Metric);
         assert!(imp.starts_with("time,actor,device_kind,manufacturer,model,firmware,"));
         assert!(imp.contains(",impact_lateral_mm,impact_vertical_mm,"));
-        assert!(imp.ends_with(",metrics_curve_yd\r\n"));
-        assert!(met.ends_with(",metrics_curve_m\r\n"));
+        assert!(imp.ends_with(",metrics_curve_yd,spin_estimated\r\n"));
+        assert!(met.ends_with(",metrics_curve_m,spin_estimated\r\n"));
         for col in [
             "ball_speed_mph",
             "carry_yd",
@@ -486,8 +489,8 @@ mod tests {
         for col in ["ball_speed_mps", "carry_m", "max_height_m", "club_offset_m"] {
             assert!(met.contains(col), "{col}");
         }
-        assert_eq!(imp.split(',').count(), 57);
-        assert_eq!(met.split(',').count(), 57);
+        assert_eq!(imp.split(',').count(), 58);
+        assert_eq!(met.split(',').count(), 58);
     }
 
     #[test]
@@ -495,7 +498,7 @@ mod tests {
         let shot = private_shot();
         let row = to_csv_row(&shot, UnitSystem::Metric);
         let cells: Vec<&str> = row.trim_end().split(',').collect();
-        assert_eq!(cells.len(), 57);
+        assert_eq!(cells.len(), 58);
         assert_eq!(cells[1], "mevo.0");
         assert_eq!(cells[2], "flightscope");
         assert_eq!(cells[4], "<redacted> v1");
@@ -530,7 +533,7 @@ mod tests {
         assert!(flight.as_array().is_some_and(|f| f.len() > 2), "{line}");
 
         let row = to_csv_row(&shot, UnitSystem::Metric);
-        assert_eq!(row.trim_end().split(',').count(), 57);
+        assert_eq!(row.trim_end().split(',').count(), 58);
     }
 
     #[test]
@@ -562,7 +565,7 @@ mod tests {
         // CSV keeps its columns: the device's carry and the simulated carry.
         let row = to_csv_row(&shot, UnitSystem::Metric);
         let cells: Vec<&str> = row.trim_end().split(',').collect();
-        assert_eq!(cells.len(), 57);
+        assert_eq!(cells.len(), 58);
         assert_eq!(cells[20], "100");
         assert_eq!(cells[28], num(sim_carry.as_meters()));
     }
@@ -742,6 +745,114 @@ mod tests {
         assert_eq!(line.shot_id, "rt");
         assert_eq!(line.shot_number, 9);
         assert_eq!(line.raw.expect("raw").frames.len(), 2);
+    }
+
+    /// A shot whose spin flighthook estimated keeps the flag through the
+    /// shot store into both exports; a measured shot has none.
+    #[tokio::test]
+    async fn estimated_spin_is_flagged_in_both_exports() {
+        let (state, _writer, _dir) = test_state();
+        let mut only_the_flag = DerivedFlight::default();
+        only_the_flag.spin_estimated = true;
+        for (n, derived) in [(1, Some(only_the_flag)), (2, None)] {
+            let key = ShotKey {
+                shot_id: format!("chip-{n}"),
+                shot_number: n,
+            };
+            feed(
+                &state,
+                "mevo.0",
+                vec![
+                    FlighthookEvent::ShotTrigger { key: key.clone() },
+                    FlighthookEvent::BallFlight {
+                        key: key.clone(),
+                        ball: Box::new(ball()),
+                        derived: derived.map(Box::new),
+                    },
+                    FlighthookEvent::ShotFinished { key, raw: None },
+                ],
+            )
+            .await;
+        }
+        let shots = state.shots.read().await.clone();
+        assert_eq!(shots.len(), 2);
+        for system in [UnitSystem::Imperial, UnitSystem::Metric] {
+            let header = csv_header(system);
+            let at = header
+                .trim_end()
+                .split(',')
+                .position(|h| h == "spin_estimated")
+                .expect("column");
+            for (shot, flagged) in shots.iter().zip([true, false]) {
+                let line: serde_json::Value =
+                    serde_json::from_str(&jsonl_line(shot, "t", Some(system), false))
+                        .expect("parses");
+                let flag = line["data"]["derived"].get("spin_estimated");
+                assert_eq!(
+                    flag,
+                    flagged.then_some(&serde_json::Value::Bool(true)),
+                    "{line}"
+                );
+                let row = to_csv_row(shot, system);
+                let cell = row.trim_end().split(',').nth(at);
+                assert_eq!(cell, Some(if flagged { "true" } else { "" }), "{row}");
+            }
+        }
+    }
+
+    /// An Auto-chip is exported with the detection mode it was simulated in,
+    /// Chipping, whatever the game mode; a device's shot keeps the game's.
+    #[tokio::test]
+    async fn auto_chip_exports_chipping_as_its_detection_mode() {
+        let (state, writer, _dir) = test_state();
+        writer.set_mode(flighthook::ShotDetectionMode::Full);
+        for (n, actor) in [(1, "mevo.0"), (2, flighthook::AUTO_CHIP_ACTOR)] {
+            let key = ShotKey {
+                shot_id: format!("shot-{n}"),
+                shot_number: n,
+            };
+            feed(
+                &state,
+                actor,
+                vec![
+                    FlighthookEvent::ShotTrigger { key: key.clone() },
+                    FlighthookEvent::BallFlight {
+                        key: key.clone(),
+                        ball: Box::new(ball()),
+                        derived: None,
+                    },
+                    FlighthookEvent::ShotFinished { key, raw: None },
+                ],
+            )
+            .await;
+        }
+        let shots = state.shots.read().await.clone();
+        let modes: Vec<serde_json::Value> = shots
+            .iter()
+            .map(|shot| {
+                let line: serde_json::Value =
+                    serde_json::from_str(&jsonl_line(shot, "t", None, false)).expect("parses");
+                line["settings"]["detection_mode"].clone()
+            })
+            .collect();
+        assert_eq!(modes, ["full", "chipping"]);
+        let at = csv_header(UnitSystem::Imperial)
+            .trim_end()
+            .split(',')
+            .position(|h| h == "detection_mode")
+            .expect("column");
+        let cells: Vec<String> = shots
+            .iter()
+            .map(|shot| {
+                to_csv_row(shot, UnitSystem::Imperial)
+                    .trim_end()
+                    .split(',')
+                    .nth(at)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(cells, ["full", "chipping"]);
     }
 
     const GROUP: &str = "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7";

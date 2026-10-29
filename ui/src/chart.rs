@@ -740,13 +740,16 @@ pub(crate) fn inside_polygon(polygon: &[Pos2], p: Pos2) -> bool {
 // Devices
 // ---------------------------------------------------------------------------
 
-/// The distinct, non-empty actor ids in `shots`, sorted. Ids are compared
-/// exactly, so a row without an actor never merges two devices.
+/// The distinct, non-empty actor ids in `shots` that statistics are kept
+/// for (every one but the Auto-chip source, [`is_auto_chip`]), sorted: the
+/// device filter's options, the range bars' per-device bands and the
+/// charts' device colours. Ids are compared exactly, so a row without an
+/// actor never merges two devices.
 #[must_use]
 pub(crate) fn device_ids(shots: &[ShotRow]) -> Vec<String> {
     let mut ids: Vec<String> = shots
         .iter()
-        .filter(|s| !s.actor.is_empty())
+        .filter(|s| !s.actor.is_empty() && !is_auto_chip(&s.actor))
         .map(|s| s.actor.clone())
         .collect();
     ids.sort_unstable();
@@ -785,11 +788,23 @@ pub(crate) fn shot_colour(devices: &[String], filter: Option<&str>, actor: &str)
     }
 }
 
-/// Label of a device: its name, or its actor id when the name is missing
-/// or empty.
+/// Whether `actor` is the Auto-chip source ([`flighthook::AUTO_CHIP_ACTOR`]).
+/// Its shots are listed, shown and exported like any other, but no set or
+/// club statistic counts them: they are never a view's members
+/// ([`members_for`]), a set's or club's shot count ([`set_shot_count`]) or a
+/// device of the device filter ([`device_ids`]).
+#[must_use]
+pub(crate) fn is_auto_chip(actor: &str) -> bool {
+    actor == flighthook::AUTO_CHIP_ACTOR
+}
+
+/// Label of a device: its name, else [`flighthook::AUTO_CHIP_NAME`] for the
+/// Auto-chip source, else its actor id.
 #[must_use]
 pub(crate) fn device_label<'a>(id: &'a str, name: Option<&'a str>) -> &'a str {
-    name.filter(|n| !n.is_empty()).unwrap_or(id)
+    name.filter(|n| !n.is_empty())
+        .or_else(|| (id == flighthook::AUTO_CHIP_ACTOR).then_some(flighthook::AUTO_CHIP_NAME))
+        .unwrap_or(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +813,8 @@ pub(crate) fn device_label<'a>(id: &'a str, name: Option<&'a str>) -> &'a str {
 
 /// Indices into `shots`, ascending, of the rows the range bars and charts
 /// show bright in `view`, among the rows from `device` (exact actor id;
-/// every device when `None`).
+/// every device when `None`). Auto-chip rows ([`is_auto_chip`]) are never
+/// members of a set or club view.
 ///
 /// `set` is the set the view is built around (the shown shot's set, or the
 /// one the next shot joins) and `shown` the index of the shown shot.
@@ -837,9 +853,24 @@ pub(crate) fn members_for(
     shots
         .iter()
         .enumerate()
-        .filter(|&(_, r)| device.is_none_or(|d| r.actor == d) && in_view(r))
+        .filter(|&(_, r)| {
+            device.is_none_or(|d| r.actor == d) && !is_auto_chip(&r.actor) && in_view(r)
+        })
         .map(|(i, _)| i)
         .collect()
+}
+
+/// The shots of `set` its headers count: its shot count less its Auto-chip
+/// shots in `shots` ([`is_auto_chip`]). A shot joins a set's count when it
+/// has data, which is when it carries the set's id.
+#[must_use]
+pub(crate) fn set_shot_count(set: &ShotGroupInfo, shots: &[ShotRow]) -> u32 {
+    let chips = shots
+        .iter()
+        .filter(|r| is_auto_chip(&r.actor) && r.group.as_deref() == Some(set.id.as_str()))
+        .count();
+    set.shots
+        .saturating_sub(u32::try_from(chips).unwrap_or(u32::MAX))
 }
 
 // ---------------------------------------------------------------------------
@@ -1766,6 +1797,8 @@ mod tests {
             "openconnect_server"
         );
         assert_eq!(device_label("square.0", None), "square.0");
+        assert_eq!(device_label("autochip", None), "Auto-chip");
+        assert_eq!(device_label("autochip", Some("")), "Auto-chip");
     }
 
     #[test]
@@ -1934,6 +1967,44 @@ mod tests {
             members_for(&shots, &g, ShotGrouping::BySet, y, Some(2), None),
             vec![2]
         );
+    }
+
+    /// Auto-chip rows are no set or club view's members and no device of the
+    /// device filter; in the view `none` a shown chip is the shown shot.
+    #[test]
+    fn auto_chip_rows_are_never_members_or_devices() {
+        assert!(is_auto_chip(flighthook::AUTO_CHIP_ACTOR));
+        assert!(!is_auto_chip("mevo.0") && !is_auto_chip(""));
+        let chip = flighthook::AUTO_CHIP_ACTOR;
+        let shots = rows(&[
+            ("mevo.0", Some("a"), I7),
+            (chip, Some("a"), I7),
+            ("mevo.0", Some("a"), I7),
+            (chip, Some("b"), I7),
+        ]);
+        let a = ShotGroupInfo {
+            shots: 3,
+            ..set("a", 1, Some(Club::Iron7), true)
+        };
+        let g = sets(vec![a.clone(), set("b", 2, Some(Club::Iron7), false)]);
+        for view in [ShotGrouping::BySet, ShotGrouping::ByClub] {
+            for shown in [1, 2] {
+                assert_eq!(
+                    members_for(&shots, &g, view, g.get("a"), Some(shown), None),
+                    vec![0, 2],
+                    "{view:?} {shown}"
+                );
+            }
+        }
+        assert_eq!(
+            members_for(&shots, &g, ShotGrouping::None, g.get("a"), Some(1), None),
+            vec![1]
+        );
+        assert_eq!(device_ids(&shots), vec!["mevo.0"]);
+        assert!(device_ids(&shots[1..2]).is_empty());
+        // The set counts 3 shots, one an Auto-chip: its headers say 2.
+        assert_eq!(set_shot_count(&a, &shots), 2);
+        assert_eq!(set_shot_count(&a, &shots[..1]), 3);
     }
 
     #[test]

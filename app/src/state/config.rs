@@ -427,6 +427,19 @@ impl SystemConfig {
             .map(|m| m.spin_source)
     }
 
+    /// The launch-only spin in effect for the `[mevo.<index>]` section, rpm
+    /// per mph (`0` = off), or `None` when that section is absent. Device
+    /// threads read it once per shot, so a change applies on the next shot
+    /// without reconnecting.
+    pub fn mevo_launch_only_spin(&self, index: &str) -> Option<f64> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .mevo
+            .get(index)
+            .map(flighthook::MevoSection::launch_only_spin_rpm_per_mph)
+    }
+
     /// Mutate the cached config in place, then persist to disk.
     pub fn update(&self, f: impl FnOnce(&mut FlighthookConfig)) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
@@ -643,6 +656,55 @@ bind = "0.0.0.0:5880"
             }
         });
         assert_eq!(cfg.mevo_spin_source("0"), Some(flighthook::SpinSource::E8));
+    }
+
+    #[test]
+    fn mevo_launch_only_spin_reads_the_live_section() {
+        let dir =
+            TempDir(std::env::temp_dir().join(format!("flighthook-config-test-{}", generate_id())));
+        let cfg = SystemConfig::new(dir.0.join("config.toml"));
+        assert_eq!(cfg.mevo_launch_only_spin("0"), None);
+        cfg.update(|c| {
+            c.mevo
+                .insert("0".into(), flighthook::MevoSection::default());
+        });
+        assert_eq!(cfg.mevo_launch_only_spin("0"), Some(100.0));
+        for (set, read) in [
+            (0.0, 0.0),
+            (80.0, 80.0),
+            (1000.0, 1000.0),
+            (1500.0, 0.0),
+            (-5.0, 0.0),
+            (f64::NAN, 0.0),
+        ] {
+            cfg.update(|c| {
+                if let Some(m) = c.mevo.get_mut("0") {
+                    m.launch_only_spin = set;
+                }
+            });
+            assert_eq!(cfg.mevo_launch_only_spin("0"), Some(read), "{set}");
+        }
+    }
+
+    #[test]
+    fn mevo_launch_only_spin_is_omitted_at_default_in_toml() {
+        let without = "[mevo.0]\nname = \"Xi\"\naddress = \"192.168.2.1:5100\"\n";
+        let c: FlighthookConfig = toml::from_str(without).expect("parses");
+        assert_eq!(c.mevo["0"].launch_only_spin, 100.0);
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(!out.contains("launch_only_spin"), "{out}");
+
+        for (line, v) in [
+            ("launch_only_spin = 0\n", 0.0),
+            ("launch_only_spin = 75.5\n", 75.5),
+        ] {
+            let c: FlighthookConfig = toml::from_str(&format!("{without}{line}")).expect("parses");
+            assert_eq!(c.mevo["0"].launch_only_spin, v);
+            let out = toml::to_string_pretty(&c).expect("ser");
+            assert!(out.contains("launch_only_spin = "), "{out}");
+            let back: FlighthookConfig = toml::from_str(&out).expect("parses");
+            assert_eq!(back, c);
+        }
     }
 
     /// A config file from before `openconnect_client`: one GSPro output

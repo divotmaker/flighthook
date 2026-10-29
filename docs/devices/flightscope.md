@@ -123,9 +123,40 @@ shot with an apex of 0 (a putt, or any bladed shot) is a ground ball: carry,
 apex and flight time are 0 and the roll is simulated from the tee, on a green
 when the shot was triggered in Putting mode (a mode change before its result
 arrives doesn't count). Estimated (`E8`) shots carry no sidespin, so they are
-not flown; one with an apex of 0 is still rolled as a ground ball. See the
-README's
+not flown; one with an apex of 0 is still rolled as a ground ball. A full
+result with launch data only is flown with an estimated spin instead; see
+[Launch-only chips](#launch-only-chips-beta). See the README's
 [Simulated values](../../README.md#simulated-values-beta) section.
+
+### Launch-only chips (beta)
+
+On very short chips (under about 25 mph of ball speed) the Xi can send a full
+result (`D4`) with launch data (ball speed, launch angle and direction) but
+no spin and no carry, apex or flight time (all three 0). When such a result
+was launched at 5° or more, flighthook estimates its backspin as
+`launch_only_spin` × ball speed in mph, with no sidespin, and leaves its
+carry, apex and flight time unset instead of reporting them as 0. The
+default is 100 rpm per mph: about 1500 rpm for a 15 mph chip. The simulation
+then computes carry, apex, flight time and descent (and roll and total) from
+the launch and that spin, and GSPro gets the estimated spin with a spin axis
+of 0. The shot's log line
+shows `spin=estimate`. The dashboard shows the spin as simulated (a `SIM`
+tag on the Backspin and Sidespin cards, italics in the table), and the API
+and export flag it `spin_estimated`.
+
+- `launch_only_spin = 0` turns it off. Such a shot is then reported as the
+  device sent it: spin 0, carry, apex and flight time 0, rolled as a ground
+  ball.
+- Not used in Putting mode: there such a shot is reported as the device sent
+  it, as with the setting at 0.
+- Applies to any FlightScope model, and only to a result with no spin and
+  none of carry, apex or flight time. A result with spin (including an Xi
+  spin taken from `spin_source`), with any of the three, or launched below
+  5° (a putt, a bladed shot) keeps what the device sent; one with an apex of
+  0 is rolled as a ground ball.
+
+In the settings UI this is **Launch-only spin** on the device. A change
+applies from the next shot, without reconnecting.
 
 ## Club data and camera mode
 
@@ -177,14 +208,18 @@ environment = "limited_flight" # limited_flight | outdoor
 camera_mode = "standard"       # standard | fusion | raw_fusion
 use_estimated = false          # true keeps estimated-only (E8) shots
 spin_source = "d4"             # d4 | e8 | auto (FlightScope Xi only)
+launch_only_spin = 100.0       # rpm per mph for launch-only chips; 0 = off
 ```
 
 Distances accept a unit suffix — `in`, `ft`, `m`, `cm`, `yd`, `mm` — and are
 converted to the wire format on demand. `track_pct` is 0–100.
+`launch_only_spin` is 0 to 1000. A value outside that range (or not a
+number) in the config file turns it off, with a warning in the log; the
+settings page and `POST /api/settings` refuse to save one.
 
 Changing the address, the environment, the camera mode, or any session
-setting restarts the actor. `spin_source` applies from the next shot without a
-restart.
+setting restarts the actor. `spin_source` and `launch_only_spin` apply from
+the next shot without a restart.
 
 ## Shot export
 
@@ -233,6 +268,9 @@ What differs from the Mevo+:
 - **Two spin values.** The Xi sends two backspin values per shot, and
   `spin_source` picks which one flighthook reports. The default is `d4`, the
   value FS Golf displays. See [Spin on the Xi](#spin-on-the-xi).
+- **Very short chips** can arrive with launch data but no spin or carry;
+  flighthook estimates their spin. See
+  [Launch-only chips](#launch-only-chips-beta).
 
 Launch data (speed, VLA, HLA, carry, apex, flight time) and club data come
 from the device as for the Mevo+. Estimated-only shots follow `use_estimated`

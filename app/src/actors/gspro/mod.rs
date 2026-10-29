@@ -283,6 +283,9 @@ struct Relay {
     accumulators: HashMap<(String, ShotKey), ShotAccumulator>,
     /// Shots finished while connected, oldest first.
     outbox: VecDeque<PendingShot>,
+    /// The `ShotNumber` handed out last ([`Relay::next_shot`]), 0 before the
+    /// first. Kept for the actor's lifetime, across reconnects.
+    last_number: u32,
 }
 
 impl Relay {
@@ -296,6 +299,7 @@ impl Relay {
             readiness_changed: false,
             accumulators: HashMap::new(),
             outbox: VecDeque::new(),
+            last_number: 0,
         }
     }
 
@@ -412,11 +416,31 @@ impl Relay {
 
     /// Next shot to send, oldest first. Shots older than [`STALE_SHOT`] at
     /// `now` are dropped.
+    ///
+    /// The shot's `shot_number` becomes its `ShotNumber` for the simulator:
+    /// the shot's own number, or one more than the last one handed out when
+    /// that is higher. Numbers handed out therefore always increase, even
+    /// across sources that count separately (a launch monitor and Auto-chip)
+    /// or a device whose count starts again after it reconnects; one
+    /// device's increasing numbers go out unchanged.
     fn next_shot(&mut self, now: Instant) -> Option<ShotData> {
         while let Some(pending) = self.outbox.pop_front() {
             let age = now.saturating_duration_since(pending.finished_at);
             if age <= STALE_SHOT {
-                return Some(pending.shot);
+                let mut shot = pending.shot;
+                let number = shot.shot_number.max(self.last_number.saturating_add(1));
+                if number != shot.shot_number {
+                    tracing::debug!(
+                        "gspro bridge: shot #{} from '{}' sent as ShotNumber {number} \
+                         (last sent {})",
+                        shot.shot_number,
+                        shot.actor,
+                        self.last_number,
+                    );
+                }
+                shot.shot_number = number;
+                self.last_number = number;
+                return Some(shot);
             }
             tracing::debug!(
                 "gspro bridge: dropping shot #{} from '{}', finished {age:?} ago",
@@ -459,7 +483,12 @@ fn readiness(
 }
 
 /// Check if a shot actor matches the routing target for the current mode.
+/// Auto-chip shots ([`flighthook::AUTO_CHIP_ACTOR`]) match every routing:
+/// they stand in for a chip the routed monitor could not read.
 fn shot_matches_routing(routing: &GsProRouting, mode: ShotDetectionMode, actor: &str) -> bool {
+    if actor == flighthook::AUTO_CHIP_ACTOR {
+        return true;
+    }
     let target = match mode {
         ShotDetectionMode::Full => &routing.full_monitor,
         ShotDetectionMode::Chipping => &routing.chipping_monitor,
@@ -732,6 +761,127 @@ mod tests {
         }
         relay.drain(&mut receiver).expect("bus open");
         assert_eq!(sent_numbers(&mut relay, Instant::now()), [1, 2, 3]);
+    }
+
+    /// One device's increasing numbers, gaps included, go out unchanged.
+    #[test]
+    fn an_increasing_sequence_keeps_its_shot_numbers() {
+        let (mut relay, monitor, mut receiver) = relay_with_bus();
+        relay.connect(Instant::now());
+        for n in [1, 2, 5, 6, 40] {
+            emit_shot(&monitor, n);
+        }
+        relay.drain(&mut receiver).expect("bus open");
+        assert_eq!(sent_numbers(&mut relay, Instant::now()), [1, 2, 5, 6, 40]);
+    }
+
+    /// Device #1, then Auto-chip #1, then device #2 go out as 1, 2, 3: a
+    /// repeated or lower number is bumped past the last one sent.
+    #[test]
+    fn an_auto_chip_between_device_shots_never_repeats_a_shot_number() {
+        let (tx, _) = broadcast::channel(64);
+        let monitor = BusSender::new("mevo.0".into(), tx.clone(), Arc::default());
+        let chip = BusSender::new(
+            flighthook::AUTO_CHIP_ACTOR.into(),
+            tx.clone(),
+            Arc::default(),
+        );
+        let mut receiver =
+            BusSender::new("openconnect_client.0".into(), tx, Arc::default()).subscribe();
+        let mut relay = Relay::new(GsProRouting::default());
+        relay.connect(Instant::now());
+        emit_shot(&monitor, 1);
+        emit_shot(&chip, 1);
+        emit_shot(&monitor, 2);
+        relay.drain(&mut receiver).expect("bus open");
+        let now = Instant::now();
+        let sent: Vec<(String, u32)> = std::iter::from_fn(|| relay.next_shot(now))
+            .map(|s| (s.actor, s.shot_number))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                ("mevo.0".to_owned(), 1),
+                (flighthook::AUTO_CHIP_ACTOR.to_owned(), 2),
+                ("mevo.0".to_owned(), 3),
+            ]
+        );
+    }
+
+    /// A device whose count starts again (it reconnected), with GSPro
+    /// reconnecting too, still gets increasing numbers.
+    #[test]
+    fn a_device_count_reset_after_a_reconnect_still_increases() {
+        let (mut relay, monitor, mut receiver) = relay_with_bus();
+        relay.connect(Instant::now());
+        for n in 1..=3 {
+            emit_shot(&monitor, n);
+        }
+        relay.drain(&mut receiver).expect("bus open");
+        assert_eq!(sent_numbers(&mut relay, Instant::now()), [1, 2, 3]);
+        relay.disconnect();
+        relay.connect(Instant::now());
+        for n in 1..=4 {
+            emit_shot(&monitor, n);
+        }
+        relay.drain(&mut receiver).expect("bus open");
+        assert_eq!(sent_numbers(&mut relay, Instant::now()), [4, 5, 6, 7]);
+    }
+
+    /// An Auto-chip goes out whatever monitor each mode is routed to, as a
+    /// straight 28 deg chip with its solved speed, speed-scaled backspin, no
+    /// sidespin, no carry and zeroed club data; under the same routing a
+    /// shot from another monitor is still skipped.
+    #[test]
+    fn an_auto_chip_is_sent_whatever_the_routing() {
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-gspro-test-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, _writer) = SystemState::new(dir.join("config.toml"));
+        let (tx, _) = broadcast::channel(64);
+        let other = BusSender::new("square.0".into(), tx.clone(), Arc::default());
+        let mut receiver =
+            BusSender::new("openconnect_client.0".into(), tx.clone(), Arc::default()).subscribe();
+        let mevo = Some("mevo.0".to_owned());
+        let mut relay = Relay::new(GsProRouting {
+            full_monitor: mevo.clone(),
+            chipping_monitor: mevo.clone(),
+            putting_monitor: mevo,
+        });
+        relay.connect(Instant::now());
+        let modes = [
+            ShotDetectionMode::Full,
+            ShotDetectionMode::Chipping,
+            ShotDetectionMode::Putting,
+        ];
+        let chips = std::sync::atomic::AtomicU32::new(0);
+        for (n, mode) in (1..).zip(modes) {
+            relay.mode = mode;
+            let (key, ball) = crate::autochip::send(&state, &tx, 3, &chips).expect("solved");
+            assert_eq!(key.shot_number, n);
+            emit_shot(&other, n);
+            relay.drain(&mut receiver).expect("bus open");
+            let shot = relay.next_shot(Instant::now()).expect("auto-chip sent");
+            assert!(relay.next_shot(Instant::now()).is_none(), "{mode:?}");
+            assert_eq!(shot.actor, flighthook::AUTO_CHIP_ACTOR);
+            assert_eq!(shot.shot_number, key.shot_number);
+            assert!(shot.club.is_none());
+
+            let msg = mapper::map_shot(&shot, Handedness::Right);
+            let speed = ball.launch_speed.expect("speed").as_mph();
+            assert!((msg.ball_data.speed - speed).abs() < 1e-9);
+            assert!(speed > 5.0 && speed < 12.0, "{speed}");
+            assert_eq!(msg.ball_data.vla, 28.0);
+            assert_eq!(msg.ball_data.hla, 0.0);
+            assert_eq!(msg.ball_data.back_spin, (100.0 * speed).round());
+            assert_eq!(msg.ball_data.side_spin, 0.0);
+            assert_eq!(msg.ball_data.spin_axis, 0.0);
+            assert_eq!(msg.ball_data.carry_distance, None);
+            assert_eq!(msg.club_data.speed, 0.0);
+            assert_eq!(msg.club_data.loft, 0.0);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

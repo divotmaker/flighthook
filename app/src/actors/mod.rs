@@ -108,6 +108,13 @@ pub fn resolve_actors(
                 let session_config = mevo::SessionConfig::from_mevo_section(section);
                 let use_estimated = section.use_estimated.unwrap_or(false);
                 let camera_mode = section.camera_mode.unwrap_or_default();
+                if !flighthook::MevoSection::launch_only_spin_valid(section.launch_only_spin) {
+                    tracing::warn!(
+                        "device '{id}': invalid launch_only_spin {} (must be 0 to {}), using 0 (off)",
+                        section.launch_only_spin,
+                        flighthook::MevoSection::MAX_LAUNCH_ONLY_SPIN,
+                    );
+                }
                 actors.push(ResolvedActor {
                     id,
                     name: section.name.clone(),
@@ -118,6 +125,7 @@ pub fn resolve_actors(
                         use_estimated,
                         camera_mode,
                         spin_source: section.spin_source,
+                        launch_only_spin: section.launch_only_spin_rpm_per_mph(),
                     }),
                 });
             }
