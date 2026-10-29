@@ -121,6 +121,9 @@ Terminal. Allow it.
   window
 - Export the session as JSONL with the raw device frames behind each shot, or CSV
 - Dual UI: native desktop window (eframe/egui) and browser dashboard (WASM, same codebase)
+- The UI scales itself to fit the window, so a 4K screen at 100 % shows about the
+  same layout as at 200 %; in the desktop app Ctrl/Cmd + `+` / `-` adjust it and
+  Ctrl/Cmd + `0` resets it (beta)
 - Configurable via TOML file with live settings updates
 - REST + WebSocket API for external consumers — subscribe to shot data, device telemetry, and raw audit events in real time. Build custom shot triggers, data loggers, or alternative integrations without touching the core.
 

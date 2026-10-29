@@ -10,6 +10,7 @@ use crate::panels::dispersion::{self, DispersionKey, EllipseSize, Points};
 use crate::panels::settings::{PendingRemoval, SettingsForm};
 use crate::panels::shots::{ShotFocus, ShotsView};
 use crate::panels::{Tab, flight};
+use crate::scale::{self, UiScale};
 use crate::theme;
 use crate::types::{
     ActorStatus, ActorStatusResponse, Club, FlighthookEvent, FlighthookMessage, GameStateSnapshot,
@@ -143,11 +144,16 @@ pub struct FlighthookApp {
     pub(crate) wizard_saving: bool,
     /// Why the last Get Started failed.
     pub(crate) wizard_error: Option<String>,
+
+    /// The UI zoom: fitted to the window every frame, plus the session's
+    /// Ctrl/Cmd +/- steps.
+    ui_scale: UiScale,
 }
 
 impl FlighthookApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
+        scale::install(&cc.egui_ctx);
         let pending = net::new_pending();
 
         // Settings at once, for wizard detection. Status, shots and sets are
@@ -221,6 +227,7 @@ impl FlighthookApp {
             wizard_gspro: false,
             wizard_saving: false,
             wizard_error: None,
+            ui_scale: UiScale::default(),
         }
     }
 
@@ -900,6 +907,8 @@ pub(crate) fn input_ms(ctx: &egui::Context) -> u64 {
 
 impl eframe::App for FlighthookApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Before any layout: a changed zoom discards this pass.
+        self.ui_scale.apply(ctx);
         self.now_ms = input_ms(ctx);
         // Poll for WebSocket events ~10x/sec instead of only on user input.
         ctx.request_repaint_after(std::time::Duration::from_millis(100));

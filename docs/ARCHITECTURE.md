@@ -1060,6 +1060,29 @@ card titles, the Shots tab's device filter and labels, and alert banners.
 - `Applied` -- config unchanged or applied without restart (default for mock actors)
 - `RestartRequired` -- address/routing/settings changed; must stop and recreate
 
+## UI Zoom
+
+The UI (native window and browser) zooms itself every frame to fit the
+window (`ui/src/scale.rs`). The layout is designed for windows from 1024×768
+to 1920×1080 points. With `w` × `h` the window's size in points at zoom 1
+(physical pixels over the screen's native pixels per point, so the display
+scale or device pixel ratio counts), the zoom is `min(w / 1920, h / 1080)`
+(at most 3.0) when that is above 1, else `min(w / 1024, h / 768)` (at least
+0.8, so a phone keeps readable text and scrolls) when that is below 1, else
+1. Both are rounded down to a multiple of 1/32, so resizing a window changes
+the zoom only now and then and the design size still fits. A 4K screen at
+100 % therefore looks almost as it does at 200 %, at 300 % it zooms out until
+768 points of height fit, and a 1920×1080 screen at 150 % lays out at about
+1365×768 points.
+
+In the native window, Ctrl/Cmd + `=` or `+` and Ctrl/Cmd + `-` step the zoom
+by a factor of 1.1 on top of that (up to 6 steps either way, for the
+session), Ctrl/Cmd + `0` goes back to the automatic zoom, and the result
+stays within 0.5–4.0. In the browser those keys are the browser's own zoom,
+which the fit absorbs while the page is larger than 1920×1080 CSS pixels.
+The browser also caps the effective pixel ratio at 2.0 on screens above 2.0,
+so text and layout use at most 2 pixels per point there.
+
 ## Devices Tab
 
 The Devices tab is where the app opens. It holds the global settings, the
