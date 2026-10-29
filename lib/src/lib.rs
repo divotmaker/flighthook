@@ -2,6 +2,7 @@ mod api;
 #[cfg(feature = "client")]
 mod client;
 mod config;
+mod connection;
 mod event;
 mod export;
 mod game_state;
@@ -14,6 +15,7 @@ pub use api::*;
 #[cfg(feature = "client")]
 pub use client::*;
 pub use config::*;
+pub use connection::*;
 pub use event::*;
 pub use export::*;
 pub use game_state::*;

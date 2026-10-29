@@ -65,8 +65,9 @@ pub struct ResolvedActor {
 
 /// Build a flat list of all actors from the persisted config.
 ///
-/// Iterates all config sections (mevo, mock_monitor, gspro, random_club,
-/// webserver) and constructs the appropriate concrete actor for each.
+/// Iterates all config sections (webserver, mevo, mock_monitor,
+/// openconnect_client, random_club, ...) and constructs the appropriate
+/// concrete actor for each, webservers first.
 /// Invalid addresses are logged and skipped.
 ///
 /// `current_mode` is the active detection mode from game state. Falls back
@@ -79,6 +80,24 @@ pub fn resolve_actors(
 
     let mode = current_mode.unwrap_or(ShotDetectionMode::Full);
     let mut actors = Vec::new();
+
+    // Webservers first: each subscribes to the bus in `start`, so the
+    // statuses the other actors emit as they start reach its state.
+    for (index, ws) in &config.webserver {
+        let id = global_id("webserver", index);
+        match ws.bind.parse::<SocketAddr>() {
+            Ok(addr) => {
+                actors.push(ResolvedActor {
+                    id,
+                    name: ws.name.clone(),
+                    actor: Box::new(web::WebActor::new(addr)),
+                });
+            }
+            Err(e) => {
+                tracing::warn!("webserver '{id}': invalid bind address '{}': {e}", ws.bind);
+            }
+        }
+    }
 
     // Mevo devices
     for (index, section) in &config.mevo {
@@ -176,9 +195,9 @@ pub fn resolve_actors(
         }
     }
 
-    // GSPro integrations
-    for (index, section) in &config.gspro {
-        let id = global_id("gspro", index);
+    // Open Connect clients (GSPro, Muni Golf, ...)
+    for (index, section) in &config.openconnect_client {
+        let id = global_id("openconnect_client", index);
         let addr_str = section.address.as_deref().unwrap_or("127.0.0.1:921");
         match addr_str.parse::<SocketAddr>() {
             Ok(addr) => {
@@ -207,23 +226,6 @@ pub fn resolve_actors(
             name: section.name.clone(),
             actor: Box::new(mock::randomclub::RandomClubActor),
         });
-    }
-
-    // Webservers
-    for (index, ws) in &config.webserver {
-        let id = global_id("webserver", index);
-        match ws.bind.parse::<SocketAddr>() {
-            Ok(addr) => {
-                actors.push(ResolvedActor {
-                    id,
-                    name: ws.name.clone(),
-                    actor: Box::new(web::WebActor::new(addr)),
-                });
-            }
-            Err(e) => {
-                tracing::warn!("webserver '{id}': invalid bind address '{}': {e}", ws.bind);
-            }
-        }
     }
 
     actors
@@ -258,8 +260,8 @@ pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String> {
     for (index, section) in &config.mock_monitor {
         names.insert(global_id("mock_monitor", index), section.name.clone());
     }
-    for (index, section) in &config.gspro {
-        names.insert(global_id("gspro", index), section.name.clone());
+    for (index, section) in &config.openconnect_client {
+        names.insert(global_id("openconnect_client", index), section.name.clone());
     }
     for (index, section) in &config.random_club {
         names.insert(global_id("random_club", index), section.name.clone());

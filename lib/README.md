@@ -9,14 +9,14 @@ Types for the TOML config file and unit-aware value handling.
 
 | Type                 | Description                                                                                      |
 | -------------------- | ------------------------------------------------------------------------------------------------ |
-| `FlighthookConfig`   | Top-level config with per-section `HashMap`s (webserver, mevo, r10, square, openconnect_server, mock_monitor, gspro, random_club) |
+| `FlighthookConfig`   | Top-level config with per-section `HashMap`s (webserver, mevo, r10, square, openconnect_server, mock_monitor, openconnect_client, random_club); `gspro` sections are read as `openconnect_client` |
 | `WebserverSection`   | Web server instance (name + bind address)                                                        |
 | `MevoSection`        | Mevo device instance (address, ball type, tee height, range, surface height, track %, camera mode) |
 | `CameraMode`         | `Standard` / `Fusion` / `RawFusion` — Fusion modes request club data from a Mevo                 |
 | `R10Section`         | Garmin R10 device instance (BLE auto-discovery, name only)                                       |
 | `SquareSection`      | Square Golf Omni device instance (address, club, advanced spin, zero-spin rejection)             |
-| `OpenConnectServerSection` | GSPro Open Connect ingest listener (bind address)                                          |
-| `GsProSection`       | GSPro integration instance (address, per-mode monitor routing)                                   |
+| `OpenConnectServerSection` | OpenConnect server: GSPro Open Connect ingest listener (bind address)                      |
+| `OpenConnectClientSection` | OpenConnect client: dials a simulator such as GSPro or Muni Golf (address, per-mode monitor routing) |
 | `MockMonitorSection` | Mock launch monitor instance                                                                     |
 | `RandomClubSection`  | Random club cycling integration instance                                                         |
 | `ShotDetectionMode`  | `Full` / `Putting` / `Chipping`                                                                  |
@@ -75,12 +75,14 @@ All variants are flat struct variants with named fields (no wrapper types).
 | Type          | Description                                                                |
 | ------------- | -------------------------------------------------------------------------- |
 | `ActorStatus` | Lifecycle enum: `Starting` / `Disconnected` / `Connected` / `Reconnecting` |
+| `ConnectionState` | Shown state: `Connecting` / `Connected` / `Reconnecting`, derived from `ActorStatus` and the history since the actor started |
+| `StatusHistory` | That history (clock-agnostic): `observe`, `restart`, `state`, `red_for_ms` (alert time left, `RECONNECT_ALERT_MS` = 10 min after a lost connection) |
 
 ### Commands and outcomes
 
 | Type           | Description                                                                      |
 | -------------- | -------------------------------------------------------------------------------- |
-| `ConfigAction` | `ReplaceAll` / `UpsertWebserver` / `UpsertMevo` / `UpsertGsPro` / `Remove` / ... |
+| `ConfigAction` | `ReplaceAll` / `UpsertWebserver` / `UpsertMevo` / `UpsertOpenConnectClient` / `Remove` / ... |
 | `Severity`     | `Warn` / `Error` / `Critical`. Re-exported from `flightrelay`                    |
 
 ## API types
@@ -90,7 +92,7 @@ REST request/response types shared between the web server and the UI.
 | Type                   | Description                                               |
 | ---------------------- | --------------------------------------------------------- |
 | `StatusResponse`       | `GET /api/status` -- actor map + current mode             |
-| `ActorStatusResponse`  | Per-actor: name, status, telemetry map                    |
+| `ActorStatusResponse`  | Per-actor: name, status, telemetry map, `state` + `red_for_ms`; build with `new`, record statuses with `observe` |
 | `ModeRequest`          | `POST /api/mode` -- target detection mode                 |
 | `PostSettingsResponse` | `POST /api/settings` -- lists of restarted/stopped actors |
 

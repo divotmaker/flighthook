@@ -10,9 +10,8 @@ pub(crate) mod shots;
 use std::collections::HashMap;
 
 use crate::app::FlighthookApp;
-use crate::panels::cards::{CardGroup, group_of, split_actor_id};
 use crate::theme;
-use crate::types::{ActorStatus, ActorStatusResponse};
+use crate::types::ActorStatusResponse;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tab {
@@ -29,21 +28,30 @@ pub(crate) const TABS: [(Tab, &str); 3] = [
 ];
 
 /// The tab that carries the red notification dot, as an index into
-/// [`TABS`]: Devices, while any connection has an issue. An output that is
-/// starting or reconnecting is not an issue: a simulator that is not running
-/// is normal, since users run one at a time.
-pub(crate) fn tab_alert(actors: &HashMap<String, ActorStatusResponse>) -> Option<usize> {
-    let issue = actors.iter().any(|(id, a)| match a.status {
-        ActorStatus::Disconnected => true,
-        ActorStatus::Reconnecting | ActorStatus::Starting => {
-            group_of(split_actor_id(id).0) != CardGroup::Outputs
-        }
-        ActorStatus::Connected => false,
-    });
-    if !issue {
+/// [`TABS`]: Devices, while any card is red at `now_ms`, i.e. an actor lost
+/// its connection less than
+/// [`RECONNECT_ALERT_MS`](crate::types::RECONNECT_ALERT_MS) ago. Every actor counts
+/// alike, outputs and servers included; nothing else lights it.
+pub(crate) fn tab_alert(
+    actors: &HashMap<String, ActorStatusResponse>,
+    now_ms: u64,
+) -> Option<usize> {
+    if !actors.values().any(|a| a.red(now_ms)) {
         return None;
     }
     TABS.iter().position(|(tab, _)| *tab == Tab::Devices)
+}
+
+/// Milliseconds until the first red card turns yellow, if any card is red.
+pub(crate) fn next_alert_change(
+    actors: &HashMap<String, ActorStatusResponse>,
+    now_ms: u64,
+) -> Option<u64> {
+    actors
+        .values()
+        .map(|a| a.red_for_ms_at(now_ms))
+        .filter(|ms| *ms > 0)
+        .min()
 }
 
 impl FlighthookApp {
@@ -54,7 +62,12 @@ impl FlighthookApp {
             .position(|(tab, _)| *tab == self.active_tab)
             .unwrap_or(0);
         let labels = TABS.map(|(_, label)| label);
-        let alert = tab_alert(&self.actors);
+        let alert = tab_alert(&self.actors, self.now_ms);
+        // A red card turns yellow on time, with no event to wake the UI.
+        if let Some(ms) = next_alert_change(&self.actors, self.now_ms) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(ms));
+        }
         let tabs = ui
             .add_enabled_ui(!self.settings.locked(), |ui| {
                 theme::segmented(ui, &labels, selected, alert)

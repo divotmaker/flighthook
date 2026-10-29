@@ -1,13 +1,20 @@
-//! GSPro Open Connect V1 bridge.
+//! GSPro Open Connect V1 client: the `openconnect_client` actor.
 //!
-//! Subscribes to the unified bus for shot data and forwards to GSPro's TCP API
-//! (port 921). Emits PlayerInfo/ClubInfo for club/player changes and
+//! Subscribes to the unified bus for shot data and forwards it over TCP to a
+//! simulator that accepts Open Connect: GSPro (port 921), Muni Golf (9210),
+//! or any other. Emits PlayerInfo/ClubInfo for club/player changes and
 //! ActorStatus for connection status. Reconnects with linear backoff on failure.
 //!
 //! The bus is drained the whole time, connected or not. Every shot that
-//! finishes while GSPro is connected is sent, in order; a shot that finishes
-//! while it is not, or is older than [`STALE_SHOT`] when the bridge could
-//! send it, is dropped (debug log only: GSPro not running is normal).
+//! finishes while the simulator is connected is sent, in order; a shot that
+//! finishes while it is not, or is older than [`STALE_SHOT`] when the bridge
+//! could send it, is dropped (debug log only: a simulator not running is
+//! normal).
+//!
+//! A connection refused by this process's own Open Connect server (the client
+//! points at it, which would loop shots back) is a setup mistake,
+//! not a simulator that is not running: the card's telemetry carries the
+//! reason as `error` until a connection is accepted or fails another way.
 
 pub mod api;
 pub mod mapper;
@@ -26,6 +33,7 @@ use super::backoff::Backoff;
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
+use crate::state::local_clients::LocalClients;
 use flighthook::{
     ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, ShotAccumulator, ShotData,
     ShotDetectionMode, ShotKey,
@@ -35,6 +43,9 @@ use flighthook::{
 #[derive(Debug)]
 pub(crate) enum BridgeError {
     Io(std::io::Error),
+    /// This process's own Open Connect server refused the connection; the
+    /// reason it gave.
+    Refused(String),
     Shutdown,
 }
 
@@ -42,6 +53,7 @@ impl fmt::Display for BridgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Refused(reason) => write!(f, "{reason}"),
             Self::Shutdown => write!(f, "shutdown"),
         }
     }
@@ -55,22 +67,24 @@ pub struct GsProRouting {
     pub putting_monitor: Option<String>,
 }
 
-/// GSPro bridge actor. Connects to GSPro on port 921 (TCP, JSON),
-/// forwards shot data, and handles heartbeats.
+/// Open Connect client actor (`openconnect_client.N`). Connects to a
+/// simulator that accepts GSPro Open Connect V1 (GSPro on port 921, Muni Golf
+/// on 9210; TCP, JSON), forwards shot data, and handles heartbeats.
 pub struct GsProActor {
     pub addr: SocketAddr,
     pub routing: GsProRouting,
 }
 
 impl Actor for GsProActor {
-    fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let addr = self.addr;
         let routing = self.routing.clone();
+        let clients = Arc::clone(&state.local_clients);
         let thread_name = format!("gspro:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
-            .spawn(move || run(addr, routing, sender, receiver))
+            .spawn(move || run(addr, routing, &clients, sender, receiver))
             .expect("failed to spawn gspro thread");
     }
 
@@ -82,7 +96,7 @@ impl Actor for GsProActor {
         };
 
         let snap = state.system.snapshot();
-        let section = match snap.gspro.get(index) {
+        let section = match snap.openconnect_client.get(index) {
             Some(s) => s,
             None => return ReconfigureOutcome::RestartRequired, // section removed
         };
@@ -133,26 +147,47 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 /// stall the bridge and leave the bus undrained.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a connection must stay up before the client reports itself
+/// connected: an Open Connect server refuses its own client as soon as it
+/// accepts it, well within this, so a refused connection never shows as
+/// Connected.
+const REFUSAL_VERDICT: Duration = Duration::from_secs(1);
+
+/// Telemetry clearing the `error` key: an empty value removes a key.
+fn clear_error() -> HashMap<String, String> {
+    HashMap::from([("error".into(), String::new())])
+}
+
 /// Main bridge loop. Reconnects forever until the bus closes.
-fn run(addr: SocketAddr, routing: GsProRouting, sender: BusSender, receiver: BusReceiver) {
+fn run(
+    addr: SocketAddr,
+    routing: GsProRouting,
+    clients: &LocalClients,
+    sender: BusSender,
+    receiver: BusReceiver,
+) {
     run_with(
         addr,
         routing,
         Backoff::new(MIN_BACKOFF, MAX_BACKOFF),
+        clients,
         &sender,
         receiver,
     );
 }
 
-fn run_with(
+pub(crate) fn run_with(
     addr: SocketAddr,
     routing: GsProRouting,
     mut backoff: Backoff,
+    clients: &LocalClients,
     sender: &BusSender,
     mut receiver: BusReceiver,
 ) {
     let mut relay = Relay::new(routing);
     let mut ever_connected = false;
+    // Whether our own Open Connect server refused the last connection.
+    let mut refused = false;
 
     loop {
         if relay.drain(&mut receiver).is_err() {
@@ -165,12 +200,18 @@ fn run_with(
         } else {
             ActorStatus::Starting
         };
+        // The first status also clears an `error` left by an earlier run of
+        // this actor.
         sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
             status,
-            telemetry: HashMap::new(),
+            telemetry: if ever_connected {
+                HashMap::new()
+            } else {
+                clear_error()
+            },
         }));
 
-        let result = connect_and_run(addr, &mut relay, sender, &mut receiver);
+        let result = connect_and_run(addr, &mut relay, clients, sender, &mut receiver);
         let session = relay.disconnect();
         ever_connected |= session.is_some();
         match result {
@@ -187,11 +228,21 @@ fn run_with(
                 let delay = backoff.delay(session);
                 let text = e.to_string();
                 // GSPro not running is normal (one simulator at a time), so a
-                // lost or refused connection is a status, not an alert.
+                // lost or refused connection is a status, not an alert. Our
+                // own server refusing us is a setup mistake: the card says
+                // why (the server raises the alert).
+                let telemetry = match e {
+                    BridgeError::Refused(reason) => {
+                        refused = true;
+                        HashMap::from([("error".into(), reason)])
+                    }
+                    _ if std::mem::take(&mut refused) => clear_error(),
+                    _ => HashMap::new(),
+                };
                 tracing::info!("gspro bridge: {text}, retrying in {delay:?}");
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
                     status: backoff_status,
-                    telemetry: HashMap::new(),
+                    telemetry,
                 }));
 
                 let deadline = Instant::now() + delay;
@@ -420,16 +471,50 @@ fn shot_matches_routing(routing: &GsProRouting, mode: ShotDetectionMode, actor: 
     }
 }
 
+/// Connect and run one session. The connection is registered in `clients`
+/// while it lasts, so this process's own Open Connect server can refuse it;
+/// a refusal ends the session as [`BridgeError::Refused`]. The client
+/// reports itself connected only once the connection has outlived
+/// [`REFUSAL_VERDICT`], clearing the error.
 fn connect_and_run(
+    addr: SocketAddr,
+    relay: &mut Relay,
+    clients: &LocalClients,
+    sender: &BusSender,
+    receiver: &mut BusReceiver,
+) -> Result<(), BridgeError> {
+    let mut stream =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(BridgeError::Io)?;
+    // Registered before anything is sent, so a server reading our data
+    // already knows the connection is ours.
+    let registration = match stream.local_addr() {
+        Ok(local) => Some(clients.register(local, sender.actor_id())),
+        Err(e) => {
+            tracing::debug!(
+                "gspro bridge: no local address ({e}); our own Open Connect server \
+                 cannot recognise this connection"
+            );
+            None
+        }
+    };
+    let result = session(&mut stream, addr, relay, sender, receiver);
+    match registration.and_then(|r| r.refusal()) {
+        Some(reason) if !matches!(result, Ok(()) | Err(BridgeError::Shutdown)) => {
+            Err(BridgeError::Refused(reason))
+        }
+        _ => result,
+    }
+}
+
+/// One connected session with the simulator.
+fn session(
+    stream: &mut TcpStream,
     addr: SocketAddr,
     relay: &mut Relay,
     sender: &BusSender,
     receiver: &mut BusReceiver,
 ) -> Result<(), BridgeError> {
     let name = sender.actor_id();
-
-    let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(BridgeError::Io)?;
     stream.set_nodelay(true).map_err(BridgeError::Io)?;
     stream
         .set_read_timeout(Some(Duration::from_millis(50)))
@@ -441,12 +526,11 @@ fn connect_and_run(
     // Shots that finished during the connect attempt finished while GSPro
     // was not connected.
     relay.drain(receiver)?;
-    relay.connect(Instant::now());
+    let connected_at = Instant::now();
+    relay.connect(connected_at);
     tracing::info!("gspro bridge: connected to {addr}");
-    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-        status: ActorStatus::Connected,
-        telemetry: HashMap::new(),
-    }));
+    // Shots flow from now; the Connected status waits for the verdict.
+    let mut announced = false;
 
     // Backdate so the first heartbeat fires after ~1s instead of waiting the full 10s.
     let mut last_heartbeat = Instant::now() - Duration::from_secs(9);
@@ -492,7 +576,7 @@ fn connect_and_run(
         relay.drain(receiver)?;
 
         // 3. Send every finished shot, oldest first
-        if send_shots(relay, &mut stream, Instant::now(), name)? {
+        if send_shots(relay, stream, Instant::now(), name)? {
             activity = true;
         }
 
@@ -509,7 +593,7 @@ fn connect_and_run(
                         "{name} sent heartbeat {json_str} | {msg:?}",
                     );
                 }
-                send_message(&mut stream, &msg)?;
+                send_message(stream, &msg)?;
                 last_heartbeat = Instant::now();
                 activity = true;
             }
@@ -528,8 +612,16 @@ fn connect_and_run(
                     "{name} sent heartbeat {json_str} | {msg:?}",
                 );
             }
-            send_message(&mut stream, &msg)?;
+            send_message(stream, &msg)?;
             activity = true;
+        }
+
+        if !announced && connected_at.elapsed() >= REFUSAL_VERDICT {
+            announced = true;
+            sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                status: ActorStatus::Connected,
+                telemetry: clear_error(),
+            }));
         }
 
         if !activity {
@@ -620,7 +712,8 @@ mod tests {
     fn relay_with_bus() -> (Relay, BusSender, BusReceiver) {
         let (tx, _) = broadcast::channel(64);
         let monitor = BusSender::new("mevo.0".into(), tx.clone(), Arc::default());
-        let receiver = BusSender::new("gspro.0".into(), tx, Arc::default()).subscribe();
+        let receiver =
+            BusSender::new("openconnect_client.0".into(), tx, Arc::default()).subscribe();
         (Relay::new(GsProRouting::default()), monitor, receiver)
     }
 
@@ -718,7 +811,12 @@ mod tests {
             pending.finished_at = finished;
         }
 
-        let failed = send_shots(&mut relay, &mut TimedOutSocket, finished, "gspro.0");
+        let failed = send_shots(
+            &mut relay,
+            &mut TimedOutSocket,
+            finished,
+            "openconnect_client.0",
+        );
         assert!(
             matches!(failed, Err(BridgeError::Io(ref e)) if e.kind() == ErrorKind::TimedOut),
             "a timed-out write ends the connection: {failed:?}"
@@ -731,7 +829,8 @@ mod tests {
         let back = finished + reconnect_after;
         relay.connect(back);
         let mut wire = Vec::new();
-        send_shots(&mut relay, &mut wire, back, "gspro.0").expect("writes to a Vec succeed");
+        send_shots(&mut relay, &mut wire, back, "openconnect_client.0")
+            .expect("writes to a Vec succeed");
         assert!(relay.outbox.is_empty());
         messages(&wire)
     }
@@ -750,7 +849,7 @@ mod tests {
 
     // -- Bridge against a fake GSPro ---------------------------------------
 
-    /// A running bridge (`gspro.0`) wired to a fake GSPro listener it dials.
+    /// A running bridge (`openconnect_client.0`) wired to a fake GSPro listener it dials.
     struct Bridge {
         gspro: TcpListener,
         monitor: BusSender,
@@ -766,12 +865,23 @@ mod tests {
             let addr = gspro.local_addr().expect("listener addr");
             let (tx, events) = broadcast::channel(1024);
             let shutdown = Arc::new(AtomicBool::new(false));
-            let sender = BusSender::new("gspro.0".into(), tx.clone(), Arc::clone(&shutdown));
+            let sender = BusSender::new(
+                "openconnect_client.0".into(),
+                tx.clone(),
+                Arc::clone(&shutdown),
+            );
             let receiver = sender.subscribe();
             let monitor = BusSender::new("mevo.0".into(), tx, Arc::default());
             let (done_tx, done) = mpsc::channel();
             std::thread::spawn(move || {
-                run_with(addr, GsProRouting::default(), backoff, &sender, receiver);
+                run_with(
+                    addr,
+                    GsProRouting::default(),
+                    backoff,
+                    &LocalClients::default(),
+                    &sender,
+                    receiver,
+                );
                 let _ = done_tx.send(());
             });
             Self {
@@ -807,14 +917,14 @@ mod tests {
             }
         }
 
-        /// Wait for a bus event from `gspro.0` matching `want`; returns every
-        /// `gspro.0` alert seen on the way.
+        /// Wait for a bus event from `openconnect_client.0` matching `want`; returns every
+        /// `openconnect_client.0` alert seen on the way.
         fn wait_for(&mut self, what: &str, want: impl Fn(&FlighthookEvent) -> bool) -> Vec<String> {
             let deadline = Instant::now() + WAIT;
             let mut alerts = Vec::new();
             loop {
                 match self.events.try_recv() {
-                    Ok(msg) if msg.actor == "gspro.0" => {
+                    Ok(msg) if msg.actor == "openconnect_client.0" => {
                         if let FlighthookEvent::Alert { ref message, .. } = msg.event {
                             alerts.push(message.clone());
                         }
@@ -832,12 +942,12 @@ mod tests {
             }
         }
 
-        /// Every `gspro.0` alert already on the bus, without waiting.
+        /// Every `openconnect_client.0` alert already on the bus, without waiting.
         fn alerts_so_far(&mut self) -> Vec<String> {
             let mut alerts = Vec::new();
             while let Ok(msg) = self.events.try_recv() {
                 if let (true, FlighthookEvent::Alert { message, .. }) =
-                    (msg.actor == "gspro.0", msg.event)
+                    (msg.actor == "openconnect_client.0", msg.event)
                 {
                     alerts.push(message);
                 }

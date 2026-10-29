@@ -50,12 +50,11 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Config::parse();
 
-    // Load (or create) config file
+    // The config file is loaded (or created) by `SystemState::new`.
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(state::config::default_config_path);
-    let _persisted = state::config::load(&config_path);
 
     // Create tokio runtime manually -- eframe::run_native() needs the main thread
     let rt = tokio::runtime::Runtime::new()?;

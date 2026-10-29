@@ -156,27 +156,57 @@ Comprehensive system state (all actors -- launch monitors and integrations).
         "external_power": "false",
         "device_info": "XXXXXXXX, H/W: XXXX v1.0, F/W: 1.00"
       },
+      "state": "connected",
+      "red_for_ms": 0
     },
-    "gspro.0": {
-      "name": "Local GSPro",
+    "openconnect_client.0": {
+      "name": "GSPro",
       "status": "connected",
       "telemetry": {
         "club": "DR"
-      }
+      },
+      "state": "connected",
+      "red_for_ms": 0
     }
   }
 }
 ```
 
-`name` is the actor's configured name. An Open Connect server with a blank
+`name` is the actor's configured name, as the config holds it at the request
+(a rename shows here at once; it restarts nothing). An Open Connect server
+with a blank
 name reads `Open Connect`, and Open Connect servers that share a name are
 numbered in index order (`Open Connect 1`, `Open Connect 2`).
 
 - `mode`: global detection mode (`"full"` | `"putting"` | `"chipping"`), `null` if not yet set
 - `club`: club in play (see [`POST /api/club`](#post-apiclub)); absent until a
   club has been selected. Same source as `init.global_state.club_info`
-- `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`
+- `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`,
+  the actor's latest [`actor_status`](#actor_status)
 - `telemetry`: actor-specific key/value pairs (all string values)
+- `state`: the [connection state](#connectionstate) the dashboard shows,
+  derived by the server from `status` and the actor's history since it last
+  started:
+  - `"connecting"`: not `connected` since it started, or since it was
+    restarted by a config change;
+  - `"connected"`: `status` is `connected`;
+  - `"reconnecting"`: `connected` since it started, and has since lost the
+    connection (any other status).
+- `red_for_ms`: milliseconds the `reconnecting` state stays an alert (red),
+  counted from when the reply was built: what is left of the 10 minutes
+  (600000 ms) after the most recent change from `connected` to any other
+  status, else `0`. Another loss while already `reconnecting` does not start
+  the 10 minutes again; a new `connected` then a loss does. A client counts
+  it down from the moment it receives the reply, so its clock need not match
+  the server's.
+
+The server keeps each actor's history for as long as it runs, whoever is
+connected: a dashboard opened five minutes after a loss still gets
+`reconnecting` with about five minutes of `red_for_ms`. A `starting` status,
+a restart from a config change and removing the actor (then adding it again)
+each begin a new history. Live [`actor_status`](#actor_status) events carry
+only `status`; a client applies the same rules to them to keep `state` and
+the red time current.
 
 Telemetry keys are merged from two sources with no overlap:
 - **Device-reported** (from `device_telemetry`): `ready`, `battery_pct`, `tilt`,
@@ -494,8 +524,9 @@ listing the codes when the club is unknown.
 Emits `club_info` on the bus (actor `web`). The detection mode is derived from
 the club as for GSPro (`chipping_clubs` → chipping, `putting_clubs` →
 putting, else full), and when it differs from the open set's club, the next
-shot starts a new [set](#get-apishotsgroups). While a GSPro bridge is connected, GSPro's next player message
-replaces the selection: GSPro is the club authority while it runs.
+shot starts a new [set](#get-apishotsgroups). While an OpenConnect client is
+connected, the simulator's next player message replaces the selection: the
+simulator (e.g. GSPro) is the club authority while it runs.
 
 ---
 
@@ -781,9 +812,9 @@ Full persisted config (mirrors `config.toml`).
       "bind": "0.0.0.0:921"
     }
   },
-  "gspro": {
+  "openconnect_client": {
     "0": {
-      "name": "Local GSPro",
+      "name": "GSPro",
       "address": "127.0.0.1:921"
     }
   },
@@ -792,7 +823,7 @@ Full persisted config (mirrors `config.toml`).
 ```
 
 - Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `square.0`, `mock_monitor.0`,
-  `openconnect_server.0`, `gspro.0`, `random_club.0`, `webserver.0`
+  `openconnect_server.0`, `openconnect_client.0`, `random_club.0`, `webserver.0`
 - `shot_grouping`: the Shots tab's default view, [`ShotGrouping`](#shotgrouping),
   `"by_set"` by default. It does not change how
   [sets](#get-apishotsgroups) are assigned. Omitted while at the default
@@ -842,10 +873,19 @@ Full persisted config (mirrors `config.toml`).
 - `openconnect_server` sections are **launch monitors**, not integrations: they
   listen (`bind`, default `0.0.0.0:921`) and accept inbound shots from any
   monitor that speaks GSPro Open Connect V1 as a client — Uneekor, Foresight,
-  SkyTrak, MLM2PRO. This is the inverse of `gspro`, which dials GSPro. GSPro
-  listens on 921 too, but moving GSPConnect to 922 (set
+  SkyTrak, MLM2PRO. This is the inverse of `openconnect_client`, which dials a
+  simulator. GSPro listens on 921 too, but moving GSPConnect to 922 (set
   `<OpenAPIUseAltPort>true</OpenAPIUseAltPort>` in
   `C:\GSPro\GSPC\GSPconnect.exe.config`) frees 921 so both can share one host
+- `openconnect_client` sections are **outputs**: each dials `address` (default
+  `127.0.0.1:921`), a simulator that accepts GSPro Open Connect V1 — GSPro on
+  921, Muni Golf on 9210 — and sends it every shot. `full_monitor`,
+  `chipping_monitor` and `putting_monitor` take a launch monitor's actor ID
+  and accept shots in that mode from it alone; absent accepts any monitor
+- `gspro` sections are also accepted when posting and read as
+  `openconnect_client` sections with the same index; when both name an index,
+  the `openconnect_client` one is used. Responses carry only
+  `openconnect_client`
 
 ---
 
@@ -858,8 +898,9 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 
 **Query parameters**:
 
-- `scope` (optional): a global actor ID (`mevo.0`, `gspro.1`, `webserver.0`)
-  or `global`.
+- `scope` (optional): a global actor ID (`mevo.0`, `openconnect_client.1`,
+  `webserver.0`) or `global`. `gspro.N` is accepted for
+  `openconnect_client.N`.
   - An actor ID narrows the save to that one actor — only its section is
     written to the config, and only that actor is reconciled. Every other
     section of the live config is left as-is, whatever the request body
@@ -871,6 +912,11 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
     carries for it. Every actor is reconciled.
   - An unparseable ID or unknown type prefix is rejected with `400`: nothing
     is saved.
+  - flighthook runs one web server. A save that removes a `webserver.N`
+    section (a `webserver.N` scope with the section left out, or a
+    whole-config body without one the config holds) is rejected with `400`,
+    as is one that adds a `webserver.N` while the config already holds one.
+    A config that already holds several keeps them, each editable.
   - Without `scope`, the body replaces the whole config and every actor is
     reconciled.
 
@@ -879,7 +925,7 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 ```json
 {
   "restarted": ["mevo.0"],
-  "stopped": ["gspro.1"]
+  "stopped": ["openconnect_client.1"]
 }
 ```
 
@@ -893,6 +939,7 @@ as applied.
 | Status | When |
 |---|---|
 | `400 Bad Request` | `scope` is not `global` and not a known actor ID |
+| `400 Bad Request` | the save removes the web server (`"the web server can't be removed"`) or adds a second one (`"flighthook runs one web server; edit the existing one"`) |
 | `504 Gateway Timeout` | SystemActor did not answer within 10 s |
 
 A body that is not a valid `FlighthookConfig` is rejected by the JSON
@@ -996,7 +1043,7 @@ messages use the FRP envelope shape:
 }
 ```
 
-- `actor`: global ID of the originator (e.g. `"mevo.0"`, `"gspro.0"`, `"system"`).
+- `actor`: global ID of the originator (e.g. `"mevo.0"`, `"openconnect_client.0"`, `"system"`).
   Flighthook extension field (FRP consumers ignore unknown fields per spec).
 - `device`: FRP device identifier (e.g. Mevo WiFi SSID). Present on shot
   lifecycle and device telemetry events; absent on system/config events.
@@ -1360,7 +1407,7 @@ Player info update (name). Flighthook extension event.
 
 ```json
 {
-  "actor": "gspro.0",
+  "actor": "openconnect_client.0",
   "event": {
     "kind": "player_info",
     "player_info": { "name": "Player 1" }
@@ -1378,7 +1425,7 @@ Club selection update.
 
 ```json
 {
-  "actor": "gspro.0",
+  "actor": "openconnect_client.0",
   "event": {
     "kind": "club_info",
     "club_info": { "club": "7I" }
@@ -1436,11 +1483,28 @@ event types have no overlapping telemetry keys.
 ```
 
 - `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`
-- `telemetry`: actor-framework key/value pairs (all string values)
+- `telemetry`: actor-framework key/value pairs (all string values). Each key
+  replaces the one held for the actor; an empty value (`""`) removes the key.
+  Keys not present are left as they were.
 
 Common keys for launch monitors: `detection_mode`, `radar_mode`, `device_info`.
 Mock launch monitors add: `shot_count`, `tracking_mode`.
 Integration actors: `club`, `handed`, `name`, `error`.
+
+An `openconnect_client` sets `error` when this flighthook's own
+`openconnect_server` refused its connection (the client points at the server,
+which would loop shots back into flighthook): `Refused by this flighthook's
+own OpenConnect Server "<server name>": this address points at it, which would
+loop shots back. Use the simulator's port instead.` The server raises an
+`alert`: `Refused OpenConnect Client "<client name>" from <peer>: it is this
+flighthook's own client, which would loop shots back. Point it at the
+simulator's port.` The client reports `connected` once a connection has lasted
+1 s, and clears `error` (`""`) then, when an attempt fails another way, and
+when it starts.
+
+A `webserver` sets `error` to `bind failed` while it cannot bind its address
+(status `disconnected`, retrying every 3 s), and clears it (`""`) with every
+other status.
 
 ---
 
@@ -1461,10 +1525,13 @@ External consumers can observe these to track config changes in flight.
 ```
 
 `action.type` is one of `replace_all`, `upsert_webserver`, `upsert_mevo`,
-`upsert_r10`, `upsert_square`, `upsert_open_connect_server`, `upsert_gs_pro`,
-`upsert_mock_monitor`, `upsert_random_club`, `remove` and `set_shot_grouping`
+`upsert_r10`, `upsert_square`, `upsert_open_connect_server`,
+`upsert_open_connect_client`, `upsert_mock_monitor`, `upsert_random_club`,
+`remove` and `set_shot_grouping`
 (`{ "type": "set_shot_grouping", "mode": "by_club" }`, from
-`POST /api/shots/grouping` or the WS `grouping` command).
+`POST /api/shots/grouping` or the WS `grouping` command). `upsert_gs_pro` is
+also accepted as `upsert_open_connect_client`, and a `remove` of `gspro.N` as
+one of `openconnect_client.N`.
 
 ---
 
@@ -1603,7 +1670,7 @@ Change the global detection mode. Emits `SetDetectionMode` on the bus.
 #### club
 
 Select the club in play. Emits `club_info` (see [POST /api/club](#post-apiclub);
-a connected GSPro replaces it with its next player message).
+a connected simulator replaces it with its next player message).
 
 ```json
 { "cmd": "club", "club": "7I" }
@@ -1667,6 +1734,11 @@ unknown club code or mode is ignored.
 ### ActorStatus
 
 `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`
+
+### ConnectionState
+
+`"connecting"` | `"connected"` | `"reconnecting"` (see
+[`GET /api/status`](#get-apistatus) for how it is derived)
 
 ### ShotDetectionMode
 

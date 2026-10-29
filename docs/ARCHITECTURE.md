@@ -29,8 +29,8 @@ surface_height = "0in"
 [r10.0]
 name = "Garmin R10"
 
-[gspro.0]
-name = "Local GSPro"
+[openconnect_client.0]
+name = "GSPro"
 address = "127.0.0.1:921"
 # full_monitor = "mevo.0"       # optional: route full-swing shots from specific monitor
 # chipping_monitor = "mevo.0"   # optional: route chipping shots
@@ -40,9 +40,14 @@ address = "127.0.0.1:921"
 - `[mevo.<idx>]` -- FlightScope device instance (Mevo/Mevo+, or Xi — detected at connect)
 - `[r10.<idx>]` -- Garmin R10 BLE device instance (auto-discovers via Bluetooth)
 - `[square.<idx>]` -- Square Golf Omni BLE device instance
-- `[openconnect_server.<idx>]` -- GSPro Open Connect ingest listener (Uneekor)
+- `[openconnect_server.<idx>]` -- OpenConnect server: GSPro Open Connect ingest listener (Uneekor)
 - `[mock_monitor.<idx>]` -- mock launch monitor instance
-- `[gspro.<idx>]` -- GSPro integration instance
+- `[openconnect_client.<idx>]` -- OpenConnect client: dials a simulator that
+  accepts GSPro Open Connect (GSPro on 921, Muni Golf on 9210). `[gspro.<idx>]`
+  sections are read as `[openconnect_client.<idx>]`; when both name an index,
+  `openconnect_client` is used and a warning is logged. Saves write only
+  `[openconnect_client.<idx>]`, and the file is rewritten that way on the next
+  start (see [Loading and migration](#loading-and-migration))
 - `[random_club.<idx>]` -- random club cycling integration instance
 - `[webserver.<idx>]` -- web server instance
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
@@ -67,8 +72,39 @@ address = "127.0.0.1:921"
 - R10 sections show name and Monitor-to-Ball (`range`, sent to the device as
   its tee distance; BLE auto-discovery, no address field)
 - Mock sections show only name (no address or radar fields)
-- Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `gspro.0`)
+- Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `openconnect_client.0`)
 - WebSocket actor IDs = `"ws.{8-hex-chars}"`
+
+### Loading and migration
+
+`state::config::load()` reads the file once at startup (`SystemState::new`).
+A missing file is created with the defaults. The text is parsed as the current
+format (which also reads `[gspro.<idx>]` as `[openconnect_client.<idx>]`), or
+failing that as the singleton-`[webserver]` format, which loads as
+`[webserver.0]` (named "Web Server" when unnamed).
+
+After a successful load the config is serialized exactly as a save writes it
+(`toml::to_string_pretty`), and that text and the file's are both parsed as
+`toml::Value` and compared: tables by key regardless of order, an integer
+equal to the float of the same value, NaN equal to NaN. Comments, key order
+and whitespace never count. When they differ, the file is brought up to date:
+
+1. The original bytes go to a new file next to it, `config.pre-<version>.toml`
+   (`<version>` = this build), or `config.pre-<version>.<n>.toml` with the
+   first free `n`; it is opened with create-new, so a backup is never
+   overwritten. If it can't be written the file is not rewritten.
+2. The new text is written to a temporary file in the same directory, synced,
+   and renamed over the config file (a replacing rename on Windows too).
+3. An `info` line names the file and the backup.
+
+Any difference rewrites the file, including values the file spells out at
+their defaults where the save leaves them out and keys the config doesn't
+read: a deliberate one-time normalisation. The rewritten text is the save
+format, which parses back to the same config, so the next start finds no
+difference. A file that fails to parse, or can't be read, is not written at
+startup; the defaults are used (and a later settings save replaces it). A failed backup or rewrite logs a warning and the app
+runs on the config it loaded. Every save (`save_to`) uses the same atomic
+write.
 
 ### Default config and setup wizard
 
@@ -76,13 +112,14 @@ On first startup the default config contains only a webserver — no devices or
 integrations. The UI detects this (`FlighthookConfig::has_user_actors()`) and
 shows a setup wizard instead of the normal dashboard. The wizard presents
 checkboxes for available devices (Mevo, Square Golf Omni, R10, Uneekor
-(OpenConnect)) and integrations (GSPro). On
+(OpenConnect)) and simulators (GSPro, as an OpenConnect client). On
 confirmation it builds a config with defaults for each selection, posts it via
 the existing settings save path, and dismisses. Users can also skip the wizard
 and configure manually on the Devices tab.
 
-`MevoSection`, `R10Section`, and `GsProSection` each implement `Default` with
-sensible values (e.g. Mevo at `192.168.2.1:5100`, GSPro at `127.0.0.1:921`).
+`MevoSection`, `R10Section`, and `OpenConnectClientSection` each implement
+`Default` with sensible values (e.g. Mevo at `192.168.2.1:5100`, the
+OpenConnect client named GSPro at `127.0.0.1:921`).
 
 ### Rust types
 
@@ -100,7 +137,7 @@ pub struct FlighthookConfig {
     pub square: HashMap<String, SquareSection>,
     pub mock_monitor: HashMap<String, MockMonitorSection>,
     pub openconnect_server: HashMap<String, OpenConnectServerSection>,
-    pub gspro: HashMap<String, GsProSection>,
+    pub openconnect_client: HashMap<String, OpenConnectClientSection>,  // `gspro` also read
     pub random_club: HashMap<String, RandomClubSection>,
 }
 
@@ -116,7 +153,7 @@ pub struct R10Section { pub name: String, pub range: Option<Distance> }
 pub struct SquareSection { pub name: String, pub address: Option<String>, pub club: Option<Club>, pub advanced_spin: Option<bool>, pub discard_non_putting_zero_spin: Option<bool> }
 pub struct MockMonitorSection { pub name: String }
 pub struct OpenConnectServerSection { pub name: String, pub bind: Option<String> }
-pub struct GsProSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
+pub struct OpenConnectClientSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
 pub struct RandomClubSection { pub name: String }
 ```
 
@@ -124,7 +161,11 @@ pub struct RandomClubSection { pub name: String }
 
 ```rust
 pub struct StatusResponse { pub actors: HashMap<String, ActorStatusResponse>, pub mode: Option<ShotDetectionMode> }
-pub struct ActorStatusResponse { pub name: String, pub status: ActorStatus, pub telemetry: HashMap<String, String> }
+pub struct ActorStatusResponse {
+    pub name: String, pub status: ActorStatus, pub telemetry: HashMap<String, String>,
+    pub state: ConnectionState, pub red_for_ms: u64,  // derived, see "Connection state" below
+    /* private, not serialised: StatusHistory */
+}
 pub struct PostSettingsResponse { pub restarted: Vec<String>, pub stopped: Vec<String> }
 pub struct ModeRequest { pub mode: ShotDetectionMode }
 ```
@@ -133,7 +174,7 @@ pub struct ModeRequest { pub mode: ShotDetectionMode }
 
 ```rust
 pub struct ResolvedActor {
-    pub id: String,             // global ID (e.g. "mevo.0", "r10.0", "gspro.0")
+    pub id: String,             // global ID (e.g. "mevo.0", "r10.0", "openconnect_client.0")
     pub name: String,           // user-visible name
     pub actor: Box<dyn Actor>,  // concrete actor ready to start
 }
@@ -142,6 +183,10 @@ pub fn resolve_actors(config: &FlighthookConfig, current_mode: Option<ShotDetect
 pub fn start_actor(id: String, actor: Box<dyn Actor>, state: &Arc<SystemState>, bus_tx: &broadcast::Sender<FlighthookMessage>);
 pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String>;
 ```
+
+`resolve_actors` lists the web servers first, and `main` starts actors in
+that order. A web server subscribes to the bus in `start`, before it returns,
+so the first status of every actor started after it reaches `/api/status`.
 
 Helper functions: `global_id(prefix, index) -> String` builds `"{prefix}.{index}"`,
 `load(path)` / `save_to(path, config)` for TOML I/O.
@@ -562,7 +607,11 @@ pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
 `ActorStatusResponse` (in `lib/src/api.rs`) adds a `name` field and is used
 as the cached per-actor state in both the web layer and the UI. The web layer
 merges telemetry from both `DeviceTelemetry` and `ActorStatus` events into
-a single per-actor telemetry map for API consumers.
+a single per-actor telemetry map for API consumers. A key in an
+`ActorStatus` replaces the one held; an empty value removes it (how the
+OpenConnect client and the web server clear `error`). The UI merges the same
+way. A web server sets `error` to `bind failed` while it cannot bind its
+address, and clears it with every other status.
 
 ### ConfigCommand / ConfigOutcome -- event-sourced config mutations
 
@@ -582,11 +631,11 @@ pub enum ConfigAction {
     UpsertR10 { index: String, section: R10Section },
     UpsertSquare { index: String, section: SquareSection },
     UpsertOpenConnectServer { index: String, section: OpenConnectServerSection },
-    UpsertGsPro { index: String, section: GsProSection },
+    UpsertOpenConnectClient { index: String, section: OpenConnectClientSection },  // `upsert_gs_pro` also read
     UpsertWebserver { index: String, section: WebserverSection },
     UpsertMockMonitor { index: String, section: MockMonitorSection },
     UpsertRandomClub { index: String, section: RandomClubSection },
-    Remove { id: String },                          // "mevo.0", "gspro.1", "webserver.0", etc.
+    Remove { id: String },                          // "mevo.0", "openconnect_client.1", "webserver.0", etc.; "gspro.N" = "openconnect_client.N"
     SetShotGrouping { mode: ShotGrouping },         // POST /api/shots/grouping, WS `grouping`
 }
 
@@ -653,16 +702,47 @@ Starting -> Connected -> (error) -> Reconnecting -> Connected -> ...
 | Reconnecting | Lost a prior connection, retrying with backoff             |
 | Disconnected | Stopped/shutdown (terminal state)                          |
 
+### Connection state
+
+What the dashboard shows is not the raw `ActorStatus` but a `ConnectionState`
+(`lib/src/connection.rs`), derived from it and the actor's history since it
+last started. Every actor is treated alike (launch monitors, outputs, the
+OpenConnect server, the web server):
+
+| ConnectionState | When | Colour |
+| --------------- | ---- | ------ |
+| Connecting      | Not `Connected` since it started, or since a config change restarted it | yellow |
+| Connected       | `ActorStatus` is `Connected` | green |
+| Reconnecting    | `Connected` since it started, and has since lost the connection (any other status) | red for 10 minutes (`RECONNECT_ALERT_MS`) after the most recent `Connected` -> other change, yellow after |
+
+`StatusHistory` holds the latest status, whether the actor has been
+`Connected` since it started, and when the alert for its last loss ends.
+Another loss while already Reconnecting keeps the window; a new `Connected`
+then a loss starts it again. A `Starting` status begins a new history, and so
+does a restart (`ConfigOutcome.restarted`: only whether it is `Connected` now
+is kept). Removing an actor drops its entry, so one added again starts fresh.
+An `error` telemetry value does not affect the state or its colour. Times are
+milliseconds on a monotonic clock each side picks: the web layer's
+`WebState::now_ms` (from `WebState::epoch`), the UI's frame input time.
+
+The web layer records every `ActorStatus` into its per-actor
+`ActorStatusResponse` (`observe`), for as long as it runs, so the history
+does not depend on any UI being connected. `GET /api/status` stamps each
+actor's `state` and `red_for_ms` (the alert time left) at reply time. The UI
+rebuilds the history from a reply (`received`, the red time counting down from
+receipt on its own clock), then applies live `actor_status` events and
+`ConfigOutcome.restarted` to it the same way the server does.
+
 All actors use linear backoff on connection failure: starts at 1s, adds 1s per
-failed attempt, capped at 15s (3s for the GSPro bridge, a loopback/LAN TCP
-connect). The GSPro and Square Golf actors restart at 1s after a connection
+failed attempt, capped at 15s (3s for the OpenConnect client, a loopback/LAN
+TCP connect). The OpenConnect client and Square Golf actors restart at 1s after a connection
 that lasted at least 10s; one that drops sooner counts as a failed attempt, so
 a link that keeps connecting and dropping still backs off to the cap. The
 OpenConnect server restarts at 1s after a successful bind. The Mevo and R10
-actors keep the grown delay. The GSPro, Square Golf, Mevo and R10 actors poll
+actors keep the grown delay. The OpenConnect client, Square Golf, Mevo and R10 actors poll
 their shutdown flag during the backoff wait, so stopping one never waits out
 the delay; the OpenConnect server sleeps through its bind retry delay, and the
-GSPro bridge's TCP connect attempt (up to 5s) is not interrupted by a stop.
+OpenConnect client's TCP connect attempt (up to 5s) is not interrupted by a stop.
 
 **Mevo actor mapping** (from internal phases):
 
@@ -680,28 +760,65 @@ completes. Emits `DeviceTelemetry` with `manufacturer: "Garmin"`,
 `model: "R10"`. Telemetry keys: `ready`, `tilt`, `roll`, `device_state`
 (`waiting` | `recording` | `processing`). Uses BLE address as FRP device ID.
 
-**GSPro actor**: emits `Starting` before first TCP connect attempt, `Connected`
-on success. Connection loss after a successful session emits `Reconnecting`;
-failure before ever connecting stays at `Starting`. A refused, failed or
-closed connection is shown only through this status and the log, with no alert:
-GSPro not running is normal when another simulator is in use.
+**OpenConnect client actor** (GSPro, Muni Golf, ...): emits `Starting` before
+first TCP connect attempt, `Connected` on success. Connection loss after a
+successful session emits `Reconnecting`; failure before ever connecting stays
+at `Starting`. A refused, failed or closed connection is shown only through
+this status and the log, with no alert: a simulator not running is normal when
+another one is in use.
 
-**GSPro shot delivery**: the bridge drains the bus the whole time it runs,
-connected or not, so nothing queues up while GSPro is away. Every shot that
-finishes while GSPro is connected is sent, in order, including several that
-finish together. A shot that finishes while GSPro is not connected (stopped,
+**OpenConnect self-loop guard**: an OpenConnect client pointed at this
+process's own OpenConnect server (e.g. client `127.0.0.1:921`, server bind
+`0.0.0.0:921`, GSPro closed) would send every shot client -> server -> bus ->
+client, forever. `SystemState.local_clients` (`state/local_clients.rs`) holds
+the local socket address of every connected OpenConnect client, registered
+right after `connect` and before anything is sent, and removed when the
+connection ends. The server looks up each peer it accepts, comparing IP and
+port with IPv4-mapped IPv6 read as IPv4 and every loopback address as
+`127.0.0.1`. It looks the peer up again after each read, before handling it,
+so the connection's data never reaches the bus even if the client registered
+a moment after the accept. The server reports `Connected` only once the first
+read (up to 100 ms) has passed that look-up too. A match is closed at once,
+unread, and refused:
+
+- the server raises one `Error` alert per burst of that client's reconnect
+  attempts (refusals less than 30 s apart are one burst), shown in the Log
+  after the server's name: "Refused OpenConnect Client "<client name>" from
+  <peer>: it is this flighthook's own client, which would loop shots back.
+  Point it at the simulator's port.";
+- the client sets its telemetry `error` key, shown after the client's name in
+  the banner: "Refused by this flighthook's own OpenConnect Server "<server
+  name>": this address points at it, which would loop shots back. Use the
+  simulator's port instead." It keeps retrying with its usual backoff.
+
+The names are the ones the cards show (the actor ID when blank). A client
+reports `Connected` only once a connection has lasted 1 s, so a refused
+connection never shows as connected. The `error` key is cleared (an empty
+value) when a connection outlasts that, when an attempt fails any other way,
+and when the actor starts.
+
+A connection from anything else, on the same host or not, is served as usual:
+a monitor's connector on 921 feeding a server whose client sends on to GSPro
+on 922 is unaffected. A stopped or unreachable simulator is unaffected too:
+still no alert and no dot.
+
+**OpenConnect client shot delivery**: the bridge drains the bus the whole time
+it runs, connected or not, so nothing queues up while the simulator is away.
+Every shot that finishes while the simulator is connected is sent, in order,
+including several that finish together. A shot that finishes while it is not
+connected (stopped,
 starting up, or between reconnects) is dropped. A shot is also dropped if it
 is more than 5s old when the bridge can send it, its age counted from when the
 bridge took the finished shot off the bus. A connected bridge sends a shot in
 the same loop pass that takes it off the bus, so in practice this only drops
 shots left queued behind a failed write when the reconnect takes longer than
-5s. Dropped shots are logged at debug level only, with no alert: GSPro not
-running is normal when another simulator is in use. A shot whose write fails
-is not retried. A write to GSPro that blocks for more than 2s fails like any
+5s. Dropped shots are logged at debug level only, with no alert: a simulator
+not running is normal when another one is in use. A shot whose write fails
+is not retried. A write to the simulator that blocks for more than 2s fails like any
 other, ending the connection and starting a reconnect, with no alert. The JSON
 sent for a shot is the same whatever happened to the connection before it.
 
-**Integration readiness**: the GSPro actor tracks device readiness from
+**Integration readiness**: the OpenConnect client actor tracks device readiness from
 `DeviceTelemetry` (`"ready"` key) and uses it to set both
 `launch_monitor_is_ready` and `launch_monitor_ball_detected` in heartbeats
 and shot messages.
@@ -739,7 +856,7 @@ also handles `ConfigOutcome` events to refresh actor name caches.
 ## Component Identity
 
 All components are identified by type-prefixed global IDs: `mevo.0`, `r10.0`,
-`gspro.0`, `mock_monitor.0`, `random_club.0`, `webserver.0`, `ws.a1b2c3d4`. The `system`
+`openconnect_client.0`, `mock_monitor.0`, `random_club.0`, `webserver.0`, `ws.a1b2c3d4`. The `system`
 actor has a fixed ID of `"system"`. The type prefix encodes the component type;
 the index is the key within that type's config section.
 
@@ -838,7 +955,7 @@ main thread (eframe)       std::thread per actor              tokio runtime (bac
                                      |                            |
                            +--------------------+        +--------------------+
                            | actors::gspro       |        | actors::mock::     |
-                           | GSPro TCP bridge    |        |   randomclub       |
+                           | OpenConnect client  |        |   randomclub       |
                            +--------------------+        +--------------------+
 ```
 
@@ -867,7 +984,7 @@ config-driven). Then each config section constructs an actor struct and calls
 `actor.start(state, sender, receiver)`. Each actor gets a per-actor
 `Arc<AtomicBool>` shutdown flag shared between the `BusReceiver` and the
 registry. Launch monitor actors (mevo, r10, mock::launch) run event loops polling
-the bus. Integration actors (gspro, mock::randomclub) subscribe to the bus
+the bus. Integration actors (the OpenConnect client in `actors::gspro`, mock::randomclub) subscribe to the bus
 and emit `ClubInfo` (for club changes) and `ActorStatus`
 (for connection status) back onto the bus.
 
@@ -890,6 +1007,9 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
   `ConfigAction` variant (e.g. `UpsertMevo`), writing only that section and
   reconciling only that actor. A scope naming a section the body omits emits
   `Remove`; an unknown scope is rejected with `400` without saving anything.
+- **One web server** -- a save that would remove a `webserver.N` section
+  (scoped or whole-config), or add one while the config already holds one,
+  is rejected with `400` before any `ConfigCommand` is emitted.
 
 `SystemActor::handle_config_command()`:
 
@@ -909,7 +1029,12 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
 5. **New actors** (expected but not current): create and start
 
 The web layer's `state_updater` handles `ConfigOutcome` events to refresh
-actor name caches and remove stopped actors.
+actor name caches (on every outcome: a rename is `Applied`, so it restarts
+nothing) and remove stopped actors. `GET /api/status` names each actor from
+the config as it is at the request, so it has a new name before the bus
+event reaches that cache. Every UI fetches the status again on any
+`ConfigOutcome`, so a rename shows in every open window without a reload:
+card titles, the Shots tab's device filter and labels, and alert banners.
 
 `ReconfigureOutcome` enum:
 
@@ -918,8 +1043,9 @@ actor name caches and remove stopped actors.
 
 ## Devices Tab
 
-The Devices tab is where the app opens. It holds every launch monitor and
-output, with its live telemetry and its settings, plus the global settings.
+The Devices tab is where the app opens. It holds the global settings, the
+web server, and every launch monitor and output, each device with its live
+telemetry and its settings.
 Three groups of cards, each group a wrapping grid: as many columns as fit at
 a 420 px minimum card width, cards at most 620 px wide, one column on a
 narrow window; card `i` goes in column `i % columns`.
@@ -933,58 +1059,113 @@ narrow window; card `i` goes in column `i % columns`.
   | Default shot view: [By set | By club | None]| Altitude:     [0] [ft v]   (greyed while Off)
   | Chipping Clubs:    [PW GW SW LW]            | Temperature:  [77] °F      (°C when Metric)
   | Putting Clubs:     [PT]                     | Surface:      [Fairway v]
+  | Web Server [CONNECTED] [Telemetry|Settings]
+  |   bind        0.0.0.0:5880
+  |   websockets  1
 
   LAUNCH MONITORS (+)
-  | Mevo WiFi   [CONNECTED] [Telemetry|Settings] | Garmin R10 [R10]      [Telemetry|Settings]
-  |   battery_pct  85                             | Name:            [Garmin R10]
-  |   ready        true                           | Monitor-to-Ball: [8] [ft v]
-  |   tilt         0.5                            |                               [Remove]
+  | Mevo WiFi [Mevo] [CONNECTED] [Telemetry|Settings] | Garmin R10 [R10]       [Telemetry|Settings]
+  |   battery_pct  85                                  | Name:            [Garmin R10]
+  |   ready        true                                | Monitor-to-Ball: [8] [ft v]
+  |   tilt         0.5                                 |                               [Remove]
 
   OUTPUTS (+)
-  | Local GSPro [GSPro]        [Cancel] [Save]   | Web Server  [CONNECTED] [Telemetry|Settings]
-  |                  Save or cancel your changes |   bind        0.0.0.0:5880
-  | Name:             [Local GSPro]              |   requests    12
-  | Address:          [127.0.0.1:921]            |   websockets  1
+  | GSPro [OpenConnect Client] [Cancel] [Save]   | Muni Golf [OpenConnect Client] [CONNECTED] [Telemetry|Settings]
+  |                  Save or cancel your changes |   address     127.0.0.1:9210
+  | Name:             [GSPro]                    |
+  | Address:          [127.0.0.1:921]            |
   | Full Monitor:     [Mevo WiFi v]              |
   | Chipping Monitor: [Any v]                    |
   | Putting Monitor:  [Any v]                    |
   |                                     [Remove] |
 ```
 
+At 1600 px wide the General row is Global, Simulation, Web Server; at 1024 px
+the Web Server card sits under Global, as above.
+
 Groups and order (`ui/src/panels/cards.rs`):
 
 | Group | Cards, in order | (+) offers |
 |---|---|---|
-| General | Global card, Simulation card | -- |
-| Launch monitors | `mevo`, `r10`, `square`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, Uneekor (OpenConnect) |
-| Outputs | `gspro`, `webserver`, `random_club` (and any type the UI does not know) | GSPro, Web Server |
+| General | Global card, Simulation card, `webserver` | -- (no (+)) |
+| Launch monitors | `mevo`, `r10`, `square`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, Uneekor (OpenConnect), OpenConnect Server |
+| Outputs | `openconnect_client`, `random_club` (and any type the UI does not know) | GSPro (OpenConnect), Muni Golf (OpenConnect), OpenConnect Client |
+
+Each (+) entry is a preset (`cards::AddPreset`): an actor type plus the new
+card's name and address. The OpenConnect presets differ only in those:
+
+| Entry | Type | Name | Address |
+|---|---|---|---|
+| Uneekor (OpenConnect) | `openconnect_server` | Uneekor | bind `0.0.0.0:921` |
+| OpenConnect Server | `openconnect_server` | OpenConnect Server | bind `0.0.0.0:921` |
+| GSPro (OpenConnect) | `openconnect_client` | GSPro | `127.0.0.1:921` |
+| Muni Golf (OpenConnect) | `openconnect_client` | Muni Golf | `127.0.0.1:9210` |
+| OpenConnect Client | `openconnect_client` | OpenConnect Client | `127.0.0.1:921` |
+
+The generic OpenConnect Server and OpenConnect Client entries are for any
+other monitor or simulator that speaks Open Connect.
+
+A card's type label names the actor type, "OpenConnect Server" or
+"OpenConnect Client", whichever preset created it.
+
+flighthook runs one web server, the one serving this UI. Its card has no
+Remove and no menu adds another; the config API refuses both (`400`, see
+[API.md](API.md)). A config file that already holds several `[webserver.N]`
+sections loads and runs them all, a card each, every one editable.
 
 Within a group, cards sort by type (the order above), then by instance index
 (numerically). The Open Connect server is a launch monitor: it receives shots.
 Random Club consumes shots (it picks the next club on each one), so it sits
 with the outputs. A card is every configured instance plus every running
 actor the settings don't list (`ui/src/panels/devices.rs`
-`device_card_order`), so two GSPro connections or two launch monitors are two
+`device_card_order`), so two simulator connections or two launch monitors are two
 cards, and the cards show (Telemetry only) before the settings have loaded.
 
 ### Device cards
 
-Each launch monitor and output card has a small segmented toggle in its
-header, **Telemetry | Settings**, Telemetry by default, remembered per card
-for the session. It flips the card body:
+Each web server, launch monitor and output card has a small segmented
+toggle in its header, **Telemetry | Settings**, Telemetry by default,
+remembered per card for the session. The card's name sits on the left of
+the header; on the right, just left of the toggle, sits the status badge on
+the Telemetry side and the type tag on the Settings side:
 
-- **Telemetry**: the actor's name and status badge (green connected, gold
-  starting/reconnecting, red disconnected), then its telemetry key/value
+```
+Telemetry:          [Name …]  ........  [STATUS BADGE] [Telemetry|Settings]
+Settings:           [Name …]  ........  [type tag] [Telemetry|Settings]
+Settings, unsaved:  [Name …]  ........  [type tag] [Cancel] [Save]
+```
+
+Hovering the name or the tag says what the type is and how it connects (the
+name's hover on the Telemetry side too). The tag is left out when the name
+reads the same as the type, ignoring case: the web server at its default
+name "Web Server", or an "OpenConnect Server" / "OpenConnect Client" card at
+its default name. The toggle, Save, Cancel and the status badge keep their
+size; a long name is cut short with "…" first, then the type tag, which is
+left out once it would be cut to a stub. The toggle flips the card body:
+
+- **Telemetry**: the actor's name and connection state badge
+  (`CONNECTING` yellow, `CONNECTED` green, `RECONNECTING` red for 10 minutes
+  after the connection was lost, then yellow; see
+  [Connection state](#connection-state)), then its
+  telemetry key/value
   pairs one per row, sorted by key. Detection mode, battery, tilt, roll,
   temperature, club, handed and the rest come from the actor's telemetry map.
-- **Settings**: the instance's name, its type tag (hover: what the type is
-  and how it connects) and its fields in a label column, ending in
-  **Remove**, which asks for confirmation in a modal dialog and then saves
-  the removal (`?scope=<actor_id>`, the section left out); the card goes
-  when the server confirms it.
+  The key column is as wide as the longest key, up to 45 % of the card; a key
+  or value too long for its column is cut short with "…" and shown in full
+  on hover (a Square Golf Omni's `device_info`, for one).
+- **Settings**: the instance's name, its type tag and its fields in a label
+  column, ending in **Remove** (every card but the web server's), which asks
+  for confirmation in a modal dialog and then saves the removal
+  (`?scope=<actor_id>`, the section left out); the card goes when the server
+  confirms it.
+
+Every card is exactly its grid column's width, on both sides: long names in
+the header and in text fields, and long entries in a dropdown, are cut short
+inside the card rather than widening it over its neighbour or the cards
+under it.
 
 The coloured stripe down the left edge of a card is the colour of the actor's
-status, on both sides, dim while the actor is not running (unsaved, or not
+connection state (the badge's), on both sides, dim while the actor is not running (unsaved, or not
 started yet). The General cards' stripe is the heading blue; they have no
 toggle (settings only).
 
@@ -1046,6 +1227,14 @@ displayed).
   data arrives in every mode)
 - R10 cards show name and Monitor-to-Ball, the tee distance sent to the device
   (BLE auto-discovery; no address or radar fields)
+- OpenConnect Server cards show name and Bind Address, the `ip:port` the
+  server listens on; blank means `0.0.0.0:921`, anything else must parse as
+  `ip:port`. A bind change restarts the actor
+- OpenConnect Client cards show name, Address (`ip:port` of the simulator)
+  and the three routing dropdowns
+- The Web Server card shows name and Bind Address, the `ip:port` it listens
+  on (`0.0.0.0` accepts other computers, `127.0.0.1` only this one). A bind
+  change restarts it
 - Mock launch monitor and Random Club are developer-only types (must be added
   manually to the config TOML; no (+) menu offers them)
 - Add/remove modify the form Vec, save writes back to TOML
@@ -1084,18 +1273,22 @@ all 33 clubs in bag rows (driver + mini driver, woods, hybrids, irons, wedges,
 putter); hovering a
 club names the mode it switches to when that is Chipping or Putting. A pick
 sends the WebSocket `club` command (`POST /api/club` when the socket is down),
-and the SystemActor then derives the detection mode as for a GSPro club
-change. While any `gspro.*` actor is Connected the pill is read-only, with
-the hover text "Set by GSPro": GSPro replaces the club on its next player
-message, so its telemetry `club` and the pill agree.
+and the SystemActor then derives the detection mode as for a simulator club
+change. While any `openconnect_client.*` actor is Connected the pill is
+read-only, with the hover text "Set by the simulator": the simulator replaces
+the club on its next player message, so its telemetry `club` and the pill
+agree.
 
 The tab bar is a segmented control, the same look as the mode selector beside
-it (`theme::segmented`). If any actor has status `disconnected`, or any
-launch monitor has status `starting` or `reconnecting`, the Devices segment
-carries a small red notification dot at the top centre, overlapping its top
-edge, whatever its selection state. An output (GSPro) that is starting or
-reconnecting does not light the dot: a simulator that is not running is normal,
-and its card's status shows the state. The
+it (`theme::segmented`). While any card is red (an actor of any kind lost
+its connection less than 10 minutes ago, see
+[Connection state](#connection-state)), the Devices segment carries a small
+red notification dot at the top centre, overlapping its top edge, whatever its
+selection state. Nothing else lights it: not an actor that has not connected
+since it started, and not an `error` in an actor's telemetry, which shows on
+its card and in the error banner instead. The UI asks for a repaint when the
+first red card is due to turn yellow, so the dot goes out on time without a
+new event. The
 web layer caches telemetry from `ActorStatus` events plus club from `ClubInfo`
 and name from `PlayerInfo` events so reconnecting clients recover latest
 values immediately.

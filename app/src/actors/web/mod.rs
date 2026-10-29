@@ -105,18 +105,47 @@ pub(crate) struct PendingShot {
 pub(crate) type PendingShots = HashMap<(String, ShotKey), PendingShot>;
 
 fn new_actor(name: String) -> ActorStatusResponse {
-    ActorStatusResponse {
-        name,
-        status: ActorStatus::Disconnected,
-        telemetry: HashMap::new(),
+    ActorStatusResponse::new(name, ActorStatus::Disconnected)
+}
+
+/// Give each actor in `actors` its name from `names` (from
+/// [`actor_names`]); an actor `names` leaves out keeps its own.
+fn rename_actors(
+    actors: &mut HashMap<String, ActorStatusResponse>,
+    names: &HashMap<String, String>,
+) {
+    for (id, actor) in actors.iter_mut() {
+        if let Some(name) = names.get(id) {
+            actor.name.clone_from(name);
+        }
     }
+}
+
+/// The actors as `/api/status` reports them at `now_ms`: each with its name
+/// from `names` (the current config) and `state` and `red_for_ms` from its
+/// history.
+pub(crate) fn actor_statuses(
+    actors: &HashMap<String, ActorStatusResponse>,
+    names: &HashMap<String, String>,
+    now_ms: u64,
+) -> HashMap<String, ActorStatusResponse> {
+    let mut actors = actors.clone();
+    rename_actors(&mut actors, names);
+    for a in actors.values_mut() {
+        a.stamp(now_ms);
+    }
+    actors
 }
 
 /// Shared state for the web layer.
 pub struct WebState {
     pub root: Arc<SystemState>,
     pub bus_tx: broadcast::Sender<FlighthookMessage>,
+    /// Per-actor state, with each actor's connection history since it last
+    /// started (kept across UI connections).
     pub actors: RwLock<HashMap<String, ActorStatusResponse>>,
+    /// Origin of the connection-history clock ([`WebState::now_ms`]).
+    pub epoch: std::time::Instant,
     pub shots: RwLock<VecDeque<StoredShot>>,
     /// Shot sets over `shots`. Lock order where both are held: `groups`,
     /// then `shots`.
@@ -136,6 +165,14 @@ pub struct WebState {
     pub request_count: AtomicU64,
 }
 
+impl WebState {
+    /// Milliseconds since [`epoch`](Self::epoch): the clock of the actors'
+    /// connection histories.
+    pub fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
 /// Emit current telemetry as an ActorStatus event on the bus.
 fn emit_status(
     status: ActorStatus,
@@ -153,9 +190,13 @@ fn emit_status(
             state.request_count.load(Ordering::Relaxed).to_string(),
         ),
     ]);
-    if status == ActorStatus::Disconnected {
-        telemetry.insert("error".into(), "bind failed".into());
-    }
+    // An empty value removes the key, so a successful bind clears the error.
+    let error = if status == ActorStatus::Disconnected {
+        "bind failed"
+    } else {
+        ""
+    };
+    telemetry.insert("error".into(), error.into());
     let _ = bus_tx.send(
         FlighthookMessage::new(FlighthookEvent::ActorStatus { status, telemetry })
             .actor(&state.actor_id),
@@ -211,6 +252,9 @@ impl Actor for WebActor {
         let addr = self.addr;
         let actor_id = sender.actor_id().to_string();
         let bus_tx = sender.raw_sender().clone();
+        // Subscribed here, before `start` returns, so no status an actor
+        // started after this one emits is missed.
+        let bus_rx = bus_tx.subscribe();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         *self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(shutdown_tx);
 
@@ -220,7 +264,7 @@ impl Actor for WebActor {
             .spawn(move || {
                 let rt = tokio::runtime::Runtime::new()
                     .expect("failed to create webserver tokio runtime");
-                rt.block_on(run(addr, actor_id, state, bus_tx, shutdown_rx));
+                rt.block_on(run(addr, actor_id, state, bus_tx, bus_rx, shutdown_rx));
             })
             .expect("failed to spawn webserver thread");
     }
@@ -257,6 +301,7 @@ async fn run(
     actor_id: String,
     root: Arc<SystemState>,
     bus_tx: broadcast::Sender<FlighthookMessage>,
+    bus_rx: broadcast::Receiver<FlighthookMessage>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     // Pre-populate per-actor state from config
@@ -272,6 +317,7 @@ async fn run(
         root,
         bus_tx: bus_tx.clone(),
         actors: RwLock::new(actors),
+        epoch: std::time::Instant::now(),
         shots: RwLock::new(VecDeque::with_capacity(MAX_SHOTS)),
         groups: RwLock::new(groups),
         raw_bytes: AtomicUsize::new(0),
@@ -284,9 +330,8 @@ async fn run(
         request_count: AtomicU64::new(0),
     });
 
-    // Background task: subscribe to bus and update web state
+    // Background task: keep web state current from the bus
     let updater_state = Arc::clone(&state);
-    let bus_rx = bus_tx.subscribe();
     tokio::spawn(state_updater(updater_state, bus_rx));
 
     // Periodic telemetry emitter (every 5s)
@@ -361,7 +406,7 @@ async fn run(
         .ok();
 }
 
-/// Background task that subscribes to the bus and keeps WebState current.
+/// Background task that drains the bus and keeps WebState current.
 async fn state_updater(state: Arc<WebState>, mut bus_rx: broadcast::Receiver<FlighthookMessage>) {
     let mut accumulators = PendingShots::new();
 
@@ -541,6 +586,18 @@ async fn drop_pending(state: &WebState, accumulators: &mut PendingShots, actor: 
     }
 }
 
+/// Merge an `actor_status` event's telemetry into an actor's: each key
+/// replaces the one held, and an empty value removes the key.
+fn merge_status_telemetry(held: &mut HashMap<String, String>, update: &HashMap<String, String>) {
+    for (k, v) in update {
+        if v.is_empty() {
+            held.remove(k);
+        } else {
+            held.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 async fn apply_bus_event(
     state: &WebState,
     msg: &FlighthookMessage,
@@ -555,10 +612,8 @@ async fn apply_bus_event(
                 let name = names.get(&msg.actor).cloned().unwrap_or_default();
                 new_actor(name)
             });
-            actor.status = *status;
-            for (k, v) in telemetry {
-                actor.telemetry.insert(k.clone(), v.clone());
-            }
+            actor.observe(*status, state.now_ms());
+            merge_status_telemetry(&mut actor.telemetry, telemetry);
             // Cache the raw message for WS replay
             state
                 .cached_actor_status
@@ -724,17 +779,24 @@ async fn apply_bus_event(
             restarted,
             ..
         } => {
+            // Names come from the config, and a rename is applied without a
+            // restart: every outcome refreshes them.
+            let names = actor_names(&state.root.system.snapshot());
+            let mut actors = state.actors.write().await;
+            rename_actors(&mut actors, &names);
             if !started.is_empty() || !stopped.is_empty() || !restarted.is_empty() {
-                // Refresh actor names from config
-                let snap = state.root.system.snapshot();
-                let names = actor_names(&snap);
-
-                let mut actors = state.actors.write().await;
+                let now = state.now_ms();
                 for (id, name) in &names {
-                    let entry = actors
+                    actors
                         .entry(id.clone())
                         .or_insert_with(|| new_actor(name.clone()));
-                    entry.name = name.clone();
+                }
+                // A restarted actor begins a new history: no alert for the
+                // connection its old instance lost.
+                for id in restarted {
+                    if let Some(entry) = actors.get_mut(id) {
+                        entry.restart(now);
+                    }
                 }
                 // Remove stopped actors
                 for id in stopped {
@@ -833,6 +895,247 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn status_telemetry_replaces_keys_and_an_empty_value_removes_one() {
+        let mut held = HashMap::from([
+            ("club".to_string(), "DR".to_string()),
+            ("error".to_string(), "refused".to_string()),
+        ]);
+        merge_status_telemetry(
+            &mut held,
+            &HashMap::from([
+                ("club".to_string(), "7I".to_string()),
+                ("error".to_string(), String::new()),
+                ("handed".to_string(), "rh".to_string()),
+            ]),
+        );
+        assert_eq!(
+            held,
+            HashMap::from([
+                ("club".to_string(), "7I".to_string()),
+                ("handed".to_string(), "rh".to_string()),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_bind_clears_the_bind_error() {
+        let (state, _writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        emit_status(ActorStatus::Disconnected, &state, &state.bus_tx);
+        emit_status(ActorStatus::Connected, &state, &state.bus_tx);
+        let mut pending = PendingShots::new();
+        let msg = rx.recv().await.expect("disconnected");
+        apply_bus_event(&state, &msg, &mut pending).await;
+        assert_eq!(
+            state.actors.read().await["webserver.0"].telemetry["error"],
+            "bind failed"
+        );
+        let msg = rx.recv().await.expect("connected");
+        apply_bus_event(&state, &msg, &mut pending).await;
+        let actors = state.actors.read().await;
+        let web = actors.get("webserver.0").expect("webserver status");
+        assert_eq!(web.status, ActorStatus::Connected);
+        assert!(!web.telemetry.contains_key("error"), "{:?}", web.telemetry);
+        assert_eq!(web.telemetry["bind"], "127.0.0.1:0");
+    }
+
+    /// GET `path` from the server at `addr`, retrying the connect until it
+    /// listens. Returns the response body.
+    fn http_get(addr: SocketAddr, path: &str) -> String {
+        use std::io::{Read, Write};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut stream = loop {
+            match std::net::TcpStream::connect(addr) {
+                Ok(s) => break s,
+                Err(e) => {
+                    assert!(std::time::Instant::now() < deadline, "connect: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        };
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("response");
+        let (_, body) = response.split_once("\r\n\r\n").expect("body");
+        body.to_string()
+    }
+
+    #[test]
+    fn a_status_sent_right_after_the_web_server_starts_is_in_api_status() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-web-start-{}",
+            crate::state::config::generate_id()
+        )));
+        let (root, _writer) = SystemState::new(dir.0.join("config.toml"));
+        let root = Arc::new(root);
+        let (bus_tx, _) = broadcast::channel(1024);
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port");
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let web_sender = BusSender::new("webserver.0".into(), bus_tx.clone(), shutdown);
+        let web = WebActor::new(addr);
+        web.start(
+            Arc::clone(&root),
+            web_sender.clone(),
+            web_sender.subscribe(),
+        );
+
+        // The next actor's first status, sent as soon as `start` returns.
+        let monitor = BusSender::new(
+            "mock_monitor.0".into(),
+            bus_tx,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        monitor.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+            status: ActorStatus::Starting,
+            telemetry: HashMap::from([("bind".into(), "first".into())]),
+        }));
+
+        let body = http_get(addr, "/api/status");
+        web.stop();
+        let status: flighthook::StatusResponse = serde_json::from_str(&body).expect("json");
+        let monitor = &status.actors["mock_monitor.0"];
+        assert_eq!(monitor.status, ActorStatus::Starting);
+        assert_eq!(monitor.telemetry["bind"], "first");
+    }
+
+    fn status_event(status: ActorStatus) -> FlighthookEvent {
+        FlighthookEvent::ActorStatus {
+            status,
+            telemetry: HashMap::new(),
+        }
+    }
+
+    fn outcome(started: &[&str], stopped: &[&str], restarted: &[&str]) -> FlighthookEvent {
+        let ids = |ids: &[&str]| ids.iter().map(|s| (*s).to_owned()).collect();
+        FlighthookEvent::ConfigOutcome {
+            request_id: None,
+            restarted: ids(restarted),
+            stopped: ids(stopped),
+            started: ids(started),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_connection_is_red_reconnecting_for_ten_minutes() {
+        let (state, _writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        let id = "openconnect_server.0";
+        let shown = |at: u64, actors: &HashMap<String, ActorStatusResponse>| {
+            let a = &actor_statuses(actors, &HashMap::new(), at)[id];
+            (a.state, a.red_for_ms)
+        };
+
+        // Listening, no peer yet: Connecting.
+        up.send(id, status_event(ActorStatus::Starting)).await;
+        up.send(id, status_event(ActorStatus::Disconnected)).await;
+        let now = state.now_ms();
+        assert_eq!(
+            shown(now, &*state.actors.read().await),
+            (flighthook::ConnectionState::Connecting, 0)
+        );
+
+        // A peer connected and left.
+        up.send(id, status_event(ActorStatus::Connected)).await;
+        up.send(id, status_event(ActorStatus::Disconnected)).await;
+        let now = state.now_ms();
+        let (shown_state, red) = shown(now, &*state.actors.read().await);
+        assert_eq!(shown_state, flighthook::ConnectionState::Reconnecting);
+        assert!(red > 0 && red <= flighthook::RECONNECT_ALERT_MS, "{red}");
+        assert_eq!(
+            shown(
+                now + flighthook::RECONNECT_ALERT_MS,
+                &*state.actors.read().await
+            ),
+            (flighthook::ConnectionState::Reconnecting, 0)
+        );
+
+        // A restart from a config change starts again at Connecting.
+        up.send("system", outcome(&[], &[], &[id])).await;
+        assert_eq!(
+            shown(state.now_ms(), &*state.actors.read().await),
+            (flighthook::ConnectionState::Connecting, 0)
+        );
+
+        // Removed and added again: a new history.
+        up.send(id, status_event(ActorStatus::Connected)).await;
+        up.send(id, status_event(ActorStatus::Disconnected)).await;
+        up.send("system", outcome(&[], &[id], &[])).await;
+        assert!(!state.actors.read().await.contains_key(id));
+        up.send(id, status_event(ActorStatus::Disconnected)).await;
+        assert_eq!(
+            shown(state.now_ms(), &*state.actors.read().await),
+            (flighthook::ConnectionState::Connecting, 0)
+        );
+    }
+
+    #[test]
+    fn a_lost_connection_stays_red_in_api_status_across_ui_connections() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-web-red-{}",
+            crate::state::config::generate_id()
+        )));
+        let (root, _writer) = SystemState::new(dir.0.join("config.toml"));
+        let root = Arc::new(root);
+        let (bus_tx, _) = broadcast::channel(1024);
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port");
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let web_sender = BusSender::new("webserver.0".into(), bus_tx.clone(), shutdown);
+        let web = WebActor::new(addr);
+        web.start(
+            Arc::clone(&root),
+            web_sender.clone(),
+            web_sender.subscribe(),
+        );
+        let server = BusSender::new(
+            "openconnect_server.0".into(),
+            bus_tx,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        for status in [
+            ActorStatus::Starting,
+            ActorStatus::Connected,
+            ActorStatus::Disconnected,
+        ] {
+            server.send(FlighthookMessage::new(status_event(status)));
+        }
+
+        // Each page load (a UI connecting) reads the same history, the red
+        // time counting down between them.
+        let red = |body: &str| {
+            let status: flighthook::StatusResponse = serde_json::from_str(body).expect("json");
+            status
+                .actors
+                .get("openconnect_server.0")
+                .filter(|a| a.state == flighthook::ConnectionState::Reconnecting)
+                .map(|a| a.red_for_ms)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let first = loop {
+            if let Some(ms) = red(&http_get(addr, "/api/status")) {
+                break ms;
+            }
+            assert!(std::time::Instant::now() < deadline, "no Reconnecting");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let second = red(&http_get(addr, "/api/status")).expect("still Reconnecting");
+        web.stop();
+        assert!(
+            first > 0 && first <= flighthook::RECONNECT_ALERT_MS,
+            "{first}"
+        );
+        assert!(second > 0 && second < first, "{first} then {second}");
+    }
+
     /// A webserver's state over `root`, on `bus_tx`, as `actor_id`.
     pub(crate) fn web_state(
         root: Arc<SystemState>,
@@ -844,6 +1147,7 @@ pub(crate) mod tests {
             root,
             bus_tx,
             actors: RwLock::new(HashMap::new()),
+            epoch: std::time::Instant::now(),
             shots: RwLock::new(VecDeque::new()),
             groups: RwLock::new(groups),
             raw_bytes: AtomicUsize::new(0),
@@ -981,7 +1285,7 @@ pub(crate) mod tests {
             FlighthookMessage::new(FlighthookEvent::ClubInfo {
                 club_info: ClubInfo { club },
             })
-            .actor("gspro.0")
+            .actor("openconnect_client.0")
         };
         apply_bus_event(&state, &club(Club::Iron8), &mut acc).await;
         apply_bus_event(
@@ -1706,7 +2010,7 @@ pub(crate) mod tests {
         let i7 = group_of(&state, 1).await.expect("grouped");
         // The bus message alone moves the selection; game state is not read.
         up.send(
-            "gspro.0",
+            "openconnect_client.0",
             FlighthookEvent::ClubInfo {
                 club_info: ClubInfo { club: Club::Driver },
             },

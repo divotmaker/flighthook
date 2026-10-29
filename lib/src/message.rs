@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRaw};
 use crate::{ClubInfo, GroupedShot, PlayerInfo, ShotGroupInfo, ShotGrouping};
 use crate::{
-    FlighthookConfig, GsProSection, MevoSection, MockMonitorSection, OpenConnectServerSection,
-    R10Section, RandomClubSection, SquareSection, WebserverSection,
+    FlighthookConfig, MevoSection, MockMonitorSection, OpenConnectClientSection,
+    OpenConnectServerSection, R10Section, RandomClubSection, SquareSection, WebserverSection,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ use crate::{
 /// `actor` is a flighthook extension field. FRP consumers ignore unknown fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlighthookMessage {
-    /// Actor ID of the originator (e.g. "mevo.0", "gspro.0", "system").
+    /// Actor ID of the originator (e.g. "mevo.0", "openconnect_client.0", "system").
     #[serde(default)]
     pub actor: String,
     /// FRP device identifier for the physical unit (e.g. the Mevo SSID).
@@ -332,9 +332,11 @@ pub enum ConfigAction {
         index: String,
         section: OpenConnectServerSection,
     },
-    UpsertGsPro {
+    /// Also accepted as `upsert_gs_pro`.
+    #[serde(alias = "upsert_gs_pro")]
+    UpsertOpenConnectClient {
         index: String,
-        section: GsProSection,
+        section: OpenConnectClientSection,
     },
     UpsertMockMonitor {
         index: String,
@@ -344,7 +346,8 @@ pub enum ConfigAction {
         index: String,
         section: RandomClubSection,
     },
-    /// Remove a section by global ID ("mevo.0", "gspro.1", "webserver.0").
+    /// Remove a section by global ID ("mevo.0", "openconnect_client.1",
+    /// "webserver.0"). A `gspro.N` ID names `openconnect_client.N`.
     Remove {
         id: String,
     },

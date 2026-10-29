@@ -51,11 +51,19 @@ Check what your unit has before buying anything.
 
 ## Configuration
 
+Add it from the Devices tab: Launch monitors (+) → **Uneekor (OpenConnect)**
+(or the generic **OpenConnect Server**, for any other Open Connect monitor),
+which creates this section:
+
 ```toml
 [openconnect_server.0]
 name = "Uneekor"
 bind = "0.0.0.0:921"
 ```
+
+To listen on another port, flip the card to Settings and edit **Bind
+Address** (`ip:port`; blank means `0.0.0.0:921`). Saving restarts the server
+on the new address.
 
 The actor accepts one monitor at a time — Open Connect is a single-peer
 protocol. A second monitor should be a second actor on its own port.
@@ -80,7 +88,9 @@ GSPro listens on 921 too, but its port is movable. Edit
 ```
 
 to start GSPConnect on **922**, which frees 921 for flighthook and lets
-everything run on one machine:
+everything run on one machine. flighthook's OpenConnect server takes the
+Uneekor's shots on 921 and its OpenConnect client passes them on to GSPro on
+922:
 
 ```text
   Uneekor software  --:921-->  flighthook  --:922-->  GSPro     (all one host)
@@ -91,12 +101,29 @@ everything run on one machine:
 name = "Uneekor"
 bind = "0.0.0.0:921"
 
-[gspro.0]
-name = "Local GSPro"
+[openconnect_client.0]
+name = "GSPro"
 address = "127.0.0.1:922"   # GSPro moved aside via OpenAPIUseAltPort
 ```
 
 Note this is a boolean toggle (921 ↔ 922), not an arbitrary port.
+
+### Don't point the client at the server
+
+The client's address must be GSPro's port (922 here), not the server's. A
+client aimed at flighthook's own server (e.g. `127.0.0.1:921` with the
+server bound to `0.0.0.0:921`) would send every shot straight back into
+flighthook, round and round. flighthook refuses that connection. The server
+raises an error alert in the Log, "Refused OpenConnect Client "<name>" from
+<address>: it is this flighthook's own client, which would loop shots
+back…". The client's card and the banner above the tabs say "Refused by this
+flighthook's own OpenConnect Server "<name>": this address points at it…",
+and the card stays at CONNECTING. Fix the client's address; the error
+clears once it connects elsewhere.
+
+The check is exact: the server refuses only a connection it can match to one
+of this flighthook's own clients. The Uneekor software connecting from the
+same computer is served as normal.
 
 Splitting across two hosts also works, but only if your monitor's connector lets
 you aim it at a non-localhost address — Open Connect's own documentation

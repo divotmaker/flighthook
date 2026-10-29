@@ -389,13 +389,13 @@ pub(crate) fn segmented_fill(
 
 /// A status badge: neutral translucent pill with a coloured outline, dot
 /// and label.
-pub(crate) fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
+pub(crate) fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_string(), FontId::proportional(12.0), color);
     let dot = 7.0;
     let size = galley.size() + egui::vec2(dot + 22.0, 8.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let radius = CornerRadius::same((rect.height() / 2.0) as u8);
     ui.painter().rect(
         rect,
@@ -411,6 +411,7 @@ pub(crate) fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
         rect.center().y - galley.size().y / 2.0,
     );
     ui.painter().galley(pos, galley, color);
+    response
 }
 
 /// A clickable chip the size of a `badge`, with an up arrow: neutral

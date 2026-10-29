@@ -145,7 +145,7 @@ mod tests {
         ];
         for (code, club) in cases {
             let (bus_tx, mut rx) = broadcast::channel(16);
-            let sender = BusSender::new("gspro.0".into(), bus_tx, Arc::default());
+            let sender = BusSender::new("openconnect_client.0".into(), bus_tx, Arc::default());
             let buf = format!(
                 r#"{{"Code":201,"Message":"GSPro Player Information","Player":{{"Club":"{code}"}}}}"#
             );

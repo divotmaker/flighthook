@@ -21,17 +21,25 @@ Each device links to its setup notes, quirks, and config reference.
 | [FlightScope Xi](docs/devices/flightscope.md)        | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
 | [Square Golf Omni](docs/devices/square-golf.md)      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Supported        |
 | [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
-| [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (OpenConnect)                          | Alpha (untested) |
+| [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (OpenConnect server)                   | Alpha (untested) |
 
 Uneekor connects through the **OpenConnect server** actor, which accepts shots
 from any launch monitor that speaks GSPro Open Connect as a client — Foresight,
-SkyTrak and MLM2PRO also emit it.
+SkyTrak and MLM2PRO also emit it. Add it from the Launch monitors (+) menu:
+**Uneekor (OpenConnect)**, or **OpenConnect Server** for any other monitor.
 
 ### Simulation Software
 
-| Software | Protocol             | Status    |
-| -------- | -------------------- | --------- |
-| GSPro    | TCP (JSON, port 921) | Supported |
+| Software  | Protocol              | Driver                        | Status           |
+| --------- | --------------------- | ----------------------------- | ---------------- |
+| GSPro     | TCP (JSON, port 921)  | built-in (OpenConnect client) | Supported        |
+| Muni Golf | TCP (JSON, port 9210) | built-in (OpenConnect client) | Alpha (untested) |
+
+Simulators are reached through the **OpenConnect client** output, which sends
+shots to any simulator that accepts GSPro Open Connect. The OpenConnect client
+and server are the two halves of the same protocol. Add one from the Outputs
+(+) menu: **GSPro (OpenConnect)**, **Muni Golf (OpenConnect)**, or
+**OpenConnect Client** for any other simulator.
 
 ### Custom Integrations
 
@@ -297,12 +305,25 @@ without an offline are left out.
 
 ![Devices](./screens/devices.png "Devices")
 
-The Devices tab, where the app opens, has a card for every launch monitor and
-output, and the Global and Simulation settings. A card's **Telemetry |
-Settings** toggle flips it between the device's live status and its settings.
-Edit a card and **Save** or **Cancel** it before moving on; the rest of the
-dashboard waits until you do. The **+** after Launch monitors or Outputs adds
-one.
+The Devices tab, where the app opens, has the Global and Simulation settings
+and the web server under General, then a card for every launch monitor and
+output. A card's **Telemetry | Settings** toggle flips it between the
+device's live status and its settings. Edit a card and **Save** or
+**Cancel** it before moving on; the rest of the dashboard waits until you
+do. The **+** after Launch monitors or Outputs adds one. There is one web
+server: it can be edited (its bind address) but not removed or added.
+
+Each card's badge and left stripe show its connection:
+
+- **CONNECTING** (yellow): not connected yet since it started or since its
+  settings were saved (e.g. GSPro not running yet).
+- **CONNECTED** (green).
+- **RECONNECTING**: it was connected and lost the connection. Red for 10
+  minutes after the loss, then yellow. This applies to every card, outputs
+  included: a simulator that closes, a monitor that drops, a launch monitor
+  that disconnects from the OpenConnect server.
+
+The Devices tab shows a red dot while any card is red.
 
 ![Device settings](./screens/devices-settings.png "Device settings")
 
@@ -366,17 +387,37 @@ DR = 15.0
 name = "Garmin R10"
 range = "7ft"                  # device-to-ball distance, sent as tee distance
 
-[gspro.0]
-name = "Local GSPro"
+[openconnect_client.0]
+name = "GSPro"
 address = "127.0.0.1:921"
+
+[openconnect_client.1]
+name = "Muni Golf"
+address = "127.0.0.1:9210"
 ```
 
 `[simulation]` is a single global table. Section prefixes encode component
 type: `webserver`, `mevo`, `r10`, `square`,
-`openconnect_server`, `mock_monitor`, `gspro`, `random_club`. The index after
-the dot (`0`, `1`, ...) identifies the instance. Per-device options are covered
-in the [device docs](#launch-monitors). Settings can also be edited live on
-the Devices tab in the UI.
+`openconnect_server`, `mock_monitor`, `openconnect_client`, `random_club`. The
+index after the dot (`0`, `1`, ...) identifies the instance. Per-device
+options are covered in the [device docs](#launch-monitors). Settings can also
+be edited live on the Devices tab in the UI.
+
+Files in an older format are read too: `[gspro.N]` sections as
+`[openconnect_client.N]`, and a single `[webserver]` table as
+`[webserver.0]`. On the next start flighthook rewrites such a file in the
+current format, keeping the original next to it as
+`config.pre-<version>.toml` (`config.pre-<version>.1.toml`, ... if that name
+is taken; a backup is never overwritten), and logs where the backup is. The
+same one-time rewrite drops keys flighthook doesn't use and values written out
+at their defaults, which it leaves out of the file (the `[simulation]` table
+above, for one). A file that already matches what flighthook would save is
+never touched: differences in comments, key order or whitespace alone, or `12`
+written for `12.0`, don't count. A rewritten file loses its comments; the
+backup keeps them. A file that fails to parse is left alone at startup
+(flighthook runs on the defaults and logs the error; a settings save from the
+UI then replaces it), and when the file can't be written
+flighthook logs a warning and runs on the settings it read.
 
 ### Second screen on a tablet or phone
 

@@ -1,5 +1,6 @@
 pub mod config;
 mod game;
+pub mod local_clients;
 
 pub use game::{GameState, GameStateWriter};
 
@@ -11,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use crate::actors::{Actor, ReconfigureOutcome};
 use crate::bus::BusSender;
 use config::SystemConfig;
+use local_clients::LocalClients;
 
 /// Root entry point for all managed application state.
 ///
@@ -18,6 +20,9 @@ use config::SystemConfig;
 pub struct SystemState {
     pub system: SystemConfig,
     pub game: GameState,
+    /// This process's connected Open Connect clients, which its Open Connect
+    /// servers refuse.
+    pub local_clients: Arc<LocalClients>,
     #[allow(clippy::type_complexity)]
     actors: RwLock<HashMap<String, (Box<dyn Actor>, Arc<AtomicBool>)>>,
 }
@@ -29,6 +34,7 @@ impl SystemState {
             Self {
                 system: SystemConfig::new(config_path),
                 game,
+                local_clients: Arc::default(),
                 actors: RwLock::new(HashMap::new()),
             },
             writer,

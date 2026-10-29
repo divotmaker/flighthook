@@ -1,9 +1,9 @@
 //! GSPro Open Connect V1 JSON types.
 //!
-//! These types are used in both directions. The `gspro` actor is a *client*:
-//! it sends [`GsProMessage`] and receives [`GsProResponse`]. The
-//! `openconnect` actor is a *server*: it receives [`GsProMessage`] from a
-//! launch monitor and sends [`GsProResponse`] back. Every type therefore
+//! These types are used in both directions. The `openconnect_client` actor
+//! is a *client*: it sends [`GsProMessage`] and receives [`GsProResponse`].
+//! The `openconnect_server` actor is a *server*: it receives [`GsProMessage`]
+//! from a launch monitor and sends [`GsProResponse`] back. Every type therefore
 //! derives both `Serialize` and `Deserialize`.
 //!
 //! Inbound messages come from third-party launch monitors that populate the

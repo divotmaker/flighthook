@@ -16,6 +16,7 @@ use super::types::{
     StatusResponse,
 };
 use super::{MAX_SHOTS, StoredShot, WebState, export};
+use crate::actors::actor_names;
 use crate::state::config::FlighthookConfig;
 use flighthook::{
     Club, ClubInfo, ConfigAction, FlighthookEvent, FlighthookMessage, ShotData, UnitSystem,
@@ -79,11 +80,10 @@ fn default_limit() -> usize {
 
 /// GET /api/status
 pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusResponse> {
-    let actors_guard = state.actors.read().await;
-    let actors = actors_guard
-        .iter()
-        .map(|(id, a)| (id.clone(), a.clone()))
-        .collect();
+    // Names from the config as it is now: a rename shows before the bus
+    // event that applied it reaches the cache.
+    let names = actor_names(&state.root.system.snapshot());
+    let actors = super::actor_statuses(&*state.actors.read().await, &names, state.now_ms());
 
     let game = state.root.game.snapshot();
     Json(StatusResponse {
@@ -374,13 +374,14 @@ pub struct SettingsQuery {
 /// The body carries the whole config, but a scoped save means only the named
 /// section: it becomes an `Upsert*` for that section alone, leaving every other
 /// section of the live config untouched. A scope naming a section the body does
-/// not carry is a removal.
+/// not carry is a removal. A `gspro.N` scope names `openconnect_client.N`.
 ///
 /// Returns `None` for a malformed ID or an unknown type prefix.
 fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction> {
+    let scope = crate::state::config::canonical_id(scope);
     let (prefix, index) = scope.split_once('.')?;
     let idx = index.to_string();
-    let id = scope.to_string();
+    let id = scope.clone();
 
     // Each arm moves `idx`/`id`, which is fine — only one arm ever runs.
     macro_rules! upsert {
@@ -403,11 +404,43 @@ fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction>
         "r10" => upsert!(r10, UpsertR10),
         "square" => upsert!(square, UpsertSquare),
         "openconnect_server" => upsert!(openconnect_server, UpsertOpenConnectServer),
-        "gspro" => upsert!(gspro, UpsertGsPro),
+        "openconnect_client" => upsert!(openconnect_client, UpsertOpenConnectClient),
         "mock_monitor" => upsert!(mock_monitor, UpsertMockMonitor),
         "random_club" => upsert!(random_club, UpsertRandomClub),
         _ => return None,
     })
+}
+
+/// Why `action` breaks the one-web-server rule, against the `live` config:
+/// no save removes a web server, and none adds one while the config holds
+/// one already. A config holding several keeps them all; each stays
+/// editable.
+fn webserver_violation(live: &FlighthookConfig, action: &ConfigAction) -> Option<&'static str> {
+    const NO_REMOVE: &str = "the web server can't be removed";
+    const ONLY_ONE: &str = "flighthook runs one web server; edit the existing one";
+    match action {
+        ConfigAction::Remove { id } => id
+            .split_once('.')
+            .is_some_and(|(prefix, _)| prefix == "webserver")
+            .then_some(NO_REMOVE),
+        ConfigAction::UpsertWebserver { index, .. } => {
+            (!live.webserver.is_empty() && !live.webserver.contains_key(index)).then_some(ONLY_ONE)
+        }
+        ConfigAction::ReplaceAll { config } => {
+            if live
+                .webserver
+                .keys()
+                .any(|k| !config.webserver.contains_key(k))
+            {
+                Some(NO_REMOVE)
+            } else if config.webserver.len() > live.webserver.len().max(1) {
+                Some(ONLY_ONE)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// POST /api/settings — config replacement via bus request-reply.
@@ -421,8 +454,9 @@ fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction>
 /// global settings, keeping every actor section of the live config. Without
 /// a scope the whole config is replaced and every actor is reconciled.
 ///
-/// An unknown scope is `400` and a missing `ConfigOutcome` `504`, each with a
-/// JSON `{"error": "..."}` body; nothing is reported as saved.
+/// An unknown scope, a removed web server or a second web server is `400`
+/// and a missing `ConfigOutcome` `504`, each with a JSON `{"error": "..."}`
+/// body; nothing is reported as saved.
 pub async fn post_settings(
     State(state): State<Arc<WebState>>,
     Query(query): Query<SettingsQuery>,
@@ -467,6 +501,12 @@ async fn save_settings(
             }
         },
     };
+    // Guards REST only: the WS path accepts no `ConfigAction`. If it ever
+    // does, this check moves into the system actor's `handle_config_command`.
+    if let Some(reason) = webserver_violation(&state.root.system.snapshot(), &action) {
+        tracing::warn!("config update: {reason}, ignoring request");
+        return Err(settings_error(StatusCode::BAD_REQUEST, reason));
+    }
 
     match send_config_command_within(state, action, timeout).await {
         Some((restarted, stopped)) => Ok(Json(PostSettingsResponse { restarted, stopped })),
@@ -545,7 +585,7 @@ mod tests {
     fn scope_upserts_only_the_named_section() {
         let mut c = config();
         c.mevo.insert("0".into(), mevo_section("Mevo WiFi"));
-        c.gspro.insert(
+        c.openconnect_client.insert(
             "0".into(),
             serde_json::from_str("{}").expect("empty section"),
         );
@@ -567,6 +607,97 @@ mod tests {
             ConfigAction::Remove { id } => assert_eq!(id, "mevo.0"),
             other => panic!("expected Remove, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gspro_scope_names_the_openconnect_client_section() {
+        let mut c = config();
+        c.openconnect_client.insert(
+            "1".into(),
+            serde_json::from_str(r#"{"name":"Muni Golf"}"#).expect("section"),
+        );
+        match scoped_action("gspro.1", &c).expect("known scope") {
+            ConfigAction::UpsertOpenConnectClient { index, section } => {
+                assert_eq!(index, "1");
+                assert_eq!(section.name, "Muni Golf");
+            }
+            other => panic!("expected UpsertOpenConnectClient, got {other:?}"),
+        }
+        match scoped_action("gspro.2", &c).expect("known scope") {
+            ConfigAction::Remove { id } => assert_eq!(id, "openconnect_client.2"),
+            other => panic!("expected Remove, got {other:?}"),
+        }
+    }
+
+    fn with_webservers(indices: &[&str]) -> FlighthookConfig {
+        let mut c = config();
+        for i in indices {
+            c.webserver.insert(
+                (*i).to_string(),
+                flighthook::WebserverSection {
+                    name: "Web Server".into(),
+                    bind: format!("0.0.0.0:588{i}"),
+                },
+            );
+        }
+        c
+    }
+
+    #[test]
+    fn no_save_removes_a_web_server_or_adds_a_second() {
+        let one = with_webservers(&["0"]);
+        let remove = |id: &str| ConfigAction::Remove { id: id.into() };
+        let upsert = |index: &str| ConfigAction::UpsertWebserver {
+            index: index.into(),
+            section: with_webservers(&[index]).webserver[index].clone(),
+        };
+        let replace = |c: FlighthookConfig| ConfigAction::ReplaceAll {
+            config: Box::new(c),
+        };
+        let no_remove = Some("the web server can't be removed");
+        let only_one = Some("flighthook runs one web server; edit the existing one");
+
+        assert_eq!(webserver_violation(&one, &remove("webserver.0")), no_remove);
+        assert_eq!(webserver_violation(&one, &remove("webserver.7")), no_remove);
+        assert_eq!(webserver_violation(&one, &remove("mevo.0")), None);
+        assert_eq!(webserver_violation(&one, &upsert("0")), None);
+        assert_eq!(webserver_violation(&one, &upsert("1")), only_one);
+        assert_eq!(webserver_violation(&config(), &upsert("0")), None);
+        assert_eq!(
+            webserver_violation(&one, &replace(with_webservers(&["0"]))),
+            None
+        );
+        assert_eq!(webserver_violation(&one, &replace(config())), no_remove);
+        assert_eq!(
+            webserver_violation(&one, &replace(with_webservers(&["1"]))),
+            no_remove
+        );
+        assert_eq!(
+            webserver_violation(&one, &replace(with_webservers(&["0", "1"]))),
+            only_one
+        );
+        assert_eq!(
+            webserver_violation(&config(), &replace(with_webservers(&["0"]))),
+            None
+        );
+
+        // A config that already holds two keeps both, and each stays
+        // editable, but gets no third.
+        let two = with_webservers(&["0", "1"]);
+        assert_eq!(webserver_violation(&two, &upsert("1")), None);
+        assert_eq!(webserver_violation(&two, &upsert("2")), only_one);
+        assert_eq!(
+            webserver_violation(&two, &replace(with_webservers(&["0", "1"]))),
+            None
+        );
+        assert_eq!(
+            webserver_violation(&two, &replace(with_webservers(&["0"]))),
+            no_remove
+        );
+        assert_eq!(
+            webserver_violation(&two, &replace(with_webservers(&["0", "1", "2"]))),
+            only_one
+        );
     }
 
     #[test]
@@ -947,7 +1078,7 @@ mod group_tests {
         let driver = FlighthookEvent::ClubInfo {
             club_info: ClubInfo { club: Club::Driver },
         };
-        feed(&state, "gspro.0", vec![driver]).await;
+        feed(&state, "openconnect_client.0", vec![driver]).await;
         feed(&state, "mevo.0", shot(2)).await;
 
         let listed = get_shot_groups(State(Arc::clone(&state))).await.0;
@@ -1003,6 +1134,51 @@ mod group_tests {
     }
 
     #[tokio::test]
+    async fn settings_save_that_removes_the_web_server_or_adds_one_is_400() {
+        let (state, _writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        assert_eq!(live.webserver.len(), 1);
+        let mut without = live.clone();
+        without.webserver.clear();
+        let mut second = live.clone();
+        second.webserver.insert(
+            "1".into(),
+            flighthook::WebserverSection {
+                name: "Web Server".into(),
+                bind: "0.0.0.0:5881".into(),
+            },
+        );
+        for (scope, body, message) in [
+            (
+                Some("webserver.0"),
+                without.clone(),
+                "the web server can't be removed",
+            ),
+            (None, without, "the web server can't be removed"),
+            (
+                Some("webserver.1"),
+                second.clone(),
+                "flighthook runs one web server; edit the existing one",
+            ),
+            (
+                None,
+                second,
+                "flighthook runs one web server; edit the existing one",
+            ),
+        ] {
+            let (status, Json(error)) =
+                save_settings(&state, scope, body, Duration::from_millis(50))
+                    .await
+                    .expect_err("rejected");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{scope:?}");
+            assert_eq!(error["error"], message, "{scope:?}");
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+    }
+
+    #[tokio::test]
     async fn settings_save_without_an_outcome_is_504_with_a_json_error() {
         let (state, _writer, _dir) = test_state();
         // No system actor answers the command.
@@ -1015,6 +1191,138 @@ mod group_tests {
             assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{scope:?}");
             assert!(error["error"].is_string(), "{scope:?}");
         }
+    }
+
+    /// A client still on the `gspro` spelling: body section and scope.
+    #[tokio::test]
+    async fn settings_save_accepts_the_gspro_spelling() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        // Stand in for the system actor: apply every config command.
+        let mut rx = state.bus_tx.subscribe();
+        let (root, bus_tx) = (Arc::clone(&state.root), state.bus_tx.clone());
+        let system = tokio::spawn(async move {
+            let sender =
+                crate::bus::BusSender::new("system".into(), bus_tx.clone(), Arc::default());
+            let mut actions = Vec::new();
+            while actions.len() < 2 {
+                let msg = rx.recv().await.expect("bus open");
+                if let FlighthookEvent::ConfigCommand { action, .. } = &msg.event {
+                    actions.push((**action).clone());
+                    crate::actors::system::handle_config_command(
+                        &msg.event, &root, &bus_tx, &sender,
+                    );
+                }
+            }
+            actions
+        });
+        let post = |body: &str, scope: &str| {
+            // As the `Json` extractor reads it.
+            let body: FlighthookConfig = serde_json::from_str(body).expect("body parses");
+            post_settings(
+                State(Arc::clone(&state)),
+                Query(SettingsQuery {
+                    scope: Some(scope.into()),
+                }),
+                Json(body),
+            )
+        };
+
+        // An address no actor can start on, so nothing dials out.
+        let upsert = r#"{"gspro":{"0":{"name":"Muni Golf","address":"no address"}}}"#;
+        let _ = post(upsert, "gspro.0").await.expect("saved");
+        let saved = state.root.system.snapshot();
+        assert_eq!(saved.openconnect_client["0"].name, "Muni Golf");
+
+        let _ = post("{}", "gspro.0").await.expect("removed");
+        assert!(state.root.system.snapshot().openconnect_client.is_empty());
+
+        let actions = system.await.expect("system task");
+        assert!(matches!(
+            &actions[0],
+            ConfigAction::UpsertOpenConnectClient { index, .. } if index == "0"
+        ));
+        assert!(matches!(
+            &actions[1],
+            ConfigAction::Remove { id } if id == "openconnect_client.0"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rename_shows_in_the_status_without_a_restart() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        // The system actor: apply each config command and keep its outcome.
+        let mut rx = state.bus_tx.subscribe();
+        let (root, bus_tx) = (Arc::clone(&state.root), state.bus_tx.clone());
+        let system = tokio::spawn(async move {
+            let sender =
+                crate::bus::BusSender::new("system".into(), bus_tx.clone(), Arc::default());
+            let mut outcomes = Vec::new();
+            while outcomes.len() < 2 {
+                let msg = rx.recv().await.expect("bus open");
+                match &msg.event {
+                    FlighthookEvent::ConfigCommand { .. } => {
+                        crate::actors::system::handle_config_command(
+                            &msg.event, &root, &bus_tx, &sender,
+                        );
+                    }
+                    FlighthookEvent::ConfigOutcome { .. } => outcomes.push(msg.event),
+                    _ => {}
+                }
+            }
+            outcomes
+        });
+        let post = |name: &str| {
+            let body: FlighthookConfig = serde_json::from_str(&format!(
+                r#"{{"mock_monitor":{{"0":{{"name":"{name}"}}}}}}"#
+            ))
+            .expect("body parses");
+            post_settings(
+                State(Arc::clone(&state)),
+                Query(SettingsQuery {
+                    scope: Some("mock_monitor.0".into()),
+                }),
+                Json(body),
+            )
+        };
+        let shown = |status: &StatusResponse| status.actors["mock_monitor.0"].name.clone();
+
+        let _ = post("Bay Mock").await.expect("added");
+        let outcome = |started: &[&str]| FlighthookEvent::ConfigOutcome {
+            request_id: None,
+            restarted: Vec::new(),
+            stopped: Vec::new(),
+            started: started.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        feed(&state, "system", vec![outcome(&["mock_monitor.0"])]).await;
+        let before = get_status(State(Arc::clone(&state))).await.0;
+        assert_eq!(shown(&before), "Bay Mock");
+
+        // Renamed: nothing restarts, and the status has the new name before
+        // the web layer has seen the outcome.
+        let Json(reply) = post("Range Mock").await.expect("renamed");
+        assert!(reply.restarted.is_empty() && reply.stopped.is_empty());
+        let now = get_status(State(Arc::clone(&state))).await.0;
+        assert_eq!(shown(&now), "Range Mock");
+        assert_eq!(
+            now.actors["mock_monitor.0"].state,
+            before.actors["mock_monitor.0"].state
+        );
+
+        let outcomes = system.await.expect("system task");
+        assert!(matches!(
+            &outcomes[1],
+            FlighthookEvent::ConfigOutcome { restarted, stopped, started, .. }
+                if restarted.is_empty() && stopped.is_empty() && started.is_empty()
+        ));
+        // The web layer's own copy takes the name from the outcome.
+        feed(&state, "system", vec![outcomes[1].clone()]).await;
+        assert_eq!(
+            state.actors.read().await["mock_monitor.0"].name,
+            "Range Mock"
+        );
+        state.root.stop_actor("mock_monitor.0");
     }
 
     #[tokio::test]

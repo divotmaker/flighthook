@@ -1,5 +1,5 @@
 //! Card layout of the Devices tab: which group each actor type belongs to,
-//! the order of cards within a group ([`grouped`]), the types each group's
+//! the order of cards within a group ([`grouped`]), the presets each group's
 //! (+) menu offers, and the wrapping grid the cards flow into.
 
 use crate::panels::devices;
@@ -8,11 +8,11 @@ use crate::theme;
 /// A heading on the Devices tab, in display order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CardGroup {
-    /// The settings-only Global and Simulation cards.
+    /// The Global and Simulation cards, then the web server.
     General,
     /// Shot sources: launch monitors and the Open Connect server.
     LaunchMonitors,
-    /// Everything that consumes shots or serves the dashboard.
+    /// Everything that consumes shots.
     Outputs,
 }
 
@@ -44,13 +44,13 @@ impl CardGroup {
 /// Every configurable actor type (its config section and actor ID prefix),
 /// in display order, with its group.
 const ACTOR_TYPES: &[(&str, CardGroup)] = &[
+    ("webserver", CardGroup::General),
     ("mevo", CardGroup::LaunchMonitors),
     ("r10", CardGroup::LaunchMonitors),
     ("square", CardGroup::LaunchMonitors),
     ("mock_monitor", CardGroup::LaunchMonitors),
     ("openconnect_server", CardGroup::LaunchMonitors),
-    ("gspro", CardGroup::Outputs),
-    ("webserver", CardGroup::Outputs),
+    ("openconnect_client", CardGroup::Outputs),
     ("random_club", CardGroup::Outputs),
 ];
 
@@ -61,6 +61,12 @@ pub(crate) fn group_of(type_key: &str) -> CardGroup {
         .iter()
         .find(|(t, _)| *t == type_key)
         .map_or(CardGroup::Outputs, |(_, g)| *g)
+}
+
+/// Whether a card of this type offers Remove. flighthook runs one web
+/// server, which serves this UI: it stays.
+pub(crate) fn removable(type_key: &str) -> bool {
+    type_key != "webserver"
 }
 
 /// Position of a type in [`ACTOR_TYPES`]; unknown types sort after them.
@@ -102,17 +108,80 @@ pub(crate) fn grouped<'a, T>(
     groups
 }
 
-/// What a group's (+) menu offers: (menu label, actor type).
-pub(crate) fn add_options(group: CardGroup) -> &'static [(&'static str, &'static str)] {
+/// An entry of a (+) menu: the actor type it adds and the new card's name
+/// and address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AddPreset {
+    /// The menu label.
+    pub(crate) label: &'static str,
+    /// The config section and actor ID prefix.
+    pub(crate) type_key: &'static str,
+    /// The new card's name.
+    pub(crate) name: &'static str,
+    /// The new card's address: the bind address of a server, blank for a
+    /// device that is auto-discovered.
+    pub(crate) address: &'static str,
+}
+
+const fn preset(
+    label: &'static str,
+    type_key: &'static str,
+    name: &'static str,
+    address: &'static str,
+) -> AddPreset {
+    AddPreset {
+        label,
+        type_key,
+        name,
+        address,
+    }
+}
+
+const LAUNCH_MONITOR_PRESETS: &[AddPreset] = &[
+    preset("Mevo", "mevo", "Mevo WiFi", "192.168.2.1:5100"),
+    preset("R10", "r10", "Garmin R10", ""),
+    preset("Square Golf Omni", "square", "Square Golf Omni", ""),
+    preset(
+        "Uneekor (OpenConnect)",
+        "openconnect_server",
+        "Uneekor",
+        "0.0.0.0:921",
+    ),
+    preset(
+        "OpenConnect Server",
+        "openconnect_server",
+        "OpenConnect Server",
+        "0.0.0.0:921",
+    ),
+];
+
+const OUTPUT_PRESETS: &[AddPreset] = &[
+    preset(
+        "GSPro (OpenConnect)",
+        "openconnect_client",
+        "GSPro",
+        "127.0.0.1:921",
+    ),
+    preset(
+        "Muni Golf (OpenConnect)",
+        "openconnect_client",
+        "Muni Golf",
+        "127.0.0.1:9210",
+    ),
+    preset(
+        "OpenConnect Client",
+        "openconnect_client",
+        "OpenConnect Client",
+        "127.0.0.1:921",
+    ),
+];
+
+/// What a group's (+) menu offers, in menu order.
+pub(crate) fn add_options(group: CardGroup) -> &'static [AddPreset] {
     match group {
         CardGroup::General => &[],
-        CardGroup::LaunchMonitors => &[
-            ("Mevo", "mevo"),
-            ("R10", "r10"),
-            ("Square Golf Omni", "square"),
-            ("Uneekor (OpenConnect)", "openconnect_server"),
-        ],
-        CardGroup::Outputs => &[("GSPro", "gspro"), ("Web Server", "webserver")],
+        CardGroup::LaunchMonitors => LAUNCH_MONITOR_PRESETS,
+        CardGroup::Outputs => OUTPUT_PRESETS,
     }
 }
 
@@ -144,13 +213,13 @@ pub(crate) fn group_heading(ui: &mut egui::Ui, group: CardGroup) {
 }
 
 /// A group heading with a (+) after it, muted at rest and accent on hover,
-/// that opens a menu of the types the group holds ([`add_options`]).
-/// Disabled unless `enabled`. Returns the type picked.
+/// that opens a menu of the group's presets ([`add_options`]). Disabled
+/// unless `enabled`. Returns the preset picked.
 pub(crate) fn add_heading(
     ui: &mut egui::Ui,
     group: CardGroup,
     enabled: bool,
-) -> Option<&'static str> {
+) -> Option<&'static AddPreset> {
     ui.add_space(4.0);
     let picked = ui
         .horizontal(|ui| {
@@ -164,11 +233,15 @@ pub(crate) fn add_heading(
             devices::mark(ui, || format!("add:{}", group.title()), &add);
             let mut picked = None;
             egui::Popup::menu(&add).show(|ui| {
-                for &(label, type_key) in add_options(group) {
-                    let item = ui.button(label);
-                    devices::mark(ui, || format!("add:{}:{type_key}", group.title()), &item);
+                for preset in add_options(group) {
+                    let item = ui.button(preset.label);
+                    devices::mark(
+                        ui,
+                        || format!("add:{}:{}", group.title(), preset.label),
+                        &item,
+                    );
                     if item.clicked() {
-                        picked = Some(type_key);
+                        picked = Some(preset);
                     }
                 }
             });
@@ -181,8 +254,9 @@ pub(crate) fn add_heading(
 
 /// Lay `n` cards out in a wrapping grid ([`grid_layout`]): card `i` goes in
 /// column `i % cols`, each column stacking its cards top-down. `card` draws
-/// card `i` and fills the width it is given. Each column is a fixed-width
-/// child, so a card that overflows never widens the grid. The grid leaves
+/// card `i` and fills the width it is given. Each column, and each card in
+/// it, is a fixed-width child, so a card that overflows never widens the
+/// grid or the cards under it. The grid leaves
 /// the width of a scroll bar free on its right, so the bar of the scroll
 /// area around it never covers a card.
 pub(crate) fn card_grid(ui: &mut egui::Ui, n: usize, mut card: impl FnMut(&mut egui::Ui, usize)) {
@@ -209,7 +283,22 @@ pub(crate) fn card_grid(ui: &mut egui::Ui, n: usize, mut card: impl FnMut(&mut e
         );
         column.set_width(width);
         for i in (col..n).step_by(cols) {
-            card(&mut column, i);
+            // Each card in a slot of its own, so one that overflows never
+            // widens the cards under it.
+            let top = column.cursor().min;
+            let mut slot = column.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("card_slot", i))
+                    .max_rect(egui::Rect::from_min_size(
+                        top,
+                        egui::vec2(width, column.available_height()),
+                    ))
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            slot.set_width(width);
+            card(&mut slot, i);
+            let used = egui::vec2(width, slot.min_rect().height());
+            column.allocate_rect(egui::Rect::from_min_size(top, used), egui::Sense::hover());
             column.add_space(CARD_GAP);
         }
         height = height.max(column.min_rect().height());
@@ -236,7 +325,8 @@ mod tests {
         ] {
             assert_eq!(group_of(t), CardGroup::LaunchMonitors, "{t}");
         }
-        for t in ["gspro", "webserver", "random_club"] {
+        assert_eq!(group_of("webserver"), CardGroup::General);
+        for t in ["openconnect_client", "random_club"] {
             assert_eq!(group_of(t), CardGroup::Outputs, "{t}");
         }
         assert_eq!(group_of("something_new"), CardGroup::Outputs);
@@ -258,7 +348,7 @@ mod tests {
             square: _,
             mock_monitor: _,
             openconnect_server: _,
-            gspro: _,
+            openconnect_client: _,
             random_club: _,
         } = flighthook::FlighthookConfig::default();
         for key in [
@@ -268,7 +358,7 @@ mod tests {
             "square",
             "mock_monitor",
             "openconnect_server",
-            "gspro",
+            "openconnect_client",
             "random_club",
         ] {
             assert!(
@@ -282,9 +372,9 @@ mod tests {
     fn cards_sort_by_group_then_type_then_index() {
         let ids = [
             "webserver.0",
-            "gspro.10",
+            "openconnect_client.10",
             "openconnect_server.0",
-            "gspro.2",
+            "openconnect_client.2",
             "mevo.1",
             "random_club.0",
             "r10.0",
@@ -300,7 +390,7 @@ mod tests {
         assert_eq!(
             groups,
             vec![
-                (CardGroup::General, vec![]),
+                (CardGroup::General, vec!["webserver.0"]),
                 (
                     CardGroup::LaunchMonitors,
                     vec![
@@ -315,9 +405,8 @@ mod tests {
                 (
                     CardGroup::Outputs,
                     vec![
-                        "gspro.2",
-                        "gspro.10",
-                        "webserver.0",
+                        "openconnect_client.2",
+                        "openconnect_client.10",
                         "random_club.0",
                         "custom.0",
                     ]
@@ -329,16 +418,82 @@ mod tests {
     #[test]
     fn add_menus_offer_only_their_groups_types() {
         assert!(add_options(CardGroup::General).is_empty());
-        let types = |g| add_options(g).iter().map(|(_, t)| *t).collect::<Vec<_>>();
+        let entries = |g| {
+            add_options(g)
+                .iter()
+                .map(|p| (p.label, p.type_key, p.name, p.address))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            types(CardGroup::LaunchMonitors),
-            ["mevo", "r10", "square", "openconnect_server"]
+            entries(CardGroup::LaunchMonitors),
+            [
+                ("Mevo", "mevo", "Mevo WiFi", "192.168.2.1:5100"),
+                ("R10", "r10", "Garmin R10", ""),
+                ("Square Golf Omni", "square", "Square Golf Omni", ""),
+                (
+                    "Uneekor (OpenConnect)",
+                    "openconnect_server",
+                    "Uneekor",
+                    "0.0.0.0:921"
+                ),
+                (
+                    "OpenConnect Server",
+                    "openconnect_server",
+                    "OpenConnect Server",
+                    "0.0.0.0:921"
+                ),
+            ]
         );
-        assert_eq!(types(CardGroup::Outputs), ["gspro", "webserver"]);
+        assert_eq!(
+            entries(CardGroup::Outputs),
+            [
+                (
+                    "GSPro (OpenConnect)",
+                    "openconnect_client",
+                    "GSPro",
+                    "127.0.0.1:921"
+                ),
+                (
+                    "Muni Golf (OpenConnect)",
+                    "openconnect_client",
+                    "Muni Golf",
+                    "127.0.0.1:9210"
+                ),
+                (
+                    "OpenConnect Client",
+                    "openconnect_client",
+                    "OpenConnect Client",
+                    "127.0.0.1:921"
+                ),
+            ]
+        );
+        assert!(
+            CardGroup::ALL
+                .iter()
+                .flat_map(|g| add_options(*g))
+                .all(|p| p.type_key != "webserver"),
+            "no menu adds a web server"
+        );
         for group in CardGroup::ALL {
-            for (_, t) in add_options(group) {
-                assert_eq!(group_of(t), group, "{t}");
+            for p in add_options(group) {
+                assert_eq!(group_of(p.type_key), group, "{}", p.label);
             }
+        }
+        // Labels name the controls the frame tests click, so they are unique.
+        let mut labels: Vec<_> = CardGroup::ALL
+            .iter()
+            .flat_map(|g| add_options(*g).iter().map(|p| p.label))
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), 8);
+    }
+
+    #[test]
+    fn every_card_but_the_web_server_can_be_removed() {
+        assert!(!removable("webserver"));
+        for (t, _) in ACTOR_TYPES.iter().filter(|(t, _)| *t != "webserver") {
+            assert!(removable(t), "{t}");
         }
     }
 

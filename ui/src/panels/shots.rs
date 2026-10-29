@@ -4127,11 +4127,8 @@ mod tests {
     #[test]
     fn device_names_follow_one_rule_everywhere() {
         let mut app = FlighthookApp::with_pending(crate::net::new_pending());
-        let named = |name: &str| ActorStatusResponse {
-            name: name.into(),
-            status: crate::types::ActorStatus::Connected,
-            telemetry: HashMap::new(),
-        };
+        let named =
+            |name: &str| ActorStatusResponse::new(name, crate::types::ActorStatus::Connected);
         app.actors.insert("mevo.0".into(), named("Mevo+"));
         app.actors.insert("square.0".into(), named(""));
         let shot = |actor: &str| ShotRow {
@@ -6326,11 +6323,8 @@ mod tests {
 
     #[test]
     fn device_filter_shows_only_with_two_devices() {
-        let named = |name: &str| ActorStatusResponse {
-            name: name.into(),
-            status: crate::types::ActorStatus::Connected,
-            telemetry: HashMap::new(),
-        };
+        let named =
+            |name: &str| ActorStatusResponse::new(name, crate::types::ActorStatus::Connected);
         let actors: HashMap<String, ActorStatusResponse> = [
             ("mevo.0".to_owned(), named("Mevo+")),
             ("openconnect_server".to_owned(), named("")),

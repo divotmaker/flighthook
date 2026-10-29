@@ -12,9 +12,9 @@ use crate::panels::shots::{ShotFocus, ShotsView};
 use crate::panels::{Tab, flight};
 use crate::theme;
 use crate::types::{
-    ActorStatus, ActorStatusResponse, Club, FlighthookEvent, FlighthookMessage, GsProSection,
-    LogEntry, MevoSection, OpenConnectServerSection, R10Section, ShotDetectionMode, ShotRow,
-    SquareSection, UnitSystem,
+    ActorStatus, ActorStatusResponse, Club, FlighthookEvent, FlighthookMessage, LogEntry,
+    MevoSection, OpenConnectClientSection, OpenConnectServerSection, R10Section, ShotDetectionMode,
+    ShotRow, SquareSection, UnitSystem,
 };
 use chrono::{SecondsFormat, Utc};
 
@@ -25,16 +25,15 @@ const API_DOCS_MD: &str = include_str!("../../docs/API.md");
 // ---------------------------------------------------------------------------
 
 fn new_actor(name: String) -> ActorStatusResponse {
-    ActorStatusResponse {
-        name,
-        status: ActorStatus::Disconnected,
-        telemetry: HashMap::new(),
-    }
+    ActorStatusResponse::new(name, ActorStatus::Disconnected)
 }
 
 pub struct FlighthookApp {
     // Unified actor state
     pub(crate) actors: HashMap<String, ActorStatusResponse>,
+    /// The frame's time in milliseconds (`egui` input time): the clock of
+    /// the actors' connection histories.
+    pub(crate) now_ms: u64,
 
     // Data
     pub(crate) shots: Vec<ShotRow>,
@@ -156,6 +155,7 @@ impl FlighthookApp {
     pub(crate) fn with_pending(pending: PendingHandle) -> Self {
         Self {
             actors: HashMap::new(),
+            now_ms: 0,
             shots: Vec::new(),
             current_mode: "full".into(),
             selected_club: None,
@@ -227,8 +227,11 @@ impl FlighthookApp {
                 self.selected_club = club;
             }
             // The reply lists every running actor: one it leaves out has
-            // stopped.
+            // stopped. Red time counts down from now.
             self.actors = status.actors;
+            for actor in self.actors.values_mut() {
+                actor.received(self.now_ms);
+            }
         }
 
         // A history cleared since the request makes a reply stale: the empty
@@ -332,7 +335,7 @@ impl FlighthookApp {
         }
     }
 
-    fn handle_bus_event(&mut self, msg: FlighthookMessage) {
+    pub(crate) fn handle_bus_event(&mut self, msg: FlighthookMessage) {
         // Buffer all events for the log panel
         {
             use crate::panels::log::{alert_severity, event_debug, message_type};
@@ -376,9 +379,14 @@ impl FlighthookApp {
                     .actors
                     .entry(actor)
                     .or_insert_with(|| new_actor(String::new()));
-                actor.status = status;
+                actor.observe(status, self.now_ms);
+                // An empty value removes the key.
                 for (k, v) in telemetry {
-                    actor.telemetry.insert(k, v);
+                    if v.is_empty() {
+                        actor.telemetry.remove(&k);
+                    } else {
+                        actor.telemetry.insert(k, v);
+                    }
                 }
             }
             FlighthookEvent::DeviceTelemetry {
@@ -447,23 +455,27 @@ impl FlighthookApp {
                 self.current_mode = m.to_string();
             }
             FlighthookEvent::ConfigOutcome {
-                ref started,
                 ref restarted,
                 ref stopped,
                 ..
             } => {
                 // A stopped actor sends no further status: drop it. A
-                // stopped GSPro then leaves the club picker live.
+                // stopped Open Connect client then leaves the club picker
+                // live.
                 for id in stopped {
                     self.actors.remove(id);
                 }
-                // New or restarted actors won't have names in the UI-side
-                // actor map (WS events don't carry names). Re-fetch from
-                // REST so the Devices cards pick up display names, and so a
-                // status reply requested before the stop is replaced.
-                if !started.is_empty() || !restarted.is_empty() || !stopped.is_empty() {
-                    self.needs_status_refresh = true;
+                // A restarted actor begins a new history.
+                for id in restarted {
+                    if let Some(actor) = self.actors.get_mut(id) {
+                        actor.restart(self.now_ms);
+                    }
                 }
+                // WS events carry no names, and a rename restarts nothing:
+                // re-fetch the status for the configured names, new actors
+                // included, and so a status reply requested before a stop
+                // is replaced.
+                self.needs_status_refresh = true;
                 // The default view may have changed, and another client's
                 // save changes the settings.
                 self.needs_groups_refresh = true;
@@ -657,7 +669,9 @@ impl FlighthookApp {
                 .insert("0".into(), OpenConnectServerSection::default());
         }
         if self.wizard_gspro {
-            config.gspro.insert("0".into(), GsProSection::default());
+            config
+                .openconnect_client
+                .insert("0".into(), OpenConnectClientSection::default());
         }
 
         self.wizard_saving = true;
@@ -716,21 +730,21 @@ const CLUB_PICKER_ROWS: [std::ops::Range<usize>; 6] = [0..2, 2..10, 10..19, 19..
 /// columns, and the height is a comfortable touch target.
 const CLUB_PILL: egui::Vec2 = egui::vec2(52.0, 38.0);
 
-/// Whether GSPro owns the club: any `gspro.*` actor is connected. GSPro
-/// replaces the club on every player message it sends, so a pick made in the
-/// UI would not last.
-pub(crate) fn club_set_by_gspro(actors: &HashMap<String, ActorStatusResponse>) -> bool {
+/// Whether the simulator owns the club: any `openconnect_client.*` actor is
+/// connected. A connected simulator replaces the club on every player
+/// message it sends, so a pick made in the UI would not last.
+pub(crate) fn club_set_by_simulator(actors: &HashMap<String, ActorStatusResponse>) -> bool {
     actors
         .iter()
-        .any(|(id, a)| id.starts_with("gspro.") && a.status == ActorStatus::Connected)
+        .any(|(id, a)| id.starts_with("openconnect_client.") && a.status == ActorStatus::Connected)
 }
 
 impl FlighthookApp {
     /// The header's club: a caps CLUB label and a pill with the club in
     /// play. The pill opens a popup with every club, or is read-only while
-    /// GSPro is connected.
+    /// an Open Connect client is connected.
     fn render_club_picker(&mut self, ui: &mut egui::Ui, row_height: f32) {
-        let read_only = club_set_by_gspro(&self.actors);
+        let read_only = club_set_by_simulator(&self.actors);
         if read_only {
             self.club_picker_open = false;
         }
@@ -745,7 +759,7 @@ impl FlighthookApp {
         ui.allocate_ui_with_layout(size, row, |ui| {
             ui.label(theme::caps("Club", 11.0, theme::TEXT_MUTED));
             if read_only {
-                theme::pill_static(ui, &code).on_hover_text("Set by GSPro");
+                theme::pill_static(ui, &code).on_hover_text("Set by the simulator");
                 return;
             }
             let pill = theme::pill(ui, false, &code)
@@ -843,8 +857,14 @@ fn club_mode_hint(settings: &SettingsForm, club: Club) -> Option<&'static str> {
     }
 }
 
+/// The frame's input time in whole milliseconds.
+pub(crate) fn input_ms(ctx: &egui::Context) -> u64 {
+    (ctx.input(|i| i.time).max(0.0) * 1000.0) as u64
+}
+
 impl eframe::App for FlighthookApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.now_ms = input_ms(ctx);
         // Poll for WebSocket events ~10x/sec instead of only on user input.
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
@@ -1036,11 +1056,7 @@ mod tests {
     use super::*;
 
     fn actor(status: ActorStatus) -> ActorStatusResponse {
-        ActorStatusResponse {
-            name: String::new(),
-            status,
-            telemetry: HashMap::new(),
-        }
+        ActorStatusResponse::new("", status)
     }
 
     #[test]
@@ -1118,25 +1134,28 @@ mod tests {
     }
 
     #[test]
-    fn club_picker_is_read_only_only_while_gspro_is_connected() {
+    fn club_picker_is_read_only_only_while_a_simulator_is_connected() {
         let mut actors = HashMap::new();
-        assert!(!club_set_by_gspro(&actors));
+        assert!(!club_set_by_simulator(&actors));
         actors.insert("mevo.0".to_owned(), actor(ActorStatus::Connected));
-        assert!(!club_set_by_gspro(&actors));
+        assert!(!club_set_by_simulator(&actors));
         for status in [
             ActorStatus::Starting,
             ActorStatus::Reconnecting,
             ActorStatus::Disconnected,
         ] {
-            actors.insert("gspro.0".to_owned(), actor(status));
-            assert!(!club_set_by_gspro(&actors), "{status:?} leaves it live");
+            actors.insert("openconnect_client.0".to_owned(), actor(status));
+            assert!(!club_set_by_simulator(&actors), "{status:?} leaves it live");
         }
-        actors.insert("gspro.1".to_owned(), actor(ActorStatus::Connected));
-        assert!(club_set_by_gspro(&actors));
+        actors.insert(
+            "openconnect_client.1".to_owned(),
+            actor(ActorStatus::Connected),
+        );
+        assert!(club_set_by_simulator(&actors));
     }
 
     #[test]
-    fn stopping_gspro_frees_the_club_picker() {
+    fn stopping_the_simulator_frees_the_club_picker() {
         use crate::types::StatusResponse;
         let status = |actors: &[(&str, ActorStatus)]| StatusResponse {
             actors: actors
@@ -1158,35 +1177,130 @@ mod tests {
         let mut app = FlighthookApp::with_pending(net::new_pending());
         app.pending.lock().expect("lock").status = Some(status(&[
             ("mevo.0", ActorStatus::Connected),
-            ("gspro.0", ActorStatus::Connected),
+            ("openconnect_client.0", ActorStatus::Connected),
         ]));
         app.apply_pending();
-        assert!(club_set_by_gspro(&app.actors));
+        assert!(club_set_by_simulator(&app.actors));
 
         // Removed in Settings: the outcome drops it and asks for the status.
-        app.handle_bus_event(outcome(&["gspro.0"]));
-        assert!(!club_set_by_gspro(&app.actors), "picker live");
-        assert!(!app.actors.contains_key("gspro.0"));
+        app.handle_bus_event(outcome(&["openconnect_client.0"]));
+        assert!(!club_set_by_simulator(&app.actors), "picker live");
+        assert!(!app.actors.contains_key("openconnect_client.0"));
         assert!(app.actors.contains_key("mevo.0"));
         assert!(app.needs_status_refresh);
 
         // A status reply replaces the map: an actor it leaves out is gone,
         // even one the UI last saw connected.
-        app.actors
-            .insert("gspro.0".to_owned(), actor(ActorStatus::Connected));
+        app.actors.insert(
+            "openconnect_client.0".to_owned(),
+            actor(ActorStatus::Connected),
+        );
         app.pending.lock().expect("lock").status =
             Some(status(&[("mevo.0", ActorStatus::Connected)]));
         app.apply_pending();
-        assert!(!club_set_by_gspro(&app.actors));
+        assert!(!club_set_by_simulator(&app.actors));
         assert_eq!(app.actors.len(), 1);
 
-        // Stopping something else leaves a connected GSPro in charge.
-        app.actors
-            .insert("gspro.1".to_owned(), actor(ActorStatus::Connected));
+        // Stopping something else leaves a connected simulator in charge.
+        app.actors.insert(
+            "openconnect_client.1".to_owned(),
+            actor(ActorStatus::Connected),
+        );
         app.needs_status_refresh = false;
         app.handle_bus_event(outcome(&["mevo.0"]));
-        assert!(club_set_by_gspro(&app.actors));
+        assert!(club_set_by_simulator(&app.actors));
         assert!(app.needs_status_refresh);
+    }
+
+    #[test]
+    fn a_status_reply_keeps_the_red_and_live_statuses_carry_it_on() {
+        use crate::panels::tab_alert;
+        use crate::types::{ConnectionState, RECONNECT_ALERT_MS};
+        let status = |status| {
+            FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                status,
+                telemetry: HashMap::new(),
+            })
+            .actor("openconnect_server.0")
+        };
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        // The UI opened 5 minutes after the drop, its clock unrelated to the
+        // server's: the red time counts from receipt.
+        app.now_ms = 7_000;
+        app.pending.lock().expect("lock").status = Some(
+            serde_json::from_str(
+                r#"{"actors":{"openconnect_server.0":{"name":"Uneekor",
+                "status":"disconnected","telemetry":{},
+                "state":"reconnecting","red_for_ms":300000}},"mode":"full"}"#,
+            )
+            .expect("reply"),
+        );
+        app.apply_pending();
+        let server = &app.actors["openconnect_server.0"];
+        assert_eq!(server.state(), ConnectionState::Reconnecting);
+        assert!(server.red(7_000 + 299_999));
+        assert!(!server.red(7_000 + 300_000));
+        assert_eq!(tab_alert(&app.actors, 7_000), Some(0));
+
+        // The same Disconnected again is no new drop.
+        app.handle_bus_event(status(ActorStatus::Disconnected));
+        assert!(!app.actors["openconnect_server.0"].red(7_000 + 300_000));
+        // A peer connects and leaves: a new ten minutes.
+        app.now_ms = 400_000;
+        app.handle_bus_event(status(ActorStatus::Connected));
+        assert_eq!(tab_alert(&app.actors, app.now_ms), None);
+        app.handle_bus_event(status(ActorStatus::Disconnected));
+        assert!(app.actors["openconnect_server.0"].red(400_000 + RECONNECT_ALERT_MS - 1));
+        // A restart from a config change starts again at Connecting.
+        app.handle_bus_event(
+            FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
+                request_id: None,
+                restarted: vec!["openconnect_server.0".into()],
+                stopped: Vec::new(),
+                started: Vec::new(),
+            })
+            .actor("system"),
+        );
+        let server = &app.actors["openconnect_server.0"];
+        assert_eq!(server.state(), ConnectionState::Connecting);
+        assert_eq!(tab_alert(&app.actors, app.now_ms), None);
+    }
+
+    #[test]
+    fn an_empty_status_telemetry_value_removes_the_key() {
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        let status = |status, telemetry: &[(&str, &str)]| {
+            FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                status,
+                telemetry: telemetry
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            })
+            .actor("openconnect_client.0")
+        };
+        app.handle_bus_event(status(
+            ActorStatus::Reconnecting,
+            &[("error", "refused"), ("club", "DR")],
+        ));
+        assert_eq!(
+            app.actors["openconnect_client.0"]
+                .telemetry
+                .get("error")
+                .map(String::as_str),
+            Some("refused")
+        );
+        // A status without the key keeps it.
+        app.handle_bus_event(status(ActorStatus::Reconnecting, &[]));
+        assert!(
+            app.actors["openconnect_client.0"]
+                .telemetry
+                .contains_key("error")
+        );
+        app.handle_bus_event(status(ActorStatus::Connected, &[("error", "")]));
+        let telemetry = &app.actors["openconnect_client.0"].telemetry;
+        assert!(!telemetry.contains_key("error"));
+        assert_eq!(telemetry.get("club").map(String::as_str), Some("DR"));
     }
 
     #[test]

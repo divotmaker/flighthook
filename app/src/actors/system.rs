@@ -271,7 +271,7 @@ fn run(
     }
 }
 
-fn handle_config_command(
+pub(crate) fn handle_config_command(
     event: &FlighthookEvent,
     state: &Arc<SystemState>,
     bus_tx: &broadcast::Sender<FlighthookMessage>,
@@ -340,12 +340,12 @@ fn handle_config_command(
             });
             scope = Some(format!("openconnect_server.{index}"));
         }
-        ConfigAction::UpsertGsPro { index, section } => {
+        ConfigAction::UpsertOpenConnectClient { index, section } => {
             let idx = index.clone();
             state.system.update(|p| {
-                p.gspro.insert(idx, section.clone());
+                p.openconnect_client.insert(idx, section.clone());
             });
-            scope = Some(format!("gspro.{index}"));
+            scope = Some(format!("openconnect_client.{index}"));
         }
         ConfigAction::UpsertMockMonitor { index, section } => {
             let idx = index.clone();
@@ -362,6 +362,7 @@ fn handle_config_command(
             scope = Some(format!("random_club.{index}"));
         }
         ConfigAction::Remove { id } => {
+            let id = crate::state::config::canonical_id(id);
             if let Some((prefix, index)) = id.split_once('.') {
                 let idx = index.to_string();
                 state.system.update(|p| match prefix {
@@ -377,8 +378,8 @@ fn handle_config_command(
                     "openconnect_server" => {
                         p.openconnect_server.remove(&idx);
                     }
-                    "gspro" => {
-                        p.gspro.remove(&idx);
+                    "openconnect_client" => {
+                        p.openconnect_client.remove(&idx);
                     }
                     "mock_monitor" => {
                         p.mock_monitor.remove(&idx);
@@ -494,7 +495,7 @@ mod tests {
         let (state, _writer) = SystemState::new(dir.0.join("config.toml"));
         let state = Arc::new(state);
         // An address no actor can start on, so the reconcile starts nothing.
-        let live_gspro = flighthook::GsProSection {
+        let live_client = flighthook::OpenConnectClientSection {
             name: "Saved elsewhere".into(),
             address: Some("not an address".into()),
             full_monitor: None,
@@ -503,14 +504,16 @@ mod tests {
         };
         state.system.update(|c| {
             c.webserver.clear();
-            c.gspro.insert("0".into(), live_gspro.clone());
+            c.openconnect_client.insert("0".into(), live_client.clone());
         });
-        // A body from a stale snapshot: other units, no gspro.0, a gspro.1.
+        // A body from a stale snapshot: other units, no openconnect_client.0,
+        // an openconnect_client.1.
         let mut body = state.system.snapshot();
         body.default_units = flighthook::UnitSystem::Metric;
         body.chipping_clubs = vec![flighthook::Club::SandWedge];
-        body.gspro.clear();
-        body.gspro.insert("1".into(), live_gspro.clone());
+        body.openconnect_client.clear();
+        body.openconnect_client
+            .insert("1".into(), live_client.clone());
         let (bus_tx, mut rx) = broadcast::channel(16);
         let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
 
@@ -529,8 +532,8 @@ mod tests {
         let saved = state.system.snapshot();
         assert_eq!(saved.default_units, flighthook::UnitSystem::Metric);
         assert_eq!(saved.chipping_clubs, vec![flighthook::Club::SandWedge]);
-        assert_eq!(saved.gspro.len(), 1);
-        assert_eq!(saved.gspro.get("0"), Some(&live_gspro));
+        assert_eq!(saved.openconnect_client.len(), 1);
+        assert_eq!(saved.openconnect_client.get("0"), Some(&live_client));
         let outcome = std::iter::from_fn(|| rx.try_recv().ok())
             .find(|m| matches!(m.event, FlighthookEvent::ConfigOutcome { .. }));
         assert!(outcome.is_some(), "the outcome is emitted");

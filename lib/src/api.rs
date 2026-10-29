@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorStatus, Club, ShotDetectionMode, ShotGroupInfo, ShotGrouping};
+use crate::{
+    ActorStatus, Club, ConnectionState, ShotDetectionMode, ShotGroupInfo, ShotGrouping,
+    StatusHistory,
+};
 
 /// GET /api/status response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,7 +22,9 @@ pub struct StatusResponse {
 }
 
 /// Per-actor status within the status response. Also used as the cached
-/// per-actor state in the web layer and UI.
+/// per-actor state in the web layer and UI, which record each reported
+/// status with [`observe`](Self::observe) so the connection history behind
+/// [`state`](Self::state) stays current.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorStatusResponse {
     #[serde(default)]
@@ -27,6 +32,81 @@ pub struct ActorStatusResponse {
     pub status: ActorStatus,
     #[serde(default)]
     pub telemetry: HashMap<String, String>,
+    /// The state to show, as of the reply: `status` plus the actor's history
+    /// since it last started.
+    #[serde(default)]
+    pub state: ConnectionState,
+    /// Milliseconds the state stays red after the reply was built: what is
+    /// left of the alert after a lost connection, else 0.
+    #[serde(default)]
+    pub red_for_ms: u64,
+    /// This process's record of the actor's statuses. Not serialised: a
+    /// reply carries it as `state` and `red_for_ms`.
+    #[serde(skip)]
+    history: StatusHistory,
+}
+
+impl ActorStatusResponse {
+    /// An actor named `name` whose first status is `status`.
+    #[must_use]
+    pub fn new(name: impl Into<String>, status: ActorStatus) -> Self {
+        let mut actor = Self {
+            name: name.into(),
+            status,
+            telemetry: HashMap::new(),
+            state: ConnectionState::default(),
+            red_for_ms: 0,
+            history: StatusHistory::default(),
+        };
+        actor.observe(status, 0);
+        actor
+    }
+
+    /// Record a status the actor reported at `now_ms` (see
+    /// [`StatusHistory`] for the clock).
+    pub fn observe(&mut self, status: ActorStatus, now_ms: u64) {
+        self.status = status;
+        self.history.observe(status, now_ms);
+        self.stamp(now_ms);
+    }
+
+    /// The actor was stopped and started again: a new history, keeping only
+    /// whether it is Connected now.
+    pub fn restart(&mut self, now_ms: u64) {
+        self.history.restart();
+        self.stamp(now_ms);
+    }
+
+    /// Take the history from a received reply's `state` and `red_for_ms`,
+    /// counting the red time from `now_ms`, the moment of receipt.
+    pub fn received(&mut self, now_ms: u64) {
+        self.history = StatusHistory::received(self.status, self.state, self.red_for_ms, now_ms);
+    }
+
+    /// Set `state` and `red_for_ms` from the history as of `now_ms`, for a
+    /// reply.
+    pub fn stamp(&mut self, now_ms: u64) {
+        self.state = self.history.state();
+        self.red_for_ms = self.history.red_for_ms(now_ms);
+    }
+
+    /// The state to show.
+    #[must_use]
+    pub fn state(&self) -> ConnectionState {
+        self.history.state()
+    }
+
+    /// Whether the state is red (an alert) at `now_ms`.
+    #[must_use]
+    pub fn red(&self, now_ms: u64) -> bool {
+        self.history.red(now_ms)
+    }
+
+    /// Milliseconds the state stays red after `now_ms`.
+    #[must_use]
+    pub fn red_for_ms_at(&self, now_ms: u64) -> u64 {
+        self.history.red_for_ms(now_ms)
+    }
 }
 
 /// POST /api/mode request body.
@@ -102,6 +182,31 @@ mod tests {
         assert_eq!(v["club"], "7I");
         let back: StatusResponse = serde_json::from_value(v).unwrap();
         assert_eq!(back.club, Some(Club::Iron7));
+    }
+
+    #[test]
+    fn actor_status_carries_state_and_red_time() {
+        let mut a = ActorStatusResponse::new("Uneekor", ActorStatus::Connected);
+        a.observe(ActorStatus::Disconnected, 1_000);
+        a.stamp(61_000);
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["status"], "disconnected");
+        assert_eq!(v["state"], "reconnecting");
+        assert_eq!(v["red_for_ms"], crate::RECONNECT_ALERT_MS - 60_000);
+        assert!(v.get("history").is_none());
+
+        // Received, the red time counts from receipt on the receiver's clock.
+        let mut back: ActorStatusResponse = serde_json::from_value(v).unwrap();
+        back.received(5);
+        assert_eq!(back.state(), ConnectionState::Reconnecting);
+        assert_eq!(back.red_for_ms_at(5), crate::RECONNECT_ALERT_MS - 60_000);
+
+        // A reply without the fields.
+        let mut old: ActorStatusResponse =
+            serde_json::from_str(r#"{"name":"Mevo","status":"connected"}"#).unwrap();
+        old.received(0);
+        assert_eq!(old.state(), ConnectionState::Connected);
+        assert_eq!(old.red_for_ms, 0);
     }
 
     #[test]
