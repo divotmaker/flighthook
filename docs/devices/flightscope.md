@@ -47,8 +47,9 @@ full result and the shot counts as estimated-only (see below).
 FlightScope's app also changes a few radar settings when it switches to
 Outdoor, which flighthook does not.
 
-On a Mevo+ or Mevo Gen2 the environment applies to full-swing mode only;
-chipping and putting modes are unchanged. On the Xi it sets the only mode used.
+The environment applies to full-swing mode only; chipping and putting modes
+are unchanged. On the Xi, chipping and putting use FS Golf's Pitching session,
+which is always limited flight (see [FlightScope Xi](#flightscope-xi)).
 
 In the settings UI this is the **Environment** dropdown on the device.
 
@@ -254,14 +255,41 @@ its device identity is `FlightScope Xi (<address>)`.
 
 What differs from the Mevo+:
 
-- **Detection mode comes from `environment`** (limited flight by default).
-  Only limited flight has been seen working on an Xi so far; use `outdoor`
-  only for real outdoor use. Mode changes from
-  club selection are logged and not applied, so **putting and chipping modes
-  are not yet supported** on the Xi.
-- **Radar settings are not sent.** `ball_type`, `tee_height`, `range`,
-  `surface_height` and `track_pct` are ignored; the Xi uses the values stored
-  on the device.
+- **Configured the way FS Golf configures it.** flighthook sends the Xi the
+  same parameter writes, radar calibration and mode settings FS Golf sends,
+  in the same order. The detection mode picks one of FS Golf's sessions:
+
+  | flighthook mode | FS Golf session | Detection mode |
+  | --- | --- | --- |
+  | Full | Full swing | from `environment`: 9 (`limited_flight`) or 8 (`outdoor`) |
+  | Chipping | Pitching | 9 (limited flight) |
+  | Putting | Pitching | 9 (limited flight) |
+
+  FS Golf's putting setup for the Xi is not known, so putting uses Pitching
+  too. A mode change from club selection disarms the Xi, sends FS Golf's
+  mode-change settings and re-arms it; a switch between Chipping and Putting
+  changes nothing on the Xi. `outdoor` sends the same settings with detection
+  mode 8; FS Golf's own Outdoor setup for the Xi has not been compared yet, so
+  use `outdoor` only for real outdoor use.
+- **The Xi's DSP is set to normal power mode at every connection.** Each
+  time flighthook connects it writes the DSP's power mode as Normal; FS Golf
+  sets it to Standby when it exits. If the DSP does not answer the write
+  within 2 seconds, flighthook carries on connecting. Right after power-on
+  the Xi takes a few seconds before it answers; flighthook keeps asking about
+  once a second and then connects as normal.
+- **A refused setting is logged and skipped.** If the Xi refuses one of the
+  configuration writes, flighthook logs a warning with the device's reply in
+  hex (`device refused a step, continuing: AVR 0x94 02303F`) and carries on
+  with the rest, rather than waiting for a timeout and reconnecting.
+- **Flight results are acked.** As FS Golf does, flighthook answers each
+  estimated (E8) and full (D4) result from the Xi with a short acknowledgement
+  the moment it arrives. The acks show up in the shot export as sent `0x95`
+  frames. The Mevo+ and Mevo Gen2 are sent none.
+- **`range` and `surface_height` are sent** as the radar calibration (the
+  distance from the Xi to the ball and the height of the hitting surface),
+  once per connection (flighthook's defaults: 8 ft and 0 in; FS Golf's: 8 ft
+  and 1 in). `ball_type`, `tee_height` and `track_pct` are not sent to the
+  Xi.
 - **No camera.** `camera_mode` does not apply.
 - **No battery level.** The Xi's status does not carry a decoded battery
   level, so `battery_pct` is not reported.
@@ -308,13 +336,7 @@ A change applies from the next shot, without reconnecting. In the settings UI
 this is the **Spin source (Xi)** dropdown on the device. The setting has no
 effect on a Mevo+ or Mevo Gen2, which report a single spin value.
 
-**Chips and pitches:** FS Golf's **Pitching** mode uses the limited-flight
-detection mode, the one flighthook selects, together with short-game setup:
-the distance from the Xi to the ball, the surface height, and a trigger
-setting for short shots. flighthook sends only the detection mode, not that
-setup (its `range` and `surface_height` are not sent either), so the Xi uses
-the setup it has stored. The Xi may keep the setup an app sends until it is
-switched off; this is not confirmed yet. If chips don't read, it may help to
-run FS Golf in **Pitching** first, close it without switching the Xi off,
-then start flighthook. To compare short shots with FS Golf, use its Pitching
-mode.
+**Chips and pitches:** in Chipping (and Putting) mode flighthook sets the Xi
+up as FS Golf's **Pitching** session. To compare short shots with FS Golf, use
+its Pitching mode. FS Golf's slow-swing option is not available in
+flighthook.

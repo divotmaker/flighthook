@@ -91,9 +91,10 @@ const EXPORT_BULK: [u8; 3] = [TYPE_PRC_DATA, TYPE_CLUB_PRC, TYPE_SPEED_PROFILE];
 /// handshake, arms, and processes shots in a reconnecting event loop.
 ///
 /// The model is detected by ironsight during the handshake. The Xi has no
-/// camera, so camera modes do not apply to it, and it runs with fixed
-/// settings: the environment's detection mode and the radar parameters
-/// stored on the device.
+/// camera, so camera modes do not apply to it. It is configured the way FS
+/// Golf configures it (`SessionConfig::to_xi_settings`), and ironsight acks
+/// each of its flight results; both go through the same send hook as every
+/// other frame, so the audit log and the shot export record them.
 ///
 /// `spin_source` picks the Xi's spin, and `launch_only_spin` (rpm per mph,
 /// `0` = off) the backspin of a result with launch data but no spin and no
@@ -201,10 +202,73 @@ fn wire_label(
     mode: &ShotDetectionMode,
 ) -> &'static str {
     if model == DeviceModel::Xi {
-        session_config.environment_label()
+        session_config.xi_label(mode)
     } else {
         session_config.mode_label(mode)
     }
+}
+
+/// Whether switching between two detection modes changes what is sent to
+/// the device. On the Xi, Chipping and Putting select the same session.
+fn changes_wire(
+    model: DeviceModel,
+    session_config: &SessionConfig,
+    from: &ShotDetectionMode,
+    to: &ShotDetectionMode,
+) -> bool {
+    if model == DeviceModel::Xi {
+        session_config.to_xi_settings(from) != session_config.to_xi_settings(to)
+    } else {
+        !same_mode(*from, *to)
+    }
+}
+
+/// Apply a mode change that waited for the device to be idle. Returns
+/// whether a configuration was queued (the device is then re-armed).
+fn apply_deferred<S: Read + Write>(
+    client: &mut BinaryClient<S>,
+    model: DeviceModel,
+    session_config: &SessionConfig,
+    current_mode: &mut ShotDetectionMode,
+    target: ShotDetectionMode,
+) -> bool {
+    let target_wire = wire_label(model, session_config, &target);
+    let is_mode_change = !same_mode(*current_mode, target);
+    if model == DeviceModel::Xi && !changes_wire(model, session_config, current_mode, &target) {
+        info!("deferred mode change to {target:?} -- device stays in {target_wire}");
+        *current_mode = target;
+        return false;
+    }
+    if is_mode_change {
+        info!("applying deferred mode change to {target:?} wire={target_wire}");
+    } else {
+        info!("applying deferred settings reconfig");
+    }
+    *current_mode = target;
+    queue_configure(client, model, session_config, &target, is_mode_change);
+    true
+}
+
+/// Queue the configuration for `mode`, then an arm. A Mevo+ gets the mode
+/// alone on a mode change and its full settings otherwise. The Xi gets FS
+/// Golf's configuration: its connect-time block on the connection's first
+/// configuration, the mode block after that (`BinaryClient` disarms first
+/// when armed).
+fn queue_configure<S: Read + Write>(
+    client: &mut BinaryClient<S>,
+    model: DeviceModel,
+    session_config: &SessionConfig,
+    mode: &ShotDetectionMode,
+    mode_change: bool,
+) {
+    if model == DeviceModel::Xi {
+        client.configure_xi(session_config.to_xi_settings(mode));
+    } else if mode_change {
+        client.configure_avr(session_config.to_avr_settings_mode_only(mode));
+    } else {
+        client.configure_avr(session_config.to_avr_settings(mode));
+    }
+    client.arm();
 }
 
 /// Whether a D4 is the device's "distance model failed" result: launch speed
@@ -867,23 +931,21 @@ fn connect_and_run(
                     } = msg.event
                         && !same_mode(current_mode, new_mode)
                     {
-                        if model == DeviceModel::Xi {
+                        if !changes_wire(model, session_config, &current_mode, &new_mode) {
                             info!(
-                                "mode change: {:?} -> {:?} not applied -- FlightScope Xi stays in {}",
+                                "mode change: {:?} -> {:?} -- device stays in {}",
                                 current_mode,
                                 new_mode,
-                                session_config.environment_label()
+                                wire_label(model, session_config, &new_mode)
                             );
                             current_mode = new_mode;
                         } else if client.is_armed() {
-                            let new_wire = session_config.mode_label(&new_mode);
+                            let new_wire = wire_label(model, session_config, &new_mode);
                             info!(
                                 "mode change: {:?} -> {:?} wire={new_wire}",
                                 current_mode, new_mode
                             );
-                            client
-                                .configure_avr(session_config.to_avr_settings_mode_only(&new_mode));
-                            client.arm();
+                            queue_configure(&mut client, model, session_config, &new_mode, true);
                             current_mode = new_mode;
                             emit_device_status(sender, ActorStatus::Connected, HashMap::new());
                             device_telemetry.insert("ready".into(), "false".into());
@@ -1007,17 +1069,23 @@ fn connect_and_run(
                         // Configure and arm for the detected model.
                         if h.model == DeviceModel::Xi {
                             info!(
-                                "FlightScope Xi (alpha): detection mode fixed to {} (environment); \
-                                 radar settings and camera mode are not applied",
-                                session_config.environment_label()
+                                "FlightScope Xi: FS Golf configuration, {}; \
+                                 ball type, tee height, track % and camera mode are not applied",
+                                session_config.xi_label(&current_mode)
                             );
                             pending_fusion_cam = None;
-                            client.configure_avr(session_config.to_xi_avr_settings());
+                            queue_configure(
+                                &mut client,
+                                h.model,
+                                session_config,
+                                &current_mode,
+                                false,
+                            );
                         } else {
                             client.configure_avr(session_config.to_avr_settings(&current_mode));
                             client.configure_cam(cam_config());
+                            client.arm();
                         }
-                        client.arm();
                     }
 
                     BinaryEvent::Disarmed => {
@@ -1038,32 +1106,15 @@ fn connect_and_run(
                         try_emit_device_telemetry(sender, device_id, &device_telemetry);
 
                         // Apply pending reconfig now that we're idle
-                        if model == DeviceModel::Xi
-                            && let Some(target) = pending_reconfig.take()
+                        if let Some(target) = pending_reconfig.take()
+                            && apply_deferred(
+                                &mut client,
+                                model,
+                                session_config,
+                                &mut current_mode,
+                                target,
+                            )
                         {
-                            info!(
-                                "deferred mode change to {target:?} not applied -- FlightScope Xi stays in {}",
-                                session_config.environment_label()
-                            );
-                            current_mode = target;
-                        } else if let Some(target) = pending_reconfig.take() {
-                            let target_wire = session_config.mode_label(&target);
-                            let is_mode_change = !same_mode(current_mode, target);
-                            if is_mode_change {
-                                info!(
-                                    "applying deferred mode change to {target:?} wire={target_wire}"
-                                );
-                            } else {
-                                info!("applying deferred settings reconfig");
-                            }
-                            current_mode = target;
-                            let avr = if is_mode_change {
-                                session_config.to_avr_settings_mode_only(&target)
-                            } else {
-                                session_config.to_avr_settings(&target)
-                            };
-                            client.configure_avr(avr);
-                            client.arm();
                             emit_device_status(sender, ActorStatus::Connected, HashMap::new());
                             device_telemetry.insert("ready".into(), "false".into());
                             try_emit_device_telemetry(sender, device_id, &device_telemetry);
@@ -1136,32 +1187,15 @@ fn connect_and_run(
                         try_emit_device_telemetry(sender, device_id, &device_telemetry);
 
                         // Apply pending reconfig if any.
-                        if model == DeviceModel::Xi
-                            && let Some(target) = pending_reconfig.take()
+                        if let Some(target) = pending_reconfig.take()
+                            && apply_deferred(
+                                &mut client,
+                                model,
+                                session_config,
+                                &mut current_mode,
+                                target,
+                            )
                         {
-                            info!(
-                                "deferred mode change to {target:?} not applied -- FlightScope Xi stays in {}",
-                                session_config.environment_label()
-                            );
-                            current_mode = target;
-                        } else if let Some(target) = pending_reconfig.take() {
-                            let target_wire = session_config.mode_label(&target);
-                            let is_mode_change = !same_mode(current_mode, target);
-                            if is_mode_change {
-                                info!(
-                                    "applying deferred mode change to {target:?} wire={target_wire}"
-                                );
-                            } else {
-                                info!("applying deferred settings reconfig");
-                            }
-                            current_mode = target;
-                            let avr = if is_mode_change {
-                                session_config.to_avr_settings_mode_only(&target)
-                            } else {
-                                session_config.to_avr_settings(&target)
-                            };
-                            client.configure_avr(avr);
-                            client.arm();
                             emit_device_status(sender, ActorStatus::Connected, HashMap::new());
                             device_telemetry.insert("ready".into(), "false".into());
                             try_emit_device_telemetry(sender, device_id, &device_telemetry);
@@ -1186,6 +1220,15 @@ fn connect_and_run(
                         if changed {
                             try_emit_device_telemetry(sender, device_id, &device_telemetry);
                         }
+                    }
+
+                    BinaryEvent::StepRefused(env) => {
+                        warn!(
+                            "device refused a step, continuing: {} 0x{:02X} {}",
+                            env.src,
+                            env.type_id,
+                            hex_string(&env.raw),
+                        );
                     }
 
                     BinaryEvent::Message(env) => match &env.message {
@@ -1527,6 +1570,20 @@ mod tests {
     use super::*;
     use ironsight::protocol::TYPE_CLUB_RESULT;
     use ironsight::protocol::shot::ClubResult;
+
+    #[test]
+    fn xi_chipping_and_putting_share_a_session() {
+        use ShotDetectionMode::{Chipping, Full, Putting};
+        let s = SessionConfig::default();
+        let xi = DeviceModel::Xi;
+        assert!(!changes_wire(xi, &s, &Chipping, &Putting));
+        assert!(!changes_wire(xi, &s, &Putting, &Chipping));
+        assert!(changes_wire(xi, &s, &Full, &Chipping));
+        assert!(changes_wire(xi, &s, &Putting, &Full));
+        assert!(changes_wire(DeviceModel::Mevo, &s, &Chipping, &Putting));
+        assert_eq!(wire_label(xi, &s, &Putting), "pitching limited-flight(9)");
+        assert_eq!(wire_label(DeviceModel::Mevo, &s, &Putting), "putting(3)");
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -2150,6 +2207,126 @@ mod tests {
         00000000000000000000000000000000000000000000000000000000000000000000000003f1";
 
     /// The frames that end a shot: E5 PROCESSED, E5 IDLE, then the B1.
+    /// The Xi's result acks are tx frames like any other: sent through
+    /// the connection, they reach the export with their hex, directed APP
+    /// to AVR, after the result they ack.
+    #[test]
+    fn raw_capture_records_xi_result_acks() {
+        use ironsight::{BusAddr, seq};
+
+        let state = Rc::new(RefCell::new(fake_device::State::default()));
+        {
+            let mut st = state.borrow_mut();
+            st.push(BusAddr::Avr, TYPE_FLIGHT_RESULT_V1, hex(XI_CHIP_E8));
+            st.push(BusAddr::Avr, TYPE_FLIGHT_RESULT, hex(CLUB_SHOT_D4));
+        }
+        let mut conn = BinaryConnection::new(fake_device::Stream(Rc::clone(&state)));
+        let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
+        let _ = attach_raw_capture(&mut conn, "mevo.0", &capture);
+        capture.borrow_mut().mark_trigger();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut acked = 0;
+        while acked < 2 {
+            assert!(Instant::now() < deadline, "results never arrived");
+            if let Some(env) = conn.recv().expect("recv") {
+                let ack = seq::result_ack(DeviceModel::Xi, &env).expect("result ack");
+                seq::send_action(&mut conn, ack).expect("send");
+                acked += 1;
+            }
+        }
+
+        let raw = capture.borrow_mut().take();
+        let got: Vec<(RawDir, &str, &str, &str, &str)> = raw
+            .frames
+            .iter()
+            .map(|r| {
+                (
+                    r.dir,
+                    r.r#type.as_deref().unwrap_or(""),
+                    r.src.as_deref().unwrap_or(""),
+                    r.dst.as_deref().unwrap_or(""),
+                    r.hex.as_deref().unwrap_or(""),
+                )
+            })
+            .collect();
+        use RawDir::{Rx, Tx};
+        assert_eq!(
+            got,
+            [
+                (Rx, "0xE8", "AVR", "APP", XI_CHIP_E8),
+                (Tx, "0x95", "APP", "AVR", "021068"),
+                (Rx, "0xD4", "AVR", "APP", CLUB_SHOT_D4),
+                (Tx, "0x95", "APP", "AVR", "021054"),
+            ]
+        );
+    }
+
+    /// The Xi DSP power-mode write (DSP param 0x01 = 1) and its ack carry
+    /// no identity, so the export keeps them like any other param write:
+    /// tx 0xBF APP→DSP with its hex, then the DSP's 0x95 and the E3 power
+    /// mode texts.
+    #[test]
+    fn raw_capture_records_xi_dsp_power_mode_write() {
+        use ironsight::BusAddr;
+        use ironsight::protocol::Command;
+        use ironsight::protocol::config::{ParamData, ParamValue};
+
+        assert!(!EXPORT_DENYLIST.contains(&ironsight::protocol::TYPE_PARAM_VALUE));
+        assert!(!EXPORT_DENYLIST.contains(&0x95));
+        let state = Rc::new(RefCell::new(fake_device::State::default()));
+        let mut conn = BinaryConnection::new(fake_device::Stream(Rc::clone(&state)));
+        let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
+        let _ = attach_raw_capture(&mut conn, "mevo.0", &capture);
+        capture.borrow_mut().mark_trigger();
+
+        let power_mode = Command::ParamValue(ParamValue {
+            param_id: 0x01,
+            value: ParamData::Int24(1),
+        });
+        conn.send(&power_mode, BusAddr::Dsp).expect("send");
+        {
+            let mut st = state.borrow_mut();
+            st.push(BusAddr::Dsp, 0x95, hex("02403f"));
+            st.push(BusAddr::Dsp, 0xE3, b"  REQ Power Mode : 1 (4) \0".to_vec());
+            st.push(BusAddr::Dsp, 0xE3, b"  NEW Power Mode : 1 \0".to_vec());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut received = 0;
+        while received < 3 {
+            assert!(Instant::now() < deadline, "replies never arrived");
+            if conn.recv().expect("recv").is_some() {
+                received += 1;
+            }
+        }
+
+        let raw = capture.borrow_mut().take();
+        let got: Vec<(RawDir, &str, &str, &str)> = raw
+            .frames
+            .iter()
+            .map(|r| {
+                (
+                    r.dir,
+                    r.r#type.as_deref().unwrap_or(""),
+                    r.src.as_deref().unwrap_or(""),
+                    r.dst.as_deref().unwrap_or(""),
+                )
+            })
+            .collect();
+        use RawDir::{Rx, Tx};
+        assert_eq!(
+            got,
+            [
+                (Tx, "0xBF", "APP", "DSP"),
+                (Rx, "0x95", "DSP", "APP"),
+                (Rx, "0xE3", "DSP", "APP"),
+                (Rx, "0xE3", "DSP", "APP"),
+            ]
+        );
+        assert_eq!(raw.frames[0].hex.as_deref(), Some("06000001000001"));
+        assert_eq!(raw.frames[1].hex.as_deref(), Some("02403f"));
+    }
+
     const SHOT_PROCESSED: &str = "0a50524f43455353454400";
     const SHOT_IDLE: &str = "0549444c4500";
     const SHOT_B1: &str = "020000";

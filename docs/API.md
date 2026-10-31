@@ -928,7 +928,7 @@ Full persisted config (mirrors `config.toml`).
   are omitted from the response when unset
 - `environment` on Mevo sections is `limited_flight` (default; detection mode 9,
   for nets and simulator screens) or `outdoor` (mode 8, full flight). It sets
-  the full-swing detection mode, and the only mode on an Xi. Omitted from the
+  the full-swing detection mode (Mevo+ and Xi). Omitted from the
   response when unset
 - `spin_source` on Mevo sections is `d4` (default), `e8`, or `auto`, and
   applies to a FlightScope Xi only. `d4` reports the Xi's final spin, which is

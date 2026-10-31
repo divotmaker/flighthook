@@ -51,13 +51,25 @@ address = "127.0.0.1:921"
 - `[random_club.<idx>]` -- random club cycling integration instance
 - `[webserver.<idx>]` -- web server instance
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
-- Radar settings (ball_type, tee_height, etc.) are per-mevo only (not applied to an Xi)
+- Radar settings (ball_type, tee_height, etc.) are per-mevo only. An Xi gets
+  FS Golf's configuration instead (`SessionConfig::to_xi_settings` →
+  ironsight `BinaryClient::configure_xi`): `range` and `surface_height` as
+  its radar calibration, Full → FS Golf's full-swing session in the
+  environment's mode, Chipping and Putting → its Pitching session (mode 9);
+  `ball_type`, `tee_height` and `track_pct` are not sent. Mode changes send
+  FS Golf's mode block after a disarm; Chipping ↔ Putting sends nothing.
+  ironsight acks each Xi E8 and D4 result with 0x95 (`02 10 68` / `02 10 54`)
+  as it arrives; the acks pass through the connection's send hook, so the
+  audit log and the shot export record them as tx. ironsight's Xi handshake
+  ends with a DSP power-mode write (DSP param 0x01 = 1, Normal), which goes
+  through the same send hook. A 0x94 refusing a configuration step arrives as
+  `BinaryEvent::StepRefused`, which the actor logs as a warning with the hex
 - `use_estimated` is per-mevo (defaults to `false`) -- controls whether estimated
   (E8) ball flights are emitted when no full (D4) result arrives; with it off,
   estimated-only shots (a flight too short to read in Outdoor mode, very short
   chips) are skipped
 - `environment` is per-mevo (`limited_flight` default / `outdoor`) -- picks the
-  full-swing detection mode (9 / 8); on an Xi it is the only mode sent
+  full-swing detection mode (9 / 8), on a Mevo+ and an Xi alike
 - `camera_mode` is per-mevo (`standard` default / `fusion` / `raw_fusion`) --
   the Fusion modes request the full club data set (radar club data arrives in
   every mode), applied after a camera warmup delay

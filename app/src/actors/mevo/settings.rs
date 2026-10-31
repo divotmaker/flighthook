@@ -3,7 +3,7 @@ use ironsight::protocol::config::{
     MODE_CHIPPING, MODE_FULL_OUTDOOR, MODE_LIMITED_FLIGHT, MODE_PUTTING, ParamData, ParamValue,
     RadarCal,
 };
-use ironsight::seq::AvrSettings;
+use ironsight::seq::{AvrSettings, XiSettings, XiShotType};
 
 use crate::state::config::MevoSection;
 use flighthook::{CameraMode, Distance, DistanceExt, FlightScopeEnvironment, ShotDetectionMode};
@@ -17,7 +17,7 @@ pub struct SessionConfig {
     pub range: Distance,
     pub surface_height: Distance,
     pub track_pct: f64, // 0-100 (user units)
-    /// Picks the full-swing detection mode (and the Xi's only mode).
+    /// Picks the full-swing detection mode (Mevo+ and Xi).
     pub environment: FlightScopeEnvironment,
 }
 
@@ -67,8 +67,8 @@ impl SessionConfig {
         }
     }
 
-    /// Detection mode commsIndex for the environment: the Mevo's full-swing
-    /// mode and the Xi's only mode.
+    /// Detection mode commsIndex for the environment: the full-swing mode of
+    /// the Mevo+ and the Xi.
     pub fn environment_mode(&self) -> u8 {
         match self.environment {
             FlightScopeEnvironment::LimitedFlight => MODE_LIMITED_FLIGHT,
@@ -96,10 +96,15 @@ impl SessionConfig {
                     value: ParamData::Float40(self.tee_height.as_meters()),
                 },
             ],
-            radar_cal: Some(RadarCal {
-                range_mm: self.range.to_mm(),
-                height_mm: (self.surface_height.as_inches() * 25.4).floor() as u8,
-            }),
+            radar_cal: Some(self.radar_cal()),
+        }
+    }
+
+    /// Radar calibration from `range` and `surface_height`.
+    fn radar_cal(&self) -> RadarCal {
+        RadarCal {
+            range_mm: self.range.to_mm(),
+            height_mm: (self.surface_height.as_inches() * 25.4).floor() as u8,
         }
     }
 
@@ -114,10 +119,36 @@ impl SessionConfig {
         }
     }
 
-    /// AVR settings for the Xi: the environment's mode only, with the radar
-    /// parameters stored on the device.
-    pub(crate) fn to_xi_avr_settings(&self) -> AvrSettings {
-        AvrSettings::xi_with_mode(self.environment_mode())
+    /// Xi configuration for a detection mode, set up as FS Golf sets up the
+    /// Xi: Full is a full-swing session in the environment's mode; Chipping
+    /// and Putting are FS Golf's Pitching session (limited flight, mode 9).
+    /// The radar calibration comes from `range` and `surface_height`.
+    pub(crate) fn to_xi_settings(&self, mode: &ShotDetectionMode) -> XiSettings {
+        let (comms_index, shot_type) = match mode {
+            ShotDetectionMode::Full => (self.environment_mode(), XiShotType::FullSwing),
+            ShotDetectionMode::Chipping | ShotDetectionMode::Putting => {
+                (MODE_LIMITED_FLIGHT, XiShotType::Pitching)
+            }
+        };
+        XiSettings {
+            mode: comms_index,
+            shot_type,
+            radar_cal: self.radar_cal(),
+        }
+    }
+
+    /// Label for the Xi session a detection mode selects, with the
+    /// commsIndex sent to the device.
+    pub fn xi_label(&self, mode: &ShotDetectionMode) -> &'static str {
+        match (mode, self.environment) {
+            (ShotDetectionMode::Full, FlightScopeEnvironment::LimitedFlight) => {
+                "full-swing limited-flight(9)"
+            }
+            (ShotDetectionMode::Full, FlightScopeEnvironment::Outdoor) => "full-swing outdoor(8)",
+            (ShotDetectionMode::Chipping | ShotDetectionMode::Putting, _) => {
+                "pitching limited-flight(9)"
+            }
+        }
     }
 
     fn comms_index(&self, mode: &ShotDetectionMode) -> u8 {
@@ -229,16 +260,59 @@ mod tests {
     }
 
     #[test]
-    fn xi_settings_follow_environment() {
-        for (env, mode) in [
-            (FlightScopeEnvironment::LimitedFlight, 9),
-            (FlightScopeEnvironment::Outdoor, 8),
+    fn xi_full_swing_follows_environment() {
+        for (env, mode, label) in [
+            (
+                FlightScopeEnvironment::LimitedFlight,
+                9,
+                "full-swing limited-flight(9)",
+            ),
+            (FlightScopeEnvironment::Outdoor, 8, "full-swing outdoor(8)"),
         ] {
-            let avr = session(env).to_xi_avr_settings();
-            assert_eq!(avr.mode, mode);
-            assert!(avr.params.is_empty());
-            assert!(avr.radar_cal.is_none());
+            let s = session(env);
+            let xi = s.to_xi_settings(&ShotDetectionMode::Full);
+            assert_eq!(xi.mode, mode);
+            assert_eq!(xi.shot_type, XiShotType::FullSwing);
+            assert_eq!(s.xi_label(&ShotDetectionMode::Full), label);
         }
+    }
+
+    #[test]
+    fn xi_chipping_and_putting_are_pitching_in_limited_flight() {
+        for env in [
+            FlightScopeEnvironment::LimitedFlight,
+            FlightScopeEnvironment::Outdoor,
+        ] {
+            let s = session(env);
+            for mode in [ShotDetectionMode::Chipping, ShotDetectionMode::Putting] {
+                let xi = s.to_xi_settings(&mode);
+                assert_eq!(xi.mode, MODE_LIMITED_FLIGHT);
+                assert_eq!(xi.shot_type, XiShotType::Pitching);
+                assert_eq!(s.xi_label(&mode), "pitching limited-flight(9)");
+            }
+        }
+    }
+
+    #[test]
+    fn xi_radar_cal_comes_from_range_and_surface_height() {
+        let s = SessionConfig {
+            range: Distance::Feet(10.0),
+            surface_height: Distance::Inches(1.0),
+            ..SessionConfig::default()
+        };
+        let cal = s.to_xi_settings(&ShotDetectionMode::Full).radar_cal;
+        assert_eq!(cal.range_mm, 3048);
+        assert_eq!(cal.height_mm, 25);
+        // Same calibration as the Mevo+ gets.
+        assert_eq!(
+            Some(cal),
+            s.to_avr_settings(&ShotDetectionMode::Full).radar_cal
+        );
+        // Defaults: 8 ft, 0 in.
+        let cal = SessionConfig::default()
+            .to_xi_settings(&ShotDetectionMode::Chipping)
+            .radar_cal;
+        assert_eq!((cal.range_mm, cal.height_mm), (2438, 0));
     }
 
     #[test]
