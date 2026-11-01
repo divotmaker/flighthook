@@ -660,11 +660,11 @@ impl MevoSection {
 pub struct R10Section {
     #[serde(default)]
     pub name: String,
-    /// Distance from the device to the tee, sent to the R10 as `tee_range`
-    /// once it wakes up. Garmin recommends placing the R10 6-8 ft behind the
-    /// ball.
+    /// Distance from the device to the tee, sent to the R10 as its tee
+    /// distance once it wakes up. Garmin recommends placing the R10 6-8 ft
+    /// behind the ball.
     ///
-    /// When absent, no shot config is sent and the device keeps whatever tee
+    /// When absent, no tee distance is sent and the device keeps whatever tee
     /// distance was last set on it (e.g. by the Garmin Golf app).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<Distance>,
@@ -689,8 +689,7 @@ pub struct SquareSection {
     /// this is only the starting value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club: Option<String>,
-    /// Use the device's advanced spin measurement. Defaults to true, matching
-    /// the vendor app.
+    /// Use the device's advanced spin measurement. Defaults to true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advanced_spin: Option<bool>,
     /// Discard shots that report zero spin, unless the putter is selected.

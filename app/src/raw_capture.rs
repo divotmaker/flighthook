@@ -195,13 +195,6 @@ fn ms_between(mark: Instant, t: Instant) -> i64 {
     }
 }
 
-/// The byte at `index` of a record's hex payload.
-pub fn byte_at(rec: &RawRecord, index: usize) -> Option<u8> {
-    let hex = rec.hex.as_deref()?;
-    let pair = hex.get(index * 2..index * 2 + 2)?;
-    u8::from_str_radix(pair, 16).ok()
-}
-
 /// The record's `type` as a byte (`"0xD4"` → `0xD4`).
 pub fn type_byte(rec: &RawRecord) -> Option<u8> {
     let t = rec.r#type.as_deref()?;
@@ -377,11 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn byte_and_type_helpers() {
+    fn type_helper() {
         let r = rec(0xD4, 3);
         assert_eq!(type_byte(&r), Some(0xD4));
-        assert_eq!(byte_at(&r, 2), Some(0xD4));
-        assert_eq!(byte_at(&r, 3), None);
     }
 
     #[test]

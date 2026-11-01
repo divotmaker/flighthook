@@ -51,18 +51,19 @@ address = "127.0.0.1:921"
 - `[random_club.<idx>]` -- random club cycling integration instance
 - `[webserver.<idx>]` -- web server instance
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
-- Radar settings (ball_type, tee_height, etc.) are per-mevo only. An Xi gets
-  FS Golf's configuration instead (`SessionConfig::to_xi_settings` →
-  ironsight `BinaryClient::configure_xi`): `range` and `surface_height` as
-  its radar calibration, Full → FS Golf's full-swing session in the
-  environment's mode, Chipping and Putting → its Pitching session (mode 9);
-  `ball_type`, `tee_height` and `track_pct` are not sent. Mode changes send
-  FS Golf's mode block after a disarm; Chipping ↔ Putting sends nothing.
-  ironsight acks each Xi E8 and D4 result with 0x95 (`02 10 68` / `02 10 54`)
-  as it arrives; the acks pass through the connection's send hook, so the
-  audit log and the shot export record them as tx. ironsight's Xi handshake
-  ends with a DSP power-mode write (DSP param 0x01 = 1, Normal), which goes
-  through the same send hook. A 0x94 refusing a configuration step arrives as
+- Radar settings (ball_type, tee_height, etc.) are per-mevo only. A Mevo+ gets
+  them through ironsight (`SessionConfig::to_avr_settings` → `MevoSettings` →
+  `BinaryClient::configure_avr`); a mode change sends the detection mode alone
+  (`AvrSettings::mode_only`). An Xi is
+  configured through ironsight (`SessionConfig::to_xi_settings` →
+  `BinaryClient::configure_xi`): `range` and `surface_height` as its radar
+  calibration, Full → a full-swing session in the environment's mode,
+  Chipping and Putting → the pitching shot type (mode 9); `ball_type`,
+  `tee_height` and `track_pct` are not sent. A mode change reconfigures
+  after a disarm; Chipping ↔ Putting sends nothing. ironsight acknowledges
+  each Xi flight result and sets the DSP power mode at connect; both go
+  through the connection's send hook, so the audit log and the shot export
+  record them as tx. A refused configuration step arrives as
   `BinaryEvent::StepRefused`, which the actor logs as a warning with the hex
 - `use_estimated` is per-mevo (defaults to `false`) -- controls whether estimated
   (E8) ball flights are emitted when no full (D4) result arrives; with it off,
@@ -498,9 +499,9 @@ the ring and every cap.
 
 | Device | Hook | Window | Excluded | Pre-roll | Max frames | Max bulk bytes |
 | --- | --- | --- | --- | --- | --- | --- |
-| FlightScope | ironsight `set_on_recv` / `set_on_send` (the same hooks log hex and keep the last D4) | BALL TRIGGER to the device re-armed, both directions | status/keepalive, device and product info, DSP query, network config, WiFi scan, calibration, time sync, AVR config query | 8 | 256 | 128 KiB (PRC, club PRC, speed profile) |
+| FlightScope | ironsight `set_on_recv` / `set_on_send` (the same hooks log hex and keep the last D4) | BALL TRIGGER to the device re-armed, both directions | what ironsight classifies as identity-bearing (`protocol::carries_identity`): status/keepalive, device and product info, DSP query, network config, WiFi scan, calibration, sensor activation, time sync, AVR config query | 8 | 256 | 128 KiB (PRC, club PRC, speed profile) |
 | Square Golf | `Tap<T>` around the allsquare transport; characteristic reads are never recorded | pre-roll through the shot event; enabled after the identity exchange | heartbeats and acks, query reply | 64 | 64 | 0 |
-| R10 | `Tap<T>` around the tenover transport; a per-direction `FrameFilter` holds each chunk until the GFDI frames it carries are complete and classified | pre-roll through the shot event; enabled at `HandshakeComplete` | every chunk carrying part of a device information (5024), FIT/file transfer (5003, 5004, 5011, 5012) or authentication (5101-5112) frame, an ACK of one, or a frame that does not decode | 256 | 256 | 0 |
+| R10 | `Tap<T>` around the tenover transport; a per-direction tenover `capture::IdentityFilter` holds each chunk until the GFDI frames it carries are complete and classified | pre-roll through the shot event; enabled at `HandshakeComplete` | what tenover classifies as identity-bearing: every chunk carrying part of a device information, FIT/file transfer or authentication frame, an ACK of one, or a frame that does not decode | 256 | 256 | 0 |
 | Open Connect | the inbound JSON text and our reply | the one message | none | - | - | - |
 | Mock | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
 

@@ -1158,7 +1158,7 @@ mod tests {
 
     /// The Square Golf Omni telemetry seen live, whose `device_info` is
     /// longer than a card's value column.
-    const OMNI_DEVICE_INFO: &str = "Square Golf SGO300A SquareGolf(54E4) (DC:0D:30:62:54:E4)";
+    const OMNI_DEVICE_INFO: &str = "Square Golf SGO300A SquareGolf(CD01) (02:00:00:AB:CD:01)";
 
     /// `app()` plus a Square Golf Omni between the Mevo and an Open Connect
     /// server, reporting [`OMNI_DEVICE_INFO`].
@@ -1182,7 +1182,7 @@ mod tests {
                 "Square Golf Omni",
                 vec![
                     ("device_info", OMNI_DEVICE_INFO),
-                    ("ble_address", "DC:0D:30:62:54:E4"),
+                    ("ble_address", "02:00:00:AB:CD:01"),
                     ("ready", "true"),
                     ("battery_pct", "85"),
                 ],
@@ -1278,7 +1278,7 @@ mod tests {
 
     #[test]
     fn a_long_name_stays_inside_its_card_on_both_sides() {
-        let long = "Square Golf SGO300A SquareGolf(54E4) in the back bay by the window";
+        let long = "Square Golf SGO300A SquareGolf(CD01) in the back bay by the window";
         for (w, h) in [(1600.0, 900.0), (1024.0, 768.0)] {
             let at = format!("{w}x{h}");
             let screen = Screen::sized(w, h);
@@ -1374,7 +1374,7 @@ mod tests {
 
     #[test]
     fn the_type_tag_shows_on_the_settings_side_only_and_a_long_name_gives_way_to_it() {
-        let long = "Square Golf SGO300A SquareGolf(54E4) in the back bay by the window";
+        let long = "Square Golf SGO300A SquareGolf(CD01) in the back bay by the window";
         let ids = ["mevo.0", "square.0", "openconnect_client.0", "webserver.0"];
         for (w, h) in [(1600.0, 900.0), (1024.0, 768.0)] {
             let at = format!("{w}x{h}");
@@ -1515,7 +1515,7 @@ mod tests {
 
     #[test]
     fn on_a_narrow_window_the_tag_shrinks_before_the_badge_and_toggle() {
-        let long = "Square Golf SGO300A SquareGolf(54E4) in the back bay by the window";
+        let long = "Square Golf SGO300A SquareGolf(CD01) in the back bay by the window";
         for w in [480.0, 400.0, 360.0] {
             let at = format!("{w}x800");
             let screen = Screen::sized(w, 800.0);

@@ -128,27 +128,41 @@ pub(crate) fn build_impact_calibration(
 // Raw capture
 // ---------------------------------------------------------------------------
 
-/// Notification family byte and kind byte of a heartbeat ack and of the
-/// reply to the status query. Neither is shot data; the query reply's
-/// contents are uncharacterised.
-const NOTIFY_FAMILY: u8 = 0x11;
-const NOTIFY_HEARTBEAT_ACK: u8 = 0x03;
-const NOTIFY_QUERY_RESPONSE: u8 = 0x06;
-
 /// Frames never captured: heartbeat acks, query replies and our heartbeats.
+/// Neither a heartbeat ack nor a query reply is shot data.
 fn export_excluded(rec: &RawRecord) -> bool {
     match rec.dir {
-        RawDir::Rx => {
-            raw_capture::byte_at(rec, 0) == Some(NOTIFY_FAMILY)
-                && matches!(
-                    raw_capture::byte_at(rec, 1),
-                    Some(NOTIFY_HEARTBEAT_ACK | NOTIFY_QUERY_RESPONSE)
+        RawDir::Rx => rec
+            .hex
+            .as_deref()
+            .and_then(decode_hex)
+            .and_then(|bytes| allsquare::protocol::parse(&bytes).ok())
+            .is_some_and(|n| {
+                matches!(
+                    n,
+                    allsquare::protocol::Notification::HeartbeatAck(_)
+                        | allsquare::protocol::Notification::QueryResponse(_)
                 )
-        }
+            }),
         RawDir::Tx => {
-            raw_capture::byte_at(rec, 1) == Some(allsquare::Command::Heartbeat.type_byte())
+            rec.hex
+                .as_deref()
+                .and_then(decode_hex)
+                .and_then(|bytes| allsquare::Command::type_byte_of(&bytes))
+                == Some(allsquare::Command::Heartbeat.type_byte())
         }
     }
+}
+
+/// The bytes of a lowercase hex string, or `None` when it is not valid hex.
+fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// Raw capture for one Square Golf connection. The pre-roll holds the ball
@@ -197,7 +211,7 @@ impl<T: allsquare::Transport> allsquare::Transport for Tap<T> {
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         self.inner.write(data)?;
         self.capture.push(RawRecord {
-            r#type: data.get(1).map(|&t| raw_capture::type_label(t)),
+            r#type: allsquare::Command::type_byte_of(data).map(raw_capture::type_label),
             channel: Some("cmd".into()),
             ..RawRecord::binary(RawDir::Tx, data)
         });
@@ -321,12 +335,11 @@ fn ball_from_square(b: &allsquare::BallMetrics) -> BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(b.speed)),
         launch_elevation: Some(b.launch_angle),
         launch_azimuth: Some(b.direction),
-        // The device measures launch only; the vendor app computes flight.
+        // The device measures launch only; flighthook simulates the flight.
         backspin_rpm: Some(i32::from(b.back_spin)),
         // Negated: the device reports negative sidespin for rightward curve,
         // FRP defines positive as rightward. Without this, fades draw and
         // draws fade in GSPro (which derives spin axis from these components).
-        // Same polarity the Mevo+ wire uses, and the same fix ironsight applies.
         sidespin_rpm: Some(-i32::from(b.side_spin)),
         // The device reports total spin and axis alongside the components.
         // The axis has the device's sidespin polarity (negative = right), so
@@ -804,6 +817,8 @@ fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use allsquare::testing::{self, BALL_NOTIFICATION};
+    use allsquare::{ClubMetrics, DeviceState};
 
     /// The device reports negative toward the toe; FRP's lateral is positive
     /// toward the toe. Vertical passes through.
@@ -838,7 +853,6 @@ mod tests {
     #[test]
     fn sidespin_polarity_is_inverted() {
         let fade = allsquare::BallMetrics {
-            shot_type: 0x37,
             speed: 3.30,
             launch_angle: 32.51,
             direction: 7.39,
@@ -846,6 +860,7 @@ mod tests {
             spin_axis: -8.00,
             back_spin: 621,
             side_spin: -87,
+            ..testing::ball_metrics()
         };
         let bf = ball_from_square(&fade);
         assert_eq!(bf.sidespin_rpm, Some(87), "device -87 (right) -> FRP +87");
@@ -858,7 +873,6 @@ mod tests {
     #[test]
     fn device_fade_lands_right_in_the_simulation() {
         let fade = allsquare::BallMetrics {
-            shot_type: 0x37,
             speed: 3.30,
             launch_angle: 32.51,
             direction: 7.39,
@@ -866,6 +880,7 @@ mod tests {
             spin_axis: -8.00,
             back_spin: 621,
             side_spin: -87,
+            ..testing::ball_metrics()
         };
         let cfg = flighthook::SimulationSection::default();
         let d = sim::derive(&ball_from_square(&fade), &cfg).expect("simulated");
@@ -889,14 +904,12 @@ mod tests {
 
     fn ball(speed_ms: f64, total: i16, back: i16, side: i16) -> allsquare::BallMetrics {
         allsquare::BallMetrics {
-            shot_type: 0x37,
             speed: speed_ms,
             launch_angle: 18.0,
-            direction: 0.0,
             total_spin: total,
-            spin_axis: 0.0,
             back_spin: back,
             side_spin: side,
+            ..testing::ball_metrics()
         }
     }
 
@@ -1112,21 +1125,16 @@ mod tests {
         }
     }
 
-    /// Synthetic ball notification: 40 m/s, 15 deg, 1 deg right, 5000 rpm.
-    const BALL: [u8; 17] = [
-        0x11, 0x02, 0x01, 0xa0, 0x0f, 0xdc, 0x05, 0x64, 0x00, 0x88, 0x13, 0xc8, 0x00, 0x7e, 0x13,
-        0x2c, 0x01,
-    ];
-
     #[test]
     fn tap_captures_the_shot_without_identity_or_housekeeping() {
+        let club = testing::club_notification(&ClubMetrics::default());
         let notifications = [
-            vec![0x11, 0x06, 0xaa, 0xbb],
-            vec![0x11, 0x03, 0x00, 0x01],
-            vec![0x11, 0x03, 0x00, 0x02],
-            BALL.to_vec(),
-            BALL.to_vec(),
-            vec![0x11, 0x07, 0x00],
+            testing::query_response(&[0xaa, 0xbb]),
+            testing::heartbeat_ack(DeviceState::Idle).to_vec(),
+            testing::heartbeat_ack(DeviceState::Init).to_vec(),
+            BALL_NOTIFICATION.to_vec(),
+            BALL_NOTIFICATION.to_vec(),
+            club.to_vec(),
         ];
         let fake = FakeTransport {
             notifications: notifications.into_iter().collect(),
@@ -1151,38 +1159,54 @@ mod tests {
         client.transport_mut().capture.mark_trigger();
         let raw = client.transport_mut().capture.take();
 
-        let seq: Vec<(RawDir, Option<&str>, Option<&str>)> = raw
+        let seq: Vec<(RawDir, Option<&str>, Option<String>)> = raw
             .frames
             .iter()
-            .map(|r| (r.dir, r.channel.as_deref(), r.r#type.as_deref()))
+            .map(|r| (r.dir, r.channel.as_deref(), r.r#type.clone()))
             .collect();
+        let notify = Some(raw_capture::type_label(BALL_NOTIFICATION[0]));
+        let request = Some(raw_capture::type_label(
+            allsquare::Command::RequestClubMetrics.type_byte(),
+        ));
         assert_eq!(
             seq,
             [
-                (RawDir::Rx, Some("notify"), Some("0x11")),
-                (RawDir::Tx, Some("cmd"), Some("0x87")),
-                (RawDir::Rx, Some("notify"), Some("0x11")),
-                (RawDir::Rx, Some("notify"), Some("0x11")),
+                (RawDir::Rx, Some("notify"), notify.clone()),
+                (RawDir::Tx, Some("cmd"), request),
+                (RawDir::Rx, Some("notify"), notify.clone()),
+                (RawDir::Rx, Some("notify"), notify),
             ]
         );
         assert_eq!(raw.transport, "square-ble");
         assert_eq!(
             raw.frames[0].hex.as_deref(),
-            Some(flighthook::hex_lower(&BALL).as_str())
+            Some(flighthook::hex_lower(&BALL_NOTIFICATION).as_str())
         );
-        assert_eq!(raw.frames[3].hex.as_deref(), Some("110700"));
-        // The query and heartbeat sent during the identity exchange happened
-        // before the capture was enabled; the identity itself is never read
-        // through the tap.
+        assert_eq!(
+            raw.frames[3].hex.as_deref(),
+            Some(flighthook::hex_lower(&club).as_str())
+        );
+        // The replies to the identity exchange's query and heartbeat arrive
+        // after the capture is enabled and are dropped by `export_excluded`;
+        // the identity itself is never read through the tap.
         let json = serde_json::to_string(&raw).expect("ser");
         assert!(!json.contains(&flighthook::hex_lower(b"SQ-123456")));
-        assert!(!json.contains("1106aabb") && !json.contains("110300"));
+        assert!(
+            !json.contains(&flighthook::hex_lower(&testing::query_response(&[
+                0xaa, 0xbb
+            ])))
+        );
+        assert!(
+            !json.contains(&flighthook::hex_lower(&testing::heartbeat_ack(
+                DeviceState::Idle
+            )))
+        );
     }
 
     #[test]
     fn tap_records_nothing_until_enabled() {
         let fake = FakeTransport {
-            notifications: [BALL.to_vec()].into_iter().collect(),
+            notifications: [BALL_NOTIFICATION.to_vec()].into_iter().collect(),
         };
         let mut tap = Tap::new(fake);
         let mut buf = [0u8; 64];
@@ -1190,7 +1214,8 @@ mod tests {
             allsquare::Transport::read(&mut tap, &mut buf).expect("read"),
             17
         );
-        allsquare::Transport::write(&mut tap, &[0x00, 0x87, 0x01]).expect("write");
+        allsquare::Transport::write(&mut tap, &allsquare::Command::RequestClubMetrics.encode(1))
+            .expect("write");
         tap.capture.mark_trigger();
         assert!(tap.capture.take().frames.is_empty());
     }
@@ -1204,7 +1229,29 @@ mod tests {
             &allsquare::Command::RequestClubMetrics.encode(7),
         );
         assert!(!export_excluded(&req));
-        assert!(!export_excluded(&RawRecord::binary(RawDir::Rx, &BALL)));
+        assert!(!export_excluded(&RawRecord::binary(
+            RawDir::Rx,
+            &BALL_NOTIFICATION
+        )));
+    }
+
+    #[test]
+    fn heartbeat_ack_and_query_reply_are_excluded() {
+        let ack = RawRecord::binary(RawDir::Rx, &testing::heartbeat_ack(DeviceState::Ready));
+        let query = RawRecord::binary(RawDir::Rx, &testing::QUERY_RESPONSE);
+        assert!(export_excluded(&ack));
+        assert!(export_excluded(&query));
+        assert!(!export_excluded(&RawRecord::binary(
+            RawDir::Rx,
+            &BALL_NOTIFICATION
+        )));
+        // A frame that does not parse is kept, never dropped silently.
+        let truncated = &testing::heartbeat_ack(DeviceState::Ready)[..3];
+        assert!(!export_excluded(&RawRecord::binary(RawDir::Rx, truncated)));
+        assert_eq!(decode_hex("0a1b"), Some(vec![0x0a, 0x1b]));
+        assert_eq!(decode_hex("0a1"), None);
+        assert_eq!(decode_hex("zz"), None);
+        assert_eq!(decode_hex("é1"), None);
     }
 
     /// The device's total spin passes through; its axis is negated like its
@@ -1213,7 +1260,6 @@ mod tests {
     #[test]
     fn total_spin_and_axis_follow_frp_signs() {
         let fade = allsquare::BallMetrics {
-            shot_type: 0x37,
             speed: 3.30,
             launch_angle: 32.51,
             direction: 7.39,
@@ -1221,6 +1267,7 @@ mod tests {
             spin_axis: -8.00,
             back_spin: 621,
             side_spin: -87,
+            ..testing::ball_metrics()
         };
         let bf = ball_from_square(&fade);
         assert_eq!(bf.total_spin_rpm, Some(627));

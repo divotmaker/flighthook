@@ -2046,7 +2046,7 @@ pub(crate) fn actor_fields(
 
                 // Track %
                 ui.horizontal(|ui| {
-                    field_label(ui, "Track %:").on_hover_text("Minimum outdoor tracking percentage (0-100).\nLower values accept shorter-tracked shots. GSPro default: 100, FS Golf default: 60.");
+                    field_label(ui, "Track %:").on_hover_text("Minimum outdoor tracking percentage (0-100).\nLower values accept shorter-tracked shots. Default: 80.");
                     if ui
                         .add(egui::TextEdit::singleline(&mut dev.track_pct).desired_width(field_width - TEXT_EDIT_MARGIN))
                         .changed()

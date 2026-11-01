@@ -1,15 +1,15 @@
 use ironsight::protocol::camera::CamConfig;
 use ironsight::protocol::config::{
-    MODE_CHIPPING, MODE_FULL_OUTDOOR, MODE_LIMITED_FLIGHT, MODE_PUTTING, ParamData, ParamValue,
-    RadarCal,
+    MODE_CHIPPING, MODE_FULL_OUTDOOR, MODE_LIMITED_FLIGHT, MODE_PUTTING, RadarCal,
 };
-use ironsight::seq::{AvrSettings, XiSettings, XiShotType};
+use ironsight::seq::{AvrSettings, MevoSettings, XiSettings};
 
 use crate::state::config::MevoSection;
 use flighthook::{CameraMode, Distance, DistanceExt, FlightScopeEnvironment, ShotDetectionMode};
 
 /// Mutable session configuration. Distance fields carry both value and unit;
-/// wire-protocol conversions happen on demand in `to_avr_settings()`.
+/// they are converted to ironsight's units on demand in `to_avr_settings()`
+/// and `to_xi_settings()`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionConfig {
     pub ball_type: u8, // 0 = Standard, 1 = RCT
@@ -76,28 +76,18 @@ impl SessionConfig {
         }
     }
 
-    /// Full AVR settings for initial configuration: params + RadarCal.
+    /// Full Mevo+ settings for the initial configuration: mode, ball type,
+    /// track percentage, tee height and radar calibration
+    /// (ironsight's `MevoSettings`).
     pub(crate) fn to_avr_settings(&self, mode: &ShotDetectionMode) -> AvrSettings {
-        let comms_index = self.comms_index(mode);
-
-        AvrSettings {
-            mode: comms_index,
-            params: vec![
-                ParamValue {
-                    param_id: 0x06,
-                    value: ParamData::Int24(i32::from(self.ball_type)),
-                },
-                ParamValue {
-                    param_id: 0x0F,
-                    value: ParamData::Float40(self.track_pct / 100.0),
-                },
-                ParamValue {
-                    param_id: 0x26,
-                    value: ParamData::Float40(self.tee_height.as_meters()),
-                },
-            ],
-            radar_cal: Some(self.radar_cal()),
-        }
+        MevoSettings::new(
+            self.comms_index(mode),
+            self.ball_type,
+            self.track_pct / 100.0,
+            self.tee_height.as_meters(),
+            self.radar_cal(),
+        )
+        .into()
     }
 
     /// Radar calibration from `range` and `surface_height`.
@@ -108,37 +98,29 @@ impl SessionConfig {
         }
     }
 
-    /// Minimal AVR settings for mode changes: ModeSet only, no params or
-    /// RadarCal. Full params trigger ~29s of ConfigNack retries on ARM;
-    /// mode-only significantly reduces (but does not eliminate) retries.
+    /// Mevo+ settings for a mode change: the detection mode alone
+    /// (ironsight's `AvrSettings::mode_only`).
     pub(crate) fn to_avr_settings_mode_only(&self, mode: &ShotDetectionMode) -> AvrSettings {
-        AvrSettings {
-            mode: self.comms_index(mode),
-            params: vec![],
-            radar_cal: None,
-        }
+        AvrSettings::mode_only(self.comms_index(mode))
     }
 
-    /// Xi configuration for a detection mode, set up as FS Golf sets up the
-    /// Xi: Full is a full-swing session in the environment's mode; Chipping
-    /// and Putting are FS Golf's Pitching session (limited flight, mode 9).
-    /// The radar calibration comes from `range` and `surface_height`.
+    /// Xi configuration for a detection mode: Full is a full-swing session
+    /// in the environment's mode; Chipping and Putting are the Xi's pitching
+    /// shot type. The radar calibration comes from `range` and
+    /// `surface_height`.
     pub(crate) fn to_xi_settings(&self, mode: &ShotDetectionMode) -> XiSettings {
-        let (comms_index, shot_type) = match mode {
-            ShotDetectionMode::Full => (self.environment_mode(), XiShotType::FullSwing),
-            ShotDetectionMode::Chipping | ShotDetectionMode::Putting => {
-                (MODE_LIMITED_FLIGHT, XiShotType::Pitching)
+        match mode {
+            ShotDetectionMode::Full => {
+                XiSettings::full_swing(self.environment_mode(), self.radar_cal())
             }
-        };
-        XiSettings {
-            mode: comms_index,
-            shot_type,
-            radar_cal: self.radar_cal(),
+            ShotDetectionMode::Chipping | ShotDetectionMode::Putting => {
+                XiSettings::pitching(self.radar_cal())
+            }
         }
     }
 
-    /// Label for the Xi session a detection mode selects, with the
-    /// commsIndex sent to the device.
+    /// Label for the Xi shot type a detection mode selects, with the
+    /// detection mode sent to the device.
     pub fn xi_label(&self, mode: &ShotDetectionMode) -> &'static str {
         match (mode, self.environment) {
             (ShotDetectionMode::Full, FlightScopeEnvironment::LimitedFlight) => {
@@ -160,46 +142,6 @@ impl SessionConfig {
     }
 }
 
-/// Camera configuration for the warmup phase of a Mevo+ session.
-///
-/// Standard resolution (1024x768) with conservative buffer settings. The Pi
-/// camera subsystem boots in this mode; a Fusion config is only accepted once
-/// warmup has finished.
-///
-/// Unused raw-camera fields carry `-1`, matching the native app's wire
-/// encoding. A `0` there reads as a real value to the Pi and disturbs SHM
-/// buffer allocation, which is what Fusion capture depends on.
-pub(crate) fn cam_config() -> CamConfig {
-    CamConfig {
-        dynamic_config: true,
-        resolution_width: 1024,
-        resolution_height: 768,
-        rotation: 0,
-        ev: 0,
-        quality: 80,
-        framerate: 20,
-        streaming_framerate: 1,
-        ringbuffer_pretime_ms: 1000,
-        ringbuffer_posttime_ms: 4000,
-        raw_camera_mode: 0,
-        fusion_camera_mode: false,
-        raw_shutter_speed_max: 0.0,
-        raw_ev_roi_x: -1,
-        raw_ev_roi_y: -1,
-        raw_ev_roi_width: -1,
-        raw_ev_roi_height: -1,
-        raw_x_offset: -1,
-        raw_bin44: false,
-        raw_live_preview_write_interval_ms: -1,
-        raw_y_offset: -1,
-        buffer_sub_sampling_pre_trigger_div: -1,
-        buffer_sub_sampling_post_trigger_div: -1,
-        buffer_sub_sampling_switch_time_offset: -1.0,
-        buffer_sub_sampling_total_buffer_size: -1,
-        buffer_sub_sampling_pre_trigger_buffer_size: -1,
-    }
-}
-
 /// The camera configuration to apply once warmup has finished, for a mode that
 /// asks for Fusion processing. `Standard` keeps the warmup config and needs no
 /// second phase.
@@ -214,6 +156,7 @@ pub(crate) fn fusion_cam_config(mode: CameraMode) -> Option<CamConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironsight::seq::XiShotType;
 
     fn session(environment: FlightScopeEnvironment) -> SessionConfig {
         SessionConfig {

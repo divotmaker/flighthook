@@ -660,8 +660,8 @@ device produced no data for are included: their `data` has no `ball`, `club`,
     "transport": "flightscope-tcp",
     "frames": [
       { "t_ms": 0, "dir": "rx", "type": "0xE5", "src": "AVR", "dst": "APP", "hex": "0c42414c4c2054524947474552000000" },
-      { "t_ms": 612, "dir": "rx", "type": "0xE8", "src": "DSP", "dst": "APP", "hex": "5d0000040000..." },
-      { "t_ms": 640, "dir": "rx", "type": "0xD4", "src": "DSP", "dst": "APP", "hex": "9c0000040000..." },
+      { "t_ms": 612, "dir": "rx", "type": "0xE8", "src": "AVR", "dst": "APP", "hex": "5d0000040000..." },
+      { "t_ms": 640, "dir": "rx", "type": "0xD4", "src": "AVR", "dst": "APP", "hex": "9c0000040000..." },
       { "t_ms": 703, "dir": "tx", "type": "0x69", "src": "APP", "dst": "AVR", "hex": "" },
       { "t_ms": 760, "dir": "tx", "type": "0xB0", "src": "APP", "dst": "AVR", "hex": "0101" }
     ]
