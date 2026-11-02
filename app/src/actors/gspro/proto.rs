@@ -3,7 +3,7 @@ use std::io::Write;
 use super::BridgeError;
 use super::api;
 use crate::bus::BusSender;
-use flighthook::{Club, ClubInfo, FlighthookEvent, FlighthookMessage, Handedness, Severity};
+use flighthook::{Club, ClubInfo, FlighthookEvent, FlighthookMessage, Severity};
 
 pub(crate) fn send_message(
     stream: &mut impl Write,
@@ -76,11 +76,7 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
                 // Emit player/club info if present
                 if let Some(ref player) = resp.player {
                     if let Some(ref handed) = player.handed {
-                        let h = match handed.to_uppercase().as_str() {
-                            "RH" => Some(Handedness::Right),
-                            "LH" => Some(Handedness::Left),
-                            _ => None,
-                        };
+                        let h = api::hand_from_code(handed);
                         if h.is_some() {
                             sender.send(FlighthookMessage::new(
                                 FlighthookEvent::SetDetectionMode {

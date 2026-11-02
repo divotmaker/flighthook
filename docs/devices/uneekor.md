@@ -66,6 +66,15 @@ on the new address.
 The actor accepts one monitor at a time — Open Connect is a single-peer
 protocol. A second monitor should be a second actor on its own port.
 
+Like GSPro, the server tells the monitor the player's hand and club: once the
+club is known it sends `{"Code":201,"Message":"GSPro Player
+Information","Player":{"Handed":"RH","Club":"DR"}}` after the monitor's first
+message (`Handed` is `RH` or `LH`, `Club` is GSPro's code, e.g. `W3`, `I7`,
+`PW`, `PT`; the mini driver is `DR`), and again whenever either changes.
+`Handed` is left out until flighthook knows the hand; nothing is sent while the
+club is unknown. The 201 is written at least 50 ms after a `200`, so the two
+reach the monitor in separate reads.
+
 ## Shot export
 
 `GET /api/shots/export` (the **JSONL** link on the Shots tab) saves

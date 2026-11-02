@@ -10,6 +10,7 @@
 //! schema unevenly, so the optional sub-objects default rather than failing
 //! the parse. Only `DeviceID` and `ShotNumber` are treated as required.
 
+use flighthook::{Club, Handedness};
 use serde::{Deserialize, Serialize};
 
 /// Top-level Open Connect message: flighthook -> GSPro, or launch monitor ->
@@ -124,6 +125,36 @@ impl GsProResponse {
             player: None,
         }
     }
+
+    /// GSPro's player information message (`201`): the player's hand
+    /// (`RH`/`LH`) and club (`DR`, `W3`, `I7`, `PT`, ...). A field that is
+    /// `None` is left out.
+    pub fn player(handed: Option<Handedness>, club: Option<Club>) -> Self {
+        Self {
+            code: 201,
+            message: "GSPro Player Information".into(),
+            player: Some(PlayerInfo {
+                handed: handed.map(|h| hand_code(h).to_string()),
+                club: club.map(|c| c.gspro_code().to_string()),
+            }),
+        }
+    }
+}
+
+/// GSPro's code for a hand: `RH` or `LH`.
+pub fn hand_code(hand: Handedness) -> &'static str {
+    match hand {
+        Handedness::Right => "RH",
+        Handedness::Left => "LH",
+    }
+}
+
+/// The hand for GSPro's code, case-insensitively; `None` for anything but
+/// `RH` or `LH`.
+pub fn hand_from_code(code: &str) -> Option<Handedness> {
+    [Handedness::Right, Handedness::Left]
+        .into_iter()
+        .find(|&h| hand_code(h).eq_ignore_ascii_case(code))
 }
 
 /// Player info carried on an Open Connect response.

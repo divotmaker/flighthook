@@ -8,8 +8,9 @@ use crate::{Handedness, ShotDetectionMode};
 
 /// Golf club.
 ///
-/// Variants serialize to GSPro wire codes (`"DR"`, `"7I"`, etc.) via serde rename.
-/// `Display` returns the same code. `from_code()` parses case-insensitively.
+/// Variants serialize to flighthook's digit-first codes (`"DR"`, `"7I"`, etc.)
+/// via serde rename; [`Club::gspro_code`] gives GSPro's letter-first form.
+/// `Display` returns the serde code. `from_code()` parses case-insensitively.
 /// `mode()` maps to the appropriate `ShotDetectionMode`. Ordering is bag
 /// order, as in [`Club::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -185,6 +186,47 @@ impl Club {
         }
     }
 
+    /// GSPro's letter-first code for this club (`DR`, `W3`, `H4`, `I7`, `PW`,
+    /// `PT`), the form [`Club::from_code`] accepts back. GSPro has no mini
+    /// driver, so [`Club::MiniDriver`] is sent as `DR`.
+    pub fn gspro_code(self) -> &'static str {
+        match self {
+            Club::Driver => "DR",
+            Club::MiniDriver => "DR",
+            Club::Wood2 => "W2",
+            Club::Wood3 => "W3",
+            Club::Wood4 => "W4",
+            Club::Wood5 => "W5",
+            Club::Wood6 => "W6",
+            Club::Wood7 => "W7",
+            Club::Wood8 => "W8",
+            Club::Wood9 => "W9",
+            Club::Hybrid1 => "H1",
+            Club::Hybrid2 => "H2",
+            Club::Hybrid3 => "H3",
+            Club::Hybrid4 => "H4",
+            Club::Hybrid5 => "H5",
+            Club::Hybrid6 => "H6",
+            Club::Hybrid7 => "H7",
+            Club::Hybrid8 => "H8",
+            Club::Hybrid9 => "H9",
+            Club::Iron1 => "I1",
+            Club::Iron2 => "I2",
+            Club::Iron3 => "I3",
+            Club::Iron4 => "I4",
+            Club::Iron5 => "I5",
+            Club::Iron6 => "I6",
+            Club::Iron7 => "I7",
+            Club::Iron8 => "I8",
+            Club::Iron9 => "I9",
+            Club::PitchingWedge => "PW",
+            Club::GapWedge => "GW",
+            Club::SandWedge => "SW",
+            Club::LobWedge => "LW",
+            Club::Putter => "PT",
+        }
+    }
+
     /// Map this club to a shot detection mode.
     ///
     /// Putter → Putting, wedges (GW/SW/LW) → Chipping, everything else → Full.
@@ -326,6 +368,30 @@ mod tests {
         assert_eq!(Club::from_code("I0"), None);
         assert_eq!(Club::from_code("W0"), None);
         assert_eq!(Club::from_code("H0"), None);
+    }
+
+    #[test]
+    fn gspro_code_round_trips_and_is_letter_first() {
+        for &club in Club::ALL {
+            let code = club.gspro_code();
+            // GSPro has no mini driver; it goes out as the driver.
+            let back = if club == Club::MiniDriver {
+                Club::Driver
+            } else {
+                club
+            };
+            assert_eq!(Club::from_code(code), Some(back), "{code}");
+            let b = code.as_bytes();
+            let numbered = b[1].is_ascii_digit();
+            assert!(!numbered || b[0].is_ascii_alphabetic(), "{code}");
+        }
+        assert_eq!(Club::Driver.gspro_code(), "DR");
+        assert_eq!(Club::MiniDriver.gspro_code(), "DR");
+        assert_eq!(Club::Wood3.gspro_code(), "W3");
+        assert_eq!(Club::Hybrid4.gspro_code(), "H4");
+        assert_eq!(Club::Iron7.gspro_code(), "I7");
+        assert_eq!(Club::PitchingWedge.gspro_code(), "PW");
+        assert_eq!(Club::Putter.gspro_code(), "PT");
     }
 
     #[test]

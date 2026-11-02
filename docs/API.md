@@ -997,6 +997,11 @@ Full persisted config (mirrors `config.toml`).
   simulator. GSPro listens on 921 too, but moving GSPConnect to 922 (set
   `<OpenAPIUseAltPort>true</OpenAPIUseAltPort>` in
   `C:\GSPro\GSPC\GSPconnect.exe.config`) frees 921 so both can share one host
+- `openconnect_server` sections answer each message with a `200` and tell the
+  monitor the player's hand and club as GSPro's player information (`201`,
+  `Handed` `RH`/`LH`, `Club` GSPro's code such as `W3`, `I7`, `PT`) once the
+  club is known: after the monitor's first message and on every change. The
+  hand is left out until it is known, and the mini driver goes out as `DR`
 - `openconnect_client` sections are **outputs**: each dials `address` (default
   `127.0.0.1:921`), a simulator that accepts GSPro Open Connect V1 — GSPro on
   921, Muni Golf on 9210 — and sends it every shot. `full_monitor`,

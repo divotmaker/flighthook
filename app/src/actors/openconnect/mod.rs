@@ -46,8 +46,8 @@ use crate::sim;
 use crate::state::SystemState;
 use crate::state::local_clients::LocalClients;
 use flighthook::{
-    ActorStatus, FlighthookEvent, FlighthookMessage, RawDir, RawPayload, RawRecord, Severity,
-    ShotKey, ShotRaw,
+    ActorStatus, Club, FlighthookEvent, FlighthookMessage, Handedness, RawDir, RawPayload,
+    RawRecord, Severity, ShotKey, ShotRaw,
 };
 
 /// Cap on buffered bytes from a single peer before the connection is dropped.
@@ -264,7 +264,16 @@ struct Peer {
     announced: bool,
     /// Last readiness we published, so telemetry is emitted only on change.
     ready: Option<bool>,
+    /// The hand and club of the last player information (201) sent to this
+    /// monitor; `None` for a field not sent yet.
+    player_sent: (Option<Handedness>, Option<Club>),
+    /// When the last reply (200) was written to this monitor.
+    replied_at: Option<Instant>,
 }
+
+/// How long after a reply (200) the player information (201) waits, so the
+/// two never arrive in the same read on the monitor's side.
+const PLAYER_INFO_GAP: Duration = Duration::from_millis(50);
 
 /// Serve a single connected monitor until it disconnects or we shut down.
 ///
@@ -301,6 +310,8 @@ fn serve(
     let mut peer = Peer {
         announced: false,
         ready: None,
+        player_sent: (None, None),
+        replied_at: None,
     };
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 4096];
@@ -359,7 +370,61 @@ fn serve(
                 return;
             }
         }
+        if !send_player_info(state, &mut stream, &mut peer, name) {
+            return;
+        }
     }
+}
+
+/// Tell the monitor the player's hand and club (a `201`, as GSPro does) once
+/// its first message has been answered, and again whenever either differs from
+/// what it was last told. The game state is compared on every pass of the
+/// serve loop, so a change is sent whenever the system actor has latched it,
+/// whichever bus event carried it. Nothing is sent while the club is not
+/// known; `Handed` is included when it is.
+///
+/// Neither object carries a terminator, so a 201 written next to a 200 would
+/// reach the monitor in the same read as one buffer. It is held back until the
+/// last 200 is at least [`PLAYER_INFO_GAP`] old; the serve loop comes round
+/// again within its read timeout, so it goes out in a read of its own.
+///
+/// Returns false if the connection should be dropped.
+fn send_player_info(
+    state: &SystemState,
+    stream: &mut TcpStream,
+    peer: &mut Peer,
+    name: &str,
+) -> bool {
+    if !peer.announced
+        || peer
+            .replied_at
+            .is_some_and(|t| t.elapsed() < PLAYER_INFO_GAP)
+    {
+        return true;
+    }
+    let game = state.game.snapshot();
+    let now = (game.handed, game.club_info.map(|c| c.club));
+    if now == peer.player_sent || now.1.is_none() {
+        return true;
+    }
+    let player = api::GsProResponse::player(now.0, now.1);
+    let text = match serde_json::to_string(&player) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!("openconnect server: could not encode player information: {e}");
+            return true;
+        }
+    };
+    tracing::info!(target: "audit", "{name} sent {text} | {player:?}");
+    if let Err(e) = stream
+        .write_all(text.as_bytes())
+        .and_then(|()| stream.flush())
+    {
+        tracing::warn!("openconnect server: write failed: {e}");
+        return false;
+    }
+    peer.player_sent = now;
+    true
 }
 
 /// Parse every complete JSON value buffered so far and handle it.
@@ -495,6 +560,7 @@ fn handle(
             tracing::warn!("openconnect server: write failed: {e}");
             return false;
         }
+        peer.replied_at = Some(Instant::now());
     }
     true
 }
@@ -815,6 +881,7 @@ mod tests {
     /// A process's worth of actors on one bus, sharing one `SystemState`.
     struct Rig {
         state: Arc<SystemState>,
+        writer: crate::state::GameStateWriter,
         tx: broadcast::Sender<FlighthookMessage>,
         events: broadcast::Receiver<FlighthookMessage>,
         flags: Vec<Arc<AtomicBool>>,
@@ -829,7 +896,7 @@ mod tests {
                 "flighthook-oc-loop-{}",
                 crate::state::config::generate_id()
             ));
-            let (state, _writer) = SystemState::new(dir.join("config.toml"));
+            let (state, writer) = SystemState::new(dir.join("config.toml"));
             state.system.update(|c| {
                 c.openconnect_client.insert(
                     "0".into(),
@@ -849,6 +916,7 @@ mod tests {
             let (tx, events) = broadcast::channel(4096);
             Self {
                 state: Arc::new(state),
+                writer,
                 tx,
                 events,
                 flags: Vec::new(),
@@ -1162,5 +1230,331 @@ mod tests {
         assert_eq!(shot["BallData"]["Speed"], 100.0);
         assert!(alerts(&seen, "openconnect_server.0").is_empty());
         assert!(!seen.iter().any(|m| client_error(m).is_some()));
+    }
+
+    // -- Player information sent to the monitor ---------------------------------
+
+    const HEARTBEAT: &str = r#"{"DeviceID":"Uneekor","ShotNumber":0,"APIversion":"1","ShotDataOptions":{"IsHeartBeat":true}}"#;
+
+    /// The JSON objects a server writes to a connected monitor, one raw text each.
+    struct Monitor {
+        stream: TcpStream,
+        buf: Vec<u8>,
+    }
+
+    impl Monitor {
+        fn connect(bind: SocketAddr) -> Self {
+            let stream = TcpStream::connect(bind).expect("monitor connects");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .expect("timeout");
+            Self {
+                stream,
+                buf: Vec::new(),
+            }
+        }
+
+        fn send(&mut self, text: &str) {
+            self.stream.write_all(text.as_bytes()).expect("send");
+        }
+
+        /// The next object the server wrote, or `None` after `wait`.
+        fn next(&mut self, wait: Duration) -> Option<String> {
+            let deadline = Instant::now() + wait;
+            let mut chunk = [0u8; 4096];
+            loop {
+                let mut it = serde_json::Deserializer::from_slice(&self.buf)
+                    .into_iter::<serde_json::Value>();
+                if let Some(Ok(_)) = it.next() {
+                    let end = it.byte_offset();
+                    let text = String::from_utf8_lossy(&self.buf[..end]).into_owned();
+                    self.buf.drain(..end);
+                    return Some(text);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                match self.stream.read(&mut chunk) {
+                    Ok(0) => return None,
+                    Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => {}
+                }
+            }
+        }
+
+        /// What the next read returns, as one string: whatever the server's
+        /// writes that reach the monitor together, or `None` after `wait`.
+        /// Nothing may be left over from [`Monitor::next`].
+        fn read_once(&mut self, wait: Duration) -> Option<String> {
+            assert!(self.buf.is_empty(), "unread bytes");
+            let deadline = Instant::now() + wait;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match self.stream.read(&mut chunk) {
+                    Ok(0) => return None,
+                    Ok(n) => return Some(String::from_utf8_lossy(&chunk[..n]).into_owned()),
+                    Err(_) if Instant::now() < deadline => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+
+        /// The next object, which must arrive within [`WAIT`].
+        fn expect(&mut self, what: &str) -> String {
+            self.next(WAIT)
+                .unwrap_or_else(|| panic!("timed out waiting for {what}"))
+        }
+
+        /// Asserts the server writes nothing for a while.
+        fn expect_quiet(&mut self) {
+            let extra = self.next(Duration::from_millis(500));
+            assert_eq!(extra, None, "an unexpected message");
+        }
+    }
+
+    const OK_HEARTBEAT: &str = r#"{"Code":200,"Message":"Heartbeat received"}"#;
+
+    fn player_info(hand: Option<&str>, club: Option<&str>) -> String {
+        let mut fields = Vec::new();
+        if let Some(h) = hand {
+            fields.push(format!(r#""Handed":"{h}""#));
+        }
+        if let Some(c) = club {
+            fields.push(format!(r#""Club":"{c}""#));
+        }
+        format!(
+            r#"{{"Code":201,"Message":"GSPro Player Information","Player":{{{}}}}}"#,
+            fields.join(",")
+        )
+    }
+
+    #[test]
+    fn the_monitor_gets_the_hand_and_club_after_its_first_message() {
+        let mut rig = Rig::new("GSPro");
+        rig.writer.set_handed(Handedness::Left);
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Iron7 });
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = Monitor::connect(bind);
+        // Nothing before the monitor has spoken.
+        assert_eq!(monitor.next(Duration::from_millis(300)), None);
+
+        monitor.send(HEARTBEAT);
+        assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
+        assert_eq!(
+            monitor.expect("the 201"),
+            r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"LH","Club":"I7"}}"#
+        );
+        monitor.expect_quiet();
+    }
+
+    #[test]
+    fn a_change_of_hand_or_club_sends_one_new_201() {
+        let mut rig = Rig::new("GSPro");
+        rig.writer.set_handed(Handedness::Right);
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = Monitor::connect(bind);
+        monitor.send(HEARTBEAT);
+        assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
+        assert_eq!(
+            monitor.expect("the first 201"),
+            player_info(Some("RH"), Some("DR"))
+        );
+        // No change, no message, however many passes the loop makes.
+        monitor.expect_quiet();
+
+        rig.writer.set_handed(Handedness::Left);
+        assert_eq!(
+            monitor.expect("the 201 for the hand"),
+            player_info(Some("LH"), Some("DR"))
+        );
+        monitor.expect_quiet();
+
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Putter });
+        assert_eq!(
+            monitor.expect("the 201 for the club"),
+            player_info(Some("LH"), Some("PT"))
+        );
+        monitor.expect_quiet();
+
+        // Setting what is already set is no change.
+        rig.writer.set_handed(Handedness::Left);
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Putter });
+        monitor.expect_quiet();
+
+        // The 200 reply to a later message is still just the 200.
+        monitor.send(HEARTBEAT);
+        assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
+        monitor.expect_quiet();
+    }
+
+    #[test]
+    fn a_hand_alone_sends_nothing() {
+        let mut rig = Rig::new("GSPro");
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = Monitor::connect(bind);
+        monitor.send(HEARTBEAT);
+        assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
+        monitor.expect_quiet();
+
+        // GSPro always sends the club with the hand: nothing goes out until
+        // the club is known, and then the hand goes with it.
+        rig.writer.set_handed(Handedness::Right);
+        monitor.expect_quiet();
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Wood3 });
+        assert_eq!(
+            monitor.expect("the 201 with both"),
+            player_info(Some("RH"), Some("W3"))
+        );
+        monitor.expect_quiet();
+    }
+
+    #[test]
+    fn a_club_without_a_hand_is_sent_alone_and_the_hand_follows() {
+        let mut rig = Rig::new("GSPro");
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = Monitor::connect(bind);
+        monitor.send(HEARTBEAT);
+        assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
+        assert_eq!(
+            monitor.expect("the 201 with the club"),
+            player_info(None, Some("DR"))
+        );
+        monitor.expect_quiet();
+        rig.writer.set_handed(Handedness::Left);
+        assert_eq!(
+            monitor.expect("the 201 with both"),
+            player_info(Some("LH"), Some("DR"))
+        );
+    }
+
+    #[test]
+    fn the_mini_driver_goes_out_as_the_driver() {
+        let mut rig = Rig::new("GSPro");
+        rig.writer.set_handed(Handedness::Right);
+        rig.writer.set_club_info(flighthook::ClubInfo {
+            club: Club::MiniDriver,
+        });
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = Monitor::connect(bind);
+        monitor.send(HEARTBEAT);
+        assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
+        assert_eq!(
+            monitor.expect("the 201"),
+            player_info(Some("RH"), Some("DR"))
+        );
+    }
+
+    const MONITOR_SHOT: &str = r#"{"DeviceID":"Uneekor","Units":"Yards","ShotNumber":1,"APIversion":"1","BallData":{"Speed":100.0},"ShotDataOptions":{"ContainsBallData":true}}"#;
+    const OK_SHOT: &str = r#"{"Code":200,"Message":"Shot received"}"#;
+
+    #[test]
+    fn the_200_arrives_alone_in_its_own_read_before_the_201() {
+        let mut rig = Rig::new("GSPro");
+        rig.writer.set_handed(Handedness::Right);
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Iron7 });
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = Monitor::connect(bind);
+        monitor.send(HEARTBEAT);
+        // Each read is exactly one object, with no terminator: a client that
+        // splits on newlines or parses one object per read gets both intact.
+        assert_eq!(monitor.read_once(WAIT).as_deref(), Some(OK_HEARTBEAT));
+        assert_eq!(
+            monitor.read_once(WAIT),
+            Some(player_info(Some("RH"), Some("I7")))
+        );
+
+        // A change made later is a read of its own as well.
+        rig.writer.set_handed(Handedness::Left);
+        assert_eq!(
+            monitor.read_once(WAIT),
+            Some(player_info(Some("LH"), Some("I7")))
+        );
+    }
+
+    #[test]
+    fn a_first_message_that_is_a_shot_gets_the_200_then_the_201() {
+        let mut rig = Rig::new("GSPro");
+        rig.writer.set_handed(Handedness::Right);
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = Monitor::connect(bind);
+        monitor.send(MONITOR_SHOT);
+        assert_eq!(monitor.read_once(WAIT).as_deref(), Some(OK_SHOT));
+        assert_eq!(
+            monitor.read_once(WAIT),
+            Some(player_info(Some("RH"), Some("DR")))
+        );
+        monitor.expect_quiet();
+    }
+
+    #[test]
+    fn the_201_is_never_part_of_a_shots_raw_frames() {
+        let mut rig = Rig::new("GSPro");
+        rig.writer.set_handed(Handedness::Right);
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = Monitor::connect(bind);
+        monitor.send(HEARTBEAT);
+        assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
+        assert_eq!(
+            monitor.expect("the first 201"),
+            player_info(Some("RH"), Some("DR"))
+        );
+
+        // A shot sent right after a change of hand: its 200 and the 201 for
+        // the change both reach the monitor, in either order.
+        rig.writer.set_handed(Handedness::Left);
+        monitor.send(MONITOR_SHOT);
+        let mut got = [monitor.expect("a reply"), monitor.expect("a reply")];
+        got.sort();
+        let mut want = [OK_SHOT.to_string(), player_info(Some("LH"), Some("DR"))];
+        want.sort();
+        assert_eq!(got, want);
+
+        let seen = rig.until("the shot finished", |m| {
+            matches!(m.event, FlighthookEvent::ShotFinished { .. })
+        });
+        let Some(FlighthookEvent::ShotFinished { raw: Some(raw), .. }) =
+            seen.into_iter().map(|m| m.event).next_back()
+        else {
+            panic!("shot_finished with raw");
+        };
+        assert_eq!(raw.frames.len(), 2);
+        assert_eq!(raw.frames[0].dir, RawDir::Rx);
+        assert_eq!(raw.frames[0].text.as_deref(), Some(MONITOR_SHOT));
+        assert_eq!(raw.frames[1].dir, RawDir::Tx);
+        assert_eq!(raw.frames[1].text.as_deref(), Some(OK_SHOT));
+    }
+
+    #[test]
+    fn a_new_connection_is_told_again() {
+        let mut rig = Rig::new("GSPro");
+        rig.writer.set_handed(Handedness::Right);
+        rig.writer.set_club_info(flighthook::ClubInfo {
+            club: Club::Hybrid4,
+        });
+        let bind = rig.server([127, 0, 0, 1]);
+        for _ in 0..2 {
+            let mut monitor = Monitor::connect(bind);
+            monitor.send(HEARTBEAT);
+            assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
+            assert_eq!(
+                monitor.expect("the 201"),
+                player_info(Some("RH"), Some("H4"))
+            );
+            drop(monitor);
+            rig.until("the server listening again", |m| listening(m).is_some());
+        }
     }
 }
