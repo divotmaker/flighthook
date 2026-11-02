@@ -785,7 +785,9 @@ OpenConnect client's TCP connect attempt (up to 5s) is not interrupted by a stop
 Neither is the ExPutt's session start: the TCP connect (up to 3s), the
 device's two handshake replies (up to 3s each) and its mat search (up to 5s).
 The ExPutt caps its first 3 reconnect delays at 1s after a session that was
-measuring, then uses the shared backoff.
+measuring, then uses the shared backoff. After a session lost to silence it
+waits 15s before the first attempt and leaves at least 15s between attempts
+until a session succeeds again; it makes one attempt at a time.
 
 **Mevo actor mapping** (from internal phases):
 
@@ -811,7 +813,10 @@ connecting`) and starts measuring with the putting hand from the game state
 (`POST /api/find-mat`, a `FindMat` bus command) has the device locate the mat
 again without reconnecting: `ready` is false until the device is ready again.
 A handedness change from the simulator starts a new round with the new hand,
-which locates the mat the same way.
+which locates the mat the same way. Mat searches are at least 10 s apart (the
+one at session start counts): requests inside that time are folded into one
+search with the latest hand, run when it ends, and a hand changed back to the
+one in effect needs none; `ready` is false while one waits.
 Emits `DeviceTelemetry` with `model: "ExPutt RG"` (and the device software
 version as `firmware` when it was discovered). Telemetry keys: `ready` (true when the device is ready for a
 putt, false from a strike until it is ready again, and false when the
@@ -824,10 +829,17 @@ direction as `launch_azimuth`, `launch_elevation` 0, no spin; `ClubPath` with
 path and face angle when the putter was tracked, none otherwise; simulated in
 Putting mode (rolled on the green). The web layer files it with club `PT` and
 detection mode Putting whatever club is in play. The session is closed on
-stop; a closed connection, or no event for 30 s (60 s after a strike, until
+stop; a closed connection, or no event for 90 s (120 s after a strike, until
 the putt's result or the device is ready again), reconnects with backoff. A
-quiet spell past 10 s logs one warning. `ShotFinished.raw` carries the putt's
-16 values as one text record (transport `exputt-wifi`).
+quiet spell past 10 s logs one warning and makes `ready` false until the
+device sends again (then it is what the device last reported). When
+connection attempts get no answer from a device that accepts them, and
+the first such attempt of an outage is 2 minutes old, one `alert` (`warn`)
+says the ExPutt is not answering and suggests turning it off and on again;
+it is sent once until a session succeeds, and the per-attempt error alerts
+stop meanwhile (attempts that fail another way do not restart the clock).
+`ShotFinished.raw` carries the putt's 16 values as one text record (transport
+`exputt-wifi`).
 
 An OpenConnect client logs a warning at start when an ExPutt is configured
 and its Putting Monitor is unset (Any).
