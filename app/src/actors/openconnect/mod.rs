@@ -46,8 +46,8 @@ use crate::sim;
 use crate::state::SystemState;
 use crate::state::local_clients::LocalClients;
 use flighthook::{
-    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, RawDir, RawPayload, RawRecord,
-    Severity, ShotKey, ShotRaw,
+    ActorStatus, FlighthookEvent, FlighthookMessage, RawDir, RawPayload, RawRecord, Severity,
+    ShotKey, ShotRaw,
 };
 
 /// Cap on buffered bytes from a single peer before the connection is dropped.
@@ -532,8 +532,7 @@ fn emit_shot(
         shot_number: msg.shot_number,
     };
 
-    let handed = state.game.snapshot().handed.unwrap_or(Handedness::Right);
-    let ball = mapper::map_ball(msg, handed);
+    let ball = mapper::map_ball(msg);
     tracing::info!(
         "openconnect <- shot #{}: {:.1}mph VLA={:.1} HLA={:.1} spin={:?}/{:?}",
         msg.shot_number,
@@ -559,7 +558,7 @@ fn emit_shot(
         sender.send(
             FlighthookMessage::new(FlighthookEvent::ClubPath {
                 key: key.clone(),
-                club: Box::new(mapper::map_club(msg, handed)),
+                club: Box::new(mapper::map_club(msg)),
             })
             .raw(payload.clone())
             .device(device),
@@ -638,6 +637,120 @@ mod tests {
                 .all(|f| f.channel.as_deref() == Some("tcp"))
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The shot `emit_shot` puts on the bus for `request` with the game
+    /// state's player `handed`.
+    fn ingested(request: &str, handed: flighthook::Handedness) -> flighthook::ShotData {
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-oc-test-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, writer) = SystemState::new(dir.join("config.toml"));
+        writer.set_handed(handed);
+        let (tx, mut rx) = broadcast::channel(16);
+        let sender = BusSender::new(
+            "openconnect_server.0".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg: api::GsProMessage = serde_json::from_str(request).expect("parses");
+        emit_shot(
+            &state,
+            &msg,
+            &RawPayload::Text(request.into()),
+            shot_raw(request, None),
+            &sender,
+        );
+        let mut acc = None;
+        while let Ok(m) = rx.try_recv() {
+            match m.event {
+                FlighthookEvent::ShotTrigger { key } => {
+                    acc = Some(flighthook::ShotAccumulator::new(m.actor, key));
+                }
+                FlighthookEvent::BallFlight { ball, .. } => {
+                    acc.as_mut().expect("trigger first").set_ball(*ball);
+                }
+                FlighthookEvent::ClubPath { club, .. } => {
+                    acc.as_mut().expect("trigger first").set_club(*club);
+                }
+                FlighthookEvent::FaceImpact { impact, .. } => {
+                    acc.as_mut().expect("trigger first").set_impact(*impact);
+                }
+                _ => {}
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        acc.expect("a shot").finish().expect("shot data")
+    }
+
+    /// A shot with every lateral field set, as components and as a total
+    /// and axis.
+    const LATERAL_SHOTS: [&str; 2] = [
+        r#"{"DeviceID":"TestLM","Units":"Yards","ShotNumber":7,"APIversion":"1","BallData":{"Speed":120.0,"SpinAxis":-13.05,"TotalSpin":2878.5,"BackSpin":2800.0,"SideSpin":-650.0,"HLA":4.2,"VLA":14.0},"ClubData":{"Speed":90.0,"FaceToTarget":2.1,"Path":-3.4,"HorizontalFaceImpact":-6.5,"VerticalFaceImpact":3.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true}}"#,
+        r#"{"DeviceID":"TestLM","Units":"Yards","ShotNumber":8,"APIversion":"1","BallData":{"Speed":120.0,"SpinAxis":-30.0,"TotalSpin":5000.0,"HLA":-2.5,"VLA":14.0},"ClubData":{"Speed":90.0,"FaceToTarget":-1.5,"Path":2.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true}}"#,
+    ];
+
+    /// A left-handed player's shot reaches the bus with the same signs as a
+    /// right-handed one's: the values the monitor sent.
+    #[test]
+    fn left_handed_ingest_puts_the_same_signs_on_the_bus() {
+        for request in LATERAL_SHOTS {
+            let rh = ingested(request, flighthook::Handedness::Right);
+            let lh = ingested(request, flighthook::Handedness::Left);
+            assert_eq!(lh.ball, rh.ball, "{request}");
+            assert_eq!(lh.club, rh.club, "{request}");
+            assert_eq!(lh.impact, rh.impact, "{request}");
+        }
+        let rh = ingested(LATERAL_SHOTS[0], flighthook::Handedness::Right);
+        let (ball, club) = (rh.ball.expect("ball"), rh.club.expect("club"));
+        assert_eq!(ball.launch_azimuth, Some(4.2));
+        assert_eq!(ball.sidespin_rpm, Some(-650));
+        assert_eq!(club.face_angle, Some(2.1));
+        assert_eq!(club.path, Some(-3.4));
+        let rh = ingested(LATERAL_SHOTS[1], flighthook::Handedness::Right);
+        let ball = rh.ball.expect("ball");
+        assert_eq!(ball.sidespin_rpm, Some(-2500));
+        assert_eq!(ball.spin_axis, Some(-30.0));
+    }
+
+    /// A GSPro-protocol monitor relayed through flighthook comes out as it
+    /// went in, for both hands: ingest, then the GSPro bridge's mapping.
+    #[test]
+    fn ingest_then_gspro_output_round_trips_for_both_hands() {
+        for request in LATERAL_SHOTS {
+            let m: api::GsProMessage = serde_json::from_str(request).expect("parses");
+            for handed in [flighthook::Handedness::Right, flighthook::Handedness::Left] {
+                let out = crate::actors::gspro::mapper::map_shot(&ingested(request, handed));
+                let eps = 1e-9;
+                let at = format!("{handed:?} {request}");
+                assert!((out.ball_data.hla - m.ball_data.hla).abs() < eps, "{at}");
+                assert!(
+                    (out.club_data.face_to_target - m.club_data.face_to_target).abs() < eps,
+                    "{at}"
+                );
+                assert!((out.club_data.path - m.club_data.path).abs() < eps, "{at}");
+                assert!(
+                    (out.club_data.horizontal_face_impact - m.club_data.horizontal_face_impact)
+                        .abs()
+                        < eps,
+                    "{at}"
+                );
+                if m.ball_data.side_spin != 0.0 {
+                    assert!(
+                        (out.ball_data.side_spin - m.ball_data.side_spin).abs() < eps,
+                        "{at}"
+                    );
+                } else {
+                    // Decomposed from the total and axis, rounded to whole rpm.
+                    assert!(
+                        (out.ball_data.spin_axis - m.ball_data.spin_axis).abs() < 0.02,
+                        "{at}"
+                    );
+                    assert!(out.ball_data.side_spin < 0.0, "{at}");
+                }
+            }
+        }
     }
 
     #[test]

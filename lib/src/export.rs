@@ -107,8 +107,8 @@ pub fn hex_lower(bytes: &[u8]) -> String {
 /// Raw frames behind one shot.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShotRaw {
-    /// `"flightscope-tcp"`, `"square-ble"`, `"r10-ble"`, `"openconnect-json"`,
-    /// `"none"`.
+    /// `"flightscope-tcp"`, `"square-ble"`, `"r10-ble"`, `"exputt-wifi"`,
+    /// `"openconnect-json"`, `"none"`.
     pub transport: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frames: Vec<RawRecord>,

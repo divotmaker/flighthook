@@ -431,7 +431,13 @@ impl FlighthookApp {
             }
             FlighthookEvent::ShotTrigger { key } => {
                 // The server stamps the club game state has at the trigger,
-                // which is the club this UI shows; `shot_group` confirms it.
+                // which is the club this UI shows (the putter for a putting
+                // device); `shot_group` confirms it.
+                let club_selected = if crate::panels::cards::split_actor_id(&actor).0 == "exputt" {
+                    Some(Club::Putter)
+                } else {
+                    self.selected_club
+                };
                 self.shots.push(ShotRow {
                     actor: actor.clone(),
                     shot_id: key.shot_id.clone(),
@@ -440,7 +446,7 @@ impl FlighthookApp {
                     club: None,
                     impact: None,
                     derived: None,
-                    club_selected: self.selected_club,
+                    club_selected,
                     handed: self.handed,
                     group: None,
                     finished: false,

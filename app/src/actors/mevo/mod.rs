@@ -2376,7 +2376,6 @@ mod tests {
         use crate::actors::gspro::mapper::map_shot;
         use crate::actors::web::export::build_export_line;
         use crate::actors::web::{routes, tests as web};
-        use flighthook::Handedness;
 
         let (web_state, _writer, _dir) = web::test_state();
         let shots = xi_chips();
@@ -2434,7 +2433,7 @@ mod tests {
         assert!(close(club.face_angle.unwrap(), -5.92));
         assert!(close(club.dynamic_loft.unwrap(), 46.31));
         assert!(close(club.smash_factor.unwrap(), 1.29));
-        let gspro = map_shot(shot, Handedness::Right);
+        let gspro = map_shot(shot);
         assert!(gspro.shot_data_options.contains_ball_data);
         assert!(close(gspro.ball_data.speed, 40.141_888_3));
         assert!(close(gspro.club_data.speed, 31.093_466));
@@ -2538,7 +2537,6 @@ mod tests {
     #[test]
     fn zero_club_speed_beside_a_d4_sends_the_club_data() {
         use crate::actors::gspro::mapper::map_shot;
-        use flighthook::Handedness;
 
         let mut club = ClubResult::decode(fixtures::XI_SHOT_ED).unwrap();
         club.pre_club_speed = 0.0;
@@ -2562,7 +2560,7 @@ mod tests {
 
             let sent = completed_shots(&messages);
             assert_eq!(sent.len(), 1);
-            let gspro = map_shot(&sent[0], Handedness::Right);
+            let gspro = map_shot(&sent[0]);
             assert!(gspro.shot_data_options.contains_club_data);
             assert_eq!(gspro.club_data.speed, 0.0);
             assert_eq!(gspro.club_data.face_to_target, -club.face_angle);

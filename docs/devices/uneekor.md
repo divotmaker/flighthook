@@ -26,18 +26,16 @@ Spin arrives one of two ways depending on the monitor: explicit back/side
 components, or a total plus a spin axis. Both are handled, and both FRP pairs
 go onto the bus: the one the monitor sent, and the other computed from it (a
 total and axis decomposed into back/side, or back/side combined into a total
-and axis). Spin axis follows the same handedness conversion as sidespin.
+and axis).
 
 Values the monitor doesn't send (apex, flight time, descent, offline, roll,
 total, and carry when absent) are simulated from the launch, as for every
 device, and marked as simulated; see the README's
 [Simulated values](../../README.md#simulated-values-beta) section. When the
 monitor sends carry, total is that carry plus the simulated roll. Launch
-direction and sidespin arrive golf-semantically (golfer-relative, like GSPro)
-and are converted to flighthook's absolute sign convention using the
-handedness GSPro reports, so the simulated offlines follow the same
-convention as every other device. Set handedness the same in both Uneekor's
-software and GSPro, since flighthook takes handedness from GSPro.
+direction, sidespin, spin axis, face to target and path are taken with the
+monitor's signs: + is right of the target line for either hand, as for every
+other device.
 
 ## Licensing
 

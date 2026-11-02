@@ -1374,6 +1374,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tenover",
+ "threeputt",
  "tokio",
  "toml 0.8.23",
  "tower-http",
@@ -3778,6 +3779,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "threeputt"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47667525f0ca4bd3f05f35fbf7067e38afd34df552f071c747710b5ad42cf447"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "socket2",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

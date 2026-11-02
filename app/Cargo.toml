@@ -41,6 +41,8 @@ dimple = "0.0.7"
 # dimple's vector type, for a ground ball's starting `BallState`; must match the
 # glam version dimple uses (already in the tree through it).
 glam = "0.32"
+# ExPutt RG putting device.
+threeputt = "0.0.1"
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.
@@ -70,6 +72,8 @@ ironsight = { version = "0.5.1", features = ["serde", "testing"] }
 tenover = { version = "0.3.0", features = ["testing"] }
 # allsquare's test support: notification fixtures and encoders.
 allsquare = { version = "0.2.1", features = ["serde", "testing"] }
+# threeputt's test support: an in-process mock device and sample putts.
+threeputt = { version = "0.0.1", features = ["testing"] }
 
 [build-dependencies]
 winresource = "0.1"

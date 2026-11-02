@@ -25,6 +25,7 @@ pub use flighthook::{
     Distance,
     DistanceExt,
     FaceImpact,
+    FindMatRequest,
     FlightPath,
     FlightScopeEnvironment,
     FlighthookConfig,

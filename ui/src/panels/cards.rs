@@ -48,6 +48,7 @@ const ACTOR_TYPES: &[(&str, CardGroup)] = &[
     ("mevo", CardGroup::LaunchMonitors),
     ("r10", CardGroup::LaunchMonitors),
     ("square", CardGroup::LaunchMonitors),
+    ("exputt", CardGroup::LaunchMonitors),
     ("mock_monitor", CardGroup::LaunchMonitors),
     ("openconnect_server", CardGroup::LaunchMonitors),
     ("openconnect_client", CardGroup::Outputs),
@@ -141,6 +142,7 @@ const LAUNCH_MONITOR_PRESETS: &[AddPreset] = &[
     preset("Mevo", "mevo", "Mevo WiFi", "192.168.2.1:5100"),
     preset("R10", "r10", "Garmin R10", ""),
     preset("Square Golf Omni", "square", "Square Golf Omni", ""),
+    preset("ExPutt", "exputt", "ExPutt", ""),
     preset(
         "Uneekor (OpenConnect)",
         "openconnect_server",
@@ -320,6 +322,7 @@ mod tests {
             "mevo",
             "r10",
             "square",
+            "exputt",
             "mock_monitor",
             "openconnect_server",
         ] {
@@ -346,6 +349,7 @@ mod tests {
             mevo: _,
             r10: _,
             square: _,
+            exputt: _,
             mock_monitor: _,
             openconnect_server: _,
             openconnect_client: _,
@@ -356,6 +360,7 @@ mod tests {
             "mevo",
             "r10",
             "square",
+            "exputt",
             "mock_monitor",
             "openconnect_server",
             "openconnect_client",
@@ -380,6 +385,7 @@ mod tests {
             "r10.0",
             "mevo.0",
             "mock_monitor.0",
+            "exputt.0",
             "square.0",
             "custom.0",
         ];
@@ -398,6 +404,7 @@ mod tests {
                         "mevo.1",
                         "r10.0",
                         "square.0",
+                        "exputt.0",
                         "mock_monitor.0",
                         "openconnect_server.0",
                     ]
@@ -430,6 +437,7 @@ mod tests {
                 ("Mevo", "mevo", "Mevo WiFi", "192.168.2.1:5100"),
                 ("R10", "r10", "Garmin R10", ""),
                 ("Square Golf Omni", "square", "Square Golf Omni", ""),
+                ("ExPutt", "exputt", "ExPutt", ""),
                 (
                     "Uneekor (OpenConnect)",
                     "openconnect_server",
@@ -486,7 +494,7 @@ mod tests {
             .collect();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 8);
+        assert_eq!(labels.len(), 9);
     }
 
     #[test]

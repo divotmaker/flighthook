@@ -15,7 +15,7 @@ use crate::panels::cards::{self, CardGroup};
 use crate::panels::monitoring;
 use crate::panels::settings::{self, ActorFormEntry, Pending, PendingRemoval, SaveTarget};
 use crate::theme;
-use crate::types::ActorStatusResponse;
+use crate::types::{ActorStatus, ActorStatusResponse};
 
 /// The side a device card shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -99,6 +99,7 @@ enum CardAction {
     Save,
     Cancel,
     Remove,
+    FindMat,
 }
 
 /// How a device card is drawn.
@@ -124,8 +125,9 @@ struct CardView<'a> {
 /// left out when it reads the same as the name), then the Telemetry |
 /// Settings toggle, or Save and Cancel while its settings have unsaved
 /// edits. The settings side ends in
-/// Remove, except on a web server's card. The left stripe is the actor's
-/// status colour, dim while it is not running.
+/// Remove, except on a web server's card; an ExPutt's telemetry side ends in
+/// Find mat, enabled while the ExPutt is connected. The left stripe is the
+/// actor's status colour, dim while it is not running.
 fn device_card(
     ui: &mut egui::Ui,
     id: &str,
@@ -212,6 +214,14 @@ fn device_card(
             _ => {
                 if let Some(actor) = view.telemetry {
                     monitoring::telemetry_body(ui, id, actor);
+                }
+                if entry_type(id) == "exputt" {
+                    let connected = view
+                        .telemetry
+                        .is_some_and(|a| a.status == ActorStatus::Connected);
+                    if settings::button_row(ui, "Find mat", &format!("find_mat:{id}"), connected) {
+                        action = Some(CardAction::FindMat);
+                    }
                 }
             }
         }
@@ -345,6 +355,7 @@ impl FlighthookApp {
     ) {
         match (action, form) {
             (CardAction::Mode(mode), _) => self.card_modes.set(id, mode),
+            (CardAction::FindMat, _) => net::post_find_mat(ctx, id),
             (CardAction::Save, Some(_)) => self.post_save(ctx, SaveTarget::Actor(id.to_string())),
             (CardAction::Cancel, Some(idx)) => self.cancel_device(idx),
             (CardAction::Remove, Some(idx)) if cards::removable(entry_type(id)) => {
@@ -1125,6 +1136,116 @@ mod tests {
         let marks = screen.frame(&mut app, Vec::new());
         assert!(enabled(&marks, &format!("save:{id}")));
         assert_eq!(bind(&app).as_deref(), Some("127.0.0.1:9921"));
+    }
+
+    #[test]
+    fn an_added_exputt_takes_an_optional_ip_address() {
+        let screen = Screen::new();
+        let mut app = app();
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, "add:Launch monitors");
+        let marks = screen.click_mark(&mut app, &marks, "add:Launch monitors:ExPutt");
+        let id = "exputt.0";
+        let entry = &app.settings.actors[form_index(&app, id)];
+        assert_eq!(entry.name(), "ExPutt");
+        assert_eq!(entry.type_label(), "ExPutt");
+        assert!(enabled(&marks, &format!("ip:{id}")));
+        let field_texts = |app: &mut FlighthookApp| {
+            let (marks, shapes) = screen.painted(app, Vec::new());
+            let (field, _) = marks[&format!("ip:{id}")];
+            shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) if field.contains(t.visual_bounding_rect().center()) => {
+                        Some(t.galley.text().to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // An empty field shows the placeholder, a filled one only its text.
+        assert_eq!(field_texts(&mut app), [settings::EXPUTT_IP_PLACEHOLDER]);
+        assert_eq!(settings::EXPUTT_IP_PLACEHOLDER, "empty = auto-detect");
+        device(&mut app, id).address = "10.0.0.7".into();
+        assert_eq!(field_texts(&mut app), ["10.0.0.7"]);
+        device(&mut app, id).address = String::new();
+        // Blank finds the device on the network.
+        assert!(enabled(&marks, &format!("save:{id}")));
+        let address = |app: &FlighthookApp| {
+            app.settings.build_actor_request(id).exputt["0"]
+                .address
+                .clone()
+        };
+        assert_eq!(address(&app), None);
+
+        device(&mut app, id).address = "192.168.1.50:5000".into();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, &format!("save:{id}")), "an IP, no port");
+
+        device(&mut app, id).address = " 192.168.1.50 ".into();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, &format!("save:{id}")));
+        assert_eq!(address(&app).as_deref(), Some("192.168.1.50"));
+    }
+
+    /// `app()` plus a saved ExPutt, `exputt.0`, with status `status` (not
+    /// running when `None`).
+    fn app_with_exputt(status: Option<ActorStatus>) -> FlighthookApp {
+        let mut app = app();
+        let mut config = app.settings.to_request();
+        config.exputt.insert(
+            "0".into(),
+            flighthook::ExPuttSection {
+                name: "ExPutt".into(),
+                address: None,
+            },
+        );
+        app.settings.load_from(&config);
+        if let Some(status) = status {
+            let mut actor = ActorStatusResponse::new("ExPutt", status);
+            actor.telemetry = HashMap::from([("ready".to_string(), "true".to_string())]);
+            app.actors.insert("exputt.0".into(), actor);
+        }
+        app
+    }
+
+    #[test]
+    fn find_mat_is_on_the_exputt_telemetry_side_and_needs_a_connection() {
+        let screen = Screen::new();
+        let mut app = app_with_exputt(Some(ActorStatus::Connected));
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "find_mat:exputt.0"));
+        let finds: Vec<&String> = marks
+            .keys()
+            .filter(|k| k.starts_with("find_mat:"))
+            .collect();
+        assert_eq!(finds, ["find_mat:exputt.0"], "ExPutt cards only");
+        // Inside its card, under the telemetry.
+        let (card, _) = marks["card:exputt.0"];
+        let (button, _) = marks["find_mat:exputt.0"];
+        assert!(card.contains_rect(button), "{button:?} in {card:?}");
+        let (badge, _) = marks["badge:exputt.0"];
+        assert!(button.top() > badge.bottom());
+
+        for status in [
+            ActorStatus::Starting,
+            ActorStatus::Reconnecting,
+            ActorStatus::Disconnected,
+        ] {
+            let mut app = app_with_exputt(Some(status));
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(!enabled(&marks, "find_mat:exputt.0"), "{status:?}");
+        }
+        let mut app = app_with_exputt(None);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, "find_mat:exputt.0"), "not running");
+
+        // Not on the settings side.
+        let mut app = app_with_exputt(Some(ActorStatus::Connected));
+        app.card_modes.set("exputt.0", CardMode::Settings);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("find_mat:exputt.0"));
+        assert!(enabled(&marks, "remove:exputt.0"));
     }
 
     #[test]

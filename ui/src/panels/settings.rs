@@ -118,6 +118,13 @@ pub(crate) fn is_ble_address(s: &str) -> bool {
     mac || hex_groups(s, '-', &[8, 4, 4, 4, 12]) || advertised_name
 }
 
+/// Whether an optional IP address field is acceptable: blank or an IP
+/// address (no port).
+fn is_ip_or_blank(s: &str) -> bool {
+    let s = s.trim();
+    s.is_empty() || s.parse::<std::net::IpAddr>().is_ok()
+}
+
 /// Clubs with their own Square Golf face impact calibration: every club the
 /// device has a code for except the putter, which has no vertical estimate.
 /// The device is armed with the nearest of these for any other club.
@@ -286,6 +293,33 @@ impl DeviceFormEntry {
         }
     }
 
+    pub(crate) fn from_exputt(id: &str, s: &flighthook::ExPuttSection) -> Self {
+        Self {
+            id: id.into(),
+            monitor_type: "exputt".into(),
+            name: s.name.clone(),
+            address: s.address.clone().unwrap_or_default(),
+            ball_type: 0,
+            tee_height_val: "1.5".into(),
+            tee_height_unit: "inches".into(),
+            range_val: "8".into(),
+            range_unit: "feet".into(),
+            surface_height_val: "0".into(),
+            surface_height_unit: "inches".into(),
+            track_pct: "80".into(),
+            use_estimated: false,
+            camera_mode: CameraMode::default(),
+            environment: FlightScopeEnvironment::default(),
+            spin_source: SpinSource::default(),
+            launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
+            discard_zero_spin: true,
+            square_club: None,
+            square_advanced_spin: None,
+            square_impact_mm: std::collections::HashMap::new(),
+            dirty: false,
+        }
+    }
+
     pub(crate) fn from_openconnect(id: &str, s: &flighthook::OpenConnectServerSection) -> Self {
         Self {
             id: id.into(),
@@ -352,6 +386,12 @@ impl DeviceFormEntry {
         self.monitor_type == "r10"
     }
 
+    /// Whether this device takes an optional IP address. Blank means find
+    /// the device on the network, so blank is valid.
+    pub(crate) fn has_ip_address(&self) -> bool {
+        self.monitor_type == "exputt"
+    }
+
     /// Whether this device takes a TCP `ip:port` address (validated as such).
     pub(crate) fn has_network_address(&self) -> bool {
         self.is_mevo()
@@ -379,6 +419,9 @@ impl DeviceFormEntry {
 
 /// The bind address of an Open Connect server whose bind is blank.
 pub(crate) const OPENCONNECT_BIND: &str = "0.0.0.0:921";
+
+/// Placeholder in an empty ExPutt IP Address field.
+pub(crate) const EXPUTT_IP_PLACEHOLDER: &str = "empty = auto-detect";
 
 /// Per-integration form entry. The `id` is the map index,
 /// `integration_type` encodes which section map it belongs to.
@@ -432,6 +475,7 @@ impl ActorFormEntry {
                 "mevo" => "Mevo",
                 "r10" => "R10",
                 "square" => "Square Golf Omni",
+                "exputt" => "ExPutt",
                 "openconnect_server" => "OpenConnect Server",
                 "mock_monitor" => "Mock",
                 _ => &d.monitor_type,
@@ -452,6 +496,9 @@ impl ActorFormEntry {
                 "r10" => "Garmin R10 — auto-detects from system connected Bluetooth devices",
                 "square" => {
                     "Square Golf Omni — BLE, no pairing required; leave address blank to auto-discover"
+                }
+                "exputt" => {
+                    "ExPutt RG putting device — WiFi; put the device in its mobile mode on the same network. Leave the IP address blank to find it automatically"
                 }
                 "openconnect_server" => {
                     "Accepts inbound shots from any launch monitor that speaks GSPro Open Connect (Uneekor, Foresight, SkyTrak). Bind address, default 0.0.0.0:921 — to share a host with GSPro, move GSPConnect to 922 via OpenAPIUseAltPort"
@@ -551,7 +598,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
     };
     match type_key {
         "mevo" => Some(device(1)),
-        "square" | "r10" | "openconnect_server" => Some(device(0)),
+        "square" | "r10" | "exputt" | "openconnect_server" => Some(device(0)),
         "openconnect_client" => Some(integration()),
         _ => None,
     }
@@ -757,6 +804,11 @@ fn actor_entries(s: &FlighthookConfig) -> Vec<ActorFormEntry> {
     }
     for (id, section) in &s.r10 {
         actors.push(ActorFormEntry::Device(DeviceFormEntry::from_r10(
+            id, section,
+        )));
+    }
+    for (id, section) in &s.exputt {
+        actors.push(ActorFormEntry::Device(DeviceFormEntry::from_exputt(
             id, section,
         )));
     }
@@ -993,6 +1045,7 @@ impl SettingsForm {
             mevo: HashMap::new(),
             r10: HashMap::new(),
             square: HashMap::new(),
+            exputt: HashMap::new(),
             mock_monitor: HashMap::new(),
             openconnect_server: HashMap::new(),
             openconnect_client: HashMap::new(),
@@ -1276,6 +1329,7 @@ fn set_section(to: &mut FlighthookConfig, from: Option<&FlighthookConfig>, globa
         "mevo" => set(&mut to.mevo, from.and_then(|f| f.mevo.get(i)), i),
         "r10" => set(&mut to.r10, from.and_then(|f| f.r10.get(i)), i),
         "square" => set(&mut to.square, from.and_then(|f| f.square.get(i)), i),
+        "exputt" => set(&mut to.exputt, from.and_then(|f| f.exputt.get(i)), i),
         "mock_monitor" => set(
             &mut to.mock_monitor,
             from.and_then(|f| f.mock_monitor.get(i)),
@@ -1314,6 +1368,7 @@ fn section_json(config: &FlighthookConfig, global_id: &str) -> Option<serde_json
         "mevo" => get(&config.mevo, i),
         "r10" => get(&config.r10, i),
         "square" => get(&config.square, i),
+        "exputt" => get(&config.exputt, i),
         "mock_monitor" => get(&config.mock_monitor, i),
         "openconnect_server" => get(&config.openconnect_server, i),
         "openconnect_client" => get(&config.openconnect_client, i),
@@ -1350,6 +1405,10 @@ pub(crate) fn actor_valid(actor: &ActorFormEntry) -> bool {
             // A BLE address is optional — blank means auto-discover.
             let ble = dev.address.trim();
             if dev.has_ble_address() && !ble.is_empty() && !is_ble_address(ble) {
+                return false;
+            }
+            // An IP address is optional — blank finds the device.
+            if dev.has_ip_address() && !is_ip_or_blank(&dev.address) {
                 return false;
             }
             if dev.is_mevo() && launch_only_spin_value(&dev.launch_only_spin).is_none() {
@@ -1428,6 +1487,19 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             dot_bottom_to_face_centre_mm: impact_mm_to_config(
                                 &dev.square_impact_mm,
                             ),
+                        },
+                    );
+                }
+                "exputt" => {
+                    config.exputt.insert(
+                        dev.id.clone(),
+                        flighthook::ExPuttSection {
+                            name: dev.name.clone(),
+                            address: if dev.address.trim().is_empty() {
+                                None
+                            } else {
+                                Some(dev.address.trim().to_string())
+                            },
                         },
                     );
                 }
@@ -1745,11 +1817,17 @@ pub(crate) fn save_error_line(ui: &mut egui::Ui, key: &str, message: &str) {
 
 /// The Remove button closing an actor's settings form, right-aligned.
 pub(crate) fn remove_row(ui: &mut egui::Ui, key: &str, enabled: bool) -> bool {
+    button_row(ui, "Remove", &format!("remove:{key}"), enabled)
+}
+
+/// A right-aligned header-style button closing a card's body. `mark` names
+/// it for the tests.
+pub(crate) fn button_row(ui: &mut egui::Ui, text: &str, mark: &str, enabled: bool) -> bool {
     ui.add_space(4.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-        let remove = ui.add_enabled(enabled, header_button("Remove", false));
-        devices::mark(ui, || format!("remove:{key}"), &remove);
-        remove.clicked()
+        let button = ui.add_enabled(enabled, header_button(text, false));
+        devices::mark(ui, || mark.to_string(), &button);
+        button.clicked()
     })
     .inner
 }
@@ -1851,6 +1929,30 @@ pub(crate) fn actor_fields(
                 let a = dev.address.trim();
                 if !a.is_empty() && !is_ble_address(a) {
                     field_error(ui, "Invalid BLE address");
+                }
+            }
+
+            if dev.has_ip_address() {
+                // IP address — optional; blank finds the device.
+                ui.horizontal(|ui| {
+                    field_label(ui, "IP Address:").on_hover_text(
+                        "IP address of the device on your network. Leave blank to \
+                         find it automatically.",
+                    );
+                    let field = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut dev.address)
+                                .desired_width(field_width - TEXT_EDIT_MARGIN)
+                                .hint_text(EXPUTT_IP_PLACEHOLDER),
+                        )
+                        .on_hover_text("optional, e.g. 192.168.1.50");
+                    devices::mark(ui, || format!("ip:{}.{}", dev.monitor_type, dev.id), &field);
+                    if field.changed() {
+                        dev.dirty = true;
+                    }
+                });
+                if !is_ip_or_blank(&dev.address) {
+                    field_error(ui, "Invalid IP address");
                 }
             }
 
@@ -2669,6 +2771,8 @@ mod tests {
                 "r10.1",
                 "square.0",
                 "square.1",
+                "exputt.0",
+                "exputt.1",
                 "mock_monitor.0",
                 "openconnect_server.0",
                 "openconnect_server.1",

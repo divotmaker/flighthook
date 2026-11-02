@@ -15,6 +15,7 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "face_impact",
     "shot_finished",
     "device_telemetry",
+    "find_mat",
     "actor_status",
     "player_info",
     "club_info",
@@ -38,6 +39,7 @@ const FILTER_GROUPS: &[(&str, &[&str])] = &[
             "face_impact",
             "shot_finished",
             "device_telemetry",
+            "find_mat",
         ],
     ),
     (
@@ -77,6 +79,7 @@ pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
         FlighthookEvent::NewShotGroup => "new_shot_group",
         FlighthookEvent::NewShotSession => "new_shot_session",
         FlighthookEvent::ClearShotHistory => "clear_shot_history",
+        FlighthookEvent::FindMat { .. } => "find_mat",
         FlighthookEvent::ShotGroup { .. } => "shot_group",
         FlighthookEvent::Alert { severity, .. } => match severity {
             Severity::Critical => "alert_critical",
@@ -149,6 +152,7 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
         FlighthookEvent::NewShotGroup => "new set".into(),
         FlighthookEvent::NewShotSession => "new session".into(),
         FlighthookEvent::ClearShotHistory => "clear history".into(),
+        FlighthookEvent::FindMat { target } => format!("find mat {target}"),
         FlighthookEvent::ShotGroup { group, shot } => {
             let club = group
                 .club

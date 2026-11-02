@@ -1,32 +1,26 @@
 //! Shot data -> GSPro message conversion.
 
 use super::api::{BallData, ClubData, GsProMessage, ShotDataOptions};
-use flighthook::{Handedness, ShotData};
+use flighthook::ShotData;
 
 /// Convert a decoded shot into a GSPro Open Connect V1 message.
 ///
-/// FRP uses absolute physical signs (positive = right of target). GSPro uses
-/// golf-semantic signs (positive = in-to-out / open *for that player*). For
-/// left-handed players, lateral fields are negated so the sim sees the shot
-/// from the golfer's perspective.
-pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
+/// FRP lateral signs are absolute: positive = right of the target line, for
+/// left- and right-handed players alike. GSPro takes HLA, SideSpin,
+/// FaceToTarget and Path with the same signs, so they are sent as they are,
+/// whatever the player's handedness.
+pub fn map_shot(shot: &ShotData) -> GsProMessage {
     let contains_ball = shot.ball.is_some();
-    // LH flip: GSPro expects golf-semantic signs, FRP uses absolute physical.
-    let flip = if handed == Handedness::Left {
-        -1.0
-    } else {
-        1.0
-    };
 
     // Ball data: extract from Option<BallFlight>, zero-fill missing fields.
     let (speed, vla, hla, carry_distance, bs, ss) = if let Some(ref b) = shot.ball {
         (
             b.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
             b.launch_elevation.unwrap_or(0.0),
-            b.launch_azimuth.unwrap_or(0.0) * flip,
+            b.launch_azimuth.unwrap_or(0.0),
             b.carry_distance.map(|d| d.as_yards()),
             b.backspin_rpm.unwrap_or(0) as f64,
-            b.sidespin_rpm.unwrap_or(0) as f64 * flip,
+            b.sidespin_rpm.unwrap_or(0) as f64,
         )
     } else {
         (0.0, 0.0, 0.0, None, 0.0, 0.0)
@@ -42,8 +36,8 @@ pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
     // u16 — a saturating cast that would silently turn every toe or low strike
     // into 0.
     //
-    // No handedness flip: toe/heel and high/low are already golfer-relative,
-    // unlike the target-relative fields above.
+    // Toe/heel and high/low are golfer-relative, the same for either hand,
+    // and are sent as they are.
     //
     // GSPro renders a face-impact diagram, so polarity is checkable end to end.
     // Any device-specific correction (e.g. the Square Omni's per-club vertical
@@ -60,9 +54,9 @@ pub fn map_shot(shot: &ShotData, handed: Handedness) -> GsProMessage {
     let club_data = ClubData {
         speed: club.and_then(|c| c.club_speed).map_or(0.0, |v| v.as_mph()),
         angle_of_attack: club.and_then(|c| c.attack_angle).unwrap_or(0.0),
-        face_to_target: club.and_then(|c| c.face_angle).unwrap_or(0.0) * flip,
+        face_to_target: club.and_then(|c| c.face_angle).unwrap_or(0.0),
         loft: club.and_then(|c| c.dynamic_loft).unwrap_or(0.0),
-        path: club.and_then(|c| c.path).unwrap_or(0.0) * flip,
+        path: club.and_then(|c| c.path).unwrap_or(0.0),
         speed_at_impact: club
             .and_then(|c| c.club_speed_post)
             .map_or(0.0, |v| v.as_mph()),
@@ -179,7 +173,6 @@ pub(super) mod tests {
     /// GSPro output for a launch-only shot; `derived` must not change it: no
     /// `CarryDistance` appears.
     pub(in crate::actors::gspro) const GOLDEN_RH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89998400000002,"SpinAxis":-2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":-300.0,"HLA":-1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Lie":0.0,"Loft":0.0,"Path":0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
-    const GOLDEN_LH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89998400000002,"SpinAxis":2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":300.0,"HLA":1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":-0.0,"Lie":0.0,"Loft":0.0,"Path":-0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
 
     #[test]
     fn gspro_output_ignores_derived_values() {
@@ -191,18 +184,12 @@ pub(super) mod tests {
             flight: vec![[0.0, 0.0, 0.0, 0.0], [2.4, 150.9, 28.0, -5.5]],
             ground: vec![[2.4, 150.9, 0.0, -5.5], [3.1, 154.6, 0.0, -5.9]],
         });
-        for (handed, golden) in [
-            (Handedness::Right, GOLDEN_RH),
-            (Handedness::Left, GOLDEN_LH),
-        ] {
-            let without = serde_json::to_string(&map_shot(&square_like_shot(None), handed))
-                .expect("serializes");
-            let with =
-                serde_json::to_string(&map_shot(&square_like_shot(Some(derived.clone())), handed))
-                    .expect("serializes");
-            assert_eq!(without, golden, "{handed:?}");
-            assert_eq!(with, golden, "{handed:?}");
-        }
+        let without =
+            serde_json::to_string(&map_shot(&square_like_shot(None))).expect("serializes");
+        let with =
+            serde_json::to_string(&map_shot(&square_like_shot(Some(derived)))).expect("serializes");
+        assert_eq!(without, GOLDEN_RH);
+        assert_eq!(with, GOLDEN_RH);
     }
 
     #[test]
@@ -219,22 +206,17 @@ pub(super) mod tests {
             derived: Some(derived),
             ..measured.clone()
         };
-        for handed in [Handedness::Right, Handedness::Left] {
-            let without = serde_json::to_string(&map_shot(&measured, handed)).expect("ser");
-            let with = serde_json::to_string(&map_shot(&replacing, handed)).expect("ser");
-            assert_eq!(with, without, "{handed:?}");
-            assert_eq!(
-                map_shot(&replacing, handed).ball_data.carry_distance,
-                Some(171.0)
-            );
-        }
+        let without = serde_json::to_string(&map_shot(&measured)).expect("ser");
+        let with = serde_json::to_string(&map_shot(&replacing)).expect("ser");
+        assert_eq!(with, without);
+        assert_eq!(map_shot(&replacing).ball_data.carry_distance, Some(171.0));
     }
 
     #[test]
     fn face_impact_reaches_gspro_with_sign_intact() {
         // A toe-side, low strike. Both values are negative in FRP terms; a
         // saturating u16 conversion would silently report 0.0 for both.
-        let msg = map_shot(&shot_with_impact(-32.19, -17.43), Handedness::Right);
+        let msg = map_shot(&shot_with_impact(-32.19, -17.43));
         assert!((msg.club_data.horizontal_face_impact - -32.19).abs() < 1e-9);
         assert!((msg.club_data.vertical_face_impact - -17.43).abs() < 1e-9);
         assert!(msg.shot_data_options.contains_club_data);
@@ -248,7 +230,7 @@ pub(super) mod tests {
         let mut shot = shot_with_impact(-32.19, -17.43);
         shot.club = None;
         shot.impact = None;
-        let msg = map_shot(&shot, Handedness::Right);
+        let msg = map_shot(&shot);
         assert!(msg.shot_data_options.contains_ball_data);
         assert!(msg.shot_data_options.contains_club_data);
         assert_eq!(msg.club_data.speed, 0.0);
@@ -258,28 +240,23 @@ pub(super) mod tests {
         assert_eq!(msg.club_data.horizontal_face_impact, 0.0);
     }
 
+    /// Every lateral field goes out with the shot's own absolute sign, and
+    /// face impact as it is.
     #[test]
-    fn face_impact_is_not_flipped_for_left_handers() {
-        // Toe/heel and high/low are already golfer-relative, unlike the
-        // target-relative fields, which do flip.
-        let shot = shot_with_impact(-32.19, -17.43);
-        let rh = map_shot(&shot, Handedness::Right);
-        let lh = map_shot(&shot, Handedness::Left);
-        assert_eq!(
-            rh.club_data.horizontal_face_impact,
-            lh.club_data.horizontal_face_impact
-        );
-        assert_eq!(
-            rh.club_data.vertical_face_impact,
-            lh.club_data.vertical_face_impact
-        );
-        // ...whereas path does flip.
-        assert_eq!(rh.club_data.path, -lh.club_data.path);
+    fn lateral_fields_and_face_impact_go_out_unchanged() {
+        let msg = map_shot(&shot_with_impact(-32.19, -17.43));
+        assert_eq!(msg.ball_data.hla, 7.39);
+        assert_eq!(msg.ball_data.side_spin, -87.0);
+        assert!(msg.ball_data.spin_axis < 0.0);
+        assert_eq!(msg.club_data.face_to_target, 8.13);
+        assert_eq!(msg.club_data.path, 4.45);
+        assert_eq!(msg.club_data.horizontal_face_impact, -32.19);
+        assert_eq!(msg.club_data.vertical_face_impact, -17.43);
     }
 
     #[test]
     fn serialized_json_carries_every_gspro_club_field() {
-        let msg = map_shot(&shot_with_impact(-32.19, -17.43), Handedness::Right);
+        let msg = map_shot(&shot_with_impact(-32.19, -17.43));
         let json = serde_json::to_string(&msg).expect("serializes");
         for field in [
             "Speed",
@@ -315,22 +292,19 @@ pub(super) mod tests {
             }),
             ..ShotData::default()
         };
-        for handed in [Handedness::Right, Handedness::Left] {
-            let b = map_shot(&chip(Some(1570), Some(0)), handed).ball_data;
-            assert_eq!(
-                (b.total_spin, b.back_spin, b.side_spin),
-                (1570.0, 1570.0, 0.0)
-            );
+        let b = map_shot(&chip(Some(1570), Some(0))).ball_data;
+        assert_eq!(
+            (b.total_spin, b.back_spin, b.side_spin),
+            (1570.0, 1570.0, 0.0)
+        );
+        assert_eq!(b.spin_axis, 0.0);
+        assert_eq!(b.carry_distance, None);
+        for (back, side) in [(Some(0), Some(0)), (None, None)] {
+            let b = map_shot(&chip(back, side)).ball_data;
+            assert_eq!((b.total_spin, b.back_spin, b.side_spin), (0.0, 0.0, 0.0));
             assert_eq!(b.spin_axis, 0.0);
-            assert_eq!(b.carry_distance, None);
-            for (back, side) in [(Some(0), Some(0)), (None, None)] {
-                let b = map_shot(&chip(back, side), handed).ball_data;
-                assert_eq!((b.total_spin, b.back_spin, b.side_spin), (0.0, 0.0, 0.0));
-                assert_eq!(b.spin_axis, 0.0);
-            }
         }
-        let json = serde_json::to_string(&map_shot(&chip(Some(1570), Some(0)), Handedness::Right))
-            .expect("serialize");
+        let json = serde_json::to_string(&map_shot(&chip(Some(1570), Some(0)))).expect("serialize");
         assert!(
             json.contains(r#""SpinAxis":0.0,"TotalSpin":1570.0,"BackSpin":1570.0,"SideSpin":0.0"#),
             "{json}"

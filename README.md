@@ -21,6 +21,7 @@ Each device links to its setup notes, quirks, and config reference.
 | [FlightScope Xi](docs/devices/flightscope.md)        | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
 | [Square Golf Omni](docs/devices/square-golf.md)      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Supported        |
 | [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
+| ExPutt RG                                            | WiFi                    | [threeputt](https://crates.io/crates/threeputt) | Alpha            |
 | [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (OpenConnect server)                   | Alpha (untested) |
 
 Uneekor connects through the **OpenConnect server** actor, which accepts shots
@@ -429,6 +430,11 @@ DR = 15.0
 name = "Garmin R10"
 range = "7ft"                  # device-to-ball distance, sent as tee distance
 
+[exputt.0]
+name = "ExPutt"
+# address is optional — omit it to find the device on the network.
+address = "192.168.1.50"
+
 [openconnect_client.0]
 name = "GSPro"
 address = "127.0.0.1:921"
@@ -439,7 +445,7 @@ address = "127.0.0.1:9210"
 ```
 
 `[simulation]` is a single global table. Section prefixes encode component
-type: `webserver`, `mevo`, `r10`, `square`,
+type: `webserver`, `mevo`, `r10`, `square`, `exputt`,
 `openconnect_server`, `mock_monitor`, `openconnect_client`, `random_club`. The
 index after the dot (`0`, `1`, ...) identifies the instance. Per-device
 options are covered in the [device docs](#launch-monitors). Settings can also

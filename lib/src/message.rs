@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRaw};
 use crate::{ClubInfo, GroupedShot, PlayerInfo, ShotGroupInfo, ShotGrouping};
 use crate::{
-    FlighthookConfig, MevoSection, MockMonitorSection, OpenConnectClientSection,
+    ExPuttSection, FlighthookConfig, MevoSection, MockMonitorSection, OpenConnectClientSection,
     OpenConnectServerSection, R10Section, RandomClubSection, SquareSection, WebserverSection,
 };
 
@@ -257,6 +257,9 @@ pub enum FlighthookEvent {
     /// session. Every web layer clears its history, and every UI that sees
     /// it clears its shot list.
     ClearShotHistory,
+    /// Command: the ExPutt actor `target` (e.g. `exputt.0`) has its device
+    /// locate the mat again. Emitted by `POST /api/find-mat`.
+    FindMat { target: String },
     /// A shot group record changed: created, a shot joined, closed, or a shot
     /// left the history. Emitted by the web layer.
     ShotGroup {
@@ -328,6 +331,11 @@ pub enum ConfigAction {
         index: String,
         section: SquareSection,
     },
+    #[serde(rename = "upsert_exputt")]
+    UpsertExPutt {
+        index: String,
+        section: ExPuttSection,
+    },
     UpsertOpenConnectServer {
         index: String,
         section: OpenConnectServerSection,
@@ -361,6 +369,26 @@ pub enum ConfigAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exputt_upsert_round_trips_as_upsert_exputt() {
+        let action = ConfigAction::UpsertExPutt {
+            index: "0".into(),
+            section: ExPuttSection {
+                name: "ExPutt".into(),
+                address: Some("192.168.1.50".into()),
+            },
+        };
+        let json = serde_json::to_string(&action).expect("ser");
+        assert_eq!(
+            json,
+            r#"{"type":"upsert_exputt","index":"0","section":{"name":"ExPutt","address":"192.168.1.50"}}"#
+        );
+        let back: ConfigAction = serde_json::from_str(&json).expect("de");
+        assert!(
+            matches!(back, ConfigAction::UpsertExPutt { section, .. } if section.address.is_some())
+        );
+    }
 
     #[test]
     fn device_event_envelope() {
@@ -479,6 +507,20 @@ mod tests {
             serde_json::from_str(r#"{"actor":"web","event":{"kind":"clear_shot_history"}}"#)
                 .unwrap();
         assert!(matches!(back.event, FlighthookEvent::ClearShotHistory));
+    }
+
+    #[test]
+    fn find_mat_names_its_target() {
+        let event = FlighthookEvent::FindMat {
+            target: "exputt.0".into(),
+        };
+        let json = serde_json::to_string(&envelope(event)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"actor":"web","event":{"kind":"find_mat","target":"exputt.0"}}"#
+        );
+        let back: FlighthookMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.event, FlighthookEvent::FindMat { target } if target == "exputt.0"));
     }
 
     fn group_info() -> ShotGroupInfo {

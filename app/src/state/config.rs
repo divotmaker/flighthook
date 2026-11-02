@@ -134,6 +134,7 @@ impl LegacyFlighthookConfig {
             mevo: self.mevo,
             r10: HashMap::new(),
             square: HashMap::new(),
+            exputt: HashMap::new(),
             mock_monitor: self.mock_monitor,
             openconnect_server: HashMap::new(),
             openconnect_client: self.gspro,

@@ -376,6 +376,7 @@ async fn run(
         .route("/api/club", post(routes::post_club))
         .route("/api/mode", post(routes::post_mode))
         .route("/api/auto-chip", post(routes::post_auto_chip))
+        .route("/api/find-mat", post(routes::post_find_mat))
         .route(
             "/api/settings",
             get(routes::get_settings).post(routes::post_settings),
@@ -425,11 +426,20 @@ async fn state_updater(state: Arc<WebState>, mut bus_rx: broadcast::Receiver<Fli
     }
 }
 
+/// Whether `actor` is a device that only measures putts: its shots are putter
+/// shots whatever club is in play.
+fn is_putting_device(actor: &str) -> bool {
+    actor
+        .split_once('.')
+        .is_some_and(|(prefix, _)| prefix == "exputt")
+}
+
 /// Stable device kind for an actor type prefix.
 fn device_kind(prefix: &str) -> &str {
     match prefix {
         "mevo" => "flightscope",
         "square" => "square_golf",
+        "exputt" => "exputt",
         "r10" => "garmin_r10",
         "openconnect_server" => "openconnect",
         "mock_monitor" => "mock",
@@ -452,6 +462,7 @@ fn device_section(
     let mut section = match prefix {
         "mevo" => value(config.mevo.get(index)),
         "square" => value(config.square.get(index)),
+        "exputt" => value(config.exputt.get(index)),
         "r10" => value(config.r10.get(index)),
         "openconnect_server" => value(config.openconnect_server.get(index)),
         "mock_monitor" => value(config.mock_monitor.get(index)),
@@ -524,9 +535,12 @@ async fn shot_context(
         device,
         club_selected,
         handed: game.handed,
-        // An Auto-chip is simulated as a chip whatever the game mode.
+        // An Auto-chip is simulated as a chip whatever the game mode, and a
+        // putting device's shot as a putt.
         detection_mode: if msg.actor == flighthook::AUTO_CHIP_ACTOR {
             Some(ShotDetectionMode::Chipping)
+        } else if is_putting_device(&msg.actor) {
+            Some(ShotDetectionMode::Putting)
         } else {
             game.mode
         },
@@ -644,7 +658,11 @@ async fn apply_bus_event(
             // changes during the flight apply to the next shot.
             let (club, (group, changes)) = {
                 let mut groups = state.groups.write().await;
-                let club = groups.selected_club();
+                let club = if is_putting_device(&msg.actor) {
+                    Some(Club::Putter)
+                } else {
+                    groups.selected_club()
+                };
                 let key_for_group = GroupKey { golfer: None, club };
                 (club, groups.assign(key_for_group, &now_rfc3339()))
             };
@@ -2141,6 +2159,31 @@ pub(crate) mod tests {
         assert_eq!(events.len(), 1, "the join only: {events:?}");
         assert_eq!(events[0].1.id, group);
         assert_eq!(events[0].1.shots, u32::try_from(MAX_SHOTS).expect("fits"));
+    }
+
+    /// A putting device's shot is a putter shot, filed in a putter set,
+    /// whatever club is in play; other devices keep the club in play.
+    #[tokio::test]
+    async fn an_exputt_shot_is_a_putt_whatever_club_is_in_play() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.club(&writer, Club::Iron7).await;
+        writer.set_mode(ShotDetectionMode::Full);
+        up.shot_as("square.0", key_id(1, "omni")).await;
+        up.shot_as("exputt.0", key_id(1, "putt")).await;
+
+        let shots = state.shots.read().await;
+        let omni = &shots[0];
+        let putt = &shots[1];
+        assert_eq!(omni.data.club_selected, Some(Club::Iron7));
+        assert_eq!(omni.context.detection_mode, Some(ShotDetectionMode::Full));
+        assert_eq!(putt.data.club_selected, Some(Club::Putter));
+        assert_eq!(
+            putt.context.detection_mode,
+            Some(ShotDetectionMode::Putting)
+        );
+        assert_eq!(putt.context.device.kind, "exputt");
+        assert_ne!(omni.data.group, putt.data.group, "a putter set");
     }
 
     #[tokio::test]

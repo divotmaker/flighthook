@@ -192,6 +192,8 @@ pub struct FlighthookConfig {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub square: std::collections::HashMap<String, SquareSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub exputt: std::collections::HashMap<String, ExPuttSection>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub mock_monitor: std::collections::HashMap<String, MockMonitorSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub openconnect_server: std::collections::HashMap<String, OpenConnectServerSection>,
@@ -716,6 +718,18 @@ pub struct SquareSection {
     pub dot_bottom_to_face_centre_mm: Option<std::collections::BTreeMap<String, f64>>,
 }
 
+/// An ExPutt RG putting device instance, reached over WiFi. The device must
+/// be in its mobile mode on the same network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExPuttSection {
+    #[serde(default)]
+    pub name: String,
+    /// IP address of the device. When absent, the device is found on the
+    /// local network automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
 fn is_none_or_empty_map(m: &Option<std::collections::BTreeMap<String, f64>>) -> bool {
     m.as_ref().is_none_or(std::collections::BTreeMap::is_empty)
 }
@@ -799,6 +813,7 @@ impl FlighthookConfig {
         !self.mevo.is_empty()
             || !self.r10.is_empty()
             || !self.square.is_empty()
+            || !self.exputt.is_empty()
             || !self.mock_monitor.is_empty()
             || !self.openconnect_server.is_empty()
             || !self.openconnect_client.is_empty()
@@ -828,6 +843,7 @@ impl Default for FlighthookConfig {
             mevo: std::collections::HashMap::new(),
             r10: std::collections::HashMap::new(),
             square: std::collections::HashMap::new(),
+            exputt: std::collections::HashMap::new(),
             mock_monitor: std::collections::HashMap::new(),
             openconnect_server: std::collections::HashMap::new(),
             openconnect_client: std::collections::HashMap::new(),
@@ -875,6 +891,16 @@ impl Default for SquareSection {
             advanced_spin: None,
             discard_non_putting_zero_spin: Some(true),
             dot_bottom_to_face_centre_mm: None,
+        }
+    }
+}
+
+impl Default for ExPuttSection {
+    fn default() -> Self {
+        Self {
+            name: "ExPutt".into(),
+            // Found on the network automatically.
+            address: None,
         }
     }
 }
@@ -1377,6 +1403,10 @@ mod openconnect_client_tests {
             mevo: one(MevoSection::default()),
             r10: one(R10Section::default()),
             square: one(SquareSection::default()),
+            exputt: one(ExPuttSection {
+                name: "Putting".into(),
+                address: Some("192.168.1.50".into()),
+            }),
             mock_monitor: one(MockMonitorSection {
                 name: "Mock".into(),
             }),

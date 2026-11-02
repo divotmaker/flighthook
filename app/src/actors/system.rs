@@ -333,6 +333,13 @@ pub(crate) fn handle_config_command(
             });
             scope = Some(format!("square.{index}"));
         }
+        ConfigAction::UpsertExPutt { index, section } => {
+            let idx = index.clone();
+            state.system.update(|p| {
+                p.exputt.insert(idx, section.clone());
+            });
+            scope = Some(format!("exputt.{index}"));
+        }
         ConfigAction::UpsertOpenConnectServer { index, section } => {
             let idx = index.clone();
             state.system.update(|p| {
@@ -374,6 +381,9 @@ pub(crate) fn handle_config_command(
                     }
                     "square" => {
                         p.square.remove(&idx);
+                    }
+                    "exputt" => {
+                        p.exputt.remove(&idx);
                     }
                     "openconnect_server" => {
                         p.openconnect_server.remove(&idx);

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use super::types::{
-    AutoChipRequest, AutoChipResponse, ClubRequest, GroupingRequest, ModeRequest,
+    AutoChipRequest, AutoChipResponse, ClubRequest, FindMatRequest, GroupingRequest, ModeRequest,
     PostSettingsResponse, ShotGroupsResponse, StatusResponse,
 };
 use super::{MAX_SHOTS, StoredShot, WebState, export};
@@ -291,6 +291,34 @@ pub async fn post_club(
     StatusCode::ACCEPTED.into_response()
 }
 
+/// POST /api/find-mat — have the ExPutt `actor` locate its mat again.
+///
+/// Emits `find_mat` on the bus (actor `web`); the ExPutt actor acts on it
+/// while it is measuring. 404 with a text body when no ExPutt has that ID.
+pub async fn post_find_mat(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<FindMatRequest>,
+) -> Response {
+    let configured = body
+        .actor
+        .strip_prefix("exputt.")
+        .is_some_and(|index| state.root.system.snapshot().exputt.contains_key(index));
+    if !configured {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )
+            .body(Body::from(format!("no ExPutt with ID '{}'", body.actor)))
+            .unwrap();
+    }
+    let _ = state
+        .bus_tx
+        .send(FlighthookMessage::new(FlighthookEvent::FindMat { target: body.actor }).actor("web"));
+    StatusCode::ACCEPTED.into_response()
+}
+
 /// GET /api/shots/groups — this webserver's shot sets, the current session
 /// and the default view.
 pub async fn get_shot_groups(State(state): State<Arc<WebState>>) -> Json<ShotGroupsResponse> {
@@ -450,6 +478,7 @@ fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction>
         "mevo" => upsert!(mevo, UpsertMevo),
         "r10" => upsert!(r10, UpsertR10),
         "square" => upsert!(square, UpsertSquare),
+        "exputt" => upsert!(exputt, UpsertExPutt),
         "openconnect_server" => upsert!(openconnect_server, UpsertOpenConnectServer),
         "openconnect_client" => upsert!(openconnect_client, UpsertOpenConnectClient),
         "mock_monitor" => upsert!(mock_monitor, UpsertMockMonitor),
@@ -1045,6 +1074,54 @@ mod group_tests {
             "{text}"
         );
         assert!(text.ends_with(", LW, PT"), "{text}");
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+    }
+
+    #[tokio::test]
+    async fn post_find_mat_emits_find_mat_for_a_configured_exputt() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.exputt
+                .insert("0".into(), flighthook::ExPuttSection::default());
+        });
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        let resp = post_find_mat(
+            State(Arc::clone(&state)),
+            Json(FindMatRequest {
+                actor: "exputt.0".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let msg = next_event(&mut rx);
+        assert_eq!(msg.actor, "web");
+        assert!(matches!(msg.event, FlighthookEvent::FindMat { target } if target == "exputt.0"));
+    }
+
+    #[tokio::test]
+    async fn post_find_mat_rejects_an_unknown_exputt() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.exputt
+                .insert("0".into(), flighthook::ExPuttSection::default());
+        });
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        for actor in ["exputt.1", "square.0", "exputt"] {
+            let resp = post_find_mat(
+                State(Arc::clone(&state)),
+                Json(FindMatRequest {
+                    actor: actor.into(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{actor}");
+            assert_eq!(
+                body_text(resp).await,
+                format!("no ExPutt with ID '{actor}'")
+            );
+        }
         assert!(rx.try_recv().is_err(), "nothing emitted");
     }
 

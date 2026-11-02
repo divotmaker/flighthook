@@ -1,6 +1,7 @@
 //! Actor infrastructure — shared trait, bus helpers, and actor resolution.
 
 pub(crate) mod backoff;
+pub mod exputt;
 pub mod gspro;
 pub mod mevo;
 pub mod mock;
@@ -175,6 +176,23 @@ pub fn resolve_actors(
         });
     }
 
+    // ExPutt putting devices
+    for (index, section) in &config.exputt {
+        let id = global_id("exputt", index);
+        match exputt::parse_address(section.address.as_deref()) {
+            Ok(address) => {
+                actors.push(ResolvedActor {
+                    id,
+                    name: section.name.clone(),
+                    actor: Box::new(exputt::ExPuttActor { address }),
+                });
+            }
+            Err(e) => {
+                tracing::warn!("device '{id}': {e}");
+            }
+        }
+    }
+
     // Mock monitors
     for (index, section) in &config.mock_monitor {
         let id = global_id("mock_monitor", index);
@@ -264,6 +282,9 @@ pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String> {
     }
     for (index, section) in &config.square {
         names.insert(global_id("square", index), section.name.clone());
+    }
+    for (index, section) in &config.exputt {
+        names.insert(global_id("exputt", index), section.name.clone());
     }
     for (index, section) in &config.mock_monitor {
         names.insert(global_id("mock_monitor", index), section.name.clone());

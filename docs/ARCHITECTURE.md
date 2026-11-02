@@ -40,6 +40,8 @@ address = "127.0.0.1:921"
 - `[mevo.<idx>]` -- FlightScope device instance (Mevo/Mevo+, or Xi — detected at connect)
 - `[r10.<idx>]` -- Garmin R10 BLE device instance (auto-discovers via Bluetooth)
 - `[square.<idx>]` -- Square Golf Omni BLE device instance
+- `[exputt.<idx>]` -- ExPutt RG putting device over WiFi (optional IP address;
+  found on the local network when absent)
 - `[openconnect_server.<idx>]` -- OpenConnect server: GSPro Open Connect ingest listener (Uneekor)
 - `[mock_monitor.<idx>]` -- mock launch monitor instance
 - `[openconnect_client.<idx>]` -- OpenConnect client: dials a simulator that
@@ -96,6 +98,8 @@ address = "127.0.0.1:921"
   the config at the default
 - R10 sections show name and Monitor-to-Ball (`range`, sent to the device as
   its tee distance; BLE auto-discovery, no address field)
+- ExPutt sections show name and an optional IP Address (blank finds the
+  device on the network); the putting hand follows the game's handedness
 - Mock sections show only name (no address or radar fields)
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `openconnect_client.0`)
 - WebSocket actor IDs = `"ws.{8-hex-chars}"`
@@ -160,6 +164,7 @@ pub struct FlighthookConfig {
     pub mevo: HashMap<String, MevoSection>,
     pub r10: HashMap<String, R10Section>,
     pub square: HashMap<String, SquareSection>,
+    pub exputt: HashMap<String, ExPuttSection>,
     pub mock_monitor: HashMap<String, MockMonitorSection>,
     pub openconnect_server: HashMap<String, OpenConnectServerSection>,
     pub openconnect_client: HashMap<String, OpenConnectClientSection>,  // `gspro` also read
@@ -176,6 +181,7 @@ pub enum FlightScopeEnvironment { LimitedFlight, Outdoor }
 pub enum SpinSource { D4, E8, Auto }
 pub struct R10Section { pub name: String, pub range: Option<Distance> }
 pub struct SquareSection { pub name: String, pub address: Option<String>, pub club: Option<Club>, pub advanced_spin: Option<bool>, pub discard_non_putting_zero_spin: Option<bool> }
+pub struct ExPuttSection { pub name: String, pub address: Option<String> }
 pub struct MockMonitorSection { pub name: String }
 pub struct OpenConnectServerSection { pub name: String, pub bind: Option<String> }
 pub struct OpenConnectClientSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
@@ -502,6 +508,7 @@ the ring and every cap.
 | FlightScope | ironsight `set_on_recv` / `set_on_send` (the same hooks log hex and keep the last D4) | BALL TRIGGER to the device re-armed, both directions | what ironsight classifies as identity-bearing (`protocol::carries_identity`): status/keepalive, device and product info, DSP query, network config, WiFi scan, calibration, sensor activation, time sync, AVR config query | 8 | 256 | 128 KiB (PRC, club PRC, speed profile) |
 | Square Golf | `Tap<T>` around the allsquare transport; characteristic reads are never recorded | pre-roll through the shot event; enabled after the identity exchange | heartbeats and acks, query reply | 64 | 64 | 0 |
 | R10 | `Tap<T>` around the tenover transport; a per-direction tenover `capture::IdentityFilter` holds each chunk until the GFDI frames it carries are complete and classified | pre-roll through the shot event; enabled at `HandshakeComplete` | what tenover classifies as identity-bearing: every chunk carrying part of a device information, FIT/file transfer or authentication frame, an ACK of one, or a frame that does not decode | 256 | 256 | 0 |
+| ExPutt | none: the putt's 16 values, comma-separated, as one text record (`transport = "exputt-wifi"`) | the putt | none | - | 1 | 0 |
 | Open Connect | the inbound JSON text and our reply | the one message | none | - | - | - |
 | Mock | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
 
@@ -605,8 +612,9 @@ The `SystemActor` auto-derives detection mode from `ClubInfo` (using
 need to emit `ClubInfo`; the SystemActor handles mode derivation
 centrally. Launch monitor actors react to `SetDetectionMode` events to reconfigure
 the device — they latch the mode and only re-arm when the mode actually changes.
-Handed-only updates (mode omitted) do not trigger re-arming. Mode is global
-state, not per-device.
+Handed-only updates (mode omitted) do not re-arm a launch monitor; the ExPutt
+starts a new round, which re-locates the mat. Mode is global state, not
+per-device.
 
 ### DeviceTelemetry / ActorStatus split
 
@@ -660,6 +668,7 @@ pub enum ConfigAction {
     UpsertMevo { index: String, section: MevoSection },
     UpsertR10 { index: String, section: R10Section },
     UpsertSquare { index: String, section: SquareSection },
+    UpsertExPutt { index: String, section: ExPuttSection },          // "upsert_exputt"
     UpsertOpenConnectServer { index: String, section: OpenConnectServerSection },
     UpsertOpenConnectClient { index: String, section: OpenConnectClientSection },  // `upsert_gs_pro` also read
     UpsertWebserver { index: String, section: WebserverSection },
@@ -765,14 +774,18 @@ receipt on its own clock), then applies live `actor_status` events and
 
 All actors use linear backoff on connection failure: starts at 1s, adds 1s per
 failed attempt, capped at 15s (3s for the OpenConnect client, a loopback/LAN
-TCP connect). The OpenConnect client and Square Golf actors restart at 1s after a connection
+TCP connect). The OpenConnect client, Square Golf and ExPutt actors restart at 1s after a connection
 that lasted at least 10s; one that drops sooner counts as a failed attempt, so
 a link that keeps connecting and dropping still backs off to the cap. The
 OpenConnect server restarts at 1s after a successful bind. The Mevo and R10
-actors keep the grown delay. The OpenConnect client, Square Golf, Mevo and R10 actors poll
+actors keep the grown delay. The OpenConnect client, Square Golf, ExPutt, Mevo and R10 actors poll
 their shutdown flag during the backoff wait, so stopping one never waits out
 the delay; the OpenConnect server sleeps through its bind retry delay, and the
 OpenConnect client's TCP connect attempt (up to 5s) is not interrupted by a stop.
+Neither is the ExPutt's session start: the TCP connect (up to 3s), the
+device's two handshake replies (up to 3s each) and its mat search (up to 5s).
+The ExPutt caps its first 3 reconnect delays at 1s after a session that was
+measuring, then uses the shared backoff.
 
 **Mevo actor mapping** (from internal phases):
 
@@ -789,6 +802,35 @@ Emits `Starting` while scanning/connecting, `Connected` after handshake
 completes. Emits `DeviceTelemetry` with `manufacturer: "Garmin"`,
 `model: "R10"`. Telemetry keys: `ready`, `tilt`, `roll`, `device_state`
 (`waiting` | `recording` | `processing`). Uses BLE address as FRP device ID.
+
+**ExPutt actor**: runs a `threeputt::Session` on its own thread. With no
+address it waits for the device to announce itself on the network
+(`actor_status` `starting`, `phase: discovering`), then connects (`phase:
+connecting`) and starts measuring with the putting hand from the game state
+(`connected`, `phase: measuring`). The device card's Find mat button
+(`POST /api/find-mat`, a `FindMat` bus command) has the device locate the mat
+again without reconnecting: `ready` is false until the device is ready again.
+A handedness change from the simulator starts a new round with the new hand,
+which locates the mat the same way.
+Emits `DeviceTelemetry` with `model: "ExPutt RG"` (and the device software
+version as `firmware` when it was discovered). Telemetry keys: `ready` (true when the device is ready for a
+putt, false from a strike until it is ready again, and false when the
+connection is lost, before `reconnecting`), `device_state` (`finding mat` |
+`mat found` | `ready` | `ball struck`; a putt result changes neither key).
+After 30 s of discovery without finding the device, one `alert` (`warn`)
+suggests entering its IP address on the device card.
+FRP device ID `"ExPutt RG (<ip>)"`. Each putt is a shot: ball speed, launch
+direction as `launch_azimuth`, `launch_elevation` 0, no spin; `ClubPath` with
+path and face angle when the putter was tracked, none otherwise; simulated in
+Putting mode (rolled on the green). The web layer files it with club `PT` and
+detection mode Putting whatever club is in play. The session is closed on
+stop; a closed connection, or no event for 30 s (60 s after a strike, until
+the putt's result or the device is ready again), reconnects with backoff. A
+quiet spell past 10 s logs one warning. `ShotFinished.raw` carries the putt's
+16 values as one text record (transport `exputt-wifi`).
+
+An OpenConnect client logs a warning at start when an ExPutt is configured
+and its Putting Monitor is unset (Any).
 
 **OpenConnect client actor** (GSPro, Muni Golf, ...): emits `Starting` before
 first TCP connect attempt, `Connected` on success. Connection loss after a
@@ -1143,7 +1185,7 @@ Groups and order (`ui/src/panels/cards.rs`):
 | Group | Cards, in order | (+) offers |
 |---|---|---|
 | General | Global card, Simulation card, `webserver` | -- (no (+)) |
-| Launch monitors | `mevo`, `r10`, `square`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, Uneekor (OpenConnect), OpenConnect Server |
+| Launch monitors | `mevo`, `r10`, `square`, `exputt`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, ExPutt, Uneekor (OpenConnect), OpenConnect Server |
 | Outputs | `openconnect_client`, `random_club` (and any type the UI does not know) | GSPro (OpenConnect), Muni Golf (OpenConnect), OpenConnect Client |
 
 Each (+) entry is a preset (`cards::AddPreset`): an actor type plus the new

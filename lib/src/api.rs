@@ -124,6 +124,12 @@ pub struct PostSettingsResponse {
     pub stopped: Vec<String>,
 }
 
+/// POST /api/find-mat request body: the ExPutt's actor ID, e.g. `exputt.0`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FindMatRequest {
+    pub actor: String,
+}
+
 /// POST /api/club request body. `club` is a club code, parsed leniently with
 /// [`Club::from_code`].
 #[derive(Debug, Clone, Deserialize, Serialize)]

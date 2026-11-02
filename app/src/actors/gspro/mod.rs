@@ -35,8 +35,8 @@ use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use crate::state::local_clients::LocalClients;
 use flighthook::{
-    ActorStatus, FlighthookEvent, FlighthookMessage, Handedness, ShotAccumulator, ShotData,
-    ShotDetectionMode, ShotKey,
+    ActorStatus, FlighthookEvent, FlighthookMessage, ShotAccumulator, ShotData, ShotDetectionMode,
+    ShotKey,
 };
 
 /// Bridge-internal error type.
@@ -81,6 +81,9 @@ impl Actor for GsProActor {
         let routing = self.routing.clone();
         let clients = Arc::clone(&state.local_clients);
         let thread_name = format!("gspro:{}", sender.actor_id());
+        if let Some(warning) = putting_routing_warning(&state.system.snapshot(), &routing) {
+            tracing::warn!("{}: {warning}", sender.actor_id());
+        }
 
         std::thread::Builder::new()
             .name(thread_name)
@@ -120,6 +123,19 @@ impl Actor for GsProActor {
 
         ReconfigureOutcome::Applied
     }
+}
+
+/// Why the routing may send unwanted putts: an ExPutt is configured but the
+/// Putting Monitor accepts any device, so a putt another device also sees
+/// reaches the simulator twice.
+fn putting_routing_warning(
+    config: &flighthook::FlighthookConfig,
+    routing: &GsProRouting,
+) -> Option<&'static str> {
+    (!config.exputt.is_empty() && routing.putting_monitor.is_none()).then_some(
+        "an ExPutt is configured but the Putting Monitor is Any, so putts from every \
+         device are sent; set the Putting Monitor to the ExPutt",
+    )
 }
 
 /// Reconnect backoff: 1 s, +1 s per failed attempt, capped at 3 s, back to
@@ -276,7 +292,6 @@ struct Relay {
     /// it is not are dropped.
     connected_at: Option<Instant>,
     mode: ShotDetectionMode,
-    handed: Handedness,
     monitor_state: HashMap<String, bool>,
     readiness_changed: bool,
     /// Per-actor shot accumulators, keyed by (actor, shot_key).
@@ -294,7 +309,6 @@ impl Relay {
             routing,
             connected_at: None,
             mode: ShotDetectionMode::Full,
-            handed: Handedness::Right,
             monitor_state: HashMap::new(),
             readiness_changed: false,
             accumulators: HashMap::new(),
@@ -391,14 +405,9 @@ impl Relay {
                 self.monitor_state.insert(msg.actor.clone(), ready);
                 self.readiness_changed = true;
             }
-            FlighthookEvent::SetDetectionMode { mode, handed } => {
-                if let Some(m) = mode {
-                    self.mode = m;
-                    self.readiness_changed = true;
-                }
-                if let Some(h) = handed {
-                    self.handed = h;
-                }
+            FlighthookEvent::SetDetectionMode { mode: Some(m), .. } => {
+                self.mode = m;
+                self.readiness_changed = true;
             }
             FlighthookEvent::ActorStatus { status, .. } => {
                 if matches!(
@@ -485,6 +494,22 @@ fn readiness(
 /// Check if a shot actor matches the routing target for the current mode.
 /// Auto-chip shots ([`flighthook::AUTO_CHIP_ACTOR`]) match every routing:
 /// they stand in for a chip the routed monitor could not read.
+/// Readiness a client with `routing` reports in `mode` after handling
+/// `messages`.
+#[cfg(test)]
+pub(crate) fn readiness_after(
+    routing: GsProRouting,
+    mode: ShotDetectionMode,
+    messages: impl IntoIterator<Item = FlighthookMessage>,
+) -> bool {
+    let mut relay = Relay::new(routing);
+    relay.mode = mode;
+    for msg in messages {
+        relay.handle(msg, Instant::now());
+    }
+    readiness(&relay.routing, relay.mode, &relay.monitor_state)
+}
+
 fn shot_matches_routing(routing: &GsProRouting, mode: ShotDetectionMode, actor: &str) -> bool {
     if actor == flighthook::AUTO_CHIP_ACTOR {
         return true;
@@ -670,7 +695,7 @@ fn send_shots(
 ) -> Result<bool, BridgeError> {
     let mut sent = false;
     while let Some(shot) = relay.next_shot(now) {
-        let msg = mapper::map_shot(&shot, relay.handed);
+        let msg = mapper::map_shot(&shot);
         log_outbound(&msg);
         if let Ok(json_str) = serde_json::to_string(&msg) {
             tracing::info!(
@@ -868,7 +893,7 @@ mod tests {
             assert_eq!(shot.shot_number, key.shot_number);
             assert!(shot.club.is_none());
 
-            let msg = mapper::map_shot(&shot, Handedness::Right);
+            let msg = mapper::map_shot(&shot);
             let speed = ball.launch_speed.expect("speed").as_mph();
             assert!((msg.ball_data.speed - speed).abs() < 1e-9);
             assert!(speed > 5.0 && speed < 12.0, "{speed}");
@@ -882,6 +907,94 @@ mod tests {
             assert_eq!(msg.club_data.loft, 0.0);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Omni for full swings and chips, ExPutt for putts: each mode sends
+    /// only its own monitor's shot, and readiness follows that monitor.
+    #[test]
+    fn full_shots_and_putts_come_from_their_own_monitors() {
+        let (tx, _) = broadcast::channel(64);
+        let omni = BusSender::new("square.0".into(), tx.clone(), Arc::default());
+        let exputt = BusSender::new("exputt.0".into(), tx.clone(), Arc::default());
+        let mut receiver =
+            BusSender::new("openconnect_client.0".into(), tx, Arc::default()).subscribe();
+        let square = Some("square.0".to_owned());
+        let routing = GsProRouting {
+            full_monitor: square.clone(),
+            chipping_monitor: square,
+            putting_monitor: Some("exputt.0".to_owned()),
+        };
+        let mut relay = Relay::new(routing.clone());
+        relay.connect(Instant::now());
+        let modes = [
+            (ShotDetectionMode::Full, "square.0"),
+            (ShotDetectionMode::Chipping, "square.0"),
+            (ShotDetectionMode::Putting, "exputt.0"),
+        ];
+        for (n, (mode, from)) in (1..).zip(modes) {
+            relay.mode = mode;
+            emit_shot(&omni, 2 * n);
+            emit_shot(&exputt, 2 * n + 1);
+            relay.drain(&mut receiver).expect("bus open");
+            let sent: Vec<String> = std::iter::from_fn(|| relay.next_shot(Instant::now()))
+                .map(|s| s.actor)
+                .collect();
+            assert_eq!(sent, [from], "{mode:?}");
+        }
+
+        let states = HashMap::from([
+            ("square.0".to_owned(), false),
+            ("exputt.0".to_owned(), true),
+        ]);
+        assert!(readiness(&routing, ShotDetectionMode::Putting, &states));
+        assert!(!readiness(&routing, ShotDetectionMode::Full, &states));
+    }
+
+    #[test]
+    fn an_exputt_with_putting_routed_to_any_is_warned_about() {
+        let mut config = flighthook::FlighthookConfig::default();
+        let any = GsProRouting::default();
+        assert_eq!(putting_routing_warning(&config, &any), None, "no ExPutt");
+        config.exputt.insert(
+            "0".into(),
+            flighthook::ExPuttSection {
+                name: "ExPutt".into(),
+                address: None,
+            },
+        );
+        assert!(putting_routing_warning(&config, &any).is_some());
+        let routed = GsProRouting {
+            putting_monitor: Some("exputt.0".into()),
+            ..GsProRouting::default()
+        };
+        assert_eq!(putting_routing_warning(&config, &routed), None);
+    }
+
+    /// An ExPutt shot in Full mode goes out while the Full Monitor accepts
+    /// any device, and is dropped when it names another device.
+    #[test]
+    fn an_exputt_shot_in_full_mode_follows_the_full_monitor() {
+        let (tx, _) = broadcast::channel(64);
+        let exputt = BusSender::new("exputt.0".into(), tx.clone(), Arc::default());
+        let mut receiver =
+            BusSender::new("openconnect_client.0".into(), tx, Arc::default()).subscribe();
+        for (n, (full_monitor, sent)) in
+            (1..).zip([(None, true), (Some("square.0".to_owned()), false)])
+        {
+            let mut relay = Relay::new(GsProRouting {
+                full_monitor,
+                chipping_monitor: None,
+                putting_monitor: Some("exputt.0".to_owned()),
+            });
+            relay.connect(Instant::now());
+            relay.mode = ShotDetectionMode::Full;
+            emit_shot(&exputt, n);
+            relay.drain(&mut receiver).expect("bus open");
+            let actors: Vec<String> = std::iter::from_fn(|| relay.next_shot(Instant::now()))
+                .map(|s| s.actor)
+                .collect();
+            assert_eq!(!actors.is_empty(), sent, "{:?}", relay.routing);
+        }
     }
 
     #[test]
@@ -983,6 +1096,40 @@ mod tests {
             .expect("writes to a Vec succeed");
         assert!(relay.outbox.is_empty());
         messages(&wire)
+    }
+
+    /// The bytes the bridge writes for one shot, with GSPro reporting a
+    /// player of `handed` first.
+    fn sent_for(handed: flighthook::Handedness) -> Vec<String> {
+        let (mut relay, monitor, mut receiver) = relay_with_bus();
+        relay.connect(Instant::now());
+        monitor.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+            mode: None,
+            handed: Some(handed),
+        }));
+        emit_shot(&monitor, 1);
+        relay.drain(&mut receiver).expect("bus open");
+        let mut wire = Vec::new();
+        send_shots(
+            &mut relay,
+            &mut wire,
+            Instant::now(),
+            "openconnect_client.0",
+        )
+        .expect("writes to a Vec succeed");
+        messages(&wire)
+    }
+
+    /// The bus carries absolute signs for both hands and GSPro takes them as
+    /// they are, so a left-handed player's shot goes out exactly like a
+    /// right-handed one's (HLA -1.2, SideSpin -300 in the golden shot).
+    #[test]
+    fn a_left_handed_players_shot_is_sent_like_a_right_handed_ones() {
+        let rh = sent_for(flighthook::Handedness::Right);
+        let lh = sent_for(flighthook::Handedness::Left);
+        assert_eq!(rh.len(), 1);
+        assert_eq!(rh[0].trim_end(), golden(1));
+        assert_eq!(lh, rh);
     }
 
     #[test]

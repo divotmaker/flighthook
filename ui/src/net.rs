@@ -7,8 +7,9 @@
 use std::sync::{Arc, Mutex};
 
 use crate::types::{
-    self, AutoChipRequest, Club, FlighthookConfig, FlighthookMessage, GameStateSnapshot,
-    PostSettingsResponse, ShotData, ShotGrouping, ShotGroupsResponse, StatusResponse,
+    self, AutoChipRequest, Club, FindMatRequest, FlighthookConfig, FlighthookMessage,
+    GameStateSnapshot, PostSettingsResponse, ShotData, ShotGrouping, ShotGroupsResponse,
+    StatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -282,6 +283,15 @@ pub fn post_mode(ctx: &egui::Context, mode: &str) {
 /// Select the club in play (`POST /api/club`).
 pub fn post_club(ctx: &egui::Context, club: Club) {
     post_json(ctx, "/api/club", format!(r#"{{"club":"{club}"}}"#));
+}
+
+/// Have ExPutt `actor` locate its mat again (`POST /api/find-mat`).
+pub fn post_find_mat(ctx: &egui::Context, actor: &str) {
+    let body = serde_json::to_string(&FindMatRequest {
+        actor: actor.to_string(),
+    })
+    .unwrap_or_default();
+    post_json(ctx, "/api/find-mat", body);
 }
 
 /// Start a new shot group (`POST /api/shots/groups`); sets

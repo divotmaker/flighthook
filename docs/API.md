@@ -212,7 +212,7 @@ Telemetry keys are merged from two sources with no overlap:
 - **Device-reported** (from `device_telemetry`): `ready`, `battery_pct`, `tilt`,
   `roll`, `temp_c`, `external_power`
 - **Actor-framework** (from `actor_status`): `detection_mode`, `radar_mode`, `device_info`,
-  `shot_count`, `tracking_mode`
+  `shot_count`, `tracking_mode`, `phase`
 - **Integration actors**: `club`, `handed`, `name`, `error`
 
 ---
@@ -336,8 +336,8 @@ With `?units=imperial`:
   `ball` and `club` when the shot finished (see [Shot metrics](#shot-metrics)).
   `curve` is converted by `?units=` like `ball`.
 - `shot_id`: the shot's `key.shot_id` from its lifecycle events.
-- `club_selected`: club in play when the shot was triggered; absent when none
-  was selected.
+- `club_selected`: club in play when the shot was triggered (`PT` for an
+  ExPutt shot); absent when none was selected.
 - `group`: id of the [set](#get-apishotsgroups) the shot joined. Every shot
   with data has one, whatever the default view (`shot_grouping`).
 - `handed`: the player's handedness (`"rh"` | `"lh"`) when the shot was
@@ -671,14 +671,14 @@ device produced no data for are included: their `data` has no `ball`, `club`,
 
 - `schema`: export format version (`1`). Bumped when a field changes meaning.
 - `time`: when `shot_trigger` reached the web layer (host clock, RFC 3339 UTC).
-- `device`: `kind` (`flightscope`, `square_golf`, `garmin_r10`, `openconnect`,
-  `mock`) plus manufacturer, model and firmware as the device reported them.
+- `device`: `kind` (`flightscope`, `square_golf`, `garmin_r10`, `exputt`,
+  `openconnect`, `mock`) plus manufacturer, model and firmware as the device reported them.
   FlightScope: `model` is the product (`Mevo+`, `Mevo Gen2`, `Mevo` when the
   generation is unknown, or `Xi`) and `firmware` the device's version and
   build date, e.g. `"1.23 (Feb 3 2024)"`.
 - `club_selected`: the club in play when the shot was triggered (the last
-  club selected on the bus, e.g. by GSPro or the club picker); absent when
-  unknown.
+  club selected on the bus, e.g. by GSPro or the club picker; `PT` for an
+  ExPutt shot); absent when unknown.
 - `settings.detection_mode`, `settings.handed`: game state when the shot was
   triggered; absent when unknown.
 - `group`: id of the [set](#get-apishotsgroups) the shot joined (a UUID,
@@ -806,6 +806,31 @@ is preserved as-is. A `derived` block, when present, is converted the same way
 
 ---
 
+### POST /api/find-mat
+
+Have an ExPutt locate its mat again, e.g. after it locked onto the wrong spot
+because someone stood in its view when it connected. The ExPutt card's Find
+mat button sends it.
+
+**Request**:
+
+```json
+{ "actor": "exputt.0" }
+```
+
+- `actor`: the ExPutt's actor ID.
+
+**Response**: `202 Accepted` (no body). `404 Not Found` with a text body
+(`no ExPutt with ID 'exputt.1'`) when no ExPutt has that ID.
+
+Emits `find_mat` (`{"kind":"find_mat","target":"exputt.0"}`, actor `web`) on
+the bus. A connected ExPutt then reports `ready` false and `device_state`
+`finding mat`, `mat found` and `ready` as the device works. An ExPutt acts on
+it once connected; while it looks for the device or waits to reconnect, it
+drops the command.
+
+---
+
 ### POST /api/mode
 
 Change the global detection mode. Emits `SetDetectionMode` on the bus;
@@ -879,6 +904,11 @@ Full persisted config (mirrors `config.toml`).
       }
     }
   },
+  "exputt": {
+    "0": {
+      "name": "ExPutt"
+    }
+  },
   "mock_monitor": {},
   "openconnect_server": {
     "0": {
@@ -896,7 +926,7 @@ Full persisted config (mirrors `config.toml`).
 }
 ```
 
-- Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `square.0`, `mock_monitor.0`,
+- Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `square.0`, `exputt.0`, `mock_monitor.0`,
   `openconnect_server.0`, `openconnect_client.0`, `random_club.0`, `webserver.0`
 - `shot_grouping`: the Shots tab's default view, [`ShotGrouping`](#shotgrouping),
   `"by_set"` by default. It does not change how
@@ -951,6 +981,11 @@ Full persisted config (mirrors `config.toml`).
   [Launch-only chips](devices/flightscope.md#launch-only-chips-beta). Omitted
   while at the default. Changes apply from the next shot without restarting
   the actor
+- ExPutt sections have `name` and an optional `address`: the device's IP
+  address (no port). When absent the device is found on the local network.
+  The device must be in its mobile mode on the same network. Its shots are
+  putts: club `PT` and Putting mode whatever club is in play, vertical
+  launch 0, no spin
 - `dot_bottom_to_face_centre_mm` on Square sections overrides allsquare's built-in
   per-club face impact calibration (distance from the bottom edge of the
   sticker's dot down to face centre, in mm). Keyed the same way `club` is. Omitted when no
@@ -1393,8 +1428,8 @@ of the ball, − behind it.
 
 Face impact location, in millimetres from the centre of the club face.
 Positive `lateral` is toward the toe, positive `vertical` is above centre.
-Neither axis is flipped for a left-handed player — toe/heel and high/low are
-already golfer-relative.
+Both axes are golfer-relative (toe/heel, high/low) and mean the same for
+either hand.
 
 Emitted only by devices whose reading is referenced to the face centre. The
 Square Golf Omni emits this event (beta): horizontal as the device measures
@@ -1443,7 +1478,8 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
 
 - `raw` (flighthook extension, omitted when absent): `ShotRaw`, the device
   frames captured for this shot. FRP consumers ignore it.
-  - `transport`: `flightscope-tcp`, `square-ble`, `r10-ble`,
+  - `transport`: `flightscope-tcp`, `square-ble`, `r10-ble`, `exputt-wifi`
+    (one text record: the putt's 16 values, comma-separated),
     `openconnect-json`, or `none` (mock).
   - `frames`: `RawRecord[]`, in arrival order:
     - `t_ms`: milliseconds relative to the shot trigger (negative = before it)
@@ -1588,6 +1624,8 @@ event types have no overlapping telemetry keys.
 
 Common keys for launch monitors: `detection_mode`, `radar_mode`, `device_info`.
 Mock launch monitors add: `shot_count`, `tracking_mode`.
+The ExPutt adds `shot_count` and `phase` (`discovering`, `connecting`,
+`measuring`).
 Integration actors: `club`, `handed`, `name`, `error`.
 
 An `openconnect_client` sets `error` when this flighthook's own
@@ -1624,7 +1662,7 @@ External consumers can observe these to track config changes in flight.
 ```
 
 `action.type` is one of `replace_all`, `upsert_webserver`, `upsert_mevo`,
-`upsert_r10`, `upsert_square`, `upsert_open_connect_server`,
+`upsert_r10`, `upsert_square`, `upsert_exputt`, `upsert_open_connect_server`,
 `upsert_open_connect_client`, `upsert_mock_monitor`, `upsert_random_club`,
 `remove` and `set_shot_grouping`
 (`{ "type": "set_shot_grouping", "mode": "by_club" }`, from
