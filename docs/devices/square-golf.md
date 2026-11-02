@@ -89,6 +89,15 @@ is simulated from the tee, from the ball speed and direction alone, on a
 green in Putting mode and on the configured surface otherwise. A shot
 launched higher is flown and needs a spin reading like every other flight.
 
+## Handedness
+
+The Omni follows the player's hand from the simulator, or from the hand
+control in the UI: every club select carries it, and a change of hand re-sends
+the active club. The device is right-handed until the simulator says otherwise.
+
+Left-handed mode is **beta**: the lateral signs (launch direction, sidespin,
+spin axis, face impact) are not yet verified on a left-handed session.
+
 ## Zero-spin rejection
 
 A ball struck near the front edge of the Omni's detection zone can come back

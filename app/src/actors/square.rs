@@ -15,7 +15,7 @@ use crate::state::SystemState;
 
 use flighthook::{
     ActorStatus, BallFlight, Club, ClubData, Distance, FaceImpact, FlighthookEvent,
-    FlighthookMessage, RawDir, RawRecord, Severity, ShotKey, Velocity,
+    FlighthookMessage, Handedness, RawDir, RawRecord, Severity, ShotKey, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per failed attempt, capped at 15s,
@@ -249,6 +249,15 @@ fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>
         severity,
         message: message.into(),
     }));
+}
+
+/// The device hand for the player's handedness; right when unknown.
+fn handed_of(handed: Option<Handedness>) -> allsquare::Handed {
+    if handed == Some(Handedness::Left) {
+        allsquare::Handed::Left
+    } else {
+        allsquare::Handed::Right
+    }
 }
 
 /// Map a flighthook club to the allsquare club the device is set to.
@@ -487,7 +496,7 @@ fn run(
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn connect_and_run(
     state: &SystemState,
     address: Option<&str>,
@@ -512,13 +521,48 @@ fn connect_and_run(
     info!("connected to {name} at {ble_address}");
     *device_id = Some(name.clone());
 
+    run_session(
+        transport,
+        name,
+        ble_address,
+        state,
+        current_club,
+        advanced_spin,
+        discard_zero_spin,
+        impact_calibration,
+        sender,
+        receiver,
+    )
+}
+
+/// Drive a connected device until shutdown or a link error: follow the bus
+/// (club, handedness), arm the device, and publish its shots.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn run_session<T: allsquare::Transport>(
+    transport: T,
+    name: String,
+    ble_address: String,
+    state: &SystemState,
+    current_club: &mut Club,
+    advanced_spin: bool,
+    discard_zero_spin: bool,
+    impact_calibration: &allsquare::ImpactCalibration,
+    sender: &BusSender,
+    receiver: &mut BusReceiver,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = Client::new(Tap::new(transport));
     client.set_impact_calibration(impact_calibration.clone());
+    // Every club select carries the player's hand.
+    let mut hand = handed_of(state.game.snapshot().handed);
+    client.set_handed(hand);
     let spin = if advanced_spin {
         SpinMode::Advanced
     } else {
         SpinMode::Standard
     };
+    // Whether the device has been armed; a hand change before that only
+    // records the hand, which the arm then carries.
+    let mut armed = false;
 
     let mut shot_counter: u32 = 0;
     let mut discarded_counter: u32 = 0;
@@ -529,6 +573,9 @@ fn connect_and_run(
         // ==============================================================
         // Phase 1: Drain bus commands
         // ==============================================================
+        // A club or hand change seen in this drain; one select after it
+        // carries both.
+        let mut reselect = false;
         loop {
             match receiver.poll() {
                 Err(PollError::Shutdown) => {
@@ -542,26 +589,40 @@ fn connect_and_run(
                     FlighthookEvent::ClubInfo { club_info } => {
                         if club_info.club != *current_club {
                             *current_club = club_info.club;
-                            let mapped = to_allsquare_club(club_info.club);
-                            info!("club -> {mapped}");
-                            if let Err(e) = client.select_club(mapped) {
-                                warn!("club select failed: {e}");
-                            }
+                            reselect = true;
                         }
                     }
-                    // There is no device-side shot mode: putting and chipping
-                    // differ only by which club is selected.
-                    FlighthookEvent::SetDetectionMode {
-                        mode: Some(new_mode),
-                        ..
-                    } => {
-                        debug!(
-                            "mode change to {new_mode:?} ignored \
-                             — Square Golf has no mode control, select a club"
-                        );
+                    // Follow the player's handedness (set by the simulator).
+                    // The same event can carry a mode, which does not apply
+                    // (see below).
+                    FlighthookEvent::SetDetectionMode { mode, handed } => {
+                        if let Some(handed) = handed {
+                            let new_hand = handed_of(Some(handed));
+                            if new_hand != hand {
+                                hand = new_hand;
+                                client.set_handed(hand);
+                                // Before the arm the hand is only recorded.
+                                reselect |= armed;
+                            }
+                        }
+                        // There is no device-side shot mode: putting and
+                        // chipping differ only by which club is selected.
+                        if let Some(new_mode) = mode {
+                            debug!(
+                                "mode change to {new_mode:?} ignored \
+                                 — Square Golf has no mode control, select a club"
+                            );
+                        }
                     }
                     _ => {}
                 },
+            }
+        }
+        if reselect {
+            let mapped = to_allsquare_club(*current_club);
+            info!("club -> {mapped}, hand {hand:?}");
+            if let Err(e) = client.select_club(mapped) {
+                warn!("club select failed: {e}");
             }
         }
 
@@ -623,6 +684,7 @@ fn connect_and_run(
 
                         // Arm once — the device stays armed across shots.
                         client.arm(to_allsquare_club(*current_club), spin)?;
+                        armed = true;
                         info!("armed with {}", to_allsquare_club(*current_club));
                     }
 
@@ -819,6 +881,9 @@ mod tests {
     use super::*;
     use allsquare::testing::{self, BALL_NOTIFICATION};
     use allsquare::{ClubMetrics, DeviceState};
+    use flighthook::ShotDetectionMode;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// The device reports negative toward the toe; FRP's lateral is positive
     /// toward the toe. Vertical passes through.
@@ -1095,14 +1160,28 @@ mod tests {
         assert_ne!(cal_a, cal_b, "changed overrides must compare unequal");
     }
 
+    /// Holds a session inside its device read, between two bus drains.
+    #[derive(Default)]
+    struct Gate {
+        closed: Mutex<()>,
+        waiting: AtomicBool,
+    }
+
     /// Scripted Omni: queued notifications, identity characteristics, and a
     /// log of every command written.
+    #[derive(Default)]
     struct FakeTransport {
         notifications: std::collections::VecDeque<Vec<u8>>,
+        written: Arc<Mutex<Vec<Vec<u8>>>>,
+        gate: Option<Arc<Gate>>,
     }
 
     impl allsquare::Transport for FakeTransport {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(gate) = &self.gate {
+                gate.waiting.store(true, Ordering::SeqCst);
+                drop(gate.closed.lock().unwrap_or_else(|e| e.into_inner()));
+            }
             let Some(n) = self.notifications.pop_front() else {
                 return Err(io::ErrorKind::WouldBlock.into());
             };
@@ -1110,7 +1189,11 @@ mod tests {
             Ok(n.len())
         }
 
-        fn write(&mut self, _data: &[u8]) -> io::Result<()> {
+        fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            self.written
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(data.to_vec());
             Ok(())
         }
 
@@ -1138,6 +1221,7 @@ mod tests {
         ];
         let fake = FakeTransport {
             notifications: notifications.into_iter().collect(),
+            ..FakeTransport::default()
         };
         let mut client = Client::new(Tap::new(fake));
 
@@ -1207,6 +1291,7 @@ mod tests {
     fn tap_records_nothing_until_enabled() {
         let fake = FakeTransport {
             notifications: [BALL_NOTIFICATION.to_vec()].into_iter().collect(),
+            ..FakeTransport::default()
         };
         let mut tap = Tap::new(fake);
         let mut buf = [0u8; 64];
@@ -1287,5 +1372,237 @@ mod tests {
         let bf = ball_from_square(&ball(1.5, 0, 0, 0));
         assert_eq!(bf.total_spin_rpm, Some(0));
         assert_eq!(bf.spin_axis, None);
+    }
+
+    #[test]
+    fn handedness_maps_to_the_device_hand() {
+        assert_eq!(handed_of(Some(Handedness::Left)), allsquare::Handed::Left);
+        assert_eq!(handed_of(Some(Handedness::Right)), allsquare::Handed::Right);
+        assert_eq!(handed_of(None), allsquare::Handed::Right);
+    }
+
+    /// A session against a scripted device on its own thread.
+    struct Session {
+        written: Arc<Mutex<Vec<Vec<u8>>>>,
+        sender: BusSender,
+        shutdown: Arc<AtomicBool>,
+        gate: Arc<Gate>,
+        thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Session {
+        /// The player's hand is `hand` when the session starts; `queued` is
+        /// on the bus before the session first looks at it.
+        fn start(hand: Option<Handedness>, queued: Vec<FlighthookEvent>) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "flighthook-square-{}",
+                crate::state::config::generate_id()
+            ));
+            let (state, writer) = SystemState::new(dir.join("config.toml"));
+            if let Some(hand) = hand {
+                writer.set_handed(hand);
+            }
+            let (tx, _rx) = tokio::sync::broadcast::channel(1024);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let sender = BusSender::new("square.0".into(), tx, shutdown.clone());
+            let mut receiver = sender.subscribe();
+            for event in queued {
+                sender.send(FlighthookMessage::new(event));
+            }
+            let gate = Arc::new(Gate::default());
+            let fake = FakeTransport {
+                gate: Some(gate.clone()),
+                ..FakeTransport::default()
+            };
+            let written = fake.written.clone();
+            let session_sender = sender.clone();
+            let thread = std::thread::spawn(move || {
+                let mut club = Club::Iron7;
+                run_session(
+                    fake,
+                    "SquareGolf(TEST)".into(),
+                    "00:11:22:33:44:55".into(),
+                    &state,
+                    &mut club,
+                    true,
+                    true,
+                    &allsquare::ImpactCalibration::default(),
+                    &session_sender,
+                    &mut receiver,
+                )
+                .map_err(|e| e.to_string())
+            });
+            Self {
+                written,
+                sender,
+                shutdown,
+                gate,
+                thread: Some(thread),
+                dir,
+            }
+        }
+
+        fn send(&self, event: FlighthookEvent) {
+            self.sender.send(FlighthookMessage::new(event));
+        }
+
+        /// Put `events` on the bus so the session drains them in one pass.
+        fn send_together(&self, events: Vec<FlighthookEvent>) {
+            let held = self.gate.closed.lock().unwrap_or_else(|e| e.into_inner());
+            self.gate.waiting.store(false, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.gate.waiting.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            for event in events {
+                self.send(event);
+            }
+            drop(held);
+        }
+
+        /// The club selects written so far, as the `(club, hand)` each one
+        /// carries.
+        fn selects(&self) -> Vec<(allsquare::Club, allsquare::Handed)> {
+            use allsquare::Handed::{Left, Right};
+            let probe = allsquare::Command::SelectClub {
+                club: allsquare::Club::Driver,
+                handed: Right,
+            };
+            let log = self.written.lock().unwrap_or_else(|e| e.into_inner());
+            log.iter()
+                .filter(|frame| allsquare::Command::type_byte_of(frame) == Some(probe.type_byte()))
+                .map(|frame| {
+                    let matches = |club, handed| {
+                        let cmd = allsquare::Command::SelectClub { club, handed };
+                        (0..=u8::MAX).any(|seq| cmd.encode(seq).as_slice() == frame.as_slice())
+                    };
+                    Club::ALL
+                        .iter()
+                        .map(|&club| to_allsquare_club(club))
+                        .flat_map(|club| [(club, Right), (club, Left)])
+                        .find(|&(club, handed)| matches(club, handed))
+                        .unwrap_or_else(|| {
+                            panic!("a club select for no club and hand: {frame:02x?}")
+                        })
+                })
+                .collect()
+        }
+
+        /// Wait until `count` club selects have been written.
+        fn wait_for(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.selects().len() < count && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Wait for `count` club selects, then stop the session and return
+        /// every select it wrote.
+        fn finish(mut self, count: usize) -> Vec<(allsquare::Club, allsquare::Handed)> {
+            self.wait_for(count);
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("session thread").expect("session ran");
+            }
+            self.selects()
+        }
+    }
+
+    impl Drop for Session {
+        /// Stops a session that `finish` did not (a failed assertion) and
+        /// removes its config directory.
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn hand_event(mode: Option<ShotDetectionMode>, handed: Handedness) -> FlighthookEvent {
+        FlighthookEvent::SetDetectionMode {
+            mode,
+            handed: Some(handed),
+        }
+    }
+
+    fn club_event(club: Club) -> FlighthookEvent {
+        FlighthookEvent::ClubInfo {
+            club_info: flighthook::ClubInfo { club },
+        }
+    }
+
+    /// A left-handed player's first club select, the arm, carries the left
+    /// hand.
+    #[test]
+    fn arm_carries_the_game_states_left_hand() {
+        let session = Session::start(Some(Handedness::Left), vec![]);
+        let seven = to_allsquare_club(Club::Iron7);
+        assert_eq!(session.finish(1), [(seven, allsquare::Handed::Left)]);
+    }
+
+    /// Without a hand in the game state the arm is right-handed.
+    #[test]
+    fn arm_is_right_handed_when_the_hand_is_unknown() {
+        let session = Session::start(None, vec![]);
+        let seven = to_allsquare_club(Club::Iron7);
+        assert_eq!(session.finish(1), [(seven, allsquare::Handed::Right)]);
+    }
+
+    /// A hand that arrives before the device is armed is recorded, not sent
+    /// as a club select of its own.
+    #[test]
+    fn hand_before_the_arm_rides_the_arm() {
+        let session = Session::start(None, vec![hand_event(None, Handedness::Left)]);
+        let seven = to_allsquare_club(Club::Iron7);
+        assert_eq!(session.finish(1), [(seven, allsquare::Handed::Left)]);
+    }
+
+    /// A hand change while connected re-sends the active club once with the
+    /// new hand; the same hand again writes nothing. The club change after it
+    /// pins the order: its select is the next frame, and carries the hand. A
+    /// mode in the same event does not matter.
+    #[test]
+    fn hand_change_resends_the_active_club_once() {
+        use allsquare::Handed::{Left, Right};
+        let session = Session::start(None, vec![]);
+        let seven = to_allsquare_club(Club::Iron7);
+        let eight = to_allsquare_club(Club::Iron8);
+        session.wait_for(1);
+        session.send(hand_event(
+            Some(ShotDetectionMode::Putting),
+            Handedness::Left,
+        ));
+        session.wait_for(2);
+        session.send(hand_event(None, Handedness::Left));
+        session.send(club_event(Club::Iron8));
+        assert_eq!(
+            session.finish(3),
+            [(seven, Right), (seven, Left), (eight, Left)]
+        );
+    }
+
+    /// A hand and a club that change in the same pass write one select: the
+    /// new club with the new hand.
+    #[test]
+    fn hand_and_club_in_one_pass_write_one_select() {
+        use allsquare::Handed::{Left, Right};
+        let session = Session::start(None, vec![]);
+        let seven = to_allsquare_club(Club::Iron7);
+        let eight = to_allsquare_club(Club::Iron8);
+        session.wait_for(1);
+        session.send_together(vec![
+            hand_event(Some(ShotDetectionMode::Full), Handedness::Left),
+            club_event(Club::Iron8),
+        ]);
+        session.wait_for(2);
+        // The next select is the next frame: nothing else was written.
+        session.send(club_event(Club::Iron7));
+        assert_eq!(
+            session.finish(3),
+            [(seven, Right), (eight, Left), (seven, Left)]
+        );
     }
 }

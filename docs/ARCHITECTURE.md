@@ -612,9 +612,9 @@ The `SystemActor` auto-derives detection mode from `ClubInfo` (using
 need to emit `ClubInfo`; the SystemActor handles mode derivation
 centrally. Launch monitor actors react to `SetDetectionMode` events to reconfigure
 the device — they latch the mode and only re-arm when the mode actually changes.
-Handed-only updates (mode omitted) do not re-arm a launch monitor; the ExPutt
-starts a new round, which re-locates the mat. Mode is global state, not
-per-device.
+Handed-only updates (mode omitted) do not re-arm a launch monitor. The ExPutt
+starts a new round, which re-locates the mat; the Square Golf actor re-sends
+the active club with the new hand. Mode is global state, not per-device.
 
 ### DeviceTelemetry / ActorStatus split
 
