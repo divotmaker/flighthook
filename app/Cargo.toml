@@ -19,8 +19,8 @@ headless = []
 gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
-ironsight = { version = "0.5.1", features = ["serde"] }
-tenover = "0.3.0"
+ironsight = { version = "0.6.0", features = ["serde"] }
+tenover = "0.4.0"
 flighthook = { path = "../lib", features = ["clap"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
@@ -47,7 +47,7 @@ glam = "0.32"
 # ExPutt RG putting device.
 threeputt = "0.0.3"
 # Swing cameras: capture, pre-roll and trigger-cut MJPEG clips.
-stance = "0.0.1"
+stance = "0.0.2"
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.
@@ -58,10 +58,10 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # allsquare's BLE backend is platform-specific: BlueZ on Linux, btleplug
 # elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
-allsquare = { version = "0.2.1", features = ["serde", "bluez"] }
+allsquare = { version = "0.3.0", features = ["serde", "bluez"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-allsquare = { version = "0.2.1", features = ["serde", "btleplug"] }
+allsquare = { version = "0.3.0", features = ["serde", "btleplug"] }
 
 # eframe backend is platform-specific: x11+wayland on Linux, Win32 on Windows.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
@@ -72,11 +72,11 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 
 [dev-dependencies]
 # ironsight's test support: a scripted device and recorded result frames.
-ironsight = { version = "0.5.1", features = ["serde", "testing"] }
+ironsight = { version = "0.6.0", features = ["serde", "testing"] }
 # tenover's test support: GFDI frame builders with synthetic identity.
-tenover = { version = "0.3.0", features = ["testing"] }
+tenover = { version = "0.4.0", features = ["testing"] }
 # allsquare's test support: notification fixtures and encoders.
-allsquare = { version = "0.2.1", features = ["serde", "testing"] }
+allsquare = { version = "0.3.0", features = ["serde", "testing"] }
 # threeputt's test support: an in-process mock device and sample putts.
 threeputt = { version = "0.0.3", features = ["testing"] }
 

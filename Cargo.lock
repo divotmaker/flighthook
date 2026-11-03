@@ -48,9 +48,9 @@ dependencies = [
 
 [[package]]
 name = "allsquare"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8777e90d72eae592e09ea6ff0a355c4e62c451349d93c8d5b7adf453f541db1"
+checksum = "b1991a86d31d582045ddab32808fa6354fa3f4294ee70d1add8a32a1e9cb91cf"
 dependencies = [
  "btleplug",
  "futures",
@@ -2009,9 +2009,9 @@ dependencies = [
 
 [[package]]
 name = "ironsight"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51bec8ac5aaeb757f9f7eef60717b23ad3b8d01e3ec7ae3d5f095d07ee20ce6f"
+checksum = "64f4bfe5fc747f23aca3749cab559dc217eba02fb7ddc256a6362de23ba4235b"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3673,9 +3673,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stance"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be13e9dfe2fd566a434357ff900e25ec8af10d16b8bbbca48682c0482adb8206"
+checksum = "37e39828408010f2aa34f7412bbaba2341c197f4a89fd46a06a6c5e65641a3b8"
 dependencies = [
  "jpeg-encoder",
  "libc",
@@ -3757,9 +3757,9 @@ dependencies = [
 
 [[package]]
 name = "tenover"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df7ada5bfc885012e60039313cfa40f1d393b58fd0d0b692f7e4286b5b733b77"
+checksum = "583c635e7fab0141de24b7c6a0d9ad98ead50c10a6909e7f2f279239e4d85449"
 dependencies = [
  "btleplug",
  "libc",
