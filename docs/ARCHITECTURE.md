@@ -682,6 +682,22 @@ OpenConnect client and the web server clear `error`). The UI merges the same
 way. A web server sets `error` to `bind failed` while it cannot bind its
 address, and clears it with every other status.
 
+A card never shows a lost connection's values. When an actor's status goes
+from `Connected` to `Disconnected` or `Reconnecting`, and on every `Starting`
+(a new instance), the web layer and the UI drop all the telemetry held for
+the actor (device-reported keys, `club`, `handed`, `name`, status keys) and
+then merge the keys that status carries, so `error` and the keys an actor
+sends with a status stay. Later statuses that do not end a connection merge
+as above. Both sides call `ActorStatusResponse::apply_status`. The web layer
+also drops the actor's cached `DeviceTelemetry`, so a WebSocket client that
+connects later is not replayed the lost device's values; the export's device
+identity stays. An actor that reports a static key once per instance sends it
+again with the statuses that clear (the OpenConnect client's `address` and
+`last_shot`, see below); the device actors send their keys again with each
+connection. The Devices card then shows its empty state until the actor
+reports: the spinner while not Connected, the connected mark when Connected
+with no rows.
+
 ### ConfigCommand / ConfigOutcome -- event-sourced config mutations
 
 Config mutations are routed through the bus as typed events, processed
@@ -1067,7 +1083,10 @@ and go out with `Connected`; after it, with a `Connected` status as they
 change. When the connection ends, the status that says so removes the
 connection's keys and `club` and `handed` (empty values). The first status of
 a new instance sets `address` and removes every other key an earlier
-instance left. Nothing here adds traffic to the simulator.
+instance left. Because a `Starting` or a lost connection drops the card's
+telemetry, every `Starting` and `Reconnecting` status carries `address`,
+`last_shot` and a held refusal `error` again, so a reconnecting card still
+shows where it dials. Nothing here adds traffic to the simulator.
 
 ## Cameras and replay (beta)
 

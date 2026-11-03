@@ -1980,7 +1980,12 @@ event types have no overlapping telemetry keys.
 - `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`
 - `telemetry`: actor-framework key/value pairs (all string values). Each key
   replaces the one held for the actor; an empty value (`""`) removes the key.
-  Keys not present are left as they were.
+  Keys not present are left as they were, except when a connection is lost
+  (`connected`, then `disconnected` or `reconnecting`) and on every
+  `starting` (a new instance): the actor's other telemetry, device-reported
+  keys included, is dropped first, so only the keys that status carries
+  remain. `/api/status` and the replay a new WebSocket client gets follow the
+  same rule.
 
 Common keys for launch monitors: `detection_mode`, `radar_mode`, `device_info`.
 Mock launch monitors add: `shot_count`, `tracking_mode`.

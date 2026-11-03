@@ -262,7 +262,9 @@ fn run(
                 } else {
                     ActorStatus::Starting
                 };
-                emit_device_status(&sender, backoff_status, HashMap::new());
+                // Not ready before the status changes: the status drops what
+                // the card held, so nothing of the lost device is left to
+                // report after it.
                 if let Some(dev) = device_id.as_deref() {
                     sender.send(
                         FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
@@ -274,6 +276,7 @@ fn run(
                         .device(dev),
                     );
                 }
+                emit_device_status(&sender, backoff_status, HashMap::new());
 
                 let verb = if ever_connected {
                     "Reconnecting"

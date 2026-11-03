@@ -766,7 +766,9 @@ fn run(
                 } else {
                     ActorStatus::Starting
                 };
-                emit_device_status(&sender, backoff_status, HashMap::new());
+                // Not ready before the status changes: the status drops what
+                // the card held, so nothing of the lost device is left to
+                // report after it.
                 if device_id.is_some() {
                     try_emit_device_telemetry(
                         &sender,
@@ -774,6 +776,7 @@ fn run(
                         &HashMap::from([("ready".into(), "false".into())]),
                     );
                 }
+                emit_device_status(&sender, backoff_status, HashMap::new());
 
                 let verb = if ever_connected {
                     "Reconnecting"

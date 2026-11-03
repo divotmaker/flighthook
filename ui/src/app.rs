@@ -591,15 +591,7 @@ impl FlighthookApp {
                     .actors
                     .entry(actor)
                     .or_insert_with(|| new_actor(String::new()));
-                actor.observe(status, self.now_ms);
-                // An empty value removes the key.
-                for (k, v) in telemetry {
-                    if v.is_empty() {
-                        actor.telemetry.remove(&k);
-                    } else {
-                        actor.telemetry.insert(k, v);
-                    }
-                }
+                actor.apply_status(status, &telemetry, self.now_ms);
             }
             FlighthookEvent::DeviceTelemetry {
                 telemetry: Some(tel),
@@ -1791,6 +1783,70 @@ mod tests {
         let telemetry = &app.actors["openconnect_client.0"].telemetry;
         assert!(!telemetry.contains_key("error"));
         assert_eq!(telemetry.get("club").map(String::as_str), Some("DR"));
+    }
+
+    #[test]
+    fn a_lost_connection_or_a_new_instance_clears_the_cards_telemetry() {
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        let status = |status, telemetry: &[(&str, &str)]| {
+            FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                status,
+                telemetry: telemetry
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            })
+            .actor("mevo.0")
+        };
+        let device = |pairs: &[(&str, &str)]| {
+            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
+                manufacturer: None,
+                model: None,
+                firmware: None,
+                telemetry: Some(
+                    pairs
+                        .iter()
+                        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                        .collect(),
+                ),
+            })
+            .actor("mevo.0")
+        };
+        let held = |app: &FlighthookApp| {
+            let mut keys: Vec<String> = app.actors["mevo.0"].telemetry.keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+
+        app.handle_bus_event(status(ActorStatus::Connected, &[("device_info", "Xi")]));
+        app.handle_bus_event(device(&[("ready", "true"), ("battery_pct", "80")]));
+        app.handle_bus_event(
+            FlighthookMessage::new(FlighthookEvent::ClubInfo {
+                club_info: crate::types::ClubInfo { club: Club::Driver },
+            })
+            .actor("mevo.0"),
+        );
+        assert_eq!(held(&app), ["battery_pct", "club", "device_info", "ready"]);
+
+        // Connected, Connected: merges.
+        app.handle_bus_event(status(ActorStatus::Connected, &[("shot_count", "1")]));
+        assert_eq!(held(&app).len(), 5);
+
+        // Lost: only the message's own keys remain.
+        app.handle_bus_event(status(ActorStatus::Reconnecting, &[("error", "gone")]));
+        assert_eq!(held(&app), ["error"]);
+        // Repeated non-Connected statuses merge.
+        app.handle_bus_event(status(ActorStatus::Disconnected, &[("phase", "x")]));
+        assert_eq!(held(&app), ["error", "phase"]);
+        app.handle_bus_event(device(&[("ready", "false")]));
+        assert_eq!(held(&app), ["error", "phase", "ready"]);
+
+        // A new instance starts over.
+        app.handle_bus_event(status(ActorStatus::Starting, &[("bind", "b")]));
+        assert_eq!(held(&app), ["bind"]);
+        app.handle_bus_event(status(ActorStatus::Connected, &[]));
+        app.handle_bus_event(status(ActorStatus::Disconnected, &[]));
+        assert!(held(&app).is_empty());
     }
 
     #[test]

@@ -198,6 +198,8 @@ fn clear_error() -> HashMap<String, String> {
     HashMap::from([("error".into(), String::new())])
 }
 
+/// Why the simulator refused the connection.
+const ERROR: &str = "error";
 /// The simulator's address.
 const ADDRESS: &str = "address";
 /// The shot number the simulator got last and when it was sent.
@@ -258,6 +260,20 @@ impl Telemetry {
         for key in PER_CONNECTION.into_iter().chain(PLAYER) {
             self.set(key, String::new());
         }
+    }
+
+    /// The changes not yet sent plus every other value the card holds, now
+    /// taken as sent. A status that starts a new instance or ends a
+    /// connection drops what the card held, so it carries the values that
+    /// outlast the connection (the address, the last shot, a refusal).
+    fn take_all(&mut self) -> HashMap<String, String> {
+        let mut update = self.take();
+        for (k, v) in &self.reported {
+            if v != "shown" {
+                update.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        update
     }
 
     /// The changes not yet sent, now taken as sent.
@@ -328,7 +344,10 @@ pub(crate) fn run_with(
         };
         // The first status also clears an `error` left by an earlier run of
         // this actor.
-        let mut update = telemetry.take();
+        if !ever_connected {
+            telemetry.set(ERROR, String::new());
+        }
+        let mut update = telemetry.take_all();
         if !ever_connected {
             update.extend(clear_error());
         }
@@ -365,15 +384,15 @@ pub(crate) fn run_with(
                 // lost or refused connection is a status, not an alert. Our
                 // own server refusing us is a setup mistake: the card says
                 // why (the server raises the alert).
-                let mut update = telemetry.take();
                 match e {
                     BridgeError::Refused(reason) => {
                         refused = true;
-                        update.insert("error".into(), reason);
+                        telemetry.set(ERROR, reason);
                     }
-                    _ if std::mem::take(&mut refused) => update.extend(clear_error()),
+                    _ if std::mem::take(&mut refused) => telemetry.set(ERROR, String::new()),
                     _ => {}
                 }
+                let update = telemetry.take_all();
                 tracing::info!("gspro bridge: {text}, retrying in {delay:?}");
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
                     status: backoff_status,
@@ -813,6 +832,7 @@ fn session(
 
         if !announced && connected_at.elapsed() >= REFUSAL_VERDICT {
             announced = true;
+            telemetry.set(ERROR, String::new());
             let mut update = telemetry.take();
             update.extend(clear_error());
             sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
@@ -873,6 +893,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
+    use flighthook::ActorStatusResponse;
     use tokio::sync::broadcast;
 
     use super::*;
@@ -1513,33 +1534,29 @@ mod tests {
         );
     }
 
-    /// The client's card telemetry, merged from its statuses as the web
-    /// layer merges them, until `done` holds for it.
+    /// The client's card, built from its statuses as the web layer builds it
+    /// (`ActorStatusResponse::apply_status`), until `done` holds for its
+    /// telemetry.
     fn telemetry_until(
         bridge: &mut Bridge,
-        card: &mut HashMap<String, String>,
+        card: &mut ActorStatusResponse,
         what: &str,
         done: impl Fn(&HashMap<String, String>) -> bool,
     ) {
         let deadline = Instant::now() + WAIT;
-        while !done(card) {
+        while !done(&card.telemetry) {
             match bridge.events.try_recv() {
                 Ok(msg) if msg.actor == "openconnect_client.0" => {
-                    if let FlighthookEvent::ActorStatus { telemetry, .. } = msg.event {
-                        for (k, v) in telemetry {
-                            if v.is_empty() {
-                                card.remove(&k);
-                            } else {
-                                card.insert(k, v);
-                            }
-                        }
+                    if let FlighthookEvent::ActorStatus { status, telemetry } = msg.event {
+                        card.apply_status(status, &telemetry, 0);
                     }
                 }
                 Ok(_) => {}
                 Err(broadcast::error::TryRecvError::Empty) => {
                     assert!(
                         Instant::now() < deadline,
-                        "timed out waiting for {what}: {card:?}"
+                        "timed out waiting for {what}: {:?}",
+                        card.telemetry
                     );
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -1557,12 +1574,12 @@ mod tests {
         let mut bridge = Bridge::start(Backoff::new(MAX_BACKOFF, MAX_BACKOFF));
         let addr = bridge.gspro.local_addr().expect("addr").to_string();
         let mut gspro = bridge.accept();
-        let mut card = HashMap::new();
+        let mut card = ActorStatusResponse::new("GSPro", ActorStatus::Starting);
         telemetry_until(&mut bridge, &mut card, "connected", |c| {
             c.get(SHOTS_SENT).map(String::as_str) == Some("0")
         });
-        assert_eq!(card[ADDRESS], addr);
-        assert!(!card.contains_key(LAST_SHOT));
+        assert_eq!(card.telemetry[ADDRESS], addr);
+        assert!(!card.telemetry.contains_key(LAST_SHOT));
 
         gspro
             .stream
@@ -1573,14 +1590,14 @@ mod tests {
         telemetry_until(&mut bridge, &mut card, "the response", |c| {
             c.contains_key(RESPONSE)
         });
-        assert_eq!(card[RESPONSE], "201 GSPro Player Information");
+        assert_eq!(card.telemetry[RESPONSE], "201 GSPro Player Information");
 
         emit_shot(&bridge.monitor, 12);
         assert_eq!(gspro.shots(1), [golden(12)]);
         telemetry_until(&mut bridge, &mut card, "the shot", |c| {
             c.get(SHOTS_SENT).map(String::as_str) == Some("1")
         });
-        let last = &card[LAST_SHOT];
+        let last = &card.telemetry[LAST_SHOT];
         assert!(last.starts_with("#12 at "), "{last}");
         let time = last.trim_start_matches("#12 at ");
         assert_eq!(time.len(), 8, "{last}");
@@ -1591,21 +1608,70 @@ mod tests {
         telemetry_until(&mut bridge, &mut card, "the readiness", |c| {
             c.contains_key(MONITOR_READY)
         });
-        assert_eq!(card[MONITOR_READY], "false");
+        assert_eq!(card.telemetry[MONITOR_READY], "false");
 
         // The player information shows (web layer) until the connection ends.
-        card.insert("club".into(), "DR".into());
-        card.insert("handed".into(), "rh".into());
+        card.telemetry.insert("club".into(), "DR".into());
+        card.telemetry.insert("handed".into(), "rh".into());
         drop(gspro);
         telemetry_until(&mut bridge, &mut card, "the connection's keys gone", |c| {
             !c.contains_key(SHOTS_SENT)
         });
         for key in PER_CONNECTION.into_iter().chain(PLAYER) {
-            assert!(!card.contains_key(key), "{key}: {card:?}");
+            assert!(
+                !card.telemetry.contains_key(key),
+                "{key}: {:?}",
+                card.telemetry
+            );
         }
-        assert_eq!(card[ADDRESS], addr);
-        assert!(card[LAST_SHOT].starts_with("#12 at "));
+        assert_eq!(card.telemetry[ADDRESS], addr);
+        assert!(card.telemetry[LAST_SHOT].starts_with("#12 at "));
         bridge.stop().expect("bridge stops");
+    }
+
+    /// Every status of a lost or restarted connection carries what outlasts
+    /// the connection, so the card (which drops its telemetry then) still
+    /// shows where it dials, the last shot and a refusal.
+    #[test]
+    fn a_status_that_drops_the_card_carries_the_lasting_values() {
+        let mut t = Telemetry::new("127.0.0.1:921".parse().expect("addr"));
+        let mut card = ActorStatusResponse::new("GSPro", ActorStatus::Starting);
+        let apply = |card: &mut ActorStatusResponse, status, update: HashMap<String, String>| {
+            card.apply_status(status, &update, 0);
+        };
+        apply(&mut card, ActorStatus::Starting, t.take_all());
+        assert_eq!(card.telemetry[ADDRESS], "127.0.0.1:921");
+
+        // A refusal, a retry before any connection: the address stays.
+        t.set(ERROR, "refused".into());
+        apply(&mut card, ActorStatus::Starting, t.take_all());
+        apply(&mut card, ActorStatus::Starting, t.take_all());
+        assert_eq!(card.telemetry[ADDRESS], "127.0.0.1:921");
+        assert_eq!(card.telemetry[ERROR], "refused");
+
+        // Connected: the verdict clears the error; one shot goes out; the
+        // connection is lost.
+        t.set(ERROR, String::new());
+        t.set(SHOTS_SENT, "0".into());
+        let mut update = t.take();
+        update.extend(clear_error());
+        apply(&mut card, ActorStatus::Connected, update);
+        t.set(SHOTS_SENT, "1".into());
+        t.set(LAST_SHOT, "#1 at 10:00:00".into());
+        apply(&mut card, ActorStatus::Connected, t.take());
+        t.clear_connection();
+        apply(&mut card, ActorStatus::Reconnecting, t.take_all());
+        assert_eq!(
+            card.telemetry,
+            HashMap::from([
+                (ADDRESS.into(), "127.0.0.1:921".into()),
+                (LAST_SHOT.into(), "#1 at 10:00:00".into()),
+            ])
+        );
+        // Player information the web layer holds is not sent back.
+        t.shown("club");
+        t.shown("handed");
+        assert!(t.take_all().keys().all(|k| k != "club" && k != "handed"));
     }
 
     #[test]

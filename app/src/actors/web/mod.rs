@@ -668,18 +668,6 @@ fn stamp_video(
     }
 }
 
-/// Merge an `actor_status` event's telemetry into an actor's: each key
-/// replaces the one held, and an empty value removes the key.
-fn merge_status_telemetry(held: &mut HashMap<String, String>, update: &HashMap<String, String>) {
-    for (k, v) in update {
-        if v.is_empty() {
-            held.remove(k);
-        } else {
-            held.insert(k.clone(), v.clone());
-        }
-    }
-}
-
 async fn apply_bus_event(
     state: &WebState,
     msg: &FlighthookMessage,
@@ -694,8 +682,10 @@ async fn apply_bus_event(
                 let name = names.get(&msg.actor).cloned().unwrap_or_default();
                 new_actor(name)
             });
-            actor.observe(*status, state.now_ms());
-            merge_status_telemetry(&mut actor.telemetry, telemetry);
+            // A lost connection or a new instance drops the telemetry held
+            // for the actor, the device's values replayed to new WS clients
+            // with it (the export's device identity stays).
+            let cleared = actor.apply_status(*status, telemetry, state.now_ms());
             // Cache the raw message for WS replay
             state
                 .cached_actor_status
@@ -703,6 +693,13 @@ async fn apply_bus_event(
                 .await
                 .insert(msg.actor.clone(), msg.clone());
             drop(actors);
+            if cleared {
+                state
+                    .cached_device_telemetry
+                    .write()
+                    .await
+                    .remove(&msg.actor);
+            }
             // Out of session, the device finishes none of its pending shots.
             if *status != ActorStatus::Connected {
                 drop_pending(state, accumulators, &msg.actor).await;
@@ -1029,26 +1026,169 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn status_telemetry_replaces_keys_and_an_empty_value_removes_one() {
-        let mut held = HashMap::from([
-            ("club".to_string(), "DR".to_string()),
-            ("error".to_string(), "refused".to_string()),
-        ]);
-        merge_status_telemetry(
-            &mut held,
-            &HashMap::from([
-                ("club".to_string(), "7I".to_string()),
-                ("error".to_string(), String::new()),
-                ("handed".to_string(), "rh".to_string()),
-            ]),
-        );
+    fn kv(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// A connected `mevo.0` holding status keys, device-reported keys (and the
+    /// identity), and the club and hand its actor reported.
+    async fn connected_mevo(up: &mut Updater<'_>) {
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ActorStatus {
+                status: ActorStatus::Connected,
+                telemetry: kv(&[("device_info", "Xi")]),
+            },
+        )
+        .await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::DeviceTelemetry {
+                manufacturer: Some("FlightScope".into()),
+                model: Some("Mevo+".into()),
+                firmware: None,
+                telemetry: Some(kv(&[("ready", "true"), ("battery_pct", "80")])),
+            },
+        )
+        .await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::DeviceTelemetry {
+                manufacturer: None,
+                model: None,
+                firmware: None,
+                telemetry: Some(kv(&[("tilt", "ok")])),
+            },
+        )
+        .await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ClubInfo {
+                club_info: ClubInfo { club: Club::Iron7 },
+            },
+        )
+        .await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::HandInfo {
+                hand_info: flighthook::HandInfo {
+                    handed: flighthook::Handedness::Left,
+                },
+            },
+        )
+        .await;
+    }
+
+    async fn held(state: &WebState) -> HashMap<String, String> {
+        state.actors.read().await["mevo.0"].telemetry.clone()
+    }
+
+    #[tokio::test]
+    async fn a_lost_connection_clears_the_actors_telemetry() {
+        for lost in [ActorStatus::Disconnected, ActorStatus::Reconnecting] {
+            let (state, _writer, _dir) = test_state();
+            let mut up = Updater::new(&state);
+            connected_mevo(&mut up).await;
+            assert_eq!(held(&state).await.len(), 6, "{:?}", held(&state).await);
+            assert!(
+                state
+                    .cached_device_telemetry
+                    .read()
+                    .await
+                    .contains_key("mevo.0")
+            );
+
+            up.send(
+                "mevo.0",
+                FlighthookEvent::ActorStatus {
+                    status: lost,
+                    telemetry: kv(&[("error", "gone")]),
+                },
+            )
+            .await;
+            assert_eq!(held(&state).await, kv(&[("error", "gone")]), "{lost:?}");
+            assert_eq!(state.actors.read().await["mevo.0"].status, lost);
+            // New WS clients are not replayed the lost device's values, and
+            // the export keeps the device's identity.
+            assert!(
+                !state
+                    .cached_device_telemetry
+                    .read()
+                    .await
+                    .contains_key("mevo.0")
+            );
+            assert_eq!(
+                state.device_identity.read().await["mevo.0"]
+                    .model
+                    .as_deref(),
+                Some("Mevo+")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_instance_starts_without_the_old_telemetry() {
+        let (state, _writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        connected_mevo(&mut up).await;
+        up.status("mevo.0", ActorStatus::Disconnected).await;
+        // Values reported after the loss are held until the next start.
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ClubInfo {
+                club_info: ClubInfo { club: Club::Driver },
+            },
+        )
+        .await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ActorStatus {
+                status: ActorStatus::Starting,
+                telemetry: kv(&[("address", "1.2.3.4:5")]),
+            },
+        )
+        .await;
+        assert_eq!(held(&state).await, kv(&[("address", "1.2.3.4:5")]));
+    }
+
+    #[tokio::test]
+    async fn repeated_statuses_that_are_not_a_loss_merge() {
+        let (state, _writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        connected_mevo(&mut up).await;
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ActorStatus {
+                status: ActorStatus::Connected,
+                telemetry: kv(&[("shot_count", "1")]),
+            },
+        )
+        .await;
+        assert_eq!(held(&state).await.len(), 7);
+        up.send(
+            "mevo.0",
+            FlighthookEvent::ActorStatus {
+                status: ActorStatus::Disconnected,
+                telemetry: kv(&[("error", "a")]),
+            },
+        )
+        .await;
+        for status in [ActorStatus::Reconnecting, ActorStatus::Disconnected] {
+            up.send(
+                "mevo.0",
+                FlighthookEvent::ActorStatus {
+                    status,
+                    telemetry: kv(&[("phase", "connecting")]),
+                },
+            )
+            .await;
+        }
         assert_eq!(
-            held,
-            HashMap::from([
-                ("club".to_string(), "7I".to_string()),
-                ("handed".to_string(), "rh".to_string()),
-            ])
+            held(&state).await,
+            kv(&[("error", "a"), ("phase", "connecting")])
         );
     }
 
