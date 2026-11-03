@@ -178,24 +178,28 @@ pub(crate) fn card() -> egui::Frame {
         .inner_margin(Margin::same(12))
 }
 
-/// A [`card`] the width of `ui` with a coloured stripe down its left edge:
-/// the Devices tab's cards.
+/// A [`card`] the width of `ui` and exactly `height` tall, with a coloured
+/// stripe down its left edge: the Devices tab's cards. The contents are
+/// given the card's inner height to fill, and no more.
 pub(crate) fn accent_card<R>(
     ui: &mut egui::Ui,
     accent: Color32,
+    height: f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
-    let card = card()
-        .inner_margin(Margin {
-            left: 18,
-            right: 14,
-            top: 12,
-            bottom: 12,
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add_contents(ui)
-        });
+    let frame = card().inner_margin(Margin {
+        left: 18,
+        right: 14,
+        top: 12,
+        bottom: 12,
+    });
+    let inner = (height - frame.total_margin().sum().y).max(0.0);
+    let card = frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.set_min_height(inner);
+        ui.set_max_height(inner);
+        add_contents(ui)
+    });
     let r = card.response.rect;
     let stripe = egui::Rect::from_min_max(
         egui::pos2(r.left() + 6.0, r.top() + 12.0),
@@ -412,6 +416,63 @@ pub(crate) fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Resp
     );
     ui.painter().galley(pos, galley, color);
     response
+}
+
+/// Diameter of [`loading_ring`] and [`connected_ring`] at 1x.
+pub(crate) const STATUS_RING: f32 = 48.0;
+
+/// Line width of [`loading_ring`] and [`connected_ring`].
+const STATUS_RING_STROKE: f32 = 4.0;
+
+/// How often a visible [`loading_ring`] is redrawn.
+pub(crate) const LOADING_FRAME: std::time::Duration = std::time::Duration::from_micros(33_333);
+
+/// A line through `points` with round ends and joints.
+fn round_line(painter: &egui::Painter, points: Vec<egui::Pos2>, color: Color32, width: f32) {
+    for p in &points {
+        painter.circle_filled(*p, width / 2.0, color);
+    }
+    painter.add(egui::Shape::line(points, Stroke::new(width, color)));
+}
+
+/// A loading spinner [`STATUS_RING`] across centred on `center`, at `time`
+/// seconds: a faint ring with an arc in `color` going round it, growing and
+/// shrinking as it goes. The caller asks for the next frame.
+pub(crate) fn loading_ring(painter: &egui::Painter, center: egui::Pos2, color: Color32, time: f64) {
+    use std::f64::consts::TAU;
+    let radius = (STATUS_RING - STATUS_RING_STROKE) / 2.0;
+    painter.circle_stroke(
+        center,
+        radius,
+        Stroke::new(STATUS_RING_STROKE, color.gamma_multiply(0.18)),
+    );
+    // One turn every 1.1 s; the arc spans 40 to 250 degrees and back.
+    let start = time * TAU / 1.1;
+    let span = (40.0 + 105.0 * (1.0 - (time * TAU / 1.6).cos())).to_radians();
+    let steps = 32;
+    let points = (0..=steps)
+        .map(|i| {
+            let a = start + span * f64::from(i) / f64::from(steps);
+            #[allow(clippy::cast_possible_truncation)]
+            let (sin, cos) = (a.sin() as f32, a.cos() as f32);
+            center + egui::vec2(cos, sin) * radius
+        })
+        .collect();
+    round_line(painter, points, color, STATUS_RING_STROKE);
+}
+
+/// A connected mark [`STATUS_RING`] across centred on `center`: a check in
+/// a ring, in the connected green. It does not move.
+pub(crate) fn connected_ring(painter: &egui::Painter, center: egui::Pos2) {
+    let radius = (STATUS_RING - STATUS_RING_STROKE) / 2.0;
+    painter.circle_stroke(center, radius, Stroke::new(STATUS_RING_STROKE, STATUS_OK));
+    let at = |x: f32, y: f32| center + egui::vec2(x, y) * radius;
+    round_line(
+        painter,
+        vec![at(-0.42, 0.02), at(-0.12, 0.32), at(0.44, -0.3)],
+        STATUS_OK,
+        STATUS_RING_STROKE,
+    );
 }
 
 /// A clickable chip the size of a `badge`, with an up arrow: neutral

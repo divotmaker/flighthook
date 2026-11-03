@@ -537,7 +537,8 @@ pub async fn post_clear_shot_history(State(state): State<Arc<WebState>>) -> Stat
 /// assigned the same way in every view.
 ///
 /// Rides the same `ConfigCommand` path as a Settings save and answers once
-/// the system actor has applied it; `504` when it does not within 10 s.
+/// the system actor has applied it; `504` when it does not within
+/// [`CONFIG_TIMEOUT`].
 pub async fn post_shot_grouping(
     State(state): State<Arc<WebState>>,
     Json(body): Json<GroupingRequest>,
@@ -764,7 +765,9 @@ async fn save_settings(
     }
 
     match send_config_command_within(state, action, timeout).await {
-        Some((restarted, stopped)) => Ok(Json(PostSettingsResponse { restarted, stopped })),
+        Some(Outcome {
+            restarted, stopped, ..
+        }) => Ok(Json(PostSettingsResponse { restarted, stopped })),
         None => {
             tracing::warn!("config update: timed out waiting for ConfigOutcome");
             Err(settings_error(
@@ -775,20 +778,178 @@ async fn save_settings(
     }
 }
 
-/// How long a config command waits for its `ConfigOutcome`.
-const CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a config command (a save, a view change, a reconnect) waits for
+/// its `ConfigOutcome`. The actors a command stops are stopped together and
+/// given up to [`MAX_STOP_WAIT`](crate::actors::MAX_STOP_WAIT), with
+/// [`START_ROOM`] for the rest. The system actor waits for them off its own
+/// thread, so a command never waits behind another one's stops.
+const CONFIG_TIMEOUT: Duration =
+    Duration::from_secs(crate::actors::MAX_STOP_WAIT.as_secs() + START_ROOM.as_secs());
+
+/// What a config command takes beyond its stop waits: the config write and
+/// the starts.
+const START_ROOM: Duration = Duration::from_secs(4);
+
+// The dashboard waits longer for a save or a reconnect than the server
+// does, so it always gets the server's answer.
+#[cfg(feature = "gui")]
+const _: () =
+    assert!(flighthook_ui::net::CONFIG_REQUEST_TIMEOUT.as_secs() > CONFIG_TIMEOUT.as_secs() + 1);
+
+/// How long a reconnect still holds its actor's in-flight guard after the
+/// request was answered `202`, waiting for the outcome.
+const RECONNECT_LINGER: Duration = CONFIG_TIMEOUT;
+
+/// POST /api/actors/{id}/reconnect — stop the launch monitor or output `id`,
+/// wait for its connection to close, and start it again from the saved
+/// settings. Nothing else is touched.
+///
+/// `200` with `{"restarted": [id]}` once it has started again; `202` with
+/// nothing restarted when it starts again by itself later: the reconnect is
+/// still running after [`CONFIG_TIMEOUT`] (the actor stays in flight until
+/// it ends), its old connection has not closed yet, or another command is
+/// restarting it; `400` for a camera, the web server or any other actor that
+/// is not a launch monitor or output; `404` for an ID no launch monitor or
+/// output has; `409` while a reconnect of it is in flight, or when it was
+/// not started again for any other reason (it was removed meanwhile).
+/// Errors carry a JSON `{"error": "..."}` body.
+pub async fn post_reconnect(
+    State(state): State<Arc<WebState>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<PostSettingsResponse>), SettingsError> {
+    reconnect(&state, &id, CONFIG_TIMEOUT).await
+}
+
+/// Reconnect actor `id`, waiting up to `timeout` for the system actor.
+async fn reconnect(
+    state: &Arc<WebState>,
+    id: &str,
+    timeout: Duration,
+) -> Result<(StatusCode, Json<PostSettingsResponse>), SettingsError> {
+    use crate::actors::system::{ReconnectRefusal, not_reconnected, reconnect_target};
+    let id = match reconnect_target(&state.root.system.snapshot(), id) {
+        Ok(id) => id,
+        Err(r @ ReconnectRefusal::NotReconnectable(_)) => {
+            return Err(settings_error(StatusCode::BAD_REQUEST, r.message()));
+        }
+        Err(r @ ReconnectRefusal::NotFound(_)) => {
+            return Err(settings_error(StatusCode::NOT_FOUND, r.message()));
+        }
+    };
+    let Some(in_flight) = InFlight::begin(state, &id) else {
+        return Err(settings_error(
+            StatusCode::CONFLICT,
+            &format!("a reconnect of '{id}' is already in progress"),
+        ));
+    };
+    let mut outcome = Box::pin(send_config_command(
+        state,
+        ConfigAction::Reconnect { id: id.clone() },
+    ));
+    match tokio::time::timeout(timeout, &mut outcome).await {
+        Ok(Some(Outcome { restarted, stopped })) if restarted.contains(&id) => Ok((
+            StatusCode::OK,
+            Json(PostSettingsResponse { restarted, stopped }),
+        )),
+        // It starts again by itself once its old connection has closed,
+        // or the command restarting it is done.
+        Ok(Some(_)) if state.root.is_closing(&id) || state.root.is_settling(&id) => Ok((
+            StatusCode::ACCEPTED,
+            Json(PostSettingsResponse {
+                restarted: Vec::new(),
+                stopped: Vec::new(),
+            }),
+        )),
+        Ok(Some(_)) => Err(settings_error(
+            StatusCode::CONFLICT,
+            &not_reconnected(&state.root, &id),
+        )),
+        Ok(None) => Err(settings_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "the reconnect did not finish",
+        )),
+        Err(_) => {
+            tracing::warn!("reconnect '{id}': still running, answered 202");
+            // Still queued or running: the guard holds until it ends, so a
+            // second request cannot restart the actor again behind it.
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(RECONNECT_LINGER, outcome).await;
+                drop(in_flight);
+            });
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(PostSettingsResponse {
+                    restarted: Vec::new(),
+                    stopped: Vec::new(),
+                }),
+            ))
+        }
+    }
+}
+
+/// A reconnect in flight: its actor ID is in the web state's set while this
+/// lives.
+struct InFlight {
+    state: Arc<WebState>,
+    id: String,
+}
+
+impl InFlight {
+    /// Mark `id` in flight; `None` when it already is.
+    fn begin(state: &Arc<WebState>, id: &str) -> Option<Self> {
+        state
+            .reconnecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_owned())
+            .then(|| Self {
+                state: Arc::clone(state),
+                id: id.to_owned(),
+            })
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.state
+            .reconnecting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// A `ConfigOutcome`'s actor lists.
+#[derive(Debug)]
+struct Outcome {
+    restarted: Vec<String>,
+    stopped: Vec<String>,
+}
 
 /// Emit a `ConfigCommand` for `action` and wait up to `timeout` for the
-/// system actor's matching `ConfigOutcome`. Returns its `(restarted,
-/// stopped)` actor IDs, or `None` on timeout or a closed bus.
+/// system actor's matching `ConfigOutcome`. Returns it, or `None` on
+/// timeout or a closed bus.
 async fn send_config_command_within(
     state: &WebState,
     action: ConfigAction,
     timeout: Duration,
-) -> Option<(Vec<String>, Vec<String>)> {
-    let request_id = crate::state::config::generate_id();
-    let mut bus_rx = state.bus_tx.subscribe();
+) -> Option<Outcome> {
+    tokio::time::timeout(timeout, send_config_command(state, action))
+        .await
+        .ok()
+        .flatten()
+}
 
+/// Emit a `ConfigCommand` for `action` now. The future resolves to the
+/// system actor's matching `ConfigOutcome`, or `None` once the bus closes.
+fn send_config_command(
+    state: &WebState,
+    action: ConfigAction,
+) -> impl Future<Output = Option<Outcome>> + Send + 'static {
+    let request_id = crate::state::config::generate_id();
+    // Subscribed before the command goes out, so its outcome cannot be
+    // missed.
+    let mut bus_rx = state.bus_tx.subscribe();
     let _ = state.bus_tx.send(
         FlighthookMessage::new(FlighthookEvent::ConfigCommand {
             request_id: Some(request_id.clone()),
@@ -796,8 +957,7 @@ async fn send_config_command_within(
         })
         .actor("web"),
     );
-
-    let result = tokio::time::timeout(timeout, async {
+    async move {
         loop {
             match bus_rx.recv().await {
                 Ok(msg) => {
@@ -809,16 +969,17 @@ async fn send_config_command_within(
                     } = msg.event
                         && *rid == request_id
                     {
-                        return Some((restarted.clone(), stopped.clone()));
+                        return Some(Outcome {
+                            restarted: restarted.clone(),
+                            stopped: stopped.clone(),
+                        });
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
             }
         }
-    })
-    .await;
-    result.ok().flatten()
+    }
 }
 
 #[cfg(test)]
@@ -1824,9 +1985,7 @@ mod group_tests {
                 let msg = rx.recv().await.expect("bus open");
                 if let FlighthookEvent::ConfigCommand { action, .. } = &msg.event {
                     actions.push((**action).clone());
-                    crate::actors::system::handle_config_command(
-                        &msg.event, &root, &bus_tx, &sender,
-                    );
+                    crate::actors::system::run_config_command(&msg.event, &root, &bus_tx, &sender);
                 }
             }
             actions
@@ -1878,7 +2037,7 @@ mod group_tests {
                 let msg = rx.recv().await.expect("bus open");
                 match &msg.event {
                     FlighthookEvent::ConfigCommand { .. } => {
-                        crate::actors::system::handle_config_command(
+                        crate::actors::system::run_config_command(
                             &msg.event, &root, &bus_tx, &sender,
                         );
                     }
@@ -2135,5 +2294,354 @@ mod group_tests {
                 .expect("ser")
                 .contains(r#""handed":"lh""#)
         );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use std::io::{Read as _, Write as _};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::super::tests::test_state;
+    use super::*;
+    use crate::actors::Actor as _;
+    use crate::bus::{BusReceiver, BusSender};
+    use crate::state::SystemState;
+
+    /// A web state whose config holds a mock monitor and a camera.
+    fn configured() -> (
+        Arc<WebState>,
+        crate::state::GameStateWriter,
+        super::super::tests::TempDir,
+    ) {
+        let (state, writer, dir) = test_state();
+        state.root.system.update(|c| {
+            c.mock_monitor.insert(
+                "0".into(),
+                flighthook::MockMonitorSection {
+                    name: "Mock".into(),
+                },
+            );
+            c.camera
+                .insert("0".into(), flighthook::CameraSection::default());
+        });
+        (Arc::new(state), writer, dir)
+    }
+
+    /// Stand-in for the system actor: answers every reconnect after
+    /// `delay`, as restarted unless `refuse`. Counts the commands.
+    fn answer(state: &Arc<WebState>, delay: Duration, refuse: bool) -> Arc<AtomicUsize> {
+        let mut rx = state.bus_tx.subscribe();
+        let bus_tx = state.bus_tx.clone();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&count);
+        tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                if let FlighthookEvent::ConfigCommand { request_id, action } = msg.event {
+                    let ConfigAction::Reconnect { id } = *action else {
+                        panic!("unexpected action {action:?}");
+                    };
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    let restarted = if refuse { Vec::new() } else { vec![id] };
+                    let _ = bus_tx.send(
+                        FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
+                            request_id,
+                            restarted,
+                            stopped: Vec::new(),
+                            started: Vec::new(),
+                        })
+                        .actor("system"),
+                    );
+                }
+            }
+        });
+        count
+    }
+
+    type Reply = Result<(StatusCode, Json<PostSettingsResponse>), SettingsError>;
+
+    fn code(result: &Reply) -> StatusCode {
+        match result {
+            Ok((status, _)) => *status,
+            Err((status, _)) => *status,
+        }
+    }
+
+    fn error_of(result: Reply) -> serde_json::Value {
+        let Err((_, Json(body))) = result else {
+            panic!("not an error")
+        };
+        body["error"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_answers_with_the_restarted_actor() {
+        let (state, _writer, _dir) = configured();
+        let count = answer(&state, Duration::ZERO, false);
+        let (status, Json(body)) = reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT)
+            .await
+            .expect("reconnected");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.restarted, ["mock_monitor.0"]);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(state.reconnecting.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cameras_general_cards_and_unknown_ids_are_refused_without_a_command() {
+        let (state, _writer, _dir) = configured();
+        let mut rx = state.bus_tx.subscribe();
+        for (id, status) in [
+            ("camera.0", StatusCode::BAD_REQUEST),
+            ("webserver.0", StatusCode::BAD_REQUEST),
+            ("system", StatusCode::BAD_REQUEST),
+            ("mock_monitor.4", StatusCode::NOT_FOUND),
+            ("mevo.0", StatusCode::NOT_FOUND),
+        ] {
+            let result = reconnect(&state, id, Duration::from_millis(50)).await;
+            assert_eq!(code(&result), status, "{id}");
+            let error = error_of(result);
+            assert!(error.as_str().is_some_and(|e| e.contains(id)), "{error}");
+        }
+        assert!(rx.try_recv().is_err(), "nothing reached the bus");
+    }
+
+    #[tokio::test]
+    async fn a_second_reconnect_of_the_same_actor_is_refused_while_one_is_in_flight() {
+        let (state, _writer, _dir) = configured();
+        let count = answer(&state, Duration::from_millis(200), false);
+        let (first, second) = tokio::join!(
+            reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT),
+            reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT),
+        );
+        assert_eq!(code(&first), StatusCode::OK);
+        assert_eq!(code(&second), StatusCode::CONFLICT);
+        assert_eq!(count.load(Ordering::SeqCst), 1, "one reconnect ran");
+        // Once it is done, another may start.
+        let again = reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT).await;
+        assert_eq!(code(&again), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    /// A reconnect still running when the request has waited its time is
+    /// `202`, and the actor stays in flight until the outcome arrives: a
+    /// second press meanwhile cannot queue a second restart.
+    #[tokio::test]
+    async fn a_reconnect_still_running_is_accepted_and_keeps_its_guard() {
+        let (state, _writer, _dir) = configured();
+        let count = answer(&state, Duration::from_millis(400), false);
+        let first = reconnect(&state, "mock_monitor.0", Duration::from_millis(50)).await;
+        assert_eq!(code(&first), StatusCode::ACCEPTED);
+        assert!(first.expect("accepted").1.restarted.is_empty());
+        let second = reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT).await;
+        assert_eq!(code(&second), StatusCode::CONFLICT);
+        assert!(
+            error_of(second)
+                .as_str()
+                .is_some_and(|e| e.contains("already in progress"))
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1, "one command on the bus");
+
+        // The outcome arrives: the guard goes with it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !state.reconnecting.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "guard released");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let third = reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT).await;
+        assert_eq!(code(&third), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_that_starts_nothing_is_a_conflict_with_the_reason() {
+        let (state, _writer, _dir) = configured();
+        let _count = answer(&state, Duration::ZERO, true);
+        let result = reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT).await;
+        assert_eq!(code(&result), StatusCode::CONFLICT);
+        assert_eq!(error_of(result), "'mock_monitor.0' was not reconnected");
+    }
+
+    /// A reconnect that starts its actor again by itself later, once the
+    /// old connection has closed or another command is done restarting it,
+    /// is accepted.
+    #[tokio::test]
+    async fn a_reconnect_that_completes_by_itself_is_accepted() {
+        let (state, _writer, _dir) = configured();
+        let _count = answer(&state, Duration::ZERO, true);
+        state.root.begin_settling("mock_monitor.0");
+        let result = reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT).await;
+        assert_eq!(code(&result), StatusCode::ACCEPTED);
+        state.root.end_settling("mock_monitor.0");
+
+        crate::actors::start_actor(
+            "mock_monitor.0".into(),
+            Box::new(crate::actors::mock::launch::MockLaunchActor {
+                initial_mode: flighthook::ShotDetectionMode::Full,
+            }),
+            &state.root,
+            &state.bus_tx,
+        );
+        state.root.close_in_background("mock_monitor.0");
+        let result = reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT).await;
+        assert_eq!(code(&result), StatusCode::ACCEPTED);
+        assert!(result.expect("accepted").1.restarted.is_empty());
+        assert!(state.reconnecting.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_config_timeout_outlasts_the_longest_stop_wait() {
+        use crate::actors::{MAX_STOP_WAIT, STOP_WAIT};
+        let exputt = crate::actors::exputt::ExPuttActor { address: None };
+        assert_eq!(exputt.stop_wait(), MAX_STOP_WAIT);
+        for wait in [STOP_WAIT, crate::actors::square::STOP_WAIT] {
+            assert!(wait <= MAX_STOP_WAIT, "{wait:?}");
+        }
+        assert!(CONFIG_TIMEOUT >= MAX_STOP_WAIT + START_ROOM);
+        assert!(RECONNECT_LINGER >= CONFIG_TIMEOUT);
+    }
+
+    /// An actor that holds its device for `holds` after a stop, waited for
+    /// `wait`.
+    struct Lingers {
+        holds: Duration,
+        wait: Duration,
+    }
+
+    impl crate::actors::Actor for Lingers {
+        fn start(
+            &self,
+            _state: Arc<SystemState>,
+            _sender: BusSender,
+            receiver: BusReceiver,
+        ) -> std::thread::JoinHandle<()> {
+            let holds = self.holds;
+            std::thread::spawn(move || {
+                while !receiver.is_shutdown() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(holds);
+            })
+        }
+
+        fn stop_wait(&self) -> Duration {
+            self.wait
+        }
+    }
+
+    /// A save sent while a reconnect waits out its actor's whole stop wait
+    /// is answered at once, not behind the reconnect; the reconnect, which
+    /// finds the old connection still closing, is accepted: it completes by
+    /// itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_during_a_long_reconnect_is_answered_at_once() {
+        let (state, writer, _dir) = configured();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        crate::actors::system::start_for_test(
+            writer,
+            &state.root,
+            &state.bus_tx,
+            Arc::clone(&shutdown),
+        );
+        let wait = Duration::from_millis(800);
+        crate::actors::start_actor(
+            "mock_monitor.0".into(),
+            Box::new(Lingers {
+                holds: Duration::from_secs(2),
+                wait,
+            }),
+            &state.root,
+            &state.bus_tx,
+        );
+        let at = std::time::Instant::now();
+        let reconnecting = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let saved = save_settings(
+            &state,
+            Some("mock_monitor.0"),
+            state.root.system.snapshot(),
+            CONFIG_TIMEOUT,
+        )
+        .await;
+        let took = at.elapsed();
+        assert!(saved.is_ok(), "{:?}", saved.err());
+        assert!(took < wait, "not behind the reconnect: {took:?}");
+        let result = reconnecting.await.expect("reconnect");
+        assert_eq!(code(&result), StatusCode::ACCEPTED);
+        assert!(at.elapsed() >= wait, "after the stop wait");
+        shutdown.store(true, Ordering::SeqCst);
+        state.root.stop_all_and_wait(Duration::from_secs(3));
+    }
+
+    /// POST `path` with no body: status code and body.
+    fn post(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).expect("request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("response");
+        let code = response
+            .split(' ')
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .expect("status");
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_owned())
+            .unwrap_or_default();
+        (code, body)
+    }
+
+    #[test]
+    fn the_route_reconnects_a_running_monitor() {
+        let (state, writer, _dir) = configured();
+        let root = Arc::clone(&state.root);
+        let bus = state.bus_tx.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        crate::actors::system::start_for_test(writer, &root, &bus, Arc::clone(&shutdown));
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port");
+        let web = super::super::WebActor::new(addr);
+        let web_sender = BusSender::new("webserver.0".into(), bus.clone(), Arc::default());
+        let web_thread = web.start(
+            Arc::clone(&root),
+            web_sender.clone(),
+            web_sender.subscribe(),
+        );
+        crate::actors::start_actor(
+            "mock_monitor.0".into(),
+            Box::new(crate::actors::mock::launch::MockLaunchActor {
+                initial_mode: flighthook::ShotDetectionMode::Full,
+            }),
+            &root,
+            &bus,
+        );
+        let before = root.actor_thread("mock_monitor.0");
+        // The server is up once it answers.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::net::TcpStream::connect(addr).is_err() {
+            assert!(std::time::Instant::now() < deadline, "web server up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let (status, body) = post(addr, "/api/actors/mock_monitor.0/reconnect");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""restarted":["mock_monitor.0"]"#), "{body}");
+        assert_ne!(root.actor_thread("mock_monitor.0"), before);
+        assert_eq!(post(addr, "/api/actors/camera.0/reconnect").0, 400);
+        assert_eq!(post(addr, "/api/actors/mock_monitor.3/reconnect").0, 404);
+        assert_eq!(post(addr, "/api/actors/mock_monitor.0/reconnect/x").0, 404);
+
+        web.stop();
+        let _ = web_thread.join();
+        root.stop_and_wait("mock_monitor.0");
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }

@@ -33,7 +33,12 @@ pub struct R10Actor {
 }
 
 impl Actor for R10Actor {
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let initial_mode = self.initial_mode;
         let tee_range_yards = self.tee_range_yards;
         let thread_name = format!("device:{}", sender.actor_id());
@@ -43,7 +48,7 @@ impl Actor for R10Actor {
             .spawn(move || {
                 run(&state, initial_mode, tee_range_yards, sender, receiver);
             })
-            .expect("failed to spawn r10 thread");
+            .expect("failed to spawn r10 thread")
     }
 
     fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {

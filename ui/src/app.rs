@@ -1,6 +1,6 @@
 //! egui application — FlighthookApp.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::battery;
 use crate::chart::{Cached, ChartKey, MembersKey};
@@ -23,11 +23,19 @@ use chrono::{SecondsFormat, Utc};
 
 const API_DOCS_MD: &str = include_str!("../../docs/API.md");
 
+/// Longest a reconnect answered "starts later" keeps its Reconnect
+/// disabled while the actor is not seen starting again.
+pub(crate) const RECONNECT_WAIT_MS: u64 = 60_000;
+
+/// The card's reason when a reconnect answered "starts later" has not
+/// started within [`RECONNECT_WAIT_MS`].
+pub(crate) const RECONNECT_UNFINISHED: &str = "the reconnect has not finished";
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
-fn new_actor(name: String) -> ActorStatusResponse {
+pub(crate) fn new_actor(name: String) -> ActorStatusResponse {
     ActorStatusResponse::new(name, ActorStatus::Disconnected)
 }
 
@@ -82,6 +90,17 @@ pub struct FlighthookApp {
     pub(crate) active_tab: Tab,
     /// The side each device card on the Devices tab shows.
     pub(crate) card_modes: CardModes,
+    /// Actors whose reconnect is in flight: their Reconnect waits until
+    /// the request fails or the new instance has started.
+    pub(crate) reconnecting: HashSet<String>,
+    /// Reconnects answered "starts later": since when (ms), until the
+    /// actor is seen starting again.
+    pub(crate) reconnect_later: HashMap<String, u64>,
+    /// Actors in flight seen starting again before their reply came.
+    reconnect_seen: HashSet<String>,
+    /// Why an actor's last reconnect request failed, shown as its card's
+    /// `error` until the actor's next status or the next press.
+    pub(crate) reconnect_errors: HashMap<String, String>,
     pub(crate) confirm_remove: Option<PendingRemoval>,
     /// The Clear history confirmation is open.
     pub(crate) confirm_clear: bool,
@@ -226,6 +245,10 @@ impl FlighthookApp {
             ws_ever_connected: false,
             active_tab: Tab::Devices,
             card_modes: CardModes::default(),
+            reconnecting: HashSet::new(),
+            reconnect_later: HashMap::new(),
+            reconnect_seen: HashSet::new(),
+            reconnect_errors: HashMap::new(),
             confirm_remove: None,
             confirm_clear: false,
             units_toggle: UnitSystem::default(),
@@ -348,6 +371,7 @@ impl FlighthookApp {
                 Err(e) => self.camera_list.error = Some(e),
             }
         }
+        let reconnects = std::mem::take(&mut p.reconnects);
         let stills = std::mem::take(&mut p.stills);
         let replies = std::mem::take(&mut p.replay);
 
@@ -387,6 +411,10 @@ impl FlighthookApp {
         }
         drop(p);
 
+        for (actor, reply) in reconnects {
+            self.reconnect_reply(actor, reply);
+        }
+        self.expire_reconnects();
         for (actor, reply) in stills {
             self.stills.entry(actor).or_default().reply(reply);
         }
@@ -396,6 +424,74 @@ impl FlighthookApp {
                 view.reply(reply);
             } else if let Some(card) = self.card_clips.values_mut().find(|c| c.seq() == seq) {
                 card.reply(reply);
+            }
+        }
+    }
+
+    /// Actor `actor`'s reconnect was answered: started, it is done; to
+    /// start later, it waits until the actor is seen starting again; a
+    /// failure frees it and shows on the card.
+    fn reconnect_reply(&mut self, actor: String, reply: Result<net::Reconnected, String>) {
+        match reply {
+            Ok(net::Reconnected::Started) => self.reconnect_done(&actor),
+            Ok(net::Reconnected::Later) if self.reconnect_seen.contains(&actor) => {
+                self.reconnect_done(&actor);
+            }
+            Ok(net::Reconnected::Later) => {
+                self.reconnect_later.insert(actor, self.now_ms);
+            }
+            Err(e) => {
+                log::warn!("reconnect {actor}: {e}");
+                self.reconnect_done(&actor);
+                self.reconnect_errors.insert(actor, e);
+            }
+        }
+    }
+
+    /// Actor `id` is starting again (its `Starting` status, or an outcome
+    /// listing it restarted; a `Connected` may still come from the
+    /// instance being replaced): a reconnect of it answered
+    /// "starts later" is done; one not yet answered is done with its
+    /// answer.
+    fn reconnect_started(&mut self, id: &str) {
+        if !self.reconnecting.contains(id) {
+            return;
+        }
+        if self.reconnect_later.contains_key(id) {
+            self.reconnect_done(id);
+        } else {
+            self.reconnect_seen.insert(id.to_owned());
+        }
+    }
+
+    /// Actor `id`'s reconnect is over: its Reconnect takes clicks again.
+    pub(crate) fn reconnect_done(&mut self, id: &str) {
+        self.reconnecting.remove(id);
+        self.reconnect_later.remove(id);
+        self.reconnect_seen.remove(id);
+    }
+
+    /// Reconnects answered "starts later" that have not started within
+    /// [`RECONNECT_WAIT_MS`] are given up on: freed, with the reason on the
+    /// card unless the actor's own `error` row already gives one.
+    fn expire_reconnects(&mut self) {
+        let now = self.now_ms;
+        let expired: Vec<String> = self
+            .reconnect_later
+            .iter()
+            .filter(|(_, since)| now.saturating_sub(**since) >= RECONNECT_WAIT_MS)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.reconnect_done(&id);
+            let explained = self
+                .actors
+                .get(&id)
+                .and_then(|a| a.telemetry.get("error"))
+                .is_some_and(|e| !e.is_empty());
+            if !explained {
+                self.reconnect_errors
+                    .insert(id, RECONNECT_UNFINISHED.into());
             }
         }
     }
@@ -486,6 +582,11 @@ impl FlighthookApp {
         let actor = msg.actor.clone();
         match msg.event {
             FlighthookEvent::ActorStatus { status, telemetry } => {
+                // The actor speaks for itself again.
+                self.reconnect_errors.remove(&actor);
+                if status == ActorStatus::Starting {
+                    self.reconnect_started(&actor);
+                }
                 let actor = self
                     .actors
                     .entry(actor)
@@ -642,6 +743,7 @@ impl FlighthookApp {
                     if let Some(actor) = self.actors.get_mut(id) {
                         actor.restart(self.now_ms);
                     }
+                    self.reconnect_started(id);
                 }
                 // WS events carry no names, and a rename restarts nothing:
                 // re-fetch the status for the configured names, new actors

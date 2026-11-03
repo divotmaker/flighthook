@@ -92,6 +92,107 @@ pub(crate) fn device_card_order(
     }))
 }
 
+/// Height of every card on the Devices tab: General, Launch monitors,
+/// Cameras and Outputs, on both sides, whatever it shows. The Telemetry side
+/// of a connected Mevo+, Omni or Open Connect client and the Settings side of
+/// the Global card fit without scrolling; a longer body scrolls inside its
+/// card.
+pub(crate) const CARD_HEIGHT: f32 = 280.0;
+
+/// Height of a card's action row (Reconnect, Find mat, Still frame,
+/// Remove): one button.
+fn action_row(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y
+}
+
+/// A Devices-tab card being laid out, top to bottom: its header and the
+/// lines under it ([`top`](Self::top)), its [`body`](Self::body), then its
+/// [`actions`](Self::actions) at the bottom.
+pub(crate) struct CardRegions<'a> {
+    ui: &'a mut egui::Ui,
+    /// The card's ID, which keys its scroll position.
+    key: &'a str,
+}
+
+impl CardRegions<'_> {
+    /// The top of the card: its header and any line under it.
+    pub(crate) fn top(&mut self) -> &mut egui::Ui {
+        self.ui
+    }
+
+    /// The card's body: everything between the top and the action row
+    /// (`with_actions`) or the bottom. It scrolls inside the card when it
+    /// does not fit, keeping its position for the session.
+    pub(crate) fn body<R>(
+        &mut self,
+        with_actions: bool,
+        add: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> R {
+        let spacing = self.ui.spacing().item_spacing.y;
+        let reserve = if with_actions {
+            action_row(self.ui) + spacing
+        } else {
+            0.0
+        };
+        let height = (self.ui.available_height() - reserve).max(0.0);
+        // Whole points, so the scroll area's pixel rounding never reaches
+        // past the card's width, with or without its bar.
+        let width = self.ui.available_width().floor();
+        let key = self.key;
+        self.ui
+            .allocate_ui_with_layout(
+                egui::vec2(width, height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_min_size(egui::vec2(width, height));
+                    // Keyed by the card, not its place in the grid.
+                    ui.scope_builder(
+                        egui::UiBuilder::new().id(("devices_card_body", key)),
+                        |ui| {
+                            // A thin bar, shown whenever the body overflows.
+                            ui.spacing_mut().scroll = egui::style::ScrollStyle::thin();
+                            let shown = egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .max_height(height)
+                                .show(ui, add);
+                            mark_body(ui, key, &shown);
+                            shown.inner
+                        },
+                    )
+                    .inner
+                },
+            )
+            .inner
+    }
+
+    /// The action row along the card's bottom, right to left: the first
+    /// button added sits furthest right.
+    pub(crate) fn actions<R>(&mut self, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let width = self.ui.available_width();
+        let height = action_row(self.ui);
+        self.ui
+            .allocate_ui_with_layout(
+                egui::vec2(width, height),
+                egui::Layout::right_to_left(egui::Align::Center),
+                add,
+            )
+            .inner
+    }
+}
+
+/// A Devices-tab card, [`CARD_HEIGHT`] tall, with an `accent` stripe;
+/// `add` lays out its regions. `key` names it.
+pub(crate) fn fixed_card<R>(
+    ui: &mut egui::Ui,
+    key: &str,
+    accent: egui::Color32,
+    add: impl FnOnce(&mut CardRegions<'_>) -> R,
+) -> egui::InnerResponse<R> {
+    theme::accent_card(ui, accent, CARD_HEIGHT, |ui| {
+        add(&mut CardRegions { ui, key })
+    })
+}
+
 /// What a click on a device card asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CardAction {
@@ -104,6 +205,8 @@ enum CardAction {
     Still,
     /// Look for cameras again.
     RefreshCameras,
+    /// Stop the actor and start it again.
+    Reconnect,
 }
 
 /// How a device card is drawn.
@@ -120,6 +223,8 @@ struct CardView<'a> {
     saving: bool,
     /// Why its last save failed.
     error: Option<&'a str>,
+    /// A reconnect of it is in flight.
+    reconnecting: bool,
     /// Launch monitors for the routing dropdowns: (actor ID, name).
     monitors: &'a [(String, String)],
     /// The camera list, for a camera card's picker.
@@ -130,17 +235,19 @@ struct CardView<'a> {
 /// right, the status badge (Telemetry side) or the type tag (Settings side,
 /// left out when it reads the same as the name), then the Telemetry |
 /// Settings toggle, or Save and Cancel while its settings have unsaved
-/// edits. The settings side ends in
-/// Remove, except on a web server's card; an ExPutt's telemetry side ends in
-/// Find mat, enabled while the ExPutt is connected, and a camera's in Still
-/// frame (`still`), which shows the camera's latest frame on the card. The
-/// left stripe is the actor's status colour, dim while it is not running.
+/// edits. The action row along the bottom holds, on the settings side,
+/// Remove, except on a web server's card; on the telemetry side, Reconnect
+/// on a launch monitor's or output's card (disabled while one is in flight
+/// and while the tab is locked), then Find mat on an ExPutt's, enabled while
+/// it is connected, and Still frame on a camera's (`still`), whose frame
+/// shows in the body. The left stripe is the actor's status colour, dim while
+/// it is not running.
 fn device_card(
     ui: &mut egui::Ui,
     id: &str,
     view: &CardView<'_>,
     form: Option<&mut ActorFormEntry>,
-    still: Option<&mut crate::panels::replay::Still>,
+    mut still: Option<&mut crate::panels::replay::Still>,
 ) -> Option<CardAction> {
     let accent = view.telemetry.map_or(theme::TEXT_DIM, |a| {
         monitoring::status_color(a, view.now_ms)
@@ -171,8 +278,9 @@ fn device_card(
         .filter(|t| t.to_lowercase() != title.trim().to_lowercase());
     let hover = form.as_ref().map(|f| f.type_tooltip().to_string());
 
-    let card = theme::accent_card(ui, accent, |ui| {
+    let card = fixed_card(ui, id, accent, |card| {
         let mut action = None;
+        let ui = card.top();
         let tag = tag.as_deref().map(|t| (t, settings::TagPlace::Buttons));
         settings::card_header(ui, id, &title, tag, hover.as_deref(), |ui| {
             if dirty {
@@ -211,38 +319,70 @@ fn device_card(
         }
         match (mode, form) {
             (CardMode::Settings, Some(entry)) => {
-                ui.add_space(6.0);
-                let refresh = ui
-                    .add_enabled_ui(view.editable, |ui| {
+                let removable = cards::removable(entry_type(id));
+                let refresh = card.body(removable, |ui| {
+                    ui.add_space(6.0);
+                    ui.add_enabled_ui(view.editable, |ui| {
                         settings::actor_fields(ui, entry, view.monitors, view.cameras)
                     })
-                    .inner;
+                    .inner
+                });
                 if refresh {
                     action = Some(CardAction::RefreshCameras);
                 }
-                if cards::removable(entry_type(id)) && settings::remove_row(ui, id, view.editable) {
+                if removable && card.actions(|ui| settings::remove_button(ui, id, view.editable)) {
                     action = Some(CardAction::Remove);
                 }
             }
             _ => {
-                if let Some(actor) = view.telemetry {
-                    monitoring::telemetry_body(ui, id, actor);
-                }
-                if entry_type(id) == "exputt" {
-                    let connected = view
-                        .telemetry
-                        .is_some_and(|a| a.status == ActorStatus::Connected);
-                    if settings::button_row(ui, "Find mat", &format!("find_mat:{id}"), connected) {
-                        action = Some(CardAction::FindMat);
+                let reconnect = cards::reconnectable(entry_type(id));
+                let find_mat = entry_type(id) == "exputt";
+                let connected = view
+                    .telemetry
+                    .is_some_and(|a| a.status == ActorStatus::Connected);
+                card.body(reconnect || find_mat || still.is_some(), |ui| {
+                    // With nothing to show, the actor's state instead.
+                    if let Some(actor) = view.telemetry {
+                        if monitoring::has_telemetry(actor)
+                            || still.as_deref().is_some_and(|s| s.shown())
+                        {
+                            monitoring::telemetry_body(ui, id, actor);
+                        } else {
+                            monitoring::no_telemetry(ui, id, actor, accent);
+                        }
                     }
-                }
-                if let Some(still) = still {
-                    let connected = view
-                        .telemetry
-                        .is_some_and(|a| a.status == ActorStatus::Connected);
-                    if crate::panels::replay::still_body(ui, id, still, connected) {
-                        action = Some(CardAction::Still);
+                    if let Some(still) = still.as_deref_mut() {
+                        crate::panels::replay::still_picture(ui, id, still);
                     }
+                });
+                if reconnect || find_mat || still.is_some() {
+                    card.actions(|ui| {
+                        if reconnect
+                            && settings::action_button(
+                                ui,
+                                "Reconnect",
+                                &format!("reconnect:{id}"),
+                                view.editable && !view.reconnecting,
+                            )
+                        {
+                            action = Some(CardAction::Reconnect);
+                        }
+                        if find_mat
+                            && settings::action_button(
+                                ui,
+                                "Find mat",
+                                &format!("find_mat:{id}"),
+                                connected,
+                            )
+                        {
+                            action = Some(CardAction::FindMat);
+                        }
+                        if let Some(still) = still
+                            && crate::panels::replay::still_button(ui, id, still, connected)
+                        {
+                            action = Some(CardAction::Still);
+                        }
+                    });
                 }
             }
         }
@@ -365,14 +505,26 @@ impl FlighthookApp {
         let dirty = form.as_ref().is_some_and(|f| f.dirty());
         let still = (entry_type(&card.id) == "camera")
             .then(|| self.stills.entry(card.id.clone()).or_default());
+        // A failed reconnect request shows as the card's `error`, like an
+        // error the actor reports.
+        let failed = self.reconnect_errors.get(&card.id).map(|e| {
+            let mut shown = self
+                .actors
+                .get(&card.id)
+                .cloned()
+                .unwrap_or_else(|| crate::app::new_actor(String::new()));
+            shown.telemetry.insert("error".into(), e.clone());
+            shown
+        });
         let view = CardView {
-            telemetry: self.actors.get(&card.id),
+            telemetry: failed.as_ref().or_else(|| self.actors.get(&card.id)),
             now_ms: self.now_ms,
             mode: self.card_modes.get(&card.id),
             editable: (!locked || dirty) && !saving,
             can_save: form.as_ref().is_some_and(|f| settings::actor_valid(f)),
             saving,
             error: error.as_deref(),
+            reconnecting: self.reconnecting.contains(&card.id),
             monitors,
             cameras: &self.camera_list,
         };
@@ -390,6 +542,7 @@ impl FlighthookApp {
         match (action, form) {
             (CardAction::Mode(mode), _) => self.card_modes.set(id, mode),
             (CardAction::FindMat, _) => net::post_find_mat(ctx, id),
+            (CardAction::Reconnect, _) => self.reconnect(ctx, id),
             (CardAction::Still, _) => {
                 #[cfg(not(test))]
                 net::fetch_still(ctx, &self.pending, id);
@@ -406,6 +559,22 @@ impl FlighthookApp {
             }
             (CardAction::Remove, Some(_)) | (_, None) => {}
         }
+    }
+
+    /// Reconnect actor `id`: one request at a time per card, the card's
+    /// Reconnect disabled until the new instance has started or the request
+    /// has failed.
+    pub(crate) fn reconnect(&mut self, ctx: &egui::Context, id: &str) {
+        if self.reconnecting.contains(id) {
+            return;
+        }
+        self.reconnect_done(id);
+        self.reconnecting.insert(id.to_owned());
+        self.reconnect_errors.remove(id);
+        #[cfg(not(test))]
+        net::post_reconnect(ctx, &self.pending, id);
+        #[cfg(test)]
+        let _ = ctx;
     }
 
     /// Ask the server for its camera list again.
@@ -471,6 +640,32 @@ pub(crate) fn mark(ui: &egui::Ui, name: impl FnOnce() -> String, response: &egui
 #[inline]
 pub(crate) fn mark(_ui: &egui::Ui, _name: impl FnOnce() -> String, _response: &egui::Response) {}
 
+/// A card body's scroll state, for the tests: its rect, content height and
+/// scroll offset, by card ID.
+#[cfg(test)]
+pub(crate) type Bodies = HashMap<String, (egui::Rect, f32, f32)>;
+
+/// Where [`Bodies`] are kept for the tests.
+#[cfg(test)]
+fn bodies_id() -> egui::Id {
+    egui::Id::new("devices_bodies")
+}
+
+/// Record card `key`'s body for the tests.
+#[cfg(test)]
+fn mark_body<R>(ui: &egui::Ui, key: &str, shown: &egui::scroll_area::ScrollAreaOutput<R>) {
+    let entry = (shown.inner_rect, shown.content_size.y, shown.state.offset.y);
+    ui.ctx().data_mut(|d| {
+        d.get_temp_mut_or_default::<Bodies>(bodies_id())
+            .insert(key.to_owned(), entry);
+    });
+}
+
+/// Record a card body for the tests: nothing outside them.
+#[cfg(not(test))]
+#[inline]
+fn mark_body<R>(_ui: &egui::Ui, _key: &str, _shown: &egui::scroll_area::ScrollAreaOutput<R>) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,12 +726,13 @@ mod tests {
         app.settings.actors[idx].set_dirty(true);
     }
 
-    /// Draws the tab bar and the Devices tab, 1600×900 unless sized.
+    /// Draws the tab bar and the Devices tab, 1600×1600 unless sized: tall
+    /// enough for every card of the tests' configs to be on screen.
     struct Screen(egui::Context, egui::Vec2);
 
     impl Screen {
         fn new() -> Self {
-            Self::sized(1600.0, 900.0)
+            Self::sized(1600.0, 1600.0)
         }
 
         fn sized(width: f32, height: f32) -> Self {
@@ -598,6 +794,13 @@ mod tests {
             self.frame(app, vec![button(true)]);
             self.frame(app, vec![button(false)]);
             self.frame(app, Vec::new())
+        }
+
+        /// The card bodies of the last pass.
+        fn bodies(&self) -> Bodies {
+            self.0
+                .data(|d| d.get_temp::<Bodies>(bodies_id()))
+                .unwrap_or_default()
         }
 
         /// Click the middle of control `name`.
@@ -2358,7 +2561,14 @@ mod tests {
         let (card, _) = marks[&format!("card:{id}")];
         assert!(image.width() > card.width() * 0.8, "at the card's width");
         assert!((image.height() / image.width() - 90.0 / 160.0).abs() < 0.02);
-        assert!(card.contains_rect(image));
+        // In the card's body, which scrolls to show it all; the card keeps
+        // its height.
+        let (body, content, _) = screen.bodies()[id];
+        assert!(card.contains_rect(body));
+        assert!(image.left() >= body.left() && image.right() <= body.right() + 0.5);
+        assert!(image.top() >= body.top() && image.top() < body.bottom());
+        assert!(content > body.height(), "the body scrolls");
+        assert!((card.height() - CARD_HEIGHT).abs() < 0.5);
     }
 
     #[test]
@@ -2402,5 +2612,728 @@ mod tests {
         assert_eq!(app.settings.replay.pre_roll_s, "4");
         assert_eq!(app.settings.replay.start_before_impact_s, "2");
         assert!(!app.settings.global_dirty);
+    }
+
+    // ----- Fixed-height cards and Reconnect -----
+
+    /// Every card on the Devices tab, in card order.
+    const EVERY_CARD: [&str; 13] = [
+        "global",
+        "simulation",
+        "replay",
+        "webserver.0",
+        "mevo.0",
+        "r10.0",
+        "square.0",
+        "exputt.0",
+        "mock_monitor.0",
+        "openconnect_server.0",
+        "camera.0",
+        "openconnect_client.0",
+        "random_club.0",
+    ];
+
+    /// The cards with a Reconnect: every launch monitor and output.
+    const RECONNECTABLE: [&str; 8] = [
+        "mevo.0",
+        "r10.0",
+        "square.0",
+        "exputt.0",
+        "mock_monitor.0",
+        "openconnect_server.0",
+        "openconnect_client.0",
+        "random_club.0",
+    ];
+
+    /// An app with a card of every type, each actor connected with the
+    /// telemetry its device reports.
+    fn app_with_every_card() -> FlighthookApp {
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        let mut config = FlighthookConfig::default();
+        config.mevo.insert(
+            "0".into(),
+            serde_json::from_str(r#"{"name":"Mevo+"}"#).expect("mevo"),
+        );
+        config.r10.insert(
+            "0".into(),
+            serde_json::from_str(r#"{"name":"R10"}"#).expect("r10"),
+        );
+        config.square.insert(
+            "0".into(),
+            flighthook::SquareSection {
+                name: "Square Golf Omni".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .exputt
+            .insert("0".into(), flighthook::ExPuttSection::default());
+        config.mock_monitor.insert(
+            "0".into(),
+            flighthook::MockMonitorSection {
+                name: "Mock".into(),
+            },
+        );
+        config
+            .openconnect_server
+            .insert("0".into(), flighthook::OpenConnectServerSection::default());
+        config
+            .camera
+            .insert("0".into(), flighthook::CameraSection::default());
+        config.openconnect_client.insert(
+            "0".into(),
+            flighthook::OpenConnectClientSection {
+                name: "GSPro".into(),
+                address: Some("127.0.0.1:921".into()),
+                ..Default::default()
+            },
+        );
+        config.random_club.insert(
+            "0".into(),
+            flighthook::RandomClubSection {
+                name: "Random club".into(),
+            },
+        );
+        app.settings.load_from(&config);
+        let telemetry: [(&str, &[(&str, &str)]); 9] = [
+            (
+                "mevo.0",
+                &[
+                    ("ready", "true"),
+                    ("battery_pct", "85"),
+                    ("tilt", "0.4"),
+                    ("roll", "-1.2"),
+                    ("temp_c", "41.5"),
+                    ("external_power", "false"),
+                ],
+            ),
+            (
+                "square.0",
+                &[
+                    ("device_info", OMNI_DEVICE_INFO),
+                    ("ble_address", "02:00:00:AB:CD:01"),
+                    ("shot_count", "12"),
+                    ("ready", "true"),
+                    ("device_state", "ready"),
+                    ("battery_pct", "85"),
+                    ("zero_spin_discards", "2"),
+                ],
+            ),
+            (
+                "exputt.0",
+                &[
+                    ("device_info", "ExPutt RG (192.168.1.40)"),
+                    ("phase", "measuring"),
+                    ("ready", "true"),
+                ],
+            ),
+            ("mock_monitor.0", &[("shot_count", "3"), ("ready", "true")]),
+            ("openconnect_server.0", &[("bind", "0.0.0.0:921")]),
+            ("camera.0", &[("fps", "119.8"), ("dropped", "0")]),
+            (
+                "openconnect_client.0",
+                &[
+                    ("address", "127.0.0.1:921"),
+                    ("club", "7I"),
+                    ("handed", "rh"),
+                    ("last_shot", "#12 at 16:41:07"),
+                    ("monitor_ready", "true"),
+                    ("response", "200 Shot received successfully"),
+                    ("shots_sent", "3"),
+                ],
+            ),
+            ("random_club.0", &[]),
+            ("webserver.0", &[("ws_clients", "1")]),
+        ];
+        for (id, pairs) in telemetry {
+            let mut actor = ActorStatusResponse::new(id, ActorStatus::Connected);
+            actor.telemetry = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            app.actors.insert(id.into(), actor);
+        }
+        app
+    }
+
+    /// Every card's rect, by ID.
+    fn card_rects(marks: &Marks) -> HashMap<String, Rect> {
+        EVERY_CARD
+            .iter()
+            .map(|id| {
+                let (rect, _) = marks
+                    .get(&format!("card:{id}"))
+                    .unwrap_or_else(|| panic!("{id} not drawn"));
+                ((*id).to_owned(), *rect)
+            })
+            .collect()
+    }
+
+    /// Draw twice (layouts settle in one pass) and return the marks.
+    fn settled(screen: &Screen, app: &mut FlighthookApp) -> Marks {
+        screen.frame(app, Vec::new());
+        screen.frame(app, Vec::new())
+    }
+
+    #[test]
+    fn every_card_is_one_height_on_both_sides() {
+        for (w, h) in [(1600.0, 2400.0), (1024.0, 4000.0)] {
+            let screen = Screen::sized(w, h);
+            let mut app = app_with_every_card();
+            for side in [CardMode::Telemetry, CardMode::Settings] {
+                for id in EVERY_CARD {
+                    app.card_modes.set(id, side);
+                }
+                let rects = card_rects(&settled(&screen, &mut app));
+                for (id, rect) in &rects {
+                    assert!(
+                        (rect.height() - CARD_HEIGHT).abs() < 0.5,
+                        "{id} is {} tall on the {side:?} side at {w}",
+                        rect.height()
+                    );
+                }
+                // Rows line up: cards side by side share their top.
+                let mevo = rects["mevo.0"];
+                let beside = rects
+                    .values()
+                    .filter(|r| (r.top() - mevo.top()).abs() < 0.5)
+                    .count();
+                assert!(beside >= 2 || w < 1100.0, "a row of cards at {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_common_cards_fit_without_scrolling() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        settled(&screen, &mut app);
+        let fits = |screen: &Screen, id: &str| {
+            let (body, content, _) = screen.bodies()[id];
+            content <= body.height()
+        };
+        for id in ["mevo.0", "square.0", "openconnect_client.0"] {
+            assert!(fits(&screen, id), "{id}'s telemetry");
+        }
+        app.card_modes.set("global", CardMode::Settings);
+        settled(&screen, &mut app);
+        assert!(fits(&screen, "global"), "the Global settings");
+    }
+
+    #[test]
+    fn telemetry_a_flip_a_validation_message_or_an_error_moves_no_card() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        let before = card_rects(&settled(&screen, &mut app));
+        let unchanged = |app: &mut FlighthookApp, what: &str| {
+            let after = card_rects(&settled(&screen, app));
+            for id in EVERY_CARD {
+                assert_eq!(after[id], before[id], "{id} after {what}");
+            }
+        };
+
+        // Telemetry discovered: many more rows than the body holds.
+        let mevo = app.actors.get_mut("mevo.0").unwrap();
+        for n in 0..25 {
+            mevo.telemetry
+                .insert(format!("extra_{n:02}"), n.to_string());
+        }
+        unchanged(&mut app, "new telemetry");
+        let (body, content, _) = screen.bodies()["mevo.0"];
+        assert!(content > body.height(), "the body scrolls instead");
+
+        // A side flip.
+        app.card_modes.set("mevo.0", CardMode::Settings);
+        unchanged(&mut app, "a flip to Settings");
+
+        // An edit with a validation message, and the lock hint.
+        let idx = form_index(&app, "mevo.0");
+        if let ActorFormEntry::Device(d) = &mut app.settings.actors[idx] {
+            d.address = "not an address".into();
+        }
+        app.settings.actors[idx].set_dirty(true);
+        unchanged(&mut app, "an invalid address");
+
+        // A failed save's error line.
+        app.settings.save_error = Some(settings::SaveError {
+            target: SaveTarget::Actor("mevo.0".into()),
+            message: "504 the settings were not applied in time".into(),
+        });
+        unchanged(&mut app, "a save error");
+
+        // A General card's edits.
+        app.settings.save_error = None;
+        app.settings.actors[idx].set_dirty(false);
+        app.settings.chipping_clubs.clear();
+        app.settings.mark_general(GeneralCard::Global);
+        unchanged(&mut app, "a Global edit");
+    }
+
+    /// `n` wheel notches over `at`, then one more pass.
+    fn wheel(screen: &Screen, app: &mut FlighthookApp, at: Pos2, down: f32, n: usize) {
+        screen.frame(app, vec![Event::PointerMoved(at)]);
+        for _ in 0..n {
+            let events = vec![
+                Event::PointerMoved(at),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -down),
+                    modifiers: Modifiers::NONE,
+                },
+            ];
+            screen.frame(app, events);
+        }
+        screen.frame(app, Vec::new());
+    }
+
+    #[test]
+    fn a_long_body_scrolls_inside_its_card_before_the_page() {
+        // The Mevo card on screen, and the tab long enough to scroll too.
+        let screen = Screen::sized(1600.0, 1100.0);
+        let mut app = app_with_every_card();
+        app.card_modes.set("mevo.0", CardMode::Settings);
+        let marks = settled(&screen, &mut app);
+        let card = marks["card:mevo.0"].0;
+        let title = marks["title:mevo.0"].0;
+        let remove = marks["remove:mevo.0"].0;
+        let (body, content, offset) = screen.bodies()["mevo.0"];
+        assert!(body.bottom() < 1100.0, "on screen");
+        assert!(content > body.height(), "the Mevo settings overflow");
+        assert_eq!(offset, 0.0);
+
+        // The wheel over the body scrolls the card, not the page.
+        wheel(&screen, &mut app, body.center(), 7.0, 6);
+        let marks = screen.frame(&mut app, Vec::new());
+        let (_, _, scrolled) = screen.bodies()["mevo.0"];
+        assert!(scrolled > 0.0, "the card scrolled");
+        assert_eq!(marks["card:mevo.0"].0, card, "the page did not move");
+        // Header and action row stay put; another card keeps its own place.
+        assert_eq!(marks["title:mevo.0"].0, title);
+        assert_eq!(marks["remove:mevo.0"].0, remove);
+        assert_eq!(screen.bodies()["square.0"].2, 0.0);
+
+        // Once the card is at its end, the page takes the wheel.
+        wheel(&screen, &mut app, body.center(), 7.0, 120);
+        let marks = screen.frame(&mut app, Vec::new());
+        let (body_after, content, end) = screen.bodies()["mevo.0"];
+        assert!(
+            (end - (content - body_after.height())).abs() < 1.0,
+            "the card reached its end: {end}"
+        );
+        assert!(
+            marks["card:mevo.0"].0.top() < card.top(),
+            "the page scrolled"
+        );
+
+        // The card keeps its position through later passes.
+        for _ in 0..3 {
+            screen.frame(&mut app, Vec::new());
+        }
+        assert_eq!(screen.bodies()["mevo.0"].2, end);
+    }
+
+    #[test]
+    fn reconnect_is_on_every_launch_monitor_and_output_telemetry_side_and_no_other() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        let marks = settled(&screen, &mut app);
+        for id in EVERY_CARD {
+            let shown = marks.contains_key(&format!("reconnect:{id}"));
+            assert_eq!(shown, RECONNECTABLE.contains(&id), "{id}");
+        }
+        // In the card's action row, at its bottom right.
+        for id in RECONNECTABLE {
+            let (button, enabled) = marks[&format!("reconnect:{id}")];
+            let card = marks[&format!("card:{id}")].0;
+            assert!(enabled, "{id}");
+            assert!(card.contains_rect(button), "{id}");
+            assert!(card.bottom() - button.bottom() < 16.0, "{id} at the bottom");
+            assert!(card.right() - button.right() < 18.0, "{id} at the right");
+        }
+        // The ExPutt's Find mat sits beside it.
+        let (find, _) = marks["find_mat:exputt.0"];
+        let (reconnect, _) = marks["reconnect:exputt.0"];
+        assert!(find.right() <= reconnect.left());
+        assert!((find.center().y - reconnect.center().y).abs() < 0.5);
+
+        // None on the Settings side.
+        for id in EVERY_CARD {
+            app.card_modes.set(id, CardMode::Settings);
+        }
+        let marks = settled(&screen, &mut app);
+        assert!(!marks.keys().any(|k| k.starts_with("reconnect:")));
+    }
+
+    #[test]
+    fn reconnect_posts_once_and_waits_for_its_answer() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        let marks = settled(&screen, &mut app);
+        let marks = screen.click_mark(&mut app, &marks, "reconnect:mevo.0");
+        assert!(app.reconnecting.contains("mevo.0"), "the request is out");
+        assert!(!enabled(&marks, "reconnect:mevo.0"), "in flight");
+        assert!(enabled(&marks, "reconnect:square.0"), "others are free");
+
+        // A second click while it is out sends nothing more.
+        app.reconnect(&screen.0, "mevo.0");
+        assert_eq!(app.reconnecting.len(), 1);
+
+        app.pending
+            .lock()
+            .unwrap()
+            .reconnects
+            .push(("mevo.0".into(), Ok(net::Reconnected::Started)));
+        app.apply_pending();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(app.reconnecting.is_empty());
+        assert!(enabled(&marks, "reconnect:mevo.0"));
+
+        // A refusal frees it too; the card says why through its telemetry.
+        let marks = screen.click_mark(&mut app, &marks, "reconnect:square.0");
+        assert!(!enabled(&marks, "reconnect:square.0"));
+        app.pending
+            .lock()
+            .unwrap()
+            .reconnects
+            .push(("square.0".into(), Err("409 still closing".into())));
+        app.apply_pending();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "reconnect:square.0"));
+    }
+
+    /// A reconnect request that fails (an error status, a network error, a
+    /// 504) shows on its card as the card's `error`, the same row an error
+    /// the actor reports takes, until the actor's next status or the next
+    /// press. A request still running (202) shows nothing.
+    #[test]
+    fn a_failed_reconnect_shows_on_its_card_until_the_next_status_or_press() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        let marks = settled(&screen, &mut app);
+        let height = marks["card:mevo.0"].0.height();
+        assert!(!marks.contains_key("telemetry:mevo.0:error"));
+        let reply = |app: &mut FlighthookApp, reply: Result<net::Reconnected, String>| {
+            app.pending
+                .lock()
+                .unwrap()
+                .reconnects
+                .push(("mevo.0".into(), reply));
+            app.apply_pending();
+        };
+
+        screen.click_mark(&mut app, &marks, "reconnect:mevo.0");
+        reply(&mut app, Err("the reconnect did not finish".into()));
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("telemetry:mevo.0:error"), "on the card");
+        assert_eq!(
+            app.reconnect_errors.get("mevo.0").map(String::as_str),
+            Some("the reconnect did not finish")
+        );
+        assert!(
+            (marks["card:mevo.0"].0.height() - height).abs() < 0.5,
+            "the card keeps its height"
+        );
+        assert!(enabled(&marks, "reconnect:mevo.0"));
+        assert!(
+            !marks.contains_key("telemetry:square.0:error"),
+            "its card only"
+        );
+
+        // The actor's next status replaces it.
+        app.handle_bus_event(
+            crate::types::FlighthookMessage::new(crate::types::FlighthookEvent::ActorStatus {
+                status: ActorStatus::Connected,
+                telemetry: HashMap::new(),
+            })
+            .actor("mevo.0"),
+        );
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("telemetry:mevo.0:error"));
+
+        // So does pressing again; a 202 adds nothing.
+        screen.click_mark(&mut app, &marks, "reconnect:mevo.0");
+        reply(&mut app, Err("connection refused".into()));
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("telemetry:mevo.0:error"));
+        screen.click_mark(&mut app, &marks, "reconnect:mevo.0");
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(
+            !marks.contains_key("telemetry:mevo.0:error"),
+            "cleared by the press"
+        );
+        reply(&mut app, Ok(net::Reconnected::Started));
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("telemetry:mevo.0:error"));
+        assert!(app.reconnect_errors.is_empty());
+    }
+
+    fn reconnect_reply(app: &mut FlighthookApp, id: &str, reply: Result<net::Reconnected, String>) {
+        app.pending
+            .lock()
+            .unwrap()
+            .reconnects
+            .push((id.into(), reply));
+        app.apply_pending();
+    }
+
+    fn status_of(app: &mut FlighthookApp, id: &str, status: ActorStatus) {
+        app.handle_bus_event(
+            crate::types::FlighthookMessage::new(crate::types::FlighthookEvent::ActorStatus {
+                status,
+                telemetry: HashMap::new(),
+            })
+            .actor(id),
+        );
+    }
+
+    /// A reconnect that starts later (202: its old connection is still
+    /// closing, or it is still running) keeps Reconnect disabled until the
+    /// actor starts again: its next Starting status, or an outcome listing
+    /// it restarted, the one with no request ID included. Other statuses,
+    /// Connected included, leave it waiting.
+    #[test]
+    fn a_reconnect_that_starts_later_waits_for_the_restart() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        let marks = settled(&screen, &mut app);
+
+        // Freed by the next Starting status.
+        screen.click_mark(&mut app, &marks, "reconnect:mevo.0");
+        reconnect_reply(&mut app, "mevo.0", Ok(net::Reconnected::Later));
+        status_of(&mut app, "mevo.0", ActorStatus::Disconnected);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, "reconnect:mevo.0"), "still closing");
+        // The instance being replaced may still report Connected.
+        status_of(&mut app, "mevo.0", ActorStatus::Connected);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, "reconnect:mevo.0"), "only Starting frees");
+        status_of(&mut app, "mevo.0", ActorStatus::Starting);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "reconnect:mevo.0"), "started again");
+        assert!(app.reconnect_errors.is_empty());
+
+        // Freed by the self-completed outcome.
+        screen.click_mark(&mut app, &marks, "reconnect:square.0");
+        reconnect_reply(&mut app, "square.0", Ok(net::Reconnected::Later));
+        app.handle_bus_event(
+            crate::types::FlighthookMessage::new(crate::types::FlighthookEvent::ConfigOutcome {
+                request_id: None,
+                restarted: vec!["mevo.0".into()],
+                stopped: Vec::new(),
+                started: Vec::new(),
+            })
+            .actor("system"),
+        );
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, "reconnect:square.0"), "another actor's");
+        app.handle_bus_event(
+            crate::types::FlighthookMessage::new(crate::types::FlighthookEvent::ConfigOutcome {
+                request_id: None,
+                restarted: vec!["square.0".into()],
+                stopped: Vec::new(),
+                started: Vec::new(),
+            })
+            .actor("system"),
+        );
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "reconnect:square.0"));
+
+        // Started before the answer came: freed by the answer.
+        screen.click_mark(&mut app, &marks, "reconnect:mevo.0");
+        status_of(&mut app, "mevo.0", ActorStatus::Starting);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, "reconnect:mevo.0"), "not answered yet");
+        reconnect_reply(&mut app, "mevo.0", Ok(net::Reconnected::Later));
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "reconnect:mevo.0"));
+    }
+
+    /// A reconnect that starts later but never does is given up on after
+    /// a while: Reconnect takes clicks again and the card says why.
+    #[test]
+    fn a_reconnect_that_never_starts_is_given_up_on() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        let marks = settled(&screen, &mut app);
+        app.now_ms = 1_000;
+        screen.click_mark(&mut app, &marks, "reconnect:mevo.0");
+        reconnect_reply(&mut app, "mevo.0", Ok(net::Reconnected::Later));
+        app.now_ms += crate::app::RECONNECT_WAIT_MS - 1;
+        app.apply_pending();
+        assert!(app.reconnecting.contains("mevo.0"));
+        app.now_ms += 1;
+        app.apply_pending();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "reconnect:mevo.0"));
+        assert_eq!(
+            app.reconnect_errors.get("mevo.0").map(String::as_str),
+            Some(crate::app::RECONNECT_UNFINISHED)
+        );
+        assert!(marks.contains_key("telemetry:mevo.0:error"), "on the card");
+    }
+
+    /// The give-up leaves the actor's own `error` row (the old connection is
+    /// still closing) on the card instead of replacing it.
+    #[test]
+    fn giving_up_keeps_the_actors_own_error() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        let marks = settled(&screen, &mut app);
+        app.now_ms = 1_000;
+        screen.click_mark(&mut app, &marks, "reconnect:mevo.0");
+        reconnect_reply(&mut app, "mevo.0", Ok(net::Reconnected::Later));
+        let closing = "The previous connection has not closed yet. It reconnects when it does.";
+        app.handle_bus_event(
+            crate::types::FlighthookMessage::new(crate::types::FlighthookEvent::ActorStatus {
+                status: ActorStatus::Disconnected,
+                telemetry: HashMap::from([("error".into(), closing.into())]),
+            })
+            .actor("mevo.0"),
+        );
+        app.now_ms += crate::app::RECONNECT_WAIT_MS;
+        app.apply_pending();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "reconnect:mevo.0"), "given up on");
+        assert!(app.reconnect_errors.is_empty(), "the actor's row stays");
+        assert_eq!(
+            app.actors["mevo.0"]
+                .telemetry
+                .get("error")
+                .map(String::as_str),
+            Some(closing)
+        );
+        assert!(marks.contains_key("telemetry:mevo.0:error"), "on the card");
+    }
+
+    /// The repaint the last pass asked for: how soon.
+    fn repaint_after(screen: &Screen, app: &mut FlighthookApp) -> std::time::Duration {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen.1)),
+            ..Default::default()
+        };
+        let output = screen.0.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let ctx = ui.ctx().clone();
+                app.render_devices_panel(&ctx, ui);
+            });
+        });
+        output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+    }
+
+    /// Set `id`'s statuses to `statuses` in turn, with no telemetry.
+    fn without_telemetry(app: &mut FlighthookApp, id: &str, statuses: &[ActorStatus]) {
+        let actor = app.actors.get_mut(id).expect("running");
+        actor.telemetry.clear();
+        for status in statuses {
+            actor.observe(*status, 0);
+        }
+    }
+
+    /// A card whose Telemetry side has no row to show shows a spinner in
+    /// the middle of its body while its actor is starting, connecting or
+    /// reconnecting, and a check in a ring once it is connected; either
+    /// goes as soon as a row arrives. A spinner asks for repaints
+    /// (`monitoring::tests` checks nothing else does).
+    #[test]
+    fn an_empty_telemetry_side_shows_a_spinner_or_the_connected_mark() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        let marks = settled(&screen, &mut app);
+        assert!(!marks.keys().any(|k| k.starts_with("spinner:")));
+        assert!(
+            marks.contains_key("connected_icon:random_club.0"),
+            "no rows"
+        );
+        assert!(!marks.contains_key("connected_icon:mevo.0"), "rows");
+
+        let cases: [(&str, &[ActorStatus]); 3] = [
+            ("mevo.0", &[ActorStatus::Starting]),
+            ("square.0", &[ActorStatus::Disconnected]),
+            (
+                "openconnect_client.0",
+                &[ActorStatus::Connected, ActorStatus::Reconnecting],
+            ),
+        ];
+        for (id, statuses) in cases {
+            without_telemetry(&mut app, id, statuses);
+        }
+        let marks = settled(&screen, &mut app);
+        for (id, _) in cases {
+            let (spinner, _) = marks[&format!("spinner:{id}")];
+            let (body, content, _) = screen.bodies()[id];
+            assert!(
+                (spinner.center().x - body.center().x).abs() < 1.0
+                    && (spinner.center().y - body.center().y).abs() < 2.0,
+                "{id}: centred in the body"
+            );
+            assert!(content <= body.height(), "{id}: nothing to scroll");
+            assert!(!marks.contains_key(&format!("connected_icon:{id}")));
+        }
+        assert!(
+            repaint_after(&screen, &mut app) <= theme::LOADING_FRAME,
+            "a spinner turns"
+        );
+
+        // A card cut off by the bottom of the window keeps its spinner in
+        // the middle of its whole body, not of the part on screen.
+        let (body, _, _) = screen.bodies()["mevo.0"];
+        let cut = Screen::sized(1600.0, (body.top() + body.height() * 0.3).round());
+        let marks = settled(&cut, &mut app);
+        let (spinner, _) = marks["spinner:mevo.0"];
+        let (cut_body, _, _) = cut.bodies()["mevo.0"];
+        assert!((cut_body.height() - body.height()).abs() < 0.5);
+        assert!(
+            (spinner.center().y - cut_body.center().y).abs() < 2.0,
+            "{spinner:?} in {cut_body:?}"
+        );
+
+        // Connected with no rows: the mark, not the spinner.
+        without_telemetry(&mut app, "mevo.0", &[ActorStatus::Connected]);
+        let marks = settled(&screen, &mut app);
+        assert!(marks.contains_key("connected_icon:mevo.0"));
+        assert!(!marks.contains_key("spinner:mevo.0"));
+        let (body, content, _) = screen.bodies()["mevo.0"];
+        assert!(content <= body.height(), "nothing to scroll");
+
+        // A row arrives: both go.
+        for id in ["mevo.0", "square.0", "openconnect_client.0"] {
+            app.actors
+                .get_mut(id)
+                .expect("running")
+                .telemetry
+                .insert("ready".into(), "false".into());
+        }
+        let marks = settled(&screen, &mut app);
+        for id in ["mevo.0", "square.0", "openconnect_client.0"] {
+            assert!(!marks.contains_key(&format!("spinner:{id}")), "{id}");
+            assert!(!marks.contains_key(&format!("connected_icon:{id}")), "{id}");
+            assert!(marks.contains_key(&format!("telemetry:{id}:ready")), "{id}");
+        }
+    }
+
+    #[test]
+    fn reconnect_waits_while_the_tab_is_locked_or_a_save_is_out() {
+        let screen = Screen::sized(1600.0, 2400.0);
+        let mut app = app_with_every_card();
+        app.card_modes
+            .set("openconnect_client.0", CardMode::Settings);
+        edit_name(&mut app, "openconnect_client.0");
+        let marks = settled(&screen, &mut app);
+        for id in RECONNECTABLE {
+            if id != "openconnect_client.0" {
+                assert!(!enabled(&marks, &format!("reconnect:{id}")), "{id} locked");
+            }
+        }
+        // Clicking a disabled one sends nothing.
+        screen.click_mark(&mut app, &marks, "reconnect:mevo.0");
+        assert!(app.reconnecting.is_empty());
+
+        let marks = screen.click_mark(&mut app, &marks, "save:openconnect_client.0");
+        assert!(app.settings.saving());
+        for id in RECONNECTABLE {
+            if id != "openconnect_client.0" {
+                assert!(!enabled(&marks, &format!("reconnect:{id}")), "{id} saving");
+            }
+        }
     }
 }

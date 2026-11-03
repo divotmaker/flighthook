@@ -84,13 +84,59 @@ pub(crate) fn telemetry_body(ui: &mut egui::Ui, id: &str, actor: &ActorStatusRes
     });
 }
 
+/// Whether [`telemetry_body`] has a row to show for `actor`.
+pub(crate) fn has_telemetry(actor: &ActorStatusResponse) -> bool {
+    actor.telemetry.values().any(|v| !v.is_empty())
+}
+
+/// The body of a card with no telemetry to show, centred in it: a check in
+/// a ring once the actor is Connected, otherwise
+/// a loading spinner in `color` (the card's status colour) going round,
+/// redrawn about 60 times a second while it is on screen.
+pub(crate) fn no_telemetry(
+    ui: &mut egui::Ui,
+    id: &str,
+    actor: &ActorStatusResponse,
+    color: egui::Color32,
+) {
+    // The rest of the body (the scroll area's viewport), a little short of
+    // it, so it never scrolls.
+    let height = (ui.available_height() - 1.0).max(theme::STATUS_RING);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height.floor()),
+        egui::Sense::hover(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let center = rect.center();
+    if actor.state() == ConnectionState::Connected {
+        theme::connected_ring(ui.painter(), center);
+        devices::mark(ui, || format!("connected_icon:{id}"), &response);
+    } else {
+        theme::loading_ring(ui.painter(), center, color, ui.input(|i| i.time));
+        ui.ctx().request_repaint_after(theme::LOADING_FRAME);
+        devices::mark(ui, || format!("spinner:{id}"), &response);
+    }
+}
+
 impl FlighthookApp {
-    /// One banner per actor reporting an `error`, then one for a failed
-    /// Auto-chip.
+    /// One banner per actor reporting an `error` (or whose reconnect
+    /// request failed), then one for a failed Auto-chip.
     pub(crate) fn render_error_banner(&self, ui: &mut egui::Ui) {
-        for actor in self.actors.values() {
-            if let Some(err) = actor.telemetry.get("error").filter(|e| !e.is_empty()) {
+        for (id, actor) in &self.actors {
+            if let Some(err) = self
+                .reconnect_errors
+                .get(id)
+                .or_else(|| actor.telemetry.get("error"))
+                .filter(|e| !e.is_empty())
+            {
                 error_banner(ui, &format!("{}: {err}", actor.name));
+            }
+        }
+        for (id, err) in &self.reconnect_errors {
+            if !self.actors.contains_key(id) {
+                error_banner(ui, &format!("{id}: {err}"));
             }
         }
         if let Some(err) = &self.auto_chip_error {
@@ -111,4 +157,71 @@ fn error_banner(ui: &mut egui::Ui, text: &str) {
             ui.label(egui::RichText::new(text).color(theme::TEXT).strong());
         });
     ui.add_space(8.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::types::ActorStatus;
+
+    /// The repaint asked for after a few passes drawing `add`, on a
+    /// 400×300 screen.
+    fn repaint_after(mut add: impl FnMut(&mut egui::Ui)) -> Duration {
+        let ctx = egui::Context::default();
+        let mut delay = Duration::MAX;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 300.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| add(ui));
+            });
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        delay
+    }
+
+    fn actor(statuses: &[ActorStatus]) -> ActorStatusResponse {
+        let mut actor = ActorStatusResponse::new("Mevo+", statuses[0]);
+        for status in &statuses[1..] {
+            actor.observe(*status, 0);
+        }
+        actor
+    }
+
+    /// A spinner on screen asks for the next frame about 30 times a
+    /// second; the connected mark, telemetry rows and a spinner off screen
+    /// ask for none.
+    #[test]
+    fn only_a_spinner_on_screen_asks_for_repaints() {
+        let connecting = actor(&[ActorStatus::Starting]);
+        let reconnecting = actor(&[ActorStatus::Connected, ActorStatus::Reconnecting]);
+        for a in [&connecting, &reconnecting] {
+            let delay = repaint_after(|ui| no_telemetry(ui, "mevo.0", a, theme::GOLD));
+            assert!(delay <= theme::LOADING_FRAME, "{delay:?}");
+        }
+
+        let connected = actor(&[ActorStatus::Connected]);
+        let delay = repaint_after(|ui| no_telemetry(ui, "mevo.0", &connected, theme::ACCENT));
+        assert_eq!(delay, Duration::MAX);
+
+        let mut rows = actor(&[ActorStatus::Starting]);
+        rows.telemetry.insert("ready".into(), "false".into());
+        assert!(has_telemetry(&rows));
+        assert!(!has_telemetry(&connecting));
+        let delay = repaint_after(|ui| telemetry_body(ui, "mevo.0", &rows));
+        assert_eq!(delay, Duration::MAX);
+
+        let delay = repaint_after(|ui| {
+            ui.add_space(1000.0);
+            no_telemetry(ui, "mevo.0", &connecting, theme::GOLD);
+        });
+        assert_eq!(delay, Duration::MAX, "off screen");
+    }
 }

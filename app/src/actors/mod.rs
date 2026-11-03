@@ -13,15 +13,17 @@ pub mod system;
 pub mod web;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tokio::sync::broadcast;
 
 use crate::bus::{BusReceiver, BusSender};
-use crate::state::SystemState;
 use crate::state::config::{FlighthookConfig, global_id};
+use crate::state::{ActorHandle, SystemState};
 use flighthook::Club;
 
 // ---------------------------------------------------------------------------
@@ -36,15 +38,45 @@ pub enum ReconfigureOutcome {
     RestartRequired,
 }
 
+/// How long a stopped actor is given to end, unless it says otherwise
+/// ([`Actor::stop_wait`]).
+pub const STOP_WAIT: Duration = Duration::from_secs(3);
+
+/// The longest [`Actor::stop_wait`] of any actor: the ExPutt's. A config
+/// command stops the actors it restarts or removes together, so this bounds
+/// how long it waits for them.
+pub const MAX_STOP_WAIT: Duration = exputt::STOP_WAIT;
+
+const _: () = assert!(STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
+const _: () = assert!(square::STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
+
 /// Common trait for self-managed actors. Each actor struct holds its own config;
 /// `start()` clones what it needs and spawns a thread.
 pub trait Actor: Send + Sync {
-    /// Spawn the actor's run loop.
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver);
+    /// Spawn the actor's run loop. Returns its thread, which ends when the
+    /// actor has let go of its device or connection.
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> JoinHandle<()>;
 
     /// Request the actor to stop. Default: no-op (actors check the shutdown
     /// flag via `BusReceiver::is_shutdown()`).
     fn stop(&self) {}
+
+    /// How long the actor's thread may take to end once stopped, at most.
+    fn stop_wait(&self) -> Duration {
+        STOP_WAIT
+    }
+
+    /// Whether a new instance may start while this one is still ending: what
+    /// it holds does not keep a new instance from its device or port.
+    /// Default: no.
+    fn replaceable_while_stopping(&self) -> bool {
+        false
+    }
 
     /// React to a config change. Implementations compare the current config
     /// snapshot against the actor's construction params and return the
@@ -282,9 +314,59 @@ pub fn start_actor(
 ) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let sender = BusSender::new(id.clone(), bus_tx.clone(), Arc::clone(&shutdown));
+    let muted = sender.muted();
     let receiver = sender.subscribe();
-    actor.start(Arc::clone(state), sender, receiver);
-    state.register_actor(id, actor, shutdown);
+    let thread = actor.start(Arc::clone(state), sender, receiver);
+    state.register_actor(
+        id,
+        actor,
+        ActorHandle {
+            shutdown,
+            muted,
+            thread: Some(thread),
+        },
+    );
+}
+
+/// Whether actors of this type can be reconnected: every launch monitor and
+/// output, not a camera, the web server or the system actor.
+pub(crate) fn reconnectable(type_key: &str) -> bool {
+    !matches!(type_key, "camera" | "webserver" | "system")
+}
+
+/// How often [`connect_tcp`] looks at the shutdown flag.
+const CONNECT_POLL: Duration = Duration::from_millis(50);
+
+/// Connect actor `actor` to `addr` within `timeout`, giving up as soon as
+/// `receiver`'s actor is told to stop: `Ok(None)`. The connect runs on a
+/// thread of its own; one that completes after the actor gave up closes the
+/// connection at once.
+pub(crate) fn connect_tcp(
+    actor: &str,
+    addr: SocketAddr,
+    timeout: Duration,
+    receiver: &BusReceiver,
+) -> std::io::Result<Option<TcpStream>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name(format!("connect:{actor}"))
+        .spawn(move || {
+            // Nobody waits for the result once the actor stopped: the
+            // stream is dropped, closing it.
+            let _ = tx.send(TcpStream::connect_timeout(&addr, timeout));
+        })?;
+    loop {
+        if receiver.is_shutdown() {
+            return Ok(None);
+        }
+        match rx.recv_timeout(CONNECT_POLL) {
+            Ok(result) => return result.map(Some),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::other("connect thread ended"));
+            }
+        }
+    }
 }
 
 /// Build a map of actor IDs to display names from config (for UI display).
@@ -365,6 +447,51 @@ fn openconnect_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connect_returns_the_stream() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let receiver =
+            BusSender::new("mevo.0".into(), broadcast::channel(1).0, Arc::default()).subscribe();
+        let stream = connect_tcp("mevo.0", addr, Duration::from_secs(2), &receiver)
+            .expect("connect")
+            .expect("not stopped");
+        assert_eq!(stream.peer_addr().expect("peer"), addr);
+    }
+
+    #[test]
+    fn a_stopped_actor_gives_up_its_connect_at_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let receiver =
+            BusSender::new("mevo.0".into(), broadcast::channel(1).0, shutdown).subscribe();
+        let at = std::time::Instant::now();
+        let stream =
+            connect_tcp("mevo.0", addr, Duration::from_secs(5), &receiver).expect("no error");
+        assert!(stream.is_none());
+        assert!(at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn only_launch_monitors_and_outputs_are_reconnectable() {
+        for t in [
+            "mevo",
+            "r10",
+            "square",
+            "exputt",
+            "mock_monitor",
+            "openconnect_server",
+            "openconnect_client",
+            "random_club",
+        ] {
+            assert!(reconnectable(t), "{t}");
+        }
+        for t in ["camera", "webserver", "system"] {
+            assert!(!reconnectable(t), "{t}");
+        }
+    }
 
     fn with_openconnect(names: &[(&str, &str)]) -> FlighthookConfig {
         let mut config = FlighthookConfig::default();

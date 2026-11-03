@@ -42,6 +42,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The longest a stop waits for the actor. A session start in progress
+/// cannot be cut short: the TCP connect and the device's greeting (up to
+/// [`CONNECT_TIMEOUT`] each), two handshake replies ([`REPLY_TIMEOUT`] each)
+/// and the mat search ([`MAT_TIMEOUT`]), then a second to close the session.
+pub(crate) const STOP_WAIT: Duration = Duration::from_secs(
+    2 * CONNECT_TIMEOUT.as_secs() + 2 * REPLY_TIMEOUT.as_secs() + MAT_TIMEOUT.as_secs() + 1,
+);
+
 /// Longest single wait for the device to show up on the network, between
 /// checks for shutdown.
 const DISCOVERY_SLICE: Duration = Duration::from_secs(1);
@@ -119,7 +127,12 @@ pub(crate) fn parse_address(address: Option<&str>) -> Result<Option<IpAddr>, Str
 }
 
 impl Actor for ExPuttActor {
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let link = Link {
             address: self.address,
             options: Box::new(session_options),
@@ -136,7 +149,12 @@ impl Actor for ExPuttActor {
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || run(&state, link, sender, receiver))
-            .expect("failed to spawn exputt thread");
+            .expect("failed to spawn exputt thread")
+    }
+
+    /// Starting a session cannot be interrupted ([`STOP_WAIT`]).
+    fn stop_wait(&self) -> Duration {
+        STOP_WAIT
     }
 
     fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
@@ -2465,5 +2483,39 @@ mod tests {
             !seen.iter().any(|m| is_status(m, ActorStatus::Reconnecting)),
             "no reconnect"
         );
+    }
+
+    #[test]
+    fn a_stop_while_measuring_closes_the_session_at_once() {
+        let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
+        let mut h = Harness::new();
+        h.start_on(&mock);
+        h.until_ready(true, Some("ready"));
+        let stopped = Instant::now();
+        h.stop();
+        let took = stopped.elapsed();
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert!(sent(&mock, Request::MatchEnded), "the session was closed");
+    }
+
+    /// Starting a session cannot be interrupted: a stop during a handshake
+    /// the device never answers ends when the handshake times out, inside
+    /// the actor's stop wait.
+    #[test]
+    fn a_stop_during_a_wedged_session_start_ends_within_the_stop_wait() {
+        let wedged = Wedged::spawn();
+        let mut h = Harness::new();
+        h.reply_timeout = Duration::from_millis(1500);
+        h.start(Arc::new(AtomicU16::new(wedged.port)));
+        h.until("connecting", |m| {
+            matches!(&m.event, FlighthookEvent::ActorStatus { telemetry, .. }
+                if telemetry.get("phase").map(String::as_str) == Some("connecting"))
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let stopped = Instant::now();
+        h.stop();
+        let took = stopped.elapsed();
+        assert!(took < h.reply_timeout + Duration::from_secs(1), "{took:?}");
+        assert!(took < ExPuttActor { address: None }.stop_wait(), "{took:?}");
     }
 }

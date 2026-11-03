@@ -28,6 +28,9 @@ pub struct BusSender {
     actor_id: String,
     inner: broadcast::Sender<FlighthookMessage>,
     shutdown: Arc<AtomicBool>,
+    /// Set once a new instance of the actor has replaced this one: what this
+    /// one still sends is dropped, so it never speaks for its successor.
+    muted: Arc<AtomicBool>,
 }
 
 impl BusSender {
@@ -40,21 +43,32 @@ impl BusSender {
             actor_id,
             inner,
             shutdown,
+            muted: Arc::default(),
         }
+    }
+
+    /// The flag that silences this sender and its clones.
+    pub(crate) fn muted(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.muted)
     }
 
     pub fn actor_id(&self) -> &str {
         &self.actor_id
     }
 
-    /// Access the underlying broadcast sender (e.g. for WebState).
+    /// Access the underlying broadcast sender (e.g. for WebState). What is
+    /// sent on it is not muted ([`Self::muted`]), so a device actor never
+    /// sends through it.
     pub fn raw_sender(&self) -> &broadcast::Sender<FlighthookMessage> {
         &self.inner
     }
 
-    /// Send a message, auto-stamping actor from the actor ID.
-    /// The message's timestamp is already set by `FlighthookMessage::new()`.
+    /// Send a message, auto-stamping actor from the actor ID. Nothing is
+    /// sent once the sender is muted.
     pub fn send(&self, mut msg: FlighthookMessage) {
+        if self.muted.load(Ordering::Relaxed) {
+            return;
+        }
         msg.actor = self.actor_id.clone();
         let _ = self.inner.send(msg);
     }
@@ -75,6 +89,7 @@ impl Clone for BusSender {
             actor_id: self.actor_id.clone(),
             inner: self.inner.clone(),
             shutdown: Arc::clone(&self.shutdown),
+            muted: Arc::clone(&self.muted),
         }
     }
 }

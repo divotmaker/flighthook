@@ -5,6 +5,7 @@
 //! data store from async callbacks.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::replay::Window;
 use crate::types::{
@@ -40,6 +41,8 @@ pub struct Pending {
     pub cameras: Option<Result<CameraListResponse, String>>,
     /// Still frames by camera actor: the JPEG, or why there is none.
     pub stills: Vec<(String, Result<Vec<u8>, String>)>,
+    /// Answered reconnects, by actor: how, or why not.
+    pub reconnects: Vec<(String, Result<Reconnected, String>)>,
     /// Replies for the replay view.
     pub(crate) replay: Vec<ReplayReply>,
 }
@@ -241,6 +244,7 @@ pub fn post_settings(
     http_req
         .headers
         .insert("Content-Type".to_string(), "application/json".to_string());
+    http_req.timeout = Some(CONFIG_REQUEST_TIMEOUT);
     ehttp::fetch(http_req, move |result| {
         if let Ok(mut p) = pending.lock() {
             p.settings_save = Some(save_reply(result));
@@ -251,6 +255,11 @@ pub fn post_settings(
 
 /// Longest server error text a save failure carries.
 const SAVE_ERROR_MAX_CHARS: usize = 120;
+
+/// How long the dashboard waits for a settings save or a reconnect: longer
+/// than the server waits for either, so the server's answer always arrives
+/// first.
+pub const CONFIG_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A `POST /api/settings` reply as applied (`Ok`) or not (`Err` with a short
 /// reason): a network error, a non-2xx status (its JSON `error`, else its
@@ -266,13 +275,19 @@ pub(crate) fn save_reply(
         .map_err(|_| "unexpected reply from the server".to_owned())
 }
 
+/// A reply's JSON `error`, cut to [`SAVE_ERROR_MAX_CHARS`].
+fn json_error(resp: &ehttp::Response) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(&resp.bytes)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(str::to_owned))
+        .filter(|e| !e.is_empty())
+        .map(|e| e.chars().take(SAVE_ERROR_MAX_CHARS).collect())
+}
+
 /// A short reason for a non-2xx reply: the status and its JSON `error`, else
 /// its text, else the status text.
 fn error_reason(resp: &ehttp::Response) -> String {
-    let json_error = serde_json::from_slice::<serde_json::Value>(&resp.bytes)
-        .ok()
-        .and_then(|v| v.get("error")?.as_str().map(str::to_owned));
-    let text = json_error
+    let text = json_error(resp)
         .or_else(|| resp.text().map(|t| t.trim().to_owned()))
         .filter(|t| !t.is_empty())
         .map(|t| t.chars().take(SAVE_ERROR_MAX_CHARS).collect::<String>());
@@ -311,6 +326,56 @@ pub fn post_auto_chip(ctx: &egui::Context, pending: &PendingHandle, yards: u32) 
     ehttp::fetch(auto_chip_request(yards), move |result| {
         if let Ok(mut p) = pending.lock() {
             p.auto_chip = Some(auto_chip_reply(result));
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// The `POST /api/actors/{id}/reconnect` request for actor `id`.
+pub(crate) fn reconnect_request(id: &str) -> ehttp::Request {
+    let url = format!("{}/api/actors/{id}/reconnect", api_base());
+    ehttp::Request {
+        headers: ehttp::Headers::new(&[("Accept", "*/*")]),
+        timeout: Some(CONFIG_REQUEST_TIMEOUT),
+        ..ehttp::Request::post(&url, Vec::new())
+    }
+}
+
+/// How the server answered a reconnect it did not refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reconnected {
+    /// `200`: the new instance has started.
+    Started,
+    /// `202`: it starts later, by itself.
+    Later,
+}
+
+/// A reconnect reply as started (`200`) or starting later (`202`), or not
+/// (`Err` with the short reason its card shows: the server's `error`, else
+/// the status, or the network error).
+pub(crate) fn reconnect_reply(
+    result: Result<ehttp::Response, String>,
+) -> Result<Reconnected, String> {
+    let resp = result.map_err(|e| e.chars().take(SAVE_ERROR_MAX_CHARS).collect::<String>())?;
+    if resp.status == 202 {
+        return Ok(Reconnected::Later);
+    }
+    if resp.ok {
+        return Ok(Reconnected::Started);
+    }
+    Err(json_error(&resp).unwrap_or_else(|| format!("{} {}", resp.status, resp.status_text)))
+}
+
+/// Reconnect actor `id` (`POST /api/actors/{id}/reconnect`); the reply
+/// lands in `reconnects`.
+pub fn post_reconnect(ctx: &egui::Context, pending: &PendingHandle, id: &str) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let id = id.to_owned();
+    ehttp::fetch(reconnect_request(&id), move |result| {
+        let reply = reconnect_reply(result);
+        if let Ok(mut p) = pending.lock() {
+            p.reconnects.push((id, reply));
         }
         ctx.request_repaint();
     });
@@ -711,6 +776,54 @@ mod tests {
             headers: ehttp::Headers::default(),
             bytes: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn a_reconnect_reply_is_started_later_or_why_not() {
+        assert_eq!(
+            reconnect_reply(Ok(response(200, "OK", r#"{"restarted":["mevo.0"]}"#))),
+            Ok(Reconnected::Started)
+        );
+        assert_eq!(
+            reconnect_reply(Ok(response(202, "Accepted", r#"{"restarted":[]}"#))),
+            Ok(Reconnected::Later)
+        );
+        assert_eq!(
+            reconnect_reply(Ok(response(
+                409,
+                "Conflict",
+                r#"{"error":"a reconnect of 'mevo.0' is already in progress"}"#
+            ))),
+            Err("a reconnect of 'mevo.0' is already in progress".into())
+        );
+        assert_eq!(
+            reconnect_reply(Ok(response(504, "Gateway Timeout", ""))),
+            Err("504 Gateway Timeout".into())
+        );
+        assert_eq!(
+            reconnect_reply(Err("connection refused".into())),
+            Err("connection refused".into())
+        );
+    }
+
+    #[test]
+    fn a_save_or_a_reconnect_waits_as_long_as_the_server_may() {
+        let req = reconnect_request("mevo.0");
+        assert_eq!(req.timeout, Some(CONFIG_REQUEST_TIMEOUT));
+        assert!(CONFIG_REQUEST_TIMEOUT > ehttp::Request::DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn a_reconnect_posts_to_its_actor() {
+        let req = reconnect_request("openconnect_client.1");
+        assert_eq!(req.method, "POST");
+        assert!(
+            req.url
+                .ends_with("/api/actors/openconnect_client.1/reconnect"),
+            "{}",
+            req.url
+        );
+        assert!(req.body.is_empty());
     }
 
     #[test]

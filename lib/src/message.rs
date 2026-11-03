@@ -314,9 +314,10 @@ impl FlighthookEvent {
 // ConfigAction — specific config mutations
 // ---------------------------------------------------------------------------
 
-/// The specific config mutation to apply.
+/// The specific config mutation to apply. New actions may be added.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ConfigAction {
     /// Replace the entire config. Used by POST /api/settings.
     ///
@@ -388,6 +389,13 @@ pub enum ConfigAction {
     /// assigned the same way in every view.
     SetShotGrouping {
         mode: ShotGrouping,
+    },
+    /// Stop the launch monitor or output `id` ("mevo.0",
+    /// "openconnect_client.1"), wait for its connection to close, and start
+    /// it again from the saved settings. The outcome lists it as restarted,
+    /// or nothing when it was not.
+    Reconnect {
+        id: String,
     },
 }
 

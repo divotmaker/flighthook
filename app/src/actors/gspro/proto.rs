@@ -56,13 +56,27 @@ pub(crate) fn parse_response_debug(buf: &[u8]) -> Option<String> {
     }
 }
 
-pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
+/// What one read from the simulator carried, for the card's telemetry.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Heard {
+    /// The last response's code and message.
+    pub last: Option<(i32, String)>,
+    /// Whether a response carried player information.
+    pub player: bool,
+}
+
+/// Handle the responses in `buf`: player and club information goes on the
+/// bus, a code outside 2xx raises an alert. Returns what they carried.
+pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) -> Heard {
     let stream = serde_json::Deserializer::from_slice(buf).into_iter::<api::GsProResponse>();
     let mut parsed_any = false;
+    let mut heard = Heard::default();
     for result in stream {
         match result {
             Ok(resp) => {
                 parsed_any = true;
+                heard.last = Some((resp.code, resp.message.clone()));
+                heard.player |= resp.player.is_some();
                 if resp.code >= 200 && resp.code < 300 {
                     tracing::info!("gspro <- {}: {}", resp.code, resp.message);
                 } else {
@@ -107,6 +121,7 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
             }
         }
     }
+    heard
 }
 
 #[cfg(test)]
@@ -139,7 +154,7 @@ mod tests {
             let buf = format!(
                 r#"{{"Code":201,"Message":"GSPro Player Information","Player":{{"Club":"{code}"}}}}"#
             );
-            handle_response(buf.as_bytes(), &sender);
+            let _ = handle_response(buf.as_bytes(), &sender);
             let msg = rx.try_recv().expect("club info");
             let FlighthookEvent::ClubInfo { club_info } = msg.event else {
                 panic!("{code}: expected ClubInfo, got {:?}", msg.event);
@@ -158,7 +173,7 @@ mod tests {
         let sender = BusSender::new("openconnect_client.0".into(), bus_tx, Arc::default());
         let buf = r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"LH","Club":"I7"}}"#;
         for _ in 0..2 {
-            handle_response(buf.as_bytes(), &sender);
+            let _ = handle_response(buf.as_bytes(), &sender);
             let events: Vec<FlighthookEvent> =
                 std::iter::from_fn(|| rx.try_recv().ok().map(|m| m.event)).collect();
             assert!(
@@ -186,11 +201,11 @@ mod tests {
         let sender = BusSender::new("openconnect_client.0".into(), bus_tx, Arc::default());
         let unknown =
             r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"XX"}}"#;
-        handle_response(unknown.as_bytes(), &sender);
+        let _ = handle_response(unknown.as_bytes(), &sender);
         assert!(rx.try_recv().is_err());
 
         let omitted = r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Club":"I7"}}"#;
-        handle_response(omitted.as_bytes(), &sender);
+        let _ = handle_response(omitted.as_bytes(), &sender);
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|m| m.event)
             .collect();

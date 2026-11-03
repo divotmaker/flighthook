@@ -72,7 +72,12 @@ pub struct MevoActor {
 }
 
 impl Actor for MevoActor {
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let addr = self.addr;
         let initial_mode = self.initial_mode;
         let session_config = self.session_config.clone();
@@ -98,7 +103,14 @@ impl Actor for MevoActor {
                     receiver,
                 );
             })
-            .expect("failed to spawn mevo thread");
+            .expect("failed to spawn mevo thread")
+    }
+
+    /// The device is reached over TCP as a client: a connect still running
+    /// in the old instance keeps nothing from the new one, and closes itself
+    /// once it completes.
+    fn replaceable_while_stopping(&self) -> bool {
+        true
     }
 
     fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
@@ -807,7 +819,13 @@ fn connect_and_run(
 ) -> Result<(), ConnError> {
     // 1. Connect
     info!("connecting to {addr}...");
-    let mut conn = BinaryConnection::connect_timeout(addr, CONNECT_TIMEOUT)?;
+    // A stop during the connect ends the session at once.
+    let Some(stream) = super::connect_tcp(sender.actor_id(), *addr, CONNECT_TIMEOUT, receiver)?
+    else {
+        return Ok(());
+    };
+    let _ = stream.set_nodelay(true);
+    let mut conn = BinaryConnection::new(stream);
     *ever_connected = true;
 
     // Audit logging, raw capture for the shot export, and the latest

@@ -22,13 +22,23 @@ const HANDEDNESS: &[Handedness] = &[Handedness::Right, Handedness::Left];
 pub struct RandomClubActor;
 
 impl Actor for RandomClubActor {
-    fn start(&self, _state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(
+        &self,
+        _state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let thread_name = format!("mock:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || run(sender, receiver))
-            .expect("failed to spawn random_club thread");
+            .expect("failed to spawn random_club thread")
+    }
+
+    /// It holds no device or port.
+    fn replaceable_while_stopping(&self) -> bool {
+        true
     }
 }
 

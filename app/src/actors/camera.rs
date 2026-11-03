@@ -146,13 +146,18 @@ pub struct CameraActor {
 }
 
 impl Actor for CameraActor {
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let section = self.section.clone();
         let thread_name = format!("device:{}", sender.actor_id());
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || run(&state, &section, &sender, receiver))
-            .expect("failed to spawn camera thread");
+            .expect("failed to spawn camera thread")
     }
 
     /// The camera and the video mode need it reopened; the card name, the

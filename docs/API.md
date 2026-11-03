@@ -231,6 +231,16 @@ Telemetry keys are merged from two sources with no overlap:
 - **Actor-framework** (from `actor_status`): `detection_mode`, `radar_mode`, `device_info`,
   `shot_count`, `tracking_mode`, `phase`
 - **Integration actors**: `club`, `handed`, `name`, `error`
+- **Open Connect clients** (GSPro, Muni Golf, generic; from `actor_status`):
+  `address` (the simulator's, `127.0.0.1:921`), `last_shot` (the
+  `ShotNumber` the simulator got last and the local time it was sent,
+  `#12 at 16:41:07`), and for the current connection only `shots_sent`
+  (`3`), `monitor_ready` (the readiness last sent to the simulator, `true` |
+  `false`) and `response` (the simulator's last response code and message,
+  `201 GSPro Player Information`). `club` and `handed` are the simulator's
+  player information. When the connection ends, `shots_sent`,
+  `monitor_ready`, `response`, `club` and `handed` are removed; `address`
+  and `last_shot` stay
 - **Cameras** (from `actor_status`): `camera` (the camera's own name),
   `position`, `resolution` (`1280x720`), `mode_fps` (the frame rate asked
   for), `fps` (achieved over the last second), `dropped` (frames missing
@@ -647,7 +657,8 @@ this changes no set.
 - `mode`: [`ShotGrouping`](#shotgrouping): `"by_set"` | `"by_club"` | `"none"`
 
 **Response** `200 OK` once the system actor has applied it, echoing the body
-(`{"mode":"by_club"}`). `504 Gateway Timeout` when it has not within 10 s;
+(`{"mode":"by_club"}`). `504 Gateway Timeout` when it has not within 22 s
+(see [config timeout](#config-timeout));
 the command is already on the bus then, so it may still apply later: re-read
 [`GET /api/shots/groups`](#get-apishotsgroups). A `mode` outside the three is
 `422 Unprocessable Entity`, a malformed body `400 Bad Request` and a missing
@@ -1005,6 +1016,82 @@ drops the command.
 
 ---
 
+### POST /api/actors/{id}/reconnect
+
+Stop a launch monitor or output, wait for its device or connection to close,
+and start it again from the saved settings: what a flighthook restart does for
+that one device. Every other actor, the shot history, the sets and the game
+state are left alone. The Reconnect button on the Telemetry side of each
+Launch monitors and Outputs card sends it.
+
+`id` is the actor ID (`mevo.0`, `square.0`, `openconnect_server.0`,
+`openconnect_client.1`, ...); `gspro.N` names `openconnect_client.N`. No
+request body.
+
+**Response** `200 OK` once the new instance has started:
+
+```json
+{ "restarted": ["mevo.0"] }
+```
+
+The card then shows the usual statuses as it connects (`starting`, then
+`connected`).
+
+`202 Accepted` with `{ "restarted": [] }` when the actor starts again by
+itself later:
+
+- its old connection has not closed in time, or is still closing from an
+  earlier request (see below); the actor's `error` telemetry says
+  `"The previous connection has not closed yet. It reconnects when it does."`;
+- another save or reconnect is restarting it already;
+- SystemActor has not finished within 22 s (see
+  [config timeout](#config-timeout)). Until it has, the actor counts as in
+  flight, so another request for it is `409`.
+
+It has started again when the actor reports `starting`, or a
+`config_outcome` lists it in `restarted` (the one without `request_id`
+included). The dashboard keeps the card's Reconnect disabled until then, for
+up to a minute.
+
+**Errors**: a JSON body `{"error": "<reason>"}`.
+
+| Status | When |
+|---|---|
+| `400 Bad Request` | `id` is a camera, the web server or another actor that is not a launch monitor or output |
+| `404 Not Found` | no launch monitor or output in the saved settings has that ID |
+| `409 Conflict` | a reconnect of the same actor is already in flight (`"a reconnect of 'mevo.0' is already in progress"`) |
+| `409 Conflict` | the actor was removed, or its saved settings cannot start it, after the request was checked |
+| `504 Gateway Timeout` | flighthook is shutting down: the command was not processed |
+
+The reply is decided when the command's outcome arrives, from the actor's state
+at that moment. A request that finds another save or reconnect restarting the
+actor is `202`; if that other command finishes in the instant between the
+refusal and the reply (under 50 ms, and only for an actor that closes at once),
+the reply is `409` with `"'mevo.0' was not reconnected"` although the actor has
+restarted. A `409` of that kind is settled by the actor's status. The
+dashboard cannot hit it: it disables Reconnect while a save is out.
+
+How long the old connection is given to close depends on the device: up to
+3 s, 5 s for a Square Golf, 18 s for an ExPutt (a session start in progress
+cannot be cut short). A Mevo/Xi, an Open Connect client or a mock still
+closing after that is replaced anyway (it holds nothing the new one needs and
+closes itself); so is an Open Connect server once its port is free. A Garmin
+R10, a Square Golf or an ExPutt is not: the request answers `202`, the
+actor's `error` telemetry and an Error alert say the previous connection has
+not closed yet, and the actor starts again by itself once it has. Its `error` is
+cleared then, and a `config_outcome` without `request_id` lists it in
+`restarted`. Pressing Reconnect again meanwhile starts nothing.
+
+An Open Connect client that is reconnected starts its `ShotNumber` count
+over, as after a flighthook restart.
+
+**Side effects**: emits a `config_command` with action
+`{ "type": "reconnect", "id": "mevo.0" }`, processed by SystemActor, which
+answers with a `config_outcome` listing the actor in `restarted`, or with
+`restarted` empty when it did not start it.
+
+---
+
 ### POST /api/mode
 
 Change the global detection mode. Emits `SetDetectionMode` on the bus;
@@ -1200,7 +1287,10 @@ Full persisted config (mirrors `config.toml`).
   [Auto-chip](#post-apiauto-chip) shots are accepted whatever they name.
   Each shot's `ShotNumber` is its `shot_number`, raised when needed to one
   more than the last one the client sent, so the numbers a simulator gets
-  always increase, across devices, Auto-chip shots and device reconnects
+  always increase, across devices, Auto-chip shots and device reconnects.
+  The count starts over when the client itself restarts: a
+  [Reconnect](#post-apiactorsidreconnect) of it, a save that restarts it, or
+  a flighthook restart
 - `replay` (beta) holds the camera clip settings: `keep_shots` (default
   `20`, 1 to 1000: clip folders kept on disk, newest first; a swing two
   launch monitors saw is one clip), `pre_roll_s` (default `4.0`) and
@@ -1287,10 +1377,28 @@ as applied.
 | `400 Bad Request` | a Mevo section it writes has a `launch_only_spin` below 0, above 1000 or not finite (`"mevo.0: launch_only_spin must be 0 to 1000 rpm per mph, not -5"`) |
 | `400 Bad Request` | a camera section it writes has no `camera` (`"camera.0: no camera picked"`) or a `mode` that is neither `auto` nor `WIDTHxHEIGHT@FPS` |
 | `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
-| `504 Gateway Timeout` | SystemActor did not answer within 10 s |
+| `504 Gateway Timeout` | SystemActor did not answer within 22 s (see below) |
 
 A body that is not a valid `FlighthookConfig` is rejected by the JSON
 extractor with a `4xx` and a plain-text reason.
+
+#### Config timeout
+
+A save that restarts or removes actors stops them together and waits for
+each to let go of its device or connection, as a
+[reconnect](#post-apiactorsidreconnect) does: up to 3 s, 5 s for a Square
+Golf, 18 s for an ExPutt. One still closing after that is handled the same way
+as for a reconnect: replaced beside it when it holds nothing the new one
+needs, otherwise its card says the previous connection has not closed yet,
+it is listed in neither `restarted` nor `started`, and it starts by itself
+once the old connection has closed. SystemActor waits for the stops off its
+own thread, so a save sent while a reconnect or another save waits is
+handled at once. A save of an actor another command is still waiting for
+follows the same rule as one whose old connection is still closing: it is
+not started by the save (removed, it is listed in `stopped`), and it starts
+from the saved settings when that wait is over. The server waits up to 22 s
+for SystemActor (the longest stop wait, 18 s, plus 4 s), so a save is
+answered with its outcome, not a `504`.
 
 A save that changes the Web Server's own `bind` restarts the server that is
 answering, so the reply can be lost even though the config was saved: read
@@ -1913,13 +2021,15 @@ External consumers can observe these to track config changes in flight.
 }
 ```
 
-`action.type` is one of `replace_all`, `upsert_webserver`, `upsert_mevo`,
-`upsert_r10`, `upsert_square`, `upsert_exputt`, `upsert_open_connect_server`,
-`upsert_open_connect_client`, `upsert_mock_monitor`, `upsert_random_club`,
-`remove` and `set_shot_grouping`
-(`{ "type": "set_shot_grouping", "mode": "by_club" }`, from
-`POST /api/shots/grouping` or the WS `grouping` command). `upsert_gs_pro` is
-also accepted as `upsert_open_connect_client`, and a `remove` of `gspro.N` as
+`action.type` is one of `replace_all`, `replace_global`, `upsert_webserver`,
+`upsert_mevo`, `upsert_r10`, `upsert_square`, `upsert_exputt`,
+`upsert_open_connect_server`, `upsert_open_connect_client`,
+`upsert_mock_monitor`, `upsert_random_club`, `upsert_camera`, `remove`,
+`set_shot_grouping` (`{ "type": "set_shot_grouping", "mode": "by_club" }`, from
+`POST /api/shots/grouping` or the WS `grouping` command) and `reconnect`
+(`{ "type": "reconnect", "id": "mevo.0" }`, from
+`POST /api/actors/{id}/reconnect`). `upsert_gs_pro` is also accepted as
+`upsert_open_connect_client`, and a `remove` or `reconnect` of `gspro.N` as
 one of `openconnect_client.N`.
 
 ---
@@ -1927,7 +2037,10 @@ one of `openconnect_client.N`.
 ##### config_outcome
 
 Config mutation outcome (emitted by SystemActor after processing). Always
-emitted after a `config_command`, even for fire-and-forget commands.
+emitted after a `config_command`, even for fire-and-forget commands. SystemActor
+also emits one without `request_id` when it starts an actor again by itself
+once that actor's old connection has closed (see
+[reconnect](#post-apiactorsidreconnect)), listing it in `restarted`.
 
 ```json
 {
@@ -1944,7 +2057,9 @@ emitted after a `config_command`, even for fire-and-forget commands.
 
 - `request_id`: correlation ID from the originating `config_command`, or omitted
   for fire-and-forget mutations
-- `restarted`, `stopped`, `started`: lists of affected actor IDs (omitted when empty)
+- `restarted`, `stopped`, `started`: lists of affected actor IDs (omitted when empty).
+  A `reconnect` lists its actor in `restarted`, or nothing when it did not start
+  it
 
 ---
 

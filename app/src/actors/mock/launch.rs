@@ -43,7 +43,12 @@ pub struct MockLaunchActor {
 }
 
 impl Actor for MockLaunchActor {
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let initial_mode = self.initial_mode;
         let device_id = format!("mock-{}", sender.actor_id());
         let thread_name = format!("device:{}", sender.actor_id());
@@ -51,7 +56,12 @@ impl Actor for MockLaunchActor {
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || run(&state, initial_mode, device_id, sender, receiver))
-            .expect("failed to spawn mock launch thread");
+            .expect("failed to spawn mock launch thread")
+    }
+
+    /// It holds no device or port.
+    fn replaceable_while_stopping(&self) -> bool {
+        true
     }
 }
 

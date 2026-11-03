@@ -88,6 +88,11 @@ impl Still {
         }
     }
 
+    /// Whether [`still_picture`] shows a frame or why there is none.
+    pub(crate) fn shown(&self) -> bool {
+        self.jpeg.is_some() || self.texture.is_some() || self.error.is_some()
+    }
+
     /// The frame as a texture, decoding a newly received one.
     fn texture(&mut self, ctx: &egui::Context, actor: &str) -> Option<&egui::TextureHandle> {
         if let Some(jpeg) = self.jpeg.take() {
@@ -100,11 +105,16 @@ impl Still {
     }
 }
 
-/// A camera card's Still frame button and, once fetched, the frame at the
-/// card's width. The button needs a running camera. Returns whether it was
-/// clicked: the caller fetches the frame.
-pub(crate) fn still_body(ui: &mut egui::Ui, actor: &str, still: &mut Still, running: bool) -> bool {
-    let clicked = crate::panels::settings::button_row(
+/// A camera card's Still frame button, for its action row. It needs a
+/// running camera and no request out. Returns whether it was clicked: the
+/// caller fetches the frame.
+pub(crate) fn still_button(
+    ui: &mut egui::Ui,
+    actor: &str,
+    still: &mut Still,
+    running: bool,
+) -> bool {
+    let clicked = crate::panels::settings::action_button(
         ui,
         "Still frame",
         &format!("still:{actor}"),
@@ -114,6 +124,12 @@ pub(crate) fn still_body(ui: &mut egui::Ui, actor: &str, still: &mut Still, runn
         still.loading = true;
         still.error = None;
     }
+    clicked
+}
+
+/// A camera card's still frame, once fetched, at the card's width, or why
+/// there is none.
+pub(crate) fn still_picture(ui: &mut egui::Ui, actor: &str, still: &mut Still) {
     let ctx = ui.ctx().clone();
     if let Some(tex) = still.texture(&ctx, actor) {
         ui.add_space(4.0);
@@ -127,7 +143,6 @@ pub(crate) fn still_body(ui: &mut egui::Ui, actor: &str, still: &mut Still, runn
                 .color(theme::TEXT_MUTED),
         );
     }
-    clicked
 }
 
 // ---------------------------------------------------------------------------

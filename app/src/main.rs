@@ -90,12 +90,21 @@ fn main() -> anyhow::Result<()> {
     {
         let shutdown = Arc::new(AtomicBool::new(false));
         let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::clone(&shutdown));
+        let muted = sender.muted();
         let receiver = sender.subscribe();
         let (actor, ready_rx) =
             actors::system::SystemActor::new(game_writer, Arc::clone(&state), bus_tx.clone());
-        actor.start(Arc::clone(&state), sender, receiver);
+        let thread = actor.start(Arc::clone(&state), sender, receiver);
         ready_rx.recv().expect("system actor failed to start");
-        state.register_actor("system".into(), Box::new(actor), shutdown);
+        state.register_actor(
+            "system".into(),
+            Box::new(actor),
+            state::ActorHandle {
+                shutdown,
+                muted,
+                thread: Some(thread),
+            },
+        );
     }
 
     // Replay clips kept from earlier runs: index them, and delete all but
@@ -195,10 +204,13 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Shutdown — stop all actors (including webserver) via registry
+    // Shutdown — stop all actors (including webserver) via registry, and
+    // give them a moment to let go of their devices (the Square Golf
+    // disconnects).
     tracing::info!("shutting down...");
-    for id in state.actor_ids() {
-        state.stop_actor(&id);
+    let running = state.stop_all_and_wait(actors::STOP_WAIT);
+    if !running.is_empty() {
+        tracing::warn!("still stopping at exit: {}", running.join(", "));
     }
     // Drop bus_tx closes the broadcast channel as secondary signal
     drop(bus_tx);

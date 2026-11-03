@@ -409,6 +409,8 @@ device's live status and its settings. Edit a card and **Save** or
 **Cancel** it before moving on; the rest of the dashboard waits until you
 do. The **+** after Launch monitors, Cameras or Outputs adds one. There is one web
 server: it can be edited (its bind address) but not removed or added.
+**Reconnect** on a launch monitor or output card closes its connection and
+starts it again from its saved settings, without restarting flighthook.
 
 Each card's badge and left stripe show its connection:
 

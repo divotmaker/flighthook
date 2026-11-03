@@ -1993,21 +1993,17 @@ pub(crate) fn save_error_line(ui: &mut egui::Ui, key: &str, message: &str) {
     devices::mark(ui, || format!("error:{key}"), &line);
 }
 
-/// The Remove button closing an actor's settings form, right-aligned.
-pub(crate) fn remove_row(ui: &mut egui::Ui, key: &str, enabled: bool) -> bool {
-    button_row(ui, "Remove", &format!("remove:{key}"), enabled)
+/// The Remove button of an actor's settings side, for its action row.
+pub(crate) fn remove_button(ui: &mut egui::Ui, key: &str, enabled: bool) -> bool {
+    action_button(ui, "Remove", &format!("remove:{key}"), enabled)
 }
 
-/// A right-aligned header-style button closing a card's body. `mark` names
-/// it for the tests.
-pub(crate) fn button_row(ui: &mut egui::Ui, text: &str, mark: &str, enabled: bool) -> bool {
-    ui.add_space(4.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-        let button = ui.add_enabled(enabled, header_button(text, false));
-        devices::mark(ui, || mark.to_string(), &button);
-        button.clicked()
-    })
-    .inner
+/// A header-style button in a card's action row. `mark` names it for the
+/// tests.
+pub(crate) fn action_button(ui: &mut egui::Ui, text: &str, mark: &str, enabled: bool) -> bool {
+    let button = ui.add_enabled(enabled, header_button(text, false));
+    devices::mark(ui, || mark.to_string(), &button);
+    button.clicked()
 }
 
 /// Hover text of the Simulation card.
@@ -2779,7 +2775,8 @@ impl FlighthookApp {
         ui: &mut egui::Ui,
         editable: bool,
     ) {
-        theme::accent_card(ui, theme::HEADING, |ui| {
+        let card = devices::fixed_card(ui, "global", theme::HEADING, |card| {
+            let ui = card.top();
             let dirty = card_header(ui, "global", "Global", None, None, |ui| {
                 let dirty = self.general_buttons(ctx, ui, GeneralCard::Global);
                 if ui
@@ -2794,9 +2791,12 @@ impl FlighthookApp {
                 lock_hint(ui);
                 self.general_error(ui, "global");
             }
-            ui.add_space(6.0);
-            ui.add_enabled_ui(editable, |ui| self.global_fields(ui));
+            card.body(false, |ui| {
+                ui.add_space(6.0);
+                ui.add_enabled_ui(editable, |ui| self.global_fields(ui));
+            });
         });
+        devices::mark(ui, || "card:global".to_owned(), &card.response);
     }
 
     /// The Global card's fields.
@@ -2902,7 +2902,8 @@ impl FlighthookApp {
         ui: &mut egui::Ui,
         editable: bool,
     ) {
-        theme::accent_card(ui, theme::HEADING, |ui| {
+        let card = devices::fixed_card(ui, "simulation", theme::HEADING, |card| {
+            let ui = card.top();
             let dirty = card_header(
                 ui,
                 "simulation",
@@ -2915,9 +2916,12 @@ impl FlighthookApp {
                 lock_hint(ui);
                 self.general_error(ui, "simulation");
             }
-            ui.add_space(6.0);
-            ui.add_enabled_ui(editable, |ui| self.simulation_fields(ui));
+            card.body(false, |ui| {
+                ui.add_space(6.0);
+                ui.add_enabled_ui(editable, |ui| self.simulation_fields(ui));
+            });
         });
+        devices::mark(ui, || "card:simulation".to_owned(), &card.response);
     }
 
     /// The Replay card: the cameras' clips (beta), saved with the Global
@@ -2928,7 +2932,8 @@ impl FlighthookApp {
         ui: &mut egui::Ui,
         editable: bool,
     ) {
-        theme::accent_card(ui, theme::HEADING, |ui| {
+        let card = devices::fixed_card(ui, "replay", theme::HEADING, |card| {
+            let ui = card.top();
             let dirty = card_header(
                 ui,
                 "replay",
@@ -2941,9 +2946,12 @@ impl FlighthookApp {
                 lock_hint(ui);
                 self.general_error(ui, "replay");
             }
-            ui.add_space(6.0);
-            ui.add_enabled_ui(editable, |ui| self.replay_fields(ui));
+            card.body(false, |ui| {
+                ui.add_space(6.0);
+                ui.add_enabled_ui(editable, |ui| self.replay_fields(ui));
+            });
         });
+        devices::mark(ui, || "card:replay".to_owned(), &card.response);
     }
 
     /// The Replay card's fields.

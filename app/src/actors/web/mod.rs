@@ -167,6 +167,8 @@ pub struct WebState {
     pub request_count: AtomicU64,
     /// Auto-chip shots sent so far: the last Auto-chip shot number.
     pub auto_chip_shots: AtomicU32,
+    /// Actors with a reconnect in flight (`POST /api/actors/{id}/reconnect`).
+    pub reconnecting: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl WebState {
@@ -252,7 +254,12 @@ impl WebActor {
 }
 
 impl Actor for WebActor {
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, _receiver: BusReceiver) {
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        _receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let addr = self.addr;
         let actor_id = sender.actor_id().to_string();
         let bus_tx = sender.raw_sender().clone();
@@ -270,7 +277,7 @@ impl Actor for WebActor {
                     .expect("failed to create webserver tokio runtime");
                 rt.block_on(run(addr, actor_id, state, bus_tx, bus_rx, shutdown_rx));
             })
-            .expect("failed to spawn webserver thread");
+            .expect("failed to spawn webserver thread")
     }
 
     fn stop(&self) {
@@ -282,6 +289,18 @@ impl Actor for WebActor {
         {
             let _ = tx.send(());
         }
+    }
+
+    /// The save that changes the bind address is answered by this server,
+    /// which does not end until it has answered: nothing waits for it.
+    fn stop_wait(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
+    /// The new server retries its bind until the old one has let go of the
+    /// port.
+    fn replaceable_while_stopping(&self) -> bool {
+        true
     }
 
     fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
@@ -333,6 +352,7 @@ async fn run(
         ws_count: AtomicU64::new(0),
         request_count: AtomicU64::new(0),
         auto_chip_shots: AtomicU32::new(0),
+        reconnecting: std::sync::Mutex::default(),
     });
 
     // Background task: keep web state current from the bus
@@ -387,6 +407,7 @@ async fn run(
         .route("/api/mode", post(routes::post_mode))
         .route("/api/auto-chip", post(routes::post_auto_chip))
         .route("/api/find-mat", post(routes::post_find_mat))
+        .route("/api/actors/{id}/reconnect", post(routes::post_reconnect))
         .route(
             "/api/settings",
             get(routes::get_settings).post(routes::post_settings),
@@ -902,7 +923,10 @@ async fn apply_bus_event(
                         .or_insert_with(|| new_actor(name.clone()));
                 }
                 // A restarted actor begins a new history: no alert for the
-                // connection its old instance lost.
+                // connection its old instance lost. The outcome can arrive
+                // after the new instance's first statuses (`Starting`, even
+                // `Connected`); `restart` keeps the latest status, so the
+                // order does not matter.
                 for id in restarted {
                     if let Some(entry) = actors.get_mut(id) {
                         entry.restart(now);
@@ -1269,6 +1293,7 @@ pub(crate) mod tests {
             ws_count: AtomicU64::new(0),
             request_count: AtomicU64::new(0),
             auto_chip_shots: AtomicU32::new(0),
+            reconnecting: std::sync::Mutex::default(),
         }
     }
 

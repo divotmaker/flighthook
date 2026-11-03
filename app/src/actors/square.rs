@@ -40,7 +40,12 @@ pub struct SquareActor {
 }
 
 impl Actor for SquareActor {
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let address = self.address.clone();
         let club = self.club;
         let advanced_spin = self.advanced_spin;
@@ -62,7 +67,12 @@ impl Actor for SquareActor {
                     receiver,
                 );
             })
-            .expect("failed to spawn square thread");
+            .expect("failed to spawn square thread")
+    }
+
+    /// Stopping disarms the device and ends the BLE link ([`STOP_WAIT`]).
+    fn stop_wait(&self) -> Duration {
+        STOP_WAIT
     }
 
     fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
@@ -192,6 +202,34 @@ impl<T> Tap<T> {
         let mut capture = RawCapture::new(raw_capture_config());
         capture.set_enabled(false);
         Self { inner, capture }
+    }
+}
+
+/// How long a stop waits for the actor: disarming the device and ending the
+/// BLE link take a few BLE operations.
+pub(crate) const STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// Ends the link to the device when the actor stops.
+trait Release {
+    /// Disconnect from the device. Default: nothing beyond dropping the
+    /// transport.
+    fn release(&mut self) {}
+}
+
+/// The Omni takes one central at a time, so the actor disconnects it when it
+/// stops, on either BLE backend: BlueZ keeps a device connected after its
+/// transport is dropped.
+impl Release for ble::BleTransport {
+    fn release(&mut self) {
+        if let Err(e) = self.disconnect() {
+            debug!("disconnect: {e}");
+        }
+    }
+}
+
+impl<T: Release> Release for Tap<T> {
+    fn release(&mut self) {
+        self.inner.release();
     }
 }
 
@@ -538,7 +576,7 @@ fn connect_and_run(
 /// Drive a connected device until shutdown or a link error: follow the bus
 /// (club, handedness), arm the device, and publish its shots.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn run_session<T: allsquare::Transport>(
+fn run_session<T: allsquare::Transport + Release>(
     transport: T,
     name: String,
     ble_address: String,
@@ -580,6 +618,7 @@ fn run_session<T: allsquare::Transport>(
             match receiver.poll() {
                 Err(PollError::Shutdown) => {
                     let _ = client.disarm();
+                    client.transport_mut().release();
                     return Ok(());
                 }
                 Ok(None) => break,
@@ -1174,6 +1213,14 @@ mod tests {
         notifications: std::collections::VecDeque<Vec<u8>>,
         written: Arc<Mutex<Vec<Vec<u8>>>>,
         gate: Option<Arc<Gate>>,
+        /// Set once the session ends the link.
+        released: Arc<AtomicBool>,
+    }
+
+    impl Release for FakeTransport {
+        fn release(&mut self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
     }
 
     impl allsquare::Transport for FakeTransport {
@@ -1384,6 +1431,7 @@ mod tests {
     /// A session against a scripted device on its own thread.
     struct Session {
         written: Arc<Mutex<Vec<Vec<u8>>>>,
+        released: Arc<AtomicBool>,
         sender: BusSender,
         shutdown: Arc<AtomicBool>,
         gate: Arc<Gate>,
@@ -1434,6 +1482,7 @@ mod tests {
                 ..FakeTransport::default()
             };
             let written = fake.written.clone();
+            let released = fake.released.clone();
             let session_sender = sender.clone();
             let thread = std::thread::spawn(move || {
                 let mut club = Club::Iron7;
@@ -1453,6 +1502,7 @@ mod tests {
             });
             Self {
                 written,
+                released,
                 sender,
                 shutdown,
                 gate,
@@ -1654,5 +1704,18 @@ mod tests {
             session.finish(3),
             [(seven, Right), (eight, Left), (seven, Left)]
         );
+    }
+
+    #[test]
+    fn a_stop_disarms_the_device_and_ends_the_link_at_once() {
+        let session = Session::start(None, vec![]);
+        session.wait_for(1);
+        let released = Arc::clone(&session.released);
+        assert!(!released.load(Ordering::SeqCst));
+        let stopped = Instant::now();
+        session.finish(1);
+        let took = stopped.elapsed();
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert!(released.load(Ordering::SeqCst), "the link is ended");
     }
 }

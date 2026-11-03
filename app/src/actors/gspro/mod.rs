@@ -15,6 +15,14 @@
 //! points at it, which would loop shots back) is a setup mistake,
 //! not a simulator that is not running: the card's telemetry carries the
 //! reason as `error` until a connection is accepted or fails another way.
+//!
+//! The card's telemetry ([`Telemetry`]): `address` (the simulator's),
+//! `last_shot` (the shot number the simulator got last and when it was
+//! sent), and for the current connection only `shots_sent`,
+//! `monitor_ready` (the readiness last sent to the simulator) and
+//! `response` (the simulator's last response code and message). The web
+//! layer shows the simulator's player information as `club` and `handed`;
+//! the client removes those too when the connection ends.
 
 pub mod api;
 pub mod mapper;
@@ -76,7 +84,12 @@ pub struct GsProActor {
 }
 
 impl Actor for GsProActor {
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let addr = self.addr;
         let routing = self.routing.clone();
         let clients = Arc::clone(&state.local_clients);
@@ -88,7 +101,15 @@ impl Actor for GsProActor {
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || run(addr, routing, &clients, sender, receiver))
-            .expect("failed to spawn gspro thread");
+            .expect("failed to spawn gspro thread")
+    }
+
+    /// The simulator is reached over TCP as a client, and the old
+    /// instance's registration as a local client ends with its connection:
+    /// a connect still running in the old instance keeps nothing from the
+    /// new one, and closes itself once it completes.
+    fn replaceable_while_stopping(&self) -> bool {
+        true
     }
 
     fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
@@ -169,9 +190,97 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Connected.
 const REFUSAL_VERDICT: Duration = Duration::from_secs(1);
 
+/// Longest a connect to the simulator may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Telemetry clearing the `error` key: an empty value removes a key.
 fn clear_error() -> HashMap<String, String> {
     HashMap::from([("error".into(), String::new())])
+}
+
+/// The simulator's address.
+const ADDRESS: &str = "address";
+/// The shot number the simulator got last and when it was sent.
+const LAST_SHOT: &str = "last_shot";
+/// The shots sent on this connection.
+const SHOTS_SENT: &str = "shots_sent";
+/// The readiness last sent to the simulator on this connection.
+const MONITOR_READY: &str = "monitor_ready";
+/// The simulator's last response on this connection: code and message.
+const RESPONSE: &str = "response";
+/// The simulator's player information, shown by the web layer.
+const PLAYER: [&str; 2] = ["club", "handed"];
+/// The keys that hold for one connection.
+const PER_CONNECTION: [&str; 3] = [SHOTS_SENT, MONITOR_READY, RESPONSE];
+
+/// The card's actor telemetry. A key goes out only when its value changes;
+/// an empty value removes it.
+struct Telemetry {
+    /// The values the card holds now.
+    reported: HashMap<String, String>,
+    /// Changes not yet sent.
+    pending: HashMap<String, String>,
+}
+
+impl Telemetry {
+    /// A new instance's telemetry for a simulator at `addr`: its first
+    /// status sets the address and removes what an earlier instance left.
+    fn new(addr: SocketAddr) -> Self {
+        let mut pending: HashMap<String, String> = std::iter::once(LAST_SHOT)
+            .chain(PER_CONNECTION)
+            .chain(PLAYER)
+            .map(|k| (k.to_owned(), String::new()))
+            .collect();
+        pending.insert(ADDRESS.into(), addr.to_string());
+        Self {
+            reported: HashMap::new(),
+            pending,
+        }
+    }
+
+    /// Set `key` to `value`.
+    fn set(&mut self, key: &str, value: String) {
+        if self.reported.get(key).map_or("", String::as_str) == value {
+            self.pending.remove(key);
+        } else {
+            self.pending.insert(key.to_owned(), value);
+        }
+    }
+
+    /// Record that the card shows `key` without sending it: the web layer
+    /// sets the player information.
+    fn shown(&mut self, key: &str) {
+        self.reported.insert(key.to_owned(), "shown".into());
+    }
+
+    /// Remove what held for the connection that ended.
+    fn clear_connection(&mut self) {
+        for key in PER_CONNECTION.into_iter().chain(PLAYER) {
+            self.set(key, String::new());
+        }
+    }
+
+    /// The changes not yet sent, now taken as sent.
+    fn take(&mut self) -> HashMap<String, String> {
+        for (k, v) in &self.pending {
+            if v.is_empty() {
+                self.reported.remove(k);
+            } else {
+                self.reported.insert(k.clone(), v.clone());
+            }
+        }
+        std::mem::take(&mut self.pending)
+    }
+}
+
+/// A response for the card: its code and message.
+fn response_text(code: i32, message: &str) -> String {
+    format!("{code} {}", message.trim()).trim_end().to_owned()
+}
+
+/// A shot sent to the simulator for the card: its number and the local time.
+fn last_shot_text(number: u32) -> String {
+    format!("#{number} at {}", chrono::Local::now().format("%H:%M:%S"))
 }
 
 /// Main bridge loop. Reconnects forever until the bus closes.
@@ -201,6 +310,7 @@ pub(crate) fn run_with(
     mut receiver: BusReceiver,
 ) {
     let mut relay = Relay::new(routing);
+    let mut telemetry = Telemetry::new(addr);
     let mut ever_connected = false;
     // Whether our own Open Connect server refused the last connection.
     let mut refused = false;
@@ -218,17 +328,25 @@ pub(crate) fn run_with(
         };
         // The first status also clears an `error` left by an earlier run of
         // this actor.
+        let mut update = telemetry.take();
+        if !ever_connected {
+            update.extend(clear_error());
+        }
         sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
             status,
-            telemetry: if ever_connected {
-                HashMap::new()
-            } else {
-                clear_error()
-            },
+            telemetry: update,
         }));
 
-        let result = connect_and_run(addr, &mut relay, clients, sender, &mut receiver);
+        let result = connect_and_run(
+            addr,
+            &mut relay,
+            &mut telemetry,
+            clients,
+            sender,
+            &mut receiver,
+        );
         let session = relay.disconnect();
+        telemetry.clear_connection();
         ever_connected |= session.is_some();
         match result {
             Ok(()) | Err(BridgeError::Shutdown) => {
@@ -247,18 +365,19 @@ pub(crate) fn run_with(
                 // lost or refused connection is a status, not an alert. Our
                 // own server refusing us is a setup mistake: the card says
                 // why (the server raises the alert).
-                let telemetry = match e {
+                let mut update = telemetry.take();
+                match e {
                     BridgeError::Refused(reason) => {
                         refused = true;
-                        HashMap::from([("error".into(), reason)])
+                        update.insert("error".into(), reason);
                     }
-                    _ if std::mem::take(&mut refused) => clear_error(),
-                    _ => HashMap::new(),
-                };
+                    _ if std::mem::take(&mut refused) => update.extend(clear_error()),
+                    _ => {}
+                }
                 tracing::info!("gspro bridge: {text}, retrying in {delay:?}");
                 sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
                     status: backoff_status,
-                    telemetry,
+                    telemetry: update,
                 }));
 
                 let deadline = Instant::now() + delay;
@@ -533,12 +652,15 @@ fn shot_matches_routing(routing: &GsProRouting, mode: ShotDetectionMode, actor: 
 fn connect_and_run(
     addr: SocketAddr,
     relay: &mut Relay,
+    telemetry: &mut Telemetry,
     clients: &LocalClients,
     sender: &BusSender,
     receiver: &mut BusReceiver,
 ) -> Result<(), BridgeError> {
-    let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(BridgeError::Io)?;
+    // A stop during the connect ends the bridge at once.
+    let mut stream = super::connect_tcp(sender.actor_id(), addr, CONNECT_TIMEOUT, receiver)
+        .map_err(BridgeError::Io)?
+        .ok_or(BridgeError::Shutdown)?;
     // Registered before anything is sent, so a server reading our data
     // already knows the connection is ours.
     let registration = match stream.local_addr() {
@@ -551,7 +673,7 @@ fn connect_and_run(
             None
         }
     };
-    let result = session(&mut stream, addr, relay, sender, receiver);
+    let result = session(&mut stream, addr, relay, telemetry, sender, receiver);
     match registration.and_then(|r| r.refusal()) {
         Some(reason) if !matches!(result, Ok(()) | Err(BridgeError::Shutdown)) => {
             Err(BridgeError::Refused(reason))
@@ -560,11 +682,13 @@ fn connect_and_run(
     }
 }
 
-/// One connected session with the simulator.
+/// One connected session with the simulator. Its telemetry goes out with
+/// the Connected status, then as it changes.
 fn session(
     stream: &mut TcpStream,
     addr: SocketAddr,
     relay: &mut Relay,
+    telemetry: &mut Telemetry,
     sender: &BusSender,
     receiver: &mut BusReceiver,
 ) -> Result<(), BridgeError> {
@@ -585,6 +709,8 @@ fn session(
     tracing::info!("gspro bridge: connected to {addr}");
     // Shots flow from now; the Connected status waits for the verdict.
     let mut announced = false;
+    let mut shots_sent: u32 = 0;
+    telemetry.set(SHOTS_SENT, shots_sent.to_string());
 
     // Backdate so the first heartbeat fires after ~1s instead of waiting the full 10s.
     let mut last_heartbeat = Instant::now() - Duration::from_secs(9);
@@ -614,7 +740,15 @@ fn session(
                     "{name} received response {raw_text}{}",
                     decoded.as_deref().map(|d| format!(" | {d}")).unwrap_or_default(),
                 );
-                handle_response(&read_buf[..n], sender);
+                let heard = handle_response(&read_buf[..n], sender);
+                if let Some((code, message)) = heard.last {
+                    telemetry.set(RESPONSE, response_text(code, &message));
+                }
+                if heard.player {
+                    for key in PLAYER {
+                        telemetry.shown(key);
+                    }
+                }
                 activity = true;
             }
             Err(ref e)
@@ -630,7 +764,12 @@ fn session(
         relay.drain(receiver)?;
 
         // 3. Send every finished shot, oldest first
-        if send_shots(relay, stream, Instant::now(), name)? {
+        let mut on_sent = |number| {
+            shots_sent += 1;
+            telemetry.set(SHOTS_SENT, shots_sent.to_string());
+            telemetry.set(LAST_SHOT, last_shot_text(number));
+        };
+        if send_shots(relay, stream, Instant::now(), name, &mut on_sent)? {
             activity = true;
         }
 
@@ -648,6 +787,7 @@ fn session(
                     );
                 }
                 send_message(stream, &msg)?;
+                telemetry.set(MONITOR_READY, new_readiness.to_string());
                 last_heartbeat = Instant::now();
                 activity = true;
             }
@@ -667,14 +807,22 @@ fn session(
                 );
             }
             send_message(stream, &msg)?;
+            telemetry.set(MONITOR_READY, ready.to_string());
             activity = true;
         }
 
         if !announced && connected_at.elapsed() >= REFUSAL_VERDICT {
             announced = true;
+            let mut update = telemetry.take();
+            update.extend(clear_error());
             sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
                 status: ActorStatus::Connected,
-                telemetry: clear_error(),
+                telemetry: update,
+            }));
+        } else if announced && !telemetry.pending.is_empty() {
+            sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                status: ActorStatus::Connected,
+                telemetry: telemetry.take(),
             }));
         }
 
@@ -684,14 +832,16 @@ fn session(
     }
 }
 
-/// Send every shot in the outbox that is not stale at `now`, oldest first.
-/// Returns whether any was sent. A failed write is returned as the
-/// connection's error; the shot it was writing is not retried.
+/// Send every shot in the outbox that is not stale at `now`, oldest first,
+/// calling `on_sent` with each one's shot number once written. Returns
+/// whether any was sent. A failed write is returned as the connection's
+/// error; the shot it was writing is not retried.
 fn send_shots(
     relay: &mut Relay,
     stream: &mut impl Write,
     now: Instant,
     name: &str,
+    on_sent: &mut impl FnMut(u32),
 ) -> Result<bool, BridgeError> {
     let mut sent = false;
     while let Some(shot) = relay.next_shot(now) {
@@ -710,6 +860,7 @@ fn send_shots(
             );
             return Err(e);
         }
+        on_sent(msg.shot_number);
         sent = true;
     }
     Ok(sent)
@@ -1079,6 +1230,7 @@ mod tests {
             &mut TimedOutSocket,
             finished,
             "openconnect_client.0",
+            &mut |_| {},
         );
         assert!(
             matches!(failed, Err(BridgeError::Io(ref e)) if e.kind() == ErrorKind::TimedOut),
@@ -1092,8 +1244,14 @@ mod tests {
         let back = finished + reconnect_after;
         relay.connect(back);
         let mut wire = Vec::new();
-        send_shots(&mut relay, &mut wire, back, "openconnect_client.0")
-            .expect("writes to a Vec succeed");
+        send_shots(
+            &mut relay,
+            &mut wire,
+            back,
+            "openconnect_client.0",
+            &mut |_| {},
+        )
+        .expect("writes to a Vec succeed");
         assert!(relay.outbox.is_empty());
         messages(&wire)
     }
@@ -1114,6 +1272,7 @@ mod tests {
             &mut wire,
             Instant::now(),
             "openconnect_client.0",
+            &mut |_| {},
         )
         .expect("writes to a Vec succeed");
         messages(&wire)
@@ -1352,6 +1511,124 @@ mod tests {
             !alerts.iter().any(|a| is_shot_alert(a)),
             "dropped shots must not raise an alert: {alerts:?}"
         );
+    }
+
+    /// The client's card telemetry, merged from its statuses as the web
+    /// layer merges them, until `done` holds for it.
+    fn telemetry_until(
+        bridge: &mut Bridge,
+        card: &mut HashMap<String, String>,
+        what: &str,
+        done: impl Fn(&HashMap<String, String>) -> bool,
+    ) {
+        let deadline = Instant::now() + WAIT;
+        while !done(card) {
+            match bridge.events.try_recv() {
+                Ok(msg) if msg.actor == "openconnect_client.0" => {
+                    if let FlighthookEvent::ActorStatus { telemetry, .. } = msg.event {
+                        for (k, v) in telemetry {
+                            if v.is_empty() {
+                                card.remove(&k);
+                            } else {
+                                card.insert(k, v);
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for {what}: {card:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("bus: {e}"),
+            }
+        }
+    }
+
+    /// The card shows the simulator's address, the readiness sent, the
+    /// simulator's last response, the shots sent on this connection and the
+    /// last one; when the connection ends, what held for it goes, the
+    /// player information included, and the address and last shot stay.
+    #[test]
+    fn the_card_shows_the_connection_and_its_shots() {
+        let mut bridge = Bridge::start(Backoff::new(MAX_BACKOFF, MAX_BACKOFF));
+        let addr = bridge.gspro.local_addr().expect("addr").to_string();
+        let mut gspro = bridge.accept();
+        let mut card = HashMap::new();
+        telemetry_until(&mut bridge, &mut card, "connected", |c| {
+            c.get(SHOTS_SENT).map(String::as_str) == Some("0")
+        });
+        assert_eq!(card[ADDRESS], addr);
+        assert!(!card.contains_key(LAST_SHOT));
+
+        gspro
+            .stream
+            .write_all(
+                br#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"RH","Club":"DR"}}"#,
+            )
+            .expect("player info");
+        telemetry_until(&mut bridge, &mut card, "the response", |c| {
+            c.contains_key(RESPONSE)
+        });
+        assert_eq!(card[RESPONSE], "201 GSPro Player Information");
+
+        emit_shot(&bridge.monitor, 12);
+        assert_eq!(gspro.shots(1), [golden(12)]);
+        telemetry_until(&mut bridge, &mut card, "the shot", |c| {
+            c.get(SHOTS_SENT).map(String::as_str) == Some("1")
+        });
+        let last = &card[LAST_SHOT];
+        assert!(last.starts_with("#12 at "), "{last}");
+        let time = last.trim_start_matches("#12 at ");
+        assert_eq!(time.len(), 8, "{last}");
+        assert!(
+            chrono::NaiveTime::parse_from_str(time, "%H:%M:%S").is_ok(),
+            "{last}"
+        );
+        telemetry_until(&mut bridge, &mut card, "the readiness", |c| {
+            c.contains_key(MONITOR_READY)
+        });
+        assert_eq!(card[MONITOR_READY], "false");
+
+        // The player information shows (web layer) until the connection ends.
+        card.insert("club".into(), "DR".into());
+        card.insert("handed".into(), "rh".into());
+        drop(gspro);
+        telemetry_until(&mut bridge, &mut card, "the connection's keys gone", |c| {
+            !c.contains_key(SHOTS_SENT)
+        });
+        for key in PER_CONNECTION.into_iter().chain(PLAYER) {
+            assert!(!card.contains_key(key), "{key}: {card:?}");
+        }
+        assert_eq!(card[ADDRESS], addr);
+        assert!(card[LAST_SHOT].starts_with("#12 at "));
+        bridge.stop().expect("bridge stops");
+    }
+
+    #[test]
+    fn telemetry_goes_out_only_when_it_changes() {
+        let mut t = Telemetry::new("127.0.0.1:921".parse().expect("addr"));
+        let first = t.take();
+        assert_eq!(first[ADDRESS], "127.0.0.1:921");
+        assert!(first[SHOTS_SENT].is_empty(), "an earlier instance's go");
+        t.set(SHOTS_SENT, "1".into());
+        t.set(SHOTS_SENT, "1".into());
+        assert_eq!(t.take(), HashMap::from([(SHOTS_SENT.into(), "1".into())]));
+        t.set(SHOTS_SENT, "1".into());
+        assert!(t.take().is_empty());
+        t.set(SHOTS_SENT, "2".into());
+        t.set(SHOTS_SENT, "1".into());
+        assert!(t.take().is_empty(), "back where it was");
+        t.clear_connection();
+        assert_eq!(
+            t.take(),
+            HashMap::from([(SHOTS_SENT.into(), String::new())])
+        );
+        t.clear_connection();
+        assert!(t.take().is_empty());
     }
 
     #[test]

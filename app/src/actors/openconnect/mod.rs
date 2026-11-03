@@ -55,6 +55,13 @@ use flighthook::{
 /// a socket and streams garbage cannot grow the buffer without bound.
 const MAX_BUFFER: usize = 1 << 20;
 
+/// How often the server looks at the shutdown flag while it waits: between
+/// accepts, between reads, and while it waits to bind again.
+const IDLE_POLL: Duration = Duration::from_millis(100);
+
+/// Longest a write to the monitor may block.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Refusals of one client closer together than this are one burst of its
 /// reconnect attempts, alerted once. The client retries every 1-3 s.
 const REFUSAL_BURST_GAP: Duration = Duration::from_secs(30);
@@ -140,14 +147,25 @@ pub struct OpenConnectServerActor {
 }
 
 impl Actor for OpenConnectServerActor {
-    fn start(&self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
+    fn start(
+        &self,
+        state: Arc<SystemState>,
+        sender: BusSender,
+        receiver: BusReceiver,
+    ) -> std::thread::JoinHandle<()> {
         let bind = self.bind;
         let thread_name = format!("device:{}", sender.actor_id());
 
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || run(&state, bind, sender, receiver))
-            .expect("failed to spawn openconnect thread");
+            .expect("failed to spawn openconnect thread")
+    }
+
+    /// A new server can start beside the old one once the old one has let
+    /// go of the listen port.
+    fn replaceable_while_stopping(&self) -> bool {
+        TcpListener::bind(self.bind).is_ok()
     }
 
     fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
@@ -199,7 +217,14 @@ fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: B
                     severity: Severity::Error,
                     message: format!("OpenConnect server could not bind {bind}: {e}"),
                 }));
-                std::thread::sleep(backoff);
+                let deadline = Instant::now() + backoff;
+                while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                    if receiver.is_shutdown() {
+                        tracing::info!("openconnect server: shutting down");
+                        return;
+                    }
+                    std::thread::sleep(left.min(IDLE_POLL));
+                }
                 backoff = (backoff + Duration::from_secs(1)).min(max_backoff);
                 continue;
             }
@@ -235,7 +260,7 @@ fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: B
                     sender.send(listening_status(bound));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(IDLE_POLL);
                 }
                 Err(e) => {
                     tracing::warn!("openconnect server: accept failed: {e}");
@@ -301,8 +326,12 @@ fn serve(
     if let Err(e) = stream.set_nonblocking(false) {
         tracing::warn!("openconnect server: set_nonblocking failed: {e}");
     }
-    if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
+    if let Err(e) = stream.set_read_timeout(Some(IDLE_POLL)) {
         tracing::warn!("openconnect server: set_read_timeout failed: {e}");
+    }
+    // A monitor that stops reading cannot hold the server in a write.
+    if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
+        tracing::warn!("openconnect server: set_write_timeout failed: {e}");
     }
     let _ = stream.set_nodelay(true);
 

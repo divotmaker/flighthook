@@ -70,6 +70,15 @@ pub(crate) fn group_of(type_key: &str) -> CardGroup {
         .map_or(CardGroup::Outputs, |(_, g)| *g)
 }
 
+/// Whether a card of this type offers Reconnect: every launch monitor and
+/// output, not a camera or a General card.
+pub(crate) fn reconnectable(type_key: &str) -> bool {
+    matches!(
+        group_of(type_key),
+        CardGroup::LaunchMonitors | CardGroup::Outputs
+    )
+}
+
 /// Whether a card of this type offers Remove. flighthook runs one web
 /// server, which serves this UI: it stays.
 pub(crate) fn removable(type_key: &str) -> bool {

@@ -665,6 +665,9 @@ with **no overlapping telemetry keys**:
   Standard telemetry keys: `detection_mode`, `radar_mode`, `device_info`.
   Mock launch monitors add: `shot_count`, `tracking_mode`.
   Integration actors: `club`, `handed`, `name`, `error`.
+  OpenConnect clients add: `address`, `last_shot`, `shots_sent`,
+  `monitor_ready`, `response` (see
+  [OpenConnect client telemetry](#openconnect-client-telemetry)).
 
 ```rust
 pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
@@ -705,6 +708,7 @@ pub enum ConfigAction {
     UpsertCamera { index: String, section: CameraSection },
     Remove { id: String },                          // "mevo.0", "openconnect_client.1", "webserver.0", etc.; "gspro.N" = "openconnect_client.N"
     SetShotGrouping { mode: ShotGrouping },         // POST /api/shots/grouping, WS `grouping`
+    Reconnect { id: String },                       // POST /api/actors/{id}/reconnect
 }
 
 // ConfigOutcome fields (on FlighthookEvent)
@@ -714,13 +718,41 @@ stopped: Vec<String>,
 started: Vec<String>,
 ```
 
+`ConfigAction` is `#[non_exhaustive]`: a consumer that matches on it keeps a
+wildcard arm.
+
 The POST handlers (`/api/settings`, `/api/shots/grouping`) use request-reply:
 emit `ConfigCommand` with a `request_id`, subscribe to the bus, and wait for
 `ConfigOutcome` with the matching ID. `SetShotGrouping` persists the default
 view and reconciles no actor; no set changes. `/api/settings` answers `400`
-for an unknown scope and `504` when no `ConfigOutcome` arrives in 10 s.
+for an unknown scope and `504` when no `ConfigOutcome` arrives within
+`CONFIG_TIMEOUT` (`web/routes.rs`): the longest stop wait of any actor
+(`actors::MAX_STOP_WAIT`, the ExPutt's 18s) plus 4s, so 22s. A command stops
+the actors it restarts or removes together, so it waits at most one longest
+stop wait, and it never waits behind another command's (see below). The UI's
+save and reconnect requests wait 60s (`net::CONFIG_REQUEST_TIMEOUT`, asserted
+longer than `CONFIG_TIMEOUT` at compile time), so they get the server's answer.
 `ConfigOutcome` is always emitted after processing, even for fire-and-forget
-commands (where `request_id` is `None`).
+commands (where `request_id` is `None`). `POST /api/actors/{id}/reconnect`
+emits `Reconnect` the same way (see [Reconnect](#reconnect)); its outcome
+lists the actor in `restarted`, or nothing when it was not started.
+
+SystemActor never waits for a stopping actor on its own thread. A command
+that stops actors (`system::StopWaits`) marks every actor it touches as
+settling (`SystemState::begin_settling`), and a `stop-wait:<ids>` helper thread
+waits for the stopped ones, each up to its stop wait, the waits overlapping.
+When they are over the helper reports back over a channel, and SystemActor,
+between bus messages, finishes the command (`system::finish`): it releases
+each stopped actor, starts what is configured now and emits the command's
+`ConfigOutcome`. A command that stops nothing finishes at once. Meanwhile
+SystemActor goes on handling `ClubInfo`, `HandInfo`, `SetDetectionMode` and
+further commands. A command that touches a settling actor follows the rule
+for an actor whose old instance is still closing: a removal lists it in
+`stopped` at once and mutes the old instance; a save or re-add starts
+nothing, and the waiting command starts it from the settings current when it
+finishes; a reconnect starts nothing more (its request answers `202`). So
+there is never more than one instance of an ID, and a new instance always
+starts after its old one has ended or been retired.
 
 ## GameState
 
@@ -809,16 +841,91 @@ TCP connect). The OpenConnect client, Square Golf and ExPutt actors restart at 1
 that lasted at least 10s; one that drops sooner counts as a failed attempt, so
 a link that keeps connecting and dropping still backs off to the cap. The
 OpenConnect server restarts at 1s after a successful bind. The Mevo and R10
-actors keep the grown delay. The OpenConnect client, Square Golf, ExPutt, Mevo and R10 actors poll
-their shutdown flag during the backoff wait, so stopping one never waits out
-the delay; the OpenConnect server sleeps through its bind retry delay, and the
-OpenConnect client's TCP connect attempt (up to 5s) is not interrupted by a stop.
-Neither is the ExPutt's session start: the TCP connect (up to 3s), the
-device's two handshake replies (up to 3s each) and its mat search (up to 5s).
+actors keep the grown delay. Every actor polls its shutdown flag during the
+backoff wait (the OpenConnect server during its bind retry delay too), so
+stopping one never waits out the delay. The Mevo and OpenConnect client TCP
+connects (up to 5s) run on a thread of their own: a stop ends the actor at
+once, and a connect that completes afterwards closes again. The ExPutt's
+session start cannot be cut short: the TCP connect and the device's greeting
+(up to 3s each), its two handshake replies (up to 3s each) and its mat search
+(up to 5s).
 The ExPutt caps its first 3 reconnect delays at 1s after a session that was
 measuring, then uses the shared backoff. After a session lost to silence it
 waits 15s before the first attempt and leaves at least 15s between attempts
 until a session succeeds again; it makes one attempt at a time.
+
+### Reconnect
+
+The Reconnect button on a Launch monitors or Outputs card
+(`POST /api/actors/{id}/reconnect`) stops that one actor, waits for it to let
+go of its device or connection, and starts a new instance from the saved
+settings: what a flighthook restart does for that device. It goes through
+SystemActor as `ConfigAction::Reconnect`, so it is sequenced with saves and
+removals; the config is not written. Cameras, the web server and the system
+actor are refused (`400`), an ID no launch monitor or output has is `404`,
+and a second request for the same actor while one is in flight is `409`.
+
+`system::reconnect()` checks the ID; while an earlier instance of it is still
+closing, or another command is restarting it, nothing more is done and the
+request answers `202` (it starts again by itself). Otherwise it stops the
+actor and the command waits for it on a helper thread (see
+[ConfigCommand / ConfigOutcome](#configcommand--configoutcome----event-sourced-config-mutations));
+`system::finish` then restarts it the way config changes do too:
+
+1. Stop: set the shutdown flag and call `stop()` (`SystemState::stop_actor`),
+   then wait up to `Actor::stop_wait()` for the actor's thread to end
+   (`SystemState::wait_for_exit`): 3s by default; 5s for a Square Golf,
+   which disarms and disconnects; 18s for an ExPutt, whose session start
+   cannot be cut short; none for the web server (the save that moves it is
+   answered by the server being stopped, and its successor retries the bind).
+2. If the thread is still running, the actor's `replaceable_while_stopping()`
+   decides: a Mevo/Xi, an OpenConnect client, the mock actors and the web
+   server hold nothing a new instance needs (a TCP client, nothing, or a port
+   the new one retries), and an OpenConnect server is replaceable once its
+   listen port binds again. A replaceable one is retired: taken out of the
+   registry, its bus sender muted so nothing it still sends speaks for its
+   successor, its thread left to end. An R10, Square Golf, ExPutt or camera
+   is not: it is retired the same way and watched
+   (`SystemState::close_in_background`: a `closing:<id>` thread joins it),
+   nothing is started, and the card's `error` telemetry and an Error alert
+   say "The previous connection has not closed yet. It reconnects when it
+   does."; a reconnect request answers `202`. Once the old thread has ended,
+   SystemActor, between bus messages, starts the actor again from the saved
+   settings by itself (`system::restart_closed`) and emits a `ConfigOutcome`
+   without `request_id` listing it in `restarted`. Until then a reconnect, a
+   save or a re-add of that ID starts nothing.
+3. Emit `ActorStatus { Starting }` for the card, clearing an earlier `error`,
+   and start the new instance (`start_actor`). The outcome lists it in
+   `restarted`, so the card begins a new history; it then shows the actor's
+   own statuses as it connects.
+
+A removal stops and releases the actor the same way, without starting
+anything; one still closing is retired and muted at once, and its card goes
+with the outcome.
+
+`POST /api/actors/{id}/reconnect` holds the actor's ID in the web state's
+in-flight set until the outcome arrives. When the outcome has not arrived
+within `CONFIG_TIMEOUT` the request answers `202` and a task keeps the ID in
+the set until it does (for up to another `CONFIG_TIMEOUT`), so a second press
+cannot queue a second restart. An outcome that lists nothing restarted while
+the actor is closing or settling also answers `202`: it starts again by
+itself. Any other empty outcome is `409` with the reason.
+
+At exit, `main` stops every actor at once and waits for them
+(`SystemState::stop_all_and_wait`), each up to its stop wait but 3s in all,
+so a Square Golf disconnects the Omni before the process ends.
+
+What a stop does, by actor:
+
+| Actor | Stops at once when | Bounded by |
+|---|---|---|
+| Mevo/Xi | always: the client is non-blocking and polls every 50 ms; the connect runs on its own thread | -- (an old instance still inside the driver is replaced beside it: a second socket to the device can overlap the old one until it closes) |
+| OpenConnect client | always: 50 ms reads, 2s write timeout, the connect on its own thread; its local-client registration ends with the connection | a write in progress (2s) |
+| OpenConnect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
+| Square Golf | in a session or a backoff wait: it disarms the device, then disconnects it, with BlueZ and with btleplug | the scan and connect inside allsquare (up to 20s scan + 20s service resolution on Linux) |
+| Garmin R10 | in a session or a backoff wait | the scan and connect inside tenover |
+| ExPutt | measuring (100 ms event wait, the session closes at once) or waiting to reconnect | a session start (up to 17s: connect and greeting, two handshake replies, mat search) |
+| Mock monitor, Random club | always (100 ms loop) | -- |
 
 **Mevo actor mapping** (from internal phases):
 
@@ -938,6 +1045,29 @@ sent for a shot is the same whatever happened to the connection before it.
 `DeviceTelemetry` (`"ready"` key) and uses it to set both
 `launch_monitor_is_ready` and `launch_monitor_ball_detected` in heartbeats
 and shot messages.
+
+#### OpenConnect client telemetry
+
+The OpenConnect client (GSPro, Muni Golf or a generic simulator; one actor)
+reports what it knows as `ActorStatus` telemetry (`gspro::Telemetry`), each
+key only when its value changes:
+
+| Key | Value | Example | Holds for |
+|---|---|---|---|
+| `address` | the simulator's address it dials | `127.0.0.1:921` | the actor |
+| `last_shot` | the `ShotNumber` the simulator got last and the local time it was written | `#12 at 16:41:07` | the actor |
+| `shots_sent` | shots written on this connection (`0` from the connect) | `3` | the connection |
+| `monitor_ready` | the readiness last sent in a heartbeat (`true`/`false`) | `true` | the connection |
+| `response` | the simulator's last response, code and message | `201 GSPro Player Information` | the connection |
+
+`club` and `handed` on the card are the simulator's player information: the
+client puts `ClubInfo`/`HandInfo` on the bus and the web layer (and the UI)
+show them on the client's card. Until the 1 s refusal verdict the keys wait
+and go out with `Connected`; after it, with a `Connected` status as they
+change. When the connection ends, the status that says so removes the
+connection's keys and `club` and `handed` (empty values). The first status of
+a new instance sets `address` and removes every other key an earlier
+instance left. Nothing here adds traffic to the simulator.
 
 ## Cameras and replay (beta)
 
@@ -1099,8 +1229,10 @@ can mutate game state and process config mutations. It handles:
 - **Config mutations**: subscribes to `ConfigCommand` bus events (from the
   REST API). Applies the mutation to `SystemConfig`, calls
   `apply_config_reload()` to reconcile actors, and emits a `ConfigOutcome`
-  on the bus. This provides natural sequencing -- all config mutations are
-  processed one at a time on the SystemActor thread.
+  on the bus once the actors it stopped have ended. This provides natural
+  sequencing -- all config mutations are processed one at a time on the
+  SystemActor thread; the stop waits run on helper threads, so game events
+  and further commands are handled meanwhile.
 - **Clear history**: on `clear_shot_history` it deletes every replay clip
   (`SystemState::clips`), once for the process, whichever web server or
   client sent it.
@@ -1145,7 +1277,7 @@ pub struct SystemState {
     pub local_clients: Arc<LocalClients>,  // this process's Open Connect clients
     pub clips: ClipStore,         // replay clips on disk (beta)
     pub cameras: Cameras,         // camera actors' latest frames + the camera list (beta)
-    actors: RwLock<HashMap<String, (Box<dyn Actor>, Arc<AtomicBool>)>>,
+    actors: RwLock<HashMap<String, Registered>>,  // the actor + its ActorHandle
 }
 ```
 
@@ -1158,10 +1290,18 @@ Config mutations are serialized through the bus (SystemActor processes
 is needed. `game` is a read-only handle for player info, club, mode and hand;
 mutations go through `GameStateWriter` held by `SystemActor`. `actors` is a
 registry of all running actors, keyed by global ID. Each entry stores the
-actor and its per-actor shutdown flag (`Arc<AtomicBool>`). Methods:
-`register_actor(id, actor, shutdown)`, `stop_actor(id)` (sets flag + calls
-`actor.stop()`), `remove_actor(id)`, `actor_ids()`.
-Actors are registered after construction and before `start()` is called.
+actor and its `ActorHandle`: the per-actor shutdown flag (`Arc<AtomicBool>`),
+the flag that mutes its bus sender, and its thread (the `JoinHandle` `start()`
+returns). Methods: `register_actor(id, actor, handle)`, `stop_actor(id)`
+(sets the flag, calls `actor.stop()`, returns the actor's `stop_wait()`),
+`wait_for_exit(id, deadline)` (wait for the thread to end: `Exited` takes it
+out of the registry and joins it, `Lingering` leaves it there flagged),
+`retire_actor(id)` (out of the registry and muted, its thread left to end),
+`close_in_background(id)` (retired and watched: `is_closing(id)` until its
+thread has ended, then `take_closed()` hands the ID to SystemActor to start
+again), `stop_all_and_wait(max)` (exit), `actor_ids()`. A thread that
+panicked is logged when it is joined.
+Actors are registered right after `start()` returns their thread.
 
 ## Log
 
@@ -1253,7 +1393,10 @@ actor's global ID on every outbound message. `BusSender` provides
 returns `Ok(None)` if empty, `Err(PollError::Shutdown)` if the per-actor
 shutdown flag is set or bus is closed) and `is_shutdown()`.
 Actor structs hold their config; `start()` clones what it
-needs and spawns a thread. `reconfigure()` compares current config against
+needs, spawns a thread and returns its `JoinHandle`, which ends once the actor
+has let go of its device or connection. `stop_wait()` (default 3s) bounds how
+long that may take after a stop, and `replaceable_while_stopping()` (default
+no) says whether a new instance may start before it has. `reconfigure()` compares current config against
 construction params and returns `Applied` or `RestartRequired`.
 Actors are registered in `SystemState.actors` for dynamic
 start/stop/reconfigure.
@@ -1294,18 +1437,32 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
 
 1. Applies the `ConfigAction` mutation to `SystemConfig` (replace, reload,
    upsert, or remove)
-2. Calls `apply_config_reload()` to reconcile actors
-3. Emits `ConfigOutcome` on the bus (always, not just for request-reply)
+2. Calls `apply_config_reload()` to stop what goes or restarts and plan the
+   rest
+3. Has `StopWaits` wait for the stopped actors on a helper thread, then
+   finishes the plan (`system::finish`) and emits `ConfigOutcome` on the bus
+   (always, not just for request-reply; at once when nothing was stopped)
 
 `apply_config_reload()` (in `actors/system.rs`) orchestrates actor lifecycle:
 
 1. Snapshot the new config and build a `ResolvedConfig`
 2. Compute current vs expected actor IDs
-3. **Deleted actors** (current but not expected): stop + remove
+3. **Deleted actors** (current but not expected): stopped, then released
 4. **Existing actors**: call `reconfigure()` on each
-   - `RestartRequired`: stop old actor, create and start new one
+   - `RestartRequired`: stopped, then restarted as a reconnect is (see
+     [Reconnect](#reconnect)): a new instance starts once the old one has
+     ended or when it holds nothing the new one needs, otherwise once the old
+     one has ended, and the actor is listed in neither `restarted` nor
+     `started`
    - `Applied`: no change needed, skip
-5. **New actors** (expected but not current): create and start
+5. **New actors** (expected but not current): created and started, unless an
+   old instance of the ID is still closing or settling (it starts once that
+   is over)
+
+Every actor a command stops (deleted or restarted) is stopped first and then
+waited for, so the waits overlap. The releases and starts happen in
+`system::finish` once the waits are over, in that order (removals, restarts,
+new actors), each from the settings current then.
 
 The web layer's `state_updater` handles `ConfigOutcome` events to refresh
 actor name caches (on every outcome: a rename is `Applied`, so it restarts
@@ -1350,7 +1507,9 @@ web server, and every launch monitor, camera and output, each device with
 its live telemetry and its settings.
 Four groups of cards, each group a wrapping grid: as many columns as fit at
 a 420 px minimum card width, cards at most 620 px wide, one column on a
-narrow window; card `i` goes in column `i % columns`.
+narrow window; card `i` goes in column `i % columns`. Every card is the same
+height, so the rows line up and the tab scrolls as a whole when there are
+more rows than fit (see [Card height](#card-height)).
 
 ```
   [Devices] [Shots] [Log]  |  [Full] [Chipping] [Putting]  [RH|LH]  CLUB [7I]  [##] FLIGHTHOOK
@@ -1369,7 +1528,8 @@ narrow window; card `i` goes in column `i % columns`.
   | Mevo WiFi [Mevo] [CONNECTED] [Telemetry|Settings] | Garmin R10 [R10]       [Telemetry|Settings]
   |   battery_pct  85                                  | Name:            [Garmin R10]
   |   ready        true                                | Monitor-to-Ball: [8] [ft v]
-  |   tilt         0.5                                 |                               [Remove]
+  |   tilt         0.5                                 |
+  |                                     [Reconnect]   |                               [Remove]
 
   CAMERAS (+)
   | Golfer Back [Camera] [CONNECTED] [Telemetry|Settings]
@@ -1377,12 +1537,12 @@ narrow window; card `i` goes in column `i % columns`.
   |   fps         60
   |   position    golfer_back
   |   resolution  1280x720
-  |   [Still frame]
+  |                                   [Still frame]
 
   OUTPUTS (+)
   | GSPro [OpenConnect Client] [Cancel] [Save]   | Muni Golf [OpenConnect Client] [CONNECTED] [Telemetry|Settings]
   |                  Save or cancel your changes |   address     127.0.0.1:9210
-  | Name:             [GSPro]                    |
+  | Name:             [GSPro]                    |                                [Reconnect]
   | Address:          [127.0.0.1:921]            |
   | Full Monitor:     [Mevo WiFi v]              |
   | Chipping Monitor: [Any v]                    |
@@ -1464,12 +1624,60 @@ left out once it would be cut to a stub. The toggle flips the card body:
   temperature, club, handed and the rest come from the actor's telemetry map.
   The key column is as wide as the longest key, up to 45 % of the card; a key
   or value too long for its column is cut short with "…" and shown in full
-  on hover (a Square Golf Omni's `device_info`, for one).
+  on hover (a Square Golf Omni's `device_info`, for one). With no row to
+  show, the body shows the actor's state in its middle instead, 48 points
+  across: a spinner (a faint ring with an arc going round it) in the card's
+  status colour while the actor is starting, connecting or reconnecting, and
+  a check in a ring in the connected green once it is connected
+  (`monitoring::no_telemetry`, `theme::loading_ring` / `connected_ring`). It
+  goes as soon as a row arrives; a camera's still frame takes its place too.
+  Only a spinner on screen asks for repaints (about 30 a second). Every launch
+  monitor and output card (Mevo/Xi, R10, Square Golf, ExPutt, the
+  OpenConnect server, the mock monitor, the OpenConnect clients, Random club
+  and any other output) has **Reconnect** in its action row: it stops the
+  actor, waits for its connection to close and starts it again from the saved
+  settings (see [Reconnect](#reconnect)); the card then shows the usual
+  statuses as it connects. Reconnect is disabled while that card's request is
+  out and while the tab is locked. After a `202` (it starts again by
+  itself later) it stays disabled until the actor reports `Starting`,
+  or a `config_outcome` lists it in `restarted` (one without
+  `request_id` included), for up to a minute (`app::RECONNECT_WAIT_MS`). A
+  request that fails (refused, no answer from the server, a network error),
+  or a `202` that has not started within that minute (unless the actor's
+  own `error` row, such as the old connection still closing, already says
+  why), shows its reason as the card's `error` row and in the error banner,
+  as an error the actor reports does, until the actor's next status or the
+  next press. An ExPutt's **Find mat** sits beside it (enabled while the ExPutt is connected), and a camera has **Still frame**
+  instead, its frame shown in the card's body. The General cards and the
+  cameras have no Reconnect.
 - **Settings**: the instance's name, its type tag and its fields in a label
-  column, ending in **Remove** (every card but the web server's), which asks
-  for confirmation in a modal dialog and then saves the removal
-  (`?scope=<actor_id>`, the section left out); the card goes when the server
-  confirms it.
+  column, with **Remove** in its action row (every card but the web
+  server's), which asks for confirmation in a modal dialog and then saves the
+  removal (`?scope=<actor_id>`, the section left out); the card goes when the
+  server confirms it.
+
+#### Card height
+
+Every card on the tab (General, Launch monitors, Cameras, Outputs) is one
+fixed height, 280 points (`devices::CARD_HEIGHT`, scaled with the UI zoom like
+every other size), on both its Telemetry and Settings sides. Telemetry that
+arrives, a side flip, an edit, a validation message, an error line or a still
+frame never changes a card's height or moves another card. Inside a card:
+
+- the header (name, badge or type tag, toggle, or Save and Cancel while it has
+  unsaved edits) stays at the top, with the "Save or cancel your changes" hint
+  and a failed save's line under it;
+- the action row (Reconnect, Find mat, Still frame, Remove) stays at the
+  bottom, right-aligned;
+- the body between them scrolls inside the card when it does not fit, with
+  egui's thin scroll bar shown only then. The mouse wheel over a card scrolls
+  that card first and the tab only once the card can scroll no further. Each
+  card keeps its own scroll position, keyed by its ID, for the session.
+
+At 280 the Telemetry side of a connected Mevo+, Square Golf Omni and
+OpenConnect client and the Settings side of the Global card fit without
+scrolling, as do the other General cards and most Settings sides. A Mevo's
+Settings side and a camera card showing a still frame scroll.
 
 Every card is exactly its grid column's width, on both sides: long names in
 the header and in text fields, and long entries in a dropdown, are cut short
