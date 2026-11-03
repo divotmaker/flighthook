@@ -798,6 +798,16 @@ pub(crate) fn is_auto_chip(actor: &str) -> bool {
     actor == flighthook::AUTO_CHIP_ACTOR
 }
 
+/// Whether the device filter `filter` (an exact actor id; every shot when
+/// `None`) passes a shot from `actor`. The one filter of the Shots tab: the
+/// shot list, the shot on show, the Table rows, the view's members and the
+/// charts' faint shots all go through it. An Auto-chip is no device, so a
+/// filter hides it like any other device's shot.
+#[must_use]
+pub(crate) fn in_filter(actor: &str, filter: Option<&str>) -> bool {
+    filter.is_none_or(|d| actor == d)
+}
+
 /// Label of a device: its name, else [`flighthook::AUTO_CHIP_NAME`] for the
 /// Auto-chip source, else its actor id.
 #[must_use]
@@ -853,18 +863,24 @@ pub(crate) fn members_for(
     shots
         .iter()
         .enumerate()
-        .filter(|&(_, r)| {
-            device.is_none_or(|d| r.actor == d) && !is_auto_chip(&r.actor) && in_view(r)
-        })
+        .filter(|&(_, r)| in_filter(&r.actor, device) && !is_auto_chip(&r.actor) && in_view(r))
         .map(|(i, _)| i)
         .collect()
 }
 
 /// The shots of `set` its headers count: its shot count less its Auto-chip
-/// shots in `shots` ([`is_auto_chip`]). A shot joins a set's count when it
-/// has data, which is when it carries the set's id.
+/// shots in `shots` ([`is_auto_chip`]); with a device filter `filter`, its
+/// rows in `shots` from that device. A shot joins a set's count when it has
+/// data, which is when it carries the set's id.
 #[must_use]
-pub(crate) fn set_shot_count(set: &ShotGroupInfo, shots: &[ShotRow]) -> u32 {
+pub(crate) fn set_shot_count(set: &ShotGroupInfo, shots: &[ShotRow], filter: Option<&str>) -> u32 {
+    if let Some(device) = filter {
+        let n = shots
+            .iter()
+            .filter(|r| r.actor == device && r.group.as_deref() == Some(set.id.as_str()))
+            .count();
+        return u32::try_from(n).unwrap_or(u32::MAX);
+    }
     let chips = shots
         .iter()
         .filter(|r| is_auto_chip(&r.actor) && r.group.as_deref() == Some(set.id.as_str()))
@@ -1742,6 +1758,7 @@ mod tests {
             handed: None,
             group: None,
             finished: true,
+            video: Vec::new(),
         }
     }
 
@@ -2003,8 +2020,13 @@ mod tests {
         assert_eq!(device_ids(&shots), vec!["mevo.0"]);
         assert!(device_ids(&shots[1..2]).is_empty());
         // The set counts 3 shots, one an Auto-chip: its headers say 2.
-        assert_eq!(set_shot_count(&a, &shots), 2);
-        assert_eq!(set_shot_count(&a, &shots[..1]), 3);
+        assert_eq!(set_shot_count(&a, &shots, None), 2);
+        assert_eq!(set_shot_count(&a, &shots[..1], None), 3);
+        // Under a device filter, the set's rows from that device.
+        assert_eq!(set_shot_count(&a, &shots, Some("mevo.0")), 2);
+        assert_eq!(set_shot_count(&a, &shots, Some("square.0")), 0);
+        assert!(in_filter("mevo.0", None) && in_filter("mevo.0", Some("mevo.0")));
+        assert!(!in_filter(flighthook::AUTO_CHIP_ACTOR, Some("mevo.0")));
     }
 
     #[test]

@@ -98,6 +98,27 @@ fn main() -> anyhow::Result<()> {
         state.register_actor("system".into(), Box::new(actor), shutdown);
     }
 
+    // Replay clips kept from earlier runs: index them, and delete all but
+    // the newest `keep_shots`.
+    {
+        let replay = state.system.replay();
+        let dir = state::clips::clip_dir(&replay);
+        let removed = state.clips.load(&dir, state::clips::keep(&replay));
+        if !removed.is_empty() {
+            tracing::info!(
+                "clips: deleted the clips of {} older shot(s) in {}",
+                removed.len(),
+                dir.display()
+            );
+            let _ = bus_tx.send(
+                FlighthookMessage::new(flighthook::FlighthookEvent::ShotVideoRemoved {
+                    keys: removed,
+                })
+                .actor("system"),
+            );
+        }
+    }
+
     // Start all actors from config (launch monitors, integrations, webserver)
     let snap = state.system.snapshot();
     let current_mode = state.game.snapshot().mode;

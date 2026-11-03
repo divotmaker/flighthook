@@ -16,6 +16,8 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "shot_finished",
     "device_telemetry",
     "find_mat",
+    "shot_video",
+    "shot_video_removed",
     "actor_status",
     "player_info",
     "club_info",
@@ -56,6 +58,7 @@ const FILTER_GROUPS: &[(&str, &[&str])] = &[
             "shot_group",
         ],
     ),
+    ("Camera", &["shot_video", "shot_video_removed"]),
     (
         "System",
         &["actor_status", "config_command", "config_outcome"],
@@ -84,6 +87,8 @@ pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
         FlighthookEvent::ClearShotHistory => "clear_shot_history",
         FlighthookEvent::FindMat { .. } => "find_mat",
         FlighthookEvent::ShotGroup { .. } => "shot_group",
+        FlighthookEvent::ShotVideo { .. } => "shot_video",
+        FlighthookEvent::ShotVideoRemoved { .. } => "shot_video_removed",
         FlighthookEvent::Alert { severity, .. } => match severity {
             Severity::Critical => "alert_critical",
             Severity::Error => "alert_error",
@@ -173,6 +178,31 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
                 ),
             }
         }
+        FlighthookEvent::ShotVideo {
+            keys,
+            position,
+            duration_ms,
+            fps,
+            complete,
+            dropped,
+            ..
+        } => {
+            let shots = keys
+                .iter()
+                .map(|k| format!("#{}", k.shot_number))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let state = if *complete { "complete" } else { "incomplete" };
+            format!(
+                "clip {shots}: {}, {:.1} s at {fps:.0} fps, {state}, {dropped} dropped",
+                position.label(),
+                *duration_ms as f64 / 1000.0
+            )
+        }
+        FlighthookEvent::ShotVideoRemoved { keys } => match keys.len() {
+            1 => "clip of 1 shot removed".into(),
+            n => format!("clips of {n} shots removed"),
+        },
         FlighthookEvent::Alert { severity, message } => format!("[{severity}] {message}"),
     }
 }
@@ -396,6 +426,40 @@ mod tests {
         );
         let changed = FlighthookEvent::ShotGroup { group, shot: None };
         assert_eq!(event_debug(&changed), "set 3 7I (4 shots, open)");
+    }
+
+    #[test]
+    fn camera_clips_are_summarised_in_their_own_group() {
+        use crate::types::{CameraPosition, ShotKey};
+        let key = |n: u32| ShotKey {
+            shot_id: format!("s{n}"),
+            shot_number: n,
+        };
+        let clip = FlighthookEvent::ShotVideo {
+            keys: vec![key(4), key(9)],
+            position: CameraPosition::TargetLine,
+            duration_ms: 5520,
+            fps: 119.6,
+            trigger_offset_ms: 4000,
+            impact_offset_ms: 4000,
+            complete: true,
+            dropped: 0,
+        };
+        assert_eq!(message_type(&clip), "shot_video");
+        assert_eq!(
+            event_debug(&clip),
+            "clip #4 #9: Target Line, 5.5 s at 120 fps, complete, 0 dropped"
+        );
+        let removed = FlighthookEvent::ShotVideoRemoved {
+            keys: vec![key(1), key(2)],
+        };
+        assert_eq!(message_type(&removed), "shot_video_removed");
+        assert_eq!(event_debug(&removed), "clips of 2 shots removed");
+        let camera = FILTER_GROUPS
+            .iter()
+            .find(|(name, _)| *name == "Camera")
+            .unwrap();
+        assert_eq!(camera.1, ["shot_video", "shot_video_removed"]);
     }
 
     #[test]

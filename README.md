@@ -29,6 +29,16 @@ from any launch monitor that speaks GSPro Open Connect as a client — Foresight
 SkyTrak and MLM2PRO also emit it. Add it from the Launch monitors (+) menu:
 **Uneekor (OpenConnect)**, or **OpenConnect Server** for any other monitor.
 
+### Cameras
+
+| Device                                    | Protocol                          | Driver                                                | Status |
+| ----------------------------------------- | --------------------------------- | ----------------------------------------------------- | ------ |
+| [USB cameras](docs/devices/cameras.md)    | UVC, MJPEG (Windows, Linux)       | [stance](https://github.com/divotmaker/stance) | Beta   |
+
+Cameras record a clip of every shot for replay on the Shots tab, from a few
+seconds before the swing to just after the launch monitor reports it. Add
+one from the Cameras (+) menu. Not available on macOS yet.
+
 ### Simulation Software
 
 | Software  | Protocol              | Driver                        | Status           |
@@ -61,8 +71,9 @@ The shot lifecycle events (`shot_trigger`, `ball_flight`, `club_path`,
 `face_impact`, `shot_finished`) and the device events (`device_telemetry`,
 `alert`) are FRP-compliant and use the spec's own field shapes; the types come
 from the [`flightrelay`](https://crates.io/crates/flightrelay) crate. flighthook
-adds its own event kinds alongside them (player/club info, config commands, actor
-status, shot groups), which FRP-only consumers ignore per spec.
+adds its own event kinds alongside them (player, club and hand info, config
+commands, actor status, shot groups, camera clips), which FRP-only consumers
+ignore per spec.
 
 The spec is CC0 and the Rust SDK is Apache-2.0/MIT, so consumers need not depend
 on flighthook itself.
@@ -107,6 +118,12 @@ Terminal. Allow it.
 - Automatic detection mode switching based on club selection (full / chipping / putting)
 - Club selection is forwarded to devices that use it — the Square Golf Omni has no
   separate putting mode, so selecting a putter in the sim puts it in putting mode
+- The player's hand (**RH | LH**, in the header beside the club picker) comes
+  from the simulator, or from the dashboard when no simulator is connected. The
+  Square Golf Omni and the ExPutt follow it, and monitors connected to the
+  OpenConnect server are told the hand and club
+- Battery icons in the header for connected devices that report a charge
+  (Mevo+, Square Golf Omni): red under 20 %, hover for the device and percentage
 - Simulated carry, apex, descent, offline, roll and total for launch monitors that
   measure launch only (beta) — see [Simulated values](#simulated-values-beta)
 - Shot metrics computed from the measured values: total spin and spin axis,
@@ -121,6 +138,9 @@ Terminal. Allow it.
 - One fixed Shots layout with both charts always on screen, sized from the
   window
 - Export the session as JSONL with the raw device frames behind each shot, or CSV
+- Swing replay: USB cameras record a clip of every shot, played back from the
+  shot with the cameras side by side, slow motion and frame stepping (beta) —
+  see [Swing replay](#swing-replay-beta)
 - Dual UI: native desktop window (eframe/egui) and browser dashboard (WASM, same codebase)
 - The UI scales itself to fit the window, so a 4K screen at 100 % shows about the
   same layout as at 200 %; in the desktop app Ctrl/Cmd + `+` / `-` adjust it and
@@ -271,15 +291,26 @@ offers three views of them (By set unless the Global card's Default shot view sa
 - **None** — the last shot only: no sections, range bars or set buttons.
 
 + New set and New session sit at the foot of the shot list. With shots from
-more than one device, a device filter picks one device or splits the bars by
-device. The export carries each shot's set.
+more than one device, a **Device** filter in the toolbar picks one device
+(All splits the bars by device). It applies to the whole Shots tab: the shot
+list and its counts, the shot on show, the Table, the cards and the charts.
+The export always carries the whole session, each shot with its set.
+
+Beside the range bars sit up to three cards, as many as the window has room
+for: a stats card (the average, median and standard deviation of each
+bar), a card per connected camera, and face impact. The stats card is on the
+left and face impact on the right; click a card to show something else on
+it.
+
+A **camera card** (beta) loops the shown shot's clip from that camera,
+cropped to fill the card, from shortly before impact to the clip end.
 
 When any shot in the history has a face impact reading (Square Golf Omni,
-Open Connect monitors that send it), a **face impact** panel (beta) sits beside the
-range bars: the club face of the shown shot's club, drawn as the ball sees
+Open Connect monitors that send it), a **face impact** card (beta) joins the
+row: the club face of the shown shot's club, drawn as the ball sees
 it (toe on the left for a right-hander, mirrored for a left-hander), with
-the shown shot as a gold dot, the rest of its set or club as dots, their
-mean, and a readout such as `4 toe · 2 low` in millimetres. The **Table**
+the shown shot as a gold dot, the rest of its set or club as dots, and a
+readout such as `4 toe · 2 low` in millimetres. The **Table**
 has Impact H and Impact V columns in the same words. Directional cards show
 the size of the value with a word for its side: L / R, Draw / Fade,
 In-to-out / Out-to-in, Up / Down, Open / Closed, read for the golfer's
@@ -289,8 +320,8 @@ The dashboard loads the whole session the server keeps (the last 1000
 shots), so the views, range bars and charts cover all of it; **Table** lists
 every one of them, a row per shot.
 
-The trash icon after the export links (**Clear history**) deletes every shot
-and set and starts a new session, after a confirmation, in every open
+The trash icon after the export links (**Clear history**) deletes every shot,
+set and camera clip and starts a new session, after a confirmation, in every open
 dashboard. Export first if you want to keep them.
 
 The charts are always on screen, in one layout sized from the window: on a
@@ -318,6 +349,29 @@ The ellipse holds about 86 % of a normal pattern (**2σ**, the default) or
 95 % (**95 %**); hover it for its size. A shot is placed by its simulated
 path, else by its carry or total and offline (measured or simulated); shots
 without an offline are left out.
+
+#### Swing replay (beta)
+
+With a USB camera added on the Devices tab (Windows and Linux; not macOS
+yet), flighthook records a clip of every shot, from a few seconds before the
+impact to just after the launch monitor reports it. A shot with clips gets a
+**Replay** button on its header in Cards and in a column of the Table.
+Replay opens playing, with the cameras side by side and a scrubber that
+marks the impact (gold) and where playback starts (green, 2 s before the
+impact by default). It loops until you turn **Loop** off; pause, step frame
+by frame, slow it to ½, ¼ or ⅛, or download a camera's clip as an AVI.
+
+- Only FlightScope monitors report a shot at impact. For the others the
+  impact is estimated a fixed time before their report (beta).
+- Clips are kept on disk, the newest 20 by default: about 2 GB for two
+  720p 120 fps cameras. The Devices tab's Replay card sets how many and
+  shows the folder; `clip_dir` under `[replay]` in the config file moves it.
+- Clips are never in the export. The dashboard has no login, so anyone who
+  can open it on your network can watch them (see
+  [Second screen](#second-screen-on-a-tablet-or-phone)).
+
+Setup, camera positions, clip timing and disk use:
+[docs/devices/cameras.md](docs/devices/cameras.md).
 
 #### Auto-chip (beta)
 
@@ -348,12 +402,12 @@ finish the hole.
 
 ![Devices](./screens/devices.png "Devices")
 
-The Devices tab, where the app opens, has the Global and Simulation settings
-and the web server under General, then a card for every launch monitor and
-output. A card's **Telemetry | Settings** toggle flips it between the
+The Devices tab, where the app opens, has the Global, Simulation and Replay
+settings and the web server under General, then a card for every launch
+monitor, camera and output. A card's **Telemetry | Settings** toggle flips it between the
 device's live status and its settings. Edit a card and **Save** or
 **Cancel** it before moving on; the rest of the dashboard waits until you
-do. The **+** after Launch monitors or Outputs adds one. There is one web
+do. The **+** after Launch monitors, Cameras or Outputs adds one. There is one web
 server: it can be edited (its bind address) but not removed or added.
 
 Each card's badge and left stripe show its connection:
@@ -435,6 +489,12 @@ name = "ExPutt"
 # address is optional — omit it to find the device on the network.
 address = "192.168.1.50"
 
+[camera.0]
+name = "Golfer Back"
+camera = "test-pattern"        # the camera's id, picked on the camera card
+position = "golfer_back"       # target_line | golfer_front | golfer_back | overhead
+mode = "auto"                  # or e.g. "1280x720@120"
+
 [openconnect_client.0]
 name = "GSPro"
 address = "127.0.0.1:921"
@@ -444,9 +504,11 @@ name = "Muni Golf"
 address = "127.0.0.1:9210"
 ```
 
-`[simulation]` is a single global table. Section prefixes encode component
-type: `webserver`, `mevo`, `r10`, `square`, `exputt`,
-`openconnect_server`, `mock_monitor`, `openconnect_client`, `random_club`. The
+`[simulation]` and `[replay]` (camera clips, see
+[Cameras](docs/devices/cameras.md)) are single global tables. Section
+prefixes encode component type: `webserver`, `mevo`, `r10`, `square`,
+`exputt`, `openconnect_server`, `mock_monitor`, `openconnect_client`,
+`random_club`, `camera`. The
 index after the dot (`0`, `1`, ...) identifies the instance. Per-device
 options are covered in the [device docs](#launch-monitors). Settings can also
 be edited live on the Devices tab in the UI.
@@ -487,8 +549,8 @@ shots, flight and dispersion alongside it.
 3. On the tablet or phone, browse to `http://<that address>:5880` (e.g.
    `http://192.168.1.50:5880`).
 
-The dashboard has no login, so anyone on that network can view shots, change
-settings or clear shot history. Only open it on a trusted home network —
+The dashboard has no login, so anyone on that network can view shots, watch
+swing clips and camera stills, change settings or clear shot history. Only open it on a trusted home network —
 never on public Wi-Fi, and never by forwarding the port to the internet.
 
 ## Developer Quick Start

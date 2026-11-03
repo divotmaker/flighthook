@@ -122,6 +122,12 @@ Set it to `false` to forward every shot, spin or not.
 The Omni has no separate putting mode. Selecting a putter in the sim puts the
 device into putting mode via the normal club-forwarding path.
 
+## Battery
+
+The Omni reports its charge (`battery_pct`). While it is connected, the
+dashboard header shows it as a battery icon, red under 20 %; hover it for
+the device's name and percentage.
+
 ## Shot export
 
 `GET /api/shots/export` (the **JSONL** link on the Shots tab) saves

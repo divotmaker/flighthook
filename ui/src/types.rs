@@ -14,7 +14,11 @@ pub use flighthook::{
     ActorStatusResponse,
     AutoChipRequest,
     BallFlight,
+    CameraListEntry,
+    CameraListResponse,
     CameraMode,
+    CameraPosition,
+    CameraSection,
     // Global state types
     Club,
     ClubData,
@@ -44,6 +48,7 @@ pub use flighthook::{
     R10Section,
     RECONNECT_ALERT_MS,
     RandomClubSection,
+    ReplaySection,
     Severity,
     ShotData,
     ShotDetectionMode,
@@ -51,6 +56,7 @@ pub use flighthook::{
     ShotGrouping,
     ShotGroupsResponse,
     ShotKey,
+    ShotVideo,
     SimSurface,
     SimulationSection,
     SpinSource,
@@ -89,6 +95,8 @@ pub struct ShotRow {
     /// The shot's `shot_finished` arrived. Always true for a row loaded
     /// from `/api/shots`.
     pub finished: bool,
+    /// The cameras' clips of the shot, one per camera.
+    pub video: Vec<ShotVideo>,
 }
 
 impl ShotRow {
@@ -115,6 +123,7 @@ impl ShotRow {
             handed: self.handed,
             group: self.group.clone(),
             finished: self.finished,
+            video: self.video.clone(),
         }
     }
 }
@@ -133,8 +142,40 @@ impl From<ShotData> for ShotRow {
             handed: shot.handed,
             group: shot.group,
             finished: true,
+            video: shot.video,
         }
     }
+}
+
+/// Stamp `video`, one camera's clip, on every row whose shot is in `keys`
+/// (by shot id, whatever device the row is from), replacing that camera's
+/// earlier clip. Returns whether a row changed.
+pub fn stamp_video(rows: &mut [ShotRow], keys: &[ShotKey], video: &ShotVideo) -> bool {
+    let mut changed = false;
+    for row in rows
+        .iter_mut()
+        .filter(|r| !r.shot_id.is_empty() && keys.iter().any(|k| k.shot_id == r.shot_id))
+    {
+        row.video.retain(|v| v.camera != video.camera);
+        row.video.push(video.clone());
+        row.video.sort_by(|a, b| a.camera.cmp(&b.camera));
+        changed = true;
+    }
+    changed
+}
+
+/// Drop every clip from the rows whose shot is in `keys`. Returns whether a
+/// row changed.
+pub fn remove_video(rows: &mut [ShotRow], keys: &[ShotKey]) -> bool {
+    let mut changed = false;
+    for row in rows
+        .iter_mut()
+        .filter(|r| !r.video.is_empty() && keys.iter().any(|k| k.shot_id == r.shot_id))
+    {
+        row.video.clear();
+        changed = true;
+    }
+    changed
 }
 
 // ---------------------------------------------------------------------------

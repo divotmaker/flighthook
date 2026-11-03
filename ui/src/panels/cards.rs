@@ -12,14 +12,17 @@ pub(crate) enum CardGroup {
     General,
     /// Shot sources: launch monitors and the Open Connect server.
     LaunchMonitors,
+    /// Swing cameras, which record a clip of every shot.
+    Cameras,
     /// Everything that consumes shots.
     Outputs,
 }
 
 impl CardGroup {
-    pub(crate) const ALL: [CardGroup; 3] = [
+    pub(crate) const ALL: [CardGroup; 4] = [
         CardGroup::General,
         CardGroup::LaunchMonitors,
+        CardGroup::Cameras,
         CardGroup::Outputs,
     ];
 
@@ -27,6 +30,7 @@ impl CardGroup {
         match self {
             CardGroup::General => "General",
             CardGroup::LaunchMonitors => "Launch monitors",
+            CardGroup::Cameras => "Cameras",
             CardGroup::Outputs => "Outputs",
         }
     }
@@ -36,6 +40,7 @@ impl CardGroup {
         match self {
             CardGroup::General => "",
             CardGroup::LaunchMonitors => "Add a launch monitor",
+            CardGroup::Cameras => "Add a camera",
             CardGroup::Outputs => "Add an output",
         }
     }
@@ -51,6 +56,7 @@ const ACTOR_TYPES: &[(&str, CardGroup)] = &[
     ("exputt", CardGroup::LaunchMonitors),
     ("mock_monitor", CardGroup::LaunchMonitors),
     ("openconnect_server", CardGroup::LaunchMonitors),
+    ("camera", CardGroup::Cameras),
     ("openconnect_client", CardGroup::Outputs),
     ("random_club", CardGroup::Outputs),
 ];
@@ -157,6 +163,8 @@ const LAUNCH_MONITOR_PRESETS: &[AddPreset] = &[
     ),
 ];
 
+const CAMERA_PRESETS: &[AddPreset] = &[preset("Camera", "camera", "Camera", "")];
+
 const OUTPUT_PRESETS: &[AddPreset] = &[
     preset(
         "GSPro (OpenConnect)",
@@ -183,6 +191,7 @@ pub(crate) fn add_options(group: CardGroup) -> &'static [AddPreset] {
     match group {
         CardGroup::General => &[],
         CardGroup::LaunchMonitors => LAUNCH_MONITOR_PRESETS,
+        CardGroup::Cameras => CAMERA_PRESETS,
         CardGroup::Outputs => OUTPUT_PRESETS,
     }
 }
@@ -329,6 +338,7 @@ mod tests {
             assert_eq!(group_of(t), CardGroup::LaunchMonitors, "{t}");
         }
         assert_eq!(group_of("webserver"), CardGroup::General);
+        assert_eq!(group_of("camera"), CardGroup::Cameras);
         for t in ["openconnect_client", "random_club"] {
             assert_eq!(group_of(t), CardGroup::Outputs, "{t}");
         }
@@ -354,6 +364,8 @@ mod tests {
             openconnect_server: _,
             openconnect_client: _,
             random_club: _,
+            replay: _,
+            camera: _,
         } = flighthook::FlighthookConfig::default();
         for key in [
             "webserver",
@@ -365,6 +377,7 @@ mod tests {
             "openconnect_server",
             "openconnect_client",
             "random_club",
+            "camera",
         ] {
             assert!(
                 ACTOR_TYPES.iter().any(|(t, _)| *t == key),
@@ -387,7 +400,9 @@ mod tests {
             "mock_monitor.0",
             "exputt.0",
             "square.0",
+            "camera.1",
             "custom.0",
+            "camera.0",
         ];
         let groups = grouped(ids.iter().map(|id| {
             let (t, i) = split_actor_id(id);
@@ -409,6 +424,7 @@ mod tests {
                         "openconnect_server.0",
                     ]
                 ),
+                (CardGroup::Cameras, vec!["camera.0", "camera.1"]),
                 (
                     CardGroup::Outputs,
                     vec![
@@ -453,6 +469,10 @@ mod tests {
             ]
         );
         assert_eq!(
+            entries(CardGroup::Cameras),
+            [("Camera", "camera", "Camera", "")]
+        );
+        assert_eq!(
             entries(CardGroup::Outputs),
             [
                 (
@@ -494,7 +514,7 @@ mod tests {
             .collect();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 9);
+        assert_eq!(labels.len(), 10);
     }
 
     #[test]

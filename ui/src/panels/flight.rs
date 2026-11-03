@@ -19,7 +19,7 @@
 
 use egui::{Color32, Pos2, Rect, Stroke, Vec2, pos2, vec2};
 
-use super::shots::{bar_group, pick};
+use super::shots::pick;
 use crate::app::FlighthookApp;
 use crate::chart::{self, Candidate, ChartKey, Curve, Projection};
 use crate::groups::ShotGroups;
@@ -208,7 +208,7 @@ pub(super) fn drawn_sets(
             .filter(|&(i, r)| {
                 i != shown
                     && !member(i)
-                    && device.is_none_or(|d| r.actor == d)
+                    && chart::in_filter(&r.actor, device)
                     && !chart::is_auto_chip(&r.actor)
                     && in_session(r)
                     && drawable(r)
@@ -981,20 +981,12 @@ impl FlighthookApp {
             return;
         }
         let view = self.groups.mode;
-        let set = bar_group(&self.groups, self.shots.get(shown), self.selected_club);
+        let members_key = self.refresh_members(shown);
         let members = self
             .view_members
-            .get(key.members.clone(), || {
-                chart::members_for(
-                    &self.shots,
-                    &self.groups,
-                    view,
-                    set,
-                    Some(shown),
-                    self.device_filter.as_deref(),
-                )
-            })
-            .clone();
+            .peek(&members_key)
+            .cloned()
+            .unwrap_or_default();
         let devices = self
             .device_ids
             .peek(&self.shots_rev)
@@ -1019,7 +1011,7 @@ impl FlighthookApp {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
         let painter = ui.painter_at(rect);
         let units = self.units_toggle;
-        let Some(shown) = self.shot_focus.index(&self.shots) else {
+        let Some(shown) = self.shown_index() else {
             paint_header(&painter, rect, units, None);
             painter.text(
                 rect.center(),
@@ -1040,8 +1032,7 @@ impl FlighthookApp {
         // The latest shot draws on while its pulse runs.
         let now = ui.ctx().input(|i| i.time);
         let progress = self
-            .shot_focus
-            .following(&self.shots)
+            .following()
             .then(|| self.shot_focus.progress(now))
             .flatten();
         let draw_on = progress.and_then(|p| DrawOn::new(scene, p));
@@ -1085,7 +1076,7 @@ impl FlighthookApp {
             None => None,
         };
         if let Some(i) = clicked {
-            self.shot_focus.select(&self.shots, i);
+            self.select_shot(i);
             self.shot_focus.reveal();
         }
     }
@@ -1169,6 +1160,7 @@ pub(super) mod tests {
             handed: None,
             group: Some(group.into()),
             finished: true,
+            video: Vec::new(),
         }
     }
 

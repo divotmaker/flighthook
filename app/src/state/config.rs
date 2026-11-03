@@ -139,6 +139,8 @@ impl LegacyFlighthookConfig {
             openconnect_server: HashMap::new(),
             openconnect_client: self.gspro,
             random_club: self.random_club,
+            replay: flighthook::ReplaySection::default(),
+            camera: HashMap::new(),
         }
     }
 }
@@ -184,6 +186,15 @@ fn parse(path: &Path, contents: &str) -> Option<FlighthookConfig> {
             toml::from_str::<ClientSectionIndices>(contents)
                 .unwrap_or_default()
                 .warn(&path.display().to_string());
+            if let Some(error) = config.replay.error() {
+                tracing::warn!(
+                    "{}: [replay] {error}; keep_shots is held to 1 to {}, each roll to 0 to {} s, and the replay start to 0 to {} s",
+                    path.display(),
+                    flighthook::ReplaySection::MAX_KEEP_SHOTS,
+                    flighthook::ReplaySection::MAX_ROLL_S,
+                    flighthook::ReplaySection::MAX_START_BEFORE_IMPACT_S
+                );
+            }
             Some(config)
         }
         Err(e) => match toml::from_str::<LegacyFlighthookConfig>(contents) {
@@ -441,6 +452,26 @@ impl SystemConfig {
             .map(flighthook::MevoSection::launch_only_spin_rpm_per_mph)
     }
 
+    /// Clone just the `[replay]` section. Camera actors read it at every
+    /// trigger and clip, so changes apply without restarting them.
+    pub fn replay(&self) -> flighthook::ReplaySection {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .replay
+            .clone()
+    }
+
+    /// The `[camera.<index>]` section, or `None` when it is absent.
+    pub fn camera(&self, index: &str) -> Option<flighthook::CameraSection> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .camera
+            .get(index)
+            .cloned()
+    }
+
     /// Mutate the cached config in place, then persist to disk.
     pub fn update(&self, f: impl FnOnce(&mut FlighthookConfig)) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
@@ -685,6 +716,19 @@ bind = "0.0.0.0:5880"
             });
             assert_eq!(cfg.mevo_launch_only_spin("0"), Some(read), "{set}");
         }
+    }
+
+    #[test]
+    fn a_hand_edited_zero_keep_shots_loads_and_keeps_one_clip() {
+        let dir = std::env::temp_dir().join(format!("flighthook-replay-load-{}", generate_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[replay]\nkeep_shots = 0\n").expect("write");
+        let c = load(&path);
+        assert_eq!(c.replay.keep_shots, 0, "the file is not rewritten");
+        assert!(c.replay.error().is_some());
+        assert_eq!(crate::state::clips::keep(&c.replay), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

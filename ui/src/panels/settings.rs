@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
-use crate::app::FlighthookApp;
+use crate::app::{CameraList, FlighthookApp};
 use crate::net;
 use crate::panels::cards::AddPreset;
 use crate::panels::devices;
 use crate::theme;
 use crate::types::{
-    CameraMode, Club, Distance, DistanceExt, FlightScopeEnvironment, FlighthookConfig, MevoSection,
-    MockMonitorSection, OpenConnectClientSection, R10Section, RandomClubSection, ShotGrouping,
+    CameraListEntry, CameraMode, CameraPosition, CameraSection, Club, Distance, DistanceExt,
+    FlightScopeEnvironment, FlighthookConfig, MevoSection, MockMonitorSection,
+    OpenConnectClientSection, R10Section, RandomClubSection, ReplaySection, ShotGrouping,
     SimSurface, SimulationSection, SpinSource, UnitSystem, WebserverSection,
 };
 use flighthook::SimMode;
@@ -88,7 +89,39 @@ pub(crate) struct DeviceFormEntry {
     /// allsquare's default" for that club. The putter is excluded — it has
     /// no vertical impact estimate.
     pub(crate) square_impact_mm: std::collections::HashMap<Club, String>,
+    /// Camera: which camera, where it stands and its video mode.
+    pub(crate) cam: Box<CameraFields>,
     pub(crate) dirty: bool,
+}
+
+/// The settings of a camera card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CameraFields {
+    /// The camera's stable id (`CameraSection::camera`); blank until one is
+    /// picked.
+    pub(crate) id: String,
+    /// The camera's own name, as the camera list gave it when it was picked.
+    pub(crate) name: Option<String>,
+    pub(crate) position: CameraPosition,
+    /// `auto` or `WIDTHxHEIGHT@FPS`.
+    pub(crate) mode: String,
+}
+
+impl Default for CameraFields {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: None,
+            position: CameraPosition::default(),
+            mode: CameraSection::AUTO_MODE.to_owned(),
+        }
+    }
+}
+
+/// Whether a camera video mode is one the server accepts: `auto` or
+/// `WIDTHxHEIGHT@FPS`.
+pub(crate) fn video_mode_valid(mode: &str) -> bool {
+    mode.parse::<stance::FormatRequest>().is_ok()
 }
 
 /// Whether a string looks like a BLE device identifier: a MAC address
@@ -231,6 +264,7 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            cam: Box::default(),
             dirty: false,
         }
     }
@@ -262,6 +296,7 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            cam: Box::default(),
             dirty: false,
         }
     }
@@ -289,6 +324,7 @@ impl DeviceFormEntry {
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
+            cam: Box::default(),
             dirty: false,
         }
     }
@@ -316,6 +352,7 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            cam: Box::default(),
             dirty: false,
         }
     }
@@ -343,6 +380,7 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            cam: Box::default(),
             dirty: false,
         }
     }
@@ -370,7 +408,27 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            cam: Box::default(),
             dirty: false,
+        }
+    }
+
+    pub(crate) fn from_camera(id: &str, s: &CameraSection) -> Self {
+        Self {
+            monitor_type: "camera".into(),
+            name: s.name.clone(),
+            cam: Box::new(CameraFields {
+                id: s.camera.clone(),
+                name: s.camera_name.clone(),
+                position: s.position,
+                mode: s.mode.clone(),
+            }),
+            ..Self::from_mock(
+                id,
+                &MockMonitorSection {
+                    name: String::new(),
+                },
+            )
         }
     }
 
@@ -384,6 +442,11 @@ impl DeviceFormEntry {
 
     pub(crate) fn is_r10(&self) -> bool {
         self.monitor_type == "r10"
+    }
+
+    /// Whether this is a swing camera rather than a launch monitor.
+    pub(crate) fn is_camera(&self) -> bool {
+        self.monitor_type == "camera"
     }
 
     /// Whether this device takes an optional IP address. Blank means find
@@ -478,6 +541,7 @@ impl ActorFormEntry {
                 "exputt" => "ExPutt",
                 "openconnect_server" => "OpenConnect Server",
                 "mock_monitor" => "Mock",
+                "camera" => "Camera",
                 _ => &d.monitor_type,
             },
             ActorFormEntry::Integration(i) => match i.integration_type.as_str() {
@@ -504,6 +568,9 @@ impl ActorFormEntry {
                     "Accepts inbound shots from any launch monitor that speaks GSPro Open Connect (Uneekor, Foresight, SkyTrak). Bind address, default 0.0.0.0:921 — to share a host with GSPro, move GSPConnect to 922 via OpenAPIUseAltPort"
                 }
                 "mock_monitor" => "Mock launch monitor — generates random shots for testing",
+                "camera" => {
+                    "Swing camera (beta) — a USB camera on this computer. Records a clip around every shot for replay on the Shots tab"
+                }
                 _ => "",
             },
             ActorFormEntry::Integration(i) => match i.integration_type.as_str() {
@@ -581,6 +648,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            cam: Box::default(),
             dirty: true,
         })
     };
@@ -598,7 +666,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
     };
     match type_key {
         "mevo" => Some(device(1)),
-        "square" | "r10" | "exputt" | "openconnect_server" => Some(device(0)),
+        "square" | "r10" | "exputt" | "openconnect_server" | "camera" => Some(device(0)),
         "openconnect_client" => Some(integration()),
         _ => None,
     }
@@ -776,6 +844,80 @@ impl SimulationForm {
     }
 }
 
+/// Form state for the `[replay]` section (beta). Fields left as loaded save
+/// their loaded value exactly; the clip folder is not edited here.
+#[derive(Clone)]
+pub(crate) struct ReplayForm {
+    pub(crate) keep_shots: String,
+    pub(crate) pre_roll_s: String,
+    pub(crate) post_roll_s: String,
+    pub(crate) start_before_impact_s: String,
+    loaded: ReplaySection,
+}
+
+impl Default for ReplayForm {
+    fn default() -> Self {
+        Self::from_section(&ReplaySection::default())
+    }
+}
+
+impl ReplayForm {
+    pub(crate) fn from_section(s: &ReplaySection) -> Self {
+        Self {
+            keep_shots: s.keep_shots.to_string(),
+            pre_roll_s: format_distance_value(s.pre_roll_s),
+            post_roll_s: format_distance_value(s.post_roll_s),
+            start_before_impact_s: format_distance_value(s.start_before_impact_s),
+            loaded: s.clone(),
+        }
+    }
+
+    /// The configured clip folder, if the section names one.
+    pub(crate) fn clip_dir(&self) -> Option<&str> {
+        self.loaded.clip_dir.as_deref()
+    }
+
+    /// Seconds before the estimated impact where a replay opens, as saved
+    /// (held to its valid range).
+    pub(crate) fn start_before_impact_s(&self) -> f64 {
+        let s = self.loaded.start_before_impact_s;
+        if s.is_finite() {
+            s.clamp(0.0, ReplaySection::MAX_START_BEFORE_IMPACT_S)
+        } else {
+            ReplaySection::DEFAULT_START_BEFORE_IMPACT_S
+        }
+    }
+
+    /// A seconds field's value: the loaded value while the text is unchanged.
+    fn seconds(text: &str, loaded: f64) -> Option<f64> {
+        if text == format_distance_value(loaded) {
+            return Some(loaded);
+        }
+        text.trim().parse().ok()
+    }
+
+    /// The section to save, or `None` while a field is unparsable or out of
+    /// range ([`ReplaySection::error`]).
+    pub(crate) fn to_section(&self) -> Option<ReplaySection> {
+        let s = ReplaySection {
+            keep_shots: self.keep_shots.trim().parse().ok()?,
+            pre_roll_s: Self::seconds(&self.pre_roll_s, self.loaded.pre_roll_s)?,
+            post_roll_s: Self::seconds(&self.post_roll_s, self.loaded.post_roll_s)?,
+            start_before_impact_s: Self::seconds(
+                &self.start_before_impact_s,
+                self.loaded.start_before_impact_s,
+            )?,
+            clip_dir: self.loaded.clip_dir.clone(),
+        };
+        s.error().is_none().then_some(s)
+    }
+
+    /// The section to save, falling back to the loaded one while invalid.
+    fn to_section_or_loaded(&self) -> ReplaySection {
+        self.to_section().unwrap_or_else(|| self.loaded.clone())
+    }
+}
+
 /// Hover text for a simulation mode in the settings dropdown.
 fn sim_mode_hover(mode: SimMode) -> &'static str {
     match mode {
@@ -822,6 +964,11 @@ fn actor_entries(s: &FlighthookConfig) -> Vec<ActorFormEntry> {
             id, section,
         )));
     }
+    for (id, section) in &s.camera {
+        actors.push(ActorFormEntry::Device(DeviceFormEntry::from_camera(
+            id, section,
+        )));
+    }
     for (id, section) in &s.openconnect_client {
         actors.push(ActorFormEntry::Integration(IntegrationFormEntry {
             id: id.clone(),
@@ -861,12 +1008,13 @@ fn actor_entries(s: &FlighthookConfig) -> Vec<ActorFormEntry> {
     actors
 }
 
-/// The two settings-only cards of the General group. They save, and cancel,
+/// The settings-only cards of the General group. They save, and cancel,
 /// together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GeneralCard {
     Global,
     Simulation,
+    Replay,
 }
 
 /// Settings form state.
@@ -877,11 +1025,13 @@ pub(crate) struct SettingsForm {
     pub(crate) chipping_clubs: Vec<Club>,
     pub(crate) putting_clubs: Vec<Club>,
     pub(crate) simulation: SimulationForm,
-    /// The Global and Simulation cards (one save) have unsaved edits.
+    pub(crate) replay: ReplayForm,
+    /// The Global, Simulation and Replay cards (one save) have unsaved
+    /// edits.
     pub(crate) global_dirty: bool,
-    /// Which of the two cards the unsaved Global edits were made on, by
+    /// Which of the cards the unsaved Global edits were made on, by
     /// [`GeneralCard`]; meaningful only while `global_dirty`.
-    general_edited: [bool; 2],
+    general_edited: [bool; 3],
     pub(crate) actors: Vec<ActorFormEntry>,
     pub(crate) loaded: bool,
     /// The save posted and not answered yet.
@@ -911,8 +1061,9 @@ impl Default for SettingsForm {
             chipping_clubs: flighthook::default_chipping_clubs(),
             putting_clubs: flighthook::default_putting_clubs(),
             simulation: SimulationForm::default(),
+            replay: ReplayForm::default(),
             global_dirty: false,
-            general_edited: [false; 2],
+            general_edited: [false; 3],
             actors: Vec::new(),
             loaded: false,
             save: None,
@@ -961,7 +1112,8 @@ impl SettingsForm {
             self.chipping_clubs = s.chipping_clubs.clone();
             self.putting_clubs = s.putting_clubs.clone();
             self.simulation = SimulationForm::from_section(&s.simulation, s.default_units);
-            self.general_edited = [false; 2];
+            self.replay = ReplayForm::from_section(&s.replay);
+            self.general_edited = [false; 3];
         }
 
         let edited: Vec<ActorFormEntry> = std::mem::take(&mut self.actors)
@@ -1006,10 +1158,10 @@ impl SettingsForm {
         }
     }
 
-    /// Whether the Global and Simulation cards can be saved: the simulation
+    /// Whether the General cards can be saved: the simulation and replay
     /// fields are in range.
     pub(crate) fn general_valid(&self) -> bool {
-        self.simulation.to_section().is_some()
+        self.simulation.to_section().is_some() && self.replay.to_section().is_some()
     }
 
     /// Clubs on the Global card are limited to the Chipping/Putting
@@ -1041,6 +1193,7 @@ impl SettingsForm {
             putting_clubs: self.filtered_putting_clubs(),
             shot_grouping: self.shot_grouping,
             simulation: self.simulation.to_section_or_loaded(),
+            replay: self.replay.to_section_or_loaded(),
             webserver: HashMap::new(),
             mevo: HashMap::new(),
             r10: HashMap::new(),
@@ -1050,6 +1203,7 @@ impl SettingsForm {
             openconnect_server: HashMap::new(),
             openconnect_client: HashMap::new(),
             random_club: HashMap::new(),
+            camera: HashMap::new(),
         };
         for actor in &self.actors {
             apply_actor_to_config(&mut config, actor);
@@ -1187,14 +1341,15 @@ impl SettingsForm {
     /// Record an edit on a General card.
     pub(crate) fn mark_general(&mut self, card: GeneralCard) {
         if !self.global_dirty {
-            self.general_edited = [false; 2];
+            self.general_edited = [false; 3];
         }
         self.general_edited[card as usize] = true;
         self.global_dirty = true;
     }
 
     /// Whether `card` shows Save and Cancel: it has unsaved edits. Global
-    /// edits made elsewhere than on either card count as the Global card's.
+    /// edits made elsewhere than on any General card count as the Global
+    /// card's.
     pub(crate) fn general_card_dirty(&self, card: GeneralCard) -> bool {
         if !self.global_dirty {
             return false;
@@ -1202,9 +1357,10 @@ impl SettingsForm {
         match card {
             GeneralCard::Global => {
                 self.general_edited[GeneralCard::Global as usize]
-                    || !self.general_edited[GeneralCard::Simulation as usize]
+                    || !(self.general_edited[GeneralCard::Simulation as usize]
+                        || self.general_edited[GeneralCard::Replay as usize])
             }
-            GeneralCard::Simulation => self.general_edited[GeneralCard::Simulation as usize],
+            GeneralCard::Simulation | GeneralCard::Replay => self.general_edited[card as usize],
         }
     }
 
@@ -1216,8 +1372,9 @@ impl SettingsForm {
         self.chipping_clubs = saved.chipping_clubs.clone();
         self.putting_clubs = saved.putting_clubs.clone();
         self.simulation = SimulationForm::from_section(&saved.simulation, saved.default_units);
+        self.replay = ReplayForm::from_section(&saved.replay);
         self.global_dirty = false;
-        self.general_edited = [false; 2];
+        self.general_edited = [false; 3];
         if self.save_error.as_ref().map(|e| &e.target) == Some(&SaveTarget::Global) {
             self.save_error = None;
         }
@@ -1277,6 +1434,7 @@ impl SettingsForm {
         config.chipping_clubs = self.filtered_chipping_clubs();
         config.putting_clubs = self.filtered_putting_clubs();
         config.simulation = self.simulation.to_section_or_loaded();
+        config.replay = self.replay.to_section_or_loaded();
         config
     }
 
@@ -1297,6 +1455,7 @@ fn global_matches(a: &FlighthookConfig, b: &FlighthookConfig) -> bool {
         && a.putting_clubs == b.putting_clubs
         && a.shot_grouping == b.shot_grouping
         && a.simulation == b.simulation
+        && a.replay == b.replay
 }
 
 /// Copy `from`'s global settings into `to`.
@@ -1306,6 +1465,7 @@ fn copy_global(to: &mut FlighthookConfig, from: &FlighthookConfig) {
     to.putting_clubs.clone_from(&from.putting_clubs);
     to.shot_grouping = from.shot_grouping;
     to.simulation = from.simulation.clone();
+    to.replay = from.replay.clone();
 }
 
 /// Set `to`'s section for actor `global_id` to `from`'s: copied, or removed
@@ -1350,6 +1510,7 @@ fn set_section(to: &mut FlighthookConfig, from: Option<&FlighthookConfig>, globa
             from.and_then(|f| f.random_club.get(i)),
             i,
         ),
+        "camera" => set(&mut to.camera, from.and_then(|f| f.camera.get(i)), i),
         _ => {}
     }
 }
@@ -1373,6 +1534,7 @@ fn section_json(config: &FlighthookConfig, global_id: &str) -> Option<serde_json
         "openconnect_server" => get(&config.openconnect_server, i),
         "openconnect_client" => get(&config.openconnect_client, i),
         "random_club" => get(&config.random_club, i),
+        "camera" => get(&config.camera, i),
         _ => None,
     }
 }
@@ -1412,6 +1574,10 @@ pub(crate) fn actor_valid(actor: &ActorFormEntry) -> bool {
                 return false;
             }
             if dev.is_mevo() && launch_only_spin_value(&dev.launch_only_spin).is_none() {
+                return false;
+            }
+            if dev.is_camera() && (dev.cam.id.trim().is_empty() || !video_mode_valid(&dev.cam.mode))
+            {
                 return false;
             }
             // Face impact calibration: blank means "use the default",
@@ -1534,6 +1700,18 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         MockMonitorSection {
                             name: dev.name.clone(),
+                        },
+                    );
+                }
+                "camera" => {
+                    config.camera.insert(
+                        dev.id.clone(),
+                        CameraSection {
+                            name: dev.name.clone(),
+                            camera: dev.cam.id.trim().to_string(),
+                            camera_name: dev.cam.name.clone(),
+                            position: dev.cam.position,
+                            mode: dev.cam.mode.trim().to_string(),
                         },
                     );
                 }
@@ -1835,13 +2013,20 @@ pub(crate) fn button_row(ui: &mut egui::Ui, text: &str, mark: &str, enabled: boo
 /// Hover text of the Simulation card.
 const SIMULATION_HOVER: &str = "When a launch monitor doesn't report carry, apex, flight time, descent, offline, roll or total, flighthook simulates them from the measured launch. Simulated values are tagged SIM on the Cards view and shown in italics in the Table. Never sent to GSPro, which simulates the flight itself.";
 
-/// The fields of one actor card, by type.
+/// Hover text of the Replay card.
+const REPLAY_HOVER: &str = "The cameras record a clip around every shot: from the pre-roll before the estimated impact to the post-roll after the launch monitor reports the shot. The newest clips are kept on disk; older ones are deleted, and Clear history deletes them all.";
+
+/// The fields of one actor card, by type. `cameras` is the camera list a
+/// camera card picks from. Returns whether the camera list was asked to
+/// refresh.
 pub(crate) fn actor_fields(
     ui: &mut egui::Ui,
     actor: &mut ActorFormEntry,
     device_monitor_options: &[(String, String)],
-) {
+    cameras: &CameraList,
+) -> bool {
     let (field_width, wide_width) = field_widths(ui);
+    let mut refresh = false;
     match actor {
         ActorFormEntry::Device(dev) => {
             // Name
@@ -1860,6 +2045,10 @@ pub(crate) fn actor_fields(
             });
             if dev.name.is_empty() {
                 field_error(ui, "Name is required");
+            }
+
+            if dev.is_camera() {
+                refresh = camera_fields(ui, dev, cameras, field_width, wide_width);
             }
 
             if dev.has_network_address() {
@@ -2366,6 +2555,153 @@ pub(crate) fn actor_fields(
             }
         }
     }
+    refresh
+}
+
+/// How a camera entry reads in the picker: its name, and the card using it
+/// when that is another one.
+fn camera_choice_label(entry: &CameraListEntry, own: &str) -> String {
+    match entry.in_use_by.as_deref() {
+        Some(user) if user != own => format!("{} (in use by {user})", entry.name),
+        _ => entry.name.clone(),
+    }
+}
+
+/// A camera card's Camera, Position and Video mode fields. Returns whether
+/// the camera list was asked to refresh.
+fn camera_fields(
+    ui: &mut egui::Ui,
+    dev: &mut DeviceFormEntry,
+    cameras: &CameraList,
+    field_width: f32,
+    wide_width: f32,
+) -> bool {
+    let own = format!("{}.{}", dev.monitor_type, dev.id);
+    let entries: &[CameraListEntry] = cameras.list.as_ref().map_or(&[], |l| &l.cameras);
+    let picked = entries.iter().find(|e| e.id == dev.cam.id);
+    let mut refresh = false;
+    ui.horizontal(|ui| {
+        field_label(ui, "Camera:").on_hover_text(
+            "The USB camera to record from. It is found again after a replug into the \
+             same port. The test pattern is a generated picture, for trying replay \
+             without a camera.",
+        );
+        let shown = match (picked, &dev.cam.name) {
+            (Some(e), _) => e.name.clone(),
+            (None, Some(name)) => format!("{name} (not connected)"),
+            (None, None) if dev.cam.id.is_empty() => "Pick a camera".to_owned(),
+            (None, None) => format!("{} (not connected)", dev.cam.id),
+        };
+        let combo = egui::ComboBox::from_id_salt(format!("camera_{}", dev.id))
+            .selected_text(shown)
+            .width(field_width)
+            .truncate()
+            .show_ui(ui, |ui| {
+                for entry in entries {
+                    let label = camera_choice_label(entry, &own);
+                    let item = ui.selectable_label(entry.id == dev.cam.id, label);
+                    if item.clicked() && entry.id != dev.cam.id {
+                        dev.cam.id.clone_from(&entry.id);
+                        dev.cam.name = Some(entry.name.clone());
+                        if !entry.modes.contains(&dev.cam.mode) {
+                            dev.cam.mode = CameraSection::AUTO_MODE.to_owned();
+                        }
+                        dev.dirty = true;
+                    }
+                }
+                if entries.is_empty() {
+                    ui.label(
+                        egui::RichText::new(if cameras.loading {
+                            "Looking for cameras…"
+                        } else {
+                            "No cameras found"
+                        })
+                        .color(theme::TEXT_MUTED),
+                    );
+                }
+            });
+        devices::mark(ui, || format!("camera_pick:{own}"), &combo.response);
+        if cameras.loading {
+            ui.spinner();
+        } else {
+            let again = theme::icon(ui, theme::Icon::Refresh, 20.0, theme::ACCENT, true)
+                .on_hover_text("Look for cameras again");
+            devices::mark(ui, || format!("camera_refresh:{own}"), &again);
+            refresh = again.clicked();
+        }
+    });
+    if let Some(error) = &cameras.error {
+        field_error(ui, &format!("Camera list: {error}"));
+    }
+    if dev.cam.id.trim().is_empty() {
+        field_error(ui, "Pick a camera");
+    }
+    if let Some(error) = picked.and_then(|e| e.error.as_deref()) {
+        field_error(ui, error);
+    }
+
+    ui.horizontal(|ui| {
+        field_label(ui, "Position:").on_hover_text("Where the camera stands.");
+        egui::ComboBox::from_id_salt(format!("camera_position_{}", dev.id))
+            .selected_text(dev.cam.position.label())
+            .width(wide_width)
+            .show_ui(ui, |ui| {
+                for position in CameraPosition::all() {
+                    if ui
+                        .selectable_label(dev.cam.position == position, position.label())
+                        .clicked()
+                    {
+                        dev.cam.position = position;
+                        dev.dirty = true;
+                    }
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        field_label(ui, "Video mode:").on_hover_text(
+            "Auto picks the camera's highest frame rate, then its largest size at that \
+             rate. A faster mode shows more of the swing in slow motion and takes more \
+             disk space.",
+        );
+        let auto = CameraSection::AUTO_MODE;
+        let label = |mode: &str| {
+            if mode == auto {
+                "Auto".to_owned()
+            } else {
+                mode.replace('x', "×").replace('@', " @ ")
+            }
+        };
+        let mut modes: Vec<&str> = vec![auto];
+        if dev.cam.mode != auto && !picked.is_some_and(|e| e.modes.contains(&dev.cam.mode)) {
+            modes.push(dev.cam.mode.as_str());
+        }
+        let listed: Vec<String> = picked.map(|e| e.modes.clone()).unwrap_or_default();
+        modes.extend(listed.iter().map(String::as_str));
+        let mut chosen = None;
+        let combo = egui::ComboBox::from_id_salt(format!("camera_mode_{}", dev.id))
+            .selected_text(label(&dev.cam.mode))
+            .width(wide_width)
+            .show_ui(ui, |ui| {
+                for mode in &modes {
+                    if ui
+                        .selectable_label(dev.cam.mode == *mode, label(mode))
+                        .clicked()
+                    {
+                        chosen = Some((*mode).to_owned());
+                    }
+                }
+            });
+        devices::mark(ui, || format!("camera_mode:{own}"), &combo.response);
+        if let Some(mode) = chosen.filter(|m| *m != dev.cam.mode) {
+            dev.cam.mode = mode;
+            dev.dirty = true;
+        }
+    });
+    if !video_mode_valid(&dev.cam.mode) {
+        field_error(ui, "Auto or WIDTHxHEIGHT@FPS");
+    }
+    refresh
 }
 
 impl FlighthookApp {
@@ -2415,6 +2751,7 @@ impl FlighthookApp {
         let key = match card {
             GeneralCard::Global => "global",
             GeneralCard::Simulation => "simulation",
+            GeneralCard::Replay => "replay",
         };
         let can_save = self.settings.general_valid();
         match save_cancel(ui, key, can_save, self.settings.saving()) {
@@ -2581,6 +2918,115 @@ impl FlighthookApp {
             ui.add_space(6.0);
             ui.add_enabled_ui(editable, |ui| self.simulation_fields(ui));
         });
+    }
+
+    /// The Replay card: the cameras' clips (beta), saved with the Global
+    /// card. Its edit controls are disabled unless `editable`.
+    pub(crate) fn render_replay_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        editable: bool,
+    ) {
+        theme::accent_card(ui, theme::HEADING, |ui| {
+            let dirty = card_header(
+                ui,
+                "replay",
+                "Replay",
+                Some(("beta", TagPlace::Title)),
+                Some(REPLAY_HOVER),
+                |ui| self.general_buttons(ctx, ui, GeneralCard::Replay),
+            );
+            if dirty {
+                lock_hint(ui);
+                self.general_error(ui, "replay");
+            }
+            ui.add_space(6.0);
+            ui.add_enabled_ui(editable, |ui| self.replay_fields(ui));
+        });
+    }
+
+    /// The Replay card's fields.
+    fn replay_fields(&mut self, ui: &mut egui::Ui) {
+        let (field_width, _) = field_widths(ui);
+        let replay = &mut self.settings.replay;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            field_label(ui, "Keep clips:").on_hover_text(format!(
+                "How many clips stay on disk, 1 to {}. Each camera's clip of a 5.5 s \
+                 window at 1280×720, 120 fps is about 55 MB.",
+                ReplaySection::MAX_KEEP_SHOTS
+            ));
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut replay.keep_shots)
+                    .desired_width(field_width - TEXT_EDIT_MARGIN),
+            );
+            devices::mark(ui, || "replay_keep".to_owned(), &field);
+            changed |= field.changed();
+        });
+        if !replay
+            .keep_shots
+            .trim()
+            .parse::<u32>()
+            .is_ok_and(|n| (1..=ReplaySection::MAX_KEEP_SHOTS).contains(&n))
+        {
+            field_error(ui, &format!("1 to {}", ReplaySection::MAX_KEEP_SHOTS));
+        }
+        for (label, hover, text, loaded) in [
+            (
+                "Pre-roll:",
+                Some("Seconds recorded before the estimated impact, 0 to 10."),
+                &mut replay.pre_roll_s,
+                replay.loaded.pre_roll_s,
+            ),
+            (
+                "Post-roll:",
+                Some("Seconds recorded after the launch monitor reports the shot, 0 to 10."),
+                &mut replay.post_roll_s,
+                replay.loaded.post_roll_s,
+            ),
+            (
+                "Start before impact:",
+                None,
+                &mut replay.start_before_impact_s,
+                replay.loaded.start_before_impact_s,
+            ),
+        ] {
+            ui.horizontal(|ui| {
+                let label = field_label(ui, label);
+                if let Some(hover) = hover {
+                    label.on_hover_text(hover);
+                }
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(text)
+                            .desired_width(field_width - TEXT_EDIT_MARGIN),
+                    )
+                    .changed();
+                ui.label("s");
+            });
+            if ReplayForm::seconds(text, loaded)
+                .is_none_or(|v| !(v.is_finite() && (0.0..=ReplaySection::MAX_ROLL_S).contains(&v)))
+            {
+                field_error(ui, "0 to 10 s");
+            }
+        }
+        let folder = replay
+            .clip_dir()
+            .map(str::to_owned)
+            .or_else(|| self.clip_dir.clone());
+        ui.horizontal(|ui| {
+            field_label(ui, "Clip folder:")
+                .on_hover_text("Where the clips are written: an AVI file and its index per camera, in a folder per clip.");
+            let text = folder.as_deref().unwrap_or("-");
+            let shown = ui.add(
+                egui::Label::new(egui::RichText::new(text).color(theme::TEXT_MUTED)).truncate(),
+            );
+            devices::mark(ui, || "replay_folder".to_owned(), &shown);
+        });
+        if changed {
+            self.settings.mark_general(GeneralCard::Replay);
+        }
     }
 
     /// The Simulation card's fields.

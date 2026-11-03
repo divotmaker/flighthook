@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::{devices, dispersion, impact, signs};
+use super::card_row::{self, CardSource};
+use super::{cards, devices, dispersion, impact, signs};
 use crate::app::FlighthookApp;
 use crate::chart::{self, MembersKey};
 use crate::groups::{
@@ -10,8 +11,8 @@ use crate::groups::{
 use crate::net;
 use crate::theme;
 use crate::types::{
-    ActorStatusResponse, BallFlight, Club, ClubData, DerivedFlight, Distance, Handedness,
-    ShotGroupInfo, ShotGrouping, ShotRow, Stats, UnitSystem, Velocity,
+    ActorStatus, ActorStatusResponse, BallFlight, Club, ClubData, DerivedFlight, Distance,
+    Handedness, ShotGroupInfo, ShotGrouping, ShotRow, Stats, UnitSystem, Velocity,
 };
 
 /// Format an optional f64 with the given precision, or "-" if None.
@@ -369,16 +370,15 @@ fn row_split(width: f32) -> (f32, f32) {
 }
 
 /// Height of a bottom row `width` wide holding `row`, from its `height` in
-/// [`chart_slots`]: raised by the Dispersion header's extra rows, so the
-/// plot keeps [`SHARED_PLOT_MIN`] or [`TABLE_PLOT_MIN`]. `filter` when the
-/// header carries the device filter.
-fn bottom_height(height: f32, row: BottomRow, width: f32, filter: bool) -> f32 {
+/// [`chart_slots`]: raised by the Dispersion header's extra row, so the
+/// plot keeps [`SHARED_PLOT_MIN`] or [`TABLE_PLOT_MIN`].
+fn bottom_height(height: f32, row: BottomRow, width: f32) -> f32 {
     let (slot, plot) = match row {
         BottomRow::Flight => return height,
         BottomRow::FlightAndDispersion => (row_split(width).1, SHARED_PLOT_MIN),
         BottomRow::Dispersion => (width, TABLE_PLOT_MIN),
     };
-    let header = dispersion::header_height(slot, filter);
+    let header = dispersion::header_height(slot);
     height.max(CHART_GAP + header + dispersion::PLOT_PAD + plot)
 }
 
@@ -411,6 +411,12 @@ fn empty_state(ui: &mut egui::Ui, detail: &str) {
 /// The view follows the latest shot unless one is pinned from the shot
 /// list. A new latest shot clears the pin; so does the pinned shot leaving
 /// the list.
+///
+/// Everything here is over the shots the device filter passes (`filter`,
+/// [`chart::in_filter`]): the latest shot is that device's newest, and a
+/// shot from another device never pulses or moves the shot on show. A new
+/// filter shows its device's newest shot, without a pulse, unless the shot
+/// on show is from that device.
 #[derive(Default)]
 pub(crate) struct ShotFocus {
     /// The latest shot (the newest one with data).
@@ -420,42 +426,49 @@ pub(crate) struct ShotFocus {
     started: Option<f64>,
     /// The list should scroll the shot on show into view.
     reveal: bool,
+    /// The device filter `latest` was found under.
+    filter: Option<String>,
 }
 
 impl ShotFocus {
     /// Note the latest shot; a new one starts a pulse at `now` and becomes
-    /// the shot on show.
-    pub(crate) fn observe(&mut self, shots: &[ShotRow], now: f64) {
-        let latest = latest_ref(shots);
+    /// the shot on show. A changed `filter` moves to its latest shot without
+    /// a pulse.
+    pub(crate) fn observe(&mut self, shots: &[ShotRow], filter: Option<&str>, now: f64) {
+        if self.filter.as_deref() != filter {
+            self.sync(shots, filter);
+            self.reveal = true;
+            return;
+        }
+        let latest = latest_ref(shots, filter);
         if latest != self.latest {
             self.started = latest.is_some().then_some(now);
             self.latest = latest;
             self.follow();
         }
-        self.drop_missing_pin(shots);
+        self.drop_missing_pin(shots, filter);
     }
 
     /// Note the latest shot without pulsing or moving off a pinned shot
-    /// that is still listed (bulk loads).
-    pub(crate) fn sync(&mut self, shots: &[ShotRow]) {
-        self.latest = latest_ref(shots);
+    /// that is still listed and passes `filter` (bulk loads, a new filter).
+    pub(crate) fn sync(&mut self, shots: &[ShotRow], filter: Option<&str>) {
+        self.filter = filter.map(str::to_owned);
+        self.latest = latest_ref(shots, filter);
         self.started = None;
-        self.drop_missing_pin(shots);
+        self.drop_missing_pin(shots, filter);
     }
 
-    fn drop_missing_pin(&mut self, shots: &[ShotRow]) {
-        if self
-            .pinned
-            .as_ref()
-            .is_some_and(|pin| !shots.iter().any(|s| pin.matches(s)))
-        {
+    fn drop_missing_pin(&mut self, shots: &[ShotRow], filter: Option<&str>) {
+        if self.pinned.as_ref().is_some_and(|pin| {
+            !chart::in_filter(&pin.actor, filter) || !shots.iter().any(|s| pin.matches(s))
+        }) {
             self.pinned = None;
         }
     }
 
     /// Show `shots[i]`; picking the latest shot follows new shots again.
-    pub(crate) fn select(&mut self, shots: &[ShotRow], i: usize) {
-        if Some(i) == latest_index(shots) {
+    pub(crate) fn select(&mut self, shots: &[ShotRow], filter: Option<&str>, i: usize) {
+        if Some(i) == latest_index(shots, filter) {
             self.follow();
         } else {
             self.pinned = shots.get(i).map(ShotRef::of);
@@ -469,13 +482,13 @@ impl ShotFocus {
     }
 
     /// Index of the shot on show.
-    pub(super) fn index(&self, shots: &[ShotRow]) -> Option<usize> {
-        focus_index(shots, self.pinned.as_ref())
+    pub(super) fn index(&self, shots: &[ShotRow], filter: Option<&str>) -> Option<usize> {
+        focus_index(shots, self.pinned.as_ref(), filter)
     }
 
     /// Whether the view is following the latest shot.
-    pub(super) fn following(&self, shots: &[ShotRow]) -> bool {
-        self.index(shots) == latest_index(shots)
+    pub(super) fn following(&self, shots: &[ShotRow], filter: Option<&str>) -> bool {
+        self.index(shots, filter) == latest_index(shots, filter)
     }
 
     /// Scroll the shot on show into view in the list, once.
@@ -504,12 +517,22 @@ impl ShotFocus {
     }
 }
 
-/// Index of the latest shot: the newest one with any data, so a
-/// just-triggered shot does not blank the cards while its data is in flight.
-pub(super) fn latest_index(shots: &[ShotRow]) -> Option<usize> {
+/// The count line's total: every row in `shots`, or with a device filter
+/// `filter` the rows it passes ([`chart::in_filter`]).
+fn shot_total(shots: &[ShotRow], filter: Option<&str>) -> usize {
     shots
         .iter()
-        .rposition(|s| s.ball.is_some() || s.club.is_some())
+        .filter(|r| chart::in_filter(&r.actor, filter))
+        .count()
+}
+
+/// Index of the latest shot the device filter `filter` passes: the newest
+/// one with any data, so a just-triggered shot does not blank the cards
+/// while its data is in flight.
+pub(super) fn latest_index(shots: &[ShotRow], filter: Option<&str>) -> Option<usize> {
+    shots
+        .iter()
+        .rposition(|s| (s.ball.is_some() || s.club.is_some()) && chart::in_filter(&s.actor, filter))
 }
 
 /// The chip on the shot header.
@@ -525,18 +548,27 @@ enum HeaderChip {
 /// The chip for shot `i` in the header: Back to latest while not
 /// `following`, else LATEST when `i` is the latest shot with data (a
 /// trigger whose data has not landed does not take it).
-fn header_chip(shots: &[ShotRow], i: usize, following: bool) -> HeaderChip {
+/// What a click on the shot header asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HeaderClick {
+    /// Back to latest.
+    back: bool,
+    /// Replay the shot's clips.
+    replay: bool,
+}
+
+fn header_chip(shots: &[ShotRow], i: usize, following: bool, filter: Option<&str>) -> HeaderChip {
     if !following {
         HeaderChip::BackToLatest
-    } else if latest_index(shots) == Some(i) {
+    } else if latest_index(shots, filter) == Some(i) {
         HeaderChip::Latest
     } else {
         HeaderChip::None
     }
 }
 
-fn latest_ref(shots: &[ShotRow]) -> Option<ShotRef> {
-    latest_index(shots).map(|i| ShotRef::of(&shots[i]))
+fn latest_ref(shots: &[ShotRow], filter: Option<&str>) -> Option<ShotRef> {
+    latest_index(shots, filter).map(|i| ShotRef::of(&shots[i]))
 }
 
 /// A shot that is found again after the list is reloaded: by `shot_id` (and
@@ -566,12 +598,13 @@ impl ShotRef {
     }
 }
 
-/// Index of the shot to show: the `pinned` one while it is listed (the
-/// newest match), else the latest.
-fn focus_index(shots: &[ShotRow], pinned: Option<&ShotRef>) -> Option<usize> {
+/// Index of the shot to show: the `pinned` one while it is listed and the
+/// device filter `filter` passes it (the newest match), else the latest.
+fn focus_index(shots: &[ShotRow], pinned: Option<&ShotRef>, filter: Option<&str>) -> Option<usize> {
     pinned
+        .filter(|pin| chart::in_filter(&pin.actor, filter))
         .and_then(|pin| shots.iter().rposition(|s| pin.matches(s)))
-        .or_else(|| latest_index(shots))
+        .or_else(|| latest_index(shots, filter))
 }
 
 // ---------------------------------------------------------------------------
@@ -924,10 +957,10 @@ struct CardsLayout {
     headline: Vec<egui::Rect>,
     /// The range bar section under the headline row.
     bars: Option<BarsLayout>,
-    /// The face impact panel right of the range bars, under the rightmost
-    /// headline column, CARD_GAP from the headline cards and from the
-    /// detail section's hairline.
-    face: Option<egui::Rect>,
+    /// The cards right of the range bars, left to right: under the
+    /// rightmost headline columns, CARD_GAP from the headline cards and
+    /// from the detail section's hairline.
+    cards: Vec<egui::Rect>,
     /// Per detail group: its label line, then its cards.
     groups: Vec<(egui::Rect, Vec<egui::Rect>)>,
     /// Bottom of the last card.
@@ -1083,65 +1116,82 @@ fn detail_columns(w: f32, counts: &[usize]) -> (Vec<DetailColumn>, f32) {
     (stacked, stacked_w)
 }
 
-/// Gap between the range bars and the face impact panel.
+/// Most cards in the row right of the range bars.
+pub(super) const MAX_CARDS: usize = 3;
+/// Gap between the range bars and the cards right of them.
 const FACE_GAP: f32 = 16.0;
 /// Least width of a range bar's plot (its track inside the gutters) beside
-/// the face impact panel; narrower than this, the panel is left out.
+/// the cards.
 const FACE_MIN_PLOT: f32 = 170.0;
 
-/// The Cards layout `width` wide with the range bars' legend placed where
-/// it fits the bars as laid out. `place(w)` is where the legend goes in a
-/// bar section `w` wide (monotone: a wider section never moves it below),
-/// and `at(legend, face)` lays the view out with it, with the face impact
-/// panel when `face`.
+/// The Cards layout with the range bars' legend placed where it fits the
+/// bars as laid out. `place(w)` is where the legend goes in a bar section
+/// `w` wide, and `at(legend)` lays the view out with it.
 ///
-/// Without the panel the bars take the full width and the legend is placed
-/// in it. Beside the panel the bars are narrower, so the legend may need
-/// its own row there; a legend on its own row always fits, so that layout
-/// is kept while the panel still fits beside it. When the extra row would
-/// leave the bars too narrow for the panel, the panel is left out and the
-/// legend goes where it fits the full width. At most three layouts are
-/// tried, and the result never shows a legend beside the title that does
-/// not fit there.
-fn settle_legend(
-    width: f32,
-    face: bool,
-    place: impl Fn(f32) -> Legend,
-    at: impl Fn(Legend, bool) -> CardsLayout,
-) -> CardsLayout {
-    let full = place(width);
-    let layout = at(full, face);
-    let Some(bars) = layout.bars.filter(|_| layout.face.is_some()) else {
-        return layout;
-    };
-    if place(bars.label.width()) == full {
-        return layout;
-    }
-    let below = at(Legend::Below, true);
-    if below.face.is_some() {
-        below
-    } else {
-        at(full, false)
+/// The cards beside the bars take their width whatever the legend does, so
+/// the legend goes beside the title when the bars' label line holds both,
+/// else on its own row. At most two layouts are tried, and the result never
+/// shows a legend beside the title that does not fit there.
+fn settle_legend(place: impl Fn(f32) -> Legend, at: impl Fn(Legend) -> CardsLayout) -> CardsLayout {
+    let beside = at(Legend::Beside);
+    match beside.bars {
+        Some(bars) if place(bars.label.width()) == Legend::Below => at(Legend::Below),
+        _ => beside,
     }
 }
 
 /// Width of a range bar's plot in a bar section `width` wide.
 fn bar_plot_width(width: f32) -> f32 {
-    width - BAR_LABEL_W - BAR_STATS_W - 2.0 * BAR_COL_GAP - 2.0 * GUTTER
+    width - BAR_LABEL_W - BAR_COL_GAP - 2.0 * GUTTER
+}
+
+/// The x ranges of up to `want` cards right of the range bars in a view `w`
+/// wide with headline columns `head_w` wide, left to right.
+///
+/// Each card is a headline column wide, flush right under the rightmost
+/// columns, as many as leave the bars the two leftmost columns and a plot
+/// of at least [`FACE_MIN_PLOT`]. When not even one does, one card is
+/// `square` wide; when that leaves the bars' plot under the least too, the
+/// bars keep the least and the card takes what is left (zero wide when that
+/// is under a point).
+fn card_columns(w: f32, head_w: f32, square: f32, want: usize) -> Vec<egui::Rangef> {
+    let reserved = 2.0 * (head_w + CARD_GAP);
+    for n in (1..=want.min(MAX_CARDS)).rev() {
+        let left = w - n as f32 * head_w - (n as f32 - 1.0) * CARD_GAP;
+        if left + 0.01 >= reserved && bar_plot_width(left - FACE_GAP) >= FACE_MIN_PLOT {
+            return (0..n)
+                .map(|i| {
+                    let l = left + i as f32 * (head_w + CARD_GAP);
+                    egui::Rangef::new(l, l + head_w)
+                })
+                .collect();
+        }
+    }
+    if want == 0 {
+        return Vec::new();
+    }
+    let side = if bar_plot_width(w - square - FACE_GAP) >= FACE_MIN_PLOT {
+        square
+    } else {
+        // The narrowest bar section with the least plot; under a point
+        // wide, no card at all.
+        let least = FACE_MIN_PLOT - bar_plot_width(0.0);
+        Some(w - FACE_GAP - least)
+            .filter(|&side| side >= 1.0)
+            .unwrap_or(0.0)
+    };
+    vec![egui::Rangef::new(w - side, w)]
 }
 
 /// Lay out the Cards view in `size`: the shot header, `headline` cards in
 /// balanced rows, the range bar section when `bars` (with its legend placed
-/// as given) and the face impact panel right of it when `face`, then detail
-/// groups of `groups[i]` cards arranged by `detail_columns`.
+/// as given) and up to `want` cards right of it, then detail groups of
+/// `groups[i]` cards arranged by `detail_columns`.
 ///
-/// The face panel sits flush right under the rightmost headline column and
-/// as wide as it, from [`CARD_GAP`] under the headline cards to
-/// [`CARD_GAP`] above the hairline of the first detail section's label.
-/// When the column would leave the bars' plot narrower than
-/// [`FACE_MIN_PLOT`], the panel narrows to a square of the bar section's
-/// label-to-last-bar height; when that is still too wide, it is left out.
-/// The bars narrow to make room, and no height changes.
+/// The cards sit flush right ([`card_columns`]), each from [`CARD_GAP`]
+/// under the headline cards to [`CARD_GAP`] above the hairline of the first
+/// detail section's label, [`CARD_GAP`] apart. The bars end [`FACE_GAP`]
+/// short of the leftmost card, and no height changes with the cards.
 ///
 /// Everything fits the height whenever it can. With room to spare, the
 /// sizes are [`ROOMY`], the cards grow with the height up to a limit, and
@@ -1154,7 +1204,7 @@ fn cards_layout(
     headline: usize,
     groups: &[usize],
     bars: Option<Legend>,
-    face: bool,
+    want: usize,
 ) -> CardsLayout {
     use egui::{Rect, pos2, vec2};
 
@@ -1266,22 +1316,24 @@ fn cards_layout(
         .collect();
     let head_bottom = y0 + span(head_rows, head_h, r.row_gap);
     let bars_top = head_bottom + r.controls_gap;
-    // The face panel sits under the rightmost headline column, as wide as
-    // it, and runs from CARD_GAP under the headline cards to CARD_GAP above
-    // the detail section's hairline. Where that column leaves the bars too
-    // narrow, it narrows to a square of the bar section's label-to-last-bar
-    // height.
-    let face = bars.filter(|_| face).and_then(|legend| {
+    // The cards run from CARD_GAP under the headline cards to CARD_GAP
+    // above the detail section's hairline; the fallback square is the bar
+    // section's label-to-last-bar height.
+    let cards: Vec<Rect> = bars.map_or_else(Vec::new, |legend| {
         let top = head_bottom + CARD_GAP;
         let bottom =
             head_bottom + r.controls_gap + r.bars(legend) + r.group_gap + GROUP_RULE_Y - CARD_GAP;
         let square = r.bars(legend) - r.controls;
-        [head_w, square]
+        card_columns(w, head_w, square, want)
             .into_iter()
-            .find(|&side| bar_plot_width(w - side - FACE_GAP) >= FACE_MIN_PLOT)
-            .map(|side| Rect::from_min_max(pos2(w - side, top), pos2(w, bottom)))
+            .map(|x| Rect::from_x_y_ranges(x, top..=bottom))
+            .collect()
     });
-    let bars_w = face.map_or(w, |panel| panel.left() - FACE_GAP);
+    // A zero-wide card takes no gap from the bars.
+    let bars_w = cards
+        .first()
+        .filter(|card| card.width() > 0.0)
+        .map_or(w, |card| card.left() - FACE_GAP);
     let bars = bars.map(|place| {
         let controls = Rect::from_min_size(pos2(0.0, bars_top), vec2(bars_w, r.controls));
         let label = Rect::from_min_size(pos2(0.0, controls.bottom()), vec2(bars_w, r.label));
@@ -1342,7 +1394,7 @@ fn cards_layout(
         header,
         headline,
         bars,
-        face,
+        cards,
         groups: out,
         height,
         scrolls,
@@ -1775,8 +1827,6 @@ fn group_label(painter: &egui::Painter, rect: egui::Rect, title: &str, color: eg
 // Range bars
 // ---------------------------------------------------------------------------
 
-/// Font size of the device filter.
-const CONTROL_FONT: f32 = 12.0;
 /// Gap between the range bars' title and a legend beside it.
 const LEGEND_GAP: f32 = 16.0;
 
@@ -1804,8 +1854,6 @@ fn legend_place(
 }
 /// Width of a bar row's label column.
 const BAR_LABEL_W: f32 = 92.0;
-/// Width of a bar row's stats column.
-const BAR_STATS_W: f32 = 150.0;
 /// Gap between a bar row's columns.
 const BAR_COL_GAP: f32 = 14.0;
 /// Height of a bar's track.
@@ -2156,7 +2204,7 @@ fn bars_title(
             let shots = if filtered {
                 u32::try_from(with_data.len()).unwrap_or(u32::MAX)
             } else {
-                chart::set_shot_count(g, shots)
+                chart::set_shot_count(g, shots, None)
             };
             let counted = ShotGroupInfo { shots, ..g.clone() };
             let title = set_title(&counted, next);
@@ -2182,40 +2230,46 @@ pub(super) fn device_options(
     })
 }
 
-/// Paint the control row in `ui` (right to left): the device filter over
-/// `devices` (`All`, then each device), with `device` picked. Returns the
-/// option picked this frame.
-pub(super) fn bar_controls(ui: &mut egui::Ui, devices: &[String], device: usize) -> Option<usize> {
-    let labels: Vec<&str> = devices.iter().map(String::as_str).collect();
-    let picked = theme::segmented_sized(ui, &labels, device, None, CONTROL_FONT).inner;
-    ui.label(theme::caps("Device", 11.0, theme::TEXT_MUTED))
-        .on_hover_text("Shots from one device, or every device coloured by device");
-    picked
+/// What the stats card shows for a value it has no number for.
+const NO_VALUE: &str = "\u{2014}";
+
+/// One row of the stats card: a bar's average and median as the bar prints
+/// them (lateral with its side), its sample standard deviation to one
+/// decimal, and how many shots have the value when some lack it. Without a
+/// value, a dash in each column (and with one value, in the SD column).
+#[derive(Debug, PartialEq, Eq)]
+struct StatsRow {
+    avg: String,
+    med: String,
+    sd: String,
+    /// `k/n`: only k of the n shots with data have the bar's value.
+    count: Option<String>,
 }
 
-/// The stats column's two lines for `bar`: averages, then spread and how
-/// many rows have the value.
-fn bar_stats_text(bar: &Bar) -> (String, String) {
-    let Some(s) = &bar.stats else {
-        return ("no data".to_owned(), String::new());
-    };
-    let k = bar.kind;
-    let first = format!(
-        "avg {} \u{b7} med {}",
-        k.format(s.mean, 0),
-        k.format(s.median, 0)
-    );
-    let mut second = s
-        .std_dev
-        .map(|sd| format!("sd {sd:.1}"))
-        .unwrap_or_default();
-    if s.count < bar.values.rows {
-        if !second.is_empty() {
-            second.push_str(" \u{b7} ");
+impl StatsRow {
+    fn of(bar: &Bar) -> Self {
+        let Some(s) = &bar.stats else {
+            return Self {
+                avg: NO_VALUE.to_owned(),
+                med: NO_VALUE.to_owned(),
+                sd: NO_VALUE.to_owned(),
+                count: None,
+            };
+        };
+        let k = bar.kind;
+        Self {
+            avg: k.format(s.mean, 0),
+            med: k.format(s.median, 0),
+            sd: s
+                .std_dev
+                .map_or_else(|| NO_VALUE.to_owned(), |sd| format!("{sd:.1}")),
+            count: (s.count < bar.values.rows).then(|| format!("{}/{}", s.count, bar.values.rows)),
         }
-        second.push_str(&format!("{}/{}", s.count, bar.values.rows));
     }
-    (first, second)
+
+    fn values(&self) -> [&str; 3] {
+        [&self.avg, &self.med, &self.sd]
+    }
 }
 
 /// Hover text on a bar's track.
@@ -2375,8 +2429,7 @@ fn range_bars(
     }
 }
 
-/// Paint one range bar row in `row`: label and unit, the track, then the
-/// stats column.
+/// Paint one range bar row in `row`: label and unit, then the track.
 fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
     use egui::text::{LayoutJob, TextFormat};
     use egui::{FontId, Stroke, StrokeKind, pos2};
@@ -2408,7 +2461,7 @@ fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
 
     // Track.
     let track = egui::Rect::from_x_y_ranges(
-        (row.left() + BAR_LABEL_W + BAR_COL_GAP)..=(row.right() - BAR_STATS_W - BAR_COL_GAP),
+        (row.left() + BAR_LABEL_W + BAR_COL_GAP)..=row.right(),
         (row.center().y - TRACK_H / 2.0)..=(row.center().y + TRACK_H / 2.0),
     );
     let radius = egui::CornerRadius::same((TRACK_H / 2.0) as u8);
@@ -2500,27 +2553,285 @@ fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
         egui::Sense::hover(),
     )
     .on_hover_text(bar_tooltip(bar));
+}
 
-    // Stats column.
-    let (first, second) = bar_stats_text(bar);
-    let left = row.right() - BAR_STATS_W;
-    let first_color = if bar.stats.is_some() {
-        theme::TEXT
-    } else {
-        theme::TEXT_DIM
+/// The stats card's column headers, over the [`StatsRow`] values.
+const STATS_COLUMNS: [&str; 3] = ["Avg", "Med", "SD"];
+/// The stats card's value size, the least it shrinks to with the row names
+/// beside the values, and the least in a narrow card.
+const STATS_VALUE: f32 = 13.0;
+const STATS_BESIDE_MIN: f32 = 11.0;
+const STATS_VALUE_MIN: f32 = 8.0;
+/// Sizes of the stats card's column headers, row names (as the bars'
+/// labels), units and `k/n`.
+const STATS_HEAD: f32 = 9.5;
+const STATS_NAME: f32 = 11.0;
+const STATS_UNIT: f32 = 10.0;
+const STATS_COUNT: f32 = 10.0;
+/// Gap before each of the stats card's value columns, and between a row
+/// name's parts on one line.
+const STATS_COL_GAP: f32 = 8.0;
+const STATS_NAME_GAP: f32 = 4.0;
+/// Where the stats card's title sits under the card's top.
+const STATS_TITLE_TOP: f32 = 8.0;
+
+/// Caps text in the label style of the Cards view.
+fn caps_galley(
+    painter: &egui::Painter,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    use egui::text::{LayoutJob, TextFormat};
+
+    painter.layout_job(LayoutJob::single_section(
+        text.to_uppercase(),
+        TextFormat {
+            font_id: egui::FontId::proportional(size),
+            color,
+            extra_letter_spacing: 0.6,
+            ..Default::default()
+        },
+    ))
+}
+
+/// The stats card's table across a width.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StatsTable {
+    /// The row names sit in a column of their own left of the values (the
+    /// unit and any `k/n` on a second line under the name and the values);
+    /// else each row's name, unit and `k/n` share a line over its values.
+    beside: bool,
+    /// Value size.
+    value: f32,
+    /// Right edge of each value column, from the table's left.
+    columns: [f32; 3],
+    /// Right edge of the widest line.
+    width: f32,
+}
+
+/// Lay the stats table of `bars`' `rows` out across `width`. The row names
+/// go beside the values while the values fit at [`STATS_BESIDE_MIN`] or
+/// more, else over them; either way the values start at [`STATS_VALUE`]
+/// and shrink in half-point steps (to [`STATS_VALUE_MIN`] with the names
+/// over them) until the widest line fits. Below that the gaps close up.
+fn stats_table(
+    painter: &egui::Painter,
+    bars: &[Bar; 3],
+    rows: &[StatsRow; 3],
+    width: f32,
+) -> StatsTable {
+    let text_w = |text: &str, size: f32| {
+        painter
+            .layout_no_wrap(
+                text.to_owned(),
+                egui::FontId::proportional(size),
+                theme::TEXT,
+            )
+            .size()
+            .x
     };
-    let first = painter.layout_no_wrap(first, FontId::proportional(13.0), first_color);
-    let first_h = first.size().y;
-    let top = if second.is_empty() {
-        row.center().y - first_h / 2.0
-    } else {
-        row.top()
+    let names = bars.each_ref().map(|bar| {
+        caps_galley(painter, bar.kind.label(), STATS_NAME, theme::TEXT_MUTED)
+            .size()
+            .x
+    });
+    let units = bars.each_ref().map(|bar| text_w(bar.unit, STATS_UNIT));
+    let counts = rows
+        .each_ref()
+        .map(|r| r.count.as_deref().map_or(0.0, |c| text_w(c, STATS_COUNT)));
+    let head_w = STATS_COLUMNS.map(|h| caps_galley(painter, h, STATS_HEAD, theme::TEXT).size().x);
+    let at = |beside: bool, value: f32, gap: f32| {
+        let mut x = if beside {
+            names.iter().chain(&units).copied().fold(0.0, f32::max)
+        } else {
+            -gap
+        };
+        let columns = std::array::from_fn(|j| {
+            let widest = rows
+                .iter()
+                .map(|r| text_w(r.values()[j], value))
+                .fold(head_w[j], f32::max);
+            x += gap + widest;
+            x
+        });
+        // The second line's unit, or the name line's parts, then the k/n.
+        let lines = (0..3)
+            .map(|k| {
+                let first = if beside {
+                    units[k]
+                } else {
+                    names[k] + STATS_NAME_GAP + units[k]
+                };
+                if counts[k] > 0.0 {
+                    first + gap + counts[k]
+                } else {
+                    first
+                }
+            })
+            .fold(0.0, f32::max);
+        StatsTable {
+            beside,
+            value,
+            columns,
+            width: x.max(lines),
+        }
     };
-    painter.galley(pos2(left, top), first, first_color);
-    if !second.is_empty() {
-        let second = painter.layout_no_wrap(second, FontId::proportional(11.0), theme::TEXT_MUTED);
-        painter.galley(pos2(left, top + first_h), second, theme::TEXT_MUTED);
+    for (beside, least) in [(true, STATS_BESIDE_MIN), (false, STATS_VALUE_MIN)] {
+        let mut value = STATS_VALUE;
+        loop {
+            let table = at(beside, value, STATS_COL_GAP);
+            if table.width <= width {
+                return table;
+            }
+            if value <= least {
+                break;
+            }
+            value = (value - 0.5).max(least);
+        }
     }
+    // Still too wide at the least size: close the gaps up.
+    let tight = at(false, STATS_VALUE_MIN, 0.0);
+    let gap = ((width - tight.width) / 2.0).clamp(2.0, STATS_COL_GAP);
+    at(false, STATS_VALUE_MIN, gap)
+}
+
+/// Paint the stats card at `rect`: the title `STATS` in its top-left in the
+/// headline cards' label style (`title` points), then a table of one row
+/// per bar, in bar order, named like the bars with the unit after the
+/// name: the average, median and standard deviation under `AVG`, `MED` and
+/// `SD` ([`StatsRow`]), and `k/n` at the row's end, under or beside the
+/// SD, when some shots lack the value ([`stats_table`] picks the
+/// arrangement). The rows sit on the bars' rows (`rows`) when the table
+/// fits there under the title, else they spread evenly down the card.
+fn stats_card(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    bars: &[Bar; 3],
+    rows: &[egui::Rect; 3],
+    title: f32,
+) {
+    use egui::{Align2, pos2};
+
+    impact::paint_card(painter, rect);
+    if rect.width() < 1.0 {
+        return;
+    }
+    let painter = painter.with_clip_rect(painter.clip_rect().intersect(rect));
+    let left = rect.left() + impact::PAD;
+    let width = (rect.width() - 2.0 * impact::PAD).max(0.0);
+    let title = caps_galley(&painter, "Stats", title, theme::TEXT_MUTED);
+    let title_bottom = rect.top() + STATS_TITLE_TOP + title.size().y;
+    painter.galley(
+        pos2(left, rect.top() + STATS_TITLE_TOP),
+        title,
+        theme::TEXT_MUTED,
+    );
+
+    let texts = bars.each_ref().map(StatsRow::of);
+    let table = stats_table(&painter, bars, &texts, width);
+    let heads = STATS_COLUMNS.map(|h| caps_galley(&painter, h, STATS_HEAD, theme::TEXT_MUTED));
+    let head_h = heads[0].size().y;
+    let line_h = |size: f32| {
+        painter
+            .layout_no_wrap(
+                "8".to_owned(),
+                egui::FontId::proportional(size),
+                theme::TEXT,
+            )
+            .size()
+            .y
+    };
+    let name_h = caps_galley(&painter, "Total", STATS_NAME, theme::TEXT_MUTED)
+        .size()
+        .y;
+    let value_h = line_h(table.value);
+    // Beside: the name line (as tall as a value) over the unit line; else
+    // the name line over the value line.
+    let (first_h, row_h) = if table.beside {
+        let first = name_h.max(value_h);
+        (first, first + line_h(STATS_UNIT))
+    } else {
+        (name_h, name_h + value_h)
+    };
+    // On the bars' rows when the headers still clear the title and the
+    // last row the card's foot; else spread down the card under the title.
+    let aligned = rows.map(|r| r.center().y);
+    let foot = rect.bottom() - impact::PAD / 2.0;
+    let centres = if aligned[0] - row_h / 2.0 - head_h - 2.0 >= title_bottom + 2.0
+        && aligned[2] + row_h / 2.0 <= foot
+    {
+        aligned
+    } else {
+        let top = title_bottom + 4.0 + head_h + 2.0;
+        let slot = ((foot - top) / 3.0).max(row_h);
+        std::array::from_fn(|k| top + slot * (k as f32 + 0.5))
+    };
+
+    let head_bottom = centres[0] - row_h / 2.0 - 2.0;
+    for (head, right) in heads.into_iter().zip(table.columns) {
+        let pos = pos2(left + right - head.size().x, head_bottom - head_h);
+        painter.galley(pos, head, theme::TEXT_MUTED);
+    }
+    let right = left + table.columns[2];
+    for ((bar, text), c) in bars.iter().zip(&texts).zip(centres) {
+        let top = c - row_h / 2.0;
+        let first_mid = top + first_h / 2.0;
+        let second_mid = top + first_h + (row_h - first_h) / 2.0;
+        let name = caps_galley(&painter, bar.kind.label(), STATS_NAME, theme::TEXT_MUTED);
+        let name_w = name.size().x;
+        painter.galley(
+            pos2(left, first_mid - name_h / 2.0),
+            name,
+            theme::TEXT_MUTED,
+        );
+        let (unit_at, values_mid, count_mid) = if table.beside {
+            (pos2(left, second_mid), first_mid, second_mid)
+        } else {
+            let unit = pos2(left + name_w + STATS_NAME_GAP, first_mid);
+            (unit, second_mid, first_mid)
+        };
+        painter.text(
+            unit_at,
+            Align2::LEFT_CENTER,
+            bar.unit,
+            egui::FontId::proportional(STATS_UNIT),
+            theme::TEXT_DIM,
+        );
+        let colour = if bar.stats.is_some() {
+            theme::TEXT
+        } else {
+            theme::TEXT_DIM
+        };
+        for (value, x) in text.values().into_iter().zip(table.columns) {
+            painter.text(
+                pos2(left + x, values_mid),
+                Align2::RIGHT_CENTER,
+                value,
+                egui::FontId::proportional(table.value),
+                colour,
+            );
+        }
+        if let Some(count) = &text.count {
+            painter.text(
+                pos2(right, count_mid),
+                Align2::RIGHT_CENTER,
+                count,
+                egui::FontId::proportional(STATS_COUNT),
+                theme::TEXT_MUTED,
+            );
+        }
+    }
+}
+
+/// Whether the card in the row beside the range bars at `rect` (slot
+/// `slot`) was clicked, with the pointer cursor over it.
+fn row_card_clicked(ui: &egui::Ui, rect: egui::Rect, slot: usize) -> bool {
+    rect.width() >= 1.0
+        && ui
+            .interact(rect, ui.id().with(("row_card", slot)), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
 }
 
 // ---------------------------------------------------------------------------
@@ -2598,13 +2909,16 @@ struct Run<'a> {
     rows: Vec<usize>,
 }
 
-/// `shots` split into runs, newest first. A run starts at each row with
-/// data whose set differs from the run before; rows without data never
-/// start one.
-fn runs<'a>(shots: &'a [ShotRow], groups: &ShotGroups) -> Vec<Run<'a>> {
+/// The rows of `shots` the device filter `filter` passes, split into runs,
+/// newest first. A run starts at each row with data whose set differs from
+/// the run before; rows without data never start one.
+fn runs<'a>(shots: &'a [ShotRow], groups: &ShotGroups, filter: Option<&str>) -> Vec<Run<'a>> {
     let mut runs: Vec<Run<'a>> = Vec::new();
     for i in (0..shots.len()).rev() {
         let row = &shots[i];
+        if !chart::in_filter(&row.actor, filter) {
+            continue;
+        }
         if row.ball.is_some() || row.club.is_some() {
             let group = row.group.as_deref().filter(|id| groups.get(id).is_some());
             if runs.last().is_none_or(|r| r.group != Some(group)) {
@@ -2630,7 +2944,8 @@ fn runs<'a>(shots: &'a [ShotRow], groups: &ShotGroups) -> Vec<Run<'a>> {
 type SectionKey = (u32, Option<Club>);
 
 /// The shot list's lines, newest shot first, under the headers of the view
-/// `groups.mode` with `club` in play.
+/// `groups.mode` with `club` in play, over the shots the device filter
+/// `filter` passes: a set or club with none of them has no header.
 ///
 /// - `none`: the last shot only, so no headers.
 /// - By set: a header goes before each run of one set, and the empty set
@@ -2647,12 +2962,21 @@ type SectionKey = (u32, Option<Club>);
 /// Rows without data never break a run, and the rows before the first row
 /// of a known set (a shot in flight, rows whose set is not known yet) come
 /// first.
-fn list_items(shots: &[ShotRow], groups: &ShotGroups, club: Option<Club>) -> Vec<ListItem> {
+fn list_items(
+    shots: &[ShotRow],
+    groups: &ShotGroups,
+    club: Option<Club>,
+    filter: Option<&str>,
+) -> Vec<ListItem> {
     let view = groups.mode;
     if view == ShotGrouping::None {
-        return (0..shots.len()).rev().map(ListItem::Shot).collect();
+        return (0..shots.len())
+            .rev()
+            .filter(|&i| chart::in_filter(&shots[i].actor, filter))
+            .map(ListItem::Shot)
+            .collect();
     }
-    let runs = runs(shots, groups);
+    let runs = runs(shots, groups, filter);
     let mut items = Vec::with_capacity(shots.len() + 4);
     let mut headed = false;
     let mut push_run = |items: &mut Vec<ListItem>, header: Option<ListItem>, rows: &[usize]| {
@@ -3146,6 +3470,60 @@ impl FlighthookApp {
         }
     }
 
+    /// Bring the cached view's members around the shown shot `shown` up to
+    /// date ([`chart::members_for`], after the device filter) and return
+    /// their key. The range bars, the stats and face impact cards, Flight
+    /// and Dispersion all take their members from here.
+    pub(super) fn refresh_members(&mut self, shown: usize) -> MembersKey {
+        let key = self.members_key(shown);
+        let set = bar_group(&self.groups, self.shots.get(shown), self.selected_club);
+        let (shots, groups, view) = (&self.shots, &self.groups, self.groups.mode);
+        let filter = self.device_filter.as_deref();
+        self.view_members.get(key.clone(), || {
+            chart::members_for(shots, groups, view, set, Some(shown), filter)
+        });
+        key
+    }
+
+    /// The device filter: an exact actor id, or every device.
+    pub(crate) fn filter(&self) -> Option<&str> {
+        self.device_filter.as_deref()
+    }
+
+    /// Index of the shot on show, from the filtered device.
+    pub(crate) fn shown_index(&self) -> Option<usize> {
+        self.shot_focus.index(&self.shots, self.filter())
+    }
+
+    /// Whether the shot on show is the filtered device's latest.
+    pub(crate) fn following(&self) -> bool {
+        self.shot_focus.following(&self.shots, self.filter())
+    }
+
+    /// Note the filtered device's latest shot ([`ShotFocus::observe`]).
+    pub(crate) fn observe_shots(&mut self, now: f64) {
+        let filter = self.device_filter.as_deref();
+        self.shot_focus.observe(&self.shots, filter, now);
+    }
+
+    /// Show `shots[i]`.
+    pub(crate) fn select_shot(&mut self, i: usize) {
+        let filter = self.device_filter.as_deref();
+        self.shot_focus.select(&self.shots, filter, i);
+    }
+
+    /// Indices into `shots`, ascending, of the rows the device filter
+    /// passes: the Table view's rows.
+    fn filtered_rows(&mut self) -> &[usize] {
+        let key = (self.shots_rev, self.device_filter.clone());
+        let (shots, filter) = (&self.shots, self.device_filter.as_deref());
+        self.filtered_rows.get(key, || {
+            (0..shots.len())
+                .filter(|&i| chart::in_filter(&shots[i].actor, filter))
+                .collect()
+        })
+    }
+
     pub(crate) fn render_shots_panel(&mut self, ui: &mut egui::Ui) {
         self.refresh_shot_caches();
         self.render_shots_toolbar(ui);
@@ -3182,9 +3560,7 @@ impl FlighthookApp {
                 .show_inside(ui, |ui| self.render_shot_list(ui));
         }
         if let Some((height, row)) = slots.bottom {
-            let filter = row == BottomRow::Dispersion
-                && self.dispersion_filter(view == ShotsView::Table).is_some();
-            let height = bottom_height(height, row, ui.available_width(), filter);
+            let height = bottom_height(height, row, ui.available_width());
             egui::TopBottomPanel::bottom(egui::Id::new(("shots_bottom", view)))
                 .resizable(false)
                 .exact_height(height)
@@ -3214,6 +3590,7 @@ impl FlighthookApp {
                 ShotsView::Table => self.render_shots_table(ui),
                 ShotsView::Cards => self.render_shot_cards(ui),
             });
+        self.render_replay(ui.ctx());
     }
 
     /// Draw `chart` in its panel `ui`.
@@ -3252,6 +3629,10 @@ impl FlighthookApp {
                 None => {}
             }
             ui.add_space(12.0);
+            if let Some(device) = self.render_device_filter(ui) {
+                self.device_filter = device;
+                ui.add_space(12.0);
+            }
             if let Some(yards) = self.render_auto_chip(ui) {
                 self.send_auto_chip(ui.ctx(), yards);
             }
@@ -3289,6 +3670,26 @@ impl FlighthookApp {
         if self.confirm_clear {
             self.render_clear_confirm(ui.ctx());
         }
+    }
+
+    /// The toolbar's device filter, `DEVICE [All | <device>…]`, while the
+    /// shots come from two or more devices ([`device_options`]). Returns
+    /// `None` when it is not shown, else `Some` of the filter after this
+    /// frame's pick.
+    fn render_device_filter(&self, ui: &mut egui::Ui) -> Option<Option<String>> {
+        let ids = self.devices();
+        let labels = device_options(&ids, &self.actors)?;
+        let at = self
+            .device_filter
+            .as_ref()
+            .and_then(|d| ids.iter().position(|id| id == d))
+            .map_or(0, |p| p + 1);
+        ui.label(theme::caps("Device", 11.0, theme::TEXT_MUTED));
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let picked = theme::segmented(ui, &labels, at, None);
+        devices::mark(ui, || "device-filter".to_owned(), &picked.response);
+        let at = picked.inner.unwrap_or(at);
+        Some(at.checked_sub(1).and_then(|p| ids.get(p).cloned()))
     }
 
     /// The Auto-chip button and its menu ([`auto_chip_items`]). Returns the
@@ -3369,13 +3770,14 @@ impl FlighthookApp {
         })
     }
 
-    /// The shot header line: number, device name, and either the LATEST
-    /// chip or, on an older shot, a Back to latest chip. Returns whether
-    /// Back to latest was clicked.
-    fn render_shot_header(&self, ui: &mut egui::Ui, i: usize, following: bool) -> bool {
+    /// The shot header line: number, device name, either the LATEST chip
+    /// or, on an older shot, a Back to latest chip, and a Replay chip when
+    /// the shot has clips. Returns what was clicked.
+    fn render_shot_header(&self, ui: &mut egui::Ui, i: usize, following: bool) -> HeaderClick {
         let shot = &self.shots[i];
         let show_device = multiple_devices(&self.shots);
         let mut back = false;
+        let mut replay = false;
         ui.horizontal_centered(|ui| {
             ui.label(
                 egui::RichText::new(format!("Shot #{}", shot.shot_number))
@@ -3391,7 +3793,7 @@ impl FlighthookApp {
                 );
             }
             ui.add_space(4.0);
-            match header_chip(&self.shots, i, following) {
+            match header_chip(&self.shots, i, following, self.filter()) {
                 HeaderChip::BackToLatest => {
                     back = theme::jump_chip(ui, "Back to latest").clicked();
                 }
@@ -3400,8 +3802,14 @@ impl FlighthookApp {
                 }
                 HeaderChip::None => {}
             }
+            if !shot.video.is_empty() {
+                ui.add_space(4.0);
+                let chip = theme::icon_chip(ui, theme::Icon::Video, "Replay");
+                devices::mark(ui, || "replay".to_owned(), &chip);
+                replay = chip.clicked();
+            }
         });
-        back
+        HeaderClick { back, replay }
     }
 
     /// The Cards view's shot list: the count line and the view selector on
@@ -3418,9 +3826,11 @@ impl FlighthookApp {
                 ui.add_space(inset);
                 ui.label(theme::caps("Shots", 11.0, theme::TEXT_MUTED));
                 ui.label(
-                    egui::RichText::new(self.shots.len().to_string())
-                        .size(13.0)
-                        .color(theme::TEXT),
+                    egui::RichText::new(
+                        shot_total(&self.shots, self.device_filter.as_deref()).to_string(),
+                    )
+                    .size(13.0)
+                    .color(theme::TEXT),
                 );
             },
         );
@@ -3435,8 +3845,9 @@ impl FlighthookApp {
         };
         let imperial = self.units_toggle == UnitSystem::Imperial;
         let show_device = multiple_devices(&self.shots);
-        let focus = self.shot_focus.index(&self.shots);
-        let latest = latest_index(&self.shots);
+        let filter = self.device_filter.as_deref();
+        let focus = self.shown_index();
+        let latest = latest_index(&self.shots, filter);
         let reveal = self.shot_focus.take_reveal();
         let pulse = self.shot_focus.strength(ui.ctx().input(|i| i.time));
         let mut clicked = None;
@@ -3458,7 +3869,9 @@ impl FlighthookApp {
                             );
                         }
                         let mut first = true;
-                        for item in list_items(&self.shots, &self.groups, self.selected_club) {
+                        let items =
+                            list_items(&self.shots, &self.groups, self.selected_club, filter);
+                        for item in items {
                             if !matches!(item, ListItem::Shot(_)) && !first {
                                 ui.add_space(HEADER_LEAD);
                             }
@@ -3527,7 +3940,7 @@ impl FlighthookApp {
                     });
             });
         if let Some(i) = clicked {
-            self.shot_focus.select(&self.shots, i);
+            self.select_shot(i);
         }
         if strip.actions {
             self.render_list_foot(ui, inset, &strip);
@@ -3677,9 +4090,10 @@ impl FlighthookApp {
         let Some(group) = self.groups.get(id) else {
             return;
         };
-        // Counted without its Auto-chip shots, which still list under it.
+        // Counted without its Auto-chip shots, which still list under it,
+        // and under a device filter, that device's shots alone.
         let counted = ShotGroupInfo {
-            shots: chart::set_shot_count(group, &self.shots),
+            shots: chart::set_shot_count(group, &self.shots, self.filter()),
             ..group.clone()
         };
         let color = match (next, group.open) {
@@ -3721,10 +4135,11 @@ impl FlighthookApp {
             .iter_sets()
             .filter(|g| g.session == session && g.club == club)
             .collect();
-        // Counted without Auto-chip shots, which still list in the section.
+        // Counted without Auto-chip shots, which still list in the section,
+        // and under a device filter, that device's shots alone.
         let per_set: Vec<u32> = sets
             .iter()
-            .map(|g| chart::set_shot_count(g, &self.shots))
+            .map(|g| chart::set_shot_count(g, &self.shots, self.filter()))
             .collect();
         let counted = per_set.iter().filter(|&&n| n > 0).count();
         let shots: u32 = per_set.iter().sum();
@@ -3759,7 +4174,8 @@ impl FlighthookApp {
     }
 
     fn render_shot_cards(&mut self, ui: &mut egui::Ui) {
-        let Some(i) = self.shot_focus.index(&self.shots) else {
+        let Some(i) = self.shown_index() else {
+            self.card_clips.clear();
             empty_state(
                 ui,
                 "The latest shot's numbers appear here as soon as it lands.",
@@ -3768,7 +4184,7 @@ impl FlighthookApp {
         };
 
         let imperial = self.units_toggle == UnitSystem::Imperial;
-        let following = self.shot_focus.following(&self.shots);
+        let following = self.following();
         let Some(shot) = self.display_row(i) else {
             return;
         };
@@ -3792,30 +4208,24 @@ impl FlighthookApp {
         // no bars and no device filter.
         let view = self.groups.mode;
         let show_bars = shows_bars(view);
+        let key = self.refresh_members(i);
         let set = bar_group(&self.groups, Some(&self.shots[i]), self.selected_club);
-        let key = self.members_key(i);
         // A handful of ids, copied so the borrow of `self` ends here.
         let devices = self.devices().into_owned();
+        // The sources of the cards beside the bars, in cycle order.
+        let face = show_bars && self.shots.iter().any(impact::has_impact);
+        let sources = card_row::sources(self.connected_cameras(), face);
         let (face_panel, bars, title) = {
-            let members = self.view_members.get(key, || {
-                chart::members_for(
-                    &self.shots,
-                    &self.groups,
-                    view,
-                    set,
-                    Some(i),
-                    self.device_filter.as_deref(),
-                )
-            });
+            let members = self.view_members.peek(&key).map_or(&[][..], Vec::as_slice);
             // With every device shown, two or more split the bands by device.
             let split: &[String] = if self.device_filter.is_none() {
                 &devices
             } else {
                 &[]
             };
-            // The face panel shows while any shot in the history has face
-            // impact, over the bars' members.
-            let face_panel = (show_bars && self.shots.iter().any(impact::has_impact)).then(|| {
+            // Face impact is a source while any shot in the history has it,
+            // over the bars' members.
+            let face_panel = face.then(|| {
                 let several = devices.len() >= 2;
                 let filter = self.device_filter.as_deref();
                 impact::FacePanel::new(
@@ -3846,22 +4256,17 @@ impl FlighthookApp {
                 ),
             )
         };
-        let device_labels = device_options(&devices, &self.actors);
         // Legend chips for the per-device sub-bands.
-        let chips: Vec<(String, egui::Color32)> = match (&device_labels, &self.device_filter) {
-            (Some(labels), None) => labels
-                .iter()
-                .skip(1)
-                .zip(&devices)
-                .map(|(label, id)| (label.clone(), chart::device_colour(&devices, id)))
-                .collect(),
-            _ => Vec::new(),
-        };
-        let device_index = self
-            .device_filter
-            .as_ref()
-            .and_then(|d| devices.iter().position(|id| id == d))
-            .map_or(0, |p| p + 1);
+        let chips: Vec<(String, egui::Color32)> =
+            match (device_options(&devices, &self.actors), &self.device_filter) {
+                (Some(labels), None) => labels
+                    .into_iter()
+                    .skip(1)
+                    .zip(&devices)
+                    .map(|(label, id)| (label, chart::device_colour(&devices, id)))
+                    .collect(),
+                _ => Vec::new(),
+            };
         let bars_note = if self.groups.is_empty() {
             "Sets start with your first shot"
         } else {
@@ -3880,16 +4285,16 @@ impl FlighthookApp {
                 )
             };
             let size = egui::vec2(width, height - 2.0 * inset - CARDS_FOOT);
-            let at = |legend: Legend, face: bool| {
+            let at = |legend: Legend| {
                 cards_layout(
                     size,
                     headline.len(),
                     &counts,
                     show_bars.then_some(legend),
-                    face,
+                    sources.len(),
                 )
             };
-            settle_legend(width, face_panel.is_some(), place, at)
+            settle_legend(place, at)
         };
         let mut layout = lay_out(ui.available_width() - 2.0 * inset);
         // Too short for everything: a solid scroll bar, always shown, with
@@ -3904,10 +4309,35 @@ impl FlighthookApp {
         } else {
             egui::scroll_area::ScrollBarVisibility::AlwaysHidden
         };
+        // What the cards show; the row exists only with the bars.
+        let shown = if show_bars {
+            self.card_row.update(&sources, layout.cards.len());
+            self.card_row.shown.clone()
+        } else {
+            Vec::new()
+        };
+        // Under a replay of this shot the row is hidden: no clips.
+        let replaying = self
+            .replay
+            .as_ref()
+            .is_some_and(|r| r.shot_id() == self.shots[i].shot_id);
+        let card_cameras: Vec<&str> = shown
+            .iter()
+            .filter(|_| !replaying)
+            .filter_map(|s| match s {
+                CardSource::Camera(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.sync_card_clips(i, &card_cameras);
+        let title_size = layout
+            .headline
+            .first()
+            .map_or(12.0, |r| CardLook::headline(r.size()).label);
 
-        let mut back = false;
-        let mut picked_device = None;
+        let mut header = HeaderClick::default();
         let mut picked_shot = None;
+        let mut cycled = None;
         ui.scope(|ui| {
             ui.spacing_mut().scroll = scroll;
             egui::ScrollArea::vertical()
@@ -3924,7 +4354,7 @@ impl FlighthookApp {
                     );
                     let origin = (rect.min + egui::vec2(inset, inset)).to_vec2();
 
-                    back = ui
+                    header = ui
                         .scope_builder(
                             egui::UiBuilder::new().max_rect(layout.header.translate(origin)),
                             |ui| self.render_shot_header(ui, i, following),
@@ -3942,20 +4372,43 @@ impl FlighthookApp {
                         }
                     }
                     if let Some(at) = layout.bars.map(|b| b.translate(origin)) {
-                        if let Some(labels) = &device_labels {
-                            picked_device = ui
-                                .scope_builder(
-                                    egui::UiBuilder::new()
-                                        .max_rect(at.controls)
-                                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                                    |ui| bar_controls(ui, labels, device_index),
-                                )
-                                .inner;
-                        }
                         range_bars(ui, &at, title.as_ref(), &bars, &chips, bars_note);
-                    }
-                    if let (Some(rect), Some(panel)) = (layout.face, &face_panel) {
-                        picked_shot = impact::paint_face_panel(ui, rect.translate(origin), panel);
+                        for (slot, (rect, source)) in layout.cards.iter().zip(&shown).enumerate() {
+                            let rect = rect.translate(origin);
+                            if rect.width() <= 0.0 {
+                                continue;
+                            }
+                            let clicked = match source {
+                                CardSource::Stats => {
+                                    stats_card(ui.painter(), rect, &bars, &at.rows, title_size);
+                                    row_card_clicked(ui, rect, slot)
+                                }
+                                CardSource::Camera(id) => {
+                                    self.camera_card(ui, rect, id);
+                                    row_card_clicked(ui, rect, slot)
+                                }
+                                CardSource::Face => match face_panel
+                                    .as_ref()
+                                    .and_then(|panel| impact::paint_face_panel(ui, rect, panel))
+                                {
+                                    Some(impact::FaceClick::Shot(shot)) => {
+                                        picked_shot = Some(shot);
+                                        false
+                                    }
+                                    Some(impact::FaceClick::Panel) => true,
+                                    None => false,
+                                },
+                            };
+                            if clicked {
+                                cycled = Some(slot);
+                            }
+                        }
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|d| {
+                            let rects: Vec<egui::Rect> =
+                                layout.cards.iter().map(|r| r.translate(origin)).collect();
+                            d.insert_temp(egui::Id::new("row_cards"), rects);
+                        });
                     }
                     let detail_cards = layout.groups.iter().flat_map(|(_, cards)| cards);
                     if let Some(first) = detail_cards.clone().next() {
@@ -3977,16 +4430,35 @@ impl FlighthookApp {
                     }
                 });
         });
-        if back {
+        self.decode_card_frame(ui.ctx());
+        if header.back {
             self.shot_focus.follow();
         }
-        if let Some(d) = picked_device {
-            self.device_filter = d.checked_sub(1).and_then(|p| devices.get(p).cloned());
+        if header.replay {
+            self.open_replay(ui.ctx(), i);
         }
         if let Some(shot) = picked_shot {
-            self.shot_focus.select(&self.shots, shot);
+            self.select_shot(shot);
             self.shot_focus.reveal();
         }
+        if let Some(slot) = cycled {
+            self.card_row.click(&sources, slot);
+        }
+    }
+
+    /// The camera actors that are connected, in Devices card order.
+    fn connected_cameras(&self) -> Vec<String> {
+        devices::device_card_order(&self.actors, &self.settings.actors)
+            .into_iter()
+            .filter(|(group, _)| *group == cards::CardGroup::Cameras)
+            .flat_map(|(_, cards)| cards)
+            .map(|card| card.id)
+            .filter(|id| {
+                self.actors
+                    .get(id)
+                    .is_some_and(|a| a.status == ActorStatus::Connected)
+            })
+            .collect()
     }
 
     fn render_shots_table(&mut self, ui: &mut egui::Ui) {
@@ -3994,13 +4466,15 @@ impl FlighthookApp {
 
         let imperial = self.units_toggle == UnitSystem::Imperial;
         let show_device = multiple_devices(&self.shots);
+        // The rows the device filter passes, copied so the borrow of `self`
+        // ends here.
+        let rows = self.filtered_rows().to_vec();
 
-        if self.shots.is_empty() {
+        let Some(&last) = rows.last() else {
             empty_state(ui, "Each shot appears here as a row as soon as it lands.");
             return;
-        }
+        };
 
-        let last = self.shots.len() - 1;
         let pulse = self.shot_focus.strength(ui.ctx().input(|i| i.time));
         if pulse > 0.0 {
             ui.ctx().request_repaint();
@@ -4010,8 +4484,17 @@ impl FlighthookApp {
             stripe: ui.visuals().faint_bg_color,
             pulse,
         };
-        let columns = table_columns(show_device, imperial);
+        // The Replay column shows while any row has clips.
+        let replay_at = rows
+            .iter()
+            .any(|&i| !self.shots[i].video.is_empty())
+            .then_some(REPLAY_AFTER + usize::from(show_device));
+        let mut columns = table_columns(show_device, imperial);
+        if let Some(at) = replay_at {
+            columns.insert(at, replay_column());
+        }
         let header = TableHeader::layout(ui.painter(), &columns);
+        let mut replay = None;
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + TABLE_ROW_PAD;
 
         // One scroll area for both directions, so both scroll bars sit on
@@ -4039,8 +4522,9 @@ impl FlighthookApp {
                 }
                 table.body(|body| {
                     widths = body.widths().to_vec();
-                    body.rows(row_height, self.shots.len(), |mut row| {
-                        let idx = row.index();
+                    body.rows(row_height, rows.len(), |mut row| {
+                        let at = row.index();
+                        let idx = rows[at];
                         let Some(converted) = self.display_row(idx) else {
                             return;
                         };
@@ -4051,12 +4535,32 @@ impl FlighthookApp {
                             .as_deref()
                             .and_then(|g| self.groups.get(g))
                             .map(|g| g.number);
-                        let cells = table_cells(&converted, device, set, idx == last);
-                        table_row(&mut row, &columns, cells, look.for_row(idx, last));
+                        let mut cells = table_cells(&converted, device, set, idx == last);
+                        if let Some(at) = replay_at {
+                            cells.insert(at, TableCell::Replay(!shot.video.is_empty()));
+                        }
+                        if table_row(&mut row, &columns, cells, look.for_row(at, rows.len() - 1)) {
+                            replay = Some(idx);
+                        }
                     });
                 });
                 header.paint(ui, origin, &columns, &widths);
             });
+        if let Some(idx) = replay {
+            self.open_replay(ui.ctx(), idx);
+        }
+    }
+}
+
+/// Columns before the Replay column (`#` and Club), not counting Device.
+const REPLAY_AFTER: usize = 2;
+
+/// The Table view's Replay column: a button on each shot with clips.
+fn replay_column() -> TableColumn {
+    TableColumn {
+        name: "Replay",
+        unit: "",
+        inset: 0.0,
     }
 }
 
@@ -4199,10 +4703,13 @@ enum TableCell {
     Picked(Option<(f64, bool)>, bool),
     /// A spin in rpm from [`spin`] (italics when estimated).
     Spin(Option<(f64, bool)>),
+    /// The replay button, on a shot with clips.
+    Replay(bool),
 }
 
 impl TableCell {
-    fn show(&self, ui: &mut egui::Ui) {
+    /// Draw the cell. Returns whether its button was clicked.
+    fn show(&self, ui: &mut egui::Ui) -> bool {
         match self {
             Self::Text(text) => {
                 ui.label(text.as_str());
@@ -4223,7 +4730,13 @@ impl TableCell {
             }
             Self::Picked(value, signed) => cell(ui, *value, 1, *signed),
             Self::Spin(value) => cell(ui, *value, 0, false),
+            Self::Replay(true) => {
+                let height = ui.text_style_height(&egui::TextStyle::Body);
+                return theme::icon(ui, theme::Icon::Video, height, theme::ACCENT, true).clicked();
+            }
+            Self::Replay(false) => {}
         }
+        false
     }
 }
 
@@ -4325,15 +4838,16 @@ impl RowLook {
 
 /// Add one Table view row of `cells` to `row`. The latest row gets a gold
 /// stripe on its left edge and an outline that fades with the new-shot
-/// glow.
+/// glow. Returns whether its replay button was clicked.
 fn table_row(
     row: &mut egui_extras::TableRow<'_, '_>,
     columns: &[TableColumn],
     cells: Vec<TableCell>,
     paint: RowPaint,
-) {
+) -> bool {
     let count = cells.len();
     let mut left = None;
+    let mut clicked = false;
     for (i, (cell, column)) in cells.into_iter().zip(columns).enumerate() {
         row.col(|ui| {
             if let Some(fill) = paint.fill {
@@ -4355,9 +4869,10 @@ fn table_row(
                     egui::StrokeKind::Inside,
                 );
             }
-            inset_cell(ui, column.inset, |ui| cell.show(ui));
+            inset_cell(ui, column.inset, |ui| clicked |= cell.show(ui));
         });
     }
+    clicked
 }
 
 /// Background of table row `idx` (of `0..=last`): `latest` for the latest
@@ -4407,6 +4922,7 @@ mod tests {
             handed: None,
             group: None,
             finished: true,
+            video: Vec::new(),
         }
     }
 
@@ -4432,9 +4948,9 @@ mod tests {
     #[test]
     fn cards_show_newest_shot_with_data() {
         let shots = vec![row(1, true), row(2, true), row(3, false)];
-        assert_eq!(latest_index(&shots), Some(1));
-        assert_eq!(latest_index(&[row(1, false)]), None);
-        assert_eq!(latest_index(&[]), None);
+        assert_eq!(latest_index(&shots, None), Some(1));
+        assert_eq!(latest_index(&[row(1, false)], None), None);
+        assert_eq!(latest_index(&[], None), None);
     }
 
     #[test]
@@ -4463,40 +4979,43 @@ mod tests {
     #[test]
     fn latest_chip_stays_while_a_trigger_has_no_data() {
         let mut shots = vec![row(1, true), row(2, true)];
-        assert_eq!(header_chip(&shots, 1, true), HeaderChip::Latest);
+        assert_eq!(header_chip(&shots, 1, true, None), HeaderChip::Latest);
         // A trigger lands; its data has not.
         shots.push(row(3, false));
-        assert_eq!(header_chip(&shots, 1, true), HeaderChip::Latest);
+        assert_eq!(header_chip(&shots, 1, true, None), HeaderChip::Latest);
         // An older shot pinned.
-        assert_eq!(header_chip(&shots, 0, false), HeaderChip::BackToLatest);
-        assert_eq!(header_chip(&shots, 0, true), HeaderChip::None);
+        assert_eq!(
+            header_chip(&shots, 0, false, None),
+            HeaderChip::BackToLatest
+        );
+        assert_eq!(header_chip(&shots, 0, true, None), HeaderChip::None);
         // The data lands: the new shot takes the chip.
         shots[2] = row(3, true);
-        assert_eq!(header_chip(&shots, 2, true), HeaderChip::Latest);
-        assert_eq!(header_chip(&shots, 1, true), HeaderChip::None);
+        assert_eq!(header_chip(&shots, 2, true, None), HeaderChip::Latest);
+        assert_eq!(header_chip(&shots, 1, true, None), HeaderChip::None);
     }
 
     #[test]
     fn pulse_starts_on_new_shot_and_fades() {
         let mut focus = ShotFocus::default();
         let mut shots = vec![row(1, true)];
-        focus.sync(&shots);
+        focus.sync(&shots, None);
         assert_eq!(focus.strength(0.0), 0.0);
 
         // A trigger without data yet does not change the latest shot.
         shots.push(row(2, false));
-        focus.observe(&shots, 10.0);
+        focus.observe(&shots, None, 10.0);
         assert_eq!(focus.strength(10.0), 0.0);
 
         shots[1].ball = Some(BallFlight::default());
-        focus.observe(&shots, 11.0);
+        focus.observe(&shots, None, 11.0);
         assert_eq!(focus.strength(11.0), 1.0);
         let mid = focus.strength(11.0 + PULSE_SECS / 2.0);
         assert!(mid > 0.0 && mid < 1.0);
         assert_eq!(focus.strength(11.0 + PULSE_SECS), 0.0);
 
         // Observing the same shot again does not restart the pulse.
-        focus.observe(&shots, 20.0);
+        focus.observe(&shots, None, 20.0);
         assert_eq!(focus.strength(20.0), 0.0);
     }
 
@@ -4504,13 +5023,13 @@ mod tests {
     fn focus_index_prefers_listed_pin() {
         let shots = vec![row(1, true), row(2, true), row(3, false)];
         let pin = |n| ShotRef::of(&row(n, true));
-        assert_eq!(focus_index(&shots, None), Some(1));
-        assert_eq!(focus_index(&shots, Some(&pin(1))), Some(0));
+        assert_eq!(focus_index(&shots, None, None), Some(1));
+        assert_eq!(focus_index(&shots, Some(&pin(1)), None), Some(0));
         // A shot without data can be picked.
-        assert_eq!(focus_index(&shots, Some(&pin(3))), Some(2));
+        assert_eq!(focus_index(&shots, Some(&pin(3)), None), Some(2));
         // A pin that is not listed falls back to the latest.
-        assert_eq!(focus_index(&shots, Some(&pin(9))), Some(1));
-        assert_eq!(focus_index(&[], Some(&pin(1))), None);
+        assert_eq!(focus_index(&shots, Some(&pin(9)), None), Some(1));
+        assert_eq!(focus_index(&[], Some(&pin(1)), None), None);
     }
 
     #[test]
@@ -4548,43 +5067,43 @@ mod tests {
     fn selection_follows_latest_until_pinned() {
         let mut focus = ShotFocus::default();
         let mut shots = vec![row(1, true), row(2, true)];
-        focus.sync(&shots);
-        assert_eq!(focus.index(&shots), Some(1));
-        assert!(focus.following(&shots));
+        focus.sync(&shots, None);
+        assert_eq!(focus.index(&shots, None), Some(1));
+        assert!(focus.following(&shots, None));
 
         // Picking an older shot pins it.
-        focus.select(&shots, 0);
-        assert_eq!(focus.index(&shots), Some(0));
-        assert!(!focus.following(&shots));
+        focus.select(&shots, None, 0);
+        assert_eq!(focus.index(&shots, None), Some(0));
+        assert!(!focus.following(&shots, None));
         // It stays pinned while a trigger without data comes in.
         shots.push(row(3, false));
-        focus.observe(&shots, 1.0);
-        assert_eq!(focus.index(&shots), Some(0));
+        focus.observe(&shots, None, 1.0);
+        assert_eq!(focus.index(&shots, None), Some(0));
 
         // The new shot's data lands: the view jumps to it, glowing.
         shots[2].ball = Some(BallFlight::default());
-        focus.observe(&shots, 2.0);
-        assert_eq!(focus.index(&shots), Some(2));
-        assert!(focus.following(&shots));
+        focus.observe(&shots, None, 2.0);
+        assert_eq!(focus.index(&shots, None), Some(2));
+        assert!(focus.following(&shots, None));
         assert_eq!(focus.strength(2.0), 1.0);
         assert!(focus.take_reveal());
         assert!(!focus.take_reveal());
 
         // Picking the latest shot, or Back to latest, follows again.
-        focus.select(&shots, 1);
-        focus.select(&shots, 2);
-        assert!(focus.following(&shots));
-        focus.select(&shots, 0);
+        focus.select(&shots, None, 1);
+        focus.select(&shots, None, 2);
+        assert!(focus.following(&shots, None));
+        focus.select(&shots, None, 0);
         focus.follow();
-        assert!(focus.following(&shots));
+        assert!(focus.following(&shots, None));
     }
 
     #[test]
     fn pin_survives_reload_until_shot_is_gone() {
         let mut focus = ShotFocus::default();
         let shots = vec![row(1, true), row(2, true), row(3, true)];
-        focus.sync(&shots);
-        focus.select(&shots, 1);
+        focus.sync(&shots, None);
+        focus.select(&shots, None, 1);
 
         // A reload that still lists the shot keeps it, even with new shots,
         // at a new index and without shot ids, and does not pulse.
@@ -4592,17 +5111,17 @@ mod tests {
         for s in &mut reloaded {
             s.shot_id.clear();
         }
-        focus.sync(&reloaded);
-        assert_eq!(focus.index(&reloaded), Some(0));
+        focus.sync(&reloaded, None);
+        assert_eq!(focus.index(&reloaded, None), Some(0));
         assert_eq!(focus.strength(0.0), 0.0);
 
         // Once it is gone the view falls back to the latest, and stays there.
         let trimmed = vec![row(3, true), row(4, true)];
-        focus.sync(&trimmed);
-        assert_eq!(focus.index(&trimmed), Some(1));
-        assert!(focus.following(&trimmed));
-        focus.sync(&reloaded);
-        assert_eq!(focus.index(&reloaded), Some(2));
+        focus.sync(&trimmed, None);
+        assert_eq!(focus.index(&trimmed, None), Some(1));
+        assert!(focus.following(&trimmed, None));
+        focus.sync(&reloaded, None);
+        assert_eq!(focus.index(&reloaded, None), Some(2));
     }
 
     #[test]
@@ -4613,37 +5132,40 @@ mod tests {
         };
         let mut focus = ShotFocus::default();
         let mut shots = vec![shot(1, "a1"), shot(2, "a2")];
-        focus.sync(&shots);
-        focus.select(&shots, 0);
+        focus.sync(&shots, None);
+        focus.select(&shots, None, 0);
 
         // The device reconnects and its shot #1 lands: a new latest shot,
         // though the actor and number match an earlier one.
         shots.push(shot(1, "b1"));
-        focus.observe(&shots, 5.0);
+        focus.observe(&shots, None, 5.0);
         assert_eq!(focus.strength(5.0), 1.0);
-        assert_eq!(focus.index(&shots), Some(2));
-        assert!(focus.following(&shots));
+        assert_eq!(focus.index(&shots, None), Some(2));
+        assert!(focus.following(&shots, None));
 
         // A pin on the earlier #1 finds that shot, not the newer #1, and
         // survives a reload.
-        focus.select(&shots, 0);
+        focus.select(&shots, None, 0);
         let reloaded = shots.clone();
-        focus.sync(&reloaded);
-        assert_eq!(focus.index(&reloaded), Some(0));
+        focus.sync(&reloaded, None);
+        assert_eq!(focus.index(&reloaded, None), Some(0));
         assert!(ShotRef::of(&shots[0]).matches(&shots[0]));
         assert!(!ShotRef::of(&shots[0]).matches(&shots[2]));
         assert!(!ShotRef::of(&shots[2]).matches(&shots[0]));
         // The newer #1 is found as itself too.
-        focus.select(&shots, 1);
-        assert_eq!(focus.index(&shots), Some(1));
-        assert_eq!(focus_index(&shots, Some(&ShotRef::of(&shots[2]))), Some(2));
+        focus.select(&shots, None, 1);
+        assert_eq!(focus.index(&shots, None), Some(1));
+        assert_eq!(
+            focus_index(&shots, Some(&ShotRef::of(&shots[2])), None),
+            Some(2)
+        );
     }
 
     #[test]
     fn list_is_newest_first() {
         let shots = vec![row(1, true), row(2, false), row(3, true)];
         assert_eq!(
-            list_items(&shots, &ShotGroups::default(), None),
+            list_items(&shots, &ShotGroups::default(), None, None),
             vec![ListItem::Shot(2), ListItem::Shot(1), ListItem::Shot(0)]
         );
     }
@@ -4715,7 +5237,7 @@ mod tests {
             vec![group("a", 1, Club::Iron7, true, 2)],
         );
         assert_eq!(
-            list_items(&shots, &g, Some(Club::Iron7)),
+            list_items(&shots, &g, Some(Club::Iron7), None),
             vec![ListItem::Shot(2), ListItem::Shot(1), ListItem::Shot(0)]
         );
     }
@@ -4737,7 +5259,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            list_items(&shots, &g, Some(Club::Driver)),
+            list_items(&shots, &g, Some(Club::Driver), None),
             vec![
                 header("b"),
                 ListItem::Shot(4),
@@ -4778,13 +5300,13 @@ mod tests {
         ];
         let driver = [club_header(0, Club::Driver), ListItem::Shot(2)];
         assert_eq!(
-            list_items(&shots, &g, Some(Club::Iron7)),
+            list_items(&shots, &g, Some(Club::Iron7), None),
             [sevens.as_slice(), &driver].concat()
         );
         // The selected club's section comes first, though its last shot
         // is older.
         assert_eq!(
-            list_items(&shots, &g, Some(Club::Driver)),
+            list_items(&shots, &g, Some(Club::Driver), None),
             [driver.as_slice(), &sevens].concat()
         );
         // + New set does not split the section: an empty open 7-iron set
@@ -4797,7 +5319,7 @@ mod tests {
         ];
         let g = groups(ShotGrouping::ByClub, list.clone());
         assert_eq!(
-            list_items(&shots, &g, Some(Club::Iron7)),
+            list_items(&shots, &g, Some(Club::Iron7), None),
             [sevens.as_slice(), &driver].concat()
         );
         // Its next shot joins the same section.
@@ -4808,7 +5330,7 @@ mod tests {
             ..row(6, true)
         });
         let g = groups(ShotGrouping::ByClub, list);
-        let items = list_items(&more, &g, Some(Club::Iron7));
+        let items = list_items(&more, &g, Some(Club::Iron7), None);
         assert_eq!(items[..2], [club_header(0, Club::Iron7), ListItem::Shot(5)]);
         assert_eq!(items[6], club_header(0, Club::Driver));
         // A dead trigger stays with the run it is in.
@@ -4822,7 +5344,7 @@ mod tests {
                 group("c", 3, Club::Iron7, true, 2),
             ],
         );
-        let items = list_items(&shots, &g, Some(Club::Iron7));
+        let items = list_items(&shots, &g, Some(Club::Iron7), None);
         assert_eq!(
             items[5..],
             [
@@ -4853,7 +5375,7 @@ mod tests {
         );
         assert_eq!(g.session(), 1);
         assert_eq!(
-            list_items(&shots, &g, Some(Club::Iron7)),
+            list_items(&shots, &g, Some(Club::Iron7), None),
             vec![
                 club_header(1, Club::Iron7),
                 ListItem::Shot(4),
@@ -4868,7 +5390,7 @@ mod tests {
         // Re-selecting a club from the earlier session does not lift its
         // earlier section.
         g.observe_club(Some(Club::Driver), &shots);
-        let ids = section_ids(&list_items(&shots, &g, Some(Club::PitchingWedge)));
+        let ids = section_ids(&list_items(&shots, &g, Some(Club::PitchingWedge), None));
         assert_eq!(
             ids,
             [
@@ -4880,7 +5402,7 @@ mod tests {
         // Right after New session nothing is combined with the earlier
         // session: every section reads earlier until the next shot.
         g.new_session();
-        let items = list_items(&shots, &g, Some(Club::Iron7));
+        let items = list_items(&shots, &g, Some(Club::Iron7), None);
         assert_eq!(items[0], club_header(1, Club::Iron7));
         assert_eq!(
             club_title(Some(Club::Iron7), 1 < g.session(), Some((1, 2))),
@@ -4928,7 +5450,7 @@ mod tests {
         g.observe_club(Some(Club::Iron7), upto(&shots, 0));
         g.observe_club(Some(Club::Driver), upto(&shots, 3));
         let ids = |g: &ShotGroups, club| {
-            section_ids(&list_items(&shots, g, club))
+            section_ids(&list_items(&shots, g, club, None))
                 .iter()
                 .map(|(_, c)| c.map_or("-".to_owned(), |c| c.to_string()))
                 .collect::<Vec<_>>()
@@ -4975,7 +5497,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            list_items(&shots, &g, Some(Club::Iron7)),
+            list_items(&shots, &g, Some(Club::Iron7), None),
             vec![
                 ListItem::Shot(5),
                 club_header(0, Club::Iron7),
@@ -5112,7 +5634,7 @@ mod tests {
             next: true,
         };
         let g = groups(ShotGrouping::BySet, list.clone());
-        let items = list_items(&shots, &g, Some(Club::Iron7));
+        let items = list_items(&shots, &g, Some(Club::Iron7), None);
         assert_eq!(
             items,
             vec![
@@ -5127,16 +5649,16 @@ mod tests {
             "Set 3 \u{b7} 7I \u{b7} Next shot"
         );
         // It takes any club: a different club in play is still its header.
-        assert_eq!(list_items(&shots, &g, Some(Club::Driver))[0], next);
+        assert_eq!(list_items(&shots, &g, Some(Club::Driver), None)[0], next);
 
         // By club: the club in play already has a section, which is the
         // first line; no extra header.
         let g = groups(ShotGrouping::ByClub, list);
-        let items = list_items(&shots, &g, Some(Club::Iron7));
+        let items = list_items(&shots, &g, Some(Club::Iron7), None);
         assert_eq!(items[0], club_header(0, Club::Iron7));
         assert_eq!(items.len(), 3);
         // A club with no section yet this session gets a next header.
-        let items = list_items(&shots, &g, Some(Club::Driver));
+        let items = list_items(&shots, &g, Some(Club::Driver), None);
         assert_eq!(
             items[0],
             ListItem::ClubHeader {
@@ -5167,7 +5689,7 @@ mod tests {
             vec![group("a", 1, Club::Iron7, true, 2)],
         );
         assert_eq!(
-            list_items(&shots, &g, Some(Club::Iron7)),
+            list_items(&shots, &g, Some(Club::Iron7), None),
             vec![
                 ListItem::Shot(6),
                 ListItem::Shot(5),
@@ -5190,7 +5712,7 @@ mod tests {
                 group("c", 2, Club::Iron7, true, 0),
             ],
         );
-        let items = list_items(&shots, &g, Some(Club::Iron7));
+        let items = list_items(&shots, &g, Some(Club::Iron7), None);
         assert_eq!(
             items[..5],
             [
@@ -5289,7 +5811,7 @@ mod tests {
     #[test]
     fn cards_sit_side_by_side_when_wide() {
         let size = egui::vec2(1560.0, 760.0);
-        let layout = cards_layout(size, 5, &[2, 4, 6], None, false);
+        let layout = cards_layout(size, 5, &[2, 4, 6], None, 1);
         assert_fits(&layout, size.x);
         // One headline row, and all group labels on one line.
         assert!(
@@ -5308,7 +5830,7 @@ mod tests {
     #[test]
     fn cards_stack_and_wrap_when_narrow() {
         let size = egui::vec2(420.0, 700.0);
-        let layout = cards_layout(size, 5, &[2, 4, 6], None, false);
+        let layout = cards_layout(size, 5, &[2, 4, 6], None, 1);
         assert_fits(&layout, size.x);
         // Headline wraps into balanced rows (3 + 2).
         let first_row = layout.headline[0].top();
@@ -5324,7 +5846,7 @@ mod tests {
             assert!(pair[1].0.top() > prev_bottom);
         }
         // Too short to fit: cards keep their compact height and scroll.
-        let short = cards_layout(egui::vec2(420.0, 300.0), 5, &[2, 4, 6], None, false);
+        let short = cards_layout(egui::vec2(420.0, 300.0), 5, &[2, 4, 6], None, 1);
         assert_fits(&short, 420.0);
         assert!(short.height > 300.0 && short.scrolls);
         assert_eq!(short.headline[0].height(), COMPACT.headline);
@@ -5336,7 +5858,7 @@ mod tests {
         // Too narrow for six cards side by side, wide enough for five
         // headline cards in a row.
         let size = egui::vec2(660.0, 620.0);
-        let layout = cards_layout(size, 5, &[2, 4, 6], None, false);
+        let layout = cards_layout(size, 5, &[2, 4, 6], None, 1);
         assert_fits(&layout, size.x);
         assert!(layout.height <= size.y);
         // One headline row of five.
@@ -5509,22 +6031,19 @@ mod tests {
         let [total, carry, lateral] = bars_for(&rows, &a, Some(1), &[], true);
         assert_eq!(total.values.values, vec![240.0, 250.0, 245.0]);
         assert_eq!(total.this, Some(250.0));
-        assert_eq!(
-            bar_stats_text(&total),
-            (
-                "avg 245 \u{b7} med 245".to_owned(),
-                "sd 5.0 \u{b7} 3/4".to_owned()
-            )
-        );
+        let row = |avg: &str, med: &str, sd: &str, count: Option<&str>| StatsRow {
+            avg: avg.into(),
+            med: med.into(),
+            sd: sd.into(),
+            count: count.map(Into::into),
+        };
+        assert_eq!(StatsRow::of(&total), row("245", "245", "5.0", Some("3/4")));
         // Total and Carry share a domain; lateral has its own.
         assert_eq!(total.domain, carry.domain);
         assert_eq!(total.domain, Some((210.0, 260.0)));
         assert_eq!(
-            bar_stats_text(&lateral),
-            (
-                "avg 1.5 R \u{b7} med 1.5 R".to_owned(),
-                "sd 0.0 \u{b7} 3/4".to_owned()
-            )
+            StatsRow::of(&lateral),
+            row("1.5 R", "1.5 R", "0.0", Some("3/4"))
         );
         // A shown shot from another group gets no dot.
         let [total, ..] = bars_for(&rows, &a, Some(3), &[], true);
@@ -5532,16 +6051,13 @@ mod tests {
 
         // One shot: no sd; no group or no values: no data and no domain.
         let one = bars_for(&rows[..1], &[0], Some(0), &[], true);
-        assert_eq!(
-            bar_stats_text(&one[0]),
-            ("avg 240 \u{b7} med 240".to_owned(), String::new())
-        );
+        assert_eq!(StatsRow::of(&one[0]), row("240", "240", NO_VALUE, None));
         assert_eq!(one[0].this, Some(240.0));
         let none = bars_for(&rows, &[], Some(0), &[], true);
         assert!(none.iter().all(|b| b.stats.is_none() && b.domain.is_none()));
         assert_eq!(
-            bar_stats_text(&none[0]),
-            ("no data".to_owned(), String::new())
+            StatsRow::of(&none[0]),
+            row(NO_VALUE, NO_VALUE, NO_VALUE, None)
         );
     }
 
@@ -5588,9 +6104,9 @@ mod tests {
     #[test]
     fn bars_sit_between_headline_and_details() {
         let size = egui::vec2(1560.0, 760.0);
-        let plain = cards_layout(size, 5, &[2, 4, 6], None, false);
+        let plain = cards_layout(size, 5, &[2, 4, 6], None, 1);
         assert!(plain.bars.is_none());
-        let layout = cards_layout(size, 5, &[2, 4, 6], Some(Legend::Beside), false);
+        let layout = cards_layout(size, 5, &[2, 4, 6], Some(Legend::Beside), 0);
         assert_fits(&layout, size.x);
         assert!(layout.height <= size.y + 1e-3, "{}", layout.height);
         let BarsLayout {
@@ -5644,8 +6160,7 @@ mod tests {
                     .frame(egui::Frame::new())
                     .show(ctx, |ui| {
                         let legend = legend_place(ui.painter(), width, Some(&title.0), &[]);
-                        let at =
-                            cards_layout(vec2(width, 760.0), 5, &[2, 4, 6], Some(legend), false);
+                        let at = cards_layout(vec2(width, 760.0), 5, &[2, 4, 6], Some(legend), 0);
                         let at = at.bars.expect("bars");
                         range_bars(ui, &at, Some(&title), &bars, &[], "");
                     });
@@ -5698,13 +6213,8 @@ mod tests {
                         .frame(egui::Frame::new())
                         .show(ctx, |ui| {
                             let legend = legend_place(ui.painter(), width, Some(&title.0), &chips);
-                            let at = cards_layout(
-                                vec2(width, height),
-                                5,
-                                &[2, 4, 6],
-                                Some(legend),
-                                false,
-                            );
+                            let at =
+                                cards_layout(vec2(width, height), 5, &[2, 4, 6], Some(legend), 0);
                             let bars_at = at.bars.expect("bars");
                             range_bars(ui, &bars_at, Some(&title), &bars, &chips, "");
                             place = Some(legend);
@@ -5860,9 +6370,12 @@ mod tests {
     fn cards_fit_every_listed_window_without_scrolling() {
         for (i, &(w, h, narrow)) in FIT_AREAS[..FIT_WINDOWS.len()].iter().enumerate() {
             for width in [w, narrow] {
-                for legend in [None, Some(Legend::Beside), Some(Legend::Below)] {
-                    let layout = cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], legend, false);
-                    let at = format!("{:?} {width}x{h} {legend:?}", FIT_WINDOWS[i]);
+                for (legend, want) in [None, Some(Legend::Beside), Some(Legend::Below)]
+                    .into_iter()
+                    .flat_map(|legend| (1..=MAX_CARDS).map(move |want| (legend, want)))
+                {
+                    let layout = cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], legend, want);
+                    let at = format!("{:?} {width}x{h} {legend:?} {want}", FIT_WINDOWS[i]);
                     assert!(!layout.scrolls, "{at}");
                     assert!(layout.height <= h + 0.01, "{at}: {}", layout.height);
                     assert_fits(&layout, width);
@@ -5902,13 +6415,8 @@ mod tests {
             let painter = ctx.layer_painter(egui::LayerId::background());
             for &(w, h, narrow) in &FIT_AREAS {
                 for width in [w, narrow] {
-                    let layout = cards_layout(
-                        egui::vec2(width, h),
-                        5,
-                        &[2, 4, 6],
-                        Some(Legend::Below),
-                        false,
-                    );
+                    let layout =
+                        cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(Legend::Below), 1);
                     let head = layout.headline[0];
                     let look =
                         CardLook::headline(head.size()).fit(&painter, &headline, head.width());
@@ -5967,14 +6475,8 @@ mod tests {
         }
         // Halfway: the bar rows, the label lines and the cards all shrank.
         let (w, h, _) = FIT_AREAS[1];
-        let roomy = cards_layout(
-            egui::vec2(w, 900.0),
-            5,
-            &[2, 4, 6],
-            Some(Legend::Beside),
-            false,
-        );
-        let fit = cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], Some(Legend::Beside), false);
+        let roomy = cards_layout(egui::vec2(w, 900.0), 5, &[2, 4, 6], Some(Legend::Beside), 1);
+        let fit = cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], Some(Legend::Beside), 1);
         let (a, b) = (roomy.bars.expect("bars"), fit.bars.expect("bars"));
         assert!(b.rows[0].height() < a.rows[0].height());
         assert!(b.rows[0].height() > COMPACT.bar_row);
@@ -5998,7 +6500,7 @@ mod tests {
                     5,
                     &[2, 4, 6],
                     Some(Legend::Beside),
-                    false,
+                    1,
                 );
                 if let Some(prev) = &last {
                     let moved = |a: egui::Rect, b: egui::Rect| {
@@ -6021,8 +6523,8 @@ mod tests {
         for (w, _, _) in FIT_AREAS {
             for legend in [Some(Legend::Beside), Some(Legend::Below)] {
                 // The compact height: what the cards need at their smallest.
-                let least = cards_layout(egui::vec2(w, 1.0), 5, &[2, 4, 6], legend, false).height;
-                let at = |h: f32| cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], legend, false);
+                let least = cards_layout(egui::vec2(w, 1.0), 5, &[2, 4, 6], legend, 1).height;
+                let at = |h: f32| cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], legend, 1);
                 assert!(!at(least).scrolls, "{w}: {least}");
                 assert!(at(least).height <= least + 0.01);
                 let short = at(least - 2.0);
@@ -6035,7 +6537,7 @@ mod tests {
         }
         // 900×700 is below it, the listed windows are not.
         let (w, h, _) = FIT_AREAS[5];
-        assert!(cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], Some(Legend::Beside), false).scrolls);
+        assert!(cards_layout(egui::vec2(w, h), 5, &[2, 4, 6], Some(Legend::Beside), 1).scrolls);
     }
 
     #[test]
@@ -6165,7 +6667,8 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(cards.len(), labels.len(), "{w}x{h}: {cards:?}");
+            // The tiles, and the stats card beside the bars.
+            assert_eq!(cards.len(), labels.len() + 1, "{w}x{h}: {cards:?}");
             for r in &cards {
                 assert!(
                     r.bottom() + CHART_GAP <= panel_top + 0.5,
@@ -6209,26 +6712,21 @@ mod tests {
                     let (height, row) = chart_slots(view, window).bottom.expect("a bottom row");
                     for width in (300..1200).step_by(7) {
                         let width = width as f32;
-                        for filter in [false, true] {
-                            let filter = filter && view == ShotsView::Table;
-                            let (slot, least) = match row {
-                                BottomRow::FlightAndDispersion => {
-                                    (row_split(width).1, SHARED_PLOT_MIN)
-                                }
-                                _ => (width, TABLE_PLOT_MIN),
-                            };
-                            let row_height = bottom_height(height, row, width, filter);
-                            assert!(row_height >= height);
-                            let plot = row_height
-                                - CHART_GAP
-                                - dispersion::header_height(slot, filter)
-                                - dispersion::PLOT_PAD;
-                            let at = format!("{view:?} {w}x{h} row {width} filter {filter}");
-                            assert!(plot >= least, "{at}: {plot}");
-                            // Only the extra header rows are added.
-                            if row_height > height {
-                                assert_eq!(plot, least, "{at}");
-                            }
+                        let (slot, least) = match row {
+                            BottomRow::FlightAndDispersion => (row_split(width).1, SHARED_PLOT_MIN),
+                            _ => (width, TABLE_PLOT_MIN),
+                        };
+                        let row_height = bottom_height(height, row, width);
+                        assert!(row_height >= height);
+                        let plot = row_height
+                            - CHART_GAP
+                            - dispersion::header_height(slot)
+                            - dispersion::PLOT_PAD;
+                        let at = format!("{view:?} {w}x{h} row {width}");
+                        assert!(plot >= least, "{at}: {plot}");
+                        // Only the extra header row is added.
+                        if row_height > height {
+                            assert_eq!(plot, least, "{at}");
                         }
                     }
                 }
@@ -6240,7 +6738,7 @@ mod tests {
             let (height, row) = chart_slots(ShotsView::Cards, window).bottom.unwrap();
             if row == BottomRow::FlightAndDispersion {
                 for width in [748.0, 785.0] {
-                    assert_eq!(bottom_height(height, row, width, false), height);
+                    assert_eq!(bottom_height(height, row, width), height);
                 }
             }
         }
@@ -6286,7 +6784,7 @@ mod tests {
             };
             assert!(plot.height() >= least - 0.5, "{at}: {plot:?}");
             // The header sits above the plot's allocation, every switch in
-            // it, and the device filter only in Table with two devices.
+            // it.
             let top = h - f32::from(TAB_MARGIN.bottom) - area;
             let texts = painted_text_rects(&out.shapes);
             let title = texts
@@ -6318,8 +6816,8 @@ mod tests {
             for label in ["DISPERSION", "2\u{3c3}", "95 %", "Total", "Carry"] {
                 assert!(shown(label), "{at}: {label}");
             }
-            let filter = view == ShotsView::Table && two;
-            assert_eq!(shown("DEVICE"), filter, "{at}");
+            // The device filter is the toolbar's, never the header's.
+            assert!(!shown("DEVICE") && !shown("All"), "{at}");
         }
     }
 
@@ -6705,7 +7203,7 @@ mod tests {
         let mut focus = ShotFocus::default();
         assert_eq!(focus.progress(0.0), None, "no shot, no pulse");
         let shots = vec![row(1, true)];
-        focus.observe(&shots, 10.0);
+        focus.observe(&shots, None, 10.0);
         assert_eq!(focus.progress(10.0), Some(0.0));
         let quarter = focus.progress(10.0 + PULSE_SECS / 4.0).unwrap();
         assert!((quarter - 0.25).abs() < 1e-6);
@@ -6715,7 +7213,7 @@ mod tests {
         assert!((focus.strength(10.0 + PULSE_SECS / 2.0) - 0.125).abs() < 1e-6);
         assert_eq!(focus.progress(10.0 + PULSE_SECS), None, "over");
         // A bulk load starts no pulse.
-        focus.sync(&shots);
+        focus.sync(&shots, None);
         assert_eq!(focus.progress(10.1), None);
     }
 
@@ -6888,7 +7386,7 @@ mod tests {
             let devices = chart::device_ids(rows);
             let bars = bars_for(rows, &m, Some(shown), &devices, true);
             let stats: Vec<_> = bars.iter().map(|b| (b.stats, b.values.rows)).collect();
-            let texts: Vec<_> = bars.iter().map(bar_stats_text).collect();
+            let texts: Vec<_> = bars.iter().map(StatsRow::of).collect();
             let this: Vec<_> = bars.iter().map(|b| b.this).collect();
             let title = bars_title(view, set, g.session(), rows, &m, false).map(|t| t.0);
             (stats, texts, title, device_options(&devices, &actors), this)
@@ -6949,21 +7447,26 @@ mod tests {
                 .map(|(t, _)| t)
                 .collect::<Vec<String>>()
         };
+        // The stats card's texts (from its title to the next section's) and
+        // every shot count.
         let stat_texts = |texts: &[String]| -> Vec<String> {
-            texts
-                .iter()
-                .filter(|t| {
-                    t.starts_with("avg ")
-                        || t.starts_with("sd ")
-                        || t.to_uppercase().contains("SHOT")
-                })
+            let card = texts.iter().position(|t| t == "STATS");
+            let card = card.map_or(&[][..], |at| {
+                let end = texts[at..]
+                    .iter()
+                    .position(|t| t == "BALL")
+                    .map_or(texts.len(), |n| at + n);
+                &texts[at..end]
+            });
+            card.iter()
+                .chain(texts.iter().filter(|t| t.to_uppercase().contains("SHOT")))
                 .cloned()
                 .collect()
         };
         let alone = paint(irons, g8);
         let chip = paint(with_chip, g9);
         let stats = stat_texts(&alone);
-        assert!(stats.iter().any(|t| t.starts_with("avg ")), "{alone:?}");
+        assert!(stats.iter().any(|t| t == "AVG"), "{alone:?}");
         assert!(
             stats.iter().any(|t| t.to_uppercase().contains("8 SHOTS")),
             "{alone:?}"
@@ -7677,13 +8180,8 @@ mod tests {
             let painter = ctx.layer_painter(egui::LayerId::background());
             for (i, &(w, h, narrow)) in FIT_AREAS.iter().enumerate() {
                 for width in [w, narrow] {
-                    let layout = cards_layout(
-                        egui::vec2(width, h),
-                        5,
-                        &[2, 4, 6],
-                        Some(Legend::Beside),
-                        false,
-                    );
+                    let layout =
+                        cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(Legend::Beside), 1);
                     let detail = layout.groups[0].1[0];
                     let all = groups.iter().flat_map(|(_, m)| m);
                     let look = CardLook::detail(detail.size()).fit(&painter, all, detail.width());
@@ -7737,174 +8235,427 @@ mod tests {
         assert_eq!(cells[columns.len() - 1], TableCell::Text("-".into()));
     }
 
+    /// The most cards beside the bars at each of [`FIT_AREAS`]' widths.
+    const FIT_CARDS: [usize; 6] = [3, 3, 2, 2, 2, 1];
+
+    /// The headline tiles' x ranges, and their bottom.
+    fn head_columns(layout: &CardsLayout) -> (Vec<egui::Rangef>, f32) {
+        let top = layout.headline[0].top();
+        let columns = layout
+            .headline
+            .iter()
+            .filter(|c| c.top() == top)
+            .map(|c| c.x_range())
+            .collect();
+        let bottom = layout
+            .headline
+            .iter()
+            .map(|c| c.bottom())
+            .fold(0.0, f32::max);
+        (columns, bottom)
+    }
+
     #[test]
-    fn the_face_panel_sits_right_of_the_bars_without_changing_a_height() {
+    fn the_card_row_takes_headline_columns_right_of_the_bars() {
         for (i, &(w, h, narrow)) in FIT_AREAS[..FIT_WINDOWS.len()].iter().enumerate() {
             for width in [w, narrow] {
                 for legend in [Legend::Beside, Legend::Below] {
-                    let at = format!("{:?} {width}x{h} {legend:?}", FIT_WINDOWS[i]);
-                    let plain =
-                        cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(legend), false);
-                    let layout =
-                        cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(legend), true);
-                    assert!(plain.face.is_none());
-                    let face = layout.face.expect(&at);
-                    let bars = layout.bars.expect("bars");
-                    let plain_bars = plain.bars.expect("bars");
-                    // Under the rightmost headline column, as wide as it,
-                    // CARD_GAP from the headline cards and from the detail
-                    // section's hairline.
-                    let column = layout
-                        .headline
-                        .iter()
-                        .map(|c| c.right())
-                        .fold(0.0, f32::max);
-                    let tile = layout
-                        .headline
-                        .iter()
-                        .find(|c| (c.right() - column).abs() < 0.01)
-                        .expect("a headline card");
-                    let head_bottom = layout
-                        .headline
-                        .iter()
-                        .map(|c| c.bottom())
-                        .fold(0.0, f32::max);
-                    let rule = layout.groups[0].0.top() + GROUP_RULE_Y;
-                    assert!((face.top() - (head_bottom + CARD_GAP)).abs() < 0.01, "{at}");
-                    assert!((face.bottom() - (rule - CARD_GAP)).abs() < 0.01, "{at}");
-                    assert!((face.right() - width).abs() < 0.01, "{at}");
-                    assert!((face.left() - tile.left()).abs() < 0.01, "{at}");
-                    assert!(!face.intersects(bars.controls), "{at}");
-                    assert!(layout.headline.iter().all(|c| !c.intersects(face)), "{at}");
-                    // The bars end FACE_GAP short of it.
-                    for r in [bars.controls, bars.label, bars.legend]
-                        .into_iter()
-                        .chain(bars.rows)
-                    {
-                        assert!((r.right() + FACE_GAP - face.left()).abs() < 0.01, "{at}");
-                        assert!(!r.intersects(face), "{at}");
-                    }
-                    assert!(
-                        bar_plot_width(bars.rows[0].width()) >= FACE_MIN_PLOT,
-                        "{at}"
-                    );
-                    // Nothing else moves.
-                    assert_eq!(layout.height, plain.height, "{at}");
-                    assert_eq!(layout.scrolls, plain.scrolls, "{at}");
-                    assert!(!layout.scrolls, "{at}");
-                    assert_eq!(layout.headline, plain.headline, "{at}");
-                    assert_eq!(layout.groups, plain.groups, "{at}");
-                    assert_eq!(
-                        bars.rows.map(|r| r.y_range()),
-                        plain_bars.rows.map(|r| r.y_range())
-                    );
-                    for (label, cards) in &layout.groups {
-                        assert!(!label.intersects(face), "{at}");
-                        assert!(cards.iter().all(|c| !c.intersects(face)), "{at}");
+                    // No cards at all: what the card row must leave as it is.
+                    let none = cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(legend), 0);
+                    assert!(none.cards.is_empty());
+                    for sources in 1..=5 {
+                        let at = format!("{:?} {width}x{h} {legend:?} {sources}", FIT_WINDOWS[i]);
+                        let layout = cards_layout(
+                            egui::vec2(width, h),
+                            5,
+                            &[2, 4, 6],
+                            Some(legend),
+                            sources,
+                        );
+                        let cards = &layout.cards;
+                        assert_eq!(cards.len(), sources.min(FIT_CARDS[i]), "{at}");
+                        let bars = layout.bars.expect("bars");
+                        // One headline column wide each, under the rightmost
+                        // columns, flush right, CARD_GAP from the headline
+                        // cards and from the detail section's hairline.
+                        let (columns, head_bottom) = head_columns(&layout);
+                        let rule = layout.groups[0].0.top() + GROUP_RULE_Y;
+                        let under = &columns[columns.len() - cards.len()..];
+                        for (card, column) in cards.iter().zip(under) {
+                            assert!((card.left() - column.min).abs() < 0.01, "{at}");
+                            assert!((card.right() - column.max).abs() < 0.01, "{at}");
+                            assert!((card.top() - (head_bottom + CARD_GAP)).abs() < 0.01, "{at}");
+                            assert!((card.bottom() - (rule - CARD_GAP)).abs() < 0.01, "{at}");
+                            assert!(!card.intersects(bars.controls), "{at}");
+                            assert!(layout.headline.iter().all(|c| !c.intersects(*card)), "{at}");
+                            for (label, details) in &layout.groups {
+                                assert!(!label.intersects(*card), "{at}");
+                                assert!(details.iter().all(|c| !c.intersects(*card)), "{at}");
+                            }
+                        }
+                        assert!((cards[cards.len() - 1].right() - width).abs() < 0.01);
+                        for pair in cards.windows(2) {
+                            assert!((pair[1].left() - pair[0].right() - CARD_GAP).abs() < 0.01);
+                        }
+                        // The bars end FACE_GAP short of the leftmost card,
+                        // keep the two leftmost columns and the least plot.
+                        for r in [bars.controls, bars.label, bars.legend]
+                            .into_iter()
+                            .chain(bars.rows)
+                        {
+                            assert!(
+                                (r.right() + FACE_GAP - cards[0].left()).abs() < 0.01,
+                                "{at}"
+                            );
+                            assert!(!r.intersects(cards[0]), "{at}");
+                        }
+                        assert!(
+                            bars.rows[0].right() + FACE_GAP >= columns[2].min - 0.01,
+                            "{at}"
+                        );
+                        assert!(
+                            bar_plot_width(bars.rows[0].width()) >= FACE_MIN_PLOT,
+                            "{at}"
+                        );
+                        // Nothing else moves with the cards.
+                        assert_eq!(layout.height, none.height, "{at}");
+                        assert!(!layout.scrolls, "{at}");
+                        assert_eq!(layout.headline, none.headline, "{at}");
+                        assert_eq!(layout.groups, none.groups, "{at}");
+                        let none_bars = none.bars.expect("bars");
+                        assert_eq!(
+                            bars.rows.map(|r| r.y_range()),
+                            none_bars.rows.map(|r| r.y_range())
+                        );
                     }
                 }
             }
         }
-        // Too narrow for the bars beside the square: no panel.
-        let narrow = cards_layout(
-            egui::vec2(560.0, 476.0),
-            5,
-            &[2, 4, 6],
-            Some(Legend::Below),
-            true,
-        );
-        assert!(narrow.face.is_none());
-        assert_eq!(narrow.bars.unwrap().rows[0].width(), 560.0);
-        // No bars, no panel.
+        // No bars, no cards.
         assert!(
-            cards_layout(egui::vec2(962.0, 476.0), 5, &[2, 4, 6], None, true)
-                .face
-                .is_none()
+            cards_layout(egui::vec2(962.0, 476.0), 5, &[2, 4, 6], None, 3)
+                .cards
+                .is_empty()
         );
     }
 
     #[test]
-    fn the_legend_settles_where_it_fits_beside_the_face_panel() {
-        let mut dropped = 0;
-        let mut kept_below = 0;
+    fn a_narrow_row_falls_back_to_a_square_then_to_what_the_bars_leave() {
+        let (mut columns, mut squares, mut shrunk, mut zero) = (0, 0, 0, 0);
+        for &(_, h, _) in &FIT_AREAS {
+            for legend in [Legend::Beside, Legend::Below] {
+                for width in (300..=1300).step_by(3) {
+                    let width = width as f32;
+                    for sources in 1..=5 {
+                        let layout = cards_layout(
+                            egui::vec2(width, h),
+                            5,
+                            &[2, 4, 6],
+                            Some(legend),
+                            sources,
+                        );
+                        let at = format!("{width}x{h} {legend:?} {sources}");
+                        let bars = layout.bars.expect("bars");
+                        let cards = &layout.cards;
+                        assert!(!cards.is_empty() && cards.len() <= sources.min(3), "{at}");
+                        let head_w = layout.headline[0].width();
+                        let square = bars.rows[2].bottom() - bars.label.top();
+                        let plot = bar_plot_width(bars.rows[0].width());
+                        assert!(
+                            (cards[cards.len() - 1].right() - width).abs() < 0.01,
+                            "{at}"
+                        );
+                        if (cards[0].width() - head_w).abs() < 0.01 {
+                            columns += 1;
+                            assert!(plot >= FACE_MIN_PLOT, "{at}");
+                        } else {
+                            assert_eq!(cards.len(), 1, "{at}");
+                            if (cards[0].width() - square).abs() < 0.01 {
+                                squares += 1;
+                                assert!(plot >= FACE_MIN_PLOT, "{at}");
+                            } else if cards[0].width() > 0.0 {
+                                // The bars keep the least plot, the card the rest.
+                                shrunk += 1;
+                                assert!((plot - FACE_MIN_PLOT).abs() < 0.01, "{at}: {plot}");
+                                assert!(cards[0].width() < square, "{at}");
+                            } else {
+                                // Nothing left for the card, which takes
+                                // no gap from the bars.
+                                assert_eq!(cards[0].width(), 0.0, "{at}");
+                                assert!(plot < FACE_MIN_PLOT + FACE_GAP + 1.0, "{at}: {plot}");
+                                assert!((bars.rows[0].right() - width).abs() < 0.01, "{at}");
+                                zero += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            columns > 0 && squares > 0 && shrunk > 0 && zero > 0,
+            "{columns} {squares} {shrunk} {zero}"
+        );
+    }
+
+    #[test]
+    fn the_legend_settles_where_it_fits_beside_the_cards() {
+        let (mut beside, mut below) = (0, 0);
         for &(_, h, _) in &FIT_AREAS {
             let mut width = 560.0;
             while width <= 1300.0 {
-                let at = |legend: Legend, face: bool| {
-                    cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(legend), face)
-                };
-                // The legend fits beside the title from `fits` up: the full
-                // width, and a sweep below it.
-                for fits in [width, width - 40.0, width - 120.0, width - 240.0] {
-                    let place = |w: f32| {
-                        if w >= fits {
-                            Legend::Beside
-                        } else {
-                            Legend::Below
-                        }
+                for sources in 1..=5 {
+                    let at = |legend: Legend| {
+                        cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(legend), sources)
                     };
-                    let layout = settle_legend(width, true, place, at);
-                    let bars = layout.bars.expect("bars");
-                    let legend = if bars.legend == bars.label {
-                        Legend::Beside
-                    } else {
-                        Legend::Below
-                    };
-                    let at_ = format!("{width}x{h}, beside from {fits}");
-                    // Never beside the title where it does not fit.
-                    if legend == Legend::Beside {
-                        assert!(bars.label.width() >= fits, "{at_}");
-                    }
-                    match layout.face {
-                        Some(face) => {
-                            assert!(bar_plot_width(face.left() - FACE_GAP) >= FACE_MIN_PLOT);
-                        }
-                        // No panel: the full-width layout, legend and all.
-                        None => {
-                            assert_eq!(legend, place(width), "{at_}");
-                            assert_eq!(
-                                format!("{layout:?}"),
-                                format!("{:?}", at(place(width), false)),
-                                "{at_}"
-                            );
-                        }
-                    }
-                    // The case two passes got wrong: beside fits the full
-                    // width, the panel narrows the bars past it, and the
-                    // legend's own row leaves no room for the panel.
-                    let narrowed = at(Legend::Beside, true);
-                    if place(width) == Legend::Beside
-                        && narrowed.face.is_some()
-                        && place(narrowed.bars.expect("bars").label.width()) == Legend::Below
-                    {
-                        if at(Legend::Below, true).face.is_none() {
-                            dropped += 1;
-                            assert!(layout.face.is_none(), "{at_}");
-                            assert_eq!(legend, Legend::Beside, "{at_}");
+                    // The legend fits beside the title in `fits` and up.
+                    for fits in [200.0, 320.0, 450.0, 700.0, 2000.0] {
+                        let place = |w: f32| {
+                            if w >= fits {
+                                Legend::Beside
+                            } else {
+                                Legend::Below
+                            }
+                        };
+                        let layout = settle_legend(place, at);
+                        let bars = layout.bars.expect("bars");
+                        let at_ = format!("{width}x{h} {sources}, beside from {fits}");
+                        // The cards don't depend on where the legend goes.
+                        assert_eq!(layout.cards.len(), at(Legend::Beside).cards.len());
+                        if bars.legend == bars.label {
+                            beside += 1;
+                            assert!(bars.label.width() >= fits, "{at_}");
                         } else {
-                            kept_below += 1;
-                            assert!(layout.face.is_some(), "{at_}");
-                            assert_eq!(legend, Legend::Below, "{at_}");
+                            below += 1;
+                            let narrow = at(Legend::Beside).bars.expect("bars").label.width();
+                            assert!(narrow < fits, "{at_}");
                         }
                     }
                 }
                 width += 2.0;
             }
         }
-        assert!(dropped > 0, "the panel-dropping case is exercised");
-        assert!(kept_below > 0, "the legend-below case is exercised");
-        // Without the panel the legend is placed in the full width.
-        let layout = settle_legend(
-            900.0,
-            false,
-            |_| Legend::Below,
-            |legend, face| {
-                cards_layout(egui::vec2(900.0, 476.0), 5, &[2, 4, 6], Some(legend), face)
+        assert!(beside > 0 && below > 0);
+    }
+
+    /// A bar of `kind` over `values` among `rows` shots with data.
+    fn stats_bar(kind: BarKind, values: &[f64], rows: usize) -> Bar {
+        Bar {
+            kind,
+            unit: "yd",
+            values: BarValues {
+                values: values.to_vec(),
+                rows,
             },
+            stats: stats(values),
+            devices: Vec::new(),
+            this: None,
+            domain: None,
+        }
+    }
+
+    /// Wide stats in every column: three-digit distances, a lateral with
+    /// its side, two-digit spreads and an `11/12` on every row.
+    fn wide_stats_bars() -> [Bar; 3] {
+        let spread = |base: f64, step: f64| -> Vec<f64> {
+            (0..11).map(|i| base + step * f64::from(i)).collect()
+        };
+        [
+            stats_bar(BarKind::Total, &spread(248.0, 9.7), 12),
+            stats_bar(BarKind::Carry, &spread(228.0, 8.8), 12),
+            stats_bar(BarKind::Lateral, &spread(-48.0, 4.3), 12),
+        ]
+    }
+
+    /// Paint `stats_card` alone at `rect` and return its texts and rects.
+    fn painted_stats_card(
+        rect: egui::Rect,
+        bars: &[Bar; 3],
+        rows: &[egui::Rect; 3],
+    ) -> Vec<(String, bool, egui::Rect)> {
+        use egui::{Pos2, Rect, vec2};
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let paint = || {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 800.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::new())
+                        .show(ctx, |ui| stats_card(ui.painter(), rect, bars, rows, 13.0));
+                },
+            )
+        };
+        // The second pass has the fonts in.
+        paint();
+        painted_text_rects(&paint().shapes)
+    }
+
+    #[test]
+    fn the_stats_card_is_a_titled_table_of_the_bars() {
+        let mut bars = [
+            stats_bar(BarKind::Total, &[163.0, 181.0, 175.0], 3),
+            stats_bar(BarKind::Carry, &[150.0, 168.0], 3),
+            stats_bar(BarKind::Lateral, &[], 3),
+        ];
+        bars[0].unit = "yd";
+        let layout = cards_layout(
+            egui::vec2(962.0, 476.0),
+            5,
+            &[2, 4, 6],
+            Some(Legend::Below),
+            3,
         );
-        assert!(layout.face.is_none());
-        let bars = layout.bars.expect("bars");
-        assert_ne!(bars.legend, bars.label);
+        let at = layout.bars.expect("bars");
+        let rect = layout.cards[0];
+        let texts = painted_stats_card(rect, &bars, &at.rows);
+        let find = |t: &str| {
+            texts
+                .iter()
+                .find(|(x, _, _)| x == t)
+                .map(|(_, _, r)| *r)
+                .unwrap_or_else(|| panic!("{t} in {texts:?}"))
+        };
+        let left = rect.left() + impact::PAD;
+        // The title in the top-left, then the column headers over the rows.
+        let title = find("STATS");
+        assert!((title.left() - left).abs() < 1.0, "{title:?}");
+        assert!(title.top() >= rect.top() && title.top() <= rect.top() + 12.0);
+        let heads = ["AVG", "MED", "SD"].map(find);
+        for pair in heads.windows(2) {
+            assert!(pair[0].right() < pair[1].left(), "{heads:?}");
+        }
+        assert!(heads.iter().all(|h| h.top() >= title.bottom()), "{heads:?}");
+        // One row per bar in bar order, named like the bars, unit under.
+        let names = ["TOTAL", "CARRY", "LATERAL"].map(find);
+        for (name, head) in names.iter().zip([heads[0]; 3]) {
+            assert!((name.left() - left).abs() < 1.0, "{name:?}");
+            assert!(name.top() >= head.bottom(), "{name:?} under {head:?}");
+        }
+        for pair in names.windows(2) {
+            assert!(pair[0].bottom() <= pair[1].top(), "{names:?}");
+        }
+        let units: Vec<egui::Rect> = texts
+            .iter()
+            .filter(|(t, _, _)| t == "yd")
+            .map(|(_, _, r)| *r)
+            .collect();
+        assert_eq!(units.len(), 3);
+        // Values right-aligned under their headers, on their row's line.
+        let row_of = |r: egui::Rect| {
+            names
+                .iter()
+                .position(|n| r.center().y > n.top() && r.center().y < n.bottom() + 14.0)
+        };
+        for (text, row, col) in [
+            ("173", 0, 0),
+            ("175", 0, 1),
+            ("9.2", 0, 2),
+            ("159", 1, 0),
+            ("159", 1, 1),
+            ("12.7", 1, 2),
+        ] {
+            let at = texts
+                .iter()
+                .filter(|(t, _, r)| t == text && row_of(*r) == Some(row))
+                .map(|(_, _, r)| *r)
+                .find(|r| (r.right() - heads[col].right()).abs() < 1.0)
+                .unwrap_or_else(|| panic!("{text} in row {row}, column {col}: {texts:?}"));
+            assert!(rect.contains_rect(at), "{at:?}");
+        }
+        // The row missing a value says k/n at its end; no data, a dash in
+        // each column and no k/n.
+        let count = find("2/3");
+        assert_eq!(row_of(count), Some(1));
+        assert!((count.right() - heads[2].right()).abs() < 1.0, "{count:?}");
+        let dashes = texts
+            .iter()
+            .filter(|(t, _, r)| t == NO_VALUE && row_of(*r) == Some(2))
+            .count();
+        assert_eq!(dashes, 3);
+        assert!(!texts.iter().any(|(t, _, _)| t.contains('/') && t != "2/3"));
+        // A card too narrow for the table is clipped to the card.
+        let thin = egui::Rect::from_min_size(rect.min, egui::vec2(60.0, rect.height()));
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new())
+                .show(ctx, |ui| {
+                    stats_card(ui.painter(), thin, &bars, &at.rows, 13.0)
+                });
+        });
+        for clipped in &out.shapes {
+            if matches!(clipped.shape, egui::Shape::Text(_)) {
+                assert!(
+                    thin.contains_rect(clipped.clip_rect),
+                    "{:?}",
+                    clipped.clip_rect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_stats_card_fits_every_listed_window() {
+        let bars = wide_stats_bars();
+        let texts_of = |b: &Bar| StatsRow::of(b);
+        assert_eq!(
+            texts_of(&bars[2]),
+            StatsRow {
+                avg: "26.5 L".into(),
+                med: "26.5 L".into(),
+                sd: "14.3".into(),
+                count: Some("11/12".into()),
+            }
+        );
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        for (i, &(w, h, narrow)) in FIT_AREAS[..FIT_WINDOWS.len()].iter().enumerate() {
+            for width in [w, narrow] {
+                for legend in [Legend::Beside, Legend::Below] {
+                    for want in 1..=MAX_CARDS {
+                        let at = format!("{:?} {width} {legend:?} {want}", FIT_WINDOWS[i]);
+                        let layout =
+                            cards_layout(egui::vec2(width, h), 5, &[2, 4, 6], Some(legend), want);
+                        let rows = layout.bars.expect("bars").rows;
+                        let rect = layout.cards[0];
+                        // The whole table at its widths, no gap closed up.
+                        let inner = rect.width() - 2.0 * impact::PAD;
+                        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                            let texts = bars.each_ref().map(StatsRow::of);
+                            let table = stats_table(
+                                &ctx.layer_painter(egui::LayerId::background()),
+                                &bars,
+                                &texts,
+                                inner,
+                            );
+                            assert!(table.width <= inner + 0.01, "{at}: {table:?} in {inner}");
+                            assert!(table.value >= STATS_VALUE_MIN, "{at}");
+                        });
+                        // Every text inside the card's padding, none cut.
+                        let texts = painted_stats_card(rect, &bars, &rows);
+                        assert!(texts.len() >= 4 + 3 + 3 + 3 * 4, "{at}: {texts:?}");
+                        let pad = rect.shrink2(egui::vec2(impact::PAD - 0.5, 0.0));
+                        for (text, _, r) in &texts {
+                            assert!(pad.contains_rect(*r), "{at}: {text} {r:?} in {rect:?}");
+                            assert!(!text.contains('\u{2026}'), "{at}: {text}");
+                        }
+                        // Title, headers and rows don't overlap.
+                        for (n, (a, _, ra)) in texts.iter().enumerate() {
+                            for (b, _, rb) in &texts[n + 1..] {
+                                assert!(
+                                    ra.intersect(*rb).area() < 1.0,
+                                    "{at}: {a} {ra:?} over {b} {rb:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -8009,5 +8760,700 @@ mod tests {
         }
         let texts = painted_texts(&shots_frame(&ctx, &mut app, window).shapes);
         assert!(!texts.iter().any(|(t, _)| t == "TOE"));
+    }
+
+    /// A clip of the shot from `camera`.
+    fn clip(camera: &str) -> crate::types::ShotVideo {
+        crate::types::ShotVideo {
+            camera: camera.into(),
+            position: crate::types::CameraPosition::GolferFront,
+            duration_ms: 1000,
+            fps: 100.0,
+            trigger_offset_ms: 500,
+            impact_offset_ms: 500,
+            complete: true,
+            dropped: 0,
+        }
+    }
+
+    /// One pass of the Shots tab at 1600×900 with `events`; returns the
+    /// marked controls and the output.
+    fn marked_frame(
+        ctx: &egui::Context,
+        app: &mut FlighthookApp,
+        events: Vec<egui::Event>,
+    ) -> (devices::Marks, egui::FullOutput) {
+        ctx.data_mut(|d| d.remove_temp::<devices::Marks>(egui::Id::NULL));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().inner_margin(TAB_MARGIN))
+                .show(ctx, |ui| app.render_shots_panel(ui));
+        });
+        let marks = ctx
+            .data(|d| d.get_temp::<devices::Marks>(egui::Id::NULL))
+            .unwrap_or_default();
+        (marks, out)
+    }
+
+    /// Click the middle of control `name`; returns the marks after.
+    fn click_marked(
+        ctx: &egui::Context,
+        app: &mut FlighthookApp,
+        marks: &devices::Marks,
+        name: &str,
+    ) -> devices::Marks {
+        use egui::{Event, Modifiers, PointerButton};
+        let at = marks[name].0.center();
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        marked_frame(ctx, app, vec![Event::PointerMoved(at)]);
+        marked_frame(ctx, app, vec![button(true)]);
+        marked_frame(ctx, app, vec![button(false)]);
+        marked_frame(ctx, app, Vec::new()).0
+    }
+
+    #[test]
+    fn a_shot_with_clips_has_a_replay_chip_that_opens_the_replay() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut app = cards_app();
+        let marks = marked_frame(&ctx, &mut app, Vec::new()).0;
+        assert!(!marks.contains_key("replay"), "no clips, no chip");
+
+        let last = app.shots.len() - 1;
+        app.shots[last].video = vec![clip("camera.0"), clip("camera.1")];
+        app.shots_rev += 1;
+        marked_frame(&ctx, &mut app, Vec::new());
+        let marks = marked_frame(&ctx, &mut app, Vec::new()).0;
+        let marks = click_marked(&ctx, &mut app, &marks, "replay");
+        assert!(app.replay.is_some());
+        for camera in ["camera.0", "camera.1"] {
+            assert!(marks.contains_key(&format!("replay:download:{camera}")));
+        }
+        assert!(!marks.contains_key("replay:play"), "no sidecar yet");
+
+        // The sidecars arrive: playing from 2 s before the impact, which the
+        // clip (1.0 to 2.0 s, impact at 1.5 s) starts later than, so from its
+        // start; the playhead holds there while the frames are on their way.
+        let seq = app.replay_seq;
+        for camera in ["camera.0", "camera.1"] {
+            let t = crate::replay::tests::track(1000, 10, 100, 50);
+            let json = serde_json::json!({
+                "version": 1, "fourcc": "MJPG", "width": 64, "height": 48,
+                "fps": {"nominal": null, "measured": 100.0},
+                "start_ns": t.start_ns, "frames": t.frames,
+                "trigger_index": 50, "impact_index": 50,
+                "trigger_ns": 500_000_000, "impact_ns": 500_000_000,
+                "complete": true, "dropped": 0, "truncated": false,
+            });
+            app.pending
+                .lock()
+                .unwrap()
+                .replay
+                .push(crate::net::ReplayReply::Sidecar {
+                    replay: seq,
+                    camera: camera.into(),
+                    result: stance::sidecar::Sidecar::from_json(&json.to_string())
+                        .map_err(|e| e.to_string()),
+                });
+        }
+        app.apply_pending();
+        marked_frame(&ctx, &mut app, Vec::new());
+        let marks = marked_frame(&ctx, &mut app, Vec::new()).0;
+        for name in [
+            "replay:play",
+            "replay:step:true",
+            "replay:step:false",
+            "replay:speed",
+            "replay:scrubber",
+        ] {
+            assert!(marks.contains_key(name), "{name}");
+        }
+        let start = app
+            .replay
+            .as_ref()
+            .unwrap()
+            .playback
+            .as_ref()
+            .unwrap()
+            .playhead;
+        assert_eq!(start, 1_000_000_000, "clamped to the clip start");
+        assert!(
+            app.replay
+                .as_ref()
+                .unwrap()
+                .playback
+                .as_ref()
+                .unwrap()
+                .playing,
+            "opens playing"
+        );
+        // Pausing before the frames are in cancels the autoplay.
+        let marks = click_marked(&ctx, &mut app, &marks, "replay:play");
+        let p = app.replay.as_ref().unwrap().playback.clone().unwrap();
+        assert_eq!((p.playhead, p.playing), (start, false));
+        let marks = click_marked(&ctx, &mut app, &marks, "replay:step:true");
+        let p = app.replay.as_ref().unwrap().playback.clone().unwrap();
+        assert_eq!(p.playhead, 1_010_000_000, "one frame on");
+        let marks = click_marked(&ctx, &mut app, &marks, "replay:play");
+        assert!(
+            app.replay
+                .as_ref()
+                .unwrap()
+                .playback
+                .as_ref()
+                .unwrap()
+                .playing
+        );
+
+        let _ = click_marked(&ctx, &mut app, &marks, "replay:close");
+        assert!(app.replay.is_none());
+    }
+
+    /// `app` with connected cameras `camera.0` "Face-on" and `camera.1`
+    /// "Down the line".
+    fn with_cameras(mut app: FlighthookApp) -> FlighthookApp {
+        use crate::types::ActorStatus;
+        for (id, name) in [("camera.0", "Face-on"), ("camera.1", "Down the line")] {
+            app.actors.insert(
+                id.into(),
+                ActorStatusResponse::new(name, ActorStatus::Connected),
+            );
+        }
+        app
+    }
+
+    /// The card row's rects as last painted.
+    fn row_cards(ctx: &egui::Context) -> Vec<egui::Rect> {
+        ctx.data(|d| d.get_temp::<Vec<egui::Rect>>(egui::Id::new("row_cards")))
+            .unwrap_or_default()
+    }
+
+    /// Click at `at` in a `window`-sized app, then settle a frame.
+    fn click_at(ctx: &egui::Context, app: &mut FlighthookApp, window: egui::Vec2, at: egui::Pos2) {
+        use egui::{Event, Modifiers, PointerButton};
+        let frame = |app: &mut FlighthookApp, events: Vec<Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window)),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().inner_margin(TAB_MARGIN))
+                    .show(ctx, |ui| app.render_shots_panel(ui));
+            });
+        };
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(app, vec![Event::PointerMoved(at)]);
+        frame(app, vec![button(true)]);
+        frame(app, vec![button(false)]);
+        frame(app, Vec::new());
+    }
+
+    #[test]
+    fn the_card_row_shows_stats_cameras_and_face_impact_and_cycles_on_a_click() {
+        use card_row::CardSource::{Camera, Face, Stats};
+        let cam = |n: u8| Camera(format!("camera.{n}"));
+        // Stats only, with nothing else to show.
+        for (w, h) in FIT_WINDOWS {
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let mut app = cards_app();
+            for _ in 0..3 {
+                shots_frame(&ctx, &mut app, egui::vec2(w, h));
+            }
+            assert_eq!(app.card_row.shown, [Stats], "{w}x{h}");
+            assert_eq!(row_cards(&ctx).len(), 1, "{w}x{h}");
+        }
+        // Two cameras and face impact: three cards at 1600x900, two at
+        // 1024x768.
+        for (window, expect) in [
+            ((1600.0, 900.0), vec![Stats, cam(0), Face]),
+            ((1024.0, 768.0), vec![Stats, Face]),
+        ] {
+            let window = egui::vec2(window.0, window.1);
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let mut app = with_cameras(impact_app());
+            for _ in 0..3 {
+                shots_frame(&ctx, &mut app, window);
+            }
+            assert_eq!(app.card_row.shown, expect, "{window:?}");
+            let texts = painted_texts(&shots_frame(&ctx, &mut app, window).shapes);
+            let painted = |t: &str| texts.iter().any(|(x, _)| x == t);
+            assert!(painted("TOE"), "{window:?}");
+            assert_eq!(painted("FACE-ON"), expect.contains(&cam(0)), "{window:?}");
+            assert!(!painted("DOWN THE LINE"), "{window:?}");
+            // A click on the second card moves it on to what is not shown.
+            let rects = row_cards(&ctx);
+            assert_eq!(rects.len(), expect.len());
+            click_at(&ctx, &mut app, window, rects[1].center());
+            let after = if expect.len() == 3 {
+                vec![Stats, cam(1), Face]
+            } else {
+                vec![Stats, cam(0)]
+            };
+            assert_eq!(app.card_row.shown, after, "{window:?}");
+            let texts = painted_texts(&shots_frame(&ctx, &mut app, window).shapes);
+            let painted = |t: &str| texts.iter().any(|(x, _)| x == t);
+            assert_eq!(painted("DOWN THE LINE"), expect.len() == 3, "{window:?}");
+            // A click on the stats card too.
+            click_at(&ctx, &mut app, window, rects[0].center());
+            assert_ne!(app.card_row.shown[0], Stats, "{window:?}");
+        }
+        // A camera that disconnects frees its card.
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let window = egui::vec2(1600.0, 900.0);
+        let mut app = with_cameras(impact_app());
+        for _ in 0..3 {
+            shots_frame(&ctx, &mut app, window);
+        }
+        app.actors.get_mut("camera.0").unwrap().status = crate::types::ActorStatus::Disconnected;
+        shots_frame(&ctx, &mut app, window);
+        assert_eq!(app.card_row.shown, [Stats, cam(1), Face]);
+        // The view None has no bars and no row.
+        app.groups.mode = ShotGrouping::None;
+        shots_frame(&ctx, &mut app, window);
+        let texts = painted_texts(&shots_frame(&ctx, &mut app, window).shapes);
+        assert!(
+            !texts
+                .iter()
+                .any(|(t, _)| t == "TOE" || t == "DOWN THE LINE")
+        );
+        assert_eq!(app.card_row.shown, [Stats, cam(1), Face], "kept for later");
+    }
+
+    #[test]
+    fn a_camera_card_plays_the_shown_shots_clip_only_when_it_has_one() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let window = egui::vec2(1600.0, 900.0);
+        let mut app = with_cameras(cards_app());
+        let last = app.shots.len() - 1;
+        app.shots[last].video = vec![clip("camera.0")];
+        app.shots[3].video = vec![clip("camera.0"), clip("camera.1")];
+        app.shots_rev += 1;
+        for _ in 0..3 {
+            shots_frame(&ctx, &mut app, window);
+        }
+        // Stats, camera.0, camera.1: only camera.0 has a clip of the shot.
+        assert_eq!(app.card_row.shown.len(), 3);
+        assert!(app.card_clips.contains_key("camera.0"));
+        assert!(
+            !app.card_clips.contains_key("camera.1"),
+            "no clip, no fetch"
+        );
+        let seq = app.card_clips["camera.0"].seq();
+        assert!(app.card_clips["camera.0"].shows(&app.shots[last].shot_id));
+        // A camera card's label is its name; the body stays empty until the
+        // frames are in.
+        let texts = painted_texts(&shots_frame(&ctx, &mut app, window).shapes);
+        assert!(texts.iter().any(|(t, _)| t == "FACE-ON"));
+        assert!(texts.iter().any(|(t, _)| t == "DOWN THE LINE"));
+        // Another shot shown: the clip goes, and that shot's come in.
+        app.select_shot(3);
+        shots_frame(&ctx, &mut app, window);
+        assert!(app.card_clips["camera.0"].shows(&app.shots[3].shot_id));
+        assert_ne!(app.card_clips["camera.0"].seq(), seq);
+        assert!(app.card_clips.contains_key("camera.1"));
+        // A shot without clips: none.
+        app.select_shot(4);
+        shots_frame(&ctx, &mut app, window);
+        assert!(app.card_clips.is_empty());
+        // Clear history drops them too.
+        app.select_shot(3);
+        shots_frame(&ctx, &mut app, window);
+        assert!(!app.card_clips.is_empty());
+        app.clear_shot_history();
+        assert!(app.card_clips.is_empty());
+    }
+
+    #[test]
+    fn the_table_shows_a_replay_column_only_while_a_shot_has_clips() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut app = cards_app();
+        app.shots_view = ShotsView::Table;
+        let header = |app: &mut FlighthookApp| {
+            marked_frame(&ctx, app, Vec::new());
+            let out = marked_frame(&ctx, app, Vec::new()).1;
+            painted_texts(&out.shapes)
+                .into_iter()
+                .any(|(text, _)| text == "Replay")
+        };
+        assert!(!header(&mut app));
+        app.shots[3].video = vec![clip("camera.0")];
+        app.shots_rev += 1;
+        assert!(header(&mut app));
+    }
+
+    #[test]
+    fn camera_cards_drop_their_clips_while_the_row_is_hidden() {
+        use card_row::CardSource::{Camera, Face, Stats};
+        let cam = |n: u8| Camera(format!("camera.{n}"));
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let (big, small) = (egui::vec2(1600.0, 900.0), egui::vec2(1024.0, 768.0));
+        let mut app = with_cameras(impact_app());
+        app.active_tab = crate::panels::Tab::Shots;
+        let last = app.shots.len() - 1;
+        app.shots[last].video = vec![clip("camera.0"), clip("camera.1")];
+        app.shots_rev += 1;
+        let settle = |app: &mut FlighthookApp, window| {
+            for _ in 0..3 {
+                shots_frame(&ctx, app, window);
+            }
+        };
+        let clips = |app: &FlighthookApp| {
+            let mut ids: Vec<String> = app.card_clips.keys().cloned().collect();
+            ids.sort();
+            ids
+        };
+        settle(&mut app, big);
+        assert_eq!(app.card_row.shown, [Stats, cam(0), Face]);
+        assert_eq!(clips(&app), ["camera.0"]);
+        // Cycling camera.0's card on to camera.1 drops camera.0's clip.
+        let rects = row_cards(&ctx);
+        click_at(&ctx, &mut app, big, rects[1].center());
+        assert_eq!(app.card_row.shown, [Stats, cam(1), Face]);
+        assert_eq!(clips(&app), ["camera.1"]);
+        // A smaller window: two cards, face impact kept rightmost, and the
+        // camera's clip goes with its card.
+        settle(&mut app, small);
+        assert_eq!(app.card_row.shown, [Stats, Face]);
+        assert_eq!(row_cards(&ctx).len(), 2);
+        assert!(app.card_clips.is_empty());
+        settle(&mut app, big);
+        assert_eq!(app.card_row.shown.len(), 3);
+        assert_eq!(clips(&app), ["camera.0"]);
+        // The Table view and another tab drop the clips; back on the row,
+        // they come again.
+        for hide in [
+            |app: &mut FlighthookApp| app.shots_view = ShotsView::Table,
+            |app: &mut FlighthookApp| app.active_tab = crate::panels::Tab::Devices,
+        ] {
+            hide(&mut app);
+            app.drop_hidden_card_clips();
+            assert!(app.card_clips.is_empty());
+            app.shots_view = ShotsView::Cards;
+            app.active_tab = crate::panels::Tab::Shots;
+            app.drop_hidden_card_clips();
+            settle(&mut app, big);
+            assert_eq!(clips(&app), ["camera.0"]);
+        }
+        // The view None has no row.
+        app.groups.mode = ShotGrouping::None;
+        settle(&mut app, big);
+        assert!(app.card_clips.is_empty());
+        app.groups.mode = ShotGrouping::BySet;
+        settle(&mut app, big);
+        assert_eq!(clips(&app), ["camera.0"]);
+        // The replay of the shown shot covers the row.
+        app.open_replay(&ctx, last);
+        settle(&mut app, big);
+        assert!(app.card_clips.is_empty());
+        app.replay = None;
+        settle(&mut app, big);
+        assert_eq!(clips(&app), ["camera.0"]);
+    }
+
+    #[test]
+    fn the_toolbar_carries_the_device_filter_with_two_devices() {
+        for (view, grouping) in [
+            (ShotsView::Cards, ShotGrouping::BySet),
+            (ShotsView::Cards, ShotGrouping::None),
+            (ShotsView::Table, ShotGrouping::BySet),
+        ] {
+            let at = format!("{view:?} {grouping:?}");
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let mut app = cards_app();
+            app.shots_view = view;
+            app.groups.mode = grouping;
+            marked_frame(&ctx, &mut app, Vec::new());
+            let (marks, out) = marked_frame(&ctx, &mut app, Vec::new());
+            let filter = marks.get("device-filter").expect("the filter").0;
+            let chip = marks["auto-chip"].0;
+            // On the toolbar row, just before Auto-chip.
+            assert!(filter.right() < chip.left(), "{at}");
+            assert!((filter.center().y - chip.center().y).abs() <= 2.5, "{at}");
+            // Its DEVICE label is the only one: none over the bars or in the
+            // Dispersion header.
+            let texts = painted_text_rects(&out.shapes);
+            let labels: Vec<egui::Rect> = texts
+                .iter()
+                .filter(|(t, _, _)| t == "DEVICE")
+                .map(|(_, _, r)| *r)
+                .collect();
+            assert_eq!(labels.len(), 1, "{at}");
+            assert!(labels[0].right() <= filter.left() + 0.5, "{at}");
+            assert!(
+                (labels[0].center().y - filter.center().y).abs() < 3.0,
+                "{at}"
+            );
+            assert_eq!(texts.iter().filter(|(t, _, _)| t == "All").count(), 1);
+            // A pick sets the filter.
+            click_marked(&ctx, &mut app, &marks, "device-filter");
+            assert_eq!(app.device_filter.as_deref(), Some("mevo.0"), "{at}");
+            // One device: no filter, and All again.
+            for shot in &mut app.shots {
+                shot.actor = "mevo.0".into();
+            }
+            app.shots[0].actor = "square.0".into();
+            app.shots_rev += 1;
+            marked_frame(&ctx, &mut app, Vec::new());
+            assert!(
+                marked_frame(&ctx, &mut app, Vec::new())
+                    .0
+                    .contains_key("device-filter")
+            );
+            app.shots[0].actor = "mevo.0".into();
+            app.shots_rev += 1;
+            app.device_filter = Some("square.0".into());
+            marked_frame(&ctx, &mut app, Vec::new());
+            let (marks, out) = marked_frame(&ctx, &mut app, Vec::new());
+            assert!(!marks.contains_key("device-filter"), "{at}");
+            assert!(
+                !painted_texts(&out.shapes)
+                    .iter()
+                    .any(|(t, _)| t == "DEVICE")
+            );
+            assert_eq!(app.device_filter, None, "{at}: its device left");
+        }
+    }
+
+    /// The numbers of the shot list's entries as painted.
+    fn listed(texts: &[(String, bool)]) -> std::collections::BTreeSet<u32> {
+        texts
+            .iter()
+            .filter_map(|(t, _)| t.strip_prefix('#')?.parse().ok())
+            .collect()
+    }
+
+    #[test]
+    fn a_device_filter_applies_to_the_list_the_shown_shot_and_the_table() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut app = cards_app();
+        let frame = |app: &mut FlighthookApp| {
+            app.refresh_shot_caches();
+            app.observe_shots(1.0);
+            marked_frame(&ctx, app, Vec::new());
+            painted_texts(&marked_frame(&ctx, app, Vec::new()).1.shapes)
+        };
+        let count =
+            |texts: &[(String, bool)], t: &str| texts.iter().filter(|(x, _)| x == t).count();
+        // The list scrolls: the entries in view, both devices'.
+        let texts = frame(&mut app);
+        let shown = listed(&texts);
+        assert!(shown.iter().any(|n| n % 2 == 0) && shown.iter().any(|n| n % 2 == 1));
+        assert!(texts.iter().any(|(t, _)| t == "SHOTS"));
+        let i = texts.iter().position(|(t, _)| t == "SHOTS").unwrap();
+        assert_eq!(texts[i + 1].0, "12", "the unfiltered total");
+        assert!(texts.iter().any(|(t, _)| t == "Shot #11"));
+        // The Mevo alone: its shots in the list, under a header counting
+        // them, a total of its own; its newest shot on show; the bars over its shots.
+        app.device_filter = Some("mevo.0".into());
+        let texts = frame(&mut app);
+        let shown = listed(&texts);
+        assert!(
+            shown.len() >= 4 && shown.iter().all(|n| n % 2 == 0),
+            "{shown:?}"
+        );
+        assert_eq!(
+            list_items(&app.shots, &app.groups, None, app.filter()),
+            std::iter::once(header("a"))
+                .chain((0..12).step_by(2).rev().map(ListItem::Shot))
+                .collect::<Vec<_>>()
+        );
+        // The total counts the Mevo's rows alone (6 of the 12).
+        let total = |texts: &[(String, bool)]| {
+            let i = texts.iter().position(|(t, _)| t == "SHOTS").unwrap();
+            texts[i + 1].0.clone()
+        };
+        assert_eq!(total(&texts), "6", "{texts:?}");
+        assert_eq!(shot_total(&app.shots, app.filter()), 6);
+        assert_eq!(shot_total(&app.shots, None), 12);
+        assert_eq!(
+            count(&texts, "SET 1 \u{b7} 7I \u{b7} 6 SHOTS"),
+            2,
+            "list and bars"
+        );
+        assert_eq!(app.shown_index(), Some(10));
+        assert!(texts.iter().any(|(t, _)| t == "Shot #10"));
+        assert!(texts.iter().any(|(t, _)| t == "LATEST"));
+        // Device names: the toolbar's two options, and the Mevo's six rows.
+        assert_eq!(count(&texts, "square.0"), 1, "{texts:?}");
+        assert_eq!(count(&texts, "mevo.0"), 1 + 6 + 1, "toolbar, list, header");
+        // The members, Flight and Dispersion: the Mevo's shots, cached on
+        // a key that holds the filter.
+        let key = app.refresh_members(10);
+        assert_eq!(key.device.as_deref(), Some("mevo.0"));
+        let members = app.view_members.peek(&key).cloned().unwrap();
+        assert_eq!(members, (0..12).step_by(2).collect::<Vec<usize>>());
+        // The Table: the Mevo's rows only.
+        app.shots_view = ShotsView::Table;
+        let texts = frame(&mut app);
+        assert_eq!(
+            app.filtered_rows(),
+            (0..12).step_by(2).collect::<Vec<usize>>()
+        );
+        assert_eq!(count(&texts, "square.0"), 1, "only the toolbar's");
+        assert_eq!(count(&texts, "mevo.0"), 1 + 6, "toolbar and rows");
+        // The Omni: its rows, its members, under keys of their own.
+        app.device_filter = Some("square.0".into());
+        let texts = frame(&mut app);
+        assert_eq!(
+            app.filtered_rows(),
+            (1..12).step_by(2).collect::<Vec<usize>>()
+        );
+        assert_eq!(count(&texts, "square.0"), 1 + 6);
+        let omni = app.refresh_members(11);
+        assert_ne!(omni, key);
+        assert_eq!(
+            app.view_members.peek(&omni).cloned().unwrap(),
+            (1..12).step_by(2).collect::<Vec<usize>>()
+        );
+        // Export stays the whole session: its links carry no filter.
+        assert!(!net::export_url("csv", app.units_toggle).contains("square"));
+    }
+
+    #[test]
+    fn a_filter_picks_its_devices_newest_shot_unless_one_of_its_shots_is_shown() {
+        let mut app = cards_app();
+        let observe = |app: &mut FlighthookApp, now: f64| {
+            app.observe_shots(now);
+        };
+        observe(&mut app, 0.0);
+        // An older Omni shot on show; the Mevo filter moves to the Mevo's
+        // newest, without a pulse.
+        app.select_shot(5);
+        assert_eq!(app.shown_index(), Some(5));
+        app.device_filter = Some("mevo.0".into());
+        assert_eq!(app.shown_index(), Some(10), "at once");
+        observe(&mut app, 1.0);
+        assert_eq!(app.shown_index(), Some(10));
+        assert!(app.following());
+        assert_eq!(app.shot_focus.progress(1.0), None, "no pulse");
+        // All again: the Omni shot is not brought back.
+        app.device_filter = None;
+        observe(&mut app, 2.0);
+        assert_eq!(app.shown_index(), Some(11));
+        // An Omni shot on show stays under the Omni's filter.
+        app.select_shot(5);
+        app.device_filter = Some("square.0".into());
+        observe(&mut app, 3.0);
+        assert_eq!(app.shown_index(), Some(5));
+        assert!(!app.following());
+    }
+
+    #[test]
+    fn a_new_shot_from_another_device_does_not_move_the_shown_shot() {
+        let mut app = cards_app();
+        app.device_filter = Some("mevo.0".into());
+        app.observe_shots(0.0);
+        assert_eq!(app.shown_index(), Some(10));
+        let shot = |n: u32, actor: &str| ShotRow {
+            actor: actor.into(),
+            group: Some("a".into()),
+            shot_number: n,
+            shot_id: format!("id{n}"),
+            ..thousand_rows().remove(0)
+        };
+        // The Omni's shot: no pulse, no move, not listed.
+        app.shots.push(shot(12, "square.0"));
+        app.shots_rev += 1;
+        app.observe_shots(5.0);
+        assert_eq!(app.shown_index(), Some(10));
+        assert_eq!(app.shot_focus.progress(5.0), None);
+        let items = list_items(&app.shots, &app.groups, None, app.filter());
+        assert!(!items.contains(&ListItem::Shot(12)));
+        // An older Mevo shot picked stays on show through it.
+        app.select_shot(4);
+        app.shots.push(shot(13, "square.0"));
+        app.shots_rev += 1;
+        app.observe_shots(6.0);
+        assert_eq!(app.shown_index(), Some(4));
+        // The Mevo's next shot is the one on show, pulsing.
+        app.shots.push(shot(14, "mevo.0"));
+        app.shots_rev += 1;
+        app.observe_shots(7.0);
+        assert_eq!(app.shown_index(), Some(14));
+        assert!(app.shot_focus.progress(7.0).is_some());
+    }
+
+    #[test]
+    fn the_list_under_a_filter_has_only_that_devices_shots_and_sections() {
+        // Set a: Mevo and Omni; set b: Omni only; set c: Mevo only.
+        let rows = vec![
+            device_shot(1, "mevo.0", "a", 150.0, 1.0),
+            device_shot(2, "square.0", "a", 151.0, 1.0),
+            device_shot(3, "square.0", "b", 230.0, 1.0),
+            device_shot(4, "mevo.0", "c", 152.0, 1.0),
+            device_shot(5, "square.0", "c", 153.0, 1.0),
+        ];
+        let list = vec![
+            group("a", 1, Club::Iron7, false, 2),
+            group("b", 2, Club::Driver, false, 1),
+            group("c", 3, Club::Iron7, true, 2),
+        ];
+        let by_set = groups(ShotGrouping::BySet, list.clone());
+        assert_eq!(
+            list_items(&rows, &by_set, Some(Club::Iron7), Some("mevo.0")),
+            [
+                header("c"),
+                ListItem::Shot(3),
+                header("a"),
+                ListItem::Shot(0)
+            ]
+        );
+        assert_eq!(
+            list_items(&rows, &by_set, Some(Club::Iron7), Some("square.0")),
+            [
+                header("c"),
+                ListItem::Shot(4),
+                header("b"),
+                ListItem::Shot(2),
+                header("a"),
+                ListItem::Shot(1)
+            ]
+        );
+        let by_club = groups(ShotGrouping::ByClub, list.clone());
+        assert_eq!(
+            list_items(&rows, &by_club, Some(Club::Iron7), Some("mevo.0")),
+            [
+                club_header(0, Club::Iron7),
+                ListItem::Shot(3),
+                ListItem::Shot(0)
+            ]
+        );
+        let none = groups(ShotGrouping::None, list.clone());
+        assert_eq!(
+            list_items(&rows, &none, None, Some("square.0")),
+            [ListItem::Shot(4), ListItem::Shot(2), ListItem::Shot(1)]
+        );
+        // The headers count the filtered device's shots.
+        let a = by_set.get("a").unwrap();
+        assert_eq!(chart::set_shot_count(a, &rows, None), 2);
+        assert_eq!(chart::set_shot_count(a, &rows, Some("mevo.0")), 1);
     }
 }

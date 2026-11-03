@@ -1,6 +1,7 @@
 //! Actor infrastructure — shared trait, bus helpers, and actor resolution.
 
 pub(crate) mod backoff;
+pub mod camera;
 pub mod exputt;
 pub mod gspro;
 pub mod mevo;
@@ -254,6 +255,21 @@ pub fn resolve_actors(
         });
     }
 
+    // Swing cameras
+    for (index, section) in &config.camera {
+        let id = global_id("camera", index);
+        if let Err(e) = section.mode.parse::<stance::FormatRequest>() {
+            tracing::warn!("camera '{id}': {e}");
+        }
+        actors.push(ResolvedActor {
+            id,
+            name: section.name.clone(),
+            actor: Box::new(camera::CameraActor {
+                section: section.clone(),
+            }),
+        });
+    }
+
     actors
 }
 
@@ -294,6 +310,9 @@ pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String> {
     }
     for (index, section) in &config.random_club {
         names.insert(global_id("random_club", index), section.name.clone());
+    }
+    for (index, section) in &config.camera {
+        names.insert(global_id("camera", index), section.name.clone());
     }
     for (index, ws) in &config.webserver {
         names.insert(global_id("webserver", index), ws.name.clone());

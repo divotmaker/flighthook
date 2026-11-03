@@ -22,6 +22,14 @@ pub struct StatusResponse {
     /// Player handedness in game state; absent when none has been set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handed: Option<Handedness>,
+    /// The server can record from cameras on its platform (beta). Omitted
+    /// when it can't.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cameras_supported: bool,
+    /// The folder replay clips are written to (`[replay] clip_dir`, or the
+    /// default). Omitted when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_dir: Option<String>,
 }
 
 /// Per-actor status within the status response. Also used as the cached

@@ -1,6 +1,6 @@
-//! The Devices tab: the settings-only Global and Simulation cards, then one
-//! card per web server, launch monitor and output that flips between its
-//! live telemetry and its settings.
+//! The Devices tab: the settings-only Global, Simulation and Replay cards,
+//! then one card per web server, launch monitor, camera and output that
+//! flips between its live telemetry and its settings.
 //!
 //! While any card has unsaved edits the tab is locked to it: the tab bar,
 //! the other cards' toggles and edit controls, and the (+) buttons are
@@ -100,6 +100,10 @@ enum CardAction {
     Cancel,
     Remove,
     FindMat,
+    /// Fetch the camera's still frame.
+    Still,
+    /// Look for cameras again.
+    RefreshCameras,
 }
 
 /// How a device card is drawn.
@@ -118,6 +122,8 @@ struct CardView<'a> {
     error: Option<&'a str>,
     /// Launch monitors for the routing dropdowns: (actor ID, name).
     monitors: &'a [(String, String)],
+    /// The camera list, for a camera card's picker.
+    cameras: &'a crate::app::CameraList,
 }
 
 /// One device card. Its header holds the name on the left and, on the
@@ -126,13 +132,15 @@ struct CardView<'a> {
 /// Settings toggle, or Save and Cancel while its settings have unsaved
 /// edits. The settings side ends in
 /// Remove, except on a web server's card; an ExPutt's telemetry side ends in
-/// Find mat, enabled while the ExPutt is connected. The left stripe is the
-/// actor's status colour, dim while it is not running.
+/// Find mat, enabled while the ExPutt is connected, and a camera's in Still
+/// frame (`still`), which shows the camera's latest frame on the card. The
+/// left stripe is the actor's status colour, dim while it is not running.
 fn device_card(
     ui: &mut egui::Ui,
     id: &str,
     view: &CardView<'_>,
     form: Option<&mut ActorFormEntry>,
+    still: Option<&mut crate::panels::replay::Still>,
 ) -> Option<CardAction> {
     let accent = view.telemetry.map_or(theme::TEXT_DIM, |a| {
         monitoring::status_color(a, view.now_ms)
@@ -204,9 +212,14 @@ fn device_card(
         match (mode, form) {
             (CardMode::Settings, Some(entry)) => {
                 ui.add_space(6.0);
-                ui.add_enabled_ui(view.editable, |ui| {
-                    settings::actor_fields(ui, entry, view.monitors);
-                });
+                let refresh = ui
+                    .add_enabled_ui(view.editable, |ui| {
+                        settings::actor_fields(ui, entry, view.monitors, view.cameras)
+                    })
+                    .inner;
+                if refresh {
+                    action = Some(CardAction::RefreshCameras);
+                }
                 if cards::removable(entry_type(id)) && settings::remove_row(ui, id, view.editable) {
                     action = Some(CardAction::Remove);
                 }
@@ -221,6 +234,14 @@ fn device_card(
                         .is_some_and(|a| a.status == ActorStatus::Connected);
                     if settings::button_row(ui, "Find mat", &format!("find_mat:{id}"), connected) {
                         action = Some(CardAction::FindMat);
+                    }
+                }
+                if let Some(still) = still {
+                    let connected = view
+                        .telemetry
+                        .is_some_and(|a| a.status == ActorStatus::Connected);
+                    if crate::panels::replay::still_body(ui, id, still, connected) {
+                        action = Some(CardAction::Still);
                     }
                 }
             }
@@ -243,6 +264,10 @@ impl FlighthookApp {
             net::fetch_settings(ctx, &self.pending);
         }
 
+        if self.camera_list_due() {
+            self.refresh_cameras(ctx);
+        }
+
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -256,22 +281,28 @@ impl FlighthookApp {
                     .actors
                     .iter()
                     .filter_map(|a| match a {
-                        ActorFormEntry::Device(d) => Some((a.global_id(), d.name.clone())),
-                        ActorFormEntry::Integration(_) => None,
+                        ActorFormEntry::Device(d) if !d.is_camera() => {
+                            Some((a.global_id(), d.name.clone()))
+                        }
+                        ActorFormEntry::Device(_) | ActorFormEntry::Integration(_) => None,
                     })
                     .collect();
 
                 let mut clicked: Option<(String, Option<usize>, CardAction)> = None;
                 let mut added = None;
                 for (group, members) in device_card_order(&self.actors, &self.settings.actors) {
-                    // General leads with the Global and Simulation cards,
-                    // once the settings have loaded, and has no (+).
+                    // General leads with the Global, Simulation and Replay
+                    // cards, once the settings have loaded, and has no (+).
                     let general = if group == CardGroup::General {
-                        if loaded { 2 } else { 0 }
+                        if loaded { 3 } else { 0 }
                     } else {
                         0
                     };
-                    if group == CardGroup::General {
+                    // Without camera support on the server, Cameras has no
+                    // (+), and shows only for cameras already configured.
+                    let fixed = group == CardGroup::General
+                        || (group == CardGroup::Cameras && !self.cameras_supported);
+                    if fixed {
                         if general + members.len() == 0 {
                             continue;
                         }
@@ -282,10 +313,10 @@ impl FlighthookApp {
                     let general_editable = (!locked || self.settings.global_dirty) && !saving;
                     cards::card_grid(ui, general + members.len(), |ui, i| {
                         if i < general {
-                            if i == 0 {
-                                self.render_global_card(ctx, ui, general_editable);
-                            } else {
-                                self.render_simulation_card(ctx, ui, general_editable);
+                            match i {
+                                0 => self.render_global_card(ctx, ui, general_editable),
+                                1 => self.render_simulation_card(ctx, ui, general_editable),
+                                _ => self.render_replay_card(ctx, ui, general_editable),
                             }
                             return;
                         }
@@ -332,6 +363,8 @@ impl FlighthookApp {
             .map(|e| e.message.clone());
         let form = card.form.and_then(|idx| self.settings.actors.get_mut(idx));
         let dirty = form.as_ref().is_some_and(|f| f.dirty());
+        let still = (entry_type(&card.id) == "camera")
+            .then(|| self.stills.entry(card.id.clone()).or_default());
         let view = CardView {
             telemetry: self.actors.get(&card.id),
             now_ms: self.now_ms,
@@ -341,8 +374,9 @@ impl FlighthookApp {
             saving,
             error: error.as_deref(),
             monitors,
+            cameras: &self.camera_list,
         };
-        device_card(ui, &card.id, &view, form)
+        device_card(ui, &card.id, &view, form, still)
     }
 
     /// Carry out a click on card `id`, whose form entry is at `form`.
@@ -356,6 +390,11 @@ impl FlighthookApp {
         match (action, form) {
             (CardAction::Mode(mode), _) => self.card_modes.set(id, mode),
             (CardAction::FindMat, _) => net::post_find_mat(ctx, id),
+            (CardAction::Still, _) => {
+                #[cfg(not(test))]
+                net::fetch_still(ctx, &self.pending, id);
+            }
+            (CardAction::RefreshCameras, _) => self.refresh_cameras(ctx),
             (CardAction::Save, Some(_)) => self.post_save(ctx, SaveTarget::Actor(id.to_string())),
             (CardAction::Cancel, Some(idx)) => self.cancel_device(idx),
             (CardAction::Remove, Some(idx)) if cards::removable(entry_type(id)) => {
@@ -367,6 +406,30 @@ impl FlighthookApp {
             }
             (CardAction::Remove, Some(_)) | (_, None) => {}
         }
+    }
+
+    /// Ask the server for its camera list again.
+    pub(crate) fn refresh_cameras(&mut self, ctx: &egui::Context) {
+        if self.camera_list.loading {
+            return;
+        }
+        self.camera_list.loading = true;
+        #[cfg(not(test))]
+        net::fetch_cameras(ctx, &self.pending);
+        #[cfg(test)]
+        let _ = ctx;
+    }
+
+    /// Fetch the camera list the first time a camera card shows its
+    /// settings.
+    fn camera_list_due(&self) -> bool {
+        self.camera_list.list.is_none()
+            && self.camera_list.error.is_none()
+            && !self.camera_list.loading
+            && self.settings.actors.iter().any(|a| {
+                matches!(a, ActorFormEntry::Device(d) if d.is_camera())
+                    && (a.dirty() || self.card_modes.get(&a.global_id()) == CardMode::Settings)
+            })
     }
 
     /// Add a new, unsaved card from (+) menu `preset`, showing its settings.
@@ -1677,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn the_web_server_card_sits_in_general_after_global_and_simulation() {
+    fn the_web_server_card_sits_in_general_after_global_simulation_and_replay() {
         for (w, h) in [(1600.0, 900.0), (1024.0, 768.0)] {
             let at = format!("{w}x{h}");
             let screen = Screen::sized(w, h);
@@ -1686,18 +1749,25 @@ mod tests {
             let marks = screen.frame(&mut app, Vec::new());
             let (global, _) = marks["title:global"];
             let (simulation, _) = marks["title:simulation"];
+            let (replay, _) = marks["title:replay"];
             let (web, _) = marks["card:webserver.0"];
             let (mevo, _) = marks["card:mevo.0"];
             assert!(global.left() < simulation.left(), "{at}");
             assert!(web.top() < mevo.top(), "above the launch monitors at {at}");
             if w > 1200.0 {
-                // One row: Global, Simulation, Web Server.
-                assert!(simulation.right() < web.left(), "{at}");
-                assert!(web.top() < global.bottom(), "the same row at {at}");
-            } else {
-                // Two columns: the web server under Global.
+                // One row: Global, Simulation, Replay; the web server under
+                // Global.
+                assert!(simulation.right() < replay.left(), "{at}");
+                assert!(replay.top() < global.bottom(), "the same row at {at}");
                 assert!(web.top() > global.bottom(), "{at}");
                 assert!(web.left() < simulation.left(), "{at}");
+            } else {
+                // Two columns: Replay under Global, the web server under
+                // Simulation.
+                assert!(replay.top() > global.bottom(), "{at}");
+                assert!(replay.left() < simulation.left(), "{at}");
+                assert!(web.top() > simulation.bottom(), "{at}");
+                assert!(web.left() > replay.right(), "{at}");
             }
             // General has no (+).
             assert!(!marks.contains_key("add:General"), "{at}");
@@ -1933,6 +2003,8 @@ mod tests {
                 mode: None,
                 club: None,
                 handed: None,
+                cameras_supported: false,
+                clip_dir: None,
             });
             app.apply_pending();
         }
@@ -2087,5 +2159,248 @@ mod tests {
         assert!(!enabled(&marks, "add:Launch monitors"));
         assert!(!enabled(&marks, "add:Outputs"));
         assert!(!marks.contains_key("save:global"));
+    }
+
+    /// The camera list a server with one USB camera, in use by `camera.1`,
+    /// and the test pattern returns.
+    fn camera_list() -> crate::types::CameraListResponse {
+        crate::types::CameraListResponse {
+            supported: true,
+            cameras: vec![
+                crate::types::CameraListEntry {
+                    id: "/dev/v4l/by-id/usb-c920".into(),
+                    name: "HD Pro Webcam C920".into(),
+                    usb: Some("046d:085e".into()),
+                    modes: vec!["1920x1080@30".into(), "1280x720@30".into()],
+                    in_use_by: Some("camera.1".into()),
+                    error: None,
+                },
+                crate::types::CameraListEntry {
+                    id: "test-pattern".into(),
+                    name: "Test pattern".into(),
+                    modes: vec!["640x360@30".into()],
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn cameras_get_a_group_whose_add_needs_server_support() {
+        let screen = Screen::new();
+        let mut app = app();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(
+            !marks.contains_key("add:Cameras"),
+            "no (+) while the server can't record"
+        );
+        app.cameras_supported = true;
+        let marks = screen.frame(&mut app, Vec::new());
+        let (cameras, _) = marks["add:Cameras"];
+        let (monitors, _) = marks["add:Launch monitors"];
+        let (outputs, _) = marks["add:Outputs"];
+        assert!(monitors.top() < cameras.top() && cameras.top() < outputs.top());
+
+        // A camera already configured keeps its card without support.
+        let id = app.settings.add_actor("camera").unwrap();
+        assert_eq!(id, "camera.0");
+        device(&mut app, &id).cam.id = "test-pattern".into();
+        let config = app.settings.to_request();
+        app.settings = SettingsForm::default();
+        app.settings.load_from(&config);
+        app.cameras_supported = false;
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("add:Cameras"));
+        assert!(marks.contains_key(&format!("card:{id}")));
+    }
+
+    #[test]
+    fn an_added_camera_needs_a_camera_from_the_list() {
+        let screen = Screen::new();
+        let mut app = app();
+        app.cameras_supported = true;
+        app.camera_list.list = Some(camera_list());
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, "add:Cameras");
+        let marks = screen.click_mark(&mut app, &marks, "add:Cameras:Camera");
+        let id = "camera.0";
+        let idx = form_index(&app, id);
+        assert_eq!(app.settings.actors[idx].name(), "Camera");
+        assert_eq!(app.settings.actors[idx].type_label(), "Camera");
+        assert!(marks.contains_key(&format!("camera_pick:{id}")));
+        assert!(marks.contains_key(&format!("camera_mode:{id}")));
+        assert!(!enabled(&marks, &format!("save:{id}")), "no camera yet");
+
+        // Picking from the list, as the picker does.
+        let entry = camera_list().cameras[0].clone();
+        let dev = device(&mut app, id);
+        dev.cam.id = entry.id.clone();
+        dev.cam.name = Some(entry.name.clone());
+        dev.cam.position = crate::types::CameraPosition::TargetLine;
+        dev.cam.mode = "1280x720@30".into();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, &format!("save:{id}")));
+        let section = &app.settings.build_actor_request(id).camera["0"];
+        assert_eq!(section.camera, "/dev/v4l/by-id/usb-c920");
+        assert_eq!(section.camera_name.as_deref(), Some("HD Pro Webcam C920"));
+        assert_eq!(section.position, crate::types::CameraPosition::TargetLine);
+        assert_eq!(section.mode, "1280x720@30");
+
+        // A mode that doesn't parse can't be saved.
+        device(&mut app, id).cam.mode = "fast".into();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, &format!("save:{id}")));
+    }
+
+    #[test]
+    fn the_camera_list_loads_with_a_camera_cards_settings_and_on_refresh() {
+        let screen = Screen::new();
+        let mut app = app();
+        let _ = app.settings.add_actor("camera");
+        screen.frame(&mut app, Vec::new());
+        assert!(app.camera_list.loading, "asked for once a card needs it");
+        // The reply lands.
+        app.pending.lock().unwrap().cameras = Some(Ok(camera_list()));
+        app.apply_pending();
+        assert!(!app.camera_list.loading);
+        assert_eq!(app.camera_list.list, Some(camera_list()));
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!app.camera_list.loading, "loaded: not asked again");
+        let marks = screen.click_mark(&mut app, &marks, "camera_refresh:camera.0");
+        let _ = marks;
+        assert!(app.camera_list.loading, "refresh asks again");
+        app.pending.lock().unwrap().cameras = Some(Err("504 Gateway Timeout".into()));
+        app.apply_pending();
+        assert_eq!(
+            app.camera_list.error.as_deref(),
+            Some("504 Gateway Timeout")
+        );
+        assert_eq!(
+            app.camera_list.list,
+            Some(camera_list()),
+            "the last list stays"
+        );
+    }
+
+    #[test]
+    fn cameras_are_not_routing_monitors() {
+        let screen = Screen::new();
+        let mut app = app();
+        let _ = app.settings.add_actor("camera");
+        let mut config = app.settings.to_request();
+        config.camera.get_mut("0").unwrap().camera = "test-pattern".into();
+        app.settings = SettingsForm::default();
+        app.settings.load_from(&config);
+        app.card_modes
+            .set("openconnect_client.0", CardMode::Settings);
+        // The routing dropdowns list the Mevo only.
+        let monitors: Vec<String> = app
+            .settings
+            .actors
+            .iter()
+            .filter_map(|a| match a {
+                ActorFormEntry::Device(d) if !d.is_camera() => Some(a.global_id()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(monitors, ["mevo.0"]);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("card:camera.0"));
+    }
+
+    #[test]
+    fn a_running_cameras_card_fetches_and_shows_a_still_frame() {
+        use stance::{Source, TestPattern, TestPatternConfig};
+
+        let screen = Screen::new();
+        let mut app = app();
+        let _ = app.settings.add_actor("camera");
+        let mut config = app.settings.to_request();
+        config.camera.get_mut("0").unwrap().camera = "test-pattern".into();
+        app.settings = SettingsForm::default();
+        app.settings.load_from(&config);
+        let id = "camera.0";
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, &format!("still:{id}")), "not running");
+
+        app.actors.insert(
+            id.into(),
+            ActorStatusResponse::new("Camera", ActorStatus::Connected),
+        );
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, &format!("still:{id}"));
+        assert!(
+            !enabled(&marks, &format!("still:{id}")),
+            "waiting for the frame"
+        );
+        assert!(app.stills[id].loading);
+
+        let mut pattern = TestPattern::new(TestPatternConfig {
+            width: 160,
+            height: 90,
+            paced: false,
+            ..TestPatternConfig::default()
+        })
+        .unwrap();
+        let frame = pattern
+            .next_frame(std::time::Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        app.pending
+            .lock()
+            .unwrap()
+            .stills
+            .push((id.into(), Ok(frame.jpeg.to_vec())));
+        app.apply_pending();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, &format!("still:{id}")));
+        let (image, _) = marks[&format!("still_image:{id}")];
+        let (card, _) = marks[&format!("card:{id}")];
+        assert!(image.width() > card.width() * 0.8, "at the card's width");
+        assert!((image.height() / image.width() - 90.0 / 160.0).abs() < 0.02);
+        assert!(card.contains_rect(image));
+    }
+
+    #[test]
+    fn the_replay_card_saves_with_the_global_settings() {
+        let screen = Screen::new();
+        let mut app = app();
+        app.clip_dir = Some("/home/golfer/.local/share/flighthook/clips".into());
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("replay_folder"));
+        assert!(!marks.contains_key("save:replay"));
+
+        app.settings.replay.keep_shots = "50".into();
+        app.settings.mark_general(GeneralCard::Replay);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "save:replay"));
+        assert!(!marks.contains_key("save:simulation"));
+        assert!(!marks.contains_key("save:global"));
+        let request = app.settings.build_global_request();
+        assert_eq!(request.replay.keep_shots, 50);
+        assert_eq!(request.replay.pre_roll_s, 4.0);
+        assert_eq!(request.replay.start_before_impact_s, 2.0);
+        assert!(marks.contains_key("replay_keep"));
+
+        // The start field saves with the rest and rejects out-of-range text.
+        app.settings.replay.start_before_impact_s = "3.5".into();
+        let request = app.settings.build_global_request();
+        assert_eq!(request.replay.start_before_impact_s, 3.5);
+        app.settings.replay.start_before_impact_s = "11".into();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, "save:replay"));
+        app.settings.replay.start_before_impact_s = "2".into();
+
+        // Out of range: no save.
+        app.settings.replay.pre_roll_s = "12".into();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, "save:replay"));
+        // Cancel puts every General card back.
+        let marks = screen.click_mark(&mut app, &marks, "cancel:replay");
+        assert!(!marks.contains_key("cancel:replay"));
+        assert_eq!(app.settings.replay.keep_shots, "20");
+        assert_eq!(app.settings.replay.pre_roll_s, "4");
+        assert_eq!(app.settings.replay.start_before_impact_s, "2");
+        assert!(!app.settings.global_dirty);
     }
 }

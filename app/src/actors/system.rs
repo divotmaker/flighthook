@@ -249,14 +249,53 @@ fn run(
             Ok(None) => {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Ok(Some(msg)) => {
-                if let FlighthookEvent::ConfigCommand { .. } = &msg.event {
+            Ok(Some(msg)) => match &msg.event {
+                FlighthookEvent::ConfigCommand { .. } => {
                     handle_config_command(&msg.event, &state, &bus_tx, &sender);
-                } else {
-                    handle_game_event(&msg.event, &writer, &state, &sender);
                 }
-            }
+                // The clips belong to the shots being cleared.
+                FlighthookEvent::ClearShotHistory => clear_clips(&state),
+                _ => handle_game_event(&msg.event, &writer, &state, &sender),
+            },
         }
+    }
+}
+
+/// Delete every replay clip (Clear history). Folders that can't be deleted
+/// now are retried later.
+pub(crate) fn clear_clips(state: &SystemState) {
+    let removed = state.clips.clear();
+    if !removed.is_empty() {
+        tracing::info!(
+            "clear history: deleted the clips of {} shot(s)",
+            removed.len()
+        );
+    }
+}
+
+/// After a config change: when the clip folder is no longer `before`, the
+/// clip store forgets the old folder's clips (left on disk as they are) and
+/// indexes the new one; the shots whose clips are no longer served go out
+/// in one `shot_video_removed`.
+fn follow_clip_dir(state: &SystemState, sender: &BusSender, before: &std::path::Path) {
+    let replay = state.system.replay();
+    let dir = crate::state::clips::clip_dir(&replay);
+    if dir == before {
+        return;
+    }
+    let removed = state
+        .clips
+        .reindex(&dir, crate::state::clips::keep(&replay));
+    tracing::info!(
+        "clips: now in {} ({} shot(s) no longer have clips; {} is left as it is)",
+        dir.display(),
+        removed.len(),
+        before.display()
+    );
+    if !removed.is_empty() {
+        sender.send(FlighthookMessage::new(FlighthookEvent::ShotVideoRemoved {
+            keys: removed,
+        }));
     }
 }
 
@@ -320,6 +359,8 @@ pub(crate) fn handle_config_command(
         return;
     };
 
+    let clip_dir = crate::state::clips::clip_dir(&state.system.replay());
+
     // Determine scope for actor reconciliation
     let scope: Option<String>;
 
@@ -335,6 +376,7 @@ pub(crate) fn handle_config_command(
                 p.putting_clubs.clone_from(&config.putting_clubs);
                 p.shot_grouping = config.shot_grouping;
                 p.simulation = config.simulation.clone();
+                p.replay = config.replay.clone();
             });
             scope = None;
         }
@@ -401,6 +443,13 @@ pub(crate) fn handle_config_command(
             });
             scope = Some(format!("random_club.{index}"));
         }
+        ConfigAction::UpsertCamera { index, section } => {
+            let idx = index.clone();
+            state.system.update(|p| {
+                p.camera.insert(idx, section.clone());
+            });
+            scope = Some(format!("camera.{index}"));
+        }
         ConfigAction::Remove { id } => {
             let id = crate::state::config::canonical_id(id);
             if let Some((prefix, index)) = id.split_once('.') {
@@ -430,6 +479,9 @@ pub(crate) fn handle_config_command(
                     "random_club" => {
                         p.random_club.remove(&idx);
                     }
+                    "camera" => {
+                        p.camera.remove(&idx);
+                    }
                     "webserver" => {
                         p.webserver.remove(&idx);
                     }
@@ -455,6 +507,8 @@ pub(crate) fn handle_config_command(
             return;
         }
     }
+
+    follow_clip_dir(state, sender, &clip_dir);
 
     // Reconcile actors (webserver included — its reconfigure() handles bind changes)
     let result = apply_config_reload(state, bus_tx, scope.as_deref());
@@ -777,5 +831,153 @@ mod tests {
         let outcome = std::iter::from_fn(|| rx.try_recv().ok())
             .find(|m| matches!(m.event, FlighthookEvent::ConfigOutcome { .. }));
         assert!(outcome.is_some(), "the outcome is emitted");
+    }
+    #[test]
+    fn replace_global_takes_the_replay_settings() {
+        let (_dir, state, _writer, sender, _rx) = game();
+        let state = Arc::new(state);
+        let mut body = state.system.snapshot();
+        body.replay.keep_shots = 3;
+        body.replay.pre_roll_s = 2.0;
+        body.replay.start_before_impact_s = 1.25;
+        body.replay.clip_dir = Some("/srv/swings".into());
+        handle_config_command(
+            &FlighthookEvent::ConfigCommand {
+                request_id: None,
+                action: Box::new(ConfigAction::ReplaceGlobal {
+                    config: Box::new(body.clone()),
+                }),
+            },
+            &state,
+            sender.raw_sender(),
+            &sender,
+        );
+        assert_eq!(state.system.replay(), body.replay);
+    }
+
+    #[test]
+    fn a_camera_section_is_upserted_and_removed_with_its_actor() {
+        let (_dir, state, _writer, sender, _rx) = game();
+        let state = Arc::new(state);
+        let section = flighthook::CameraSection {
+            camera: flighthook::CameraSection::TEST_PATTERN.into(),
+            mode: "160x120@15".into(),
+            ..flighthook::CameraSection::default()
+        };
+        let command = |action| FlighthookEvent::ConfigCommand {
+            request_id: None,
+            action: Box::new(action),
+        };
+        handle_config_command(
+            &command(ConfigAction::UpsertCamera {
+                index: "4".into(),
+                section: section.clone(),
+            }),
+            &state,
+            sender.raw_sender(),
+            &sender,
+        );
+        assert_eq!(state.system.camera("4"), Some(section));
+        assert!(state.actor_ids().contains(&"camera.4".to_owned()));
+        handle_config_command(
+            &command(ConfigAction::Remove {
+                id: "camera.4".into(),
+            }),
+            &state,
+            sender.raw_sender(),
+            &sender,
+        );
+        assert_eq!(state.system.camera("4"), None);
+        assert!(!state.actor_ids().contains(&"camera.4".to_owned()));
+    }
+
+    #[test]
+    fn a_new_clip_folder_is_followed_and_the_old_clips_are_no_longer_served() {
+        let (dir, state, _writer, sender, mut rx) = game();
+        let state = Arc::new(state);
+        let old = dir.0.join("old");
+        state
+            .system
+            .update(|c| c.replay.clip_dir = Some(old.display().to_string()));
+        let key = flighthook::ShotKey {
+            shot_id: "a".into(),
+            shot_number: 1,
+        };
+        let shot = crate::state::clips::ClipShot {
+            key: key.clone(),
+            device: "mock".into(),
+            impact_lead_ms: 0,
+        };
+        let slot = state
+            .clips
+            .begin(&old, &[shot], state.clips.generation())
+            .expect("begin");
+        let video = flighthook::ShotVideo {
+            camera: "camera.0".into(),
+            position: flighthook::CameraPosition::GolferFront,
+            duration_ms: 1,
+            fps: 30.0,
+            trigger_offset_ms: 0,
+            impact_offset_ms: 0,
+            complete: true,
+            dropped: 0,
+        };
+        assert!(state.clips.finish(&slot, video, 20).kept);
+
+        let mut body = state.system.snapshot();
+        body.replay.clip_dir = Some(dir.0.join("new").display().to_string());
+        handle_config_command(
+            &FlighthookEvent::ConfigCommand {
+                request_id: None,
+                action: Box::new(ConfigAction::ReplaceGlobal {
+                    config: Box::new(body),
+                }),
+            },
+            &state,
+            sender.raw_sender(),
+            &sender,
+        );
+        assert!(state.clips.videos("a").is_empty());
+        assert!(slot.dir.is_dir(), "the old folder is left as it is");
+        let removed = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|m| match m.event {
+                FlighthookEvent::ShotVideoRemoved { keys } => Some(keys),
+                _ => None,
+            })
+            .expect("shot_video_removed");
+        assert_eq!(removed, [key]);
+    }
+
+    #[test]
+    fn clear_history_deletes_the_clips() {
+        let (dir, state, _writer, _sender, _rx) = game();
+        let clips = dir.0.join("clips");
+        let shot = crate::state::clips::ClipShot {
+            key: flighthook::ShotKey {
+                shot_id: "a".into(),
+                shot_number: 1,
+            },
+            device: "mock".into(),
+            impact_lead_ms: 0,
+        };
+        let slot = state
+            .clips
+            .begin(&clips, &[shot], state.clips.generation())
+            .expect("begin");
+        let video = flighthook::ShotVideo {
+            camera: "camera.0".into(),
+            position: flighthook::CameraPosition::GolferFront,
+            duration_ms: 1,
+            fps: 30.0,
+            trigger_offset_ms: 0,
+            impact_offset_ms: 0,
+            complete: true,
+            dropped: 0,
+        };
+        assert!(state.clips.finish(&slot, video, 20).kept);
+        assert_eq!(state.clips.videos("a").len(), 1);
+        clear_clips(&state);
+        assert!(state.clips.videos("a").is_empty());
+        assert!(!slot.dir.exists());
     }
 }

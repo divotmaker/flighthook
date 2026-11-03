@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use flightrelay::types::{BallFlight, ClubData, FaceImpact};
 use flightrelay::units::{Distance, Velocity};
 
-use crate::{Club, Handedness, ShotKey, ShotMetrics, ShotRaw, UnitSystem};
+use crate::{Club, Handedness, ShotKey, ShotMetrics, ShotRaw, ShotVideo, UnitSystem};
 
 // ---------------------------------------------------------------------------
 // Derived (simulated) flight values
@@ -172,8 +172,8 @@ impl DerivedFlight {
 
 /// One shot as stored and served by the web layer (`/api/shots`).
 ///
-/// `shot_id`, `club_selected`, `group` and `handed` are set by the web layer
-/// on stored shots and are omitted on the wire when absent. Build one with
+/// `shot_id`, `club_selected`, `group`, `handed` and `video` are set by the
+/// web layer on stored shots and are omitted on the wire when absent. Build one with
 /// `ShotData::default()` and struct-update syntax.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShotData {
@@ -209,6 +209,10 @@ pub struct ShotData {
     /// Player handedness in game state when the shot was triggered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handed: Option<Handedness>,
+    /// The cameras' clips of the shot (beta), one per camera. Never in the
+    /// export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub video: Vec<ShotVideo>,
 }
 
 impl ShotData {
@@ -275,6 +279,7 @@ impl ShotData {
             club_selected: self.club_selected,
             group: self.group.clone(),
             handed: self.handed,
+            video: self.video.clone(),
         }
     }
 
@@ -329,6 +334,7 @@ impl ShotData {
             club_selected: self.club_selected,
             group: self.group.clone(),
             handed: self.handed,
+            video: self.video.clone(),
         }
     }
 }
@@ -1135,6 +1141,35 @@ mod tests {
         assert_eq!(minimal.shot_id.as_deref(), Some("abc"));
         assert_eq!(minimal.club_selected, Some(Club::Iron7));
         assert_eq!(minimal.group.as_deref(), Some(GROUP_ID));
+    }
+
+    #[test]
+    fn video_is_omitted_when_empty_and_survives_unit_conversion() {
+        let plain = serde_json::to_string(&stamped()).expect("ser");
+        assert!(!plain.contains("video"), "{plain}");
+        let shot = ShotData {
+            video: vec![ShotVideo {
+                camera: "camera.0".into(),
+                position: crate::CameraPosition::GolferFront,
+                duration_ms: 5500,
+                fps: 120.0,
+                trigger_offset_ms: 4000,
+                impact_offset_ms: 4000,
+                complete: true,
+                dropped: 0,
+            }],
+            ..stamped()
+        };
+        let json = serde_json::to_string(&shot).expect("ser");
+        assert!(
+            json.ends_with(r#""video":[{"camera":"camera.0","position":"golfer_front","duration_ms":5500,"fps":120.0,"trigger_offset_ms":4000,"impact_offset_ms":4000,"complete":true,"dropped":0}]}"#),
+            "{json}"
+        );
+        let back: ShotData = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, shot);
+        for system in [UnitSystem::Imperial, UnitSystem::Metric] {
+            assert_eq!(shot.to_unit_system(system).video, shot.video);
+        }
     }
 
     #[test]

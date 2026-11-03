@@ -10,6 +10,7 @@ mod group;
 mod message;
 mod metrics;
 mod stats;
+mod video;
 
 pub use api::*;
 #[cfg(feature = "client")]
@@ -23,6 +24,7 @@ pub use group::*;
 pub use message::*;
 pub use metrics::*;
 pub use stats::*;
+pub use video::*;
 
 // Re-export flightrelay types used throughout flighthook.
 pub use flightrelay::types::{BallFlight, ClubData, FaceImpact};

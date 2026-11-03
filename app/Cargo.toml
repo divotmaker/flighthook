@@ -30,7 +30,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["cors"] }
+# `fs`: clips and their sidecars are served with HTTP Range support.
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+# Runs tower-http's file service inside a handler (`ServiceExt::oneshot`).
+tower = { version = "0.5", features = ["util"] }
 futures-util = "0.3"
 toml = "0.8"
 dirs = "6"
@@ -43,6 +46,8 @@ dimple = "0.0.7"
 glam = "0.32"
 # ExPutt RG putting device.
 threeputt = "0.0.1"
+# Swing cameras: capture, pre-roll and trigger-cut MJPEG clips.
+stance = "0.0.1"
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.

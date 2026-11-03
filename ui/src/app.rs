@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 
+use crate::battery;
 use crate::chart::{Cached, ChartKey, MembersKey};
 use crate::groups::{self, GroupEvent, ShotGroups};
 use crate::net::{self, PendingHandle, WsPollEvent};
-use crate::panels::devices::CardModes;
+use crate::panels::devices::{CardModes, mark};
 use crate::panels::dispersion::{self, DispersionKey, EllipseSize, Points};
 use crate::panels::settings::{PendingRemoval, SettingsForm};
 use crate::panels::shots::{ShotFocus, ShotsView};
@@ -13,9 +14,10 @@ use crate::panels::{Tab, flight};
 use crate::scale::{self, UiScale};
 use crate::theme;
 use crate::types::{
-    ActorStatus, ActorStatusResponse, Club, FlighthookEvent, FlighthookMessage, GameStateSnapshot,
-    Handedness, LogEntry, MevoSection, OpenConnectClientSection, OpenConnectServerSection,
-    R10Section, ShotDetectionMode, ShotRow, SquareSection, UnitSystem,
+    ActorStatus, ActorStatusResponse, CameraListResponse, Club, FlighthookEvent, FlighthookMessage,
+    GameStateSnapshot, Handedness, LogEntry, MevoSection, OpenConnectClientSection,
+    OpenConnectServerSection, R10Section, ShotDetectionMode, ShotRow, ShotVideo, SquareSection,
+    UnitSystem,
 };
 use chrono::{SecondsFormat, Utc};
 
@@ -101,8 +103,11 @@ pub struct FlighthookApp {
     pub(crate) display_rows: Cached<(u64, UnitSystem), Vec<ShotRow>>,
     /// Distinct actor ids in `shots`, exact and sorted.
     pub(crate) device_ids: Cached<u64, Vec<String>>,
-    /// Device filter: one exact actor id, or every device (`None`).
+    /// Device filter: one exact actor id, or every device (`None`). It
+    /// applies to everything on the Shots tab and lasts for the session.
     pub(crate) device_filter: Option<String>,
+    /// Indices into `shots` of the rows `device_filter` passes.
+    pub(crate) filtered_rows: Cached<(u64, Option<String>), Vec<usize>>,
     /// Indices into `shots` of the view's members around the shown shot,
     /// after `device_filter`.
     pub(crate) view_members: Cached<MembersKey, Vec<usize>>,
@@ -151,6 +156,35 @@ pub struct FlighthookApp {
     /// The UI zoom: fitted to the window every frame, plus the session's
     /// Ctrl/Cmd +/- steps.
     ui_scale: UiScale,
+
+    // Cameras and replay
+    /// The server can record from cameras (`/api/status`).
+    pub(crate) cameras_supported: bool,
+    /// The folder the server writes clips to (`/api/status`).
+    pub(crate) clip_dir: Option<String>,
+    /// The camera list for the camera cards' pickers.
+    pub(crate) camera_list: CameraList,
+    /// Each camera card's still frame, by actor ID.
+    pub(crate) stills: HashMap<String, crate::panels::replay::Still>,
+    /// The open replay view.
+    pub(crate) replay: Option<crate::panels::replay::ReplayView>,
+    /// Number of the last replay or camera card clip opened: replies for
+    /// another are dropped.
+    pub(crate) replay_seq: u64,
+    /// What each card in the Cards view's row beside the range bars shows.
+    pub(crate) card_row: crate::panels::card_row::CardRow,
+    /// The camera cards' clips of the shown shot, by camera actor ID.
+    pub(crate) card_clips: HashMap<String, crate::panels::replay::CardClip>,
+}
+
+/// The server's camera list, as the camera cards' pickers use it.
+#[derive(Default)]
+pub(crate) struct CameraList {
+    pub(crate) list: Option<CameraListResponse>,
+    /// Why the last fetch failed.
+    pub(crate) error: Option<String>,
+    /// A fetch is out.
+    pub(crate) loading: bool,
 }
 
 impl FlighthookApp {
@@ -202,6 +236,7 @@ impl FlighthookApp {
             display_rows: Cached::default(),
             device_ids: Cached::default(),
             device_filter: None,
+            filtered_rows: Cached::default(),
             view_members: Cached::default(),
             flight_scene: Cached::default(),
             dispersion_points: Points::default(),
@@ -232,6 +267,14 @@ impl FlighthookApp {
             wizard_saving: false,
             wizard_error: None,
             ui_scale: UiScale::default(),
+            cameras_supported: false,
+            clip_dir: None,
+            camera_list: CameraList::default(),
+            stills: HashMap::new(),
+            replay: None,
+            replay_seq: 0,
+            card_row: crate::panels::card_row::CardRow::default(),
+            card_clips: HashMap::new(),
         }
     }
 
@@ -252,6 +295,8 @@ impl FlighthookApp {
             {
                 self.handed = handed;
             }
+            self.cameras_supported = status.cameras_supported;
+            self.clip_dir = status.clip_dir;
             // The reply lists every running actor: one it leaves out has
             // stopped. Red time counts down from now.
             self.actors = status.actors;
@@ -267,7 +312,8 @@ impl FlighthookApp {
         {
             self.shots = shots.into_iter().map(ShotRow::from).collect();
             self.shots_rev += 1;
-            self.shot_focus.sync(&self.shots);
+            self.shot_focus
+                .sync(&self.shots, self.device_filter.as_deref());
         }
 
         // Sets also go stale with a new session (it counts the session up
@@ -291,6 +337,19 @@ impl FlighthookApp {
             self.auto_chip_in_flight = None;
             self.auto_chip_error = reply.err();
         }
+
+        if let Some(reply) = p.cameras.take() {
+            self.camera_list.loading = false;
+            match reply {
+                Ok(list) => {
+                    self.camera_list.list = Some(list);
+                    self.camera_list.error = None;
+                }
+                Err(e) => self.camera_list.error = Some(e),
+            }
+        }
+        let stills = std::mem::take(&mut p.stills);
+        let replies = std::mem::take(&mut p.replay);
 
         // Unsaved edits survive a reload; one the server already holds
         // turns clean.
@@ -325,6 +384,19 @@ impl FlighthookApp {
         }
         if !self.settings.global_dirty {
             self.units_before_edit = None;
+        }
+        drop(p);
+
+        for (actor, reply) in stills {
+            self.stills.entry(actor).or_default().reply(reply);
+        }
+        for reply in replies {
+            let seq = reply.seq();
+            if let Some(view) = self.replay.as_mut().filter(|v| v.seq() == seq) {
+                view.reply(reply);
+            } else if let Some(card) = self.card_clips.values_mut().find(|c| c.seq() == seq) {
+                card.reply(reply);
+            }
         }
     }
 
@@ -459,8 +531,46 @@ impl FlighthookApp {
                     handed: self.handed,
                     group: None,
                     finished: false,
+                    video: Vec::new(),
                 });
                 self.shots_rev += 1;
+            }
+            FlighthookEvent::ShotVideo {
+                keys,
+                position,
+                duration_ms,
+                fps,
+                trigger_offset_ms,
+                impact_offset_ms,
+                complete,
+                dropped,
+            } => {
+                let video = ShotVideo {
+                    camera: actor,
+                    position,
+                    duration_ms,
+                    fps,
+                    trigger_offset_ms,
+                    impact_offset_ms,
+                    complete,
+                    dropped,
+                };
+                if crate::types::stamp_video(&mut self.shots, &keys, &video) {
+                    self.shots_rev += 1;
+                }
+            }
+            FlighthookEvent::ShotVideoRemoved { keys } => {
+                if crate::types::remove_video(&mut self.shots, &keys) {
+                    self.shots_rev += 1;
+                }
+                // The open replay's clips are gone: close it.
+                if self
+                    .replay
+                    .as_ref()
+                    .is_some_and(|r| keys.iter().any(|k| k.shot_id == r.shot_id()))
+                {
+                    self.replay = None;
+                }
             }
             FlighthookEvent::BallFlight { key, ball, derived } => {
                 if let Some(i) = groups::find_row(&self.shots, &actor, &key) {
@@ -579,10 +689,13 @@ impl FlighthookApp {
     }
 
     /// The server cleared its shot history (`clear_shot_history` on the
-    /// bus): drop every shot and set, the shown shot, the device filter and
-    /// an open Clear history confirmation, so the Shots tab shows its empty
-    /// state. The caches are emptied; their keys (`shots_rev`, the sets'
-    /// revision) move on. A shots or sets reply requested before the clear,
+    /// bus): drop every shot and set, the shown shot, the device filter, an
+    /// open Clear history confirmation, an open replay and the camera cards'
+    /// clips (the clips are deleted with the history), so the Shots tab
+    /// shows its empty state; face impact's next appearance takes the
+    /// rightmost card beside the range bars again.
+    /// The caches are emptied; their keys (`shots_rev`, the sets' revision)
+    /// move on. A shots or sets reply requested before the clear,
     /// queued or still in flight, is dropped when it lands.
     pub(crate) fn clear_shot_history(&mut self) {
         self.history_generation += 1;
@@ -595,10 +708,23 @@ impl FlighthookApp {
         self.device_filter = None;
         self.display_rows = Cached::default();
         self.device_ids = Cached::default();
+        self.filtered_rows = Cached::default();
         self.view_members = Cached::default();
         self.flight_scene = Cached::default();
         self.dispersion_scene = Cached::default();
         self.confirm_clear = false;
+        self.replay = None;
+        self.card_row.clear();
+        self.card_clips.clear();
+    }
+
+    /// The camera cards hold their clips only while the card row can be on
+    /// screen: on the Shots tab's Cards view. Elsewhere they are dropped,
+    /// and fetched again when the row returns.
+    pub(crate) fn drop_hidden_card_clips(&mut self) {
+        if self.active_tab != Tab::Shots || self.shots_view != ShotsView::Cards {
+            self.card_clips.clear();
+        }
     }
 
     fn show_wizard(&self) -> bool {
@@ -862,11 +988,13 @@ impl FlighthookApp {
         ui.allocate_ui_with_layout(size, row, |ui| {
             ui.label(theme::caps("Club", 11.0, theme::TEXT_MUTED));
             if read_only {
-                theme::pill_static(ui, &code).on_hover_text("Set by the simulator");
+                let pill = theme::pill_static(ui, &code).on_hover_text("Set by the simulator");
+                mark(ui, || "club".to_owned(), &pill);
                 return;
             }
             let pill = theme::pill(ui, false, &code)
                 .on_hover_text("Club in play. Sets the detection mode; a change starts a new set.");
+            mark(ui, || "club".to_owned(), &pill);
             if pill.clicked() {
                 self.club_picker_open = !self.club_picker_open;
             }
@@ -989,6 +1117,105 @@ pub(crate) fn input_ms(ctx: &egui::Context) -> u64 {
     (ctx.input(|i| i.time).max(0.0) * 1000.0) as u64
 }
 
+impl FlighthookApp {
+    /// The top bar: tabs, detection mode, hand, club and, right-aligned, the
+    /// battery indicators and the title.
+    pub(crate) fn render_header(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
+            )
+            .show_separator_line(true)
+            .show(ctx, |ui| {
+                // Top-aligned: the tab group and the segmented track share
+                // the same 3 px margin, so their pills line up exactly.
+                let row = egui::Layout::left_to_right(egui::Align::Min);
+                ui.with_layout(row, |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let tab_group = self.render_tabs(ui);
+                    let row_height = tab_group.rect.height();
+
+                    ui.add_space(10.0);
+                    let (divider, _) =
+                        ui.allocate_exact_size(egui::vec2(1.0, row_height), egui::Sense::hover());
+                    ui.painter().vline(
+                        divider.center().x,
+                        divider.shrink2(egui::vec2(0.0, 6.0)).y_range(),
+                        egui::Stroke::new(1.0, theme::BORDER),
+                    );
+                    ui.add_space(10.0);
+
+                    // Global mode selector
+                    let modes = [
+                        ("full", "Full"),
+                        ("chipping", "Chipping"),
+                        ("putting", "Putting"),
+                    ];
+                    let selected = modes
+                        .iter()
+                        .position(|(val, _)| self.current_mode == *val)
+                        .unwrap_or(usize::MAX);
+                    let labels = modes.map(|(_, label)| label);
+                    if let Some(i) = theme::segmented(ui, &labels, selected, None).inner {
+                        let mode = modes[i].0;
+                        self.current_mode = mode.to_string();
+                        if let Some(tx) = &mut self.ws_sender {
+                            let msg = format!(r#"{{"cmd":"mode","mode":"{mode}"}}"#);
+                            tx.send(ewebsock::WsMessage::Text(msg));
+                        } else {
+                            net::post_mode(ui.ctx(), mode);
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    self.render_hand_picker(ui, row_height);
+                    ui.add_space(10.0);
+                    self.render_club_picker(ui, row_height);
+
+                    // Right-aligned title
+                    let title = egui::Layout::right_to_left(egui::Align::Center);
+                    let title_size = egui::vec2(ui.available_width(), row_height);
+                    ui.allocate_ui_with_layout(title_size, title, |ui| {
+                        ui.label(
+                            egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(2.0);
+                        let label = ui.label(
+                            egui::RichText::new("FLIGHTHOOK")
+                                .strong()
+                                .size(15.0)
+                                .extra_letter_spacing(2.5)
+                                .color(theme::ACCENT),
+                        );
+                        mark(ui, || "title".to_owned(), &label);
+                        let (dot, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 4.0, theme::ACCENT);
+
+                        // Batteries, left of the title: the first device
+                        // furthest left, so this right-to-left row adds the
+                        // last one first.
+                        let batteries = battery::batteries(&self.actors, &self.settings.actors);
+                        if !batteries.is_empty() {
+                            ui.add_space(10.0);
+                        }
+                        for (i, b) in batteries.iter().rev().enumerate() {
+                            if i > 0 {
+                                ui.add_space(battery::GAP - ui.spacing().item_spacing.x);
+                            }
+                            let response = battery::show(ui, b);
+                            mark(ui, || format!("battery:{}", b.actor), &response);
+                        }
+                    });
+                });
+            });
+    }
+}
+
 impl eframe::App for FlighthookApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Before any layout: a changed zoom discards this pass.
@@ -1019,8 +1246,10 @@ impl eframe::App for FlighthookApp {
 
         self.apply_pending();
         self.poll_ws();
-        self.shot_focus.observe(&self.shots, ctx.input(|i| i.time));
+        self.refresh_shot_caches();
+        self.observe_shots(ctx.input(|i| i.time));
         self.groups.observe_club(self.selected_club, &self.shots);
+        self.drop_hidden_card_clips();
 
         if self.needs_status_refresh {
             self.needs_status_refresh = false;
@@ -1085,82 +1314,7 @@ impl eframe::App for FlighthookApp {
             return;
         }
 
-        egui::TopBottomPanel::top("header")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(14, 10)),
-            )
-            .show_separator_line(true)
-            .show(ctx, |ui| {
-                // Top-aligned: the tab group and the segmented track share
-                // the same 3 px margin, so their pills line up exactly.
-                let row = egui::Layout::left_to_right(egui::Align::Min);
-                ui.with_layout(row, |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let tab_group = self.render_tabs(ui);
-                    let row_height = tab_group.rect.height();
-
-                    ui.add_space(10.0);
-                    let (divider, _) =
-                        ui.allocate_exact_size(egui::vec2(1.0, row_height), egui::Sense::hover());
-                    ui.painter().vline(
-                        divider.center().x,
-                        divider.shrink2(egui::vec2(0.0, 6.0)).y_range(),
-                        egui::Stroke::new(1.0, theme::BORDER),
-                    );
-                    ui.add_space(10.0);
-
-                    // Global mode selector
-                    let modes = [
-                        ("full", "Full"),
-                        ("chipping", "Chipping"),
-                        ("putting", "Putting"),
-                    ];
-                    let selected = modes
-                        .iter()
-                        .position(|(val, _)| self.current_mode == *val)
-                        .unwrap_or(usize::MAX);
-                    let labels = modes.map(|(_, label)| label);
-                    if let Some(i) = theme::segmented(ui, &labels, selected, None).inner {
-                        let mode = modes[i].0;
-                        self.current_mode = mode.to_string();
-                        if let Some(tx) = &mut self.ws_sender {
-                            let msg = format!(r#"{{"cmd":"mode","mode":"{mode}"}}"#);
-                            tx.send(ewebsock::WsMessage::Text(msg));
-                        } else {
-                            net::post_mode(ui.ctx(), mode);
-                        }
-                    }
-
-                    ui.add_space(10.0);
-                    self.render_hand_picker(ui, row_height);
-                    ui.add_space(10.0);
-                    self.render_club_picker(ui, row_height);
-
-                    // Right-aligned title
-                    let title = egui::Layout::right_to_left(egui::Align::Center);
-                    let title_size = egui::vec2(ui.available_width(), row_height);
-                    ui.allocate_ui_with_layout(title_size, title, |ui| {
-                        ui.label(
-                            egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
-                                .size(11.0)
-                                .color(theme::TEXT_DIM),
-                        );
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new("FLIGHTHOOK")
-                                .strong()
-                                .size(15.0)
-                                .extra_letter_spacing(2.5)
-                                .color(theme::ACCENT),
-                        );
-                        let (dot, _) =
-                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 4.0, theme::ACCENT);
-                    });
-                });
-            });
+        self.render_header(ctx);
 
         let content_frame = egui::Frame::new()
             .fill(theme::BG)
@@ -1274,6 +1428,8 @@ mod tests {
             mode: None,
             club: None,
             handed,
+            cameras_supported: false,
+            clip_dir: None,
         };
         let mut app = FlighthookApp::with_pending(net::new_pending());
         app.pending.lock().expect("lock").status = Some(status(Some(Handedness::Left)));
@@ -1394,6 +1550,8 @@ mod tests {
             mode: None,
             club: None,
             handed: None,
+            cameras_supported: false,
+            clip_dir: None,
         };
         let outcome = |stopped: &[&str]| {
             FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
@@ -1903,7 +2061,7 @@ mod tests {
         ] {
             app.handle_bus_event(FlighthookMessage::new(event).actor("mevo.0"));
         }
-        app.shot_focus.observe(&app.shots, 10.0);
+        app.shot_focus.observe(&app.shots, None, 10.0);
         app.device_filter = Some("square.0".into());
         app.confirm_clear = true;
         app.refresh_shot_caches();
@@ -2190,5 +2348,173 @@ mod tests {
             let lateral = converted.impact.unwrap().lateral.unwrap();
             assert!((lateral.as_millimeters() - 7.874).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn a_clip_stamps_every_row_of_its_shots_and_a_removal_clears_them() {
+        use crate::types::{CameraPosition, ShotKey};
+
+        let key = |id: &str, n: u32| ShotKey {
+            shot_id: id.into(),
+            shot_number: n,
+        };
+        let clip = |camera: &str, keys: Vec<ShotKey>, duration_ms| {
+            FlighthookMessage::new(FlighthookEvent::ShotVideo {
+                keys,
+                position: CameraPosition::GolferFront,
+                duration_ms,
+                fps: 120.0,
+                trigger_offset_ms: 4000,
+                impact_offset_ms: 4000,
+                complete: true,
+                dropped: 0,
+            })
+            .actor(camera)
+        };
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        // Two launch monitors saw one swing; a third shot has no clip.
+        for (actor, k) in [
+            ("mevo.0", key("a", 1)),
+            ("square.0", key("b", 1)),
+            ("mevo.0", key("c", 2)),
+        ] {
+            app.handle_bus_event(
+                FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: k }).actor(actor),
+            );
+        }
+        // The clip lands before either shot finished.
+        let rev = app.shots_rev;
+        app.handle_bus_event(clip("camera.0", vec![key("a", 1), key("b", 1)], 5500));
+        assert!(app.shots_rev > rev);
+        assert_eq!(app.shots[0].video.len(), 1);
+        assert_eq!(app.shots[1].video[0].camera, "camera.0");
+        assert!(app.shots[2].video.is_empty());
+        // Finishing keeps it; a second camera adds its own; the same camera
+        // again replaces its clip.
+        app.handle_bus_event(
+            FlighthookMessage::new(FlighthookEvent::ShotFinished {
+                key: key("a", 1),
+                raw: None,
+            })
+            .actor("mevo.0"),
+        );
+        app.handle_bus_event(clip("camera.1", vec![key("a", 1)], 5500));
+        app.handle_bus_event(clip("camera.0", vec![key("a", 1)], 4000));
+        let cameras: Vec<(&str, u64)> = app.shots[0]
+            .video
+            .iter()
+            .map(|v| (v.camera.as_str(), v.duration_ms))
+            .collect();
+        assert_eq!(cameras, [("camera.0", 4000), ("camera.1", 5500)]);
+        // A clip after its shot finished stamps it too.
+        app.handle_bus_event(
+            FlighthookMessage::new(FlighthookEvent::ShotFinished {
+                key: key("c", 2),
+                raw: None,
+            })
+            .actor("mevo.0"),
+        );
+        app.handle_bus_event(clip("camera.0", vec![key("c", 2)], 5500));
+        assert_eq!(app.shots[2].video.len(), 1);
+        // A clip of a shot the UI doesn't hold changes nothing.
+        let rev = app.shots_rev;
+        app.handle_bus_event(clip("camera.0", vec![key("zzz", 9)], 5500));
+        assert_eq!(app.shots_rev, rev);
+
+        app.handle_bus_event(
+            FlighthookMessage::new(FlighthookEvent::ShotVideoRemoved {
+                keys: vec![key("a", 1), key("b", 1)],
+            })
+            .actor("camera.0"),
+        );
+        assert!(app.shots[0].video.is_empty() && app.shots[1].video.is_empty());
+        assert_eq!(app.shots[2].video.len(), 1);
+        assert_eq!(
+            app.log_entries.last().unwrap().message_type,
+            "shot_video_removed"
+        );
+    }
+
+    #[test]
+    fn an_open_replay_closes_when_its_clips_are_removed() {
+        use crate::types::{CameraPosition, ShotKey};
+
+        let key = |id: &str| ShotKey {
+            shot_id: id.into(),
+            shot_number: 1,
+        };
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        for (actor, id) in [("mevo.0", "a"), ("mevo.1", "b")] {
+            app.handle_bus_event(
+                FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key(id) }).actor(actor),
+            );
+            app.handle_bus_event(
+                FlighthookMessage::new(FlighthookEvent::ShotVideo {
+                    keys: vec![key(id)],
+                    position: CameraPosition::GolferFront,
+                    duration_ms: 5500,
+                    fps: 60.0,
+                    trigger_offset_ms: 4000,
+                    impact_offset_ms: 4000,
+                    complete: true,
+                    dropped: 0,
+                })
+                .actor("camera.0"),
+            );
+        }
+        let ctx = egui::Context::default();
+        app.open_replay(&ctx, 0);
+        assert_eq!(app.replay.as_ref().map(|r| r.shot_id()), Some("a"));
+        let removed = |id: &str| {
+            FlighthookMessage::new(FlighthookEvent::ShotVideoRemoved {
+                keys: vec![key(id)],
+            })
+            .actor("camera.0")
+        };
+        app.handle_bus_event(removed("b"));
+        assert!(app.replay.is_some(), "another shot's clips");
+        app.handle_bus_event(removed("a"));
+        assert!(app.replay.is_none());
+    }
+
+    #[test]
+    fn rows_from_the_server_carry_their_clips_and_the_camera_flags() {
+        use crate::types::{CameraPosition, ShotData, ShotVideo, StatusResponse};
+
+        let video = ShotVideo {
+            camera: "camera.0".into(),
+            position: CameraPosition::TargetLine,
+            duration_ms: 5500,
+            fps: 60.0,
+            trigger_offset_ms: 4000,
+            impact_offset_ms: 2500,
+            complete: false,
+            dropped: 3,
+        };
+        let row: ShotData = serde_json::from_value(serde_json::json!({
+            "actor": "mevo.0", "shot_number": 4, "shot_id": "s4",
+            "ball": {}, "video": [video],
+        }))
+        .unwrap();
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        {
+            let mut p = app.pending.lock().unwrap();
+            p.shots = Some(vec![row]);
+            p.status = Some(StatusResponse {
+                actors: HashMap::new(),
+                mode: None,
+                club: None,
+                handed: None,
+                cameras_supported: true,
+                clip_dir: Some("/clips".into()),
+            });
+        }
+        app.apply_pending();
+        assert_eq!(app.shots[0].video, [video]);
+        assert!(app.cameras_supported);
+        assert_eq!(app.clip_dir.as_deref(), Some("/clips"));
+        // Converting units keeps the clips.
+        let metric = app.shots[0].to_unit_system(UnitSystem::Metric);
+        assert_eq!(metric.video.len(), 1);
     }
 }

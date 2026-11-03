@@ -51,7 +51,11 @@ address = "127.0.0.1:921"
   `[openconnect_client.<idx>]`, and the file is rewritten that way on the next
   start (see [Loading and migration](#loading-and-migration))
 - `[random_club.<idx>]` -- random club cycling integration instance
+- `[camera.<idx>]` -- swing camera (beta): records a clip of every shot (see
+  [Cameras and replay](#cameras-and-replay-beta))
 - `[webserver.<idx>]` -- web server instance
+- `[replay]` -- global camera clip settings (beta: `keep_shots`, `pre_roll_s`, `post_roll_s`, `start_before_impact_s`, `clip_dir`), omitted at its defaults
+  like `[simulation]`
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
 - Radar settings (ball_type, tee_height, etc.) are per-mevo only. A Mevo+ gets
   them through ironsight (`SessionConfig::to_avr_settings` → `MevoSettings` →
@@ -160,6 +164,7 @@ pub struct FlighthookConfig {
     pub chipping_clubs: Vec<Club>,
     pub putting_clubs: Vec<Club>,
     pub simulation: SimulationSection,     // [simulation], omitted at defaults
+    pub replay: ReplaySection,             // [replay], omitted at defaults
     pub webserver: HashMap<String, WebserverSection>,
     pub mevo: HashMap<String, MevoSection>,
     pub r10: HashMap<String, R10Section>,
@@ -169,8 +174,12 @@ pub struct FlighthookConfig {
     pub openconnect_server: HashMap<String, OpenConnectServerSection>,
     pub openconnect_client: HashMap<String, OpenConnectClientSection>,  // `gspro` also read
     pub random_club: HashMap<String, RandomClubSection>,
+    pub camera: HashMap<String, CameraSection>,
 }
 
+pub struct ReplaySection { pub keep_shots: u32, pub pre_roll_s: f64, pub post_roll_s: f64, pub start_before_impact_s: f64, pub clip_dir: Option<String> }  // 20, 4.0, 1.5, 2.0, None
+pub struct CameraSection { pub name: String, pub camera: String, pub camera_name: Option<String>, pub position: CameraPosition, pub mode: String }  // mode "auto" | "WxH@fps"
+pub enum CameraPosition { TargetLine, GolferFront, GolferBack, Overhead }  // default GolferFront
 pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface }
 pub enum SimMode { Off, On, Force }                 // default On
 pub enum SimSurface { Fairway, Green, FirmGreen }
@@ -293,7 +302,11 @@ pub enum FlighthookEvent {
     NewShotGroup,                                                     // command: new set for the selected club
     NewShotSession,                                                   // command: close the open set, next session
     ClearShotHistory,                                                 // command: delete shots and sets, next session
+    FindMat { target: String },                                       // command: the ExPutt `target` locates its mat again
     ShotGroup { group: ShotGroupInfo, shot: Option<GroupedShot> },    // a set record changed (web layer)
+    ShotVideo { keys: Vec<ShotKey>, position: CameraPosition, duration_ms: u64, fps: f64,
+                trigger_offset_ms: i64, impact_offset_ms: i64, complete: bool, dropped: u32 },  // a camera clip (beta)
+    ShotVideoRemoved { keys: Vec<ShotKey> },                          // these shots' clips are gone (beta)
 }
 ```
 
@@ -544,7 +557,10 @@ Each stored `ShotData` is stamped by the web layer at `shot_finished`:
 `ShotContext`), `handed` (the trigger-time handedness from the same
 context) and `group` (below). FRP events are untouched; these fields
 exist only on `/api/shots`, the export and `/api/shots/convert`, and are
-omitted when unset, so their JSON is unchanged without them.
+omitted when unset, so their JSON is unchanged without them. `video`, the
+shot's camera clips (beta), is stamped from `shot_video` whenever it arrives
+(see [Cameras and replay](#cameras-and-replay-beta)) and is on `/api/shots`
+only: the export and `/api/shots/convert` drop it.
 
 ### Shot sets
 
@@ -686,6 +702,7 @@ pub enum ConfigAction {
     UpsertWebserver { index: String, section: WebserverSection },
     UpsertMockMonitor { index: String, section: MockMonitorSection },
     UpsertRandomClub { index: String, section: RandomClubSection },
+    UpsertCamera { index: String, section: CameraSection },
     Remove { id: String },                          // "mevo.0", "openconnect_client.1", "webserver.0", etc.; "gspro.N" = "openconnect_client.N"
     SetShotGrouping { mode: ShotGrouping },         // POST /api/shots/grouping, WS `grouping`
 }
@@ -922,6 +939,147 @@ sent for a shot is the same whatever happened to the connection before it.
 `launch_monitor_is_ready` and `launch_monitor_ball_detected` in heartbeats
 and shot messages.
 
+## Cameras and replay (beta)
+
+USB cameras record a clip of every swing; the Shots tab replays it beside
+the shot. Capture, the pre-roll and clip cutting are the
+[stance](https://github.com/divotmaker/stance) crate's; flighthook
+supplies the triggers, stores the clips and serves them. Frames never travel
+on the bus: only one `shot_video` event per finished clip.
+
+### Camera actor
+
+One `CameraActor` (`app/src/actors/camera.rs`) per `[camera.N]`, on its own
+thread. It opens its source with stance's `Capture::start` (which
+blocks while the camera opens; the camera then runs on a capture thread of
+its own, frames going into a bounded ring) and loops:
+
+- every waiting bus message is read first; each `shot_trigger` becomes a
+  recorder trigger (below);
+- frames newer than its cursor (`Capture::wait_frames_after`, waiting at
+  most 10 ms) go to a `ClipRecorder`, which keeps the pre-roll;
+- `ClipRecorder::poll` runs every pass, so clips finish when frames stop;
+- every 500 ms the newest frame goes to the actor's slot in
+  `SystemState::cameras`, for the still;
+- every 2 s, telemetry (`fps`, `dropped`, `position`) goes out in an
+  `actor_status`, only when it changed; `fps` moves only when the measured
+  rate is 2 % of the mode's rate (at least 1 fps) away from the value last
+  sent, so a camera hovering around its rate stays quiet; one `warn` alert
+  when the frame rate stays under half the mode's for 10 s.
+
+The source is the test picture for `camera = "test-pattern"` (stance's
+`TestPattern`, set up by `TestPattern::config_for(mode)`: `auto` picks from
+its listed modes like a camera's, `WxH@fps` sets it), else
+`stance::open(camera, mode)`. When the id is not connected and the
+live section has a `camera_name`, the camera with that name is opened
+instead, with a warning in the log.
+
+Status follows the other device actors: `starting` while opening (and while
+the first attempts fail), `connected` with `camera`, `position`,
+`resolution`, `mode_fps` (and `error` cleared) once open, `reconnecting`
+with `error` after a loss, retried with the shared linear backoff (1 s up to
+15 s, reset after a session of 10 s). A lost camera's open clips are
+finished at once (`ClipRecorder::flush`): one that holds its impact frame is
+saved with `complete: false`, one without is dropped (logged). Where the
+platform has no camera backend (macOS) the actor reports `disconnected` with
+`error: "cameras are not supported on macOS yet"` and waits to be stopped.
+`reconfigure` restarts the actor when `camera` or `mode` changed; the name,
+`camera_name` (used at the next open) and position are read live.
+
+### Triggers
+
+A `shot_trigger` from a launch monitor is stamped with the host monotonic
+clock (`stance::clock::now_ns`) when the actor reads it: FRP
+triggers carry no time. The actor reads the bus at least every 10 ms while
+capturing, so a stamp lags the trigger's arrival by 10 ms at most (100 ms
+while the camera is being reopened, when there are no frames to cut). The
+trigger also records the clip store's generation (see below). A repeat of a shot the actor has seen (same actor
+and `shot_id`, among the last 64) is dropped; the recorder counts every
+trigger. The trigger's impact lead comes from the source's actor type
+(`camera::impact_lead`, beta estimates):
+
+| Source | Impact lead |
+| --- | --- |
+| `mevo`, `mock_monitor` | 0 |
+| `square` | 1000 ms |
+| `exputt` | 1500 ms |
+| `r10` | 2000 ms |
+| `openconnect_server` | 2500 ms |
+| `autochip`, anything else | not recorded |
+
+Pre- and post-roll come from the live `[replay]` section at every trigger;
+the recorder's history is the pre-roll plus the longest lead plus 0.5 s. The
+recorder's rules (stance): the window is `[impact − pre_roll,
+latest trigger + post_roll]`; a trigger from another source whose impact
+estimate is within 500 ms of an open clip's joins it (one swing, two
+monitors); a trigger from a source already in an open clip cuts that clip
+(`truncated`) and starts a new one.
+
+### Clip store
+
+A finished clip is saved on a thread of its own (`clip:camera.N`). Shots
+whose trigger came before a Clear history are left out; a clip with none
+left is not written. `ClipStore::begin` (`app/src/state/clips.rs`, one store
+in `SystemState`) picks the clip folder: the folder of a clip that already holds one of the
+clip's shots (another camera's clip of the same swing), else a new one,
+named `YYYYMMDD-HHMMSS-mmm-xxxxxxxx` (UTC, so names sort by time) under the
+clip folder (`[replay] clip_dir`, default `dirs::data_local_dir()/flighthook/clips`).
+`stance::write_clip` writes `<camera-actor>.avi` and `.json` there
+(each as `.part`, synced and renamed, the sidecar last), then
+`ClipStore::finish` records the camera's `ShotVideo`, rewrites the folder's
+`shot.json` (`version`, `shots`: key, device kind and impact lead per shot,
+`cameras`: each camera's `ShotVideo`) and prunes. `begin` counts a writer
+on the clip and `finish`/`abandon` count it off; the camera checks the slot
+is still current (`ClipStore::is_current`) before writing, so a clip
+cleared meanwhile costs no write. The camera actor then emits
+`shot_video` (`keys`, `position`, `duration_ms`, `fps`, `trigger_offset_ms`,
+`impact_offset_ms`, `complete`, `dropped`, from the sidecar) and, when the
+prune deleted clips, `shot_video_removed { keys }`. A failed write raises a
+`warn` alert and leaves no folder.
+
+The store indexes shot id → clip. Pruning keeps the newest `keep_shots`
+clip folders (read live, held to 1 to 1000) after every clip and at startup
+(`main` loads the folder, indexes every folder with a `shot.json`, deletes
+the rest and emits `shot_video_removed` as `system`). It skips folders with
+a writer and the clip just finished; those stay over the count until a later
+prune. Clear history (`clear_shot_history`, handled by the system actor)
+deletes every clip and counts the store's generation up; a clip begun before
+it is dropped when its camera finishes. A folder that can't be deleted (a
+file still open, on Windows) is retried at the next clip and at startup.
+Only folders named like clip ids are ever read or deleted.
+
+When a config change moves `clip_dir`, the system actor calls
+`ClipStore::reindex`: the store forgets the clips of other folders (their
+files stay), keeps clips still being written until they finish, indexes the
+new folder like at startup, and the shots that lost their clips go out in
+one `shot_video_removed` from `system`. Clips in an earlier folder are never
+deleted by flighthook afterwards.
+
+### Web
+
+Each web server stamps a `shot_video` onto the shots it names, found by
+`shot_id` whatever actor took them: a pending shot keeps it until
+`shot_finished`, a stored shot gets it in `data.video` (one entry per camera,
+replacing that camera's earlier one). `shot_video_removed` clears `video` on
+its shots. Routes (`web/routes.rs`):
+
+- `GET /api/shots/{shot_id}/video`: the clip's finished cameras
+  (`ClipStore::videos`).
+- `GET /api/shots/{shot_id}/video/{camera}.json | .avi`: a finished
+  camera's sidecar or AVI (`ClipStore::file`: only cameras the store
+  recorded as finished, so no path from the URL reaches the file system),
+  served by tower-http's `ServeFile` with `Range` support and
+  `Cache-Control: private, no-cache`.
+- `GET /api/cameras`: `Cameras::list`, on a blocking thread, reused for 3 s
+  (`500` with a text body when that thread fails); `in_use_by` from the
+  actors' slots; stance never opens a held camera to list it; the
+  test picture (`TestPattern::camera_info`) last.
+- `GET /api/cameras/{actor}/still`: the slot's newest JPEG, `no-store`.
+- `GET /api/status`: `cameras_supported` (`stance::camera::SUPPORTED`)
+  and `clip_dir`.
+
+The export and `/api/shots/convert` drop `video`.
+
 ## SystemActor
 
 The `SystemActor` (`actors/system.rs`) is a default actor that always runs,
@@ -943,6 +1101,11 @@ can mutate game state and process config mutations. It handles:
   `apply_config_reload()` to reconcile actors, and emits a `ConfigOutcome`
   on the bus. This provides natural sequencing -- all config mutations are
   processed one at a time on the SystemActor thread.
+- **Clear history**: on `clear_shot_history` it deletes every replay clip
+  (`SystemState::clips`), once for the process, whichever web server or
+  client sent it.
+- **Clip folder**: after a config command that moves `[replay] clip_dir`, it
+  reindexes the clip store (see [Clip store](#clip-store)).
 - Ensures game state and config are consistent even without the web server
 
 Created via `SystemActor::new(writer, state, bus_tx)` in `main()` before
@@ -959,7 +1122,8 @@ also handles `ConfigOutcome` events to refresh actor name caches.
 ## Component Identity
 
 All components are identified by type-prefixed global IDs: `mevo.0`, `r10.0`,
-`openconnect_client.0`, `mock_monitor.0`, `random_club.0`, `webserver.0`, `ws.a1b2c3d4`. The `system`
+`openconnect_client.0`, `mock_monitor.0`, `random_club.0`, `camera.0`,
+`webserver.0`, `ws.a1b2c3d4`. The `system`
 actor has a fixed ID of `"system"`. The type prefix encodes the component type;
 the index is the key within that type's config section. `autochip` is the
 one id with no index and no config section: the virtual source of Auto-chip
@@ -978,6 +1142,9 @@ Root entry point for all managed application state, passed as
 pub struct SystemState {
     pub system: SystemConfig,     // cached config (RwLock + disk persistence + reload lock)
     pub game: GameState,          // read-only game state for the current round
+    pub local_clients: Arc<LocalClients>,  // this process's Open Connect clients
+    pub clips: ClipStore,         // replay clips on disk (beta)
+    pub cameras: Cameras,         // camera actors' latest frames + the camera list (beta)
     actors: RwLock<HashMap<String, (Box<dyn Actor>, Arc<AtomicBool>)>>,
 }
 ```
@@ -1004,7 +1171,10 @@ Binary payloads serialize as hex strings; GSPro JSON payloads serialize as-is.
 Events without a `raw_payload` (e.g. `actor_status`, `config_outcome`) display
 the event's JSON serialization as the payload instead. The log retains the last
 500 events. Protocol-level tracing is always emitted to the `audit` tracing
-target (filtered by `RUST_LOG`, not shown by default).
+target (filtered by `RUST_LOG`, not shown by default). `shot_video` and
+`shot_video_removed` sit in their own Camera filter group, each with a
+one-line summary (the clip's shots, camera, length, frame rate,
+completeness and dropped frames; how many shots' clips were removed).
 
 ## WebSocket Init Protocol
 
@@ -1054,6 +1224,7 @@ main thread (eframe)       std::thread per actor              tokio runtime (bac
 |   native() or   |        |   (GameState updates)  |        | state_updater task     |
 | ctrl-c (headless|        | actors::mevo           |        | drain subscriber       |
 +-----------------+        | actors::r10            |        +------------------------+
+                           | actors::camera (beta)  |
                            | actors::mock::launch   |
   GUI --ehttp/ws---->      | polls bus via poll()    |            ^
   (to local web server)    +------------------------+            |
@@ -1109,8 +1280,8 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
   `ConfigOutcome` (request-reply pattern, 10s timeout; `504` with a JSON
   `error` body when it doesn't come).
 - **Global settings** -- `POST /api/settings?scope=global` emits
-  `ReplaceGlobal`: units, chipping/putting clubs, default view and
-  simulation from the body, every actor section of the live config kept.
+  `ReplaceGlobal`: units, chipping/putting clubs, default view, simulation
+  and replay from the body, every actor section of the live config kept.
 - **Per-section upserts** -- `POST /api/settings?scope=<id>` emits a scoped
   `ConfigAction` variant (e.g. `UpsertMevo`), writing only that section and
   reconciling only that actor. A scope naming a section the body omits emits
@@ -1175,14 +1346,14 @@ so text and layout use at most 2 pixels per point there.
 ## Devices Tab
 
 The Devices tab is where the app opens. It holds the global settings, the
-web server, and every launch monitor and output, each device with its live
-telemetry and its settings.
-Three groups of cards, each group a wrapping grid: as many columns as fit at
+web server, and every launch monitor, camera and output, each device with
+its live telemetry and its settings.
+Four groups of cards, each group a wrapping grid: as many columns as fit at
 a 420 px minimum card width, cards at most 620 px wide, one column on a
 narrow window; card `i` goes in column `i % columns`.
 
 ```
-  [Devices] [Shots] [Log]  |  [Full] [Chipping] [Putting]  [RH|LH]  CLUB [7I]  FLIGHTHOOK
+  [Devices] [Shots] [Log]  |  [Full] [Chipping] [Putting]  [RH|LH]  CLUB [7I]  [##] FLIGHTHOOK
 
   GENERAL
   | Global                           [API Docs] | Simulation [beta]
@@ -1200,6 +1371,14 @@ narrow window; card `i` goes in column `i % columns`.
   |   ready        true                                | Monitor-to-Ball: [8] [ft v]
   |   tilt         0.5                                 |                               [Remove]
 
+  CAMERAS (+)
+  | Golfer Back [Camera] [CONNECTED] [Telemetry|Settings]
+  |   camera      Test pattern
+  |   fps         60
+  |   position    golfer_back
+  |   resolution  1280x720
+  |   [Still frame]
+
   OUTPUTS (+)
   | GSPro [OpenConnect Client] [Cancel] [Save]   | Muni Golf [OpenConnect Client] [CONNECTED] [Telemetry|Settings]
   |                  Save or cancel your changes |   address     127.0.0.1:9210
@@ -1211,15 +1390,17 @@ narrow window; card `i` goes in column `i % columns`.
   |                                     [Remove] |
 ```
 
-At 1600 px wide the General row is Global, Simulation, Web Server; at 1024 px
-the Web Server card sits under Global, as above.
+At 1600 px wide the General row is Global, Simulation, Replay, with the Web
+Server card under Global; at 1024 px Replay sits under Global and the Web
+Server under Simulation.
 
 Groups and order (`ui/src/panels/cards.rs`):
 
 | Group | Cards, in order | (+) offers |
 |---|---|---|
-| General | Global card, Simulation card, `webserver` | -- (no (+)) |
+| General | Global card, Simulation card, Replay card, `webserver` | -- (no (+)) |
 | Launch monitors | `mevo`, `r10`, `square`, `exputt`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, ExPutt, Uneekor (OpenConnect), OpenConnect Server |
+| Cameras | `camera` | Camera (only while `/api/status` says `cameras_supported`; without it the group shows the cameras already configured and no (+)) |
 | Outputs | `openconnect_client`, `random_club` (and any type the UI does not know) | GSPro (OpenConnect), Muni Golf (OpenConnect), OpenConnect Client |
 
 Each (+) entry is a preset (`cards::AddPreset`): an actor type plus the new
@@ -1254,7 +1435,7 @@ cards, and the cards show (Telemetry only) before the settings have loaded.
 
 ### Device cards
 
-Each web server, launch monitor and output card has a small segmented
+Each web server, launch monitor, camera and output card has a small segmented
 toggle in its header, **Telemetry | Settings**, Telemetry by default,
 remembered per card for the session. The card's name sits on the left of
 the header; on the right, just left of the toggle, sits the status badge on
@@ -1366,6 +1547,22 @@ displayed).
 - The Web Server card shows name and Bind Address, the `ip:port` it listens
   on (`0.0.0.0` accepts other computers, `127.0.0.1` only this one). A bind
   change restarts it
+- Camera cards (beta) show name, Camera (a dropdown of
+  [`GET /api/cameras`](API.md#get-apicameras), fetched the first time a
+  camera card shows its settings, with a refresh icon; a camera another card
+  uses reads "(in use by camera.N)", a saved camera that is not connected
+  "(not connected)"), Position, and Video mode (Auto or one of the picked
+  camera's modes, `1280×720 @ 120`; a saved mode the list lacks stays
+  selectable). Save needs a camera and a mode. They are left out of the
+  Open Connect clients' routing dropdowns. The Telemetry side ends in
+  **Still frame**, enabled while the camera is connected: it fetches
+  [`GET /api/cameras/{actor}/still`](API.md#get-apicamerasactorstill) and
+  shows the frame at the card's width (decoded like the replay's frames)
+- The Replay card (beta, General) holds `[replay]`: Keep clips, Pre-roll,
+  Post-roll and Start before impact in seconds, and the clip folder,
+  read-only (`/api/status` `clip_dir`). It saves and cancels with the Global and Simulation cards
+  (`scope=global`), and its fields are checked like the server's
+  (`ReplaySection::error`)
 - Mock launch monitor and Random Club are developer-only types (must be added
   manually to the config TOML; no (+) menu offers them)
 - Add/remove modify the form Vec, save writes back to TOML
@@ -1421,6 +1618,13 @@ with the hover text "Set by the simulator"): the simulator replaces the hand
 with its next player message. Hovering the live control says "Player's hand.
 Devices that follow it are told on a change."
 
+**Battery indicators** sit left of the FLIGHTHOOK title, one small battery per
+device that is shown Connected and reports `battery_pct` as a whole number from
+0 to 100, in Devices card order (the first device furthest left). The fill is
+that percentage of the battery and is red below 20 %, otherwise green; hovering
+one says which device it is for and what is left (`Square Omni 74%`). A device
+that is not Connected, or has no readable charge, has none.
+
 The tab bar is a segmented control, the same look as the mode selector beside
 it (`theme::segmented`). While any card is red (an actor of any kind lost
 its connection less than 10 minutes ago, see
@@ -1438,7 +1642,8 @@ values immediately.
 ## Shots Tab
 
 ```
-  VIEW [Cards|Table]  UNITS [Imperial|Metric]  (Auto-chip v)  EXPORT SESSION JSONL CSV [trash]
+  VIEW [Cards|Table]  UNITS [Imperial|Metric]  DEVICE [All|Mevo+|Omni]  (Auto-chip v)
+                                              (2+ devices)   EXPORT SESSION JSONL CSV [trash]
 
   Layout: the charts are always shown, sized from the window (not resizable)
 
@@ -1466,13 +1671,14 @@ values immediately.
   Cards (default), wide
   SHOTS 42             Shot #42  LATEST          (older shot: [^ Back to latest])
   [By set|By club|None][ Ball speed ] [ Carry ] [ Total ] [ Launch ] [ Backspin ]
-  SET 3 · 7I · 10 ---               DEVICE [All|Mevo+|Omni] +-------------+
-  [#42      ]          SET 3 · 7I · 10 -- ●avg ○med |shot   |4 toe · 2 low|
-  [carry tot]          TOTAL   148 |[==○|=●] 217 avg 192    |  .--------. |
-  [#41      ]          CARRY   148 [|○●]     217 avg 174    | ( · ●+ ·  / |
-  SET 2 · DR · 4 ----  LATERAL L  [=○|●]       R avg 1.1 L  |  '------'   |
-                       (face panel: any shot has impact)    |TOE  mm HEEL |
-                                                            +-------------+
+  SET 3 · 7I · 10 ---                          +--------+ +--------+ +--------+
+  [#42      ]          SET 3 · 7I · 10 -------- |STATS   | |FACE-ON | |4 toe · |
+  [carry tot]          ●avg ○med |shot ---------| AVG MED| | (clip  | | .----. |
+  [#41      ]          TOTAL 148 [==○|=●] 217   |TOTAL..2| |  loop) | |( ●+ /  |
+  SET 2 · DR · 4 ----  CARRY 148 [|○●]    217   |CARRY..4| |        | | '--'   |
+                       LATERAL L [=○|●]     R   |LATERAL | |        | |TOE  mm |
+                       (cards: stats, cameras,  +--------+ +--------+ +--------+
+                        face impact; up to 3, click to cycle)
   [#40      ]          BALL --------  FLIGHT --------------  CLUB ----------------------
   (list scrolls)       [Direction]    [Apex]    [Offline]    [Club speed] [Smash] [Path]
   ------------------   [Sidespin]     [Descent] [Roll]       [AoA]        [Face]  [Loft]
@@ -1491,7 +1697,6 @@ values immediately.
 
   Dispersion
   +- DISPERSION yd   [Total|Carry] [2σ|95 %] -+
-  |           DEVICE [All|Mevo+|Omni]          |  Table only, 2+ devices
   | 225 -------------------:------------------ |
   | 200 ---------  .-( ·  ·:+ · )-.  --------- |  ellipse, gold + at the mean
   |                '-( ●   :  · )-'            |  gold dot at rest (Total),
@@ -1503,11 +1708,29 @@ values immediately.
   +--------------------------------------------+
 ```
 
-A toolbar (view toggle, units, the Auto-chip menu, export links and Clear
-history) sits above both views. Only
+A toolbar (view toggle, units, the device filter, the Auto-chip menu,
+export links and Clear history) sits above both views. Only
 Table adds the "italic = simulated" legend, since only Table draws simulated
 values in italics (`ShotsView::shows_simulated_legend`). The chosen view
 (`ShotsView` in `panels/shots.rs`) lasts for the session and is not saved.
+
+The **device filter** (`DEVICE [All | <device>…]`, its own group after the
+units, styled like them) shows in both views, in every grouping, while the
+session's shots come from two or more devices (`device_options`); each
+device is labelled by `chart::device_label`. It lasts for the session
+(`FlighthookApp::device_filter`) and falls back to All when its device
+leaves the history. One filter applies to everything on the Shots tab,
+through one predicate (`chart::in_filter`): the shot list and its section
+counts, the shot on show, the Table's rows, the view's members (range bars,
+stats and face impact cards, Flight, Dispersion) and the charts' faint
+shots. An Auto-chip is no device, so a filter hides it like any other
+device's shot. With All, the bars, Flight and Dispersion keep their device
+colours and sub-bands. The JSONL/CSV export and the server are not
+filtered: the export is always the whole session. Every cache that depends
+on the filter holds it in its key: the members (`chart::MembersKey`, and so
+the chart scenes) and the Table's rows (`FlighthookApp::filtered_rows`, on
+the shots revision and the filter).
+
 Both views always show their charts, in one fixed layout per window size
 (`chart_slots` in `panels/shots.rs`); nothing is toggled or dragged, and
 every size follows from the window's, so the layout holds still until the
@@ -1523,9 +1746,8 @@ centre's width; the row is 27 % of the window's height (210-320 px). Narrow
 Table puts Dispersion under the table, 35 % of the window's height (266-400
 px). The floors hold a Dispersion plot (inside its label gutters) of at
 least 144 px in the Cards row, the most the cards leave at 1024×768, and
-200 px under the Table. Each extra header row (30 px: the switches on their
-own row in a panel narrower than 312 px, and Table's device filter) raises
-the row by its height, so the plot keeps that minimum.
+200 px under the Table. The switches' own row (30 px, in a panel narrower
+than 312 px) raises the row by its height, so the plot keeps that minimum.
 
 **Cards** has a resizable shot list down its left-hand side (200-320 px):
 a header line with the shot count, then one mini card per shot, newest
@@ -1553,6 +1775,16 @@ being reloaded (e.g. after a reconnect): the shot is found again by actor and
 shot id when both sides have one, else by actor and shot number, and if it is gone the
 view falls back to the latest shot (`ShotFocus` in `panels/shots.rs`).
 
+Under a device filter the list holds only that device's shots: a set or club
+section counts only that device's shots in its header (`chart::set_shot_count`
+over the rows the UI holds), one with none of them is not shown, and the
+count line's total is the number of that device's shots. The latest shot is that device's newest with
+data, so the shot on show, its header, LATEST and Replay are that device's;
+a shot from another device never glows, takes the selection or moves the
+shot on show. Picking a filter while a shot of another device is on show
+moves to the filtered device's newest shot (without a glow); a shot of the
+filtered device stays on show.
+
 Under the count line, a selector picks the **view** (By set | By club |
 None). It starts on the `shot_grouping` setting (default By set); a click
 applies it at once and saves it as the default view, over the WebSocket,
@@ -1566,7 +1798,7 @@ club in play differs from the open set's, and "No club selected" when no club
 is in play. The view `none` has no foot.
 
 **None** shows the last shot only: the list is a plain newest-first list with
-no headers, and the cards have no range bars and no device filter. **By set**
+no headers, and the cards have no range bars. **By set**
 keeps the list chronological: a header goes before each run of consecutive
 rows of one set, reading `SET 3 · 7I · 10 SHOTS` with the local start time,
 accent while the set is open and muted once closed. The set the next shot
@@ -1615,6 +1847,48 @@ dashboard that sees `clear_shot_history` on the WebSocket clears at once
 the shown shot, the device filter, the caches and an open confirmation. The
 Shots tab then shows its empty state.
 
+**Replay** (beta): a shot whose row has `video` gets a **Replay** chip (a
+video icon) on the Cards view's shot header line, after LATEST or Back to
+latest, and the Table view a **Replay** column after Club, shown only while
+some row has clips. Rows take `video` from `/api/shots`, from each
+`shot_video` (every row whose `shot_id` is in its `keys`, whatever device
+took it, before or after `shot_finished`; a camera's newer clip replaces its
+older one) and lose it on `shot_video_removed`.
+
+The chip opens the replay, an `egui::Modal` over the Shots tab
+(`ui/src/panels/replay.rs`, logic in `ui/src/replay.rs`): the shot's cameras
+side by side, each labelled with its card's name and position and with a
+Download link (the `.avi`); a scrubber with the start point as a green tick
+and the estimated impact as a gold tick; play/pause; previous/next frame;
+speed 1× · ½ · ¼ · ⅛; a Loop toggle (on whenever a replay opens, UI state only). Close, Escape
+or the backdrop closes it, and so do Clear history and a
+`shot_video_removed` naming its shot. Each camera's track
+is its sidecar: frame `i` is at `start_ns + frames[i].t_ns` on the server's
+clock, so the cameras line up, and each shows its last frame at or before
+the playhead. It opens playing from `[replay] start_before_impact_s` before the
+estimated impact (the trigger mark when the clip has no impact estimate, the
+clip start when it has neither; never before the clip start). The playhead
+holds there, shown as playing, until every camera that is loading normally
+holds the frame at the start point (a camera whose clip or frames failed does
+not count) or 1.5 s have passed since the first sidecar arrived; a pause,
+scrub or frame step before then cancels the autoplay. With Loop on,
+playback reaching the clip end jumps to that point and keeps playing at the
+current speed; with it off it stops at the end and play restarts from that
+point. A frame step moves to the next
+(or previous) frame time of any camera and pauses. Frames come in HTTP range
+requests of one window of consecutive frames each (100 ms behind to 400 ms
+ahead of the frame, at most 8 MiB; while playing, the window 300 ms ahead
+too; two requests per camera at most), kept in a 24 MiB byte cache per
+camera. A failed request is asked again once; after a second failure its
+error is drawn over that camera's picture whenever the playhead is in that
+window (the rest of the clip still loads), and a clip whose sidecar failed
+shows its error the same way. Only the frame on screen is decoded, at most
+one per camera per screen update (`jpeg::ensure_huffman`, then zune-jpeg),
+into a texture cache of 32 frames (8 on screens under 800 pt wide). The
+playhead follows the wall clock, so when decoding can't keep up (1× on a
+phone) frames are skipped and the clip keeps its time. The view never
+fetches a whole clip.
+
 **Auto-chip** (beta) is a menu chip (`theme::menu_chip`: a `chip_button`
 with a drawn chevron) after the units toggle. Its menu (`egui::Popup::menu`)
 lists `1 Yard`, `3 Yard`, `5 Yard` (`flighthook::AUTO_CHIP_YARDS`); a pick
@@ -1644,7 +1918,7 @@ the `ShotNumber`, so device and Auto-chip numbers never repeat.
 
 The server sets count an Auto-chip like any shot. The UI keeps it out of
 every statistic through one predicate, `chart::is_auto_chip`: it is never a
-view member (`chart::members_for`), so the range bars, face panel,
+view member (`chart::members_for`), so the range bars, stats and face impact cards,
 dispersion ellipse and flight set overlay leave it out; it is not in
 `chart::device_ids`, so it has no device filter option, band or colour; and
 list and range-bar headers count a set as `chart::set_shot_count` (the
@@ -1686,8 +1960,8 @@ bar shows beside them, and the column ends a chart gap below the last row so
 it clears the panel when scrolled to the end. Numerals shrink to fit their
 card width.
 
-The view `none` tracks only the last shot, so it has no range bars and no
-device filter. In By set and By club, three **range bars** sit between the
+The view `none` tracks only the last shot, so it has no range bars. In By
+set and By club, three **range bars** sit between the
 headline row and the detail groups: Total, Carry and Lateral over the view's
 members around the shown shot (`chart::members_for`). By set: the shown
 shot's set. By club: that club's shots in the shot's session (for a shot of
@@ -1698,11 +1972,13 @@ says the next shot starts one. The section's title matches the list header
 open or current, muted closed or earlier, gold for an empty open set), with a
 legend on the right; when the title and the legend (with its device chips)
 don't both fit on the line, the legend moves to a row of its own under the
-title (`legend_place`), so the two never overlap. With shots from two or more devices, a **device filter**
-(`DEVICE [All | <device>…]`) sits above the bars; it applies before the view,
-and with All each bar's band splits into one sub-band per device, coloured by
-device. The members are cached on `chart::MembersKey` (shot and set
-revisions, view, device filter, shown shot, club in play). Each bar is
+title (`legend_place`), so the two never overlap. The device filter (in the
+toolbar, above) applies before the view; with All and two or more devices,
+each bar's band splits into one sub-band per device, coloured by device. The
+members are cached on `chart::MembersKey` (shot and set revisions, view,
+device filter, shown shot, club in play) by
+`FlighthookApp::refresh_members`, which the bars, the stats and face impact
+cards, Flight and Dispersion all take them from. Each bar is
 drawn on a track, painted in this order: the set's range as a translucent
 accent band with its min and max beside it; the median as a hollow white
 ring sitting on the track's centre line, its radius just inside the track's
@@ -1723,27 +1999,101 @@ past the ring and dot. Total and Carry are picked like the cards' values
 Lateral is the carry offline, picked the same way, and prints with its
 side: `3.2 L`, `1.4 R` (`0.0` on the line; L and R are the same for both
 hands). The bars carry no simulated marks; that distinction is the cards'
-`SIM` tags and Table's italics. A stats column shows `avg · med`, then `sd` (two or
-more values) and `k/n` when some of the set's shots lack the value, or
-`no data`. Hovering a track lists n, min, max, avg, median and sd. The stats
+`SIM` tags and Table's italics. The stats card (below) holds each bar's
+average, median and spread. Hovering a track lists n, min, max, avg, median and sd. The stats
 come from `flighthook::Stats` over the rows the UI holds (the server's whole
 history, up to the last 1000 shots, plus live ones), so for a session longer
 than that they can cover fewer shots than the header's count.
 
-**Face impact** (`ui/src/panels/impact.rs`) is a panel right of the range
-bars, 16 pt from them, under the rightmost headline card and as wide as it.
-It runs from the headline cards to the hairline of the first detail
-section's label, with the same 12 pt gap as between the cards at both
-ends. The bars, their filter and their legend narrow to make room, and no
-height changes. It shows while any shot in the history has face impact on
-either axis, and only with the range bars (not in the view None); otherwise
-the bars take the full width. When the headline column would leave the
-bars' plot narrower than 170 pt, the panel narrows to a square as tall as
-the bars' title line to their last bar; narrower than that still, it is
-left out. Beside the panel the
-legend goes on its own row when the narrowed line can't hold it; when that
-row would leave the bars too narrow for the panel, the panel is left out
-and the legend is placed in the full width (`settle_legend`). It draws the shown
+**The card row.** Right of the range bars, 16 pt from them, sit one to
+three cards (only with the bars, so not in the view None). Each is one
+headline column wide, under the rightmost headline columns and flush right,
+12 pt apart like the headline cards so their edges line up, and runs from
+the headline cards to the hairline of the first detail section's label with
+the same 12 pt gap at both ends. The bars and their legend take the rest,
+and no height changes. There are as many cards as there are
+sources, at most three, while the bars and the gap keep the two leftmost
+headline columns and a plot of at least 170 pt (`card_columns`); always at
+least one. When not even one column-wide card fits, one card narrows to a
+square as tall as the bars' title line to their last bar, and when that
+still leaves the plot under 170 pt the bars keep 170 pt and the card takes
+what is left; under a point of it, the card is not drawn and the bars run
+the full width. The legend goes on its own row when the bars' line can't hold
+it beside the title (`settle_legend`).
+
+The sources, in cycle order (`ui/src/panels/card_row.rs`): **Stats**,
+always (below). **Camera** (beta), one per camera actor that is
+Connected, in Devices card order (below). **Face impact**, while any shot in
+the history has face impact on either axis. By default the leftmost card is
+Stats, face impact is the rightmost, and cameras fill the cards between in
+order. The first time face impact is available in the session (and again
+after Clear history) it takes the rightmost card, as a new card when one
+fits, else in place of what was there; after that the user's choices stand.
+A click on a card (except on a face impact dot, which selects its shot)
+moves it on to the next source in cycle order that no other card shows,
+wrapping round, and does nothing when every source is on screen; the cursor
+is a pointer over the cards, with no hover text. A camera that disconnects
+frees its card (it takes the first source not on screen other than face
+impact, or the row loses a card; when face impact is all that is left, it
+takes the rightmost card, so it never moves into the middle); one that
+connects takes a new card when one fits, left of face
+impact, else it is a click away. When a resize leaves fewer cards they go
+from the right, but face impact keeps the rightmost card when it was on
+screen. Nothing shows on two cards at once. The choices are UI state for
+the session (`CardRow`).
+
+The **stats card** (`stats_card` in `panels/shots.rs`) reads on its own,
+wherever it sits in the row. `STATS` sits in its top-left in the headline
+cards' label style. Under it, a table: column headers `AVG`, `MED`, `SD` in
+small muted capitals, then one row per bar in bar order, named like the bars
+(`TOTAL`, `CARRY`, `LATERAL`) with the unit in small muted text. The values
+are printed like the bars' (`StatsRow`): average and median as whole yards
+or metres, lateral to a tenth with its side (`3.2 L`), the standard
+deviation to a tenth; a value the row lacks is an em dash (every column
+when the bar has no values, the SD with only one), and when only k of the n
+shots with data have the value, a small muted `k/n` ends the row. With room
+(`stats_table`), each row's name and unit stack in a column left of the
+values and the `k/n` sits under the SD; in a narrow card each row's name,
+unit and `k/n` share a line over its values. The values start at 13 pt and
+shrink to fit the card before anything is cut (to 11 pt with the names
+beside, then to 8 pt with the names over them), so every listed window
+shows the whole table. The rows sit on the bars' rows when the table fits
+there under the title, else they spread evenly down the card.
+
+A **camera card** (beta, `ui/src/panels/replay.rs` `CardClip`) shows the
+camera's name (its `[camera.N]` `name`) in capitals in its top-left (the face impact readout's
+font and size) and, under it, the shown shot's clip from that camera:
+playing at 1×, looping from the replay's start point (`[replay]
+start_before_impact_s` before the impact, `replay::start_point`) to the end
+of the last frame, starting once the frame at the start point is in. Each
+frame is cut to the card body's aspect about its centre (no letterbox) and
+scaled by box averaging (nearest when scaling up) to the body's pixel size
+(`ctx.pixels_per_point()`, each side rounded up to an even number). Nothing else is drawn on the
+picture. Without a clip of the shown shot from that camera (still recording,
+an older shot, a discarded recording) the card shows its name over an empty
+body and fetches nothing; the clip starts when it arrives (`shot_video`, the
+row's `video`). It fetches like the replay view: the sidecar, then range
+windows around the playhead and 300 ms ahead (from the start point again
+past the end), two requests at most, into a 24 MiB byte cache. Each frame is
+decoded once and kept as a texture while the card shows that shot's clip, as
+long as the whole loop fits 48 MiB of textures; past that the card keeps the
+replay view's 32 most recent frames. The camera cards share one decode per
+screen update between them (`FlighthookApp::decode_card_frame`: the card
+that has waited longest for one goes first). While the whole loop is kept,
+a card decodes the first frame not decoded yet from the playhead on, in loop
+order, so its loop fills in ahead of the playhead; otherwise the frame at
+the playhead. A decoded frame shows on the next screen update. A new shown
+shot, another camera on the card, Clear history or a new card size drops
+what it holds (a new size also the picture on screen). The card row holds
+clips only while it is on screen: the Table view, the view None, another tab
+and the replay view of the shown shot drop every card's clip, and the cards
+fetch and decode again when the row returns. While it plays a card asks for
+a repaint when the next frame is due (`request_repaint_after`), never sooner
+than 1/60 s, so a faster camera skips frames to keep its time; it asks none
+while the replay view is open. A click cycles the card; the shot header's
+Replay chip opens the replay.
+
+**Face impact** (`ui/src/panels/impact.rs`) is a source of the card row. It draws the shown
 shot's club face, face-on as the ball sees it: a right-hander's toe on the
 left and hosel on the right, a left-hander's mirrored (the shot's
 handedness, else the game state's, else right). Face impact itself is
@@ -1764,8 +2114,8 @@ Inside: a dashed crosshair at the face centre; the view's other members
 device colours by the same rule as the Flight and Dispersion charts; the
 shown shot as a gold dot, or a gold line across the face when only one
 axis was read. The shown shot
-is marked only when it is a member, as on the bars and the charts: when the
-device filter leaves it out, there is no gold mark and the readout is `-`.
+is marked only when it is a member, as on the bars; otherwise there is no
+gold mark and the readout is `-`.
 A mark off the face is drawn as a ring, pulled into the panel when it is
 off it. The readout above the face reads `4 toe · 2 low` in whole
 millimetres (`-` when the shown shot has no reading), 12.5 pt, shrinking to
@@ -1874,9 +2224,8 @@ members, in accent or coloured by device when the filter is on All with two
 or more devices; **faint** the rest of the current session from the
 filtered device, newest 200, at 18 % alpha, clipped and not setting the
 scale; **None** draws the shown shot alone. In Table view the panel is
-built around the latest shot (its rows cannot be picked), and the panel's
-header carries the device filter (two or more devices, not in view None),
-which Cards keeps above the range bars. One covariance ellipse covers the
+built around the latest shot of the filtered device (its rows cannot be
+picked). One covariance ellipse covers the
 bright and gold points (three or more), or with the filter on All and two
 or more devices one per device in its colour: centred on the mean, axes
 along the eigenvectors of the sample covariance (n − 1), semi-axes k·√λ
@@ -1898,7 +2247,8 @@ key plus the two switches), so it is rebuilt only when the members, units,
 shown shot, device filter, panel size or a switch changes.
 
 **Table** shows
-one row per shot, with a Club column after `#`, built with
+one row per shot (under a device filter, per shot of that device; the
+latest row is that device's newest), with a Club column after `#`, built with
 `egui_extras::TableBuilder`: only the rows in view are laid out, so a
 1000-shot session costs no more per frame than a short one. One scroll area
 covers both directions, with its scroll bars on the view's edges; the

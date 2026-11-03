@@ -1,8 +1,10 @@
 pub mod app;
+pub(crate) mod battery;
 pub(crate) mod chart;
 pub(crate) mod groups;
 pub mod net;
 pub(crate) mod panels;
+pub(crate) mod replay;
 pub(crate) mod scale;
 pub(crate) mod theme;
 pub mod types;

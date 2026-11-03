@@ -27,11 +27,12 @@ use crate::{Handedness, ShotDetectionMode};
 use std::collections::HashMap;
 
 use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRaw};
-use crate::{ClubInfo, GroupedShot, HandInfo, PlayerInfo, ShotGroupInfo, ShotGrouping};
 use crate::{
-    ExPuttSection, FlighthookConfig, MevoSection, MockMonitorSection, OpenConnectClientSection,
-    OpenConnectServerSection, R10Section, RandomClubSection, SquareSection, WebserverSection,
+    CameraPosition, CameraSection, ExPuttSection, FlighthookConfig, MevoSection,
+    MockMonitorSection, OpenConnectClientSection, OpenConnectServerSection, R10Section,
+    RandomClubSection, SquareSection, WebserverSection,
 };
+use crate::{ClubInfo, GroupedShot, HandInfo, PlayerInfo, ShotGroupInfo, ShotGrouping};
 
 // ---------------------------------------------------------------------------
 // Top-level message
@@ -270,6 +271,23 @@ pub enum FlighthookEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shot: Option<GroupedShot>,
     },
+    /// A camera finished a clip of a shot (beta). Emitted by the camera
+    /// actor (the envelope's `actor`), once per clip; the clip itself is
+    /// served over HTTP, never on the bus. `keys` are every shot the clip
+    /// belongs to: one per launch monitor that saw the swing.
+    ShotVideo {
+        keys: Vec<ShotKey>,
+        position: CameraPosition,
+        duration_ms: u64,
+        fps: f64,
+        trigger_offset_ms: i64,
+        impact_offset_ms: i64,
+        complete: bool,
+        dropped: u32,
+    },
+    /// The clips of these shots were deleted to keep the newest
+    /// `[replay] keep_shots` (beta).
+    ShotVideoRemoved { keys: Vec<ShotKey> },
     /// Actor/connection lifecycle update.
     ///
     /// Carries actor-framework state: connection status enum and actor-specific
@@ -310,7 +328,8 @@ pub enum ConfigAction {
         config: Box<FlighthookConfig>,
     },
     /// Replace the global settings (everything but the actor sections:
-    /// units, chipping and putting clubs, default shot view, simulation)
+    /// units, chipping and putting clubs, default shot view, simulation,
+    /// replay)
     /// with `config`'s, keeping every actor section of the live config.
     /// Used by POST /api/settings?scope=global.
     ReplaceGlobal {
@@ -355,6 +374,10 @@ pub enum ConfigAction {
     UpsertRandomClub {
         index: String,
         section: RandomClubSection,
+    },
+    UpsertCamera {
+        index: String,
+        section: CameraSection,
     },
     /// Remove a section by global ID ("mevo.0", "openconnect_client.1",
     /// "webserver.0"). A `gspro.N` ID names `openconnect_client.N`.
@@ -607,6 +630,78 @@ mod tests {
         };
         assert_eq!(group, group_info());
         assert_eq!(shot, Some(joined));
+    }
+
+    #[test]
+    fn shot_video_round_trips_with_its_keys() {
+        let keys = vec![
+            ShotKey {
+                shot_id: "a".into(),
+                shot_number: 1,
+            },
+            ShotKey {
+                shot_id: "b".into(),
+                shot_number: 7,
+            },
+        ];
+        let msg = FlighthookMessage {
+            actor: "camera.0".into(),
+            ..envelope(FlighthookEvent::ShotVideo {
+                keys: keys.clone(),
+                position: CameraPosition::TargetLine,
+                duration_ms: 5500,
+                fps: 119.5,
+                trigger_offset_ms: 4000,
+                impact_offset_ms: 2000,
+                complete: false,
+                dropped: 3,
+            })
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"actor":"camera.0","event":{"kind":"shot_video","keys":[{"shot_id":"a","shot_number":1},{"shot_id":"b","shot_number":7}],"position":"target_line","duration_ms":5500,"fps":119.5,"trigger_offset_ms":4000,"impact_offset_ms":2000,"complete":false,"dropped":3}}"#
+        );
+        let back: FlighthookMessage = serde_json::from_str(&json).unwrap();
+        let FlighthookEvent::ShotVideo {
+            keys: got,
+            position,
+            impact_offset_ms,
+            ..
+        } = back.event
+        else {
+            panic!("not shot_video");
+        };
+        assert_eq!(got, keys);
+        assert_eq!(position, CameraPosition::TargetLine);
+        assert_eq!(impact_offset_ms, 2000);
+
+        let removed = envelope(FlighthookEvent::ShotVideoRemoved { keys: keys.clone() });
+        let json = serde_json::to_string(&removed).unwrap();
+        assert!(json.contains(r#""kind":"shot_video_removed""#), "{json}");
+        let back: FlighthookMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.event, FlighthookEvent::ShotVideoRemoved { keys: k } if k == keys));
+    }
+
+    #[test]
+    fn upsert_camera_round_trips() {
+        let action = ConfigAction::UpsertCamera {
+            index: "1".into(),
+            section: CameraSection {
+                name: "Face".into(),
+                camera: "test-pattern".into(),
+                camera_name: None,
+                position: CameraPosition::GolferFront,
+                mode: "auto".into(),
+            },
+        };
+        let json = serde_json::to_string(&action).expect("ser");
+        assert_eq!(
+            json,
+            r#"{"type":"upsert_camera","index":"1","section":{"name":"Face","camera":"test-pattern","position":"golfer_front","mode":"auto"}}"#
+        );
+        let back: ConfigAction = serde_json::from_str(&json).expect("de");
+        assert!(matches!(back, ConfigAction::UpsertCamera { index, .. } if index == "1"));
     }
 
     #[test]

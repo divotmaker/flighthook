@@ -416,6 +416,7 @@ mod tests {
             handed: None,
             group: None,
             finished: true,
+            video: Vec::new(),
         }
     }
 

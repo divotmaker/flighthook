@@ -24,7 +24,7 @@ use crate::state::SystemState;
 use flighthook::{
     ActorStatus, ActorStatusResponse, Club, ExportDevice, FlighthookConfig, FlighthookEvent,
     FlighthookMessage, GroupKey, GroupedShot, Handedness, ShotAccumulator, ShotData,
-    ShotDetectionMode, ShotGroupInfo, ShotKey, ShotRaw, SimulationSection,
+    ShotDetectionMode, ShotGroupInfo, ShotKey, ShotRaw, ShotVideo, SimulationSection,
 };
 use groups::GroupState;
 
@@ -100,6 +100,8 @@ pub(crate) struct PendingShot {
     context: ShotContext,
     /// Set assigned at the trigger.
     group: String,
+    /// Camera clips that finished before the shot did.
+    video: Vec<ShotVideo>,
 }
 
 pub(crate) type PendingShots = HashMap<(String, ShotKey), PendingShot>;
@@ -366,6 +368,13 @@ async fn run(
         .route("/api/shots", get(routes::get_shots))
         .route("/api/shots/export", get(routes::get_shots_export))
         .route("/api/shots/convert", post(routes::post_convert_shot))
+        .route("/api/shots/{shot_id}/video", get(routes::get_shot_video))
+        .route(
+            "/api/shots/{shot_id}/video/{file}",
+            get(routes::get_shot_video_file),
+        )
+        .route("/api/cameras", get(routes::get_cameras))
+        .route("/api/cameras/{actor}/still", get(routes::get_camera_still))
         .route(
             "/api/shots/groups",
             get(routes::get_shot_groups).post(routes::post_new_shot_group),
@@ -436,7 +445,7 @@ fn is_putting_device(actor: &str) -> bool {
 }
 
 /// Stable device kind for an actor type prefix.
-fn device_kind(prefix: &str) -> &str {
+pub(crate) fn device_kind(prefix: &str) -> &str {
     match prefix {
         "mevo" => "flightscope",
         "square" => "square_golf",
@@ -610,6 +619,34 @@ async fn drop_pending(state: &WebState, accumulators: &mut PendingShots, actor: 
     }
 }
 
+/// Put a camera's clip on shot `shot_id`, replacing that camera's earlier
+/// one, or with `None` drop every clip of the shot. The shot is found by its
+/// id whatever device took it, pending or stored; a shot the history no
+/// longer holds is left alone.
+fn stamp_video(
+    shots: &mut VecDeque<StoredShot>,
+    pending: &mut PendingShots,
+    shot_id: &str,
+    video: Option<&ShotVideo>,
+) {
+    let apply = |list: &mut Vec<ShotVideo>| match video {
+        Some(v) => {
+            list.retain(|old| old.camera != v.camera);
+            list.push(v.clone());
+            list.sort_by(|a, b| a.camera.cmp(&b.camera));
+        }
+        None => list.clear(),
+    };
+    for ((_, key), p) in pending.iter_mut() {
+        if key.shot_id == shot_id {
+            apply(&mut p.video);
+        }
+    }
+    if let Some(stored) = shots.iter_mut().rev().find(|s| s.key.shot_id == shot_id) {
+        apply(&mut stored.data.video);
+    }
+}
+
 /// Merge an `actor_status` event's telemetry into an actor's: each key
 /// replaces the one held, and an empty value removes the key.
 fn merge_status_telemetry(held: &mut HashMap<String, String>, update: &HashMap<String, String>) {
@@ -673,6 +710,7 @@ async fn apply_bus_event(
                 received_at: Utc::now(),
                 context,
                 group,
+                video: Vec::new(),
             };
             accumulators.insert((msg.actor.clone(), key.clone()), pending);
             for group in changes {
@@ -703,6 +741,7 @@ async fn apply_bus_event(
                 received_at,
                 context,
                 group,
+                video,
             }) = accumulators.remove(&(msg.actor.clone(), key.clone()))
             else {
                 return;
@@ -729,6 +768,7 @@ async fn apply_bus_event(
             data.shot_id = Some(key.shot_id.clone());
             data.club_selected = context.club_selected;
             data.handed = context.handed;
+            data.video = video;
             if counted {
                 data.group = Some(group.clone());
             }
@@ -787,6 +827,37 @@ async fn apply_bus_event(
                 actor
                     .telemetry
                     .insert("handed".into(), hand_info.handed.to_string());
+            }
+        }
+        FlighthookEvent::ShotVideo {
+            keys,
+            position,
+            duration_ms,
+            fps,
+            trigger_offset_ms,
+            impact_offset_ms,
+            complete,
+            dropped,
+        } => {
+            let video = ShotVideo {
+                camera: msg.actor.clone(),
+                position: *position,
+                duration_ms: *duration_ms,
+                fps: *fps,
+                trigger_offset_ms: *trigger_offset_ms,
+                impact_offset_ms: *impact_offset_ms,
+                complete: *complete,
+                dropped: *dropped,
+            };
+            let mut shots = state.shots.write().await;
+            for key in keys {
+                stamp_video(&mut shots, accumulators, &key.shot_id, Some(&video));
+            }
+        }
+        FlighthookEvent::ShotVideoRemoved { keys } => {
+            let mut shots = state.shots.write().await;
+            for key in keys {
+                stamp_video(&mut shots, accumulators, &key.shot_id, None);
             }
         }
         FlighthookEvent::NewShotGroup => {
@@ -1230,6 +1301,138 @@ pub(crate) mod tests {
                 .collect(),
             ..ShotRaw::default()
         }
+    }
+
+    /// `shot_video` from `camera` for `keys`, lasting `duration_ms`.
+    fn shot_video(keys: &[&ShotKey], duration_ms: u64) -> FlighthookEvent {
+        FlighthookEvent::ShotVideo {
+            keys: keys.iter().map(|k| (*k).clone()).collect(),
+            position: flighthook::CameraPosition::GolferFront,
+            duration_ms,
+            fps: 120.0,
+            trigger_offset_ms: 4000,
+            impact_offset_ms: 4000,
+            complete: true,
+            dropped: 0,
+        }
+    }
+
+    /// The camera actors of the stored shot `shot_id`'s clips, with their
+    /// durations.
+    async fn stored_video(state: &WebState, shot_id: &str) -> Vec<(String, u64)> {
+        state
+            .shots
+            .read()
+            .await
+            .iter()
+            .find(|s| s.key.shot_id == shot_id)
+            .map(|s| {
+                s.data
+                    .video
+                    .iter()
+                    .map(|v| (v.camera.clone(), v.duration_ms))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn shot_video_stamps_every_listed_shot_pending_or_stored() {
+        let (state, _writer, _dir) = test_state();
+        let mut pending = PendingShots::new();
+        let a = ShotKey {
+            shot_id: "uuid-a".into(),
+            shot_number: 1,
+        };
+        let b = ShotKey {
+            shot_id: "uuid-b".into(),
+            shot_number: 1,
+        };
+        let mut apply = async |actor: &str, event: FlighthookEvent| {
+            let msg = FlighthookMessage::new(event).actor(actor);
+            apply_bus_event(&state, &msg, &mut pending).await;
+        };
+        // a: stored before its clip; b (another device): still pending.
+        apply("mevo.0", FlighthookEvent::ShotTrigger { key: a.clone() }).await;
+        apply(
+            "mevo.0",
+            FlighthookEvent::BallFlight {
+                key: a.clone(),
+                ball: Box::new(ball()),
+                derived: None,
+            },
+        )
+        .await;
+        apply(
+            "mevo.0",
+            FlighthookEvent::ShotFinished {
+                key: a.clone(),
+                raw: None,
+            },
+        )
+        .await;
+        apply("r10.0", FlighthookEvent::ShotTrigger { key: b.clone() }).await;
+        apply(
+            "r10.0",
+            FlighthookEvent::BallFlight {
+                key: b.clone(),
+                ball: Box::new(ball()),
+                derived: None,
+            },
+        )
+        .await;
+
+        apply("camera.0", shot_video(&[&a, &b], 5000)).await;
+        apply("camera.1", shot_video(&[&a], 5100)).await;
+        // A camera's newer clip of the shot replaces its earlier one.
+        apply("camera.0", shot_video(&[&a], 5200)).await;
+        // A shot the history doesn't hold is ignored.
+        let gone = ShotKey {
+            shot_id: "uuid-gone".into(),
+            shot_number: 9,
+        };
+        apply("camera.0", shot_video(&[&gone], 1)).await;
+        assert_eq!(
+            stored_video(&state, "uuid-a").await,
+            [("camera.0".to_owned(), 5200), ("camera.1".to_owned(), 5100)]
+        );
+        assert!(stored_video(&state, "uuid-b").await.is_empty(), "pending");
+
+        apply(
+            "r10.0",
+            FlighthookEvent::ShotFinished {
+                key: b.clone(),
+                raw: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            stored_video(&state, "uuid-b").await,
+            [("camera.0".to_owned(), 5000)]
+        );
+
+        // `/api/shots` carries it; pruned clips leave the rows.
+        let rows = serde_json::to_value(
+            state
+                .shots
+                .read()
+                .await
+                .iter()
+                .map(|s| s.data.clone())
+                .collect::<Vec<_>>(),
+        )
+        .expect("ser");
+        assert_eq!(rows[0]["video"][1]["camera"], "camera.1");
+        assert_eq!(rows[1]["video"][0]["duration_ms"], 5000);
+        apply(
+            "camera.0",
+            FlighthookEvent::ShotVideoRemoved {
+                keys: vec![a.clone()],
+            },
+        )
+        .await;
+        assert!(stored_video(&state, "uuid-a").await.is_empty());
+        assert_eq!(stored_video(&state, "uuid-b").await.len(), 1);
     }
 
     pub(crate) async fn feed(state: &WebState, actor: &str, events: Vec<FlighthookEvent>) {

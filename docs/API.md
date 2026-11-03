@@ -32,11 +32,13 @@ Other useful events on the same connection:
 
 - `device_telemetry` -- device-reported state (ready, battery, tilt, temp, identity)
 - `actor_status` -- actor/connection lifecycle (status enum, mode, radar_mode)
-- `hand_info` -- the player's hand changed
+- `hand_info` -- the player's hand, set by the simulator, the UI or the API
 - `set_detection_mode` -- detection mode and/or handedness change (both optional, latched)
 - `shot_group` -- which [set](#get-apishotsgroups) a finished shot joined
   (and so its club); the shot's `/api/shots` element carries the same
   `group`
+- `shot_video` / `shot_video_removed` -- a camera clip of a shot is ready to
+  replay, or has been deleted (beta)
 
 ### Terminal
 
@@ -130,9 +132,10 @@ ws.onmessage = (e) => {
 ## REST Endpoints
 
 The API has no authentication; it is meant for a trusted LAN. Any client that
-reaches the port can change settings or clear the shot history, and the
-bodiless `POST`s (New set, New session, Clear history) are CORS simple
-requests, so a web page open in a browser on the LAN can send them too.
+reaches the port can change settings or clear the shot history, download
+swing clips and camera stills, and the bodiless `POST`s (New set, New
+session, Clear history) are CORS simple requests, so a web page open in a
+browser on the LAN can send them too.
 
 ### GET /api/status
 
@@ -145,6 +148,8 @@ Comprehensive system state (all actors -- launch monitors and integrations).
   "mode": "full",
   "club": "7I",
   "handed": "rh",
+  "cameras_supported": true,
+  "clip_dir": "C:\\Users\\me\\AppData\\Local\\flighthook\\clips",
   "actors": {
     "mevo.0": {
       "name": "Mevo WiFi",
@@ -187,6 +192,12 @@ numbered in index order (`Open Connect 1`, `Open Connect 2`).
 - `handed`: the player's [hand](#handedness) (see
   [`POST /api/hand`](#post-apihand)); absent until a hand has been set. Same
   source as `init.global_state.handed`
+- `cameras_supported`: `true` when this server can record from cameras
+  (Windows and Linux); omitted where it can't (macOS). The
+  [test picture](#get-apicameras) works everywhere
+- `clip_dir`: the folder [camera clips](#get-apishotsshot_idvideo) are
+  written to: `[replay] clip_dir`, or `flighthook/clips` in the user's local
+  data folder (`%LOCALAPPDATA%` on Windows, `~/.local/share` on Linux)
 - `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`,
   the actor's latest [`actor_status`](#actor_status)
 - `telemetry`: actor-specific key/value pairs (all string values)
@@ -220,6 +231,11 @@ Telemetry keys are merged from two sources with no overlap:
 - **Actor-framework** (from `actor_status`): `detection_mode`, `radar_mode`, `device_info`,
   `shot_count`, `tracking_mode`, `phase`
 - **Integration actors**: `club`, `handed`, `name`, `error`
+- **Cameras** (from `actor_status`): `camera` (the camera's own name),
+  `position`, `resolution` (`1280x720`), `mode_fps` (the frame rate asked
+  for), `fps` (achieved over the last second), `dropped` (frames missing
+  since it connected), `error`. `fps`, `dropped` and `position` are sent at
+  most every 2 s, and only when they change
 
 ---
 
@@ -350,9 +366,26 @@ With `?units=imperial`:
   triggered; absent when unknown. Face impact is the same for either hand;
   a face-on drawing of it puts a right-hander's toe on the left and a
   left-hander's on the right.
+- `video` (beta): the cameras' clips of the shot, one per camera, omitted
+  when there are none. Each is a `ShotVideo`, the fields of
+  [`shot_video`](#shot_video) plus `camera`, the camera's actor ID:
+
+  ```json
+  "video": [
+    { "camera": "camera.0", "position": "golfer_front", "duration_ms": 5500, "fps": 119.6,
+      "trigger_offset_ms": 4000, "impact_offset_ms": 4000, "complete": true, "dropped": 0 }
+  ]
+  ```
+
+  A clip that two launch monitors' triggers share (one swing) is on both
+  shots' rows. It is added when the camera finishes the clip, which can be
+  before or after the shot finishes, and removed when the clip is deleted
+  ([`shot_video_removed`](#shot_video_removed)). Clips are files on disk and
+  outlive a restart; the shot history doesn't, so after a restart a clip is
+  reachable by its shot ID only. Never in the [export](#get-apishotsexport).
 
 `POST /api/shots/convert` passes `shot_id`, `club_selected`, `group` and
-`handed` through unchanged.
+`handed` through unchanged, and drops `video`.
 
 #### Shot metrics
 
@@ -385,6 +418,106 @@ the device's events, which hold no `metrics`: the `flighthook` crate's
 consumers can use the formulas above or read the shot from `/api/shots`.
 
 ---
+
+### GET /api/shots/{shot_id}/video
+
+The shot's camera clips (beta): a `ShotVideo[]` (see
+[`video`](#get-apishots)), one per camera whose clip is finished on disk,
+`[]` when there are none. `shot_id` is the shot's `key.shot_id`; any of the
+shots a clip belongs to finds it.
+
+### GET /api/shots/{shot_id}/video/{camera}.json and .avi
+
+One camera's clip of the shot (beta). `{camera}` is the camera's actor ID,
+dot included: `/api/shots/550e8400-.../video/camera.0.avi`. Only finished
+clips are served; anything else is `404` with a text body.
+
+- `.avi`: the clip, MJPEG frames exactly as the camera sent them in an AVI
+  1.0 file (`Content-Type: video/x-msvideo`). VLC, Kinovea and Windows Media
+  Player play it; it is also the download.
+- `.json`: its sidecar, the frame index:
+
+  ```json
+  {
+    "version": 1, "fourcc": "MJPG", "width": 1280, "height": 720,
+    "fps": { "nominal": 120.0, "measured": 119.62 },
+    "start_ns": 81234567890123,
+    "frames": [ { "t_ns": 0, "offset": 232, "len": 41022 }, ... ],
+    "trigger_index": 480, "impact_index": 480,
+    "trigger_ns": 4012000000, "impact_ns": 4012000000,
+    "complete": true, "dropped": 0, "truncated": false
+  }
+  ```
+
+  `start_ns` is the first frame's time on the server's monotonic clock, the
+  same clock for every camera, so `start_ns + frames[i].t_ns` lines cameras
+  up. `offset`/`len` locate each frame's JPEG inside the AVI. `trigger_ns`
+  and `impact_ns` are relative to the first frame (`impact_ns` is negative
+  when the estimate precedes the clip); `trigger_index` may equal the frame
+  count when frames stopped before the trigger. `truncated` is true when the
+  same launch monitor's next shot cut the clip short.
+
+Both support HTTP `Range` (`206 Partial Content`), so a client fetches the
+sidecar, then just the frames it needs. Both are sent with
+`Cache-Control: private, no-cache`: a finished file doesn't change, but its
+clip can be deleted, so a cached copy is checked with the server first.
+
+```
+GET /api/shots/550e8400-.../video/camera.0.avi
+Range: bytes=41262-82137
+```
+
+Many webcams leave the Huffman tables out of their JPEG frames; strict
+decoders need them inserted first (the stance crate's
+`jpeg::ensure_huffman` does that).
+
+### GET /api/cameras
+
+The cameras this computer has (beta), for picking one on a camera card.
+Enumerating can take a second; the result is reused for 3 s. A camera a
+camera actor records from is never opened again to list it (its entry is
+the one read when it was opened).
+
+**Response** `200 OK` -- `CameraListResponse` (`500` with a text body when
+the enumeration fails unexpectedly):
+
+```json
+{
+  "supported": true,
+  "cameras": [
+    {
+      "id": "\\\\?\\usb#vid_046d&pid_085e&mi_00#...",
+      "name": "HD Pro Webcam C920",
+      "usb": "046d:085e",
+      "modes": ["1280x720@60", "1920x1080@30", "640x480@30"],
+      "in_use_by": "camera.0"
+    },
+    { "id": "test-pattern", "name": "Test pattern", "modes": ["1280x720@60", "640x360@30"] }
+  ]
+}
+```
+
+- `supported`: as `cameras_supported` in [`GET /api/status`](#get-apistatus).
+- `id`: the stable id a camera section's `camera` holds: on Windows the
+  device's symbolic link, on Linux its `/dev/v4l/by-id` path, or
+  `<bus>/<name>` for identical cameras without serial numbers. It survives
+  replugging into the same USB port and reboots.
+- `name`: the camera's own name.
+- `usb`: its USB vendor and product id, when known.
+- `modes`: its MJPEG modes, fastest first.
+- `in_use_by`: the camera actor recording from it, if one is.
+- `error`: why its modes could not be read (in use by another application).
+- The last entry is always the test picture, `test-pattern`, with the modes
+  it suggests (it renders any `WIDTHxHEIGHT@FPS`; `auto` is its fastest
+  listed mode).
+
+### GET /api/cameras/{actor}/still
+
+The camera actor's newest frame (beta): a JPEG as the camera sent it, at
+most half a second old while it records (`Content-Type: image/jpeg`,
+`Cache-Control: no-store`). `404` while the actor has no frame. The frame
+comes from the actor's own capture; the camera is never opened a second
+time.
 
 ### GET /api/shots/groups
 
@@ -488,9 +621,14 @@ confirmation) sends this or its WS twin. Every webserver then:
   before the clear stores nothing and changes no set. The next trigger is a
   new shot.
 
+The system actor deletes every camera clip on disk too (beta): the clips
+belong to the shots. A clip a camera is still writing is dropped when it
+finishes, and a folder that can't be deleted at once (a file still open) is
+retried later.
+
 No `shot_group` events follow: every client clears its shots and sets when
 it sees [`clear_shot_history`](#clear_shot_history). Nothing is undone; export
-first to keep the shots.
+first to keep the shots (the export never holds the clips).
 
 ---
 
@@ -557,7 +695,7 @@ Set the player's hand.
 
 **Response**: `202 Accepted` (no body). `400 Bad Request` with a text body
 for any other body (another value, a missing field, malformed JSON, a missing
-`Content-Type`): `/api/hand` answers 400 with a text body for any bad body.
+`Content-Type`).
 
 Emits `hand_info` on the bus (actor `web`), like a hand from GSPro. The
 system actor stores it and, when it differs from the hand in effect, sends
@@ -657,6 +795,10 @@ disk.
 With no shots stored, the body is empty (CSV: the header row only). Shots the
 device produced no data for are included: their `data` has no `ball`, `club`,
 `impact` or `group`, and `raw` shows what the device sent.
+
+Camera clips are never exported: `data` carries no `video`, and nothing
+names a camera. Swing video shows the player; it stays on the computer
+running flighthook.
 
 **JSONL**: one `ShotExport` object per line (pretty-printed here):
 
@@ -954,12 +1096,28 @@ Full persisted config (mirrors `config.toml`).
       "address": "127.0.0.1:921"
     }
   },
-  "random_club": {}
+  "random_club": {},
+  "replay": {
+    "keep_shots": 50,
+    "pre_roll_s": 4.0,
+    "post_roll_s": 1.5,
+    "start_before_impact_s": 2.0
+  },
+  "camera": {
+    "0": {
+      "name": "Golfer Front",
+      "camera": "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_8A2B3C4D-video-index0",
+      "camera_name": "HD Pro Webcam C920",
+      "position": "golfer_front",
+      "mode": "auto"
+    }
+  }
 }
 ```
 
 - Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `square.0`, `exputt.0`, `mock_monitor.0`,
-  `openconnect_server.0`, `openconnect_client.0`, `random_club.0`, `webserver.0`
+  `openconnect_server.0`, `openconnect_client.0`, `random_club.0`, `webserver.0`,
+  `camera.0`
 - `shot_grouping`: the Shots tab's default view, [`ShotGrouping`](#shotgrouping),
   `"by_set"` by default. It does not change how
   [sets](#get-apishotsgroups) are assigned. Omitted while at the default
@@ -1043,6 +1201,31 @@ Full persisted config (mirrors `config.toml`).
   Each shot's `ShotNumber` is its `shot_number`, raised when needed to one
   more than the last one the client sent, so the numbers a simulator gets
   always increase, across devices, Auto-chip shots and device reconnects
+- `replay` (beta) holds the camera clip settings: `keep_shots` (default
+  `20`, 1 to 1000: clip folders kept on disk, newest first; a swing two
+  launch monitors saw is one clip), `pre_roll_s` (default `4.0`) and
+  `post_roll_s` (default `1.5`), each 0 to 10 seconds, `start_before_impact_s`
+  (default `2.0`, 0 to 10 seconds: where a replay opens and restarts, that
+  long before the estimated impact), and an optional
+  `clip_dir` (the folder clips go to; see `clip_dir` in
+  [`GET /api/status`](#get-apistatus)). Omitted while at its defaults. The
+  rolls apply from the next shot without restarting any camera, the start
+  from the next replay opened; a lower
+  `keep_shots` deletes the oldest clips when the next clip finishes. A save
+  with a value out of range is `400`; a file holding one loads with a
+  warning in the log, and the value is held to its range. A new `clip_dir`
+  applies to the next clip: the clips in the old folder stay on disk as
+  they are, and only the new folder's clips are listed (a
+  [`shot_video_removed`](#shot_video_removed) names the shots that lost
+  theirs)
+- `camera` sections (beta) are swing cameras: `name`; `camera`, the stable id
+  from [`GET /api/cameras`](#get-apicameras) (`test-pattern` for the test
+  picture); `camera_name`, the camera's own name when it was picked, used
+  when the id is not connected (a camera moved to another USB port);
+  `position` ([`CameraPosition`](#cameraposition), default `golfer_front`); and
+  `mode`, `auto` (the highest frame rate, then the largest size) or
+  `WIDTHxHEIGHT@FPS` (`1280x720@120`). Changing the camera or the mode
+  restarts the actor; a name or position change applies at once
 - `gspro` sections are also accepted when posting and read as
   `openconnect_client` sections with the same index; when both name an index,
   the `openconnect_client` one is used. Responses carry only
@@ -1068,8 +1251,8 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
     carries for it. A `scope` naming a section the body omits removes that
     actor.
   - `global` writes only the global settings (`default_units`,
-    `chipping_clubs`, `putting_clubs`, `shot_grouping`, `simulation`) from the
-    body; every actor section of the live config is kept, whatever the body
+    `chipping_clubs`, `putting_clubs`, `shot_grouping`, `simulation`,
+    `replay`) from the body; every actor section of the live config is kept, whatever the body
     carries for it. Every actor is reconciled.
   - An unparseable ID or unknown type prefix is rejected with `400`: nothing
     is saved.
@@ -1102,6 +1285,8 @@ as applied.
 | `400 Bad Request` | `scope` is not `global` and not a known actor ID |
 | `400 Bad Request` | the save removes the web server (`"the web server can't be removed"`) or adds a second one (`"flighthook runs one web server; edit the existing one"`) |
 | `400 Bad Request` | a Mevo section it writes has a `launch_only_spin` below 0, above 1000 or not finite (`"mevo.0: launch_only_spin must be 0 to 1000 rpm per mph, not -5"`) |
+| `400 Bad Request` | a camera section it writes has no `camera` (`"camera.0: no camera picked"`) or a `mode` that is neither `auto` nor `WIDTHxHEIGHT@FPS` |
+| `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
 | `504 Gateway Timeout` | SystemActor did not answer within 10 s |
 
 A body that is not a valid `FlighthookConfig` is rejected by the JSON
@@ -1792,8 +1977,9 @@ acts on it. Flighthook extension event.
 Command: delete the shot history and every set, and start a new session.
 Emitted by `POST /api/shots/clear` (actor `web`) or the WS `clear_history`
 command (the socket's actor ID); every webserver acts on it (see
-[POST /api/shots/clear](#post-apishotsclear)). A dashboard that sees it
-clears its shot list, sets and shown shot. Flighthook extension event.
+[POST /api/shots/clear](#post-apishotsclear)), and the system actor deletes
+every camera clip. A dashboard that sees it clears its shot list, sets and
+shown shot. Flighthook extension event.
 
 ```json
 { "actor": "web", "event": { "kind": "clear_shot_history" } }
@@ -1828,6 +2014,71 @@ Flighthook extension event.
   shot was in flight when it closed: that shot's join follows
   when it finishes with data. A shot that finishes without data sends the
   set's last record, `open: false, shots: 0`, again.
+
+---
+
+##### shot_video
+
+A camera finished a clip of a shot (beta). Emitted by the camera actor (its
+actor ID), once per clip, when the clip's files are complete on disk. The
+clip itself is served over HTTP
+([`/api/shots/{shot_id}/video`](#get-apishotsshot_idvideo)); no frame goes
+on the bus. Flighthook extension event.
+
+```json
+{
+  "actor": "camera.0",
+  "event": {
+    "kind": "shot_video",
+    "keys": [
+      { "shot_id": "550e8400-e29b-41d4-a716-446655440000", "shot_number": 42 },
+      { "shot_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "shot_number": 17 }
+    ],
+    "position": "golfer_front",
+    "duration_ms": 5500,
+    "fps": 119.6,
+    "trigger_offset_ms": 4000,
+    "impact_offset_ms": 4000,
+    "complete": true,
+    "dropped": 0
+  }
+}
+```
+
+- `keys`: every shot the clip belongs to, one per launch monitor whose
+  `shot_trigger` joined it (two monitors seeing one swing). The same monitor
+  triggering again starts a new clip.
+- `position`: where the camera stands ([`CameraPosition`](#cameraposition)).
+- `duration_ms`: first frame to last.
+- `fps`: frames per second captured over the clip.
+- `trigger_offset_ms`: when the first `shot_trigger` arrived, after the
+  clip's first frame.
+- `impact_offset_ms`: the estimated impact, after the first frame (negative
+  when it precedes the clip). Only a FlightScope triggers at impact; other
+  launch monitors report the shot once it is measured, so the impact is
+  estimated a fixed time before their trigger (beta estimates: Square Golf
+  1 s, ExPutt 1.5 s, R10 2 s, Open Connect 2.5 s). With two monitors it is
+  the first trigger's.
+- `complete`: the whole clip was captured with no frames missing at the
+  trigger or the impact. `false` when the camera stopped first.
+- `dropped`: frames missing inside the clip.
+
+[Auto-chip](#post-apiauto-chip) shots are never recorded.
+
+---
+
+##### shot_video_removed
+
+These shots' clips are gone (beta): drop their `video`.
+Emitted by the camera actor whose clip made room under
+[`replay.keep_shots`](#get-apisettings), and by `system` when the clip
+folder setting changes (only the new folder's clips are listed) or
+when flighthook starts and deletes old clips. Clear history deletes every
+clip without this event.
+
+```json
+{ "actor": "camera.0", "event": { "kind": "shot_video_removed", "keys": [ { "shot_id": "550e8400-...", "shot_number": 42 } ] } }
+```
 
 ---
 
@@ -1961,6 +2212,13 @@ unknown club code or mode is ignored.
 ### Handedness
 
 `"rh"` | `"lh"`
+
+### CameraPosition
+
+Where a camera stands: `"target_line"` (behind the golfer's hands, looking
+down the target line) | `"golfer_front"` (facing the golfer's chest) |
+`"golfer_back"` (looking at the golfer's back) | `"overhead"` (above, looking
+down)
 
 ### Severity
 

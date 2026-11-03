@@ -25,7 +25,7 @@
 use egui::{Color32, Pos2, Rect, Stroke, Vec2, pos2, vec2};
 
 use super::flight;
-use super::shots::{bar_controls, bar_group, device_options, latest_index, pick};
+use super::shots::{latest_index, pick};
 use crate::app::FlighthookApp;
 use crate::chart::{self, Candidate, ChartKey, Curve, Ellipse, Projection};
 use crate::groups::ShotGroups;
@@ -340,12 +340,11 @@ struct SceneInput<'a> {
     area: Vec2,
 }
 
-/// Height of the header of a panel `width` wide: the title row, the
-/// switches' own row when they don't fit beside the title, and the device
-/// filter's row when `filter` (see `FlighthookApp::dispersion_filter`).
+/// Height of the header of a panel `width` wide: the title row, and the
+/// switches' own row when they don't fit beside the title.
 #[must_use]
-pub(super) fn header_height(width: f32, filter: bool) -> f32 {
-    let rows = 1 + usize::from(width < ONE_ROW_MIN_WIDTH) + usize::from(filter);
+pub(super) fn header_height(width: f32) -> f32 {
+    let rows = 1 + usize::from(width < ONE_ROW_MIN_WIDTH);
     rows as f32 * ROW_H
 }
 
@@ -831,12 +830,13 @@ fn oval_tooltip(
 
 impl FlighthookApp {
     /// The shot the panel is built around: the shown shot in Cards, the
-    /// latest one in Table (`table`), whose rows cannot be picked.
+    /// latest one in Table (`table`), whose rows cannot be picked; both
+    /// from the filtered device.
     pub(super) fn dispersion_shown(&self, table: bool) -> Option<usize> {
         if table {
-            latest_index(&self.shots)
+            latest_index(&self.shots, self.filter())
         } else {
-            self.shot_focus.index(&self.shots)
+            self.shown_index()
         }
     }
 
@@ -858,20 +858,12 @@ impl FlighthookApp {
             return;
         }
         let view = self.groups.mode;
-        let set = bar_group(&self.groups, self.shots.get(shown), self.selected_club);
+        let members_key = self.refresh_members(shown);
         let members = self
             .view_members
-            .get(key.chart.members.clone(), || {
-                chart::members_for(
-                    &self.shots,
-                    &self.groups,
-                    view,
-                    set,
-                    Some(shown),
-                    self.device_filter.as_deref(),
-                )
-            })
-            .clone();
+            .peek(&members_key)
+            .cloned()
+            .unwrap_or_default();
         let devices = self.devices().into_owned();
         let scene = build_scene(&SceneInput {
             shots: &self.shots,
@@ -889,19 +881,10 @@ impl FlighthookApp {
         self.dispersion_scene.get(key.clone(), || scene);
     }
 
-    /// The device filter's options when the header carries it: in Table
-    /// view, which has no other place for it, with a set or club view and
-    /// two or more devices.
-    pub(super) fn dispersion_filter(&self, table: bool) -> Option<Vec<String>> {
-        (table && self.groups.mode != ShotGrouping::None)
-            .then(|| device_options(&self.devices(), &self.actors))
-            .flatten()
-    }
-
     /// The header in `rect` ([`header_height`] tall): `DISPERSION` and the
-    /// unit, the `Total | Carry` and `2σ | 95 %` switches (on a second row
-    /// when the panel is narrow), and the device filter over `filter`.
-    fn dispersion_header(&mut self, ui: &mut egui::Ui, rect: Rect, filter: Option<&[String]>) {
+    /// unit, then the `Total | Carry` and `2σ | 95 %` switches (on a second
+    /// row when the panel is narrow).
+    fn dispersion_header(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let one_row = rect.width() >= ONE_ROW_MIN_WIDTH;
         let row = |i: usize| {
             Rect::from_min_size(
@@ -947,33 +930,14 @@ impl FlighthookApp {
         }
         self.dispersion_points = points;
         self.ellipse_size = size;
-
-        if let Some(labels) = filter {
-            let devices = self.devices().into_owned();
-            let at = self
-                .device_filter
-                .as_ref()
-                .and_then(|d| devices.iter().position(|id| id == d))
-                .map_or(0, |p| p + 1);
-            let last = 1 + usize::from(!one_row);
-            let picked = ui
-                .scope_builder(in_row(last, right_to_left), |ui| {
-                    bar_controls(ui, labels, at)
-                })
-                .inner;
-            if let Some(d) = picked {
-                self.device_filter = d.checked_sub(1).and_then(|p| devices.get(p).cloned());
-            }
-        }
     }
 
     /// The Dispersion panel, filling `ui`; `table` when it sits beside the
     /// Table view.
     pub(super) fn render_dispersion_panel(&mut self, ui: &mut egui::Ui, table: bool) {
         let full = ui.available_rect_before_wrap();
-        let filter = self.dispersion_filter(table);
-        let header = header_height(full.width(), filter.is_some());
-        self.dispersion_header(ui, full.with_max_y(full.top() + header), filter.as_deref());
+        let header = header_height(full.width());
+        self.dispersion_header(ui, full.with_max_y(full.top() + header));
         let rect = full.with_min_y(full.top() + header);
         let response = ui.allocate_rect(rect, egui::Sense::click());
         let painter = ui.painter_at(rect);
@@ -997,7 +961,7 @@ impl FlighthookApp {
 
         // The latest shot flies out from the tee while its pulse runs.
         let now = ui.ctx().input(|i| i.time);
-        let following = table || self.shot_focus.following(&self.shots);
+        let following = table || self.following();
         let progress = following.then(|| self.shot_focus.progress(now)).flatten();
         let draw_on = progress.and_then(|p| DrawOn::new(scene, p));
         if draw_on.is_some() {
@@ -1052,7 +1016,7 @@ impl FlighthookApp {
             None => {}
         }
         if let Some(i) = clicked {
-            self.shot_focus.select(&self.shots, i);
+            self.select_shot(i);
             self.shot_focus.reveal();
         }
     }
@@ -1142,6 +1106,7 @@ mod tests {
             handed: None,
             group: Some(group.into()),
             finished: true,
+            video: Vec::new(),
         }
     }
 
@@ -1717,8 +1682,8 @@ mod tests {
         app.shots_rev = 1;
         app.groups = g;
         app.refresh_shot_caches();
-        app.shot_focus.observe(&app.shots, 0.0);
-        app.shot_focus.select(&app.shots, 3);
+        app.shot_focus.observe(&app.shots, None, 0.0);
+        app.select_shot(3);
         assert_eq!(app.dispersion_shown(false), Some(3));
         assert_eq!(app.dispersion_shown(true), Some(7));
         // Table: the latest shot's set is bright, whatever the Cards pin.
@@ -1906,8 +1871,8 @@ mod tests {
                     .frame(egui::Frame::new())
                     .show(ctx, |ui| {
                         let rect = Rect::from_min_size(Pos2::ZERO, vec2(ONE_ROW_MIN_WIDTH, ROW_H));
-                        assert_eq!(header_height(rect.width(), false), ROW_H);
-                        app.dispersion_header(ui, rect, None);
+                        assert_eq!(header_height(rect.width()), ROW_H);
+                        app.dispersion_header(ui, rect);
                     });
             });
             let (mut texts, mut tracks) = (Vec::new(), Vec::new());

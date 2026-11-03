@@ -62,12 +62,21 @@ pub fn build_export_line(
             detection_mode: ctx.detection_mode,
             handed: ctx.handed,
         },
-        data: match units {
-            Some(u) => shot.data.to_unit_system(u),
-            None => shot.data.clone(),
-        },
+        data: export_data(&shot.data, units),
         raw,
     }
+}
+
+/// `data` as the export carries it: in `units` (native when `None`), and
+/// without the shot's camera clips, which never leave this computer through
+/// the export.
+fn export_data(data: &flighthook::ShotData, units: Option<UnitSystem>) -> flighthook::ShotData {
+    let mut data = match units {
+        Some(u) => data.to_unit_system(u),
+        None => data.clone(),
+    };
+    data.video = Vec::new();
+    data
 }
 
 /// One JSONL line, newline-terminated.
@@ -446,6 +455,26 @@ mod tests {
         );
         assert_eq!(raw.frames[1].hex.as_deref(), Some("d401"));
         assert_eq!(parsed.settings.device["ball_type"], 1);
+    }
+
+    #[test]
+    fn the_export_never_carries_camera_clips() {
+        let mut shot = private_shot();
+        shot.data.video = vec![flighthook::ShotVideo {
+            camera: "camera.0".into(),
+            position: flighthook::CameraPosition::GolferFront,
+            duration_ms: 5500,
+            fps: 120.0,
+            trigger_offset_ms: 4000,
+            impact_offset_ms: 4000,
+            complete: true,
+            dropped: 0,
+        }];
+        for units in [None, Some(UnitSystem::Imperial), Some(UnitSystem::Metric)] {
+            let line = jsonl_line(&shot, "t", units, true);
+            assert!(!line.contains("video"), "{line}");
+            assert!(!line.contains("camera.0"), "{line}");
+        }
     }
 
     #[test]

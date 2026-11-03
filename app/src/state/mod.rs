@@ -1,3 +1,5 @@
+pub mod cameras;
+pub mod clips;
 pub mod config;
 mod game;
 pub mod local_clients;
@@ -11,6 +13,8 @@ use std::sync::{Arc, RwLock};
 
 use crate::actors::{Actor, ReconfigureOutcome};
 use crate::bus::BusSender;
+use cameras::Cameras;
+use clips::ClipStore;
 use config::SystemConfig;
 use local_clients::LocalClients;
 
@@ -23,6 +27,10 @@ pub struct SystemState {
     /// This process's connected Open Connect clients, which its Open Connect
     /// servers refuse.
     pub local_clients: Arc<LocalClients>,
+    /// The replay clips on disk, shared by the camera actors (beta).
+    pub clips: ClipStore,
+    /// The camera actors' latest frames and the camera list (beta).
+    pub cameras: Cameras,
     #[allow(clippy::type_complexity)]
     actors: RwLock<HashMap<String, (Box<dyn Actor>, Arc<AtomicBool>)>>,
 }
@@ -35,6 +43,8 @@ impl SystemState {
                 system: SystemConfig::new(config_path),
                 game,
                 local_clients: Arc::default(),
+                clips: ClipStore::default(),
+                cameras: Cameras::default(),
                 actors: RwLock::new(HashMap::new()),
             },
             writer,

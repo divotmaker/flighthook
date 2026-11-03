@@ -671,7 +671,7 @@ fn impact_hover(lat: Option<f64>, vert: Option<f64>) -> String {
 /// Padding inside the panel.
 pub(crate) const PAD: f32 = 10.0;
 /// The readout line's height at the top.
-const HEAD_H: f32 = 24.0;
+pub(crate) const HEAD_H: f32 = 24.0;
 /// The TOE / HEEL line's height at the bottom.
 const FOOT_H: f32 = 16.0;
 /// Readout font size, and the least it shrinks to in a narrow panel.
@@ -989,13 +989,8 @@ fn paint_marks(painter: &egui::Painter, view: FaceView, plot: Rect, panel: &Face
     }
 }
 
-/// Paint the face panel in `rect` and handle the pointer: hovering a dot
-/// shows its shot, clicking it returns the shot's index.
-pub(crate) fn paint_face_panel(ui: &egui::Ui, rect: Rect, panel: &FacePanel) -> Option<usize> {
-    if !ui.is_rect_visible(rect) {
-        return None;
-    }
-    let painter = ui.painter();
+/// Paint the chrome of a card in the row beside the range bars at `rect`.
+pub(crate) fn paint_card(painter: &egui::Painter, rect: Rect) {
     painter.rect(
         rect,
         egui::CornerRadius::same(theme::CARD_RADIUS),
@@ -1003,6 +998,37 @@ pub(crate) fn paint_face_panel(ui: &egui::Ui, rect: Rect, panel: &FacePanel) -> 
         Stroke::new(1.0, theme::BORDER),
         egui::StrokeKind::Inside,
     );
+}
+
+/// A card's name line laid out like the readout ([`readout_galley`]), in
+/// capitals.
+pub(crate) fn label_galley(
+    painter: &egui::Painter,
+    text: &str,
+    width: f32,
+    colour: Color32,
+) -> std::sync::Arc<egui::Galley> {
+    readout_galley(painter, &text.to_uppercase(), width, colour)
+}
+
+/// A click on the face panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FaceClick {
+    /// On a dot: the shot's index.
+    Shot(usize),
+    /// Anywhere else in the panel.
+    Panel,
+}
+
+/// Paint the face panel in `rect` and handle the pointer: hovering a dot
+/// shows its shot, clicking it returns the shot's index; a click elsewhere
+/// in the panel is [`FaceClick::Panel`].
+pub(crate) fn paint_face_panel(ui: &egui::Ui, rect: Rect, panel: &FacePanel) -> Option<FaceClick> {
+    if !ui.is_rect_visible(rect) {
+        return None;
+    }
+    let painter = ui.painter();
+    paint_card(painter, rect);
 
     // Readout.
     let colour = if panel.shown.is_some() {
@@ -1022,13 +1048,15 @@ pub(crate) fn paint_face_panel(ui: &egui::Ui, rect: Rect, panel: &FacePanel) -> 
     paint_face(painter, rect, view);
     paint_marks(painter, view, plot, panel);
 
-    let response = ui.interact(rect, ui.id().with("face_panel"), egui::Sense::click());
+    let response = ui
+        .interact(rect, ui.id().with("face_panel"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     let hovered = response.hover_pos().and_then(|p| hit(view, plot, panel, p));
-    let (index, text) = hovered?;
-    let response = response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text_at_pointer(text);
-    response.clicked().then_some(index)
+    let Some((index, text)) = hovered else {
+        return response.clicked().then_some(FaceClick::Panel);
+    };
+    let response = response.on_hover_text_at_pointer(text);
+    response.clicked().then_some(FaceClick::Shot(index))
 }
 
 #[cfg(test)]
@@ -1344,6 +1372,7 @@ mod tests {
             handed: None,
             group: Some("a".into()),
             finished: true,
+            video: Vec::new(),
         }
     }
 

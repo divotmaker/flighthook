@@ -183,6 +183,10 @@ pub struct FlighthookConfig {
     /// while it is at its defaults.
     #[serde(default, skip_serializing_if = "SimulationSection::is_default")]
     pub simulation: SimulationSection,
+    /// Swing replay clips from the cameras (beta). Omitted from the file and
+    /// the API while it is at its defaults.
+    #[serde(default, skip_serializing_if = "ReplaySection::is_default")]
+    pub replay: ReplaySection,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub webserver: std::collections::HashMap<String, WebserverSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -203,6 +207,9 @@ pub struct FlighthookConfig {
     pub openconnect_client: std::collections::HashMap<String, OpenConnectClientSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub random_club: std::collections::HashMap<String, RandomClubSection>,
+    /// Swing cameras (beta).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub camera: std::collections::HashMap<String, CameraSection>,
 }
 
 /// [`FlighthookConfig`] as read: its own fields, plus `gspro` sections.
@@ -420,6 +427,209 @@ impl SimSurface {
     #[must_use]
     pub fn all() -> [Self; 3] {
         [Self::Fairway, Self::Green, Self::FirmGreen]
+    }
+}
+
+/// Settings for the swing replay clips the cameras record (beta).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplaySection {
+    /// Clips kept on disk, newest first; older ones are deleted. Counts
+    /// clips, not shots: a swing two launch monitors saw is one clip, and a
+    /// trigger that read nothing records one too. Defaults to 20.
+    #[serde(default = "default_keep_shots")]
+    pub keep_shots: u32,
+    /// Seconds recorded before the estimated impact. Defaults to 4.
+    #[serde(default = "default_pre_roll_s")]
+    pub pre_roll_s: f64,
+    /// Seconds recorded after the launch monitor reports the shot. Defaults
+    /// to 1.5.
+    #[serde(default = "default_post_roll_s")]
+    pub post_roll_s: f64,
+    /// Seconds before the estimated impact where a replay opens, and where it
+    /// restarts once it played to the end. Defaults to 2.
+    #[serde(default = "default_start_before_impact_s")]
+    pub start_before_impact_s: f64,
+    /// Folder the clips are written to. Defaults to `flighthook/clips` in
+    /// the user's local data folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_dir: Option<String>,
+}
+
+fn default_keep_shots() -> u32 {
+    ReplaySection::DEFAULT_KEEP_SHOTS
+}
+
+fn default_pre_roll_s() -> f64 {
+    ReplaySection::DEFAULT_PRE_ROLL_S
+}
+
+fn default_post_roll_s() -> f64 {
+    ReplaySection::DEFAULT_POST_ROLL_S
+}
+
+fn default_start_before_impact_s() -> f64 {
+    ReplaySection::DEFAULT_START_BEFORE_IMPACT_S
+}
+
+impl Default for ReplaySection {
+    fn default() -> Self {
+        Self {
+            keep_shots: Self::DEFAULT_KEEP_SHOTS,
+            pre_roll_s: Self::DEFAULT_PRE_ROLL_S,
+            post_roll_s: Self::DEFAULT_POST_ROLL_S,
+            start_before_impact_s: Self::DEFAULT_START_BEFORE_IMPACT_S,
+            clip_dir: None,
+        }
+    }
+}
+
+impl ReplaySection {
+    /// Default clips kept.
+    pub const DEFAULT_KEEP_SHOTS: u32 = 20;
+    /// Most clips kept.
+    pub const MAX_KEEP_SHOTS: u32 = 1000;
+    /// Default seconds before the estimated impact.
+    pub const DEFAULT_PRE_ROLL_S: f64 = 4.0;
+    /// Default seconds after the shot is reported.
+    pub const DEFAULT_POST_ROLL_S: f64 = 1.5;
+    /// Longest pre-roll or post-roll, seconds.
+    pub const MAX_ROLL_S: f64 = 10.0;
+    /// Default seconds before the estimated impact where a replay starts: a
+    /// backswing and downswing take about 1.2 to 1.5 s, plus a buffer.
+    pub const DEFAULT_START_BEFORE_IMPACT_S: f64 = 2.0;
+    /// Longest start before the impact, seconds.
+    pub const MAX_START_BEFORE_IMPACT_S: f64 = 10.0;
+
+    /// True when every setting is at its default.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Why a setting is out of range, or `None` when all are valid:
+    /// `keep_shots` 1 to [`MAX_KEEP_SHOTS`](Self::MAX_KEEP_SHOTS), each roll
+    /// 0 to [`MAX_ROLL_S`](Self::MAX_ROLL_S) seconds, `start_before_impact_s`
+    /// 0 to [`MAX_START_BEFORE_IMPACT_S`](Self::MAX_START_BEFORE_IMPACT_S)
+    /// seconds.
+    #[must_use]
+    pub fn error(&self) -> Option<String> {
+        if !(1..=Self::MAX_KEEP_SHOTS).contains(&self.keep_shots) {
+            return Some(format!(
+                "keep_shots {} is outside 1 to {}",
+                self.keep_shots,
+                Self::MAX_KEEP_SHOTS
+            ));
+        }
+        for (name, v, max) in [
+            ("pre_roll_s", self.pre_roll_s, Self::MAX_ROLL_S),
+            ("post_roll_s", self.post_roll_s, Self::MAX_ROLL_S),
+            (
+                "start_before_impact_s",
+                self.start_before_impact_s,
+                Self::MAX_START_BEFORE_IMPACT_S,
+            ),
+        ] {
+            if !v.is_finite() || !(0.0..=max).contains(&v) {
+                return Some(format!("{name} {v} is outside 0 to {max} s"));
+            }
+        }
+        None
+    }
+}
+
+/// Where a camera stands, as seen from the golfer's stance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraPosition {
+    /// Looking down the target line from behind the golfer's hands.
+    TargetLine,
+    /// Facing the golfer's chest. The default.
+    #[default]
+    GolferFront,
+    /// Looking at the golfer's back.
+    GolferBack,
+    /// Above the golfer, looking down.
+    Overhead,
+}
+
+impl CameraPosition {
+    /// Stable key used by the settings UI and config file.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::TargetLine => "target_line",
+            Self::GolferFront => "golfer_front",
+            Self::GolferBack => "golfer_back",
+            Self::Overhead => "overhead",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TargetLine => "Target Line",
+            Self::GolferFront => "Golfer Front",
+            Self::GolferBack => "Golfer Back",
+            Self::Overhead => "Overhead",
+        }
+    }
+
+    /// Every position, in display order.
+    #[must_use]
+    pub fn all() -> [Self; 4] {
+        [
+            Self::TargetLine,
+            Self::GolferFront,
+            Self::GolferBack,
+            Self::Overhead,
+        ]
+    }
+}
+
+/// A swing camera instance (beta): records a clip around every shot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraSection {
+    #[serde(default)]
+    pub name: String,
+    /// The camera's stable id, from the camera list (`GET /api/cameras`):
+    /// it survives replugging into the same USB port and reboots.
+    /// [`CameraSection::TEST_PATTERN`] is a generated test picture.
+    #[serde(default)]
+    pub camera: String,
+    /// The camera's own name when it was picked, for display, and to find
+    /// the camera when its id is not connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_name: Option<String>,
+    /// Where the camera stands.
+    #[serde(default)]
+    pub position: CameraPosition,
+    /// Video mode: `auto` (the highest frame rate, then the largest size)
+    /// or `WIDTHxHEIGHT@FPS`, e.g. `1280x720@120`.
+    #[serde(default = "default_video_mode")]
+    pub mode: String,
+}
+
+fn default_video_mode() -> String {
+    CameraSection::AUTO_MODE.to_owned()
+}
+
+impl CameraSection {
+    /// The [`camera`](Self::camera) id of the generated test picture.
+    pub const TEST_PATTERN: &'static str = "test-pattern";
+    /// The automatic [`mode`](Self::mode).
+    pub const AUTO_MODE: &'static str = "auto";
+}
+
+impl Default for CameraSection {
+    fn default() -> Self {
+        Self {
+            name: "Camera".into(),
+            camera: String::new(),
+            camera_name: None,
+            position: CameraPosition::default(),
+            mode: default_video_mode(),
+        }
     }
 }
 
@@ -818,6 +1028,7 @@ impl FlighthookConfig {
             || !self.openconnect_server.is_empty()
             || !self.openconnect_client.is_empty()
             || !self.random_club.is_empty()
+            || !self.camera.is_empty()
     }
 }
 
@@ -839,6 +1050,7 @@ impl Default for FlighthookConfig {
             putting_clubs: default_putting_clubs(),
             shot_grouping: ShotGrouping::default(),
             simulation: SimulationSection::default(),
+            replay: ReplaySection::default(),
             webserver,
             mevo: std::collections::HashMap::new(),
             r10: std::collections::HashMap::new(),
@@ -848,6 +1060,7 @@ impl Default for FlighthookConfig {
             openconnect_server: std::collections::HashMap::new(),
             openconnect_client: std::collections::HashMap::new(),
             random_club: std::collections::HashMap::new(),
+            camera: std::collections::HashMap::new(),
         }
     }
 }
@@ -1396,6 +1609,13 @@ mod openconnect_client_tests {
                 temperature_c: 12.5,
                 surface: SimSurface::FirmGreen,
             },
+            replay: ReplaySection {
+                keep_shots: 7,
+                pre_roll_s: 2.5,
+                post_roll_s: 0.5,
+                start_before_impact_s: 1.5,
+                clip_dir: Some("/srv/clips".into()),
+            },
             webserver: one(WebserverSection {
                 name: "Web".into(),
                 bind: "0.0.0.0:5881".into(),
@@ -1422,6 +1642,13 @@ mod openconnect_client_tests {
             }),
             random_club: one(RandomClubSection {
                 name: "Clubs".into(),
+            }),
+            camera: one(CameraSection {
+                name: "Face".into(),
+                camera: "usb-0000:00:14.0-1/HD Pro Webcam C920".into(),
+                camera_name: Some("HD Pro Webcam C920".into()),
+                position: CameraPosition::Overhead,
+                mode: "1920x1080@30".into(),
             }),
         }
     }
@@ -1466,5 +1693,162 @@ mod openconnect_client_tests {
         ));
         let json = serde_json::to_value(&a).expect("serialize");
         assert_eq!(json["type"], "upsert_open_connect_client");
+    }
+}
+
+#[cfg(test)]
+mod camera_tests {
+    use super::*;
+
+    #[test]
+    fn replay_defaults_are_omitted_and_read_back() {
+        let config = FlighthookConfig::default();
+        let json = serde_json::to_string(&config).expect("ser");
+        assert!(!json.contains("replay"), "{json}");
+        assert!(!json.contains("camera"), "{json}");
+        let back: FlighthookConfig = serde_json::from_str(&json).expect("de");
+        assert_eq!(back.replay, ReplaySection::default());
+        let r = ReplaySection::default();
+        assert_eq!((r.keep_shots, r.pre_roll_s, r.post_roll_s), (20, 4.0, 1.5));
+        assert_eq!(r.start_before_impact_s, 2.0);
+        assert_eq!(r.clip_dir, None);
+        assert!(r.error().is_none());
+        // A section with only some keys takes the defaults for the rest.
+        let r: ReplaySection = serde_json::from_str(r#"{"keep_shots":5}"#).expect("de");
+        assert_eq!((r.keep_shots, r.pre_roll_s, r.post_roll_s), (5, 4.0, 1.5));
+        assert_eq!(r.start_before_impact_s, 2.0);
+    }
+
+    #[test]
+    fn a_changed_replay_section_round_trips() {
+        let config = FlighthookConfig {
+            replay: ReplaySection {
+                keep_shots: 50,
+                pre_roll_s: 3.0,
+                post_roll_s: 2.0,
+                start_before_impact_s: 3.5,
+                clip_dir: Some("D:/swings".into()),
+            },
+            ..FlighthookConfig::default()
+        };
+        let v = serde_json::to_value(&config).expect("ser");
+        assert_eq!(v["replay"]["keep_shots"], 50);
+        assert_eq!(v["replay"]["start_before_impact_s"], 3.5);
+        assert_eq!(v["replay"]["clip_dir"], "D:/swings");
+        let back: FlighthookConfig = serde_json::from_value(v).expect("de");
+        assert_eq!(back.replay, config.replay);
+    }
+
+    #[test]
+    fn replay_values_out_of_range_are_errors() {
+        let bad = [
+            ReplaySection {
+                keep_shots: 0,
+                ..ReplaySection::default()
+            },
+            ReplaySection {
+                keep_shots: ReplaySection::MAX_KEEP_SHOTS + 1,
+                ..ReplaySection::default()
+            },
+            ReplaySection {
+                pre_roll_s: -0.1,
+                ..ReplaySection::default()
+            },
+            ReplaySection {
+                post_roll_s: 10.5,
+                ..ReplaySection::default()
+            },
+            ReplaySection {
+                pre_roll_s: f64::NAN,
+                ..ReplaySection::default()
+            },
+            ReplaySection {
+                start_before_impact_s: -0.1,
+                ..ReplaySection::default()
+            },
+            ReplaySection {
+                start_before_impact_s: 10.5,
+                ..ReplaySection::default()
+            },
+            ReplaySection {
+                start_before_impact_s: f64::INFINITY,
+                ..ReplaySection::default()
+            },
+        ];
+        for r in bad {
+            assert!(r.error().is_some(), "{r:?}");
+        }
+        let edge = ReplaySection {
+            keep_shots: 1,
+            pre_roll_s: 0.0,
+            post_roll_s: ReplaySection::MAX_ROLL_S,
+            start_before_impact_s: ReplaySection::MAX_START_BEFORE_IMPACT_S,
+            clip_dir: None,
+        };
+        assert!(edge.error().is_none());
+        let zero = ReplaySection {
+            start_before_impact_s: 0.0,
+            ..edge
+        };
+        assert!(zero.error().is_none());
+    }
+
+    #[test]
+    fn camera_sections_round_trip_with_snake_case_positions() {
+        let keys = [
+            (CameraPosition::TargetLine, "target_line"),
+            (CameraPosition::GolferFront, "golfer_front"),
+            (CameraPosition::GolferBack, "golfer_back"),
+            (CameraPosition::Overhead, "overhead"),
+        ];
+        // The settings picker lists `all()` in this order.
+        assert_eq!(CameraPosition::all(), keys.map(|(position, _)| position));
+        assert_eq!(
+            CameraPosition::all().map(CameraPosition::label),
+            ["Target Line", "Golfer Front", "Golfer Back", "Overhead"]
+        );
+        for (position, key) in keys {
+            assert_eq!(position.key(), key);
+            let section = CameraSection {
+                name: "DTL".into(),
+                camera: "/dev/v4l/by-id/usb-cam-video-index0".into(),
+                camera_name: Some("HD Pro Webcam C920".into()),
+                position,
+                mode: "1280x720@120".into(),
+            };
+            let v = serde_json::to_value(&section).expect("ser");
+            assert_eq!(v["position"], key);
+            let back: CameraSection = serde_json::from_value(v).expect("de");
+            assert_eq!(back, section);
+        }
+    }
+
+    #[test]
+    fn a_camera_section_needs_only_its_camera() {
+        let s: CameraSection =
+            serde_json::from_str(r#"{"name":"Cam","camera":"test-pattern"}"#).expect("de");
+        assert_eq!(s.position, CameraPosition::GolferFront);
+        assert_eq!(s.mode, CameraSection::AUTO_MODE);
+        assert_eq!(s.camera_name, None);
+        assert_eq!(s.camera, CameraSection::TEST_PATTERN);
+    }
+
+    #[test]
+    fn cameras_count_as_user_actors_and_round_trip_in_toml_shape() {
+        let mut config = FlighthookConfig::default();
+        assert!(!config.has_user_actors());
+        config.camera.insert(
+            "0".into(),
+            CameraSection {
+                camera: CameraSection::TEST_PATTERN.into(),
+                ..CameraSection::default()
+            },
+        );
+        assert!(config.has_user_actors());
+        let v = serde_json::to_value(&config).expect("ser");
+        assert_eq!(v["camera"]["0"]["camera"], "test-pattern");
+        assert_eq!(v["camera"]["0"]["mode"], "auto");
+        let back: FlighthookConfig = serde_json::from_value(v).expect("de");
+        assert_eq!(back, config);
     }
 }

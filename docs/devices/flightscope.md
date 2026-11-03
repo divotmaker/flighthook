@@ -12,6 +12,11 @@ Connect over the launch monitor's WiFi network. A Mevo+ or Mevo Gen2 reports
 its SSID during the handshake, and flighthook uses that as the FRP device
 identity.
 
+A Mevo+ reports its battery level (`battery_pct`). While it is connected,
+the dashboard header shows it as a battery icon, red under 20 %; hover it
+for the device's name and percentage. The Mevo Gen2 and the Xi report no
+battery level.
+
 ### Upgrade notes
 
 For anyone updating from flighthook 0.1.x with a Mevo+ or Mevo Gen2:

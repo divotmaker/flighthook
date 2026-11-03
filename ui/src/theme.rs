@@ -463,6 +463,55 @@ pub(crate) fn jump_chip(ui: &mut egui::Ui, text: &str) -> egui::Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// A clickable chip with a Codicons glyph before its label: the
+/// [`jump_chip`] look with `icon` in place of the arrow.
+pub(crate) fn icon_chip(ui: &mut egui::Ui, icon: Icon, text: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::proportional(12.0),
+        Color32::PLACEHOLDER,
+    );
+    let glyph = 14.0;
+    let size = galley.size() + egui::vec2(glyph + 26.0, 8.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let family = icon_family();
+    let loaded = ui.fonts(|f| f.definitions().families.contains_key(&family));
+    if !loaded {
+        add_icon_font(ui.ctx());
+    }
+    if ui.is_rect_visible(rect) {
+        let (fill, color) = if response.hovered() {
+            (VEIL_HOVER, ACCENT_BRIGHT)
+        } else {
+            (VEIL, ACCENT)
+        };
+        let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            radius,
+            fill,
+            Stroke::new(1.0, color),
+            egui::StrokeKind::Inside,
+        );
+        if loaded {
+            let icon = painter.layout_no_wrap(
+                icon.codepoint().to_string(),
+                FontId::new(glyph, family),
+                color,
+            );
+            let at = egui::pos2(rect.left() + 10.0, rect.center().y - icon.size().y / 2.0);
+            painter.galley(at, icon, color);
+        }
+        let pos = egui::pos2(
+            rect.left() + glyph + 16.0,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        painter.galley(pos, galley, color);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// A clickable chip the size of a `badge`, at least `min_size` big: the
 /// [`jump_chip`] look without the arrow (neutral translucent pill, accent
 /// outline and label, brighter on hover). Disabled, it is dimmed and takes
@@ -588,6 +637,18 @@ pub(crate) enum Icon {
     Add,
     /// `trash`.
     Trash,
+    /// `play`.
+    Play,
+    /// `debug-pause`.
+    Pause,
+    /// `chevron-left`.
+    ChevronLeft,
+    /// `chevron-right`.
+    ChevronRight,
+    /// `device-camera-video`.
+    Video,
+    /// `refresh`.
+    Refresh,
 }
 
 impl Icon {
@@ -596,6 +657,12 @@ impl Icon {
         match self {
             Icon::Add => '\u{ea60}',
             Icon::Trash => '\u{ea81}',
+            Icon::Play => '\u{eb2c}',
+            Icon::Pause => '\u{ead1}',
+            Icon::ChevronLeft => '\u{eab5}',
+            Icon::ChevronRight => '\u{eab6}',
+            Icon::Video => '\u{ead9}',
+            Icon::Refresh => '\u{eb37}',
         }
     }
 }
@@ -748,6 +815,29 @@ mod tests {
         let _ = frame(&ctx, |_| {});
         let font = FontId::new(ICON_SIZE, icon_family());
         assert!(ctx.fonts_mut(|f| f.has_glyph(&font, Icon::Add.codepoint())));
+    }
+
+    #[test]
+    fn replay_icons_are_codicons_glyphs() {
+        // Codepoints from Codicons' mapping.json: play 60204, debug-pause
+        // 60113, chevron-left 60085, chevron-right 60086,
+        // device-camera-video 60121, refresh 60215.
+        let icons = [
+            (Icon::Play, '\u{eb2c}'),
+            (Icon::Pause, '\u{ead1}'),
+            (Icon::ChevronLeft, '\u{eab5}'),
+            (Icon::ChevronRight, '\u{eab6}'),
+            (Icon::Video, '\u{ead9}'),
+            (Icon::Refresh, '\u{eb37}'),
+        ];
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let _ = frame(&ctx, |_| {});
+        let font = FontId::new(ICON_SIZE, icon_family());
+        for (icon, codepoint) in icons {
+            assert_eq!(icon.codepoint(), codepoint, "{icon:?}");
+            assert!(ctx.fonts_mut(|f| f.has_glyph(&font, codepoint)), "{icon:?}");
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -20,8 +20,8 @@ use super::{MAX_SHOTS, StoredShot, WebState, export};
 use crate::actors::actor_names;
 use crate::state::config::FlighthookConfig;
 use flighthook::{
-    Club, ClubInfo, ConfigAction, FlighthookEvent, FlighthookMessage, HandInfo, ShotData,
-    UnitSystem,
+    CameraListResponse, Club, ClubInfo, ConfigAction, FlighthookEvent, FlighthookMessage, HandInfo,
+    ShotData, ShotVideo, UnitSystem,
 };
 
 // ---------------------------------------------------------------------------
@@ -88,12 +88,112 @@ pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusRespon
     let actors = super::actor_statuses(&*state.actors.read().await, &names, state.now_ms());
 
     let game = state.root.game.snapshot();
+    let clip_dir = crate::state::clips::clip_dir(&state.root.system.replay());
     Json(StatusResponse {
         actors,
         mode: game.mode,
         club: game.club_info.map(|c| c.club),
         handed: game.handed,
+        cameras_supported: crate::state::cameras::supported(),
+        clip_dir: Some(clip_dir.display().to_string()),
     })
+}
+
+/// GET /api/cameras — the cameras this computer has, and the test picture.
+///
+/// Enumerates on a blocking thread, at most every few seconds (the result is
+/// reused meanwhile). A camera a camera actor records from is not opened
+/// again to list it and is marked `in_use_by`. `500` with a text body when
+/// the enumeration thread fails.
+pub async fn get_cameras(State(state): State<Arc<WebState>>) -> Response {
+    let root = Arc::clone(&state.root);
+    match tokio::task::spawn_blocking(move || root.cameras.list()).await {
+        Ok(list) => Json::<CameraListResponse>(list).into_response(),
+        Err(e) => {
+            tracing::warn!("cameras: listing failed: {e}");
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("listing the cameras failed: {e}"),
+            )
+        }
+    }
+}
+
+/// A response with status `status` and a short text body.
+fn text_response(status: StatusCode, text: String) -> Response {
+    Response::builder()
+        .status(status)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )
+        .body(Body::from(text))
+        .unwrap()
+}
+
+/// A `404` with a short text body.
+fn not_found(text: String) -> Response {
+    text_response(StatusCode::NOT_FOUND, text)
+}
+
+/// GET /api/cameras/{actor}/still — the camera actor's newest frame, a JPEG
+/// as the camera sent it (at most half a second old while it records).
+/// `404` when the actor has no frame.
+pub async fn get_camera_still(
+    State(state): State<Arc<WebState>>,
+    Path(actor): Path<String>,
+) -> Response {
+    let Some(jpeg) = state.root.cameras.still(&actor) else {
+        return not_found(format!("no frame from '{actor}'"));
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
+        .body(Body::from(jpeg.to_vec()))
+        .unwrap()
+}
+
+/// GET /api/shots/{shot_id}/video — the shot's finished camera clips.
+pub async fn get_shot_video(
+    State(state): State<Arc<WebState>>,
+    Path(shot_id): Path<String>,
+) -> Json<Vec<ShotVideo>> {
+    Json(state.root.clips.videos(&shot_id))
+}
+
+/// GET /api/shots/{shot_id}/video/{camera}.avi | .json — a camera's clip of
+/// the shot (MJPEG AVI) or its frame index (the sidecar), with HTTP `Range`
+/// support. Only finished clips are served; `404` otherwise. Sent with
+/// `Cache-Control: private, no-cache`: a finished file never changes, but a
+/// pruned clip's URL must not be served from a cache, and a camera that
+/// records the same swing again replaces its files.
+pub async fn get_shot_video_file(
+    State(state): State<Arc<WebState>>,
+    Path((shot_id, file)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    use tower::ServiceExt as _;
+
+    let path = file
+        .rsplit_once('.')
+        .and_then(|(camera, ext)| state.root.clips.file(&shot_id, camera, ext));
+    let Some(path) = path else {
+        return not_found(format!("no clip '{file}' for shot '{shot_id}'"));
+    };
+    match tower_http::services::ServeFile::new(path)
+        .oneshot(request)
+        .await
+    {
+        Ok(response) => {
+            let mut response = response.map(Body::new);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-cache"),
+            );
+            response
+        }
+        Err(never) => match never {},
+    }
 }
 
 /// GET /api/shots?limit=50&units=imperial|metric
@@ -253,7 +353,10 @@ pub async fn post_convert_shot(
         "metric" => UnitSystem::Metric,
         _ => return Err(StatusCode::BAD_REQUEST),
     };
-    Ok(Json(shot.to_unit_system(system)))
+    // Camera clips stay with the server's history.
+    let mut shot = shot.to_unit_system(system);
+    shot.video = Vec::new();
+    Ok(Json(shot))
 }
 
 /// POST /api/mode
@@ -508,6 +611,7 @@ fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction>
         "openconnect_client" => upsert!(openconnect_client, UpsertOpenConnectClient),
         "mock_monitor" => upsert!(mock_monitor, UpsertMockMonitor),
         "random_club" => upsert!(random_club, UpsertRandomClub),
+        "camera" => upsert!(camera, UpsertCamera),
         _ => return None,
     })
 }
@@ -544,11 +648,36 @@ fn webserver_violation(live: &FlighthookConfig, action: &ConfigAction) -> Option
     }
 }
 
-/// Why `action` would save an invalid device setting, or `None`: a
+/// Why `action` would save an invalid setting, or `None`: a
 /// `launch_only_spin` outside 0 to
 /// [`MevoSection::MAX_LAUNCH_ONLY_SPIN`](flighthook::MevoSection::MAX_LAUNCH_ONLY_SPIN)
-/// in a Mevo section the action writes.
+/// in a Mevo section the action writes, a camera section without a camera
+/// or with a video mode that is neither `auto` nor `WIDTHxHEIGHT@FPS`, or a
+/// `[replay]` value out of range ([`ReplaySection::error`](flighthook::ReplaySection::error)).
 fn invalid_setting(action: &ConfigAction) -> Option<String> {
+    if let ConfigAction::ReplaceAll { config } | ConfigAction::ReplaceGlobal { config } = action
+        && let Some(error) = config.replay.error()
+    {
+        return Some(format!("replay: {error}"));
+    }
+    let cameras: Vec<(&String, &flighthook::CameraSection)> = match action {
+        ConfigAction::ReplaceAll { config } => config.camera.iter().collect(),
+        ConfigAction::UpsertCamera { index, section } => vec![(index, section)],
+        _ => Vec::new(),
+    };
+    for (index, camera) in cameras {
+        if camera.camera.trim().is_empty() {
+            return Some(format!("camera.{index}: no camera picked"));
+        }
+        if let Err(e) = camera.mode.parse::<stance::FormatRequest>() {
+            return Some(format!("camera.{index}: {e}"));
+        }
+    }
+    invalid_mevo_setting(action)
+}
+
+/// [`invalid_setting`] for Mevo sections.
+fn invalid_mevo_setting(action: &ConfigAction) -> Option<String> {
     let mevo: Vec<(&String, &flighthook::MevoSection)> = match action {
         ConfigAction::ReplaceAll { config } => config.mevo.iter().collect(),
         ConfigAction::UpsertMevo { index, section } => vec![(index, section)],
@@ -727,6 +856,74 @@ mod tests {
     }
 
     #[test]
+    fn a_camera_scope_upserts_or_removes_its_section() {
+        let mut c = config();
+        c.camera.insert(
+            "2".into(),
+            flighthook::CameraSection {
+                camera: "test-pattern".into(),
+                ..flighthook::CameraSection::default()
+            },
+        );
+        match scoped_action("camera.2", &c).expect("known scope") {
+            ConfigAction::UpsertCamera { index, section } => {
+                assert_eq!(index, "2");
+                assert_eq!(section.camera, "test-pattern");
+            }
+            other => panic!("expected UpsertCamera, got {other:?}"),
+        }
+        match scoped_action("camera.3", &c).expect("known scope") {
+            ConfigAction::Remove { id } => assert_eq!(id, "camera.3"),
+            other => panic!("expected Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_camera_without_a_camera_or_with_a_bad_mode_or_bad_replay_values_is_invalid() {
+        let camera = |camera: &str, mode: &str| ConfigAction::UpsertCamera {
+            index: "0".into(),
+            section: flighthook::CameraSection {
+                camera: camera.into(),
+                mode: mode.into(),
+                ..flighthook::CameraSection::default()
+            },
+        };
+        assert_eq!(invalid_setting(&camera("test-pattern", "auto")), None);
+        assert_eq!(invalid_setting(&camera("usb-1", "1280x720@120")), None);
+        assert_eq!(
+            invalid_setting(&camera(" ", "auto")).as_deref(),
+            Some("camera.0: no camera picked")
+        );
+        let bad_mode = invalid_setting(&camera("usb-1", "fast")).expect("rejected");
+        assert!(
+            bad_mode.starts_with("camera.0: invalid argument: video mode `fast`"),
+            "{bad_mode}"
+        );
+
+        let mut c = config();
+        c.replay.keep_shots = 0;
+        for action in [
+            ConfigAction::ReplaceGlobal {
+                config: Box::new(c.clone()),
+            },
+            ConfigAction::ReplaceAll {
+                config: Box::new(c.clone()),
+            },
+        ] {
+            let error = invalid_setting(&action).expect("rejected");
+            assert!(error.starts_with("replay: keep_shots 0"), "{error}");
+        }
+        c.replay.keep_shots = 5;
+        c.replay.pre_roll_s = 2.0;
+        assert_eq!(
+            invalid_setting(&ConfigAction::ReplaceGlobal {
+                config: Box::new(c)
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn scope_naming_an_absent_section_is_a_removal() {
         let action = scoped_action("mevo.0", &config()).expect("known scope");
         match action {
@@ -883,6 +1080,27 @@ mod convert_tests {
         .await
         .expect("converts");
         serde_json::from_str(&serde_json::to_string(&out).expect("ser")).expect("de")
+    }
+
+    #[tokio::test]
+    async fn convert_drops_camera_clips() {
+        let mut shot = shot();
+        shot.video = vec![ShotVideo {
+            camera: "camera.0".into(),
+            position: flighthook::CameraPosition::GolferFront,
+            duration_ms: 1,
+            fps: 30.0,
+            trigger_offset_ms: 0,
+            impact_offset_ms: 0,
+            complete: true,
+            dropped: 0,
+        }];
+        for units in ["imperial", "metric"] {
+            assert!(
+                convert(shot.clone(), units).await.video.is_empty(),
+                "{units}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1861,6 +2079,29 @@ mod group_tests {
         assert_eq!(after.session, 1);
         assert_eq!(after.current, None);
         assert!(after.groups.iter().all(|g| !g.open && g.session == 0));
+    }
+
+    #[tokio::test]
+    async fn get_status_says_where_clips_go_and_whether_cameras_work() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let Json(status) = get_status(State(Arc::clone(&state))).await;
+        assert_eq!(
+            status.clip_dir.as_deref(),
+            Some(
+                crate::state::clips::default_dir()
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(status.cameras_supported, crate::state::cameras::supported());
+        state
+            .root
+            .system
+            .update(|c| c.replay.clip_dir = Some("/srv/swings".into()));
+        let Json(status) = get_status(State(Arc::clone(&state))).await;
+        assert_eq!(status.clip_dir.as_deref(), Some("/srv/swings"));
     }
 
     #[tokio::test]

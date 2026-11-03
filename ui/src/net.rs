@@ -6,10 +6,11 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::replay::Window;
 use crate::types::{
-    self, AutoChipRequest, Club, FindMatRequest, FlighthookConfig, FlighthookMessage,
-    GameStateSnapshot, HandRequest, Handedness, PostSettingsResponse, ShotData, ShotGrouping,
-    ShotGroupsResponse, StatusResponse,
+    self, AutoChipRequest, CameraListResponse, Club, FindMatRequest, FlighthookConfig,
+    FlighthookMessage, GameStateSnapshot, HandRequest, Handedness, PostSettingsResponse, ShotData,
+    ShotGrouping, ShotGroupsResponse, StatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,39 @@ pub struct Pending {
     pub groups_posted: bool,
     /// The reply to a `POST /api/auto-chip`: sent, or why not.
     pub auto_chip: Option<Result<(), String>>,
+    /// The reply to `GET /api/cameras`: the camera list, or why not.
+    pub cameras: Option<Result<CameraListResponse, String>>,
+    /// Still frames by camera actor: the JPEG, or why there is none.
+    pub stills: Vec<(String, Result<Vec<u8>, String>)>,
+    /// Replies for the replay view.
+    pub(crate) replay: Vec<ReplayReply>,
+}
+
+/// A reply for the replay view, tagged with the replay it was asked for.
+#[derive(Debug)]
+pub(crate) enum ReplayReply {
+    /// A camera's clip sidecar.
+    Sidecar {
+        replay: u64,
+        camera: String,
+        result: Result<stance::sidecar::Sidecar, String>,
+    },
+    /// The bytes of a run of a camera's frames.
+    Frames {
+        replay: u64,
+        camera: String,
+        window: Window,
+        result: Result<Vec<u8>, String>,
+    },
+}
+
+impl ReplayReply {
+    /// The replay or camera card clip it was asked for.
+    pub(crate) fn seq(&self) -> u64 {
+        match self {
+            Self::Sidecar { replay, .. } | Self::Frames { replay, .. } => *replay,
+        }
+    }
 }
 
 pub type PendingHandle = Arc<Mutex<Pending>>;
@@ -108,6 +142,12 @@ pub(crate) fn export_url(format: &str, units: types::UnitSystem) -> String {
         "{}/api/shots/export?format={format}&units={units}",
         api_base()
     )
+}
+
+/// URL of a shot's clip file from `camera`: `ext` is `avi` (the clip) or
+/// `json` (its sidecar).
+pub(crate) fn clip_url(shot_id: &str, camera: &str, ext: &str) -> String {
+    format!("{}/api/shots/{shot_id}/video/{camera}.{ext}", api_base())
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +311,144 @@ pub fn post_auto_chip(ctx: &egui::Context, pending: &PendingHandle, yards: u32) 
     ehttp::fetch(auto_chip_request(yards), move |result| {
         if let Ok(mut p) = pending.lock() {
             p.auto_chip = Some(auto_chip_reply(result));
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Fetch the camera list (`GET /api/cameras`) into `cameras`.
+pub fn fetch_cameras(ctx: &egui::Context, pending: &PendingHandle) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let url = format!("{}/api/cameras", api_base());
+    ehttp::fetch(ehttp::Request::get(&url), move |result| {
+        let reply = result.and_then(|resp| {
+            if !resp.ok {
+                return Err(error_reason(&resp));
+            }
+            serde_json::from_slice::<CameraListResponse>(&resp.bytes)
+                .map_err(|_| "unexpected reply from the server".to_owned())
+        });
+        if let Ok(mut p) = pending.lock() {
+            p.cameras = Some(reply);
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Fetch camera `actor`'s latest frame (`GET /api/cameras/{actor}/still`)
+/// into `stills`.
+pub fn fetch_still(ctx: &egui::Context, pending: &PendingHandle, actor: &str) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let actor = actor.to_owned();
+    let url = format!("{}/api/cameras/{actor}/still", api_base());
+    ehttp::fetch(ehttp::Request::get(&url), move |result| {
+        let reply = result.and_then(|resp| {
+            if resp.ok {
+                Ok(resp.bytes)
+            } else if resp.status == 404 {
+                Err("no frame yet".to_owned())
+            } else {
+                Err(error_reason(&resp))
+            }
+        });
+        if let Ok(mut p) = pending.lock() {
+            p.stills.push((actor, reply));
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Fetch the sidecar of `shot_id`'s clip from `camera`, for replay `replay`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn fetch_sidecar(
+    ctx: &egui::Context,
+    pending: &PendingHandle,
+    replay: u64,
+    shot_id: &str,
+    camera: &str,
+) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let camera = camera.to_owned();
+    let url = clip_url(shot_id, &camera, "json");
+    ehttp::fetch(ehttp::Request::get(&url), move |result| {
+        let result = result.and_then(|resp| {
+            if !resp.ok {
+                return Err(error_reason(&resp));
+            }
+            let text = resp.text().unwrap_or_default();
+            stance::sidecar::Sidecar::from_json(text).map_err(|e| e.to_string())
+        });
+        if let Ok(mut p) = pending.lock() {
+            p.replay.push(ReplayReply::Sidecar {
+                replay,
+                camera,
+                result,
+            });
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// The `GET` of bytes `start..end` of `url`.
+pub(crate) fn range_request(url: &str, start: u64, end: u64) -> ehttp::Request {
+    let range = format!("bytes={start}-{}", end.saturating_sub(1));
+    ehttp::Request {
+        headers: ehttp::Headers::new(&[("Accept", "*/*"), ("Range", range.as_str())]),
+        ..ehttp::Request::get(url)
+    }
+}
+
+/// The bytes `start..end` from a reply to [`range_request`]: the body of a
+/// `206`, or that part of a whole file sent with `200`.
+pub(crate) fn range_reply(
+    result: Result<ehttp::Response, String>,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, String> {
+    let resp = result?;
+    match resp.status {
+        206 => Ok(resp.bytes),
+        200 => {
+            let a = usize::try_from(start).map_err(|e| e.to_string())?;
+            let b = usize::try_from(end).map_err(|e| e.to_string())?;
+            resp.bytes
+                .get(a..b.min(resp.bytes.len()))
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| "the clip is shorter than its index".to_owned())
+        }
+        _ => Err(error_reason(&resp)),
+    }
+}
+
+/// Fetch the frames of `window` of `shot_id`'s clip from `camera` with one
+/// range request, for replay `replay`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn fetch_frames(
+    ctx: &egui::Context,
+    pending: &PendingHandle,
+    replay: u64,
+    shot_id: &str,
+    camera: &str,
+    window: Window,
+    bytes: (u64, u64),
+) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let camera = camera.to_owned();
+    let (start, end) = bytes;
+    let req = range_request(&clip_url(shot_id, &camera, "avi"), start, end);
+    ehttp::fetch(req, move |result| {
+        let result = range_reply(result, start, end);
+        if let Ok(mut p) = pending.lock() {
+            p.replay.push(ReplayReply::Frames {
+                replay,
+                camera,
+                window,
+                result,
+            });
         }
         ctx.request_repaint();
     });
@@ -578,6 +756,86 @@ mod tests {
         let long = "x".repeat(500);
         let reply = save_reply(Ok(response(500, "Internal Server Error", &long)));
         assert_eq!(reply.err().map(|e| e.len()), Some("500 ".len() + 120));
+    }
+
+    #[test]
+    fn a_frame_window_asks_for_its_byte_range() {
+        let req = range_request("http://h/api/shots/s1/video/camera.0.avi", 232, 41_262);
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.headers.get("Range"), Some("bytes=232-41261"));
+        assert!(req.url.ends_with("/video/camera.0.avi"));
+        assert!(clip_url("s1", "camera.0", "json").ends_with("/api/shots/s1/video/camera.0.json"));
+
+        let mut partial = response(206, "Partial Content", "abcd");
+        partial.bytes = vec![1, 2, 3];
+        assert_eq!(range_reply(Ok(partial), 10, 13), Ok(vec![1, 2, 3]));
+        // A server that ignores the range sends the whole file.
+        let mut whole = response(200, "OK", "");
+        whole.bytes = (0..20).collect();
+        assert_eq!(range_reply(Ok(whole.clone()), 10, 13), Ok(vec![10, 11, 12]));
+        assert!(range_reply(Ok(whole), 30, 33).is_err());
+        assert_eq!(
+            range_reply(Ok(response(404, "Not Found", "no such clip")), 0, 1),
+            Err("404 no such clip".to_owned())
+        );
+    }
+
+    /// The camera additions reach the UI the way the server sends them.
+    #[test]
+    fn camera_replies_and_events_round_trip_on_the_wire() {
+        use crate::types::{CameraPosition, FlighthookEvent, ShotKey};
+
+        let status: StatusResponse = serde_json::from_str(
+            r#"{"actors":{},"mode":null,"cameras_supported":true,"clip_dir":"/data/clips"}"#,
+        )
+        .expect("status");
+        assert!(status.cameras_supported);
+        assert_eq!(status.clip_dir.as_deref(), Some("/data/clips"));
+        let status: StatusResponse =
+            serde_json::from_str(r#"{"actors":{},"mode":null}"#).expect("status");
+        assert!(!status.cameras_supported, "absent means unsupported");
+
+        let list: CameraListResponse = serde_json::from_str(
+            r#"{"supported":true,"cameras":[
+                {"id":"/dev/v4l/by-id/usb-cam","name":"HD Pro Webcam C920","usb":"046d:085e",
+                 "modes":["1920x1080@30","1280x720@30"],"in_use_by":"camera.0"},
+                {"id":"test-pattern","name":"Test pattern","modes":["640x360@30"]}]}"#,
+        )
+        .expect("list");
+        assert_eq!(list.cameras.len(), 2);
+        assert_eq!(list.cameras[0].in_use_by.as_deref(), Some("camera.0"));
+        assert_eq!(list.cameras[1].usb, None);
+
+        let key = |n: u32| ShotKey {
+            shot_id: format!("s{n}"),
+            shot_number: n,
+        };
+        let sent = FlighthookMessage::new(FlighthookEvent::ShotVideo {
+            keys: vec![key(1), key(2)],
+            position: CameraPosition::GolferFront,
+            duration_ms: 5500,
+            fps: 120.0,
+            trigger_offset_ms: 4000,
+            impact_offset_ms: 4000,
+            complete: true,
+            dropped: 0,
+        })
+        .actor("camera.0");
+        let text = serde_json::to_string(&sent).expect("ser");
+        assert!(text.contains(r#""kind":"shot_video""#), "{text}");
+        assert!(text.contains(r#""position":"golfer_front""#), "{text}");
+        let got = types::parse_ws_message(&text).expect("a bus message");
+        assert_eq!(got.actor, "camera.0");
+        let FlighthookEvent::ShotVideo { keys, fps, .. } = got.event else {
+            panic!("not shot_video");
+        };
+        assert_eq!((keys.len(), fps), (2, 120.0));
+
+        let text = r#"{"actor":"camera.0","event":{"kind":"shot_video_removed","keys":[{"shot_id":"s1","shot_number":1}]}}"#;
+        let got = types::parse_ws_message(text).expect("a bus message");
+        assert!(
+            matches!(got.event, FlighthookEvent::ShotVideoRemoved { ref keys } if keys == &[key(1)])
+        );
     }
 
     #[test]
