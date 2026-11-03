@@ -3823,9 +3823,9 @@ dependencies = [
 
 [[package]]
 name = "threeputt"
-version = "0.0.1"
+version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47667525f0ca4bd3f05f35fbf7067e38afd34df552f071c747710b5ad42cf447"
+checksum = "b94195e488df3629ba2bbae0d237109a331dbee3b80112252a31585bad2421d6"
 dependencies = [
  "base64",
  "serde",

@@ -45,7 +45,7 @@ dimple = "0.0.7"
 # glam version dimple uses (already in the tree through it).
 glam = "0.32"
 # ExPutt RG putting device.
-threeputt = "0.0.1"
+threeputt = "0.0.3"
 # Swing cameras: capture, pre-roll and trigger-cut MJPEG clips.
 stance = "0.0.1"
 
@@ -78,7 +78,7 @@ tenover = { version = "0.3.0", features = ["testing"] }
 # allsquare's test support: notification fixtures and encoders.
 allsquare = { version = "0.2.1", features = ["serde", "testing"] }
 # threeputt's test support: an in-process mock device and sample putts.
-threeputt = { version = "0.0.1", features = ["testing"] }
+threeputt = { version = "0.0.3", features = ["testing"] }
 
 [build-dependencies]
 winresource = "0.1"
