@@ -588,7 +588,7 @@ impl CameraPosition {
 }
 
 /// A swing camera instance (beta): records a clip around every shot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CameraSection {
     #[serde(default)]
     pub name: String,
@@ -608,6 +608,11 @@ pub struct CameraSection {
     /// or `WIDTHxHEIGHT@FPS`, e.g. `1280x720@120`.
     #[serde(default = "default_video_mode")]
     pub mode: String,
+    /// Seconds a frame is old when it arrives, 0 to [`MAX_LATENCY_S`]: a
+    /// camera that delivers late, such as a buffered network stream. Every
+    /// frame is dated that much earlier than its arrival. Absent is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_s: Option<f64>,
 }
 
 fn default_video_mode() -> String {
@@ -629,8 +634,38 @@ impl Default for CameraSection {
             camera_name: None,
             position: CameraPosition::default(),
             mode: default_video_mode(),
+            latency_s: None,
         }
     }
+}
+
+/// Longest camera `latency_s`, seconds.
+pub const MAX_LATENCY_S: f64 = 10.0;
+
+/// Whether `v`, a camera's `latency_s`, is acceptable: absent, or finite and
+/// from 0 to [`MAX_LATENCY_S`].
+#[must_use]
+pub fn latency_valid(v: Option<f64>) -> bool {
+    v.is_none_or(|v| v.is_finite() && (0.0..=MAX_LATENCY_S).contains(&v))
+}
+
+/// The latency in effect for a camera, seconds: its `configured` value when
+/// it is valid, else 0.
+#[must_use]
+pub fn latency_in_effect_s(configured: Option<f64>) -> f64 {
+    configured
+        .filter(|v| latency_valid(Some(*v)))
+        .unwrap_or(0.0)
+}
+
+/// Why `latency_s` of camera `id` (e.g. `camera.0`) is not acceptable, or
+/// `None` when it is ([`latency_valid`]).
+#[must_use]
+pub fn latency_error(id: &str, v: Option<f64>) -> Option<String> {
+    if latency_valid(v) {
+        return None;
+    }
+    v.map(|v| format!("{id}: latency_s {v} is outside 0 to {MAX_LATENCY_S} s"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -828,6 +863,11 @@ pub struct MevoSection {
         skip_serializing_if = "is_default_launch_only_spin"
     )]
     pub launch_only_spin: f64,
+    /// Seconds before the shot's report that the swing's impact happened, for
+    /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
+    /// device's default ([`impact_lead_default_s`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_lead_s: Option<f64>,
 }
 
 fn default_launch_only_spin() -> f64 {
@@ -880,6 +920,11 @@ pub struct R10Section {
     /// distance was last set on it (e.g. by the Garmin Golf app).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<Distance>,
+    /// Seconds before the shot's report that the swing's impact happened, for
+    /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
+    /// device's default ([`impact_lead_default_s`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_lead_s: Option<f64>,
 }
 
 /// A Square Golf Omni BLE device instance.
@@ -926,11 +971,16 @@ pub struct SquareSection {
     /// default and reports no vertical impact unless given one here.
     #[serde(default, skip_serializing_if = "is_none_or_empty_map")]
     pub dot_bottom_to_face_centre_mm: Option<std::collections::BTreeMap<String, f64>>,
+    /// Seconds before the shot's report that the swing's impact happened, for
+    /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
+    /// device's default ([`impact_lead_default_s`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_lead_s: Option<f64>,
 }
 
 /// An ExPutt RG putting device instance, reached over WiFi. The device must
 /// be in its mobile mode on the same network.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExPuttSection {
     #[serde(default)]
     pub name: String,
@@ -938,6 +988,11 @@ pub struct ExPuttSection {
     /// local network automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// Seconds before the shot's report that the swing's impact happened, for
+    /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
+    /// device's default ([`impact_lead_default_s`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_lead_s: Option<f64>,
 }
 
 fn is_none_or_empty_map(m: &Option<std::collections::BTreeMap<String, f64>>) -> bool {
@@ -945,10 +1000,15 @@ fn is_none_or_empty_map(m: &Option<std::collections::BTreeMap<String, f64>>) -> 
 }
 
 /// A mock launch monitor instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MockMonitorSection {
     #[serde(default)]
     pub name: String,
+    /// Seconds before the shot's report that the swing's impact happened, for
+    /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
+    /// device's default ([`impact_lead_default_s`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_lead_s: Option<f64>,
 }
 
 /// An OpenConnect server instance — a *launch monitor*, not an integration.
@@ -961,12 +1021,17 @@ pub struct MockMonitorSection {
 /// `<OpenAPIUseAltPort>true</OpenAPIUseAltPort>` in
 /// `C:\GSPro\GSPC\GSPconnect.exe.config` to move GSPConnect to 922 and free
 /// 921 for this actor, so both can share one host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenConnectServerSection {
     #[serde(default)]
     pub name: String,
     /// Bind address. Defaults to `0.0.0.0:921`.
     pub bind: Option<String>,
+    /// Seconds before the shot's report that the swing's impact happened, for
+    /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
+    /// device's default ([`impact_lead_default_s`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_lead_s: Option<f64>,
 }
 
 /// An OpenConnect client instance — an *output*.
@@ -1002,7 +1067,127 @@ pub struct RandomClubSection {
     pub name: String,
 }
 
+/// Seconds before the report of a shot that a clip assumes the swing's impact
+/// happened, for a launch monitor without a better-known value. Beta.
+pub const DEFAULT_IMPACT_LEAD_S: f64 = 1.5;
+
+/// Longest `impact_lead_s`, seconds.
+pub const MAX_IMPACT_LEAD_S: f64 = 5.0;
+
+/// The default impact lead of the launch monitor type `prefix` (the part of
+/// an actor ID before the dot, e.g. `mevo`), seconds: how long before the
+/// monitor's `shot_trigger` the ball was struck. `None` for Auto-chip, which
+/// is not a swing. Any other source is a launch monitor and gets
+/// [`DEFAULT_IMPACT_LEAD_S`] unless a value is better known.
+#[must_use]
+pub fn impact_lead_default_s(prefix: &str) -> Option<f64> {
+    match prefix {
+        crate::api::AUTO_CHIP_ACTOR => None,
+        // Reports at impact.
+        "mevo" | "mock_monitor" => Some(0.0),
+        "square" => Some(1.0),
+        "r10" => Some(2.0),
+        "openconnect_server" => Some(2.5),
+        _ => Some(DEFAULT_IMPACT_LEAD_S),
+    }
+}
+
+/// Whether `v`, a section's `impact_lead_s`, is acceptable: absent, or finite
+/// and from 0 to [`MAX_IMPACT_LEAD_S`].
+#[must_use]
+pub fn impact_lead_valid(v: Option<f64>) -> bool {
+    v.is_none_or(|v| v.is_finite() && (0.0..=MAX_IMPACT_LEAD_S).contains(&v))
+}
+
+/// The impact lead in effect for launch monitor type `prefix`, seconds: the
+/// section's `configured` value when it is valid, else the type's default
+/// ([`impact_lead_default_s`]). `None` for a source that is not a swing.
+#[must_use]
+pub fn impact_lead_in_effect_s(prefix: &str, configured: Option<f64>) -> Option<f64> {
+    let default = impact_lead_default_s(prefix)?;
+    Some(
+        configured
+            .filter(|v| impact_lead_valid(Some(*v)))
+            .unwrap_or(default),
+    )
+}
+
+/// Why `impact_lead_s` of section `id` (e.g. `mevo.0`) is not acceptable, or
+/// `None` when it is ([`impact_lead_valid`]).
+#[must_use]
+pub fn impact_lead_error(id: &str, v: Option<f64>) -> Option<String> {
+    if impact_lead_valid(v) {
+        return None;
+    }
+    v.map(|v| format!("{id}: impact_lead_s {v} is outside 0 to {MAX_IMPACT_LEAD_S} s"))
+}
+
 impl FlighthookConfig {
+    /// Every launch monitor section as (type, index, `impact_lead_s`), types
+    /// in the order of the sections' fields and indices sorted.
+    #[must_use]
+    pub fn launch_monitor_leads(&self) -> Vec<(&'static str, &str, Option<f64>)> {
+        fn rows<'a, T>(
+            out: &mut Vec<(&'static str, &'a str, Option<f64>)>,
+            kind: &'static str,
+            map: &'a std::collections::HashMap<String, T>,
+            lead: impl Fn(&T) -> Option<f64>,
+        ) {
+            let mut rows: Vec<_> = map
+                .iter()
+                .map(|(i, s)| (kind, i.as_str(), lead(s)))
+                .collect();
+            rows.sort_by(|a, b| a.1.cmp(b.1));
+            out.extend(rows);
+        }
+        let mut out = Vec::new();
+        rows(&mut out, "mevo", &self.mevo, |s| s.impact_lead_s);
+        rows(&mut out, "r10", &self.r10, |s| s.impact_lead_s);
+        rows(&mut out, "square", &self.square, |s| s.impact_lead_s);
+        rows(&mut out, "exputt", &self.exputt, |s| s.impact_lead_s);
+        rows(&mut out, "mock_monitor", &self.mock_monitor, |s| {
+            s.impact_lead_s
+        });
+        rows(
+            &mut out,
+            "openconnect_server",
+            &self.openconnect_server,
+            |s| s.impact_lead_s,
+        );
+        out
+    }
+
+    /// The `impact_lead_s` configured on launch monitor `actor_id` (e.g.
+    /// `mevo.0`), or `None` when it is absent or there is no such section.
+    #[must_use]
+    pub fn configured_impact_lead_s(&self, actor_id: &str) -> Option<f64> {
+        let (kind, index) = actor_id.split_once('.')?;
+        self.launch_monitor_leads()
+            .into_iter()
+            .find(|(k, i, _)| *k == kind && *i == index)
+            .and_then(|(_, _, lead)| lead)
+    }
+
+    /// The first camera section whose `latency_s` is out of range, as a
+    /// message.
+    #[must_use]
+    pub fn latency_error(&self) -> Option<String> {
+        let mut cameras: Vec<_> = self.camera.iter().collect();
+        cameras.sort_by(|a, b| a.0.cmp(b.0));
+        cameras
+            .into_iter()
+            .find_map(|(index, s)| latency_error(&format!("camera.{index}"), s.latency_s))
+    }
+
+    /// The first launch monitor section whose `impact_lead_s` is out of
+    /// range, as a message.
+    #[must_use]
+    pub fn impact_lead_error(&self) -> Option<String> {
+        self.launch_monitor_leads()
+            .into_iter()
+            .find_map(|(kind, index, lead)| impact_lead_error(&format!("{kind}.{index}"), lead))
+    }
+
     /// Look up the detection mode for a club based on the configured mapping.
     ///
     /// Clubs in `putting_clubs` → Putting, in `chipping_clubs` → Chipping,
@@ -1080,6 +1265,7 @@ impl Default for MevoSection {
             environment: None,
             spin_source: SpinSource::D4,
             launch_only_spin: Self::DEFAULT_LAUNCH_ONLY_SPIN,
+            impact_lead_s: None,
         }
     }
 }
@@ -1090,6 +1276,7 @@ impl Default for R10Section {
             name: "Garmin R10".into(),
             // Absent: leave the device's own tee distance untouched.
             range: None,
+            impact_lead_s: None,
         }
     }
 }
@@ -1104,6 +1291,7 @@ impl Default for SquareSection {
             advanced_spin: None,
             discard_non_putting_zero_spin: Some(true),
             dot_bottom_to_face_centre_mm: None,
+            impact_lead_s: None,
         }
     }
 }
@@ -1114,6 +1302,7 @@ impl Default for ExPuttSection {
             name: "ExPutt".into(),
             // Found on the network automatically.
             address: None,
+            impact_lead_s: None,
         }
     }
 }
@@ -1123,6 +1312,7 @@ impl Default for OpenConnectServerSection {
         Self {
             name: "OpenConnect Server".into(),
             bind: Some("0.0.0.0:921".into()),
+            impact_lead_s: None,
         }
     }
 }
@@ -1626,13 +1816,16 @@ mod openconnect_client_tests {
             exputt: one(ExPuttSection {
                 name: "Putting".into(),
                 address: Some("192.168.1.50".into()),
+                impact_lead_s: None,
             }),
             mock_monitor: one(MockMonitorSection {
                 name: "Mock".into(),
+                impact_lead_s: None,
             }),
             openconnect_server: one(OpenConnectServerSection {
                 name: "Uneekor".into(),
                 bind: Some("0.0.0.0:921".into()),
+                impact_lead_s: None,
             }),
             openconnect_client: one(OpenConnectClientSection {
                 name: "Muni Golf".into(),
@@ -1649,6 +1842,7 @@ mod openconnect_client_tests {
                 camera_name: Some("HD Pro Webcam C920".into()),
                 position: CameraPosition::Overhead,
                 mode: "1920x1080@30".into(),
+                latency_s: Some(0.4),
             }),
         }
     }
@@ -1815,6 +2009,7 @@ mod camera_tests {
                 camera_name: Some("HD Pro Webcam C920".into()),
                 position,
                 mode: "1280x720@120".into(),
+                latency_s: Some(2.5),
             };
             let v = serde_json::to_value(&section).expect("ser");
             assert_eq!(v["position"], key);
@@ -1850,5 +2045,189 @@ mod camera_tests {
         assert_eq!(v["camera"]["0"]["mode"], "auto");
         let back: FlighthookConfig = serde_json::from_value(v).expect("de");
         assert_eq!(back, config);
+    }
+}
+
+#[cfg(test)]
+mod impact_lead_tests {
+    use super::*;
+    use crate::AUTO_CHIP_ACTOR;
+
+    #[test]
+    fn defaults_by_launch_monitor_kind() {
+        for (prefix, s) in [
+            ("mevo", 0.0),
+            ("mock_monitor", 0.0),
+            ("square", 1.0),
+            ("exputt", 1.5),
+            ("r10", 2.0),
+            ("openconnect_server", 2.5),
+            // A kind added later, or one without a better-known value.
+            ("someday", 1.5),
+        ] {
+            assert_eq!(impact_lead_default_s(prefix), Some(s), "{prefix}");
+        }
+        assert_eq!(DEFAULT_IMPACT_LEAD_S, 1.5);
+        assert_eq!(impact_lead_default_s(AUTO_CHIP_ACTOR), None);
+    }
+
+    #[test]
+    fn the_value_in_effect_is_the_valid_setting_else_the_default() {
+        assert_eq!(impact_lead_in_effect_s("square", Some(0.25)), Some(0.25));
+        assert_eq!(impact_lead_in_effect_s("square", Some(0.0)), Some(0.0));
+        assert_eq!(impact_lead_in_effect_s("square", Some(5.0)), Some(5.0));
+        assert_eq!(impact_lead_in_effect_s("square", None), Some(1.0));
+        for bad in [-0.1, 5.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                impact_lead_in_effect_s("r10", Some(bad)),
+                Some(2.0),
+                "{bad}"
+            );
+        }
+        assert_eq!(impact_lead_in_effect_s(AUTO_CHIP_ACTOR, Some(1.0)), None);
+    }
+
+    #[test]
+    fn the_setting_is_validated() {
+        for ok in [None, Some(0.0), Some(1.5), Some(5.0)] {
+            assert!(impact_lead_valid(ok), "{ok:?}");
+            assert_eq!(impact_lead_error("mevo.0", ok), None);
+        }
+        for bad in [-0.1, 5.1, f64::NAN, f64::INFINITY] {
+            assert!(!impact_lead_valid(Some(bad)), "{bad}");
+            let error = impact_lead_error("mevo.0", Some(bad)).expect("error");
+            assert!(error.starts_with("mevo.0: impact_lead_s "), "{error}");
+            assert!(error.ends_with("is outside 0 to 5 s"), "{error}");
+        }
+        let mut config = FlighthookConfig::default();
+        config.square.insert("1".into(), SquareSection::default());
+        assert_eq!(config.impact_lead_error(), None);
+        config.square.get_mut("1").unwrap().impact_lead_s = Some(6.0);
+        assert!(
+            config
+                .impact_lead_error()
+                .is_some_and(|e| e.starts_with("square.1:"))
+        );
+    }
+
+    #[test]
+    fn a_section_without_the_setting_serialises_as_before() {
+        let json = serde_json::to_string(&MevoSection::default()).expect("ser");
+        assert!(!json.contains("impact_lead_s"), "{json}");
+        for json in [
+            r#"{"mevo":{"0":{"name":"Mevo"}}}"#,
+            r#"{"r10":{"0":{"name":"R10"}}}"#,
+            r#"{"square":{"0":{"name":"Omni"}}}"#,
+            r#"{"exputt":{"0":{"name":"Putt"}}}"#,
+            r#"{"mock_monitor":{"0":{"name":"Mock"}}}"#,
+            r#"{"openconnect_server":{"0":{"name":"Server","bind":null}}}"#,
+        ] {
+            let config: FlighthookConfig = serde_json::from_str(json).expect("parse");
+            let out = serde_json::to_string(&config).expect("ser");
+            assert!(!out.contains("impact_lead_s"), "{out}");
+            let back: FlighthookConfig = serde_json::from_str(&out).expect("parse");
+            assert_eq!(back, config);
+        }
+    }
+
+    #[test]
+    fn the_setting_round_trips_on_every_launch_monitor_section() {
+        for kind in [
+            "mevo",
+            "r10",
+            "square",
+            "exputt",
+            "mock_monitor",
+            "openconnect_server",
+        ] {
+            let json = format!(r#"{{"{kind}":{{"0":{{"name":"X","impact_lead_s":0.75}}}}}}"#);
+            let config: FlighthookConfig = serde_json::from_str(&json).expect("parse");
+            assert_eq!(
+                config.configured_impact_lead_s(&format!("{kind}.0")),
+                Some(0.75)
+            );
+            assert_eq!(config.configured_impact_lead_s(&format!("{kind}.1")), None);
+            let out = serde_json::to_string(&config).expect("ser");
+            assert!(out.contains(r#""impact_lead_s":0.75"#), "{out}");
+            let back: FlighthookConfig = serde_json::from_str(&out).expect("parse");
+            assert_eq!(back, config);
+        }
+        // An integer is a number too.
+        let config: FlighthookConfig =
+            serde_json::from_str(r#"{"square":{"0":{"name":"X","impact_lead_s":2}}}"#)
+                .expect("parse");
+        assert_eq!(config.configured_impact_lead_s("square.0"), Some(2.0));
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+
+    #[test]
+    fn latency_is_valid_from_zero_to_the_maximum() {
+        for ok in [None, Some(0.0), Some(0.25), Some(10.0)] {
+            assert!(latency_valid(ok), "{ok:?}");
+            assert_eq!(latency_error("camera.0", ok), None);
+        }
+        for bad in [-0.1, 10.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!latency_valid(Some(bad)), "{bad}");
+            let error = latency_error("camera.0", Some(bad)).expect("error");
+            assert!(error.starts_with("camera.0: latency_s "), "{error}");
+            assert!(error.ends_with("is outside 0 to 10 s"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_latency_is_not_in_effect() {
+        assert!((latency_in_effect_s(Some(2.5)) - 2.5).abs() < f64::EPSILON);
+        assert!(latency_in_effect_s(Some(0.0)).abs() < f64::EPSILON);
+        assert!(latency_in_effect_s(None).abs() < f64::EPSILON);
+        for bad in [-0.1, 10.1, f64::NAN] {
+            assert!(latency_in_effect_s(Some(bad)).abs() < f64::EPSILON, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_config_reports_its_first_invalid_camera_latency() {
+        let mut config = FlighthookConfig::default();
+        assert_eq!(config.latency_error(), None);
+        for (index, latency_s) in [("0", Some(1.0)), ("1", Some(11.0)), ("2", Some(-1.0))] {
+            config.camera.insert(
+                index.into(),
+                CameraSection {
+                    camera: CameraSection::TEST_PATTERN.into(),
+                    latency_s,
+                    ..CameraSection::default()
+                },
+            );
+        }
+        let error = config.latency_error().expect("error");
+        assert!(error.starts_with("camera.1: latency_s 11 "), "{error}");
+    }
+
+    #[test]
+    fn a_camera_without_a_latency_serialises_byte_identically() {
+        let section = CameraSection {
+            camera: CameraSection::TEST_PATTERN.into(),
+            ..CameraSection::default()
+        };
+        assert_eq!(section.latency_s, None);
+        let json = serde_json::to_string(&section).expect("ser");
+        assert!(!json.contains("latency_s"), "{json}");
+    }
+
+    #[test]
+    fn a_latency_round_trips_and_zero_is_kept() {
+        for (text, expected) in [
+            (r#"{"camera":"test-pattern","latency_s":2.5}"#, Some(2.5)),
+            (r#"{"camera":"test-pattern","latency_s":0}"#, Some(0.0)),
+            (r#"{"camera":"test-pattern"}"#, None),
+        ] {
+            let s: CameraSection = serde_json::from_str(text).expect("de");
+            assert_eq!(s.latency_s, expected, "{text}");
+            let back = serde_json::to_string(&s).expect("ser");
+            assert_eq!(back.contains("latency_s"), expected.is_some(), "{back}");
+        }
     }
 }

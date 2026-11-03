@@ -1464,6 +1464,7 @@ mod tests {
             flighthook::ExPuttSection {
                 name: "ExPutt".into(),
                 address: None,
+                impact_lead_s: None,
             },
         );
         app.settings.load_from(&config);
@@ -1524,6 +1525,7 @@ mod tests {
             flighthook::OpenConnectServerSection {
                 name: "Uneekor".into(),
                 bind: Some("0.0.0.0:9921".into()),
+                impact_lead_s: None,
             },
         );
         app.settings.load_from(&config);
@@ -2417,6 +2419,256 @@ mod tests {
         assert!(marks.contains_key(&format!("card:{id}")));
     }
 
+    /// The launch monitor kinds and the default camera timing each shows in
+    /// its empty field.
+    const MONITOR_TIMINGS: [(&str, &str); 6] = [
+        ("mevo", "0"),
+        ("r10", "2"),
+        ("square", "1"),
+        ("exputt", "1.5"),
+        ("mock_monitor", "0"),
+        ("openconnect_server", "2.5"),
+    ];
+
+    /// An app with one saved `kind.0` launch monitor, its card showing
+    /// `mode`.
+    fn app_with_monitor(kind: &str, mode: CardMode) -> FlighthookApp {
+        let mut config = FlighthookConfig::default();
+        match kind {
+            "mevo" => drop(config.mevo.insert("0".into(), Default::default())),
+            "r10" => drop(config.r10.insert("0".into(), Default::default())),
+            "square" => drop(config.square.insert("0".into(), Default::default())),
+            "exputt" => drop(config.exputt.insert("0".into(), Default::default())),
+            "mock_monitor" => drop(config.mock_monitor.insert(
+                "0".into(),
+                flighthook::MockMonitorSection {
+                    name: "Mock".into(),
+                    impact_lead_s: None,
+                },
+            )),
+            _ => drop(
+                config
+                    .openconnect_server
+                    .insert("0".into(), Default::default()),
+            ),
+        }
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        app.settings.load_from(&config);
+        app.card_modes.set(&format!("{kind}.0"), mode);
+        app
+    }
+
+    #[test]
+    fn camera_timing_is_on_every_launch_monitors_settings_side_only() {
+        let screen = Screen::new();
+        for (kind, default) in MONITOR_TIMINGS {
+            let id = format!("{kind}.0");
+            let mark = format!("camera_timing:{id}");
+            let mut app = app_with_monitor(kind, CardMode::Telemetry);
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(!marks.contains_key(&mark), "{kind}: telemetry side");
+
+            let mut app = app_with_monitor(kind, CardMode::Settings);
+            let (marks, shapes) = screen.painted(&mut app, Vec::new());
+            let (field, _) = marks[&mark];
+            let (card, _) = marks[&format!("card:{id}")];
+            // Mevo's long settings scroll inside the card; the others fit.
+            assert!(
+                card.x_range().contains(field.left()) && card.x_range().contains(field.right()),
+                "{kind}: {field:?} in {card:?}"
+            );
+            if kind != "mevo" {
+                assert!(card.contains_rect(field), "{kind}: {field:?} in {card:?}");
+            }
+            // Empty: the device's default is shown in the field itself.
+            let texts: Vec<String> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) if field.contains(t.visual_bounding_rect().center()) => {
+                        Some(t.galley.text().to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            // (Mevo's field is scrolled out of the card, so not painted.)
+            if kind != "mevo" {
+                assert_eq!(texts, [default], "{kind}");
+            }
+        }
+        // Not on a camera or an output.
+        let mut app = app();
+        for a in ["mevo.0", "openconnect_client.0"] {
+            app.card_modes.set(a, CardMode::Settings);
+        }
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("camera_timing:mevo.0"));
+        assert!(
+            !marks
+                .keys()
+                .any(|k| k.starts_with("camera_timing:") && !k.contains("mevo")),
+            "{:?}",
+            marks.keys().collect::<Vec<_>>()
+        );
+        let mut app = app_with_monitor("mevo", CardMode::Settings);
+        app.cameras_supported = true;
+        app.camera_list.list = Some(camera_list());
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, "add:Cameras");
+        let _ = screen.click_mark(&mut app, &marks, "add:Cameras:Camera");
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("camera_pick:camera.0"));
+        assert!(!marks.contains_key("camera_timing:camera.0"));
+    }
+
+    #[test]
+    fn camera_timing_saves_and_is_validated() {
+        let screen = Screen::new();
+        for (kind, _) in MONITOR_TIMINGS {
+            let id = format!("{kind}.0");
+            let mut app = app_with_monitor(kind, CardMode::Settings);
+            let lead = |app: &FlighthookApp| {
+                app.settings
+                    .build_actor_request(&id)
+                    .configured_impact_lead_s(&id)
+            };
+            // Blank: the device's default, nothing saved.
+            assert_eq!(lead(&app), None, "{kind}");
+
+            for (typed, saved) in [("0", 0.0), (" 1.25 ", 1.25), ("5", 5.0)] {
+                device(&mut app, &id).impact_lead = typed.into();
+                device(&mut app, &id).dirty = true;
+                let marks = screen.frame(&mut app, Vec::new());
+                assert!(enabled(&marks, &format!("save:{id}")), "{kind} {typed}");
+                assert_eq!(lead(&app), Some(saved), "{kind} {typed}");
+            }
+            for bad in ["-0.1", "5.1", "NaN", "inf", "soon"] {
+                device(&mut app, &id).impact_lead = bad.into();
+                let marks = screen.frame(&mut app, Vec::new());
+                assert!(!enabled(&marks, &format!("save:{id}")), "{kind} {bad}");
+            }
+            device(&mut app, &id).impact_lead = String::new();
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(enabled(&marks, &format!("save:{id}")), "{kind}: blank");
+            assert_eq!(lead(&app), None);
+        }
+        // A saved value loads back into the field.
+        let mut config = FlighthookConfig::default();
+        config.square.insert(
+            "0".into(),
+            flighthook::SquareSection {
+                impact_lead_s: Some(0.5),
+                ..Default::default()
+            },
+        );
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        app.settings.load_from(&config);
+        assert_eq!(device(&mut app, "square.0").impact_lead, "0.5");
+    }
+
+    /// An app with one saved test-pattern `camera.0`, its card showing `mode`.
+    fn app_with_camera(mode: CardMode) -> FlighthookApp {
+        let mut config = FlighthookConfig::default();
+        config.camera.insert(
+            "0".into(),
+            flighthook::CameraSection {
+                camera: flighthook::CameraSection::TEST_PATTERN.into(),
+                ..Default::default()
+            },
+        );
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        app.settings.load_from(&config);
+        app.card_modes.set("camera.0", mode);
+        app
+    }
+
+    #[test]
+    fn latency_is_on_a_camera_cards_settings_side_only() {
+        let screen = Screen::new();
+        let mark = "camera_latency:camera.0";
+        let mut cam = app_with_camera(CardMode::Telemetry);
+        let marks = screen.frame(&mut cam, Vec::new());
+        assert!(!marks.contains_key(mark), "telemetry side");
+
+        let mut cam = app_with_camera(CardMode::Settings);
+        let (marks, shapes) = screen.painted(&mut cam, Vec::new());
+        let (field, _) = marks[mark];
+        let (card, _) = marks["card:camera.0"];
+        assert!(card.contains_rect(field), "{field:?} in {card:?}");
+        // Empty: the hint `0` is shown in the field itself.
+        let texts: Vec<String> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) if field.contains(t.visual_bounding_rect().center()) => {
+                    Some(t.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["0"]);
+
+        // Not on a launch monitor or an output.
+        let mut others = app();
+        for a in ["mevo.0", "openconnect_client.0"] {
+            others.card_modes.set(a, CardMode::Settings);
+        }
+        let marks = screen.frame(&mut others, Vec::new());
+        assert!(
+            !marks.keys().any(|k| k.starts_with("camera_latency:")),
+            "{:?}",
+            marks.keys().collect::<Vec<_>>()
+        );
+        for (kind, _) in MONITOR_TIMINGS {
+            let mut app = app_with_monitor(kind, CardMode::Settings);
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(
+                !marks.keys().any(|k| k.starts_with("camera_latency:")),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_latency_saves_and_is_validated() {
+        let screen = Screen::new();
+        let id = "camera.0";
+        let mut app = app_with_camera(CardMode::Settings);
+        let latency =
+            |app: &FlighthookApp| app.settings.build_actor_request(id).camera["0"].latency_s;
+        // Blank: no latency, nothing saved.
+        assert_eq!(latency(&app), None);
+
+        for (typed, saved) in [("0", 0.0), (" 1.25 ", 1.25), ("10", 10.0)] {
+            device(&mut app, id).cam.latency = typed.into();
+            device(&mut app, id).dirty = true;
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(enabled(&marks, &format!("save:{id}")), "{typed}");
+            assert_eq!(latency(&app), Some(saved), "{typed}");
+        }
+        for bad in ["-0.1", "10.1", "NaN", "inf", "soon"] {
+            device(&mut app, id).cam.latency = bad.into();
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(!enabled(&marks, &format!("save:{id}")), "{bad}");
+        }
+        device(&mut app, id).cam.latency = String::new();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, &format!("save:{id}")), "blank");
+        assert_eq!(latency(&app), None);
+
+        // A saved value loads back into the field.
+        let mut config = FlighthookConfig::default();
+        config.camera.insert(
+            "0".into(),
+            flighthook::CameraSection {
+                camera: flighthook::CameraSection::TEST_PATTERN.into(),
+                latency_s: Some(2.5),
+                ..Default::default()
+            },
+        );
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        app.settings.load_from(&config);
+        assert_eq!(device(&mut app, id).cam.latency, "2.5");
+    }
+
     #[test]
     fn an_added_camera_needs_a_camera_from_the_list() {
         let screen = Screen::new();
@@ -2672,6 +2924,7 @@ mod tests {
             "0".into(),
             flighthook::MockMonitorSection {
                 name: "Mock".into(),
+                impact_lead_s: None,
             },
         );
         config

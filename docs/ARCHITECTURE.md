@@ -1108,7 +1108,8 @@ its own, frames going into a bounded ring) and loops:
 - every waiting bus message is read first; each `shot_trigger` becomes a
   recorder trigger (below);
 - frames newer than its cursor (`Capture::wait_frames_after`, waiting at
-  most 10 ms) go to a `ClipRecorder`, which keeps the pre-roll;
+  most 10 ms) are restamped (below) and go to a `ClipRecorder`, which keeps
+  the pre-roll;
 - `ClipRecorder::poll` runs every pass, so clips finish when frames stop;
 - every 500 ms the newest frame goes to the actor's slot in
   `SystemState::cameras`, for the still;
@@ -1137,6 +1138,38 @@ platform has no camera backend (macOS) the actor reports `disconnected` with
 `reconfigure` restarts the actor when `camera` or `mode` changed; the name,
 `camera_name` (used at the next open) and position are read live.
 
+### Frame restamping (latency)
+
+`[camera.N] latency_s` (`Option<f64>`, 0 to 10 s, serde-omitted when unset =
+0; out of range is refused with `400` on save and ignored with a warning at
+load) is how long a frame is old when it reaches flighthook, for a camera
+that delivers late (a buffered network stream). Every frame's host
+timestamp, which the platform sets to its arrival, becomes
+`arrival − latency` (`camera::Restamp`; saturating at 0, the device time
+moves with it) before it reaches the `ClipRecorder`; the still slot carries
+no time and takes the frame as it is. Triggers are stamped when read, so
+frames, triggers and impact estimates share real time: the clip window, the
+sidecar times and the replay's sync between cameras need nothing else. The
+latency is read from the live config on every capture pass (`reconfigure` is
+`Applied` for a latency-only change; the camera is not reopened).
+
+The recorder takes frames in strictly increasing time and ignores one that
+is not newer than the newest it holds, so `Restamp` passes on only frames
+dated after the previous one: raising the latency by `d` drops the
+camera's next `d` of frames (their new dates overlap frames already held);
+lowering it leaves a gap of `d` that the clip counts as dropped frames.
+
+The recorder finishes a clip when a frame past its window arrives, or
+through `ClipRecorder::poll(now)` once `now` is `stall` (1 s) past the
+window. `poll` compares `now` with the frame dates, so the actor passes
+`camera::frame_clock(now, latency)` = `now − latency`: with latency `L`
+the frames of a window's end arrive `L` after it, and a plain wall clock
+would finish (or discard, for want of the impact frame) any clip of a
+camera more than about `stall` behind. A clip of a camera with latency
+therefore finishes `L` later. The ring holds the dated frames, which stop
+`L` short of a trigger's time, so the history (pre-roll + longest impact
+lead + 0.5 s) needs nothing for the latency.
+
 ### Triggers
 
 A `shot_trigger` from a launch monitor is stamped with the host monotonic
@@ -1146,20 +1179,30 @@ capturing, so a stamp lags the trigger's arrival by 10 ms at most (100 ms
 while the camera is being reopened, when there are no frames to cut). The
 trigger also records the clip store's generation (see below). A repeat of a shot the actor has seen (same actor
 and `shot_id`, among the last 64) is dropped; the recorder counts every
-trigger. The trigger's impact lead comes from the source's actor type
-(`camera::impact_lead`, beta estimates):
+trigger. The trigger's impact lead (`camera::impact_lead`, beta estimates) is read
+from the live config at every trigger: the source's `impact_lead_s`
+(`Option<f64>` on each launch monitor section, 0 to 5 s; out of range is
+refused with `400` on save and ignored with a warning at load), else the
+default for its actor type (`flighthook::impact_lead_default_s`). A change
+applies to the next shot; neither the camera nor the monitor restarts
+(`reconfigure` is `Applied`). The defaults:
 
-| Source | Impact lead |
+| Source | Default impact lead |
 | --- | --- |
 | `mevo`, `mock_monitor` | 0 |
 | `square` | 1000 ms |
 | `exputt` | 1500 ms |
 | `r10` | 2000 ms |
 | `openconnect_server` | 2500 ms |
-| `autochip`, anything else | not recorded |
+| any other launch monitor (`DEFAULT_IMPACT_LEAD_S`) | 1500 ms |
+| `autochip` | not recorded |
 
 Pre- and post-roll come from the live `[replay]` section at every trigger;
-the recorder's history is the pre-roll plus the longest lead plus 0.5 s. The
+the recorder's history is the pre-roll plus the longest impact lead in
+effect over the configured launch monitors (settings and defaults, at most
+5 s) plus 0.5 s. It is re-applied at every trigger, so a setting raised
+above the history takes effect at its next shot. The lead used is recorded
+in the clip's `shot.json`. The
 recorder's rules (stance): the window is `[impact − pre_roll,
 latest trigger + post_roll]`; a trigger from another source whose impact
 estimate is within 500 ms of an open clip's joins it (one swing, two

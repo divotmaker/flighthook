@@ -1668,6 +1668,7 @@ pub(crate) mod tests {
                     environment: None,
                     spin_source: flighthook::SpinSource::D4,
                     launch_only_spin: MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
+                    impact_lead_s: None,
                 },
             );
         });

@@ -654,7 +654,10 @@ fn webserver_violation(live: &FlighthookConfig, action: &ConfigAction) -> Option
 /// `launch_only_spin` outside 0 to
 /// [`MevoSection::MAX_LAUNCH_ONLY_SPIN`](flighthook::MevoSection::MAX_LAUNCH_ONLY_SPIN)
 /// in a Mevo section the action writes, a camera section without a camera
-/// or with a video mode that is neither `auto` nor `WIDTHxHEIGHT@FPS`, or a
+/// or with a video mode that is neither `auto` nor `WIDTHxHEIGHT@FPS`, a
+/// launch monitor `impact_lead_s` outside 0 to
+/// [`MAX_IMPACT_LEAD_S`](flighthook::MAX_IMPACT_LEAD_S), a camera `latency_s`
+/// outside 0 to [`MAX_LATENCY_S`](flighthook::MAX_LATENCY_S), or a
 /// `[replay]` value out of range ([`ReplaySection::error`](flighthook::ReplaySection::error)).
 fn invalid_setting(action: &ConfigAction) -> Option<String> {
     if let ConfigAction::ReplaceAll { config } | ConfigAction::ReplaceGlobal { config } = action
@@ -675,7 +678,43 @@ fn invalid_setting(action: &ConfigAction) -> Option<String> {
             return Some(format!("camera.{index}: {e}"));
         }
     }
+    if let Some(error) = invalid_impact_lead(action) {
+        return Some(error);
+    }
+    if let Some(error) = invalid_latency(action) {
+        return Some(error);
+    }
     invalid_mevo_setting(action)
+}
+
+/// [`invalid_setting`] for a camera's `latency_s`.
+fn invalid_latency(action: &ConfigAction) -> Option<String> {
+    match action {
+        ConfigAction::ReplaceAll { config } => config.latency_error(),
+        ConfigAction::UpsertCamera { index, section } => {
+            flighthook::latency_error(&format!("camera.{index}"), section.latency_s)
+        }
+        _ => None,
+    }
+}
+
+/// [`invalid_setting`] for a launch monitor's `impact_lead_s`.
+fn invalid_impact_lead(action: &ConfigAction) -> Option<String> {
+    let (kind, index, lead) = match action {
+        ConfigAction::ReplaceAll { config } => return config.impact_lead_error(),
+        ConfigAction::UpsertMevo { index, section } => ("mevo", index, section.impact_lead_s),
+        ConfigAction::UpsertR10 { index, section } => ("r10", index, section.impact_lead_s),
+        ConfigAction::UpsertSquare { index, section } => ("square", index, section.impact_lead_s),
+        ConfigAction::UpsertExPutt { index, section } => ("exputt", index, section.impact_lead_s),
+        ConfigAction::UpsertMockMonitor { index, section } => {
+            ("mock_monitor", index, section.impact_lead_s)
+        }
+        ConfigAction::UpsertOpenConnectServer { index, section } => {
+            ("openconnect_server", index, section.impact_lead_s)
+        }
+        _ => return None,
+    };
+    flighthook::impact_lead_error(&format!("{kind}.{index}"), lead)
 }
 
 /// [`invalid_setting`] for Mevo sections.
@@ -1955,6 +1994,134 @@ mod group_tests {
         );
     }
 
+    /// A save with a launch monitor `impact_lead_s` below 0, above 5 or
+    /// non-finite is 400 and saves nothing, for every launch monitor type, in
+    /// a whole-config and a scoped save; 0 and 5 are accepted.
+    #[tokio::test]
+    async fn settings_save_with_an_invalid_impact_lead_is_400() {
+        let (state, _writer, _dir) = test_state();
+        let ids = [
+            "mevo.0",
+            "r10.0",
+            "square.0",
+            "exputt.0",
+            "mock_monitor.0",
+            "openconnect_server.0",
+        ];
+        state.root.system.update(|c| {
+            c.mevo.insert("0".into(), Default::default());
+            c.r10.insert("0".into(), Default::default());
+            c.square.insert("0".into(), Default::default());
+            c.exputt.insert("0".into(), Default::default());
+            c.mock_monitor.insert(
+                "0".into(),
+                flighthook::MockMonitorSection {
+                    name: "Mock".into(),
+                    impact_lead_s: None,
+                },
+            );
+            c.openconnect_server.insert("0".into(), Default::default());
+        });
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        let set = |config: &mut FlighthookConfig, id: &str, v: Option<f64>| match id {
+            "mevo.0" => config.mevo.get_mut("0").unwrap().impact_lead_s = v,
+            "r10.0" => config.r10.get_mut("0").unwrap().impact_lead_s = v,
+            "square.0" => config.square.get_mut("0").unwrap().impact_lead_s = v,
+            "exputt.0" => config.exputt.get_mut("0").unwrap().impact_lead_s = v,
+            "mock_monitor.0" => config.mock_monitor.get_mut("0").unwrap().impact_lead_s = v,
+            _ => {
+                config
+                    .openconnect_server
+                    .get_mut("0")
+                    .unwrap()
+                    .impact_lead_s = v
+            }
+        };
+        for id in ids {
+            for bad in [-0.1, 5.1, f64::NAN, f64::INFINITY] {
+                let mut body = live.clone();
+                set(&mut body, id, Some(bad));
+                for scope in [None, Some(id)] {
+                    let (status, Json(error)) =
+                        save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                            .await
+                            .expect_err("rejected");
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{id} {bad} {scope:?}");
+                    let error = error["error"].as_str().expect("error");
+                    assert!(
+                        error.starts_with(&format!("{id}: impact_lead_s "))
+                            && error.ends_with("is outside 0 to 5 s"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+        for id in ids {
+            for ok in [None, Some(0.0), Some(1.5), Some(5.0)] {
+                let mut body = live.clone();
+                set(&mut body, id, ok);
+                let action = ConfigAction::ReplaceAll {
+                    config: Box::new(body),
+                };
+                assert_eq!(invalid_setting(&action), None, "{id} {ok:?}");
+            }
+        }
+    }
+
+    /// A save with a camera `latency_s` below 0, above 10 or non-finite is 400
+    /// and saves nothing, in a whole-config and a scoped save; 0 and 10 are
+    /// accepted.
+    #[tokio::test]
+    async fn settings_save_with_an_invalid_camera_latency_is_400() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.camera.insert(
+                "0".into(),
+                flighthook::CameraSection {
+                    camera: flighthook::CameraSection::TEST_PATTERN.into(),
+                    ..flighthook::CameraSection::default()
+                },
+            );
+        });
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        for bad in [-0.1, 10.1, f64::NAN, f64::INFINITY] {
+            let mut body = live.clone();
+            body.camera.get_mut("0").unwrap().latency_s = Some(bad);
+            for scope in [None, Some("camera.0")] {
+                let (status, Json(error)) =
+                    save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                        .await
+                        .expect_err("rejected");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} {scope:?}");
+                let error = error["error"].as_str().expect("error");
+                assert!(
+                    error.starts_with("camera.0: latency_s ")
+                        && error.ends_with("is outside 0 to 10 s"),
+                    "{error}"
+                );
+            }
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+        for ok in [None, Some(0.0), Some(2.5), Some(10.0)] {
+            let mut body = live.clone();
+            body.camera.get_mut("0").unwrap().latency_s = ok;
+            let action = ConfigAction::ReplaceAll {
+                config: Box::new(body.clone()),
+            };
+            assert_eq!(invalid_setting(&action), None, "{ok:?}");
+            let upsert = ConfigAction::UpsertCamera {
+                index: "0".into(),
+                section: body.camera["0"].clone(),
+            };
+            assert_eq!(invalid_setting(&upsert), None, "{ok:?}");
+        }
+    }
+
     #[tokio::test]
     async fn settings_save_without_an_outcome_is_504_with_a_json_error() {
         let (state, _writer, _dir) = test_state();
@@ -2321,6 +2488,7 @@ mod reconnect_tests {
                 "0".into(),
                 flighthook::MockMonitorSection {
                     name: "Mock".into(),
+                    impact_lead_s: None,
                 },
             );
             c.camera

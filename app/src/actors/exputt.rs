@@ -1698,6 +1698,7 @@ mod tests {
                     flighthook::ExPuttSection {
                         name: "ExPutt".into(),
                         address: address.map(str::to_string),
+                        impact_lead_s: None,
                     },
                 );
             });

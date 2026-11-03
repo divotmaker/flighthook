@@ -362,7 +362,9 @@ impact by default). It loops until you turn **Loop** off; pause, step frame
 by frame, slow it to ½, ¼ or ⅛, or download a camera's clip as an AVI.
 
 - Only FlightScope monitors report a shot at impact. For the others the
-  impact is estimated a fixed time before their report (beta).
+  impact is estimated a fixed time before their report (beta); each monitor
+  has a default, and **Camera timing** on its card's Settings side changes
+  it. See [Cameras](docs/devices/cameras.md#when-a-clip-starts-and-ends).
 - Clips are kept on disk, the newest 20 by default: about 2 GB for two
   720p 120 fps cameras. The Devices tab's Replay card sets how many and
   shows the folder; `clip_dir` under `[replay]` in the config file moves it.

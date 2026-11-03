@@ -78,6 +78,9 @@ pub(crate) struct DeviceFormEntry {
     /// FlightScope: backspin per mph of ball speed for a result with launch
     /// data but no spin, as typed. Blank means the default.
     pub(crate) launch_only_spin: String,
+    /// Launch monitors: seconds from impact to the monitor's report, for the
+    /// cameras' clips, as typed. Blank means the device's default.
+    pub(crate) impact_lead: String,
     /// Square Golf: discard zero-spin reads, except when putting.
     pub(crate) discard_zero_spin: bool,
     /// Square Golf fields the form does not surface. Carried verbatim so that
@@ -105,6 +108,8 @@ pub(crate) struct CameraFields {
     pub(crate) position: CameraPosition,
     /// `auto` or `WIDTHxHEIGHT@FPS`.
     pub(crate) mode: String,
+    /// Seconds a frame is old when it arrives, as typed. Blank means 0.
+    pub(crate) latency: String,
 }
 
 impl Default for CameraFields {
@@ -114,6 +119,7 @@ impl Default for CameraFields {
             name: None,
             position: CameraPosition::default(),
             mode: CameraSection::AUTO_MODE.to_owned(),
+            latency: String::new(),
         }
     }
 }
@@ -219,6 +225,38 @@ fn launch_only_spin_value(s: &str) -> Option<f64> {
         .filter(|v| MevoSection::launch_only_spin_valid(*v))
 }
 
+/// The `impact_lead_s` a form field holds: `Some(None)` when blank (the
+/// device default), `Some(Some(s))` for a number from 0 to 5, `None` when it
+/// is neither.
+fn impact_lead_value(s: &str) -> Option<Option<f64>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(None);
+    }
+    s.parse::<f64>()
+        .ok()
+        .filter(|v| flighthook::impact_lead_valid(Some(*v)))
+        .map(Some)
+}
+
+/// The `latency_s` a camera form field holds: `Some(None)` when blank (0),
+/// `Some(Some(s))` for a number from 0 to 10, `None` when it is neither.
+fn latency_value(s: &str) -> Option<Option<f64>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(None);
+    }
+    s.parse::<f64>()
+        .ok()
+        .filter(|v| flighthook::latency_valid(Some(*v)))
+        .map(Some)
+}
+
+/// A section's `impact_lead_s` as the form field shows it.
+fn impact_lead_text(v: Option<f64>) -> String {
+    v.map(format_distance_value).unwrap_or_default()
+}
+
 /// Build the `dot_bottom_to_face_centre_mm` config map from the form: non-blank
 /// entries only, keyed by club code. Returns `None` when no overrides are set.
 fn impact_mm_to_config(
@@ -260,6 +298,7 @@ impl DeviceFormEntry {
             environment: s.environment.unwrap_or_default(),
             spin_source: s.spin_source,
             launch_only_spin: format_distance_value(s.launch_only_spin),
+            impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -292,6 +331,7 @@ impl DeviceFormEntry {
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
+            impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -324,6 +364,7 @@ impl DeviceFormEntry {
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
+            impact_lead: impact_lead_text(s.impact_lead_s),
             cam: Box::default(),
             dirty: false,
         }
@@ -348,6 +389,7 @@ impl DeviceFormEntry {
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
+            impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -376,6 +418,7 @@ impl DeviceFormEntry {
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
+            impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -404,6 +447,7 @@ impl DeviceFormEntry {
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
+            impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -422,11 +466,13 @@ impl DeviceFormEntry {
                 name: s.camera_name.clone(),
                 position: s.position,
                 mode: s.mode.clone(),
+                latency: impact_lead_text(s.latency_s),
             }),
             ..Self::from_mock(
                 id,
                 &MockMonitorSection {
                     name: String::new(),
+                    impact_lead_s: None,
                 },
             )
         }
@@ -442,6 +488,11 @@ impl DeviceFormEntry {
 
     pub(crate) fn is_r10(&self) -> bool {
         self.monitor_type == "r10"
+    }
+
+    /// Whether this is a launch monitor: anything but a swing camera.
+    pub(crate) fn is_launch_monitor(&self) -> bool {
+        !self.is_camera()
     }
 
     /// Whether this is a swing camera rather than a launch monitor.
@@ -504,6 +555,9 @@ pub(crate) struct IntegrationFormEntry {
 }
 
 /// Unified actor form entry wrapping both device and integration entries.
+// One entry per card, a few dozen at most, built and matched in many places:
+// boxing the device entry would only add indirection at each of them.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub(crate) enum ActorFormEntry {
     Device(DeviceFormEntry),
@@ -644,6 +698,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
+            impact_lead: String::new(),
             discard_zero_spin: true,
             square_club: None,
             square_advanced_spin: None,
@@ -1576,7 +1631,13 @@ pub(crate) fn actor_valid(actor: &ActorFormEntry) -> bool {
             if dev.is_mevo() && launch_only_spin_value(&dev.launch_only_spin).is_none() {
                 return false;
             }
-            if dev.is_camera() && (dev.cam.id.trim().is_empty() || !video_mode_valid(&dev.cam.mode))
+            if dev.is_launch_monitor() && impact_lead_value(&dev.impact_lead).is_none() {
+                return false;
+            }
+            if dev.is_camera()
+                && (dev.cam.id.trim().is_empty()
+                    || !video_mode_valid(&dev.cam.mode)
+                    || latency_value(&dev.cam.latency).is_none())
             {
                 return false;
             }
@@ -1634,6 +1695,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             spin_source: dev.spin_source,
                             launch_only_spin: launch_only_spin_value(&dev.launch_only_spin)
                                 .unwrap_or(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
+                            impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
                         },
                     );
                 }
@@ -1653,6 +1715,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             dot_bottom_to_face_centre_mm: impact_mm_to_config(
                                 &dev.square_impact_mm,
                             ),
+                            impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
                         },
                     );
                 }
@@ -1666,6 +1729,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             } else {
                                 Some(dev.address.trim().to_string())
                             },
+                            impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
                         },
                     );
                 }
@@ -1679,6 +1743,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                                 .parse::<f64>()
                                 .ok()
                                 .map(|v| Distance::from_value_and_unit(v, &dev.range_unit)),
+                            impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
                         },
                     );
                 }
@@ -1692,6 +1757,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             } else {
                                 Some(dev.address.clone())
                             },
+                            impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
                         },
                     );
                 }
@@ -1700,6 +1766,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         MockMonitorSection {
                             name: dev.name.clone(),
+                            impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
                         },
                     );
                 }
@@ -1712,6 +1779,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             camera_name: dev.cam.name.clone(),
                             position: dev.cam.position,
                             mode: dev.cam.mode.trim().to_string(),
+                            latency_s: latency_value(&dev.cam.latency).flatten(),
                         },
                     );
                 }
@@ -2455,6 +2523,10 @@ pub(crate) fn actor_fields(
                         });
                 });
             }
+
+            if dev.is_launch_monitor() {
+                camera_timing_field(ui, dev, field_width);
+            }
         }
         ActorFormEntry::Integration(entry) => {
             // Name
@@ -2563,8 +2635,39 @@ fn camera_choice_label(entry: &CameraListEntry, own: &str) -> String {
     }
 }
 
-/// A camera card's Camera, Position and Video mode fields. Returns whether
-/// the camera list was asked to refresh.
+/// A launch monitor card's Camera timing field: seconds from impact to the
+/// monitor's report, blank for the device's default (shown in the field).
+fn camera_timing_field(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: f32) {
+    ui.horizontal(|ui| {
+        field_label(ui, "Camera timing:");
+        let hint = flighthook::impact_lead_default_s(&dev.monitor_type)
+            .map(format_distance_value)
+            .unwrap_or_default();
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut dev.impact_lead)
+                .desired_width(field_width - TEXT_EDIT_MARGIN)
+                .hint_text(hint),
+        );
+        devices::mark(
+            ui,
+            || format!("camera_timing:{}.{}", dev.monitor_type, dev.id),
+            &field,
+        );
+        if field.changed() {
+            dev.dirty = true;
+        }
+        ui.label("s");
+    });
+    if impact_lead_value(&dev.impact_lead).is_none() {
+        field_error(
+            ui,
+            &format!("Must be a number, 0 to {}", flighthook::MAX_IMPACT_LEAD_S),
+        );
+    }
+}
+
+/// A camera card's Camera, Position, Video mode and Latency fields. Returns
+/// whether the camera list was asked to refresh.
 fn camera_fields(
     ui: &mut egui::Ui,
     dev: &mut DeviceFormEntry,
@@ -2696,6 +2799,26 @@ fn camera_fields(
     });
     if !video_mode_valid(&dev.cam.mode) {
         field_error(ui, "Auto or WIDTHxHEIGHT@FPS");
+    }
+
+    ui.horizontal(|ui| {
+        field_label(ui, "Latency:");
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut dev.cam.latency)
+                .desired_width(field_width - TEXT_EDIT_MARGIN)
+                .hint_text("0"),
+        );
+        devices::mark(ui, || format!("camera_latency:{own}"), &field);
+        if field.changed() {
+            dev.dirty = true;
+        }
+        ui.label("s");
+    });
+    if latency_value(&dev.cam.latency).is_none() {
+        field_error(
+            ui,
+            &format!("Must be a number, 0 to {}", flighthook::MAX_LATENCY_S),
+        );
     }
     refresh
 }
@@ -3195,6 +3318,7 @@ mod tests {
             "0".into(),
             MockMonitorSection {
                 name: "Mock Monitor".into(),
+                impact_lead_s: None,
             },
         );
         config.random_club.insert(

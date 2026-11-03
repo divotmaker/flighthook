@@ -501,6 +501,7 @@ mod tests {
                 flighthook::OpenConnectServerSection {
                     name: (*name).to_owned(),
                     bind: None,
+                    impact_lead_s: None,
                 },
             );
         }

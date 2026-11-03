@@ -186,6 +186,12 @@ fn parse(path: &Path, contents: &str) -> Option<FlighthookConfig> {
             toml::from_str::<ClientSectionIndices>(contents)
                 .unwrap_or_default()
                 .warn(&path.display().to_string());
+            if let Some(error) = config.impact_lead_error() {
+                tracing::warn!("{}: {error}; the device default is used", path.display());
+            }
+            if let Some(error) = config.latency_error() {
+                tracing::warn!("{}: {error}; a latency of 0 is used", path.display());
+            }
             if let Some(error) = config.replay.error() {
                 tracing::warn!(
                     "{}: [replay] {error}; keep_shots is held to 1 to {}, each roll to 0 to {} s, and the replay start to 0 to {} s",
@@ -450,6 +456,49 @@ impl SystemConfig {
             .mevo
             .get(index)
             .map(flighthook::MevoSection::launch_only_spin_rpm_per_mph)
+    }
+
+    /// The impact lead in effect for launch monitor `actor` (e.g. `mevo.0`),
+    /// seconds: its section's `impact_lead_s` when valid, else the monitor
+    /// type's default. `None` for a source that is not a swing (Auto-chip).
+    /// Camera actors read it at every trigger, so a change applies to the
+    /// next shot without restarting anything.
+    pub fn impact_lead_s(&self, actor: &str) -> Option<f64> {
+        let prefix = actor.split_once('.').map_or(actor, |(prefix, _)| prefix);
+        let configured = self
+            .inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .configured_impact_lead_s(actor);
+        flighthook::impact_lead_in_effect_s(prefix, configured)
+    }
+
+    /// The longest impact lead in effect over the configured launch
+    /// monitors, seconds (0 with none).
+    pub fn longest_impact_lead_s(&self) -> f64 {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .launch_monitor_leads()
+            .into_iter()
+            .filter_map(|(kind, _, lead)| flighthook::impact_lead_in_effect_s(kind, lead))
+            .fold(0.0, f64::max)
+    }
+
+    /// The latency in effect for camera `actor` (e.g. `camera.0`), seconds:
+    /// its section's `latency_s` when valid, else 0. The camera actor reads
+    /// it for every frame, so a change applies at once without reopening
+    /// the camera.
+    pub fn camera_latency_s(&self, actor: &str) -> f64 {
+        let configured = actor.strip_prefix("camera.").and_then(|index| {
+            self.inner
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .camera
+                .get(index)
+                .and_then(|c| c.latency_s)
+        });
+        flighthook::latency_in_effect_s(configured)
     }
 
     /// Clone just the `[replay]` section. Camera actors read it at every
@@ -729,6 +778,82 @@ bind = "0.0.0.0:5880"
         assert!(c.replay.error().is_some());
         assert_eq!(crate::state::clips::keep(&c.replay), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn impact_lead_s_is_omitted_when_absent_and_kept_when_set_in_toml() {
+        for kind in [
+            "mevo",
+            "r10",
+            "square",
+            "exputt",
+            "mock_monitor",
+            "openconnect_server",
+        ] {
+            let plain = format!("[{kind}.0]\nname = \"X\"\n");
+            let c: FlighthookConfig = toml::from_str(&plain).expect("parse");
+            let out = toml::to_string_pretty(&c).expect("ser");
+            assert!(!out.contains("impact_lead_s"), "{kind}: {out}");
+            // What was saved without the field parses and saves the same.
+            let again: FlighthookConfig = toml::from_str(&out).expect("parse");
+            assert_eq!(toml::to_string_pretty(&again).expect("ser"), out);
+
+            let set = format!("[{kind}.0]\nname = \"X\"\nimpact_lead_s = 0.75\n");
+            let c: FlighthookConfig = toml::from_str(&set).expect("parse");
+            assert_eq!(c.configured_impact_lead_s(&format!("{kind}.0")), Some(0.75));
+            let out = toml::to_string_pretty(&c).expect("ser");
+            assert!(out.contains("impact_lead_s = 0.75"), "{kind}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_file_with_an_invalid_impact_lead_loads_and_uses_the_default() {
+        let dir = std::env::temp_dir().join(format!("flighthook-lead-{}", generate_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[square.0]\nname = \"Omni\"\nimpact_lead_s = 7.5\n").expect("write");
+        let cfg = SystemConfig::new(path);
+        assert!(cfg.snapshot().impact_lead_error().is_some());
+        assert_eq!(cfg.impact_lead_s("square.0"), Some(1.0));
+        assert_eq!(cfg.longest_impact_lead_s(), 1.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn camera_latency_s_is_omitted_when_absent_and_kept_when_set_in_toml() {
+        let plain = "[camera.0]\nname = \"Cam\"\ncamera = \"test-pattern\"\n";
+        let c: FlighthookConfig = toml::from_str(plain).expect("parse");
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(!out.contains("latency_s"), "{out}");
+        // What was saved without the field parses and saves the same.
+        let again: FlighthookConfig = toml::from_str(&out).expect("parse");
+        assert_eq!(toml::to_string_pretty(&again).expect("ser"), out);
+
+        let set = format!("{plain}latency_s = 2.5\n");
+        let c: FlighthookConfig = toml::from_str(&set).expect("parse");
+        assert_eq!(c.camera["0"].latency_s, Some(2.5));
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(out.contains("latency_s = 2.5"), "{out}");
+    }
+
+    #[test]
+    fn a_file_with_an_invalid_camera_latency_loads_and_uses_zero() {
+        let dir = std::env::temp_dir().join(format!("flighthook-latency-{}", generate_id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[camera.0]\nname = \"A\"\ncamera = \"test-pattern\"\nlatency_s = 12\n\n\
+             [camera.1]\nname = \"B\"\ncamera = \"test-pattern\"\nlatency_s = 1.5\n",
+        )
+        .expect("write");
+        let cfg = SystemConfig::new(path);
+        assert!(cfg.snapshot().latency_error().is_some());
+        assert_eq!(cfg.camera_latency_s("camera.0"), 0.0);
+        assert_eq!(cfg.camera_latency_s("camera.1"), 1.5);
+        assert_eq!(cfg.camera_latency_s("camera.9"), 0.0);
+        assert_eq!(cfg.camera_latency_s("mevo.0"), 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

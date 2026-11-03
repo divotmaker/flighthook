@@ -1260,6 +1260,21 @@ Full persisted config (mirrors `config.toml`).
   the actor
 - ExPutt sections have `name` and an optional `address`: the device's IP
   address (no port). When absent the device is found on the local network.
+- Every launch monitor section (`mevo`, `r10`, `square`, `exputt`,
+  `mock_monitor`, `openconnect_server`) takes an optional `impact_lead_s`:
+  seconds, 0 to 5, from the ball's impact to the monitor's `shot_trigger`,
+  used to place the cameras' clips (beta). Omitted when unset, which uses the
+  device's default (FlightScope and mock 0, Square 1, R10 2, Open Connect
+  2.5, ExPutt and any other 1.5). A save with a value below 0, above 5 or not
+  finite is rejected with `400`; one outside that range in the config file is
+  ignored. Changes apply from the next shot without restarting anything
+- `camera` sections take an optional `latency_s`: seconds, 0 to 10, a frame is
+  old when it reaches flighthook, for a camera that delivers late such as a
+  buffered network stream (beta). Every frame is dated that much earlier than it
+  arrived, which lines the clips up with the shot and with the other cameras.
+  Omitted when unset (0). A save with a value below 0, above 10 or not finite
+  is rejected with `400`; one outside that range in the config file is
+  ignored. Changes apply at once without reopening the camera
   The device must be in its mobile mode on the same network. Its shots are
   putts: club `PT` and Putting mode whatever club is in play, vertical
   launch 0, no spin
@@ -1375,6 +1390,8 @@ as applied.
 | `400 Bad Request` | `scope` is not `global` and not a known actor ID |
 | `400 Bad Request` | the save removes the web server (`"the web server can't be removed"`) or adds a second one (`"flighthook runs one web server; edit the existing one"`) |
 | `400 Bad Request` | a Mevo section it writes has a `launch_only_spin` below 0, above 1000 or not finite (`"mevo.0: launch_only_spin must be 0 to 1000 rpm per mph, not -5"`) |
+| `400 Bad Request` | a launch monitor section it writes has an `impact_lead_s` below 0, above 5 or not finite (`"square.0: impact_lead_s 6 is outside 0 to 5 s"`) |
+| `400 Bad Request` | a camera section it writes has a `latency_s` below 0, above 10 or not finite (`"camera.0: latency_s 11 is outside 0 to 10 s"`) |
 | `400 Bad Request` | a camera section it writes has no `camera` (`"camera.0: no camera picked"`) or a `mode` that is neither `auto` nor `WIDTHxHEIGHT@FPS` |
 | `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
 | `504 Gateway Timeout` | SystemActor did not answer within 22 s (see below) |

@@ -43,6 +43,7 @@ camera = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_8A2B3C4D-video-index0"
 camera_name = "HD Pro Webcam C920"
 position = "golfer_front"  # target_line | golfer_front | golfer_back | overhead
 mode = "auto"              # or e.g. "1280x720@120"
+# latency_s = 0            # seconds a frame is old when it arrives, 0 to 10; see Camera latency
 
 # optional; shown at its defaults
 [replay]
@@ -103,19 +104,73 @@ A clip runs from `pre_roll_s` before the **estimated impact** to
 
 Only a FlightScope (Mevo+, Gen2, Xi) reports the shot at impact. The others
 report once the shot is measured, so flighthook estimates the impact a fixed
-time before their report. These are **beta estimates**, to be measured with
-a camera:
+time before their report: the monitor's **camera timing**. Every launch
+monitor has a default, and the default for a kind of monitor without a
+better-known value is 1.5 s. These are **beta estimates**, to be measured
+with a camera:
 
-| Launch monitor | Impact before the report |
+| Launch monitor | Default camera timing |
 | --- | --- |
 | FlightScope Mevo+ / Gen2 / Xi | 0 s |
 | Square Golf Omni | 1 s |
 | ExPutt | 1.5 s |
 | Garmin R10 | 2 s |
 | Open Connect (Uneekor, ...) | 2.5 s |
+| Any other launch monitor | 1.5 s |
 
 With the default 4 s pre-roll the backswing is in the clip even when an
 estimate is off by a second.
+
+### Setting the camera timing
+
+If a monitor's impact sits early or late in its clips, set its camera
+timing: on the monitor's card, on the **Settings** side, **Camera timing**
+takes seconds from 0 to 5. Empty uses the default, which the empty field
+shows. In the config file it is `impact_lead_s` on the monitor's section:
+
+```toml
+[square.0]
+name = "Square Golf Omni"
+impact_lead_s = 0.8   # seconds, 0 to 5; leave it out for the default
+```
+
+A change applies to the next shot; the monitor and the cameras keep running.
+A value outside 0 to 5 is refused when saved, and ignored (the default is
+used) with a warning when it is in the config file. A clip's `shot.json`
+records the timing used for each shot.
+
+### Camera latency
+
+A camera that delivers its frames late, such as a buffered network stream,
+shows the swing after it happened: a frame arrives a second or more after
+the moment it shows. **Latency** is that delay. On the camera's card, on the
+**Settings** side, **Latency** takes seconds from 0 to 10; empty is 0. flighthook
+dates every frame that much earlier than it arrived, so the clip lines up
+with the launch monitor's report and with the other cameras. In the config
+file it is `latency_s` on the camera's section:
+
+```toml
+[camera.1]
+name = "Network camera"
+camera = "..."
+latency_s = 1.8   # seconds, 0 to 10; leave it out for none
+```
+
+To set it, hit a shot and open the replay. If the gold impact mark sits
+before the club reaches the ball (the clip shows the swing late), raise
+Latency until the mark sits on the impact; if it sits after the impact,
+lower it. Change one thing at a time: **Camera timing** on the launch monitor is the other knob,
+and moves every camera's mark for that monitor (how long the monitor takes
+to report), where Latency moves one camera (how long the camera takes to
+deliver). Set a USB webcam's latency to 0 unless its picture is measurably
+behind.
+
+A change applies at once to the frames that follow; the camera keeps running.
+Frames that arrive during the change can be dropped or leave a gap of up to
+the difference, so change it between shots. A clip with a latency finishes
+that much later: the end of its window arrives late. A value outside 0 to
+10 is refused when saved, and ignored (no latency) with a warning when it is
+in the config file.
 
 - Two launch monitors seeing one swing (reports from different monitors whose
   impact estimates are within 0.5 s) make **one clip**, shown on both shots.
@@ -129,9 +184,9 @@ estimate is off by a second.
   usually two cameras sharing a USB controller, or a long exposure in low
   light.
 
-Cameras are synced on when each frame reached the computer, which includes
-each camera's driver delay: expect up to a few tens of milliseconds between
-two cameras. Each camera notes a launch monitor's report within 10 ms of
+Cameras are synced on when each frame reached the computer, less the
+camera's Latency, which includes each camera's driver delay: expect up to a
+few tens of milliseconds between two cameras. Each camera notes a launch monitor's report within 10 ms of
 its arrival, so the impact mark can sit a frame apart between cameras.
 
 ## Disk and memory
@@ -145,8 +200,9 @@ are deleted when a new one is saved, and when flighthook starts; a clip
 another camera is still writing waits for the next one. A value out of
 range in the config file is held to 1 to 1000, with a warning in the log.
 
-Each camera keeps the pre-roll plus 3 s in memory: about 70 MB at 720p120
-with the default 4 s pre-roll.
+Each camera keeps the pre-roll plus the longest camera timing in effect plus
+0.5 s in memory: about 70 MB at 720p120 with the default 4 s pre-roll and an
+Open Connect monitor's 2.5 s.
 
 Each clip is a folder in the clip folder (shown on the Replay card): one
 `<camera>.avi` (plays in VLC, Kinovea, Windows Media Player) and

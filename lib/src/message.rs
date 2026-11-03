@@ -412,6 +412,7 @@ mod tests {
             section: ExPuttSection {
                 name: "ExPutt".into(),
                 address: Some("192.168.1.50".into()),
+                impact_lead_s: None,
             },
         };
         let json = serde_json::to_string(&action).expect("ser");
@@ -809,6 +810,7 @@ mod tests {
                 camera_name: None,
                 position: CameraPosition::GolferFront,
                 mode: "auto".into(),
+                latency_s: None,
             },
         };
         let json = serde_json::to_string(&action).expect("ser");

@@ -863,6 +863,7 @@ mod tests {
                     flighthook::OpenConnectServerSection {
                         name: "Uneekor".into(),
                         bind: bind.map(str::to_string),
+                        impact_lead_s: None,
                     },
                 );
             });
@@ -939,6 +940,7 @@ mod tests {
                     flighthook::OpenConnectServerSection {
                         name: "Bay Uneekor".into(),
                         bind: None,
+                        impact_lead_s: None,
                     },
                 );
             });

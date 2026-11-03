@@ -1217,6 +1217,7 @@ mod tests {
                 "0".into(),
                 flighthook::MockMonitorSection {
                     name: "Mock".into(),
+                    impact_lead_s: None,
                 },
             );
         });
@@ -1458,6 +1459,64 @@ mod tests {
         assert!(!slot.dir.exists());
     }
 
+    /// A launch monitor's `impact_lead_s` is read live by the cameras, so
+    /// changing it never restarts the monitor.
+    #[test]
+    fn changing_a_monitors_impact_lead_applies_without_a_restart() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-system-test-{}",
+            crate::state::config::generate_id()
+        )));
+        let (state, _writer) = SystemState::new(dir.0.join("config.toml"));
+        let state = Arc::new(state);
+        let (bus_tx, _rx) = broadcast::channel(16);
+        let ids = [
+            "mevo.0",
+            "r10.0",
+            "square.0",
+            "exputt.0",
+            "mock_monitor.0",
+            "openconnect_server.0",
+        ];
+        state.system.update(|c| {
+            c.webserver.clear();
+            c.mevo.insert("0".into(), Default::default());
+            c.r10.insert("0".into(), Default::default());
+            c.square.insert("0".into(), Default::default());
+            c.exputt.insert("0".into(), Default::default());
+            c.mock_monitor.insert(
+                "0".into(),
+                flighthook::MockMonitorSection {
+                    name: "Mock".into(),
+                    impact_lead_s: None,
+                },
+            );
+            c.openconnect_server.insert("0".into(), Default::default());
+        });
+        let actors = resolve_actors(&state.system.snapshot(), None);
+        assert_eq!(actors.len(), ids.len());
+        state.system.update(|c| {
+            c.mevo.get_mut("0").unwrap().impact_lead_s = Some(0.5);
+            c.r10.get_mut("0").unwrap().impact_lead_s = Some(0.5);
+            c.square.get_mut("0").unwrap().impact_lead_s = Some(0.5);
+            c.exputt.get_mut("0").unwrap().impact_lead_s = Some(0.5);
+            c.mock_monitor.get_mut("0").unwrap().impact_lead_s = Some(0.5);
+            c.openconnect_server.get_mut("0").unwrap().impact_lead_s = Some(0.5);
+        });
+        for ra in actors {
+            let sender = BusSender::new(ra.id.clone(), bus_tx.clone(), Arc::default());
+            assert!(ids.contains(&ra.id.as_str()), "{}", ra.id);
+            assert!(
+                matches!(
+                    ra.actor.reconfigure(&state, &sender),
+                    ReconfigureOutcome::Applied
+                ),
+                "{}",
+                ra.id
+            );
+        }
+    }
+
     // ----- Reconnect -----
 
     /// State whose config `edit` sets up, its bus with a receiver, and every
@@ -1488,7 +1547,10 @@ mod tests {
     }
 
     fn mock(name: &str) -> flighthook::MockMonitorSection {
-        flighthook::MockMonitorSection { name: name.into() }
+        flighthook::MockMonitorSection {
+            name: name.into(),
+            impact_lead_s: None,
+        }
     }
 
     /// Reconnect `id` through the system actor's command handler. Returns
@@ -1794,6 +1856,7 @@ mod tests {
                 flighthook::OpenConnectServerSection {
                     name: "Uneekor".into(),
                     bind: Some("127.0.0.1:0".into()),
+                    impact_lead_s: None,
                 },
             );
         });
@@ -2580,6 +2643,7 @@ mod tests {
                 flighthook::OpenConnectServerSection {
                     name: "Uneekor".into(),
                     bind: Some(bind.to_string()),
+                    impact_lead_s: None,
                 },
             );
         });
@@ -2610,6 +2674,7 @@ mod tests {
                 flighthook::OpenConnectServerSection {
                     name: "Uneekor".into(),
                     bind: Some(bind.to_string()),
+                    impact_lead_s: None,
                 },
             );
         });
@@ -2694,6 +2759,7 @@ mod tests {
                 flighthook::OpenConnectServerSection {
                     name: "Uneekor".into(),
                     bind: Some(bind.to_string()),
+                    impact_lead_s: None,
                 },
             );
         });
