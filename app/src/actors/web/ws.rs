@@ -18,7 +18,7 @@ use super::{WebState, emit_telemetry};
 use crate::state::SystemState;
 use crate::state::config;
 use flighthook::{
-    Club, ClubInfo, ConfigAction, FRP_VERSION, FlighthookEvent, FlighthookMessage,
+    Club, ClubInfo, ConfigAction, FRP_VERSION, FlighthookEvent, FlighthookMessage, HandInfo,
     ShotDetectionMode, ShotGrouping,
 };
 
@@ -213,6 +213,7 @@ fn parse_start_message(text: &str) -> Option<StartResult> {
 /// Expected formats:
 ///   `{ "cmd": "mode", "mode": "putting" }`
 ///   `{ "cmd": "club", "club": "7I" }`
+///   `{ "cmd": "hand", "handed": "lh" }`
 ///   `{ "cmd": "new_group" }`
 ///   `{ "cmd": "new_session" }`
 ///   `{ "cmd": "clear_history" }`
@@ -229,6 +230,7 @@ fn handle_ws_command(
         cmd: String,
         mode: Option<String>,
         club: Option<String>,
+        handed: Option<String>,
     }
 
     let Ok(msg) = serde_json::from_str::<WsCmd>(text) else {
@@ -256,6 +258,12 @@ fn handle_ws_command(
                 club_info: ClubInfo { club },
             }
         }
+        "hand" => {
+            let Some(hand_info) = msg.handed.as_deref().and_then(HandInfo::from_code) else {
+                return;
+            };
+            FlighthookEvent::HandInfo { hand_info }
+        }
         "new_group" => FlighthookEvent::NewShotGroup,
         "new_session" => FlighthookEvent::NewShotSession,
         "clear_history" => FlighthookEvent::ClearShotHistory,
@@ -280,6 +288,7 @@ fn handle_ws_command(
 mod tests {
     use super::super::tests::test_state;
     use super::*;
+    use flighthook::Handedness;
     use tokio::sync::broadcast;
 
     /// Run one command as `ws.test`; returns what it put on the bus.
@@ -292,6 +301,26 @@ mod tests {
             assert_eq!(m.actor, "ws.test");
         }
         msg
+    }
+
+    #[test]
+    fn hand_command_emits_hand_info() {
+        for (text, handed) in [
+            (r#"{"cmd":"hand","handed":"lh"}"#, Handedness::Left),
+            (r#"{"cmd":"hand","handed":"rh"}"#, Handedness::Right),
+        ] {
+            let msg = run(text).expect("emitted");
+            assert!(
+                matches!(
+                    msg.event,
+                    FlighthookEvent::HandInfo { hand_info } if hand_info.handed == handed
+                ),
+                "{text}: {:?}",
+                msg.event
+            );
+        }
+        assert!(run(r#"{"cmd":"hand","handed":"left"}"#).is_none());
+        assert!(run(r#"{"cmd":"hand"}"#).is_none());
     }
 
     #[test]

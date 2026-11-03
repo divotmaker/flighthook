@@ -592,7 +592,7 @@ fn run_session<T: allsquare::Transport>(
                             reselect = true;
                         }
                     }
-                    // Follow the player's handedness (set by the simulator).
+                    // Follow the player's hand: the system actor's command, whatever set it.
                     // The same event can carry a mode, which does not apply
                     // (see below).
                     FlighthookEvent::SetDetectionMode { mode, handed } => {
@@ -1395,16 +1395,34 @@ mod tests {
         /// The player's hand is `hand` when the session starts; `queued` is
         /// on the bus before the session first looks at it.
         fn start(hand: Option<Handedness>, queued: Vec<FlighthookEvent>) -> Self {
+            Self::launch(hand, queued, false)
+        }
+
+        /// A session with the system actor on its bus, so the hand is set
+        /// with `hand_info` as every source sets it.
+        fn with_system_actor() -> Self {
+            Self::launch(None, vec![], true)
+        }
+
+        fn launch(
+            hand: Option<Handedness>,
+            queued: Vec<FlighthookEvent>,
+            system_actor: bool,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "flighthook-square-{}",
                 crate::state::config::generate_id()
             ));
             let (state, writer) = SystemState::new(dir.join("config.toml"));
+            let state = Arc::new(state);
             if let Some(hand) = hand {
                 writer.set_handed(hand);
             }
             let (tx, _rx) = tokio::sync::broadcast::channel(1024);
             let shutdown = Arc::new(AtomicBool::new(false));
+            if system_actor {
+                crate::actors::system::start_for_test(writer, &state, &tx, shutdown.clone());
+            }
             let sender = BusSender::new("square.0".into(), tx, shutdown.clone());
             let mut receiver = sender.subscribe();
             for event in queued {
@@ -1578,6 +1596,38 @@ mod tests {
         session.wait_for(2);
         session.send(hand_event(None, Handedness::Left));
         session.send(club_event(Club::Iron8));
+        assert_eq!(
+            session.finish(3),
+            [(seven, Right), (seven, Left), (eight, Left)]
+        );
+    }
+
+    /// A hand set in the UI (`hand_info` from `web`) reaches the Omni through
+    /// the system actor's command: the active club is re-sent once with it,
+    /// and the next club carries it.
+    #[test]
+    fn a_hand_set_in_the_ui_reaches_the_device() {
+        use allsquare::Handed::{Left, Right};
+        let session = Session::with_system_actor();
+        let seven = to_allsquare_club(Club::Iron7);
+        let eight = to_allsquare_club(Club::Iron8);
+        session.wait_for(1);
+        let web = BusSender::new(
+            "web".into(),
+            session.sender.raw_sender().clone(),
+            Arc::default(),
+        );
+        let left = || {
+            FlighthookMessage::new(FlighthookEvent::HandInfo {
+                hand_info: flighthook::HandInfo {
+                    handed: Handedness::Left,
+                },
+            })
+        };
+        web.send(left());
+        session.wait_for(2);
+        web.send(left());
+        web.send(FlighthookMessage::new(club_event(Club::Iron8)));
         assert_eq!(
             session.finish(3),
             [(seven, Right), (seven, Left), (eight, Left)]

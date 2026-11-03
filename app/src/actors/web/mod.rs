@@ -374,6 +374,7 @@ async fn run(
         .route("/api/shots/clear", post(routes::post_clear_shot_history))
         .route("/api/shots/grouping", post(routes::post_shot_grouping))
         .route("/api/club", post(routes::post_club))
+        .route("/api/hand", post(routes::post_hand))
         .route("/api/mode", post(routes::post_mode))
         .route("/api/auto-chip", post(routes::post_auto_chip))
         .route("/api/find-mat", post(routes::post_find_mat))
@@ -776,6 +777,16 @@ async fn apply_bus_event(
                 actor
                     .telemetry
                     .insert("club".into(), club_info.club.to_string());
+            }
+        }
+        // The shot context reads the hand from game state at the trigger;
+        // here only the source's card learns it.
+        FlighthookEvent::HandInfo { hand_info } => {
+            let mut actors = state.actors.write().await;
+            if let Some(actor) = actors.get_mut(&msg.actor) {
+                actor
+                    .telemetry
+                    .insert("handed".into(), hand_info.handed.to_string());
             }
         }
         FlighthookEvent::NewShotGroup => {

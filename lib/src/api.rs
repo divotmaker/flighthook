@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActorStatus, Club, ConnectionState, ShotDetectionMode, ShotGroupInfo, ShotGrouping,
+    ActorStatus, Club, ConnectionState, Handedness, ShotDetectionMode, ShotGroupInfo, ShotGrouping,
     StatusHistory,
 };
 
@@ -19,6 +19,9 @@ pub struct StatusResponse {
     /// Club selected in game state; absent when none has been selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club: Option<Club>,
+    /// Player handedness in game state; absent when none has been set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed: Option<Handedness>,
 }
 
 /// Per-actor status within the status response. Also used as the cached
@@ -137,6 +140,12 @@ pub struct ClubRequest {
     pub club: String,
 }
 
+/// POST /api/hand request body. `handed` is `rh` or `lh`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HandRequest {
+    pub handed: String,
+}
+
 /// Actor id of the Auto-chip source: shots sent with `POST /api/auto-chip`
 /// come from this id, a virtual device with no config section.
 pub const AUTO_CHIP_ACTOR: &str = "autochip";
@@ -203,7 +212,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_club_is_optional() {
+    fn status_club_and_hand_are_optional() {
         let s: StatusResponse = serde_json::from_str(r#"{"actors":{},"mode":"full"}"#).unwrap();
         assert_eq!(s.club, None);
         let json = serde_json::to_string(&s).unwrap();
@@ -211,12 +220,15 @@ mod tests {
 
         let s = StatusResponse {
             club: Some(Club::Iron7),
+            handed: Some(Handedness::Left),
             ..s
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["club"], "7I");
+        assert_eq!(v["handed"], "lh");
         let back: StatusResponse = serde_json::from_value(v).unwrap();
         assert_eq!(back.club, Some(Club::Iron7));
+        assert_eq!(back.handed, Some(Handedness::Left));
     }
 
     #[test]

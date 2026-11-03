@@ -53,8 +53,11 @@ pub struct FlighthookApp {
     /// the next one.
     pub(crate) auto_chip_error: Option<String>,
     /// Player handedness in game state (`None` until the server reports
-    /// one). Stamped on shots as they trigger, like the club.
+    /// one), or the user's own pick until the server echoes it. Stamped on
+    /// shots as they trigger, like the club.
     pub(crate) handed: Option<Handedness>,
+    /// A hand picked over REST that no `/api/status` reply has carried yet.
+    pub(crate) hand_pick: Option<Handedness>,
 
     // Shot groups of the webserver the UI talks to
     pub(crate) groups: ShotGroups,
@@ -178,6 +181,7 @@ impl FlighthookApp {
             auto_chip_in_flight: None,
             auto_chip_error: None,
             handed: None,
+            hand_pick: None,
             groups: ShotGroups::default(),
             groups_out_of_step: false,
             settings: SettingsForm::default(),
@@ -241,8 +245,12 @@ impl FlighthookApp {
             if let Some(mode) = status.mode {
                 self.current_mode = mode.to_string();
             }
-            if let Some(club) = status_club(self.ws_connected, &mut self.club_pick, status.club) {
+            if let Some(club) = status_pick(self.ws_connected, &mut self.club_pick, status.club) {
                 self.selected_club = club;
+            }
+            if let Some(handed) = status_pick(self.ws_connected, &mut self.hand_pick, status.handed)
+            {
+                self.handed = handed;
             }
             // The reply lists every running actor: one it leaves out has
             // stopped. Red time counts down from now.
@@ -363,6 +371,7 @@ impl FlighthookApp {
         self.selected_club = state.club_info.map(|c| c.club);
         self.club_pick = None;
         self.handed = state.handed;
+        self.hand_pick = None;
     }
 
     pub(crate) fn handle_bus_event(&mut self, msg: FlighthookMessage) {
@@ -495,13 +504,17 @@ impl FlighthookApp {
                         .insert("club".into(), club_info.club.to_string());
                 }
             }
-            FlighthookEvent::SetDetectionMode { mode, handed } => {
-                if let Some(m) = mode {
-                    self.current_mode = m.to_string();
+            FlighthookEvent::HandInfo { hand_info } => {
+                self.handed = Some(hand_info.handed);
+                self.hand_pick = None;
+                if let Some(actor) = self.actors.get_mut(&actor) {
+                    actor
+                        .telemetry
+                        .insert("handed".into(), hand_info.handed.to_string());
                 }
-                if handed.is_some() {
-                    self.handed = handed;
-                }
+            }
+            FlighthookEvent::SetDetectionMode { mode: Some(m), .. } => {
+                self.current_mode = m.to_string();
             }
             FlighthookEvent::ConfigOutcome {
                 ref restarted,
@@ -779,13 +792,54 @@ const CLUB_PICKER_ROWS: [std::ops::Range<usize>; 6] = [0..2, 2..10, 10..19, 19..
 /// columns, and the height is a comfortable touch target.
 const CLUB_PILL: egui::Vec2 = egui::vec2(52.0, 38.0);
 
-/// Whether the simulator owns the club: any `openconnect_client.*` actor is
-/// connected. A connected simulator replaces the club on every player
-/// message it sends, so a pick made in the UI would not last.
-pub(crate) fn club_set_by_simulator(actors: &HashMap<String, ActorStatusResponse>) -> bool {
+/// The hand picker's options, in display order.
+const HANDS: [Handedness; 2] = [Handedness::Right, Handedness::Left];
+
+/// The code a hand is shown with: `RH` or `LH`.
+pub(crate) fn hand_code(handed: Handedness) -> &'static str {
+    match handed {
+        Handedness::Right => "RH",
+        Handedness::Left => "LH",
+    }
+}
+
+/// Whether the simulator owns the club and the hand: any
+/// `openconnect_client.*` actor is connected. A connected simulator replaces
+/// both on every player message it sends, so a pick made in the UI would not
+/// last.
+pub(crate) fn set_by_simulator(actors: &HashMap<String, ActorStatusResponse>) -> bool {
     actors
         .iter()
         .any(|(id, a)| id.starts_with("openconnect_client.") && a.status == ActorStatus::Connected)
+}
+
+/// The header's hand: an RH | LH control with `shown`, the player's hand (RH
+/// while none is set, the hand the devices then use). Returns the hand a click
+/// picks. With `read_only` the hand is a static pill and nothing can be
+/// picked.
+fn hand_control(
+    ui: &mut egui::Ui,
+    row_height: f32,
+    shown: Handedness,
+    read_only: bool,
+) -> Option<Handedness> {
+    let selected = HANDS.iter().position(|&h| h == shown).unwrap_or(0);
+    let mut picked = None;
+    let size = egui::vec2(ui.available_width(), row_height);
+    let row = egui::Layout::left_to_right(egui::Align::Center);
+    ui.allocate_ui_with_layout(size, row, |ui| {
+        if read_only {
+            theme::pill_static(ui, hand_code(shown)).on_hover_text("Set by the simulator");
+            return;
+        }
+        let labels = HANDS.map(hand_code);
+        let control = theme::segmented(ui, &labels, selected, None);
+        control
+            .response
+            .on_hover_text("Player's hand. Devices that follow it are told on a change.");
+        picked = control.inner.map(|i| HANDS[i]);
+    });
+    picked
 }
 
 impl FlighthookApp {
@@ -793,7 +847,7 @@ impl FlighthookApp {
     /// play. The pill opens a popup with every club, or is read-only while
     /// an Open Connect client is connected.
     fn render_club_picker(&mut self, ui: &mut egui::Ui, row_height: f32) {
-        let read_only = club_set_by_simulator(&self.actors);
+        let read_only = set_by_simulator(&self.actors);
         if read_only {
             self.club_picker_open = false;
         }
@@ -853,6 +907,29 @@ impl FlighthookApp {
         }
     }
 
+    /// The header's hand: see [`hand_control`]. Read-only while an Open
+    /// Connect client is connected.
+    fn render_hand_picker(&mut self, ui: &mut egui::Ui, row_height: f32) {
+        let read_only = set_by_simulator(&self.actors);
+        let shown = self.handed.unwrap_or(Handedness::Right);
+        if let Some(handed) = hand_control(ui, row_height, shown, read_only) {
+            self.pick_hand(ui.ctx(), handed);
+        }
+    }
+
+    /// Set the player's hand: over the WebSocket when it is up, else over
+    /// REST.
+    fn pick_hand(&mut self, ctx: &egui::Context, handed: Handedness) {
+        self.handed = Some(handed);
+        if let Some(tx) = &mut self.ws_sender {
+            let msg = format!(r#"{{"cmd":"hand","handed":"{handed}"}}"#);
+            tx.send(ewebsock::WsMessage::Text(msg));
+        } else {
+            self.hand_pick = Some(handed);
+            net::post_hand(ctx, handed);
+        }
+    }
+
     /// Select `club` as the club in play: over the WebSocket when it is up,
     /// else over REST.
     fn pick_club(&mut self, ctx: &egui::Context, club: Club) {
@@ -867,15 +944,16 @@ impl FlighthookApp {
     }
 }
 
-/// The club a `/api/status` reply sets, if it sets one. With the WebSocket
-/// up, its `init` and `club_info` are the live source and the reply is
-/// ignored. Without it, a reply that does not carry the club picked over
-/// REST yet (`pick`) is ignored too; the first that does clears `pick`.
-fn status_club(
+/// The club or hand a `/api/status` reply sets, if it sets one. With the
+/// WebSocket up, its `init`, `club_info` and `hand_info` are the live source
+/// and the reply is ignored. Without it, a reply that does not carry the
+/// value picked over REST yet (`pick`) is ignored too; the first that does
+/// clears `pick`.
+fn status_pick<T: Copy + PartialEq>(
     ws_connected: bool,
-    pick: &mut Option<Club>,
-    reply: Option<Club>,
-) -> Option<Option<Club>> {
+    pick: &mut Option<T>,
+    reply: Option<T>,
+) -> Option<Option<T>> {
     if ws_connected {
         return None;
     }
@@ -1056,6 +1134,8 @@ impl eframe::App for FlighthookApp {
                     }
 
                     ui.add_space(10.0);
+                    self.render_hand_picker(ui, row_height);
+                    ui.add_space(10.0);
                     self.render_club_picker(ui, row_height);
 
                     // Right-aligned title
@@ -1162,47 +1242,145 @@ mod tests {
     fn status_reply_never_clobbers_a_live_or_pending_club() {
         let mut pick = None;
         // The WebSocket is the live source while it is up.
-        assert_eq!(status_club(true, &mut pick, Some(Club::Driver)), None);
+        assert_eq!(status_pick(true, &mut pick, Some(Club::Driver)), None);
         // Without it, the reply is the source...
         assert_eq!(
-            status_club(false, &mut pick, Some(Club::Driver)),
+            status_pick(false, &mut pick, Some(Club::Driver)),
             Some(Some(Club::Driver))
         );
-        assert_eq!(status_club(false, &mut pick, None), Some(None));
+        assert_eq!(status_pick(false, &mut pick, None), Some(None));
         // ...except a reply that predates a REST pick.
         pick = Some(Club::Iron7);
-        assert_eq!(status_club(false, &mut pick, Some(Club::Driver)), None);
+        assert_eq!(status_pick(false, &mut pick, Some(Club::Driver)), None);
         assert_eq!(pick, Some(Club::Iron7));
         assert_eq!(
-            status_club(false, &mut pick, Some(Club::Iron7)),
+            status_pick(false, &mut pick, Some(Club::Iron7)),
             Some(Some(Club::Iron7))
         );
         assert_eq!(pick, None, "confirmed");
         assert_eq!(
-            status_club(false, &mut pick, Some(Club::Driver)),
+            status_pick(false, &mut pick, Some(Club::Driver)),
             Some(Some(Club::Driver))
         );
+    }
+
+    /// Without the WebSocket, the hand picked over REST shows until a status
+    /// reply carries it; with it, `hand_info` is the source and the reply's
+    /// hand is ignored.
+    #[test]
+    fn the_hand_follows_status_replies_and_hand_info() {
+        let status = |handed| crate::types::StatusResponse {
+            actors: HashMap::new(),
+            mode: None,
+            club: None,
+            handed,
+        };
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        app.pending.lock().expect("lock").status = Some(status(Some(Handedness::Left)));
+        app.apply_pending();
+        assert_eq!(app.handed, Some(Handedness::Left));
+
+        // A REST pick holds against a reply that does not carry it yet.
+        app.handed = Some(Handedness::Right);
+        app.hand_pick = Some(Handedness::Right);
+        app.pending.lock().expect("lock").status = Some(status(Some(Handedness::Left)));
+        app.apply_pending();
+        assert_eq!(app.handed, Some(Handedness::Right));
+        app.pending.lock().expect("lock").status = Some(status(Some(Handedness::Right)));
+        app.apply_pending();
+        assert_eq!(app.hand_pick, None);
+
+        // With the WebSocket up the reply does not move it; hand_info does,
+        // and the source's card learns it.
+        app.ws_connected = true;
+        app.pending.lock().expect("lock").status = Some(status(Some(Handedness::Left)));
+        app.apply_pending();
+        assert_eq!(app.handed, Some(Handedness::Right));
+        app.actors
+            .insert("openconnect_client.0".into(), new_actor("GSPro".into()));
+        app.handle_bus_event(
+            FlighthookMessage::new(FlighthookEvent::HandInfo {
+                hand_info: crate::types::HandInfo {
+                    handed: Handedness::Left,
+                },
+            })
+            .actor("openconnect_client.0"),
+        );
+        assert_eq!(app.handed, Some(Handedness::Left));
+        assert_eq!(app.actors["openconnect_client.0"].telemetry["handed"], "lh");
+    }
+
+    #[test]
+    fn hand_codes_are_rh_and_lh() {
+        assert_eq!(HANDS.map(hand_code), ["RH", "LH"]);
     }
 
     #[test]
     fn club_picker_is_read_only_only_while_a_simulator_is_connected() {
         let mut actors = HashMap::new();
-        assert!(!club_set_by_simulator(&actors));
+        assert!(!set_by_simulator(&actors));
         actors.insert("mevo.0".to_owned(), actor(ActorStatus::Connected));
-        assert!(!club_set_by_simulator(&actors));
+        assert!(!set_by_simulator(&actors));
         for status in [
             ActorStatus::Starting,
             ActorStatus::Reconnecting,
             ActorStatus::Disconnected,
         ] {
             actors.insert("openconnect_client.0".to_owned(), actor(status));
-            assert!(!club_set_by_simulator(&actors), "{status:?} leaves it live");
+            assert!(!set_by_simulator(&actors), "{status:?} leaves it live");
         }
         actors.insert(
             "openconnect_client.1".to_owned(),
             actor(ActorStatus::Connected),
         );
-        assert!(club_set_by_simulator(&actors));
+        assert!(set_by_simulator(&actors));
+    }
+
+    #[test]
+    fn hand_control_is_read_only_only_while_a_simulator_is_connected() {
+        use egui::{Event, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
+
+        // Click along the control's centre line; the hand a click picks, if
+        // any.
+        let click_across = |read_only: bool| {
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let frame = |events: Vec<Event>| {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 60.0))),
+                    events,
+                    ..Default::default()
+                };
+                let mut picked = None;
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            picked = hand_control(ui, 30.0, Handedness::Right, read_only);
+                        });
+                });
+                picked
+            };
+            let button = |at: Pos2, pressed| Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            frame(Vec::new());
+            let mut picks = Vec::new();
+            for x in (0..200).step_by(4) {
+                let at = pos2(x as f32 + 2.0, 20.0);
+                frame(vec![Event::PointerMoved(at)]);
+                frame(vec![button(at, true)]);
+                picks.extend(frame(vec![button(at, false)]));
+            }
+            picks
+        };
+        let live = click_across(false);
+        assert!(!live.is_empty(), "live: LH is pickable");
+        assert!(live.iter().all(|&h| h == Handedness::Left), "{live:?}");
+        assert!(click_across(true).is_empty(), "read-only: no click picks");
     }
 
     #[test]
@@ -1215,6 +1393,7 @@ mod tests {
                 .collect(),
             mode: None,
             club: None,
+            handed: None,
         };
         let outcome = |stopped: &[&str]| {
             FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
@@ -1231,11 +1410,11 @@ mod tests {
             ("openconnect_client.0", ActorStatus::Connected),
         ]));
         app.apply_pending();
-        assert!(club_set_by_simulator(&app.actors));
+        assert!(set_by_simulator(&app.actors));
 
         // Removed in Settings: the outcome drops it and asks for the status.
         app.handle_bus_event(outcome(&["openconnect_client.0"]));
-        assert!(!club_set_by_simulator(&app.actors), "picker live");
+        assert!(!set_by_simulator(&app.actors), "picker live");
         assert!(!app.actors.contains_key("openconnect_client.0"));
         assert!(app.actors.contains_key("mevo.0"));
         assert!(app.needs_status_refresh);
@@ -1249,7 +1428,7 @@ mod tests {
         app.pending.lock().expect("lock").status =
             Some(status(&[("mevo.0", ActorStatus::Connected)]));
         app.apply_pending();
-        assert!(!club_set_by_simulator(&app.actors));
+        assert!(!set_by_simulator(&app.actors));
         assert_eq!(app.actors.len(), 1);
 
         // Stopping something else leaves a connected simulator in charge.
@@ -1259,7 +1438,7 @@ mod tests {
         );
         app.needs_status_refresh = false;
         app.handle_bus_event(outcome(&["mevo.0"]));
-        assert!(club_set_by_simulator(&app.actors));
+        assert!(set_by_simulator(&app.actors));
         assert!(app.needs_status_refresh);
     }
 
@@ -1944,18 +2123,29 @@ mod tests {
         });
         assert_eq!(app.handed, Some(Handedness::Left));
         assert_eq!(app.selected_club, Some(Club::Iron7));
+        let hand = |app: &mut FlighthookApp, handed| {
+            app.handle_bus_event(
+                FlighthookMessage::new(FlighthookEvent::HandInfo {
+                    hand_info: crate::types::HandInfo { handed },
+                })
+                .actor("openconnect_client.0"),
+            );
+        };
         let set = |app: &mut FlighthookApp, mode, handed| {
             app.handle_bus_event(
                 FlighthookMessage::new(FlighthookEvent::SetDetectionMode { mode, handed })
                     .actor("system"),
             );
         };
-        set(&mut app, None, Some(Handedness::Right));
+        hand(&mut app, Handedness::Right);
         assert_eq!(app.handed, Some(Handedness::Right));
         set(&mut app, Some(ShotDetectionMode::Chipping), None);
         assert_eq!(app.handed, Some(Handedness::Right));
         assert_eq!(app.current_mode, ShotDetectionMode::Chipping.to_string());
+        // The device command is not where the UI takes the hand from.
         set(&mut app, None, Some(Handedness::Left));
+        assert_eq!(app.handed, Some(Handedness::Right));
+        hand(&mut app, Handedness::Left);
 
         // A live shot is stamped with the handedness at its trigger, and
         // its face impact fills the row.

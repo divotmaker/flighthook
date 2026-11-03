@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -12,14 +13,15 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use super::types::{
-    AutoChipRequest, AutoChipResponse, ClubRequest, FindMatRequest, GroupingRequest, ModeRequest,
-    PostSettingsResponse, ShotGroupsResponse, StatusResponse,
+    AutoChipRequest, AutoChipResponse, ClubRequest, FindMatRequest, GroupingRequest, HandRequest,
+    ModeRequest, PostSettingsResponse, ShotGroupsResponse, StatusResponse,
 };
 use super::{MAX_SHOTS, StoredShot, WebState, export};
 use crate::actors::actor_names;
 use crate::state::config::FlighthookConfig;
 use flighthook::{
-    Club, ClubInfo, ConfigAction, FlighthookEvent, FlighthookMessage, ShotData, UnitSystem,
+    Club, ClubInfo, ConfigAction, FlighthookEvent, FlighthookMessage, HandInfo, ShotData,
+    UnitSystem,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +92,7 @@ pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusRespon
         actors,
         mode: game.mode,
         club: game.club_info.map(|c| c.club),
+        handed: game.handed,
     })
 }
 
@@ -288,6 +291,28 @@ pub async fn post_club(
         })
         .actor("web"),
     );
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// POST /api/hand — set the player's hand.
+///
+/// Emits `hand_info` on the bus (actor `web`); the system actor stores it and,
+/// when the hand changed, tells the devices, as for a hand from GSPro. A
+/// connected GSPro replaces it with the hand of its next player message.
+/// 400 with a text body for anything but `{"handed":"rh"|"lh"}`.
+pub async fn post_hand(
+    State(state): State<Arc<WebState>>,
+    body: Result<Json<HandRequest>, JsonRejection>,
+) -> Response {
+    let Some(hand_info) = body
+        .ok()
+        .and_then(|Json(body)| HandInfo::from_code(&body.handed))
+    else {
+        return bad_request(r#"body must be {"handed":"rh"} or {"handed":"lh"}"#);
+    };
+    let _ = state
+        .bus_tx
+        .send(FlighthookMessage::new(FlighthookEvent::HandInfo { hand_info }).actor("web"));
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -1021,7 +1046,7 @@ mod shot_fields_tests {
 mod group_tests {
     use super::super::tests::{feed, test_state};
     use super::*;
-    use flighthook::{BallFlight, ShotGrouping, ShotKey, Velocity};
+    use flighthook::{BallFlight, Handedness, ShotGrouping, ShotKey, Velocity};
 
     fn next_event(rx: &mut broadcast::Receiver<FlighthookMessage>) -> FlighthookMessage {
         rx.try_recv().expect("a bus message")
@@ -1053,6 +1078,62 @@ mod group_tests {
                 club_info: ClubInfo { club: Club::Iron7 }
             }
         ));
+    }
+
+    /// `POST /api/hand` with `body`, as axum extracts it.
+    async fn hand_request(state: &Arc<WebState>, body: &str) -> Response {
+        post_hand(
+            State(Arc::clone(state)),
+            Json::<HandRequest>::from_bytes(body.as_bytes()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn post_hand_emits_hand_info_as_web() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        for (body, handed) in [
+            (r#"{"handed":"lh"}"#, Handedness::Left),
+            (r#"{"handed":"rh"}"#, Handedness::Right),
+        ] {
+            let resp = hand_request(&state, body).await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{body}");
+            let msg = next_event(&mut rx);
+            assert_eq!(msg.actor, "web");
+            assert!(
+                matches!(
+                    msg.event,
+                    FlighthookEvent::HandInfo { hand_info } if hand_info.handed == handed
+                ),
+                "{body}: {:?}",
+                msg.event
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_hand_rejects_anything_else_with_a_400() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        for body in [
+            r#"{"handed":"left"}"#,
+            r#"{"handed":""}"#,
+            r#"{"hand":"lh"}"#,
+            r#"{"handed":1}"#,
+            "not json",
+        ] {
+            let resp = hand_request(&state, body).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(
+                body_text(resp).await,
+                r#"body must be {"handed":"rh"} or {"handed":"lh"}"#,
+                "{body}"
+            );
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
     }
 
     #[tokio::test]
@@ -1792,5 +1873,26 @@ mod group_tests {
         writer.set_club_info(ClubInfo { club: Club::Iron7 });
         let set = get_status(State(Arc::clone(&state))).await.0;
         assert_eq!(set.club, Some(Club::Iron7));
+    }
+
+    #[tokio::test]
+    async fn get_status_carries_the_hand() {
+        let (state, writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let none = get_status(State(Arc::clone(&state))).await.0;
+        assert_eq!(none.handed, None);
+        assert!(
+            !serde_json::to_string(&none)
+                .expect("ser")
+                .contains("handed")
+        );
+        writer.set_handed(Handedness::Left);
+        let set = get_status(State(Arc::clone(&state))).await.0;
+        assert_eq!(set.handed, Some(Handedness::Left));
+        assert!(
+            serde_json::to_string(&set)
+                .expect("ser")
+                .contains(r#""handed":"lh""#)
+        );
     }
 }

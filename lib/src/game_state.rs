@@ -293,6 +293,23 @@ pub struct ClubInfo {
     pub club: Club,
 }
 
+/// Player handedness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandInfo {
+    pub handed: Handedness,
+}
+
+impl HandInfo {
+    /// Parse a hand code, `rh` or `lh`, case-insensitively.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        [Handedness::Right, Handedness::Left]
+            .into_iter()
+            .find(|h| h.to_string().eq_ignore_ascii_case(code))
+            .map(|handed| Self { handed })
+    }
+}
+
 /// Immutable snapshot of the current global state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameStateSnapshot {
@@ -309,6 +326,25 @@ pub struct GameStateSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hand_codes_parse_in_any_case() {
+        for (code, handed) in [
+            ("rh", Handedness::Right),
+            ("RH", Handedness::Right),
+            ("lh", Handedness::Left),
+            ("Lh", Handedness::Left),
+        ] {
+            assert_eq!(
+                HandInfo::from_code(code),
+                Some(HandInfo { handed }),
+                "{code}"
+            );
+        }
+        for code in ["", "r", "left", "rhh", " lh"] {
+            assert_eq!(HandInfo::from_code(code), None, "{code:?}");
+        }
+    }
 
     #[test]
     fn every_code_round_trips_both_forms() {

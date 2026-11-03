@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::types::{
     self, AutoChipRequest, Club, FindMatRequest, FlighthookConfig, FlighthookMessage,
-    GameStateSnapshot, PostSettingsResponse, ShotData, ShotGrouping, ShotGroupsResponse,
-    StatusResponse,
+    GameStateSnapshot, HandRequest, Handedness, PostSettingsResponse, ShotData, ShotGrouping,
+    ShotGroupsResponse, StatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -285,6 +285,19 @@ pub fn post_club(ctx: &egui::Context, club: Club) {
     post_json(ctx, "/api/club", format!(r#"{{"club":"{club}"}}"#));
 }
 
+/// Set the player's hand (`POST /api/hand`).
+pub fn post_hand(ctx: &egui::Context, handed: Handedness) {
+    post_json(ctx, "/api/hand", hand_body(handed));
+}
+
+/// The `POST /api/hand` body for `handed`.
+pub(crate) fn hand_body(handed: Handedness) -> String {
+    serde_json::to_string(&HandRequest {
+        handed: handed.to_string(),
+    })
+    .unwrap_or_default()
+}
+
 /// Have ExPutt `actor` locate its mat again (`POST /api/find-mat`).
 pub fn post_find_mat(ctx: &egui::Context, actor: &str) {
     let body = serde_json::to_string(&FindMatRequest {
@@ -463,6 +476,52 @@ mod tests {
         assert!(
             parse_init_response(r#"{"actor":"x","event":{"kind":"new_shot_group"}}"#).is_none()
         );
+    }
+
+    /// The hand reaches the UI the way the server sends it: in the init's
+    /// game state, as `hand_info` on the bus and in the status reply; and
+    /// the UI posts it in the body the server takes.
+    #[test]
+    fn the_hand_round_trips_on_the_wire() {
+        use crate::types::{FlighthookEvent, HandInfo};
+
+        let init = r#"{"kind":"init","version":"0.1.0","actor_id":"ws.1",
+            "global_state":{"player_info":null,"club_info":null,"mode":null,"handed":"lh"}}"#;
+        let Some(WsPollEvent::Init { global_state, .. }) = parse_init_response(init) else {
+            panic!("not an init");
+        };
+        assert_eq!(global_state.unwrap().handed, Some(Handedness::Left));
+
+        let sent = FlighthookMessage::new(FlighthookEvent::HandInfo {
+            hand_info: HandInfo {
+                handed: Handedness::Left,
+            },
+        })
+        .actor("web");
+        let text = serde_json::to_string(&sent).expect("ser");
+        assert!(
+            text.contains(r#""kind":"hand_info","hand_info":{"handed":"lh"}"#),
+            "{text}"
+        );
+        assert!(parse_init_response(&text).is_none());
+        let got = types::parse_ws_message(&text).expect("a bus message");
+        assert_eq!(got.actor, "web");
+        assert!(matches!(
+            got.event,
+            FlighthookEvent::HandInfo {
+                hand_info: HandInfo {
+                    handed: Handedness::Left
+                }
+            }
+        ));
+
+        let status: StatusResponse =
+            serde_json::from_str(r#"{"actors":{},"mode":"full","club":"7I","handed":"rh"}"#)
+                .expect("status");
+        assert_eq!(status.handed, Some(Handedness::Right));
+
+        assert_eq!(hand_body(Handedness::Left), r#"{"handed":"lh"}"#);
+        assert_eq!(hand_body(Handedness::Right), r#"{"handed":"rh"}"#);
     }
 
     fn response(status: u16, status_text: &str, body: &str) -> ehttp::Response {

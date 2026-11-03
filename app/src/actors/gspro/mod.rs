@@ -2,8 +2,8 @@
 //!
 //! Subscribes to the unified bus for shot data and forwards it over TCP to a
 //! simulator that accepts Open Connect: GSPro (port 921), Muni Golf (9210),
-//! or any other. Emits PlayerInfo/ClubInfo for club/player changes and
-//! ActorStatus for connection status. Reconnects with linear backoff on failure.
+//! or any other. Emits PlayerInfo/ClubInfo/HandInfo for player, club and
+//! hand changes and ActorStatus for connection status. Reconnects with linear backoff on failure.
 //!
 //! The bus is drained the whole time, connected or not. Every shot that
 //! finishes while the simulator is connected is sent, in order; a shot that
@@ -1098,14 +1098,13 @@ mod tests {
         messages(&wire)
     }
 
-    /// The bytes the bridge writes for one shot, with GSPro reporting a
-    /// player of `handed` first.
+    /// The bytes the bridge writes for one shot, with the hand set to
+    /// `handed` first and the devices told so.
     fn sent_for(handed: flighthook::Handedness) -> Vec<String> {
         let (mut relay, monitor, mut receiver) = relay_with_bus();
         relay.connect(Instant::now());
-        monitor.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
-            mode: None,
-            handed: Some(handed),
+        monitor.send(FlighthookMessage::new(FlighthookEvent::HandInfo {
+            hand_info: flighthook::HandInfo { handed },
         }));
         emit_shot(&monitor, 1);
         relay.drain(&mut receiver).expect("bus open");

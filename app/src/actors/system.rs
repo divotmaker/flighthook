@@ -2,7 +2,16 @@
 //! housekeeping for updating `SystemState`.
 //!
 //! Subscribes to the bus and processes game state events (PlayerInfo,
-//! ClubInfo, SetDetectionMode) to keep `GameState` in sync.
+//! ClubInfo, HandInfo, SetDetectionMode) to keep `GameState` in sync.
+//! The club and the hand are set the same way by every source (a simulator,
+//! the UI, the REST API, a WebSocket client): `club_info` and `hand_info`.
+//! The system actor stores them and projects them onto the FRP controller
+//! command the device actors follow: a club becomes
+//! `SetDetectionMode { mode }` (the mode derived from it), and a hand that
+//! differs from the stored one becomes `SetDetectionMode { handed }`. From
+//! `SetDetectionMode` itself only the mode is stored, so the system actor's
+//! own commands change nothing when they come back round.
+//!
 //! Also processes `ConfigCommand` events for config mutations (from the
 //! REST API). This runs independently of the web server, so `SystemState`
 //! is always consistent even in headless mode.
@@ -240,34 +249,58 @@ fn run(
             Ok(None) => {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Ok(Some(msg)) => match &msg.event {
-                FlighthookEvent::PlayerInfo { player_info } => {
-                    writer.set_player_info(player_info.clone());
-                }
-                FlighthookEvent::ClubInfo { club_info } => {
-                    writer.set_club_info(*club_info);
-                    // Auto-derive detection mode from club selection
-                    let mode = state.system.snapshot().club_mode(club_info.club);
-                    writer.set_mode(mode);
-                    sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
-                        mode: Some(mode),
-                        handed: None,
-                    }));
-                }
-                FlighthookEvent::SetDetectionMode { mode, handed } => {
-                    if let Some(m) = mode {
-                        writer.set_mode(*m);
-                    }
-                    if let Some(h) = handed {
-                        writer.set_handed(*h);
-                    }
-                }
-                FlighthookEvent::ConfigCommand { .. } => {
+            Ok(Some(msg)) => {
+                if let FlighthookEvent::ConfigCommand { .. } = &msg.event {
                     handle_config_command(&msg.event, &state, &bus_tx, &sender);
+                } else {
+                    handle_game_event(&msg.event, &writer, &state, &sender);
                 }
-                _ => {}
-            },
+            }
         }
+    }
+}
+
+/// Apply a game state event: store it, and emit the controller command a
+/// club or hand change implies.
+pub(crate) fn handle_game_event(
+    event: &FlighthookEvent,
+    writer: &GameStateWriter,
+    state: &SystemState,
+    sender: &BusSender,
+) {
+    match event {
+        FlighthookEvent::PlayerInfo { player_info } => {
+            writer.set_player_info(player_info.clone());
+        }
+        FlighthookEvent::ClubInfo { club_info } => {
+            writer.set_club_info(*club_info);
+            // Auto-derive detection mode from club selection
+            let mode = state.system.snapshot().club_mode(club_info.club);
+            writer.set_mode(mode);
+            sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+                mode: Some(mode),
+                handed: None,
+            }));
+        }
+        FlighthookEvent::HandInfo { hand_info } => {
+            let handed = hand_info.handed;
+            // The devices are told only when the hand changes: a source
+            // that repeats the same hand does not re-command them.
+            let changed = state.game.snapshot().handed != Some(handed);
+            writer.set_handed(handed);
+            if changed {
+                sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+                    mode: None,
+                    handed: Some(handed),
+                }));
+            }
+        }
+        // The hand on this command is the projection of `hand_info` for the
+        // devices, not a source of game state.
+        FlighthookEvent::SetDetectionMode { mode: Some(m), .. } => {
+            writer.set_mode(*m);
+        }
+        _ => {}
     }
 }
 
@@ -434,11 +467,208 @@ pub(crate) fn handle_config_command(
     }));
 }
 
+/// Start a system actor on `bus_tx` holding `writer`, as `main` does, and
+/// wait until it polls the bus. It stops when `shutdown` is set.
+#[cfg(test)]
+pub(crate) fn start_for_test(
+    writer: GameStateWriter,
+    state: &Arc<SystemState>,
+    bus_tx: &broadcast::Sender<FlighthookMessage>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let sender = BusSender::new("system".into(), bus_tx.clone(), shutdown);
+    let receiver = sender.subscribe();
+    let (actor, ready) = SystemActor::new(writer, Arc::clone(state), bus_tx.clone());
+    actor.start(Arc::clone(state), sender, receiver);
+    ready.recv().expect("system actor up");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::actors::web::tests::TempDir;
-    use flighthook::{ConfigAction, ShotGrouping};
+    use flighthook::{
+        Club, ClubInfo, ConfigAction, HandInfo, Handedness, ShotDetectionMode, ShotGrouping,
+    };
+
+    /// Game state, its writer and the system actor's sender, with a
+    /// receiver for what the actor emits.
+    fn game() -> (
+        TempDir,
+        SystemState,
+        GameStateWriter,
+        BusSender,
+        broadcast::Receiver<FlighthookMessage>,
+    ) {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-system-test-{}",
+            crate::state::config::generate_id()
+        )));
+        let (state, writer) = SystemState::new(dir.0.join("config.toml"));
+        let (bus_tx, rx) = broadcast::channel(16);
+        let sender = BusSender::new("system".into(), bus_tx, Arc::default());
+        (dir, state, writer, sender, rx)
+    }
+
+    fn hand_info(handed: Handedness) -> FlighthookEvent {
+        FlighthookEvent::HandInfo {
+            hand_info: HandInfo { handed },
+        }
+    }
+
+    fn emitted(rx: &mut broadcast::Receiver<FlighthookMessage>) -> Vec<FlighthookEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|m| {
+                assert_eq!(m.actor, "system");
+                m.event
+            })
+            .collect()
+    }
+
+    fn is_hand_command(event: &FlighthookEvent, hand: Handedness) -> bool {
+        matches!(
+            event,
+            FlighthookEvent::SetDetectionMode { mode: None, handed: Some(h) } if *h == hand
+        )
+    }
+
+    #[test]
+    fn hand_info_is_stored_and_commands_the_devices_once() {
+        let (_dir, state, writer, sender, mut rx) = game();
+        handle_game_event(&hand_info(Handedness::Left), &writer, &state, &sender);
+        assert_eq!(state.game.snapshot().handed, Some(Handedness::Left));
+        let out = emitted(&mut rx);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(is_hand_command(&out[0], Handedness::Left), "{out:?}");
+
+        // The same hand again: stored, nothing emitted.
+        handle_game_event(&hand_info(Handedness::Left), &writer, &state, &sender);
+        assert_eq!(state.game.snapshot().handed, Some(Handedness::Left));
+        assert!(emitted(&mut rx).is_empty());
+
+        // A change is one command again.
+        handle_game_event(&hand_info(Handedness::Right), &writer, &state, &sender);
+        assert_eq!(state.game.snapshot().handed, Some(Handedness::Right));
+        let out = emitted(&mut rx);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(is_hand_command(&out[0], Handedness::Right), "{out:?}");
+    }
+
+    /// The first hand is a change from none, the right hand included.
+    #[test]
+    fn a_first_right_hand_commands_the_devices() {
+        let (_dir, state, writer, sender, mut rx) = game();
+        handle_game_event(&hand_info(Handedness::Right), &writer, &state, &sender);
+        let out = emitted(&mut rx);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(is_hand_command(&out[0], Handedness::Right), "{out:?}");
+    }
+
+    #[test]
+    fn a_club_change_leaves_the_hand_alone() {
+        let (_dir, state, writer, sender, mut rx) = game();
+        handle_game_event(&hand_info(Handedness::Left), &writer, &state, &sender);
+        emitted(&mut rx);
+        handle_game_event(
+            &FlighthookEvent::ClubInfo {
+                club_info: ClubInfo { club: Club::Putter },
+            },
+            &writer,
+            &state,
+            &sender,
+        );
+        let game = state.game.snapshot();
+        assert_eq!(game.handed, Some(Handedness::Left));
+        assert_eq!(game.mode, Some(ShotDetectionMode::Putting));
+        let out = emitted(&mut rx);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [FlighthookEvent::SetDetectionMode {
+                    mode: Some(ShotDetectionMode::Putting),
+                    handed: None
+                }]
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// The controller command is not a source of game state: its own
+    /// command coming back round, or any other, stores only the mode and
+    /// emits nothing.
+    #[test]
+    fn a_hand_on_the_device_command_is_not_stored() {
+        let (_dir, state, writer, sender, mut rx) = game();
+        handle_game_event(&hand_info(Handedness::Right), &writer, &state, &sender);
+        let own = emitted(&mut rx);
+        handle_game_event(&own[0], &writer, &state, &sender);
+        handle_game_event(
+            &FlighthookEvent::SetDetectionMode {
+                mode: Some(ShotDetectionMode::Chipping),
+                handed: Some(Handedness::Left),
+            },
+            &writer,
+            &state,
+            &sender,
+        );
+        let game = state.game.snapshot();
+        assert_eq!(game.handed, Some(Handedness::Right));
+        assert_eq!(game.mode, Some(ShotDetectionMode::Chipping));
+        assert!(emitted(&mut rx).is_empty());
+    }
+
+    /// The running actor, fed through the bus: a hand sent once and then
+    /// repeated produces one command, and its own command does not loop.
+    #[test]
+    fn the_running_actor_commands_a_hand_change_once() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-system-test-{}",
+            crate::state::config::generate_id()
+        )));
+        let (state, writer) = SystemState::new(dir.0.join("config.toml"));
+        let state = Arc::new(state);
+        let (bus_tx, mut rx) = broadcast::channel(64);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        start_for_test(writer, &state, &bus_tx, Arc::clone(&shutdown));
+        let web = BusSender::new("web".into(), bus_tx.clone(), Arc::default());
+        for _ in 0..3 {
+            web.send(FlighthookMessage::new(hand_info(Handedness::Left)));
+        }
+        // The actor handles the bus in order, so its mode command for this
+        // club comes after everything it does for the three repeats.
+        web.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
+            club_info: ClubInfo { club: Club::Putter },
+        }));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut commands = Vec::new();
+        'wait: while std::time::Instant::now() < deadline {
+            while let Ok(m) = rx.try_recv() {
+                if m.actor != "system" {
+                    continue;
+                }
+                let sentinel = matches!(
+                    m.event,
+                    FlighthookEvent::SetDetectionMode { mode: Some(_), .. }
+                );
+                commands.push(m);
+                if sentinel {
+                    break 'wait;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(is_hand_command(&commands[0].event, Handedness::Left));
+        assert!(matches!(
+            commands[1].event,
+            FlighthookEvent::SetDetectionMode {
+                mode: Some(ShotDetectionMode::Putting),
+                handed: None
+            }
+        ));
+        assert_eq!(state.game.snapshot().handed, Some(Handedness::Left));
+    }
 
     #[test]
     fn set_shot_grouping_persists_and_emits_the_outcome() {

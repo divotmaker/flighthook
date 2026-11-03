@@ -32,6 +32,8 @@ pub use flighthook::{
     FlighthookEvent,
     FlighthookMessage,
     GameStateSnapshot,
+    HandInfo,
+    HandRequest,
     Handedness,
     MevoSection,
     MockMonitorSection,

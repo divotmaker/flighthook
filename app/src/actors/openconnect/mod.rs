@@ -1392,6 +1392,38 @@ mod tests {
         monitor.expect_quiet();
     }
 
+    /// A hand set in the UI is the game state's hand like any other: the
+    /// system actor stores the UI's `hand_info` and the monitor gets a 201
+    /// with it.
+    #[test]
+    fn a_hand_set_in_the_ui_sends_a_201() {
+        let mut rig = Rig::new("GSPro");
+        rig.writer
+            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = Monitor::connect(bind);
+        monitor.send(HEARTBEAT);
+        assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
+        assert_eq!(
+            monitor.expect("the first 201"),
+            player_info(None, Some("DR"))
+        );
+
+        let system = rig.sender("system");
+        let from_ui = FlighthookMessage::new(FlighthookEvent::HandInfo {
+            hand_info: flighthook::HandInfo {
+                handed: Handedness::Left,
+            },
+        })
+        .actor("web");
+        crate::actors::system::handle_game_event(&from_ui.event, &rig.writer, &rig.state, &system);
+        assert_eq!(
+            monitor.expect("the 201 for the hand"),
+            player_info(Some("LH"), Some("DR"))
+        );
+        monitor.expect_quiet();
+    }
+
     #[test]
     fn a_hand_alone_sends_nothing() {
         let mut rig = Rig::new("GSPro");

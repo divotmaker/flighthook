@@ -1932,6 +1932,7 @@ mod tests {
                 actors,
                 mode: None,
                 club: None,
+                handed: None,
             });
             app.apply_pending();
         }

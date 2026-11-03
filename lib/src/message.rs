@@ -27,7 +27,7 @@ use crate::{Handedness, ShotDetectionMode};
 use std::collections::HashMap;
 
 use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRaw};
-use crate::{ClubInfo, GroupedShot, PlayerInfo, ShotGroupInfo, ShotGrouping};
+use crate::{ClubInfo, GroupedShot, HandInfo, PlayerInfo, ShotGroupInfo, ShotGrouping};
 use crate::{
     ExPuttSection, FlighthookConfig, MevoSection, MockMonitorSection, OpenConnectClientSection,
     OpenConnectServerSection, R10Section, RandomClubSection, SquareSection, WebserverSection,
@@ -229,6 +229,8 @@ pub enum FlighthookEvent {
     PlayerInfo { player_info: PlayerInfo },
     /// Club selection update.
     ClubInfo { club_info: ClubInfo },
+    /// Player handedness update.
+    HandInfo { hand_info: HandInfo },
     /// Config mutation request (emitted by POST handler, processed by SystemActor).
     ConfigCommand {
         /// Opaque correlation ID for request-reply pattern.
@@ -507,6 +509,29 @@ mod tests {
             serde_json::from_str(r#"{"actor":"web","event":{"kind":"clear_shot_history"}}"#)
                 .unwrap();
         assert!(matches!(back.event, FlighthookEvent::ClearShotHistory));
+    }
+
+    #[test]
+    fn hand_info_round_trips() {
+        let event = FlighthookEvent::HandInfo {
+            hand_info: HandInfo {
+                handed: Handedness::Left,
+            },
+        };
+        let json = serde_json::to_string(&envelope(event)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"actor":"web","event":{"kind":"hand_info","hand_info":{"handed":"lh"}}}"#
+        );
+        let back: FlighthookMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back.event,
+            FlighthookEvent::HandInfo {
+                hand_info: HandInfo {
+                    handed: Handedness::Left
+                }
+            }
+        ));
     }
 
     #[test]

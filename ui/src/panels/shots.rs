@@ -51,7 +51,7 @@ fn auto_chip_blocked(
 ) -> Option<&'static str> {
     if in_flight.is_some() {
         Some("Sending the chip\u{2026}")
-    } else if !crate::app::club_set_by_simulator(actors) {
+    } else if !crate::app::set_by_simulator(actors) {
         Some("Auto-chip: no simulator connected. Connect an OpenConnect Client output first.")
     } else {
         None

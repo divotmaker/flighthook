@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use super::super::Actor;
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
-use flighthook::{ActorStatus, Club, ClubInfo, FlighthookEvent, FlighthookMessage, Handedness};
+use flighthook::{
+    ActorStatus, Club, ClubInfo, FlighthookEvent, FlighthookMessage, HandInfo, Handedness,
+};
 
 const HANDEDNESS: &[Handedness] = &[Handedness::Right, Handedness::Left];
 
@@ -69,9 +71,8 @@ fn run(sender: BusSender, mut receiver: BusReceiver) {
     sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
         club_info: ClubInfo { club },
     }));
-    sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
-        mode: None,
-        handed: Some(handed),
+    sender.send(FlighthookMessage::new(FlighthookEvent::HandInfo {
+        hand_info: HandInfo { handed },
     }));
 
     loop {
@@ -92,9 +93,8 @@ fn run(sender: BusSender, mut receiver: BusReceiver) {
                     sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
                         club_info: ClubInfo { club },
                     }));
-                    sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
-                        mode: None,
-                        handed: Some(handed),
+                    sender.send(FlighthookMessage::new(FlighthookEvent::HandInfo {
+                        hand_info: HandInfo { handed },
                     }));
                 }
             }

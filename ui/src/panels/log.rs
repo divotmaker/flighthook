@@ -1,4 +1,4 @@
-use crate::app::FlighthookApp;
+use crate::app::{FlighthookApp, hand_code};
 use crate::theme;
 use crate::types::{FlighthookEvent, Severity};
 
@@ -19,6 +19,7 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "actor_status",
     "player_info",
     "club_info",
+    "hand_info",
     "set_detection_mode",
     "new_shot_group",
     "new_shot_session",
@@ -47,6 +48,7 @@ const FILTER_GROUPS: &[(&str, &[&str])] = &[
         &[
             "player_info",
             "club_info",
+            "hand_info",
             "set_detection_mode",
             "new_shot_group",
             "new_shot_session",
@@ -72,6 +74,7 @@ pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
         FlighthookEvent::DeviceTelemetry { .. } => "device_telemetry",
         FlighthookEvent::PlayerInfo { .. } => "player_info",
         FlighthookEvent::ClubInfo { .. } => "club_info",
+        FlighthookEvent::HandInfo { .. } => "hand_info",
         FlighthookEvent::SetDetectionMode { .. } => "set_detection_mode",
         FlighthookEvent::ActorStatus { .. } => "actor_status",
         FlighthookEvent::ConfigCommand { .. } => "config_command",
@@ -137,6 +140,7 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
             format!("name={}", player_info.name.as_deref().unwrap_or("?"))
         }
         FlighthookEvent::ClubInfo { club_info } => format!("club={}", club_info.club),
+        FlighthookEvent::HandInfo { hand_info } => format!("hand={}", hand_code(hand_info.handed)),
         FlighthookEvent::SetDetectionMode { mode, handed } => match (mode, handed) {
             (Some(m), Some(h)) => format!("{m:?} handed={h}"),
             (Some(m), None) => format!("{m:?}"),
@@ -392,5 +396,25 @@ mod tests {
         );
         let changed = FlighthookEvent::ShotGroup { group, shot: None };
         assert_eq!(event_debug(&changed), "set 3 7I (4 shots, open)");
+    }
+
+    #[test]
+    fn hand_info_is_a_game_event_summarised_as_the_hand() {
+        use crate::types::{HandInfo, Handedness};
+        for (handed, summary) in [
+            (Handedness::Left, "hand=LH"),
+            (Handedness::Right, "hand=RH"),
+        ] {
+            let event = FlighthookEvent::HandInfo {
+                hand_info: HandInfo { handed },
+            };
+            assert_eq!(message_type(&event), "hand_info");
+            assert_eq!(event_debug(&event), summary);
+        }
+        let game = FILTER_GROUPS
+            .iter()
+            .find(|(name, _)| *name == "Game")
+            .unwrap();
+        assert!(game.1.contains(&"hand_info"));
     }
 }

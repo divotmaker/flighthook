@@ -32,6 +32,7 @@ Other useful events on the same connection:
 
 - `device_telemetry` -- device-reported state (ready, battery, tilt, temp, identity)
 - `actor_status` -- actor/connection lifecycle (status enum, mode, radar_mode)
+- `hand_info` -- the player's hand changed
 - `set_detection_mode` -- detection mode and/or handedness change (both optional, latched)
 - `shot_group` -- which [set](#get-apishotsgroups) a finished shot joined
   (and so its club); the shot's `/api/shots` element carries the same
@@ -143,6 +144,7 @@ Comprehensive system state (all actors -- launch monitors and integrations).
 {
   "mode": "full",
   "club": "7I",
+  "handed": "rh",
   "actors": {
     "mevo.0": {
       "name": "Mevo WiFi",
@@ -163,7 +165,8 @@ Comprehensive system state (all actors -- launch monitors and integrations).
       "name": "GSPro",
       "status": "connected",
       "telemetry": {
-        "club": "DR"
+        "club": "DR",
+        "handed": "rh"
       },
       "state": "connected",
       "red_for_ms": 0
@@ -181,6 +184,9 @@ numbered in index order (`Open Connect 1`, `Open Connect 2`).
 - `mode`: global detection mode (`"full"` | `"putting"` | `"chipping"`), `null` if not yet set
 - `club`: club in play (see [`POST /api/club`](#post-apiclub)); absent until a
   club has been selected. Same source as `init.global_state.club_info`
+- `handed`: the player's [hand](#handedness) (see
+  [`POST /api/hand`](#post-apihand)); absent until a hand has been set. Same
+  source as `init.global_state.handed`
 - `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`,
   the actor's latest [`actor_status`](#actor_status)
 - `telemetry`: actor-specific key/value pairs (all string values)
@@ -534,6 +540,32 @@ putting, else full), and when it differs from the open set's club, the next
 shot starts a new [set](#get-apishotsgroups). While an OpenConnect client is
 connected, the simulator's next player message replaces the selection: the
 simulator (e.g. GSPro) is the club authority while it runs.
+
+---
+
+### POST /api/hand
+
+Set the player's hand.
+
+**Request**:
+
+```json
+{ "handed": "lh" }
+```
+
+- `handed`: `"rh"` or `"lh"`, case-insensitive.
+
+**Response**: `202 Accepted` (no body). `400 Bad Request` with a text body
+for any other body (another value, a missing field, malformed JSON, a missing
+`Content-Type`): `/api/hand` answers 400 with a text body for any bad body.
+
+Emits `hand_info` on the bus (actor `web`), like a hand from GSPro. The
+system actor stores it and, when it differs from the hand in effect, sends
+the devices that follow the player's hand (Square Golf, ExPutt) a
+`set_detection_mode` with `handed`; the Open Connect server tells its monitor
+too. While an OpenConnect client is connected, the UI's hand control is
+read-only, as the club picker is, because the simulator's next player message
+replaces the hand.
 
 ---
 
@@ -1141,7 +1173,9 @@ Before streaming begins, the client must complete a handshake:
     "player_info": null,
     "club_info": {
       "club": "DR"
-    }
+    },
+    "mode": "full",
+    "handed": "lh"
   }
 }
 ```
@@ -1152,6 +1186,8 @@ Before streaming begins, the client must complete a handshake:
 - `global_state`: current snapshot of shared state
   - `player_info`: `{ "name": "Player 1" }` or `null`
   - `club_info`: `{ "club": "DR" }` or `null`
+  - `mode`: the detection mode or `null`
+  - `handed`: the player's hand (`"rh"` | `"lh"`) or `null`
 
 3. **Server streams** `FlighthookMessage` events (described below).
 
@@ -1575,6 +1611,27 @@ Club selection update.
 
 ---
 
+##### hand_info
+
+Player handedness update. Every source sets the hand this way: GSPro's player
+message (actor `openconnect_client.N`), [`POST /api/hand`](#post-apihand)
+(actor `web`) and the WebSocket [`hand`](#hand) command (the socket's actor
+ID).
+
+```json
+{
+  "actor": "web",
+  "event": {
+    "kind": "hand_info",
+    "hand_info": { "handed": "lh" }
+  }
+}
+```
+
+- `hand_info.handed`: `"rh"` | `"lh"`
+
+---
+
 ##### set_detection_mode
 
 FRP controller command. Sets the shot detection mode and/or player handedness.
@@ -1594,6 +1651,11 @@ each field is the active value. Omitting a field does not reset it.
 
 - `mode` (optional): `"full"` | `"putting"` | `"chipping"`
 - `handed` (optional): `"rh"` | `"lh"`
+
+The system actor sends it with `mode` when the club changes (`club_info`) and
+with `handed` when the hand changes (`hand_info`); `POST /api/mode` and the
+WebSocket `mode` command send `mode`. Game state takes only `mode` from it:
+the hand is set with `hand_info`.
 
 ---
 
@@ -1816,6 +1878,16 @@ a connected simulator replaces it with its next player message).
 
 ```json
 { "cmd": "club", "club": "7I" }
+```
+
+#### hand
+
+Set the player's hand. Emits `hand_info` (see [POST /api/hand](#post-apihand);
+a connected simulator replaces it with its next player message, and the UI
+shows the hand control read-only). Any other `handed` value is ignored.
+
+```json
+{ "cmd": "hand", "handed": "lh" }
 ```
 
 #### new_group

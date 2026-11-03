@@ -93,7 +93,7 @@ launched higher is flown and needs a spin reading like every other flight.
 
 The Omni follows the player's hand from the simulator, or from the hand
 control in the UI: every club select carries it, and a change of hand re-sends
-the active club. The device is right-handed until the simulator says otherwise.
+the active club. The device is right-handed until a hand is set.
 
 Left-handed mode is **beta**: the lateral signs (launch direction, sidespin,
 spin axis, face impact) are not yet verified on a left-handed session.

@@ -3,7 +3,7 @@ use std::io::Write;
 use super::BridgeError;
 use super::api;
 use crate::bus::BusSender;
-use flighthook::{Club, ClubInfo, FlighthookEvent, FlighthookMessage, Severity};
+use flighthook::{Club, ClubInfo, FlighthookEvent, FlighthookMessage, HandInfo, Severity};
 
 pub(crate) fn send_message(
     stream: &mut impl Write,
@@ -75,16 +75,10 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) {
 
                 // Emit player/club info if present
                 if let Some(ref player) = resp.player {
-                    if let Some(ref handed) = player.handed {
-                        let h = api::hand_from_code(handed);
-                        if h.is_some() {
-                            sender.send(FlighthookMessage::new(
-                                FlighthookEvent::SetDetectionMode {
-                                    mode: None,
-                                    handed: h,
-                                },
-                            ));
-                        }
+                    if let Some(handed) = player.handed.as_deref().and_then(api::hand_from_code) {
+                        sender.send(FlighthookMessage::new(FlighthookEvent::HandInfo {
+                            hand_info: HandInfo { handed },
+                        }));
                     }
                     if let Some(ref club_str) = player.club {
                         if let Some(club) = Club::from_code(club_str) {
@@ -153,5 +147,59 @@ mod tests {
             assert_eq!(club_info.club, club, "{code}");
             assert!(rx.try_recv().is_err(), "{code}: no alert expected");
         }
+    }
+
+    /// GSPro's player message sets the hand the way every source does, with
+    /// `hand_info`; it does not command the devices itself. Each repeat is
+    /// passed on: the system actor tells the devices only about a change.
+    #[test]
+    fn the_player_hand_becomes_hand_info() {
+        let (bus_tx, mut rx) = broadcast::channel(16);
+        let sender = BusSender::new("openconnect_client.0".into(), bus_tx, Arc::default());
+        let buf = r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"LH","Club":"I7"}}"#;
+        for _ in 0..2 {
+            handle_response(buf.as_bytes(), &sender);
+            let events: Vec<FlighthookEvent> =
+                std::iter::from_fn(|| rx.try_recv().ok().map(|m| m.event)).collect();
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [
+                        FlighthookEvent::HandInfo {
+                            hand_info: HandInfo {
+                                handed: flighthook::Handedness::Left
+                            }
+                        },
+                        FlighthookEvent::ClubInfo { club_info },
+                    ] if club_info.club == Club::Iron7
+                ),
+                "{events:?}"
+            );
+        }
+    }
+
+    /// A hand GSPro does not define, or omits, is ignored: no `hand_info`,
+    /// and a club in the same message still comes through.
+    #[test]
+    fn an_unknown_or_omitted_hand_is_ignored() {
+        let (bus_tx, mut rx) = broadcast::channel(16);
+        let sender = BusSender::new("openconnect_client.0".into(), bus_tx, Arc::default());
+        let unknown =
+            r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"XX"}}"#;
+        handle_response(unknown.as_bytes(), &sender);
+        assert!(rx.try_recv().is_err());
+
+        let omitted = r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Club":"I7"}}"#;
+        handle_response(omitted.as_bytes(), &sender);
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|m| m.event)
+            .collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [FlighthookEvent::ClubInfo { club_info }] if club_info.club == Club::Iron7
+            ),
+            "{events:?}"
+        );
     }
 }

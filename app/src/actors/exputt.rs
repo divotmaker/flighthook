@@ -793,7 +793,7 @@ fn connect_and_run(
                 }
                 Ok(None) => break,
                 Ok(Some(msg)) => match msg.event {
-                    // Follow the player's handedness (set by the simulator).
+                    // Follow the player's hand: the system actor's command, whatever set it.
                     // The detection mode does not apply: the device only
                     // measures putts. The new round finds the mat first, so
                     // the device is not ready until it reports ready again,
@@ -1083,7 +1083,8 @@ mod tests {
     /// The actor running against a mock device on `port`.
     struct Harness {
         state: Arc<SystemState>,
-        writer: GameStateWriter,
+        /// Game state's writer, until a system actor takes it.
+        writer: Option<GameStateWriter>,
         tx: broadcast::Sender<FlighthookMessage>,
         rx: broadcast::Receiver<FlighthookMessage>,
         shutdown: Arc<AtomicBool>,
@@ -1109,7 +1110,7 @@ mod tests {
             let (tx, rx) = broadcast::channel(1024);
             Self {
                 state: Arc::new(state),
-                writer,
+                writer: Some(writer),
                 tx,
                 rx,
                 shutdown: Arc::new(AtomicBool::new(false)),
@@ -1122,6 +1123,18 @@ mod tests {
                 not_answering_after: Duration::from_secs(3600),
                 reply_timeout: Duration::from_secs(2),
             }
+        }
+
+        /// Start a system actor on the bus, holding game state's writer: the
+        /// hand is then set with `hand_info`, as every source sets it.
+        fn start_system_actor(&mut self) {
+            let writer = self.writer.take().expect("writer");
+            crate::actors::system::start_for_test(
+                writer,
+                &self.state,
+                &self.tx,
+                self.shutdown.clone(),
+            );
         }
 
         /// Start the actor; each connection attempt goes to the port held
@@ -1509,19 +1522,22 @@ mod tests {
     fn the_hand_follows_the_player() {
         let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
         let mut h = Harness::new();
-        h.writer.set_handed(Handedness::Left);
+        h.writer
+            .as_ref()
+            .expect("writer")
+            .set_handed(Handedness::Left);
         h.start_on(&mock);
         h.until_ready(true, Some("ready"));
         assert!(sent(&mock, Request::SetHand(Hand::Left)), "starts left");
         let before = mock.received().len();
 
-        // The simulator reports a right-handed player.
+        // The devices are told the player is right-handed.
         let _ = h.tx.send(
             FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
                 mode: None,
                 handed: Some(Handedness::Right),
             })
-            .actor("openconnect_client.0"),
+            .actor("system"),
         );
         let mut seen = h.until_ready(false, Some("ready"));
         seen.extend(h.until_ready(true, Some("ready")));
@@ -1535,6 +1551,55 @@ mod tests {
         );
         assert!(
             mock.wait_until(WAIT, |p| round_sent(&p[before..], Hand::Right)),
+            "{:?}",
+            mock.received()
+        );
+    }
+
+    /// A hand set in the UI (`hand_info` from `web`) reaches the ExPutt
+    /// through the system actor's command: a new round with the new hand,
+    /// and a repeat of the same hand starts no other.
+    #[test]
+    fn a_hand_set_in_the_ui_reaches_the_device() {
+        let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
+        let mut h = Harness::new();
+        h.start_system_actor();
+        h.start_on(&mock);
+        h.until_ready(true, Some("ready"));
+        assert!(sent(&mock, Request::SetHand(Hand::Right)), "starts right");
+        let before = mock.received().len();
+
+        let left = || {
+            FlighthookMessage::new(FlighthookEvent::HandInfo {
+                hand_info: flighthook::HandInfo {
+                    handed: Handedness::Left,
+                },
+            })
+            .actor("web")
+        };
+        let _ = h.tx.send(left());
+        h.until_ready(false, Some("ready"));
+        h.until_ready(true, Some("ready"));
+        assert!(
+            mock.wait_until(WAIT, |p| round_sent(&p[before..], Hand::Left)),
+            "{:?}",
+            mock.received()
+        );
+        let after = mock.received().len();
+        // A repeat of the same hand, then the other hand as a sentinel: the
+        // bus is in order, so the round for the sentinel is the only one
+        // since `after` unless the repeat started one of its own.
+        let _ = h.tx.send(left());
+        let _ = h.tx.send(
+            FlighthookMessage::new(FlighthookEvent::HandInfo {
+                hand_info: flighthook::HandInfo {
+                    handed: Handedness::Right,
+                },
+            })
+            .actor("web"),
+        );
+        assert!(
+            mock.wait_until(WAIT, |p| round_sent(&p[after..], Hand::Right)),
             "{:?}",
             mock.received()
         );
@@ -2187,7 +2252,7 @@ mod tests {
                 mode: None,
                 handed: Some(handed),
             })
-            .actor("openconnect_client.0")
+            .actor("system")
         };
         // Within the gap after the session's own search: right (in effect),
         // left, right, left, left.
@@ -2236,7 +2301,7 @@ mod tests {
                 mode: None,
                 handed: Some(handed),
             })
-            .actor("openconnect_client.0")
+            .actor("system")
         };
         // Held for the gap: not ready meanwhile.
         let _ = h.tx.send(hand(Handedness::Left));

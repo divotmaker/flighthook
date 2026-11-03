@@ -286,6 +286,7 @@ pub enum FlighthookEvent {
     // -- Flighthook extensions --
     PlayerInfo { player_info: PlayerInfo },
     ClubInfo { club_info: ClubInfo },
+    HandInfo { hand_info: HandInfo },
     ConfigCommand { request_id: Option<String>, action: ConfigAction },
     ConfigOutcome { request_id: Option<String>, restarted: Vec<String>, stopped: Vec<String>, started: Vec<String> },
     ActorStatus { status: ActorStatus, telemetry: HashMap<String, String> },
@@ -577,6 +578,7 @@ a UUID v4 `id`, a per-run display `number`, `session`, `club`, `started_at`,
 | `shot_finished` | the shot is stamped and `finish` counts it when it has data; a shot with no data and no raw frames still ends its assignment |
 | a shot leaves the 1000-shot history | `release`: count down; a closed set at zero is dropped |
 | `club_info` | `select`: the club `new_shot_group` and the next trigger use |
+| `hand_info` | none (the source's card gets `handed`; the shot takes the trigger-time hand from game state) |
 | `new_shot_group` | no-op while the open set is empty; otherwise close it and open a manual set for the selected club |
 | `new_shot_session` | close the open set and count the session up |
 | `clear_shot_history` | empty the shot history (raw byte count to 0), drop every set, forget the shots in flight, count the session up; set numbers restart at 1; no `shot_group` is emitted |
@@ -599,22 +601,32 @@ Game state is mutated via typed events on the bus:
 
 - `PlayerInfo { player_info }` -- player name
 - `ClubInfo { club_info }` -- club selection
-- `SetDetectionMode { mode?, handed? }` -- detection mode and/or handedness (both optional, latched)
+- `HandInfo { hand_info }` -- player handedness
+- `SetDetectionMode { mode?, handed? }` -- the FRP controller command the
+  devices follow: detection mode and/or handedness (both optional, latched).
+  Game state takes only its `mode`.
 
-`POST /api/club` and the WS `club` command emit `ClubInfo` like any
-integration, so a club picked in the UI drives the mode the same way. GSPro
-is a club source only (flighthook never sends it a club) and re-sends its club
-with every player message, so while it is connected its selection wins.
+The club and the hand are set the same way by every source: GSPro's player
+message, the UI's club picker and hand control, `POST /api/club` /
+`POST /api/hand`, and the WS `club` / `hand` commands all emit `ClubInfo` /
+`HandInfo`. The last one wins. GSPro is a club and hand source only
+(flighthook never sends it either) and re-sends both with every player
+message, so while it is connected its selection wins.
 
-The `SystemActor` auto-derives detection mode from `ClubInfo` (using
-`config.club_mode()` to map club to detection mode via the configurable
-`chipping_clubs`/`putting_clubs` lists). Integrations only
-need to emit `ClubInfo`; the SystemActor handles mode derivation
-centrally. Launch monitor actors react to `SetDetectionMode` events to reconfigure
-the device — they latch the mode and only re-arm when the mode actually changes.
-Handed-only updates (mode omitted) do not re-arm a launch monitor. The ExPutt
-starts a new round, which re-locates the mat; the Square Golf actor re-sends
-the active club with the new hand. Mode is global state, not per-device.
+The `SystemActor` projects both onto the controller command. From `ClubInfo`
+it derives the detection mode (using `config.club_mode()` to map club to
+detection mode via the configurable `chipping_clubs`/`putting_clubs` lists)
+and emits `SetDetectionMode { mode }`. From `HandInfo` it emits
+`SetDetectionMode { handed }` when the hand differs from the stored one (or
+none was stored), so a source that repeats the hand does not re-command the
+devices. Sources only emit `ClubInfo` / `HandInfo`; no source emits
+`SetDetectionMode` with a hand. Launch monitor actors react to
+`SetDetectionMode` events to reconfigure the device — they latch the mode and
+only re-arm when the mode actually changes. Handed-only updates (mode
+omitted) do not re-arm a launch monitor. The ExPutt starts a new round, which
+re-locates the mat; the Square Golf actor re-sends the active club with the
+new hand. Both also take the hand from game state when their session starts.
+Mode and hand are global state, not per-device.
 
 ### DeviceTelemetry / ActorStatus split
 
@@ -696,9 +708,9 @@ commands (where `request_id` is `None`).
 ## GameState
 
 `GameState` in `state/game.rs` -- read-only handle for the current round's
-`PlayerInfo` (player name), `ClubInfo` (club selection), and
-`ShotDetectionMode` (global detection mode). Lives inside `SystemState` as
-the `game` field. Only exposes `snapshot()`. All actors and the web layer
+`PlayerInfo` (player name), `ClubInfo` (club selection),
+`ShotDetectionMode` (global detection mode) and `Handedness` (player hand).
+Lives inside `SystemState` as the `game` field. Only exposes `snapshot()`. All actors and the web layer
 can read via `state.game.snapshot()`.
 
 Mutations flow through `GameStateWriter`, a separate write handle that only
@@ -711,6 +723,7 @@ struct GameStateInner {
     player_info: RwLock<Option<PlayerInfo>>,
     club_info: RwLock<Option<ClubInfo>>,
     mode: RwLock<Option<ShotDetectionMode>>,
+    handed: RwLock<Option<Handedness>>,
 }
 
 pub struct GameState { inner: Arc<GameStateInner> }        // read-only
@@ -720,6 +733,7 @@ pub struct GameStateSnapshot {
     pub player_info: Option<PlayerInfo>,
     pub club_info: Option<ClubInfo>,
     pub mode: Option<ShotDetectionMode>,
+    pub handed: Option<Handedness>,
 }
 ```
 
@@ -812,7 +826,8 @@ connecting`) and starts measuring with the putting hand from the game state
 (`connected`, `phase: measuring`). The device card's Find mat button
 (`POST /api/find-mat`, a `FindMat` bus command) has the device locate the mat
 again without reconnecting: `ready` is false until the device is ready again.
-A handedness change from the simulator starts a new round with the new hand,
+A handedness change (from any source, via the system actor's
+`SetDetectionMode { handed }`) starts a new round with the new hand,
 which locates the mat the same way. Mat searches are at least 10 s apart (the
 one at session start counts): requests inside that time are folded into one
 search with the latest hand, run when it ends, and a hand changed back to the
@@ -914,11 +929,15 @@ independent of config. It holds the sole `GameStateWriter`, `Arc<SystemState>`,
 and `broadcast::Sender`, enforcing at the type level that only `SystemActor`
 can mutate game state and process config mutations. It handles:
 
-- **Game state**: subscribes to `PlayerInfo`, `ClubInfo`, and
+- **Game state**: subscribes to `PlayerInfo`, `ClubInfo`, `HandInfo` and
   `SetDetectionMode` bus events, updates game state via the writer.
-  **Auto-derives detection mode from club selection**: when `ClubInfo` is
-  received, calls `club_mode()` and emits `SetDetectionMode` on the bus.
-  This centralizes mode derivation so all integrations trigger mode changes.
+  **Projects the club and the hand onto the controller command**: when
+  `ClubInfo` is received, calls `club_mode()` and emits
+  `SetDetectionMode { mode }`; when `HandInfo` carries a hand that differs
+  from the stored one (or none was stored), emits
+  `SetDetectionMode { handed }`. From `SetDetectionMode` only the mode is
+  stored, so its own command coming back round changes nothing. This
+  centralizes the device commands so every source triggers them the same way.
 - **Config mutations**: subscribes to `ConfigCommand` bus events (from the
   REST API). Applies the mutation to `SystemConfig`, calls
   `apply_config_reload()` to reconcile actors, and emits a `ConfigOutcome`
@@ -969,7 +988,7 @@ to `SystemActor` at construction time.
 `system` provides cached read/write access to the persisted TOML config.
 Config mutations are serialized through the bus (SystemActor processes
 `ConfigCommand` events one at a time on its thread), so no external lock
-is needed. `game` is a read-only handle for player info and club selection;
+is needed. `game` is a read-only handle for player info, club, mode and hand;
 mutations go through `GameStateWriter` held by `SystemActor`. `actors` is a
 registry of all running actors, keyed by global ID. Each entry stores the
 actor and its per-actor shutdown flag (`Arc<AtomicBool>`). Methods:
@@ -1009,6 +1028,7 @@ Client -> server commands:
 ```json
 { "cmd": "mode", "mode": "putting" }
 { "cmd": "club", "club": "7I" }
+{ "cmd": "hand", "handed": "lh" }
 { "cmd": "new_group" }
 { "cmd": "new_session" }
 { "cmd": "clear_history" }
@@ -1016,11 +1036,12 @@ Client -> server commands:
 ```
 
 Mode commands emit `SetDetectionMode` on the bus (mode is global,
-not per-device). `club` emits `ClubInfo`, `new_group` / `new_session` /
+not per-device). `club` emits `ClubInfo`, `hand` emits `HandInfo`,
+`new_group` / `new_session` /
 `clear_history` emit `NewShotGroup` / `NewShotSession` / `ClearShotHistory`,
 and `grouping` emits a fire-and-forget
 `ConfigCommand` (`SetShotGrouping`), each with the socket's actor ID. Each has
-a REST twin (`POST /api/club`, `/api/shots/groups`, `/api/shots/session`,
+a REST twin (`POST /api/club`, `/api/hand`, `/api/shots/groups`, `/api/shots/session`,
 `/api/shots/clear`, `/api/shots/grouping`). Config updates go through `POST /api/settings` ->
 `ConfigCommand` on the bus -> SystemActor processes -> `ConfigOutcome` reply.
 
@@ -1046,9 +1067,10 @@ main thread (eframe)       std::thread per actor              tokio runtime (bac
 ```
 
 **Bus-based command delivery**: actor threads poll the bus via `BusReceiver::poll()`
-in their event loop. They filter for `SetDetectionMode` events (for mode
-changes). The `SystemActor` auto-derives detection mode from `ClubInfo`
-using `club_mode()`, so integrations only need to emit `ClubInfo`. There is
+in their event loop. They filter for `SetDetectionMode` events (mode and
+hand changes). The `SystemActor` derives these commands from
+`ClubInfo` (mode, using `club_mode()`) and `HandInfo` (hand), so integrations
+only need to emit `ClubInfo` and `HandInfo`. There is
 no per-device `mpsc` channel and no centralized router task.
 
 **Actor trait and bus wrappers**: all actors implement the `Actor` trait
@@ -1071,7 +1093,7 @@ config-driven). Then each config section constructs an actor struct and calls
 `Arc<AtomicBool>` shutdown flag shared between the `BusReceiver` and the
 registry. Launch monitor actors (mevo, r10, mock::launch) run event loops polling
 the bus. Integration actors (the OpenConnect client in `actors::gspro`, mock::randomclub) subscribe to the bus
-and emit `ClubInfo` (for club changes) and `ActorStatus`
+and emit `ClubInfo` / `HandInfo` (for club and hand changes) and `ActorStatus`
 (for connection status) back onto the bus.
 
 **Drain subscriber**: a tokio task that consumes all bus messages to keep the
@@ -1160,7 +1182,7 @@ a 420 px minimum card width, cards at most 620 px wide, one column on a
 narrow window; card `i` goes in column `i % columns`.
 
 ```
-  [Devices] [Shots] [Log]  |  [Full] [Chipping] [Putting]  CLUB [7I]  FLIGHTHOOK
+  [Devices] [Shots] [Log]  |  [Full] [Chipping] [Putting]  [RH|LH]  CLUB [7I]  FLIGHTHOOK
 
   GENERAL
   | Global                           [API Docs] | Simulation [beta]
@@ -1375,7 +1397,7 @@ buttons are in the tab bar, between the tab selectors and the title.
 Clicking a mode button emits `SetDetectionMode` on the bus.
 Launch monitor actors react to `SetDetectionMode` events to reconfigure the device.
 
-The **club picker** sits beside the mode selector on every tab: a pill with
+The **club picker** sits right of the hand control on every tab: a pill with
 the club in play (`—` when none), from `/api/status.club`, the WebSocket
 `init.global_state` and every `club_info` event. Clicking it opens a popup of
 all 33 clubs in bag rows (driver + mini driver, woods, hybrids, irons, wedges,
@@ -1387,6 +1409,17 @@ change. While any `openconnect_client.*` actor is Connected the pill is
 read-only, with the hover text "Set by the simulator": the simulator replaces
 the club on its next player message, so its telemetry `club` and the pill
 agree.
+
+The **hand control** sits between the mode selector and the club picker: an
+RH | LH segmented control with the player's hand, from `/api/status.handed`,
+the WebSocket `init.global_state` and every `hand_info` event; RH while no hand
+is set, the hand the devices use then. A click sends the WebSocket `hand`
+command (`POST /api/hand` when the socket is down); the SystemActor then tells
+the devices, as for a hand from the simulator. Like the club pill it is
+read-only while any `openconnect_client.*` actor is Connected (a static pill
+with the hover text "Set by the simulator"): the simulator replaces the hand
+with its next player message. Hovering the live control says "Player's hand.
+Devices that follow it are told on a change."
 
 The tab bar is a segmented control, the same look as the mode selector beside
 it (`theme::segmented`). While any card is red (an actor of any kind lost
@@ -1587,7 +1620,7 @@ with a drawn chevron) after the units toggle. Its menu (`egui::Popup::menu`)
 lists `1 Yard`, `3 Yard`, `5 Yard` (`flighthook::AUTO_CHIP_YARDS`); a pick
 sends `POST /api/auto-chip` (`net::post_auto_chip`). The button is disabled,
 with the reason on hover, while no `openconnect_client.*` actor is Connected
-(`app::club_set_by_simulator`) and while a chip is waiting for its reply
+(`app::set_by_simulator`) and while a chip is waiting for its reply
 (`auto_chip_in_flight`). A failed reply shows in the error banner above the
 tabs (`Auto-chip: <status> <error>`) until the next pick.
 
