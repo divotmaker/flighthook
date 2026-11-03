@@ -248,6 +248,7 @@ fn handle_ws_command(
             FlighthookEvent::SetDetectionMode {
                 mode: Some(mode),
                 handed: None,
+                club: None,
             }
         }
         "club" => {
@@ -374,7 +375,8 @@ mod tests {
             msg.event,
             FlighthookEvent::SetDetectionMode {
                 mode: Some(ShotDetectionMode::Putting),
-                handed: None
+                handed: None,
+                club: None
             }
         ));
         assert!(run(r#"{"cmd":"mode","mode":"by_club"}"#).is_none());

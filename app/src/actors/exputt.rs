@@ -1554,6 +1554,7 @@ mod tests {
             FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
                 mode: None,
                 handed: Some(Handedness::Right),
+                club: None,
             })
             .actor("system"),
         );
@@ -2269,6 +2270,7 @@ mod tests {
             FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
                 mode: None,
                 handed: Some(handed),
+                club: None,
             })
             .actor("system")
         };
@@ -2318,6 +2320,7 @@ mod tests {
             FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
                 mode: None,
                 handed: Some(handed),
+                club: None,
             })
             .actor("system")
         };

@@ -2449,8 +2449,12 @@ mod tests {
         };
         let set = |app: &mut FlighthookApp, mode, handed| {
             app.handle_bus_event(
-                FlighthookMessage::new(FlighthookEvent::SetDetectionMode { mode, handed })
-                    .actor("system"),
+                FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+                    mode,
+                    handed,
+                    club: None,
+                })
+                .actor("system"),
             );
         };
         hand(&mut app, Handedness::Right);

@@ -33,7 +33,7 @@ Other useful events on the same connection:
 - `device_telemetry` -- device-reported state (ready, battery, tilt, temp, identity)
 - `actor_status` -- actor/connection lifecycle (status enum, mode, radar_mode)
 - `hand_info` -- the player's hand, set by the simulator, the UI or the API
-- `set_detection_mode` -- detection mode and/or handedness change (both optional, latched)
+- `set_detection_mode` -- detection mode, handedness and/or club change (all optional, latched)
 - `shot_group` -- which [set](#get-apishotsgroups) a finished shot joined
   (and so its club); the shot's `/api/shots` element carries the same
   `group`
@@ -1927,9 +1927,10 @@ ID).
 
 ##### set_detection_mode
 
-FRP controller command. Sets the shot detection mode and/or player handedness.
-Both fields are optional and latched independently — the most recent value for
-each field is the active value. Omitting a field does not reset it.
+FRP controller command. Sets the shot detection mode, player handedness and/or
+club in play. All fields are optional and latched independently — the most
+recent value for each field is the active value. Omitting a field does not
+reset it. The member order and codes are the spec's.
 
 ```json
 {
@@ -1937,18 +1938,27 @@ each field is the active value. Omitting a field does not reset it.
   "event": {
     "kind": "set_detection_mode",
     "mode": "chipping",
-    "handed": "rh"
+    "handed": "rh",
+    "club": "SW"
   }
 }
 ```
 
 - `mode` (optional): `"full"` | `"putting"` | `"chipping"`
 - `handed` (optional): `"rh"` | `"lh"`
+- `club` (optional): a club code, `"DR"` | `"MD"` | `"2W"`–`"9W"` |
+  `"1H"`–`"9H"` | `"1I"`–`"9I"` | `"PW"` | `"GW"` | `"SW"` | `"LW"` | `"PT"`.
+  The club the player is about to hit; a hint for the next shot, never a shot
+  record and never implying `mode`. A field that is absent is left out of the
+  JSON.
 
-The system actor sends it with `mode` when the club changes (`club_info`) and
-with `handed` when the hand changes (`hand_info`); `POST /api/mode` and the
-WebSocket `mode` command send `mode`. Game state takes only `mode` from it:
-the hand is set with `hand_info`.
+The system actor sends it with `mode` and `club` when the club changes
+(`club_info`) and with `handed` alone when the hand changes (`hand_info`);
+`POST /api/mode` and the WebSocket `mode` command send `mode` alone. Game state
+takes only `mode` from it: the club is set with `club_info` and the hand with
+`hand_info`. flighthook's own `/frp` endpoint takes the `{ "cmd": ... }`
+commands listed under [Client -> Server](#client---server), not an FRP
+`set_detection_mode`.
 
 ---
 

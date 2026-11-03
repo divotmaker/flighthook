@@ -146,12 +146,21 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
         }
         FlighthookEvent::ClubInfo { club_info } => format!("club={}", club_info.club),
         FlighthookEvent::HandInfo { hand_info } => format!("hand={}", hand_code(hand_info.handed)),
-        FlighthookEvent::SetDetectionMode { mode, handed } => match (mode, handed) {
-            (Some(m), Some(h)) => format!("{m:?} handed={h}"),
-            (Some(m), None) => format!("{m:?}"),
-            (None, Some(h)) => format!("handed={h}"),
-            (None, None) => "no-op".into(),
-        },
+        FlighthookEvent::SetDetectionMode { mode, handed, club } => {
+            let parts: Vec<String> = [
+                mode.map(|m| format!("{m:?}")),
+                handed.map(|h| format!("handed={h}")),
+                club.map(|c| format!("club={c}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if parts.is_empty() {
+                "no-op".into()
+            } else {
+                parts.join(" ")
+            }
+        }
         FlighthookEvent::ActorStatus { status, .. } => format!("{status:?}"),
         FlighthookEvent::ConfigCommand { action, .. } => format!("{action:?}"),
         FlighthookEvent::ConfigOutcome { request_id, .. } => match request_id {

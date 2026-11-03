@@ -290,7 +290,7 @@ pub enum FlighthookEvent {
     Alert { severity: Severity, message: String },
 
     // -- FRP: Controller commands --
-    SetDetectionMode { mode: Option<ShotDetectionMode>, handed: Option<Handedness> },
+    SetDetectionMode { mode: Option<ShotDetectionMode>, handed: Option<Handedness>, club: Option<Club> },
 
     // -- Flighthook extensions --
     PlayerInfo { player_info: PlayerInfo },
@@ -618,9 +618,10 @@ Game state is mutated via typed events on the bus:
 - `PlayerInfo { player_info }` -- player name
 - `ClubInfo { club_info }` -- club selection
 - `HandInfo { hand_info }` -- player handedness
-- `SetDetectionMode { mode?, handed? }` -- the FRP controller command the
-  devices follow: detection mode and/or handedness (both optional, latched).
-  Game state takes only its `mode`.
+- `SetDetectionMode { mode?, handed?, club? }` -- the FRP controller command the
+  devices follow: detection mode, handedness and/or club (all optional,
+  latched; `club` is a hint and never implies `mode`). Game state takes only
+  its `mode`.
 
 The club and the hand are set the same way by every source: GSPro's player
 message, the UI's club picker and hand control, `POST /api/club` /
@@ -632,7 +633,8 @@ message, so while it is connected its selection wins.
 The `SystemActor` projects both onto the controller command. From `ClubInfo`
 it derives the detection mode (using `config.club_mode()` to map club to
 detection mode via the configurable `chipping_clubs`/`putting_clubs` lists)
-and emits `SetDetectionMode { mode }`. From `HandInfo` it emits
+and emits `SetDetectionMode { mode, club }`, carrying the selected club next to
+the mode it implies. From `HandInfo` it emits
 `SetDetectionMode { handed }` when the hand differs from the stored one (or
 none was stored), so a source that repeats the hand does not re-command the
 devices. Sources only emit `ClubInfo` / `HandInfo`; no source emits
@@ -1240,7 +1242,7 @@ can mutate game state and process config mutations. It handles:
   `SetDetectionMode` bus events, updates game state via the writer.
   **Projects the club and the hand onto the controller command**: when
   `ClubInfo` is received, calls `club_mode()` and emits
-  `SetDetectionMode { mode }`; when `HandInfo` carries a hand that differs
+  `SetDetectionMode { mode, club }`; when `HandInfo` carries a hand that differs
   from the stored one (or none was stored), emits
   `SetDetectionMode { handed }`. From `SetDetectionMode` only the mode is
   stored, so its own command coming back round changes nothing. This
@@ -1397,9 +1399,9 @@ main thread (eframe)       std::thread per actor              tokio runtime (bac
 ```
 
 **Bus-based command delivery**: actor threads poll the bus via `BusReceiver::poll()`
-in their event loop. They filter for `SetDetectionMode` events (mode and
-hand changes). The `SystemActor` derives these commands from
-`ClubInfo` (mode, using `club_mode()`) and `HandInfo` (hand), so integrations
+in their event loop. They filter for `SetDetectionMode` events (mode, hand
+and club changes). The `SystemActor` derives these commands from
+`ClubInfo` (mode and club, using `club_mode()`) and `HandInfo` (hand), so integrations
 only need to emit `ClubInfo` and `HandInfo`. There is
 no per-device `mpsc` channel and no centralized router task.
 

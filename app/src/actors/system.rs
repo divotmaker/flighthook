@@ -721,6 +721,7 @@ pub(crate) fn handle_game_event(
             sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
                 mode: Some(mode),
                 handed: None,
+                club: Some(club_info.club),
             }));
         }
         FlighthookEvent::HandInfo { hand_info } => {
@@ -733,6 +734,7 @@ pub(crate) fn handle_game_event(
                 sender.send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
                     mode: None,
                     handed: Some(handed),
+                    club: None,
                 }));
             }
         }
@@ -1023,7 +1025,7 @@ mod tests {
     fn is_hand_command(event: &FlighthookEvent, hand: Handedness) -> bool {
         matches!(
             event,
-            FlighthookEvent::SetDetectionMode { mode: None, handed: Some(h) } if *h == hand
+            FlighthookEvent::SetDetectionMode { mode: None, handed: Some(h), club: None } if *h == hand
         )
     }
 
@@ -1059,6 +1061,37 @@ mod tests {
         assert!(is_hand_command(&out[0], Handedness::Right), "{out:?}");
     }
 
+    /// A club change is one command carrying the club next to the mode it
+    /// implies, each time it is selected; the club does not decide the mode
+    /// on the receiving side, so both are always sent.
+    #[test]
+    fn a_club_change_commands_the_mode_and_the_club() {
+        let (_dir, state, writer, sender, mut rx) = game();
+        for club in [Club::Driver, Club::SandWedge, Club::Putter, Club::Putter] {
+            handle_game_event(
+                &FlighthookEvent::ClubInfo {
+                    club_info: ClubInfo { club },
+                },
+                &writer,
+                &state,
+                &sender,
+            );
+            let mode = state.system.snapshot().club_mode(club);
+            let out = emitted(&mut rx);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [FlighthookEvent::SetDetectionMode {
+                        mode: Some(m),
+                        handed: None,
+                        club: Some(c),
+                    }] if *m == mode && *c == club
+                ),
+                "{club}: {out:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_club_change_leaves_the_hand_alone() {
         let (_dir, state, writer, sender, mut rx) = game();
@@ -1081,7 +1114,8 @@ mod tests {
                 out.as_slice(),
                 [FlighthookEvent::SetDetectionMode {
                     mode: Some(ShotDetectionMode::Putting),
-                    handed: None
+                    handed: None,
+                    club: Some(Club::Putter),
                 }]
             ),
             "{out:?}"
@@ -1101,6 +1135,7 @@ mod tests {
             &FlighthookEvent::SetDetectionMode {
                 mode: Some(ShotDetectionMode::Chipping),
                 handed: Some(Handedness::Left),
+                club: Some(Club::Driver),
             },
             &writer,
             &state,
@@ -1159,7 +1194,8 @@ mod tests {
             commands[1].event,
             FlighthookEvent::SetDetectionMode {
                 mode: Some(ShotDetectionMode::Putting),
-                handed: None
+                handed: None,
+                club: Some(Club::Putter),
             }
         ));
         assert_eq!(state.game.snapshot().handed, Some(Handedness::Left));

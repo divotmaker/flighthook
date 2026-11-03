@@ -32,7 +32,7 @@ use crate::{
     MockMonitorSection, OpenConnectClientSection, OpenConnectServerSection, R10Section,
     RandomClubSection, SquareSection, WebserverSection,
 };
-use crate::{ClubInfo, GroupedShot, HandInfo, PlayerInfo, ShotGroupInfo, ShotGrouping};
+use crate::{Club, ClubInfo, GroupedShot, HandInfo, PlayerInfo, ShotGroupInfo, ShotGrouping};
 
 // ---------------------------------------------------------------------------
 // Top-level message
@@ -213,16 +213,18 @@ pub enum FlighthookEvent {
     },
 
     // -- FRP: Controller commands --
-    /// Set the shot detection mode and/or handedness on the device.
+    /// Set the shot detection mode, handedness and/or club on the device.
     ///
-    /// Both fields are optional and latched independently — the most recent
+    /// All fields are optional and latched independently — the most recent
     /// value for each field is the active value. Omitting a field does not
-    /// reset it.
+    /// reset it. `club` is a hint for the next shot and never implies `mode`.
     SetDetectionMode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<ShotDetectionMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         handed: Option<Handedness>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        club: Option<Club>,
     },
 
     // -- Flighthook extensions --
@@ -563,6 +565,112 @@ mod tests {
                 }
             }
         ));
+    }
+
+    /// The JSON of the `event` member of the bus message carrying `event`,
+    /// in wire order.
+    fn event_json(event: FlighthookEvent) -> String {
+        let json = serde_json::to_string(&envelope(event)).unwrap();
+        json.strip_prefix(r#"{"actor":"web","event":"#)
+            .and_then(|rest| rest.strip_suffix('}'))
+            .expect("actor, then event")
+            .to_owned()
+    }
+
+    #[test]
+    fn set_detection_mode_without_club_is_unchanged() {
+        assert_eq!(
+            event_json(FlighthookEvent::SetDetectionMode {
+                mode: Some(ShotDetectionMode::Putting),
+                handed: None,
+                club: None,
+            }),
+            r#"{"kind":"set_detection_mode","mode":"putting"}"#
+        );
+        assert_eq!(
+            event_json(FlighthookEvent::SetDetectionMode {
+                mode: Some(ShotDetectionMode::Full),
+                handed: Some(Handedness::Left),
+                club: None,
+            }),
+            r#"{"kind":"set_detection_mode","mode":"full","handed":"lh"}"#
+        );
+        assert_eq!(
+            event_json(FlighthookEvent::SetDetectionMode {
+                mode: None,
+                handed: Some(Handedness::Right),
+                club: None,
+            }),
+            r#"{"kind":"set_detection_mode","handed":"rh"}"#
+        );
+    }
+
+    /// The spec's `set_detection_mode` example, member for member.
+    #[test]
+    fn set_detection_mode_with_club_matches_the_frp_example() {
+        let json = event_json(FlighthookEvent::SetDetectionMode {
+            mode: Some(ShotDetectionMode::Chipping),
+            handed: Some(Handedness::Right),
+            club: Some(Club::SandWedge),
+        });
+        assert_eq!(
+            json,
+            r#"{"kind":"set_detection_mode","mode":"chipping","handed":"rh","club":"SW"}"#
+        );
+
+        // An FRP client parses what flighthook puts on the wire, club included.
+        let parsed = flightrelay::FrpMessage::parse(&json).unwrap();
+        assert_eq!(
+            parsed,
+            flightrelay::FrpMessage::Protocol(flightrelay::FrpProtocolMessage::SetDetectionMode {
+                mode: Some(flightrelay::DetectionMode::Chipping),
+                handed: Some(Handedness::Right),
+                club: Some(flightrelay::Club::SandWedge),
+            })
+        );
+
+        // A club alone leaves mode and hand to their latched values.
+        let json = event_json(FlighthookEvent::SetDetectionMode {
+            mode: None,
+            handed: None,
+            club: Some(Club::Iron7),
+        });
+        assert_eq!(json, r#"{"kind":"set_detection_mode","club":"7I"}"#);
+        let back: FlighthookEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            FlighthookEvent::SetDetectionMode {
+                mode: None,
+                handed: None,
+                club: Some(Club::Iron7)
+            }
+        ));
+    }
+
+    /// Every flighthook club code is an FRP club code and the other way
+    /// round: 33 clubs, same code, same serde form.
+    #[test]
+    fn club_codes_match_flightrelay() {
+        assert_eq!(Club::ALL.len(), 33);
+        assert_eq!(flightrelay::Club::ALL.len(), Club::ALL.len());
+        for &club in Club::ALL {
+            let code = club.to_string();
+            let frp: flightrelay::Club = code
+                .parse()
+                .unwrap_or_else(|e| panic!("{code} is not an FRP club: {e}"));
+            assert_eq!(frp.to_string(), code);
+            assert_eq!(
+                serde_json::to_string(&frp).unwrap(),
+                serde_json::to_string(&club).unwrap()
+            );
+            let back: Club = serde_json::from_str(&serde_json::to_string(&frp).unwrap()).unwrap();
+            assert_eq!(back, club);
+        }
+        for &frp in flightrelay::Club::ALL {
+            let club = Club::from_code(&frp.to_string())
+                .unwrap_or_else(|| panic!("{frp} is not a flighthook club"));
+            assert_eq!(club.to_string(), frp.to_string());
+        }
     }
 
     #[test]

@@ -637,7 +637,7 @@ fn run_session<T: allsquare::Transport + Release>(
                     // Follow the player's hand: the system actor's command, whatever set it.
                     // The same event can carry a mode, which does not apply
                     // (see below).
-                    FlighthookEvent::SetDetectionMode { mode, handed } => {
+                    FlighthookEvent::SetDetectionMode { mode, handed, .. } => {
                         if let Some(handed) = handed {
                             let new_hand = handed_of(Some(handed));
                             if new_hand != hand {
@@ -1596,6 +1596,7 @@ mod tests {
         FlighthookEvent::SetDetectionMode {
             mode,
             handed: Some(handed),
+            club: None,
         }
     }
 

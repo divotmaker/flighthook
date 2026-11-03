@@ -369,6 +369,7 @@ pub async fn post_mode(
         FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
             mode: Some(mode),
             handed: None,
+            club: None,
         })
         .actor("web"),
     );
