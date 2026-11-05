@@ -18,6 +18,8 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "find_mat",
     "shot_video",
     "shot_video_removed",
+    "shot_pose",
+    "shot_swing",
     "actor_status",
     "player_info",
     "club_info",
@@ -58,7 +60,15 @@ const FILTER_GROUPS: &[(&str, &[&str])] = &[
             "shot_group",
         ],
     ),
-    ("Camera", &["shot_video", "shot_video_removed"]),
+    (
+        "Camera",
+        &[
+            "shot_video",
+            "shot_video_removed",
+            "shot_pose",
+            "shot_swing",
+        ],
+    ),
     (
         "System",
         &["actor_status", "config_command", "config_outcome"],
@@ -89,6 +99,8 @@ pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
         FlighthookEvent::ShotGroup { .. } => "shot_group",
         FlighthookEvent::ShotVideo { .. } => "shot_video",
         FlighthookEvent::ShotVideoRemoved { .. } => "shot_video_removed",
+        FlighthookEvent::ShotPose { .. } => "shot_pose",
+        FlighthookEvent::ShotSwing { .. } => "shot_swing",
         FlighthookEvent::Alert { severity, .. } => match severity {
             Severity::Critical => "alert_critical",
             Severity::Error => "alert_error",
@@ -103,6 +115,14 @@ pub(crate) fn alert_severity(event: &FlighthookEvent) -> Option<Severity> {
         FlighthookEvent::Alert { severity, .. } => Some(*severity),
         _ => None,
     }
+}
+
+/// `#1 #2`: the shot numbers of `keys`.
+fn shot_numbers(keys: &[crate::types::ShotKey]) -> String {
+    keys.iter()
+        .map(|k| format!("#{}", k.shot_number))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Debug representation of the inner event (unwraps envelope layers).
@@ -212,6 +232,12 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
             1 => "clip of 1 shot removed".into(),
             n => format!("clips of {n} shots removed"),
         },
+        FlighthookEvent::ShotPose { keys } => {
+            format!("body tracking of clip {} done", shot_numbers(keys))
+        }
+        FlighthookEvent::ShotSwing { keys } => {
+            format!("swing analysis of clip {} done", shot_numbers(keys))
+        }
         FlighthookEvent::Alert { severity, message } => format!("[{severity}] {message}"),
     }
 }
@@ -468,7 +494,23 @@ mod tests {
             .iter()
             .find(|(name, _)| *name == "Camera")
             .unwrap();
-        assert_eq!(camera.1, ["shot_video", "shot_video_removed"]);
+        assert_eq!(
+            camera.1,
+            [
+                "shot_video",
+                "shot_video_removed",
+                "shot_pose",
+                "shot_swing"
+            ]
+        );
+        let pose = FlighthookEvent::ShotPose { keys: vec![key(4)] };
+        assert_eq!(message_type(&pose), "shot_pose");
+        assert_eq!(event_debug(&pose), "body tracking of clip #4 done");
+        let swing = FlighthookEvent::ShotSwing {
+            keys: vec![key(4), key(5)],
+        };
+        assert_eq!(message_type(&swing), "shot_swing");
+        assert_eq!(event_debug(&swing), "swing analysis of clip #4 #5 done");
     }
 
     #[test]

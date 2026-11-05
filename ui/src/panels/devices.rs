@@ -431,10 +431,11 @@ impl FlighthookApp {
                 let mut clicked: Option<(String, Option<usize>, CardAction)> = None;
                 let mut added = None;
                 for (group, members) in device_card_order(&self.actors, &self.settings.actors) {
-                    // General leads with the Global, Simulation and Replay
-                    // cards, once the settings have loaded, and has no (+).
+                    // General leads with the Global, Simulation, Replay and
+                    // Body tracking cards, once the settings have loaded, and
+                    // has no (+).
                     let general = if group == CardGroup::General {
-                        if loaded { 3 } else { 0 }
+                        if loaded { 4 } else { 0 }
                     } else {
                         0
                     };
@@ -456,7 +457,8 @@ impl FlighthookApp {
                             match i {
                                 0 => self.render_global_card(ctx, ui, general_editable),
                                 1 => self.render_simulation_card(ctx, ui, general_editable),
-                                _ => self.render_replay_card(ctx, ui, general_editable),
+                                2 => self.render_replay_card(ctx, ui, general_editable),
+                                _ => self.render_body_tracking_card(ctx, ui, general_editable),
                             }
                             return;
                         }
@@ -1249,7 +1251,7 @@ mod tests {
 
         // A Global edit: the pair on Global only, the rest locked.
         app.set_default_units(UnitSystem::Metric);
-        assert_eq!(app.units_toggle, UnitSystem::Metric);
+        assert_eq!(app.units(), UnitSystem::Metric);
         let marks = screen.frame(&mut app, Vec::new());
         assert!(enabled(&marks, "save:global"));
         assert!(enabled(&marks, "cancel:global"));
@@ -1272,22 +1274,46 @@ mod tests {
         assert_eq!(app.settings.default_units, UnitSystem::Imperial);
         assert!(app.settings.simulation.fahrenheit);
         assert_eq!(app.settings.simulation.altitude_val, "0");
-        assert_eq!(app.units_toggle, UnitSystem::Imperial);
+        assert_eq!(app.units(), UnitSystem::Imperial);
     }
 
     #[test]
-    fn cancel_general_keeps_the_units_the_shots_tab_had_before_the_edit() {
+    fn the_units_control_on_the_global_card_sets_the_units_and_the_saved_config() {
         let screen = Screen::new();
         let mut app = app();
-        // Saved Imperial; the Shots tab toggled to Metric for the session.
-        app.units_toggle = UnitSystem::Metric;
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks["units"].0.top() > marks["card:global"].0.top());
+        // The control picks Metric: the Shots tab's units and the request
+        // that Save posts follow.
+        let marks = screen.click_mark(&mut app, &marks, "units");
+        screen.click_mark(&mut app, &marks, "units:metric");
+        assert_eq!(app.units(), UnitSystem::Metric);
+        assert_eq!(
+            app.settings.build_global_request().default_units,
+            UnitSystem::Metric
+        );
+        // Saved and read back, it stays; a stored Imperial reads back too.
+        app.settings.global_dirty = false;
+        let mut saved = app.settings.to_request();
+        app.settings.load_from(&saved);
+        assert_eq!(app.units(), UnitSystem::Metric);
+        saved.default_units = UnitSystem::Imperial;
+        app.settings.load_from(&saved);
+        assert_eq!(app.units(), UnitSystem::Imperial);
+    }
+
+    #[test]
+    fn the_units_setting_is_the_shots_tabs_units_and_cancel_puts_the_saved_ones_back() {
+        let screen = Screen::new();
+        let mut app = app();
+        assert_eq!(app.units(), UnitSystem::Imperial);
+        // Changed on the Global card, the Shots tab follows at once.
         app.set_default_units(UnitSystem::Metric);
-        app.set_default_units(UnitSystem::Imperial);
+        assert_eq!(app.units(), UnitSystem::Metric);
         let marks = screen.frame(&mut app, Vec::new());
         screen.click_mark(&mut app, &marks, "cancel:global");
         assert_eq!(app.settings.default_units, UnitSystem::Imperial);
-        assert_eq!(app.units_toggle, UnitSystem::Metric);
-        assert_eq!(app.units_before_edit, None);
+        assert_eq!(app.units(), UnitSystem::Imperial);
     }
 
     #[test]
@@ -1945,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn the_web_server_card_sits_in_general_after_global_simulation_and_replay() {
+    fn the_web_server_card_sits_in_general_after_the_settings_cards() {
         for (w, h) in [(1600.0, 900.0), (1024.0, 768.0)] {
             let at = format!("{w}x{h}");
             let screen = Screen::sized(w, h);
@@ -1955,24 +1981,30 @@ mod tests {
             let (global, _) = marks["title:global"];
             let (simulation, _) = marks["title:simulation"];
             let (replay, _) = marks["title:replay"];
+            let (body, _) = marks["title:body_tracking"];
             let (web, _) = marks["card:webserver.0"];
             let (mevo, _) = marks["card:mevo.0"];
             assert!(global.left() < simulation.left(), "{at}");
             assert!(web.top() < mevo.top(), "above the launch monitors at {at}");
             if w > 1200.0 {
-                // One row: Global, Simulation, Replay; the web server under
-                // Global.
+                // Three columns: Global, Simulation, Replay; Body tracking
+                // under Global, the web server under Simulation.
                 assert!(simulation.right() < replay.left(), "{at}");
                 assert!(replay.top() < global.bottom(), "the same row at {at}");
+                assert!(body.top() > global.bottom(), "{at}");
+                assert!(body.left() < simulation.left(), "{at}");
                 assert!(web.top() > global.bottom(), "{at}");
-                assert!(web.left() < simulation.left(), "{at}");
+                assert!(web.left() > body.right(), "{at}");
+                assert!(web.right() < replay.left(), "{at}");
             } else {
-                // Two columns: Replay under Global, the web server under
-                // Simulation.
+                // Two columns: Replay and Body tracking under Global and
+                // Simulation, the web server under Replay.
                 assert!(replay.top() > global.bottom(), "{at}");
                 assert!(replay.left() < simulation.left(), "{at}");
-                assert!(web.top() > simulation.bottom(), "{at}");
-                assert!(web.left() > replay.right(), "{at}");
+                assert!(body.top() > simulation.bottom(), "{at}");
+                assert!(body.left() > replay.right(), "{at}");
+                assert!(web.top() > replay.bottom(), "{at}");
+                assert!(web.left() < body.left(), "{at}");
             }
             // General has no (+).
             assert!(!marks.contains_key("add:General"), "{at}");
@@ -2210,6 +2242,7 @@ mod tests {
                 handed: None,
                 cameras_supported: false,
                 clip_dir: None,
+                config_error: None,
             });
             app.apply_pending();
         }
@@ -2821,6 +2854,141 @@ mod tests {
         assert!(image.top() >= body.top() && image.top() < body.bottom());
         assert!(content > body.height(), "the body scrolls");
         assert!((card.height() - CARD_HEIGHT).abs() < 0.5);
+    }
+
+    #[test]
+    fn the_body_tracking_card_picks_the_mode_and_the_model_saved_with_the_global_settings() {
+        use flighthook::{BodyTrackingMode, PoseModel};
+        let screen = Screen::new();
+        let mut app = app();
+        assert_eq!(
+            app.settings.body_tracking.mode,
+            BodyTrackingMode::Off,
+            "off by default"
+        );
+        // Saved on: changing the mode is an edit, saved with Save (turning
+        // it on from Off is the download prompt's, see body_models).
+        let mut saved = app.settings.to_request();
+        saved.body_tracking.min_score = 0.45;
+        saved.body_tracking.mode = BodyTrackingMode::Historical;
+        app.settings.load_from(&saved);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("card:body_tracking"));
+        assert!(marks.contains_key("body_tracking_model"));
+        assert!(!marks.contains_key("body_tracking_enabled"));
+        assert!(!marks.contains_key("save:body_tracking"));
+        // Off | Historical | Live, left to right in one row, Historical as
+        // saved.
+        let pills: Vec<egui::Rect> = BodyTrackingMode::all()
+            .map(|m| marks[&format!("body_tracking_mode:{}", m.key())].0)
+            .to_vec();
+        assert!(pills[0].right() <= pills[1].left() && pills[1].right() <= pills[2].left());
+        assert!(
+            pills
+                .iter()
+                .all(|p| (p.center().y - pills[0].center().y).abs() < 0.5)
+        );
+        let (control, _) = marks["body_tracking_mode"];
+        assert!(pills.iter().all(|p| control.contains_rect(*p)));
+        assert_eq!(
+            app.settings.body_tracking.mode,
+            BodyTrackingMode::Historical
+        );
+        // Each mode, and the lighter model: Save on this card alone.
+        for mode in [
+            BodyTrackingMode::Live,
+            BodyTrackingMode::Off,
+            BodyTrackingMode::Historical,
+            BodyTrackingMode::Off,
+        ] {
+            let marks = screen.frame(&mut app, Vec::new());
+            screen.click_mark(
+                &mut app,
+                &marks,
+                &format!("body_tracking_mode:{}", mode.key()),
+            );
+            assert_eq!(app.settings.body_tracking.mode, mode);
+        }
+        app.settings.body_tracking.model = PoseModel::RtmposeS;
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "save:body_tracking"));
+        assert!(!marks.contains_key("save:replay"));
+        assert!(!marks.contains_key("save:global"));
+        let request = app.settings.build_global_request();
+        assert_eq!(request.body_tracking.mode, BodyTrackingMode::Off);
+        assert_eq!(request.body_tracking.model, PoseModel::RtmposeS);
+        assert_eq!(
+            request.body_tracking.min_score, 0.45,
+            "the tuned values stay"
+        );
+        // Off is the default: left out, and no `enabled`.
+        let json = serde_json::to_string(&request.body_tracking).unwrap();
+        assert_eq!(json, r#"{"model":"rtmpose-s","min_score":0.45}"#);
+        // Cancel puts it back.
+        let marks = screen.click_mark(&mut app, &marks, "cancel:body_tracking");
+        assert!(!marks.contains_key("cancel:body_tracking"));
+        assert_eq!(
+            app.settings.body_tracking.mode,
+            BodyTrackingMode::Historical
+        );
+        assert_eq!(app.settings.body_tracking.model, PoseModel::RtmposeM);
+    }
+
+    #[test]
+    fn the_golfer_height_is_typed_in_the_unit_setting_and_saved_in_centimetres() {
+        let screen = Screen::new();
+        let mut app = app();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("body_tracking_height"));
+        // Imperial by default: inches; empty is no height and saves none.
+        assert!(app.settings.body_tracking.inches);
+        assert_eq!(app.settings.body_tracking.golfer_height, "");
+        assert_eq!(
+            app.settings
+                .build_global_request()
+                .body_tracking
+                .golfer_height,
+            None
+        );
+        app.settings.body_tracking.golfer_height = "71".into();
+        app.settings.mark_general(GeneralCard::BodyTracking);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "save:body_tracking"));
+        let request = app.settings.build_global_request();
+        assert_eq!(request.body_tracking.golfer_height, Some(180.3));
+        // Out of range or not a number: no save.
+        for bad in ["30", "tall"] {
+            app.settings.body_tracking.golfer_height = bad.into();
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(!enabled(&marks, "save:body_tracking"), "{bad}");
+            assert!(!app.settings.general_valid());
+        }
+        // Metric default units convert what is typed.
+        app.settings.body_tracking.golfer_height = "71".into();
+        app.set_default_units(UnitSystem::Metric);
+        assert_eq!(app.settings.body_tracking.golfer_height, "180.3");
+        assert_eq!(app.settings.body_tracking.height_unit(), "cm");
+        assert_eq!(
+            app.settings
+                .build_global_request()
+                .body_tracking
+                .golfer_height,
+            Some(180.3)
+        );
+        // Loaded, it reads back in the unit and saves exactly as loaded.
+        let mut saved = app.settings.to_request();
+        saved.default_units = UnitSystem::Imperial;
+        saved.body_tracking.golfer_height = Some(182.0);
+        app.settings.global_dirty = false;
+        app.settings.load_from(&saved);
+        assert_eq!(app.settings.body_tracking.golfer_height, "71.7");
+        assert_eq!(
+            app.settings
+                .build_global_request()
+                .body_tracking
+                .golfer_height,
+            Some(182.0)
+        );
     }
 
     #[test]

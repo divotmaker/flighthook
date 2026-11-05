@@ -2,6 +2,8 @@
 
 pub(crate) mod backoff;
 pub mod camera;
+#[cfg(debug_assertions)]
+pub mod clip_source;
 pub mod exputt;
 pub mod gspro;
 pub mod mevo;

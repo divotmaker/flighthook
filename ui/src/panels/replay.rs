@@ -1,7 +1,8 @@
 //! Camera pictures: a camera card's still frame, the replay view, a modal
-//! over the Shots tab that plays a shot's clips side by side, and the
-//! camera cards in the Cards view's row beside the range bars, which loop
-//! the shown shot's clip.
+//! over the Shots tab that plays a shot's clips side by side, the same
+//! player inline in the Shots tab's Cameras pane (with each clip's swing
+//! analysis), and the camera cards in the Cards view's row beside the range
+//! bars, which loop the shown shot's clip.
 //!
 //! The replay fetches each clip's sidecar, then the bytes of the frames
 //! around the playhead with HTTP range requests, and decodes only the frames
@@ -12,6 +13,7 @@
 //! a second failure is shown over that camera's picture.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::app::FlighthookApp;
 use crate::net::{self, ReplayReply};
@@ -21,7 +23,7 @@ use crate::replay::{
     window_for,
 };
 use crate::theme;
-use crate::types::{ShotRow, ShotVideo};
+use crate::types::{BodyTrackingMode, CameraPosition, ShotRow, ShotVideo};
 
 /// Decoded frames the replay keeps as textures.
 const TEXTURES: usize = 32;
@@ -46,7 +48,11 @@ const VIEW_SHARE: f32 = 0.9;
 const PICTURE_SHARE: f32 = 0.6;
 
 /// A JPEG made into a texture, or `None` when it does not decode.
-fn texture(ctx: &egui::Context, name: String, jpeg: &[u8]) -> Option<egui::TextureHandle> {
+pub(crate) fn texture(
+    ctx: &egui::Context,
+    name: String,
+    jpeg: &[u8],
+) -> Option<egui::TextureHandle> {
     let (w, h, rgb) = decode(jpeg)?;
     let image = egui::ColorImage::from_rgb([w, h], &rgb);
     Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR))
@@ -156,6 +162,12 @@ enum Fetch {
     Sidecar(String),
     /// A camera's frames: the window and its bytes in the AVI.
     Frames(String, Window, (u64, u64)),
+    /// A camera's clip keypoints (body tracking).
+    Pose(String),
+    /// A camera's clip swing analysis.
+    Swing(String),
+    /// Track a camera's clip now (body tracking not off, no keypoints yet).
+    Analyze(String),
 }
 
 /// Whether the play a replay opens with has begun.
@@ -291,8 +303,58 @@ fn send(
             Fetch::Frames(camera, window, bytes) => {
                 net::fetch_frames(ctx, pending, seq, shot_id, &camera, window, bytes);
             }
+            Fetch::Pose(camera) => net::fetch_pose(ctx, pending, seq, shot_id, &camera),
+            Fetch::Swing(camera) => net::fetch_swing(ctx, pending, seq, shot_id, &camera),
+            Fetch::Analyze(camera) => net::post_analyze(ctx, pending, seq, shot_id, &camera),
         }
     }
+}
+
+/// One camera's clip keypoints (body tracking), fetched once.
+#[derive(Default)]
+struct PoseClip {
+    requested: bool,
+    track: Option<crate::types::PoseTrackFile>,
+}
+
+impl PoseClip {
+    /// The request to send for a clip whose body tracking is done
+    /// (`ready`): once.
+    fn due(&mut self, camera: &str, ready: bool) -> Option<Fetch> {
+        if !ready || self.requested {
+            return None;
+        }
+        self.requested = true;
+        Some(Fetch::Pose(camera.to_owned()))
+    }
+}
+
+/// One camera's clip swing analysis, fetched once.
+#[derive(Default)]
+struct SwingClip {
+    requested: bool,
+    report: Option<Arc<crate::types::SwingReportFile>>,
+}
+
+impl SwingClip {
+    /// The request to send for a clip whose swing analysis is done
+    /// (`ready`): once.
+    fn due(&mut self, camera: &str, ready: bool) -> Option<Fetch> {
+        if !ready || self.requested {
+            return None;
+        }
+        self.requested = true;
+        Some(Fetch::Swing(camera.to_owned()))
+    }
+}
+
+/// How the replay draws skeletons: whether at all (the Cameras pane's `B`),
+/// below which score a keypoint is hidden, and the golfer's hand.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoseDraw {
+    pub(crate) overlay: bool,
+    pub(crate) min_score: f32,
+    pub(crate) hand: crate::types::Handedness,
 }
 
 /// One camera in the replay view.
@@ -301,8 +363,22 @@ struct Camera {
     /// Its card's name, or its actor ID.
     name: String,
     clip: Clip,
+    pose: PoseClip,
+    swing: SwingClip,
+    /// Its clip was asked to be tracked.
+    analyze_requested: bool,
     /// The frame on screen while the next one loads.
     shown: Option<(usize, egui::TextureHandle)>,
+}
+
+impl Camera {
+    /// The keypoints of the frame on screen: the pose frame at its exact
+    /// time on the sidecar's time base, when there is one.
+    fn shown_keypoints(&self) -> Option<&[flighthook::Keypoint]> {
+        let (frame, _) = self.shown.as_ref()?;
+        let t_ns = self.clip.track.as_ref()?.frames.get(*frame)?.t_ns;
+        self.pose.track.as_ref()?.keypoints_at(t_ns)
+    }
 }
 
 /// The open replay of one shot.
@@ -320,6 +396,13 @@ pub(crate) struct ReplayView {
     textures: Lru<(usize, usize), egui::TextureHandle>,
     /// The input time of the last frame drawn (s).
     last_time: Option<f64>,
+    /// The golfer's hand, for the skeleton's lead side.
+    pub(crate) hand: crate::types::Handedness,
+    /// The clips' swing analyses are fetched too (the inline player).
+    swing: bool,
+    /// When body tracking runs: nothing is fetched or asked for while it
+    /// is off.
+    mode: BodyTrackingMode,
 }
 
 impl ReplayView {
@@ -339,6 +422,9 @@ impl ReplayView {
                 video: v.clone(),
                 name: name(&v.camera),
                 clip: Clip::new(&v.camera),
+                pose: PoseClip::default(),
+                swing: SwingClip::default(),
+                analyze_requested: false,
                 shown: None,
             })
             .collect();
@@ -352,6 +438,75 @@ impl ReplayView {
             autoplay: Autoplay::Waiting { since: None },
             textures: Lru::new(if small { TEXTURES_SMALL } else { TEXTURES }),
             last_time: None,
+            hand: shot.handed.unwrap_or(crate::types::Handedness::Right),
+            swing: false,
+            mode: BodyTrackingMode::default(),
+        }
+    }
+
+    /// The same view, fetching each clip's swing analysis once it is done.
+    pub(crate) fn with_swing(mut self) -> Self {
+        self.swing = true;
+        self
+    }
+
+    /// The swing events its clips' reports found, for the scrubber: none
+    /// while body tracking is off.
+    fn swing_markers(&self) -> Vec<Marker> {
+        if !self.mode.is_on() {
+            return Vec::new();
+        }
+        swing_markers(self.cameras.iter().filter_map(|c| {
+            let track = c.clip.track.as_ref()?;
+            Some((track.start_ns, c.swing.report.as_deref()?))
+        }))
+    }
+
+    /// The cameras it plays, in order.
+    pub(crate) fn cameras(&self) -> impl Iterator<Item = &str> {
+        self.cameras.iter().map(|c| c.video.camera.as_str())
+    }
+
+    /// Whether camera `camera`'s swing analysis is fetched (or fetched):
+    /// this view fetches them and the analysis is done.
+    #[cfg(test)]
+    pub(crate) fn wants_swing_of(&self, camera: &str) -> bool {
+        self.swing
+            && self
+                .cameras
+                .iter()
+                .any(|c| c.video.camera == camera && c.video.swing)
+    }
+
+    /// Whether camera `camera`'s clip was asked to be tracked.
+    #[cfg(test)]
+    pub(crate) fn asked_to_track(&self, camera: &str) -> bool {
+        self.cameras
+            .iter()
+            .any(|c| c.video.camera == camera && c.analyze_requested)
+    }
+
+    /// Follow body tracking's `mode` and take what is due, as a frame does
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn step(&mut self, mode: BodyTrackingMode) {
+        self.mode = mode;
+        let _ = self.due();
+    }
+
+    /// Ask again for every clip without keypoints to be tracked (the models
+    /// were just downloaded, so the first ask found none).
+    pub(crate) fn ask_again(&mut self) {
+        for cam in self.cameras.iter_mut().filter(|c| !c.video.pose) {
+            cam.analyze_requested = false;
+        }
+    }
+
+    /// Camera `camera`'s swing analysis of the clip is done: it is fetched
+    /// with the next requests (when this view fetches them).
+    pub(crate) fn swing_ready(&mut self, camera: &str) {
+        for cam in self.cameras.iter_mut().filter(|c| c.video.camera == camera) {
+            cam.video.swing = true;
         }
     }
 
@@ -363,6 +518,14 @@ impl ReplayView {
     /// The number its replies carry.
     pub(crate) fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Camera `camera`'s body tracking of the clip is done: its keypoints
+    /// are fetched with the next requests.
+    pub(crate) fn pose_ready(&mut self, camera: &str) {
+        for cam in self.cameras.iter_mut().filter(|c| c.video.camera == camera) {
+            cam.video.pose = true;
+        }
     }
 
     /// The tracks loaded so far.
@@ -407,6 +570,35 @@ impl ReplayView {
                     return;
                 };
                 cam.clip.take_frames(window, result);
+            }
+            ReplayReply::Pose {
+                replay,
+                camera,
+                result,
+            } if replay == self.seq => {
+                if let Some(cam) = self.cameras.iter_mut().find(|c| c.video.camera == camera) {
+                    // A clip whose keypoints don't load is shown without them.
+                    cam.pose.track = result.ok();
+                }
+            }
+            ReplayReply::Swing {
+                replay,
+                camera,
+                result,
+            } if replay == self.seq => {
+                if let Some(cam) = self.cameras.iter_mut().find(|c| c.video.camera == camera) {
+                    // A report that doesn't load leaves the clip without one.
+                    cam.swing.report = result.ok().map(Arc::new);
+                }
+            }
+            ReplayReply::Analyzed {
+                replay,
+                camera,
+                done: true,
+            } if replay == self.seq => {
+                // Tracked before this view knew: fetch what is there.
+                self.pose_ready(&camera);
+                self.swing_ready(&camera);
             }
             _ => {}
         }
@@ -479,7 +671,9 @@ impl ReplayView {
 
     /// What to ask the server for now: every sidecar not asked for yet,
     /// and the frames around the playhead (and, while playing, a little
-    /// ahead) each camera lacks. Each is recorded as asked for.
+    /// ahead) each camera lacks. Unless body tracking is off, also each clip's
+    /// keypoints (and swing analysis) once done, and once each, tracking
+    /// for a clip without keypoints. Each is recorded as asked for.
     fn due(&mut self) -> Vec<Fetch> {
         let playhead = self.playback.as_ref().map(|p| (p.playhead, p.playing));
         let mut due = Vec::new();
@@ -495,6 +689,17 @@ impl ReplayView {
                 _ => Vec::new(),
             };
             due.extend(cam.clip.due(&frames));
+            if !self.mode.is_on() {
+                continue;
+            }
+            if !cam.video.pose && !cam.analyze_requested {
+                cam.analyze_requested = true;
+                due.push(Fetch::Analyze(cam.video.camera.clone()));
+            }
+            due.extend(cam.pose.due(&cam.video.camera, cam.video.pose));
+            if self.swing {
+                due.extend(cam.swing.due(&cam.video.camera, cam.video.swing));
+            }
         }
         due
     }
@@ -559,19 +764,88 @@ fn tick_x(left: f32, width: f32, span: (u64, u64), t: u64) -> f32 {
     left + (t.saturating_sub(span.0) as f64 / len) as f32 * width
 }
 
+/// A swing event on the scrubber: its name and its time on the shot
+/// timeline.
+type Marker = (&'static str, u64);
+
+/// Pixels apart under which two event markers share one spot (and one
+/// hover, one click).
+const MARKER_MERGE_PX: f32 = 6.0;
+
+/// Width of an event marker's hover and click area.
+const MARKER_HIT_PX: f32 = 10.0;
+
+/// The mean of `n` values summing to `sum` (ns), to the nearest ns: it lies
+/// between its terms. The scrubber's markers and the swing tempo average
+/// the cameras with it.
+pub(crate) fn rounded_mean(sum: u128, n: u128) -> u64 {
+    u64::try_from((sum + n / 2) / n).unwrap_or(u64::MAX)
+}
+
+/// The events a shot's swing reports found, on the shot timeline: one per
+/// event, in swing order, at the mean of the cameras' times. Each item is a
+/// camera's track start (host ns) and its swing report; impact is left out
+/// (it is the scrubber's gold tick) and so is a camera with no swing found.
+fn swing_markers<'a>(
+    reports: impl IntoIterator<Item = (u64, &'a crate::types::SwingReportFile)>,
+) -> Vec<Marker> {
+    const EVENTS: [&str; 4] = ["Address", "Takeaway", "Top", "Finish"];
+    let mut sums = [(0_u128, 0_u128); EVENTS.len()];
+    for (start_ns, report) in reports {
+        if !report.swing_found() {
+            continue;
+        }
+        for (name, event) in report.events.named() {
+            let slot = EVENTS.iter().position(|n| *n == name);
+            if let (Some(slot), Some(event)) = (slot, event) {
+                sums[slot].0 += u128::from(start_ns) + u128::from(event.t_ns);
+                sums[slot].1 += 1;
+            }
+        }
+    }
+    EVENTS
+        .into_iter()
+        .zip(sums)
+        .filter(|(_, (_, n))| *n > 0)
+        .map(|(name, (sum, n))| (name, rounded_mean(sum, n)))
+        .collect()
+}
+
+/// `markers` drawn at `x_of`, with markers closer than [`MARKER_MERGE_PX`]
+/// joined: each group is its events' names, the first one's time, and its x.
+fn marker_groups(
+    markers: &[Marker],
+    x_of: impl Fn(u64) -> f32,
+) -> Vec<(Vec<&'static str>, u64, f32)> {
+    let mut groups: Vec<(Vec<&'static str>, u64, f32)> = Vec::new();
+    for &(name, t) in markers {
+        let x = x_of(t);
+        match groups.last_mut() {
+            Some((names, _, at)) if x - *at < MARKER_MERGE_PX => names.push(name),
+            _ => groups.push((vec![name], t, x)),
+        }
+    }
+    groups
+}
+
 /// The scrubber: the clip span as a track, the start point as a green tick,
-/// the estimated impact as a gold tick, and the playhead as a handle. A
-/// click or drag seeks.
+/// the estimated impact as a gold tick, the swing events as small grey
+/// ticks (hover names the event, a click seeks to it), and the playhead as
+/// a handle. A click or drag seeks. Its mark is `<prefix>:scrubber`; an
+/// event's is `<prefix>:event:<name>` in lower case, events sharing a spot
+/// joined with `+`.
 fn scrubber(
     ui: &mut egui::Ui,
+    prefix: &str,
     span: (u64, u64),
     start: u64,
     impact: Option<u64>,
+    events: &[Marker],
     playhead: u64,
 ) -> Option<u64> {
     let size = egui::vec2(ui.available_width(), 22.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-    devices::mark(ui, || "replay:scrubber".to_owned(), &response);
+    devices::mark(ui, || format!("{prefix}:scrubber"), &response);
     let track = rect.shrink2(egui::vec2(8.0, 8.0));
     let len = span.1.saturating_sub(span.0).max(1) as f64;
     let x_of = |t: u64| tick_x(track.left(), track.width(), span, t);
@@ -591,11 +865,49 @@ fn scrubber(
             egui::Stroke::new(2.0, theme::GOLD),
         );
     }
+    let mut seek = None;
+    for (names, t, x) in marker_groups(events, x_of) {
+        let hit = egui::Rect::from_center_size(
+            egui::pos2(x, track.center().y),
+            egui::vec2(MARKER_HIT_PX, rect.height()),
+        );
+        let id = ui.id().with(("event", names[0]));
+        let marker = ui
+            .interact(hit, id, egui::Sense::click())
+            .on_hover_text(names.join(", "))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        devices::mark(
+            ui,
+            || {
+                let names: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+                format!("{prefix}:event:{}", names.join("+"))
+            },
+            &marker,
+        );
+        let colour = if marker.hovered() {
+            theme::TEXT
+        } else {
+            theme::TEXT_MUTED
+        };
+        painter.line_segment(
+            [
+                egui::pos2(x, track.center().y - 5.0),
+                egui::pos2(x, track.center().y + 5.0),
+            ],
+            egui::Stroke::new(1.5, colour),
+        );
+        if marker.clicked() {
+            seek = Some(t);
+        }
+    }
     painter.circle_filled(
         egui::pos2(x_of(playhead), track.center().y),
         6.0,
         theme::TEXT,
     );
+    if seek.is_some() {
+        return seek;
+    }
     let pos = response.interact_pointer_pos()?;
     if !(response.clicked() || response.dragged()) {
         return None;
@@ -606,14 +918,215 @@ fn scrubber(
     Some(span.0 + (f64::from(share) * len) as u64)
 }
 
+/// The clips' timeline for one screen update: the tracks loaded, their
+/// span and the estimated impact.
+struct Timeline {
+    tracks: Vec<Track>,
+    span: Option<(u64, u64)>,
+    impact: Option<u64>,
+    /// The swing events the clips' reports found (none without reports).
+    events: Vec<Marker>,
+}
+
+impl ReplayView {
+    /// Get ready to draw at input time `now`, body tracking in `mode`:
+    /// while `active`, send what is due and run the clock; otherwise
+    /// (another player is in front) the clock holds and nothing is fetched.
+    fn prepare(
+        &mut self,
+        ctx: &egui::Context,
+        pending: &net::PendingHandle,
+        active: bool,
+        mode: BodyTrackingMode,
+    ) -> Timeline {
+        self.mode = mode;
+        let tracks = self.tracks();
+        let span = crate::replay::span(&tracks);
+        let impact = crate::replay::impact(&tracks);
+        if active {
+            let fetches = self.due();
+            #[cfg(not(test))]
+            self.send(ctx, pending, fetches);
+            #[cfg(test)]
+            drop((fetches, pending));
+            self.tick(ctx.input(|i| i.time), span);
+            if self.playback.as_ref().is_some_and(|p| p.playing) {
+                ctx.request_repaint();
+            }
+        } else {
+            self.last_time = None;
+        }
+        let events = self.swing_markers();
+        Timeline {
+            tracks,
+            span,
+            impact,
+            events,
+        }
+    }
+
+    /// Height over width of the tallest clip, 16:9 until one is known.
+    fn aspect(timeline: &Timeline) -> f32 {
+        timeline
+            .tracks
+            .iter()
+            .filter(|t| t.width > 0)
+            .map(|t| t.height as f32 / t.width as f32)
+            .fold(9.0 / 16.0, f32::max)
+    }
+
+    /// The cameras' columns side by side, each `column` wide, `gap` apart,
+    /// at the playhead, marked under `prefix`.
+    fn columns(&mut self, ui: &mut egui::Ui, prefix: &str, column: f32, gap: f32, draw: PoseDraw) {
+        let ctx = ui.ctx().clone();
+        let textures: Vec<Option<egui::TextureHandle>> = (0..self.cameras.len())
+            .map(|i| self.frame_texture(&ctx, i))
+            .collect();
+        let errors: Vec<Option<String>> = (0..self.cameras.len())
+            .map(|i| self.camera_error(i))
+            .collect();
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for ((cam, tex), error) in self.cameras.iter().zip(&textures).zip(&errors) {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(column, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(column);
+                        camera_column(
+                            ui,
+                            prefix,
+                            &self.shot_id,
+                            cam,
+                            tex.as_ref(),
+                            error.as_deref(),
+                            column,
+                            draw,
+                        );
+                    },
+                );
+            }
+        });
+    }
+
+    /// The scrubber and the transport row (play, frame steps, speed, loop),
+    /// marked under `prefix`; a spinner while the clips load, or a line when
+    /// none could be. Returns what was clicked.
+    fn controls(
+        &self,
+        ui: &mut egui::Ui,
+        prefix: &str,
+        timeline: &Timeline,
+    ) -> Option<ReplayAction> {
+        let mut action = None;
+        if let (Some(p), Some(span)) = (&self.playback, timeline.span) {
+            if let Some(t) = scrubber(
+                ui,
+                prefix,
+                span,
+                p.start,
+                timeline.impact,
+                &timeline.events,
+                p.playhead,
+            ) {
+                action = Some(ReplayAction::Seek(t));
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let (icon, hover) = if p.playing {
+                    (theme::Icon::Pause, "Pause")
+                } else {
+                    (theme::Icon::Play, "Play")
+                };
+                let play = theme::icon(ui, icon, 26.0, theme::ACCENT, true).on_hover_text(hover);
+                devices::mark(ui, || format!("{prefix}:play"), &play);
+                if play.clicked() {
+                    action = Some(ReplayAction::Toggle);
+                }
+                for (forward, icon, hover) in [
+                    (false, theme::Icon::ChevronLeft, "Previous frame"),
+                    (true, theme::Icon::ChevronRight, "Next frame"),
+                ] {
+                    let step =
+                        theme::icon(ui, icon, 26.0, theme::ACCENT, true).on_hover_text(hover);
+                    devices::mark(ui, || format!("{prefix}:step:{forward}"), &step);
+                    if step.clicked() {
+                        action = Some(ReplayAction::Step(forward));
+                    }
+                }
+                ui.add_space(8.0);
+                let labels = Speed::ALL.map(Speed::label);
+                let selected = Speed::ALL.iter().position(|s| *s == p.speed).unwrap_or(0);
+                let speed = theme::segmented(ui, &labels, selected, None);
+                devices::mark(ui, || format!("{prefix}:speed"), &speed.response);
+                if let Some(i) = speed.inner {
+                    action = Some(ReplayAction::Speed(Speed::ALL[i]));
+                }
+                ui.add_space(8.0);
+                let looping = theme::pill(ui, p.looping, "Loop");
+                devices::mark(ui, || format!("{prefix}:loop"), &looping);
+                if looping.clicked() {
+                    action = Some(ReplayAction::Loop(!p.looping));
+                }
+            });
+        } else if self.cameras.iter().all(|c| c.clip.error.is_some()) {
+            ui.label(
+                egui::RichText::new("The clips could not be loaded.").color(theme::TEXT_MUTED),
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+            });
+        }
+        action
+    }
+
+    /// Carry out `action` against this update's `timeline`.
+    fn act(&mut self, action: Option<ReplayAction>, timeline: &Timeline) {
+        if let (Some(action), Some(span)) = (action, timeline.span) {
+            self.apply(action, span, &timeline.tracks);
+        }
+    }
+}
+
+/// One camera's column of the inline player: its actor ID, the column's
+/// width and its swing analysis once fetched.
+pub(crate) struct PlayerColumn {
+    pub(crate) camera: String,
+    pub(crate) width: f32,
+    pub(crate) swing: Option<Arc<crate::types::SwingReportFile>>,
+    /// The frame its picture is of: its time after the clip's first frame
+    /// (the time base of the swing report), `None` while the playhead is
+    /// outside the clip or the clip hasn't loaded.
+    pub(crate) frame_t_ns: Option<u64>,
+}
+
+/// How the inline player laid out its columns: the space before the first,
+/// the gap between them, and each column.
+pub(crate) struct PlayerLayout {
+    pub(crate) pad: f32,
+    pub(crate) gap: f32,
+    pub(crate) columns: Vec<PlayerColumn>,
+}
+
+/// Space between two columns of a player.
+pub(crate) const PLAYER_GAP: f32 = 12.0;
+
 impl FlighthookApp {
     /// Open the replay of shot row `i`.
     pub(crate) fn open_replay(&mut self, ctx: &egui::Context, i: usize) {
-        let Some(shot) = self.shots.get(i) else {
+        let Some(view) = self.new_player(ctx, i) else {
             return;
         };
+        self.replay = Some(view);
+    }
+
+    /// A player of shot row `i`'s clips, numbered afresh; `None` when it
+    /// has none.
+    fn new_player(&mut self, ctx: &egui::Context, i: usize) -> Option<ReplayView> {
+        let shot = self.shots.get(i)?;
         if shot.video.is_empty() {
-            return;
+            return None;
         }
         self.replay_seq += 1;
         let actors = &self.actors;
@@ -626,47 +1139,47 @@ impl FlighthookApp {
         };
         let small = ctx.content_rect().width() < SMALL_SCREEN;
         let start = self.settings.replay.start_before_impact_s();
-        self.replay = Some(ReplayView::new(self.replay_seq, shot, name, small, start));
+        let mut view = ReplayView::new(self.replay_seq, shot, name, small, start);
+        // A shot without its own hand takes the game's, as elsewhere.
+        if shot.handed.is_none()
+            && let Some(hand) = self.handed
+        {
+            view.hand = hand;
+        }
+        Some(view)
+    }
+
+    /// How skeletons are drawn now, for a golfer playing with `hand`: not
+    /// at all while body tracking is off.
+    pub(crate) fn pose_draw(&self, hand: crate::types::Handedness) -> PoseDraw {
+        PoseDraw {
+            overlay: self.pose_overlay && self.body_tracking().mode.is_on(),
+            min_score: self.pose_min_score(),
+            hand,
+        }
     }
 
     /// The replay view over the Shots tab, while one is open.
     pub(crate) fn render_replay(&mut self, ctx: &egui::Context) {
+        let Some(hand) = self.replay.as_ref().map(|v| v.hand) else {
+            return;
+        };
+        let draw = self.pose_draw(hand);
+        let mode = self.body_tracking().mode;
         let Some(view) = &mut self.replay else {
             return;
         };
-        let fetches = view.due();
-        #[cfg(not(test))]
-        view.send(ctx, &self.pending, fetches);
-        #[cfg(test)]
-        drop(fetches);
-        let now = ctx.input(|i| i.time);
-        let tracks = view.tracks();
-        let span = crate::replay::span(&tracks);
-        let impact = crate::replay::impact(&tracks);
-        view.tick(now, span);
-        if view.playback.as_ref().is_some_and(|p| p.playing) {
-            ctx.request_repaint();
-        }
+        let timeline = view.prepare(ctx, &self.pending, true, mode);
 
         // As wide as the screen allows, unless the pictures would be taller
         // than their share of its height.
         let n = view.cameras.len().max(1);
-        let gap = 12.0;
+        let gap = PLAYER_GAP;
         let screen = ctx.content_rect().size();
-        let aspect = tracks
-            .iter()
-            .filter(|t| t.width > 0)
-            .map(|t| t.height as f32 / t.width as f32)
-            .fold(9.0 / 16.0, f32::max);
+        let aspect = ReplayView::aspect(&timeline);
         let tallest = (screen.x * VIEW_SHARE - gap * (n as f32 - 1.0)) / n as f32;
         let column = tallest.min(screen.y * PICTURE_SHARE / aspect);
         let width = column * n as f32 + gap * (n as f32 - 1.0);
-        let textures: Vec<Option<egui::TextureHandle>> = (0..view.cameras.len())
-            .map(|i| view.frame_texture(ctx, i))
-            .collect();
-        let errors: Vec<Option<String>> = (0..view.cameras.len())
-            .map(|i| view.camera_error(i))
-            .collect();
         let mut action = None;
         let modal = egui::Modal::new(egui::Id::new("replay"))
             .frame(theme::card().inner_margin(egui::Margin::same(16)))
@@ -688,122 +1201,141 @@ impl FlighthookApp {
                     });
                 });
                 ui.add_space(8.0);
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    for ((cam, tex), error) in view.cameras.iter().zip(&textures).zip(&errors) {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(column, 0.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.set_width(column);
-                                camera_column(
-                                    ui,
-                                    &view.shot_id,
-                                    cam,
-                                    tex.as_ref(),
-                                    error.as_deref(),
-                                    column,
-                                );
-                            },
-                        );
-                    }
-                });
+                view.columns(ui, "replay", column, gap, draw);
                 ui.add_space(10.0);
-                if let (Some(p), Some(span)) = (&view.playback, span) {
-                    if let Some(t) = scrubber(ui, span, p.start, impact, p.playhead) {
-                        action = Some(ReplayAction::Seek(t));
-                    }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let (icon, hover) = if p.playing {
-                            (theme::Icon::Pause, "Pause")
-                        } else {
-                            (theme::Icon::Play, "Play")
-                        };
-                        let play =
-                            theme::icon(ui, icon, 26.0, theme::ACCENT, true).on_hover_text(hover);
-                        devices::mark(ui, || "replay:play".to_owned(), &play);
-                        if play.clicked() {
-                            action = Some(ReplayAction::Toggle);
-                        }
-                        for (forward, icon, hover) in [
-                            (false, theme::Icon::ChevronLeft, "Previous frame"),
-                            (true, theme::Icon::ChevronRight, "Next frame"),
-                        ] {
-                            let step = theme::icon(ui, icon, 26.0, theme::ACCENT, true)
-                                .on_hover_text(hover);
-                            devices::mark(ui, || format!("replay:step:{forward}"), &step);
-                            if step.clicked() {
-                                action = Some(ReplayAction::Step(forward));
-                            }
-                        }
-                        ui.add_space(8.0);
-                        let labels = Speed::ALL.map(Speed::label);
-                        let selected = Speed::ALL.iter().position(|s| *s == p.speed).unwrap_or(0);
-                        let speed = theme::segmented(ui, &labels, selected, None);
-                        devices::mark(ui, || "replay:speed".to_owned(), &speed.response);
-                        if let Some(i) = speed.inner {
-                            action = Some(ReplayAction::Speed(Speed::ALL[i]));
-                        }
-                        ui.add_space(8.0);
-                        let looping = theme::pill(ui, p.looping, "Loop");
-                        devices::mark(ui, || "replay:loop".to_owned(), &looping);
-                        if looping.clicked() {
-                            action = Some(ReplayAction::Loop(!p.looping));
-                        }
-                    });
-                } else if view.cameras.iter().all(|c| c.clip.error.is_some()) {
-                    ui.label(
-                        egui::RichText::new("The clips could not be loaded.")
-                            .color(theme::TEXT_MUTED),
-                    );
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                    });
+                if let Some(a) = view.controls(ui, "replay", &timeline) {
+                    action = Some(a);
                 }
             });
         let close = modal.should_close() || matches!(action, Some(ReplayAction::Close));
-        if let (Some(action), Some(span)) = (action, span) {
-            view.apply(action, span, &tracks);
-        }
+        view.act(action, &timeline);
         if close {
             self.replay = None;
         }
+    }
+
+    /// Keep the inline player on shot row `i`'s clips: a new one when the
+    /// shot or its cameras change.
+    pub(crate) fn sync_shot_player(&mut self, ctx: &egui::Context, i: usize) {
+        let Some(shot) = self.shots.get(i) else {
+            self.shot_player = None;
+            return;
+        };
+        let same = self.shot_player.as_ref().is_some_and(|p| {
+            p.shot_id == shot.shot_id
+                && p.cameras().eq(shot.video.iter().map(|v| v.camera.as_str()))
+        });
+        if same {
+            // Keep it told what has finished since.
+            if let Some(player) = &mut self.shot_player {
+                for (cam, video) in player.cameras.iter_mut().zip(&shot.video) {
+                    cam.video.pose |= video.pose;
+                    cam.video.swing |= video.swing;
+                }
+            }
+            return;
+        }
+        self.shot_player = self.new_player(ctx, i).map(ReplayView::with_swing);
+    }
+
+    /// The inline player in `ui`: the shot's clips side by side, each
+    /// picture at most `max_picture` tall, then the scrubber and transport
+    /// across them. It fetches nothing and holds its clock while the replay
+    /// view is open. Returns its columns, for what goes under them.
+    pub(crate) fn render_shot_player(
+        &mut self,
+        ui: &mut egui::Ui,
+        max_picture: f32,
+    ) -> Option<PlayerLayout> {
+        let hand = self.shot_player.as_ref()?.hand;
+        let draw = self.pose_draw(hand);
+        let mode = self.body_tracking().mode;
+        let active = self.replay.is_none();
+        let ctx = ui.ctx().clone();
+        let view = self.shot_player.as_mut()?;
+        let timeline = view.prepare(&ctx, &self.pending, active, mode);
+        // The playhead the pictures below are drawn at.
+        let playhead = view.playback.as_ref().map(|p| p.playhead);
+        let n = view.cameras.len().max(1) as f32;
+        let gap = PLAYER_GAP;
+        let available = ui.available_width();
+        let aspect = ReplayView::aspect(&timeline);
+        let column = ((available - gap * (n - 1.0)) / n)
+            .min(max_picture / aspect)
+            .max(1.0);
+        let row = column * n + gap * (n - 1.0);
+        let pad = ((available - row) / 2.0).max(0.0);
+        let mut action = None;
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.vertical(|ui| {
+                ui.set_width(row);
+                view.columns(ui, "player", column, gap, draw);
+                ui.add_space(8.0);
+                action = view.controls(ui, "player", &timeline);
+            });
+        });
+        view.act(action, &timeline);
+        let columns = view
+            .cameras
+            .iter()
+            .map(|c| PlayerColumn {
+                camera: c.video.camera.clone(),
+                width: column,
+                swing: c.swing.report.clone().filter(|_| mode.is_on()),
+                frame_t_ns: c
+                    .clip
+                    .track
+                    .as_ref()
+                    .zip(playhead)
+                    .and_then(|(track, t)| track.shown_t_ns(t)),
+            })
+            .collect();
+        Some(PlayerLayout { pad, gap, columns })
+    }
+}
+
+/// A camera's name and position, the position left out when the name reads
+/// the same.
+pub(crate) fn camera_heading(ui: &mut egui::Ui, name: &str, position: CameraPosition) {
+    ui.label(egui::RichText::new(name).strong().color(theme::HEADING));
+    let position = position.label();
+    if !position.eq_ignore_ascii_case(name.trim()) {
+        ui.label(egui::RichText::new(position).color(theme::TEXT_MUTED));
     }
 }
 
 /// One camera's column: its name and position (the position left out when
 /// the name reads the same), its picture at the playhead with `error` over
-/// it when the frame can't be shown, and the clip's download link.
+/// it when the frame can't be shown, and the clip's download icon beside the
+/// name; marked under `prefix`.
+#[allow(clippy::too_many_arguments)]
 fn camera_column(
     ui: &mut egui::Ui,
+    prefix: &str,
     shot_id: &str,
     cam: &Camera,
     tex: Option<&egui::TextureHandle>,
     error: Option<&str>,
     width: f32,
+    draw: PoseDraw,
 ) {
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(&cam.name)
-                .strong()
-                .color(theme::HEADING),
+        camera_heading(ui, &cam.name, cam.video.position);
+        let download = theme::icon(ui, theme::Icon::Download, 20.0, theme::ACCENT, true)
+            .on_hover_text("Download");
+        devices::mark(
+            ui,
+            || format!("{prefix}:download:{}", cam.video.camera),
+            &download,
         );
-        let position = cam.video.position.label();
-        // A camera named after its position is labelled once.
-        if !position.eq_ignore_ascii_case(cam.name.trim()) {
-            ui.label(egui::RichText::new(position).color(theme::TEXT_MUTED));
+        if download.clicked() {
+            ui.ctx().open_url(egui::OpenUrl::same_tab(net::clip_url(
+                shot_id,
+                &cam.video.camera,
+                "avi",
+            )));
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let link =
-                ui.hyperlink_to("Download", net::clip_url(shot_id, &cam.video.camera, "avi"));
-            devices::mark(
-                ui,
-                || format!("replay:download:{}", cam.video.camera),
-                &link,
-            );
-        });
     });
     let aspect = cam
         .clip
@@ -816,14 +1348,31 @@ fn camera_column(
             let shown = picture(ui, tex, width);
             devices::mark(
                 ui,
-                || format!("replay:picture:{}", cam.video.camera),
+                || format!("{prefix}:picture:{}", cam.video.camera),
                 &shown,
             );
+            if let (true, Some(keypoints), Some(track)) =
+                (draw.overlay, cam.shown_keypoints(), &cam.clip.track)
+            {
+                crate::pose::paint(
+                    &ui.painter_at(shown.rect),
+                    [track.width, track.height],
+                    shown.rect,
+                    keypoints,
+                    draw.min_score,
+                    draw.hand,
+                );
+            }
             shown.rect
         }
         None => {
-            let (rect, _) =
+            let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(width, width * aspect), egui::Sense::hover());
+            devices::mark(
+                ui,
+                || format!("{prefix}:picture:{}", cam.video.camera),
+                &response,
+            );
             ui.painter().rect_filled(rect, 6.0, theme::SURFACE_RAISED);
             if error.is_none() {
                 ui.painter().text(
@@ -1276,14 +1825,14 @@ impl FlighthookApp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::replay::tests::track;
     use crate::types::CameraPosition;
 
     const MS: u64 = 1_000_000;
 
-    fn video(camera: &str) -> ShotVideo {
+    pub(crate) fn video(camera: &str) -> ShotVideo {
         ShotVideo {
             camera: camera.to_owned(),
             position: CameraPosition::GolferFront,
@@ -1293,10 +1842,12 @@ mod tests {
             impact_offset_ms: 500,
             complete: true,
             dropped: 0,
+            pose: false,
+            swing: false,
         }
     }
 
-    fn shot(videos: &[&str]) -> ShotRow {
+    pub(crate) fn shot(videos: &[&str]) -> ShotRow {
         ShotRow {
             actor: "mock_monitor.0".into(),
             shot_id: "s1".into(),
@@ -1329,6 +1880,194 @@ mod tests {
             result: stance::sidecar::Sidecar::from_json(&json.to_string())
                 .map_err(|e| e.to_string()),
         }
+    }
+
+    #[test]
+    fn the_inline_player_fetches_each_swing_analysis_once_and_the_modal_none() {
+        let swings = |due: &[Fetch]| {
+            due.iter()
+                .filter_map(|f| match f {
+                    Fetch::Swing(c) => Some(c.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut row = shot(&["camera.0", "camera.1"]);
+        row.video[0].swing = true;
+        let mut modal = ReplayView::new(1, &row, str::to_owned, false, 0.2);
+        modal.mode = BodyTrackingMode::Historical;
+        assert!(swings(&modal.due()).is_empty(), "the modal shows none");
+        modal.swing_ready("camera.1");
+        assert!(swings(&modal.due()).is_empty());
+        let mut inline = ReplayView::new(2, &row, str::to_owned, false, 0.2).with_swing();
+        inline.mode = BodyTrackingMode::Historical;
+        assert_eq!(
+            swings(&inline.due()),
+            ["camera.0"],
+            "the analysed clip only"
+        );
+        assert!(swings(&inline.due()).is_empty(), "once");
+        inline.swing_ready("camera.1");
+        assert_eq!(swings(&inline.due()), ["camera.1"]);
+        // A reply for another player is not taken; a failed one leaves none.
+        let report: crate::types::SwingReportFile = serde_json::from_str(
+            r#"{"version":1,"setup":{"view":"face_on"},"events":{},"metrics":[]}"#,
+        )
+        .unwrap();
+        inline.reply(ReplayReply::Swing {
+            replay: 1,
+            camera: "camera.0".into(),
+            result: Ok(report.clone()),
+        });
+        assert!(inline.cameras[0].swing.report.is_none());
+        inline.reply(ReplayReply::Swing {
+            replay: 2,
+            camera: "camera.0".into(),
+            result: Ok(report),
+        });
+        inline.reply(ReplayReply::Swing {
+            replay: 2,
+            camera: "camera.1".into(),
+            result: Err("404".into()),
+        });
+        assert!(inline.cameras[0].swing.report.is_some());
+        assert!(inline.cameras[1].swing.report.is_none());
+    }
+
+    #[test]
+    fn a_clip_without_keypoints_is_asked_to_be_tracked_once_unless_tracking_is_off() {
+        let asks = |due: &[Fetch]| {
+            due.iter()
+                .filter_map(|f| match f {
+                    Fetch::Analyze(c) => Some(c.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let fetched = |due: &[Fetch]| {
+            due.iter()
+                .filter(|f| matches!(f, Fetch::Pose(_) | Fetch::Swing(_)))
+                .count()
+        };
+        let mut row = shot(&["camera.0", "camera.1"]);
+        row.video[1].pose = true;
+        row.video[1].swing = true;
+        // Off: nothing asked for or fetched, whatever is on disk.
+        let mut view = ReplayView::new(1, &row, str::to_owned, false, 0.2).with_swing();
+        view.mode = BodyTrackingMode::Off;
+        let due = view.due();
+        assert!(asks(&due).is_empty());
+        assert_eq!(fetched(&due), 0);
+        // Historical, and Live alike: the clip without keypoints is asked
+        // for once; the tracked one's files are fetched.
+        for mode in [BodyTrackingMode::Historical, BodyTrackingMode::Live] {
+            let mut view = ReplayView::new(1, &row, str::to_owned, false, 0.2).with_swing();
+            view.mode = mode;
+            let due = view.due();
+            assert_eq!(asks(&due), ["camera.0"], "{mode:?}");
+            assert_eq!(fetched(&due), 2, "{mode:?}");
+            assert!(asks(&view.due()).is_empty(), "once");
+            // Queued: its keypoints follow with shot_pose.
+            view.reply(ReplayReply::Analyzed {
+                replay: 1,
+                camera: "camera.0".into(),
+                done: false,
+            });
+            assert_eq!(fetched(&view.due()), 0);
+            view.pose_ready("camera.0");
+            assert_eq!(fetched(&view.due()), 1);
+        }
+        // Asked again (the models were just downloaded): only the clip
+        // without keypoints, once.
+        let mut view = ReplayView::new(2, &row, str::to_owned, false, 0.2).with_swing();
+        view.mode = BodyTrackingMode::Historical;
+        assert_eq!(asks(&view.due()), ["camera.0"]);
+        assert!(asks(&view.due()).is_empty());
+        view.ask_again();
+        assert_eq!(asks(&view.due()), ["camera.0"]);
+        assert!(asks(&view.due()).is_empty());
+        // Done already (the row was behind): fetched at once.
+        let mut view = ReplayView::new(3, &row, str::to_owned, false, 0.2).with_swing();
+        view.mode = BodyTrackingMode::Historical;
+        assert_eq!(asks(&view.due()), ["camera.0"]);
+        view.reply(ReplayReply::Analyzed {
+            replay: 3,
+            camera: "camera.0".into(),
+            done: true,
+        });
+        assert_eq!(fetched(&view.due()), 2, "keypoints and swing");
+        // A reply for another view changes nothing.
+        let mut other = ReplayView::new(4, &row, str::to_owned, false, 0.2);
+        other.mode = BodyTrackingMode::Historical;
+        let _ = other.due();
+        other.reply(ReplayReply::Analyzed {
+            replay: 3,
+            camera: "camera.0".into(),
+            done: true,
+        });
+        assert!(!other.cameras[0].video.pose);
+    }
+
+    #[test]
+    fn a_tracked_clips_keypoints_are_fetched_once_and_drawn_on_the_frame_shown() {
+        let t = track(1000, 10, 50, 100);
+        let mut row = shot(&["camera.0", "camera.1"]);
+        row.video[0].pose = true;
+        let mut view = ReplayView::new(1, &row, str::to_owned, false, 0.2);
+        view.mode = BodyTrackingMode::Historical;
+        let reply = sidecar(&view, "camera.0", &t);
+        view.reply(reply);
+        let poses = |due: &[Fetch]| {
+            due.iter()
+                .filter_map(|f| match f {
+                    Fetch::Pose(c) => Some(c.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(poses(&view.due()), ["camera.0"], "the tracked clip only");
+        assert!(poses(&view.due()).is_empty(), "once");
+        // The other camera's tracking finishes while the replay is open.
+        view.pose_ready("camera.1");
+        assert_eq!(poses(&view.due()), ["camera.1"]);
+        // Keypoints for every other frame (frame k at k × 10 ms).
+        let frames: Vec<serde_json::Value> = t
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if i % 2 == 0 {
+                    serde_json::json!({"t_ns": f.t_ns, "keypoints": vec![[i as f32, 1.0, 0.9]; 26]})
+                } else {
+                    serde_json::json!({"t_ns": f.t_ns})
+                }
+            })
+            .collect();
+        let file = serde_json::json!({"version": 1, "skeleton": "halpe26", "width": 64,
+            "height": 48, "frames": frames});
+        view.reply(ReplayReply::Pose {
+            replay: 1,
+            camera: "camera.0".into(),
+            result: serde_json::from_value(file).map_err(|e| e.to_string()),
+        });
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "t",
+            egui::ColorImage::filled([2, 2], egui::Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let cam = &mut view.cameras[0];
+        for (frame, nose_x) in [(10, Some(10.0)), (11, None), (24, Some(24.0))] {
+            cam.shown = Some((frame, tex.clone()));
+            assert_eq!(
+                cam.shown_keypoints().map(|k| k[0][0]),
+                nose_x,
+                "frame {frame}"
+            );
+        }
+        // No keypoints for a camera whose file is not in.
+        view.cameras[1].shown = Some((10, tex));
+        assert!(view.cameras[1].shown_keypoints().is_none());
     }
 
     #[test]
@@ -1382,6 +2121,8 @@ mod tests {
         let t = track(1000, 10, 100, 50);
         let span = (t.start_ns, t.end_ns());
         let mut view = ReplayView::new(1, &shot(cameras), str::to_owned, false, 0.3);
+        // The frames alone.
+        view.mode = BodyTrackingMode::Off;
         for camera in loaded {
             let reply = sidecar(&view, camera, &t);
             view.reply(reply);
@@ -1411,7 +2152,7 @@ mod tests {
             .iter()
             .filter_map(|f| match f {
                 Fetch::Frames(c, w, _) => Some((c.clone(), *w)),
-                Fetch::Sidecar(_) => None,
+                Fetch::Sidecar(_) | Fetch::Pose(_) | Fetch::Swing(_) | Fetch::Analyze(_) => None,
             })
             .collect();
         assert_eq!(windows.len(), 2, "{due:?}");
@@ -1463,7 +2204,9 @@ mod tests {
                 .iter()
                 .find_map(|f| match f {
                     Fetch::Frames(_, w, _) => Some(*w),
-                    Fetch::Sidecar(_) => None,
+                    Fetch::Sidecar(_) | Fetch::Pose(_) | Fetch::Swing(_) | Fetch::Analyze(_) => {
+                        None
+                    }
                 })
                 .expect("a window");
             view.reply(ReplayReply::Frames {
@@ -1624,6 +2367,7 @@ mod tests {
             false,
             0.0,
         );
+        view.mode = BodyTrackingMode::Off;
         assert_eq!(
             view.due(),
             [
@@ -1655,6 +2399,7 @@ mod tests {
     #[test]
     fn a_failed_window_is_retried_once_then_its_error_is_shown() {
         let mut view = ReplayView::new(1, &shot(&["camera.0"]), str::to_owned, false, 0.0);
+        view.mode = BodyTrackingMode::Off;
         assert_eq!(view.due(), [Fetch::Sidecar("camera.0".into())]);
         let t = track(0, 10, 100, 50);
         let reply = sidecar(&view, "camera.0", &t);
@@ -1972,5 +2717,386 @@ mod tests {
         assert_eq!(view.textures.capacity(), TEXTURES_SMALL);
         let view = ReplayView::new(1, &shot(&["camera.0"]), str::to_owned, false, 0.0);
         assert_eq!(view.textures.capacity(), TEXTURES);
+    }
+
+    // -----------------------------------------------------------------------
+    // Swing events on the scrubber
+    // -----------------------------------------------------------------------
+
+    /// A swing report with `events` (name, ms after the clip start) and its
+    /// impact source (`refined` found a swing, `given` did not).
+    fn swing_report(events: &[(&str, u64)], source: &str) -> crate::types::SwingReportFile {
+        let mut map = serde_json::Map::new();
+        for (name, ms) in events {
+            map.insert(
+                (*name).to_owned(),
+                serde_json::json!({"t_ns": ms * MS, "frame": 0, "confidence": 0.9}),
+            );
+        }
+        map.insert("impact_source".into(), source.into());
+        serde_json::from_value(serde_json::json!({
+            "version": 1, "view": "face_on", "handed": "right", "events": map, "metrics": []
+        }))
+        .expect("report")
+    }
+
+    fn names(markers: &[Marker]) -> Vec<&'static str> {
+        markers.iter().map(|m| m.0).collect()
+    }
+
+    /// Each event sits at the mean of the times the cameras found it at, on
+    /// the shot timeline (a camera's clip start plus its event time); one
+    /// camera's time stands alone; an event no camera found has no marker;
+    /// impact is the gold tick's, and a camera that found no swing counts
+    /// for nothing.
+    #[test]
+    fn a_marker_is_the_mean_of_the_cameras_that_found_the_event() {
+        let a = swing_report(
+            &[
+                ("address", 100),
+                ("takeaway", 150),
+                ("top", 600),
+                ("impact", 750),
+                ("finish", 900),
+            ],
+            "refined",
+        );
+        let b = swing_report(&[("address", 120), ("top", 640)], "refined");
+        let nothing = swing_report(&[("address", 5000), ("impact", 750)], "given");
+
+        // Two cameras (clips starting 1000 and 1010 ms), an event missing
+        // from one, and a third that found no swing.
+        let markers = swing_markers([(1000 * MS, &a), (1010 * MS, &b), (1000 * MS, &nothing)]);
+        assert_eq!(
+            markers,
+            [
+                ("Address", 1115 * MS),
+                ("Takeaway", 1150 * MS),
+                ("Top", 1625 * MS),
+                ("Finish", 1900 * MS),
+            ]
+        );
+        // One camera: its own times, in swing order.
+        let one = swing_markers([(2000 * MS, &b)]);
+        assert_eq!(one, [("Address", 2120 * MS), ("Top", 2640 * MS)]);
+        // A mean of times 1 ns apart rounds to the nearest ns.
+        let mut c = swing_report(&[("top", 0)], "refined");
+        let mut d = c.clone();
+        c.events.top = Some(flighthook::SwingEvent {
+            t_ns: 10,
+            confidence: 1.0,
+        });
+        d.events.top = Some(flighthook::SwingEvent {
+            t_ns: 11,
+            confidence: 1.0,
+        });
+        assert_eq!(swing_markers([(0, &c), (0, &d)]), [("Top", 11)]);
+        // No reports, or none that found a swing: no markers.
+        assert!(swing_markers(std::iter::empty()).is_empty());
+        assert!(swing_markers([(0, &nothing)]).is_empty());
+        let empty = swing_report(&[], "refined");
+        assert!(swing_markers([(0, &empty)]).is_empty());
+    }
+
+    /// Markers a few pixels apart share one spot, named in swing order and
+    /// seeking to the first; ones further apart stay apart.
+    #[test]
+    fn close_markers_merge_into_one_spot_that_names_both() {
+        let markers = [
+            ("Address", 1000 * MS),
+            ("Takeaway", 1010 * MS),
+            ("Top", 1600 * MS),
+            ("Finish", 1900 * MS),
+        ];
+        // 1 px per 10 ms: address and takeaway are 1 px apart.
+        let x_of = |t: u64| t as f32 / (10.0 * MS as f32);
+        let groups = marker_groups(&markers, x_of);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].0, ["Address", "Takeaway"]);
+        assert_eq!(groups[0].1, 1000 * MS);
+        assert_eq!(groups[1].0, ["Top"]);
+        assert_eq!(groups[2].0, ["Finish"]);
+        // 10 px per 10 ms: all four apart.
+        let wide = marker_groups(&markers, |t| t as f32 / MS as f32);
+        assert_eq!(wide.len(), 4);
+        assert!(marker_groups(&[], x_of).is_empty());
+    }
+
+    /// One pass of `view`'s controls on a 800 wide screen, marked under
+    /// `player`; the playhead after the pass.
+    fn controls_pass(
+        ctx: &egui::Context,
+        view: &mut ReplayView,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> (crate::panels::devices::Marks, Vec<String>) {
+        use crate::panels::devices::Marks;
+        ctx.data_mut(|d| d.remove::<Marks>(egui::Id::NULL));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 200.0),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let pending = net::new_pending();
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let timeline = view.prepare(ctx, &pending, true, BodyTrackingMode::Historical);
+                let action = view.controls(ui, "player", &timeline);
+                view.act(action, &timeline);
+            });
+        });
+        let marks = ctx
+            .data(|d| d.get_temp::<Marks>(egui::Id::NULL))
+            .unwrap_or_default();
+        let mut texts = Vec::new();
+        fn collect(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, texts)),
+                _ => {}
+            }
+        }
+        for clipped in &out.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        (marks, texts)
+    }
+
+    /// A view of two cameras with the clips from 1000 to 1990 ms (the
+    /// second a 20 ms later start), each with its swing report.
+    fn view_with_swings() -> ReplayView {
+        let mut view = ReplayView::new(
+            1,
+            &shot(&["camera.0", "camera.1"]),
+            str::to_owned,
+            false,
+            0.3,
+        );
+        view.mode = BodyTrackingMode::Historical;
+        let (first, second) = (track(1000, 10, 100, 50), track(1020, 10, 100, 50));
+        for (camera, t) in [("camera.0", &first), ("camera.1", &second)] {
+            let reply = sidecar(&view, camera, t);
+            view.reply(reply);
+        }
+        view
+    }
+
+    /// The scrubber carries a marker for each event the reports found, at
+    /// the mean time, none for impact, hover names the event, and a click
+    /// seeks to it.
+    #[test]
+    fn the_scrubber_marks_the_events_names_them_on_hover_and_seeks_on_a_click() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut view = view_with_swings();
+        let events = [("address", 100), ("takeaway", 150), ("top", 500)];
+        view.cameras[0].swing.report = Some(Arc::new(swing_report(&events, "refined")));
+        let mut other = events.to_vec();
+        other.pop();
+        other.push(("finish", 800));
+        view.cameras[1].swing.report = Some(Arc::new(swing_report(&other, "refined")));
+
+        controls_pass(&ctx, &mut view, Vec::new(), 0.0);
+        let (marks, _) = controls_pass(&ctx, &mut view, Vec::new(), 0.1);
+        let mut found: Vec<&str> = marks
+            .keys()
+            .filter_map(|k| k.strip_prefix("player:event:"))
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, ["address", "finish", "takeaway", "top"]);
+        assert!(!marks.contains_key("player:event:impact"), "the gold tick");
+
+        // The scrubber spans 1000 to 2010 ms; the track is inset 8 px.
+        let scrubber = marks["player:scrubber"].0;
+        let (left, width) = (scrubber.left() + 8.0, scrubber.width() - 16.0);
+        let at = |ms: f32| left + (ms - 1000.0) / 1010.0 * width;
+        let x = |name: &str| marks[&format!("player:event:{name}")].0.center().x;
+        // Address: the mean of 1000+100 and 1020+100 = 1110 ms. Top: one
+        // camera, 1000+500. Finish: one camera, 1020+800.
+        assert!((x("address") - at(1110.0)).abs() < 0.6, "{}", x("address"));
+        assert!((x("top") - at(1500.0)).abs() < 0.6);
+        assert!((x("finish") - at(1820.0)).abs() < 0.6);
+        assert!(x("address") < x("takeaway") && x("takeaway") < x("top"));
+        for name in ["address", "takeaway", "top", "finish"] {
+            let rect = marks[&format!("player:event:{name}")].0;
+            assert!(rect.height() >= scrubber.height() - 0.5, "{name}");
+        }
+
+        // Hover names the event and nothing else.
+        let top = marks["player:event:top"].0.center();
+        let mut texts = Vec::new();
+        for (i, t) in [0.0, 0.3, 1.2, 1.4].into_iter().enumerate() {
+            let moved = if i == 0 {
+                vec![egui::Event::PointerMoved(top)]
+            } else {
+                Vec::new()
+            };
+            texts = controls_pass(&ctx, &mut view, moved, 2.0 + t).1;
+        }
+        assert!(texts.iter().any(|t| t == "Top"), "{texts:?}");
+        for other in ["Address", "Takeaway", "Finish", "Impact"] {
+            assert!(!texts.iter().any(|t| t == other), "{other}: {texts:?}");
+        }
+
+        // A click seeks there.
+        let button = |pressed| egui::Event::PointerButton {
+            pos: top,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        controls_pass(&ctx, &mut view, vec![button(true)], 3.0);
+        controls_pass(&ctx, &mut view, vec![button(false)], 3.1);
+        assert_eq!(playhead(&view), 1500 * MS);
+    }
+
+    /// No marker without a swing report that found a swing, nor with body
+    /// tracking off.
+    #[test]
+    fn no_markers_without_a_report_that_found_a_swing() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut view = view_with_swings();
+        let has_events = |marks: &crate::panels::devices::Marks| {
+            marks.keys().any(|k| k.starts_with("player:event:"))
+        };
+        let pass = |view: &mut ReplayView| {
+            controls_pass(&ctx, view, Vec::new(), 0.0);
+            controls_pass(&ctx, view, Vec::new(), 0.1).0
+        };
+        // Still analysing, failed, or not fetched: no reports.
+        let marks = pass(&mut view);
+        assert!(marks.contains_key("player:scrubber"));
+        assert!(!has_events(&marks));
+        // A report with no swing found: none.
+        view.cameras[0].swing.report = Some(Arc::new(swing_report(
+            &[("address", 100), ("top", 500)],
+            "given",
+        )));
+        assert!(!has_events(&pass(&mut view)));
+        // One that found a swing: markers; and not in Off.
+        view.cameras[0].swing.report = Some(Arc::new(swing_report(
+            &[("address", 100), ("top", 500)],
+            "refined",
+        )));
+        assert!(has_events(&pass(&mut view)));
+        assert_eq!(names(&view.swing_markers()), ["Address", "Top"]);
+        view.mode = BodyTrackingMode::Off;
+        assert!(view.swing_markers().is_empty());
+    }
+
+    /// One pass of `view`'s columns, 300 px each, on a 800×400 screen.
+    fn columns_pass(
+        ctx: &egui::Context,
+        view: &mut ReplayView,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> (crate::panels::devices::Marks, egui::FullOutput) {
+        use crate::panels::devices::Marks;
+        ctx.data_mut(|d| d.remove::<Marks>(egui::Id::NULL));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 400.0),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let draw = PoseDraw {
+            overlay: false,
+            min_score: 0.3,
+            hand: crate::types::Handedness::Right,
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                view.columns(ui, "player", 300.0, 12.0, draw);
+            });
+        });
+        let marks = ctx
+            .data(|d| d.get_temp::<Marks>(egui::Id::NULL))
+            .unwrap_or_default();
+        (marks, out)
+    }
+
+    /// Each camera's title row ends in a download icon right beside the
+    /// title, not a link at the far right; it says "Download" on hover and a
+    /// click opens the clip's URL.
+    #[test]
+    fn a_download_icon_follows_each_camera_title_and_opens_the_clip() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut view = ReplayView::new(
+            1,
+            &shot(&["camera.0", "camera.1"]),
+            |id| format!("Cam {id}"),
+            false,
+            0.3,
+        );
+        columns_pass(&ctx, &mut view, Vec::new(), 0.0);
+        let (marks, _) = columns_pass(&ctx, &mut view, Vec::new(), 0.1);
+        for camera in ["camera.0", "camera.1"] {
+            let icon = marks[&format!("player:download:{camera}")].0;
+            let picture = marks[&format!("player:picture:{camera}")].0;
+            assert!(icon.bottom() <= picture.top() + 0.5, "{camera}: title row");
+            assert!(
+                icon.left() > picture.left() && icon.left() - picture.left() < 200.0,
+                "{camera}: beside the title, not at the far right: {icon:?}"
+            );
+            assert!(
+                icon.right() < picture.right() - 40.0,
+                "{camera}: not at the right edge"
+            );
+            assert!((icon.width() - icon.height()).abs() < 0.5, "an icon");
+        }
+
+        // Hover: just "Download".
+        let over = marks["player:download:camera.0"].0.center();
+        let mut shapes = Vec::new();
+        for (i, t) in [1.0, 1.3, 2.2, 2.4].into_iter().enumerate() {
+            let moved = if i == 0 {
+                vec![egui::Event::PointerMoved(over)]
+            } else {
+                Vec::new()
+            };
+            shapes = columns_pass(&ctx, &mut view, moved, t).1.shapes;
+        }
+        let mut texts = Vec::new();
+        fn collect(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, texts)),
+                _ => {}
+            }
+        }
+        for clipped in &shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|t| t == "Download"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Download ")), "{texts:?}");
+
+        // A click opens the clip.
+        let button = |pressed| egui::Event::PointerButton {
+            pos: over,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        columns_pass(&ctx, &mut view, vec![button(true)], 3.0);
+        let (_, out) = columns_pass(&ctx, &mut view, vec![button(false)], 3.1);
+        let opened: Vec<String> = out
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, [net::clip_url("s1", "camera.0", "avi")]);
     }
 }

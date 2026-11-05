@@ -56,6 +56,11 @@ address = "127.0.0.1:921"
 - `[webserver.<idx>]` -- web server instance
 - `[replay]` -- global camera clip settings (beta: `keep_shots`, `pre_roll_s`, `post_roll_s`, `start_before_impact_s`, `clip_dir`), omitted at its defaults
   like `[simulation]`
+- `[body_tracking]` -- body tracking on the cameras' pictures (alpha:
+  `mode`, `model`, `min_score`, `smoothing`, `detect_every`,
+  `golfer_height`), each field
+  omitted at its default and the section with them (see
+  [Body tracking](#body-tracking-alpha))
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
 - Radar settings (ball_type, tee_height, etc.) are per-mevo only. A Mevo+ gets
   them through ironsight (`SessionConfig::to_avr_settings` → `MevoSettings` →
@@ -134,10 +139,28 @@ Any difference rewrites the file, including values the file spells out at
 their defaults where the save leaves them out and keys the config doesn't
 read: a deliberate one-time normalisation. The rewritten text is the save
 format, which parses back to the same config, so the next start finds no
-difference. A file that fails to parse, or can't be read, is not written at
-startup; the defaults are used (and a later settings save replaces it). A failed backup or rewrite logs a warning and the app
+difference. A failed backup or rewrite logs a warning and the app
 runs on the config it loaded. Every save (`save_to`) uses the same atomic
 write.
+
+A file that fails to parse, or can't be read (any error but "not found"), is
+not written at startup; the defaults are used. A fallback to the older
+format is tried only for a file with a singleton `[webserver]` table, so a
+fault in any other file (an unknown `[body_tracking]` `mode`, say) fails the
+load instead of loading with the sections the older format doesn't know
+dropped. `SystemConfig` keeps the fault as a `ConfigLoadError` (the file's
+path, and the line, column and message, or the read error) and
+`GET /api/status` reports it as `config_error`, so the dashboard shows an
+error frame over every tab: one line saying the file couldn't be read and the
+defaults are in use, then the path and the error. The first save over such a
+file, from a settings request or from the app itself, copies it first to the
+`config.pre-<version>.toml` backup the migration uses (the file as it is on
+disk then, never overwriting an older backup), logs the backup's path at
+`warn`, and clears the error, so the frame goes away with the next status
+read; only then is the file replaced. A settings request that can't make the
+copy answers `500` and saves nothing; an internal save skips the write. The
+backup's path goes to the log only: the frame is gone once the save has made
+the copy, so there is no frame left to show it in.
 
 ### Default config and setup wizard
 
@@ -165,6 +188,7 @@ pub struct FlighthookConfig {
     pub putting_clubs: Vec<Club>,
     pub simulation: SimulationSection,     // [simulation], omitted at defaults
     pub replay: ReplaySection,             // [replay], omitted at defaults
+    pub body_tracking: BodyTrackingSection, // [body_tracking], omitted at defaults
     pub webserver: HashMap<String, WebserverSection>,
     pub mevo: HashMap<String, MevoSection>,
     pub r10: HashMap<String, R10Section>,
@@ -180,7 +204,7 @@ pub struct FlighthookConfig {
 pub struct ReplaySection { pub keep_shots: u32, pub pre_roll_s: f64, pub post_roll_s: f64, pub start_before_impact_s: f64, pub clip_dir: Option<String> }  // 20, 4.0, 1.5, 2.0, None
 pub struct CameraSection { pub name: String, pub camera: String, pub camera_name: Option<String>, pub position: CameraPosition, pub mode: String }  // mode "auto" | "WxH@fps"
 pub enum CameraPosition { TargetLine, GolferFront, GolferBack, Overhead }  // default GolferFront
-pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface }
+pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface, pub auto_chip: bool }  // auto_chip default false
 pub enum SimMode { Off, On, Force }                 // default On
 pub enum SimSurface { Fairway, Green, FirmGreen }
 pub struct WebserverSection { pub name: String, pub bind: String }
@@ -307,6 +331,8 @@ pub enum FlighthookEvent {
     ShotVideo { keys: Vec<ShotKey>, position: CameraPosition, duration_ms: u64, fps: f64,
                 trigger_offset_ms: i64, impact_offset_ms: i64, complete: bool, dropped: u32 },  // a camera clip (beta)
     ShotVideoRemoved { keys: Vec<ShotKey> },                          // these shots' clips are gone (beta)
+    ShotPose { keys: Vec<ShotKey> },                                  // a camera clip's keypoints are written (alpha)
+    ShotSwing { keys: Vec<ShotKey> },                                 // a camera clip's swing analysis is written (alpha)
 }
 ```
 
@@ -726,6 +752,7 @@ pub enum ConfigAction {
     UpsertCamera { index: String, section: CameraSection },
     Remove { id: String },                          // "mevo.0", "openconnect_client.1", "webserver.0", etc.; "gspro.N" = "openconnect_client.N"
     SetShotGrouping { mode: ShotGrouping },         // POST /api/shots/grouping, WS `grouping`
+    SetBodyTracking { section: BodyTrackingSection },  // POST /api/settings?scope=body_tracking
     Reconnect { id: String },                       // POST /api/actors/{id}/reconnect
 }
 
@@ -742,7 +769,8 @@ wildcard arm.
 The POST handlers (`/api/settings`, `/api/shots/grouping`) use request-reply:
 emit `ConfigCommand` with a `request_id`, subscribe to the bus, and wait for
 `ConfigOutcome` with the matching ID. `SetShotGrouping` persists the default
-view and reconciles no actor; no set changes. `/api/settings` answers `400`
+view and reconciles no actor; no set changes. `SetBodyTracking` persists the
+`[body_tracking]` section alone and reconciles no actor (it is read live). `/api/settings` answers `400`
 for an unknown scope and `504` when no `ConfigOutcome` arrives within
 `CONFIG_TIMEOUT` (`web/routes.rs`): the longest stop wait of any actor
 (`actors::MAX_STOP_WAIT`, the ExPutt's 18s) plus 4s, so 22s. A command stops
@@ -1113,6 +1141,10 @@ its own, frames going into a bounded ring) and loops:
 - `ClipRecorder::poll` runs every pass, so clips finish when frames stop;
 - every 500 ms the newest frame goes to the actor's slot in
   `SystemState::cameras`, for the still;
+- while the slot is watched (below), the newest frame of the pass goes to
+  its live slot, at most `LIVE_FPS` (15) a second, or with body tracking
+  in Live mode through the camera's body tracking worker, which puts it
+  there with its pose (see [Body tracking](#body-tracking-alpha));
 - every 2 s, telemetry (`fps`, `dropped`, `position`) goes out in an
   `actor_status`, only when it changed; `fps` moves only when the measured
   rate is 2 % of the mode's rate (at least 1 fps) away from the value last
@@ -1137,6 +1169,146 @@ platform has no camera backend (macOS) the actor reports `disconnected` with
 `error: "cameras are not supported on macOS yet"` and waits to be stopped.
 `reconfigure` restarts the actor when `camera` or `mode` changed; the name,
 `camera_name` (used at the next open) and position are read live.
+
+### Live frames
+
+The Shots tab's Live view shows each camera live through the actor's **live slot** in
+`SystemState::cameras` (`state/cameras.rs`): one frame, the JPEG as the
+camera sent it, with a sequence number and its time. The number counts up
+over every camera's live frames and never repeats while the server runs;
+the time is the frame's host time less the camera's latency
+(`stance::clock` nanoseconds, the clock of the clips' sidecars).
+
+- **Watched.** Each `GET /api/cameras/{actor}/live` marks the camera
+  watched (`Cameras::watch_live`). The actor fills the live slot only while
+  a request came within the last 3 s (`LIVE_WATCH`), so an unwatched camera
+  costs nothing beyond the still. A request after a lapse empties the slot
+  first, so a new viewer never gets a frame from an earlier viewing; a
+  camera that stops (lost or reopened) empties it too.
+- **Rate.** At most 15 frames a second (`LIVE_FPS`) go to the slot, on a
+  schedule of one per 1/15 s (`camera::LiveGate`): a faster camera's frames
+  in between are left out, a slower camera's all go, and a schedule more
+  than an interval behind restarts from the frame at hand. Only the newest
+  frame of a capture pass is a candidate.
+- **Long poll.** The slot is a `tokio::sync::watch` channel. The route
+  answers at once when the slot holds a frame numbered above `after`, else
+  waits for one up to 1 s (`LIVE_WAIT`) and answers `204`. At most 8
+  requests (`LIVE_WAITERS`) wait on one camera; one more gets `503` at
+  once. Every request is answered within the wait, so nothing waits
+  unbounded, and no frame goes on the bus.
+
+The still slot and its route are separate and unchanged by watching.
+
+The **Cameras pane** (`ui/src/panels/cameras.rs`) is part of the Shots
+tab's Cards view, shown when the server can record from cameras
+(`cameras_supported`, as for the Devices tab's Cameras (+)) and the saved
+config has a camera (`FlighthookApp::cameras_shown`). The toolbar gets a
+**Data | Cameras** switch as its first control (`ShotsPane`, kept in local
+UI storage under `shots_pane`). Right of it the Cards | Table switch shows
+while Data is showing; while the Cameras pane shows (`cameras_pane_shown`)
+an on/off **Live** switch takes its slot (`render_live_toggle`,
+`theme::switch_pill`, `live_selected`). With Cameras picked the pane takes
+everything right of the shot list: the Dispersion column and the bottom
+chart row are not laid out, and the card row's camera clips are dropped.
+Live is part of the Cameras pane: picking Data leaves Live, picking a shot
+leaves Live, turning Live off shows the shot the list shows, and a new shot
+keeps Live (the newest shot is selected underneath, as in Data). The Table
+view has neither switch.
+
+Each time the pane comes on screen (`sync_cameras_pane`, comparing with
+`cameras_pane_was_shown`; called at the start of each update, in the
+toolbar after the Data | Cameras switch and after the toolbar, so a click
+that shows the pane is applied before it draws), the shot focus follows the
+latest shot again (any pin dropped) and Live is turned on exactly when
+there is then no shot to show under the device filter. Clear history marks
+the pane as not shown, so a pane on screen turns Live on.
+
+- **A shot** (`render_shot_cameras`): the shot's header (number, LATEST /
+  Back to latest, Replay), then the inline player (`FlighthookApp::
+  shot_player`, a `replay::ReplayView` made `with_swing`, kept while the
+  shown shot and its cameras stay the same): the clips side by side, each
+  picture at most 62 % of the pane's height, the replay's scrubber and
+  transport across them, looping from the start point with the skeleton.
+  Besides the green start tick and the gold impact tick, the scrubber has a
+  small grey tick for each swing event the reports found other than impact
+  (`swing_markers` in `panels/replay.rs`: address, takeaway, top, finish),
+  at the mean over the cameras that found it of the camera's clip start plus
+  the event's `t_ns` (the impact tick's time base); an event no report found
+  has none, and none shows with body tracking Off or while no report has a
+  swing. Markers under 6 px apart share one hover (the names, in swing order)
+  and one click (which seeks to the first); hover shows the event name, a
+  click seeks there (marks `<prefix>:event:<name>`, lower case, `+` between
+  merged names). The replay modal fetches no reports and so shows none.
+  It holds its clock and fetches nothing while the replay modal is open.
+  Under the columns, the swing analysis, fetched once per clip when
+  `video[].swing` is set or `shot_swing` arrives: one row of tempo tiles
+  across all the columns (the tempo of the cameras that measured one,
+  averaged: the mean backswing and downswing, and the ratio of those means;
+  one camera shows its own; mark `swing_tempo`), right under it one row of
+  six tiles of the same style and width with the body at the playhead
+  (`frame_tiles` / `frame_row`, mark `frame_metrics`, `frame_metric:<id>` per
+  tile): Hip turn, Shoulder turn, Hip sway (`hip_sway`), Head sway
+  (`head_lateral`) from face-on reports, Forward bend
+  (`spine_forward_bend`) and Hip depth (`early_extension`) from
+  down-the-line reports; with no down-the-line report the spine tile is
+  face-on `lateral_spine_tilt` ("Side bend"). The labels (`metric_label`,
+  the tiles, the live posture tiles) name what is measured.
+  Each report is sampled from its `series` at the frame its picture shows:
+  `render_shot_player` takes the playhead the pictures are drawn at and
+  returns, per column, `Track::shown_t_ns` (the sidecar `t_ns` of
+  `Track::frame_at(playhead)`, `None` before the clip's first frame or after
+  its last); `SwingReportFile::sample(id, t_ns)` takes the nearest series
+  frame (none outside the series) and the centimetres from `scale`. Several
+  reports of one view average; a tile with no value is a dash. Formatting is
+  the metrics table's (`metric_shown`). Then under each column that
+  camera's metrics at address, top and impact
+  (degrees whole; `torso` metrics in inches or centimetres by the Units
+  switch when the report has `cm`, else as a share of the torso). The
+  shifts from address show their magnitude and a direction word
+  (`direction_word`, none when the value shows as 0): `hip_sway` and
+  `head_lateral` (signed towards the target) from `signs::target`
+  (`Toward` / `Away`), `early_extension` (signed towards the ball) from
+  `signs::ball` (`Toward ball` / `Back`) and `head_vertical` (signed up)
+  from `signs::rise` (`Up` / `Down`), painted after the
+  value on its baseline at the Cards view's sign-word size, shrinking to the
+  cards' floor before the numeral does (`worded_value`, shared by the tiles
+  and the table). A report
+  whose `impact_source` is `given` (no swing found near the impact) shows
+  only the line "No swing found in this clip" there, in the clip status
+  lines' style. The table has Hip turn and Shoulder turn and leaves out
+  `hip_width_proxy` and `loss_of_posture` (the Forward bend row's change
+  from address), which stay in the file. The UI reads the file through
+  lenient mirror types (`SwingReportFile`, with `scale` and `series`; a
+  series of the wrong length is dropped, a file without one reads with an
+  empty one), which also read the earlier layout with the view in a `setup`
+  object and the `hip_width_ratio` id, and leave out the `sway` and `slide`
+  ids (metrics and series). The pane
+  scrolls (a solid bar) when the numbers don't fit. A shot without clips
+  shows each saved camera's status in its picture's place.
+- **Live** (`render_live`): the saved cameras side by side, each fitted to
+  the pane at its aspect under its name and position, with room left for
+  the posture tiles and the readout line. Each camera has a `LiveView` with
+  its own fetch loop: the next request goes out on the screen update after
+  the last one is answered, asking `after` the newest frame it holds; a
+  frame is decoded (`ensure_huffman` + zune-jpeg) into the view's texture on
+  the next update, and only a frame asks for a repaint. A failed request
+  waits 1 s. The views exist only while Live is on screen (the Shots tab,
+  the Cards view, Live on, the window not minimised, not a hidden
+  browser tab); otherwise they are dropped and their late replies ignored.
+  A camera that is not Connected shows its Devices card's badge and `error`
+  instead of a picture. Each picture carries the skeleton of the pose that
+  came with it, and under it the posture tiles of the camera's view from the
+  same `X-Pose` (golfer_front: Side bend, Shoulder tilt, Lead elbow;
+  target_line: Forward bend, Lead knee flex, Trail knee flex, Trail elbow;
+  none for
+  golfer_back and overhead). A readout line under the row names the body
+  tracking values and each camera's live rate and pose time (see
+  [Body tracking](#body-tracking-alpha)).
+
+Keys: while the pane is on screen and neither a text field nor a dialog has
+the keyboard, it takes the presses bound in `cameras::KEY_BINDINGS` before
+any widget sees them, each in its scope: the tuning keys on Live only, `B`
+on Live and on a shot's clips. The zoom shortcuts are applied before it.
 
 ### Frame restamping (latency)
 
@@ -1255,12 +1427,15 @@ Each web server stamps a `shot_video` onto the shots it names, found by
 `shot_id` whatever actor took them: a pending shot keeps it until
 `shot_finished`, a stored shot gets it in `data.video` (one entry per camera,
 replacing that camera's earlier one). `shot_video_removed` clears `video` on
-its shots. Routes (`web/routes.rs`):
+its shots, `shot_pose` sets `pose` on its camera's entry and `shot_swing`
+sets `swing`. Routes
+(`web/routes.rs`):
 
 - `GET /api/shots/{shot_id}/video`: the clip's finished cameras
   (`ClipStore::videos`).
-- `GET /api/shots/{shot_id}/video/{camera}.json | .avi`: a finished
-  camera's sidecar or AVI (`ClipStore::file`: only cameras the store
+- `GET /api/shots/{shot_id}/video/{camera}.json | .avi | .pose.json | .swing.json`:
+  a finished camera's sidecar, AVI, keypoints or swing analysis
+  (`ClipStore::file`: only cameras the store
   recorded as finished, so no path from the URL reaches the file system),
   served by tower-http's `ServeFile` with `Range` support and
   `Cache-Control: private, no-cache`.
@@ -1269,10 +1444,267 @@ its shots. Routes (`web/routes.rs`):
   actors' slots; stance never opens a held camera to list it; the
   test picture (`TestPattern::camera_info`) last.
 - `GET /api/cameras/{actor}/still`: the slot's newest JPEG, `no-store`.
+- `GET /api/cameras/{actor}/live?after=<seq>`: the live slot's frame
+  numbered above `after` (see [Live frames](#live-frames)), with
+  `X-Frame-Seq`, `X-Frame-Time-Ns` and `no-store`, the frame's pose in
+  `X-Pose` when body tracking ran on it, and body tracking's state in
+  `X-Pose-State` / `X-Pose-Error` (on the `204` too); `204` after 1 s
+  without one, `404` when `actor` is not a configured camera, `503` when
+  8 requests already wait on it. An `after` above every number this
+  process has given out (a viewer from before a restart) counts as 0, and
+  the UI takes a frame numbered below its last one, so a view survives a
+  server restart.
+- `GET /api/shots/{shot_id}/video/{camera}.pose.json` and `.swing.json`: a
+  camera clip's keypoints, and its swing analysis, once each is done,
+  served like the `.avi`.
+- `POST /api/shots/{shot_id}/video/{camera}/analyze`: track that clip now
+  for a viewer (`pose::clips::request`): `202 {"state":"queued"}`, `200
+  {"state":"done"}` when its keypoints are there, `409` in Off mode, `404`
+  without the clip.
 - `GET /api/status`: `cameras_supported` (`stance::camera::SUPPORTED`)
   and `clip_dir`.
 
 The export and `/api/shots/convert` drop `video`.
+
+### Body tracking (alpha)
+
+The golfer's keypoints on the cameras' pictures, live and over each shot's
+clips, found on this computer's CPU by stance's `pose` feature: a
+YOLOX-Tiny person detector finds the golfer, RTMPose-m or -s finds 26 Halpe
+keypoints in that box (tract, pure Rust, no native libraries); and golf
+numbers measured on them by stance's golf analysis (`stance::golf`): each
+recorded swing's events, tempo and metrics, and the live posture. The code
+is `app/src/pose/` (`models.rs`, `live.rs`, `clips.rs`, `priority.rs`,
+`swing.rs`, the one module that calls `stance::golf`), held in `SystemState::pose`. `[body_tracking]` is read live
+through `SystemConfig::body_tracking()` (out-of-range values at their
+defaults): no change restarts a camera.
+
+| Field | Default | Range | Used by |
+| --- | --- | --- | --- |
+| `mode` | `"off"` | `"off"` \| `"historical"` \| `"live"` | everything below |
+| `model` | `"rtmpose-m"` | `"rtmpose-m"` \| `"rtmpose-s"` | live and recorded |
+| `min_score` | 0.3 | 0 to 1 | drawing (UI): keypoints below it are hidden |
+| `smoothing` | 1.0 | 0 (off), or 0.1 to 10 Hz | live only: One Euro cutoff at rest |
+| `detect_every` | 10 | 1 to 60 | live only: frames between detections |
+| `golfer_height` | unset | 100 to 250 cm | swing analysis: distances in cm |
+
+Out-of-range values are refused with `400` on save (`BodyTrackingSection::error`)
+and replaced by their default, with a warning, from the file. `mode` is an
+enum like `model`: an unknown value is an invalid body (the JSON extractor's
+`4xx`) or an unparsable file. A section with `enabled` and no `mode`
+(`BodyTrackingRaw`, `#[serde(from)]`) reads `false` as `off` and `true` as
+`historical`; a section with neither is `off`. Only `mode` is written, so
+such a file is brought up to date with a backup at load, and a config
+without the section stays byte-identical. The Body
+tracking card (General) edits `mode`, `model` and `golfer_height` (typed
+in inches with imperial default units, centimetres with metric; stored in
+centimetres); the Live keys tune the rest and save through
+`POST /api/settings?scope=body_tracking` (`SetBodyTracking`: that section
+alone, so a tuning key never writes another setting).
+
+**Modes.** `mode` decides what runs:
+
+| Mode | Live views | Recorded clips | Models |
+| --- | --- | --- | --- |
+| `off` | pictures only | none | never wanted; let go on entering Off |
+| `historical` | pictures only | a clip when a viewer asks for it (`POST .../analyze`), at once | wanted by the first clip asked for |
+| `live` | tracked while watched | every clip, queued when saved, 3 s delay; also any clip a viewer asks for | wanted by each camera at start and every 2 s |
+
+The camera actor reads the mode per frame (`LiveRoute`: a worker only in
+Live; leaving Live drops it at the next frame) and per saved clip (a
+`ClipJob` only in Live). After every config command the system actor calls
+`BodyTracking::follow` with the settings in effect: on entering Off it drops
+every queued clip (`ClipQueue::clear`; a pass already running finishes),
+lets the models go (`Models::unload`: the map is emptied and a generation
+counter moves, so a load running now stores nothing when it ends; instances
+already made keep their weights until dropped), stops a model download
+(`Models::cancel_download`) and forgets the cameras' live failures. A queued recorded clip whose turn comes outside
+Live is skipped (`clips::wanted`); a viewer's clip runs in Historical and
+Live.
+
+**Models** (`pose::models`). Stored in `<local data dir>/flighthook/models/`
+beside the default clip folder, as `<name>.onnx`. Nothing is ever downloaded
+on its own: no mode, camera start, clip, retry or startup path fetches a
+file. A model is loaded the first time it is wanted, on a thread of its own
+(`pose-models:<model>`), one load at a time, once both its files are in the
+folder and match their SHA-256 (`Source::verified`; the official source
+remembers each file's result by size and modification time, so a file is
+hashed once until it changes). A file missing or mismatched leaves the model
+`Missing` (logged once, info): it is not tried again until the files are
+there, which every later `want` checks by stat alone. A load that fails on
+files that are there is `Failed` until the models are let go or a download
+finishes. In Live mode each camera actor asks for the model in effect when
+its capture starts and every 2 s, so the models are ready before anyone
+watches; in Historical mode the first clip a viewer asks for does, and the
+clip waits for the load (a clip whose models are missing or failed is left
+untracked; the viewer asks again on its next view). stance's loaded models
+are not `Sync`, so they sit behind a mutex (`models::Shared`) and every user
+takes its own instances with `fork`, which share the weights; no file is
+read twice. Asking for a model lets go of the other one once it is loaded
+and unused (only the map holds it; instances already made keep their
+weights).
+
+**Model downloads** (`Models::download`, `cancel_download`, `files`). The
+only download path is `POST /api/body_tracking/models/download`, which the
+UI sends after the user confirms the download dialog. It fetches the files
+the configured model lacks, one after the other, on a `pose-download`
+thread, through stance's `fetch_model_with` (OpenMMLab's zip for RTMPose,
+Megvii's GitHub release for YOLOX; HTTPS, hash-verified, written through a
+`.part` file and a rename) with a progress callback and a cancel flag. One
+download runs at a time: a POST while one runs starts nothing (`202`), a
+POST with every file there answers `200`. Its progress (per file: bytes done
+and the response's length, the model's size until it is known; the file
+being fetched; overall done and total) is kept in a slot that
+`GET /api/body_tracking/models` reads (`BodyTrackingModels`: `missing`,
+`downloading`, `ready` or `failed`, the files with their labels, hosts,
+sizes and whether they are there, and the folder). The UI polls it at
+about 4 Hz while its overlay is open; nothing goes on the bus.
+`DELETE /api/body_tracking/models/download` (and entering Off) sets the
+cancel flag and empties the slot at once; the download's thread notices
+between two reads, stance deletes the partial file, and the state is
+`missing` again with no error. A failed download keeps its error for that
+model (`failed`) until the next download or a cancel. When a download
+finishes, every `Missing` or `Failed` model entry is dropped, so the next
+`want` loads. A `.part` file unwritten for 10 min, left by a process stopped
+mid-download, is deleted before the next download. Tests never reach the
+network: `SystemState` in tests has an empty models folder of its own and a
+stand-in source (`models::fake`), which writes a placeholder file in steps,
+honours the cancel flag and can be made to fail.
+
+**Live** (`pose::live`). While a camera's live view is watched and body
+tracking is in Live mode, the camera actor runs a worker thread `pose:camera.N` and
+offers it every frame through a one-frame handoff (`LiveWorker::offer`):
+each offer replaces the frame waiting, which is skipped, never queued. The
+worker takes the newest frame when it is free, at most 15 a second (one
+start per 1/15 s), decodes it, runs stance's `PoseTracker` (detection on
+the first frame, every `detect_every` frames and when the golfer is lost;
+otherwise a crop around the last keypoints; inference on up to 4 cores),
+smooths the keypoints with a One Euro filter per coordinate at the
+`smoothing` cutoff (beta 0.05, reset when the golfer is lost, the cutoff
+changes, or a frame is dated no later than the one before, as after a
+latency change), and puts the frame in the live slot together with its pose, so
+the picture and the skeleton always match. The live rate is the pose rate,
+at most 15. A new `model` or `detect_every` makes a new tracker. When the
+watch lapses or body tracking leaves Live mode the worker is stopped (its
+tracker with it) and frames go to the slot directly, without a pose; while
+the models are not ready the worker passes frames on without one. Dropping
+the worker sets its stop flag without joining it, so the capture loop never
+waits on a pose or a model build; it ends within one pose and publishes
+nothing more. A worker whose thread ended by itself (a panic;
+`LiveWorker::alive`) is replaced at the next frame, up to 3 times while
+watched; after that the camera's live frames go out without a pose and
+`X-Pose-State` is `failed` for it (`BodyTracking::set_live_failed`) until
+the watch lapses or tracking leaves Live mode. For a
+camera at golfer_front or target_line (`swing::live_setup`, read per frame
+with the player's hand from the game state and `swing::mirrored`), the
+worker also measures the found pose's posture for that view
+(`stance::golf::posture`, on `stance::golf::unmirror`ed keypoints for a
+mirrored picture), smoothed by a
+`PostureFilter` at the same cutoff (raw when smoothing is off; reset with
+the keypoint filter). The live route sends the pose as `X-Pose`, compact
+JSON (`skeleton`, one `[x, y, score]` per keypoint at 0.1 px and 0.01,
+`bbox`, `ms`, and `posture`: the view and its angles to 0.1°), about 1 KB
+per frame, and `X-Pose-State` (`off` outside Live mode, `loading`, `missing`
+while the model's files are not downloaded, `downloading` while a model
+download runs, `ready`, `failed` with `X-Pose-Error`: the model's load, or
+the camera's live worker) on every answer, the `204` included.
+
+**Recorded swings** (`pose::clips`). In Live mode a camera's clip is queued
+for body tracking when it is saved and announced (`shot_video`), to start no
+sooner than 3 s after it was written (`CLIP_DELAY`), so the pass stays clear
+of the shot itself. A viewer's request (`clips::request`, from
+`POST /api/shots/{shot_id}/video/{camera}/analyze`; the UI sends it in
+Historical and Live mode for each clip it shows without `pose`) builds the
+same `ClipJob` from the clip store (`ClipStore::camera_clip`: folder, AVI,
+shots, position; the hand from `shot.json`'s first shot, `ClipShot.hand`;
+the impact prior from the sidecar; the camera's current latency for the log
+line) with `on_demand` set: no delay, since the clip is not the shot just
+hit. Requests are deduplicated: a clip whose `pose` is set answers `done`,
+and one waiting or being tracked (`ClipQueue::has`: queue by folder id and
+camera, plus the running job) is not queued again; a recorded clip viewed
+while it waits keeps its place and its delay. One worker thread
+(`pose:clips`) takes the clips one at a time: a viewer's clip goes to the
+front (the clip on screen is the one wanted now; a clip asked for earlier
+was likely left behind), recorded clips to the back, oldest first. The
+queue holds at most `keep_shots` × the number of cameras, dropping the clip
+queued longest ago with a warning when full; a clip pruned or cleared before
+its turn is skipped, and so is everything while the models are missing or
+fail. Each clip
+runs stance's `analyze_clip` (detection on key frames, interpolated boxes,
+pose on every frame, a fix-up pass; detection every 10 frames) on a quarter
+of the logical CPUs (`clip_threads`, at least 1) at below-normal priority
+(`pose::priority`: the `pose:clips` worker lowers itself, and the pass's
+`PoseConfig::on_worker_start` hook has each of stance's worker threads lower
+itself before it takes a frame; nice 10 on Linux, below normal on Windows,
+no other thread touched). A panic in a clip's pass is
+caught and logged, and the queue goes on; the worker clears its running
+flag however it ends. Then `PoseTrack::write_beside` writes
+`<clip folder>/<camera>.pose.json`: one entry per clip frame on the sidecar's
+time base (`t_ns`), raw keypoints (no smoothing), empty where nobody was
+found. `ClipStore::set_pose` then marks the camera's `ShotVideo` (`pose:
+true`, kept in `shot.json`) and the queue sends one `shot_pose { keys }`
+with the camera as its actor, straight on the bus (a fact about files, sent
+even if the camera actor has been restarted since). A clip pruned or
+cleared while it ran keeps no pose file. Pose files are deleted with their
+clip folder (pruning, Clear history).
+
+**Swing analysis** (`pose::swing`). Right after a clip's pose file is
+written and announced, the same worker runs `stance::golf::analyze_swing` on
+the track, for a camera at golfer_front (face-on) or target_line (down the
+line); golfer_back and overhead get none. It is given the view, the hand at
+the shot (the game's hand when the camera saw the trigger, carried with the
+recorder's tag; right-handed when unknown), the clip's estimated impact (the
+sidecar's `impact_ns`, the launch monitor's impact shifted by its camera
+timing, when it falls inside the clip's frames: at or after the first, at
+or before the last), `golfer_height`, and whether the
+camera's picture is mirrored (`swing::mirrored`, the one place a mirror
+setting plugs in; no camera is mirrored yet). stance takes the impact as a
+prior: it moves it to the hands' low point within 0.3 s (`refined`), or,
+with no swing there, keeps it and reports the impact alone (`given`). The
+refined impact minus the estimate is logged at info per shot and camera,
+with the launch monitor kind, its camera timing and the camera's latency
+(`ClipJob.timing`, from the clip's first shot), to calibrate each
+monitor's camera timing; a `given` report logs that no swing was found. A
+`handed_guess` that disagrees with the hand at 0.6 confidence or more is
+logged as a warning (a mirrored picture). `SwingReport::write_beside`
+writes `<clip folder>/<camera>.swing.json` (events, tempo, the metrics at
+the key positions and every metric at every frame); `ClipStore::set_swing` marks
+the camera's `ShotVideo` (`swing: true`, kept in `shot.json`) and one
+`shot_swing { keys }` follows, as for the pose. A track the analysis can't
+use (fewer than three frames with the golfer) leaves no swing file (logged
+at info). `GET /api/shots/{shot_id}/video/{camera}.swing.json` serves it
+with the `.avi` rules; swing files go with their clip folder.
+
+**UI.** The Live view draws each view's pose (the one that came with the
+picture on screen) into the picture's rect with `ui/src/pose.rs`: the frame
+fitted to the rect at its aspect, keypoints under `min_score` hidden with
+their bones, the lead side (a right-hander's left; the game's hand) in teal,
+the trail side in orange, the midline light. While the models are not
+ready a band at the bottom of the picture says what they are doing. The
+replay and the Cameras pane's player fetch each tracked clip's
+`.pose.json` once (when the row's video has `pose`, or when `shot_pose`
+arrives while they are open) and draw the pose frame whose `t_ns` equals
+the shown frame's, with the shot's hand.
+In Off mode nothing is fetched or drawn: no `.pose.json` / `.swing.json`
+fetch, no skeleton, no swing panel, no analyze request, also for clips
+tracked earlier. Outside Live mode the Live view shows the pictures alone
+(no skeleton, posture tiles or readout line). In Historical and Live mode
+the player and the replay send one analyze request per clip without `pose`
+(`Fetch::Analyze`, once per view); the answer only matters when it is `200`
+(done already: the files are fetched at once), otherwise `shot_pose` and
+`shot_swing` bring them as for a recorded clip, and until then the clip
+plays without them, as while any clip is tracked.
+Keys (`cameras::KEY_BINDINGS`, no modifier; none in Off mode): `B` skeleton
+on/off (Live and a shot's clips, Historical and Live mode; this device:
+browser local storage, or `flighthook/ui.json` in the local data folder
+natively; the replay follows it); on Live in Live mode only, `M` model,
+`[` `]`
+`min_score` ∓ 0.05, `,` `.` smoothing less/more along off, 10, 5, 3, 2, 1,
+0.5, 0.3, 0.2, 0.1 Hz, `D` `detect_every` 1 → 5 → 10 → 30. A key changes
+the values shown at once; they are saved one request at a time, the newest
+winning, and shown until the reloaded settings hold them (a failed save
+shows the saved ones again). In Live mode a line under the live views reads
+out the values and each camera's measured live rate and pose time.
 
 ## SystemActor
 
@@ -1341,6 +1773,7 @@ pub struct SystemState {
     pub local_clients: Arc<LocalClients>,  // this process's Open Connect clients
     pub clips: ClipStore,         // replay clips on disk (beta)
     pub cameras: Cameras,         // camera actors' latest frames + the camera list (beta)
+    pub pose: BodyTracking,       // body tracking models + the recorded-clip queue (alpha)
     actors: RwLock<HashMap<String, Registered>>,  // the actor + its ActorHandle
 }
 ```
@@ -1487,8 +1920,11 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
   `ConfigOutcome` (request-reply pattern, 10s timeout; `504` with a JSON
   `error` body when it doesn't come).
 - **Global settings** -- `POST /api/settings?scope=global` emits
-  `ReplaceGlobal`: units, chipping/putting clubs, default view, simulation
-  and replay from the body, every actor section of the live config kept.
+  `ReplaceGlobal`: units, chipping/putting clubs, default view, simulation,
+  replay and body tracking from the body, every actor section of the live
+  config kept.
+- **Body tracking** -- `POST /api/settings?scope=body_tracking` emits
+  `SetBodyTracking`: the body's `[body_tracking]` alone.
 - **Per-section upserts** -- `POST /api/settings?scope=<id>` emits a scoped
   `ConfigAction` variant (e.g. `UpsertMevo`), writing only that section and
   reconciling only that actor. A scope naming a section the body omits emits
@@ -1580,7 +2016,7 @@ more rows than fit (see [Card height](#card-height)).
 
   GENERAL
   | Global                           [API Docs] | Simulation [beta]
-  | Default Units:     [Imperial v]             | Simulation:   [On v]  (Off | On | Force)
+  | Units:             [Imperial v]             | Simulation:   [On v]  (Off | On | Force)
   | Default shot view: [By set | By club | None]| Altitude:     [0] [ft v]   (greyed while Off)
   | Chipping Clubs:    [PW GW SW LW]            | Temperature:  [77] °F      (°C when Metric)
   | Putting Clubs:     [PT]                     | Surface:      [Fairway v]
@@ -1766,8 +2202,10 @@ either.
 The Global and Simulation cards share one save request (`build_global_request`).
 Each shows the pair while it has unsaved edits, and an edit on either card
 leaves both editable: Save on either saves both, Cancel on either reverts
-both; the Shots tab's units, which follow a change of default units, go
-back to what they were before it.
+both. The Shots tab's units are the Global card's **Units** value
+(`FlighthookApp::units` reads `SettingsForm::default_units`, the persisted
+`default_units`; there is no separate toolbar toggle), so they follow an edit
+at once and Cancel puts the saved value back.
 
 While anything is unsaved the tab is **locked** to it: the tab bar, the other
 cards' toggles and edit controls, and both (+) buttons are disabled (the
@@ -1830,6 +2268,37 @@ displayed).
   **Still frame**, enabled while the camera is connected: it fetches
   [`GET /api/cameras/{actor}/still`](API.md#get-apicamerasactorstill) and
   shows the frame at the card's width (decoded like the replay's frames)
+- The Body tracking card (alpha, General, after Replay) holds
+  `[body_tracking]` `mode` (Off | Historical | Live, pills like Model's),
+  `model` (RTMPose-m |
+  RTMPose-s) and Golfer height (in inches with imperial default units,
+  centimetres with metric, converted when the units change; empty is none;
+  checked like the server's); it saves and cancels with the other General
+  cards. The other values are tuned with the Live keys, which save with
+  `?scope=body_tracking` (that section alone). Picking Historical or Live
+  while the mode in effect is Off is not a form edit: it goes through the
+  model download prompt (`panels/body_models.rs`, below), which saves the
+  mode itself
+- The model download prompt (`panels/body_models.rs`, `ModelsPrompt`): the
+  card's Off → on first asks `GET /api/body_tracking/models`. `ready`: the
+  mode is saved at once through the tuning saves (`Tuning`,
+  `?scope=body_tracking`, one at a time, the newest winning) and shown on the
+  card. `missing` or `failed`: an `egui::Modal` dialog lists the missing
+  files (label, MB, host), the total in whole MB, the models folder and that
+  body tracking runs locally afterwards, with **Download** and **Cancel**
+  (Cancel, Escape or the backdrop: nothing saved). Download saves the mode,
+  `POST`s the download and turns the modal into the progress overlay: a bar
+  per file and an overall bar with MB done/total, the current host, and
+  **Cancel** (`DELETE`, then the mode saved Off). The overlay polls the state
+  every 0.25 s once the POST is answered, one request at a time; `ready`
+  closes it and has the replay and the inline player ask again for every
+  clip without `pose` (`ReplayView::ask_again`); `failed` (or no answer to
+  the POST) shows the error, a one-line firewall/proxy hint, **Retry** and
+  **Turn off**. With the mode already on, the same check runs once per
+  model per on-period the first time something needs the models (a shot's
+  clips in the Cameras pane, Live in Live mode, Replay); its Cancel leaves
+  the mode as it is. The camera keys are off while the prompt is up. No
+  hover text
 - The Replay card (beta, General) holds `[replay]`: Keep clips, Pre-roll,
   Post-roll and Start before impact in seconds, and the clip folder,
   read-only (`/api/status` `clip_dir`). It saves and cancels with the Global and Simulation cards
@@ -1890,6 +2359,9 @@ with the hover text "Set by the simulator"): the simulator replaces the hand
 with its next player message. Hovering the live control says "Player's hand.
 Devices that follow it are told on a change."
 
+The **Auto-chip** chip sits right of the club picker, a gap after it, and
+shows on every tab (see [Auto-chip](#auto-chip-beta) below).
+
 **Battery indicators** sit left of the FLIGHTHOOK title, one small battery per
 device that is shown Connected and reports `battery_pct` as a whole number from
 0 to 100, in Devices card order (the first device furthest left). The fill is
@@ -1914,8 +2386,8 @@ values immediately.
 ## Shots Tab
 
 ```
-  VIEW [Cards|Table]  UNITS [Imperial|Metric]  DEVICE [All|Mevo+|Omni]  (Auto-chip v)
-                                              (2+ devices)   EXPORT SESSION JSONL CSV [trash]
+  [Data|Cameras]  [Cards|Table]  DEVICE [All|Mevo+|Omni]                 [export] [trash]
+  (cameras only)  (not in Cameras) (2+ devices)                          (JSONL | CSV menu)
 
   Layout: the charts are always shown, sized from the window (not resizable)
 
@@ -1955,7 +2427,7 @@ values immediately.
   (list scrolls)       [Direction]    [Apex]    [Offline]    [Club speed] [Smash] [Path]
   ------------------   [Sidespin]     [Descent] [Roll]       [AoA]        [Face]  [Loft]
   Next shot starts ... +---------------------- Flight -----------------------+
-  [+ New set][New sess]| FLIGHT yd · ft     APEX 94 ft · CARRY 173 · TOTAL 185 |
+  [New set][New sess]  | FLIGHT yd · ft     APEX 94 ft · CARRY 173 · TOTAL 185 |
                        | 90-       .-- 94 ft --.      (faint: rest of session) |
                        |  0- ^----'             '---o~~o---------------------- |
                        |     0     50    100    150 173 185   200   250        |
@@ -1980,8 +2452,9 @@ values immediately.
   +--------------------------------------------+
 ```
 
-A toolbar (view toggle, units, the device filter, the Auto-chip menu,
-export links and Clear history) sits above both views. Only
+A toolbar (the Data | Cameras switch when cameras are configured, the
+Cards | Table switch, which Cameras hides, the device filter, the export icon
+and Clear history) sits above both views. Only
 Table adds the "italic = simulated" legend, since only Table draws simulated
 values in italics (`ShotsView::shows_simulated_legend`). The chosen view
 (`ShotsView` in `panels/shots.rs`) lasts for the session and is not saved.
@@ -2063,7 +2536,7 @@ applies it at once and saves it as the default view, over the WebSocket,
 else `POST /api/shots/grouping`. The view only changes what the tab shows:
 sets are recorded the same way in every view. The list scrolls between the
 selector and its **foot**, pinned at the bottom of the column: a hairline, a
-one-line hint when there is one, then **+ New set** (`new_group`; disabled
+one-line hint when there is one, then **New set** (`new_group`; disabled
 while the open set has no shots) and **New session** (disabled while no set
 is open). The hint reads "Next shot starts a new set (DR)" in By set when the
 club in play differs from the open set's, and "No club selected" when no club
@@ -2083,7 +2556,7 @@ more), `NO CLUB · …` for shots hit with no club, and a muted `7 IRON ·
 EARLIER · 4 SHOTS` for a section from an earlier session (its set count is
 in the hover text, which keeps the title short). A title too long for the
 list is cut with an ellipsis before its last part, so the shot count always
-shows whole. + New set does not
+shows whole. New set does not
 split a club's section; only New session does. While the open set is empty
 and the club in play has no section in the session yet, a gold `7 IRON ·
 NEXT SHOT` header sits at the top. The section of the club in play in the
@@ -2105,11 +2578,20 @@ known yet) come first, under a dim `NOT IN A SET` header when a header is
 above them. Later rows in no known set get the same header: in place in By
 set, gathered in one last section in By club.
 
-**Clear history** is the trash icon after the CSV link in the toolbar's
-export group: a Codicons glyph (`theme::icon` with `Icon::Trash`; the
+**Export** is an icon immediately left of the trash (`export_menu` in
+`panels/shots.rs`: `theme::icon` with `Icon::Export`, Codicons `export`
+U+EBAC, the same height as the trash, muted at rest and accent on hover,
+hover text "Export session"). A click opens an `egui::Popup::menu` listing
+**JSONL** and **CSV** (`EXPORT_FORMATS`); a pick opens
+`GET /api/shots/export?format=…&units=…` in the shown units, the same URLs the
+toolbar's links used. It is always enabled (an empty session exports an empty
+file).
+
+**Clear history** is the trash icon at the toolbar's right end: a Codicons glyph
+(`theme::icon` with `Icon::Trash`; the
 font is `ui/assets/fonts/codicon.ttf`, compiled in with `include_bytes!` and
 registered as its own font family by `theme::install`), as tall as the
-export links, muted at rest and alert red on hover. It is disabled while
+export icon, muted at rest and alert red on hover. It is disabled while
 there are no shots. A click opens a modal: "Delete all N shots and sets?
 This can't be undone. Export first if you want to keep them." with Cancel
 and a red Delete; Escape or a click outside cancels. Delete sends
@@ -2129,8 +2611,8 @@ older one) and lose it on `shot_video_removed`.
 
 The chip opens the replay, an `egui::Modal` over the Shots tab
 (`ui/src/panels/replay.rs`, logic in `ui/src/replay.rs`): the shot's cameras
-side by side, each labelled with its card's name and position and with a
-Download link (the `.avi`); a scrubber with the start point as a green tick
+side by side, each labelled with its card's name and position and followed
+by a download icon (Codicons `download`, hover "Download"; the `.avi`); a scrubber with the start point as a green tick
 and the estimated impact as a gold tick; play/pause; previous/next frame;
 speed 1× · ½ · ¼ · ⅛; a Loop toggle (on whenever a replay opens, UI state only). Close, Escape
 or the backdrop closes it, and so do Clear history and a
@@ -2161,14 +2643,23 @@ playhead follows the wall clock, so when decoding can't keep up (1× on a
 phone) frames are skipped and the clip keeps its time. The view never
 fetches a whole clip.
 
-**Auto-chip** (beta) is a menu chip (`theme::menu_chip`: a `chip_button`
-with a drawn chevron) after the units toggle. Its menu (`egui::Popup::menu`)
+<a id="auto-chip-beta"></a>**Auto-chip** (beta) is a menu chip (`theme::menu_chip`: a `chip_button`
+with a drawn chevron) in the header, right of the club picker
+(`panels/auto_chip.rs`; it is not part of the Shots tab, which shows live and
+historical data rather than controls). It shows while `[simulation]
+auto_chip` (default `false`, serde-omitted at the default; the Simulation
+card's **Auto-chip** checkbox; `SimulationSection::auto_chip`) is on in the
+*saved* settings, and not before they have loaded. It is off by default; turn
+it on in Settings → Simulation (useful with radar launch monitors that miss
+short chips). With it off the chip is not drawn and `POST /api/auto-chip` answers `409`. The header has room for
+it down to the smallest window the UI fits, 1024 px wide. Its menu (`egui::Popup::menu`)
 lists `1 Yard`, `3 Yard`, `5 Yard` (`flighthook::AUTO_CHIP_YARDS`); a pick
 sends `POST /api/auto-chip` (`net::post_auto_chip`). The button is disabled,
 with the reason on hover, while no `openconnect_client.*` actor is Connected
 (`app::set_by_simulator`) and while a chip is waiting for its reply
 (`auto_chip_in_flight`). A failed reply shows in the error banner above the
-tabs (`Auto-chip: <status> <error>`) until the next pick.
+tabs (`Auto-chip: <status> <error>`) until the next pick. Auto-chip shots
+already recorded display as before when the setting is turned off.
 
 On the server (`app/src/autochip.rs`), `solve_speed` bisects the ball speed
 (0.1-60 mph, to 1e-4 mph) at which dimple, with the `[simulation]`

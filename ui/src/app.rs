@@ -107,18 +107,12 @@ pub struct FlighthookApp {
     pub(crate) show_api_docs: bool,
     pub(crate) api_docs_cache: egui_commonmark::CommonMarkCache,
 
-    // Unit display
-    pub(crate) units_toggle: UnitSystem,
-    /// The Shots tab's units before the unsaved Global edits first changed
-    /// the default units: what their Cancel puts back.
-    pub(crate) units_before_edit: Option<UnitSystem>,
-
     // Shots tab
     pub(crate) shots_view: ShotsView,
     pub(crate) shot_focus: ShotFocus,
     /// Bumped at every change to `shots`; keys the caches derived from it.
     pub(crate) shots_rev: u64,
-    /// `shots` converted to `units_toggle`, for the list, cards and table.
+    /// `shots` converted to [`FlighthookApp::units`], for the list, cards and table.
     pub(crate) display_rows: Cached<(u64, UnitSystem), Vec<ShotRow>>,
     /// Distinct actor ids in `shots`, exact and sorted.
     pub(crate) device_ids: Cached<u64, Vec<String>>,
@@ -181,6 +175,9 @@ pub struct FlighthookApp {
     pub(crate) cameras_supported: bool,
     /// The folder the server writes clips to (`/api/status`).
     pub(crate) clip_dir: Option<String>,
+    /// Why the server's config file was not used (`/api/status`): the
+    /// error frame over every tab shows it until a save replaces the file.
+    pub(crate) config_error: Option<crate::types::ConfigLoadError>,
     /// The camera list for the camera cards' pickers.
     pub(crate) camera_list: CameraList,
     /// Each camera card's still frame, by actor ID.
@@ -194,6 +191,31 @@ pub struct FlighthookApp {
     pub(crate) card_row: crate::panels::card_row::CardRow,
     /// The camera cards' clips of the shown shot, by camera actor ID.
     pub(crate) card_clips: HashMap<String, crate::panels::replay::CardClip>,
+    /// The Shots tab's Cards view shows the shot's data or its cameras
+    /// (the Data | Cameras toggle), kept on this device.
+    pub(crate) shots_pane: crate::panels::cameras::ShotsPane,
+    /// Live is on (the Cameras pane's Live switch): the pane shows the
+    /// live views.
+    pub(crate) live_selected: bool,
+    /// The Cameras pane was on screen at the last
+    /// [`FlighthookApp::sync_cameras_pane`]: coming on screen picks Live or
+    /// the latest shot.
+    pub(crate) cameras_pane_was_shown: bool,
+    /// The Cameras pane's player of the shown shot's clips.
+    pub(crate) shot_player: Option<crate::panels::replay::ReplayView>,
+    /// The Cameras pane's live views, by camera actor ID, while Live is on
+    /// screen.
+    pub(crate) live: crate::panels::cameras::LiveViews,
+    /// Number of the last live view opened: replies for another are
+    /// dropped.
+    pub(crate) live_seq: u64,
+    /// The skeleton is drawn over camera pictures (the Cameras pane's `B`),
+    /// kept on this device.
+    pub(crate) pose_overlay: bool,
+    /// The body tracking values the Live keys set, and their saves.
+    pub(crate) tuning: crate::panels::cameras::Tuning,
+    /// Body tracking's model download prompt: the dialog and the overlay.
+    pub(crate) body_models: crate::panels::body_models::ModelsPrompt,
 }
 
 /// The server's camera list, as the camera cards' pickers use it.
@@ -251,8 +273,6 @@ impl FlighthookApp {
             reconnect_errors: HashMap::new(),
             confirm_remove: None,
             confirm_clear: false,
-            units_toggle: UnitSystem::default(),
-            units_before_edit: None,
             shots_view: ShotsView::default(),
             shot_focus: ShotFocus::default(),
             shots_rev: 0,
@@ -292,12 +312,22 @@ impl FlighthookApp {
             ui_scale: UiScale::default(),
             cameras_supported: false,
             clip_dir: None,
+            config_error: None,
             camera_list: CameraList::default(),
             stills: HashMap::new(),
             replay: None,
             replay_seq: 0,
             card_row: crate::panels::card_row::CardRow::default(),
             card_clips: HashMap::new(),
+            shots_pane: crate::panels::cameras::ShotsPane::stored(),
+            live_selected: false,
+            cameras_pane_was_shown: false,
+            shot_player: None,
+            live: HashMap::new(),
+            live_seq: 0,
+            pose_overlay: crate::local::flag(crate::panels::cameras::OVERLAY_KEY, true),
+            tuning: crate::panels::cameras::Tuning::default(),
+            body_models: crate::panels::body_models::ModelsPrompt::default(),
         }
     }
 
@@ -320,6 +350,7 @@ impl FlighthookApp {
             }
             self.cameras_supported = status.cameras_supported;
             self.clip_dir = status.clip_dir;
+            self.config_error = status.config_error;
             // The reply lists every running actor: one it leaves out has
             // stopped. Red time counts down from now.
             self.actors = status.actors;
@@ -374,20 +405,19 @@ impl FlighthookApp {
         let reconnects = std::mem::take(&mut p.reconnects);
         let stills = std::mem::take(&mut p.stills);
         let replies = std::mem::take(&mut p.replay);
+        let live = std::mem::take(&mut p.live);
+        let tuning = p.tuning.take();
+        let body_models = std::mem::take(&mut p.body_models);
 
         // Unsaved edits survive a reload; one the server already holds
         // turns clean.
         if let Some(s) = p.settings.take() {
-            let first_load = !self.settings.loaded;
             // Check if we need to show the setup wizard (no user actors)
             if !self.wizard_checked {
                 self.wizard_checked = true;
                 self.wizard_dismissed = s.has_user_actors();
             }
             self.settings.load_from(&s);
-            if first_load {
-                self.units_toggle = s.default_units;
-            }
         }
 
         if let Some(reply) = p.settings_save.take() {
@@ -406,9 +436,6 @@ impl FlighthookApp {
                 self.card_modes.forget(&removed);
             }
         }
-        if !self.settings.global_dirty {
-            self.units_before_edit = None;
-        }
         drop(p);
 
         for (actor, reply) in reconnects {
@@ -418,9 +445,18 @@ impl FlighthookApp {
         for (actor, reply) in stills {
             self.stills.entry(actor).or_default().reply(reply);
         }
+        self.live_replies(live, self.now_ms as f64 / 1000.0);
+        if let Some(reply) = tuning {
+            self.tuning.reply(reply);
+        }
+        for (call, reply) in body_models {
+            self.body_models_reply(call, reply);
+        }
         for reply in replies {
             let seq = reply.seq();
             if let Some(view) = self.replay.as_mut().filter(|v| v.seq() == seq) {
+                view.reply(reply);
+            } else if let Some(view) = self.shot_player.as_mut().filter(|v| v.seq() == seq) {
                 view.reply(reply);
             } else if let Some(card) = self.card_clips.values_mut().find(|c| c.seq() == seq) {
                 card.reply(reply);
@@ -647,16 +683,50 @@ impl FlighthookApp {
                     impact_offset_ms,
                     complete,
                     dropped,
+                    pose: false,
+                    swing: false,
                 };
                 if crate::types::stamp_video(&mut self.shots, &keys, &video) {
                     self.shots_rev += 1;
+                }
+            }
+            FlighthookEvent::ShotPose { keys } => {
+                if crate::types::mark_pose(&mut self.shots, &keys, &actor) {
+                    self.shots_rev += 1;
+                }
+                // The open players draw it once they have the keypoints.
+                for player in [&mut self.replay, &mut self.shot_player]
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| keys.iter().any(|k| k.shot_id == r.shot_id()))
+                {
+                    player.pose_ready(&actor);
+                }
+            }
+            FlighthookEvent::ShotSwing { keys } => {
+                if crate::types::mark_swing(&mut self.shots, &keys, &actor) {
+                    self.shots_rev += 1;
+                }
+                if let Some(player) = self
+                    .shot_player
+                    .as_mut()
+                    .filter(|r| keys.iter().any(|k| k.shot_id == r.shot_id()))
+                {
+                    player.swing_ready(&actor);
                 }
             }
             FlighthookEvent::ShotVideoRemoved { keys } => {
                 if crate::types::remove_video(&mut self.shots, &keys) {
                     self.shots_rev += 1;
                 }
-                // The open replay's clips are gone: close it.
+                // The open players' clips are gone: close them.
+                if self
+                    .shot_player
+                    .as_ref()
+                    .is_some_and(|r| keys.iter().any(|k| k.shot_id == r.shot_id()))
+                {
+                    self.shot_player = None;
+                }
                 if self
                     .replay
                     .as_ref()
@@ -787,7 +857,8 @@ impl FlighthookApp {
     /// open Clear history confirmation, an open replay and the camera cards'
     /// clips (the clips are deleted with the history), so the Shots tab
     /// shows its empty state; face impact's next appearance takes the
-    /// rightmost card beside the range bars again.
+    /// rightmost card beside the range bars again. A Cameras pane on screen
+    /// counts as shown anew, so it turns Live on.
     /// The caches are emptied; their keys (`shots_rev`, the sets' revision)
     /// move on. A shots or sets reply requested before the clear,
     /// queued or still in flight, is dropped when it lands.
@@ -808,16 +879,25 @@ impl FlighthookApp {
         self.dispersion_scene = Cached::default();
         self.confirm_clear = false;
         self.replay = None;
+        self.shot_player = None;
         self.card_row.clear();
         self.card_clips.clear();
+        self.cameras_pane_was_shown = false;
     }
 
     /// The camera cards hold their clips only while the card row can be on
-    /// screen: on the Shots tab's Cards view. Elsewhere they are dropped,
-    /// and fetched again when the row returns.
+    /// screen: on the Shots tab's Cards view, showing the shot's data.
+    /// Elsewhere they are dropped, and fetched again when the row returns.
+    /// The Cameras pane's player likewise lives only while it shows a shot.
     pub(crate) fn drop_hidden_card_clips(&mut self) {
-        if self.active_tab != Tab::Shots || self.shots_view != ShotsView::Cards {
+        if self.active_tab != Tab::Shots
+            || self.shots_view != ShotsView::Cards
+            || self.cameras_pane_shown()
+        {
             self.card_clips.clear();
+        }
+        if !self.cameras_pane_shown() || self.live_selected {
+            self.shot_player = None;
         }
     }
 
@@ -1075,6 +1155,7 @@ impl FlighthookApp {
             .selected_club
             .map_or_else(|| "\u{2014}".to_owned(), |c| c.to_string());
         let mut picked = None;
+        let mut chip = None;
         // Laid out at the header row's height so the label and the pill
         // centre on one line.
         let size = egui::vec2(ui.available_width(), row_height);
@@ -1084,6 +1165,7 @@ impl FlighthookApp {
             if read_only {
                 let pill = theme::pill_static(ui, &code).on_hover_text("Set by the simulator");
                 mark(ui, || "club".to_owned(), &pill);
+                chip = self.header_auto_chip(ui);
                 return;
             }
             let pill = theme::pill(ui, false, &code)
@@ -1122,7 +1204,11 @@ impl FlighthookApp {
                         });
                     }
                 });
+            chip = self.header_auto_chip(ui);
         });
+        if let Some(yards) = chip {
+            self.send_auto_chip(ui.ctx(), yards);
+        }
         if let Some(club) = picked {
             self.club_picker_open = false;
             self.pick_club(ui.ctx(), club);
@@ -1343,7 +1429,10 @@ impl eframe::App for FlighthookApp {
         self.refresh_shot_caches();
         self.observe_shots(ctx.input(|i| i.time));
         self.groups.observe_club(self.selected_club, &self.shots);
+        self.sync_cameras_pane();
         self.drop_hidden_card_clips();
+        self.sync_live_views(ctx);
+        self.drive_body_models(ctx);
 
         if self.needs_status_refresh {
             self.needs_status_refresh = false;
@@ -1361,6 +1450,7 @@ impl eframe::App for FlighthookApp {
         if self.confirm_remove.is_some() {
             self.render_remove_confirm(ctx);
         }
+        self.render_body_models(ctx);
 
         // API documentation popup
         if self.show_api_docs {
@@ -1409,24 +1499,30 @@ impl eframe::App for FlighthookApp {
         }
 
         self.render_header(ctx);
+        self.camera_keys(ctx, crate::panels::cameras::KEY_BINDINGS);
 
         let content_frame = egui::Frame::new()
             .fill(theme::BG)
             .inner_margin(egui::Margin::same(14));
         egui::CentralPanel::default()
             .frame(content_frame)
-            .show(ctx, |ui| {
-                self.render_error_banner(ui);
+            .show(ctx, |ui| self.render_content(ui));
+    }
+}
 
-                match self.active_tab {
-                    Tab::Devices => {
-                        let ctx = ui.ctx().clone();
-                        self.render_devices_panel(&ctx, ui);
-                    }
-                    Tab::Shots => self.render_shots_panel(ui),
-                    Tab::Log => self.render_log_panel(ui),
-                }
-            });
+impl FlighthookApp {
+    /// The main content: the error frames over the active tab.
+    pub(crate) fn render_content(&mut self, ui: &mut egui::Ui) {
+        self.render_error_banner(ui);
+
+        match self.active_tab {
+            Tab::Devices => {
+                let ctx = ui.ctx().clone();
+                self.render_devices_panel(&ctx, ui);
+            }
+            Tab::Shots => self.render_shots_panel(ui),
+            Tab::Log => self.render_log_panel(ui),
+        }
     }
 }
 
@@ -1436,6 +1532,69 @@ mod tests {
 
     fn actor(status: ActorStatus) -> ActorStatusResponse {
         ActorStatusResponse::new("", status)
+    }
+
+    /// One pass of the main content on a 1600×900 screen. Returns the
+    /// marked controls.
+    fn content_marks(
+        ctx: &egui::Context,
+        app: &mut FlighthookApp,
+    ) -> crate::panels::devices::Marks {
+        use crate::panels::devices::Marks;
+        ctx.data_mut(|d| d.remove_temp::<Marks>(egui::Id::NULL));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.render_content(ui));
+        });
+        ctx.data(|d| d.get_temp::<Marks>(egui::Id::NULL))
+            .unwrap_or_default()
+    }
+
+    /// A config file the server could not use shows as a red frame across
+    /// the top of every tab, saying which file and what is wrong, until a
+    /// status reply says it is gone.
+    #[test]
+    fn a_config_error_shows_in_a_frame_on_every_tab_until_the_status_drops_it() {
+        let ctx = egui::Context::default();
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        assert!(!content_marks(&ctx, &mut app).contains_key("config_error"));
+
+        let status = |config_error| crate::types::StatusResponse {
+            actors: HashMap::new(),
+            mode: None,
+            club: None,
+            handed: None,
+            cameras_supported: false,
+            clip_dir: None,
+            config_error,
+        };
+        let error = crate::types::ConfigLoadError {
+            path: "/home/golfer/.config/flighthook/config.toml".into(),
+            error: "line 4, column 8: unknown variant `liv`".into(),
+        };
+        app.pending.lock().unwrap().status = Some(status(Some(error.clone())));
+        app.apply_pending();
+        assert_eq!(app.config_error.as_ref(), Some(&error));
+        for tab in [Tab::Devices, Tab::Shots, Tab::Log] {
+            app.active_tab = tab;
+            let marks = content_marks(&ctx, &mut app);
+            let (rect, _) = marks["config_error"];
+            assert!(
+                rect.width() > 1200.0,
+                "{tab:?}: across the content {rect:?}"
+            );
+            assert!(rect.min.y < 40.0, "{tab:?}: at the top {rect:?}");
+        }
+
+        app.pending.lock().unwrap().status = Some(status(None));
+        app.apply_pending();
+        assert!(!content_marks(&ctx, &mut app).contains_key("config_error"));
     }
 
     #[test]
@@ -1524,6 +1683,7 @@ mod tests {
             handed,
             cameras_supported: false,
             clip_dir: None,
+            config_error: None,
         };
         let mut app = FlighthookApp::with_pending(net::new_pending());
         app.pending.lock().expect("lock").status = Some(status(Some(Handedness::Left)));
@@ -1646,6 +1806,7 @@ mod tests {
             handed: None,
             cameras_supported: false,
             clip_dir: None,
+            config_error: None,
         };
         let outcome = |stopped: &[&str]| {
             FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
@@ -2072,7 +2233,7 @@ mod tests {
         app.refresh_shot_caches();
         assert_eq!(
             app.display_rows
-                .peek(&(app.shots_rev, app.units_toggle))
+                .peek(&(app.shots_rev, app.units()))
                 .map(Vec::len),
             Some(1)
         );
@@ -2148,7 +2309,7 @@ mod tests {
 
         // The caches follow: the display rows and the device ids.
         app.refresh_shot_caches();
-        let rows = app.display_rows.peek(&(app.shots_rev, app.units_toggle));
+        let rows = app.display_rows.peek(&(app.shots_rev, app.units()));
         assert_eq!(rows.map(Vec::len), Some(2));
         assert_eq!(rows.and_then(|r| r[1].group.as_deref()), Some("s1"));
         assert_eq!(
@@ -2157,7 +2318,7 @@ mod tests {
         );
         // A unit flip rebuilds the rows without touching the shots.
         let rev = rev.get();
-        app.units_toggle = UnitSystem::Metric;
+        app.settings.default_units = UnitSystem::Metric;
         assert!(app.display_rows.peek(&(rev, UnitSystem::Metric)).is_none());
         app.refresh_shot_caches();
         assert!(app.display_rows.peek(&(rev, UnitSystem::Metric)).is_some());
@@ -2652,6 +2813,8 @@ mod tests {
             impact_offset_ms: 2500,
             complete: false,
             dropped: 3,
+            pose: false,
+            swing: false,
         };
         let row: ShotData = serde_json::from_value(serde_json::json!({
             "actor": "mevo.0", "shot_number": 4, "shot_id": "s4",
@@ -2669,6 +2832,7 @@ mod tests {
                 handed: None,
                 cameras_supported: true,
                 clip_dir: Some("/clips".into()),
+                config_error: None,
             });
         }
         app.apply_pending();

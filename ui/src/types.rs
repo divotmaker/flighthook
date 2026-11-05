@@ -14,6 +14,8 @@ pub use flighthook::{
     ActorStatusResponse,
     AutoChipRequest,
     BallFlight,
+    BodyTrackingMode,
+    BodyTrackingSection,
     CameraListEntry,
     CameraListResponse,
     CameraMode,
@@ -23,6 +25,7 @@ pub use flighthook::{
     Club,
     ClubData,
     ClubInfo,
+    ConfigLoadError,
     ConnectionState,
     DerivedFlight,
     // Config types
@@ -39,11 +42,14 @@ pub use flighthook::{
     HandInfo,
     HandRequest,
     Handedness,
+    LivePose,
+    LivePosture,
     MevoSection,
     MockMonitorSection,
     OpenConnectClientSection,
     OpenConnectServerSection,
     PlayerInfo,
+    PoseTrackFile,
     PostSettingsResponse,
     R10Section,
     RECONNECT_ALERT_MS,
@@ -63,6 +69,11 @@ pub use flighthook::{
     SquareSection,
     Stats,
     StatusResponse,
+    SwingMetric,
+    SwingPositions,
+    SwingReportFile,
+    SwingTempo,
+    SwingView,
     UnitSystem,
     Velocity,
     WebserverSection,
@@ -160,6 +171,40 @@ pub fn stamp_video(rows: &mut [ShotRow], keys: &[ShotKey], video: &ShotVideo) ->
         row.video.push(video.clone());
         row.video.sort_by(|a, b| a.camera.cmp(&b.camera));
         changed = true;
+    }
+    changed
+}
+
+/// Mark camera `camera`'s clip of the rows whose shot is in `keys` as body
+/// tracked: its keypoints can be fetched. Returns whether a row changed.
+pub fn mark_pose(rows: &mut [ShotRow], keys: &[ShotKey], camera: &str) -> bool {
+    mark_video(rows, keys, camera, |v| &mut v.pose)
+}
+
+/// Mark camera `camera`'s clip of the rows whose shot is in `keys` as swing
+/// analysed: its report can be fetched. Returns whether a row changed.
+pub fn mark_swing(rows: &mut [ShotRow], keys: &[ShotKey], camera: &str) -> bool {
+    mark_video(rows, keys, camera, |v| &mut v.swing)
+}
+
+/// Set the flag `flag` picks on camera `camera`'s clip of the rows whose
+/// shot is in `keys`. Returns whether a row changed.
+fn mark_video(
+    rows: &mut [ShotRow],
+    keys: &[ShotKey],
+    camera: &str,
+    flag: fn(&mut ShotVideo) -> &mut bool,
+) -> bool {
+    let mut changed = false;
+    for row in rows
+        .iter_mut()
+        .filter(|r| !r.shot_id.is_empty() && keys.iter().any(|k| k.shot_id == r.shot_id))
+    {
+        for video in row.video.iter_mut().filter(|v| v.camera == camera) {
+            let f = flag(video);
+            changed |= !*f;
+            *f = true;
+        }
     }
     changed
 }

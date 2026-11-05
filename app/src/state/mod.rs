@@ -33,6 +33,8 @@ pub struct SystemState {
     pub clips: ClipStore,
     /// The camera actors' latest frames and the camera list (beta).
     pub cameras: Cameras,
+    /// Body tracking's models and recorded-clip queue (alpha).
+    pub pose: crate::pose::BodyTracking,
     actors: RwLock<HashMap<String, Registered>>,
     /// Actors taken out of the registry whose thread is still ending while
     /// it holds their device or port: by ID, whether it has ended since.
@@ -81,6 +83,30 @@ pub enum Stopped {
     Lingering,
 }
 
+/// Body tracking with the models in the models folder, from their official
+/// sources. Tests never download: each state has an empty folder of its own
+/// and a stand-in source (`models::fake`, a "download" of about 0.4 s per
+/// file).
+fn body_tracking() -> crate::pose::BodyTracking {
+    #[cfg(test)]
+    {
+        crate::pose::BodyTracking::new(
+            std::env::temp_dir().join(format!(
+                "flighthook-test-models-{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+            crate::pose::models::fake::Fake::new(40, Duration::from_millis(10)),
+        )
+    }
+    #[cfg(not(test))]
+    {
+        crate::pose::BodyTracking::new(
+            crate::pose::models::default_dir(),
+            std::sync::Arc::new(crate::pose::models::Official::default()),
+        )
+    }
+}
+
 /// How often [`SystemState::wait_for_exit`] looks at the thread.
 const EXIT_POLL: Duration = Duration::from_millis(10);
 
@@ -102,6 +128,7 @@ impl SystemState {
                 local_clients: Arc::default(),
                 clips: ClipStore::default(),
                 cameras: Cameras::default(),
+                pose: body_tracking(),
                 actors: RwLock::new(HashMap::new()),
                 closing: Arc::default(),
                 settling: Mutex::default(),

@@ -971,7 +971,7 @@ impl FlighthookApp {
     /// Key of the Flight scene for a panel of `size` around the shown shot
     /// `shown`.
     fn flight_key(&self, shown: usize, size: Vec2) -> ChartKey {
-        ChartKey::new(self.members_key(shown), self.units_toggle, size)
+        ChartKey::new(self.members_key(shown), self.units(), size)
     }
 
     /// Bring the cached Flight scene up to date for `key`: rebuilt only when
@@ -1000,7 +1000,7 @@ impl FlighthookApp {
             shown,
             devices: &devices,
             device: self.device_filter.as_deref(),
-            units: self.units_toggle,
+            units: self.units(),
             size: vec2(key.size[0] as f32, key.size[1] as f32),
         });
         self.flight_scene.get(key.clone(), || scene);
@@ -1010,7 +1010,7 @@ impl FlighthookApp {
     pub(super) fn render_flight_panel(&mut self, ui: &mut egui::Ui) {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
         let painter = ui.painter_at(rect);
-        let units = self.units_toggle;
+        let units = self.units();
         let Some(shown) = self.shown_index() else {
             paint_header(&painter, rect, units, None);
             painter.text(
@@ -1845,7 +1845,7 @@ pub(super) mod tests {
             assert!(app.flight_scene.peek(&next).is_some(), "{what}");
             *key = next;
         }
-        app.units_toggle = UnitSystem::Metric;
+        app.settings.default_units = UnitSystem::Metric;
         changed(&mut app, &mut key, 7, size, "units");
         let apex = &app.flight_scene.peek(&key).unwrap().marks.apex;
         assert!(apex.as_ref().unwrap().1.ends_with(" m"));

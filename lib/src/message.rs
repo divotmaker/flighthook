@@ -28,9 +28,9 @@ use std::collections::HashMap;
 
 use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRaw};
 use crate::{
-    CameraPosition, CameraSection, ExPuttSection, FlighthookConfig, MevoSection,
-    MockMonitorSection, OpenConnectClientSection, OpenConnectServerSection, R10Section,
-    RandomClubSection, SquareSection, WebserverSection,
+    BodyTrackingSection, CameraPosition, CameraSection, ExPuttSection, FlighthookConfig,
+    MevoSection, MockMonitorSection, OpenConnectClientSection, OpenConnectServerSection,
+    R10Section, RandomClubSection, SquareSection, WebserverSection,
 };
 use crate::{Club, ClubInfo, GroupedShot, HandInfo, PlayerInfo, ShotGroupInfo, ShotGrouping};
 
@@ -290,6 +290,14 @@ pub enum FlighthookEvent {
     /// The clips of these shots were deleted to keep the newest
     /// `[replay] keep_shots` (beta).
     ShotVideoRemoved { keys: Vec<ShotKey> },
+    /// Body tracking of a camera's clip is done (alpha): its keypoints are
+    /// served beside the clip. The envelope's `actor` is the camera, as for
+    /// `shot_video`; `keys` are the clip's shots. Never per-frame data.
+    ShotPose { keys: Vec<ShotKey> },
+    /// The swing analysis of a camera's clip is done (alpha): events, tempo
+    /// and metrics are served beside the clip. The envelope's `actor` is
+    /// the camera; `keys` are the clip's shots. Never per-frame data.
+    ShotSwing { keys: Vec<ShotKey> },
     /// Actor/connection lifecycle update.
     ///
     /// Carries actor-framework state: connection status enum and actor-specific
@@ -391,6 +399,11 @@ pub enum ConfigAction {
     /// assigned the same way in every view.
     SetShotGrouping {
         mode: ShotGrouping,
+    },
+    /// Replace the `[body_tracking]` settings alone (persisted). Used by
+    /// POST /api/settings?scope=body_tracking.
+    SetBodyTracking {
+        section: BodyTrackingSection,
     },
     /// Stop the launch monitor or output `id` ("mevo.0",
     /// "openconnect_client.1"), wait for its connection to close, and start
@@ -820,6 +833,26 @@ mod tests {
         );
         let back: ConfigAction = serde_json::from_str(&json).expect("de");
         assert!(matches!(back, ConfigAction::UpsertCamera { index, .. } if index == "1"));
+    }
+
+    #[test]
+    fn set_body_tracking_round_trips() {
+        let action = ConfigAction::SetBodyTracking {
+            section: BodyTrackingSection {
+                min_score: 0.5,
+                ..BodyTrackingSection::default()
+            },
+        };
+        let json = serde_json::to_string(&action).expect("ser");
+        assert_eq!(
+            json,
+            r#"{"type":"set_body_tracking","section":{"min_score":0.5}}"#
+        );
+        let back: ConfigAction = serde_json::from_str(&json).expect("de");
+        assert!(matches!(
+            back,
+            ConfigAction::SetBodyTracking { section } if section.min_score.to_bits() == 0.5f64.to_bits()
+        ));
     }
 
     #[test]

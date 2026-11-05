@@ -844,7 +844,7 @@ impl FlighthookApp {
     /// shown shot `shown`.
     fn dispersion_key(&self, shown: usize, size: Vec2) -> DispersionKey {
         DispersionKey {
-            chart: ChartKey::new(self.members_key(shown), self.units_toggle, size),
+            chart: ChartKey::new(self.members_key(shown), self.units(), size),
             points: self.dispersion_points,
             size: self.ellipse_size,
         }
@@ -873,7 +873,7 @@ impl FlighthookApp {
             shown,
             devices: &devices,
             device: self.device_filter.as_deref(),
-            units: self.units_toggle,
+            units: self.units(),
             points: key.points,
             size: key.size,
             area: vec2(key.chart.size[0] as f32, key.chart.size[1] as f32),
@@ -895,7 +895,7 @@ impl FlighthookApp {
         let in_row =
             |i: usize, layout: egui::Layout| egui::UiBuilder::new().max_rect(row(i)).layout(layout);
         let right_to_left = egui::Layout::right_to_left(egui::Align::Center);
-        let (dist, _) = flight::unit_labels(self.units_toggle);
+        let (dist, _) = flight::unit_labels(self.units());
         let mut points = self.dispersion_points;
         let mut size = self.ellipse_size;
         let mut switches = |ui: &mut egui::Ui| {
@@ -941,7 +941,7 @@ impl FlighthookApp {
         let rect = full.with_min_y(full.top() + header);
         let response = ui.allocate_rect(rect, egui::Sense::click());
         let painter = ui.painter_at(rect);
-        let units = self.units_toggle;
+        let units = self.units();
         let Some(shown) = self.dispersion_shown(table) else {
             painter.text(
                 rect.center(),
@@ -1751,7 +1751,7 @@ mod tests {
             app.dispersion_scene.peek(&key).unwrap().size,
             EllipseSize::P95
         );
-        app.units_toggle = UnitSystem::Metric;
+        app.settings.default_units = UnitSystem::Metric;
         changed(&mut app, &mut key, 7, size, "units");
         changed(&mut app, &mut key, 6, size, "shown shot");
         assert_eq!(gold(app.dispersion_scene.peek(&key).unwrap()), Some(6));
@@ -1861,7 +1861,7 @@ mod tests {
         theme::install(&ctx);
         let mut app = FlighthookApp::with_pending(crate::net::new_pending());
         for units in [UnitSystem::Imperial, UnitSystem::Metric] {
-            app.units_toggle = units;
+            app.settings.default_units = units;
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 200.0))),
                 ..Default::default()

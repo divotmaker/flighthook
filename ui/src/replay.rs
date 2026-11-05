@@ -56,6 +56,17 @@ impl Track {
             .partition_point(|f| self.start_ns.saturating_add(f.t_ns) <= t)
             .saturating_sub(1)
     }
+
+    /// The time after the first frame (the sidecar's `t_ns`) of the frame
+    /// shown at host time `t` ([`Track::frame_at`]); `None` before the
+    /// first frame or after the last, where the clip has no frame of that
+    /// moment.
+    pub(crate) fn shown_t_ns(&self, t: u64) -> Option<u64> {
+        if self.frames.is_empty() || t < self.time(0) || t > self.end_ns() {
+            return None;
+        }
+        self.frames.get(self.frame_at(t)).map(|f| f.t_ns)
+    }
 }
 
 /// The span every track covers, host ns.
@@ -531,6 +542,29 @@ pub(crate) mod tests {
             trigger_ns: (start + period * n * 3 / 4) * MS,
             impact_ns: Some((start + period * n / 2) * MS),
         }
+    }
+
+    #[test]
+    fn the_frame_shown_is_known_only_inside_the_clip() {
+        // A 30 fps camera from 1010 ms to 1010 + 33 × 49 ms.
+        let slow = track(1010, 33, 50, 100);
+        assert_eq!(slow.shown_t_ns(1005 * MS), None, "before its first frame");
+        assert_eq!(slow.shown_t_ns(1010 * MS), Some(0));
+        // Between frames: the frame on screen, the last one at or before.
+        assert_eq!(slow.shown_t_ns(1100 * MS), Some(66 * MS));
+        assert_eq!(
+            slow.shown_t_ns(1100 * MS).map(|t| slow.start_ns + t),
+            Some(slow.time(slow.frame_at(1100 * MS)))
+        );
+        assert_eq!(slow.shown_t_ns(slow.end_ns()), Some(33 * 49 * MS));
+        assert_eq!(
+            slow.shown_t_ns(slow.end_ns() + 1),
+            None,
+            "after its last frame"
+        );
+        let mut empty = slow;
+        empty.frames.clear();
+        assert_eq!(empty.shown_t_ns(1010 * MS), None);
     }
 
     #[test]

@@ -46,8 +46,9 @@ dimple = "0.0.7"
 glam = "0.32"
 # ExPutt RG putting device.
 threeputt = "0.0.3"
-# Swing cameras: capture, pre-roll and trigger-cut MJPEG clips.
-stance = "0.0.2"
+# Swing cameras: capture, pre-roll and trigger-cut MJPEG clips; `pose` is
+# body tracking (RTMPose on the CPU), `pose-download` fetches its models.
+stance = { version = "0.0.3", features = ["pose", "pose-download"] }
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.
@@ -59,6 +60,9 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
 allsquare = { version = "0.3.0", features = ["serde", "bluez"] }
+# The body tracking clip pass runs at a higher nice value (setpriority);
+# already in the tree (tokio, ...).
+libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 allsquare = { version = "0.3.0", features = ["serde", "btleplug"] }
@@ -69,6 +73,9 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 
 [target.'cfg(target_os = "windows")'.dependencies]
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"], optional = true }
+# The body tracking clip pass runs at below-normal priority (thread priority
+# calls); already in the tree (tokio, dirs, ...).
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 # ironsight's test support: a scripted device and recorded result frames.
@@ -79,6 +86,9 @@ tenover = { version = "0.4.0", features = ["testing"] }
 allsquare = { version = "0.3.0", features = ["serde", "testing"] }
 # threeputt's test support: an in-process mock device and sample putts.
 threeputt = { version = "0.0.3", features = ["testing"] }
+# Encodes the numbered test frames of the body tracking tests (already in the
+# tree through stance).
+jpeg-encoder = "0.7"
 
 [build-dependencies]
 winresource = "0.1"

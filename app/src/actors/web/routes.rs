@@ -96,6 +96,7 @@ pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusRespon
         handed: game.handed,
         cameras_supported: crate::state::cameras::supported(),
         clip_dir: Some(clip_dir.display().to_string()),
+        config_error: state.root.system.load_error(),
     })
 }
 
@@ -153,6 +154,123 @@ pub async fn get_camera_still(
         .unwrap()
 }
 
+/// Query of `GET /api/cameras/{actor}/live`.
+#[derive(Debug, Deserialize)]
+pub struct LiveQuery {
+    /// The sequence number of the frame the viewer has; 0 for none.
+    #[serde(default)]
+    after: u64,
+}
+
+/// GET /api/cameras/{actor}/live?after=<seq> — the camera's live frame
+/// newer than `after`, a JPEG as the camera sent it, with its sequence
+/// number (`X-Frame-Seq`) and time (`X-Frame-Time-Ns`, see
+/// [`LiveFrame::time_ns`](crate::state::cameras::LiveFrame)), and the
+/// golfer's keypoints on that frame (`X-Pose`, compact JSON) when body
+/// tracking ran on it. Waits up to
+/// [`LIVE_WAIT`](crate::state::cameras::LIVE_WAIT) for one, then `204`.
+/// Both carry body tracking's state (`X-Pose-State`: `off`, `loading`,
+/// `downloading`, `ready` or `failed`, the failure in `X-Pose-Error`).
+/// Each request keeps the camera's live slot updated for the next
+/// [`LIVE_WATCH`](crate::state::cameras::LIVE_WATCH). `404` when `actor` is
+/// not a configured camera; `503` when the camera already has
+/// [`LIVE_WAITERS`](crate::state::cameras::LIVE_WAITERS) requests waiting.
+pub async fn get_camera_live(
+    State(state): State<Arc<WebState>>,
+    Path(actor): Path<String>,
+    Query(query): Query<LiveQuery>,
+) -> Response {
+    get_camera_live_with(
+        &state,
+        &actor,
+        query.after,
+        crate::state::cameras::LIVE_WAIT,
+    )
+    .await
+}
+
+/// [`get_camera_live`] waiting at most `wait`.
+async fn get_camera_live_with(
+    state: &WebState,
+    actor: &str,
+    after: u64,
+    wait: Duration,
+) -> Response {
+    use crate::state::cameras::LiveWait;
+    let configured = actor
+        .strip_prefix("camera.")
+        .is_some_and(|index| state.root.system.camera(index).is_some());
+    if !configured {
+        return not_found(format!("no camera '{actor}'"));
+    }
+    let cameras = &state.root.cameras;
+    cameras.watch_live(actor, std::time::Instant::now());
+    let answer = cameras.next_live(actor, after, wait).await;
+    let pose_state = || {
+        let settings = state.root.system.body_tracking();
+        state.root.pose.live_state(&settings, actor)
+    };
+    match answer {
+        LiveWait::Frame(frame) => {
+            let mut builder = Response::builder()
+                .header(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))
+                .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
+                .header("X-Frame-Seq", frame.seq)
+                .header("X-Frame-Time-Ns", frame.time_ns);
+            if let Some(pose) = frame.pose.as_deref() {
+                match HeaderValue::from_str(pose) {
+                    Ok(value) => builder = builder.header("X-Pose", value),
+                    Err(_) => {
+                        tracing::debug!("{actor}: live pose left out, not a valid header: {pose}")
+                    }
+                }
+            }
+            pose_headers(builder, pose_state())
+                .body(Body::from(frame.jpeg.to_vec()))
+                .unwrap()
+        }
+        LiveWait::Timeout => {
+            let builder = Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            pose_headers(builder, pose_state())
+                .body(Body::empty())
+                .unwrap()
+        }
+        LiveWait::Busy => text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("too many live requests waiting on '{actor}'"),
+        ),
+    }
+}
+
+/// Add body tracking's `state` (`X-Pose-State`) and its error, if any
+/// (`X-Pose-Error`, printable ASCII, at most 300 characters).
+fn pose_headers(
+    builder: axum::http::response::Builder,
+    (state, error): (&'static str, Option<String>),
+) -> axum::http::response::Builder {
+    let builder = builder.header("X-Pose-State", state);
+    let Some(error) = error else {
+        return builder;
+    };
+    let text: String = error
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .take(300)
+        .collect();
+    match HeaderValue::from_str(&text) {
+        Ok(value) => builder.header("X-Pose-Error", value),
+        Err(_) => builder,
+    }
+}
+
 /// GET /api/shots/{shot_id}/video — the shot's finished camera clips.
 pub async fn get_shot_video(
     State(state): State<Arc<WebState>>,
@@ -161,9 +279,11 @@ pub async fn get_shot_video(
     Json(state.root.clips.videos(&shot_id))
 }
 
-/// GET /api/shots/{shot_id}/video/{camera}.avi | .json — a camera's clip of
-/// the shot (MJPEG AVI) or its frame index (the sidecar), with HTTP `Range`
-/// support. Only finished clips are served; `404` otherwise. Sent with
+/// GET /api/shots/{shot_id}/video/{camera}.avi | .json | .pose.json |
+/// .swing.json — a camera's clip of the shot (MJPEG AVI), its frame index
+/// (the sidecar), the golfer's keypoints on every frame (body tracking) or
+/// the swing analysis, with HTTP `Range` support. Only finished clips, and
+/// finished body tracking and swing analysis, are served; `404` otherwise. Sent with
 /// `Cache-Control: private, no-cache`: a finished file never changes, but a
 /// pruned clip's URL must not be served from a cache, and a camera that
 /// records the same swing again replaces its files.
@@ -175,7 +295,13 @@ pub async fn get_shot_video_file(
     use tower::ServiceExt as _;
 
     let path = file
-        .rsplit_once('.')
+        .strip_suffix(".pose.json")
+        .map(|camera| (camera, "pose.json"))
+        .or_else(|| {
+            file.strip_suffix(".swing.json")
+                .map(|camera| (camera, "swing.json"))
+        })
+        .or_else(|| file.rsplit_once('.'))
         .and_then(|(camera, ext)| state.root.clips.file(&shot_id, camera, ext));
     let Some(path) = path else {
         return not_found(format!("no clip '{file}' for shot '{shot_id}'"));
@@ -193,6 +319,111 @@ pub async fn get_shot_video_file(
             response
         }
         Err(never) => match never {},
+    }
+}
+
+/// POST /api/shots/{shot_id}/video/{camera}/analyze — track camera
+/// `camera`'s clip of the shot now (body tracking, for a viewer), unless it
+/// is done or already queued ([`crate::pose::clips::request`]): `202
+/// {"state":"queued"}` (its `shot_pose`, then `shot_swing`, follow on the
+/// bus), `200 {"state":"done"}` when its keypoints are there, `409` while
+/// body tracking is off, `404` when the shot has no clip from the camera;
+/// errors carry `{"error": "..."}`.
+pub async fn post_analyze_clip(
+    State(state): State<Arc<WebState>>,
+    Path((shot_id, camera)): Path<(String, String)>,
+) -> Response {
+    use crate::pose::clips::{Requested, request};
+    let root = Arc::clone(&state.root);
+    let bus = state.bus_tx.clone();
+    let (shot, cam) = (shot_id.clone(), camera.clone());
+    let requested = tokio::task::spawn_blocking(move || request(&root, &shot, &cam, &bus)).await;
+    let json = |status: StatusCode, body: serde_json::Value| (status, Json(body)).into_response();
+    match requested {
+        Ok(Requested::Queued) => json(
+            StatusCode::ACCEPTED,
+            serde_json::json!({ "state": "queued" }),
+        ),
+        Ok(Requested::Done) => json(StatusCode::OK, serde_json::json!({ "state": "done" })),
+        Ok(Requested::Off) => json(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "error": "body tracking is off" }),
+        ),
+        Ok(Requested::NoClip) => json(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": format!("no clip from '{camera}' for shot '{shot_id}'") }),
+        ),
+        Err(e) => json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": e.to_string() }),
+        ),
+    }
+}
+
+/// GET /api/body_tracking/models — the state of the files the configured
+/// pose model needs: `missing`, `downloading` (with the download's
+/// progress), `ready` or `failed` (with why), the files, their hosts and
+/// sizes, and the models folder. Checking a file hashes it the first time
+/// (a few hundred ms); later calls only look at its size and time.
+pub async fn get_body_tracking_models(State(state): State<Arc<WebState>>) -> Response {
+    let root = Arc::clone(&state.root);
+    match tokio::task::spawn_blocking(move || {
+        root.pose.models.files(root.system.body_tracking().model)
+    })
+    .await
+    {
+        Ok(files) => Json(files).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/body_tracking/models/download — download the files the
+/// configured pose model lacks, from their official sources: `202` with
+/// the state when a download starts or is already running (one at a time;
+/// asking again starts nothing), `200` with the state when every file is
+/// there already. The only way flighthook downloads a model.
+pub async fn post_body_tracking_models_download(State(state): State<Arc<WebState>>) -> Response {
+    use crate::pose::models::DownloadStart;
+    let root = Arc::clone(&state.root);
+    let answered = tokio::task::spawn_blocking(move || {
+        let model = root.system.body_tracking().model;
+        let started = root.pose.models.download(model);
+        (started, root.pose.models.files(model))
+    })
+    .await;
+    match answered {
+        Ok((DownloadStart::Ready, files)) => (StatusCode::OK, Json(files)).into_response(),
+        Ok((DownloadStart::Started | DownloadStart::Running, files)) => {
+            (StatusCode::ACCEPTED, Json(files)).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/body_tracking/models/download — stop the download running,
+/// if any; its partial file is deleted. `200` with the state either way.
+pub async fn delete_body_tracking_models_download(State(state): State<Arc<WebState>>) -> Response {
+    let root = Arc::clone(&state.root);
+    let answered = tokio::task::spawn_blocking(move || {
+        root.pose.models.cancel_download();
+        root.pose.models.files(root.system.body_tracking().model)
+    })
+    .await;
+    match answered {
+        Ok(files) => Json(files).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -468,12 +699,19 @@ pub async fn get_shot_groups(State(state): State<Arc<WebState>>) -> Json<ShotGro
 /// The ball speed is solved against the live `[simulation]` environment and
 /// surface ([`crate::autochip`]); the shot goes on the bus as actor
 /// [`flighthook::AUTO_CHIP_ACTOR`], so every output forwards it and it is
-/// stored like a device's shot. 400 for any other distance, 409 when the
-/// simulation environment is invalid; both with a JSON `{"error"}` body.
+/// stored like a device's shot. 409 when Auto-chip is disabled in the
+/// settings (`[simulation] auto_chip`) or the simulation environment is
+/// invalid, 400 for any other distance; all with a JSON `{"error"}` body.
 pub async fn post_auto_chip(
     State(state): State<Arc<WebState>>,
     Json(body): Json<AutoChipRequest>,
 ) -> Result<Json<AutoChipResponse>, SettingsError> {
+    if !state.root.system.simulation().auto_chip {
+        return Err(settings_error(
+            StatusCode::CONFLICT,
+            "Auto-chip is disabled in settings",
+        ));
+    }
     let yards = body.yards;
     if !flighthook::AUTO_CHIP_YARDS.contains(&yards) {
         let allowed: Vec<String> = flighthook::AUTO_CHIP_YARDS
@@ -657,13 +895,23 @@ fn webserver_violation(live: &FlighthookConfig, action: &ConfigAction) -> Option
 /// or with a video mode that is neither `auto` nor `WIDTHxHEIGHT@FPS`, a
 /// launch monitor `impact_lead_s` outside 0 to
 /// [`MAX_IMPACT_LEAD_S`](flighthook::MAX_IMPACT_LEAD_S), a camera `latency_s`
-/// outside 0 to [`MAX_LATENCY_S`](flighthook::MAX_LATENCY_S), or a
-/// `[replay]` value out of range ([`ReplaySection::error`](flighthook::ReplaySection::error)).
+/// outside 0 to [`MAX_LATENCY_S`](flighthook::MAX_LATENCY_S), a
+/// `[replay]` value out of range ([`ReplaySection::error`](flighthook::ReplaySection::error)),
+/// or a `[body_tracking]` one
+/// ([`BodyTrackingSection::error`](flighthook::BodyTrackingSection::error)).
 fn invalid_setting(action: &ConfigAction) -> Option<String> {
-    if let ConfigAction::ReplaceAll { config } | ConfigAction::ReplaceGlobal { config } = action
-        && let Some(error) = config.replay.error()
+    if let ConfigAction::ReplaceAll { config } | ConfigAction::ReplaceGlobal { config } = action {
+        if let Some(error) = config.replay.error() {
+            return Some(format!("replay: {error}"));
+        }
+        if let Some(error) = config.body_tracking.error() {
+            return Some(format!("body_tracking: {error}"));
+        }
+    }
+    if let ConfigAction::SetBodyTracking { section } = action
+        && let Some(error) = section.error()
     {
-        return Some(format!("replay: {error}"));
+        return Some(format!("body_tracking: {error}"));
     }
     let cameras: Vec<(&String, &flighthook::CameraSection)> = match action {
         ConfigAction::ReplaceAll { config } => config.camera.iter().collect(),
@@ -743,8 +991,10 @@ fn invalid_mevo_setting(action: &ConfigAction) -> Option<String> {
 ///
 /// `?scope=<global_id>` narrows the save to one actor: only that section is
 /// written and only that actor is reconciled. `?scope=global` writes only the
-/// global settings, keeping every actor section of the live config. Without
-/// a scope the whole config is replaced and every actor is reconciled.
+/// global settings, keeping every actor section of the live config.
+/// `?scope=body_tracking` writes only `[body_tracking]` and reconciles no
+/// actor. Without a scope the whole config is replaced and every actor is
+/// reconciled.
 ///
 /// An unknown scope, a removed web server, a second web server or an
 /// invalid device setting ([`invalid_setting`]) is `400` and a missing `ConfigOutcome` `504`, each with a JSON `{"error": "..."}`
@@ -780,6 +1030,9 @@ async fn save_settings(
         Some("global") => ConfigAction::ReplaceGlobal {
             config: Box::new(new_config),
         },
+        Some("body_tracking") => ConfigAction::SetBodyTracking {
+            section: new_config.body_tracking,
+        },
         Some(scope) => match scoped_action(scope, &new_config) {
             Some(action) => action,
             // Applying the body wholesale here would save far more than the
@@ -802,6 +1055,12 @@ async fn save_settings(
     if let Some(reason) = invalid_setting(&action) {
         tracing::warn!("config update: {reason}, ignoring request");
         return Err(settings_error(StatusCode::BAD_REQUEST, &reason));
+    }
+    // A config file that failed to load is copied aside before the first
+    // save replaces it; without the copy nothing is saved.
+    if let Err(reason) = state.root.system.back_up_unusable_file() {
+        tracing::warn!("config update: {reason}, ignoring request");
+        return Err(settings_error(StatusCode::INTERNAL_SERVER_ERROR, &reason));
     }
 
     match send_config_command_within(state, action, timeout).await {
@@ -1118,6 +1377,41 @@ mod tests {
         c.replay.pre_roll_s = 2.0;
         assert_eq!(
             invalid_setting(&ConfigAction::ReplaceGlobal {
+                config: Box::new(c.clone())
+            }),
+            None
+        );
+        // Body tracking values out of range are refused the same way.
+        for (field, set) in [
+            (
+                "min_score",
+                (|b: &mut flighthook::BodyTrackingSection| b.min_score = 2.0)
+                    as fn(&mut flighthook::BodyTrackingSection),
+            ),
+            ("smoothing", |b| b.smoothing = 50.0),
+            ("detect_every", |b| b.detect_every = 0),
+        ] {
+            let mut bad = c.clone();
+            set(&mut bad.body_tracking);
+            for action in [
+                ConfigAction::ReplaceGlobal {
+                    config: Box::new(bad.clone()),
+                },
+                ConfigAction::ReplaceAll {
+                    config: Box::new(bad.clone()),
+                },
+            ] {
+                let error = invalid_setting(&action).expect("rejected");
+                assert!(
+                    error.starts_with(&format!("body_tracking: {field}")),
+                    "{error}"
+                );
+            }
+        }
+        c.body_tracking.model = flighthook::PoseModel::RtmposeS;
+        c.body_tracking.detect_every = 60;
+        assert_eq!(
+            invalid_setting(&ConfigAction::ReplaceGlobal {
                 config: Box::new(c)
             }),
             None
@@ -1295,6 +1589,8 @@ mod convert_tests {
             impact_offset_ms: 0,
             complete: true,
             dropped: 0,
+            pose: false,
+            swing: false,
         }];
         for units in ["imperial", "metric"] {
             assert!(
@@ -1463,7 +1759,7 @@ mod shot_fields_tests {
 
 #[cfg(test)]
 mod group_tests {
-    use super::super::tests::{feed, test_state};
+    use super::super::tests::{TempDir, feed, test_state, web_state};
     use super::*;
     use flighthook::{BallFlight, Handedness, ShotGrouping, ShotKey, Velocity};
 
@@ -1636,6 +1932,7 @@ mod group_tests {
     #[tokio::test]
     async fn auto_chip_sends_1_3_and_5_yards() {
         let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| c.simulation.auto_chip = true);
         let state = Arc::new(state);
         let mut rx = state.bus_tx.subscribe();
         for (n, yards) in (1..).zip(flighthook::AUTO_CHIP_YARDS) {
@@ -1681,6 +1978,7 @@ mod group_tests {
     #[tokio::test]
     async fn auto_chip_rejects_any_other_distance() {
         let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| c.simulation.auto_chip = true);
         let state = Arc::new(state);
         let mut rx = state.bus_tx.subscribe();
         for yards in [0, 2, 4, 6, 10, 100, u32::MAX] {
@@ -1695,8 +1993,42 @@ mod group_tests {
     }
 
     #[tokio::test]
+    async fn auto_chip_refuses_while_disabled_in_settings() {
+        let (state, _writer, _dir) = test_state();
+        assert!(!state.root.system.simulation().auto_chip, "off by default");
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        let (status, Json(body)) = post_auto_chip(
+            State(Arc::clone(&state)),
+            Json(AutoChipRequest { yards: 3 }),
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "Auto-chip is disabled in settings");
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(
+            state
+                .auto_chip_shots
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no number taken"
+        );
+
+        state.root.system.update(|c| c.simulation.auto_chip = true);
+        let Json(resp) = post_auto_chip(
+            State(Arc::clone(&state)),
+            Json(AutoChipRequest { yards: 3 }),
+        )
+        .await
+        .expect("accepted once enabled");
+        assert_eq!(resp.shot_number, 1);
+    }
+
+    #[tokio::test]
     async fn auto_chip_needs_a_valid_simulation_environment() {
         let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| c.simulation.auto_chip = true);
         state
             .root
             .system
@@ -2281,6 +2613,58 @@ mod group_tests {
     }
 
     #[tokio::test]
+    async fn a_body_tracking_save_writes_that_section_alone() {
+        let (state, _writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        // The UI's copy is out of date on everything else.
+        let mut body = state.root.system.snapshot();
+        body.default_units = flighthook::UnitSystem::Metric;
+        body.replay.keep_shots = 5;
+        body.body_tracking.min_score = 0.55;
+        let _ = save_settings(
+            &state,
+            Some("body_tracking"),
+            body.clone(),
+            Duration::from_millis(10),
+        )
+        .await;
+        let msg = next_event(&mut rx);
+        let FlighthookEvent::ConfigCommand { action, .. } = &msg.event else {
+            panic!("not a config command: {:?}", msg.event);
+        };
+        assert!(matches!(
+            action.as_ref(),
+            ConfigAction::SetBodyTracking { section } if *section == body.body_tracking
+        ));
+        // Applied: body tracking changes, nothing else does.
+        let before = state.root.system.snapshot();
+        let sender =
+            crate::bus::BusSender::new("system".into(), state.bus_tx.clone(), Arc::default());
+        crate::actors::system::run_config_command(&msg.event, &state.root, &state.bus_tx, &sender);
+        let after = state.root.system.snapshot();
+        assert_eq!(after.body_tracking, body.body_tracking);
+        assert_eq!(after.default_units, before.default_units);
+        assert_eq!(after.replay, before.replay);
+        // A value out of range is refused, nothing sent.
+        body.body_tracking.min_score = 2.0;
+        let (status, Json(error)) = save_settings(
+            &state,
+            Some("body_tracking"),
+            body,
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error["error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("body_tracking: min_score")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn clear_endpoint_emits_its_command_and_the_history_and_export_empty() {
         let (state, writer, _dir) = test_state();
         let state = Arc::new(state);
@@ -2429,6 +2813,86 @@ mod group_tests {
             .update(|c| c.replay.clip_dir = Some("/srv/swings".into()));
         let Json(status) = get_status(State(Arc::clone(&state))).await;
         assert_eq!(status.clip_dir.as_deref(), Some("/srv/swings"));
+    }
+
+    /// A web state over a config file holding `contents`.
+    fn state_over(contents: &str) -> (WebState, std::path::PathBuf, TempDir) {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-web-config-test-{}",
+            crate::state::config::generate_id()
+        )));
+        std::fs::create_dir_all(&dir.0).expect("mkdir");
+        let path = dir.0.join("config.toml");
+        std::fs::write(&path, contents).expect("write");
+        let (root, _writer) = crate::state::SystemState::new(path.clone());
+        let (bus_tx, _) = broadcast::channel(1024);
+        let state = web_state(Arc::new(root), bus_tx, "webserver.0");
+        (state, path, dir)
+    }
+
+    #[tokio::test]
+    async fn get_status_carries_the_config_error_until_a_save_backs_the_file_up() {
+        let (state, _writer, _dir) = test_state();
+        let status = get_status(State(Arc::new(state))).await.0;
+        assert_eq!(status.config_error, None);
+        assert!(
+            !serde_json::to_string(&status)
+                .expect("ser")
+                .contains("config_error")
+        );
+
+        let broken = "[body_tracking]\nmode = \"liv\"\n";
+        let (state, path, dir) = state_over(broken);
+        let state = Arc::new(state);
+        let status = get_status(State(Arc::clone(&state))).await.0;
+        let error = status.config_error.expect("the config error");
+        assert_eq!(error.path, path.display().to_string());
+        assert!(error.error.starts_with("line 2, column 8: "), "{error:?}");
+        let json =
+            serde_json::to_value(get_status(State(Arc::clone(&state))).await.0).expect("ser");
+        assert_eq!(json["config_error"]["path"], error.path);
+
+        // No system actor here: the save times out, after the backup.
+        let saved = save_settings(
+            &state,
+            Some("global"),
+            state.root.system.snapshot(),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(saved.err().map(|e| e.0), Some(StatusCode::GATEWAY_TIMEOUT));
+        assert_eq!(get_status(State(state)).await.0.config_error, None);
+        let backup = dir
+            .0
+            .join(format!("config.pre-{}.toml", env!("CARGO_PKG_VERSION")));
+        assert_eq!(std::fs::read_to_string(backup).expect("backup"), broken);
+    }
+
+    #[tokio::test]
+    async fn a_save_is_refused_when_the_unusable_file_cannot_be_backed_up() {
+        let (_state, _path, dir) = state_over("");
+        // A directory in the file's place cannot be read, so not copied.
+        let folder = dir.0.join("folder.toml");
+        std::fs::create_dir(&folder).expect("mkdir");
+        let (root, _writer) = crate::state::SystemState::new(folder.clone());
+        let (bus_tx, _) = broadcast::channel(1024);
+        let state = web_state(Arc::new(root), bus_tx, "webserver.0");
+        let saved = save_settings(
+            &state,
+            Some("global"),
+            state.root.system.snapshot(),
+            Duration::from_millis(50),
+        )
+        .await;
+        let Err(refused) = saved else {
+            panic!("the save was not refused");
+        };
+        assert_eq!(refused.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let message = refused.1.0["error"].as_str().expect("message").to_string();
+        assert!(message.contains("cannot be backed up"), "{message}");
+        assert!(message.contains("folder.toml"), "{message}");
+        assert!(state.root.system.load_error().is_some());
+        assert!(folder.is_dir());
     }
 
     #[tokio::test]
@@ -2812,5 +3276,320 @@ mod reconnect_tests {
         let _ = web_thread.join();
         root.stop_and_wait("mock_monitor.0");
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use std::time::Instant;
+
+    use super::super::tests::test_state;
+    use super::*;
+    use flighthook::CameraSection;
+
+    /// A web state with one configured camera, `camera.0`.
+    fn with_camera() -> (WebState, super::super::tests::TempDir) {
+        let (state, _writer, dir) = test_state();
+        state.root.system.update(|c| {
+            c.camera.insert(
+                "0".into(),
+                CameraSection {
+                    name: "Face".into(),
+                    camera: CameraSection::TEST_PATTERN.into(),
+                    ..CameraSection::default()
+                },
+            );
+        });
+        (state, dir)
+    }
+
+    fn jpeg() -> Arc<[u8]> {
+        Arc::from(vec![0xFF, 0xD8, 0xFF, 0xD9].as_slice())
+    }
+
+    async fn body(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_newer_frame_is_answered_at_once_with_its_number_and_time() {
+        let (state, _dir) = with_camera();
+        // Watched (the camera only puts frames then) before the frame came.
+        state.root.cameras.watch_live("camera.0", Instant::now());
+        let seq = state
+            .root
+            .cameras
+            .set_live("camera.0", 123_456, jpeg(), None);
+        let started = Instant::now();
+        let resp = get_camera_live_with(&state, "camera.0", 0, Duration::from_secs(5)).await;
+        assert!(started.elapsed() < Duration::from_secs(1), "no wait");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert_eq!(headers[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers["x-frame-seq"], seq.to_string().as_str());
+        assert_eq!(headers["x-frame-time-ns"], "123456");
+        assert_eq!(body(resp).await, jpeg().to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_live_frame_carries_its_pose_and_body_trackings_state() {
+        use flighthook::BodyTrackingMode;
+        let (state, _dir) = with_camera();
+        state
+            .root
+            .system
+            .update(|c| c.body_tracking.mode = BodyTrackingMode::Live);
+        state.root.cameras.watch_live("camera.0", Instant::now());
+        let pose: Arc<str> = Arc::from(r#"{"skeleton":"halpe26","keypoints":[],"ms":4.0}"#);
+        let seq = state
+            .root
+            .cameras
+            .set_live("camera.0", 5, jpeg(), Some(Arc::clone(&pose)));
+        let resp = get_camera_live_with(&state, "camera.0", 0, Duration::from_secs(5)).await;
+        let headers = resp.headers().clone();
+        assert_eq!(headers["x-frame-seq"], seq.to_string().as_str());
+        assert_eq!(headers["x-pose"], &*pose);
+        // Nothing asked for the models yet.
+        assert_eq!(headers["x-pose-state"], "loading");
+        assert!(!headers.contains_key("x-pose-error"));
+        // A frame without a pose has no X-Pose; out of Live mode, off says
+        // so.
+        let mut seq = 0;
+        for mode in [BodyTrackingMode::Historical, BodyTrackingMode::Off] {
+            state.root.system.update(|c| c.body_tracking.mode = mode);
+            seq = state.root.cameras.set_live("camera.0", 6, jpeg(), None);
+            let resp =
+                get_camera_live_with(&state, "camera.0", seq - 1, Duration::from_secs(5)).await;
+            assert!(!resp.headers().contains_key("x-pose"));
+            assert_eq!(resp.headers()["x-pose-state"], "off", "{mode:?}");
+        }
+        // The 204 carries the state too: missing (the test models folder is
+        // empty), downloading while a download runs, then a failed load and
+        // why (the stand-in files are no models).
+        state
+            .root
+            .system
+            .update(|c| c.body_tracking.mode = BodyTrackingMode::Live);
+        let model = state.root.system.body_tracking().model;
+        let mut headers = Vec::new();
+        for want in ["missing", "downloading", "failed"] {
+            if want == "downloading" {
+                state.root.pose.models.download(model);
+            }
+            let mut seen = None;
+            for _ in 0..300 {
+                state.root.pose.models.want(model);
+                let resp =
+                    get_camera_live_with(&state, "camera.0", seq, Duration::from_millis(1)).await;
+                assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+                if resp.headers()["x-pose-state"] == want {
+                    seen = Some(resp.headers().clone());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            headers.push(seen.unwrap_or_else(|| panic!("never {want}")));
+        }
+        assert!(!headers[0].contains_key("x-pose-error"));
+        let error = headers[2]["x-pose-error"].to_str().expect("ascii");
+        assert!(error.contains("model"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn nothing_newer_in_time_is_a_204() {
+        let (state, _dir) = with_camera();
+        state.root.cameras.watch_live("camera.0", Instant::now());
+        let seq = state.root.cameras.set_live("camera.0", 1, jpeg(), None);
+        let wait = Duration::from_millis(80);
+        let started = Instant::now();
+        let resp = get_camera_live_with(&state, "camera.0", seq, wait).await;
+        assert!(started.elapsed() >= wait);
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(body(resp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_frame_arriving_while_it_waits_is_answered() {
+        let (state, _dir) = with_camera();
+        let state = Arc::new(state);
+        let root = Arc::clone(&state.root);
+        let put = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            root.cameras.set_live("camera.0", 9, jpeg(), None)
+        });
+        let resp = get_camera_live(
+            State(Arc::clone(&state)),
+            Path("camera.0".into()),
+            Query(LiveQuery { after: 0 }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seq = put.await.expect("put").to_string();
+        assert_eq!(resp.headers()["x-frame-seq"], seq.as_str());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_actor_is_a_404() {
+        let (state, _dir) = with_camera();
+        for actor in ["camera.1", "mevo.0", "camera", "webserver.0"] {
+            let resp = get_camera_live_with(&state, actor, 0, Duration::from_secs(5)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{actor}");
+            assert!(
+                !state.root.cameras.live_wanted(actor, Instant::now()),
+                "{actor}: no slot is watched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_keeps_the_live_slot_updated_only_for_a_while() {
+        let (state, _dir) = with_camera();
+        let cams = &state.root.cameras;
+        assert!(!cams.live_wanted("camera.0", Instant::now()));
+        let asked = Instant::now();
+        let resp = get_camera_live_with(&state, "camera.0", 0, Duration::from_millis(1)).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(cams.live_wanted("camera.0", Instant::now()));
+        let lapsed = asked + crate::state::cameras::LIVE_WATCH + Duration::from_millis(50);
+        assert!(!cams.live_wanted("camera.0", lapsed));
+    }
+
+    #[tokio::test]
+    async fn too_many_waiting_requests_are_refused() {
+        let (state, _dir) = with_camera();
+        let state = Arc::new(state);
+        let waits: Vec<_> = (0..crate::state::cameras::LIVE_WAITERS)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    get_camera_live_with(&state, "camera.0", 0, Duration::from_secs(5))
+                        .await
+                        .status()
+                })
+            })
+            .collect();
+        let cams = &state.root.cameras;
+        for _ in 0..400 {
+            if cams.live_waiters("camera.0") == crate::state::cameras::LIVE_WAITERS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let resp = get_camera_live_with(&state, "camera.0", 0, Duration::from_secs(5)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        state.root.cameras.set_live("camera.0", 1, jpeg(), None);
+        for wait in waits {
+            assert_eq!(wait.await.expect("wait"), StatusCode::OK);
+        }
+    }
+}
+
+#[cfg(test)]
+mod body_tracking_models_tests {
+    use super::super::tests::test_state;
+    use super::*;
+    use flighthook::{BodyTrackingModels, ModelFilesState};
+
+    async fn read(resp: Response) -> (StatusCode, BodyTrackingModels) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).expect("models json"))
+    }
+
+    async fn get(state: &Arc<WebState>) -> BodyTrackingModels {
+        read(get_body_tracking_models(State(Arc::clone(state))).await)
+            .await
+            .1
+    }
+
+    async fn settle(state: &Arc<WebState>) -> BodyTrackingModels {
+        for _ in 0..500 {
+            let m = get(state).await;
+            if m.state != ModelFilesState::Downloading {
+                return m;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the download did not end");
+    }
+
+    #[tokio::test]
+    async fn the_models_download_only_when_posted_and_stop_when_deleted() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let models_dir = state.root.pose.models.dir();
+        // Missing, nothing downloading, nothing written.
+        let m = get(&state).await;
+        assert_eq!(m.state, ModelFilesState::Missing);
+        assert_eq!(m.model, flighthook::PoseModel::RtmposeM);
+        assert_eq!(m.files.len(), 2);
+        assert!(m.download.is_none() && m.error.is_none());
+        assert_eq!(m.dir, models_dir.display().to_string());
+        assert!(!models_dir.exists());
+        // Started; asking again starts nothing new.
+        let (code, m) =
+            read(post_body_tracking_models_download(State(Arc::clone(&state))).await).await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(m.state, ModelFilesState::Downloading);
+        let (code, again) =
+            read(post_body_tracking_models_download(State(Arc::clone(&state))).await).await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(again.state, ModelFilesState::Downloading);
+        // Cancelled: missing at once, the partial file goes.
+        let (code, m) =
+            read(delete_body_tracking_models_download(State(Arc::clone(&state))).await).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(m.state, ModelFilesState::Missing);
+        assert!(m.error.is_none());
+        for _ in 0..200 {
+            let parts = std::fs::read_dir(&models_dir)
+                .map(|d| d.count())
+                .unwrap_or(0);
+            if parts == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read_dir(&models_dir)
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0,
+            "no partial file left"
+        );
+        // Cancelling with nothing running is fine.
+        let (code, _) =
+            read(delete_body_tracking_models_download(State(Arc::clone(&state))).await).await;
+        assert_eq!(code, StatusCode::OK);
+        // Downloaded to the end: ready, and a POST then has nothing to do.
+        read(post_body_tracking_models_download(State(Arc::clone(&state))).await).await;
+        let m = settle(&state).await;
+        assert_eq!(m.state, ModelFilesState::Ready);
+        assert!(m.files.iter().all(|f| f.present));
+        let (code, m) =
+            read(post_body_tracking_models_download(State(Arc::clone(&state))).await).await;
+        assert_eq!((code, m.state), (StatusCode::OK, ModelFilesState::Ready));
+        let _ = std::fs::remove_dir_all(&models_dir);
+    }
+
+    #[tokio::test]
+    async fn the_state_follows_the_configured_model() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        state
+            .root
+            .system
+            .update(|c| c.body_tracking.model = flighthook::PoseModel::RtmposeS);
+        let m = get(&state).await;
+        assert_eq!(m.model, flighthook::PoseModel::RtmposeS);
+        assert_eq!(m.files[0].name, "rtmpose-s-halpe26.onnx");
+        assert_eq!(m.files[1].host, "github.com");
     }
 }

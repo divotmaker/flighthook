@@ -374,6 +374,7 @@ mod tests {
             openconnect_client: _,
             random_club: _,
             replay: _,
+            body_tracking: _,
             camera: _,
         } = flighthook::FlighthookConfig::default();
         for key in [

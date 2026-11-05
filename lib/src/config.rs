@@ -187,6 +187,10 @@ pub struct FlighthookConfig {
     /// the API while it is at its defaults.
     #[serde(default, skip_serializing_if = "ReplaySection::is_default")]
     pub replay: ReplaySection,
+    /// Body tracking on the cameras' pictures (alpha). Omitted from the file
+    /// and the API while it is at its defaults.
+    #[serde(default, skip_serializing_if = "BodyTrackingSection::is_default")]
+    pub body_tracking: BodyTrackingSection,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub webserver: std::collections::HashMap<String, WebserverSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -273,6 +277,16 @@ pub struct SimulationSection {
     /// Ground the ball lands and rolls on. Defaults to `fairway`.
     #[serde(default)]
     pub surface: SimSurface,
+    /// Whether the Auto-chip control is offered (the header chip and
+    /// `POST /api/auto-chip`). Defaults to `false`; omitted from the file and
+    /// the API while at the default. Auto-chip is simulated under the
+    /// conditions above whatever `mode` is.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_chip: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What flighthook simulates for each shot.
@@ -340,6 +354,7 @@ impl Default for SimulationSection {
             altitude: default_sim_altitude(),
             temperature_c: default_sim_temperature_c(),
             surface: SimSurface::default(),
+            auto_chip: false,
         }
     }
 }
@@ -362,6 +377,7 @@ impl SimulationSection {
             && self.altitude.as_meters() == 0.0
             && self.temperature_c == Self::DEFAULT_TEMPERATURE_C
             && self.surface == SimSurface::default()
+            && !self.auto_chip
     }
 
     /// Why the altitude or temperature is out of range, or `None` when both
@@ -535,6 +551,348 @@ impl ReplaySection {
         }
         None
     }
+}
+
+/// The body tracking pose model (alpha).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PoseModel {
+    /// RTMPose-m: the more accurate, about twice the work of `-s`.
+    #[default]
+    #[serde(rename = "rtmpose-m")]
+    RtmposeM,
+    /// RTMPose-s: lighter and faster.
+    #[serde(rename = "rtmpose-s")]
+    RtmposeS,
+}
+
+impl PoseModel {
+    /// Stable key, as the config file holds it.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::RtmposeM => "rtmpose-m",
+            Self::RtmposeS => "rtmpose-s",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RtmposeM => "RTMPose-m",
+            Self::RtmposeS => "RTMPose-s",
+        }
+    }
+
+    /// Every model, in display order.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::RtmposeM, Self::RtmposeS]
+    }
+
+    /// The other model.
+    #[must_use]
+    pub fn other(self) -> Self {
+        match self {
+            Self::RtmposeM => Self::RtmposeS,
+            Self::RtmposeS => Self::RtmposeM,
+        }
+    }
+}
+
+/// When body tracking runs (alpha).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyTrackingMode {
+    /// No body tracking: the cameras record and replay clips only. The
+    /// default.
+    #[default]
+    Off,
+    /// A clip is tracked the first time it is viewed, and the result kept
+    /// beside it. No live tracking.
+    Historical,
+    /// The live views are tracked while watched, and every clip right
+    /// after it is recorded.
+    Live,
+}
+
+impl BodyTrackingMode {
+    /// True for the default mode ([`BodyTrackingMode::Off`]).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Stable key, as the config file holds it.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Historical => "historical",
+            Self::Live => "live",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Historical => "Historical",
+            Self::Live => "Live",
+        }
+    }
+
+    /// Every mode, in display order.
+    #[must_use]
+    pub fn all() -> [Self; 3] {
+        [Self::Off, Self::Historical, Self::Live]
+    }
+
+    /// Whether body tracking runs at all (not [`BodyTrackingMode::Off`]).
+    #[must_use]
+    pub fn is_on(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// Body tracking on the cameras' pictures (alpha): a skeleton drawn over
+/// the live views and over the shots' clips, and the swing analysis of
+/// each clip.
+///
+/// Every field is read live; a change never restarts a camera. A field at
+/// its default is left out of the file and the API. A section with
+/// `enabled` and no `mode` reads `enabled = false` as
+/// [`BodyTrackingMode::Off`] and `enabled = true` as
+/// [`BodyTrackingMode::Historical`]; only `mode` is written.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "BodyTrackingRaw")]
+pub struct BodyTrackingSection {
+    /// When body tracking runs. Defaults to [`BodyTrackingMode::Off`].
+    #[serde(skip_serializing_if = "BodyTrackingMode::is_default")]
+    pub mode: BodyTrackingMode,
+    /// The pose model. Defaults to RTMPose-m.
+    #[serde(default, skip_serializing_if = "is_default_pose_model")]
+    pub model: PoseModel,
+    /// Keypoints scoring below this are not drawn, 0 to 1. Defaults to 0.3.
+    #[serde(
+        default = "default_min_score",
+        skip_serializing_if = "is_default_min_score"
+    )]
+    pub min_score: f64,
+    /// Live smoothing: the One Euro filter's cutoff at rest in Hz, 0 (off)
+    /// or [`MIN_SMOOTHING_HZ`](Self::MIN_SMOOTHING_HZ) to
+    /// [`MAX_SMOOTHING_HZ`](Self::MAX_SMOOTHING_HZ). Lower is smoother and
+    /// lags more. Defaults to 1 Hz. Live views only; recorded swings keep the
+    /// model's raw keypoints.
+    #[serde(
+        default = "default_smoothing",
+        skip_serializing_if = "is_default_smoothing"
+    )]
+    pub smoothing: f64,
+    /// The live view looks for the golfer afresh at least every this many
+    /// frames, 1 to [`MAX_DETECT_EVERY`](Self::MAX_DETECT_EVERY) (and
+    /// whenever it loses them); in between it follows them from the last
+    /// frame. Defaults to 10.
+    #[serde(
+        default = "default_detect_every",
+        skip_serializing_if = "is_default_detect_every"
+    )]
+    pub detect_every: u32,
+    /// The golfer's height in centimetres,
+    /// [`MIN_GOLFER_HEIGHT_CM`](Self::MIN_GOLFER_HEIGHT_CM) to
+    /// [`MAX_GOLFER_HEIGHT_CM`](Self::MAX_GOLFER_HEIGHT_CM). With it, swing
+    /// metrics that are distances are also given in centimetres (inches in
+    /// imperial units); without it they stay fractions of the golfer's
+    /// torso length. Not set by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golfer_height: Option<f64>,
+}
+
+/// `[body_tracking]` as written: `mode`, or the `enabled` switch of a
+/// section from before the modes.
+#[derive(Deserialize)]
+struct BodyTrackingRaw {
+    #[serde(default)]
+    mode: Option<BodyTrackingMode>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    model: PoseModel,
+    #[serde(default = "default_min_score")]
+    min_score: f64,
+    #[serde(default = "default_smoothing")]
+    smoothing: f64,
+    #[serde(default = "default_detect_every")]
+    detect_every: u32,
+    #[serde(default)]
+    golfer_height: Option<f64>,
+}
+
+impl From<BodyTrackingRaw> for BodyTrackingSection {
+    fn from(raw: BodyTrackingRaw) -> Self {
+        let mode = raw.mode.unwrap_or(match raw.enabled {
+            Some(true) => BodyTrackingMode::Historical,
+            Some(false) | None => BodyTrackingMode::Off,
+        });
+        Self {
+            mode,
+            model: raw.model,
+            min_score: raw.min_score,
+            smoothing: raw.smoothing,
+            detect_every: raw.detect_every,
+            golfer_height: raw.golfer_height,
+        }
+    }
+}
+
+fn is_default_pose_model(v: &PoseModel) -> bool {
+    *v == PoseModel::default()
+}
+
+fn default_min_score() -> f64 {
+    BodyTrackingSection::DEFAULT_MIN_SCORE
+}
+
+fn is_default_min_score(v: &f64) -> bool {
+    v.to_bits() == BodyTrackingSection::DEFAULT_MIN_SCORE.to_bits()
+}
+
+fn default_smoothing() -> f64 {
+    BodyTrackingSection::DEFAULT_SMOOTHING_HZ
+}
+
+fn is_default_smoothing(v: &f64) -> bool {
+    v.to_bits() == BodyTrackingSection::DEFAULT_SMOOTHING_HZ.to_bits()
+}
+
+fn default_detect_every() -> u32 {
+    BodyTrackingSection::DEFAULT_DETECT_EVERY
+}
+
+fn is_default_detect_every(v: &u32) -> bool {
+    *v == BodyTrackingSection::DEFAULT_DETECT_EVERY
+}
+
+impl Default for BodyTrackingSection {
+    fn default() -> Self {
+        Self {
+            mode: BodyTrackingMode::default(),
+            model: PoseModel::default(),
+            min_score: Self::DEFAULT_MIN_SCORE,
+            smoothing: Self::DEFAULT_SMOOTHING_HZ,
+            detect_every: Self::DEFAULT_DETECT_EVERY,
+            golfer_height: None,
+        }
+    }
+}
+
+impl BodyTrackingSection {
+    /// Default keypoint drawing threshold.
+    pub const DEFAULT_MIN_SCORE: f64 = 0.3;
+    /// Default live smoothing, Hz.
+    pub const DEFAULT_SMOOTHING_HZ: f64 = 1.0;
+    /// Lowest live smoothing cutoff other than off, Hz: the smoothest.
+    pub const MIN_SMOOTHING_HZ: f64 = 0.1;
+    /// Highest live smoothing cutoff, Hz: the least smoothing.
+    pub const MAX_SMOOTHING_HZ: f64 = 10.0;
+    /// Default frames between two looks for the golfer.
+    pub const DEFAULT_DETECT_EVERY: u32 = 10;
+    /// Most frames between two looks for the golfer.
+    pub const MAX_DETECT_EVERY: u32 = 60;
+    /// Shortest golfer height accepted, cm.
+    pub const MIN_GOLFER_HEIGHT_CM: f64 = 100.0;
+    /// Tallest golfer height accepted, cm.
+    pub const MAX_GOLFER_HEIGHT_CM: f64 = 250.0;
+
+    /// True when every setting is at its default.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Why a setting is out of range, or `None` when all are valid:
+    /// `min_score` 0 to 1, `smoothing` 0 or
+    /// [`MIN_SMOOTHING_HZ`](Self::MIN_SMOOTHING_HZ) to
+    /// [`MAX_SMOOTHING_HZ`](Self::MAX_SMOOTHING_HZ), `detect_every` 1 to
+    /// [`MAX_DETECT_EVERY`](Self::MAX_DETECT_EVERY), `golfer_height` (when
+    /// set) [`MIN_GOLFER_HEIGHT_CM`](Self::MIN_GOLFER_HEIGHT_CM) to
+    /// [`MAX_GOLFER_HEIGHT_CM`](Self::MAX_GOLFER_HEIGHT_CM).
+    #[must_use]
+    pub fn error(&self) -> Option<String> {
+        if !self.min_score.is_finite() || !(0.0..=1.0).contains(&self.min_score) {
+            return Some(format!("min_score {} is outside 0 to 1", self.min_score));
+        }
+        if !smoothing_valid(self.smoothing) {
+            return Some(format!(
+                "smoothing {} is neither 0 (off) nor {} to {} Hz",
+                self.smoothing,
+                Self::MIN_SMOOTHING_HZ,
+                Self::MAX_SMOOTHING_HZ
+            ));
+        }
+        if !(1..=Self::MAX_DETECT_EVERY).contains(&self.detect_every) {
+            return Some(format!(
+                "detect_every {} is outside 1 to {}",
+                self.detect_every,
+                Self::MAX_DETECT_EVERY
+            ));
+        }
+        if let Some(h) = self.golfer_height.filter(|h| !golfer_height_valid(*h)) {
+            return Some(format!(
+                "golfer_height {h} is outside {} to {} cm",
+                Self::MIN_GOLFER_HEIGHT_CM,
+                Self::MAX_GOLFER_HEIGHT_CM
+            ));
+        }
+        None
+    }
+
+    /// The settings in effect: every value out of range replaced by its
+    /// default.
+    #[must_use]
+    pub fn in_effect(&self) -> Self {
+        let defaults = Self::default();
+        Self {
+            mode: self.mode,
+            model: self.model,
+            min_score: if self.min_score.is_finite() && (0.0..=1.0).contains(&self.min_score) {
+                self.min_score
+            } else {
+                defaults.min_score
+            },
+            smoothing: if smoothing_valid(self.smoothing) {
+                self.smoothing
+            } else {
+                defaults.smoothing
+            },
+            detect_every: if (1..=Self::MAX_DETECT_EVERY).contains(&self.detect_every) {
+                self.detect_every
+            } else {
+                defaults.detect_every
+            },
+            golfer_height: self.golfer_height.filter(|h| golfer_height_valid(*h)),
+        }
+    }
+}
+
+/// Whether `cm` is an acceptable golfer height: finite and from
+/// [`BodyTrackingSection::MIN_GOLFER_HEIGHT_CM`] to
+/// [`BodyTrackingSection::MAX_GOLFER_HEIGHT_CM`].
+fn golfer_height_valid(cm: f64) -> bool {
+    cm.is_finite()
+        && (BodyTrackingSection::MIN_GOLFER_HEIGHT_CM..=BodyTrackingSection::MAX_GOLFER_HEIGHT_CM)
+            .contains(&cm)
+}
+
+/// Whether `hz` is an acceptable live smoothing: 0 (off), or finite and
+/// from [`BodyTrackingSection::MIN_SMOOTHING_HZ`] to
+/// [`BodyTrackingSection::MAX_SMOOTHING_HZ`].
+fn smoothing_valid(hz: f64) -> bool {
+    hz == 0.0
+        || (hz.is_finite()
+            && (BodyTrackingSection::MIN_SMOOTHING_HZ..=BodyTrackingSection::MAX_SMOOTHING_HZ)
+                .contains(&hz))
 }
 
 /// Where a camera stands, as seen from the golfer's stance.
@@ -874,7 +1232,6 @@ fn default_launch_only_spin() -> f64 {
     MevoSection::DEFAULT_LAUNCH_ONLY_SPIN
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
 fn is_default_launch_only_spin(v: &f64) -> bool {
     *v == MevoSection::DEFAULT_LAUNCH_ONLY_SPIN
 }
@@ -1236,6 +1593,7 @@ impl Default for FlighthookConfig {
             shot_grouping: ShotGrouping::default(),
             simulation: SimulationSection::default(),
             replay: ReplaySection::default(),
+            body_tracking: BodyTrackingSection::default(),
             webserver,
             mevo: std::collections::HashMap::new(),
             r10: std::collections::HashMap::new(),
@@ -1651,6 +2009,29 @@ mod simulation_tests {
         );
     }
 
+    /// Auto-chip is disabled by default and written only when enabled; an
+    /// enabled one survives a JSON round trip and makes the section
+    /// non-default.
+    #[test]
+    fn auto_chip_defaults_off_and_round_trips_when_on() {
+        assert!(!SimulationSection::default().auto_chip);
+        assert!(SimulationSection::default().is_default());
+        let s: SimulationSection = serde_json::from_str("{}").expect("parses");
+        assert!(!s.auto_chip, "an absent key is disabled");
+        let json = serde_json::to_string(&SimulationSection::default()).expect("ser");
+        assert!(!json.contains("auto_chip"), "{json}");
+
+        let on = SimulationSection {
+            auto_chip: true,
+            ..SimulationSection::default()
+        };
+        assert!(!on.is_default());
+        let json = serde_json::to_string(&on).expect("ser");
+        assert!(json.contains(r#""auto_chip":true"#), "{json}");
+        let back: SimulationSection = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back, on);
+    }
+
     #[test]
     fn environment_bounds() {
         let ok = |altitude, temperature_c| {
@@ -1798,6 +2179,7 @@ mod openconnect_client_tests {
                 altitude: Distance::Meters(250.0),
                 temperature_c: 12.5,
                 surface: SimSurface::FirmGreen,
+                auto_chip: true,
             },
             replay: ReplaySection {
                 keep_shots: 7,
@@ -1805,6 +2187,14 @@ mod openconnect_client_tests {
                 post_roll_s: 0.5,
                 start_before_impact_s: 1.5,
                 clip_dir: Some("/srv/clips".into()),
+            },
+            body_tracking: BodyTrackingSection {
+                mode: BodyTrackingMode::Live,
+                model: PoseModel::RtmposeS,
+                min_score: 0.45,
+                smoothing: 2.0,
+                detect_every: 5,
+                golfer_height: Some(180.0),
             },
             webserver: one(WebserverSection {
                 name: "Web".into(),
@@ -2228,6 +2618,221 @@ mod latency_tests {
             assert_eq!(s.latency_s, expected, "{text}");
             let back = serde_json::to_string(&s).expect("ser");
             assert_eq!(back.contains("latency_s"), expected.is_some(), "{back}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod body_tracking_tests {
+    use super::*;
+
+    #[test]
+    fn a_config_without_the_section_reads_and_writes_without_it() {
+        let c: FlighthookConfig =
+            serde_json::from_str(r#"{"default_units":"metric"}"#).expect("parse");
+        assert!(c.body_tracking.is_default());
+        let json = serde_json::to_string(&c).expect("serialize");
+        assert!(!json.contains("body_tracking"), "{json}");
+        assert_eq!(
+            c.body_tracking.mode,
+            BodyTrackingMode::Off,
+            "off by default"
+        );
+        // Written out at the defaults, the section is left out again.
+        let c: FlighthookConfig = serde_json::from_str(
+            r#"{"body_tracking":{"enabled":false,"model":"rtmpose-m","min_score":0.3,"smoothing":1.0,"detect_every":10}}"#,
+        )
+        .expect("parse");
+        assert!(!serde_json::to_string(&c).unwrap().contains("body_tracking"));
+    }
+
+    #[test]
+    fn only_the_fields_off_their_defaults_are_written() {
+        let section = BodyTrackingSection {
+            model: PoseModel::RtmposeS,
+            detect_every: 30,
+            ..BodyTrackingSection::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&section).unwrap(),
+            r#"{"model":"rtmpose-s","detect_every":30}"#
+        );
+        let back: BodyTrackingSection =
+            serde_json::from_str(r#"{"model":"rtmpose-s","detect_every":30}"#).unwrap();
+        assert_eq!(back, section);
+        let live: BodyTrackingSection = serde_json::from_str(r#"{"mode":"live"}"#).unwrap();
+        assert!(live.mode == BodyTrackingMode::Live && live.model == PoseModel::RtmposeM);
+        assert_eq!(serde_json::to_string(&live).unwrap(), r#"{"mode":"live"}"#);
+        let off: BodyTrackingSection = serde_json::from_str(r#"{"mode":"off"}"#).unwrap();
+        assert_eq!(off, BodyTrackingSection::default());
+        assert!(serde_json::from_str::<BodyTrackingSection>(r#"{"model":"rtmpose-x"}"#).is_err());
+        assert!(serde_json::from_str::<BodyTrackingSection>(r#"{"mode":"always"}"#).is_err());
+    }
+
+    #[test]
+    fn each_mode_round_trips_and_only_off_the_default_is_written() {
+        for mode in BodyTrackingMode::all() {
+            let section = BodyTrackingSection {
+                mode,
+                ..BodyTrackingSection::default()
+            };
+            let json = serde_json::to_string(&section).unwrap();
+            if mode == BodyTrackingMode::Off {
+                assert_eq!(json, "{}");
+                assert!(section.is_default());
+            } else {
+                assert_eq!(json, format!(r#"{{"mode":"{}"}}"#, mode.key()));
+            }
+            assert_eq!(
+                serde_json::from_str::<BodyTrackingSection>(&json).unwrap(),
+                section
+            );
+        }
+        assert_eq!(
+            BodyTrackingMode::all().map(BodyTrackingMode::label),
+            ["Off", "Historical", "Live"]
+        );
+        assert!(!BodyTrackingMode::Off.is_on() && BodyTrackingMode::Live.is_on());
+    }
+
+    #[test]
+    fn the_switch_of_an_older_section_reads_as_a_mode_and_only_the_mode_is_written() {
+        let read = |text: &str| -> BodyTrackingSection { serde_json::from_str(text).unwrap() };
+        let on = read(r#"{"enabled":true,"model":"rtmpose-s"}"#);
+        assert_eq!(on.mode, BodyTrackingMode::Historical);
+        assert_eq!(on.model, PoseModel::RtmposeS);
+        assert_eq!(
+            serde_json::to_string(&on).unwrap(),
+            r#"{"mode":"historical","model":"rtmpose-s"}"#
+        );
+        let off = read(r#"{"enabled":false}"#);
+        assert_eq!(off.mode, BodyTrackingMode::Off);
+        assert!(off.is_default());
+        assert_eq!(serde_json::to_string(&off).unwrap(), "{}");
+        // Neither: off.
+        assert_eq!(read(r#"{"model":"rtmpose-s"}"#).mode, BodyTrackingMode::Off);
+        // A mode wins over the switch.
+        assert_eq!(
+            read(r#"{"enabled":false,"mode":"live"}"#).mode,
+            BodyTrackingMode::Live
+        );
+        // In a whole config.
+        let c: FlighthookConfig =
+            serde_json::from_str(r#"{"body_tracking":{"enabled":false}}"#).unwrap();
+        assert!(c.body_tracking.is_default());
+        assert!(!serde_json::to_string(&c).unwrap().contains("body_tracking"));
+        let c: FlighthookConfig =
+            serde_json::from_str(r#"{"body_tracking":{"enabled":true}}"#).unwrap();
+        assert_eq!(c.body_tracking.mode, BodyTrackingMode::Historical);
+        assert!(
+            serde_json::to_string(&c)
+                .unwrap()
+                .contains(r#""body_tracking":{"mode":"historical"}"#)
+        );
+    }
+
+    #[test]
+    fn out_of_range_values_are_errors_and_default_in_effect() {
+        let ok = BodyTrackingSection::default();
+        assert_eq!(ok.error(), None);
+        for (bad, field) in [
+            (
+                BodyTrackingSection {
+                    min_score: 1.5,
+                    ..ok.clone()
+                },
+                "min_score",
+            ),
+            (
+                BodyTrackingSection {
+                    min_score: f64::NAN,
+                    ..ok.clone()
+                },
+                "min_score",
+            ),
+            (
+                BodyTrackingSection {
+                    smoothing: 0.05,
+                    ..ok.clone()
+                },
+                "smoothing",
+            ),
+            (
+                BodyTrackingSection {
+                    smoothing: 11.0,
+                    ..ok.clone()
+                },
+                "smoothing",
+            ),
+            (
+                BodyTrackingSection {
+                    detect_every: 0,
+                    ..ok.clone()
+                },
+                "detect_every",
+            ),
+            (
+                BodyTrackingSection {
+                    detect_every: 61,
+                    ..ok.clone()
+                },
+                "detect_every",
+            ),
+        ] {
+            let error = bad.error().expect(field);
+            assert!(error.starts_with(field), "{error}");
+            assert_eq!(bad.in_effect(), ok, "{field}");
+        }
+        // Off, and the ends of each range, are fine.
+        for good in [
+            BodyTrackingSection {
+                smoothing: 0.0,
+                min_score: 0.0,
+                detect_every: 1,
+                ..ok.clone()
+            },
+            BodyTrackingSection {
+                smoothing: BodyTrackingSection::MAX_SMOOTHING_HZ,
+                min_score: 1.0,
+                detect_every: BodyTrackingSection::MAX_DETECT_EVERY,
+                mode: BodyTrackingMode::Off,
+                model: PoseModel::RtmposeS,
+                golfer_height: Some(BodyTrackingSection::MAX_GOLFER_HEIGHT_CM),
+            },
+            BodyTrackingSection {
+                golfer_height: Some(BodyTrackingSection::MIN_GOLFER_HEIGHT_CM),
+                ..ok.clone()
+            },
+        ] {
+            assert_eq!(good.error(), None);
+            assert_eq!(good.in_effect(), good);
+        }
+    }
+
+    #[test]
+    fn a_golfer_height_round_trips_in_centimetres_and_is_validated() {
+        let section = BodyTrackingSection {
+            golfer_height: Some(182.5),
+            ..BodyTrackingSection::default()
+        };
+        assert!(!section.is_default());
+        let json = serde_json::to_string(&section).unwrap();
+        assert_eq!(json, r#"{"golfer_height":182.5}"#);
+        assert_eq!(
+            serde_json::from_str::<BodyTrackingSection>(&json).unwrap(),
+            section
+        );
+        let c: FlighthookConfig =
+            serde_json::from_str(r#"{"body_tracking":{"golfer_height":182.5}}"#).unwrap();
+        assert_eq!(c.body_tracking.golfer_height, Some(182.5));
+        for bad in [99.9, 250.5, f64::NAN, f64::INFINITY, -180.0] {
+            let s = BodyTrackingSection {
+                golfer_height: Some(bad),
+                ..BodyTrackingSection::default()
+            };
+            let error = s.error().expect("out of range");
+            assert!(error.starts_with("golfer_height"), "{error}");
+            assert_eq!(s.in_effect().golfer_height, None, "{bad}");
         }
     }
 }

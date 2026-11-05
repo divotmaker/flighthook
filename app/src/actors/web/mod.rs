@@ -393,8 +393,22 @@ async fn run(
             "/api/shots/{shot_id}/video/{file}",
             get(routes::get_shot_video_file),
         )
+        .route(
+            "/api/shots/{shot_id}/video/{camera}/analyze",
+            post(routes::post_analyze_clip),
+        )
+        .route(
+            "/api/body_tracking/models",
+            get(routes::get_body_tracking_models),
+        )
+        .route(
+            "/api/body_tracking/models/download",
+            post(routes::post_body_tracking_models_download)
+                .delete(routes::delete_body_tracking_models_download),
+        )
         .route("/api/cameras", get(routes::get_cameras))
         .route("/api/cameras/{actor}/still", get(routes::get_camera_still))
+        .route("/api/cameras/{actor}/live", get(routes::get_camera_live))
         .route(
             "/api/shots/groups",
             get(routes::get_shot_groups).post(routes::post_new_shot_group),
@@ -668,6 +682,30 @@ fn stamp_video(
     }
 }
 
+/// Mark camera `camera`'s clip of shot `shot_id` with `set` (body tracked,
+/// swing analysed), pending or stored, whatever device took the shot.
+fn mark_video(
+    shots: &mut VecDeque<StoredShot>,
+    pending: &mut PendingShots,
+    shot_id: &str,
+    camera: &str,
+    set: fn(&mut ShotVideo),
+) {
+    let apply = |list: &mut Vec<ShotVideo>| {
+        for video in list.iter_mut().filter(|v| v.camera == camera) {
+            set(video);
+        }
+    };
+    for ((_, key), p) in pending.iter_mut() {
+        if key.shot_id == shot_id {
+            apply(&mut p.video);
+        }
+    }
+    if let Some(stored) = shots.iter_mut().rev().find(|s| s.key.shot_id == shot_id) {
+        apply(&mut stored.data.video);
+    }
+}
+
 async fn apply_bus_event(
     state: &WebState,
     msg: &FlighthookMessage,
@@ -866,6 +904,8 @@ async fn apply_bus_event(
                 impact_offset_ms: *impact_offset_ms,
                 complete: *complete,
                 dropped: *dropped,
+                pose: false,
+                swing: false,
             };
             let mut shots = state.shots.write().await;
             for key in keys {
@@ -876,6 +916,22 @@ async fn apply_bus_event(
             let mut shots = state.shots.write().await;
             for key in keys {
                 stamp_video(&mut shots, accumulators, &key.shot_id, None);
+            }
+        }
+        FlighthookEvent::ShotPose { keys } => {
+            let mut shots = state.shots.write().await;
+            for key in keys {
+                mark_video(&mut shots, accumulators, &key.shot_id, &msg.actor, |v| {
+                    v.pose = true;
+                });
+            }
+        }
+        FlighthookEvent::ShotSwing { keys } => {
+            let mut shots = state.shots.write().await;
+            for key in keys {
+                mark_video(&mut shots, accumulators, &key.shot_id, &msg.actor, |v| {
+                    v.swing = true;
+                });
             }
         }
         FlighthookEvent::NewShotGroup => {
@@ -1598,6 +1654,81 @@ pub(crate) mod tests {
         .await;
         assert!(stored_video(&state, "uuid-a").await.is_empty());
         assert_eq!(stored_video(&state, "uuid-b").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shot_pose_marks_that_cameras_clip_of_every_listed_shot() {
+        let (state, _writer, _dir) = test_state();
+        let mut pending = PendingShots::new();
+        let a = ShotKey {
+            shot_id: "uuid-a".into(),
+            shot_number: 1,
+        };
+        let mut apply = async |actor: &str, event: FlighthookEvent| {
+            let msg = FlighthookMessage::new(event).actor(actor);
+            apply_bus_event(&state, &msg, &mut pending).await;
+        };
+        apply("mevo.0", FlighthookEvent::ShotTrigger { key: a.clone() }).await;
+        apply(
+            "mevo.0",
+            FlighthookEvent::BallFlight {
+                key: a.clone(),
+                ball: Box::new(ball()),
+                derived: None,
+            },
+        )
+        .await;
+        apply("camera.0", shot_video(&[&a], 5000)).await;
+        apply("camera.1", shot_video(&[&a], 5000)).await;
+        // Pending still: marked, and stored with the mark.
+        apply(
+            "camera.1",
+            FlighthookEvent::ShotPose {
+                keys: vec![a.clone()],
+            },
+        )
+        .await;
+        apply(
+            "mevo.0",
+            FlighthookEvent::ShotFinished {
+                key: a.clone(),
+                raw: None,
+            },
+        )
+        .await;
+        let poses = |state: &WebState| {
+            let shots = state.shots.try_read().expect("shots");
+            shots
+                .iter()
+                .find(|s| s.key.shot_id == "uuid-a")
+                .map(|s| s.data.video.iter().map(|v| v.pose).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert_eq!(poses(&state), [false, true]);
+        apply(
+            "camera.0",
+            FlighthookEvent::ShotPose {
+                keys: vec![a.clone()],
+            },
+        )
+        .await;
+        assert_eq!(poses(&state), [true, true]);
+        let rows = serde_json::to_value(&state.shots.read().await[0].data).expect("ser");
+        assert_eq!(rows["video"][0]["pose"], true);
+        assert!(
+            rows["video"][0].get("swing").is_none(),
+            "omitted while false"
+        );
+        apply(
+            "camera.1",
+            FlighthookEvent::ShotSwing {
+                keys: vec![a.clone()],
+            },
+        )
+        .await;
+        let rows = serde_json::to_value(&state.shots.read().await[0].data).expect("ser");
+        assert!(rows["video"][0].get("swing").is_none());
+        assert_eq!(rows["video"][1]["swing"], true);
     }
 
     pub(crate) async fn feed(state: &WebState, actor: &str, events: Vec<FlighthookEvent>) {

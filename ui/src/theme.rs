@@ -251,7 +251,7 @@ pub(crate) fn pill_static(ui: &mut egui::Ui, text: &str) -> egui::Response {
 }
 
 /// Label size of a pill.
-const PILL_FONT: f32 = 14.0;
+pub(crate) const PILL_FONT: f32 = 14.0;
 
 fn pill_with(
     ui: &mut egui::Ui,
@@ -315,12 +315,26 @@ pub(crate) fn segmented_sized(
     alert: Option<usize>,
     font_size: f32,
 ) -> egui::InnerResponse<Option<usize>> {
+    let shown = segmented_pills(ui, options, selected, alert, font_size);
+    egui::InnerResponse::new(shown.inner.0, shown.response)
+}
+
+/// A [`segmented_sized`] control that also returns each option's pill, in
+/// `options` order.
+pub(crate) fn segmented_pills(
+    ui: &mut egui::Ui,
+    options: &[&str],
+    selected: usize,
+    alert: Option<usize>,
+    font_size: f32,
+) -> egui::InnerResponse<(Option<usize>, Vec<egui::Response>)> {
     egui::Frame::new()
         .fill(VEIL)
         .corner_radius(CornerRadius::same(255))
         .inner_margin(Margin::same(3))
         .show(ui, |ui| {
             let mut clicked = None;
+            let mut pills: Vec<Option<egui::Response>> = vec![None; options.len()];
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.horizontal(|ui| {
                 // Inside a right-to-left parent the row fills from the right,
@@ -346,10 +360,71 @@ pub(crate) fn segmented_sized(
                         ui.painter()
                             .circle(center, 4.5, DANGER, Stroke::new(2.0, SURFACE));
                     }
+                    pills[i] = Some(pill);
                 }
             });
-            clicked
+            (clicked, pills.into_iter().flatten().collect())
         })
+}
+
+/// A single on/off pill in a [`segmented`] track, so it stands as tall as
+/// one: `text` after a `dot` of that colour, accent filled while `on`.
+/// The inner response is the pill's; the outer one covers the track.
+pub(crate) fn switch_pill(
+    ui: &mut egui::Ui,
+    on: bool,
+    text: &str,
+    dot: Color32,
+) -> egui::InnerResponse<egui::Response> {
+    egui::Frame::new()
+        .fill(VEIL)
+        .corner_radius(CornerRadius::same(255))
+        .inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| switch_pill_inner(ui, on, text, dot))
+                .inner
+        })
+}
+
+/// The pill of [`switch_pill`], inside its track.
+fn switch_pill_inner(ui: &mut egui::Ui, on: bool, text: &str, dot: Color32) -> egui::Response {
+    const DOT_RADIUS: f32 = 4.5;
+    const DOT_GAP: f32 = 7.0;
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::proportional(PILL_FONT),
+        Color32::PLACEHOLDER,
+    );
+    let pad = egui::vec2(28.0, 12.0);
+    let lead = 2.0 * DOT_RADIUS + DOT_GAP;
+    let size = galley.size() + pad + egui::vec2(lead, 0.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+        let hovered = response.hovered();
+        let (fill, stroke) = match (on, hovered) {
+            (true, false) => (ACCENT, Stroke::NONE),
+            (true, true) => (ACCENT_BRIGHT, Stroke::NONE),
+            (false, false) => (Color32::TRANSPARENT, Stroke::NONE),
+            (false, true) => (VEIL_HOVER, Stroke::new(1.0, VEIL_HOVER)),
+        };
+        let text_color = match (on, hovered) {
+            (true, _) => ON_ACCENT,
+            (false, true) => TEXT,
+            (false, false) => TEXT_MUTED,
+        };
+        let painter = ui.painter();
+        painter.rect(rect, radius, fill, stroke, egui::StrokeKind::Inside);
+        let left = rect.left() + pad.x / 2.0;
+        painter.circle_filled(
+            egui::pos2(left + DOT_RADIUS, rect.center().y),
+            DOT_RADIUS,
+            dot,
+        );
+        let y = rect.center().y - galley.size().y / 2.0;
+        painter.galley(egui::pos2(left + lead, y), galley, text_color);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// A compact [`segmented`] control with `font_size` labels that fills the
@@ -710,6 +785,10 @@ pub(crate) enum Icon {
     Video,
     /// `refresh`.
     Refresh,
+    /// `download`.
+    Download,
+    /// `export`.
+    Export,
 }
 
 impl Icon {
@@ -724,6 +803,8 @@ impl Icon {
             Icon::ChevronRight => '\u{eab6}',
             Icon::Video => '\u{ead9}',
             Icon::Refresh => '\u{eb37}',
+            Icon::Download => '\u{ec74}',
+            Icon::Export => '\u{ebac}',
         }
     }
 }
@@ -882,7 +963,7 @@ mod tests {
     fn replay_icons_are_codicons_glyphs() {
         // Codepoints from Codicons' mapping.json: play 60204, debug-pause
         // 60113, chevron-left 60085, chevron-right 60086,
-        // device-camera-video 60121, refresh 60215.
+        // device-camera-video 60121, refresh 60215, download 60532, export 60332.
         let icons = [
             (Icon::Play, '\u{eb2c}'),
             (Icon::Pause, '\u{ead1}'),
@@ -890,6 +971,8 @@ mod tests {
             (Icon::ChevronRight, '\u{eab6}'),
             (Icon::Video, '\u{ead9}'),
             (Icon::Refresh, '\u{eb37}'),
+            (Icon::Download, '\u{ec74}'),
+            (Icon::Export, '\u{ebac}'),
         ];
         let ctx = egui::Context::default();
         install(&ctx);

@@ -1,3 +1,6 @@
+pub(crate) mod auto_chip;
+pub(crate) mod body_models;
+pub(crate) mod cameras;
 pub(crate) mod card_row;
 pub(crate) mod cards;
 pub(crate) mod devices;

@@ -124,6 +124,9 @@ impl FlighthookApp {
     /// One banner per actor reporting an `error` (or whose reconnect
     /// request failed), then one for a failed Auto-chip.
     pub(crate) fn render_error_banner(&self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.config_error {
+            config_error_frame(ui, error);
+        }
         for (id, actor) in &self.actors {
             if let Some(err) = self
                 .reconnect_errors
@@ -143,6 +146,28 @@ impl FlighthookApp {
             error_banner(ui, &format!("{}: {err}", flighthook::AUTO_CHIP_NAME));
         }
     }
+}
+
+/// The error frame for a config file the server could not use: what
+/// happened, which file, and the fault.
+fn config_error_frame(ui: &mut egui::Ui, error: &crate::types::ConfigLoadError) {
+    let shown = egui::Frame::new()
+        .fill(theme::DANGER.gamma_multiply(0.22))
+        .stroke(egui::Stroke::new(1.0, theme::DANGER))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("The config file couldn't be read. The defaults are in use.")
+                    .color(theme::TEXT)
+                    .strong(),
+            );
+            ui.label(egui::RichText::new(&error.path).color(theme::TEXT));
+            ui.label(egui::RichText::new(&error.error).color(theme::TEXT));
+        });
+    devices::mark(ui, || "config_error".into(), &shown.response);
+    ui.add_space(8.0);
 }
 
 /// A full-width red banner with `text`.

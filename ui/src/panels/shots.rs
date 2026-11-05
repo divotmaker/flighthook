@@ -26,44 +26,25 @@ fn opt_f(v: Option<f64>, prec: usize) -> String {
 /// Hover text on every simulated cell.
 const SIMULATED_HINT: &str = "Simulated or estimated by flighthook, not measured by the device";
 
-/// Hover text on the JSONL export link.
+/// Hover text on the JSONL export menu item.
 const EXPORT_HINT: &str = "Every shot this session (the last 1000), including shots the device \
      sent no data for, with the raw device frames behind each one. \
      Contains no serial numbers, addresses or network names.";
 
+/// Hover text on the CSV export menu item.
+const EXPORT_CSV_HINT: &str = "Decoded shots, one row each. No raw frames.";
+
+/// Hover text on the export icon.
+const EXPORT_ICON_HINT: &str = "Export session";
+
 /// Hover text on the Clear history icon.
 const CLEAR_HINT: &str = "Clear history";
-
-/// Hover text on the Auto-chip button.
-const AUTO_CHIP_HINT: &str =
-    "Send a short straight chip to the sim, for chips your launch monitor can't read.";
-
-/// The Auto-chip menu's items, in order: label and total distance (yards).
-fn auto_chip_items() -> [(String, u32); 3] {
-    flighthook::AUTO_CHIP_YARDS.map(|yards| (format!("{yards} Yard"), yards))
-}
-
-/// Why the Auto-chip button is disabled, or `None` when it is enabled: a
-/// chip is on its way, or no output that forwards shots (an Open Connect
-/// client) is connected.
-fn auto_chip_blocked(
-    actors: &HashMap<String, ActorStatusResponse>,
-    in_flight: Option<u32>,
-) -> Option<&'static str> {
-    if in_flight.is_some() {
-        Some("Sending the chip\u{2026}")
-    } else if !crate::app::set_by_simulator(actors) {
-        Some("Auto-chip: no simulator connected. Connect an OpenConnect Client output first.")
-    } else {
-        None
-    }
-}
 
 /// Width of the Clear history confirmation's text.
 const CLEAR_CONFIRM_WIDTH: f32 = 440.0;
 
-/// The trash icon after the export links, as tall as they are: muted, red
-/// on hover. Disabled (dimmed, no clicks) when there is no shot to clear.
+/// The trash icon at the toolbar's right end, as tall as the body text:
+/// muted, red on hover. Disabled (dimmed, no clicks) when there is no shot to clear.
 fn clear_history_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     let height = ui.text_style_height(&egui::TextStyle::Body);
     let response = theme::icon(ui, theme::Icon::Trash, height, theme::DANGER, enabled);
@@ -72,6 +53,33 @@ fn clear_history_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     } else {
         response.on_hover_text("Clear history: no shots yet")
     }
+}
+
+/// The export formats the export icon's menu lists, in order: menu label,
+/// the `format` of [`net::export_url`], hover text.
+const EXPORT_FORMATS: [(&str, &str, &str); 2] = [
+    ("JSONL", "jsonl", EXPORT_HINT),
+    ("CSV", "csv", EXPORT_CSV_HINT),
+];
+
+/// The export icon left of the trash icon, as tall as it: muted, accent on
+/// hover. It opens a menu of the export formats ([`EXPORT_FORMATS`]);
+/// picking one downloads the whole session in `units`.
+fn export_menu(ui: &mut egui::Ui, units: UnitSystem) {
+    let height = ui.text_style_height(&egui::TextStyle::Body);
+    let icon = theme::icon(ui, theme::Icon::Export, height, theme::ACCENT, true);
+    devices::mark(ui, || "export".to_owned(), &icon);
+    let icon = icon.on_hover_text(EXPORT_ICON_HINT);
+    egui::Popup::menu(&icon).show(|ui| {
+        for (label, format, hint) in EXPORT_FORMATS {
+            let item = ui.button(label).on_hover_text(hint);
+            devices::mark(ui, || format!("export:{format}"), &item);
+            if item.clicked() {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::same_tab(net::export_url(format, units)));
+            }
+        }
+    });
 }
 
 /// The Clear history confirmation's question for `n` shots.
@@ -383,7 +391,7 @@ fn bottom_height(height: f32, row: BottomRow, width: f32) -> f32 {
 }
 
 /// Centred placeholder for a view with no shot to show.
-fn empty_state(ui: &mut egui::Ui, detail: &str) {
+pub(super) fn empty_state(ui: &mut egui::Ui, detail: &str) {
     let top = ui.available_height() * 0.36;
     ui.vertical_centered(|ui| {
         ui.add_space(top);
@@ -476,7 +484,7 @@ impl ShotFocus {
     }
 
     /// Show the latest shot, and every new one as it arrives.
-    fn follow(&mut self) {
+    pub(super) fn follow(&mut self) {
         self.pinned = None;
         self.reveal = true;
     }
@@ -550,11 +558,11 @@ enum HeaderChip {
 /// trigger whose data has not landed does not take it).
 /// What a click on the shot header asks for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct HeaderClick {
+pub(super) struct HeaderClick {
     /// Back to latest.
-    back: bool,
+    pub(super) back: bool,
     /// Replay the shot's clips.
-    replay: bool,
+    pub(super) replay: bool,
 }
 
 fn header_chip(shots: &[ShotRow], i: usize, following: bool, filter: Option<&str>) -> HeaderChip {
@@ -1485,7 +1493,7 @@ impl CardLook {
 }
 
 /// Approximate descent of the proportional font, as a fraction of its size.
-const DESCENT: f32 = 0.2;
+pub(crate) const DESCENT: f32 = 0.2;
 /// Approximate height of a numeral, as a fraction of the font size.
 const DIGIT_HEIGHT: f32 = 0.7;
 
@@ -1499,14 +1507,14 @@ struct Reading {
 }
 
 /// Font size of a card's word unit or sign word next to a `size` numeral.
-fn small_size(size: f32) -> f32 {
+pub(crate) fn small_size(size: f32) -> f32 {
     (size * 0.36).max(12.0)
 }
 
 /// The smallest a card's numeral shrinks to when fitting its width.
-const NUMERAL_FLOOR: f32 = 8.0;
+pub(crate) const NUMERAL_FLOOR: f32 = 8.0;
 /// The smallest a sign word shrinks to before the numeral gives way.
-const WORD_MIN: f32 = 9.0;
+pub(crate) const WORD_MIN: f32 = 9.0;
 
 /// `m`'s reading at numeral size `size` within `room`: the sign word starts
 /// at the word unit's size and shrinks towards [`WORD_MIN`] to fit; only
@@ -3133,7 +3141,7 @@ fn clock_time(rfc3339: &str) -> Option<String> {
     Some(t.with_timezone(&chrono::Local).format("%H:%M").to_string())
 }
 
-/// Hover text for + New set in `view`.
+/// Hover text for New set in `view`.
 fn new_group_hint(view: ShotGrouping) -> &'static str {
     if view == ShotGrouping::ByClub {
         "Start a fresh set with the next shot. By club keeps combining a club's \
@@ -3295,13 +3303,11 @@ struct EntryState {
     pulse: f32,
 }
 
-/// Paint one shot list entry at `rect`: a mini card with the shot number
-/// and device on top, then carry and total.
-fn list_entry(ui: &egui::Ui, rect: egui::Rect, e: &ListEntry, state: EntryState) {
-    use egui::text::{LayoutJob, TextFormat, TextWrapping};
-    use egui::{FontId, Stroke, StrokeKind, pos2, vec2};
+/// A shot entry's frame at `rect`: its fill, sheen and border, the glow of
+/// a pulse, and the selected entry's stripe.
+fn entry_frame(painter: &egui::Painter, rect: egui::Rect, state: EntryState) {
+    use egui::{Stroke, StrokeKind, vec2};
 
-    let painter = ui.painter();
     let radius = egui::CornerRadius::same(ENTRY_RADIUS);
     let pulse = state.pulse;
     if pulse > 0.0 {
@@ -3338,6 +3344,16 @@ fn list_entry(ui: &egui::Ui, rect: egui::Rect, e: &ListEntry, state: EntryState)
         };
         painter.rect_filled(stripe, corners, theme::ACCENT);
     }
+}
+
+/// Paint one shot list entry at `rect`: a mini card with the shot number
+/// and device on top, then carry and total.
+fn list_entry(ui: &egui::Ui, rect: egui::Rect, e: &ListEntry, state: EntryState) {
+    use egui::text::{LayoutJob, TextFormat, TextWrapping};
+    use egui::{FontId, pos2};
+
+    let painter = ui.painter();
+    entry_frame(painter, rect, state);
 
     let left = rect.left() + ENTRY_PAD + 2.0;
     let right = rect.right() - ENTRY_PAD;
@@ -3419,7 +3435,7 @@ impl FlighthookApp {
     /// display units and the device ids. A device filter whose device has
     /// left the history falls back to every device.
     pub(crate) fn refresh_shot_caches(&mut self) {
-        let (rev, units) = (self.shots_rev, self.units_toggle);
+        let (rev, units) = (self.shots_rev, self.units());
         let shots = &self.shots;
         self.display_rows.get((rev, units), || {
             shots.iter().map(|s| s.to_unit_system(units)).collect()
@@ -3439,14 +3455,14 @@ impl FlighthookApp {
     fn display_row(&self, i: usize) -> Option<Cow<'_, ShotRow>> {
         let cached = self
             .display_rows
-            .peek(&(self.shots_rev, self.units_toggle))
+            .peek(&(self.shots_rev, self.units()))
             .and_then(|rows| rows.get(i));
         match cached {
             Some(row) => Some(Cow::Borrowed(row)),
             None => self
                 .shots
                 .get(i)
-                .map(|s| Cow::Owned(s.to_unit_system(self.units_toggle))),
+                .map(|s| Cow::Owned(s.to_unit_system(self.units()))),
         }
     }
 
@@ -3506,10 +3522,11 @@ impl FlighthookApp {
         self.shot_focus.observe(&self.shots, filter, now);
     }
 
-    /// Show `shots[i]`.
+    /// Show `shots[i]`, leaving Live.
     pub(crate) fn select_shot(&mut self, i: usize) {
         let filter = self.device_filter.as_deref();
         self.shot_focus.select(&self.shots, filter, i);
+        self.live_selected = false;
     }
 
     /// Indices into `shots`, ascending, of the rows the device filter
@@ -3527,6 +3544,8 @@ impl FlighthookApp {
     pub(crate) fn render_shots_panel(&mut self, ui: &mut egui::Ui) {
         self.refresh_shot_caches();
         self.render_shots_toolbar(ui);
+        // The toolbar may have shown the Cameras pane (Table -> Cards).
+        self.sync_cameras_pane();
         ui.add_space(8.0);
 
         // The right-hand column and the shot list are laid out first so
@@ -3535,7 +3554,9 @@ impl FlighthookApp {
         let view = self.shots_view;
         let slots = chart_slots(view, ui.ctx().content_rect().size());
         let gap = CHART_GAP as i8;
-        if let Some(width) = slots.right {
+        // The Cameras pane takes everything right of the shot list.
+        let cameras = view == ShotsView::Cards && self.cameras_pane_shown();
+        if let Some(width) = slots.right.filter(|_| !cameras) {
             egui::SidePanel::right(egui::Id::new("shots_right"))
                 .resizable(false)
                 .exact_width(width)
@@ -3559,7 +3580,7 @@ impl FlighthookApp {
                 }))
                 .show_inside(ui, |ui| self.render_shot_list(ui));
         }
-        if let Some((height, row)) = slots.bottom {
+        if let Some((height, row)) = slots.bottom.filter(|_| !cameras) {
             let height = bottom_height(height, row, ui.available_width());
             egui::TopBottomPanel::bottom(egui::Id::new(("shots_bottom", view)))
                 .resizable(false)
@@ -3588,6 +3609,7 @@ impl FlighthookApp {
             .frame(egui::Frame::new())
             .show_inside(ui, |ui| match view {
                 ShotsView::Table => self.render_shots_table(ui),
+                ShotsView::Cards if cameras => self.render_cameras_pane(ui),
                 ShotsView::Cards => self.render_shot_cards(ui),
             });
         self.render_replay(ui.ctx());
@@ -3605,36 +3627,37 @@ impl FlighthookApp {
     }
 
     fn render_shots_toolbar(&mut self, ui: &mut egui::Ui) {
-        let imperial = self.units_toggle == UnitSystem::Imperial;
         // A fixed row height, taller than any item, so every item centres on
         // the same line.
         let row = egui::vec2(ui.available_width(), 38.0);
         let layout = egui::Layout::left_to_right(egui::Align::Center);
         ui.allocate_ui_with_layout(row, layout, |ui| {
-            ui.label(theme::caps("View", 11.0, theme::TEXT_MUTED));
-            let current = ShotsView::ALL
-                .iter()
-                .position(|v| *v == self.shots_view)
-                .unwrap_or(0);
-            let labels: Vec<&str> = ShotsView::ALL.iter().map(|v| v.label()).collect();
-            if let Some(i) = theme::segmented(ui, &labels, current, None).inner {
-                self.shots_view = ShotsView::ALL[i];
+            if self.render_pane_toggle(ui) {
+                ui.add_space(12.0);
             }
-            ui.add_space(12.0);
-            ui.label(theme::caps("Units", 11.0, theme::TEXT_MUTED));
-            match theme::segmented(ui, &["Imperial", "Metric"], usize::from(!imperial), None).inner
-            {
-                Some(0) => self.units_toggle = UnitSystem::Imperial,
-                Some(_) => self.units_toggle = UnitSystem::Metric,
-                None => {}
+            // Cameras just clicked: Live or the latest shot, before the
+            // Live switch shows which.
+            self.sync_cameras_pane();
+            // The Live switch takes the Cards | Table slot in the Cameras
+            // pane; the Cards | Table choice is kept while it is hidden.
+            if self.render_live_toggle(ui) {
+                ui.add_space(12.0);
+            } else {
+                let current = ShotsView::ALL
+                    .iter()
+                    .position(|v| *v == self.shots_view)
+                    .unwrap_or(0);
+                let labels: Vec<&str> = ShotsView::ALL.iter().map(|v| v.label()).collect();
+                let view = theme::segmented(ui, &labels, current, None);
+                devices::mark(ui, || "view_toggle".to_owned(), &view.response);
+                if let Some(i) = view.inner {
+                    self.shots_view = ShotsView::ALL[i];
+                }
+                ui.add_space(12.0);
             }
-            ui.add_space(12.0);
             if let Some(device) = self.render_device_filter(ui) {
                 self.device_filter = device;
                 ui.add_space(12.0);
-            }
-            if let Some(yards) = self.render_auto_chip(ui) {
-                self.send_auto_chip(ui.ctx(), yards);
             }
             if self.shots_view.shows_simulated_legend() {
                 ui.add_space(12.0);
@@ -3651,17 +3674,15 @@ impl FlighthookApp {
                 );
             }
 
-            let units = self.units_toggle;
+            let units = self.units();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if clear_history_button(ui, !self.shots.is_empty()).clicked() {
+                let clear = clear_history_button(ui, !self.shots.is_empty());
+                devices::mark(ui, || "clear_history".to_owned(), &clear);
+                if clear.clicked() {
                     self.confirm_clear = true;
                 }
                 ui.add_space(4.0);
-                ui.hyperlink_to("CSV", net::export_url("csv", units))
-                    .on_hover_text("Decoded shots, one row each. No raw frames.");
-                ui.hyperlink_to("JSONL", net::export_url("jsonl", units))
-                    .on_hover_text(EXPORT_HINT);
-                ui.label(theme::caps("Export session", 11.0, theme::TEXT_MUTED));
+                export_menu(ui, units);
             });
         });
         if self.shots.is_empty() {
@@ -3690,38 +3711,6 @@ impl FlighthookApp {
         devices::mark(ui, || "device-filter".to_owned(), &picked.response);
         let at = picked.inner.unwrap_or(at);
         Some(at.checked_sub(1).and_then(|p| ids.get(p).cloned()))
-    }
-
-    /// The Auto-chip button and its menu ([`auto_chip_items`]). Returns the
-    /// distance picked this frame.
-    fn render_auto_chip(&self, ui: &mut egui::Ui) -> Option<u32> {
-        let blocked = auto_chip_blocked(&self.actors, self.auto_chip_in_flight);
-        let button = theme::menu_chip(ui, "Auto-chip", blocked.is_none(), egui::vec2(0.0, 26.0));
-        devices::mark(ui, || "auto-chip".to_owned(), &button);
-        let button = button.on_hover_text(blocked.unwrap_or(AUTO_CHIP_HINT));
-        let mut picked = None;
-        egui::Popup::menu(&button).show(|ui| {
-            for (label, yards) in auto_chip_items() {
-                let item = ui.button(label.as_str());
-                devices::mark(ui, || format!("auto-chip:{label}"), &item);
-                if item.clicked() {
-                    picked = Some(yards);
-                }
-            }
-        });
-        picked
-    }
-
-    /// Send an Auto-chip of `yards`: the button waits for the reply, and a
-    /// failure shows in the error banner.
-    pub(crate) fn send_auto_chip(&mut self, ctx: &egui::Context, yards: u32) {
-        self.auto_chip_error = None;
-        self.auto_chip_in_flight = Some(yards);
-        // The UI tests pick from the menu with no server behind them.
-        #[cfg(not(test))]
-        net::post_auto_chip(ctx, &self.pending, yards);
-        #[cfg(test)]
-        let _ = ctx;
     }
 
     /// The Clear history confirmation, over everything. Delete sends the
@@ -3773,7 +3762,12 @@ impl FlighthookApp {
     /// The shot header line: number, device name, either the LATEST chip
     /// or, on an older shot, a Back to latest chip, and a Replay chip when
     /// the shot has clips. Returns what was clicked.
-    fn render_shot_header(&self, ui: &mut egui::Ui, i: usize, following: bool) -> HeaderClick {
+    pub(super) fn render_shot_header(
+        &self,
+        ui: &mut egui::Ui,
+        i: usize,
+        following: bool,
+    ) -> HeaderClick {
         let shot = &self.shots[i];
         let show_device = multiple_devices(&self.shots);
         let mut back = false;
@@ -3815,7 +3809,7 @@ impl FlighthookApp {
     /// The Cards view's shot list: the count line and the view selector on
     /// top; one entry per shot, newest first, under the view's headers,
     /// scrolling in the middle; and, outside the view `none`, the hint line
-    /// and + New set / New session pinned at the foot. Clicking an entry
+    /// and New set / New session pinned at the foot. Clicking an entry
     /// shows that shot.
     fn render_shot_list(&mut self, ui: &mut egui::Ui) {
         let inset = f32::from(GLOW_WIDTH);
@@ -3843,7 +3837,7 @@ impl FlighthookApp {
         } else {
             ui.available_height()
         };
-        let imperial = self.units_toggle == UnitSystem::Imperial;
+        let imperial = self.units() == UnitSystem::Imperial;
         let show_device = multiple_devices(&self.shots);
         let filter = self.device_filter.as_deref();
         let focus = self.shown_index();
@@ -3908,7 +3902,7 @@ impl FlighthookApp {
                             let size = egui::vec2(ui.available_width(), ENTRY_HEIGHT);
                             let (rect, response) =
                                 ui.allocate_exact_size(size, egui::Sense::click());
-                            let selected = Some(i) == focus;
+                            let selected = Some(i) == focus && !self.live_selected;
                             if reveal && selected {
                                 ui.scroll_to_rect(rect.expand(inset), None);
                             }
@@ -3930,6 +3924,7 @@ impl FlighthookApp {
                                 };
                                 list_entry(ui, rect, &entry, state);
                             }
+                            devices::mark(ui, || format!("shot_entry:{i}"), &response);
                             if response
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .clicked()
@@ -3966,6 +3961,7 @@ impl FlighthookApp {
                         picked = theme::segmented_fill(ui, &labels, current, 12.0);
                     })
                     .response;
+                devices::mark(ui, || "view_selector".to_owned(), &response);
                 response.on_hover_text(GROUPING_HINT);
             });
         });
@@ -3977,7 +3973,7 @@ impl FlighthookApp {
     }
 
     /// The list's foot, pinned under the scrolling entries: a hairline, the
-    /// hint line when `strip` has one, then + New set and New session
+    /// hint line when `strip` has one, then New set and New session
     /// sharing the width.
     fn render_list_foot(&mut self, ui: &mut egui::Ui, inset: f32, strip: &Strip) {
         let width = ui.available_width() - 2.0 * inset;
@@ -4014,7 +4010,7 @@ impl FlighthookApp {
                 let chip = egui::vec2((width - gap) / 2.0, STRIP_BUTTONS_HEIGHT);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
-                    let group = theme::chip_button(ui, "+ New set", strip.new_group, chip);
+                    let group = theme::chip_button(ui, "New set", strip.new_group, chip);
                     new_group = if strip.new_group {
                         group.on_hover_text(new_group_hint(view)).clicked()
                     } else {
@@ -4183,7 +4179,7 @@ impl FlighthookApp {
             return;
         };
 
-        let imperial = self.units_toggle == UnitSystem::Imperial;
+        let imperial = self.units() == UnitSystem::Imperial;
         let following = self.following();
         let Some(shot) = self.display_row(i) else {
             return;
@@ -4464,7 +4460,7 @@ impl FlighthookApp {
     fn render_shots_table(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
 
-        let imperial = self.units_toggle == UnitSystem::Imperial;
+        let imperial = self.units() == UnitSystem::Imperial;
         let show_device = multiple_devices(&self.shots);
         // The rows the device filter passes, copied so the borrow of `self`
         // ends here.
@@ -5309,7 +5305,7 @@ mod tests {
             list_items(&shots, &g, Some(Club::Driver), None),
             [driver.as_slice(), &sevens].concat()
         );
-        // + New set does not split the section: an empty open 7-iron set
+        // New set does not split the section: an empty open 7-iron set
         // adds no header while the club has a section.
         let mut list = vec![
             group("a", 1, Club::Iron7, false, 2),
@@ -7658,33 +7654,33 @@ mod tests {
         assert!(!app.confirm_clear);
     }
 
-    /// The Auto-chip button opens a menu of 1, 3 and 5 Yard, in that order;
-    /// picking one sends that chip and holds the button until the reply. It
-    /// is disabled while no simulator is connected.
     #[test]
-    fn auto_chip_menu_lists_three_distances_and_sends_the_pick() {
-        use super::devices::Marks;
+    fn the_export_icon_opens_a_menu_of_the_formats_left_of_the_trash() {
         use egui::{Event, Modifiers, PointerButton, Pos2, Rect, vec2};
 
         let ctx = egui::Context::default();
         theme::install(&ctx);
         let mut app = FlighthookApp::with_pending(crate::net::new_pending());
-        let frame = |app: &mut FlighthookApp, events: Vec<Event>| -> Marks {
-            ctx.data_mut(|d| d.remove::<Marks>(egui::Id::NULL));
+        app.shots = vec![row(1, true)];
+        app.shots_rev += 1;
+        let frame = |app: &mut FlighthookApp, events: Vec<Event>| {
+            ctx.data_mut(|d| d.remove_temp::<devices::Marks>(egui::Id::NULL));
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
                 events,
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
+            let out = ctx.run(input, |ctx| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ctx, |ui| app.render_shots_toolbar(ui));
             });
-            ctx.data(|d| d.get_temp::<Marks>(egui::Id::NULL))
-                .unwrap_or_default()
+            let marks = ctx
+                .data(|d| d.get_temp::<devices::Marks>(egui::Id::NULL))
+                .unwrap_or_default();
+            (marks, out)
         };
-        let click = |app: &mut FlighthookApp, at: Pos2| -> Marks {
+        let click = |app: &mut FlighthookApp, at: Pos2| {
             let button = |pressed| Event::PointerButton {
                 pos: at,
                 button: PointerButton::Primary,
@@ -7696,72 +7692,81 @@ mod tests {
             frame(app, vec![button(false)]);
             frame(app, Vec::new())
         };
-        let items = |marks: &Marks| -> Vec<(String, f32)> {
-            let mut items: Vec<(String, f32)> = marks
-                .iter()
-                .filter_map(|(k, (rect, _))| {
-                    k.strip_prefix("auto-chip:")
-                        .map(|l| (l.to_owned(), rect.top()))
-                })
-                .collect();
-            items.sort_by(|a, b| a.1.total_cmp(&b.1));
-            items
+
+        // One icon, immediately left of the trash and the same size; no
+        // caption, links or units control.
+        let (marks, out) = frame(&mut app, Vec::new());
+        let (export, trash) = (marks["export"].0, marks["clear_history"].0);
+        assert_eq!(export.size(), trash.size(), "the trash's size");
+        assert!(export.right() < trash.left() && trash.left() - export.right() < 16.0);
+        assert!((export.center().y - trash.center().y).abs() < 0.5);
+        assert!(marks["export"].1, "enabled");
+        let texts: Vec<String> = painted_text_rects(&out.shapes)
+            .into_iter()
+            .map(|(t, _, _)| t)
+            .collect();
+        for gone in [
+            "EXPORT SESSION",
+            "UNITS",
+            "VIEW",
+            "CSV",
+            "JSONL",
+            "Imperial",
+            "Metric",
+        ] {
+            assert!(!texts.iter().any(|t| t == gone), "{gone}");
+        }
+        assert!(!marks.contains_key("export:jsonl"), "closed");
+
+        // A click opens the menu: JSONL then CSV, under the icon.
+        let (marks, out) = click(&mut app, export.center());
+        let (jsonl, csv) = (marks["export:jsonl"].0, marks["export:csv"].0);
+        assert!(jsonl.bottom() <= csv.top() + 0.5, "JSONL first");
+        assert!(jsonl.top() >= export.bottom() - 0.5, "under the icon");
+        let texts: Vec<String> = painted_text_rects(&out.shapes)
+            .into_iter()
+            .map(|(t, _, _)| t)
+            .collect();
+        assert!(texts.iter().any(|t| t == "JSONL") && texts.iter().any(|t| t == "CSV"));
+
+        // Picking one opens that export, in the shown units, and closes it.
+        let url_of = |out: &egui::FullOutput| {
+            out.platform_output.commands.iter().find_map(|c| match c {
+                egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
+                _ => None,
+            })
         };
-
-        // No simulator connected: disabled, and a click opens nothing.
-        let button = frame(&mut app, Vec::new())["auto-chip"].0;
-        assert!(items(&click(&mut app, button.center())).is_empty());
-        assert_eq!(app.auto_chip_in_flight, None);
-
-        // GSPro connected: the menu opens with the three distances in order.
-        app.actors.insert(
-            "openconnect_client.0".into(),
-            ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Connected),
+        let at = csv.center();
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut app, vec![Event::PointerMoved(at)]);
+        frame(&mut app, vec![button(true)]);
+        let (_, out) = frame(&mut app, vec![button(false)]);
+        assert_eq!(url_of(&out), Some(net::export_url("csv", app.units())));
+        let marks = frame(&mut app, Vec::new()).0;
+        assert!(!marks.contains_key("export:csv"), "the menu closed");
+        // The metric setting changes what the export asks for.
+        app.set_default_units(UnitSystem::Metric);
+        let (marks, _) = click(&mut app, export.center());
+        let at = marks["export:jsonl"].0.center();
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut app, vec![Event::PointerMoved(at)]);
+        frame(&mut app, vec![button(true)]);
+        let (_, out) = frame(&mut app, vec![button(false)]);
+        let url = url_of(&out).expect("the export opens");
+        assert!(
+            url.contains("format=jsonl") && url.contains("units=metric"),
+            "{url}"
         );
-        let marks = click(&mut app, button.center());
-        let labels: Vec<String> = items(&marks).into_iter().map(|(l, _)| l).collect();
-        assert_eq!(labels, ["1 Yard", "3 Yard", "5 Yard"]);
-
-        // Picking 3 Yard sends it and closes the menu.
-        let three = marks["auto-chip:3 Yard"].0.center();
-        let marks = click(&mut app, three);
-        assert_eq!(app.auto_chip_in_flight, Some(3));
-        assert!(items(&marks).is_empty(), "menu closed");
-        let marks = click(&mut app, button.center());
-        assert!(items(&marks).is_empty(), "held until the reply");
-
-        // A failed reply frees the button and shows in the error banner.
-        app.pending.lock().expect("pending").auto_chip = Some(Err("409 no".into()));
-        app.apply_pending();
-        assert_eq!(app.auto_chip_in_flight, None);
-        assert_eq!(app.auto_chip_error.as_deref(), Some("409 no"));
-        let marks = click(&mut app, button.center());
-        assert_eq!(items(&marks).len(), 3, "free again");
-
-        // The next pick clears it; a good reply leaves it clear.
-        app.send_auto_chip(&ctx, 1);
-        assert_eq!(app.auto_chip_error, None);
-        assert_eq!(app.auto_chip_in_flight, Some(1));
-        app.pending.lock().expect("pending").auto_chip = Some(Ok(()));
-        app.apply_pending();
-        assert_eq!((app.auto_chip_in_flight, app.auto_chip_error), (None, None));
-    }
-
-    #[test]
-    fn auto_chip_hover_says_why_it_is_disabled() {
-        let mut actors = HashMap::new();
-        assert!(auto_chip_blocked(&actors, None).is_some_and(|w| w.contains("no simulator")));
-        actors.insert(
-            "openconnect_client.0".into(),
-            ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Reconnecting),
-        );
-        assert!(auto_chip_blocked(&actors, None).is_some());
-        actors.insert(
-            "openconnect_client.1".into(),
-            ActorStatusResponse::new("Muni Golf", crate::types::ActorStatus::Connected),
-        );
-        assert_eq!(auto_chip_blocked(&actors, None), None);
-        assert!(auto_chip_blocked(&actors, Some(5)).is_some_and(|w| w.starts_with("Sending")));
     }
 
     /// 1000 simulated shots from two devices, each with every table field.
@@ -8773,6 +8778,8 @@ mod tests {
             impact_offset_ms: 500,
             complete: true,
             dropped: 0,
+            pose: false,
+            swing: false,
         }
     }
 
@@ -9192,10 +9199,8 @@ mod tests {
             marked_frame(&ctx, &mut app, Vec::new());
             let (marks, out) = marked_frame(&ctx, &mut app, Vec::new());
             let filter = marks.get("device-filter").expect("the filter").0;
-            let chip = marks["auto-chip"].0;
-            // On the toolbar row, just before Auto-chip.
-            assert!(filter.right() < chip.left(), "{at}");
-            assert!((filter.center().y - chip.center().y).abs() <= 2.5, "{at}");
+            // Auto-chip lives in the header, not on this toolbar.
+            assert!(!marks.contains_key("auto-chip"), "{at}");
             // Its DEVICE label is the only one: none over the bars or in the
             // Dispersion header.
             let texts = painted_text_rects(&out.shapes);
@@ -9334,7 +9339,7 @@ mod tests {
             (1..12).step_by(2).collect::<Vec<usize>>()
         );
         // Export stays the whole session: its links carry no filter.
-        assert!(!net::export_url("csv", app.units_toggle).contains("square"));
+        assert!(!net::export_url("csv", app.units()).contains("square"));
     }
 
     #[test]

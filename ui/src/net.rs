@@ -10,8 +10,8 @@ use std::time::Duration;
 use crate::replay::Window;
 use crate::types::{
     self, AutoChipRequest, CameraListResponse, Club, FindMatRequest, FlighthookConfig,
-    FlighthookMessage, GameStateSnapshot, HandRequest, Handedness, PostSettingsResponse, ShotData,
-    ShotGrouping, ShotGroupsResponse, StatusResponse,
+    FlighthookMessage, GameStateSnapshot, HandRequest, Handedness, LivePose, PostSettingsResponse,
+    ShotData, ShotGrouping, ShotGroupsResponse, StatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,6 +45,80 @@ pub struct Pending {
     pub reconnects: Vec<(String, Result<Reconnected, String>)>,
     /// Replies for the replay view.
     pub(crate) replay: Vec<ReplayReply>,
+    /// Replies for the Live view's cameras: the view's number and its
+    /// reply.
+    pub(crate) live: Vec<(u64, LiveReply)>,
+    /// The reply to a Live tuning save: saved, or why not.
+    pub(crate) tuning: Option<Result<(), String>>,
+    /// Replies about body tracking's model files: which call, and the
+    /// state, or why not.
+    pub(crate) body_models: Vec<(ModelsCall, Result<flighthook::BodyTrackingModels, String>)>,
+}
+
+/// A request about body tracking's model files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelsCall {
+    /// `GET /api/body_tracking/models`.
+    State,
+    /// `POST /api/body_tracking/models/download`.
+    Download,
+    /// `DELETE /api/body_tracking/models/download`.
+    Cancel,
+}
+
+impl ModelsCall {
+    /// The request's method and URL.
+    pub(crate) fn request(self) -> (&'static str, String) {
+        let base = api_base();
+        match self {
+            Self::State => ("GET", format!("{base}/api/body_tracking/models")),
+            Self::Download => ("POST", format!("{base}/api/body_tracking/models/download")),
+            Self::Cancel => (
+                "DELETE",
+                format!("{base}/api/body_tracking/models/download"),
+            ),
+        }
+    }
+}
+
+/// The reply to a `GET /api/cameras/{actor}/live`.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LiveReply {
+    /// A newer frame, its sequence number, the golfer's keypoints on it when
+    /// body tracking ran (`X-Pose`), and body tracking's state.
+    Frame {
+        seq: u64,
+        jpeg: Vec<u8>,
+        pose: Option<LivePose>,
+        state: PoseState,
+    },
+    /// None arrived within the server's wait (`204`), and body tracking's
+    /// state.
+    Nothing(PoseState),
+    /// The request failed: why.
+    Failed(String),
+}
+
+/// Body tracking's state as a live reply carries it (`X-Pose-State`,
+/// `X-Pose-Error`): `off`, `loading`, `missing`, `downloading`, `ready` or
+/// `failed` and why. Empty from a server without body tracking.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PoseState {
+    pub(crate) state: String,
+    pub(crate) error: Option<String>,
+}
+
+impl PoseState {
+    fn of(resp: &ehttp::Response) -> Self {
+        Self {
+            state: resp
+                .headers
+                .get("x-pose-state")
+                .unwrap_or_default()
+                .to_owned(),
+            error: resp.headers.get("x-pose-error").map(str::to_owned),
+        }
+    }
 }
 
 /// A reply for the replay view, tagged with the replay it was asked for.
@@ -63,13 +137,36 @@ pub(crate) enum ReplayReply {
         window: Window,
         result: Result<Vec<u8>, String>,
     },
+    /// A camera's clip keypoints (body tracking).
+    Pose {
+        replay: u64,
+        camera: String,
+        result: Result<types::PoseTrackFile, String>,
+    },
+    /// A camera's clip swing analysis.
+    Swing {
+        replay: u64,
+        camera: String,
+        result: Result<types::SwingReportFile, String>,
+    },
+    /// The answer to asking for a camera's clip to be tracked: `done` when
+    /// its keypoints were there already.
+    Analyzed {
+        replay: u64,
+        camera: String,
+        done: bool,
+    },
 }
 
 impl ReplayReply {
     /// The replay or camera card clip it was asked for.
     pub(crate) fn seq(&self) -> u64 {
         match self {
-            Self::Sidecar { replay, .. } | Self::Frames { replay, .. } => *replay,
+            Self::Sidecar { replay, .. }
+            | Self::Frames { replay, .. }
+            | Self::Pose { replay, .. }
+            | Self::Swing { replay, .. }
+            | Self::Analyzed { replay, .. } => *replay,
         }
     }
 }
@@ -422,6 +519,216 @@ pub fn fetch_still(ctx: &egui::Context, pending: &PendingHandle, actor: &str) {
             p.stills.push((actor, reply));
         }
         ctx.request_repaint();
+    });
+}
+
+/// The `GET` of camera `actor`'s live frame newer than `after`.
+pub(crate) fn live_request(actor: &str, after: u64) -> ehttp::Request {
+    ehttp::Request::get(format!(
+        "{}/api/cameras/{actor}/live?after={after}",
+        api_base()
+    ))
+}
+
+/// A reply to [`live_request`].
+pub(crate) fn live_reply(result: Result<ehttp::Response, String>) -> LiveReply {
+    let resp = match result {
+        Ok(resp) => resp,
+        Err(e) => return LiveReply::Failed(e),
+    };
+    match resp.status {
+        200 => match resp.headers.get("x-frame-seq").map(str::parse::<u64>) {
+            Some(Ok(seq)) => LiveReply::Frame {
+                seq,
+                pose: resp
+                    .headers
+                    .get("x-pose")
+                    .and_then(|p| serde_json::from_str(p).ok()),
+                state: PoseState::of(&resp),
+                jpeg: resp.bytes,
+            },
+            _ => LiveReply::Failed("unexpected reply from the server".to_owned()),
+        },
+        204 => LiveReply::Nothing(PoseState::of(&resp)),
+        _ => LiveReply::Failed(error_reason(&resp)),
+    }
+}
+
+/// Save `req`'s body tracking settings for a Live tuning key (nothing else
+/// in `req` is written): the reply goes to [`Pending::tuning`].
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn post_tuning(ctx: &egui::Context, pending: &PendingHandle, req: &FlighthookConfig) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let url = format!("{}/api/settings?scope=body_tracking", api_base());
+    let body = serde_json::to_vec(req).unwrap_or_default();
+    let mut http_req = ehttp::Request::post(&url, body);
+    http_req
+        .headers
+        .insert("Content-Type".to_string(), "application/json".to_string());
+    http_req.timeout = Some(CONFIG_REQUEST_TIMEOUT);
+    ehttp::fetch(http_req, move |result| {
+        if let Ok(mut p) = pending.lock() {
+            p.tuning = Some(save_reply(result).map(|_| ()));
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Fetch the keypoints of `shot_id`'s clip from `camera`
+/// (`<camera>.pose.json`), for replay `replay`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn fetch_pose(
+    ctx: &egui::Context,
+    pending: &PendingHandle,
+    replay: u64,
+    shot_id: &str,
+    camera: &str,
+) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let camera = camera.to_owned();
+    let url = clip_url(shot_id, &camera, "pose.json");
+    ehttp::fetch(ehttp::Request::get(&url), move |result| {
+        let result = pose_reply(result);
+        if let Ok(mut p) = pending.lock() {
+            p.replay.push(ReplayReply::Pose {
+                replay,
+                camera,
+                result,
+            });
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Fetch the swing analysis of `shot_id`'s clip from `camera`
+/// (`<camera>.swing.json`), for replay `replay`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn fetch_swing(
+    ctx: &egui::Context,
+    pending: &PendingHandle,
+    replay: u64,
+    shot_id: &str,
+    camera: &str,
+) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let camera = camera.to_owned();
+    let url = clip_url(shot_id, &camera, "swing.json");
+    ehttp::fetch(ehttp::Request::get(&url), move |result| {
+        let result = json_reply(result);
+        if let Ok(mut p) = pending.lock() {
+            p.replay.push(ReplayReply::Swing {
+                replay,
+                camera,
+                result,
+            });
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Ask the server to track `shot_id`'s clip from `camera` now
+/// (`POST .../video/{camera}/analyze`), for replay `replay`. Its keypoints
+/// follow with `shot_pose`; the reply only says whether they were there
+/// already.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn post_analyze(
+    ctx: &egui::Context,
+    pending: &PendingHandle,
+    replay: u64,
+    shot_id: &str,
+    camera: &str,
+) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let camera = camera.to_owned();
+    let url = analyze_url(shot_id, &camera);
+    ehttp::fetch(ehttp::Request::post(url, Vec::new()), move |result| {
+        let done = analyze_done(&result);
+        if let Ok(mut p) = pending.lock() {
+            p.replay.push(ReplayReply::Analyzed {
+                replay,
+                camera,
+                done,
+            });
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Send `call` about body tracking's model files; its reply goes into
+/// [`Pending::body_models`].
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn body_models(ctx: &egui::Context, pending: &PendingHandle, call: ModelsCall) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let (method, url) = call.request();
+    let request = ehttp::Request {
+        method: method.to_owned(),
+        ..ehttp::Request::get(url)
+    };
+    ehttp::fetch(request, move |result| {
+        let reply = json_reply(result);
+        if let Ok(mut p) = pending.lock() {
+            p.body_models.push((call, reply));
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// The URL that asks for `shot_id`'s clip from `camera` to be tracked.
+pub(crate) fn analyze_url(shot_id: &str, camera: &str) -> String {
+    format!("{}/api/shots/{shot_id}/video/{camera}/analyze", api_base())
+}
+
+/// Whether an analyze reply says the keypoints are there already: `200`.
+/// `202` (queued), an error or no reply at all is not.
+pub(crate) fn analyze_done(result: &Result<ehttp::Response, String>) -> bool {
+    result.as_ref().is_ok_and(|r| r.status == 200)
+}
+
+/// A reply to a JSON file request, parsed, or why not.
+fn json_reply<T: serde::de::DeserializeOwned>(
+    result: Result<ehttp::Response, String>,
+) -> Result<T, String> {
+    let resp = result?;
+    if !resp.ok {
+        return Err(error_reason(&resp));
+    }
+    serde_json::from_slice(&resp.bytes).map_err(|e| e.to_string())
+}
+
+/// A reply to a `<camera>.pose.json` request: the keypoints, or why not.
+pub(crate) fn pose_reply(
+    result: Result<ehttp::Response, String>,
+) -> Result<types::PoseTrackFile, String> {
+    json_reply(result)
+}
+
+/// Fetch camera `actor`'s live frame newer than `after`, for live view
+/// `view`. Only a frame asks for a repaint: the next request goes out on the
+/// next screen update.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn fetch_live(
+    ctx: &egui::Context,
+    pending: &PendingHandle,
+    view: u64,
+    actor: &str,
+    after: u64,
+) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    ehttp::fetch(live_request(actor, after), move |result| {
+        let reply = live_reply(result);
+        let frame = matches!(reply, LiveReply::Frame { .. });
+        if let Ok(mut p) = pending.lock() {
+            p.live.push((view, reply));
+        }
+        if frame {
+            ctx.request_repaint();
+        }
     });
 }
 
@@ -779,6 +1086,27 @@ mod tests {
     }
 
     #[test]
+    fn an_analyze_reply_is_done_only_when_the_keypoints_were_there() {
+        assert!(analyze_done(&Ok(response(
+            200,
+            "OK",
+            r#"{"state":"done"}"#
+        ))));
+        assert!(!analyze_done(&Ok(response(
+            202,
+            "Accepted",
+            r#"{"state":"queued"}"#
+        ))));
+        assert!(!analyze_done(&Ok(response(
+            409,
+            "Conflict",
+            r#"{"error":"body tracking is off"}"#
+        ))));
+        assert!(!analyze_done(&Err("offline".into())));
+        assert!(analyze_url("s1", "camera.0").ends_with("/api/shots/s1/video/camera.0/analyze"));
+    }
+
+    #[test]
     fn a_reconnect_reply_is_started_later_or_why_not() {
         assert_eq!(
             reconnect_reply(Ok(response(200, "OK", r#"{"restarted":["mevo.0"]}"#))),
@@ -869,6 +1197,74 @@ mod tests {
         let long = "x".repeat(500);
         let reply = save_reply(Ok(response(500, "Internal Server Error", &long)));
         assert_eq!(reply.err().map(|e| e.len()), Some("500 ".len() + 120));
+    }
+
+    #[test]
+    fn a_live_reply_is_a_frame_nothing_or_why_not() {
+        let req = live_request("camera.1", 41);
+        assert!(
+            req.url.ends_with("/api/cameras/camera.1/live?after=41"),
+            "{}",
+            req.url
+        );
+        assert_eq!(req.method, "GET");
+        let mut frame = response(200, "OK", "jpeg");
+        frame.headers = ehttp::Headers::new(&[("X-Frame-Seq", "42"), ("X-Frame-Time-Ns", "7")]);
+        assert_eq!(
+            live_reply(Ok(frame)),
+            LiveReply::Frame {
+                seq: 42,
+                jpeg: b"jpeg".to_vec(),
+                pose: None,
+                state: PoseState::default(),
+            }
+        );
+        assert_eq!(
+            live_reply(Ok(response(200, "OK", "jpeg"))),
+            LiveReply::Failed("unexpected reply from the server".into()),
+            "a frame without its number"
+        );
+        assert_eq!(
+            live_reply(Ok(response(204, "No Content", ""))),
+            LiveReply::Nothing(PoseState::default())
+        );
+        // Body tracking: the pose of the frame, and the models' state.
+        let mut frame = response(200, "OK", "jpeg");
+        frame.headers = ehttp::Headers::new(&[
+            ("X-Frame-Seq", "43"),
+            (
+                "X-Pose",
+                r#"{"skeleton":"halpe26","keypoints":[[1.5,2.0,0.9]],"ms":18.5}"#,
+            ),
+            ("X-Pose-State", "ready"),
+        ]);
+        let LiveReply::Frame { pose, state, .. } = live_reply(Ok(frame)) else {
+            panic!("not a frame");
+        };
+        let pose = pose.expect("pose");
+        assert_eq!(pose.keypoints, [[1.5, 2.0, 0.9]]);
+        assert!((pose.ms - 18.5).abs() < f32::EPSILON);
+        assert_eq!(state.state, "ready");
+        let mut nothing = response(204, "No Content", "");
+        nothing.headers = ehttp::Headers::new(&[
+            ("X-Pose-State", "failed"),
+            ("X-Pose-Error", "rtmpose-m-halpe26.onnx is missing"),
+        ]);
+        assert_eq!(
+            live_reply(Ok(nothing)),
+            LiveReply::Nothing(PoseState {
+                state: "failed".into(),
+                error: Some("rtmpose-m-halpe26.onnx is missing".into()),
+            })
+        );
+        assert_eq!(
+            live_reply(Ok(response(404, "Not Found", "no camera 'camera.1'"))),
+            LiveReply::Failed("404 no camera 'camera.1'".into())
+        );
+        assert_eq!(
+            live_reply(Err("connection refused".into())),
+            LiveReply::Failed("connection refused".into())
+        );
     }
 
     #[test]

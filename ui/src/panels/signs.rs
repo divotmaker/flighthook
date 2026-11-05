@@ -8,6 +8,11 @@
 //! pointing right of the target is open for a right-hander and closed for
 //! a left-hander. Left, right, up and down do not.
 //!
+//! The swing analysis's body shifts from address don't depend on the hand
+//! either: the sideways ones (hip sway, head sway) are measured along the
+//! target line, + towards the target for either hand; hip depth is measured
+//! down the line, + towards the ball; head height is + up.
+//!
 //! A value of exactly 0 has no word.
 
 use crate::types::Handedness;
@@ -71,6 +76,23 @@ pub(crate) fn sidespin(v: f64, handed: Handedness) -> Option<&'static str> {
     by_sign(v, right, left)
 }
 
+/// A sideways body shift from address (hip sway, head sway): `Toward` the
+/// target or `Away` from it.
+pub(crate) fn target(v: f64) -> Option<&'static str> {
+    by_sign(v, "Toward", "Away")
+}
+
+/// The hips' shift from address down the line (hip depth): `Toward ball`
+/// or `Back` from it.
+pub(crate) fn ball(v: f64) -> Option<&'static str> {
+    by_sign(v, "Toward ball", "Back")
+}
+
+/// The head's height from address (head height): `Up` or `Down`.
+pub(crate) fn rise(v: f64) -> Option<&'static str> {
+    by_sign(v, "Up", "Down")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +132,30 @@ mod tests {
         assert_eq!(attack(3.0), Some("Up"));
         assert_eq!(attack(-0.9), Some("Down"));
         assert_eq!(attack(0.0), None);
+    }
+
+    #[test]
+    fn a_body_shift_is_toward_or_away_from_the_target() {
+        assert_eq!(target(0.12), Some("Toward"));
+        assert_eq!(target(-0.05), Some("Away"));
+        assert_eq!(target(0.0), None);
+        assert_eq!(target(-0.0), None);
+    }
+
+    #[test]
+    fn the_hips_move_toward_the_ball_or_back() {
+        assert_eq!(ball(0.03), Some("Toward ball"));
+        assert_eq!(ball(-0.02), Some("Back"));
+        assert_eq!(ball(0.0), None);
+        assert_eq!(ball(-0.0), None);
+    }
+
+    #[test]
+    fn the_head_moves_up_or_down() {
+        assert_eq!(rise(0.01), Some("Up"));
+        assert_eq!(rise(-0.04), Some("Down"));
+        assert_eq!(rise(0.0), None);
+        assert_eq!(rise(-0.0), None);
     }
 
     #[test]

@@ -39,6 +39,10 @@ Other useful events on the same connection:
   `group`
 - `shot_video` / `shot_video_removed` -- a camera clip of a shot is ready to
   replay, or has been deleted (beta)
+- `shot_pose` -- the golfer's keypoints on a camera clip are ready (body
+  tracking, alpha)
+- `shot_swing` -- a camera clip's swing analysis is ready (body tracking,
+  alpha)
 
 ### Terminal
 
@@ -133,8 +137,9 @@ ws.onmessage = (e) => {
 
 The API has no authentication; it is meant for a trusted LAN. Any client that
 reaches the port can change settings or clear the shot history, download
-swing clips and camera stills, and the bodiless `POST`s (New set, New
-session, Clear history) are CORS simple requests, so a web page open in a
+swing clips, camera stills and live camera frames, and the bodiless `POST`s
+(New set, New session, Clear history, a clip's body tracking, the body
+tracking model download) are CORS simple requests, so a web page open in a
 browser on the LAN can send them too.
 
 ### GET /api/status
@@ -150,6 +155,10 @@ Comprehensive system state (all actors -- launch monitors and integrations).
   "handed": "rh",
   "cameras_supported": true,
   "clip_dir": "C:\\Users\\me\\AppData\\Local\\flighthook\\clips",
+  "config_error": {
+    "path": "C:\\Users\\me\\AppData\\Roaming\\flighthook\\config.toml",
+    "error": "line 4, column 8: unknown variant `liv`, expected one of `off`, `historical`, `live`"
+  },
   "actors": {
     "mevo.0": {
       "name": "Mevo WiFi",
@@ -198,6 +207,17 @@ numbered in index order (`Open Connect 1`, `Open Connect 2`).
 - `clip_dir`: the folder [camera clips](#get-apishotsshot_idvideo) are
   written to: `[replay] clip_dir`, or `flighthook/clips` in the user's local
   data folder (`%LOCALAPPDATA%` on Windows, `~/.local/share` on Linux)
+- `config_error`: present only while the config file at startup could not be
+  used (it failed to parse, or could not be read) and the app runs on the
+  defaults. `path` is the file; `error` is the reason, for a parse error the
+  line and column, then the message. The dashboard shows it as an error frame
+  over every tab. The file is left as it is until the first settings save:
+  that save copies it to `config.pre-<version>.toml` (see
+  [Loading and migration](ARCHITECTURE.md#loading-and-migration)) and then
+  replaces it, after which the field is gone. A save is refused with `500`
+  and `{"error": "..."}` when the copy can't be made; the file and the field
+  stay. The dashboard reads it with the rest of the status at startup and
+  again after every settings change.
 - `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`,
   the actor's latest [`actor_status`](#actor_status)
 - `telemetry`: actor-specific key/value pairs (all string values)
@@ -383,9 +403,21 @@ With `?units=imperial`:
   ```json
   "video": [
     { "camera": "camera.0", "position": "golfer_front", "duration_ms": 5500, "fps": 119.6,
-      "trigger_offset_ms": 4000, "impact_offset_ms": 4000, "complete": true, "dropped": 0 }
+      "trigger_offset_ms": 4000, "impact_offset_ms": 4000, "complete": true, "dropped": 0,
+      "pose": true, "swing": true }
   ]
   ```
+
+  `pose` (body tracking, alpha; omitted while false) says the golfer's
+  keypoints on every frame of the clip are ready at
+  [`{camera}.pose.json`](#get-apishotsshot_idvideocameraposejson); it turns
+  true with [`shot_pose`](#shot_pose). In Historical mode a clip is tracked
+  only once asked for
+  ([`POST .../analyze`](#post-apishotsshot_idvideocameraanalyze)). `swing` (alpha; omitted while false)
+  says the clip's swing analysis is ready at
+  [`{camera}.swing.json`](#get-apishotsshot_idvideocameraswingjson); it turns
+  true with [`shot_swing`](#shot_swing), and stays false for a camera at
+  `golfer_back` or `overhead`.
 
   A clip that two launch monitors' triggers share (one swing) is on both
   shots' rows. It is added when the camera finishes the clip, which can be
@@ -481,6 +513,254 @@ Many webcams leave the Huffman tables out of their JPEG frames; strict
 decoders need them inserted first (the stance crate's
 `jpeg::ensure_huffman` does that).
 
+### GET /api/shots/{shot_id}/video/{camera}.pose.json
+
+The golfer's keypoints on every frame of one camera's clip (body tracking,
+alpha), once they are written: after the camera's `video` entry has
+`pose: true` ([`shot_pose`](#shot_pose)). Served with the same rules as the
+`.avi` and `.json`: `404` with a text body before then and once the clip is
+deleted, HTTP `Range`, `Cache-Control: private, no-cache`.
+
+```json
+{
+  "version": 1, "skeleton": "halpe26",
+  "model": "rtmpose-m-halpe26", "detector": "yolox-tiny",
+  "width": 1280, "height": 720,
+  "frames": [
+    { "t_ns": 0, "score": 0.81, "bbox": { "x1": 512.0, "y1": 96.0, "x2": 790.0, "y2": 700.0 },
+      "keypoints": [[651.2, 160.4, 0.93], ...] },
+    { "t_ns": 8358000 },
+    ...
+  ]
+}
+```
+
+- One entry per clip frame, in order; `t_ns` is the sidecar's `t_ns` of that
+  frame, so frame `i` of the clip is the entry with the same `t_ns`.
+- `keypoints`: 26 `[x, y, score]` in frame pixels, in the
+  [Halpe-26 order](#halpe-26-keypoints), as the model found them (not
+  smoothed); absent, with `score` and `bbox`, where nobody was found.
+- `score`: the mean keypoint score; `bbox`: the box the pose model looked in.
+
+About 1 KB per frame: a 240-frame clip's file is about 220 KB.
+
+### GET /api/shots/{shot_id}/video/{camera}.swing.json
+
+The swing analysis of one camera's clip (alpha): swing events, tempo and the
+camera view's body metrics, measured on the clip's keypoints. Written right
+after the [`.pose.json`](#get-apishotsshot_idvideocameraposejson) for a
+camera at `golfer_front` (face-on) or `target_line` (down the line); a
+camera at `golfer_back` or `overhead` gets none. Served once the camera's
+`video` entry has `swing: true` ([`shot_swing`](#shot_swing)), with the same
+rules as the `.avi` and `.json`: `404` with a text body before then and once
+the clip is deleted, HTTP `Range`, `Cache-Control: private, no-cache`.
+
+```json
+{
+  "version": 1,
+  "view": "face_on",
+  "handed": "right",
+  "view_guess": { "value": "face_on", "confidence": 0.8 },
+  "handed_guess": { "value": "right", "confidence": 1.0 },
+  "height_cm": 180.0,
+  "scale": { "torso_px": 200.0, "cm_per_px": 0.25 },
+  "smoothing": { "min_score": 0.3, "max_gap_ns": 150000000, "cutoff_hz": 8.0, "order": 2 },
+  "events": {
+    "address": { "t_ns": 1000000000, "frame": 120, "confidence": 0.8 },
+    "takeaway": { "t_ns": 1008333333, "frame": 121, "confidence": 0.8 },
+    "top": { "t_ns": 1850000000, "frame": 222, "confidence": 0.9 },
+    "impact": { "t_ns": 2150000000, "frame": 258, "confidence": 0.9 },
+    "impact_source": "refined",
+    "finish": { "t_ns": 2800000000, "frame": 336, "confidence": 0.7 }
+  },
+  "tempo": { "backswing_ns": 841666667, "downswing_ns": 300000000, "ratio": 2.81 },
+  "metrics": [
+    { "id": "hip_sway", "view": "face_on", "unit": "torso",
+      "values": { "top": -0.05, "impact": 0.12 }, "cm": { "top": -2.5, "impact": 6.0 },
+      "confidence": 0.8 },
+    { "id": "lead_arm_angle", "view": "face_on", "unit": "degrees",
+      "values": { "address": 175.0, "top": 150.0, "impact": 176.0 }, "confidence": 0.8 },
+    { "id": "hip_turn", "view": "face_on", "unit": "degrees",
+      "values": { "top": 41.4, "impact": 38.8 }, "confidence": 0.7 }
+  ],
+  "series": {
+    "t_ns": [0, 8333333, 16666667],
+    "metrics": [
+      { "id": "hip_sway", "unit": "torso", "values": [null, 0.0, -0.0021] },
+      { "id": "hip_turn", "unit": "degrees", "values": [null, 0.0, 6.4638] }
+    ]
+  }
+}
+```
+
+- `view` (from the camera's position) and `handed`, the hand the shot was
+  hit with (flighthook's hand at the shot, right-handed when unknown).
+  `view_guess` and `handed_guess` are what the swing itself suggests.
+  `mirrored` (`true`, else absent) says the picture was mirrored and
+  analysed as the golfer's true side; `smoothing` is the keypoint cleaning
+  used.
+- `events`: times on the clip's time base (`t_ns` as in the sidecar), each
+  with a 0 to 1 confidence; an event the clip doesn't show is absent.
+  flighthook gives the analysis the clip's estimated impact (the sidecar's
+  `impact_ns`, when it falls inside the clip). `impact_source` says what
+  became of it:
+  - `refined`: moved to where the hands bottom out within 0.3 s of it;
+  - `given`: no swing found near it. The file holds the impact alone (no
+    other event, no `tempo`, no `handed_guess`), and the Cameras pane shows
+    "No swing found in this clip" for the camera instead of the numbers;
+  - `estimated`: there was no estimate, so impact was found from the hands
+    alone.
+- `tempo`: takeaway to top against top to impact.
+- `metrics`: the view's metrics at `address`, `top`, `impact` and `finish`
+  (each absent where not measured). `unit` is `degrees`, `torso` (a share of
+  the torso length, with `cm` when `body_tracking.golfer_height` is set) or
+  `ratio`. Every value is a 2D measure in this camera's picture. Sideways
+  shifts face-on (`hip_sway`, `head_lateral`) are positive towards the
+  target and negative away from it, for either hand. The ids and their
+  definitions are in
+  [Cameras](devices/cameras.md#swing-analysis).
+- `series`: every metric at every frame of the clip, for following a
+  replay frame by frame: `t_ns` (the clip's frame times, as in the
+  sidecar) and per metric its `unit` and one value per frame (`null` where
+  not measured), from the same formulas; shifts and turns are from address.
+  At an event's frame a series holds the metric's value at that position.
+  Values have 4 decimals. `torso` values convert to centimetres as
+  `value × scale.torso_px × scale.cm_per_px`. Absent when no metric was
+  measured; a file without it is read as before. About 100 bytes per frame
+  face-on: a 560-frame clip's file is about 55 KB.
+
+#### Halpe-26 keypoints
+
+`0` nose, `1`/`2` left/right eye, `3`/`4` ears, `5`/`6` shoulders, `7`/`8`
+elbows, `9`/`10` wrists, `11`/`12` hips, `13`/`14` knees, `15`/`16`
+ankles, `17` head (top), `18` neck, `19` hip (centre), `20`/`21` left/right
+big toe, `22`/`23` small toes, `24`/`25` heels. Left and right are the
+golfer's own sides.
+
+### POST /api/shots/{shot_id}/video/{camera}/analyze
+
+Track one camera's clip now (body tracking, alpha): find the golfer's
+keypoints on it and, for a `golfer_front` or `target_line` camera, analyse
+the swing. This is how a clip is tracked in Historical mode, where nothing
+runs until a clip is viewed; the UI sends it, once per clip,
+when it shows a clip whose `video` entry has no `pose`, in Historical and
+Live mode (in Live mode, for a clip recorded before Live was on: a clip
+recorded in Live mode is tracked by itself). No body.
+
+The clip goes to the front of body tracking's queue (clips run one at a
+time; the clip just asked for is the one on screen) and starts at once,
+without the 3 s wait a clip recorded in Live mode has. The models are
+loaded by the first such request, so that clip waits for them; they are
+never downloaded by it: while their files are missing (see
+[`GET /api/body_tracking/models`](#get-apibody_trackingmodels)) the clip is
+left untracked, and a later request tries again. When it is done the files are written beside the clip as for
+any tracked clip, and [`shot_pose`](#shot_pose), then
+[`shot_swing`](#shot_swing), go out on the WebSocket. A clip already
+tracked, waiting or being tracked is not tracked again.
+
+**Response**: `{"state": "queued"}` or `{"state": "done"}`; errors carry
+`{"error": "<reason>"}`.
+
+| Status | When |
+| --- | --- |
+| `202 Accepted` | queued, or already waiting or being tracked (`"queued"`) |
+| `200 OK` | its keypoints are there already (`"done"`): fetch the files |
+| `404 Not Found` | the shot has no finished clip from `{camera}` |
+| `409 Conflict` | body tracking is off (`"body tracking is off"`) |
+
+```
+POST /api/shots/550e8400-e29b-41d4-a716-446655440000/video/camera.0/analyze
+→ 202 {"state":"queued"}
+… WS: shot_pose, then shot_swing
+POST /api/shots/550e8400-e29b-41d4-a716-446655440000/video/camera.0/analyze
+→ 200 {"state":"done"}
+```
+
+### GET /api/body_tracking/models
+
+Where body tracking's model files are (alpha): the files the configured
+`body_tracking.model` needs (the pose model, then the YOLOX-Tiny person
+detector), whether each is in the models folder and matches its SHA-256,
+and a download's progress. flighthook downloads them only through
+[`POST /api/body_tracking/models/download`](#post-apibody_trackingmodelsdownload);
+the UI asks for that only after the user confirms its download dialog, and
+polls this route about 4 times a second while it shows the download.
+Checking a file reads and hashes it the first time (a few hundred ms);
+later calls only look at its size and modification time.
+
+**Response**: `200`
+
+```json
+{
+  "state": "downloading",
+  "model": "rtmpose-m",
+  "dir": "/home/golfer/.local/share/flighthook/models",
+  "files": [
+    {"name": "rtmpose-m-halpe26.onnx", "label": "RTMPose-m pose model",
+     "host": "download.openmmlab.com", "size": 55685444, "present": false},
+    {"name": "yolox-tiny.onnx", "label": "YOLOX-Tiny person detector",
+     "host": "github.com", "size": 20219662, "present": true}
+  ],
+  "download": {
+    "files": [
+      {"name": "rtmpose-m-halpe26.onnx", "label": "RTMPose-m pose model",
+       "host": "download.openmmlab.com", "done": 20971520, "total": 52089522}
+    ],
+    "current": 0,
+    "done": 20971520,
+    "total": 52089522
+  }
+}
+```
+
+- `state`: `missing` (a file is not there, or does not match, and no
+  download runs), `downloading` (a download runs: `download` is present),
+  `ready` (every file is there) or `failed` (the last download for this
+  model failed: `error` says why, as stance words it: the URL and the
+  network error, or a hash mismatch).
+  A failure stays until the next download or a cancel; a cancelled download
+  leaves `missing`, with no error.
+- `model`, `dir`: the configured pose model and the models folder.
+- `files`: `name` (in `dir`), `label`, `host` (where it is downloaded from;
+  GitHub hands its file over from `release-assets.githubusercontent.com`),
+  `size` (bytes of the model file), `present`.
+- `download` (only while one runs, whichever model it fetches): `files`,
+  the files it fetches in order, each with `done` and `total` bytes (`total`
+  is the response's length once it has started, which for a zip source is
+  the archive's, and the model's size until then); `current`, the index of
+  the one being fetched; `done` and `total` over all of them.
+
+### POST /api/body_tracking/models/download
+
+Download the files the configured pose model lacks (alpha), from their
+official sources over HTTPS, one after the other, each checked against its
+SHA-256 before it is kept. This is the only way flighthook downloads a
+model: no mode, camera, clip or startup does. One download runs at a time;
+asking again while one runs starts nothing. No body.
+
+**Response**: the [state](#get-apibody_trackingmodels).
+
+| Status | When |
+| --- | --- |
+| `202 Accepted` | a download started, or one was already running (`"downloading"`) |
+| `200 OK` | every file is there already (`"ready"`): nothing to download |
+
+Once it is done the state is `ready` and the models load the next time
+body tracking needs them; a model wanted while its files were missing loads
+then.
+
+### DELETE /api/body_tracking/models/download
+
+Stop the download running, if any (alpha). The state is `missing` at once;
+the download stops between two reads (at most one read's timeout on a
+stalled connection) and its partial file is deleted. The files already
+completed by it stay. The UI sends it from the download overlay's Cancel and
+then saves `body_tracking.mode` as `"off"`; this route does not change the
+mode. Saving `"off"` also stops a download.
+
+**Response**: `200` with the [state](#get-apibody_trackingmodels), whether
+or not a download was running.
+
 ### GET /api/cameras
 
 The cameras this computer has (beta), for picking one on a camera card.
@@ -529,6 +809,90 @@ most half a second old while it records (`Content-Type: image/jpeg`,
 comes from the actor's own capture; the camera is never opened a second
 time.
 
+### GET /api/cameras/{actor}/live
+
+The camera actor's live frame (beta), for showing the camera live: a JPEG
+as the camera sent it. The request waits until the camera has a frame newer
+than the one the client has, up to 1 s.
+
+**Query**: `after` — the `X-Frame-Seq` of the frame the client has; `0` (or
+omitted) for none. Sequence numbers start again at 1 when flighthook
+restarts: an `after` above every number given out since counts as `0`, so a
+client should take a frame numbered below its last one as the newest.
+
+**Response** `200 OK` (`Content-Type: image/jpeg`, `Cache-Control:
+no-store`) with:
+
+- `X-Frame-Seq`: the frame's sequence number, to send as the next
+  request's `after`. Numbers count up over every camera's live frames and
+  never repeat while the server runs.
+- `X-Frame-Time-Ns`: when the frame reached the computer, less the
+  camera's latency, in nanoseconds on the server's monotonic clock: the
+  clock of the clip sidecars' `start_ns`.
+- `X-Pose` (body tracking, alpha): the golfer's keypoints on this frame,
+  present when body tracking ran on it. Compact JSON:
+
+  ```json
+  {"skeleton":"halpe26","keypoints":[[605.0,251.9,0.88],[602.5,237.0,0.85],...],"bbox":[529.8,184.0,791.6,691.3],"ms":35.6}
+  ```
+
+  `keypoints`: 26 `[x, y, score]` in frame pixels to 0.1 px, scores to
+  0.01, in the [Halpe-26 order](#halpe-26-keypoints), smoothed with the
+  `body_tracking.smoothing` filter; `[]` when nobody was found, then without
+  `bbox`. `bbox`: `[x1, y1, x2, y2]`, the box the pose model looked in.
+  `ms`: how long body tracking took on the frame. The pose is for this exact
+  frame: a header on the frame's own response needs no matching on the
+  client and leaves the JPEG body as the camera sent it; it is about 1 KB.
+
+  For a camera at `golfer_front` or `target_line` that found the golfer,
+  `posture` adds the golfer's posture on the frame for that view, measured
+  for the hand in effect and smoothed with the same `body_tracking.smoothing`
+  filter: 2D angles in degrees to 0.1, each left out when its keypoints were
+  not found.
+
+  ```json
+  "posture":{"view":"face_on","spine_angle":11.2,"shoulder_tilt":19.4,"lead_arm_angle":172.0}
+  "posture":{"view":"down_the_line","spine_angle":27.3,"lead_knee_flex":18.1,"trail_knee_flex":17.0,"trail_elbow_angle":160.2}
+  ```
+
+  `view` `face_on` carries `spine_angle` (the spine's sideways tilt, positive
+  with the shoulders away from the target), `shoulder_tilt` (positive with
+  the lead shoulder higher) and `lead_arm_angle` (180 straight);
+  `down_the_line` carries `spine_angle` (the forward bend, positive towards
+  the ball), `lead_knee_flex`, `trail_knee_flex` (0 straight) and
+  `trail_elbow_angle` (180 straight).
+- `X-Pose-State` (body tracking): `off` (`body_tracking.mode` is not
+  `live`: no live tracking),
+  `loading` (the model is not ready yet), `missing` (its files are not
+  downloaded: see
+  [`GET /api/body_tracking/models`](#get-apibody_trackingmodels)) or
+  `downloading` (a model download is running); in these frames go out
+  without `X-Pose`. Then `ready`, or `failed`, with `X-Pose-Error` saying why
+  (printable ASCII, at most 300 characters): the model could not be loaded,
+  or this camera's live body tracking stopped after repeated errors (frames
+  then go out without `X-Pose` until no request has come for 3 s). Also on
+  the `204`.
+
+| Status | When |
+| --- | --- |
+| `204 No Content` | no newer frame within 1 s (the camera is not capturing, or its frames are slower) |
+| `404 Not Found` | `{actor}` is not a configured camera |
+| `503 Service Unavailable` | 8 requests are already waiting on this camera |
+
+Each request keeps the camera preparing live frames for the next 3 s, at up
+to 15 frames a second (slower cameras send every frame); frames in between
+are skipped. With body tracking in Live mode, frames come at the rate body tracking
+keeps up with, at most 15 a second, each with its pose; frames that arrive
+while it works on one are skipped. Send the next request when the last one is answered. A camera
+that nobody asked for in the last 3 s prepares none, and the first request
+after that waits for a fresh frame. The camera is never opened a second
+time, and recording is unaffected.
+
+```
+GET /api/cameras/camera.0/live?after=1841
+→ 200, X-Frame-Seq: 1843, X-Frame-Time-Ns: 5123456789012, X-Pose: {...}, X-Pose-State: ready, <JPEG>
+```
+
 ### GET /api/shots/groups
 
 Shot sets ("groups" on the wire) over this webserver's shot history. Sets are
@@ -538,7 +902,7 @@ the Shots tab's default view (see [POST /api/shots/grouping](#post-apishotsgroup
 - At most one set is **open**. A shot joins it unless the club in play differs
   from the set's club, in which case the open set closes and a new one starts.
   Returning to an earlier club starts a new set; a closed set never reopens.
-- An open set with no shots (one **+ New set** just started, or one opened by
+- An open set with no shots (one **New set** just started, or one opened by
   a trigger that read nothing) takes the next shot's club instead.
 - **New set** ([POST /api/shots/groups](#post-apishotsgroups)) closes the open
   set; the next shot joins a fresh one.
@@ -586,7 +950,7 @@ reconnects keeps the open set: its next shot with the same club joins it.
   - `club`: absent for the set of shots hit with no club selected.
   - `started_at`: when the set was created (host clock, RFC 3339 UTC).
   - `manual`: `true` when started by `POST /api/shots/groups` (the Shots
-    tab's **+ New set**); omitted when `false`.
+    tab's **New set**); omitted when `false`.
   - `open`: still receiving shots. A closed set never reopens.
   - `shots`: stored shots with data in the set (the ones `/api/shots` lists).
 
@@ -595,7 +959,7 @@ reconnects keeps the open set: its next shot with the same club joins it.
 ### POST /api/shots/groups
 
 No body. Emits `new_shot_group` on the bus (actor `web`) and returns
-`202 Accepted`; `shot_group` events follow. The Shots tab's **+ New set**
+`202 Accepted`; `shot_group` events follow. The Shots tab's **New set**
 button sends this (or its WS twin).
 
 Closes the open set and opens a fresh one for the selected club, in the
@@ -619,7 +983,7 @@ session only, so it starts every club afresh.
 ### POST /api/shots/clear
 
 No body. Emits `clear_shot_history` on the bus (actor `web`) and returns
-`202 Accepted`; the Shots tab's **Clear history** (trash icon, after a
+`202 Accepted`; the Shots tab's **Clear history** (trash icon, at the toolbar's right end, after a
 confirmation) sends this or its WS twin. Every webserver then:
 
 - deletes its shot history: `/api/shots` and the
@@ -722,6 +1086,8 @@ replaces the hand.
 
 Send an Auto-chip (beta): a short, straight chip of a chosen total distance,
 for chips the launch monitor can't read.
+Off by default; turn it on in Settings → Simulation (useful with radar launch
+monitors that miss short chips).
 
 **Request**:
 
@@ -747,7 +1113,9 @@ for chips the launch monitor can't read.
 
 `400 Bad Request` with a JSON `{"error": "yards must be one of 1, 3, 5"}`
 body for any other distance. `409 Conflict` with a JSON `{"error"}` body when
-the `[simulation]` altitude or temperature is out of range. A body that is not
+Auto-chip is turned off (`[simulation]` `auto_chip` is `false`, the default; the error is
+`"Auto-chip is disabled in settings"`, and no shot is sent or numbered) or
+when the `[simulation]` altitude or temperature is out of range. A body that is not
 `{"yards": <non-negative integer>}` is `422 Unprocessable Entity`, and a
 missing `Content-Type: application/json` `415 Unsupported Media Type`.
 
@@ -1190,6 +1558,11 @@ Full persisted config (mirrors `config.toml`).
     "post_roll_s": 1.5,
     "start_before_impact_s": 2.0
   },
+  "body_tracking": {
+    "model": "rtmpose-s",
+    "detect_every": 5,
+    "golfer_height": 180.0
+  },
   "camera": {
     "0": {
       "name": "Golfer Front",
@@ -1212,7 +1585,10 @@ Full persisted config (mirrors `config.toml`).
   ([`SimMode`](#simmode), default `"on"`, omitted while `"on"`), `altitude`
   (unit-tagged distance, default `"0ft"`, valid 0 to 5000 m), `temperature_c`
   (default `25.0`, valid -30 to 50) and `surface` ([`SimSurface`](#simsurface),
-  default `"fairway"`). With `"mode": "force"`, every simulated shot's results
+  default `"fairway"`) and `auto_chip` (boolean, default `false`, omitted
+  while `false`): whether the dashboard offers [Auto-chip](#post-apiauto-chip)
+  and `POST /api/auto-chip` accepts a chip. Off by default; turn it on in
+  Settings → Simulation (useful with radar launch monitors that miss short chips). With `"mode": "force"`, every simulated shot's results
   (carry, apex, flight time, descent, offline, roll, total) come from the
   simulation for every device, and its `derived` block carries all of them
   with `replaces_measured: true`; the device's own results stay under `ball`.
@@ -1323,6 +1699,28 @@ Full persisted config (mirrors `config.toml`).
   they are, and only the new folder's clips are listed (a
   [`shot_video_removed`](#shot_video_removed) names the shots that lost
   theirs)
+- `body_tracking` (alpha) holds the body tracking settings, each omitted
+  while at its default, and the section with them: `mode` (`"off"`, the
+  default: no body tracking, clips only; `"historical"`: a clip is tracked
+  the first time it is viewed, see
+  [`POST .../analyze`](#post-apishotsshot_idvideocameraanalyze); `"live"`:
+  the live views while watched and every clip as it is recorded), `model`
+  (`"rtmpose-m"` default, or `"rtmpose-s"`), `min_score`
+  (default `0.3`, 0 to 1: keypoints scoring below it are not drawn),
+  `smoothing` (default `1.0`: the live One Euro filter's cutoff at rest in
+  Hz, 0.1 to 10, lower is smoother; `0` is off) and `detect_every` (default
+  `10`, 1 to 60: the live view looks for the golfer afresh at least every
+  that many frames) and `golfer_height` (not set by default; the golfer's
+  height in centimetres, 100 to 250, for the swing analysis' distances in
+  centimetres). Every value applies at once, without restarting a
+  camera. A save with a value out of range is `400`; a file holding one
+  loads with a warning in the log, and the default is used. An unknown
+  `mode` is an invalid body, like an unknown `model`. A section with
+  `enabled` instead of `mode` (a config from before the modes) reads
+  `false` as `"off"` and `true` as `"historical"`, and one with neither as
+  `"off"`; responses carry `mode` only. Saving a mode other than `"off"`
+  downloads nothing: the models are downloaded only through
+  [`POST /api/body_tracking/models/download`](#post-apibody_trackingmodelsdownload)
 - `camera` sections (beta) are swing cameras: `name`; `camera`, the stable id
   from [`GET /api/cameras`](#get-apicameras) (`test-pattern` for the test
   picture); `camera_name`, the camera's own name when it was picked, used
@@ -1348,7 +1746,7 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 **Query parameters**:
 
 - `scope` (optional): a global actor ID (`mevo.0`, `openconnect_client.1`,
-  `webserver.0`) or `global`. `gspro.N` is accepted for
+  `webserver.0`), `global` or `body_tracking`. `gspro.N` is accepted for
   `openconnect_client.N`.
   - An actor ID narrows the save to that one actor — only its section is
     written to the config, and only that actor is reconciled. Every other
@@ -1357,8 +1755,16 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
     actor.
   - `global` writes only the global settings (`default_units`,
     `chipping_clubs`, `putting_clubs`, `shot_grouping`, `simulation`,
-    `replay`) from the body; every actor section of the live config is kept, whatever the body
+    `replay`, `body_tracking`) from the body; every actor section of the live config is kept, whatever the body
     carries for it. Every actor is reconciled.
+  - `body_tracking` writes only the body's `body_tracking` section; every
+    other setting of the live config is kept, whatever the body carries for
+    it. No actor is reconciled (body tracking is read live). The UI's Live
+    tuning keys save this way.
+  - Any save that changes `body_tracking.mode` applies it at once: leaving
+    `live` stops live tracking and the recorded clips still waiting to be
+    tracked (a clip being tracked finishes); `off` also drops every clip
+    waiting, releases the models and stops a model download.
   - An unparseable ID or unknown type prefix is rejected with `400`: nothing
     is saved.
   - flighthook runs one web server. A save that removes a `webserver.N`
@@ -1394,6 +1800,7 @@ as applied.
 | `400 Bad Request` | a camera section it writes has a `latency_s` below 0, above 10 or not finite (`"camera.0: latency_s 11 is outside 0 to 10 s"`) |
 | `400 Bad Request` | a camera section it writes has no `camera` (`"camera.0: no camera picked"`) or a `mode` that is neither `auto` nor `WIDTHxHEIGHT@FPS` |
 | `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
+| `400 Bad Request` | a whole-config, `global` or `body_tracking` save has a `body_tracking` value out of range (`"body_tracking: min_score 2 is outside 0 to 1"`) |
 | `504 Gateway Timeout` | SystemActor did not answer within 22 s (see below) |
 
 A body that is not a valid `FlighthookConfig` is rejected by the JSON
@@ -1424,7 +1831,8 @@ answering, so the reply can be lost even though the config was saved: read
 **Side effects**:
 
 - Emits `ConfigCommand` on the bus, processed by SystemActor. Without `scope`
-  the action is `ReplaceAll`; with `scope=global`, `ReplaceGlobal`; with an
+  the action is `ReplaceAll`; with `scope=global`, `ReplaceGlobal`; with
+  `scope=body_tracking`, `SetBodyTracking`; with an
   actor ID, the matching `Upsert*` variant for that section (or `Remove` when
   the body omits it)
 - SystemActor persists the new config to disk and reconciles actors:
@@ -2225,6 +2633,40 @@ clip without this event.
 
 ```json
 { "actor": "camera.0", "event": { "kind": "shot_video_removed", "keys": [ { "shot_id": "550e8400-...", "shot_number": 42 } ] } }
+```
+
+---
+
+##### shot_pose
+
+Body tracking of a camera's clip is done (alpha): the golfer's keypoints on
+every frame are served at
+[`/api/shots/{shot_id}/video/{camera}.pose.json`](#get-apishotsshot_idvideocameraposejson).
+The envelope's `actor` is the camera, as for [`shot_video`](#shot_video);
+`keys` are the clip's shots. Sent once per clip when its tracking is done:
+in Live mode a few seconds after its `shot_video`, in Historical mode after
+the clip was asked for with
+[`POST .../analyze`](#post-apishotsshot_idvideocameraanalyze); no keypoints
+go on the bus. Flighthook extension event.
+
+```json
+{ "actor": "camera.0", "event": { "kind": "shot_pose", "keys": [ { "shot_id": "550e8400-...", "shot_number": 42 } ] } }
+```
+
+---
+
+##### shot_swing
+
+The swing analysis of a camera's clip is done (alpha): its events, tempo
+and metrics are served at
+[`/api/shots/{shot_id}/video/{camera}.swing.json`](#get-apishotsshot_idvideocameraswingjson).
+The envelope's `actor` is the camera; `keys` are the clip's shots. Sent once
+per face-on or down-the-line clip, right after its
+[`shot_pose`](#shot_pose); no numbers go on the bus. Flighthook extension
+event.
+
+```json
+{ "actor": "camera.0", "event": { "kind": "shot_swing", "keys": [ { "shot_id": "550e8400-...", "shot_number": 42 } ] } }
 ```
 
 ---

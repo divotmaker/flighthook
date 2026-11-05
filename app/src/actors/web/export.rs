@@ -58,7 +58,12 @@ pub fn build_export_line(
         group: shot.data.group.clone(),
         settings: ExportSettings {
             device: ctx.device_section.clone(),
-            simulation: ctx.simulation.clone(),
+            // The conditions the shot was simulated under; whether the
+            // dashboard offers Auto-chip is no part of them.
+            simulation: flighthook::SimulationSection {
+                auto_chip: false,
+                ..ctx.simulation.clone()
+            },
             detection_mode: ctx.detection_mode,
             handed: ctx.handed,
         },
@@ -470,6 +475,8 @@ mod tests {
             impact_offset_ms: 4000,
             complete: true,
             dropped: 0,
+            pose: false,
+            swing: false,
         }];
         for units in [None, Some(UnitSystem::Imperial), Some(UnitSystem::Metric)] {
             let line = jsonl_line(&shot, "t", units, true);
@@ -564,6 +571,18 @@ mod tests {
 
         let row = to_csv_row(&shot, UnitSystem::Metric);
         assert_eq!(row.trim_end().split(',').count(), 58);
+    }
+
+    #[test]
+    fn the_auto_chip_setting_is_not_exported_with_a_shots_simulation() {
+        let mut shot = private_shot();
+        shot.context.simulation.auto_chip = true;
+        let line: serde_json::Value =
+            serde_json::from_str(&jsonl_line(&shot, "t", None, false)).expect("parses");
+        assert!(
+            line["settings"]["simulation"].get("auto_chip").is_none(),
+            "{line}"
+        );
     }
 
     #[test]

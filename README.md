@@ -36,8 +36,10 @@ SkyTrak and MLM2PRO also emit it. Add it from the Launch monitors (+) menu:
 | [USB cameras](docs/devices/cameras.md)    | UVC, MJPEG (Windows, Linux)       | [stance](https://github.com/divotmaker/stance) | Beta   |
 
 Cameras record a clip of every shot for replay on the Shots tab, from a few
-seconds before the swing to just after the launch monitor reports it. Add
-one from the Cameras (+) menu. Not available on macOS yet.
+seconds before the swing to just after the launch monitor reports it, and
+show live in the Shots tab's Cameras pane, with the golfer's skeleton and
+swing numbers under each clip (body tracking, alpha). Add one from the Cameras (+) menu. Not available on
+macOS yet.
 
 ### Simulation Software
 
@@ -128,7 +130,7 @@ Terminal. Allow it.
   measure launch only (beta) — see [Simulated values](#simulated-values-beta)
 - Shot metrics computed from the measured values: total spin and spin axis,
   face to path, spin loft and curve — see [Shot metrics](#shot-metrics)
-- Shot sets: every shot joins a set, and a club change or **+ New set** starts
+- Shot sets: every shot joins a set, and a club change or **New set** starts
   a new one — see [Shot Tracking](#shot-tracking)
 - Flight chart: a side view of the simulated ball flights of the shown shot's
   set or club, drawn as smooth curves, with the rest of the session faint
@@ -141,6 +143,15 @@ Terminal. Allow it.
 - Swing replay: USB cameras record a clip of every shot, played back from the
   shot with the cameras side by side, slow motion and frame stepping (beta) —
   see [Swing replay](#swing-replay-beta)
+- Body tracking: the golfer's skeleton drawn over the replays, with each
+  swing's tempo (averaged over the cameras), key moments and body angles,
+  and the hip turn, shoulder turn, hip sway and spine at the frame on screen,
+  found on this computer's CPU with RTMPose; Off (the default), Historical (a clip is
+  tracked the first time it is viewed, which keeps the CPU free while you
+  play) or Live (every camera live and every clip as it is recorded, tuned
+  with keys); its models (about 76 MB) are downloaded only after you
+  confirm it, with the download's progress on screen (alpha) — see
+  [Body tracking](docs/devices/cameras.md#body-tracking-alpha)
 - Dual UI: native desktop window (eframe/egui) and browser dashboard (WASM, same codebase)
 - The UI scales itself to fit the window, so a 4K screen at 100 % shows about the
   same layout as at 200 %; in the desktop app Ctrl/Cmd + `+` / `-` adjust it and
@@ -225,6 +236,7 @@ mode = "on"               # off | on | force
 altitude = "0ft"          # any distance unit, 0 to 5000 m
 temperature_c = 25.0      # -30 to 50
 surface = "fairway"       # fairway | green | firm_green
+auto_chip = false         # true shows the header's Auto-chip button
 ```
 
 The mode applies per shot: changing it affects new shots only. An altitude or
@@ -253,7 +265,8 @@ monitor sent), never from the simulation. They are in the API
 
 ### Sharing shot data
 
-The Shots tab has two export links for the current session (also available as
+The Shots tab's export icon (at the right end of the toolbar, left of the trash
+icon) opens a menu of two formats for the current session (also available as
 `GET /api/shots/export`, see [docs/API.md](docs/API.md#get-apishotsexport)):
 
 - **JSONL** — one line per shot: the decoded shot exactly as the
@@ -279,22 +292,24 @@ is written to disk.
 
 Shots are recorded in **sets**: a shot joins the current set unless the club
 in play changed (going back to an earlier club starts a new set too) or you
-pressed **+ New set**. **New session** closes the set and starts a fresh
+pressed **New set**. **New session** closes the set and starts a fresh
 session. Sets are recorded the same way whatever you look at; the Shots tab
 offers three views of them (By set unless the Global card's Default shot view says otherwise):
 
 - **By set** — the shot list in sections per set, with range bars (total,
   carry, lateral) for the shown shot's set.
 - **By club** — one section per club, combining every set with that club
-  since the last **New session**, and range bars over that club. + New set
+  since the last **New session**, and range bars over that club. New set
   doesn't reset a club's numbers here; only New session does.
 - **None** — the last shot only: no sections, range bars or set buttons.
 
-+ New set and New session sit at the foot of the shot list. With shots from
+New set and New session sit at the foot of the shot list. With shots from
 more than one device, a **Device** filter in the toolbar picks one device
 (All splits the bars by device). It applies to the whole Shots tab: the shot
 list and its counts, the shot on show, the Table, the cards and the charts.
 The export always carries the whole session, each shot with its set.
+The Shots tab and the export show values in the unit system set by **Units**
+(Imperial or Metric) on the Devices tab's Global card.
 
 Beside the range bars sit up to three cards, as many as the window has room
 for: a stats card (the average, median and standard deviation of each
@@ -320,7 +335,7 @@ The dashboard loads the whole session the server keeps (the last 1000
 shots), so the views, range bars and charts cover all of it; **Table** lists
 every one of them, a row per shot.
 
-The trash icon after the export links (**Clear history**) deletes every shot,
+The trash icon at the toolbar's right end (**Clear history**) deletes every shot,
 set and camera clip and starts a new session, after a confirmation, in every open
 dashboard. Export first if you want to keep them.
 
@@ -359,7 +374,8 @@ impact to just after the launch monitor reports it. A shot with clips gets a
 Replay opens playing, with the cameras side by side and a scrubber that
 marks the impact (gold) and where playback starts (green, 2 s before the
 impact by default). It loops until you turn **Loop** off; pause, step frame
-by frame, slow it to ½, ¼ or ⅛, or download a camera's clip as an AVI.
+by frame, slow it to ½, ¼ or ⅛, or download a camera's clip as an AVI with
+the download icon next to its name.
 
 - Only FlightScope monitors report a shot at impact. For the others the
   impact is estimated a fixed time before their report (beta); each monitor
@@ -372,16 +388,33 @@ by frame, slow it to ½, ¼ or ⅛, or download a camera's clip as an AVI.
   can open it on your network can watch them (see
   [Second screen](#second-screen-on-a-tablet-or-phone)).
 
+With body tracking on, each clip shows its pose skeleton and swing data, and
+the scrubber marks the swing's address, takeaway, top and finish (hover a
+mark for its name, click it to jump there). Under the tempo, a row of tiles
+shows the body at the frame on screen: hip turn, shoulder turn, hip sway,
+head sway, forward bend and hip depth. They follow the replay as it
+plays, steps or is scrubbed. Hip sway and head sway read as a distance
+toward or away from the target, e.g. `3.8 in Toward`, and hip depth as a
+distance toward the ball or back, e.g. `0.8 in Back`:
+
+![Cameras](./screens/cameras.png "Cameras")
+
+*Swing footage: Wikimedia Commons, CC0 1.0. Shown with flighthook's overlays:
+pose skeleton and swing data.*
+
 Setup, camera positions, clip timing and disk use:
 [docs/devices/cameras.md](docs/devices/cameras.md).
 
 #### Auto-chip (beta)
 
 Some launch monitors can't read a very short chip. The **Auto-chip** button
-in the Shots toolbar opens a menu of **1 Yard**, **3 Yard** and **5 Yard**:
-pick one to send a short, straight chip of that total distance to the
-simulator, so the ball gets onto the green and the simulator's auto-putt can
-finish the hole.
+in the header, right of the **Club** picker, opens a menu of **1 Yard**,
+**3 Yard** and **5 Yard**: pick one to send a short, straight chip of that
+total distance to the simulator, so the ball gets onto the green and the
+simulator's auto-putt can finish the hole. It is off by default; turn it on
+in Settings → Simulation (the **Auto-chip** checkbox on the Devices tab's
+Simulation card, or `auto_chip = true` under `[simulation]`). It is useful
+with radar launch monitors that miss short chips.
 
 - The chip is launched straight at 28° with 100 rpm of backspin per mph of
   ball speed, no sidespin and no club data. The distance is flighthook's own
@@ -456,6 +489,7 @@ mode = "on"
 altitude = "0ft"
 temperature_c = 25.0
 surface = "fairway"
+auto_chip = false
 
 [webserver.0]
 name = "Web Server"
@@ -528,9 +562,13 @@ at their defaults, which it leaves out of the file (the `[simulation]` table
 above, for one). A file that already matches what flighthook would save is
 never touched: differences in comments, key order or whitespace alone, or `12`
 written for `12.0`, don't count. A rewritten file loses its comments; the
-backup keeps them. A file that fails to parse is left alone at startup
-(flighthook runs on the defaults and logs the error; a settings save from the
-UI then replaces it), and when the file can't be written
+backup keeps them. A file that fails to parse, or can't be read, is left alone
+at startup: flighthook runs on the defaults, logs the error, and shows it in a
+red frame over every tab of the app with the file's path and the line and
+message of the fault. The first settings save from the app then copies that
+file to `config.pre-<version>.toml` (as above) and replaces it with the
+defaults plus the change; the frame goes away. When the copy can't be made the
+save is refused and the file stays. When the file can't be written
 flighthook logs a warning and runs on the settings it read.
 
 ### Second screen on a tablet or phone
@@ -612,6 +650,17 @@ To run with a mock device, point `--config` at a TOML file with
 
 ## Third-party
 
+- Body tracking runs the [stance](https://github.com/divotmaker/stance)
+  crate's pose code, parts of it ported from
+  [rtmlib](https://github.com/Tau-J/rtmlib) (Apache-2.0, Tau-J and
+  contributors), which derives from
+  [MMPose](https://github.com/open-mmlab/mmpose) (Apache-2.0, OpenMMLab) and
+  [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) (Apache-2.0, Megvii
+  Inc.); the attributions are in [NOTICE](NOTICE). Its models are not
+  shipped: when you turn body tracking on and confirm the download,
+  flighthook downloads them from OpenMMLab (RTMPose, Apache-2.0) and Megvii
+  (YOLOX-Tiny, Apache-2.0); see
+  [Body tracking](docs/devices/cameras.md#body-tracking-alpha).
 - Icons: [Codicons](https://github.com/microsoft/vscode-codicons) by Microsoft,
   [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The font ships
   unmodified as `ui/assets/fonts/codicon.ttf`; version, source and licence

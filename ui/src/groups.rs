@@ -52,7 +52,7 @@ pub(crate) const GROUPING_MODES: [(ShotGrouping, &str); 3] = [
 
 /// Hover text for the view selector.
 pub(crate) const GROUPING_HINT: &str = "Sets are recorded the same way in every view: \
-     a club change or + New set starts one. \
+     a club change or New set starts one. \
      By set: a section per set. \
      By club: a section per club, combining its sets since the last New session. \
      None: the last shot only.";

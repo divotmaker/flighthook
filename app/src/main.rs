@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 mod actors;
 mod autochip;
 mod bus;
+mod pose;
 mod raw_capture;
 mod sim;
 mod state;

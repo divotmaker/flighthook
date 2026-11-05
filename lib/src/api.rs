@@ -30,6 +30,21 @@ pub struct StatusResponse {
     /// default). Omitted when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip_dir: Option<String>,
+    /// Why the config file was not used at startup. Omitted when it was
+    /// read, or after a save has replaced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<ConfigLoadError>,
+}
+
+/// A config file the app could not use at startup, so it runs on the
+/// defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigLoadError {
+    /// The config file.
+    pub path: String,
+    /// What is wrong with it: for a parse error the line and column, then
+    /// the message; for a read error the reason.
+    pub error: String,
 }
 
 /// Per-actor status within the status response. Also used as the cached

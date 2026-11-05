@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use serde::Deserialize;
 
@@ -140,6 +140,7 @@ impl LegacyFlighthookConfig {
             openconnect_client: self.gspro,
             random_club: self.random_club,
             replay: flighthook::ReplaySection::default(),
+            body_tracking: flighthook::BodyTrackingSection::default(),
             camera: HashMap::new(),
         }
     }
@@ -152,34 +153,39 @@ impl LegacyFlighthookConfig {
 /// `[webserver.0]`, and `[gspro.N]` sections load as
 /// `[openconnect_client.N]` (see [`FlighthookConfig`]). A file that does not
 /// hold what the app would save for it is then brought up to date (see
-/// [`bring_up_to_date`]). A file that fails to parse is left alone and the
-/// defaults are used.
-pub fn load(path: &Path) -> FlighthookConfig {
+/// [`bring_up_to_date`]). A file that fails to parse, or cannot be read, is
+/// left alone and the defaults are used; the second value says why, for the
+/// UI.
+pub fn load(path: &Path) -> (FlighthookConfig, Option<flighthook::ConfigLoadError>) {
+    let failed = |error: String| flighthook::ConfigLoadError {
+        path: path.display().to_string(),
+        error,
+    };
     match std::fs::read_to_string(path) {
         Ok(contents) => match parse(path, &contents) {
-            Some(config) => {
+            Ok(config) => {
                 bring_up_to_date(path, &contents, &config);
-                config
+                (config, None)
             }
-            None => FlighthookConfig::default(),
+            Err(error) => (FlighthookConfig::default(), Some(failed(error))),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let defaults = FlighthookConfig::default();
             tracing::info!("no config file found, creating {}", path.display());
             save_to(path, &defaults);
-            defaults
+            (defaults, None)
         }
         Err(e) => {
             tracing::warn!("failed to read {}: {e}", path.display());
-            FlighthookConfig::default()
+            (FlighthookConfig::default(), Some(failed(e.to_string())))
         }
     }
 }
 
 /// Parse config text `contents` read from `path`, in the current format or
-/// the singleton-`[webserver]` one. `None` (after logging why) when it is
-/// neither.
-fn parse(path: &Path, contents: &str) -> Option<FlighthookConfig> {
+/// the singleton-`[webserver]` one. The fault's line, column and message
+/// (after logging them) when it is neither.
+fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
     match toml::from_str::<FlighthookConfig>(contents) {
         Ok(config) => {
             tracing::info!("loaded config from {}", path.display());
@@ -192,6 +198,12 @@ fn parse(path: &Path, contents: &str) -> Option<FlighthookConfig> {
             if let Some(error) = config.latency_error() {
                 tracing::warn!("{}: {error}; a latency of 0 is used", path.display());
             }
+            if let Some(error) = config.body_tracking.error() {
+                tracing::warn!(
+                    "{}: [body_tracking] {error}; the default is used",
+                    path.display()
+                );
+            }
             if let Some(error) = config.replay.error() {
                 tracing::warn!(
                     "{}: [replay] {error}; keep_shots is held to 1 to {}, each roll to 0 to {} s, and the replay start to 0 to {} s",
@@ -201,20 +213,23 @@ fn parse(path: &Path, contents: &str) -> Option<FlighthookConfig> {
                     flighthook::ReplaySection::MAX_START_BEFORE_IMPACT_S
                 );
             }
-            Some(config)
+            Ok(config)
         }
-        Err(e) => match toml::from_str::<LegacyFlighthookConfig>(contents) {
-            Ok(legacy) => {
+        Err(e) => match singleton_webserver(contents)
+            .then(|| toml::from_str::<LegacyFlighthookConfig>(contents))
+            .and_then(Result::ok)
+        {
+            Some(legacy) => {
                 tracing::info!(
                     "loaded config from {} (singleton [webserver])",
                     path.display()
                 );
-                Some(legacy.into_current())
+                Ok(legacy.into_current())
             }
-            Err(_) => {
+            None => {
                 let e = located_error(contents, e);
                 tracing::warn!("failed to parse {}: {e}", path.display());
-                None
+                Err(fault(contents, &e))
             }
         },
     }
@@ -371,6 +386,35 @@ fn located_error(contents: &str, error: toml::de::Error) -> toml::de::Error {
         .unwrap_or(error)
 }
 
+/// Whether config text `contents` has the older singleton `[webserver]`
+/// table (its settings directly under `webserver`) rather than indexed
+/// `[webserver.<id>]` ones. Only such a file is read in the older format: the
+/// older format knows no later section, so it would load any other file whose
+/// current-format parse failed with those sections dropped.
+fn singleton_webserver(contents: &str) -> bool {
+    contents
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|t| match t.get("webserver") {
+            Some(toml::Value::Table(ws)) => Some(ws.values().any(|v| !v.is_table())),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// The fault `error` in config text `contents` as one line: its line and
+/// column, then its message (just the message when it has no position).
+fn fault(contents: &str, error: &toml::de::Error) -> String {
+    let message = error.message().trim();
+    let Some(span) = error.span() else {
+        return message.to_string();
+    };
+    let before = contents.get(..span.start).unwrap_or(contents);
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    format!("line {line}, column {column}: {message}")
+}
+
 /// Write config to a specific path, atomically (see [`write_atomic`]).
 /// Creates parent dirs if needed. Never panics.
 pub fn save_to(path: &Path, config: &FlighthookConfig) {
@@ -406,16 +450,81 @@ pub fn save_to(path: &Path, config: &FlighthookConfig) {
 pub struct SystemConfig {
     path: PathBuf,
     inner: RwLock<FlighthookConfig>,
+    /// Why the file was not used at startup, until a save has backed it up
+    /// and replaced it.
+    load_error: Mutex<Option<flighthook::ConfigLoadError>>,
 }
 
 impl SystemConfig {
     /// Load config from disk (or create defaults) and cache it.
     pub fn new(path: PathBuf) -> Self {
-        let config = load(&path);
+        let (config, load_error) = load(&path);
         Self {
             path,
             inner: RwLock::new(config),
+            load_error: Mutex::new(load_error),
         }
+    }
+
+    /// Why the config file was not used at startup, while it still sits
+    /// unreplaced: the first save backs it up and clears this.
+    pub fn load_error(&self) -> Option<flighthook::ConfigLoadError> {
+        self.load_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Before the first save over a config file that failed to load: copy
+    /// it to a backup next to it (see [`write_backup`]) and clear
+    /// [`Self::load_error`]. Returns the backup's path, `None` when there
+    /// was nothing to keep (the file loaded, was backed up already, or is
+    /// gone). `Err` with the reason when the file cannot be read or the
+    /// backup cannot be written: the file is then left alone and still
+    /// reported, and the caller must not save.
+    pub fn back_up_unusable_file(&self) -> Result<Option<PathBuf>, String> {
+        let mut held = self.load_error.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            return Ok(None);
+        }
+        let backup = match std::fs::read(&self.path) {
+            Ok(bytes) => write_backup(&self.path, &bytes).map(Some).map_err(|e| {
+                format!(
+                    "the config file {} could not be read at startup and could not be \
+                     backed up before it is replaced: {e}",
+                    self.path.display()
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(format!(
+                    "the config file {} could not be read at startup and still cannot be, \
+                     so it cannot be backed up before it is replaced: {e}",
+                    self.path.display()
+                ));
+            }
+        };
+        *held = None;
+        drop(held);
+        if let Some(backup) = &backup {
+            tracing::warn!(
+                "saving over the config file {} that could not be used at startup; \
+                 the original is kept as {}",
+                self.path.display(),
+                backup.display()
+            );
+        }
+        Ok(backup)
+    }
+
+    /// Write `config` to the config file, after backing up a file that
+    /// failed to load. A file that cannot be backed up is left alone.
+    fn persist(&self, config: &FlighthookConfig) {
+        if let Err(e) = self.back_up_unusable_file() {
+            tracing::warn!("not saving the config: {e}");
+            return;
+        }
+        save_to(&self.path, config);
     }
 
     /// Clone the current cached config.
@@ -501,6 +610,26 @@ impl SystemConfig {
         flighthook::latency_in_effect_s(configured)
     }
 
+    /// The `[body_tracking]` settings in effect: a value out of range is its
+    /// default. Read live by the camera actors and the body tracking
+    /// workers, so every change applies without a restart.
+    pub fn body_tracking(&self) -> flighthook::BodyTrackingSection {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .body_tracking
+            .in_effect()
+    }
+
+    /// Number of configured cameras.
+    pub fn camera_count(&self) -> usize {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .camera
+            .len()
+    }
+
     /// Clone just the `[replay]` section. Camera actors read it at every
     /// trigger and clip, so changes apply without restarting them.
     pub fn replay(&self) -> flighthook::ReplaySection {
@@ -525,14 +654,14 @@ impl SystemConfig {
     pub fn update(&self, f: impl FnOnce(&mut FlighthookConfig)) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         f(&mut guard);
-        save_to(&self.path, &guard);
+        self.persist(&guard);
     }
 
     /// Replace the entire cached config and persist to disk.
     pub fn replace(&self, new: FlighthookConfig) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         *guard = new;
-        save_to(&self.path, &guard);
+        self.persist(&guard);
     }
 }
 
@@ -596,6 +725,25 @@ bind = "0.0.0.0:5880"
         let sim = out.find("[simulation]").expect("simulation table");
         let web = out.find("[webserver.0]").expect("webserver table");
         assert!(sim < web, "{out}");
+    }
+
+    /// `auto_chip` is written only when enabled, and a file without it
+    /// leaves Auto-chip disabled.
+    #[test]
+    fn auto_chip_setting_round_trips_in_toml() {
+        let c: FlighthookConfig = toml::from_str(GOLDEN_DEFAULT_TOML).expect("parses");
+        assert!(!c.simulation.auto_chip, "disabled when absent");
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(!out.contains("auto_chip"), "{out}");
+
+        let file = format!("[simulation]\nauto_chip = true\n{GOLDEN_DEFAULT_TOML}");
+        let c: FlighthookConfig = toml::from_str(&file).expect("parses");
+        assert!(c.simulation.auto_chip);
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert!(out.contains("[simulation]"), "{out}");
+        assert!(out.contains("auto_chip = true\n"), "{out}");
+        let back: FlighthookConfig = toml::from_str(&out).expect("parses");
+        assert_eq!(back, c);
     }
 
     /// A `[simulation]` table carrying unknown keys (e.g. `enabled`) loads,
@@ -773,7 +921,7 @@ bind = "0.0.0.0:5880"
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("config.toml");
         std::fs::write(&path, "[replay]\nkeep_shots = 0\n").expect("write");
-        let c = load(&path);
+        let c = load(&path).0;
         assert_eq!(c.replay.keep_shots, 0, "the file is not rewritten");
         assert!(c.replay.error().is_some());
         assert_eq!(crate::state::clips::keep(&c.replay), 1);
@@ -998,7 +1146,7 @@ full_monitor = "mevo.0"
     #[test]
     fn a_gspro_file_is_rewritten_with_a_backup_of_the_original() {
         let (dir, path) = config_dir(GSPRO_TOML);
-        let loaded = load(&path);
+        let loaded = load(&path).0;
 
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
         let backup = std::fs::read(dir.0.join(backup_name())).expect("backup");
@@ -1017,7 +1165,7 @@ full_monitor = "mevo.0"
     fn a_singleton_webserver_file_is_rewritten_with_a_backup() {
         let src = "[webserver]\nname = \"\"\nbind = \"0.0.0.0:5881\"\n";
         let (dir, path) = config_dir(src);
-        let loaded = load(&path);
+        let loaded = load(&path).0;
         assert_eq!(loaded.webserver["0"].name, "Web Server");
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
         assert_eq!(
@@ -1029,12 +1177,90 @@ full_monitor = "mevo.0"
     }
 
     #[test]
+    fn a_body_tracking_section_loads_as_written_and_bad_values_default_in_effect() {
+        // Only the values off their defaults: read and left byte-identical.
+        let src = format!(
+            "{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmodel = \"rtmpose-s\"\ndetect_every = 5\n"
+        );
+        let src = src.as_str();
+        let (dir, path) = config_dir(src);
+        let loaded = load(&path).0;
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), src);
+        assert_eq!(files(&dir.0), ["config.toml"]);
+        assert_eq!(loaded.body_tracking.model, flighthook::PoseModel::RtmposeS);
+        assert_eq!(loaded.body_tracking.detect_every, 5);
+        assert_eq!(loaded.body_tracking.mode, flighthook::BodyTrackingMode::Off);
+        // Out of range: loaded as written (the file is not rewritten), the
+        // default in effect.
+        let src =
+            format!("{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmin_score = 3.0\nsmoothing = 0.5\n");
+        let src = src.as_str();
+        let (dir, path) = config_dir(src);
+        let cfg = SystemConfig::new(path.clone());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), src);
+        assert_eq!(files(&dir.0), ["config.toml"]);
+        let in_effect = cfg.body_tracking();
+        assert_eq!(
+            in_effect.min_score,
+            flighthook::BodyTrackingSection::DEFAULT_MIN_SCORE
+        );
+        assert_eq!(in_effect.smoothing, 0.5, "the valid value is kept");
+        // A change is read live.
+        cfg.update(|c| c.body_tracking.mode = flighthook::BodyTrackingMode::Live);
+        assert_eq!(cfg.body_tracking().mode, flighthook::BodyTrackingMode::Live);
+    }
+
+    #[test]
+    fn a_body_tracking_mode_loads_byte_identical_and_the_older_switch_becomes_one() {
+        use flighthook::BodyTrackingMode;
+        // Without the section (Off, the default), and with a mode other
+        // than the default written: left as it is.
+        for (src, mode) in [
+            (GOLDEN_DEFAULT_TOML.to_owned(), BodyTrackingMode::Off),
+            (
+                format!("{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmode = \"live\"\n"),
+                BodyTrackingMode::Live,
+            ),
+            (
+                format!("{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmode = \"historical\"\n"),
+                BodyTrackingMode::Historical,
+            ),
+        ] {
+            let (dir, path) = config_dir(&src);
+            let loaded = load(&path).0;
+            assert_eq!(loaded.body_tracking.mode, mode);
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), src);
+            assert_eq!(files(&dir.0), ["config.toml"]);
+        }
+        // `enabled = true` is Historical, written as the mode, the original
+        // backed up.
+        let src = format!("{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nenabled = true\n");
+        let (dir, path) = config_dir(&src);
+        assert_eq!(
+            load(&path).0.body_tracking.mode,
+            BodyTrackingMode::Historical
+        );
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert!(saved.contains("mode = \"historical\""), "{saved}");
+        assert!(!saved.contains("enabled"), "{saved}");
+        assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
+        // `enabled = false` is the default, Off: the section goes.
+        let src = format!("{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nenabled = false\n");
+        let (_dir, path) = config_dir(&src);
+        assert_eq!(load(&path).0.body_tracking.mode, BodyTrackingMode::Off);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            GOLDEN_DEFAULT_TOML
+        );
+    }
+
+    #[test]
     fn a_current_file_is_left_byte_identical_with_no_backup() {
         let c: FlighthookConfig = toml::from_str(EVERY_SECTION_TOML).expect("parses");
         let current = toml::to_string_pretty(&c).expect("ser");
         for contents in [GOLDEN_DEFAULT_TOML, current.as_str()] {
             let (dir, path) = config_dir(contents);
-            let loaded = load(&path);
+            let loaded = load(&path).0;
             assert_eq!(std::fs::read_to_string(&path).expect("read"), contents);
             assert_eq!(files(&dir.0), ["config.toml"]);
             let want: FlighthookConfig = toml::from_str(contents).expect("parses");
@@ -1070,7 +1296,7 @@ altitude = "0ft"
 surface = "firm_green"
 "#;
         let (dir, path) = config_dir(src);
-        let loaded = load(&path);
+        let loaded = load(&path).0;
         assert!((loaded.simulation.temperature_c - 12.0).abs() < f64::EPSILON);
         assert_eq!(loaded.openconnect_client["0"].name, "Bay GSPro");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), src);
@@ -1083,11 +1309,11 @@ surface = "firm_green"
     fn explicit_defaults_are_normalised_once() {
         let src = format!("{GOLDEN_DEFAULT_TOML}\n[mevo.0]\nname = \"Xi\"\nspin_source = \"d4\"\n");
         let (dir, path) = config_dir(&src);
-        let loaded = load(&path);
+        let loaded = load(&path).0;
         let saved = std::fs::read_to_string(&path).expect("read");
         assert!(!saved.contains("spin_source"), "{saved}");
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
-        assert_eq!(load(&path), loaded);
+        assert_eq!(load(&path).0, loaded);
         assert_eq!(std::fs::read_to_string(&path).expect("read"), saved);
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
     }
@@ -1099,13 +1325,13 @@ surface = "firm_green"
         let unknown = "[simulation]\nenabled = false\ntemperature_c = 30.0\n";
         for contents in [GSPRO_TOML, EVERY_SECTION_TOML, legacy, unknown] {
             let (dir, path) = config_dir(contents);
-            let first = load(&path);
+            let first = load(&path).0;
             let migrated = std::fs::read(&path).expect("read");
             assert_ne!(migrated, contents.as_bytes(), "{contents}");
             let after_first = files(&dir.0);
             assert_eq!(after_first, [backup_name(), "config.toml".to_string()]);
 
-            let second = load(&path);
+            let second = load(&path).0;
             assert_eq!(second, first);
             assert_eq!(std::fs::read(&path).expect("read"), migrated);
             assert_eq!(files(&dir.0), after_first);
@@ -1117,7 +1343,7 @@ surface = "firm_green"
         let (dir, path) = config_dir(GSPRO_TOML);
         let older = dir.0.join(backup_name());
         std::fs::write(&older, "older backup").expect("write");
-        load(&path);
+        let _ = load(&path);
         let next = format!("config.pre-{}.1.toml", env!("CARGO_PKG_VERSION"));
         assert_eq!(
             files(&dir.0),
@@ -1146,6 +1372,101 @@ surface = "firm_green"
             assert_eq!(std::fs::read_to_string(&path).expect("read"), contents);
             assert_eq!(files(&dir.0), ["config.toml"]);
         }
+    }
+
+    /// The error `load` keeps for config text `contents`.
+    fn kept_error(contents: &str) -> flighthook::ConfigLoadError {
+        let (dir, path) = config_dir(contents);
+        let (config, error) = load(&path);
+        assert_eq!(config, FlighthookConfig::default());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), contents);
+        drop(dir);
+        error.expect("an error")
+    }
+
+    #[test]
+    fn a_file_that_fails_to_parse_keeps_its_located_error() {
+        let bad_mode = "default_units = \"metric\"\n\n[body_tracking]\nmode = \"liv\"\n";
+        let error = kept_error(bad_mode);
+        assert!(error.path.ends_with("config.toml"), "{}", error.path);
+        assert!(error.error.starts_with("line 4, column 8: "), "{error:?}");
+        assert!(error.error.contains("liv"), "{error:?}");
+
+        let syntax = kept_error("default_units = \"metric\"\n[simulation\n");
+        assert!(syntax.error.starts_with("line 2, "), "{syntax:?}");
+
+        let gspro = kept_error("[mevo.0]\nname = \"Mevo+\"\n\n[gspro.0]\nname = 7\n");
+        assert!(gspro.error.starts_with("line 5, "), "{gspro:?}");
+    }
+
+    #[test]
+    fn a_clean_file_and_a_missing_file_keep_no_error() {
+        let (_dir, path) = config_dir(GSPRO_TOML);
+        assert_eq!(SystemConfig::new(path).load_error(), None);
+        let (dir, _) = config_dir("");
+        let missing = dir.0.join("elsewhere.toml");
+        assert_eq!(SystemConfig::new(missing).load_error(), None);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_keeps_the_reason() {
+        // A directory where the file should be: not NotFound.
+        let (dir, _) = config_dir("");
+        let path = dir.0.join("folder.toml");
+        std::fs::create_dir(&path).expect("mkdir");
+        let cfg = SystemConfig::new(path.clone());
+        let error = cfg.load_error().expect("an error");
+        assert!(error.path.ends_with("folder.toml"), "{}", error.path);
+        assert!(!error.error.is_empty());
+
+        // It cannot be backed up either: the save is refused and the file
+        // stays.
+        let refused = cfg.back_up_unusable_file().expect_err("refused");
+        assert!(refused.contains("cannot be backed up"), "{refused}");
+        cfg.update(|c| c.simulation.mode = SimMode::Off);
+        assert!(path.is_dir());
+        assert!(cfg.load_error().is_some(), "still reported");
+        assert_eq!(files(&dir.0), ["config.toml", "folder.toml"]);
+    }
+
+    #[test]
+    fn the_first_save_backs_up_a_file_that_failed_to_parse_and_clears_the_error() {
+        let broken = "default_units = \"metric\"\n[body_tracking]\nmode = \"liv\"\n";
+        let (dir, path) = config_dir(broken);
+        let cfg = SystemConfig::new(path.clone());
+        assert!(cfg.load_error().is_some());
+        assert_eq!(files(&dir.0), ["config.toml"], "start leaves it alone");
+
+        cfg.update(|c| c.simulation.mode = SimMode::Off);
+        assert_eq!(cfg.load_error(), None);
+        assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(backup_name())).expect("read"),
+            broken
+        );
+        let saved = std::fs::read_to_string(&path).expect("read");
+        let back: FlighthookConfig = toml::from_str(&saved).expect("parses");
+        assert_eq!(back.simulation.mode, SimMode::Off);
+
+        // Later saves back up nothing more.
+        cfg.update(|c| c.simulation.mode = SimMode::On);
+        assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
+    }
+
+    #[test]
+    fn backing_up_ahead_of_a_save_clears_the_error_once() {
+        let broken = "[body_tracking]\nmode = \"liv\"\n";
+        let (dir, path) = config_dir(broken);
+        let cfg = SystemConfig::new(path.clone());
+        let backup = cfg.back_up_unusable_file().expect("backed up");
+        assert_eq!(backup, Some(dir.0.join(backup_name())));
+        assert_eq!(cfg.load_error(), None);
+        assert_eq!(cfg.back_up_unusable_file(), Ok(None));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            broken,
+            "the file itself is the save's to replace"
+        );
     }
 
     /// A directory the app may not write to: the file is left as it was and

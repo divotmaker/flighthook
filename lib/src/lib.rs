@@ -9,6 +9,7 @@ mod game_state;
 mod group;
 mod message;
 mod metrics;
+mod pose;
 mod stats;
 mod video;
 
@@ -23,6 +24,7 @@ pub use game_state::*;
 pub use group::*;
 pub use message::*;
 pub use metrics::*;
+pub use pose::*;
 pub use stats::*;
 pub use video::*;
 

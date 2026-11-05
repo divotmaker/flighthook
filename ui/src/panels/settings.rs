@@ -11,7 +11,7 @@ use crate::types::{
     OpenConnectClientSection, R10Section, RandomClubSection, ReplaySection, ShotGrouping,
     SimSurface, SimulationSection, SpinSource, UnitSystem, WebserverSection,
 };
-use flighthook::SimMode;
+use flighthook::{BodyTrackingMode, BodyTrackingSection, PoseModel, SimMode};
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
     ("inches", "in"),
@@ -795,6 +795,7 @@ pub(crate) struct SimulationForm {
     pub(crate) temperature_val: String,
     pub(crate) fahrenheit: bool,
     pub(crate) surface: SimSurface,
+    pub(crate) auto_chip: bool,
     loaded: SimulationSection,
 }
 
@@ -822,6 +823,7 @@ impl SimulationForm {
             temperature_val: Self::temperature_text(s.temperature_c, fahrenheit),
             fahrenheit,
             surface: s.surface,
+            auto_chip: s.auto_chip,
             loaded: s.clone(),
         }
     }
@@ -889,6 +891,7 @@ impl SimulationForm {
             altitude: self.altitude()?,
             temperature_c: self.temperature_c()?,
             surface: self.surface,
+            auto_chip: self.auto_chip,
         };
         s.environment_error().is_none().then_some(s)
     }
@@ -969,6 +972,90 @@ impl ReplayForm {
 
     /// The section to save, falling back to the loaded one while invalid.
     fn to_section_or_loaded(&self) -> ReplaySection {
+        self.to_section().unwrap_or_else(|| self.loaded.clone())
+    }
+}
+
+/// Form state for the `[body_tracking]` section (alpha): the Body tracking
+/// card's mode, model and golfer height. The other values are tuned with
+/// keys on the Shots tab's Live view and saved as loaded.
+///
+/// The height is edited in inches when `inches` is set (imperial default
+/// units), centimetres otherwise, and stored in centimetres rounded to 0.1;
+/// left as loaded, it saves its loaded value exactly. Empty is no height.
+#[derive(Clone, Default)]
+pub(crate) struct BodyTrackingForm {
+    pub(crate) mode: BodyTrackingMode,
+    pub(crate) model: PoseModel,
+    pub(crate) golfer_height: String,
+    pub(crate) inches: bool,
+    loaded: BodyTrackingSection,
+}
+
+impl BodyTrackingForm {
+    pub(crate) fn from_section(s: &BodyTrackingSection, units: UnitSystem) -> Self {
+        let inches = units == UnitSystem::Imperial;
+        Self {
+            mode: s.mode,
+            model: s.model,
+            golfer_height: Self::height_text(s.golfer_height, inches),
+            inches,
+            loaded: s.clone(),
+        }
+    }
+
+    fn height_text(cm: Option<f64>, inches: bool) -> String {
+        cm.map_or_else(String::new, |cm| {
+            let v = if inches { cm / 2.54 } else { cm };
+            format_distance_value((v * 10.0).round() / 10.0)
+        })
+    }
+
+    /// The height's unit as the card shows it.
+    pub(crate) fn height_unit(&self) -> &'static str {
+        if self.inches { "in" } else { "cm" }
+    }
+
+    /// Switch the height's unit, converting the typed value.
+    pub(crate) fn set_inches(&mut self, inches: bool) {
+        if inches == self.inches {
+            return;
+        }
+        if let Some(cm) = self.golfer_height_cm() {
+            self.golfer_height = Self::height_text(cm, inches);
+        }
+        self.inches = inches;
+    }
+
+    /// The height to save in centimetres (`Some(None)`: no height), or
+    /// `None` while the text is not a number.
+    fn golfer_height_cm(&self) -> Option<Option<f64>> {
+        if self.golfer_height == Self::height_text(self.loaded.golfer_height, self.inches) {
+            return Some(self.loaded.golfer_height);
+        }
+        let text = self.golfer_height.trim();
+        if text.is_empty() {
+            return Some(None);
+        }
+        let v: f64 = text.parse().ok()?;
+        let cm = if self.inches { v * 2.54 } else { v };
+        Some(Some((cm * 10.0).round() / 10.0))
+    }
+
+    /// The section to save, the loaded one with the card's values, or
+    /// `None` while the height is unparsable or out of range.
+    pub(crate) fn to_section(&self) -> Option<BodyTrackingSection> {
+        let s = BodyTrackingSection {
+            mode: self.mode,
+            model: self.model,
+            golfer_height: self.golfer_height_cm()?,
+            ..self.loaded.clone()
+        };
+        s.error().is_none().then_some(s)
+    }
+
+    /// The section to save, falling back to the loaded one while invalid.
+    fn to_section_or_loaded(&self) -> BodyTrackingSection {
         self.to_section().unwrap_or_else(|| self.loaded.clone())
     }
 }
@@ -1070,6 +1157,7 @@ pub(crate) enum GeneralCard {
     Global,
     Simulation,
     Replay,
+    BodyTracking,
 }
 
 /// Settings form state.
@@ -1081,12 +1169,13 @@ pub(crate) struct SettingsForm {
     pub(crate) putting_clubs: Vec<Club>,
     pub(crate) simulation: SimulationForm,
     pub(crate) replay: ReplayForm,
-    /// The Global, Simulation and Replay cards (one save) have unsaved
-    /// edits.
+    pub(crate) body_tracking: BodyTrackingForm,
+    /// The Global, Simulation, Replay and Body tracking cards (one save)
+    /// have unsaved edits.
     pub(crate) global_dirty: bool,
     /// Which of the cards the unsaved Global edits were made on, by
     /// [`GeneralCard`]; meaningful only while `global_dirty`.
-    general_edited: [bool; 3],
+    general_edited: [bool; 4],
     pub(crate) actors: Vec<ActorFormEntry>,
     pub(crate) loaded: bool,
     /// The save posted and not answered yet.
@@ -1117,8 +1206,12 @@ impl Default for SettingsForm {
             putting_clubs: flighthook::default_putting_clubs(),
             simulation: SimulationForm::default(),
             replay: ReplayForm::default(),
+            body_tracking: BodyTrackingForm::from_section(
+                &BodyTrackingSection::default(),
+                UnitSystem::default(),
+            ),
             global_dirty: false,
-            general_edited: [false; 3],
+            general_edited: [false; 4],
             actors: Vec::new(),
             loaded: false,
             save: None,
@@ -1168,7 +1261,8 @@ impl SettingsForm {
             self.putting_clubs = s.putting_clubs.clone();
             self.simulation = SimulationForm::from_section(&s.simulation, s.default_units);
             self.replay = ReplayForm::from_section(&s.replay);
-            self.general_edited = [false; 3];
+            self.body_tracking = BodyTrackingForm::from_section(&s.body_tracking, s.default_units);
+            self.general_edited = [false; 4];
         }
 
         let edited: Vec<ActorFormEntry> = std::mem::take(&mut self.actors)
@@ -1213,10 +1307,12 @@ impl SettingsForm {
         }
     }
 
-    /// Whether the General cards can be saved: the simulation and replay
-    /// fields are in range.
+    /// Whether the General cards can be saved: the simulation, replay and
+    /// body tracking fields are in range.
     pub(crate) fn general_valid(&self) -> bool {
-        self.simulation.to_section().is_some() && self.replay.to_section().is_some()
+        self.simulation.to_section().is_some()
+            && self.replay.to_section().is_some()
+            && self.body_tracking.to_section().is_some()
     }
 
     /// Clubs on the Global card are limited to the Chipping/Putting
@@ -1249,6 +1345,7 @@ impl SettingsForm {
             shot_grouping: self.shot_grouping,
             simulation: self.simulation.to_section_or_loaded(),
             replay: self.replay.to_section_or_loaded(),
+            body_tracking: self.body_tracking.to_section_or_loaded(),
             webserver: HashMap::new(),
             mevo: HashMap::new(),
             r10: HashMap::new(),
@@ -1301,6 +1398,22 @@ impl SettingsForm {
     /// Whether a save has been posted and not answered yet.
     pub(crate) fn saving(&self) -> bool {
         self.save.is_some()
+    }
+
+    /// The saved cameras, as of the last load or save: actor ID and section,
+    /// by index.
+    pub(crate) fn saved_cameras(&self) -> Vec<(String, CameraSection)> {
+        let Some(config) = &self.original_config else {
+            return Vec::new();
+        };
+        let mut cameras: Vec<(&String, &CameraSection)> = config.camera.iter().collect();
+        cameras.sort_by(|(a, _), (b, _)| {
+            (a.parse::<u64>().ok(), a.as_str()).cmp(&(b.parse::<u64>().ok(), b.as_str()))
+        });
+        cameras
+            .into_iter()
+            .map(|(index, section)| (format!("camera.{index}"), section.clone()))
+            .collect()
     }
 
     /// Whether the Devices tab is locked: something has unsaved edits, or a
@@ -1396,7 +1509,7 @@ impl SettingsForm {
     /// Record an edit on a General card.
     pub(crate) fn mark_general(&mut self, card: GeneralCard) {
         if !self.global_dirty {
-            self.general_edited = [false; 3];
+            self.general_edited = [false; 4];
         }
         self.general_edited[card as usize] = true;
         self.global_dirty = true;
@@ -1413,9 +1526,12 @@ impl SettingsForm {
             GeneralCard::Global => {
                 self.general_edited[GeneralCard::Global as usize]
                     || !(self.general_edited[GeneralCard::Simulation as usize]
-                        || self.general_edited[GeneralCard::Replay as usize])
+                        || self.general_edited[GeneralCard::Replay as usize]
+                        || self.general_edited[GeneralCard::BodyTracking as usize])
             }
-            GeneralCard::Simulation | GeneralCard::Replay => self.general_edited[card as usize],
+            GeneralCard::Simulation | GeneralCard::Replay | GeneralCard::BodyTracking => {
+                self.general_edited[card as usize]
+            }
         }
     }
 
@@ -1428,8 +1544,10 @@ impl SettingsForm {
         self.putting_clubs = saved.putting_clubs.clone();
         self.simulation = SimulationForm::from_section(&saved.simulation, saved.default_units);
         self.replay = ReplayForm::from_section(&saved.replay);
+        self.body_tracking =
+            BodyTrackingForm::from_section(&saved.body_tracking, saved.default_units);
         self.global_dirty = false;
-        self.general_edited = [false; 3];
+        self.general_edited = [false; 4];
         if self.save_error.as_ref().map(|e| &e.target) == Some(&SaveTarget::Global) {
             self.save_error = None;
         }
@@ -1490,6 +1608,33 @@ impl SettingsForm {
         config.putting_clubs = self.filtered_putting_clubs();
         config.simulation = self.simulation.to_section_or_loaded();
         config.replay = self.replay.to_section_or_loaded();
+        config.body_tracking = self.body_tracking.to_section_or_loaded();
+        config
+    }
+
+    /// Whether the saved settings offer Auto-chip. False until the settings
+    /// have loaded, so a disabled chip never flashes at startup.
+    pub(crate) fn auto_chip_enabled(&self) -> bool {
+        self.original_config
+            .as_ref()
+            .is_some_and(|c| c.simulation.auto_chip)
+    }
+
+    /// The saved `[body_tracking]` settings in effect (defaults until the
+    /// settings have loaded).
+    pub(crate) fn saved_body_tracking(&self) -> BodyTrackingSection {
+        self.original_config
+            .as_ref()
+            .map(|c| c.body_tracking.in_effect())
+            .unwrap_or_default()
+    }
+
+    /// The saved config with `body_tracking` in place of its own: what a
+    /// Live tuning key sends (`scope=body_tracking`, which writes only that
+    /// section).
+    pub(crate) fn tuning_request(&self, body_tracking: &BodyTrackingSection) -> FlighthookConfig {
+        let mut config = self.saved_config();
+        config.body_tracking = body_tracking.clone();
         config
     }
 
@@ -1511,6 +1656,7 @@ fn global_matches(a: &FlighthookConfig, b: &FlighthookConfig) -> bool {
         && a.shot_grouping == b.shot_grouping
         && a.simulation == b.simulation
         && a.replay == b.replay
+        && a.body_tracking == b.body_tracking
 }
 
 /// Copy `from`'s global settings into `to`.
@@ -1521,6 +1667,7 @@ fn copy_global(to: &mut FlighthookConfig, from: &FlighthookConfig) {
     to.shot_grouping = from.shot_grouping;
     to.simulation = from.simulation.clone();
     to.replay = from.replay.clone();
+    to.body_tracking = from.body_tracking.clone();
 }
 
 /// Set `to`'s section for actor `global_id` to `from`'s: copied, or removed
@@ -2076,6 +2223,9 @@ pub(crate) fn action_button(ui: &mut egui::Ui, text: &str, mark: &str, enabled: 
 
 /// Hover text of the Simulation card.
 const SIMULATION_HOVER: &str = "When a launch monitor doesn't report carry, apex, flight time, descent, offline, roll or total, flighthook simulates them from the measured launch. Simulated values are tagged SIM on the Cards view and shown in italics in the Table. Never sent to GSPro, which simulates the flight itself.";
+
+/// Hover text of the Auto-chip checkbox on the Simulation card.
+const AUTO_CHIP_SETTING_HOVER: &str = "Show the Auto-chip control in the header: it sends a short straight chip to the sim, for chips your launch monitor can't read (radar monitors often miss short chips). The chip is simulated under the altitude, temperature and surface below, whatever the Simulation mode.";
 
 /// Hover text of the Replay card.
 const REPLAY_HOVER: &str = "The cameras record a clip around every shot: from the pre-roll before the estimated impact to the post-roll after the launch monitor reports the shot. The newest clips are kept on disk; older ones are deleted, and Clear history deletes them all.";
@@ -2836,24 +2986,28 @@ impl FlighthookApp {
     }
 
     /// Cancel the Global and Simulation cards together. The Shots tab's
-    /// units go back to what they were before the default units changed.
+    /// units go back with the setting.
     pub(crate) fn cancel_general(&mut self) {
         self.settings.cancel_general();
-        if let Some(units) = self.units_before_edit.take() {
-            self.units_toggle = units;
-        }
     }
 
-    /// Change the default units on the Global card. The Shots tab follows;
-    /// the units it showed before are kept for Cancel.
+    /// The unit system every Shots view and the exports use: the Units
+    /// setting, which the Shots tab follows as soon as it is changed on the
+    /// Global card (Cancel puts the saved one back).
+    pub(crate) fn units(&self) -> UnitSystem {
+        self.settings.default_units
+    }
+
+    /// Change the Units setting on the Global card.
     pub(crate) fn set_default_units(&mut self, units: UnitSystem) {
-        self.units_before_edit.get_or_insert(self.units_toggle);
         self.settings.default_units = units;
         self.settings
             .simulation
             .set_fahrenheit(units == UnitSystem::Imperial);
+        self.settings
+            .body_tracking
+            .set_inches(units == UnitSystem::Imperial);
         self.settings.mark_general(GeneralCard::Global);
-        self.units_toggle = units;
     }
 
     /// A General card's header buttons, right to left: Save and Cancel
@@ -2871,6 +3025,7 @@ impl FlighthookApp {
             GeneralCard::Global => "global",
             GeneralCard::Simulation => "simulation",
             GeneralCard::Replay => "replay",
+            GeneralCard::BodyTracking => "body_tracking",
         };
         let can_save = self.settings.general_valid();
         match save_cancel(ui, key, can_save, self.settings.saving()) {
@@ -2927,22 +3082,30 @@ impl FlighthookApp {
         let (field_width, _) = field_widths(ui);
 
         ui.horizontal(|ui| {
-                field_label(ui, "Default Units:").on_hover_text("Default unit system for shot display. Can be toggled per-session in the Shots tab.");
-                let units_label = match self.settings.default_units {
-                    UnitSystem::Imperial => "Imperial",
-                    UnitSystem::Metric => "Metric",
-                };
-                egui::ComboBox::from_id_salt("default_units")
-                    .selected_text(units_label)
-                    .width(field_width)
-                    .show_ui(ui, |ui| {
-                        for (units, label) in [(UnitSystem::Imperial, "Imperial"), (UnitSystem::Metric, "Metric")] {
-                            if ui.selectable_label(self.settings.default_units == units, label).clicked() {
-                                self.set_default_units(units);
-                            }
+            field_label(ui, "Units:").on_hover_text(
+                "Unit system for shot display and exports. The Shots tab follows it.",
+            );
+            let units_label = match self.settings.default_units {
+                UnitSystem::Imperial => "Imperial",
+                UnitSystem::Metric => "Metric",
+            };
+            let combo = egui::ComboBox::from_id_salt("default_units")
+                .selected_text(units_label)
+                .width(field_width)
+                .show_ui(ui, |ui| {
+                    for (units, label) in [
+                        (UnitSystem::Imperial, "Imperial"),
+                        (UnitSystem::Metric, "Metric"),
+                    ] {
+                        let item = ui.selectable_label(self.settings.default_units == units, label);
+                        devices::mark(ui, || format!("units:{}", label.to_lowercase()), &item);
+                        if item.clicked() {
+                            self.set_default_units(units);
                         }
-                    });
-            });
+                    }
+                });
+            devices::mark(ui, || "units".to_owned(), &combo.response);
+        });
         // A fixed row height, the segmented control's, so the label
         // centres on it.
         let row = egui::vec2(ui.available_width(), 36.0);
@@ -3075,6 +3238,118 @@ impl FlighthookApp {
             });
         });
         devices::mark(ui, || "card:replay".to_owned(), &card.response);
+    }
+
+    /// The Body tracking card (alpha): the mode, the pose model and the
+    /// golfer's height, saved with the Global card (turning it on from Off
+    /// saves at once, after the model download prompt). Its edit controls are
+    /// disabled unless `editable`. The rest is tuned with keys on the Shots
+    /// tab's Live view.
+    pub(crate) fn render_body_tracking_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        editable: bool,
+    ) {
+        let card = devices::fixed_card(ui, "body_tracking", theme::HEADING, |card| {
+            let ui = card.top();
+            let dirty = card_header(
+                ui,
+                "body_tracking",
+                "Body tracking",
+                Some(("alpha", TagPlace::Title)),
+                None,
+                |ui| self.general_buttons(ctx, ui, GeneralCard::BodyTracking),
+            );
+            if dirty {
+                lock_hint(ui);
+                self.general_error(ui, "body_tracking");
+            }
+            card.body(false, |ui| {
+                ui.add_space(6.0);
+                ui.add_enabled_ui(editable, |ui| self.body_tracking_fields(ui));
+            });
+        });
+        devices::mark(ui, || "card:body_tracking".to_owned(), &card.response);
+    }
+
+    /// The Body tracking card's fields: Mode, Model and Golfer height.
+    /// Turning body tracking on from Off goes through the model download
+    /// prompt ([`FlighthookApp::turn_body_tracking_on`]), which saves the
+    /// mode itself; every other change is an edit saved with Save.
+    fn body_tracking_fields(&mut self, ui: &mut egui::Ui) {
+        let (field_width, _) = field_widths(ui);
+        let off = self.body_tracking().mode == BodyTrackingMode::Off;
+        let mut turn_on = None;
+        let form = &mut self.settings.body_tracking;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            field_label(ui, "Mode:");
+            let modes = BodyTrackingMode::all();
+            let labels = modes.map(BodyTrackingMode::label);
+            let selected = modes.iter().position(|m| *m == form.mode).unwrap_or(1);
+            let toggle = theme::segmented_pills(ui, &labels, selected, None, theme::PILL_FONT);
+            devices::mark(ui, || "body_tracking_mode".to_owned(), &toggle.response);
+            let (clicked, pills) = toggle.inner;
+            for (mode, pill) in modes.iter().zip(&pills) {
+                devices::mark(ui, || format!("body_tracking_mode:{}", mode.key()), pill);
+            }
+            if let Some(i) = clicked {
+                if off && modes[i].is_on() {
+                    turn_on = Some(modes[i]);
+                } else {
+                    changed |= modes[i] != form.mode;
+                    form.mode = modes[i];
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            field_label(ui, "Model:");
+            let models = PoseModel::all();
+            let labels = models.map(PoseModel::label);
+            let selected = models.iter().position(|m| *m == form.model).unwrap_or(0);
+            let picker = theme::segmented(ui, &labels, selected, None);
+            devices::mark(ui, || "body_tracking_model".to_owned(), &picker.response);
+            if let Some(i) = picker.inner {
+                changed |= models[i] != form.model;
+                form.model = models[i];
+            }
+        });
+        ui.horizontal(|ui| {
+            field_label(ui, "Golfer height:");
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut form.golfer_height)
+                    .desired_width(field_width - TEXT_EDIT_MARGIN),
+            );
+            devices::mark(ui, || "body_tracking_height".to_owned(), &field);
+            changed |= field.changed();
+            ui.label(form.height_unit());
+        });
+        if form.to_section().is_none() {
+            let (min, max) = (
+                BodyTrackingSection::MIN_GOLFER_HEIGHT_CM,
+                BodyTrackingSection::MAX_GOLFER_HEIGHT_CM,
+            );
+            field_error(
+                ui,
+                &if form.inches {
+                    format!(
+                        "{:.0} to {:.0} in",
+                        (min / 2.54).ceil(),
+                        (max / 2.54).floor()
+                    )
+                } else {
+                    format!("{min:.0} to {max:.0} cm")
+                },
+            );
+        }
+        if changed {
+            self.settings.mark_general(GeneralCard::BodyTracking);
+        }
+        if let Some(mode) = turn_on {
+            let ctx = ui.ctx().clone();
+            self.turn_body_tracking_on(&ctx, mode);
+        }
     }
 
     /// The Replay card's fields.
@@ -3255,6 +3530,16 @@ impl FlighthookApp {
                         }
                     });
             });
+        });
+        ui.horizontal(|ui| {
+            field_indent(ui);
+            if ui
+                .checkbox(&mut sim.auto_chip, "Auto-chip")
+                .on_hover_text(AUTO_CHIP_SETTING_HOVER)
+                .changed()
+            {
+                sim_changed = true;
+            }
         });
         if sim_changed {
             self.settings.mark_general(GeneralCard::Simulation);
@@ -3617,6 +3902,50 @@ mod tests {
                 assert!(json.contains(&want), "{json}");
             }
         }
+    }
+
+    /// The Auto-chip setting loads into the form, is edited there, and goes
+    /// out in the save request only while enabled (the default stays off
+    /// the wire).
+    #[test]
+    fn the_auto_chip_setting_round_trips_through_the_form() {
+        let mut settings = SettingsForm::default();
+        assert!(
+            !settings.auto_chip_enabled(),
+            "off before the settings load"
+        );
+        settings.load_from(&FlighthookConfig::default());
+        assert!(!settings.simulation.auto_chip, "disabled by default");
+        assert!(!settings.auto_chip_enabled());
+        let json = serde_json::to_string(&settings.build_global_request()).expect("ser");
+        assert!(!json.contains("auto_chip"), "{json}");
+
+        settings.simulation.auto_chip = true;
+        settings.mark_general(GeneralCard::Simulation);
+        assert!(
+            settings
+                .simulation
+                .to_section()
+                .is_some_and(|s| s.auto_chip)
+        );
+        let json = serde_json::to_string(&settings.build_global_request()).expect("ser");
+        assert!(json.contains(r#""auto_chip":true"#), "{json}");
+        assert!(
+            !settings.auto_chip_enabled(),
+            "the header follows the saved setting, not the edit"
+        );
+
+        let on = FlighthookConfig {
+            simulation: SimulationSection {
+                auto_chip: true,
+                ..SimulationSection::default()
+            },
+            ..FlighthookConfig::default()
+        };
+        let mut loaded = SettingsForm::default();
+        loaded.load_from(&on);
+        assert!(loaded.simulation.auto_chip);
+        assert!(loaded.auto_chip_enabled());
     }
 
     #[test]

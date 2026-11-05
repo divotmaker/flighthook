@@ -25,17 +25,23 @@ egui_extras = { version = "0.33", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 # The replay view: clip sidecars, and webcam frames made decodable
 # (`jpeg::ensure_huffman`).
-stance = "0.0.2"
+stance = "0.0.3"
 # Decodes the replay's MJPEG frames; pure Rust, builds for wasm.
 zune-jpeg = "0.5"
 
 # eframe backend is platform-specific: x11+wayland on Linux, Win32 on Windows, web-sys on WASM.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }
-web-sys = "0.3"
+# `Document`: whether the browser tab is hidden; `Storage`: UI preferences in
+# the browser's local storage.
+web-sys = { version = "0.3", features = ["Document", "Storage", "Window"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
+
+# The native window keeps its UI preferences in the user's local data folder.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dirs = "6"
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))'.dependencies]
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }

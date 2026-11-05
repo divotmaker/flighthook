@@ -26,7 +26,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
-use flighthook::{ReplaySection, ShotKey, ShotVideo};
+use flighthook::{Handedness, ReplaySection, ShotKey, ShotVideo};
 
 /// The flighthook index file in each clip folder.
 pub const SHOT_FILE: &str = "shot.json";
@@ -60,6 +60,9 @@ pub struct ClipShot {
     pub device: String,
     /// How long before its trigger the impact was estimated, ms.
     pub impact_lead_ms: u64,
+    /// The player's hand when it triggered, for the swing analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hand: Option<Handedness>,
 }
 
 /// `shot.json`.
@@ -108,6 +111,19 @@ pub struct ClipSlot {
     pub id: String,
     pub dir: PathBuf,
     generation: u64,
+}
+
+/// One camera's finished clip, as [`ClipStore::camera_clip`] finds it.
+#[derive(Debug, Clone)]
+pub struct CameraClip {
+    /// Its folder.
+    pub slot: ClipSlot,
+    /// Its AVI, the sidecar beside it.
+    pub avi: PathBuf,
+    /// The shots the clip belongs to.
+    pub shots: Vec<ClipShot>,
+    /// Its listing (`pose` and `swing` say what is done).
+    pub video: ShotVideo,
 }
 
 /// What [`ClipStore::finish`] did.
@@ -355,6 +371,24 @@ impl ClipStore {
         removed
     }
 
+    /// Camera `camera`'s finished clip of shot `shot_id`: where it is, the
+    /// clip's shots and its listing.
+    pub fn camera_clip(&self, shot_id: &str, camera: &str) -> Option<CameraClip> {
+        let inner = self.lock();
+        let clip = clip_of(&inner, shot_id)?;
+        let video = clip.cameras.iter().find(|c| c.camera == camera)?.clone();
+        Some(CameraClip {
+            slot: ClipSlot {
+                id: clip.id.clone(),
+                dir: clip.dir.clone(),
+                generation: inner.generation,
+            },
+            avi: clip.dir.join(format!("{camera}.avi")),
+            shots: clip.shots.clone(),
+            video,
+        })
+    }
+
     /// The finished camera clips of shot `shot_id`, by camera.
     pub fn videos(&self, shot_id: &str) -> Vec<ShotVideo> {
         let inner = self.lock();
@@ -362,17 +396,62 @@ impl ClipStore {
     }
 
     /// The file `<camera>.<ext>` of shot `shot_id`'s clip, when that
-    /// camera's clip is finished (`ext` is `avi` or `json`).
+    /// camera's clip is finished (`ext` is `avi` or `json`), or its body
+    /// tracking is (`ext` is `pose.json`), or its swing analysis is (`ext`
+    /// is `swing.json`).
     pub fn file(&self, shot_id: &str, camera: &str, ext: &str) -> Option<PathBuf> {
-        if !matches!(ext, "avi" | "json") {
-            return None;
-        }
+        let done: fn(&ShotVideo) -> bool = match ext {
+            "avi" | "json" => |_| true,
+            "pose.json" => |c| c.pose,
+            "swing.json" => |c| c.swing,
+            _ => return None,
+        };
         let inner = self.lock();
         let clip = clip_of(&inner, shot_id)?;
         clip.cameras
             .iter()
-            .any(|c| c.camera == camera)
+            .any(|c| c.camera == camera && done(c))
             .then(|| clip.dir.join(format!("{camera}.{ext}")))
+    }
+
+    /// Record that body tracking of `camera`'s clip in `slot` is done (its
+    /// `<camera>.pose.json` is written) and rewrite `shot.json`. False when
+    /// the clip is gone (pruned, or a Clear history since it was begun):
+    /// then the file is not served, and the caller deletes it if its folder
+    /// is still there.
+    pub fn set_pose(&self, slot: &ClipSlot, camera: &str) -> bool {
+        self.mark(slot, camera, |video| video.pose = true)
+    }
+
+    /// Record that the swing analysis of `camera`'s clip in `slot` is done
+    /// (its `<camera>.swing.json` is written), as [`ClipStore::set_pose`].
+    pub fn set_swing(&self, slot: &ClipSlot, camera: &str) -> bool {
+        self.mark(slot, camera, |video| video.swing = true)
+    }
+
+    /// Apply `set` to `camera`'s clip in `slot` and rewrite `shot.json`.
+    /// False when the clip is gone.
+    fn mark(&self, slot: &ClipSlot, camera: &str, set: fn(&mut ShotVideo)) -> bool {
+        let mut inner = self.lock();
+        if slot.generation != inner.generation {
+            return false;
+        }
+        let Some(clip) = inner.clips.iter_mut().find(|c| c.id == slot.id) else {
+            return false;
+        };
+        let Some(video) = clip.cameras.iter_mut().find(|c| c.camera == camera) else {
+            return false;
+        };
+        set(video);
+        let file = ShotFile {
+            version: SHOT_FILE_VERSION,
+            shots: clip.shots.clone(),
+            cameras: clip.cameras.clone(),
+        };
+        if let Err(e) = write_shot_file(&clip.dir, &file) {
+            tracing::warn!("clips: writing {}: {e}", clip.dir.join(SHOT_FILE).display());
+        }
+        true
     }
 
     /// Number of clip folders held.
@@ -509,6 +588,7 @@ mod tests {
             key: key(id),
             device: "mock".into(),
             impact_lead_ms: 0,
+            hand: None,
         }
     }
 
@@ -522,6 +602,8 @@ mod tests {
             impact_offset_ms: 4000,
             complete: true,
             dropped: 0,
+            pose: false,
+            swing: false,
         }
     }
 
@@ -780,5 +862,85 @@ mod tests {
         assert_eq!(clip_dir(&replay), PathBuf::from("/tmp/swings"));
         replay.clip_dir = Some("  ".into());
         assert_eq!(clip_dir(&replay), default_dir());
+    }
+
+    /// Begin, write and finish camera.0's clip of shot `id`, then its pose
+    /// file, as the body tracking queue does. Returns the slot.
+    fn record_with_pose(store: &ClipStore, dir: &Path, id: &str, keep: u32) -> ClipSlot {
+        let slot = store
+            .begin(dir, &[shot(id)], store.generation())
+            .expect("begin");
+        std::fs::write(slot.dir.join("camera.0.avi"), b"RIFF").expect("avi");
+        std::fs::write(slot.dir.join("camera.0.json"), b"{}").expect("json");
+        assert!(store.finish(&slot, video("camera.0"), keep).kept);
+        assert!(store.file(id, "camera.0", "pose.json").is_none(), "not yet");
+        std::fs::write(slot.dir.join("camera.0.pose.json"), b"{}").expect("pose");
+        assert!(store.set_pose(&slot, "camera.0"));
+        slot
+    }
+
+    #[test]
+    fn a_clips_pose_file_is_served_once_done_and_survives_a_restart() {
+        let tmp = temp();
+        let store = ClipStore::default();
+        let slot = record_with_pose(&store, &tmp.0, "a", 20);
+        let pose = store.file("a", "camera.0", "pose.json").expect("served");
+        assert_eq!(pose, slot.dir.join("camera.0.pose.json"));
+        assert!(store.videos("a")[0].pose);
+        assert!(!store.set_pose(&slot, "camera.7"), "no such camera clip");
+        // shot.json carries it into the next run.
+        let again = ClipStore::default();
+        assert!(again.load(&tmp.0, 20).is_empty());
+        assert!(again.videos("a")[0].pose);
+        assert!(again.file("a", "camera.0", "pose.json").is_some());
+    }
+
+    #[test]
+    fn a_clips_swing_file_is_served_once_done_and_goes_with_the_clip() {
+        let tmp = temp();
+        let store = ClipStore::default();
+        let first = record_with_pose(&store, &tmp.0, "a", 1);
+        assert!(
+            store.file("a", "camera.0", "swing.json").is_none(),
+            "not yet"
+        );
+        std::fs::write(first.dir.join("camera.0.swing.json"), b"{}").expect("swing");
+        assert!(store.set_swing(&first, "camera.0"));
+        let swing = store.file("a", "camera.0", "swing.json").expect("served");
+        assert_eq!(swing, first.dir.join("camera.0.swing.json"));
+        assert!(store.videos("a")[0].swing);
+        assert!(!store.set_swing(&first, "camera.7"), "no such camera clip");
+        // shot.json carries it into the next run.
+        let again = ClipStore::default();
+        again.load(&tmp.0, 20);
+        assert!(again.videos("a")[0].swing);
+        // Pruned with its clip, and a late one is not kept.
+        let second = record_with_pose(&store, &tmp.0, "b", 1);
+        assert!(!swing.exists());
+        assert!(store.file("a", "camera.0", "swing.json").is_none());
+        assert!(!store.set_swing(&first, "camera.0"));
+        std::fs::write(second.dir.join("camera.0.swing.json"), b"{}").expect("swing");
+        assert!(store.set_swing(&second, "camera.0"));
+        store.clear();
+        assert!(!second.dir.join("camera.0.swing.json").exists(), "cleared");
+        assert!(!store.set_swing(&second, "camera.0"));
+    }
+
+    #[test]
+    fn pruning_and_clear_history_delete_the_pose_file_with_the_clip() {
+        let tmp = temp();
+        let store = ClipStore::default();
+        let first = record_with_pose(&store, &tmp.0, "a", 1);
+        let pose = first.dir.join("camera.0.pose.json");
+        assert!(pose.exists());
+        let second = record_with_pose(&store, &tmp.0, "b", 1);
+        assert!(!pose.exists(), "pruned with its clip");
+        assert!(store.file("a", "camera.0", "pose.json").is_none());
+        // A pose finished after its clip was pruned is not kept.
+        assert!(!store.set_pose(&first, "camera.0"));
+        let pose = second.dir.join("camera.0.pose.json");
+        assert!(store.clear().contains(&key("b")));
+        assert!(!pose.exists(), "cleared with its clip");
+        assert!(!store.set_pose(&second, "camera.0"), "cleared since");
     }
 }

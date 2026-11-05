@@ -9,7 +9,11 @@ use crate::CameraPosition;
 /// `video` and `GET /api/shots/{shot_id}/video` lists it.
 ///
 /// The clip itself is served at `/api/shots/{shot_id}/video/{camera}.avi`
-/// (MJPEG AVI) with its frame index at `/api/shots/{shot_id}/video/{camera}.json`.
+/// (MJPEG AVI) with its frame index at `/api/shots/{shot_id}/video/{camera}.json`
+/// and, once [`pose`](Self::pose) is set, the golfer's keypoints at
+/// `/api/shots/{shot_id}/video/{camera}.pose.json`; once
+/// [`swing`](Self::swing) is set, the swing analysis at
+/// `/api/shots/{shot_id}/video/{camera}.swing.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShotVideo {
     /// The camera's actor ID (`camera.0`).
@@ -30,6 +34,17 @@ pub struct ShotVideo {
     pub complete: bool,
     /// Frames missing inside the clip.
     pub dropped: u32,
+    /// Body tracking of the clip is done (alpha): its keypoints are served
+    /// at `/api/shots/{shot_id}/video/{camera}.pose.json`. Omitted while
+    /// false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pose: bool,
+    /// The swing analysis of the clip is done (alpha): its events, tempo
+    /// and metrics are served at
+    /// `/api/shots/{shot_id}/video/{camera}.swing.json`. Omitted while
+    /// false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub swing: bool,
 }
 
 /// `GET /api/cameras`: the cameras this computer has.

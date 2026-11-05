@@ -1157,6 +1157,8 @@ mod tests {
                 impact_offset_ms: 4000,
                 complete: true,
                 dropped: 0,
+                pose: false,
+                swing: false,
             }],
             ..stamped()
         };

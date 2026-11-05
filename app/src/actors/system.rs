@@ -750,7 +750,20 @@ pub(crate) fn handle_game_event(
 /// Apply config command `event`. The actors it stops are waited for on a
 /// helper thread (`waits`); its `ConfigOutcome` goes out once they have
 /// ended and what it starts has started, at once when it stops nothing.
+/// Body tracking then follows its mode ([`crate::pose::BodyTracking::follow`]).
 pub(crate) fn handle_config_command(
+    event: &FlighthookEvent,
+    state: &Arc<SystemState>,
+    bus_tx: &broadcast::Sender<FlighthookMessage>,
+    sender: &BusSender,
+    waits: &mut StopWaits,
+) {
+    apply_config_command(event, state, bus_tx, sender, waits);
+    state.pose.follow(&state.system.body_tracking());
+}
+
+/// [`handle_config_command`] but for body tracking.
+fn apply_config_command(
     event: &FlighthookEvent,
     state: &Arc<SystemState>,
     bus_tx: &broadcast::Sender<FlighthookMessage>,
@@ -785,6 +798,7 @@ pub(crate) fn handle_config_command(
                 p.shot_grouping = config.shot_grouping;
                 p.simulation = config.simulation.clone();
                 p.replay = config.replay.clone();
+                p.body_tracking = config.body_tracking.clone();
             });
             scope = None;
         }
@@ -906,6 +920,18 @@ pub(crate) fn handle_config_command(
             // nothing.
             let mode = *mode;
             state.system.update(|p| p.shot_grouping = mode);
+            sender.send(FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
+                request_id: request_id.clone(),
+                restarted: Vec::new(),
+                stopped: Vec::new(),
+                started: Vec::new(),
+            }));
+            return;
+        }
+        ConfigAction::SetBodyTracking { section } => {
+            // Body tracking is read live everywhere: persist it and
+            // reconcile nothing.
+            state.system.update(|p| p.body_tracking = section.clone());
             sender.send(FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
                 request_id: request_id.clone(),
                 restarted: Vec::new(),
@@ -1385,6 +1411,7 @@ mod tests {
             key: key.clone(),
             device: "mock".into(),
             impact_lead_ms: 0,
+            hand: None,
         };
         let slot = state
             .clips
@@ -1399,6 +1426,8 @@ mod tests {
             impact_offset_ms: 0,
             complete: true,
             dropped: 0,
+            pose: false,
+            swing: false,
         };
         assert!(state.clips.finish(&slot, video, 20).kept);
 
@@ -1437,6 +1466,7 @@ mod tests {
             },
             device: "mock".into(),
             impact_lead_ms: 0,
+            hand: None,
         };
         let slot = state
             .clips
@@ -1451,6 +1481,8 @@ mod tests {
             impact_offset_ms: 0,
             complete: true,
             dropped: 0,
+            pose: false,
+            swing: false,
         };
         assert!(state.clips.finish(&slot, video, 20).kept);
         assert_eq!(state.clips.videos("a").len(), 1);

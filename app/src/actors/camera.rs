@@ -22,7 +22,14 @@
 //! (`SystemState::clips`), then announced with one `shot_video` event; no
 //! frame goes on the bus. The newest frame is put in the actor's slot
 //! (`SystemState::cameras`) at most twice a second, for the device card's
-//! still.
+//! still, and, while a viewer of the Live view has asked within the last
+//! few seconds, in its live slot at most [`LIVE_FPS`] times a second.
+//!
+//! With body tracking in Live mode (alpha, `crate::pose`), a watched live
+//! view's frames go through the camera's body tracking worker, which puts
+//! each in the live slot with the golfer's keypoints on it, and every saved
+//! clip is queued for body tracking of the whole swing. In Historical mode
+//! a clip is tracked when a viewer asks for it (`pose::clips::request`).
 //!
 //! Status follows the other device actors: `starting` while opening,
 //! `connected` while frames arrive, `reconnecting` with the shared backoff
@@ -43,11 +50,13 @@ use tracing::{debug, info, warn};
 use crate::actors::backoff::Backoff;
 use crate::actors::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::pose::live::{self, LiveWorker};
+use crate::pose::{clips::ClipJob, models};
 use crate::state::SystemState;
 use crate::state::clips::{self, ClipShot};
 use flighthook::{
-    ActorStatus, CameraSection, FlighthookEvent, FlighthookMessage, MAX_IMPACT_LEAD_S,
-    MAX_LATENCY_S, ReplaySection, Severity, ShotKey, ShotVideo,
+    ActorStatus, BodyTrackingMode, CameraSection, FlighthookEvent, FlighthookMessage,
+    MAX_IMPACT_LEAD_S, MAX_LATENCY_S, ReplaySection, Severity, ShotKey, ShotVideo,
 };
 
 /// Recorder history beyond the pre-roll and the longest impact lead.
@@ -62,6 +71,13 @@ const TELEMETRY_EVERY: Duration = Duration::from_secs(2);
 
 /// How often the newest frame is put in the actor's still slot.
 const STILL_EVERY: Duration = Duration::from_millis(500);
+
+/// Most frames a second put in the actor's live slot while it is watched;
+/// the frames in between are left out.
+pub(crate) const LIVE_FPS: u32 = 15;
+
+/// Least time between two live frames.
+const LIVE_EVERY: Duration = Duration::from_nanos(1_000_000_000 / LIVE_FPS as u64);
 
 /// How long the frame rate must stay under half the requested one before
 /// the actor warns.
@@ -136,6 +152,189 @@ impl Restamp {
         }
         self.newest = Some(frame.host_ns);
         Some(frame)
+    }
+}
+
+/// Paces the live slot to [`LIVE_FPS`]: frames are due one [`LIVE_EVERY`]
+/// apart on a schedule, so a camera a little faster than an even multiple
+/// still delivers the full rate; a schedule fallen a whole interval behind
+/// restarts from the frame at hand.
+#[derive(Debug, Default)]
+struct LiveGate {
+    /// When the next live frame is due.
+    next: Option<Instant>,
+}
+
+impl LiveGate {
+    /// Whether a frame at `now` goes to the live slot, `wanted` saying
+    /// whether a viewer watches it. Not watched, nothing goes, and the
+    /// schedule starts afresh with the next viewer.
+    fn admit(&mut self, wanted: bool, now: Instant) -> bool {
+        if !wanted {
+            self.next = None;
+            return false;
+        }
+        if self.next.is_some_and(|due| now < due) {
+            return false;
+        }
+        let base = self
+            .next
+            .filter(|due| now.duration_since(*due) < LIVE_EVERY)
+            .unwrap_or(now);
+        self.next = Some(base + LIVE_EVERY);
+        true
+    }
+}
+
+/// Where a capture pass's newest frame goes while a viewer watches the
+/// live view: with body tracking Live, to the camera's body tracking worker
+/// (`pose:camera.N`), which puts it in the live slot with its pose at the
+/// pose rate (at most [`LIVE_FPS`]); otherwise straight into the slot,
+/// paced by [`LiveGate`]. The worker runs only while the camera is watched
+/// in Live mode: a lapsed watch or another mode stops it, and the next
+/// viewer gets a fresh tracker.
+///
+/// A worker whose thread ended by itself (a panic) is replaced, up to
+/// [`LIVE_RESTARTS`] times; after that live tracking stays off for the
+/// camera, which its live frames say (`X-Pose-State` `failed`), until the
+/// watch lapses or body tracking leaves Live.
+struct LiveRoute {
+    gate: LiveGate,
+    worker: Option<LiveWorker>,
+    /// Workers that ended by themselves since the watch began.
+    deaths: u32,
+    /// Starts a worker: [`start_live_worker`], or a stand-in in tests.
+    start: fn(&Arc<SystemState>, &str) -> Option<LiveWorker>,
+}
+
+/// How many times a camera's live worker is replaced after its thread
+/// ended by itself, while it is watched.
+const LIVE_RESTARTS: u32 = 3;
+
+impl Default for LiveRoute {
+    fn default() -> Self {
+        Self {
+            gate: LiveGate::default(),
+            worker: None,
+            deaths: 0,
+            start: start_live_worker,
+        }
+    }
+}
+
+impl LiveRoute {
+    /// Route the frame at `time_ns`, `wanted` saying whether a viewer
+    /// watches.
+    fn route(
+        &mut self,
+        state: &Arc<SystemState>,
+        actor: &str,
+        wanted: bool,
+        now: Instant,
+        time_ns: u64,
+        jpeg: Arc<[u8]>,
+    ) {
+        if wanted && state.system.body_tracking().mode == BodyTrackingMode::Live {
+            if self.worker.as_ref().is_some_and(|w| !w.alive()) {
+                self.worker = None;
+                self.deaths += 1;
+                if self.deaths > LIVE_RESTARTS {
+                    warn!("{actor}: live body tracking stopped after repeated errors");
+                    state.pose.set_live_failed(
+                        actor,
+                        Some("stopped on this camera after repeated errors".to_owned()),
+                    );
+                } else {
+                    warn!("{actor}: live body tracking stopped on an error; restarting it");
+                }
+            }
+            if self.worker.is_none() && self.deaths <= LIVE_RESTARTS {
+                self.worker = (self.start)(state, actor);
+            }
+            if let Some(worker) = &self.worker {
+                self.gate.admit(false, now);
+                worker.offer(time_ns, jpeg);
+                return;
+            }
+        } else {
+            self.worker = None;
+            if self.deaths > 0 {
+                self.deaths = 0;
+                state.pose.set_live_failed(actor, None);
+            }
+        }
+        if self.gate.admit(wanted, now) {
+            state.cameras.set_live(actor, time_ns, jpeg, None);
+        }
+    }
+}
+
+/// Start camera `actor`'s live body tracking worker on the shared models,
+/// following the live settings. `None` (logged) when its thread can't
+/// start: frames then go out without a pose.
+fn start_live_worker(state: &Arc<SystemState>, actor: &str) -> Option<LiveWorker> {
+    let settings_state = Arc::clone(state);
+    let settings_actor = actor.to_owned();
+    let settings: live::Settings =
+        Box::new(move || live_settings(&settings_state, &settings_actor));
+    let build_state = Arc::clone(state);
+    let build_actor = actor.to_owned();
+    let build: live::Build = Box::new(move |s| {
+        let shared = build_state.pose.models.want(s.model).ready()?;
+        let made = shared
+            .fork()
+            .and_then(|m| m.tracker(models::pose_config(s.model, s.detect_every)));
+        match made {
+            Ok(tracker) => Some(Box::new(tracker) as Box<dyn live::Estimate>),
+            Err(e) => {
+                warn!("{build_actor}: body tracking could not start: {e}");
+                None
+            }
+        }
+    });
+    let publish_state = Arc::clone(state);
+    let publish_actor = actor.to_owned();
+    let publish: live::Publish = Box::new(move |time_ns, jpeg, pose| {
+        publish_state
+            .cameras
+            .set_live(&publish_actor, time_ns, jpeg, pose);
+    });
+    match LiveWorker::start(actor, settings, build, publish) {
+        Ok(worker) => Some(worker),
+        Err(e) => {
+            warn!("{actor}: no thread for body tracking: {e}");
+            None
+        }
+    }
+}
+
+/// What camera `actor`'s live view follows now: body tracking's settings,
+/// and the posture setup for the camera's position and the player's hand.
+fn live_settings(state: &SystemState, actor: &str) -> live::LiveSettings {
+    let index = actor.strip_prefix("camera.").unwrap_or("");
+    let position = state
+        .system
+        .camera(index)
+        .map(|c| c.position)
+        .unwrap_or_default();
+    live::LiveSettings {
+        body: state.system.body_tracking(),
+        posture: crate::pose::swing::live_setup(
+            position,
+            state.game.snapshot().handed,
+            crate::pose::swing::mirrored(actor),
+        ),
+    }
+}
+
+/// Ask for body tracking's models in Live mode, so they are loaded before a
+/// viewer or a clip needs them (never downloaded: missing files wait for
+/// the user's download). In Historical mode the first clip viewed asks for
+/// them.
+fn want_models(state: &SystemState) {
+    let settings = state.system.body_tracking();
+    if settings.mode == BodyTrackingMode::Live {
+        state.pose.models.want(settings.model);
     }
 }
 
@@ -259,6 +458,12 @@ fn open_source(
     section: &CameraSection,
 ) -> stance::Result<Box<dyn Source>> {
     let request: FormatRequest = section.mode.parse()?;
+    #[cfg(debug_assertions)]
+    if let Some(path) = section.camera.strip_prefix(super::clip_source::PREFIX) {
+        return Ok(Box::new(super::clip_source::LoopingClip::open(
+            std::path::Path::new(path),
+        )?));
+    }
     if section.camera == CameraSection::TEST_PATTERN {
         return Ok(Box::new(TestPattern::new(TestPattern::config_for(
             &request,
@@ -477,6 +682,7 @@ fn capture_session(
             .map(|c| c.position.label().to_owned())
             .unwrap_or_default()
     };
+    want_models(state);
     info!("{actor}: capturing from '{}' in {format}", info.name);
     status(
         sender,
@@ -496,8 +702,9 @@ fn capture_session(
     let started = Instant::now();
     let mut cursor = None;
     let mut last_still: Option<Instant> = None;
+    let mut live = LiveRoute::default();
     let mut last_telemetry = Instant::now();
-    let mut live: Option<Live> = None;
+    let mut reported: Option<Live> = None;
     let mut fps = FpsReport::default();
     let mut restamp = Restamp::default();
     let mut slow_since: Option<Instant> = None;
@@ -510,18 +717,26 @@ fn capture_session(
             return SessionEnd::Shutdown;
         }
         let lag = latency(state, &actor);
+        // The newest frame of the pass, for the live slot.
+        let mut newest = None;
         for frame in capture.wait_frames_after(cursor, FRAME_WAIT) {
             cursor = Some(frame.seq);
             if last_still.is_none_or(|t| t.elapsed() >= STILL_EVERY) {
                 state.cameras.set_still(&actor, Arc::clone(&frame.jpeg));
                 last_still = Some(Instant::now());
             }
+            newest = Some((frame_clock(frame.host_ns, lag), Arc::clone(&frame.jpeg)));
             let Some(frame) = restamp.apply(frame, lag) else {
                 continue;
             };
             for event in recorder.push(frame) {
                 finished(state, sender, event);
             }
+        }
+        if let Some((time_ns, jpeg)) = newest {
+            let now = Instant::now();
+            let wanted = state.cameras.live_wanted(&actor, now);
+            live.route(state, &actor, wanted, now, time_ns, jpeg);
         }
         for event in recorder.poll(frame_clock(clock::now_ns(), lag)) {
             finished(state, sender, event);
@@ -538,7 +753,7 @@ fn capture_session(
                 dropped: stats.dropped.to_string(),
                 position: position(state),
             };
-            if live.as_ref() != Some(&now) {
+            if reported.as_ref() != Some(&now) {
                 status(
                     sender,
                     ActorStatus::Connected,
@@ -548,8 +763,10 @@ fn capture_session(
                         ("position".to_owned(), now.position.clone()),
                     ]),
                 );
-                live = Some(now);
+                reported = Some(now);
             }
+            // Body tracking's models load once it is on and a camera runs.
+            want_models(state);
             // The rate is measured over the last second of frames.
             let slow =
                 nominal > 0.0 && started.elapsed() >= TELEMETRY_EVERY && stats.fps < nominal / 2.0;
@@ -632,6 +849,7 @@ fn trigger(
         key: key.clone(),
         device: crate::actors::web::device_kind(prefix).to_owned(),
         impact_lead_ms: u64::try_from(lead.as_millis()).unwrap_or(u64::MAX),
+        hand: state.game.snapshot().handed,
     };
     let tag = Tag {
         shot,
@@ -681,10 +899,18 @@ fn ms(ns: i64) -> i64 {
     ms
 }
 
+/// A clip's estimated impact for its swing analysis, ns after its first
+/// frame: `None` when it falls outside the clip's frames (before the first,
+/// or after the last of a clip cut short).
+pub(crate) fn clip_impact(sidecar: &stance::sidecar::Sidecar) -> Option<u64> {
+    let last = sidecar.frames.last()?.t_ns;
+    u64::try_from(sidecar.impact_ns).ok().filter(|t| *t <= last)
+}
+
 /// Write a finished clip into the clip store and announce it: one
 /// `shot_video`, and `shot_video_removed` for the clips pruned to make
 /// room. A failed write (disk full) raises a warning alert.
-fn save(state: &SystemState, sender: &BusSender, clip: &stance::Clip<Tag>) {
+fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) {
     let actor = sender.actor_id().to_owned();
     let replay = state.system.replay();
     // Shots a Clear history removed since they triggered are left out; a
@@ -696,6 +922,7 @@ fn save(state: &SystemState, sender: &BusSender, clip: &stance::Clip<Tag>) {
         .filter(|t| t.generation == generation)
         .map(|t| t.shot.clone())
         .collect();
+    let hand = shots.first().and_then(|s| s.hand);
     if shots.is_empty() {
         info!("{actor}: history cleared since the swing, clip not saved");
         return;
@@ -760,11 +987,21 @@ fn save(state: &SystemState, sender: &BusSender, clip: &stance::Clip<Tag>) {
         impact_offset_ms: ms(sidecar.impact_ns),
         complete: sidecar.complete,
         dropped: sidecar.dropped,
+        pose: false,
+        swing: false,
     };
     let done = state
         .clips
         .finish(&slot, video.clone(), clips::keep(&replay));
     if done.kept {
+        let timing = shots
+            .first()
+            .map(|s| crate::pose::clips::ClipTiming {
+                device: s.device.clone(),
+                impact_lead_ms: s.impact_lead_ms,
+                latency_ms: u64::try_from(lag.as_millis()).unwrap_or(u64::MAX),
+            })
+            .unwrap_or_default();
         let keys: Vec<ShotKey> = shots.into_iter().map(|s| s.key).collect();
         info!(
             "{actor}: clip of {} shot(s), {} ms at {:.1} fps{}{} in {}",
@@ -779,6 +1016,28 @@ fn save(state: &SystemState, sender: &BusSender, clip: &stance::Clip<Tag>) {
             if video.complete { "" } else { ", incomplete" },
             slot.dir.display()
         );
+        // Body tracking of the clip in Live mode, announced on the bus
+        // directly: its keypoints are files beside the clip, worth
+        // announcing even when this camera has been restarted since.
+        if state.system.body_tracking().mode == BodyTrackingMode::Live {
+            let job = ClipJob {
+                avi: files.avi.clone(),
+                slot: slot.clone(),
+                camera: actor.clone(),
+                keys: keys.clone(),
+                position,
+                hand,
+                impact_ns: clip_impact(sidecar),
+                written: Instant::now(),
+                on_demand: false,
+                timing,
+                bus: sender.raw_sender().clone(),
+            };
+            state
+                .pose
+                .clips
+                .push(state, job, crate::pose::clips::bound(state));
+        }
         sender.send(FlighthookMessage::new(FlighthookEvent::ShotVideo {
             keys,
             position: video.position,
@@ -823,6 +1082,9 @@ mod tests {
         let (state, _writer) = SystemState::new(dir.0.join("config.toml"));
         (dir, state)
     }
+
+    /// A config in Live mode.
+    const LIVE: &str = "[body_tracking]\nmode = \"live\"\n";
 
     fn ms(state: &SystemState, actor: &str) -> Option<u128> {
         impact_lead(state, actor).map(|d| d.as_millis())
@@ -1267,6 +1529,50 @@ mod tests {
         assert_eq!(clip.impact_frame().expect("impact").seq, 2050);
     }
 
+    /// Frames admitted by a watched [`LiveGate`] from a camera at `fps`
+    /// over `secs` seconds.
+    fn admitted(fps: f64, secs: f64) -> usize {
+        let t0 = Instant::now();
+        let mut gate = LiveGate::default();
+        let frames = (fps * secs) as u32;
+        (0..frames)
+            .filter(|n| gate.admit(true, t0 + Duration::from_secs_f64(f64::from(*n) / fps)))
+            .count()
+    }
+
+    #[test]
+    fn the_live_slot_takes_at_most_live_fps_frames_a_second() {
+        let fps = LIVE_FPS as usize;
+        // Faster cameras are thinned to the live rate, a 30 fps one too
+        // (its frames sit right on the schedule).
+        for camera in [30.0, 31.0, 60.0, 120.0, 240.0] {
+            let n = admitted(camera, 10.0);
+            assert!(
+                (fps * 10 - 1..=fps * 10 + 1).contains(&n),
+                "{camera} fps: {n}"
+            );
+        }
+        // A slower one keeps every frame.
+        assert_eq!(admitted(10.0, 10.0), 100);
+        assert_eq!(admitted(15.0, 10.0), 150);
+    }
+
+    #[test]
+    fn the_live_slot_takes_nothing_unwatched_and_starts_afresh() {
+        let t0 = Instant::now();
+        let mut gate = LiveGate::default();
+        assert!(!gate.admit(false, t0));
+        assert!(gate.admit(true, t0 + millis(10)));
+        assert!(!gate.admit(true, t0 + millis(20)), "within one interval");
+        assert!(!gate.admit(false, t0 + millis(200)));
+        // A new viewer gets the next frame at once.
+        assert!(gate.admit(true, t0 + millis(210)));
+        // A stall doesn't bank frames: one, then the rate again.
+        assert!(gate.admit(true, t0 + millis(2000)));
+        assert!(!gate.admit(true, t0 + millis(2010)));
+        assert!(gate.admit(true, t0 + millis(2000) + LIVE_EVERY));
+    }
+
     #[test]
     fn the_reported_frame_rate_moves_only_on_a_real_change() {
         let mut fps = FpsReport::default();
@@ -1382,6 +1688,7 @@ mod tests {
                     },
                     device: "mock".into(),
                     impact_lead_ms: 0,
+                    hand: None,
                 },
                 generation: g,
             };
@@ -1453,6 +1760,11 @@ mod tests {
         /// post-roll, which a second trigger has to land in for the
         /// back-to-back case (sent 120 ms after the first).
         fn start(keep: u32) -> Self {
+            Self::start_in(keep, BodyTrackingMode::default())
+        }
+
+        /// [`Rig::start`] with body tracking in `mode`.
+        fn start_in(keep: u32, mode: BodyTrackingMode) -> Self {
             let dir = TempDir(std::env::temp_dir().join(format!(
                 "flighthook-camera-test-{}",
                 uuid::Uuid::new_v4().simple()
@@ -1461,8 +1773,10 @@ mod tests {
             let clips = dir.0.join("clips");
             let config = format!(
                 "[replay]\nkeep_shots = {keep}\npre_roll_s = 0.4\npost_roll_s = 0.6\nclip_dir = {:?}\n\n\
-                 [camera.0]\nname = \"Face\"\ncamera = \"test-pattern\"\nposition = \"golfer_front\"\nmode = \"160x120@30\"\n",
-                clips.display().to_string()
+                 [camera.0]\nname = \"Face\"\ncamera = \"test-pattern\"\nposition = \"golfer_front\"\nmode = \"160x120@30\"\n\n\
+                 [body_tracking]\nmode = {:?}\n",
+                clips.display().to_string(),
+                mode.key()
             );
             std::fs::write(dir.0.join("config.toml"), config).expect("config");
             let (state, writer) = SystemState::new(dir.0.join("config.toml"));
@@ -1597,9 +1911,25 @@ mod tests {
             path: &str,
             headers: &[(&str, &str)],
         ) -> (u16, HashMap<String, String>, Vec<u8>) {
+            self.call("GET", path, headers)
+        }
+
+        /// POST `path` with no body: status code and body.
+        fn post(&self, path: &str) -> (u16, serde_json::Value) {
+            let (code, _, body) = self.call("POST", path, &[("Content-Length", "0")]);
+            (code, serde_json::from_slice(&body).unwrap_or_default())
+        }
+
+        /// `method` `path` with `headers`, as [`Rig::get`].
+        fn call(
+            &self,
+            method: &str,
+            path: &str,
+            headers: &[(&str, &str)],
+        ) -> (u16, HashMap<String, String>, Vec<u8>) {
             let mut stream = std::net::TcpStream::connect(self.addr).expect("connect");
             let mut req = format!(
-                "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
                 self.addr
             );
             for (k, v) in headers {
@@ -1808,6 +2138,39 @@ mod tests {
     }
 
     #[test]
+    fn live_frames_flow_to_a_viewer_at_the_live_rate() {
+        let rig = Rig::start(20);
+        assert!(
+            !rig.state.cameras.live_wanted("camera.0", Instant::now()),
+            "nobody watches yet"
+        );
+        let mut after = 0;
+        let mut frames = 0;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(1) {
+            let (code, headers, body) =
+                rig.get(&format!("/api/cameras/camera.0/live?after={after}"), &[]);
+            assert_eq!(code, 200, "a 30 fps camera has a frame within the wait");
+            assert_eq!(headers["content-type"], "image/jpeg");
+            assert_eq!(headers["cache-control"], "no-store");
+            assert_eq!(&body[..2], &[0xFF, 0xD8]);
+            let seq: u64 = headers["x-frame-seq"].parse().expect("seq");
+            assert!(seq > after);
+            let time_ns: u64 = headers["x-frame-time-ns"].parse().expect("time");
+            assert!(time_ns > 0 && time_ns <= clock::now_ns());
+            // Historical mode: the picture alone.
+            assert!(!headers.contains_key("x-pose"), "{headers:?}");
+            assert_eq!(headers["x-pose-state"], "off");
+            after = seq;
+            frames += 1;
+        }
+        assert!(rig.state.cameras.live_wanted("camera.0", Instant::now()));
+        let most = LIVE_FPS as usize + 2;
+        assert!((3..=most).contains(&frames), "{frames} frames in a second");
+        assert_eq!(rig.get("/api/cameras/camera.9/live", &[]).0, 404);
+    }
+
+    #[test]
     fn a_latency_saved_while_recording_applies_without_reopening_the_camera() {
         let mut rig = Rig::start(20);
         let section = CameraSection {
@@ -1955,5 +2318,548 @@ mod tests {
         assert_eq!(rig.folders(), 0);
         assert!(rig.state.clips.videos(&key.shot_id).is_empty());
         assert!(rig.shots(0).is_empty());
+    }
+
+    static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A live worker on a fake tracker, counting the trackers it makes.
+    fn fake_worker(state: &Arc<SystemState>, actor: &str) -> Option<LiveWorker> {
+        let settings_state = Arc::clone(state);
+        let settings_actor = actor.to_owned();
+        let settings: live::Settings =
+            Box::new(move || live_settings(&settings_state, &settings_actor));
+        let build: live::Build = Box::new(|s| {
+            BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Some(live::tests::fake_tracker(
+                Duration::ZERO,
+                &calls,
+                true,
+                s.detect_every,
+            ))
+        });
+        let publish_state = Arc::clone(state);
+        let publish_actor = actor.to_owned();
+        let publish: live::Publish = Box::new(move |t, jpeg, pose| {
+            publish_state
+                .cameras
+                .set_live(&publish_actor, t, jpeg, pose);
+        });
+        LiveWorker::start(actor, settings, build, publish).ok()
+    }
+
+    /// The live slot's frame once it is newer than `after`.
+    fn live_after(state: &SystemState, after: u64) -> Arc<crate::state::cameras::LiveFrame> {
+        for _ in 0..400 {
+            if let Some(f) = state.cameras.live("camera.0").filter(|f| f.seq > after) {
+                return f;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("no live frame after {after}");
+    }
+
+    #[test]
+    fn a_watched_camera_goes_live_with_poses_and_a_lapsed_watch_resets_the_tracker() {
+        use crate::pose::live::tests::numbered_jpeg;
+        let (_dir, state) = state_with(LIVE);
+        let state = Arc::new(state);
+        let mut route = LiveRoute {
+            start: fake_worker,
+            ..LiveRoute::default()
+        };
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // Watched, in Live mode: the frame goes out with its pose.
+        route.route(&state, "camera.0", true, at(0), 11, numbered_jpeg(60));
+        let frame = live_after(&state, 0);
+        assert_eq!(frame.time_ns, 11);
+        let pose: flighthook::LivePose =
+            serde_json::from_str(frame.pose.as_deref().expect("a pose")).expect("json");
+        assert_eq!(pose.keypoints.len(), 26);
+        assert!((pose.keypoints[0][0] - 60.0).abs() <= 3.0, "{pose:?}");
+        assert_eq!(BUILDS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The watch lapses: the worker goes, and nothing is put.
+        route.route(&state, "camera.0", false, at(100), 12, numbered_jpeg(1));
+        assert!(route.worker.is_none());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            state.cameras.live("camera.0").map(|f| f.seq),
+            Some(frame.seq)
+        );
+        // Watched again: a new tracker, nothing remembered.
+        route.route(&state, "camera.0", true, at(200), 13, numbered_jpeg(120));
+        let again = live_after(&state, frame.seq);
+        assert_eq!(again.time_ns, 13);
+        assert!(again.pose.is_some());
+        assert_eq!(BUILDS.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Out of Live mode: frames go straight out, without a pose.
+        let mut last = again.seq;
+        for (n, mode) in [BodyTrackingMode::Historical, BodyTrackingMode::Off]
+            .into_iter()
+            .enumerate()
+        {
+            state.system.update(|c| c.body_tracking.mode = mode);
+            let ms = 300 + 100 * n as u64;
+            route.route(&state, "camera.0", true, at(ms), ms, numbered_jpeg(1));
+            assert!(route.worker.is_none(), "{mode:?}");
+            let plain = live_after(&state, last);
+            assert_eq!(plain.time_ns, ms);
+            assert!(plain.pose.is_none());
+            last = plain.seq;
+        }
+        assert_eq!(BUILDS.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    static DYING_STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A live worker whose thread panics on its first frame.
+    fn dying_worker(state: &Arc<SystemState>, actor: &str) -> Option<LiveWorker> {
+        DYING_STARTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let settings_state = Arc::clone(state);
+        let settings_actor = actor.to_owned();
+        let settings: live::Settings =
+            Box::new(move || live_settings(&settings_state, &settings_actor));
+        let build: live::Build = Box::new(|_| panic!("a broken model"));
+        let publish: live::Publish = Box::new(|_, _, _| {});
+        LiveWorker::start(actor, settings, build, publish).ok()
+    }
+
+    #[test]
+    fn a_dead_live_worker_is_restarted_then_reported_as_failed() {
+        use crate::pose::live::tests::numbered_jpeg;
+        use std::sync::atomic::Ordering;
+        let (_dir, state) = state_with(LIVE);
+        let state = Arc::new(state);
+        let mut route = LiveRoute {
+            start: dying_worker,
+            ..LiveRoute::default()
+        };
+        let settings = state.system.body_tracking();
+        let t0 = Instant::now();
+        let mut t = 0;
+        let mut frame = |route: &mut LiveRoute, wanted: bool| {
+            t += 1;
+            route.route(
+                &state,
+                "camera.0",
+                wanted,
+                t0 + Duration::from_millis(t * 70),
+                t,
+                numbered_jpeg(1),
+            );
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // The first worker and three replacements die on their frame.
+        for starts in 1..=4 {
+            frame(&mut route, true);
+            assert_eq!(DYING_STARTS.load(Ordering::SeqCst), starts);
+            while route.worker.as_ref().is_some_and(LiveWorker::alive) {
+                assert!(Instant::now() < deadline, "the worker did not end");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(state.pose.live_state(&settings, "camera.0").0, "loading");
+        }
+        // The fourth death: no more workers, frames go out without a pose,
+        // and the live state says why.
+        frame(&mut route, true);
+        assert!(route.worker.is_none());
+        assert_eq!(DYING_STARTS.load(Ordering::SeqCst), 4);
+        let (code, error) = state.pose.live_state(&settings, "camera.0");
+        assert_eq!(code, "failed");
+        assert!(error.expect("why").contains("stopped"));
+        let plain = state.cameras.live("camera.0").expect("a frame");
+        assert!(plain.pose.is_none());
+        frame(&mut route, true);
+        assert_eq!(DYING_STARTS.load(Ordering::SeqCst), 4);
+        // The watch lapses: forgotten, and the next viewer gets a worker.
+        frame(&mut route, false);
+        assert_eq!(state.pose.live_state(&settings, "camera.0").0, "loading");
+        frame(&mut route, true);
+        assert_eq!(DYING_STARTS.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn an_impact_outside_the_clip_is_no_prior() {
+        use stance::sidecar::{Sidecar, SidecarFps, SidecarFrame};
+        let frames = (0..10u64)
+            .map(|i| SidecarFrame {
+                t_ns: i * 100_000_000,
+                offset: 0,
+                len: 0,
+            })
+            .collect();
+        let mut sidecar = Sidecar {
+            version: stance::sidecar::SIDECAR_VERSION,
+            fourcc: "MJPG".into(),
+            width: 64,
+            height: 48,
+            fps: SidecarFps {
+                nominal: Some(10.0),
+                measured: 10.0,
+            },
+            start_ns: 0,
+            frames,
+            trigger_index: 9,
+            impact_index: 5,
+            trigger_ns: 900_000_000,
+            impact_ns: 500_000_000,
+            complete: true,
+            dropped: 0,
+            truncated: false,
+        };
+        assert_eq!(clip_impact(&sidecar), Some(500_000_000));
+        sidecar.impact_ns = 900_000_000;
+        assert_eq!(clip_impact(&sidecar), Some(900_000_000), "the last frame");
+        // A clip cut short before the impact.
+        sidecar.impact_ns = 950_000_000;
+        assert_eq!(clip_impact(&sidecar), None);
+        sidecar.impact_ns = -1;
+        assert_eq!(clip_impact(&sidecar), None);
+    }
+
+    /// A clip pass without models: the golfer standing at address on every
+    /// sidecar frame, so the swing analysis has a track to measure.
+    fn fake_pass(
+        avi: &std::path::Path,
+        _config: &stance::pose::PoseConfig,
+    ) -> stance::Result<stance::pose::PoseTrack> {
+        use stance::pose::{PoseFrame, PoseTrack, Skeleton};
+        let name = avi.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let (_, sidecar) = stance::open_clip(avi.parent().expect("folder"), name)?;
+        let pose = crate::pose::swing::tests::golfer((300.0, 260.0));
+        Ok(PoseTrack {
+            version: stance::pose::POSE_TRACK_VERSION,
+            skeleton: Skeleton::Halpe26,
+            model: "fake".into(),
+            detector: "fake".into(),
+            width: sidecar.width,
+            height: sidecar.height,
+            frames: sidecar
+                .frames
+                .iter()
+                .map(|f| PoseFrame::with_pose(f.t_ns, &pose))
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn a_recorded_clips_keypoints_and_swing_are_served_beside_it_and_pruned_with_it() {
+        let mut rig = Rig::start_in(1, BodyTrackingMode::Live);
+        rig.state.pose.clips.fake(fake_pass);
+        let a = rig.shot("mock_monitor.0", 1);
+        rig.next_video().expect("shot_video");
+        let done = rig
+            .wait_for(Duration::from_secs(10), |m| {
+                matches!(m.event, FlighthookEvent::ShotPose { .. })
+            })
+            .expect("shot_pose");
+        assert_eq!(done.actor, "camera.0");
+        let FlighthookEvent::ShotPose { keys } = done.event else {
+            unreachable!()
+        };
+        assert_eq!(keys, std::slice::from_ref(&a));
+        // The row says so.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rig.row(&a, 1)["video"][0]["pose"] != true {
+            assert!(Instant::now() < deadline, "{}", rig.row(&a, 1));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Served like the clip: whole, in ranges, never cached.
+        let id = &a.shot_id;
+        let path = format!("/api/shots/{id}/video/camera.0.pose.json");
+        let (code, headers, body) = rig.get(&path, &[]);
+        assert_eq!(code, 200);
+        assert!(headers["content-type"].contains("json"), "{headers:?}");
+        assert_eq!(headers["cache-control"], "private, no-cache");
+        let track: flighthook::PoseTrackFile = serde_json::from_slice(&body).expect("pose json");
+        let (_, _, sidecar) = rig.get(&format!("/api/shots/{id}/video/camera.0.json"), &[]);
+        let sidecar =
+            stance::sidecar::Sidecar::from_json(std::str::from_utf8(&sidecar).expect("utf-8"))
+                .expect("sidecar");
+        assert_eq!(track.frames.len(), sidecar.frames.len());
+        let impact_t = sidecar.frames[sidecar.impact_index].t_ns;
+        assert_eq!(track.keypoints_at(impact_t).map(<[_]>::len), Some(26));
+        let (code, _, part) = rig.get(&path, &[("Range", "bytes=0-9")]);
+        assert_eq!((code, part.len()), (206, 10));
+        assert_eq!(
+            rig.get(&format!("/api/shots/{id}/video/camera.1.pose.json"), &[])
+                .0,
+            404
+        );
+        // Then the swing analysis, served the same way.
+        let swung = rig
+            .wait_for(Duration::from_secs(10), |m| {
+                matches!(m.event, FlighthookEvent::ShotSwing { .. })
+            })
+            .expect("shot_swing");
+        assert_eq!(swung.actor, "camera.0");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rig.row(&a, 1)["video"][0]["swing"] != true {
+            assert!(Instant::now() < deadline, "{}", rig.row(&a, 1));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let swing_path = format!("/api/shots/{id}/video/camera.0.swing.json");
+        let (code, headers, body) = rig.get(&swing_path, &[]);
+        assert_eq!(code, 200);
+        assert_eq!(headers["cache-control"], "private, no-cache");
+        let report: flighthook::SwingReportFile =
+            serde_json::from_slice(&body).expect("swing json");
+        assert_eq!(report.view, Some(flighthook::SwingView::FaceOn));
+        let (code, _, part) = rig.get(&swing_path, &[("Range", "bytes=0-9")]);
+        assert_eq!((code, part.len()), (206, 10));
+        assert_eq!(
+            rig.get(&format!("/api/shots/{id}/video/camera.1.swing.json"), &[])
+                .0,
+            404
+        );
+        let swing_file = rig
+            .state
+            .clips
+            .file(id, "camera.0", "swing.json")
+            .expect("swing file");
+        // The next clip prunes this one, keypoints and all.
+        let file = rig
+            .state
+            .clips
+            .file(id, "camera.0", "pose.json")
+            .expect("file");
+        assert!(file.is_file());
+        rig.shot("mock_monitor.0", 2);
+        rig.wait_for(Duration::from_secs(10), |m| {
+            matches!(m.event, FlighthookEvent::ShotVideoRemoved { .. })
+        })
+        .expect("shot_video_removed");
+        assert!(!file.exists());
+        assert!(!swing_file.exists());
+        assert_eq!(rig.get(&path, &[]).0, 404);
+        assert_eq!(rig.get(&swing_path, &[]).0, 404);
+    }
+
+    #[test]
+    fn historical_mode_tracks_a_clip_when_it_is_viewed_and_only_then() {
+        let mut rig = Rig::start_in(20, BodyTrackingMode::Historical);
+        rig.state.pose.clips.fake(fake_pass);
+        let a = rig.shot("mock_monitor.0", 1);
+        rig.next_video().expect("shot_video");
+        // Nothing queued, no model asked for.
+        assert!(rig.state.pose.clips.waiting().is_empty());
+        assert!(!rig.state.pose.clips.working());
+        let model = rig.state.system.body_tracking().model;
+        assert!(rig.state.pose.models.state(model).is_none());
+        let id = &a.shot_id;
+        let analyze = format!("/api/shots/{id}/video/camera.0/analyze");
+        assert_eq!(rig.row(&a, 1)["video"][0]["pose"], serde_json::Value::Null);
+        // Viewed: queued, then tracked at once (no 3 s wait) with its events.
+        let asked = Instant::now();
+        let (code, body) = rig.post(&analyze);
+        assert_eq!(code, 202, "{body}");
+        assert_eq!(body["state"], "queued");
+        let done = rig
+            .wait_for(Duration::from_secs(10), |m| {
+                matches!(m.event, FlighthookEvent::ShotPose { .. })
+            })
+            .expect("shot_pose");
+        assert!(
+            asked.elapsed() < crate::pose::clips::CLIP_DELAY,
+            "{:?}",
+            asked.elapsed()
+        );
+        assert_eq!(done.actor, "camera.0");
+        rig.wait_for(Duration::from_secs(10), |m| {
+            matches!(m.event, FlighthookEvent::ShotSwing { .. })
+        })
+        .expect("shot_swing");
+        let pose = format!("/api/shots/{id}/video/camera.0.pose.json");
+        assert_eq!(rig.get(&pose, &[]).0, 200);
+        assert_eq!(
+            rig.get(&format!("/api/shots/{id}/video/camera.0.swing.json"), &[])
+                .0,
+            200
+        );
+        // Viewed again: done, nothing queued.
+        let (code, body) = rig.post(&analyze);
+        assert_eq!((code, body["state"].as_str()), (200, Some("done")));
+        assert!(rig.state.pose.clips.waiting().is_empty());
+        // No such clip.
+        let (code, body) = rig.post(&format!("/api/shots/{id}/video/camera.7/analyze"));
+        assert_eq!(code, 404);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("camera.7"))
+        );
+        assert_eq!(rig.post("/api/shots/nope/video/camera.0/analyze").0, 404);
+        // A second shot asked for twice while it waits: queued once.
+        let b = rig.shot("mock_monitor.0", 2);
+        rig.next_video().expect("shot_video");
+        let analyze_b = format!("/api/shots/{}/video/camera.0/analyze", b.shot_id);
+        assert_eq!(rig.post(&analyze_b).0, 202);
+        assert_eq!(rig.post(&analyze_b).0, 202);
+        rig.wait_for(Duration::from_secs(10), |m| {
+            matches!(m.event, FlighthookEvent::ShotPose { .. })
+        })
+        .expect("shot_pose");
+        assert!(
+            rig.wait_for(Duration::from_millis(500), |m| {
+                matches!(m.event, FlighthookEvent::ShotPose { .. })
+            })
+            .is_none(),
+            "tracked once"
+        );
+    }
+
+    #[test]
+    fn off_mode_records_and_replays_clips_without_tracking_them() {
+        let mut rig = Rig::start_in(20, BodyTrackingMode::Off);
+        rig.state.pose.clips.fake(fake_pass);
+        let a = rig.shot("mock_monitor.0", 1);
+        rig.next_video().expect("shot_video");
+        let id = &a.shot_id;
+        assert_eq!(
+            rig.get(&format!("/api/shots/{id}/video/camera.0.avi"), &[])
+                .0,
+            200
+        );
+        let (code, body) = rig.post(&format!("/api/shots/{id}/video/camera.0/analyze"));
+        assert_eq!(code, 409);
+        assert_eq!(body["error"], "body tracking is off");
+        assert!(rig.state.pose.clips.waiting().is_empty());
+        assert!(!rig.state.pose.clips.working());
+        let model = rig.state.system.body_tracking().model;
+        assert!(
+            rig.state.pose.models.state(model).is_none(),
+            "no model asked for"
+        );
+        // The live view: the picture alone.
+        let (code, headers, _) = rig.get("/api/cameras/camera.0/live?after=0", &[]);
+        assert_eq!(code, 200);
+        assert!(!headers.contains_key("x-pose"));
+        assert_eq!(headers["x-pose-state"], "off");
+        assert!(
+            rig.wait_for(Duration::from_millis(3500), |m| {
+                matches!(m.event, FlighthookEvent::ShotPose { .. })
+            })
+            .is_none()
+        );
+        assert!(rig.state.pose.models.state(model).is_none());
+        assert!(
+            !rig.dir
+                .0
+                .join("clips")
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|e| { e.path().join("camera.0.pose.json").exists() })
+        );
+    }
+
+    #[test]
+    fn no_mode_downloads_the_models_on_its_own() {
+        for mode in [BodyTrackingMode::Historical, BodyTrackingMode::Live] {
+            let mut rig = Rig::start_in(20, mode);
+            let model = rig.state.system.body_tracking().model;
+            let a = rig.shot("mock_monitor.0", 1);
+            rig.next_video().expect("shot_video");
+            // Viewed (and in Live, recorded): asked for, but the models are
+            // missing, so the clip stays untracked.
+            let analyze = format!("/api/shots/{}/video/camera.0/analyze", a.shot_id);
+            assert_eq!(rig.post(&analyze).0, 202, "{mode:?}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !matches!(
+                rig.state.pose.models.state(model),
+                Some(crate::pose::models::ModelState::Missing)
+            ) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{mode:?}: the models are missing"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let (code, headers, _) = rig.get("/api/cameras/camera.0/live?after=0", &[]);
+            assert_eq!(code, 200);
+            let live_state = if mode == BodyTrackingMode::Live {
+                "missing"
+            } else {
+                "off"
+            };
+            assert_eq!(headers["x-pose-state"], live_state, "{mode:?}");
+            assert!(
+                rig.wait_for(Duration::from_millis(3500), |m| {
+                    matches!(m.event, FlighthookEvent::ShotPose { .. })
+                })
+                .is_none(),
+                "{mode:?}"
+            );
+            assert!(!rig.state.pose.models.downloading(), "{mode:?}");
+            assert!(
+                !rig.state.pose.models.dir().exists(),
+                "{mode:?}: nothing written to the models folder"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_modes_at_runtime_follows_at_once_without_a_restart() {
+        use flighthook::ConfigAction;
+        let mut rig = Rig::start_in(20, BodyTrackingMode::Live);
+        // Live asks for the models when the camera starts.
+        let model = rig.state.system.body_tracking().model;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rig.state.pose.models.state(model).is_none() {
+            assert!(Instant::now() < deadline, "Live loads the models");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let save = |rig: &mut Rig, mode: BodyTrackingMode| {
+            let mut section = rig.state.system.body_tracking();
+            section.mode = mode;
+            let request_id = uuid::Uuid::new_v4().to_string();
+            rig.sender("web")
+                .send(FlighthookMessage::new(FlighthookEvent::ConfigCommand {
+                    request_id: Some(request_id.clone()),
+                    action: Box::new(ConfigAction::SetBodyTracking { section }),
+                }));
+            let outcome = rig
+                .wait_for(Duration::from_secs(5), |m| {
+                    matches!(&m.event, FlighthookEvent::ConfigOutcome { request_id: Some(r), .. } if *r == request_id)
+                })
+                .expect("outcome");
+            let FlighthookEvent::ConfigOutcome { restarted, .. } = outcome.event else {
+                unreachable!()
+            };
+            assert!(restarted.is_empty(), "no camera restart");
+        };
+        // A recorded clip waits its 3 s in Live; leaving Live before its
+        // turn leaves it untracked.
+        rig.state.pose.clips.fake(fake_pass);
+        rig.shot("mock_monitor.0", 1);
+        rig.next_video().expect("shot_video");
+        assert!(rig.state.pose.clips.working(), "queued for its pass");
+        save(&mut rig, BodyTrackingMode::Historical);
+        assert!(
+            rig.wait_for(
+                crate::pose::clips::CLIP_DELAY + Duration::from_secs(1),
+                |m| { matches!(m.event, FlighthookEvent::ShotPose { .. }) }
+            )
+            .is_none(),
+            "no automatic pass out of Live"
+        );
+        // Historical keeps the models for the clips viewed; Off lets them go
+        // and drops what waits.
+        assert!(rig.state.pose.models.state(model).is_some());
+        save(&mut rig, BodyTrackingMode::Off);
+        assert!(rig.state.pose.models.state(model).is_none());
+        assert!(rig.state.pose.clips.waiting().is_empty());
+        rig.shot("mock_monitor.0", 2);
+        rig.next_video().expect("shot_video");
+        assert!(rig.state.pose.clips.waiting().is_empty());
+        // Back to Live: recorded clips are tracked again.
+        save(&mut rig, BodyTrackingMode::Live);
+        rig.shot("mock_monitor.0", 3);
+        rig.next_video().expect("shot_video");
+        rig.wait_for(Duration::from_secs(10), |m| {
+            matches!(m.event, FlighthookEvent::ShotPose { .. })
+        })
+        .expect("Live tracks the clip");
     }
 }
