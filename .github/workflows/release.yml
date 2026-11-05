@@ -157,6 +157,10 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+
       - uses: actions/download-artifact@v4
 
       - name: Prepare release assets
@@ -167,6 +171,7 @@ jobs:
           cp flighthook-macos-aarch64/flighthook dist/flighthook-macos-aarch64
           chmod +x dist/flighthook-linux-x86_64
           chmod +x dist/flighthook-macos-aarch64
+          cp src/NOTICE src/LICENSE-APACHE src/LICENSE-MIT dist/
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -176,3 +181,6 @@ jobs:
             dist/flighthook-windows-x86_64.exe
             dist/flighthook-linux-x86_64
             dist/flighthook-macos-aarch64
+            dist/NOTICE
+            dist/LICENSE-APACHE
+            dist/LICENSE-MIT
