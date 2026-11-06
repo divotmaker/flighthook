@@ -976,17 +976,21 @@ impl ReplayForm {
     }
 }
 
-/// Form state for the `[body_tracking]` section (alpha): the Body tracking
-/// card's mode, model and golfer height. The other values are tuned with
-/// keys on the Shots tab's Live view and saved as loaded.
+/// Form state for the `[body_tracking]` section (alpha): every field of the
+/// Body tracking card.
 ///
-/// The height is edited in inches when `inches` is set (imperial default
-/// units), centimetres otherwise, and stored in centimetres rounded to 0.1;
-/// left as loaded, it saves its loaded value exactly. Empty is no height.
+/// A number field left as loaded saves its loaded value exactly. The height
+/// is edited in inches when `inches` is set (imperial default units),
+/// centimetres otherwise, and stored in centimetres rounded to 0.1. Empty
+/// is no height.
 #[derive(Clone, Default)]
 pub(crate) struct BodyTrackingForm {
     pub(crate) mode: BodyTrackingMode,
     pub(crate) model: PoseModel,
+    pub(crate) show_skeleton: bool,
+    pub(crate) min_score: String,
+    pub(crate) smoothing: String,
+    pub(crate) detect_every: String,
     pub(crate) golfer_height: String,
     pub(crate) inches: bool,
     loaded: BodyTrackingSection,
@@ -998,10 +1002,58 @@ impl BodyTrackingForm {
         Self {
             mode: s.mode,
             model: s.model,
+            show_skeleton: s.show_skeleton,
+            min_score: format_distance_value(s.min_score),
+            smoothing: format_distance_value(s.smoothing),
+            detect_every: s.detect_every.to_string(),
             golfer_height: Self::height_text(s.golfer_height, inches),
             inches,
             loaded: s.clone(),
         }
+    }
+
+    /// A decimal field's value: the loaded value while the text is
+    /// unchanged.
+    fn decimal(text: &str, loaded: f64) -> Option<f64> {
+        if text == format_distance_value(loaded) {
+            return Some(loaded);
+        }
+        text.trim().parse().ok()
+    }
+
+    /// Whether the defaults with `set` applied are valid: one field checked
+    /// by [`BodyTrackingSection::error`], as the server checks it.
+    fn valid(set: impl FnOnce(&mut BodyTrackingSection)) -> bool {
+        let mut s = BodyTrackingSection::default();
+        set(&mut s);
+        s.error().is_none()
+    }
+
+    /// The minimum score to save, or `None` while it is not a number from 0
+    /// to 1.
+    pub(crate) fn min_score_value(&self) -> Option<f64> {
+        let v = Self::decimal(&self.min_score, self.loaded.min_score)?;
+        Self::valid(|s| s.min_score = v).then_some(v)
+    }
+
+    /// The live smoothing to save (Hz), or `None` while it is neither 0 nor
+    /// a number in range.
+    pub(crate) fn smoothing_value(&self) -> Option<f64> {
+        let v = Self::decimal(&self.smoothing, self.loaded.smoothing)?;
+        Self::valid(|s| s.smoothing = v).then_some(v)
+    }
+
+    /// The detection interval to save (frames), or `None` while it is not a
+    /// whole number in range.
+    pub(crate) fn detect_every_value(&self) -> Option<u32> {
+        let v = self.detect_every.trim().parse().ok()?;
+        Self::valid(|s| s.detect_every = v).then_some(v)
+    }
+
+    /// Whether the height is empty or a number in range.
+    fn golfer_height_valid(&self) -> bool {
+        self.golfer_height_cm()
+            .is_some_and(|cm| Self::valid(|s| s.golfer_height = cm))
     }
 
     fn height_text(cm: Option<f64>, inches: bool) -> String {
@@ -1042,14 +1094,17 @@ impl BodyTrackingForm {
         Some(Some((cm * 10.0).round() / 10.0))
     }
 
-    /// The section to save, the loaded one with the card's values, or
-    /// `None` while the height is unparsable or out of range.
+    /// The section to save, or `None` while a field is unparsable or out
+    /// of range.
     pub(crate) fn to_section(&self) -> Option<BodyTrackingSection> {
         let s = BodyTrackingSection {
             mode: self.mode,
             model: self.model,
+            min_score: self.min_score_value()?,
+            smoothing: self.smoothing_value()?,
+            detect_every: self.detect_every_value()?,
             golfer_height: self.golfer_height_cm()?,
-            ..self.loaded.clone()
+            show_skeleton: self.show_skeleton,
         };
         s.error().is_none().then_some(s)
     }
@@ -1630,8 +1685,8 @@ impl SettingsForm {
     }
 
     /// The saved config with `body_tracking` in place of its own: what a
-    /// Live tuning key sends (`scope=body_tracking`, which writes only that
-    /// section).
+    /// save outside the card's Save sends (`scope=body_tracking`, which
+    /// writes only that section).
     pub(crate) fn tuning_request(&self, body_tracking: &BodyTrackingSection) -> FlighthookConfig {
         let mut config = self.saved_config();
         config.body_tracking = body_tracking.clone();
@@ -3240,11 +3295,10 @@ impl FlighthookApp {
         devices::mark(ui, || "card:replay".to_owned(), &card.response);
     }
 
-    /// The Body tracking card (alpha): the mode, the pose model and the
-    /// golfer's height, saved with the Global card (turning it on from Off
-    /// saves at once, after the model download prompt). Its edit controls are
-    /// disabled unless `editable`. The rest is tuned with keys on the Shots
-    /// tab's Live view.
+    /// The Body tracking card (alpha): every body tracking setting, saved
+    /// with the Global card (turning it on from Off saves at once, after the
+    /// model download prompt). Its edit controls are disabled unless
+    /// `editable`.
     pub(crate) fn render_body_tracking_card(
         &mut self,
         ctx: &egui::Context,
@@ -3265,16 +3319,20 @@ impl FlighthookApp {
                 lock_hint(ui);
                 self.general_error(ui, "body_tracking");
             }
+            // Seven rows: no space above the first and a point less between
+            // them than on the other cards, so they fit the card's height.
             card.body(false, |ui| {
-                ui.add_space(6.0);
+                ui.spacing_mut().item_spacing.y -= 1.0;
                 ui.add_enabled_ui(editable, |ui| self.body_tracking_fields(ui));
             });
         });
         devices::mark(ui, || "card:body_tracking".to_owned(), &card.response);
     }
 
-    /// The Body tracking card's fields: Mode, Model and Golfer height.
-    /// Turning body tracking on from Off goes through the model download
+    /// The Body tracking card's fields: Mode, Model, Show skeleton, Minimum
+    /// score, Smoothing, Detect every and Golfer height, each with its range
+    /// under it while out of range. Turning body tracking on from Off goes
+    /// through the model download
     /// prompt ([`FlighthookApp::turn_body_tracking_on`]), which saves the
     /// mode itself; every other change is an edit saved with Save.
     fn body_tracking_fields(&mut self, ui: &mut egui::Ui) {
@@ -3316,6 +3374,67 @@ impl FlighthookApp {
             }
         });
         ui.horizontal(|ui| {
+            field_indent(ui);
+            let check = ui.checkbox(&mut form.show_skeleton, "Show skeleton");
+            devices::mark(ui, || "body_tracking_skeleton".to_owned(), &check);
+            changed |= check.changed();
+        });
+        let mut number_field =
+            |ui: &mut egui::Ui, label: &str, mark: &str, text: &mut String, unit: Option<&str>| {
+                ui.horizontal(|ui| {
+                    field_label(ui, label);
+                    let field = ui.add(
+                        egui::TextEdit::singleline(text)
+                            .desired_width(field_width - TEXT_EDIT_MARGIN),
+                    );
+                    devices::mark(ui, || mark.to_owned(), &field);
+                    changed |= field.changed();
+                    if let Some(unit) = unit {
+                        ui.label(unit);
+                    }
+                });
+            };
+        number_field(
+            ui,
+            "Minimum score:",
+            "body_tracking_min_score",
+            &mut form.min_score,
+            None,
+        );
+        if form.min_score_value().is_none() {
+            field_error(ui, "0 to 1");
+        }
+        number_field(
+            ui,
+            "Smoothing:",
+            "body_tracking_smoothing",
+            &mut form.smoothing,
+            Some("Hz"),
+        );
+        if form.smoothing_value().is_none() {
+            field_error(
+                ui,
+                &format!(
+                    "0, or {} to {} Hz",
+                    BodyTrackingSection::MIN_SMOOTHING_HZ,
+                    BodyTrackingSection::MAX_SMOOTHING_HZ
+                ),
+            );
+        }
+        number_field(
+            ui,
+            "Detect every:",
+            "body_tracking_detect_every",
+            &mut form.detect_every,
+            Some("frames"),
+        );
+        if form.detect_every_value().is_none() {
+            field_error(
+                ui,
+                &format!("1 to {}", BodyTrackingSection::MAX_DETECT_EVERY),
+            );
+        }
+        ui.horizontal(|ui| {
             field_label(ui, "Golfer height:");
             let field = ui.add(
                 egui::TextEdit::singleline(&mut form.golfer_height)
@@ -3325,7 +3444,7 @@ impl FlighthookApp {
             changed |= field.changed();
             ui.label(form.height_unit());
         });
-        if form.to_section().is_none() {
+        if !form.golfer_height_valid() {
             let (min, max) = (
                 BodyTrackingSection::MIN_GOLFER_HEIGHT_CM,
                 BodyTrackingSection::MAX_GOLFER_HEIGHT_CM,

@@ -48,7 +48,7 @@ pub struct Pending {
     /// Replies for the Live view's cameras: the view's number and its
     /// reply.
     pub(crate) live: Vec<(u64, LiveReply)>,
-    /// The reply to a Live tuning save: saved, or why not.
+    /// The reply to a body tracking save made at once: saved, or why not.
     pub(crate) tuning: Option<Result<(), String>>,
     /// Replies about body tracking's model files: which call, and the
     /// state, or why not.
@@ -554,8 +554,8 @@ pub(crate) fn live_reply(result: Result<ehttp::Response, String>) -> LiveReply {
     }
 }
 
-/// Save `req`'s body tracking settings for a Live tuning key (nothing else
-/// in `req` is written): the reply goes to [`Pending::tuning`].
+/// Save `req`'s body tracking settings at once (nothing else in `req` is
+/// written): the reply goes to [`Pending::tuning`].
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn post_tuning(ctx: &egui::Context, pending: &PendingHandle, req: &FlighthookConfig) {
     let ctx = ctx.clone();

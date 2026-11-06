@@ -1,5 +1,5 @@
-//! UI preferences kept on this device, such as whether the skeleton is
-//! drawn: the browser's local storage on the web, a small JSON file in the
+//! UI preferences kept on this device, such as the Shots tab's pane: the
+//! browser's local storage on the web, a small JSON file in the
 //! user's local data folder in the native window (`flighthook/ui.json`).
 //! Nothing here goes to the server. Tests keep them in memory.
 
@@ -12,11 +12,6 @@ pub(crate) fn load(key: &str) -> Option<String> {
 /// for this session only.
 pub(crate) fn store(key: &str, value: &str) {
     imp::store(key, value);
-}
-
-/// The stored flag `key`, `default` when unset.
-pub(crate) fn flag(key: &str, default: bool) -> bool {
-    load(key).map_or(default, |v| v == "true")
 }
 
 #[cfg(all(target_arch = "wasm32", not(test)))]
@@ -98,13 +93,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_flag_reads_back_and_defaults_when_unset() {
-        assert!(flag("test_unset", true));
-        assert!(!flag("test_unset", false));
-        store("test_flag", "false");
-        assert!(!flag("test_flag", true));
-        store("test_flag", "true");
-        assert!(flag("test_flag", false));
-        assert_eq!(load("test_flag").as_deref(), Some("true"));
+    fn a_value_reads_back_and_is_none_when_unset() {
+        assert_eq!(load("test_unset"), None);
+        store("test_value", "cameras");
+        assert_eq!(load("test_value").as_deref(), Some("cameras"));
+        store("test_value", "data");
+        assert_eq!(load("test_value").as_deref(), Some("data"));
     }
 }

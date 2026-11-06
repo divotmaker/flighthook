@@ -58,7 +58,7 @@ address = "127.0.0.1:921"
   like `[simulation]`
 - `[body_tracking]` -- body tracking on the cameras' pictures (alpha:
   `mode`, `model`, `min_score`, `smoothing`, `detect_every`,
-  `golfer_height`), each field
+  `golfer_height`, `show_skeleton`), each field
   omitted at its default and the section with them (see
   [Body tracking](#body-tracking-alpha))
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
@@ -1312,11 +1312,6 @@ the pane as not shown, so a pane on screen turns Live on.
   tracking values and each camera's live rate and pose time (see
   [Body tracking](#body-tracking-alpha)).
 
-Keys: while the pane is on screen and neither a text field nor a dialog has
-the keyboard, it takes the presses bound in `cameras::KEY_BINDINGS` before
-any widget sees them, each in its scope: the tuning keys on Live only, `B`
-on Live and on a shot's clips. The zoom shortcuts are applied before it.
-
 ### Frame restamping (latency)
 
 `[camera.N] latency_s` (`Option<f64>`, 0 to 10 s, serde-omitted when unset =
@@ -1494,6 +1489,7 @@ defaults): no change restarts a camera.
 | `smoothing` | 1.0 | 0 (off), or 0.1 to 10 Hz | live only: One Euro cutoff at rest |
 | `detect_every` | 10 | 1 to 60 | live only: frames between detections |
 | `golfer_height` | unset | 100 to 250 cm | swing analysis: distances in cm |
+| `show_skeleton` | true | true \| false | drawing (UI): the skeleton over the live views, the clips and the replay |
 
 Out-of-range values are refused with `400` on save (`BodyTrackingSection::error`)
 and replaced by their default, with a warning, from the file. `mode` is an
@@ -1503,11 +1499,12 @@ enum like `model`: an unknown value is an invalid body (the JSON extractor's
 `historical`; a section with neither is `off`. Only `mode` is written, so
 such a file is brought up to date with a backup at load, and a config
 without the section stays byte-identical. The Body
-tracking card (General) edits `mode`, `model` and `golfer_height` (typed
-in inches with imperial default units, centimetres with metric; stored in
-centimetres); the Live keys tune the rest and save through
+tracking card (General) edits every field (`golfer_height` typed in inches
+with imperial default units, centimetres with metric; stored in
+centimetres), saved with the General cards. Turning body tracking on from
+Off saves the mode at once through
 `POST /api/settings?scope=body_tracking` (`SetBodyTracking`: that section
-alone, so a tuning key never writes another setting).
+alone, so it never writes another setting).
 
 **Modes.** `mode` decides what runs:
 
@@ -1701,17 +1698,11 @@ the player and the replay send one analyze request per clip without `pose`
 (done already: the files are fetched at once), otherwise `shot_pose` and
 `shot_swing` bring them as for a recorded clip, and until then the clip
 plays without them, as while any clip is tracked.
-Keys (`cameras::KEY_BINDINGS`, no modifier; none in Off mode): `B` skeleton
-on/off (Live and a shot's clips, Historical and Live mode; this device:
-browser local storage, or `flighthook/ui.json` in the local data folder
-natively; the replay follows it); on Live in Live mode only, `M` model,
-`[` `]`
-`min_score` ∓ 0.05, `,` `.` smoothing less/more along off, 10, 5, 3, 2, 1,
-0.5, 0.3, 0.2, 0.1 Hz, `D` `detect_every` 1 → 5 → 10 → 30. A key changes
-the values shown at once; they are saved one request at a time, the newest
-winning, and shown until the reloaded settings hold them (a failed save
-shows the saved ones again). In Live mode a line under the live views reads
-out the values and each camera's measured live rate and pose time.
+With `show_skeleton` false no skeleton is drawn anywhere (Live, the
+Cameras pane's player, the replay); the poses are still fetched and the
+swing numbers shown. In Live mode a line under the live views reads out the
+values (`skeleton off` while it is hidden) and each camera's measured live
+rate and pose time.
 
 ## SystemActor
 
@@ -2275,14 +2266,18 @@ displayed).
   **Still frame**, enabled while the camera is connected: it fetches
   [`GET /api/cameras/{actor}/still`](API.md#get-apicamerasactorstill) and
   shows the frame at the card's width (decoded like the replay's frames)
-- The Body tracking card (alpha, General, after Replay) holds
-  `[body_tracking]` `mode` (Off | Historical | Live, pills like Model's),
-  `model` (RTMPose-m |
-  RTMPose-s) and Golfer height (in inches with imperial default units,
-  centimetres with metric, converted when the units change; empty is none;
-  checked like the server's); it saves and cancels with the other General
-  cards. The other values are tuned with the Live keys, which save with
-  `?scope=body_tracking` (that section alone). Picking Historical or Live
+- The Body tracking card (alpha, General, after Replay) holds every
+  `[body_tracking]` field, in this order: Mode (`mode`, Off | Historical |
+  Live, pills like Model's), Model (`model`, RTMPose-m | RTMPose-s), Show
+  skeleton (`show_skeleton`, a checkbox), Minimum score (`min_score`),
+  Smoothing (`smoothing`, Hz), Detect every (`detect_every`, frames) and
+  Golfer height (in inches with imperial default units, centimetres with
+  metric, converted when the units change; empty is none). Every field
+  shows in every mode; each number is checked like the server's
+  (`BodyTrackingSection::error`, one field at a time) with its range under
+  it while out of range, and a field left as loaded saves its loaded value
+  exactly. It saves and cancels with the other General cards. Picking
+  Historical or Live
   while the mode in effect is Off is not a form edit: it goes through the
   model download prompt (`panels/body_models.rs`, below), which saves the
   mode itself
@@ -2304,8 +2299,7 @@ displayed).
   **Turn off**. With the mode already on, the same check runs once per
   model per on-period the first time something needs the models (a shot's
   clips in the Cameras pane, Live in Live mode, Replay); its Cancel leaves
-  the mode as it is. The camera keys are off while the prompt is up. No
-  hover text
+  the mode as it is. No hover text
 - The Replay card (beta, General) holds `[replay]`: Keep clips, Pre-roll,
   Post-roll and Start before impact in seconds, and the clip folder,
   read-only (`/api/status` `clip_dir`). It saves and cancels with the Global and Simulation cards

@@ -150,9 +150,10 @@ Terminal. Allow it.
   and the hip turn, shoulder turn, hip sway and spine at the frame on screen,
   found on this computer's CPU with RTMPose; Off (the default), Historical (a clip is
   tracked the first time it is viewed, which keeps the CPU free while you
-  play) or Live (every camera live and every clip as it is recorded, tuned
-  with keys); its models (about 76 MB) are downloaded only after you
-  confirm it, with the download's progress on screen (alpha) — see
+  play) or Live (every camera live and every clip as it is recorded), set
+  on the Devices tab's Body tracking card; its models (about 76 MB) are
+  downloaded only after you confirm it, with the download's progress on
+  screen (alpha) — see
   [Body tracking](docs/devices/cameras.md#body-tracking-alpha)
 - Dual UI: native desktop window (eframe/egui) and browser dashboard (WASM, same codebase)
 - The UI scales itself to fit the window, so a 4K screen at 100 % shows about the

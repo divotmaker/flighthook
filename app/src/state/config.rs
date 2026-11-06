@@ -1211,6 +1211,33 @@ full_monitor = "mevo.0"
     }
 
     #[test]
+    fn show_skeleton_reads_on_without_the_field_and_off_as_written() {
+        // A config from before the field: the skeleton shows and the file
+        // is left byte-identical, with no backup.
+        for src in [
+            GOLDEN_DEFAULT_TOML.to_owned(),
+            format!("{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmode = \"live\"\nmin_score = 0.45\n"),
+        ] {
+            let (dir, path) = config_dir(&src);
+            let loaded = load(&path).0;
+            assert!(loaded.body_tracking.show_skeleton, "{src}");
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), src);
+            assert_eq!(files(&dir.0), ["config.toml"]);
+        }
+        // Off: loaded and left as written; a change is read live.
+        let src = format!(
+            "{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmode = \"live\"\nshow_skeleton = false\n"
+        );
+        let (dir, path) = config_dir(&src);
+        let cfg = SystemConfig::new(path.clone());
+        assert!(!cfg.body_tracking().show_skeleton);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), src);
+        assert_eq!(files(&dir.0), ["config.toml"]);
+        cfg.update(|c| c.body_tracking.show_skeleton = true);
+        assert!(cfg.body_tracking().show_skeleton);
+    }
+
+    #[test]
     fn a_body_tracking_mode_loads_byte_identical_and_the_older_switch_becomes_one() {
         use flighthook::BodyTrackingMode;
         // Without the section (Off, the default), and with a mode other

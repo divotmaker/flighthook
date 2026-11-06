@@ -209,10 +209,7 @@ pub struct FlighthookApp {
     /// Number of the last live view opened: replies for another are
     /// dropped.
     pub(crate) live_seq: u64,
-    /// The skeleton is drawn over camera pictures (the Cameras pane's `B`),
-    /// kept on this device.
-    pub(crate) pose_overlay: bool,
-    /// The body tracking values the Live keys set, and their saves.
+    /// Body tracking values saved at once, and their saves.
     pub(crate) tuning: crate::panels::cameras::Tuning,
     /// Body tracking's model download prompt: the dialog and the overlay.
     pub(crate) body_models: crate::panels::body_models::ModelsPrompt,
@@ -325,7 +322,6 @@ impl FlighthookApp {
             shot_player: None,
             live: HashMap::new(),
             live_seq: 0,
-            pose_overlay: crate::local::flag(crate::panels::cameras::OVERLAY_KEY, true),
             tuning: crate::panels::cameras::Tuning::default(),
             body_models: crate::panels::body_models::ModelsPrompt::default(),
         }
@@ -1496,7 +1492,6 @@ impl eframe::App for FlighthookApp {
         }
 
         self.render_header(ctx);
-        self.camera_keys(ctx, crate::panels::cameras::KEY_BINDINGS);
 
         let content_frame = egui::Frame::new()
             .fill(theme::BG)

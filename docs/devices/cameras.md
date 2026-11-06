@@ -137,9 +137,9 @@ Devices card. The page scrolls when the numbers don't fit under the clips.
 **Live.** Turn on **Live** to see every camera live, side by side, labelled
 with its name and position, at up to 15 frames a second. With body tracking
 in Live mode, each picture also has the golfer's skeleton and posture (see
-[Live posture](#live-posture)) and a line under them reads out the tuning
-(see [Tuning keys](#tuning-keys)); in the other modes it shows the pictures
-alone. A new shot doesn't take you
+[Live posture](#live-posture)) and a line under them reads out the
+settings (see [Settings](#settings)); in the other modes it shows the
+pictures alone. A new shot doesn't take you
 off Live; turn **Live** off (back to the shot the list shows), pick a shot,
 or switch to **Data** to leave it. A camera that is not connected shows its
 status as on its Devices card.
@@ -158,8 +158,8 @@ Body tracking finds the golfer's body in each camera's picture: 26 points
 (head, neck, shoulders, elbows, wrists, hips, knees, ankles, heels and toes),
 joined into a skeleton. The golfer's lead side (the left of a right-hander)
 is drawn in teal, the trail side in orange, the head, neck and hips in
-white. The **Body tracking** card under General sets its mode, picks the
-model and takes the golfer's height.
+white. The **Body tracking** card under General holds its settings (see
+[Settings](#settings)).
 
 The mode decides when body tracking runs, and so what it costs:
 
@@ -227,8 +227,8 @@ pane, **Live** in Live mode, or a replay. Until they are downloaded there is
 no skeleton.
 
 Turning body tracking on from Off saves the mode at once; every other change
-on the card (the mode between Historical, Live and Off, the model, the
-height) is saved with the card's **Save**.
+on the card (the mode between Historical, Live and Off, and every other
+field) is saved with the card's **Save**.
 
 ### Switching modes
 
@@ -369,33 +369,36 @@ the skeleton:
 They are measured as in the swing analysis, for the hand in the header. A
 dash is a point not found.
 
-### Tuning keys
+### Settings
 
-Tune it live on **Live** with these keys, in Live mode (no Ctrl or Cmd;
-they do nothing while a text field has the keyboard). `B` also works in
-Historical mode, on **Live** and on a shot's clips in the Cameras pane. In
-Off mode no key does anything.
+The **Body tracking** card under General holds every body tracking setting,
+in this order, saved with its **Save** like the other General cards:
 
-| Key | Does |
+| Field | Does |
 | --- | --- |
-| `B` | skeleton on or off, on this computer or browser only (the replay follows it) |
-| `M` | switch between RTMPose-m and RTMPose-s |
-| `[` / `]` | hide / show more of the uncertain points: the minimum score a point needs to be drawn, down or up by 0.05 (0 to 1, default 0.3) |
-| `,` / `.` | less / more smoothing of the live skeleton: off, 10, 5, 3, 2, 1, 0.5, 0.3, 0.2, 0.1 (default 1). More is steadier at address and lags more in the swing |
-| `D` | how often the live view looks for the golfer afresh: every 1, 5, 10 or 30 frames (default 10); in between it follows them from the last frame |
+| **Mode** | Off, Historical or Live (see the modes above) |
+| **Model** | RTMPose-m or RTMPose-s (see [Models](#models)) |
+| **Show skeleton** | draw the skeleton over the live views, the shots' clips and the replay (on by default) |
+| **Minimum score** | the score a point needs to be drawn, 0 to 1 (default 0.3); higher hides more of the uncertain points |
+| **Smoothing** | smoothing of the live skeleton, in Hz: 0 is off, else 0.1 to 10 (default 1). Lower is steadier at address and lags more in the swing |
+| **Detect every** | how often the live view looks for the golfer afresh, 1 to 60 frames (default 10); in between it follows them from the last frame |
+| **Golfer height** | in inches or centimetres, as the Units setting (see [Swing analysis](#swing-analysis)) |
 
-A line under the pictures shows the values in effect and, for each camera,
-the live frame rate and how long body tracking takes per frame:
+The fields show in every mode. A value out of range shows its range under
+the field, and the card can't be saved until it is fixed.
+
+On **Live**, in Live mode, a line under the pictures shows the values in
+effect and, for each camera, the live frame rate and how long body tracking
+takes per frame:
 
 ```text
 RTMPose-m · min score 0.30 · smoothing 1.0 · detect every 10 · Face On 14.8 fps 36 ms · Down the Line 14.6 fps 34 ms
 ```
 
-Every key but `B` saves its value in the settings at once, and nothing
-restarts. Smoothing and the look-again interval are for the live view;
-recorded swings always keep the model's own points, looked for every 10
-frames. The values are in the config file too, each left out while at its
-default:
+A change applies as soon as it is saved, and nothing restarts. Smoothing
+and the look-again interval are for the live view; recorded swings always
+keep the model's own points, looked for every 10 frames. The values are in
+the config file too, each left out while at its default:
 
 ```toml
 [body_tracking]
@@ -404,6 +407,7 @@ model = "rtmpose-m"    # or "rtmpose-s"
 min_score = 0.3        # 0 to 1
 smoothing = 1.0        # 0 (off), or 0.1 to 10
 detect_every = 10      # 1 to 60
+show_skeleton = true   # or false
 # golfer_height = 180  # cm, 100 to 250; not set by default
 ```
 
@@ -430,8 +434,7 @@ downswing. The RTMPose weights are OpenMMLab's own release, labelled
 Apache-2.0; they were trained on public pose datasets whose terms are mixed,
 some of them research-only.
 
-The **Body tracking** card under General sets the mode, picks the model and
-takes the golfer's height; the other values are tuned with the keys.
+The **Body tracking** card under General picks the model.
 
 The models are not part of flighthook, and nothing is downloaded until you
 confirm it in the dialog (see [Turning it on](#turning-it-on)). flighthook

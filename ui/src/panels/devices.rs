@@ -2919,7 +2919,7 @@ mod tests {
         assert_eq!(request.body_tracking.model, PoseModel::RtmposeS);
         assert_eq!(
             request.body_tracking.min_score, 0.45,
-            "the tuned values stay"
+            "the other fields as loaded"
         );
         // Off is the default: left out, and no `enabled`.
         let json = serde_json::to_string(&request.body_tracking).unwrap();
@@ -2932,6 +2932,216 @@ mod tests {
             BodyTrackingMode::Historical
         );
         assert_eq!(app.settings.body_tracking.model, PoseModel::RtmposeM);
+    }
+
+    /// The Body tracking card's fields, top to bottom.
+    const BODY_TRACKING_FIELDS: [&str; 7] = [
+        "body_tracking_mode",
+        "body_tracking_model",
+        "body_tracking_skeleton",
+        "body_tracking_min_score",
+        "body_tracking_smoothing",
+        "body_tracking_detect_every",
+        "body_tracking_height",
+    ];
+
+    /// Click text field `name`, select its text and type `text` over it.
+    fn type_over(screen: &Screen, app: &mut FlighthookApp, name: &str, text: &str) {
+        let marks = screen.frame(app, Vec::new());
+        screen.click_mark(app, &marks, name);
+        let select_all = Event::Key {
+            key: Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        screen.frame(app, vec![select_all, Event::Text(text.into())]);
+    }
+
+    #[test]
+    fn the_body_tracking_card_shows_every_setting_in_order_in_every_mode() {
+        use flighthook::BodyTrackingMode;
+        let screen = Screen::new();
+        let mut app = app();
+        for mode in BodyTrackingMode::all() {
+            let mut saved = app.settings.to_request();
+            saved.body_tracking.mode = mode;
+            app.settings.load_from(&saved);
+            let marks = screen.frame(&mut app, Vec::new());
+            let (card, _) = marks["card:body_tracking"];
+            let rows: Vec<Rect> = BODY_TRACKING_FIELDS.iter().map(|f| marks[*f].0).collect();
+            for (pair, names) in rows.windows(2).zip(BODY_TRACKING_FIELDS.windows(2)) {
+                assert!(
+                    pair[0].bottom() <= pair[1].top() + 0.5,
+                    "{mode:?}: {} above {}",
+                    names[0],
+                    names[1]
+                );
+            }
+            assert!(
+                rows.iter().all(|r| card.contains_rect(*r)),
+                "{mode:?}: every field fits the card"
+            );
+            for field in BODY_TRACKING_FIELDS {
+                assert!(enabled(&marks, field), "{mode:?}: {field}");
+            }
+            let (body, content, _) = screen.bodies()["body_tracking"];
+            assert!(
+                content <= body.height(),
+                "{mode:?}: the body fits without scrolling ({content} in {})",
+                body.height()
+            );
+        }
+        // At the zooms the UI picks, too.
+        for ppp in [0.8, 1.25, 1.5, 1.875, 2.0, 2.5, 3.0] {
+            screen.0.set_pixels_per_point(ppp);
+            screen.frame(&mut app, Vec::new());
+            screen.frame(&mut app, Vec::new());
+            let (body, content, _) = screen.bodies()["body_tracking"];
+            assert!(
+                content <= body.height(),
+                "ppp {ppp}: {content} in {}",
+                body.height()
+            );
+        }
+        screen.0.set_pixels_per_point(1.0);
+        // As loaded: the defaults, the skeleton shown.
+        let form = &app.settings.body_tracking;
+        assert!(form.show_skeleton);
+        assert_eq!(
+            (
+                form.min_score.as_str(),
+                form.smoothing.as_str(),
+                form.detect_every.as_str()
+            ),
+            ("0.3", "1", "10")
+        );
+    }
+
+    #[test]
+    fn the_body_tracking_card_saves_the_skeleton_and_the_tuning_values() {
+        use flighthook::{BodyTrackingMode, BodyTrackingSection};
+        let screen = Screen::new();
+        let mut app = app();
+        let mut saved = app.settings.to_request();
+        saved.body_tracking.mode = BodyTrackingMode::Historical;
+        app.settings.load_from(&saved);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("save:body_tracking"));
+        // Hide the skeleton and type the three values.
+        let marks = screen.click_mark(&mut app, &marks, "body_tracking_skeleton");
+        assert!(!app.settings.body_tracking.show_skeleton);
+        assert!(enabled(&marks, "save:body_tracking"));
+        type_over(&screen, &mut app, "body_tracking_min_score", "0.45");
+        type_over(&screen, &mut app, "body_tracking_smoothing", "0.5");
+        type_over(&screen, &mut app, "body_tracking_detect_every", "30");
+        let form = &app.settings.body_tracking;
+        assert_eq!(
+            (
+                form.min_score.as_str(),
+                form.smoothing.as_str(),
+                form.detect_every.as_str()
+            ),
+            ("0.45", "0.5", "30")
+        );
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "save:body_tracking"));
+        assert!(!marks.contains_key("save:global"));
+        let wanted = BodyTrackingSection {
+            mode: BodyTrackingMode::Historical,
+            min_score: 0.45,
+            smoothing: 0.5,
+            detect_every: 30,
+            show_skeleton: false,
+            ..BodyTrackingSection::default()
+        };
+        assert_eq!(app.settings.build_global_request().body_tracking, wanted);
+        // Out of range, at the ranges the server holds: the range under the
+        // field and no Save.
+        let texts = |shapes: &[egui::Shape]| -> Vec<String> {
+            shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (field, bad, range) in [
+            ("min_score", "1.5", "0 to 1"),
+            ("min_score", "x", "0 to 1"),
+            ("smoothing", "0.05", "0, or 0.1 to 10 Hz"),
+            ("smoothing", "11", "0, or 0.1 to 10 Hz"),
+            ("detect_every", "0", "1 to 60"),
+            ("detect_every", "61", "1 to 60"),
+            ("detect_every", "2.5", "1 to 60"),
+        ] {
+            let form = &mut app.settings.body_tracking;
+            let text = match field {
+                "min_score" => &mut form.min_score,
+                "smoothing" => &mut form.smoothing,
+                _ => &mut form.detect_every,
+            };
+            let good = std::mem::replace(text, bad.to_owned());
+            // The range row lengthens the body: scrolled to its end.
+            let marks = screen.frame(&mut app, Vec::new());
+            let (card, _) = marks["card:body_tracking"];
+            let wheel = |dy| Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, dy),
+                modifiers: Modifiers::NONE,
+            };
+            screen.frame(
+                &mut app,
+                vec![Event::PointerMoved(card.center()), wheel(-500.0)],
+            );
+            let (marks, shapes) = screen.painted(&mut app, Vec::new());
+            screen.frame(&mut app, vec![wheel(500.0)]);
+            assert!(!enabled(&marks, "save:body_tracking"), "{field} {bad}");
+            assert!(texts(&shapes).contains(&range.to_owned()), "{field} {bad}");
+            let form = &mut app.settings.body_tracking;
+            match field {
+                "min_score" => form.min_score = good,
+                "smoothing" => form.smoothing = good,
+                _ => form.detect_every = good,
+            }
+        }
+        // Smoothing 0 is off, and valid.
+        app.settings.body_tracking.smoothing = "0".into();
+        assert_eq!(app.settings.body_tracking.smoothing_value(), Some(0.0));
+        app.settings.body_tracking.smoothing = "0.5".into();
+        let (_, shapes) = screen.painted(&mut app, Vec::new());
+        assert!(!texts(&shapes).contains(&"0, or 0.1 to 10 Hz".to_owned()));
+        // Saved: the card reads the saved values back, clean.
+        let posted = app.settings.begin_save(SaveTarget::Global);
+        assert_eq!(posted.body_tracking, wanted);
+        assert_eq!(
+            serde_json::to_string(&posted.body_tracking).unwrap(),
+            r#"{"mode":"historical","min_score":0.45,"smoothing":0.5,"detect_every":30,"show_skeleton":false}"#
+        );
+        assert_eq!(app.settings.finish_save(Ok(())), None);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("save:body_tracking"));
+        assert_eq!(app.settings.saved_body_tracking(), wanted);
+        assert_eq!(app.body_tracking(), wanted);
+        let form = &app.settings.body_tracking;
+        assert!(!form.show_skeleton);
+        assert_eq!(
+            (
+                form.min_score.as_str(),
+                form.smoothing.as_str(),
+                form.detect_every.as_str()
+            ),
+            ("0.45", "0.5", "30")
+        );
+        assert_eq!(form.to_section(), Some(wanted));
+        // Turned back on: shown again, and the field left out at its default.
+        let marks = screen.click_mark(&mut app, &marks, "body_tracking_skeleton");
+        assert!(app.settings.body_tracking.show_skeleton);
+        assert!(enabled(&marks, "save:body_tracking"));
+        let json = serde_json::to_string(&app.settings.build_global_request().body_tracking);
+        assert!(!json.unwrap().contains("show_skeleton"));
     }
 
     #[test]

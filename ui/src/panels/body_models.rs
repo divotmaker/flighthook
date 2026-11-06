@@ -18,8 +18,8 @@
 //!   to be tracked again.
 //!
 //! The mode is saved through the body tracking settings alone
-//! (`scope=body_tracking`, as the Live tuning keys save), so other unsaved
-//! edits on the card stay unsaved.
+//! (`scope=body_tracking`), so other unsaved edits on the card stay
+//! unsaved.
 
 use flighthook::{BodyTrackingMode, BodyTrackingModels, ModelFilesState, PoseModel};
 

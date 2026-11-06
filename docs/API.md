@@ -1710,9 +1710,11 @@ Full persisted config (mirrors `config.toml`).
   `smoothing` (default `1.0`: the live One Euro filter's cutoff at rest in
   Hz, 0.1 to 10, lower is smoother; `0` is off) and `detect_every` (default
   `10`, 1 to 60: the live view looks for the golfer afresh at least every
-  that many frames) and `golfer_height` (not set by default; the golfer's
+  that many frames), `golfer_height` (not set by default; the golfer's
   height in centimetres, 100 to 250, for the swing analysis' distances in
-  centimetres). Every value applies at once, without restarting a
+  centimetres) and `show_skeleton` (default `true`; `false`: the UI draws
+  no skeleton over the live views, the clips or the replay). Every value
+  applies at once, without restarting a
   camera. A save with a value out of range is `400`; a file holding one
   loads with a warning in the log, and the default is used. An unknown
   `mode` is an invalid body, like an unknown `model`. A section with
@@ -1759,8 +1761,9 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
     carries for it. Every actor is reconciled.
   - `body_tracking` writes only the body's `body_tracking` section; every
     other setting of the live config is kept, whatever the body carries for
-    it. No actor is reconciled (body tracking is read live). The UI's Live
-    tuning keys save this way.
+    it. No actor is reconciled (body tracking is read live). The UI saves
+    this way from the model download prompt: when body tracking is turned on
+    from `off`, and when the prompt's Cancel or Turn off sets it back to `off`.
   - Any save that changes `body_tracking.mode` applies it at once: leaving
     `live` stops live tracking and the recorded clips still waiting to be
     tracked (a clip being tracked finishes); `off` also drops every clip

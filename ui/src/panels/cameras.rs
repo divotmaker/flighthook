@@ -23,15 +23,11 @@
 //!   the browser tab hidden, the views are dropped, and the server stops
 //!   updating the live frames a few seconds later.
 //!
-//! The pane owns the key presses while it shows ([`KEY_BINDINGS`]): the
-//! body tracking tuning keys while Live is on, the skeleton switch
-//! `B` on a shot's clips too. Server-side values are saved through the
-//! settings, one save at a time; a single line under the live views reads
-//! out the values and each camera's measured rate and pose time.
+//! Body tracking's settings are on the Devices tab's Body tracking card; a
+//! single line under the live views reads out the values and each camera's
+//! measured rate and pose time.
 
 use std::collections::{HashMap, VecDeque};
-
-use egui::{Key, KeyboardShortcut, Modifiers};
 
 use crate::app::{FlighthookApp, new_actor};
 use crate::net::{LiveReply, PoseState};
@@ -67,121 +63,6 @@ const PANE_KEY: &str = "shots_pane";
 const NONE: &str = "\u{2014}";
 /// The span a view's frame rate is measured over (s).
 const FPS_WINDOW_S: f64 = 2.0;
-/// Where the skeleton overlay's switch (`B`) is kept on this device.
-pub(crate) const OVERLAY_KEY: &str = "pose_overlay";
-/// One `[` / `]` step of the minimum keypoint score.
-const MIN_SCORE_STEP: f64 = 0.05;
-/// The live smoothing cutoffs `,` and `.` step through, from the least
-/// smoothing (off) to the most (Hz).
-const SMOOTHING_STEPS: [f64; 10] = [0.0, 10.0, 5.0, 3.0, 2.0, 1.0, 0.5, 0.3, 0.2, 0.1];
-/// The detection intervals `D` cycles through (frames).
-const DETECT_STEPS: [u32; 4] = [1, 5, 10, 30];
-
-/// Where a key works: while Live is on, or whenever the Cameras pane
-/// shows (Live or a shot's clips).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeyScope {
-    Live,
-    Cameras,
-}
-
-/// A key press the Cameras pane acts on, what it does, and where.
-pub(crate) type KeyBinding = (egui::KeyboardShortcut, fn(&mut FlighthookApp), KeyScope);
-
-/// A plain key, no modifier.
-const fn plain(key: Key) -> KeyboardShortcut {
-    KeyboardShortcut::new(Modifiers::NONE, key)
-}
-
-/// The Cameras pane's key bindings, the one place they are listed. While
-/// the pane owns the keyboard ([`FlighthookApp::cameras_own_keys`]) a bound
-/// press in its scope is taken out of the input before anything else on
-/// the page sees it; elsewhere, or while a text field or a dialog has the
-/// keyboard, nothing here reacts. None of them collides with another
-/// shortcut: the zoom keys all hold Ctrl/Cmd, and the dialogs' Escape is
-/// not bound here.
-///
-/// - `B`: skeleton on or off (this device only, kept between sessions), on
-///   the live views and on a shot's clips; Historical and Live modes
-/// - `M`: RTMPose-m or RTMPose-s (Live, Live mode)
-/// - `[` / `]`: minimum keypoint score down / up by 0.05 (Live, Live mode)
-/// - `,` / `.`: less / more live smoothing (Live, Live mode)
-/// - `D`: look for the golfer every 1, 5, 10 or 30 frames (Live, Live
-///   mode)
-///
-/// With body tracking off no key applies.
-pub(crate) const KEY_BINDINGS: &[KeyBinding] = &[
-    (
-        plain(Key::B),
-        FlighthookApp::toggle_pose_overlay,
-        KeyScope::Cameras,
-    ),
-    (
-        plain(Key::M),
-        FlighthookApp::switch_pose_model,
-        KeyScope::Live,
-    ),
-    (
-        plain(Key::OpenBracket),
-        FlighthookApp::lower_min_score,
-        KeyScope::Live,
-    ),
-    (
-        plain(Key::CloseBracket),
-        FlighthookApp::raise_min_score,
-        KeyScope::Live,
-    ),
-    (
-        plain(Key::Comma),
-        FlighthookApp::less_smoothing,
-        KeyScope::Live,
-    ),
-    (
-        plain(Key::Period),
-        FlighthookApp::more_smoothing,
-        KeyScope::Live,
-    ),
-    (
-        plain(Key::D),
-        FlighthookApp::next_detect_every,
-        KeyScope::Live,
-    ),
-];
-
-/// The minimum score one step down (`up` false) or up from `score`, on
-/// the 0.05 grid, held to 0 to 1.
-pub(crate) fn step_min_score(score: f64, up: bool) -> f64 {
-    let steps = (score / MIN_SCORE_STEP).round() + if up { 1.0 } else { -1.0 };
-    (steps * MIN_SCORE_STEP * 100.0).round().clamp(0.0, 100.0) / 100.0
-}
-
-/// The smoothing one step from `hz` towards more smoothing (`more`) or
-/// less, along [`SMOOTHING_STEPS`]; a value between steps starts from the
-/// nearest.
-pub(crate) fn step_smoothing(hz: f64, more: bool) -> f64 {
-    let nearest = SMOOTHING_STEPS
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| (*a - hz).abs().total_cmp(&(*b - hz).abs()))
-        .map_or(0, |(i, _)| i);
-    let i = if more {
-        (nearest + 1).min(SMOOTHING_STEPS.len() - 1)
-    } else {
-        nearest.saturating_sub(1)
-    };
-    SMOOTHING_STEPS[i]
-}
-
-/// The detection interval after `frames` in [`DETECT_STEPS`], wrapping
-/// back to the first.
-pub(crate) fn next_detect_every(frames: u32) -> u32 {
-    DETECT_STEPS
-        .iter()
-        .copied()
-        .find(|&n| n > frames)
-        .unwrap_or(DETECT_STEPS[0])
-}
-
 /// What the readout says about one camera.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CameraReading {
@@ -195,7 +76,7 @@ pub(crate) struct CameraReading {
 /// The readout line, shown in Live mode: the body tracking values in
 /// effect (`s`), whether the skeleton is drawn, and each camera's measured
 /// live rate and pose time, named when there are several.
-pub(crate) fn readout(s: &BodyTrackingSection, overlay: bool, cameras: &[CameraReading]) -> String {
+pub(crate) fn readout(s: &BodyTrackingSection, cameras: &[CameraReading]) -> String {
     let mut parts: Vec<String> = vec![
         s.model.label().to_owned(),
         format!("min score {:.2}", s.min_score),
@@ -206,7 +87,7 @@ pub(crate) fn readout(s: &BodyTrackingSection, overlay: bool, cameras: &[CameraR
         },
         format!("detect every {}", s.detect_every),
     ];
-    if !overlay {
+    if !s.show_skeleton {
         parts.push("skeleton off".to_owned());
     }
     let named = cameras.len() > 1;
@@ -245,12 +126,13 @@ pub(crate) fn pose_status_text(state: &PoseState) -> Option<String> {
     }
 }
 
-/// The body tracking values the tuning keys set, and their saves: one at a
-/// time, the newest values winning. Until the saved settings hold them,
-/// the readout shows the wanted values.
+/// Body tracking values saved at once, outside the Body tracking card's
+/// Save (turning body tracking on from the model download prompt), and
+/// their saves: one at a time, the newest values winning. Until the saved
+/// settings hold them, they are the values in effect.
 #[derive(Debug, Default)]
 pub(crate) struct Tuning {
-    /// What the keys set, until the saved settings hold it.
+    /// The values set, until the saved settings hold them.
     wanted: Option<BodyTrackingSection>,
     /// The values of the save that is out.
     in_flight: Option<BodyTrackingSection>,
@@ -537,50 +419,8 @@ impl FlighthookApp {
         self.cameras_pane_was_shown = shown;
     }
 
-    /// Where the Cameras pane takes key presses now, if it does: it is on
-    /// screen showing Live or a shot, no text field has the keyboard and no
-    /// dialog is open.
-    pub(crate) fn cameras_own_keys(&self, ctx: &egui::Context) -> Option<KeyScope> {
-        if !self.cameras_pane_shown()
-            || ctx.wants_keyboard_input()
-            || self.confirm_remove.is_some()
-            || self.body_models.is_open()
-            || self.show_api_docs
-        {
-            return None;
-        }
-        if self.live_selected {
-            Some(KeyScope::Live)
-        } else {
-            self.shown_index().map(|_| KeyScope::Cameras)
-        }
-    }
-
-    /// Apply `bindings` to this pass's key presses while the Cameras pane
-    /// owns them, taking each bound press in scope out of the input. With
-    /// body tracking off none applies; the Live keys need Live mode too.
-    pub(crate) fn camera_keys(&mut self, ctx: &egui::Context, bindings: &[KeyBinding]) {
-        let Some(scope) = self.cameras_own_keys(ctx) else {
-            return;
-        };
-        let mode = self.body_tracking().mode;
-        if !mode.is_on() {
-            return;
-        }
-        for (shortcut, action, needs) in bindings {
-            if *needs == KeyScope::Live
-                && (scope != KeyScope::Live || mode != BodyTrackingMode::Live)
-            {
-                continue;
-            }
-            while ctx.input_mut(|i| i.consume_shortcut(shortcut)) {
-                action(self);
-            }
-        }
-    }
-
-    /// The body tracking values in effect: those the tuning keys set, else
-    /// the saved ones.
+    /// The body tracking values in effect: those being saved at once
+    /// ([`Tuning`]), else the saved ones.
     pub(crate) fn body_tracking(&self) -> BodyTrackingSection {
         self.tuning.current(&self.settings.saved_body_tracking())
     }
@@ -596,45 +436,6 @@ impl FlighthookApp {
         let mut values = self.body_tracking();
         f(&mut values);
         self.tuning.set(values);
-    }
-
-    /// `B`: the skeleton on or off, on this device.
-    fn toggle_pose_overlay(&mut self) {
-        self.pose_overlay = !self.pose_overlay;
-        crate::local::store(
-            OVERLAY_KEY,
-            if self.pose_overlay { "true" } else { "false" },
-        );
-    }
-
-    /// `M`: the other pose model.
-    fn switch_pose_model(&mut self) {
-        self.tune(|s| s.model = s.model.other());
-    }
-
-    /// `[`: the minimum keypoint score down a step.
-    fn lower_min_score(&mut self) {
-        self.tune(|s| s.min_score = step_min_score(s.min_score, false));
-    }
-
-    /// `]`: the minimum keypoint score up a step.
-    fn raise_min_score(&mut self) {
-        self.tune(|s| s.min_score = step_min_score(s.min_score, true));
-    }
-
-    /// `,`: less live smoothing.
-    fn less_smoothing(&mut self) {
-        self.tune(|s| s.smoothing = step_smoothing(s.smoothing, false));
-    }
-
-    /// `.`: more live smoothing.
-    fn more_smoothing(&mut self) {
-        self.tune(|s| s.smoothing = step_smoothing(s.smoothing, true));
-    }
-
-    /// `D`: the next detection interval.
-    fn next_detect_every(&mut self) {
-        self.tune(|s| s.detect_every = next_detect_every(s.detect_every));
     }
 
     /// Save the tuned values when a save is due: one at a time, through the
@@ -809,7 +610,7 @@ impl FlighthookApp {
                 }
             })
             .collect();
-        readout(&self.body_tracking(), self.pose_overlay, &readings)
+        readout(&self.body_tracking(), &readings)
     }
 
     /// Height over width of camera `actor`'s picture: the frame shown, else
@@ -891,7 +692,7 @@ impl FlighthookApp {
             devices::mark(ui, || format!("pose_status:{actor}"), &band);
             return;
         }
-        let Some(pose) = view.shown_pose.as_ref().filter(|_| self.pose_overlay) else {
+        let Some(pose) = view.shown_pose.as_ref().filter(|_| settings.show_skeleton) else {
             return;
         };
         let frame = size.map(|v| u32::try_from(v).unwrap_or(u32::MAX));
@@ -1839,7 +1640,6 @@ mod tests {
         ShotVideo,
     };
     use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
-    use std::cell::Cell;
 
     #[test]
     fn values_that_round_to_zero_show_no_minus_sign() {
@@ -1896,8 +1696,14 @@ mod tests {
     }
 
     /// Draws the tab bar and the active tab's panel (the Shots tab, or
-    /// nothing), as the app does, applying the pane's keys first.
-    struct Screen(egui::Context, egui::Vec2, std::cell::RefCell<Vec<String>>);
+    /// nothing), as the app does; keeps what the last frame painted as text
+    /// and the centres of the circles it painted.
+    struct Screen(
+        egui::Context,
+        egui::Vec2,
+        std::cell::RefCell<Vec<String>>,
+        std::cell::RefCell<Vec<Pos2>>,
+    );
 
     impl Screen {
         fn new() -> Self {
@@ -1907,19 +1713,15 @@ mod tests {
         fn sized(w: f32, h: f32) -> Self {
             let ctx = egui::Context::default();
             theme::install(&ctx);
-            Self(ctx, vec2(w, h), std::cell::RefCell::default())
+            Self(
+                ctx,
+                vec2(w, h),
+                std::cell::RefCell::default(),
+                std::cell::RefCell::default(),
+            )
         }
 
         fn frame(&self, app: &mut FlighthookApp, events: Vec<Event>) -> Marks {
-            self.frame_with(app, events, KEY_BINDINGS)
-        }
-
-        fn frame_with(
-            &self,
-            app: &mut FlighthookApp,
-            events: Vec<Event>,
-            bindings: &[KeyBinding],
-        ) -> Marks {
             self.0.data_mut(|d| d.remove_temp::<Marks>(egui::Id::NULL));
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.1)),
@@ -1928,7 +1730,6 @@ mod tests {
             };
             let out = self.0.run(input, |ctx| {
                 app.sync_cameras_pane();
-                app.camera_keys(ctx, bindings);
                 app.drop_hidden_card_clips();
                 app.sync_live_views(ctx);
                 egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
@@ -1941,6 +1742,7 @@ mod tests {
                 });
             });
             *self.2.borrow_mut() = painted_texts(&out.shapes);
+            *self.3.borrow_mut() = painted_circles(&out.shapes);
             self.0
                 .data(|d| d.get_temp::<Marks>(egui::Id::NULL))
                 .unwrap_or_default()
@@ -1949,6 +1751,15 @@ mod tests {
         /// What the last frame painted as text.
         fn texts(&self) -> Vec<String> {
             self.2.borrow().clone()
+        }
+
+        /// How many circles the last frame painted inside `rect`.
+        fn circles_in(&self, rect: Rect) -> usize {
+            self.3
+                .borrow()
+                .iter()
+                .filter(|c| rect.contains(**c))
+                .count()
         }
 
         fn click(&self, app: &mut FlighthookApp, at: Pos2) -> Marks {
@@ -2539,81 +2350,6 @@ mod tests {
     }
 
     #[test]
-    fn the_page_owns_bound_keys_only_while_it_is_active() {
-        thread_local! {
-            static PRESSED: Cell<u32> = const { Cell::new(0) };
-        }
-        fn count(_: &mut FlighthookApp) {
-            PRESSED.with(|p| p.set(p.get() + 1));
-        }
-        let bindings: &[KeyBinding] = &[(
-            egui::KeyboardShortcut::new(Modifiers::NONE, Key::Space),
-            count,
-            KeyScope::Live,
-        )];
-        let press = || {
-            vec![Event::Key {
-                key: Key::Space,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::NONE,
-            }]
-        };
-        let screen = Screen::new();
-        let mut app = app(&[0], true);
-        // The shot's data: nothing.
-        screen.frame_with(&mut app, press(), bindings);
-        assert_eq!(PRESSED.with(Cell::get), 0);
-        // Another tab, Live on: nothing.
-        app.select_live();
-        app.active_tab = Tab::Log;
-        screen.frame_with(&mut app, press(), bindings);
-        assert_eq!(PRESSED.with(Cell::get), 0);
-        // Live on screen: the binding runs.
-        app.active_tab = Tab::Shots;
-        screen.frame_with(&mut app, press(), bindings);
-        assert_eq!(PRESSED.with(Cell::get), 1);
-        // A dialog open: nothing.
-        app.show_api_docs = true;
-        screen.frame_with(&mut app, press(), bindings);
-        assert_eq!(PRESSED.with(Cell::get), 1);
-        app.show_api_docs = false;
-        // A text field with the keyboard: nothing.
-        let field = egui::Id::new("some field");
-        let mut text = String::new();
-        let mut typing = |app: &mut FlighthookApp, events: Vec<Event>| {
-            let input = egui::RawInput {
-                events,
-                ..Default::default()
-            };
-            let _ = screen.0.run(input, |ctx| {
-                app.camera_keys(ctx, bindings);
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let edit = ui.add(egui::TextEdit::singleline(&mut text).id(field));
-                    edit.request_focus();
-                });
-            });
-        };
-        typing(&mut app, Vec::new());
-        typing(&mut app, press());
-        assert_eq!(PRESSED.with(Cell::get), 1);
-        screen.0.memory_mut(|m| m.surrender_focus(field));
-        // A press with a modifier is not the binding's.
-        let with_command = vec![Event::Key {
-            key: Key::Space,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: Modifiers::COMMAND,
-        }];
-        screen.frame_with(&mut app, with_command, bindings);
-        assert_eq!(PRESSED.with(Cell::get), 1);
-        screen.frame_with(&mut app, press(), bindings);
-        assert_eq!(PRESSED.with(Cell::get), 2);
-    }
-
-    #[test]
     fn columns_fit_the_panel_keeping_their_aspect() {
         let panel = vec2(1600.0, 900.0);
         // Two 16:9 cameras: limited by the width.
@@ -2638,39 +2374,6 @@ mod tests {
     }
 
     #[test]
-    fn the_tuning_steps_stay_in_range() {
-        assert!((step_min_score(0.3, true) - 0.35).abs() < 1e-9);
-        assert!((step_min_score(0.3, false) - 0.25).abs() < 1e-9);
-        assert!(
-            (step_min_score(0.32, true) - 0.35).abs() < 1e-9,
-            "onto the grid"
-        );
-        assert_eq!(step_min_score(1.0, true), 1.0);
-        assert_eq!(step_min_score(0.0, false), 0.0);
-        // Smoothing: more goes to lower cutoffs, less to higher, then off.
-        assert_eq!(step_smoothing(1.0, true), 0.5);
-        assert_eq!(step_smoothing(1.0, false), 2.0);
-        assert_eq!(step_smoothing(10.0, false), 0.0);
-        assert_eq!(step_smoothing(0.0, false), 0.0);
-        assert_eq!(step_smoothing(0.0, true), 10.0);
-        assert_eq!(step_smoothing(0.1, true), 0.1);
-        assert_eq!(step_smoothing(0.7, true), 0.3, "from the nearest step");
-        for hz in SMOOTHING_STEPS {
-            let s = BodyTrackingSection {
-                smoothing: hz,
-                ..BodyTrackingSection::default()
-            };
-            assert_eq!(s.error(), None, "{hz}");
-        }
-        assert_eq!(next_detect_every(1), 5);
-        assert_eq!(next_detect_every(5), 10);
-        assert_eq!(next_detect_every(10), 30);
-        assert_eq!(next_detect_every(30), 1);
-        assert_eq!(next_detect_every(17), 30);
-        assert_eq!(next_detect_every(60), 1);
-    }
-
-    #[test]
     fn the_readout_names_every_value_and_each_cameras_rate() {
         let s = BodyTrackingSection::default();
         let one = [CameraReading {
@@ -2679,7 +2382,7 @@ mod tests {
             pose_ms: Some(19.4),
         }];
         assert_eq!(
-            readout(&s, true, &one),
+            readout(&s, &one),
             "RTMPose-m · min score 0.30 · smoothing 1.0 · detect every 10 · 14.8 fps · 19 ms"
         );
         let two = [
@@ -2695,77 +2398,14 @@ mod tests {
             min_score: 0.45,
             smoothing: 0.0,
             detect_every: 30,
+            show_skeleton: false,
             ..s.clone()
         };
         assert_eq!(
-            readout(&tuned, false, &two),
+            readout(&tuned, &two),
             "RTMPose-s · min score 0.45 · smoothing off · detect every 30 · skeleton off · \
              Face On 14.8 fps 19 ms · Down the Line 14.6 fps"
         );
-    }
-
-    #[test]
-    fn the_keys_change_the_values_and_save_them_one_at_a_time() {
-        let screen = Screen::new();
-        let mut app = app(&[0], true);
-        app.select_live();
-        screen.frame(&mut app, Vec::new());
-        assert!(app.tuning.sent.is_empty());
-        // `]` raises the minimum score: saved at once.
-        screen.frame(&mut app, press(Key::CloseBracket));
-        assert_eq!(app.tuning.sent.len(), 1);
-        assert!((app.tuning.sent[0].min_score - 0.35).abs() < 1e-9);
-        assert!((app.body_tracking().min_score - 0.35).abs() < 1e-9);
-        // More presses while that save is out: shown at once, saved after.
-        screen.frame(&mut app, press(Key::M));
-        screen.frame(&mut app, press(Key::D));
-        screen.frame(&mut app, press(Key::Period));
-        assert_eq!(app.tuning.sent.len(), 1, "one save at a time");
-        let shown = app.body_tracking();
-        assert_eq!(shown.model, flighthook::PoseModel::RtmposeS);
-        assert_eq!(shown.detect_every, 30);
-        assert_eq!(shown.smoothing, 0.5);
-        app.tuning.reply(Ok(()));
-        screen.frame(&mut app, Vec::new());
-        assert_eq!(app.tuning.sent.len(), 2);
-        assert_eq!(app.tuning.sent[1], shown);
-        app.tuning.reply(Ok(()));
-        screen.frame(&mut app, Vec::new());
-        assert_eq!(app.tuning.sent.len(), 2, "nothing new to save");
-        // The settings reload with the saved values: the readout follows them.
-        let mut saved = config(&[0]);
-        saved.body_tracking = shown.clone();
-        app.settings.load_from(&saved);
-        screen.frame(&mut app, Vec::new());
-        assert_eq!(app.body_tracking(), shown);
-        // A save that fails puts the saved values back.
-        screen.frame(&mut app, press(Key::OpenBracket));
-        assert_eq!(app.tuning.sent.len(), 3);
-        app.tuning.reply(Err("400 body_tracking: ...".into()));
-        assert_eq!(app.body_tracking(), shown);
-        // `,` is less smoothing; the keys do nothing off Live.
-        app.live_selected = false;
-        screen.frame(&mut app, press(Key::Comma));
-        assert_eq!(app.body_tracking(), shown);
-    }
-
-    #[test]
-    fn b_turns_the_skeleton_off_and_on_and_is_remembered() {
-        let screen = Screen::new();
-        let mut app = app(&[0], true);
-        app.select_live();
-        assert!(app.pose_overlay);
-        screen.frame(&mut app, press(Key::B));
-        assert!(!app.pose_overlay);
-        assert!(app.tuning.sent.is_empty(), "this device only: no save");
-        assert!(!crate::local::flag(OVERLAY_KEY, true));
-        let again = FlighthookApp::with_pending(crate::net::new_pending());
-        assert!(!again.pose_overlay, "kept for the next session");
-        let marks = screen.frame(&mut app, Vec::new());
-        assert!(marks.contains_key("pose_readout"));
-        screen.frame(&mut app, press(Key::B));
-        assert!(app.pose_overlay);
-        assert!(crate::local::flag(OVERLAY_KEY, false));
     }
 
     fn pose(x: f32) -> LivePose {
@@ -3866,29 +3506,6 @@ mod tests {
         assert_eq!(clip_status_text(false), "No clip of this shot");
     }
 
-    #[test]
-    fn keys_work_by_where_they_belong() {
-        let screen = Screen::new();
-        let mut app = app(&[0], true);
-        app.shots = vec![shot_row(1, &["camera.0"])];
-        app.shots_rev += 1;
-        // The data: no key.
-        screen.frame(&mut app, press(Key::B));
-        assert!(app.pose_overlay);
-        // A shot's clips: B, not the tuning keys.
-        app.set_shots_pane(ShotsPane::Cameras);
-        screen.frame(&mut app, press(Key::B));
-        assert!(!app.pose_overlay);
-        screen.frame(&mut app, press(Key::M));
-        assert_eq!(app.body_tracking().model, flighthook::PoseModel::RtmposeM);
-        // Live: all of them.
-        app.select_live();
-        screen.frame(&mut app, press(Key::B));
-        assert!(app.pose_overlay);
-        screen.frame(&mut app, press(Key::M));
-        assert_eq!(app.body_tracking().model, flighthook::PoseModel::RtmposeS);
-    }
-
     /// Put body tracking in `mode`, as saved settings.
     fn set_mode(app: &mut FlighthookApp, mode: BodyTrackingMode) {
         let mut saved = app.settings.to_request();
@@ -3933,39 +3550,109 @@ mod tests {
         }
     }
 
+    /// Show or hide the skeleton, as saved settings.
+    fn set_show_skeleton(app: &mut FlighthookApp, show: bool) {
+        let mut saved = app.settings.to_request();
+        saved.body_tracking.show_skeleton = show;
+        app.settings.load_from(&saved);
+    }
+
     #[test]
-    fn the_keys_follow_the_mode() {
+    fn the_old_body_tracking_keys_change_nothing_on_the_cameras_pane() {
         let screen = Screen::new();
         let mut app = app(&[0], true);
         app.shots = vec![shot_row(1, &["camera.0"])];
         app.shots_rev += 1;
-        app.select_live();
-        // Historical: B on Live and on a shot's clips, no tuning key.
-        set_mode(&mut app, BodyTrackingMode::Historical);
-        screen.frame(&mut app, press(Key::B));
-        assert!(!app.pose_overlay);
-        for key in [Key::M, Key::CloseBracket, Key::Period, Key::D] {
-            screen.frame(&mut app, press(key));
-        }
-        assert!(app.tuning.sent.is_empty());
-        assert_eq!(app.body_tracking(), app.settings.saved_body_tracking());
-        app.select_shot(0);
-        app.set_shots_pane(ShotsPane::Cameras);
-        screen.frame(&mut app, press(Key::B));
-        assert!(app.pose_overlay);
-        // Off: none.
-        set_mode(&mut app, BodyTrackingMode::Off);
-        screen.frame(&mut app, press(Key::B));
-        assert!(app.pose_overlay);
-        app.select_live();
-        screen.frame(&mut app, press(Key::B));
-        screen.frame(&mut app, press(Key::M));
-        assert!(app.pose_overlay);
-        assert!(app.tuning.sent.is_empty());
-        // Live: all of them.
         set_mode(&mut app, BodyTrackingMode::Live);
-        screen.frame(&mut app, press(Key::M));
-        assert_eq!(app.tuning.sent.len(), 1);
+        let saved = app.settings.saved_body_tracking();
+        let keys = [
+            Key::B,
+            Key::M,
+            Key::OpenBracket,
+            Key::CloseBracket,
+            Key::Comma,
+            Key::Period,
+            Key::D,
+        ];
+        // Live, then a shot's clips.
+        for live in [true, false] {
+            if live {
+                app.select_live();
+            } else {
+                app.select_shot(0);
+                app.set_shots_pane(ShotsPane::Cameras);
+            }
+            screen.frame(&mut app, Vec::new());
+            assert!(app.cameras_pane_shown());
+            assert_eq!(app.live_shown(), live);
+            for key in keys {
+                screen.frame(&mut app, press(key));
+                screen.frame(&mut app, Vec::new());
+            }
+            assert_eq!(app.body_tracking(), saved, "live {live}");
+            assert!(app.tuning.sent.is_empty(), "live {live}");
+            assert!(!app.settings.global_dirty, "live {live}");
+            assert_eq!(app.settings.body_tracking.to_section(), Some(saved.clone()));
+            assert!(app.pose_draw(Handedness::Right).overlay, "live {live}");
+        }
+    }
+
+    #[test]
+    fn show_skeleton_off_hides_the_skeleton_on_a_live_view() {
+        let screen = Screen::new();
+        let mut app = app(&[0], true);
+        set_mode(&mut app, BodyTrackingMode::Live);
+        app.select_live();
+        screen.frame(&mut app, Vec::new());
+        let id = app.live["camera.0"].id;
+        app.live_replies(
+            vec![(
+                id,
+                LiveReply::Frame {
+                    seq: 1,
+                    jpeg: frame_jpeg(),
+                    pose: Some(pose(5.0)),
+                    state: PoseState {
+                        state: "ready".into(),
+                        error: None,
+                    },
+                },
+            )],
+            1.0,
+        );
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(
+            screen.circles_in(marks["camera_live:camera.0"].0) > 0,
+            "drawn by default"
+        );
+        assert!(!screen.texts().iter().any(|t| t.contains("skeleton off")));
+        set_show_skeleton(&mut app, false);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert_eq!(app.live["camera.0"].shown_pose, Some(pose(5.0)));
+        assert_eq!(screen.circles_in(marks["camera_live:camera.0"].0), 0);
+        assert!(screen.texts().iter().any(|t| t.contains("skeleton off")));
+        set_show_skeleton(&mut app, true);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(screen.circles_in(marks["camera_live:camera.0"].0) > 0);
+    }
+
+    #[test]
+    fn show_skeleton_off_hides_the_skeleton_in_the_player_and_the_replay() {
+        let screen = Screen::new();
+        let mut app = app(&[0], true);
+        app.shots = vec![shot_row(1, &["camera.0"])];
+        app.shots_rev += 1;
+        app.set_shots_pane(ShotsPane::Cameras);
+        for mode in [BodyTrackingMode::Historical, BodyTrackingMode::Live] {
+            set_mode(&mut app, mode);
+            screen.frame(&mut app, Vec::new());
+            assert!(app.pose_draw(Handedness::Right).overlay, "{mode:?}");
+            set_show_skeleton(&mut app, false);
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(marks.contains_key("player:picture:camera.0"), "{mode:?}");
+            assert!(!app.pose_draw(Handedness::Right).overlay, "{mode:?}");
+            set_show_skeleton(&mut app, true);
+        }
     }
 
     #[test]
@@ -4155,6 +3842,21 @@ mod tests {
     #[test]
     fn the_cameras_pane_fits_1024x768_with_two_cameras() {
         layout_at(1024.0, 768.0);
+    }
+
+    fn painted_circles(shapes: &[egui::epaint::ClippedShape]) -> Vec<Pos2> {
+        fn collect(shape: &egui::Shape, centres: &mut Vec<Pos2>) {
+            match shape {
+                egui::Shape::Circle(c) => centres.push(c.center),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, centres)),
+                _ => {}
+            }
+        }
+        let mut centres = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, &mut centres);
+        }
+        centres
     }
 
     fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {

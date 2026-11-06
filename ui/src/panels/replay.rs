@@ -1150,10 +1150,11 @@ impl FlighthookApp {
     }
 
     /// How skeletons are drawn now, for a golfer playing with `hand`: not
-    /// at all while body tracking is off.
+    /// at all while body tracking is off or the skeleton is hidden.
     pub(crate) fn pose_draw(&self, hand: crate::types::Handedness) -> PoseDraw {
+        let settings = self.body_tracking();
         PoseDraw {
-            overlay: self.pose_overlay && self.body_tracking().mode.is_on(),
+            overlay: settings.show_skeleton && settings.mode.is_on(),
             min_score: self.pose_min_score(),
             hand,
         }
@@ -2068,6 +2069,64 @@ pub(crate) mod tests {
         // No keypoints for a camera whose file is not in.
         view.cameras[1].shown = Some((10, tex));
         assert!(view.cameras[1].shown_keypoints().is_none());
+    }
+
+    /// The centres of the circles `out` painted inside `rect`: a skeleton's
+    /// joints.
+    fn joints_in(out: &egui::FullOutput, rect: egui::Rect) -> usize {
+        fn count(shape: &egui::Shape, rect: egui::Rect) -> usize {
+            match shape {
+                egui::Shape::Circle(c) => usize::from(rect.contains(c.center)),
+                egui::Shape::Vec(v) => v.iter().map(|s| count(s, rect)).sum(),
+                _ => 0,
+            }
+        }
+        out.shapes.iter().map(|c| count(&c.shape, rect)).sum()
+    }
+
+    #[test]
+    fn a_tracked_clip_shows_its_skeleton_only_while_show_skeleton_is_on() {
+        let t = track(1000, 10, 50, 100);
+        let mut row = shot(&["camera.0"]);
+        row.video[0].pose = true;
+        let mut view = ReplayView::new(1, &row, str::to_owned, false, 0.2);
+        view.mode = BodyTrackingMode::Historical;
+        let reply = sidecar(&view, "camera.0", &t);
+        view.reply(reply);
+        let frames: Vec<serde_json::Value> = t
+            .frames
+            .iter()
+            .map(|f| serde_json::json!({"t_ns": f.t_ns, "keypoints": vec![[32.0, 24.0, 0.9]; 26]}))
+            .collect();
+        let file = serde_json::json!({"version": 1, "skeleton": "halpe26", "width": 64,
+            "height": 48, "frames": frames});
+        view.reply(ReplayReply::Pose {
+            replay: 1,
+            camera: "camera.0".into(),
+            result: serde_json::from_value(file).map_err(|e| e.to_string()),
+        });
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "t",
+            egui::ColorImage::filled([2, 2], egui::Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+        let playhead = view.playback.as_ref().expect("playback").playhead;
+        let frame = t.frame_at(playhead);
+        // The inline player and the replay both draw as the app says.
+        let mut app = FlighthookApp::with_pending(crate::net::new_pending());
+        let mut config = flighthook::FlighthookConfig::default();
+        config.body_tracking.mode = BodyTrackingMode::Historical;
+        for show in [true, false, true] {
+            config.body_tracking.show_skeleton = show;
+            app.settings.load_from(&config);
+            let draw = app.pose_draw(crate::types::Handedness::Right);
+            assert_eq!(draw.overlay, show);
+            view.cameras[0].shown = Some((frame, tex.clone()));
+            let (marks, out) = columns_pass_drawing(&ctx, &mut view, Vec::new(), 0.0, draw);
+            let picture = marks["player:picture:camera.0"].0;
+            assert_eq!(joints_in(&out, picture) > 0, show, "show_skeleton {show}");
+        }
     }
 
     #[test]
@@ -2989,12 +3048,30 @@ pub(crate) mod tests {
         assert!(view.swing_markers().is_empty());
     }
 
-    /// One pass of `view`'s columns, 300 px each, on a 800×400 screen.
+    /// One pass of `view`'s columns, 300 px each, on a 800×400 screen,
+    /// without skeletons.
     fn columns_pass(
         ctx: &egui::Context,
         view: &mut ReplayView,
         events: Vec<egui::Event>,
         time: f64,
+    ) -> (crate::panels::devices::Marks, egui::FullOutput) {
+        let draw = PoseDraw {
+            overlay: false,
+            min_score: 0.3,
+            hand: crate::types::Handedness::Right,
+        };
+        columns_pass_drawing(ctx, view, events, time, draw)
+    }
+
+    /// One pass of `view`'s columns as [`columns_pass`], skeletons drawn as
+    /// `draw` says.
+    fn columns_pass_drawing(
+        ctx: &egui::Context,
+        view: &mut ReplayView,
+        events: Vec<egui::Event>,
+        time: f64,
+        draw: PoseDraw,
     ) -> (crate::panels::devices::Marks, egui::FullOutput) {
         use crate::panels::devices::Marks;
         ctx.data_mut(|d| d.remove::<Marks>(egui::Id::NULL));
@@ -3006,11 +3083,6 @@ pub(crate) mod tests {
             time: Some(time),
             events,
             ..Default::default()
-        };
-        let draw = PoseDraw {
-            overlay: false,
-            min_score: 0.3,
-            hand: crate::types::Handedness::Right,
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {

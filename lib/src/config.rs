@@ -589,15 +589,6 @@ impl PoseModel {
     pub fn all() -> [Self; 2] {
         [Self::RtmposeM, Self::RtmposeS]
     }
-
-    /// The other model.
-    #[must_use]
-    pub fn other(self) -> Self {
-        match self {
-            Self::RtmposeM => Self::RtmposeS,
-            Self::RtmposeS => Self::RtmposeM,
-        }
-    }
 }
 
 /// When body tracking runs (alpha).
@@ -707,6 +698,10 @@ pub struct BodyTrackingSection {
     /// torso length. Not set by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golfer_height: Option<f64>,
+    /// The skeleton is drawn over the live views, the shots' clips and the
+    /// replay. Defaults to true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub show_skeleton: bool,
 }
 
 /// `[body_tracking]` as written: `mode`, or the `enabled` switch of a
@@ -727,6 +722,8 @@ struct BodyTrackingRaw {
     detect_every: u32,
     #[serde(default)]
     golfer_height: Option<f64>,
+    #[serde(default = "default_true")]
+    show_skeleton: bool,
 }
 
 impl From<BodyTrackingRaw> for BodyTrackingSection {
@@ -742,6 +739,7 @@ impl From<BodyTrackingRaw> for BodyTrackingSection {
             smoothing: raw.smoothing,
             detect_every: raw.detect_every,
             golfer_height: raw.golfer_height,
+            show_skeleton: raw.show_skeleton,
         }
     }
 }
@@ -774,6 +772,14 @@ fn is_default_detect_every(v: &u32) -> bool {
     *v == BodyTrackingSection::DEFAULT_DETECT_EVERY
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 impl Default for BodyTrackingSection {
     fn default() -> Self {
         Self {
@@ -783,6 +789,7 @@ impl Default for BodyTrackingSection {
             smoothing: Self::DEFAULT_SMOOTHING_HZ,
             detect_every: Self::DEFAULT_DETECT_EVERY,
             golfer_height: None,
+            show_skeleton: true,
         }
     }
 }
@@ -872,6 +879,7 @@ impl BodyTrackingSection {
                 defaults.detect_every
             },
             golfer_height: self.golfer_height.filter(|h| golfer_height_valid(*h)),
+            show_skeleton: self.show_skeleton,
         }
     }
 }
@@ -2195,6 +2203,7 @@ mod openconnect_client_tests {
                 smoothing: 2.0,
                 detect_every: 5,
                 golfer_height: Some(180.0),
+                show_skeleton: false,
             },
             webserver: one(WebserverSection {
                 name: "Web".into(),
@@ -2670,6 +2679,37 @@ mod body_tracking_tests {
     }
 
     #[test]
+    fn show_skeleton_defaults_on_and_is_written_only_when_off() {
+        // A section from before the field: on, and written back unchanged.
+        for text in [
+            "{}",
+            r#"{"mode":"live","min_score":0.45}"#,
+            r#"{"mode":"historical","model":"rtmpose-s","detect_every":30}"#,
+        ] {
+            let section: BodyTrackingSection = serde_json::from_str(text).unwrap();
+            assert!(section.show_skeleton, "{text}");
+            assert_eq!(serde_json::to_string(&section).unwrap(), text);
+        }
+        assert!(BodyTrackingSection::default().show_skeleton);
+        let hidden = BodyTrackingSection {
+            show_skeleton: false,
+            ..BodyTrackingSection::default()
+        };
+        assert!(!hidden.is_default());
+        assert_eq!(hidden.error(), None);
+        assert!(!hidden.in_effect().show_skeleton);
+        let json = serde_json::to_string(&hidden).unwrap();
+        assert_eq!(json, r#"{"show_skeleton":false}"#);
+        assert_eq!(
+            serde_json::from_str::<BodyTrackingSection>(&json).unwrap(),
+            hidden
+        );
+        let shown: BodyTrackingSection = serde_json::from_str(r#"{"show_skeleton":true}"#).unwrap();
+        assert!(shown.is_default());
+        assert_eq!(serde_json::to_string(&shown).unwrap(), "{}");
+    }
+
+    #[test]
     fn each_mode_round_trips_and_only_off_the_default_is_written() {
         for mode in BodyTrackingMode::all() {
             let section = BodyTrackingSection {
@@ -2798,6 +2838,7 @@ mod body_tracking_tests {
                 mode: BodyTrackingMode::Off,
                 model: PoseModel::RtmposeS,
                 golfer_height: Some(BodyTrackingSection::MAX_GOLFER_HEIGHT_CM),
+                show_skeleton: false,
             },
             BodyTrackingSection {
                 golfer_height: Some(BodyTrackingSection::MIN_GOLFER_HEIGHT_CM),
