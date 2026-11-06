@@ -1,3 +1,5 @@
+<img src="app/assets/icon-1024.png" alt="" width="96">
+
 # flighthook
 
 [![CI](https://github.com/divotmaker/flighthook/actions/workflows/ci.yml/badge.svg)](https://github.com/divotmaker/flighthook/actions/workflows/ci.yml)

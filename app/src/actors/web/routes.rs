@@ -31,6 +31,9 @@ use flighthook::{
 const UI_HTML: &str = include_str!("../../../../ui/dist/index.html");
 const UI_JS: &[u8] = include_bytes!("../../../../ui/dist/flighthook-ui.js");
 const UI_WASM: &[u8] = include_bytes!("../../../../ui/dist/flighthook-ui_bg.wasm");
+const UI_FAVICON_ICO: &[u8] = include_bytes!("../../../../ui/dist/favicon.ico");
+const UI_FAVICON_PNG: &[u8] = include_bytes!("../../../../ui/dist/favicon-32.png");
+const UI_APPLE_TOUCH_ICON: &[u8] = include_bytes!("../../../../ui/dist/apple-touch-icon.png");
 
 /// GET / — serve the egui dashboard HTML.
 pub async fn get_ui_html() -> Response {
@@ -62,6 +65,28 @@ pub async fn get_ui_wasm() -> Response {
             HeaderValue::from_static("application/wasm"),
         )
         .body(Body::from(UI_WASM))
+        .unwrap()
+}
+
+/// GET /favicon.ico — the browser tab icon.
+pub async fn get_favicon_ico() -> Response {
+    icon_response("image/x-icon", UI_FAVICON_ICO)
+}
+
+/// GET /favicon-32.png — the tab icon for browsers that prefer PNG.
+pub async fn get_favicon_png() -> Response {
+    icon_response("image/png", UI_FAVICON_PNG)
+}
+
+/// GET /apple-touch-icon.png — the home-screen icon on iOS.
+pub async fn get_apple_touch_icon() -> Response {
+    icon_response("image/png", UI_APPLE_TOUCH_ICON)
+}
+
+fn icon_response(content_type: &'static str, body: &'static [u8]) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, HeaderValue::from_static(content_type))
+        .body(Body::from(body))
         .unwrap()
 }
 
@@ -1288,6 +1313,21 @@ mod tests {
 
     fn config() -> FlighthookConfig {
         serde_json::from_str("{}").expect("empty config")
+    }
+
+    #[tokio::test]
+    async fn the_page_icons_are_served_with_their_types() {
+        for (response, content_type, magic) in [
+            (get_favicon_ico().await, "image/x-icon", &[0, 0, 1, 0][..]),
+            (get_favicon_png().await, "image/png", &b"\x89PNG"[..]),
+            (get_apple_touch_icon().await, "image/png", &b"\x89PNG"[..]),
+        ] {
+            assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.starts_with(magic), "{content_type}");
+        }
     }
 
     fn mevo_section(name: &str) -> MevoSection {
