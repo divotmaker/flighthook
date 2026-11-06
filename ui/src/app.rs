@@ -9,7 +9,7 @@ use crate::net::{self, PendingHandle, WsPollEvent};
 use crate::panels::devices::{CardModes, mark};
 use crate::panels::dispersion::{self, DispersionKey, EllipseSize, Points};
 use crate::panels::settings::{PendingRemoval, SettingsForm};
-use crate::panels::shots::{ShotFocus, ShotsView};
+use crate::panels::shots::{ShotFocus, ShotsLayout, ShotsView};
 use crate::panels::{Tab, flight};
 use crate::scale::{self, UiScale};
 use crate::theme;
@@ -191,7 +191,7 @@ pub struct FlighthookApp {
     pub(crate) card_row: crate::panels::card_row::CardRow,
     /// The camera cards' clips of the shown shot, by camera actor ID.
     pub(crate) card_clips: HashMap<String, crate::panels::replay::CardClip>,
-    /// The Shots tab's Cards view shows the shot's data or its cameras
+    /// The Shots tab shows the shots' data or the shown shot's cameras
     /// (the Data | Cameras toggle), kept on this device.
     pub(crate) shots_pane: crate::panels::cameras::ShotsPane,
     /// Live is on (the Cameras pane's Live switch): the pane shows the
@@ -890,10 +890,7 @@ impl FlighthookApp {
     /// Elsewhere they are dropped, and fetched again when the row returns.
     /// The Cameras pane's player likewise lives only while it shows a shot.
     pub(crate) fn drop_hidden_card_clips(&mut self) {
-        if self.active_tab != Tab::Shots
-            || self.shots_view != ShotsView::Cards
-            || self.cameras_pane_shown()
-        {
+        if self.active_tab != Tab::Shots || self.shots_layout() != ShotsLayout::Cards {
             self.card_clips.clear();
         }
         if !self.cameras_pane_shown() || self.live_selected {

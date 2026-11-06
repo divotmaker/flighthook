@@ -235,7 +235,7 @@ impl GroupCommand {
     }
 }
 
-/// What the Shots tab shows below its toolbar.
+/// How the Data pane shows the shots: cards for one shot, or a table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub(crate) enum ShotsView {
     /// One row per shot.
@@ -265,6 +265,29 @@ impl ShotsView {
     /// Table uses italics for simulated values, so only Table needs it.
     fn shows_simulated_legend(self) -> bool {
         self == ShotsView::Table
+    }
+}
+
+/// What the Shots tab lays out under its toolbar
+/// ([`FlighthookApp::shots_layout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShotsLayout {
+    /// The Data pane's Cards view.
+    Cards,
+    /// The Data pane's Table view.
+    Table,
+    /// The Cameras pane right of the shot list, whichever view is chosen.
+    Cameras,
+}
+
+impl ShotsLayout {
+    /// The view whose shot list and charts it lays out: the Cameras pane
+    /// keeps the Cards view's shot list and draws no charts.
+    fn view(self) -> ShotsView {
+        match self {
+            Self::Cards | Self::Cameras => ShotsView::Cards,
+            Self::Table => ShotsView::Table,
+        }
     }
 }
 
@@ -3544,18 +3567,19 @@ impl FlighthookApp {
     pub(crate) fn render_shots_panel(&mut self, ui: &mut egui::Ui) {
         self.refresh_shot_caches();
         self.render_shots_toolbar(ui);
-        // The toolbar may have shown the Cameras pane (Table -> Cards).
+        // Whatever the toolbar changed is settled before the panes read it.
         self.sync_cameras_pane();
         ui.add_space(8.0);
 
         // The right-hand column and the shot list are laid out first so
         // they run the full height; the bottom row then spans the width
         // between them. Chart sizes are fixed for a window size.
-        let view = self.shots_view;
+        let layout = self.shots_layout();
+        let view = layout.view();
         let slots = chart_slots(view, ui.ctx().content_rect().size());
         let gap = CHART_GAP as i8;
         // The Cameras pane takes everything right of the shot list.
-        let cameras = view == ShotsView::Cards && self.cameras_pane_shown();
+        let cameras = layout == ShotsLayout::Cameras;
         if let Some(width) = slots.right.filter(|_| !cameras) {
             egui::SidePanel::right(egui::Id::new("shots_right"))
                 .resizable(false)
@@ -3567,7 +3591,10 @@ impl FlighthookApp {
                 .show_inside(ui, |ui| self.render_chart(ui, Chart::Dispersion));
         }
         if view.shot_list() {
-            let default = (ui.available_width() * 0.18)
+            // The Cameras pane starts the list at the Cards view's width,
+            // whichever of the two shows it first.
+            let beside = slots.right.filter(|_| cameras).unwrap_or(0.0);
+            let default = ((ui.available_width() - beside) * 0.18)
                 .clamp(*LIST_DEFAULT_WIDTH.start(), *LIST_DEFAULT_WIDTH.end());
             egui::SidePanel::left(egui::Id::new(("shots_list", view)))
                 .resizable(true)
@@ -3607,10 +3634,10 @@ impl FlighthookApp {
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
-            .show_inside(ui, |ui| match view {
-                ShotsView::Table => self.render_shots_table(ui),
-                ShotsView::Cards if cameras => self.render_cameras_pane(ui),
-                ShotsView::Cards => self.render_shot_cards(ui),
+            .show_inside(ui, |ui| match layout {
+                ShotsLayout::Table => self.render_shots_table(ui),
+                ShotsLayout::Cameras => self.render_cameras_pane(ui),
+                ShotsLayout::Cards => self.render_shot_cards(ui),
             });
         self.render_replay(ui.ctx());
     }
@@ -3659,7 +3686,7 @@ impl FlighthookApp {
                 self.device_filter = device;
                 ui.add_space(12.0);
             }
-            if self.shots_view.shows_simulated_legend() {
+            if self.shots_layout().view().shows_simulated_legend() {
                 ui.add_space(12.0);
                 ui.label(
                     egui::RichText::new("italic = simulated")
@@ -3806,11 +3833,11 @@ impl FlighthookApp {
         HeaderClick { back, replay }
     }
 
-    /// The Cards view's shot list: the count line and the view selector on
-    /// top; one entry per shot, newest first, under the view's headers,
-    /// scrolling in the middle; and, outside the view `none`, the hint line
-    /// and New set / New session pinned at the foot. Clicking an entry
-    /// shows that shot.
+    /// The shot list of the Cards view and the Cameras pane: the count line
+    /// and the view selector on top; one entry per shot, newest first,
+    /// under the view's headers, scrolling in the middle; and, outside the
+    /// view `none`, the hint line and New set / New session pinned at the
+    /// foot. Clicking an entry shows that shot.
     fn render_shot_list(&mut self, ui: &mut egui::Ui) {
         let inset = f32::from(GLOW_WIDTH);
         ui.allocate_ui_with_layout(

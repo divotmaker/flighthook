@@ -90,7 +90,7 @@ the clip goes on from the start point. With Loop off it stops at the end, and
 play restarts from the start point; drag the scrubber to reach the start of
 the clip. Each camera has a download icon next to its name for its clip.
 
-The Cards view's **Cameras** pane plays the shot's clips too, in the page
+The Shots tab's **Cameras** pane plays the shot's clips too, in the page
 rather than over it (see [Cameras pane](#cameras-pane)).
 
 In the Cards view, each connected camera can also have a card beside the
@@ -106,16 +106,18 @@ slower show every frame.
 ## Cameras pane
 
 **Beta.** With at least one camera added (on Windows or Linux), the Shots
-tab's Cards view gets a **Data | Cameras** switch at the start of the
-toolbar. **Data** is the shot's numbers, cards and charts. **Cameras** gives
-the whole page right of the shot list to the cameras. The choice is kept on
-this computer or browser. Next to it, **Data** has the Cards | Table switch
-and **Cameras** a **Live** switch in its place; your Cards | Table choice is
-kept for when you switch back. The Table view has no Data | Cameras switch;
-its Replay column stays.
+tab gets a **Data | Cameras** switch at the start of the toolbar, in both
+the Cards and the Table view. **Data** is the shots' numbers and charts, in
+the Cards or Table view. **Cameras** shows the shot list on the left and
+gives the whole page right of it to the cameras, the same from either view.
+The choice is kept on this computer or browser. Next to it, **Data** has the
+Cards | Table switch and **Cameras** a **Live** switch in its place; your
+Cards | Table choice is kept for when you switch back, so picking **Data**
+from Table returns to Table. In Table, each row's Replay button still opens
+the replay over the page.
 
 Each time the Cameras pane comes up (you pick **Cameras**, or come back to
-the Shots tab or the Cards view with Cameras picked), it shows the latest
+the Shots tab with Cameras picked), it shows the latest
 shot, or Live when there is no shot yet (under the device filter, when one
 is set). Clearing the shot history while it shows turns Live on.
 

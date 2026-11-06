@@ -1,9 +1,9 @@
 //! The Shots tab's Cameras pane (beta): with body tracking (alpha), the
 //! golfer's skeleton over every camera's picture, and the golf numbers
-//! measured on it. The Cards view's right-hand pane switches between the
-//! shown shot's data and its cameras (the Data | Cameras toggle,
-//! [`ShotsPane`]); in the Cameras pane the toolbar's Live switch shows the
-//! cameras live.
+//! measured on it. The Shots tab switches between the shots' data (in the
+//! Cards or Table view) and the shown shot's cameras (the Data | Cameras
+//! toggle, [`ShotsPane`]); in the Cameras pane the toolbar's Live switch
+//! shows the cameras live.
 //!
 //! - **A shot:** its clips play inline, side by side, with the replay's
 //!   transport controls ([`replay`]); under each, that camera's swing
@@ -35,7 +35,7 @@ use egui::{Key, KeyboardShortcut, Modifiers};
 
 use crate::app::{FlighthookApp, new_actor};
 use crate::net::{LiveReply, PoseState};
-use crate::panels::shots::ShotsView;
+use crate::panels::shots::{ShotsLayout, ShotsView};
 use crate::panels::{Tab, devices, monitoring, replay, shots, signs};
 use crate::replay::decode;
 use crate::theme;
@@ -61,7 +61,7 @@ const TITLE_H: f32 = 40.0;
 const TILES_H: f32 = 52.0;
 /// Tallest a shot's clips get, as a share of the pane's height.
 const PLAYER_SHARE: f32 = 0.62;
-/// Where the Cards view's pane choice is kept on this device.
+/// Where the Shots tab's pane choice is kept on this device.
 const PANE_KEY: &str = "shots_pane";
 /// Shown for a number that was not measured.
 const NONE: &str = "\u{2014}";
@@ -475,13 +475,26 @@ impl FlighthookApp {
         self.cameras_supported && !self.settings.saved_cameras().is_empty()
     }
 
-    /// Whether the Cameras pane is on screen: the Shots tab's Cards view,
-    /// with cameras, showing Live or a shot's cameras.
+    /// Whether the Cameras pane is on screen: the Shots tab with cameras
+    /// and Cameras chosen, in either view, showing Live or a shot's
+    /// cameras.
     pub(crate) fn cameras_pane_shown(&self) -> bool {
         self.active_tab == Tab::Shots
-            && self.shots_view == ShotsView::Cards
             && self.cameras_shown()
             && self.shots_pane == ShotsPane::Cameras
+    }
+
+    /// What the Shots tab lays out: the Cameras pane while it is chosen
+    /// ([`FlighthookApp::cameras_pane_shown`]), else the Data pane in the
+    /// Cards | Table choice.
+    pub(crate) fn shots_layout(&self) -> ShotsLayout {
+        if self.cameras_pane_shown() {
+            return ShotsLayout::Cameras;
+        }
+        match self.shots_view {
+            ShotsView::Cards => ShotsLayout::Cards,
+            ShotsView::Table => ShotsLayout::Table,
+        }
     }
 
     /// Whether the live views are on screen.
@@ -510,8 +523,8 @@ impl FlighthookApp {
     }
 
     /// Each time the Cameras pane comes on screen (Cameras clicked, the
-    /// Shots tab or the Cards view shown again with Cameras chosen, or the
-    /// shot history cleared while it shows): Live when there is no shot to
+    /// Shots tab shown again with Cameras chosen, or the shot history
+    /// cleared while it shows): Live when there is no shot to
     /// show under the device filter, else the latest shot, any pin dropped.
     /// Called before anything reads the pane's state in a frame; a call
     /// with no change does nothing.
@@ -957,10 +970,10 @@ pub(crate) type LiveViews = HashMap<String, LiveView>;
 // The pane toggle
 // ---------------------------------------------------------------------------
 
-/// What the Cards view's right-hand pane shows.
+/// What the Shots tab shows under the toolbar.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ShotsPane {
-    /// The shot's numbers, cards and charts.
+    /// The shots' numbers and charts, in the Cards | Table choice.
     #[default]
     Data,
     /// The shot's clips and swing analysis.
@@ -995,10 +1008,10 @@ impl ShotsPane {
 }
 
 impl FlighthookApp {
-    /// The toolbar's Data | Cameras toggle, while the Cards view has
+    /// The toolbar's Data | Cameras toggle, in both views while there are
     /// cameras ([`FlighthookApp::cameras_shown`]).
     pub(crate) fn render_pane_toggle(&mut self, ui: &mut egui::Ui) -> bool {
-        if self.shots_view != ShotsView::Cards || !self.cameras_shown() {
+        if !self.cameras_shown() {
             return false;
         }
         let selected = ShotsPane::ALL
@@ -1963,13 +1976,17 @@ mod tests {
         ] {
             let mut app = app(cameras, supported);
             assert_eq!(app.cameras_shown(), shown, "{cameras:?} {supported}");
-            let marks = screen.frame(&mut app, Vec::new());
-            assert_eq!(
-                marks.contains_key("pane_toggle"),
-                shown,
-                "{cameras:?} {supported}"
-            );
-            assert!(!marks.contains_key("live_toggle"), "not in the Data pane");
+            for view in [ShotsView::Table, ShotsView::Cards] {
+                app.shots_view = view;
+                let marks = screen.frame(&mut app, Vec::new());
+                assert_eq!(
+                    marks.contains_key("pane_toggle"),
+                    shown,
+                    "{view:?} {cameras:?} {supported}"
+                );
+                assert!(marks.contains_key("view_toggle"), "{view:?}");
+                assert!(!marks.contains_key("live_toggle"), "not in the Data pane");
+            }
             app.set_shots_pane(ShotsPane::Cameras);
             let marks = screen.frame(&mut app, Vec::new());
             assert_eq!(
@@ -1991,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn the_toggle_follows_the_view_pills_and_the_table_has_none() {
+    fn the_toggle_leads_the_toolbar_in_both_views() {
         let screen = Screen::new();
         let mut app = app(&[0], true);
         let marks = screen.frame(&mut app, Vec::new());
@@ -2005,14 +2022,23 @@ mod tests {
         let selector = marks["view_selector"].0;
         assert!(selector.top() > toggle.bottom());
         assert!(selector.right() < 400.0, "on the left");
-        // The Table view: no toggle, no Live, with Cameras chosen too.
-        app.set_shots_pane(ShotsPane::Cameras);
+        // The Table view: the same toggle in the same place, Cards | Table
+        // after it, no shot list and no Live.
+        let view = marks["view_toggle"].0;
         app.shots_view = ShotsView::Table;
         let marks = screen.frame(&mut app, Vec::new());
-        assert!(!marks.contains_key("pane_toggle"));
+        assert_eq!(marks["pane_toggle"].0, toggle);
+        assert_eq!(marks["view_toggle"].0, view);
+        assert!(!marks.contains_key("view_selector"));
         assert!(!marks.contains_key("live_toggle"));
-        assert!(!marks.contains_key("live_entry"));
         assert!(!app.cameras_pane_shown());
+        // Cameras chosen in the Table view shows the Cameras pane.
+        app.set_shots_pane(ShotsPane::Cameras);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(app.cameras_pane_shown());
+        assert!(marks.contains_key("live_toggle"));
+        assert!(!marks.contains_key("view_toggle"));
+        assert!(marks.contains_key("view_selector"));
     }
 
     #[test]
@@ -2068,11 +2094,83 @@ mod tests {
 
         assert!(!marks.contains_key("live_toggle"));
 
-        // The Table view has no pane toggle: Cards | Table leads.
+        // The Table view: Data | Cameras still leads, Cards | Table follows
+        // it where it is in the Cards view.
         app.shots_view = ShotsView::Table;
         let marks = screen.frame(&mut app, Vec::new());
-        assert!(!marks.contains_key("pane_toggle"));
-        assert!((marks["view_toggle"].0.left() - pane.left()).abs() < 1.0);
+        assert_eq!(marks["pane_toggle"].0, pane);
+        assert_eq!(marks["view_toggle"].0, view);
+    }
+
+    /// Cameras picked from the Table view gives the screen it gives from
+    /// the Cards view: the shot list, the Cameras pane and the Live switch
+    /// in the Cards | Table slot. Data brings the Table view back.
+    #[test]
+    fn cameras_from_the_table_view_is_the_cameras_pane_of_the_cards_view() {
+        let from = |view: ShotsView| {
+            let screen = Screen::new();
+            let mut app = app_with_shots(3);
+            app.shots_view = view;
+            let marks = screen.frame(&mut app, Vec::new());
+            let before = (marks["pane_toggle"].0, marks["view_toggle"].0);
+            assert_eq!(
+                marks.contains_key("view_selector"),
+                view == ShotsView::Cards,
+                "the shot list only in the Cards view"
+            );
+            screen.click(&mut app, marks["pane:cameras"].0.center());
+            let marks = screen.frame(&mut app, Vec::new());
+            let texts = screen.texts();
+            (screen, app, marks, texts, before)
+        };
+        let (_, _, cards, cards_texts, _) = from(ShotsView::Cards);
+        let (screen, mut app, table, table_texts, (pane, view)) = from(ShotsView::Table);
+
+        assert!(app.cameras_pane_shown());
+        assert_eq!(app.shots_layout(), ShotsLayout::Cameras);
+        assert_eq!(app.shots_view, ShotsView::Table, "the choice is kept");
+        assert!(!table.contains_key("view_toggle"));
+        assert!(table.contains_key("view_selector"), "the shot list");
+        assert!(!app.live_selected);
+        assert_eq!(app.shown_index(), Some(2), "the latest shot");
+        for mark in [
+            "pane_toggle",
+            "live_toggle",
+            "view_selector",
+            "shot_entry:0",
+        ] {
+            assert_eq!(table[mark].0, cards[mark].0, "{mark}");
+        }
+        assert_eq!(table.len(), cards.len());
+        assert_eq!(table_texts, cards_texts, "the same screen");
+
+        // Data: the Table view again, Cards | Table where it was.
+        screen.click(&mut app, table["pane:data"].0.center());
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!app.cameras_pane_shown());
+        assert_eq!(app.shots_layout(), ShotsLayout::Table);
+        assert_eq!(app.shots_view, ShotsView::Table);
+        assert_eq!(marks["pane_toggle"].0, pane);
+        assert_eq!(marks["view_toggle"].0, view);
+        assert!(!marks.contains_key("live_toggle"));
+        assert!(!marks.contains_key("view_selector"), "no shot list");
+    }
+
+    /// A kept Cameras choice opens on the Cameras pane in the Table view.
+    #[test]
+    fn a_kept_cameras_choice_opens_the_cameras_pane_in_the_table_view() {
+        let screen = Screen::new();
+        app(&[0], true).set_shots_pane(ShotsPane::Cameras);
+        let mut app = app(&[0], true);
+        app.shots_pane = ShotsPane::stored();
+        app.shots_view = ShotsView::Table;
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(app.cameras_pane_shown());
+        assert!(app.live_selected, "no shots: Live");
+        assert!(marks.contains_key("live_toggle"));
+        assert!(marks.contains_key("live_title"));
+        assert!(!marks.contains_key("view_toggle"));
+        app.set_shots_pane(ShotsPane::Data);
     }
 
     #[test]
@@ -2148,17 +2246,14 @@ mod tests {
         assert!(!marks.contains_key("live_title"));
         assert_eq!(app.shown_index(), Some(2));
 
-        // ... and Table -> Cards.
+        // ... and Data -> Cameras in the Table view.
         app.select_shot(0);
+        app.set_shots_pane(ShotsPane::Data);
         app.shots_view = ShotsView::Table;
-        screen.frame(&mut app, Vec::new());
-        app.select_live();
-        assert!(!app.cameras_pane_shown(), "no Live in the Table view");
         let marks = screen.frame(&mut app, Vec::new());
-        let view = marks["view_toggle"].0;
-        let cards = egui::pos2(view.left() + view.width() / 4.0, view.center().y);
-        screen.click(&mut app, cards);
-        assert_eq!(app.shots_view, ShotsView::Cards);
+        assert!(!app.cameras_pane_shown());
+        screen.click(&mut app, marks["pane:cameras"].0.center());
+        assert_eq!(app.shots_view, ShotsView::Table);
         assert!(app.cameras_pane_shown());
         assert!(!app.live_selected);
         assert_eq!(app.shown_index(), Some(2), "pin dropped");
@@ -2341,8 +2436,8 @@ mod tests {
         app.active_tab = Tab::Shots;
         screen.frame(&mut app, Vec::new());
         assert!(app.live["camera.0"].id > id);
-        // The Table view drops them too.
-        app.shots_view = ShotsView::Table;
+        // The Data pane drops them too.
+        app.set_shots_pane(ShotsPane::Data);
         screen.frame(&mut app, Vec::new());
         assert!(app.live.is_empty());
     }

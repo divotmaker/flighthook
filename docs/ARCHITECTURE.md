@@ -1200,20 +1200,26 @@ the time is the frame's host time less the camera's latency
 The still slot and its route are separate and unchanged by watching.
 
 The **Cameras pane** (`ui/src/panels/cameras.rs`) is part of the Shots
-tab's Cards view, shown when the server can record from cameras
-(`cameras_supported`, as for the Devices tab's Cameras (+)) and the saved
-config has a camera (`FlighthookApp::cameras_shown`). The toolbar gets a
-**Data | Cameras** switch as its first control (`ShotsPane`, kept in local
-UI storage under `shots_pane`). Right of it the Cards | Table switch shows
-while Data is showing; while the Cameras pane shows (`cameras_pane_shown`)
-an on/off **Live** switch takes its slot (`render_live_toggle`,
-`theme::switch_pill`, `live_selected`). With Cameras picked the pane takes
-everything right of the shot list: the Dispersion column and the bottom
-chart row are not laid out, and the card row's camera clips are dropped.
-Live is part of the Cameras pane: picking Data leaves Live, picking a shot
-leaves Live, turning Live off shows the shot the list shows, and a new shot
-keeps Live (the newest shot is selected underneath, as in Data). The Table
-view has neither switch.
+tab, shown when the server can record from cameras (`cameras_supported`,
+as for the Devices tab's Cameras (+)) and the saved config has a camera
+(`FlighthookApp::cameras_shown`). The toolbar gets a **Data | Cameras**
+switch as its first control in both views (`ShotsPane`, kept in local UI
+storage under `shots_pane`): Data | Cameras is the parent, Cards | Table
+the way Data is shown. Right of it the Cards | Table switch shows while
+Data is showing; while the Cameras pane shows (`cameras_pane_shown`) an
+on/off **Live** switch takes its slot (`render_live_toggle`,
+`theme::switch_pill`, `live_selected`) and the Cards | Table choice is kept
+for Data. One helper says what the tab lays out,
+`FlighthookApp::shots_layout` -> `ShotsLayout` `Cards | Table | Cameras`
+(Cameras whenever the pane is chosen, whatever the view); the panel, the
+toolbar's legend and the card clips all go by it. With Cameras picked the
+pane takes everything right of the Cards view's shot list (the list keeps
+the Cards view's panel and default width, so the screen is the same from
+either view): the Dispersion column and the bottom chart row are not laid
+out, and the card row's camera clips are dropped. Live is part of the
+Cameras pane: picking Data leaves Live, picking a shot leaves Live, turning
+Live off shows the shot the list shows, and a new shot keeps Live (the
+newest shot is selected underneath, as in Data).
 
 Each time the pane comes on screen (`sync_cameras_pane`, comparing with
 `cameras_pane_was_shown`; called at the start of each update, in the
@@ -1293,8 +1299,9 @@ the pane as not shown, so a pane on screen turns Live on.
   frame is decoded (`ensure_huffman` + zune-jpeg) into the view's texture on
   the next update, and only a frame asks for a repaint. A failed request
   waits 1 s. The views exist only while Live is on screen (the Shots tab,
-  the Cards view, Live on, the window not minimised, not a hidden
-  browser tab); otherwise they are dropped and their late replies ignored.
+  the Cameras pane in either view, Live on, the window not minimised, not a
+  hidden browser tab); otherwise they are dropped and their late replies
+  ignored.
   A camera that is not Connected shows its Devices card's badge and `error`
   instead of a picture. Each picture carries the skeleton of the pose that
   came with it, and under it the posture tiles of the camera's view from the
@@ -2387,7 +2394,8 @@ values immediately.
 
 ```
   [Data|Cameras]  [Cards|Table]  DEVICE [All|Mevo+|Omni]                 [export] [trash]
-  (cameras only)  (not in Cameras) (2+ devices)                          (JSONL | CSV menu)
+  (cameras only,  (Data only;      (2+ devices)                          (JSONL | CSV menu)
+   both views)     Cameras: Live)
 
   Layout: the charts are always shown, sized from the window (not resizable)
 
@@ -2452,10 +2460,10 @@ values immediately.
   +--------------------------------------------+
 ```
 
-A toolbar (the Data | Cameras switch when cameras are configured, the
-Cards | Table switch, which Cameras hides, the device filter, the export icon
-and Clear history) sits above both views. Only
-Table adds the "italic = simulated" legend, since only Table draws simulated
+A toolbar (the Data | Cameras switch when cameras are configured, in both
+views, the Cards | Table switch, which Cameras hides, the device filter, the
+export icon and Clear history) sits above both views. Only
+the Table view's Data pane adds the "italic = simulated" legend, since only Table draws simulated
 values in italics (`ShotsView::shows_simulated_legend`). The chosen view
 (`ShotsView` in `panels/shots.rs`) lasts for the session and is not saved.
 
