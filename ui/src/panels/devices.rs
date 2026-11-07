@@ -3244,6 +3244,38 @@ mod tests {
         assert!(!app.settings.global_dirty);
     }
 
+    #[test]
+    fn the_replay_card_saves_the_shot_cards_checkbox() {
+        let screen = Screen::new();
+        let mut app = app();
+        let saved = app.settings.to_request();
+        app.settings.load_from(&saved);
+        // As loaded: on.
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(app.settings.replay.shot_cards);
+        assert!(!marks.contains_key("save:replay"));
+        // Unticked: saved with the global settings; the shown cards follow
+        // the saved setting.
+        let marks = screen.click_mark(&mut app, &marks, "replay_shot_cards");
+        assert!(!app.settings.replay.shot_cards);
+        assert!(enabled(&marks, "save:replay"));
+        assert!(!app.settings.build_global_request().replay.shot_cards);
+        assert!(app.settings.shot_cards_enabled(), "not saved yet");
+        let mut off = app.settings.build_global_request();
+        app.settings.global_dirty = false;
+        app.settings.load_from(&off);
+        assert!(!app.settings.replay.shot_cards);
+        assert!(!app.settings.shot_cards_enabled());
+        // Ticked again and saved.
+        let marks = screen.frame(&mut app, Vec::new());
+        let _ = screen.click_mark(&mut app, &marks, "replay_shot_cards");
+        assert!(app.settings.build_global_request().replay.shot_cards);
+        off.replay.shot_cards = true;
+        app.settings.global_dirty = false;
+        app.settings.load_from(&off);
+        assert!(app.settings.shot_cards_enabled());
+    }
+
     // ----- Fixed-height cards and Reconnect -----
 
     /// Every card on the Devices tab, in card order.

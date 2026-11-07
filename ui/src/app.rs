@@ -882,11 +882,15 @@ impl FlighthookApp {
     }
 
     /// The camera cards hold their clips only while the card row can be on
-    /// screen: on the Shots tab's Cards view, showing the shot's data.
-    /// Elsewhere they are dropped, and fetched again when the row returns.
-    /// The Cameras pane's player likewise lives only while it shows a shot.
+    /// screen: on the Shots tab's Cards view, showing the shot's data, with
+    /// the camera cards on in the settings. Elsewhere they are dropped, and
+    /// fetched again when the row returns. The Cameras pane's player
+    /// likewise lives only while it shows a shot.
     pub(crate) fn drop_hidden_card_clips(&mut self) {
-        if self.active_tab != Tab::Shots || self.shots_layout() != ShotsLayout::Cards {
+        if self.active_tab != Tab::Shots
+            || self.shots_layout() != ShotsLayout::Cards
+            || !self.settings.shot_cards_enabled()
+        {
             self.card_clips.clear();
         }
         if !self.cameras_pane_shown() || self.live_selected {

@@ -4235,9 +4235,15 @@ impl FlighthookApp {
         let set = bar_group(&self.groups, Some(&self.shots[i]), self.selected_club);
         // A handful of ids, copied so the borrow of `self` ends here.
         let devices = self.devices().into_owned();
-        // The sources of the cards beside the bars, in cycle order.
+        // The sources of the cards beside the bars, in cycle order: no
+        // cameras while the settings hide the camera cards.
         let face = show_bars && self.shots.iter().any(impact::has_impact);
-        let sources = card_row::sources(self.connected_cameras(), face);
+        let cameras = if self.settings.shot_cards_enabled() {
+            self.connected_cameras()
+        } else {
+            Vec::new()
+        };
+        let sources = card_row::sources(cameras, face);
         let (face_panel, bars, title) = {
             let members = self.view_members.peek(&key).map_or(&[][..], Vec::as_slice);
             // With every device shown, two or more split the bands by device.
@@ -9119,6 +9125,67 @@ mod tests {
         assert!(!app.card_clips.is_empty());
         app.clear_shot_history();
         assert!(app.card_clips.is_empty());
+    }
+
+    #[test]
+    fn the_shot_cards_setting_shows_or_drops_the_camera_cards() {
+        use card_row::CardSource::{Camera, Stats};
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let window = egui::vec2(1600.0, 900.0);
+        let mut app = with_cameras(cards_app());
+        app.active_tab = crate::panels::Tab::Shots;
+        let last = app.shots.len() - 1;
+        app.shots[last].video = vec![clip("camera.0"), clip("camera.1")];
+        app.shots_rev += 1;
+        let set = |app: &mut FlighthookApp, on: bool| {
+            let mut saved = app.settings.to_request();
+            saved.replay.shot_cards = on;
+            app.settings.load_from(&saved);
+            assert_eq!(app.settings.shot_cards_enabled(), on);
+        };
+        let settle = |app: &mut FlighthookApp| {
+            for _ in 0..3 {
+                app.drop_hidden_card_clips();
+                shots_frame(&ctx, app, window);
+            }
+        };
+        let camera_names = |app: &mut FlighthookApp| {
+            let texts = painted_texts(&shots_frame(&ctx, app, window).shapes);
+            ["FACE-ON", "DOWN THE LINE"].map(|n| texts.iter().any(|(t, _)| t == n))
+        };
+        // On, the default: the camera cards as before, each with its clip.
+        assert!(app.settings.shot_cards_enabled());
+        settle(&mut app);
+        let both = [Stats, Camera("camera.0".into()), Camera("camera.1".into())];
+        assert_eq!(app.card_row.shown, both);
+        assert_eq!(app.card_clips.len(), 2);
+        assert!(app.card_clips["camera.0"].shows(&app.shots[last].shot_id));
+        assert_eq!(camera_names(&mut app), [true, true]);
+        // Off: the stats card alone, no clips held or decoding.
+        set(&mut app, false);
+        settle(&mut app);
+        assert_eq!(app.card_row.shown, [Stats]);
+        assert!(app.card_clips.is_empty());
+        assert_eq!(camera_names(&mut app), [false, false]);
+        assert_eq!(row_cards(&ctx).len(), 1);
+        // Another shot with clips picked while off: still none.
+        app.shots[3].video = vec![clip("camera.0")];
+        app.shots_rev += 1;
+        app.select_shot(3);
+        settle(&mut app);
+        assert!(app.card_clips.is_empty());
+        // The clips are still there to replay.
+        app.open_replay(&ctx, 3);
+        assert!(app.replay.is_some());
+        app.replay = None;
+        // On again: the cards come back for the shown shot.
+        set(&mut app, true);
+        settle(&mut app);
+        assert_eq!(app.card_row.shown, both);
+        assert_eq!(app.card_clips.len(), 1, "only camera.0 has a clip of #3");
+        assert!(app.card_clips["camera.0"].shows(&app.shots[3].shot_id));
+        assert_eq!(camera_names(&mut app), [true, true]);
     }
 
     #[test]

@@ -910,6 +910,7 @@ pub(crate) struct ReplayForm {
     pub(crate) pre_roll_s: String,
     pub(crate) post_roll_s: String,
     pub(crate) start_before_impact_s: String,
+    pub(crate) shot_cards: bool,
     loaded: ReplaySection,
 }
 
@@ -926,6 +927,7 @@ impl ReplayForm {
             pre_roll_s: format_distance_value(s.pre_roll_s),
             post_roll_s: format_distance_value(s.post_roll_s),
             start_before_impact_s: format_distance_value(s.start_before_impact_s),
+            shot_cards: s.shot_cards,
             loaded: s.clone(),
         }
     }
@@ -966,6 +968,7 @@ impl ReplayForm {
                 self.loaded.start_before_impact_s,
             )?,
             clip_dir: self.loaded.clip_dir.clone(),
+            shot_cards: self.shot_cards,
         };
         s.error().is_none().then_some(s)
     }
@@ -1673,6 +1676,14 @@ impl SettingsForm {
         self.original_config
             .as_ref()
             .is_some_and(|c| c.simulation.auto_chip)
+    }
+
+    /// Whether the saved settings show the camera cards in the Shots tab's
+    /// card row. True until the settings have loaded, as the default is.
+    pub(crate) fn shot_cards_enabled(&self) -> bool {
+        self.original_config
+            .as_ref()
+            .is_none_or(|c| c.replay.shot_cards)
     }
 
     /// The saved `[body_tracking]` settings in effect (defaults until the
@@ -3536,6 +3547,12 @@ impl FlighthookApp {
                 field_error(ui, "0 to 10 s");
             }
         }
+        ui.horizontal(|ui| {
+            field_indent(ui);
+            let check = ui.checkbox(&mut replay.shot_cards, "Show video on shot cards");
+            devices::mark(ui, || "replay_shot_cards".to_owned(), &check);
+            changed |= check.changed();
+        });
         let folder = replay
             .clip_dir()
             .map(str::to_owned)

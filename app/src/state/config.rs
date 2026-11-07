@@ -1238,6 +1238,32 @@ full_monitor = "mevo.0"
     }
 
     #[test]
+    fn shot_cards_read_on_without_the_key_and_off_as_written() {
+        // A config without the key: the camera cards show and the file is
+        // left byte-identical, with no backup.
+        let replay = "[replay]\nkeep_shots = 5\npre_roll_s = 4.0\npost_roll_s = 1.5\nstart_before_impact_s = 2.0\n";
+        for src in [
+            GOLDEN_DEFAULT_TOML.to_owned(),
+            format!("{GOLDEN_DEFAULT_TOML}\n{replay}"),
+        ] {
+            let (dir, path) = config_dir(&src);
+            let loaded = load(&path).0;
+            assert!(loaded.replay.shot_cards, "{src}");
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), src);
+            assert_eq!(files(&dir.0), ["config.toml"]);
+        }
+        // Off: loaded and left as written; a change is read live.
+        let src = format!("{GOLDEN_DEFAULT_TOML}\n{replay}shot_cards = false\n");
+        let (dir, path) = config_dir(&src);
+        let cfg = SystemConfig::new(path.clone());
+        assert!(!cfg.replay().shot_cards);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), src);
+        assert_eq!(files(&dir.0), ["config.toml"]);
+        cfg.update(|c| c.replay.shot_cards = true);
+        assert!(cfg.replay().shot_cards);
+    }
+
+    #[test]
     fn a_body_tracking_mode_loads_byte_identical_and_the_older_switch_becomes_one() {
         use flighthook::BodyTrackingMode;
         // Without the section (Off, the default), and with a mode other

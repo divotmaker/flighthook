@@ -322,6 +322,8 @@ it.
 
 A **camera card** (beta) loops the shown shot's clip from that camera,
 cropped to fill the card, from shortly before impact to the clip end.
+**Show video on shot cards** on the Devices tab's Replay card turns the
+camera cards on or off (on by default).
 
 When any shot in the history has a face impact reading (Square Golf Omni,
 Open Connect monitors that send it), a **face impact** card (beta) joins the

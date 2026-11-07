@@ -54,6 +54,7 @@ keep_shots = 20          # clips kept on disk, newest first
 pre_roll_s = 4.0         # seconds before the estimated impact, 0 to 10
 post_roll_s = 1.5        # seconds after the shot is reported, 0 to 10
 start_before_impact_s = 2.0  # where a replay starts, before the estimated impact, 0 to 10
+shot_cards = true        # camera cards in the Shots tab's Cards view
 # clip_dir = "D:/swings" # default: flighthook/clips in your local data folder
 ```
 
@@ -96,7 +97,9 @@ rather than over it (see [Cameras pane](#cameras-pane)).
 In the Cards view, each connected camera can also have a card beside the
 range bars, when the window has room (click a card to cycle what it shows).
 It loops the shown shot's clip from that camera at 1×, cropped to fill the
-card, from the same start point to the end of the clip.
+card, from the same start point to the end of the clip. Untick **Show video
+on shot cards** on the Replay card (`shot_cards = false`) to leave the camera
+cards out of the row; the clips are still recorded and replayable.
 
 The browser fetches only the frames around the playhead, so a phone can
 replay a long 120 fps clip. At 1× a phone may not decode every frame of a

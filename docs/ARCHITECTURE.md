@@ -54,7 +54,7 @@ address = "127.0.0.1:921"
 - `[camera.<idx>]` -- swing camera (beta): records a clip of every shot (see
   [Cameras and replay](#cameras-and-replay-beta))
 - `[webserver.<idx>]` -- web server instance
-- `[replay]` -- global camera clip settings (beta: `keep_shots`, `pre_roll_s`, `post_roll_s`, `start_before_impact_s`, `clip_dir`), omitted at its defaults
+- `[replay]` -- global camera clip settings (beta: `keep_shots`, `pre_roll_s`, `post_roll_s`, `start_before_impact_s`, `clip_dir`, `shot_cards`), omitted at its defaults
   like `[simulation]`
 - `[body_tracking]` -- body tracking on the cameras' pictures (alpha:
   `mode`, `model`, `min_score`, `smoothing`, `detect_every`,
@@ -201,7 +201,7 @@ pub struct FlighthookConfig {
     pub camera: HashMap<String, CameraSection>,
 }
 
-pub struct ReplaySection { pub keep_shots: u32, pub pre_roll_s: f64, pub post_roll_s: f64, pub start_before_impact_s: f64, pub clip_dir: Option<String> }  // 20, 4.0, 1.5, 2.0, None
+pub struct ReplaySection { pub keep_shots: u32, pub pre_roll_s: f64, pub post_roll_s: f64, pub start_before_impact_s: f64, pub clip_dir: Option<String>, pub shot_cards: bool }  // 20, 4.0, 1.5, 2.0, None, true (written only when false)
 pub struct CameraSection { pub name: String, pub camera: String, pub camera_name: Option<String>, pub position: CameraPosition, pub mode: String }  // mode "auto" | "WxH@fps"
 pub enum CameraPosition { TargetLine, GolferFront, GolferBack, Overhead }  // default GolferFront
 pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface, pub auto_chip: bool }  // auto_chip default false
@@ -2301,7 +2301,8 @@ displayed).
   clips in the Cameras pane, Live in Live mode, Replay); its Cancel leaves
   the mode as it is. No hover text
 - The Replay card (beta, General) holds `[replay]`: Keep clips, Pre-roll,
-  Post-roll and Start before impact in seconds, and the clip folder,
+  Post-roll and Start before impact in seconds, a **Show video on shot
+  cards** checkbox (`shot_cards`), and the clip folder,
   read-only (`/api/status` `clip_dir`). It saves and cancels with the Global and Simulation cards
   (`scope=global`), and its fields are checked like the server's
   (`ReplaySection::error`)
@@ -2859,7 +2860,12 @@ fetch and decode again when the row returns. While it plays a card asks for
 a repaint when its next kept frame is due (`request_repaint_after`), never sooner
 than 1/60 s, so a faster camera skips frames to keep its time; it asks none
 while the replay view is open. A click cycles the card; the shot header's
-Replay chip opens the replay.
+Replay chip opens the replay. With `[replay] shot_cards` false in the saved
+settings (`SettingsForm::shot_cards_enabled`, true until they load) the row's
+sources hold no cameras, so it lays out as with no camera connected, and
+`drop_hidden_card_clips` drops every card's clip; recording, the Cameras pane
+and the replay view are unchanged. Turned on again, the cards return for the
+shown shot.
 
 **Face impact** (`ui/src/panels/impact.rs`) is a source of the card row. It draws the shown
 shot's club face, face-on as the ball sees it: a right-hander's toe on the

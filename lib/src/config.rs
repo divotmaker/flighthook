@@ -469,6 +469,11 @@ pub struct ReplaySection {
     /// the user's local data folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip_dir: Option<String>,
+    /// The Shots tab's Cards view shows camera cards that loop the shown
+    /// shot's clip. Off, the card row has no camera cards; clips are still
+    /// recorded and replayed. Defaults to true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub shot_cards: bool,
 }
 
 fn default_keep_shots() -> u32 {
@@ -495,6 +500,7 @@ impl Default for ReplaySection {
             post_roll_s: Self::DEFAULT_POST_ROLL_S,
             start_before_impact_s: Self::DEFAULT_START_BEFORE_IMPACT_S,
             clip_dir: None,
+            shot_cards: true,
         }
     }
 }
@@ -2195,6 +2201,7 @@ mod openconnect_client_tests {
                 post_roll_s: 0.5,
                 start_before_impact_s: 1.5,
                 clip_dir: Some("/srv/clips".into()),
+                shot_cards: false,
             },
             body_tracking: BodyTrackingSection {
                 mode: BodyTrackingMode::Live,
@@ -2321,6 +2328,7 @@ mod camera_tests {
                 post_roll_s: 2.0,
                 start_before_impact_s: 3.5,
                 clip_dir: Some("D:/swings".into()),
+                shot_cards: false,
             },
             ..FlighthookConfig::default()
         };
@@ -2328,8 +2336,43 @@ mod camera_tests {
         assert_eq!(v["replay"]["keep_shots"], 50);
         assert_eq!(v["replay"]["start_before_impact_s"], 3.5);
         assert_eq!(v["replay"]["clip_dir"], "D:/swings");
+        assert_eq!(v["replay"]["shot_cards"], false);
         let back: FlighthookConfig = serde_json::from_value(v).expect("de");
         assert_eq!(back.replay, config.replay);
+    }
+
+    #[test]
+    fn shot_cards_default_on_and_are_written_only_when_off() {
+        // A section without the key: on, and written back without it.
+        for text in ["{}", r#"{"keep_shots":5}"#, r#"{"clip_dir":"D:/swings"}"#] {
+            let section: ReplaySection = serde_json::from_str(text).expect("de");
+            assert!(section.shot_cards, "{text}");
+            let json = serde_json::to_string(&section).expect("ser");
+            assert!(!json.contains("shot_cards"), "{json}");
+        }
+        assert!(ReplaySection::default().shot_cards);
+        let off = ReplaySection {
+            shot_cards: false,
+            ..ReplaySection::default()
+        };
+        assert!(!off.is_default());
+        assert_eq!(off.error(), None);
+        let config = FlighthookConfig {
+            replay: off.clone(),
+            ..FlighthookConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("ser");
+        assert!(json.contains(r#""shot_cards":false"#), "{json}");
+        let back: FlighthookConfig = serde_json::from_str(&json).expect("de");
+        assert_eq!(back.replay, off);
+        let on: ReplaySection = serde_json::from_str(r#"{"shot_cards":true}"#).expect("de");
+        assert!(on.is_default());
+        let config = FlighthookConfig {
+            replay: on,
+            ..FlighthookConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("ser");
+        assert!(!json.contains("replay"), "{json}");
     }
 
     #[test]
@@ -2377,6 +2420,7 @@ mod camera_tests {
             post_roll_s: ReplaySection::MAX_ROLL_S,
             start_before_impact_s: ReplaySection::MAX_START_BEFORE_IMPACT_S,
             clip_dir: None,
+            shot_cards: true,
         };
         assert!(edge.error().is_none());
         let zero = ReplaySection {

@@ -1345,6 +1345,7 @@ mod tests {
         body.replay.pre_roll_s = 2.0;
         body.replay.start_before_impact_s = 1.25;
         body.replay.clip_dir = Some("/srv/swings".into());
+        body.replay.shot_cards = false;
         run_config_command(
             &FlighthookEvent::ConfigCommand {
                 request_id: None,

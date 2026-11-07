@@ -1687,7 +1687,9 @@ Full persisted config (mirrors `config.toml`).
   launch monitors saw is one clip), `pre_roll_s` (default `4.0`) and
   `post_roll_s` (default `1.5`), each 0 to 10 seconds, `start_before_impact_s`
   (default `2.0`, 0 to 10 seconds: where a replay opens and restarts, that
-  long before the estimated impact), and an optional
+  long before the estimated impact), `shot_cards` (default `true`; `false`:
+  the UI's Cards view shows no camera cards, clips are still recorded; written
+  only when `false`), and an optional
   `clip_dir` (the folder clips go to; see `clip_dir` in
   [`GET /api/status`](#get-apistatus)). Omitted while at its defaults. The
   rolls apply from the next shot without restarting any camera, the start
