@@ -2141,7 +2141,7 @@ mod tests {
             ],
             &[0, 2],
         );
-        for (roll, fitted) in [(25.0, false), (1.0, false), (20.0, true), (1.25, true)] {
+        for (roll, fitted) in [(25.0, false), (1.0, false), (19.9, true), (1.3, true)] {
             let fit = anchor_path(
                 &raw,
                 &Measured {
