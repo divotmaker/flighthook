@@ -296,6 +296,10 @@ fn response_text(code: i32, message: &str) -> String {
 
 /// A shot sent to the simulator for the card: its number and the local time.
 fn last_shot_text(number: u32) -> String {
+    #[cfg(debug_assertions)]
+    if let Some(clock) = crate::screens::clock() {
+        return format!("#{number} at {clock}");
+    }
     format!("#{number} at {}", chrono::Local::now().format("%H:%M:%S"))
 }
 

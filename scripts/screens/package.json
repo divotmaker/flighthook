@@ -1,0 +1,12 @@
+{
+  "name": "flighthook-screens",
+  "private": true,
+  "description": "Regenerates the README screenshots (make screens)",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "1.48.0"
+  }
+}

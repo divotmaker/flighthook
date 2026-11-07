@@ -4,7 +4,9 @@
 //! A camera section whose `camera` is `clip:<path to an .avi>` plays that
 //! stance clip (its sidecar beside it) in a loop at its own pace, every
 //! frame stamped afresh on the host clock as it is delivered, so the actor
-//! records, goes live and tracks bodies on it as on a real camera.
+//! records, goes live and tracks bodies on it as on a real camera. With the
+//! screenshot grid on ([`crate::screens`]), each loop starts so that the
+//! clip's labelled impact lands on the grid, with no frames in between.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,6 +24,9 @@ pub struct LoopingClip {
     format: Format,
     /// Host time of the last frame delivered.
     last_ns: Option<u64>,
+    /// With the screenshot grid on: the grid step and the clip's labelled
+    /// impact (ns after its first frame), which every loop puts on the grid.
+    grid: Option<(u64, u64)>,
 }
 
 impl LoopingClip {
@@ -38,14 +43,30 @@ impl LoopingClip {
         let mut info = file.info().clone();
         info.id = format!("{PREFIX}{}", path.display());
         let format = file.format().clone();
+        let grid = crate::screens::grid_ns().map(|step| {
+            let impact = stance::read_sidecar(&path.with_extension("json"))
+                .map_or(0, |s| u64::try_from(s.impact_ns).unwrap_or(0));
+            (step, impact)
+        });
+        let file = match grid {
+            Some(grid) => file.with_origin(on_grid(stance::clock::now_ns(), grid)),
+            None => file,
+        };
         Ok(Self {
             path: path.to_owned(),
             file,
             info,
             format,
             last_ns: None,
+            grid,
         })
     }
+}
+
+/// The first loop start at or after `earliest` whose impact lands on the
+/// grid.
+fn on_grid(earliest: u64, (step, impact): (u64, u64)) -> u64 {
+    crate::screens::ceil_to(earliest.saturating_add(impact), step).saturating_sub(impact)
 }
 
 impl Source for LoopingClip {
@@ -57,6 +78,7 @@ impl Source for LoopingClip {
                 let origin = self
                     .last_ns
                     .map_or_else(stance::clock::now_ns, |t| t.saturating_add(period));
+                let origin = self.grid.map_or(origin, |grid| on_grid(origin, grid));
                 self.file = AviFile::open(&self.path, true)?.with_origin(origin);
                 self.file.next_frame(timeout).map(|f| self.seen(f))
             }
@@ -118,6 +140,19 @@ mod tests {
         }
         let files = stance::write_clip(dir, "camera.0", &clip.expect("clip")).expect("write");
         files.avi
+    }
+
+    #[test]
+    fn a_loop_on_the_grid_puts_its_impact_on_a_multiple_of_the_step() {
+        let step = 2_000_000_000;
+        let impact = 1_250_000_000;
+        assert_eq!(on_grid(0, (step, impact)), step - impact);
+        assert_eq!(on_grid(step - impact, (step, impact)), step - impact);
+        assert_eq!(
+            on_grid(step - impact + 1, (step, impact)),
+            2 * step - impact
+        );
+        assert_eq!(on_grid(5 * step, (step, 0)), 5 * step);
     }
 
     #[test]

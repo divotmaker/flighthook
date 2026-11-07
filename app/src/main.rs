@@ -16,6 +16,8 @@ mod autochip;
 mod bus;
 mod pose;
 mod raw_capture;
+#[cfg(debug_assertions)]
+mod screens;
 mod sim;
 mod state;
 

@@ -808,6 +808,8 @@ fn drain_bus(
                 if let FlighthookEvent::ShotTrigger { key } = &msg.event {
                     // Stamped on arrival: FRP triggers carry no time.
                     let at = clock::now_ns();
+                    #[cfg(debug_assertions)]
+                    let at = crate::screens::trigger_ns(at);
                     trigger(state, recorder, seen, &msg.actor, key, at);
                 }
             }

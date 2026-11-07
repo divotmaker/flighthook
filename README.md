@@ -652,6 +652,8 @@ To run with a mock device, point `--config` at a TOML file with
   unified bus, threading, state machine, settings UI design.
 - **[docs/API.md](docs/API.md)** — REST and WebSocket API reference for the web
   dashboard (`/api/status`, `/api/shots`, `/frp`, etc.).
+- **[docs/SCREENSHOTS.md](docs/SCREENSHOTS.md)** — `make screens` regenerates
+  the screenshots in this README; `make screens-check` checks they are current.
 
 ## Third-party
 

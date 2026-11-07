@@ -47,6 +47,20 @@ deploy: ui
 	scp target/$(WIN_TARGET)/release/flighthook.exe "$(host):$(dir)/"
 	$(if $(filter true,$(headless)),@echo "==> starting flighthook on $(host)" && ssh -t "$(host)" "cd $(dir) && flighthook.exe --headless $(args)")
 
+# README screenshots (docs/SCREENSHOTS.md): regenerate screens/*.png, or check
+# that they are up to date. `only=shots,cameras` runs just those scenes.
+SCREENS_ARGS := $(if $(only),--only $(only))
+
+screens: scripts/screens/node_modules
+	node scripts/screens/run.js $(SCREENS_ARGS)
+
+screens-check: scripts/screens/node_modules
+	node scripts/screens/run.js --check $(SCREENS_ARGS)
+
+scripts/screens/node_modules: scripts/screens/package.json scripts/screens/package-lock.json
+	cd scripts/screens && npm ci --no-audit --no-fund
+	@touch $@
+
 # Ensure Rust toolchain, wasm target, and trunk are installed
 buildtools:
 	@command -v cargo >/dev/null 2>&1 || { echo "Installing Rust via rustup..."; curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; }
@@ -73,4 +87,4 @@ clean:
 	cd app && cargo clean
 	rm -rf ui/dist
 
-.PHONY: build build-windows release ui test clippy lint run deploy stop clean buildtools publish
+.PHONY: build build-windows release ui test clippy lint run deploy stop clean buildtools publish screens screens-check
