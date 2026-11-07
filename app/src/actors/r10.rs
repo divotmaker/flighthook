@@ -16,7 +16,7 @@ use crate::state::SystemState;
 
 use flighthook::{
     ActorStatus, BallFlight, ClubData, FlighthookEvent, FlighthookMessage, RawDir, RawRecord,
-    Severity, ShotDetectionMode, ShotKey, Velocity,
+    Severity, ShotDetectionMode, ShotField, ShotKey, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
@@ -180,9 +180,14 @@ fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>
 // Protocol type -> bus type conversion helpers
 // ---------------------------------------------------------------------------
 
+/// The values of [`ball_from_r10`] the R10 does not report: tenover
+/// computes back and side spin from the measured total and axis.
+const R10_COMPUTED: [ShotField; 2] = [ShotField::BackspinRpm, ShotField::SidespinRpm];
+
 /// The R10 measures total spin and spin axis; tenover also hands back the
-/// back/side components computed from them, so both FRP spin pairs are sent.
-/// A total of 0 has no axis.
+/// back/side components computed from them, so both FRP spin pairs are sent
+/// and the components are marked computed ([`R10_COMPUTED`]). A total of 0
+/// has no axis.
 fn ball_from_r10(b: &tenover::proto::BallData) -> BallFlight {
     #[allow(clippy::cast_possible_truncation)]
     let total_spin = b.total_spin.round() as i32;
@@ -451,14 +456,9 @@ fn connect_and_run(
                                 bf.backspin_rpm.unwrap_or(0),
                                 bf.sidespin_rpm.unwrap_or(0),
                             );
-                            sender.send(
-                                FlighthookMessage::new(sim::ball_flight_event(
-                                    state,
-                                    key.clone(),
-                                    bf,
-                                ))
-                                .device(&addr),
-                            );
+                            let mut event = sim::ball_flight_event(state, key.clone(), bf);
+                            sim::mark_computed(&mut event, &R10_COMPUTED);
+                            sender.send(FlighthookMessage::new(event).device(&addr));
                         }
 
                         // Emit ClubPath if club data present
@@ -839,6 +839,18 @@ mod tests {
             assert_eq!(components.total_spin_rpm, bf.total_spin_rpm);
             assert!((components.spin_axis.unwrap() - f64::from(axis)).abs() < 0.05);
         }
+    }
+
+    /// The R10 reports total spin and axis; the components tenover works
+    /// out from them are the ones marked computed.
+    #[test]
+    fn r10_marks_its_spin_components_computed() {
+        assert_eq!(
+            R10_COMPUTED,
+            [ShotField::BackspinRpm, ShotField::SidespinRpm]
+        );
+        let bf = ball_from_r10(&r10_ball(3231.0, 8.0));
+        assert!(bf.backspin_rpm.is_some() && bf.sidespin_rpm.is_some());
     }
 
     #[test]

@@ -209,6 +209,9 @@ pub struct FlighthookConfig {
     /// Golf, ...).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub openconnect_client: std::collections::HashMap<String, OpenConnectClientSection>,
+    /// Pureplay outputs (beta): dial Pureplay over Pureplay Connect.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub pureplay: std::collections::HashMap<String, PureplaySection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub random_club: std::collections::HashMap<String, RandomClubSection>,
     /// Swing cameras (beta).
@@ -1431,6 +1434,28 @@ pub struct OpenConnectClientSection {
 #[deprecated(note = "use OpenConnectClientSection")]
 pub type GsProSection = OpenConnectClientSection;
 
+/// A Pureplay output instance (beta).
+///
+/// Dials Pureplay (port 9760) and sends it every routed shot over the
+/// Pureplay Connect protocol, taking its club, hand and strict-mode
+/// commands. Routing works as for [`OpenConnectClientSection`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PureplaySection {
+    #[serde(default)]
+    pub name: String,
+    /// Pureplay's address. Defaults to `127.0.0.1:9760`.
+    pub address: Option<String>,
+    /// Actor ID for full-swing shots (e.g. "mevo.0"). None = accept from any monitor.
+    #[serde(default)]
+    pub full_monitor: Option<String>,
+    /// Actor ID for chipping shots. None = accept from any monitor.
+    #[serde(default)]
+    pub chipping_monitor: Option<String>,
+    /// Actor ID for putting shots. None = accept from any monitor.
+    #[serde(default)]
+    pub putting_monitor: Option<String>,
+}
+
 /// A random club cycling integration instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RandomClubSection {
@@ -1583,6 +1608,7 @@ impl FlighthookConfig {
             || !self.mock_monitor.is_empty()
             || !self.openconnect_server.is_empty()
             || !self.openconnect_client.is_empty()
+            || !self.pureplay.is_empty()
             || !self.random_club.is_empty()
             || !self.camera.is_empty()
     }
@@ -1616,6 +1642,7 @@ impl Default for FlighthookConfig {
             mock_monitor: std::collections::HashMap::new(),
             openconnect_server: std::collections::HashMap::new(),
             openconnect_client: std::collections::HashMap::new(),
+            pureplay: std::collections::HashMap::new(),
             random_club: std::collections::HashMap::new(),
             camera: std::collections::HashMap::new(),
         }
@@ -1694,6 +1721,18 @@ impl Default for OpenConnectClientSection {
         Self {
             name: "GSPro".into(),
             address: Some("127.0.0.1:921".into()),
+            full_monitor: None,
+            chipping_monitor: None,
+            putting_monitor: None,
+        }
+    }
+}
+
+impl Default for PureplaySection {
+    fn default() -> Self {
+        Self {
+            name: "Pureplay".into(),
+            address: Some("127.0.0.1:9760".into()),
             full_monitor: None,
             chipping_monitor: None,
             putting_monitor: None,
@@ -2238,6 +2277,12 @@ mod openconnect_client_tests {
                 address: Some("127.0.0.1:9210".into()),
                 full_monitor: Some("openconnect_server.3".into()),
                 ..OpenConnectClientSection::default()
+            }),
+            pureplay: one(PureplaySection {
+                name: "Pureplay".into(),
+                address: Some("192.168.1.20:9760".into()),
+                putting_monitor: Some("exputt.3".into()),
+                ..PureplaySection::default()
             }),
             random_club: one(RandomClubSection {
                 name: "Clubs".into(),

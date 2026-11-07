@@ -1336,6 +1336,7 @@ mod tests {
                 "GSPro (OpenConnect)",
                 "Muni Golf (OpenConnect)",
                 "OpenConnect Client",
+                "Pureplay",
             ],
             "the menu offers exactly these"
         );
@@ -1378,6 +1379,43 @@ mod tests {
         assert!(!marks.keys().any(|k| k.ends_with("openconnect_client.2")));
         assert!(!app.settings.locked());
         assert!(enabled(&marks, "tabs"));
+    }
+
+    /// The Pureplay entry adds a card with Pureplay's address and the
+    /// routing dropdowns; it saves as a `pureplay` section.
+    #[test]
+    fn an_added_pureplay_output_saves_its_address_and_routing() {
+        let screen = Screen::new();
+        let mut app = app();
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, "add:Outputs");
+        let marks = screen.click_mark(&mut app, &marks, "add:Outputs:Pureplay");
+        let new = &app.settings.actors[form_index(&app, "pureplay.0")];
+        assert_eq!(new.name(), "Pureplay");
+        assert_eq!(new.type_label(), "Pureplay");
+        assert!(new.dirty());
+        assert_eq!(
+            integration(&mut app, "pureplay.0").address,
+            "127.0.0.1:9760"
+        );
+        assert_eq!(app.card_modes.get("pureplay.0"), CardMode::Settings);
+        assert!(enabled(&marks, "save:pureplay.0"));
+        assert_header_fits(&marks, "pureplay.0", "default");
+
+        let entry = integration(&mut app, "pureplay.0");
+        entry.address = "192.168.1.20:9760".into();
+        entry.putting_monitor = "mevo.0".into();
+        let config = app.settings.to_request();
+        assert_eq!(
+            config.pureplay["0"],
+            crate::types::PureplaySection {
+                name: "Pureplay".into(),
+                address: Some("192.168.1.20:9760".into()),
+                full_monitor: None,
+                chipping_monitor: None,
+                putting_monitor: Some("mevo.0".into()),
+            }
+        );
     }
 
     fn device<'a>(app: &'a mut FlighthookApp, id: &str) -> &'a mut settings::DeviceFormEntry {

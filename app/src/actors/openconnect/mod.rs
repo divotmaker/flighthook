@@ -643,8 +643,10 @@ fn emit_shot(
             .raw(payload.clone())
             .device(device),
     );
+    let mut event = sim::ball_flight_event(state, key.clone(), ball);
+    sim::mark_computed(&mut event, &mapper::computed_spin(msg));
     sender.send(
-        FlighthookMessage::new(sim::ball_flight_event(state, key.clone(), ball))
+        FlighthookMessage::new(event)
             .raw(payload.clone())
             .device(device),
     );
@@ -763,8 +765,10 @@ mod tests {
                 FlighthookEvent::ShotTrigger { key } => {
                     acc = Some(flighthook::ShotAccumulator::new(m.actor, key));
                 }
-                FlighthookEvent::BallFlight { ball, .. } => {
-                    acc.as_mut().expect("trigger first").set_ball(*ball);
+                FlighthookEvent::BallFlight { ball, derived, .. } => {
+                    let acc = acc.as_mut().expect("trigger first");
+                    acc.set_ball(*ball);
+                    acc.set_derived(derived.map(|d| *d));
                 }
                 FlighthookEvent::ClubPath { club, .. } => {
                     acc.as_mut().expect("trigger first").set_club(*club);
@@ -807,6 +811,29 @@ mod tests {
         let ball = rh.ball.expect("ball");
         assert_eq!(ball.sidespin_rpm, Some(-2500));
         assert_eq!(ball.spin_axis, Some(-30.0));
+    }
+
+    /// The spin pair the monitor did not send is completed from the one it
+    /// did, and marked computed.
+    #[test]
+    fn the_completed_spin_pair_is_marked_computed() {
+        use flighthook::ShotField;
+        let computed = |request| {
+            ingested(request, flighthook::Handedness::Right)
+                .derived
+                .expect("derived")
+                .computed
+        };
+        assert_eq!(
+            computed(LATERAL_SHOTS[0]),
+            [ShotField::TotalSpinRpm, ShotField::SpinAxis],
+            "components sent"
+        );
+        assert_eq!(
+            computed(LATERAL_SHOTS[1]),
+            [ShotField::BackspinRpm, ShotField::SidespinRpm],
+            "total and axis sent"
+        );
     }
 
     /// A GSPro-protocol monitor relayed through flighthook comes out as it

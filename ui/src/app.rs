@@ -1101,13 +1101,14 @@ pub(crate) fn hand_code(handed: Handedness) -> &'static str {
 }
 
 /// Whether the simulator owns the club and the hand: any
-/// `openconnect_client.*` actor is connected. A connected simulator replaces
-/// both on every player message it sends, so a pick made in the UI would not
-/// last.
+/// `openconnect_client.*` or `pureplay.*` actor is connected. A connected
+/// simulator replaces both whenever it sends its player or club
+/// information, so a pick made in the UI would not last.
 pub(crate) fn set_by_simulator(actors: &HashMap<String, ActorStatusResponse>) -> bool {
-    actors
-        .iter()
-        .any(|(id, a)| id.starts_with("openconnect_client.") && a.status == ActorStatus::Connected)
+    actors.iter().any(|(id, a)| {
+        (id.starts_with("openconnect_client.") || id.starts_with("pureplay."))
+            && a.status == ActorStatus::Connected
+    })
 }
 
 /// The header's hand: an RH | LH control with `shown`, the player's hand (RH
@@ -1739,6 +1740,13 @@ mod tests {
             "openconnect_client.1".to_owned(),
             actor(ActorStatus::Connected),
         );
+        assert!(set_by_simulator(&actors));
+
+        // A connected Pureplay output owns them too.
+        let mut actors = HashMap::new();
+        actors.insert("pureplay.0".to_owned(), actor(ActorStatus::Reconnecting));
+        assert!(!set_by_simulator(&actors));
+        actors.insert("pureplay.0".to_owned(), actor(ActorStatus::Connected));
         assert!(set_by_simulator(&actors));
     }
 

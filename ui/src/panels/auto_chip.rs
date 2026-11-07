@@ -1,16 +1,16 @@
 //! Auto-chip (beta): a menu chip in the header, right of the club picker,
 //! that sends a short straight chip to the sim (`POST /api/auto-chip`). It
 //! shows while the `[simulation] auto_chip` setting enables it and is
-//! disabled, with the reason as its hover text, while no simulator is
-//! connected or a chip is on its way. A refused chip shows in the error
-//! banner ([`super::monitoring`]).
+//! disabled, with the reason as its hover text, while a Pureplay output is
+//! in a strict-mode round, no simulator is connected or a chip is on its
+//! way. A refused chip shows in the error banner ([`super::monitoring`]).
 
 use std::collections::HashMap;
 
 use super::devices;
 use crate::app::FlighthookApp;
 use crate::theme;
-use crate::types::ActorStatusResponse;
+use crate::types::{ActorStatus, ActorStatusResponse};
 
 /// Hover text on the Auto-chip button.
 const AUTO_CHIP_HINT: &str =
@@ -21,17 +21,33 @@ fn auto_chip_items() -> [(String, u32); 3] {
     flighthook::AUTO_CHIP_YARDS.map(|yards| (format!("{yards} Yard"), yards))
 }
 
+/// Whether a Pureplay output is in a strict-mode round (a recorded
+/// tournament round): its card is connected and shows `strict_mode` on.
+/// The server fires no Auto-chip while one is.
+fn strict_round(actors: &HashMap<String, ActorStatusResponse>) -> bool {
+    actors.iter().any(|(id, a)| {
+        id.starts_with("pureplay.")
+            && a.status == ActorStatus::Connected
+            && a.telemetry.get("strict_mode").is_some_and(|v| v == "on")
+    })
+}
+
 /// Why the Auto-chip button is disabled, or `None` when it is enabled: a
-/// chip is on its way, or no output that forwards shots (an Open Connect
-/// client) is connected.
+/// Pureplay output is in a strict-mode round, a chip is on its way, or no
+/// output that forwards shots (an Open Connect client or Pureplay) is
+/// connected.
 fn auto_chip_blocked(
     actors: &HashMap<String, ActorStatusResponse>,
     in_flight: Option<u32>,
 ) -> Option<&'static str> {
-    if in_flight.is_some() {
+    if strict_round(actors) {
+        Some("Auto-chip is off during a Pureplay strict-mode round.")
+    } else if in_flight.is_some() {
         Some("Sending the chip\u{2026}")
     } else if !crate::app::set_by_simulator(actors) {
-        Some("Auto-chip: no simulator connected. Connect an OpenConnect Client output first.")
+        Some(
+            "Auto-chip: no simulator connected. Connect an OpenConnect Client or Pureplay output first.",
+        )
     } else {
         None
     }
@@ -203,6 +219,89 @@ mod tests {
         );
         assert_eq!(auto_chip_blocked(&actors, None), None);
         assert!(auto_chip_blocked(&actors, Some(5)).is_some_and(|w| w.starts_with("Sending")));
+    }
+
+    /// A Pureplay card, connected or not, with `strict_mode` as given.
+    fn pureplay(status: ActorStatus, strict: &str) -> ActorStatusResponse {
+        let mut card = ActorStatusResponse::new("Pureplay", status);
+        card.telemetry.insert("strict_mode".into(), strict.into());
+        card
+    }
+
+    /// A strict-mode round turns the chip off, whatever else is connected,
+    /// until the round ends or the Pureplay link drops.
+    #[test]
+    fn a_strict_round_turns_auto_chip_off_until_it_ends() {
+        let strict = "Auto-chip is off during a Pureplay strict-mode round.";
+        let mut actors = HashMap::new();
+        actors.insert(
+            "openconnect_client.0".into(),
+            ActorStatusResponse::new("GSPro", ActorStatus::Connected),
+        );
+        actors.insert("pureplay.0".into(), pureplay(ActorStatus::Connected, "off"));
+        assert_eq!(auto_chip_blocked(&actors, None), None);
+        actors.insert("pureplay.0".into(), pureplay(ActorStatus::Connected, "on"));
+        assert_eq!(auto_chip_blocked(&actors, None), Some(strict));
+        assert_eq!(auto_chip_blocked(&actors, Some(3)), Some(strict));
+        // The round ends: back to the user's setting.
+        actors.insert("pureplay.0".into(), pureplay(ActorStatus::Connected, "off"));
+        assert_eq!(auto_chip_blocked(&actors, None), None);
+        // A dropped link ends it too, even with a stale key.
+        actors.insert(
+            "pureplay.0".into(),
+            pureplay(ActorStatus::Reconnecting, "on"),
+        );
+        assert_eq!(auto_chip_blocked(&actors, None), None);
+    }
+
+    /// In the header the chip stays where it is, disabled: a click opens no
+    /// menu while the round holds, and the menu opens again after it.
+    #[test]
+    fn the_header_chip_is_read_only_during_a_strict_round() {
+        use egui::{Event, Modifiers, PointerButton};
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut app = enabled_app();
+        app.actors
+            .insert("pureplay.0".into(), pureplay(ActorStatus::Connected, "on"));
+        let click = |app: &mut FlighthookApp, at: egui::Pos2| -> Marks {
+            let button = |pressed| Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            for events in [
+                vec![Event::PointerMoved(at)],
+                vec![button(true)],
+                vec![button(false)],
+            ] {
+                ctx.data_mut(|d| d.remove::<Marks>(egui::Id::NULL));
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1600.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| app.render_header(ctx));
+            }
+            header_marks(&ctx, app, 1600.0)
+        };
+        let menu = |marks: &Marks| marks.keys().any(|k| k.starts_with("auto-chip:"));
+
+        header_marks(&ctx, &mut app, 1600.0);
+        let chip = header_marks(&ctx, &mut app, 1600.0)["auto-chip"].0;
+        assert!(!menu(&click(&mut app, chip.center())), "read-only");
+        assert_eq!(app.auto_chip_in_flight, None);
+
+        app.actors
+            .insert("pureplay.0".into(), pureplay(ActorStatus::Connected, "off"));
+        let marks = click(&mut app, chip.center());
+        assert_eq!(marks["auto-chip"].0, chip, "same place");
+        assert!(menu(&marks), "the menu opens once the round ends");
     }
 
     /// One pass of the header on a 1600×900 screen; its marked controls.

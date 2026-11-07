@@ -22,7 +22,7 @@ use crate::state::SystemState;
 
 use flighthook::{
     ActorStatus, BallFlight, ClubData, FlighthookEvent, FlighthookMessage, Handedness, RawDir,
-    RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw, Velocity,
+    RawRecord, Severity, ShotDetectionMode, ShotField, ShotKey, ShotRaw, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per failed attempt, capped at 15s,
@@ -540,9 +540,13 @@ fn hand_of(handed: Option<Handedness>) -> Hand {
 // Protocol type -> bus type conversion helpers
 // ---------------------------------------------------------------------------
 
+/// The value of [`ball_from_putt`] the device does not measure: the
+/// vertical launch, filled in as 0.
+const PUTT_COMPUTED: [ShotField; 1] = [ShotField::LaunchElevation];
+
 /// Ball data of a putt: ball speed and launch direction, rolled along the
-/// ground (vertical launch 0). The device measures no spin, so none is
-/// reported.
+/// ground (vertical launch 0, marked computed: [`PUTT_COMPUTED`]). The
+/// device measures no spin, so none is reported.
 fn ball_from_putt(putt: &PuttResult) -> BallFlight {
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(putt.ball_speed_mps)),
@@ -1021,15 +1025,10 @@ fn emit_putt(
     sender.send(
         FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() }).device(device),
     );
-    sender.send(
-        FlighthookMessage::new(sim::ball_flight_event_in_mode(
-            state,
-            key.clone(),
-            ball,
-            Some(ShotDetectionMode::Putting),
-        ))
-        .device(device),
-    );
+    let mut event =
+        sim::ball_flight_event_in_mode(state, key.clone(), ball, Some(ShotDetectionMode::Putting));
+    sim::mark_computed(&mut event, &PUTT_COMPUTED);
+    sender.send(FlighthookMessage::new(event).device(device));
     if let Some(club) = club {
         sender.send(
             FlighthookMessage::new(FlighthookEvent::ClubPath {
@@ -1387,6 +1386,9 @@ mod tests {
         assert_eq!(ball.backspin_rpm, None);
         assert_eq!(ball.sidespin_rpm, None);
         assert_eq!(ball.total_spin_rpm, None);
+        // The 0 launch angle is filled in, and marked so.
+        let derived = shot.derived.as_ref().expect("derived");
+        assert_eq!(derived.computed, [flighthook::ShotField::LaunchElevation]);
 
         let club = shot.club.as_ref().expect("club data");
         assert_eq!(club.path, expected.path_deg);

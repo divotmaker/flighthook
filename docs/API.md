@@ -261,6 +261,16 @@ Telemetry keys are merged from two sources with no overlap:
   player information. When the connection ends, `shots_sent`,
   `monitor_ready`, `response`, `club` and `handed` are removed; `address`
   and `last_shot` stay
+- **Pureplay outputs** (beta; from `actor_status`): `address` (Pureplay's,
+  `127.0.0.1:9760`), `last_shot` (the ShotId Pureplay got last and the local
+  time it was sent, `#4 at 16:41:07`), and for the current link only
+  `shots_sent` (`4`), `ready_state` (the ready state last sent, `ready` |
+  `not ready` | `processing`) and `strict_mode` (`on` | `off`; `on` while a
+  tournament round is in progress, when Auto-chip does not fire). `club` and
+  `handed` are the club and hand Pureplay set. `error` says why the handshake
+  failed (no reply to Hello, an unsupported protocol version); a refused or
+  closed connection sets none. When the link ends, `shots_sent`,
+  `ready_state`, `strict_mode`, `club` and `handed` are removed
 - **Cameras** (from `actor_status`): `camera` (the camera's own name),
   `position`, `resolution` (`1280x720`), `mode_fps` (the frame rate asked
   for), `fps` (achieved over the last second), `dropped` (frames missing
@@ -374,7 +384,8 @@ With `?units=imperial`:
 - `ball`: `BallFlight` or `null`. Launch conditions and distances, exactly as
   the device measured them, except on a shot flagged `derived.spin_estimated`:
   its spin is flighthook's estimate, and the device's 0 carry, apex and flight
-  time are left out. All fields are `Option`.
+  time are left out; and the values `derived.computed` lists, which the
+  device actor worked out or filled in. All fields are `Option`.
   Velocity fields are unit-tagged strings (`"67.2mps"`, `"150.3mph"`).
   Distance fields are unit-tagged strings (`"180.5m"`, `"197.4yd"`).
 - `derived`: `DerivedFlight` or absent. Values simulated for fields the device
@@ -1114,7 +1125,9 @@ monitors that miss short chips).
 `400 Bad Request` with a JSON `{"error": "yards must be one of 1, 3, 5"}`
 body for any other distance. `409 Conflict` with a JSON `{"error"}` body when
 Auto-chip is turned off (`[simulation]` `auto_chip` is `false`, the default; the error is
-`"Auto-chip is disabled in settings"`, and no shot is sent or numbered) or
+`"Auto-chip is disabled in settings"`, and no shot is sent or numbered), while
+a Pureplay output is in a strict-mode (tournament) round (`"Auto-chip is off
+during a Pureplay strict-mode round"`, nothing sent or numbered either), or
 when the `[simulation]` altitude or temperature is out of range. A body that is not
 `{"yards": <non-negative integer>}` is `422 Unprocessable Entity`, and a
 missing `Content-Type: application/json` `415 Unsupported Media Type`.
@@ -1138,9 +1151,9 @@ total are the chip's only results), and [`shot_finished`](#shot_finished)
 [`GET /api/shots`](#get-apishots), the shot sets and the
 [export](#get-apishotsexport) (device kind `autochip`, `settings.detection_mode`
 `"chipping"`), and every
-OpenConnect client sends it to its simulator: Auto-chip shots are taken
-whatever monitor `full_monitor`, `chipping_monitor` and `putting_monitor`
-route to.
+OpenConnect client sends it to its simulator, and every Pureplay output to
+Pureplay: Auto-chip shots are taken whatever monitor `full_monitor`,
+`chipping_monitor` and `putting_monitor` route to.
 
 An Auto-chip joins the set in play like any shot, and counts in that set's
 `shots`. The dashboard lists it under that set but leaves it out of the
@@ -1682,6 +1695,14 @@ Full persisted config (mirrors `config.toml`).
   The count starts over when the client itself restarts: a
   [Reconnect](#post-apiactorsidreconnect) of it, a save that restarts it, or
   a flighthook restart
+- `pureplay` sections (beta) are **outputs**: each dials `address` (default
+  `127.0.0.1:9760`), Pureplay, and sends it every shot over Pureplay
+  Connect, numbered from 1 on each connection. `full_monitor`,
+  `chipping_monitor` and `putting_monitor` route as for `openconnect_client`,
+  and also pick the launch monitor whose ready state, connection and battery
+  Pureplay is told. Pureplay's club and hand commands set flighthook's club
+  and hand ([`club_info`](#club_info), [`hand_info`](#hand_info) from actor
+  `pureplay.N`). See [Pureplay](outputs/pureplay.md)
 - `replay` (beta) holds the camera clip settings: `keep_shots` (default
   `20`, 1 to 1000: clip folders kept on disk, newest first; a swing two
   launch monitors saw is one clip), `pre_roll_s` (default `4.0`) and
@@ -1750,7 +1771,7 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 **Query parameters**:
 
 - `scope` (optional): a global actor ID (`mevo.0`, `openconnect_client.1`,
-  `webserver.0`), `global` or `body_tracking`. `gspro.N` is accepted for
+  `pureplay.0`, `webserver.0`), `global` or `body_tracking`. `gspro.N` is accepted for
   `openconnect_client.N`.
   - An actor ID narrows the save to that one actor — only its section is
     written to the config, and only that actor is reconciled. Every other
@@ -2060,13 +2081,27 @@ the measured ones, which stay unchanged under `ball`. FRP consumers ignore
 spin reading (back and side both 0) — see the README's "Simulated values"
 section for the rules, except that a shot whose spin flighthook estimated
 always has one: `"derived": {"spin_estimated": true}` when it was not
-simulated. It is never sent to GSPro.
+simulated, and so does a shot with `computed` values (`"derived":
+{"computed": [...]}`). It is never sent to GSPro.
 
 `"spin_estimated": true` marks the spin under `ball` (`backspin_rpm`,
 `sidespin_rpm`) as flighthook's estimate rather than the device's reading:
 a FlightScope result with launch data but no spin
 ([Launch-only chips](devices/flightscope.md#launch-only-chips-beta)). The
 spin stays under `ball` and is sent to GSPro like a measured one.
+
+`"computed"` lists the values under `ball` (or the shot's face impact) that
+the device actor computed from other readings or filled in, rather than the
+device reporting them; they stay where they are and go to GSPro as before.
+Names are FRP field names: `launch_elevation`, `backspin_rpm`,
+`sidespin_rpm`, `total_spin_rpm`, `spin_axis`, and `impact_vertical` for the
+face impact's `vertical`. Today: the Garmin R10's `backspin_rpm` and
+`sidespin_rpm` (worked out from its total spin and axis), the Xi's
+`backspin_rpm` and `sidespin_rpm` when **Spin source (Xi)** combines the E8
+total with an axis, the ExPutt's `launch_elevation` (always 0), the Square
+Golf Omni's `impact_vertical` (it includes the club's offset from the
+sticker to the face centre), and for the OpenConnect input the spin pair the
+monitor did not send. The Pureplay output leaves these out in strict mode.
 
 A ground ball is rolled, not flown: a shot whose measured apex is 0, or,
 from a device that reports no apex, whose launch angle is at most 0.5°,
@@ -2116,6 +2151,7 @@ A launch-monitor-only device such as the Square Golf Omni gets the full set:
 | `path` | FlightPath | Simulated ball path, tee to rest (see below) |
 | `replaces_measured` | bool | `true` when these values replace the device's results (`[simulation] mode` was `"force"` when the shot was simulated): every result field is simulated and takes precedence over `ball`. Omitted when false |
 | `spin_estimated` | bool | `true` when `ball.backspin_rpm` and `ball.sidespin_rpm` are flighthook's estimate, not measured. Set with or without the simulation. Omitted when false |
+| `computed` | array of string | The measured-block values the device actor computed or filled in (see above). Set with or without the simulation. Omitted when empty |
 
 Every field is optional. Offline values are absolute: + is right of the target
 line for every golfer, as in `launch_azimuth`. Where the device measures carry
@@ -2320,7 +2356,9 @@ Player info update (name). Flighthook extension event.
 
 ##### club_info
 
-Club selection update.
+Club selection update. Sources include GSPro's player message (actor
+`openconnect_client.N`), Pureplay's club information (actor `pureplay.N`),
+[`POST /api/club`](#post-apiclub) and the WebSocket [`club`](#club) command.
 
 ```json
 {
@@ -2337,7 +2375,8 @@ Club selection update.
 ##### hand_info
 
 Player handedness update. Every source sets the hand this way: GSPro's player
-message (actor `openconnect_client.N`), [`POST /api/hand`](#post-apihand)
+message (actor `openconnect_client.N`), Pureplay's club information (actor
+`pureplay.N`), [`POST /api/hand`](#post-apihand)
 (actor `web`) and the WebSocket [`hand`](#hand) command (the socket's actor
 ID).
 
@@ -2468,7 +2507,7 @@ External consumers can observe these to track config changes in flight.
 
 `action.type` is one of `replace_all`, `replace_global`, `upsert_webserver`,
 `upsert_mevo`, `upsert_r10`, `upsert_square`, `upsert_exputt`,
-`upsert_open_connect_server`, `upsert_open_connect_client`,
+`upsert_open_connect_server`, `upsert_open_connect_client`, `upsert_pureplay`,
 `upsert_mock_monitor`, `upsert_random_club`, `upsert_camera`, `remove`,
 `set_shot_grouping` (`{ "type": "set_shot_grouping", "mode": "by_club" }`, from
 `POST /api/shots/grouping` or the WS `grouping` command) and `reconnect`

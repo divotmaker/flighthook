@@ -652,7 +652,11 @@ pub(crate) fn readiness_after(
     readiness(&relay.routing, relay.mode, &relay.monitor_state)
 }
 
-fn shot_matches_routing(routing: &GsProRouting, mode: ShotDetectionMode, actor: &str) -> bool {
+pub(crate) fn shot_matches_routing(
+    routing: &GsProRouting,
+    mode: ShotDetectionMode,
+    actor: &str,
+) -> bool {
     if actor == flighthook::AUTO_CHIP_ACTOR {
         return true;
     }

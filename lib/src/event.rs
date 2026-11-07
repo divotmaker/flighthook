@@ -41,7 +41,9 @@ use crate::{Club, Handedness, ShotKey, ShotMetrics, ShotRaw, ShotVideo, UnitSyst
 /// unchanged.
 ///
 /// [`spin_estimated`](Self::spin_estimated) marks a spin in [`BallFlight`]
-/// that flighthook estimated rather than the device measured.
+/// that flighthook estimated rather than the device measured, and
+/// [`computed`](Self::computed) the values in the shot's measured blocks
+/// that the device actor computed or filled in.
 ///
 /// Non-exhaustive so fields can be added; build one with
 /// `DerivedFlight::default()` and assign the fields.
@@ -99,6 +101,38 @@ pub struct DerivedFlight {
     /// simulated. Omitted on the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spin_estimated: bool,
+    /// Values in the shot's measured blocks ([`BallFlight`], `ClubData`,
+    /// `FaceImpact`) that the device actor or its driver computed from
+    /// other readings or filled in, rather than the device reporting them:
+    /// for example back and side spin worked out from a measured total and
+    /// axis. The values stay where outputs read them; this list only marks
+    /// their source. Set on its own (every other field empty) when the shot
+    /// was not simulated. Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub computed: Vec<ShotField>,
+}
+
+/// A value in a shot's measured blocks, as named in
+/// [`DerivedFlight::computed`]. Serialized with the FRP field name
+/// (`impact_vertical` for `FaceImpact.vertical`).
+///
+/// Non-exhaustive so fields can be added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ShotField {
+    /// `BallFlight.launch_elevation`.
+    LaunchElevation,
+    /// `BallFlight.backspin_rpm`.
+    BackspinRpm,
+    /// `BallFlight.sidespin_rpm`.
+    SidespinRpm,
+    /// `BallFlight.total_spin_rpm`.
+    TotalSpinRpm,
+    /// `BallFlight.spin_axis`.
+    SpinAxis,
+    /// `FaceImpact.vertical`.
+    ImpactVertical,
 }
 
 /// A simulated ball path from the tee to rest.
@@ -123,6 +157,27 @@ impl DerivedFlight {
         *self == Self::default()
     }
 
+    /// Whether `field` is marked as [`computed`](Self::computed).
+    #[must_use]
+    pub fn is_computed(&self, field: ShotField) -> bool {
+        self.computed.contains(&field)
+    }
+
+    /// Mark `fields` as [`computed`](Self::computed) in `derived`, adding a
+    /// block that holds only the marks when there is none. Marks already
+    /// there are kept once.
+    pub fn mark_computed(derived: &mut Option<Box<DerivedFlight>>, fields: &[ShotField]) {
+        if fields.is_empty() {
+            return;
+        }
+        let d = derived.get_or_insert_with(Box::default);
+        for f in fields {
+            if !d.computed.contains(f) {
+                d.computed.push(*f);
+            }
+        }
+    }
+
     /// Convert distances to yards (heights to feet, as for [`BallFlight`]).
     /// `path` is always metres/seconds and is carried over unchanged.
     #[must_use]
@@ -141,6 +196,7 @@ impl DerivedFlight {
             path: self.path.clone(),
             replaces_measured: self.replaces_measured,
             spin_estimated: self.spin_estimated,
+            computed: self.computed.clone(),
         }
     }
 
@@ -162,6 +218,7 @@ impl DerivedFlight {
             path: self.path.clone(),
             replaces_measured: self.replaces_measured,
             spin_estimated: self.spin_estimated,
+            computed: self.computed.clone(),
         }
     }
 }
@@ -864,6 +921,41 @@ mod tests {
         let back: ShotData =
             serde_json::from_str(&serde_json::to_string(&s).expect("ser")).expect("de");
         assert_eq!(back.derived, Some(derived()));
+    }
+
+    #[test]
+    fn computed_marks_are_omitted_when_empty_and_round_trip() {
+        let json = serde_json::to_value(shot(Some(derived()))).expect("ser");
+        assert!(json["derived"].get("computed").is_none(), "{json}");
+        let old: DerivedFlight = serde_json::from_str(r#"{"descent_angle":41.3}"#).expect("de");
+        assert!(old.computed.is_empty());
+
+        let mut marked = None;
+        DerivedFlight::mark_computed(&mut marked, &[]);
+        assert!(marked.is_none(), "nothing to mark adds no block");
+        DerivedFlight::mark_computed(
+            &mut marked,
+            &[ShotField::BackspinRpm, ShotField::SidespinRpm],
+        );
+        DerivedFlight::mark_computed(&mut marked, &[ShotField::SidespinRpm]);
+        let d = *marked.expect("a block holding only the marks");
+        assert_eq!(d.computed, [ShotField::BackspinRpm, ShotField::SidespinRpm]);
+        assert!(d.is_computed(ShotField::SidespinRpm));
+        assert!(!d.is_computed(ShotField::SpinAxis));
+        assert!(!d.is_empty());
+        assert_eq!(
+            serde_json::to_value(&d).expect("ser"),
+            serde_json::json!({"computed": ["backspin_rpm", "sidespin_rpm"]})
+        );
+        let back: DerivedFlight =
+            serde_json::from_str(r#"{"computed":["launch_elevation","impact_vertical"]}"#)
+                .expect("de");
+        assert_eq!(
+            back.computed,
+            [ShotField::LaunchElevation, ShotField::ImpactVertical]
+        );
+        assert_eq!(d.to_imperial().computed, d.computed);
+        assert_eq!(d.to_metric().computed, d.computed);
     }
 
     #[test]

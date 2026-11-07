@@ -15,7 +15,7 @@ use crate::state::SystemState;
 
 use flighthook::{
     ActorStatus, BallFlight, Club, ClubData, Distance, FaceImpact, FlighthookEvent,
-    FlighthookMessage, Handedness, RawDir, RawRecord, Severity, ShotKey, Velocity,
+    FlighthookMessage, Handedness, RawDir, RawRecord, Severity, ShotField, ShotKey, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per failed attempt, capped at 15s,
@@ -413,6 +413,18 @@ fn club_from_square(c: &allsquare::ClubMetrics) -> ClubData {
         club_offset: None,
         club_height: None,
         ..ClubData::default()
+    }
+}
+
+/// The values of a shot the Omni does not report as it measured them: the
+/// vertical face impact is the device's reading from the club sticker's dot
+/// plus allsquare's per-club offset to the face centre (fitted defaults, or
+/// the user's calibration).
+fn square_computed(club: Option<&allsquare::ClubMetrics>) -> &'static [ShotField] {
+    if club.is_some_and(|c| c.impact_vertical.is_some()) {
+        &[ShotField::ImpactVertical]
+    } else {
+        &[]
     }
 }
 
@@ -836,10 +848,9 @@ fn run_session<T: allsquare::Transport + Release>(
                             bf.backspin_rpm.unwrap_or(0),
                             bf.sidespin_rpm.unwrap_or(0),
                         );
-                        sender.send(
-                            FlighthookMessage::new(sim::ball_flight_event(state, key.clone(), bf))
-                                .device(&name),
-                        );
+                        let mut event = sim::ball_flight_event(state, key.clone(), bf);
+                        sim::mark_computed(&mut event, square_computed(club.as_ref()));
+                        sender.send(FlighthookMessage::new(event).device(&name));
 
                         // Club data is absent when the device could not track
                         // the sticker — a putt, or a mishit it declined.
@@ -939,6 +950,24 @@ mod tests {
         let impact = face_impact_from_square(&c).expect("impact");
         assert_eq!(impact.lateral, Some(Distance::Millimeters(12.5)));
         assert_eq!(impact.vertical, Some(Distance::Millimeters(3.0)));
+    }
+
+    /// A shot's vertical impact carries allsquare's offset to the face
+    /// centre, so it is marked computed; lateral and the rest are not.
+    #[test]
+    fn the_calibrated_impact_height_is_marked_computed() {
+        let c = allsquare::ClubMetrics {
+            impact_horizontal: Some(-12.5),
+            impact_vertical: Some(3.0),
+            ..Default::default()
+        };
+        assert_eq!(square_computed(Some(&c)), [ShotField::ImpactVertical]);
+        let lateral_only = allsquare::ClubMetrics {
+            impact_horizontal: Some(4.0),
+            ..Default::default()
+        };
+        assert!(square_computed(Some(&lateral_only)).is_empty());
+        assert!(square_computed(None).is_empty());
     }
 
     /// No vertical estimate (e.g. the putter) still reports lateral.

@@ -50,6 +50,9 @@ address = "127.0.0.1:921"
   `openconnect_client` is used and a warning is logged. Saves write only
   `[openconnect_client.<idx>]`, and the file is rewritten that way on the next
   start (see [Loading and migration](#loading-and-migration))
+- `[pureplay.<idx>]` -- Pureplay output (beta): dials Pureplay (default
+  `127.0.0.1:9760`) over Pureplay Connect; same routing keys as
+  `openconnect_client` (see [Pureplay output](#pureplay-output-beta))
 - `[random_club.<idx>]` -- random club cycling integration instance
 - `[camera.<idx>]` -- swing camera (beta): records a clip of every shot (see
   [Cameras and replay](#cameras-and-replay-beta))
@@ -197,6 +200,7 @@ pub struct FlighthookConfig {
     pub mock_monitor: HashMap<String, MockMonitorSection>,
     pub openconnect_server: HashMap<String, OpenConnectServerSection>,
     pub openconnect_client: HashMap<String, OpenConnectClientSection>,  // `gspro` also read
+    pub pureplay: HashMap<String, PureplaySection>,  // name, address, full/chipping/putting_monitor
     pub random_club: HashMap<String, RandomClubSection>,
     pub camera: HashMap<String, CameraSection>,
 }
@@ -404,7 +408,15 @@ Launch values (speed, angles, spin, club data) are never replaced.
 `DerivedFlight::spin_estimated` marks the spin in `ball` as flighthook's
 estimate (the mevo actor's launch-only chips); the actor sets it after the
 simulation, on a `derived` that holds only the flag when the shot was not
-simulated, so `derive` never sees it.
+simulated, so `derive` never sees it. `DerivedFlight::computed`
+(`Vec<ShotField>`) marks, the same way (`sim::mark_computed`), the values in
+the measured blocks that the device actor or its driver computed or filled
+in rather than the device reporting them: the R10's back/side spin (tenover
+works them out from the measured total and axis), the Xi's back/side spin
+under the E8 spin source, the ExPutt's launch elevation (0), the Omni's
+vertical face impact (allsquare adds the per-club sticker offset), and the
+spin pair the Open Connect input completes. The values stay where outputs
+read them; only Pureplay's strict mode acts on the marks.
 
 The simulation runs in `app/src/sim.rs` with the
 [dimple](https://crates.io/crates/dimple) crate, an app-only dependency (the
@@ -696,6 +708,8 @@ with **no overlapping telemetry keys**:
   OpenConnect clients add: `address`, `last_shot`, `shots_sent`,
   `monitor_ready`, `response` (see
   [OpenConnect client telemetry](#openconnect-client-telemetry)).
+  Pureplay outputs add: `address`, `last_shot`, `shots_sent`, `ready_state`,
+  `strict_mode` (see [Pureplay output](#pureplay-output-beta)).
 
 ```rust
 pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
@@ -967,6 +981,7 @@ What a stop does, by actor:
 |---|---|---|
 | Mevo/Xi | always: the client is non-blocking and polls every 50 ms; the connect runs on its own thread | -- (an old instance still inside the driver is replaced beside it: a second socket to the device can overlap the old one until it closes) |
 | OpenConnect client | always: 50 ms reads, 2s write timeout, the connect on its own thread; its local-client registration ends with the connection | a write in progress (2s) |
+| Pureplay | always: 50 ms reads, 2s write timeout, the connect on its own thread | a write in progress (2s) |
 | OpenConnect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
 | Square Golf | in a session or a backoff wait: it disarms the device, then disconnects it, with BlueZ and with btleplug | the scan and connect inside allsquare (up to 20s scan + 20s service resolution on Linux) |
 | Garmin R10 | in a session or a backoff wait | the scan and connect inside tenover |
@@ -1117,6 +1132,139 @@ instance left. Because a `Starting` or a lost connection drops the card's
 telemetry, every `Starting` and `Reconnecting` status carries `address`,
 `last_shot` and a held refusal `error` again, so a reconnecting card still
 shows where it dials. Nothing here adds traffic to the simulator.
+
+#### Pureplay output (beta)
+
+`actors/pureplay/` (actor `pureplay.N`, config `[pureplay.N]`,
+`PureplaySection`, UI type label "Pureplay") sends shots to Pureplay over
+Pureplay Connect v1, Pureplay's published protocol: Pureplay is the host and
+listens on TCP 9760, flighthook is the device and connects. The user guide is
+[outputs/pureplay.md](outputs/pureplay.md).
+
+- `codec.rs` is the wire format, pure and unit-tested: frames (`"PL"`,
+  version 1, reserved 0, type, u16 LE length, payload, CRC32C LE over header
+  and payload; a table-driven CRC32C, no crate), `FrameReader` (splits frames
+  out of the TCP stream; on a bad magic, a header with version 0, or a CRC
+  mismatch it skips one byte and looks again, all skips of one call leaving
+  the buffer in one drain, and hands back the skipped bytes for the log; a
+  frame is read whatever its reserved byte, which the link logs once per link
+  when it is not 0), and every v1 message type both ways.
+  Payloads decode their known prefix and ignore any appended bytes;
+  enumerated fields stay raw bytes, so an enumerator added later passes
+  through. The spec's worked examples are golden tests, byte for byte.
+- `mapper.rs` maps a finished shot to BallData and, when any club value or
+  face impact was measured, ClubData with the same ShotId. A ValidMask bit
+  is set only for a value present (and finite) in the shot's measured blocks
+  (`ball`, `club`, `impact`); `derived` is read only for its marks
+  (`spin_estimated`, `computed`), which strict mode withholds (bit clear,
+  0.0).
+  Nothing is computed (no total/axis from the components, no smash factor):
+  Pureplay fills those gaps. Speeds in m/s, impact in mm via
+  `Distance::as_millimeters()`. Signs pass through unchanged for both hands:
+  HLA, SpinAxis, FaceAngle and ClubPath are target-absolute on the bus and in
+  Pureplay; face impact is golfer-relative (+ toe, + high) on both. Pureplay
+  Connect v1 leaves SideSpin's sign undefined; it goes out with the bus's
+  (+ curves right) through `mapper::side_spin` (`SIDE_SPIN_SIGN`), the one
+  place to change it, to be confirmed against Pureplay. Pureplay's club numbers map to flighthook's clubs in
+  `club_from_pureplay` (0 driver, 1-8 woods 2-9, 9-16 hybrids 2-9, 17-25
+  irons 1-9, 26-29 PW/GW/SW/LW, 30 putter).
+- `mod.rs` runs the link like the OpenConnect client runs its connection:
+  the detection mode starts as the game state's at `start` and follows
+  `SetDetectionMode`, the bus is drained the whole time (shots still
+  unfinished a minute after their trigger are let go), the same backoff (1 s, +1 s, cap 3 s,
+  reset after a 10 s link), the same per-mode routing (`GsProRouting`,
+  `gspro::shot_matches_routing`, Auto-chip always accepted), shots queued
+  only while the link is up and dropped when older than 5 s. A link: TCP
+  connect (5 s), Hello (ProtocolVersion 1; DeviceCaps BatteryPowered when the
+  monitor that stands for the device has reported `battery_pct`;
+  DeviceName `flighthook (<monitor name>)` or `flighthook`; Firmware the app
+  version), then HelloAck within 5 s, else the handshake fails with `error`
+  telemetry. A HelloAck choosing any version but 1 fails it too. Then the
+  status goes `Connected`, the ReadyState is pushed and every change after
+  it, and each routed shot goes out as BallData (+ ClubData), ShotId
+  counting from 1 on every link.
+- The device's state comes from the launch monitor actors (the
+  `actors::provenance::ShotSource` types with a config section: `mevo`,
+  `r10`, `square`, `exputt`, `mock_monitor`, `openconnect_server`) on the bus:
+  `ActorStatus` (and its `error` key), `DeviceTelemetry` `ready` and
+  `battery_pct`, and `ShotTrigger`/`ShotFinished`. `ready=true` from a
+  monitor with no status seen yet (the output started while it was
+  connected) counts as Connected. ReadyState: NotReady while the monitor is
+  not Connected or not ready, Processing from a trigger until its shot
+  finishes (at most 10 s), Ready otherwise; never BallDetected.
+  ConnectionState: Connected, Connecting (`Starting`), Reconnecting, Error
+  (an `error` key while not connected) or Disconnected. The `error` key is
+  read as the monitor's card holds it: set or removed by a status carrying
+  it, dropped by `Starting` and by a drop from Connected. The monitor read is
+  the one routed for the current mode; with Any, the best state of every
+  monitor, and the battery and name of the only configured monitor, if there
+  is one.
+- Host commands: Ping → Heartbeat (ConnectionState, ReadyState, battery
+  0-100 or 0xFF). SetClubInfo → `HandInfo` then `ClubInfo` on the bus, as a
+  simulator's player information (unknown values logged and ignored); the
+  card shows them as `club`/`handed` and the UI's club and hand selectors are
+  read-only while a `pureplay.*` actor is Connected (`app::set_by_simulator`).
+  SetDetect, SetBallType and SetShotContext are logged only. SetStrictMode
+  is tournament (strict) mode, below. Strict mode starts off on every link.
+  Error from the host → a Warn alert, one per burst of Errors less than 30 s
+  apart across links (not the StrictModeRequired that follows a refusal on
+  the same link). Any
+  other type, including a device-to-host one, or a payload too short for its
+  type → Error code 0, and the link carries on.
+- Audit log (`audit` target): every frame sent and received as its type and
+  full frame hex, then the decoded message; bytes skipped while
+  resynchronising, as hex.
+
+Tournament (strict) mode. Rule: while it is on for a link, flighthook sends
+only values a physical launch monitor measured for that shot.
+
+- `actors/provenance.rs`: every shot source is a `ShotSource` (`Mevo`,
+  `R10`, `Square`, `ExPutt`, `MockMonitor`, `OpenConnectServer`, `AutoChip`)
+  with a `Provenance` (`Measured`: the hardware drivers; `Virtual`: the mock
+  monitor and Auto-chip, and the trackball launch monitor when it is added;
+  `Relayed`: the Open Connect input), both exhaustive matches, so a new
+  source type has to pick a class; `ShotSource::of(actor)` finds it by actor
+  ID prefix (Auto-chip by its fixed ID). A test resolves one actor per config
+  section and checks each is a source or a listed non-source (webserver,
+  camera, openconnect_client, pureplay, random_club).
+- SetStrictMode(1) → `Relay::strict_refusal`: the routed launch monitors
+  (each mode's monitor; "Any" = every configured one from the live config
+  plus every one seen on the bus) in ID order; the first that is not
+  `Measured` gives StrictModeAck(0, "`<name>` is a virtual launch monitor" /
+  "`<name>` relays shots from another app"), strict mode stays off, and a Warn
+  alert names it (one per 30 s burst; Pureplay closes the link and every
+  reconnect asks again). None → StrictModeAck(1). No launch monitor at all
+  → accepted. SetStrictMode(0) → StrictModeAck(1), off.
+- While on: a shot whose source is not `Measured` is not sent and takes no
+  ShotId (an info log line once per source per link); `mapper::map_shot`
+  clears the bit (value 0.0) of every value marked `spin_estimated` (all
+  four spin fields) or `computed`; ClubData with nothing left is not sent.
+- `state::strict::StrictRounds` (`SystemState::strict_rounds`): the link
+  holds its actor ID from the accepted ack until strict mode ends; `Link`'s
+  `Drop` releases it, so a dropped link or a stopped actor ends it too.
+  While any is held `autochip::send` refuses (`SolveError::StrictRound`) and
+  `POST /api/auto-chip` answers 409 before solving. The UI disables the
+  header's Auto-chip chip (hover "Auto-chip is off during a Pureplay
+  strict-mode round.") while a `pureplay.*` card is Connected with
+  `strict_mode` `on` (`auto_chip::strict_round`).
+
+Pureplay telemetry (`ActorStatus`, each key only when it changes):
+
+| Key | Value | Example | Holds for |
+|---|---|---|---|
+| `address` | Pureplay's address | `127.0.0.1:9760` | the actor |
+| `last_shot` | the ShotId sent last and the local time | `#4 at 16:41:07` | the actor |
+| `shots_sent` | shots sent on this link | `4` | the link |
+| `ready_state` | the ReadyState last sent | `ready` | the link |
+| `strict_mode` | `on` / `off` | `off` | the link |
+| `error` | why the handshake failed | `no reply to Hello from 127.0.0.1:9760 within 5s; ...` | until a handshake succeeds or a connect fails another way |
+
+As for the OpenConnect client, a connection refused or closed is a status,
+never an `error` or an alert, and `club`/`handed` are removed when the link
+ends. The state of a launch monitor is learnt only from its own bus events,
+so an output that starts while a monitor is already connected reports it
+NotReady/Disconnected until the monitor's next status or its next
+`ready=true`.
 
 ## Cameras and replay (beta)
 
@@ -1901,7 +2049,8 @@ config-driven). Then each config section constructs an actor struct and calls
 `actor.start(state, sender, receiver)`. Each actor gets a per-actor
 `Arc<AtomicBool>` shutdown flag shared between the `BusReceiver` and the
 registry. Launch monitor actors (mevo, r10, mock::launch) run event loops polling
-the bus. Integration actors (the OpenConnect client in `actors::gspro`, mock::randomclub) subscribe to the bus
+the bus. Integration actors (the OpenConnect client in `actors::gspro`, the
+Pureplay output in `actors::pureplay`, mock::randomclub) subscribe to the bus
 and emit `ClubInfo` / `HandInfo` (for club and hand changes) and `ActorStatus`
 (for connection status) back onto the bus.
 
@@ -2059,10 +2208,10 @@ Groups and order (`ui/src/panels/cards.rs`):
 | General | Global card, Simulation card, Replay card, `webserver` | -- (no (+)) |
 | Launch monitors | `mevo`, `r10`, `square`, `exputt`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, ExPutt, Uneekor (OpenConnect), OpenConnect Server |
 | Cameras | `camera` | Camera (only while `/api/status` says `cameras_supported`; without it the group shows the cameras already configured and no (+)) |
-| Outputs | `openconnect_client`, `random_club` (and any type the UI does not know) | GSPro (OpenConnect), Muni Golf (OpenConnect), OpenConnect Client |
+| Outputs | `openconnect_client`, `pureplay`, `random_club` (and any type the UI does not know) | GSPro (OpenConnect), Muni Golf (OpenConnect), OpenConnect Client, Pureplay |
 
 Each (+) entry is a preset (`cards::AddPreset`): an actor type plus the new
-card's name and address. The OpenConnect presets differ only in those:
+card's name and address. The OpenConnect and Pureplay presets:
 
 | Entry | Type | Name | Address |
 |---|---|---|---|
@@ -2071,6 +2220,7 @@ card's name and address. The OpenConnect presets differ only in those:
 | GSPro (OpenConnect) | `openconnect_client` | GSPro | `127.0.0.1:921` |
 | Muni Golf (OpenConnect) | `openconnect_client` | Muni Golf | `127.0.0.1:9210` |
 | OpenConnect Client | `openconnect_client` | OpenConnect Client | `127.0.0.1:921` |
+| Pureplay | `pureplay` | Pureplay | `127.0.0.1:9760` |
 
 The generic OpenConnect Server and OpenConnect Client entries are for any
 other monitor or simulator that speaks Open Connect.
@@ -2252,6 +2402,8 @@ displayed).
   `ip:port`. A bind change restarts the actor
 - OpenConnect Client cards show name, Address (`ip:port` of the simulator)
   and the three routing dropdowns
+- Pureplay cards show the same: name, Address (`ip:port` of Pureplay) and the
+  three routing dropdowns
 - The Web Server card shows name and Bind Address, the `ip:port` it listens
   on (`0.0.0.0` accepts other computers, `127.0.0.1` only this one). A bind
   change restarts it
@@ -2345,8 +2497,8 @@ putter); hovering a
 club names the mode it switches to when that is Chipping or Putting. A pick
 sends the WebSocket `club` command (`POST /api/club` when the socket is down),
 and the SystemActor then derives the detection mode as for a simulator club
-change. While any `openconnect_client.*` actor is Connected the pill is
-read-only, with the hover text "Set by the simulator": the simulator replaces
+change. While any `openconnect_client.*` or `pureplay.*` actor is Connected
+the pill is read-only, with the hover text "Set by the simulator": the simulator replaces
 the club on its next player message, so its telemetry `club` and the pill
 agree.
 
@@ -2356,7 +2508,7 @@ the WebSocket `init.global_state` and every `hand_info` event; RH while no hand
 is set, the hand the devices use then. A click sends the WebSocket `hand`
 command (`POST /api/hand` when the socket is down); the SystemActor then tells
 the devices, as for a hand from the simulator. Like the club pill it is
-read-only while any `openconnect_client.*` actor is Connected (a static pill
+read-only while any `openconnect_client.*` or `pureplay.*` actor is Connected (a static pill
 with the hover text "Set by the simulator"): the simulator replaces the hand
 with its next player message. Hovering the live control says "Player's hand.
 Devices that follow it are told on a change."
@@ -2658,8 +2810,10 @@ short chips). With it off the chip is not drawn and `POST /api/auto-chip` answer
 it down to the smallest window the UI fits, 1024 px wide. Its menu (`egui::Popup::menu`)
 lists `1 Yard`, `3 Yard`, `5 Yard` (`flighthook::AUTO_CHIP_YARDS`); a pick
 sends `POST /api/auto-chip` (`net::post_auto_chip`). The button is disabled,
-with the reason on hover, while no `openconnect_client.*` actor is Connected
-(`app::set_by_simulator`) and while a chip is waiting for its reply
+with the reason on hover, while a Pureplay output is in a strict-mode round
+(its card Connected with `strict_mode` `on`; the server fires no chip then),
+while no `openconnect_client.*` or `pureplay.*`
+actor is Connected (`app::set_by_simulator`) and while a chip is waiting for its reply
 (`auto_chip_in_flight`). A failed reply shows in the error banner above the
 tabs (`Auto-chip: <status> <error>`) until the next pick. Auto-chip shots
 already recorded display as before when the setting is turned off.

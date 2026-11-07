@@ -30,7 +30,7 @@ use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRa
 use crate::{
     BodyTrackingSection, CameraPosition, CameraSection, ExPuttSection, FlighthookConfig,
     MevoSection, MockMonitorSection, OpenConnectClientSection, OpenConnectServerSection,
-    R10Section, RandomClubSection, SquareSection, WebserverSection,
+    PureplaySection, R10Section, RandomClubSection, SquareSection, WebserverSection,
 };
 use crate::{Club, ClubInfo, GroupedShot, HandInfo, PlayerInfo, ShotGroupInfo, ShotGrouping};
 
@@ -377,6 +377,10 @@ pub enum ConfigAction {
     UpsertOpenConnectClient {
         index: String,
         section: OpenConnectClientSection,
+    },
+    UpsertPureplay {
+        index: String,
+        section: PureplaySection,
     },
     UpsertMockMonitor {
         index: String,

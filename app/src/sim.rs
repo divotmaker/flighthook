@@ -43,8 +43,8 @@ use dimple::ground::{BallState, GroundModel, GroundResult, Surface, Termination}
 use dimple::stats::ShotStats;
 use dimple::trajectory::{ShotInput, ShotResult, simulate_shot};
 use flighthook::{
-    BallFlight, DerivedFlight, Distance, FlightPath, FlighthookEvent, ShotDetectionMode, ShotKey,
-    SimMode, SimSurface, SimulationSection,
+    BallFlight, DerivedFlight, Distance, FlightPath, FlighthookEvent, ShotDetectionMode, ShotField,
+    ShotKey, SimMode, SimSurface, SimulationSection,
 };
 use glam::DVec3;
 use tracing::{debug, info, warn};
@@ -1149,6 +1149,16 @@ fn warn_invalid_environment(cfg: &SimulationSection, env_err: Option<&str>) {
     }
 }
 
+/// Mark `fields` of a `BallFlight` event as computed by the device actor
+/// ([`DerivedFlight::computed`]), adding a derived block that holds only
+/// the marks when the shot was not simulated. Any other event is left as
+/// it is.
+pub(crate) fn mark_computed(event: &mut FlighthookEvent, fields: &[ShotField]) {
+    if let FlighthookEvent::BallFlight { derived, .. } = event {
+        DerivedFlight::mark_computed(derived, fields);
+    }
+}
+
 /// Build the `BallFlight` bus event for a measured ball taken in the
 /// current detection mode (the live game mode); see
 /// [`ball_flight_event_in_mode`].
@@ -1279,6 +1289,39 @@ mod tests {
             shot_id: "abc".into(),
             shot_number: 1,
         }
+    }
+
+    /// Marks land in the simulated block when there is one, and in a block
+    /// of their own when the shot was not simulated; the ball is untouched.
+    #[test]
+    fn computed_marks_ride_on_the_ball_flight_event() {
+        let marks = [ShotField::BackspinRpm, ShotField::SidespinRpm];
+        let mut simulated = simulated_ball_flight_event(&cfg(), key(), square_like(), None);
+        mark_computed(&mut simulated, &marks);
+        let FlighthookEvent::BallFlight { ball, derived, .. } = simulated else {
+            panic!("ball flight");
+        };
+        assert_eq!(*ball, square_like());
+        let d = derived.expect("simulated");
+        assert!(d.carry_distance.is_some(), "the simulation is kept");
+        assert_eq!(d.computed, marks);
+
+        let off = state_with(SimulationSection {
+            mode: SimMode::Off,
+            ..cfg()
+        });
+        let mut plain = ball_flight_event(&off.state, key(), square_like());
+        mark_computed(&mut plain, &marks);
+        let FlighthookEvent::BallFlight { derived, .. } = plain else {
+            panic!("ball flight");
+        };
+        let d = derived.expect("a block holding only the marks");
+        assert_eq!(d.computed, marks);
+        assert_eq!(d.carry_distance, None);
+
+        let mut other = FlighthookEvent::ShotTrigger { key: key() };
+        mark_computed(&mut other, &marks);
+        assert!(matches!(other, FlighthookEvent::ShotTrigger { .. }));
     }
 
     // -- 1. Measured value wins ------------------------------------------------

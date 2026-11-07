@@ -51,6 +51,7 @@ pub use flighthook::{
     PlayerInfo,
     PoseTrackFile,
     PostSettingsResponse,
+    PureplaySection,
     R10Section,
     RECONNECT_ALERT_MS,
     RandomClubSection,

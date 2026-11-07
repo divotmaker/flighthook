@@ -49,12 +49,19 @@ macOS yet.
 | --------- | --------------------- | ----------------------------- | ---------------- |
 | GSPro     | TCP (JSON, port 921)  | built-in (OpenConnect client) | Supported        |
 | Muni Golf | TCP (JSON, port 9210) | built-in (OpenConnect client) | Alpha (untested) |
+| [Pureplay](docs/outputs/pureplay.md) | TCP (binary, port 9760) | built-in (Pureplay Connect) | Beta |
 
 Simulators are reached through the **OpenConnect client** output, which sends
 shots to any simulator that accepts GSPro Open Connect. The OpenConnect client
 and server are the two halves of the same protocol. Add one from the Outputs
 (+) menu: **GSPro (OpenConnect)**, **Muni Golf (OpenConnect)**, or
 **OpenConnect Client** for any other simulator.
+
+Pureplay has its own output, **Pureplay** in the same menu, which speaks
+Pureplay's open Pureplay Connect protocol: shots go out with only the values
+the device measured, and Pureplay sets flighthook's club and hand. Tournament
+rounds take shots from measured launch monitors only. See
+[Pureplay](docs/outputs/pureplay.md).
 
 ### Custom Integrations
 
@@ -428,9 +435,10 @@ with radar launch monitors that miss short chips.
   the configured surface, comes to rest at the chosen distance (carry plus
   roll). The simulator runs its own physics on that launch, so its green
   speed changes the actual roll.
-- It goes to every connected OpenConnect Client output, whatever launch
-  monitor each detection mode is routed to. The button is disabled until one
-  is connected.
+- It goes to every connected OpenConnect Client and Pureplay output,
+  whatever launch monitor each detection mode is routed to. The button is
+  disabled until one is connected, and while Pureplay has a strict-mode
+  (tournament) round in progress, when Auto-chip does not fire at all.
 - The shot list, the Cards and Table views and the export show it as its own
   device, **Auto-chip**. It stays out of your shot statistics: it is listed
   under the set it was hit in, but the set's shot count, the range bars, the
@@ -545,13 +553,17 @@ address = "127.0.0.1:921"
 [openconnect_client.1]
 name = "Muni Golf"
 address = "127.0.0.1:9210"
+
+[pureplay.0]
+name = "Pureplay"
+address = "127.0.0.1:9760"
 ```
 
 `[simulation]` and `[replay]` (camera clips, see
 [Cameras](docs/devices/cameras.md)) are single global tables. Section
 prefixes encode component type: `webserver`, `mevo`, `r10`, `square`,
 `exputt`, `openconnect_server`, `mock_monitor`, `openconnect_client`,
-`random_club`, `camera`. The
+`pureplay`, `random_club`, `camera`. The
 index after the dot (`0`, `1`, ...) identifies the instance. Per-device
 options are covered in the [device docs](#launch-monitors). Settings can also
 be edited live on the Devices tab in the UI.
@@ -675,4 +687,4 @@ To run with a mock device, point `--config` at a TOML file with
 
 ---
 
-Mevo+ and FlightScope are trademarks of FlightScope (Pty) Ltd. Garmin and Approach R10 are trademarks of Garmin Ltd. or its subsidiaries. ExPutt, Square Golf and Square Omni are trademarks of Invant Inc. Uneekor, EYE MINI, EYE XO and QED are trademarks of Uneekor, Inc. GSPro is a trademark of GSP Golf AB. Foresight Sports, SkyTrak and MLM2PRO are trademarks of their respective owners. flighthook is not affiliated with, endorsed by, or sponsored by any of these companies.
+Mevo+ and FlightScope are trademarks of FlightScope (Pty) Ltd. Garmin and Approach R10 are trademarks of Garmin Ltd. or its subsidiaries. ExPutt, Square Golf and Square Omni are trademarks of Invant Inc. Uneekor, EYE MINI, EYE XO and QED are trademarks of Uneekor, Inc. GSPro is a trademark of GSP Golf AB. Foresight Sports, SkyTrak, MLM2PRO and Pureplay are trademarks of their respective owners. flighthook is not affiliated with, endorsed by, or sponsored by any of these companies.

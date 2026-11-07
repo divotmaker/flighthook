@@ -725,8 +725,9 @@ pub async fn get_shot_groups(State(state): State<Arc<WebState>>) -> Json<ShotGro
 /// surface ([`crate::autochip`]); the shot goes on the bus as actor
 /// [`flighthook::AUTO_CHIP_ACTOR`], so every output forwards it and it is
 /// stored like a device's shot. 409 when Auto-chip is disabled in the
-/// settings (`[simulation] auto_chip`) or the simulation environment is
-/// invalid, 400 for any other distance; all with a JSON `{"error"}` body.
+/// settings (`[simulation] auto_chip`), a Pureplay link is in strict mode
+/// (a recorded round) or the simulation environment is invalid, 400 for any
+/// other distance; all with a JSON `{"error"}` body.
 pub async fn post_auto_chip(
     State(state): State<Arc<WebState>>,
     Json(body): Json<AutoChipRequest>,
@@ -735,6 +736,12 @@ pub async fn post_auto_chip(
         return Err(settings_error(
             StatusCode::CONFLICT,
             "Auto-chip is disabled in settings",
+        ));
+    }
+    if state.root.strict_rounds.any() {
+        return Err(settings_error(
+            StatusCode::CONFLICT,
+            crate::autochip::STRICT_ROUND,
         ));
     }
     let yards = body.yards;
@@ -874,6 +881,7 @@ fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction>
         "exputt" => upsert!(exputt, UpsertExPutt),
         "openconnect_server" => upsert!(openconnect_server, UpsertOpenConnectServer),
         "openconnect_client" => upsert!(openconnect_client, UpsertOpenConnectClient),
+        "pureplay" => upsert!(pureplay, UpsertPureplay),
         "mock_monitor" => upsert!(mock_monitor, UpsertMockMonitor),
         "random_club" => upsert!(random_club, UpsertRandomClub),
         "camera" => upsert!(camera, UpsertCamera),
@@ -1487,6 +1495,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_pureplay_scope_upserts_or_removes_its_section() {
+        let mut c = config();
+        c.pureplay.insert(
+            "0".into(),
+            serde_json::from_str(r#"{"name":"Pureplay","address":"127.0.0.1:9760"}"#)
+                .expect("section"),
+        );
+        match scoped_action("pureplay.0", &c).expect("known scope") {
+            ConfigAction::UpsertPureplay { index, section } => {
+                assert_eq!(index, "0");
+                assert_eq!(section.address.as_deref(), Some("127.0.0.1:9760"));
+            }
+            other => panic!("expected UpsertPureplay, got {other:?}"),
+        }
+        match scoped_action("pureplay.1", &c).expect("known scope") {
+            ConfigAction::Remove { id } => assert_eq!(id, "pureplay.1"),
+            other => panic!("expected Remove, got {other:?}"),
+        }
+    }
+
     fn with_webservers(indices: &[&str]) -> FlighthookConfig {
         let mut c = config();
         for i in indices {
@@ -2062,6 +2091,50 @@ mod group_tests {
         )
         .await
         .expect("accepted once enabled");
+        assert_eq!(resp.shot_number, 1);
+    }
+
+    /// While a Pureplay link is in strict mode no chip fires, neither
+    /// through the route nor through `autochip::send`; once it ends the
+    /// user's setting applies again.
+    #[tokio::test]
+    async fn auto_chip_does_not_fire_during_a_strict_round() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| c.simulation.auto_chip = true);
+        state.root.strict_rounds.hold("pureplay.0");
+        let state = Arc::new(state);
+        let mut rx = state.bus_tx.subscribe();
+        let (status, Json(body)) = post_auto_chip(
+            State(Arc::clone(&state)),
+            Json(AutoChipRequest { yards: 3 }),
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"],
+            "Auto-chip is off during a Pureplay strict-mode round"
+        );
+        assert_eq!(
+            crate::autochip::send(&state.root, &state.bus_tx, 3, &state.auto_chip_shots),
+            Err(crate::autochip::SolveError::StrictRound)
+        );
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(
+            state
+                .auto_chip_shots
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no number taken"
+        );
+
+        state.root.strict_rounds.release("pureplay.0");
+        let Json(resp) = post_auto_chip(
+            State(Arc::clone(&state)),
+            Json(AutoChipRequest { yards: 3 }),
+        )
+        .await
+        .expect("fires again once the round ends");
         assert_eq!(resp.shot_number, 1);
     }
 

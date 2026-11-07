@@ -9,6 +9,8 @@ pub mod gspro;
 pub mod mevo;
 pub mod mock;
 pub mod openconnect;
+pub mod provenance;
+pub mod pureplay;
 pub mod r10;
 pub mod square;
 pub mod system;
@@ -102,7 +104,7 @@ pub struct ResolvedActor {
 /// Build a flat list of all actors from the persisted config.
 ///
 /// Iterates all config sections (webserver, mevo, mock_monitor,
-/// openconnect_client, random_club, ...) and constructs the appropriate
+/// openconnect_client, pureplay, random_club, ...) and constructs the appropriate
 /// concrete actor for each, webservers first.
 /// Invalid addresses are logged and skipped.
 ///
@@ -279,6 +281,32 @@ pub fn resolve_actors(
         }
     }
 
+    // Pureplay outputs
+    for (index, section) in &config.pureplay {
+        let id = global_id("pureplay", index);
+        let addr_str = section
+            .address
+            .as_deref()
+            .unwrap_or(pureplay::DEFAULT_ADDRESS);
+        match addr_str.parse::<SocketAddr>() {
+            Ok(addr) => {
+                let routing = gspro::GsProRouting {
+                    full_monitor: section.full_monitor.clone(),
+                    chipping_monitor: section.chipping_monitor.clone(),
+                    putting_monitor: section.putting_monitor.clone(),
+                };
+                actors.push(ResolvedActor {
+                    id,
+                    name: section.name.clone(),
+                    actor: Box::new(pureplay::PureplayActor { addr, routing }),
+                });
+            }
+            Err(e) => {
+                tracing::warn!("integration '{id}': invalid address '{addr_str}': {e}");
+            }
+        }
+    }
+
     // Random club integrations
     for (index, section) in &config.random_club {
         let id = global_id("random_club", index);
@@ -392,6 +420,9 @@ pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String> {
     for (index, section) in &config.openconnect_client {
         names.insert(global_id("openconnect_client", index), section.name.clone());
     }
+    for (index, section) in &config.pureplay {
+        names.insert(global_id("pureplay", index), section.name.clone());
+    }
     for (index, section) in &config.random_club {
         names.insert(global_id("random_club", index), section.name.clone());
     }
@@ -486,6 +517,7 @@ mod tests {
             "mock_monitor",
             "openconnect_server",
             "openconnect_client",
+            "pureplay",
             "random_club",
         ] {
             assert!(reconnectable(t), "{t}");
@@ -493,6 +525,29 @@ mod tests {
         for t in ["camera", "webserver", "system"] {
             assert!(!reconnectable(t), "{t}");
         }
+    }
+
+    #[test]
+    fn a_pureplay_section_resolves_to_its_output() {
+        let mut config = FlighthookConfig::default();
+        config
+            .pureplay
+            .insert("0".into(), flighthook::PureplaySection::default());
+        config.pureplay.insert(
+            "1".into(),
+            flighthook::PureplaySection {
+                name: "Bad".into(),
+                address: Some("not an address".into()),
+                ..flighthook::PureplaySection::default()
+            },
+        );
+        let ids: Vec<String> = resolve_actors(&config, None)
+            .into_iter()
+            .map(|a| a.id)
+            .filter(|id| id.starts_with("pureplay."))
+            .collect();
+        assert_eq!(ids, ["pureplay.0"], "an invalid address is skipped");
+        assert_eq!(actor_names(&config)["pureplay.0"], "Pureplay");
     }
 
     fn with_openconnect(names: &[(&str, &str)]) -> FlighthookConfig {

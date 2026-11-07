@@ -8,8 +8,8 @@ use crate::theme;
 use crate::types::{
     CameraListEntry, CameraMode, CameraPosition, CameraSection, Club, Distance, DistanceExt,
     FlightScopeEnvironment, FlighthookConfig, MevoSection, MockMonitorSection,
-    OpenConnectClientSection, R10Section, RandomClubSection, ReplaySection, ShotGrouping,
-    SimSurface, SimulationSection, SpinSource, UnitSystem, WebserverSection,
+    OpenConnectClientSection, PureplaySection, R10Section, RandomClubSection, ReplaySection,
+    ShotGrouping, SimSurface, SimulationSection, SpinSource, UnitSystem, WebserverSection,
 };
 use flighthook::{BodyTrackingMode, BodyTrackingSection, PoseModel, SimMode};
 
@@ -542,7 +542,7 @@ pub(crate) const EXPUTT_IP_PLACEHOLDER: &str = "empty = auto-detect";
 #[derive(Clone)]
 pub(crate) struct IntegrationFormEntry {
     pub(crate) id: String,
-    pub(crate) integration_type: String, // "openconnect_client" | "random_club" | "webserver"
+    pub(crate) integration_type: String, // "openconnect_client" | "pureplay" | "random_club" | "webserver"
     pub(crate) name: String,
     pub(crate) address: String,
     /// Routing: actor ID for full-swing monitor, or empty = "Any".
@@ -600,6 +600,7 @@ impl ActorFormEntry {
             },
             ActorFormEntry::Integration(i) => match i.integration_type.as_str() {
                 "openconnect_client" => "OpenConnect Client",
+                "pureplay" => "Pureplay",
                 "random_club" => "Random Club",
                 "webserver" => "Web Server",
                 _ => &i.integration_type,
@@ -630,6 +631,9 @@ impl ActorFormEntry {
             ActorFormEntry::Integration(i) => match i.integration_type.as_str() {
                 "openconnect_client" => {
                     "Sends shots to a simulator that accepts GSPro Open Connect (GSPro on 921, Muni Golf on 9210) — connects via TCP"
+                }
+                "pureplay" => {
+                    "Sends shots to Pureplay over Pureplay Connect (port 9760) and takes its club and hand (beta) — connects via TCP"
                 }
                 "random_club" => "Cycles through clubs automatically on each shot",
                 "webserver" => "HTTP/WebSocket server for the dashboard UI and API",
@@ -722,7 +726,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
     match type_key {
         "mevo" => Some(device(1)),
         "square" | "r10" | "exputt" | "openconnect_server" | "camera" => Some(device(0)),
-        "openconnect_client" => Some(integration()),
+        "openconnect_client" | "pureplay" => Some(integration()),
         _ => None,
     }
 }
@@ -1181,6 +1185,18 @@ fn actor_entries(s: &FlighthookConfig) -> Vec<ActorFormEntry> {
             dirty: false,
         }));
     }
+    for (id, section) in &s.pureplay {
+        actors.push(ActorFormEntry::Integration(IntegrationFormEntry {
+            id: id.clone(),
+            integration_type: "pureplay".into(),
+            name: section.name.clone(),
+            address: section.address.clone().unwrap_or_default(),
+            full_monitor: section.full_monitor.clone().unwrap_or_default(),
+            chipping_monitor: section.chipping_monitor.clone().unwrap_or_default(),
+            putting_monitor: section.putting_monitor.clone().unwrap_or_default(),
+            dirty: false,
+        }));
+    }
     for (id, section) in &s.random_club {
         actors.push(ActorFormEntry::Integration(IntegrationFormEntry {
             id: id.clone(),
@@ -1412,6 +1428,7 @@ impl SettingsForm {
             mock_monitor: HashMap::new(),
             openconnect_server: HashMap::new(),
             openconnect_client: HashMap::new(),
+            pureplay: HashMap::new(),
             random_club: HashMap::new(),
             camera: HashMap::new(),
         };
@@ -1773,6 +1790,7 @@ fn set_section(to: &mut FlighthookConfig, from: Option<&FlighthookConfig>, globa
             from.and_then(|f| f.openconnect_client.get(i)),
             i,
         ),
+        "pureplay" => set(&mut to.pureplay, from.and_then(|f| f.pureplay.get(i)), i),
         "random_club" => set(
             &mut to.random_club,
             from.and_then(|f| f.random_club.get(i)),
@@ -1801,6 +1819,7 @@ fn section_json(config: &FlighthookConfig, global_id: &str) -> Option<serde_json
         "mock_monitor" => get(&config.mock_monitor, i),
         "openconnect_server" => get(&config.openconnect_server, i),
         "openconnect_client" => get(&config.openconnect_client, i),
+        "pureplay" => get(&config.pureplay, i),
         "random_club" => get(&config.random_club, i),
         "camera" => get(&config.camera, i),
         _ => None,
@@ -2028,6 +2047,19 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             } else {
                                 Some(entry.putting_monitor.clone())
                             },
+                        },
+                    );
+                }
+                "pureplay" => {
+                    let set = |v: &String| (!v.is_empty()).then(|| v.clone());
+                    config.pureplay.insert(
+                        entry.id.clone(),
+                        PureplaySection {
+                            name: entry.name.clone(),
+                            address: set(&entry.address),
+                            full_monitor: set(&entry.full_monitor),
+                            chipping_monitor: set(&entry.chipping_monitor),
+                            putting_monitor: set(&entry.putting_monitor),
                         },
                     );
                 }
@@ -2774,6 +2806,12 @@ pub(crate) fn actor_fields(
                          too; 127.0.0.1 only from this one.",
                         "ip:port (e.g. 0.0.0.0:5880)",
                     )
+                } else if entry.integration_type == "pureplay" {
+                    (
+                        "Address:",
+                        "TCP address of Pureplay. Shot data is sent here over Pureplay Connect.",
+                        "ip:port (e.g. 127.0.0.1:9760)",
+                    )
                 } else {
                     (
                         "Address:",
@@ -2799,8 +2837,11 @@ pub(crate) fn actor_fields(
                 }
             }
 
-            // Routing dropdowns (Open Connect clients only)
-            if entry.integration_type == "openconnect_client" {
+            // Routing dropdowns (Open Connect clients and Pureplay)
+            if matches!(
+                entry.integration_type.as_str(),
+                "openconnect_client" | "pureplay"
+            ) {
                 for (label_text, field_val, salt) in [
                     ("Full Monitor:", &mut entry.full_monitor, "full"),
                     ("Chipping Monitor:", &mut entry.chipping_monitor, "chipping"),
@@ -3788,6 +3829,8 @@ mod tests {
                 "openconnect_client.3",
                 "openconnect_client.4",
                 "openconnect_client.5",
+                "pureplay.0",
+                "pureplay.1",
                 "random_club.0",
             ]
         );

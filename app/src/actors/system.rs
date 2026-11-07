@@ -851,6 +851,13 @@ fn apply_config_command(
             });
             scope = Some(format!("openconnect_client.{index}"));
         }
+        ConfigAction::UpsertPureplay { index, section } => {
+            let idx = index.clone();
+            state.system.update(|p| {
+                p.pureplay.insert(idx, section.clone());
+            });
+            scope = Some(format!("pureplay.{index}"));
+        }
         ConfigAction::UpsertMockMonitor { index, section } => {
             let idx = index.clone();
             state.system.update(|p| {
@@ -894,6 +901,9 @@ fn apply_config_command(
                     }
                     "openconnect_client" => {
                         p.openconnect_client.remove(&idx);
+                    }
+                    "pureplay" => {
+                        p.pureplay.remove(&idx);
                     }
                     "mock_monitor" => {
                         p.mock_monitor.remove(&idx);

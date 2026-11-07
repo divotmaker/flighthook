@@ -58,6 +58,7 @@ const ACTOR_TYPES: &[(&str, CardGroup)] = &[
     ("openconnect_server", CardGroup::LaunchMonitors),
     ("camera", CardGroup::Cameras),
     ("openconnect_client", CardGroup::Outputs),
+    ("pureplay", CardGroup::Outputs),
     ("random_club", CardGroup::Outputs),
 ];
 
@@ -193,6 +194,7 @@ const OUTPUT_PRESETS: &[AddPreset] = &[
         "OpenConnect Client",
         "127.0.0.1:921",
     ),
+    preset("Pureplay", "pureplay", "Pureplay", "127.0.0.1:9760"),
 ];
 
 /// What a group's (+) menu offers, in menu order.
@@ -348,7 +350,7 @@ mod tests {
         }
         assert_eq!(group_of("webserver"), CardGroup::General);
         assert_eq!(group_of("camera"), CardGroup::Cameras);
-        for t in ["openconnect_client", "random_club"] {
+        for t in ["openconnect_client", "pureplay", "random_club"] {
             assert_eq!(group_of(t), CardGroup::Outputs, "{t}");
         }
         assert_eq!(group_of("something_new"), CardGroup::Outputs);
@@ -372,6 +374,7 @@ mod tests {
             mock_monitor: _,
             openconnect_server: _,
             openconnect_client: _,
+            pureplay: _,
             random_club: _,
             replay: _,
             body_tracking: _,
@@ -386,6 +389,7 @@ mod tests {
             "mock_monitor",
             "openconnect_server",
             "openconnect_client",
+            "pureplay",
             "random_club",
             "camera",
         ] {
@@ -503,6 +507,7 @@ mod tests {
                     "OpenConnect Client",
                     "127.0.0.1:921"
                 ),
+                ("Pureplay", "pureplay", "Pureplay", "127.0.0.1:9760"),
             ]
         );
         assert!(
@@ -524,7 +529,7 @@ mod tests {
             .collect();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 10);
+        assert_eq!(labels.len(), 11);
     }
 
     #[test]

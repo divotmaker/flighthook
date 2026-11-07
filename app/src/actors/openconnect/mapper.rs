@@ -7,7 +7,7 @@
 //! so HLA, SideSpin, SpinAxis, FaceToTarget and Path are taken as they are.
 
 use super::super::gspro::api;
-use flighthook::{BallFlight, ClubData, Distance, FaceImpact, Velocity};
+use flighthook::{BallFlight, ClubData, Distance, FaceImpact, ShotField, Velocity};
 
 /// Distance unit selected by the message's `Units` field.
 ///
@@ -79,6 +79,17 @@ pub fn map_ball(msg: &api::GsProMessage) -> BallFlight {
         }
     }
     ball
+}
+
+/// The spin pair [`map_ball`] computes rather than the message carries:
+/// total spin and axis when the monitor sent the components, the components
+/// when it sent a total and axis.
+#[must_use]
+pub fn computed_spin(msg: &api::GsProMessage) -> [ShotField; 2] {
+    match spin(&msg.ball_data) {
+        Spin::Components(..) => [ShotField::TotalSpinRpm, ShotField::SpinAxis],
+        Spin::TotalAndAxis(..) => [ShotField::BackspinRpm, ShotField::SidespinRpm],
+    }
 }
 
 /// Map the club half of an Open Connect message.

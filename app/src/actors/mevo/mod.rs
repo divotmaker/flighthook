@@ -31,8 +31,8 @@ use settings::fusion_cam_config;
 
 use flighthook::{
     ActorStatus, BallFlight, CameraMode, ClubData, Distance, FlighthookEvent, FlighthookMessage,
-    RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw, SpinSource, Velocity,
-    hex_lower,
+    RawDir, RawRecord, Severity, ShotDetectionMode, ShotField, ShotKey, ShotRaw, SpinSource,
+    Velocity, hex_lower,
 };
 
 /// No events for this long → treat as disconnected.
@@ -513,12 +513,14 @@ fn on_shot_datum(
             let held_club = results.accept_d4();
             let mut ball = ball_from_d4(&d4);
             let mut spin_source = "D4";
+            let mut computed: &[ShotField] = &[];
             if model == DeviceModel::Xi {
                 let source = live_spin_source(state, sender.actor_id()).unwrap_or(ctx.spin_source);
                 let (spin, label) = xi_spin(source, mode, &d4, results.e8.as_ref());
                 if let Some((back, side)) = spin {
                     ball.backspin_rpm = Some(back);
                     ball.sidespin_rpm = Some(side);
+                    computed = &XI_E8_COMPUTED;
                 }
                 spin_source = label;
             }
@@ -542,6 +544,7 @@ fn on_shot_datum(
             if estimated {
                 mark_spin_estimated(&mut event);
             }
+            sim::mark_computed(&mut event, computed);
             let msg = FlighthookMessage::new(event);
             sender.send(stamp_device(msg, device_id));
             if let Some(club) = held_club {
@@ -1403,6 +1406,11 @@ fn live_launch_only_spin(state: &SystemState, actor_id: &str) -> Option<f64> {
     let (_, index) = actor_id.split_once('.')?;
     state.system.mevo_launch_only_spin(index)
 }
+
+/// The values an Xi spin from [`xi_spin`] puts on the ball that the device
+/// does not report: back and side spin worked out from the E8 total and an
+/// axis taken from D4 (or 0).
+const XI_E8_COMPUTED: [ShotField; 2] = [ShotField::BackspinRpm, ShotField::SidespinRpm];
 
 /// Xi spin for `source`: the (backspin, FRP sidespin) to use
 /// instead of D4's, or `None` to keep D4's, plus a label naming the source
@@ -2937,6 +2945,54 @@ mod tests {
             }
         }
         panic!("no ball flight sent");
+    }
+
+    /// With the Xi's Spin source E8, the back and side spin worked out from
+    /// the E8 total and D4's axis are marked computed; with D4 nothing is.
+    #[test]
+    fn an_xi_e8_spin_is_marked_computed() {
+        for (source, want) in [
+            (SpinSource::E8, &XI_E8_COMPUTED[..]),
+            (SpinSource::D4, &[][..]),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "flighthook-mevo-test-{}",
+                crate::state::config::generate_id()
+            ));
+            let (state, _writer) = SystemState::new(dir.join("config.toml"));
+            let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel(16);
+            let sender = BusSender::new("mevo.0".into(), bus_tx, Arc::default());
+            let device_id = None;
+            let result_raw = RefCell::new(ResultRaw::default());
+            let ctx = ShotContext {
+                state: &state,
+                sender: &sender,
+                device_id: &device_id,
+                model: DeviceModel::Xi,
+                spin_source: source,
+                launch_only_spin: flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
+                result_raw: &result_raw,
+            };
+            let key = ShotKey {
+                shot_id: "e8".into(),
+                shot_number: 1,
+            };
+            let (d4, e8) = shot_with_club_data();
+            let mut results = ShotResults::default();
+            let mode = ShotDetectionMode::Full;
+            on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::FlightV1(e8));
+            on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::Flight(d4));
+            let _ = std::fs::remove_dir_all(&dir);
+            let computed = std::iter::from_fn(|| bus_rx.try_recv().ok())
+                .find_map(|msg| match msg.event {
+                    FlighthookEvent::BallFlight { derived, .. } => {
+                        Some(derived.map(|d| d.computed).unwrap_or_default())
+                    }
+                    _ => None,
+                })
+                .expect("a ball flight");
+            assert_eq!(computed, want, "{source:?}");
+        }
     }
 
     /// The Xi's launch-only chip gets the default 100 rpm per mph of

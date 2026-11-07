@@ -138,6 +138,7 @@ impl LegacyFlighthookConfig {
             mock_monitor: self.mock_monitor,
             openconnect_server: HashMap::new(),
             openconnect_client: self.gspro,
+            pureplay: HashMap::new(),
             random_club: self.random_club,
             replay: flighthook::ReplaySection::default(),
             body_tracking: flighthook::BodyTrackingSection::default(),
@@ -1668,6 +1669,11 @@ full_monitor = "openconnect_server.0"
 name = "Muni Golf"
 address = "127.0.0.1:9210"
 
+[pureplay.0]
+name = "Pureplay"
+address = "127.0.0.1:9760"
+full_monitor = "mevo.0"
+
 [random_club.0]
 name = "Clubs"
 "#;
@@ -1698,6 +1704,8 @@ name = "Clubs"
         assert_eq!(c.openconnect_client["0"].name, "GSPro");
         assert_eq!(c.openconnect_client["1"].name, "Muni Golf");
         assert_eq!(c.random_club["0"].name, "Clubs");
+        assert_eq!(c.pureplay["0"].address.as_deref(), Some("127.0.0.1:9760"));
+        assert_eq!(c.pureplay["0"].full_monitor.as_deref(), Some("mevo.0"));
 
         let out = toml::to_string_pretty(&c).expect("ser");
         let back: FlighthookConfig = toml::from_str(&out).expect("parses");

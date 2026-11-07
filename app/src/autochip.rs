@@ -29,6 +29,9 @@ use tracing::info;
 use crate::sim;
 use crate::state::SystemState;
 
+/// Why Auto-chip does not fire during a strict-mode round.
+pub(crate) const STRICT_ROUND: &str = "Auto-chip is off during a Pureplay strict-mode round";
+
 /// Launch angle of every Auto-chip, degrees.
 pub(crate) const LAUNCH_ELEVATION_DEG: f64 = 28.0;
 
@@ -42,9 +45,13 @@ const MAX_SPEED_MPH: f64 = 60.0;
 /// The solver stops once the speed bracket is this narrow, mph.
 const SPEED_TOLERANCE_MPH: f64 = 1e-4;
 
-/// Why no speed could be solved for a distance.
+/// Why no chip could be sent: Auto-chip is off for a strict-mode round, or
+/// no speed could be solved for the distance.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SolveError {
+    /// A Pureplay link is in strict mode (a recorded round), which takes
+    /// measured shots only ([`SystemState::strict_rounds`]).
+    StrictRound,
     /// The `[simulation]` environment is invalid (the reason).
     Environment(String),
     /// The target is not positive and finite.
@@ -56,6 +63,7 @@ pub(crate) enum SolveError {
 impl std::fmt::Display for SolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::StrictRound => write!(f, "{STRICT_ROUND}"),
             Self::Environment(e) => write!(f, "simulation environment invalid: {e}"),
             Self::Distance => write!(f, "distance must be positive"),
             Self::Unreachable => write!(f, "no ball speed gives that distance"),
@@ -139,13 +147,17 @@ pub(crate) fn solve_speed(yards: f64, cfg: &SimulationSection) -> Result<f64, So
 /// settings, as the next shot of [`AUTO_CHIP_ACTOR`]: `shots` counts the
 /// Auto-chip shots sent, and is advanced only once the solve has succeeded,
 /// so a chip that is not sent takes no number. Blocks for the solve (some
-/// tens of simulations). Returns the shot's key and ball.
+/// tens of simulations). Returns the shot's key and ball. Sends nothing
+/// while a Pureplay link is in strict mode.
 pub(crate) fn send(
     state: &SystemState,
     bus: &broadcast::Sender<FlighthookMessage>,
     yards: u32,
     shots: &AtomicU32,
 ) -> Result<(ShotKey, BallFlight), SolveError> {
+    if state.strict_rounds.any() {
+        return Err(SolveError::StrictRound);
+    }
     let cfg = state.system.simulation();
     let speed = solve_speed(f64::from(yards), &cfg)?;
     let shot_number = shots.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
