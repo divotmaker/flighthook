@@ -2839,21 +2839,24 @@ an older shot, a discarded recording) the card shows its name over an empty
 body and fetches nothing; the clip starts when it arrives (`shot_video`, the
 row's `video`). It fetches like the replay view: the sidecar, then range
 windows around the playhead and 300 ms ahead (from the start point again
-past the end), two requests at most, into a 24 MiB byte cache. Each frame is
-decoded once and kept as a texture while the card shows that shot's clip, as
-long as the whole loop fits 48 MiB of textures; past that the card keeps the
-replay view's 32 most recent frames. The camera cards share one decode per
+past the end), two requests at most, into a 24 MiB byte cache. A card keeps
+every k-th frame of its loop, from the start point's frame on, with k the
+smallest stride whose frames fit 48 MiB of textures at the card's pixel size
+(every frame when the whole loop fits; a 556-frame loop at 182x144 px keeps
+every other frame). Each kept frame is decoded once and kept as a texture
+while the card shows that shot's clip. The camera cards share one decode per
 screen update between them (`FlighthookApp::decode_card_frame`: the card
-that has waited longest for one goes first). While the whole loop is kept,
-a card decodes the first frame not decoded yet from the playhead on, in loop
-order, so its loop fills in ahead of the playhead; otherwise the frame at
-the playhead. A decoded frame shows on the next screen update. A new shown
+that has waited longest for one goes first). A card decodes the first kept
+frame not decoded yet from the playhead on, in loop order, so its loop fills
+in ahead of the playhead. It shows the decoded kept frame at or nearest
+before the playhead, so a clip whose playhead moves several frames per
+screen update still plays while its loop fills in. A new shown
 shot, another camera on the card, Clear history or a new card size drops
 what it holds (a new size also the picture on screen). The card row holds
 clips only while it is on screen: the Table view, the view None, another tab
 and the replay view of the shown shot drop every card's clip, and the cards
 fetch and decode again when the row returns. While it plays a card asks for
-a repaint when the next frame is due (`request_repaint_after`), never sooner
+a repaint when its next kept frame is due (`request_repaint_after`), never sooner
 than 1/60 s, so a faster camera skips frames to keep its time; it asks none
 while the replay view is open. A click cycles the card; the shot header's
 Replay chip opens the replay.

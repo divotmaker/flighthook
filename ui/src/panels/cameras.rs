@@ -1972,8 +1972,13 @@ mod tests {
     fn a_kept_cameras_choice_opens_the_cameras_pane_in_the_table_view() {
         let screen = Screen::new();
         app(&[0], true).set_shots_pane(ShotsPane::Cameras);
+        let kept = ShotsPane::stored();
+        // Data is stored again before anything is checked, so a failure
+        // leaves no Cameras choice for later tests on this thread.
+        crate::local::store(PANE_KEY, ShotsPane::Data.key());
+        assert_eq!(kept, ShotsPane::Cameras);
         let mut app = app(&[0], true);
-        app.shots_pane = ShotsPane::stored();
+        app.shots_pane = kept;
         app.shots_view = ShotsView::Table;
         let marks = screen.frame(&mut app, Vec::new());
         assert!(app.cameras_pane_shown());
@@ -1981,7 +1986,6 @@ mod tests {
         assert!(marks.contains_key("live_toggle"));
         assert!(marks.contains_key("live_title"));
         assert!(!marks.contains_key("view_toggle"));
-        app.set_shots_pane(ShotsPane::Data);
     }
 
     #[test]
@@ -2136,21 +2140,28 @@ mod tests {
     #[test]
     fn clear_history_in_the_cameras_pane_turns_live_on() {
         let screen = Screen::new();
-        let mut app = app_with_shots(2);
-        screen.frame(&mut app, Vec::new());
-        // In the Data pane it changes nothing.
-        app.clear_shot_history();
-        screen.frame(&mut app, Vec::new());
-        assert!(!app.live_selected);
-        app.shots = vec![shot_row(1, &[])];
-        app.shots_rev += 1;
-        app.set_shots_pane(ShotsPane::Cameras);
-        screen.frame(&mut app, Vec::new());
-        assert!(!app.live_selected);
-        app.clear_shot_history();
-        let marks = screen.frame(&mut app, Vec::new());
-        assert!(app.live_selected);
-        assert!(marks.contains_key("live_title"));
+        for view in [ShotsView::Cards, ShotsView::Table] {
+            let mut app = app_with_shots(2);
+            app.shots_view = view;
+            screen.frame(&mut app, Vec::new());
+            // In the Data pane it changes nothing.
+            app.clear_shot_history();
+            screen.frame(&mut app, Vec::new());
+            assert!(!app.live_selected, "{view:?}");
+            app.shots = vec![shot_row(1, &[])];
+            app.shots_rev += 1;
+            app.set_shots_pane(ShotsPane::Cameras);
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(app.cameras_pane_shown(), "{view:?}");
+            assert!(!app.live_selected, "{view:?}: the shot");
+            assert!(!marks.contains_key("live_title"), "{view:?}");
+            app.clear_shot_history();
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(app.live_selected, "{view:?}");
+            assert!(marks.contains_key("live_title"), "{view:?}");
+            assert_eq!(app.shots_view, view, "the Data pane's view is kept");
+            app.set_shots_pane(ShotsPane::Data);
+        }
     }
 
     #[test]
@@ -2256,15 +2267,25 @@ mod tests {
     #[test]
     fn removing_the_cameras_leaves_live() {
         let screen = Screen::new();
-        let mut app = app(&[0], true);
-        app.select_live();
-        screen.frame(&mut app, Vec::new());
-        assert_eq!(app.live.len(), 1);
-        app.settings.load_from(&config(&[]));
-        screen.frame(&mut app, Vec::new());
-        assert!(!app.live_selected);
-        assert_eq!(app.active_tab, Tab::Shots);
-        assert!(app.live.is_empty());
+        for view in [ShotsView::Cards, ShotsView::Table] {
+            let mut app = app(&[0], true);
+            app.shots_view = view;
+            app.select_live();
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(app.cameras_pane_shown(), "{view:?}");
+            assert!(marks.contains_key("live_title"), "{view:?}");
+            assert_eq!(app.live.len(), 1, "{view:?}");
+            app.settings.load_from(&config(&[]));
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(!app.live_selected, "{view:?}");
+            assert!(!app.cameras_pane_shown(), "{view:?}");
+            assert!(!marks.contains_key("live_title"), "{view:?}");
+            assert!(marks.contains_key("view_toggle"), "{view:?}: Cards | Table");
+            assert_eq!(app.shots_view, view, "the Data pane's view is kept");
+            assert_eq!(app.active_tab, Tab::Shots);
+            assert!(app.live.is_empty(), "{view:?}");
+            app.set_shots_pane(ShotsPane::Data);
+        }
     }
 
     /// A 64×48 JPEG, as a camera sends one.

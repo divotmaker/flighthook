@@ -1408,9 +1408,10 @@ fn camera_column(
 // Camera card
 // ---------------------------------------------------------------------------
 
-/// Most bytes of decoded frames a camera card keeps. Within it every frame
-/// of the loop is decoded once and kept; past it the card keeps the replay
-/// view's [`TEXTURES`] most recent frames.
+/// Most bytes of decoded frames a camera card keeps. A card keeps every
+/// k-th frame of its loop, k the smallest stride whose frames fit this at
+/// the card's pixel size (every frame when the whole loop fits), and
+/// decodes each kept frame once.
 pub(crate) const CARD_TEXTURE_BYTES: usize = 48 << 20;
 
 /// A camera card's clip of the shown shot: played at 1×, looping from the
@@ -1499,22 +1500,34 @@ impl CardClip {
         }
     }
 
-    /// How many decoded frames it keeps: the whole loop when it fits
-    /// [`CARD_TEXTURE_BYTES`] at `px`, else [`TEXTURES`].
+    /// Every how many frames of the loop it keeps: the smallest stride
+    /// whose frames fit [`CARD_TEXTURE_BYTES`] at `px`, 1 when the whole
+    /// loop fits. Kept are the start point's frame and every `stride`-th
+    /// after it.
+    fn stride(&self) -> usize {
+        let frame_bytes = (self.px[0] * self.px[1] * 4).max(1);
+        let fit = (CARD_TEXTURE_BYTES / frame_bytes).max(1);
+        self.loop_frames().div_ceil(fit).max(1)
+    }
+
+    /// How many decoded frames it keeps: the kept frames of the loop.
     fn capacity(&self) -> usize {
-        let frames = self.loop_frames();
-        let bytes = frames.saturating_mul(self.px[0] * self.px[1] * 4);
-        if frames > 0 && bytes <= CARD_TEXTURE_BYTES {
-            frames
-        } else {
-            TEXTURES
-        }
+        self.loop_frames().div_ceil(self.stride())
+    }
+
+    /// The kept frame at or before `frame` (the start point's frame for a
+    /// frame before it).
+    fn kept_at(&self, frame: usize) -> Option<usize> {
+        let p = self.playback.as_ref()?;
+        let start = self.clip.track.as_ref()?.frame_at(p.start);
+        let stride = self.stride();
+        Some(start + frame.saturating_sub(start) / stride * stride)
     }
 
     /// Whether every frame of the loop is kept once decoded.
     #[cfg(test)]
     pub(crate) fn keeps_every_frame(&self) -> bool {
-        self.loop_frames() > 0 && self.capacity() == self.loop_frames()
+        self.loop_frames() > 0 && self.stride() == 1
     }
 
     /// Take a reply from the server.
@@ -1567,7 +1580,7 @@ impl CardClip {
         }
     }
 
-    /// What to ask the server for: the sidecar, then the frames at the
+    /// What to ask the server for: the sidecar, then the kept frames at the
     /// playhead and a little ahead (from the start point again past the
     /// end) that are not decoded yet.
     fn due(&mut self) -> Vec<Fetch> {
@@ -1581,6 +1594,7 @@ impl CardClip {
                 };
                 [track.frame_at(p.playhead), track.frame_at(ahead)]
                     .into_iter()
+                    .filter_map(|f| self.kept_at(f))
                     .filter(|f| !self.textures.contains(f))
                     .collect()
             }
@@ -1589,23 +1603,23 @@ impl CardClip {
         self.clip.due(&frames)
     }
 
-    /// The frame to decode next, when its bytes are in. While the whole
-    /// loop is kept, the first frame not decoded yet from the playhead on,
-    /// in loop order (from the start point again past the end), so the
-    /// loop fills in ahead of the playhead; else the frame at the playhead.
+    /// The frame to decode next, when its bytes are in: the first kept
+    /// frame not decoded yet from the playhead on, in loop order (from the
+    /// start point again past the end), so the loop fills in ahead of the
+    /// playhead.
     pub(crate) fn next_to_decode(&self) -> Option<usize> {
         let p = self.playback.as_ref()?;
         let track = self.clip.track.as_ref()?;
-        let frame = track.frame_at(p.playhead);
+        let at = self.kept_at(track.frame_at(p.playhead))?;
         let wanted = |f: &usize| {
             !self.textures.contains(f) && !self.undecodable.contains(f) && self.clip.bytes.has(*f)
         };
-        if self.capacity() < self.loop_frames() {
-            return Some(frame).filter(wanted);
-        }
         let start = track.frame_at(p.start);
-        let n = track.frames.len();
-        (frame..n).chain(start..frame).find(wanted)
+        let (n, stride) = (track.frames.len(), self.stride());
+        (at..n)
+            .step_by(stride)
+            .chain((start..at).step_by(stride))
+            .find(wanted)
     }
 
     /// Decode [`CardClip::next_to_decode`]: cut to the card's aspect and
@@ -1633,15 +1647,20 @@ impl CardClip {
         }
     }
 
-    /// The picture at the playhead: its decoded frame when it is kept, else
-    /// the last picture shown. The clock starts once the start frame is on
-    /// screen.
+    /// The picture at the playhead: the decoded kept frame at or nearest
+    /// before it in the loop, else the last picture shown. The clock starts
+    /// once the start frame is on screen.
     fn frame_texture(&mut self) -> Option<egui::TextureHandle> {
         let p = self.playback.as_ref()?;
         let track = self.clip.track.as_ref()?;
-        let frame = track.frame_at(p.playhead);
+        let at = self.kept_at(track.frame_at(p.playhead))?;
         let start = track.frame_at(p.start);
-        if self.shown.as_ref().is_none_or(|(shown, _)| *shown != frame)
+        let decoded = (start..=at)
+            .rev()
+            .step_by(self.stride())
+            .find(|f| self.textures.contains(f));
+        if let Some(frame) = decoded
+            && self.shown.as_ref().is_none_or(|(shown, _)| *shown != frame)
             && let Some(tex) = self.textures.get(&frame)
         {
             self.shown = Some((frame, tex.clone()));
@@ -1656,8 +1675,8 @@ impl CardClip {
         self.shown.as_ref().map(|(_, tex)| tex.clone())
     }
 
-    /// Seconds until the next frame is due (the start point's again at the
-    /// end of the loop), while the clock runs; never under
+    /// Seconds until the next kept frame is due (the start point's again
+    /// at the end of the loop), while the clock runs; never under
     /// [`CARD_REPAINT_MIN_S`].
     fn next_due(&self) -> Option<f64> {
         let (p, track) = (self.playback.as_ref()?, self.clip.track.as_ref()?);
@@ -1665,9 +1684,9 @@ impl CardClip {
         if !self.running || end <= start {
             return None;
         }
-        let frame = track.frame_at(p.playhead);
-        let next = if frame + 1 < track.frames.len() {
-            track.time(frame + 1)
+        let next = self.kept_at(track.frame_at(p.playhead))? + self.stride();
+        let next = if next < track.frames.len() {
+            track.time(next)
         } else {
             end
         }
@@ -2513,6 +2532,12 @@ pub(crate) mod tests {
     /// A clip of `n` test-pattern frames 10 ms apart from 1000 ms (impact
     /// half way), and the bytes of the file it indexes.
     fn jpeg_clip(n: u64) -> (Track, Vec<u8>) {
+        jpeg_clip_at(n, 10)
+    }
+
+    /// A clip of `n` test-pattern frames `period` ms apart from 1000 ms
+    /// (impact half way), and the bytes of the file it indexes.
+    fn jpeg_clip_at(n: u64, period: u64) -> (Track, Vec<u8>) {
         use stance::{Source, TestPattern, TestPatternConfig};
         let mut pattern = TestPattern::new(TestPatternConfig {
             width: 64,
@@ -2522,7 +2547,7 @@ pub(crate) mod tests {
         })
         .unwrap();
         let mut file = vec![0; 232];
-        let mut t = track(1000, 10, n, 1);
+        let mut t = track(1000, period, n, 1);
         for f in &mut t.frames {
             let jpeg = pattern
                 .next_frame(std::time::Duration::ZERO)
@@ -2624,14 +2649,15 @@ pub(crate) mod tests {
         assert!(card.keeps_every_frame(), "30 x 640 kB");
         assert_eq!(card.textures.capacity(), 30);
         // 48 MiB holds 30 frames of 646 x 646, not of 648 x 648: past it,
-        // the replay view's window instead.
+        // every other frame (15 of them).
         const { assert!(30 * 646 * 646 * 4 <= CARD_TEXTURE_BYTES) };
         const { assert!(30 * 648 * 648 * 4 > CARD_TEXTURE_BYTES) };
         card.resize([646, 646]);
         assert!(card.keeps_every_frame());
         card.resize([648, 648]);
         assert!(!card.keeps_every_frame());
-        assert_eq!(card.textures.capacity(), TEXTURES);
+        assert_eq!(card.stride(), 2);
+        assert_eq!(card.textures.capacity(), 15);
         // Another reply's seq is not this card's.
         let mut other = sidecar(&view, "camera.0", &t);
         if let ReplayReply::Sidecar { replay, .. } = &mut other {
@@ -2687,15 +2713,109 @@ pub(crate) mod tests {
         let want: Vec<usize> = (30..40).chain(start..30).collect();
         assert_eq!(order, want);
         // Past the texture budget, with a loop longer than the replay
-        // view's window, only the frame at the playhead.
+        // view's window: every kept frame the same way, from the kept frame
+        // at the playhead.
         let (t, file) = jpeg_clip(80);
         let mut card = loaded_card(1, "camera.0", &t, &file);
         card.resize([648, 648]);
-        assert!(!card.keeps_every_frame() && card.loop_frames() > TEXTURES);
-        card.playback.as_mut().unwrap().playhead = t.time(30);
-        assert_eq!(card.next_to_decode(), Some(30));
-        assert!(card.decode_next(&ctx));
-        assert_eq!(card.next_to_decode(), None);
+        let start = t.frame_at(card.playback.as_ref().unwrap().start);
+        assert!(card.loop_frames() > TEXTURES);
+        assert_eq!((start, card.loop_frames(), card.stride()), (30, 50, 2));
+        card.playback.as_mut().unwrap().playhead = t.time(41);
+        let mut order = Vec::new();
+        while let Some(frame) = card.next_to_decode() {
+            order.push(frame);
+            assert!(card.decode_next(&ctx));
+        }
+        let want: Vec<usize> = (40..80).step_by(2).chain((30..40).step_by(2)).collect();
+        assert_eq!(order, want);
+        assert_eq!(card.textures.len(), 25);
+    }
+
+    #[test]
+    fn a_cards_stride_is_the_smallest_that_fits_and_a_resize_recomputes_it() {
+        // A 556-frame loop (frames 244..800).
+        let t = track(1000, 1, 800, 1);
+        let view = ReplayView::new(1, &shot(&["camera.0"]), str::to_owned, false, 0.0);
+        let mut card = CardClip::new(1, "s1", "camera.0", 0.156);
+        card.reply(sidecar(&view, "camera.0", &t));
+        assert_eq!(card.loop_frames(), 556);
+        // At 182 x 144 the loop is 58 MB; 48 MiB holds 480 of its frames,
+        // so every other frame: 278.
+        card.resize([182, 144]);
+        const { assert!(556 * 182 * 144 * 4 > CARD_TEXTURE_BYTES) };
+        const { assert!(480 * 182 * 144 * 4 <= CARD_TEXTURE_BYTES) };
+        const { assert!(481 * 182 * 144 * 4 > CARD_TEXTURE_BYTES) };
+        assert_eq!(card.stride(), 2);
+        assert_eq!(card.textures.capacity(), 278);
+        assert_eq!(card.kept_at(100), Some(244));
+        assert_eq!(card.kept_at(245), Some(244));
+        assert_eq!(card.kept_at(799), Some(798));
+        // A smaller card keeps every frame; a larger one a longer stride,
+        // the smallest that fits.
+        card.resize([160, 128]);
+        const { assert!(556 * 160 * 128 * 4 <= CARD_TEXTURE_BYTES) };
+        assert!(card.keeps_every_frame());
+        assert_eq!(card.textures.capacity(), 556);
+        card.resize([400, 300]);
+        let frame = 400 * 300 * 4;
+        let stride = card.stride();
+        assert_eq!(stride, 6);
+        assert!(556_usize.div_ceil(stride) * frame <= CARD_TEXTURE_BYTES);
+        assert!(556_usize.div_ceil(stride - 1) * frame > CARD_TEXTURE_BYTES);
+        assert_eq!(card.textures.capacity(), 93);
+    }
+
+    /// Frame index shown by `card`.
+    fn shown_frame(card: &CardClip) -> Option<usize> {
+        card.shown.as_ref().map(|(f, _)| *f)
+    }
+
+    #[test]
+    fn a_long_fast_loop_past_the_budget_plays_through_its_frames() {
+        let ctx = egui::Context::default();
+        // 250 fps, 400 frames: a 225-frame loop from 0.1 s before the
+        // impact, longer than the replay view's texture window.
+        let (t, file) = jpeg_clip_at(400, 4);
+        let mut card = loaded_card(1, "camera.0", &t, &file);
+        card.resize([400, 400]);
+        assert_eq!(card.loop_frames(), 225);
+        const { assert!(225 * 400 * 400 * 4 > CARD_TEXTURE_BYTES) };
+        assert!(!card.keeps_every_frame());
+        let start = t.frame_at(card.playback.as_ref().unwrap().start);
+        // Screen updates at 60 Hz for 4 s: the playhead moves about four
+        // frames each.
+        let mut shown = Vec::new();
+        for step in 0..240_u32 {
+            card.tick(5.0 + f64::from(step) / 60.0);
+            serve(&mut card, &t, &file);
+            card.frame_texture();
+            shown.extend(shown_frame(&card));
+            card.decode_next(&ctx);
+        }
+        assert!(card.running, "the start frame came up");
+        let changes = shown.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(
+            changes * 10 >= shown.len() * 9,
+            "the picture changes nearly every update: {changes} of {}: {shown:?}",
+            shown.len()
+        );
+        // Forward through the loop, back to its start at the end.
+        for w in shown.windows(2) {
+            assert!(
+                w[1] >= w[0] || w[1] < start + 8,
+                "{} after {}: {shown:?}",
+                w[1],
+                w[0]
+            );
+        }
+        let distinct: std::collections::BTreeSet<_> = shown.iter().collect();
+        assert!(distinct.len() > 40, "{distinct:?}");
+        // Only kept frames, every third, all within the budget.
+        assert_eq!(card.stride(), 3);
+        assert!(shown.iter().all(|f| (f - start) % 3 == 0), "{shown:?}");
+        assert!(card.textures.len() <= card.capacity());
+        assert_eq!(card.capacity(), 75);
     }
 
     #[test]
