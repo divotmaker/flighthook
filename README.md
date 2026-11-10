@@ -10,6 +10,22 @@ Acts as a bridge between golf launch monitors and simulation software.
 Connects to launch monitors, decodes shot data, and forwards it to integrations like GSPro.
 Provides a REST and WebSocket API for custom integrations to participate on the central event bus.
 
+![Shots](./screens/shots.png "Shots")
+
+<table>
+<tr>
+<td width="50%"><a href="./screens/cameras.png"><img src="./screens/cameras.png" alt="Cameras"></a></td>
+<td width="50%"><a href="./screens/devices.png"><img src="./screens/devices.png" alt="Devices"></a></td>
+</tr>
+<tr>
+<td>Swing replay with body tracking (<a href="#swing-replay-beta">more</a>)</td>
+<td>Launch monitors, cameras and outputs (<a href="#devices">more</a>)</td>
+</tr>
+</table>
+
+*Swing footage: Wikimedia Commons, CC0 1.0. Shown with flighthook's overlays:
+pose skeleton and swing data.*
+
 ## Supported Integrations
 
 ### Launch Monitors
@@ -313,8 +329,6 @@ is written to disk.
 
 ### Shot Tracking
 
-![Shots](./screens/shots.png "Shots")
-
 Shots are recorded in **sets**: a shot joins the current set unless the club
 in play changed (going back to an earlier club starts a new set too) or you
 pressed **New set**. **New session** closes the set and starts a fresh
@@ -437,12 +451,7 @@ the shot's shape, yellow near, red far, always with words; a line under the
 tiles names each one off its band. Tiles color on a key moment's frame, such
 as the impact tick, and with Live on a Last shot strip under the live
 pictures shows the newest shot at impact. See
-[Bands and colors](docs/devices/cameras.md#bands-and-colors):
-
-![Cameras](./screens/cameras.png "Cameras")
-
-*Swing footage: Wikimedia Commons, CC0 1.0. Shown with flighthook's overlays:
-pose skeleton and swing data.*
+[Bands and colors](docs/devices/cameras.md#bands-and-colors).
 
 Setup, camera positions, clip timing and disk use:
 [docs/devices/cameras.md](docs/devices/cameras.md).
@@ -476,8 +485,6 @@ with radar launch monitors that miss short chips.
   set's shots.
 
 ### Devices
-
-![Devices](./screens/devices.png "Devices")
 
 The Devices tab, where the app opens, has the Global, Simulation and Replay
 settings and the web server under General, then a card for every launch
