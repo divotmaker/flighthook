@@ -585,6 +585,7 @@ mod tests {
         assert_eq!(new_export.len(), old_export.len());
         for (mut want, got) in old_export.into_iter().zip(new_export) {
             want["time"] = got["time"].clone();
+            want["flighthook_version"] = got["flighthook_version"].clone();
             if let Some(metrics) = want
                 .pointer_mut("/data/metrics")
                 .and_then(Value::as_object_mut)

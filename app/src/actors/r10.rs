@@ -690,6 +690,7 @@ mod tests {
             assert_eq!(want["schema"], 2);
             want["schema"] = json!(flighthook::EXPORT_SCHEMA);
             want["time"] = got["time"].clone();
+            want["flighthook_version"] = got["flighthook_version"].clone();
             if flip_recorded_spin(&mut want["data"]["launch"]) {
                 for line in [&mut want, &mut got] {
                     if let Some(data) = line["data"].as_object_mut() {

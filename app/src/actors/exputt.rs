@@ -929,6 +929,7 @@ mod tests {
         for (mut want, got) in old_export.into_iter().zip(new_export) {
             assert_eq!(want["schema"], 3);
             want["time"] = got["time"].clone();
+            want["flighthook_version"] = got["flighthook_version"].clone();
             assert_eq!(got, want);
         }
         assert_raw_matches(&old_export_raws, &new_export_raws);

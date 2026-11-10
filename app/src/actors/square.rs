@@ -936,6 +936,7 @@ mod tests {
         for (mut want, got) in old_export.into_iter().zip(new_export) {
             assert_eq!(want["schema"], 3);
             want["time"] = got["time"].clone();
+            want["flighthook_version"] = got["flighthook_version"].clone();
             let settings = want["settings"]["device"]
                 .as_object_mut()
                 .expect("device settings");
