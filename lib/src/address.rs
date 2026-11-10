@@ -113,8 +113,10 @@ struct Card {
     address: String,
 }
 
-/// Index `a` before `b`: numeric indices in number order, others by text.
-fn index_order(a: &str, b: &str) -> std::cmp::Ordering {
+/// Index `a` before `b`: numeric indices in number order, others by text
+/// (the order cards are listed and checked in).
+#[must_use]
+pub fn index_order(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<u64>(), b.parse::<u64>()) {
         (Ok(x), Ok(y)) => x.cmp(&y),
         _ => a.cmp(b),

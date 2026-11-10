@@ -23,13 +23,16 @@
 //!   Telemetry is merged per actor and published in full; raw frames go to
 //!   the shot's capture for the export, never onto the bus.
 //! - **Live config** ([`DriverActor::reconfigure`]): host fields and the
-//!   driver fields the driver applies live take effect without a restart;
-//!   any other change restarts the card.
+//!   driver fields the driver applies live take effect without a restart,
+//!   at the loop's next pass whatever it is doing (in a session, before a
+//!   connect, during a retry delay); any other change restarts the card.
+//! - **A driver panic** ends the card Disconnected with an error (and
+//!   `ready=false`), never stuck Connected; Reconnect starts it again.
 //!
 //! What a card adds to its driver is its [`Hooks`]: its config section, its
 //! shot source and any host-side processing of the device's events.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -40,7 +43,7 @@ use flightrelay::driver::{
     DeviceSession, DriverInfo, Events, HostFlags, Level, SessionEnd, Stop,
 };
 use flightrelay::{FrpEvent, RawFrame};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::actors::provenance::{Provenance, ShotSource};
 use crate::actors::{Actor, ReconfigureOutcome};
@@ -59,6 +62,9 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(50);
 /// How often the bus is drained while the actor waits (a retry delay, or
 /// for its stop).
 const IDLE_SLICE: Duration = Duration::from_millis(100);
+
+/// The card's error after the device driver panicked.
+const DRIVER_FAILED: &str = "the device driver failed; press Reconnect";
 
 // ---------------------------------------------------------------------------
 // Hooks
@@ -97,7 +103,9 @@ pub struct HookCtx<'a, S> {
     /// The card's section as it is in effect.
     pub section: &'a S,
     /// The detection mode the shot is simulated in: the driver's fixed mode,
-    /// else the live game mode.
+    /// else the live game mode. On a `launch` a hook may change it: the
+    /// shot is simulated in the mode it leaves here (e.g. the mode the hook
+    /// saw at the shot's trigger).
     pub mode: Option<ShotDetectionMode>,
     /// For a `launch`: the device's flight result of the same shot, if it
     /// sent one.
@@ -237,7 +245,19 @@ fn min_level() -> Level {
     }
 }
 
+/// The text of panic payload `panic`.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
 impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
+    /// The actor's thread: [`run_with`](Self::run_with), and if the driver
+    /// panics, `ready=false` and Disconnected with [`DRIVER_FAILED`], then
+    /// the thread ends (Reconnect starts a new one).
     fn run(self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let actor = sender.actor_id().to_owned();
         let info = D::info(self.section.driver());
@@ -246,7 +266,23 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
         flags.set_min_level(min_level());
         let mut host = Host::<D, H>::new(receiver, self.stop.clone(), actor.clone(), &state);
         let mut sink = Sink::<D, H>::new(state, sender, info, self.section.clone());
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_with(&mut host, &mut sink, &flags);
+        }));
+        if let Err(panic) = ran {
+            error!("{actor}: the device driver failed: {}", panic_text(&*panic));
+            sink.session_ended();
+            sink.status(
+                ActorStatus::Disconnected,
+                HashMap::from([("error".into(), DRIVER_FAILED.into())]),
+            );
+        }
+    }
 
+    /// Build the driver, then connect, drive each session and wait out the
+    /// retry delays until the actor is stopped or the driver gives up.
+    fn run_with(&self, host: &mut Host<D, H>, sink: &mut Sink<D, H>, flags: &HostFlags) {
+        let actor = sink.actor.clone();
         let mut driver = match D::new(sink.section.driver().clone()) {
             Ok(driver) => driver,
             Err(e) => {
@@ -255,7 +291,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                     ActorStatus::Disconnected,
                     HashMap::from([("error".into(), e.to_string())]),
                 );
-                host.wait_for_stop();
+                self.wait_for_stop(host, sink, None);
                 return;
             }
         };
@@ -267,12 +303,13 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
             if host.stopped() {
                 break;
             }
+            take_update(&self.updates, sink, Some(&mut driver));
             sink.begin_session();
             flags.set_shots_allowed(sink.shots_allowed());
             let connected = {
                 let mut emit = |e| sink.handle(e);
-                let out = Events::new(&mut emit, &flags);
-                let mut ctx = ConnectCtx::new(&self.stop, out, &mut host);
+                let out = Events::new(&mut emit, flags);
+                let mut ctx = ConnectCtx::new(&self.stop, out, host);
                 driver.connect(&mut ctx)
             };
             let (error, connected_for) = match connected {
@@ -287,7 +324,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                     attempts = 0;
                     let since = Instant::now();
                     sink.connected(session.identity());
-                    let ended = self.drive(&mut session, &mut driver, &mut host, &mut sink, &flags);
+                    let ended = self.drive(&mut session, &mut driver, host, sink, flags);
                     sink.release_all();
                     match ended {
                         Err(e) if !host.stopped() => {
@@ -297,7 +334,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                         }
                         _ => {
                             let mut emit = |e| sink.handle(e);
-                            if let Err(e) = session.close(&mut Events::new(&mut emit, &flags)) {
+                            if let Err(e) = session.close(&mut Events::new(&mut emit, flags)) {
                                 warn!("{actor}: the device was not released cleanly: {e}");
                             }
                             break;
@@ -312,11 +349,11 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
             };
             let delay = {
                 let mut emit = |e| sink.handle(e);
-                driver.retry_delay(&ended, &mut backoff, &mut Events::new(&mut emit, &flags))
+                driver.retry_delay(&ended, &mut backoff, &mut Events::new(&mut emit, flags))
             };
             match delay {
                 Some(delay) => {
-                    if !host.idle(delay) {
+                    if !self.wait(host, sink, &mut driver, delay) {
                         break;
                     }
                 }
@@ -326,12 +363,47 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                         ActorStatus::Disconnected,
                         HashMap::from([("error".into(), error.to_string())]),
                     );
-                    host.wait_for_stop();
+                    self.wait_for_stop(host, sink, Some(&mut driver));
                     return;
                 }
             }
         }
         sink.status(ActorStatus::Disconnected, HashMap::new());
+    }
+
+    /// Wait `duration` (a retry delay), draining the bus and taking live
+    /// config; `false` when a stop cut it short.
+    fn wait(
+        &self,
+        host: &mut Host<D, H>,
+        sink: &mut Sink<D, H>,
+        driver: &mut D,
+        duration: Duration,
+    ) -> bool {
+        let end = Instant::now() + duration;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if !host.idle(left.min(IDLE_SLICE)) {
+                return false;
+            }
+            take_update(&self.updates, sink, Some(driver));
+            if left <= IDLE_SLICE {
+                return true;
+            }
+        }
+    }
+
+    /// Wait for the stop (refused settings, or the driver gave up), taking
+    /// live config meanwhile.
+    fn wait_for_stop(
+        &self,
+        host: &mut Host<D, H>,
+        sink: &mut Sink<D, H>,
+        mut driver: Option<&mut D>,
+    ) {
+        while host.idle(IDLE_SLICE) {
+            take_update(&self.updates, sink, driver.as_deref_mut());
+        }
     }
 
     /// Poll `session` until it fails (`Err`) or the actor is stopped
@@ -362,12 +434,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
             while let Some(action) = host.actions.pop_front() {
                 session.action(&action)?;
             }
-            if let Some(new) = lock(&self.updates).take() {
-                if new.driver() != sink.section.driver() {
-                    driver.apply_config(new.driver());
-                }
-                sink.section = new;
-            }
+            take_update(&self.updates, sink, Some(driver));
             flags.set_shots_allowed(sink.shots_allowed());
             {
                 let mut emit = |e| sink.handle(e);
@@ -376,6 +443,25 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
             sink.prune_held();
         }
     }
+}
+
+/// Take a section applied live, if one waits in `updates`: the sink's (and
+/// so the hooks') section, and the driver's config when its part changed
+/// and there is a driver.
+fn take_update<D: DeviceDriver, H: Hooks<D>>(
+    updates: &Mutex<Option<H::Section>>,
+    sink: &mut Sink<D, H>,
+    driver: Option<&mut D>,
+) {
+    let Some(new) = lock(updates).take() else {
+        return;
+    };
+    if let Some(driver) = driver
+        && new.driver() != sink.section.driver()
+    {
+        driver.apply_config(new.driver());
+    }
+    sink.section = new;
 }
 
 // ---------------------------------------------------------------------------
@@ -490,11 +576,6 @@ impl<D: DeviceDriver, H: Hooks<D>> Host<D, H> {
             std::thread::sleep(left.min(IDLE_SLICE));
         }
     }
-
-    /// Drain the bus until the actor is stopped.
-    fn wait_for_stop(&mut self) {
-        while self.idle(Duration::from_secs(1)) {}
-    }
 }
 
 impl<D: DeviceDriver, H: Hooks<D>> ConnectHost for Host<D, H> {
@@ -541,8 +622,9 @@ struct Sink<D: DeviceDriver, H: Hooks<D>> {
     seqs: HashMap<String, u64>,
     /// Launches and flight results held, by shot id.
     held: HashMap<String, Held>,
-    /// Shots the round policy refused at their trigger, by shot id.
-    refused: HashSet<String>,
+    /// Shots the round policy refused at their trigger, by shot id, with
+    /// when.
+    refused: HashMap<String, Instant>,
     /// A shot has been held back for the tournament round since the last
     /// one went out (one log line per round).
     holding: bool,
@@ -612,7 +694,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             capture: None,
             seqs: HashMap::new(),
             held: HashMap::new(),
-            refused: HashSet::new(),
+            refused: HashMap::new(),
             holding: false,
             shot_count: 0,
             _driver: PhantomData,
@@ -656,6 +738,13 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     /// the shot count, then the device's identity (and `source`, which the
     /// bus sender stamps) before any shot.
     fn connected(&mut self, identity: &DeviceIdentity) {
+        // Frames sent while the first connect ran were numbered under the
+        // actor's id; the device's numbers go on from there.
+        if !self.seqs.contains_key(&identity.device)
+            && let Some(next) = self.seqs.remove(&self.actor)
+        {
+            self.seqs.insert(identity.device.clone(), next);
+        }
         self.device = Some(identity.device.clone());
         info!("{}: connected to {}", self.actor, identity.label());
         self.status(
@@ -677,6 +766,12 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     /// The session failed: `ready=false`, then Reconnecting, so a card
     /// never shows a lost connection's values.
     fn session_lost(&mut self) {
+        self.session_ended();
+        self.status(ActorStatus::Reconnecting, HashMap::new());
+    }
+
+    /// `ready=false` with the rest of the session's telemetry.
+    fn session_ended(&mut self) {
         self.telemetry.insert("ready".into(), "false".into());
         self.send(FlighthookEvent::DeviceTelemetry {
             manufacturer: None,
@@ -685,7 +780,6 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             source: None,
             telemetry: Some(self.telemetry.clone()),
         });
-        self.status(ActorStatus::Reconnecting, HashMap::new());
     }
 
     /// Whether the driver may start a shot now, by the round policy; logs
@@ -760,7 +854,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             _ => None,
         };
         if let Some(id) = &shot
-            && self.refused.contains(id)
+            && self.refused.contains_key(id)
         {
             if matches!(event, FrpEvent::ShotFinished { .. }) {
                 self.refused.remove(id);
@@ -863,7 +957,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
                 capture.mark_trigger_at(timestamp.map_or_else(Instant::now, instant_of));
             }
         } else {
-            self.refused.insert(key.shot_id);
+            self.refused.insert(key.shot_id, Instant::now());
             if !std::mem::replace(&mut self.holding, true) {
                 info!("{}: no shots during the tournament round", self.actor);
             }
@@ -928,6 +1022,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             launch,
         };
         let mut spin_estimated = false;
+        let mut mode = mode;
         {
             let flight = match &flight_event {
                 Some(FrpEvent::FlightResult { flight, .. }) => Some(flight),
@@ -941,6 +1036,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             };
             self.hooks.on_frp(&mut launch_event, &mut ctx);
             spin_estimated |= ctx.spin_estimated;
+            // The hook may have set the mode to simulate in.
+            mode = ctx.mode;
         }
         if let Some(event) = &mut flight_event {
             let mut ctx = HookCtx {
@@ -986,8 +1083,11 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     }
 
     /// Drop shots held longer than flighthook's shot timeout: by then every
-    /// consumer has given up on the shot.
+    /// consumer has given up on the shot. Refused shots are forgotten after
+    /// the same time.
     fn prune_held(&mut self) {
+        self.refused
+            .retain(|_, at| at.elapsed() < flighthook::SHOT_TIMEOUT);
         let actor = &self.actor;
         self.held.retain(|_, h| {
             let keep = h.since.elapsed() < flighthook::SHOT_TIMEOUT;
@@ -1125,6 +1225,7 @@ mod tests {
     enum Step {
         Emit(Vec<DeviceEvent>),
         Fail(&'static str),
+        Panic,
     }
 
     #[derive(Default)]
@@ -1137,6 +1238,8 @@ mod tests {
         /// The latched command at each connect.
         latched: Vec<DeviceCommand>,
         closes: u32,
+        /// The retry delay the driver asks for; 10 ms when `None`.
+        retry: Option<Duration>,
     }
 
     static SCRIPTS: LazyLock<Mutex<HashMap<u64, Arc<Mutex<Script>>>>> =
@@ -1242,7 +1345,11 @@ mod tests {
             if let Some(error) = ended.error {
                 out.alert(Severity::Warn, error.to_string());
             }
-            Some(Duration::from_millis(10))
+            Some(
+                lock(&self.script)
+                    .retry
+                    .unwrap_or(Duration::from_millis(10)),
+            )
         }
 
         fn apply_config(&mut self, new: &FakeConfig) {
@@ -1263,6 +1370,7 @@ mod tests {
                     Ok(())
                 }
                 Some(Step::Fail(why)) => Err(FakeError(why.into())),
+                Some(Step::Panic) => panic!("a decoder bug"),
                 None => {
                     std::thread::sleep(timeout.min(Duration::from_millis(10)));
                     Ok(())
@@ -1287,8 +1395,9 @@ mod tests {
     }
 
     /// A measured card. Its hook fills an estimated backspin into a launch
-    /// without spin on a card named "estimate", and marks a launch whose
-    /// flight result it saw with spin axis 0.5.
+    /// without spin on a card named "estimate", has a card named "putt"
+    /// simulate its launches in Putting, and marks a launch whose flight
+    /// result it saw with spin axis 0.5.
     #[derive(Default)]
     struct FakeHooks;
 
@@ -1307,6 +1416,9 @@ mod tests {
                 {
                     launch.backspin_rpm = Some(1234);
                     ctx.spin_estimated = true;
+                }
+                if ctx.section.name == "putt" {
+                    ctx.mode = Some(ShotDetectionMode::Putting);
                 }
             }
         }
@@ -1373,6 +1485,20 @@ mod tests {
         broadcast::Receiver<FlighthookMessage>,
         GameStateWriter,
     ) {
+        let (dir, mut sink, rx, writer) = connecting_sink(name);
+        sink.connected(&DeviceIdentity::new("FAKE-1").with_model("Eagle"));
+        (dir, sink, rx, writer)
+    }
+
+    /// [`sink`] before its first session has connected.
+    fn connecting_sink<H: Hooks<FakeDriver, Section = FakeSection>>(
+        name: &str,
+    ) -> (
+        TempDir,
+        Sink<FakeDriver, H>,
+        broadcast::Receiver<FlighthookMessage>,
+        GameStateWriter,
+    ) {
         let (dir, state, writer) = temp_state();
         let (tx, rx) = broadcast::channel(256);
         let sender = BusSender::new("fake.0".into(), tx, Arc::default())
@@ -1383,7 +1509,6 @@ mod tests {
         };
         let mut sink = Sink::new(state, sender, FakeDriver::info(&section.driver), section);
         sink.begin_session();
-        sink.connected(&DeviceIdentity::new("FAKE-1").with_model("Eagle"));
         (dir, sink, rx, writer)
     }
 
@@ -1634,6 +1759,43 @@ mod tests {
         assert!(derived.as_ref().is_some_and(|d| d.spin_estimated));
     }
 
+    /// A hook may set the mode a launch is simulated in: a ground ball the
+    /// "putt" card's hook sends to Putting rolls as on a green, like one
+    /// struck with the game in Putting.
+    #[test]
+    fn a_hook_sets_the_mode_a_launch_is_simulated_in() {
+        let ground_ball = Launch {
+            launch_speed: Some(Velocity::MetersPerSecond(3.0)),
+            launch_elevation: Some(0.0),
+            launch_azimuth: Some(0.0),
+            backspin_rpm: None,
+            sidespin_rpm: None,
+            ..Launch::default()
+        };
+        let total = |name: &str, game: Option<ShotDetectionMode>| {
+            let (_dir, mut sink, mut rx, writer) = sink::<FakeHooks>(name);
+            if let Some(mode) = game {
+                writer.set_mode(mode);
+            }
+            drain(&mut rx);
+            sink.handle(frp(FrpEvent::launch(key(1), ground_ball.clone())));
+            sink.handle(frp(FrpEvent::shot_finished(key(1))));
+            drain(&mut rx)
+                .iter()
+                .find_map(|m| match &m.event {
+                    FlighthookEvent::Launch {
+                        derived: Some(d), ..
+                    } => d.total_distance.map(|t| t.as_meters()),
+                    _ => None,
+                })
+                .expect("a rolled total")
+        };
+        let fairway = total("", Some(ShotDetectionMode::Full));
+        let green = total("", Some(ShotDetectionMode::Putting));
+        assert!(green > fairway, "{green} vs {fairway}");
+        assert_eq!(total("putt", Some(ShotDetectionMode::Full)), green);
+    }
+
     /// Held launches go out when the session ends; one held past
     /// flighthook's shot timeout is dropped, since every consumer has given
     /// up on its shot by then.
@@ -1696,6 +1858,20 @@ mod tests {
         sink.connected(&DeviceIdentity::new("FAKE-1"));
         sink.handle(frame(Rx, "again", &[0x02]));
         assert_eq!(sink.seqs["FAKE-1"], 5, "counting on in the next session");
+    }
+
+    /// Frames sent during the first connect, before the device id is known,
+    /// are numbered on into the session.
+    #[test]
+    fn frames_before_the_first_session_are_numbered_on() {
+        use flightrelay::RawDir::{Rx, Tx};
+        let (_dir, mut sink, _rx, _w) = connecting_sink::<FakeHooks>("");
+        sink.handle(frame(Tx, "hello", &[0x01]));
+        sink.handle(frame(Rx, "hello back", &[0x02]));
+        sink.connected(&DeviceIdentity::new("FAKE-1"));
+        sink.handle(frame(Rx, "status", &[0x03]));
+        assert_eq!(sink.seqs.len(), 1);
+        assert_eq!(sink.seqs["FAKE-1"], 3);
     }
 
     /// A discarded shot's frames leave the pre-roll.
@@ -1777,6 +1953,14 @@ mod tests {
         }
         assert!(drain(&mut rx).is_empty(), "nothing of the shot");
         assert!(sink.refused.is_empty() && sink.held.is_empty());
+        sink.handle(frp(FrpEvent::shot_trigger(key(9))));
+        assert_eq!(sink.refused.len(), 1, "a shot that never finishes");
+        let old = Instant::now()
+            .checked_sub(flighthook::SHOT_TIMEOUT + Duration::from_secs(1))
+            .expect("an old instant");
+        *sink.refused.get_mut("shot-9").expect("refused") = old;
+        sink.prune_held();
+        assert!(sink.refused.is_empty(), "forgotten after the shot timeout");
         drop(guard);
         assert!(sink.shots_allowed());
         sink.handle(frp(FrpEvent::shot_trigger(key(2))));
@@ -1970,6 +2154,73 @@ mod tests {
         assert!(at.elapsed() < Duration::from_secs(2));
     }
 
+    /// A driver that panics ends the card Disconnected with the error and
+    /// `ready=false`, never stuck Connected; the thread has ended.
+    #[test]
+    fn a_driver_panic_ends_disconnected_with_the_error() {
+        let ready = frp(FrpEvent::DeviceTelemetry {
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            source: None,
+            telemetry: Some(HashMap::from([("ready".into(), "true".into())])),
+        });
+        let (id, _script) = script(vec![Connect::Session(vec![
+            Step::Emit(vec![ready]),
+            Step::Panic,
+        ])]);
+        let mut rig = rig();
+        rig.start(section(id));
+        let seen = rig.until(|m| is_status(m, ActorStatus::Disconnected));
+        use ActorStatus::{Connected, Disconnected, Starting};
+        assert_eq!(statuses(&seen), [Starting, Connected, Disconnected]);
+        let last = seen.len() - 1;
+        assert!(
+            matches!(&seen[last].event, FlighthookEvent::ActorStatus { telemetry, .. }
+            if telemetry["error"] == DRIVER_FAILED)
+        );
+        assert!(
+            matches!(&seen[last - 1].event, FlighthookEvent::DeviceTelemetry { telemetry: Some(t), .. }
+            if t["ready"] == "false"),
+            "{:?}",
+            kinds(&seen)
+        );
+        assert_eq!(
+            rig.state.stop_and_wait("fake.0"),
+            crate::state::Stopped::Exited
+        );
+    }
+
+    /// A live change made during a retry delay reaches the driver (and the
+    /// hooks' section) before the next connect, not only in a session.
+    #[test]
+    fn live_config_is_applied_during_a_retry_delay() {
+        let (id, script) = script(vec![Connect::Fail("no device"), Connect::Session(vec![])]);
+        lock(&script).retry = Some(Duration::from_secs(3));
+        let mut rig = rig();
+        let start = section(id);
+        let actor = DriverActor::<FakeDriver, FakeHooks>::new(start.clone());
+        let sender = BusSender::new("fake.0".into(), rig.tx.clone(), Arc::default())
+            .with_provenance(Provenance::Measured);
+        let thread = actor.start(Arc::clone(&rig.state), sender.clone(), sender.subscribe());
+        rig.until(|m| matches!(&m.event, FlighthookEvent::Alert { .. }));
+        let mut live = start.clone();
+        live.driver.live = 7;
+        assert!(matches!(
+            actor.apply_section(Some(live)),
+            ReconfigureOutcome::Applied
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock(&script).applied.is_empty() {
+            assert!(Instant::now() < deadline, "not applied during the delay");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(lock(&script).applied, [7]);
+        assert_eq!(lock(&script).latched.len(), 1, "before the next connect");
+        actor.stop();
+        thread.join().expect("the thread ends");
+    }
+
     /// Host fields and live driver fields are applied without a restart, the
     /// live ones handed to the running driver; any other change, a refused
     /// config or a removed section restarts the card.
@@ -2137,8 +2388,12 @@ mod tests {
     /// writes only host keys, none of them a driver key, and a section with
     /// every driver field set reads back as written.
     fn keys_apart<S: DeviceSection>(populated: &S, full: &S) {
+        assert!(
+            !struct_fields::<S::Driver>().is_empty(),
+            "{}: the driver config reads as a struct",
+            S::KIND
+        );
         let driver = driver_keys::<S::Driver>();
-        assert!(!driver.is_empty());
         let serde_json::Value::Object(host) = serde_json::to_value(populated).expect("json") else {
             panic!("a section is a table");
         };

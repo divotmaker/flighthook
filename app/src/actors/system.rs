@@ -1749,7 +1749,6 @@ mod tests {
             .expect("the outcome is emitted")
     }
 
-    /// Statuses `actor` sent, in order.
     /// How many times the system started `actor` afresh in `seen`: its
     /// Starting statuses that clear the card's `error` (an actor's own
     /// Starting carries no such key).
@@ -1763,6 +1762,7 @@ mod tests {
             .count()
     }
 
+    /// Statuses `actor` sent, in order.
     fn statuses(seen: &[FlighthookMessage], actor: &str) -> Vec<ActorStatus> {
         seen.iter()
             .filter(|m| m.actor == actor)

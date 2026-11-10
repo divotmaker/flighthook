@@ -1097,22 +1097,23 @@ fn invalid_setting(action: &ConfigAction) -> Option<String> {
     if let Some(error) = invalid_camera_setting(action) {
         return Some(error);
     }
-    if let Some(error) = invalid_driver_setting(action) {
-        return Some(error);
-    }
     invalid_mevo_setting(action)
 }
 
-/// [`invalid_setting`] for the settings of a card's device driver: what its
-/// own validation refuses, with the field named
-/// ([`flighthook::DeviceSection::driver_error`]).
-fn invalid_driver_setting(action: &ConfigAction) -> Option<String> {
+/// Why `action` would save device driver settings the driver refuses (its
+/// own validation, with the field named), or `None`. Only a card whose
+/// driver settings the action changes counts, measured against `saved`, the
+/// settings saved now: a card whose saved driver settings are refused still
+/// saves its other fields and its on/off switch
+/// ([`flighthook::DeviceSection::changed_driver_error`]).
+fn invalid_driver_setting(saved: &FlighthookConfig, action: &ConfigAction) -> Option<String> {
     use flighthook::DeviceSection;
     match action {
-        ConfigAction::ReplaceAll { config } => config.device_error(),
-        ConfigAction::UpsertMockMonitor { index, section } => {
-            section.driver_error(&format!("mock_monitor.{index}"))
-        }
+        ConfigAction::ReplaceAll { config } => config.changed_device_error(saved),
+        ConfigAction::UpsertMockMonitor { index, section } => section.changed_driver_error(
+            saved.mock_monitor.get(index),
+            &format!("mock_monitor.{index}"),
+        ),
         _ => None,
     }
 }
@@ -1237,7 +1238,9 @@ async fn save_settings(
         tracing::warn!("config update: {reason}, ignoring request");
         return Err(settings_error(StatusCode::BAD_REQUEST, reason));
     }
-    if let Some(reason) = invalid_setting(&action) {
+    if let Some(reason) = invalid_setting(&action)
+        .or_else(|| invalid_driver_setting(&state.root.system.snapshot(), &action))
+    {
         tracing::warn!("config update: {reason}, ignoring request");
         return Err(settings_error(StatusCode::BAD_REQUEST, &reason));
     }
@@ -2799,11 +2802,91 @@ mod group_tests {
                 let action = ConfigAction::ReplaceAll {
                     config: Box::new(body),
                 };
-                assert_eq!(invalid_setting(&action), None, "{field} {ok}");
+                assert_eq!(invalid_driver_setting(&live, &action), None, "{field} {ok}");
             }
         }
         assert!(rx.try_recv().is_err(), "nothing emitted");
         assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+
+        // Saved refused settings: a rename or the on/off switch passes the
+        // checks (here the command times out: no system actor runs).
+        state.root.system.update(|c| {
+            c.mock_monitor.get_mut("0").unwrap().driver.shot_interval_s = -1.0;
+        });
+        let stored = state.root.system.snapshot();
+        let mut renamed = stored.clone();
+        renamed.mock_monitor.get_mut("0").unwrap().name = "Renamed".into();
+        let mut off = stored.clone();
+        off.mock_monitor.get_mut("0").unwrap().enabled = false;
+        for body in [renamed, off] {
+            for scope in [None, Some("mock_monitor.0")] {
+                let res =
+                    save_settings(&state, scope, body.clone(), Duration::from_millis(50)).await;
+                assert_eq!(res.err().map(|e| e.0), Some(StatusCode::GATEWAY_TIMEOUT));
+            }
+        }
+    }
+
+    /// A card whose saved driver settings are refused still saves its host
+    /// fields and its on/off switch, whole and scoped, as long as the save
+    /// keeps the refused driver settings as they are (a NaN read from the
+    /// file included); a change into other refused settings is refused, one
+    /// into usable settings is not.
+    #[test]
+    fn a_card_with_refused_saved_driver_settings_saves_its_other_fields() {
+        for stored in [-1.0, f64::NAN] {
+            let mut saved = FlighthookConfig::default();
+            let mut section = flighthook::MockMonitorSection::default();
+            section.driver.shot_interval_s = stored;
+            saved.mock_monitor.insert("0".into(), section);
+            let edit = |f: fn(&mut flighthook::MockMonitorSection)| {
+                let mut config = saved.clone();
+                f(config.mock_monitor.get_mut("0").unwrap());
+                config
+            };
+            let check = |config: FlighthookConfig| {
+                let scoped = ConfigAction::UpsertMockMonitor {
+                    index: "0".into(),
+                    section: config.mock_monitor["0"].clone(),
+                };
+                let whole = ConfigAction::ReplaceAll {
+                    config: Box::new(config),
+                };
+                let (whole, scoped) = (
+                    invalid_driver_setting(&saved, &whole),
+                    invalid_driver_setting(&saved, &scoped),
+                );
+                assert_eq!(whole, scoped);
+                whole
+            };
+            assert_eq!(check(edit(|s| s.name = "Renamed".into())), None);
+            assert_eq!(check(edit(|s| s.enabled = false)), None);
+            assert_eq!(check(edit(|s| s.impact_lead_s = Some(1.0))), None);
+            assert_eq!(
+                check(edit(|s| s.driver.shot_interval_s = -2.0)).as_deref(),
+                Some("mock_monitor.0: shot_interval_s: must be 0 to 86400")
+            );
+            assert_eq!(
+                check(edit(|s| s.driver.arm_delay_s = -1.0)).as_deref(),
+                Some("mock_monitor.0: shot_interval_s: must be 0 to 86400"),
+                "the stored refusal still names its field"
+            );
+            assert_eq!(check(edit(|s| s.driver.shot_interval_s = 10.0)), None);
+        }
+        let mut added = FlighthookConfig::default();
+        let mut section = flighthook::MockMonitorSection::default();
+        section.driver.shot_interval_s = -1.0;
+        added.mock_monitor.insert("1".into(), section);
+        assert!(
+            invalid_driver_setting(
+                &FlighthookConfig::default(),
+                &ConfigAction::ReplaceAll {
+                    config: Box::new(added)
+                }
+            )
+            .is_some(),
+            "a new card's refused settings are refused"
+        );
     }
 
     /// A save with a camera `latency_s` below 0, above 10 or non-finite is 400

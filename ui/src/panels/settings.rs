@@ -102,6 +102,11 @@ pub(crate) struct DeviceFormEntry {
     /// surface. Carried verbatim so that saving settings does not wipe them
     /// from the config file, and checked with the driver's own validation.
     pub(crate) mock: MockConfig,
+    /// The card's device driver settings as saved, as JSON; `None` for a
+    /// card not saved yet or one that runs no device driver. A refused
+    /// value blocks a save only when the card changes it
+    /// ([`driver_blocks_save`](Self::driver_blocks_save)).
+    pub(crate) saved_driver: Option<serde_json::Value>,
     /// Camera: which camera, where it stands and its video mode.
     pub(crate) cam: Box<CameraFields>,
     pub(crate) dirty: bool,
@@ -338,6 +343,7 @@ impl DeviceFormEntry {
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
+            saved_driver: None,
             cam: Box::default(),
             dirty: false,
         }
@@ -373,6 +379,7 @@ impl DeviceFormEntry {
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
+            saved_driver: None,
             cam: Box::default(),
             dirty: false,
         }
@@ -390,6 +397,7 @@ impl DeviceFormEntry {
             square_advanced_spin: s.advanced_spin,
             square_impact_mm: impact_mm_form(s.dot_bottom_to_face_center_mm.as_ref()),
             mock: MockConfig::default(),
+            saved_driver: None,
             ball_type: 0,
             tee_height_val: "1.5".into(),
             tee_height_unit: "inches".into(),
@@ -435,6 +443,7 @@ impl DeviceFormEntry {
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
+            saved_driver: None,
             cam: Box::default(),
             dirty: false,
         }
@@ -466,6 +475,7 @@ impl DeviceFormEntry {
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
+            saved_driver: None,
             cam: Box::default(),
             dirty: false,
         }
@@ -497,6 +507,7 @@ impl DeviceFormEntry {
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
             mock: s.driver.clone(),
+            saved_driver: serde_json::to_value(&s.driver).ok(),
             cam: Box::default(),
             dirty: false,
         }
@@ -517,6 +528,7 @@ impl DeviceFormEntry {
                 yaw: impact_lead_text(s.yaw_deg),
                 pitch: impact_lead_text(s.pitch_deg),
             }),
+            saved_driver: None,
             ..Self::from_mock(
                 id,
                 &MockMonitorSection {
@@ -538,6 +550,24 @@ impl DeviceFormEntry {
             "mock_monitor" => self.mock.validate().err().map(|e| e.to_string()),
             _ => None,
         }
+    }
+
+    /// The device driver settings the form carries, as JSON; `None` for a
+    /// card that runs no device driver.
+    fn driver_json(&self) -> Option<serde_json::Value> {
+        match self.monitor_type.as_str() {
+            "mock_monitor" => serde_json::to_value(&self.mock).ok(),
+            _ => None,
+        }
+    }
+
+    /// Whether the driver settings keep the card from saving: refused
+    /// ([`driver_error`](Self::driver_error)) and changed from the saved
+    /// ones. A refused saved value still shows on the card, and the card
+    /// still saves its other fields and its on/off switch, as the server
+    /// does.
+    pub(crate) fn driver_blocks_save(&self) -> bool {
+        self.driver_error().is_some() && self.saved_driver != self.driver_json()
     }
 
     pub(crate) fn is_mevo(&self) -> bool {
@@ -781,6 +811,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
+            saved_driver: None,
             cam: Box::default(),
             dirty: true,
         })
@@ -2074,7 +2105,7 @@ pub(crate) fn actor_valid(actor: &ActorFormEntry) -> bool {
             if dev.is_launch_monitor() && impact_lead_value(&dev.impact_lead).is_none() {
                 return false;
             }
-            if dev.driver_error().is_some() {
+            if dev.driver_blocks_save() {
                 return false;
             }
             if dev.is_camera()
@@ -4690,6 +4721,56 @@ mod tests {
             Some("shot_interval_s: must be 0 to 86400")
         );
         assert!(!super::actor_valid(&form.actors[0]));
+    }
+
+    /// A card whose saved driver settings are refused shows the refusal and
+    /// still saves its name (its other fields stay as saved); changing the
+    /// driver settings into other refused ones blocks the save, into usable
+    /// ones does not.
+    #[test]
+    fn a_refused_saved_driver_setting_does_not_lock_the_card() {
+        let mut cfg = FlighthookConfig::default();
+        let mut section = MockMonitorSection {
+            name: "Mock".into(),
+            ..MockMonitorSection::default()
+        };
+        section.driver.shot_interval_s = -1.0;
+        cfg.mock_monitor.insert("0".into(), section);
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert_eq!(
+            dev.driver_error().as_deref(),
+            Some("shot_interval_s: must be 0 to 86400"),
+            "the card shows it"
+        );
+        dev.name = "Renamed".into();
+        dev.dirty = true;
+        assert!(super::actor_valid(&form.actors[0]), "a rename saves");
+        let saved = form.build_actor_request("mock_monitor.0");
+        assert_eq!(saved.mock_monitor["0"].name, "Renamed");
+        assert_eq!(saved.mock_monitor["0"].driver.shot_interval_s, -1.0);
+        assert!(
+            form.begin_enable("mock_monitor.0", false).is_some(),
+            "the switch saves"
+        );
+
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        dev.mock.arm_delay_s = -1.0;
+        assert!(
+            !super::actor_valid(&form.actors[0]),
+            "another refused value"
+        );
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        dev.mock.arm_delay_s = MockConfig::default().arm_delay_s;
+        dev.mock.shot_interval_s = 10.0;
+        assert!(super::actor_valid(&form.actors[0]), "fixed");
     }
 
     #[test]

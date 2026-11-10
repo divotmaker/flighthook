@@ -1639,16 +1639,42 @@ pub trait DeviceSection:
     fn driver_error(&self, id: &str) -> Option<String> {
         self.driver().validate().err().map(|e| format!("{id}: {e}"))
     }
+
+    /// [`driver_error`](Self::driver_error) for a save: `None` also when
+    /// the driver settings are those of `saved`, the section as it is saved
+    /// now, so a card whose saved driver settings are refused can still
+    /// save its other fields. Only a change into refused settings counts.
+    #[must_use]
+    fn changed_driver_error(&self, saved: Option<&Self>, id: &str) -> Option<String> {
+        // Compared as JSON too, so a NaN read from the file equals itself.
+        if saved.is_some_and(|s| {
+            s.driver() == self.driver()
+                || serde_json::to_value(s.driver()).ok() == serde_json::to_value(self.driver()).ok()
+        }) {
+            return None;
+        }
+        self.driver_error(id)
+    }
 }
 
-/// The first section of type `S` in `config`, by index, whose driver
-/// settings are not usable ([`DeviceSection::driver_error`]).
-fn first_driver_error<S: DeviceSection>(config: &FlighthookConfig) -> Option<String> {
+/// The first section of type `S` in `config`, in index order
+/// ([`index_order`](crate::index_order)), whose driver settings are not
+/// usable ([`DeviceSection::driver_error`]); with `saved`, only one whose
+/// driver settings differ from that config's
+/// ([`DeviceSection::changed_driver_error`]).
+fn first_driver_error<S: DeviceSection>(
+    config: &FlighthookConfig,
+    saved: Option<&FlighthookConfig>,
+) -> Option<String> {
     let mut sections: Vec<_> = S::sections(config).iter().collect();
-    sections.sort_by(|a, b| a.0.cmp(b.0));
-    sections
-        .into_iter()
-        .find_map(|(index, s)| s.driver_error(&format!("{}.{index}", S::KIND)))
+    sections.sort_by(|a, b| crate::index_order(a.0, b.0));
+    sections.into_iter().find_map(|(index, s)| {
+        let id = format!("{}.{index}", S::KIND);
+        match saved {
+            Some(saved) => s.changed_driver_error(S::sections(saved).get(index), &id),
+            None => s.driver_error(&id),
+        }
+    })
 }
 
 /// A mock launch monitor instance: a virtual device that makes a shot at a
@@ -1982,7 +2008,16 @@ impl FlighthookConfig {
     /// e.g. `mock_monitor.0: shot_interval_s: must be 0 to 86400`.
     #[must_use]
     pub fn device_error(&self) -> Option<String> {
-        first_driver_error::<MockMonitorSection>(self)
+        first_driver_error::<MockMonitorSection>(self, None)
+    }
+
+    /// [`device_error`](Self::device_error) for saving this config over
+    /// `saved`: only a card whose driver settings the save changes into
+    /// refused ones counts
+    /// ([`DeviceSection::changed_driver_error`]).
+    #[must_use]
+    pub fn changed_device_error(&self, saved: &FlighthookConfig) -> Option<String> {
+        first_driver_error::<MockMonitorSection>(self, Some(saved))
     }
 
     /// Look up the detection mode for a club based on the configured mapping.
@@ -3726,5 +3761,17 @@ mod mock_section_tests {
             Some("mock_monitor.1: shot_interval_s: must be 0 to 86400")
         );
         assert_eq!(MockMonitorSection::sections(&config).len(), 3);
+
+        // In number order: card 2 before card 10.
+        let mut config = FlighthookConfig::default();
+        for index in ["10", "2"] {
+            let mut bad = MockMonitorSection::default();
+            bad.driver.shot_interval_s = -1.0;
+            config.mock_monitor.insert(index.into(), bad);
+        }
+        assert_eq!(
+            config.device_error().as_deref(),
+            Some("mock_monitor.2: shot_interval_s: must be 0 to 86400")
+        );
     }
 }

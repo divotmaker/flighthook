@@ -431,7 +431,7 @@ fn driver_type_error<S: flighthook::DeviceSection>(contents: &str) -> Option<Str
     let table: toml::Table = contents.parse().ok()?;
     let sections = table.get(S::KIND)?.as_table()?;
     let mut indices: Vec<&String> = sections.keys().collect();
-    indices.sort();
+    indices.sort_by(|a, b| flighthook::index_order(a, b));
     indices.into_iter().find_map(|index| {
         let serde_json::Value::Object(map) = serde_json::to_value(&sections[index]).ok()? else {
             return None;
@@ -448,6 +448,9 @@ fn driver_type_error<S: flighthook::DeviceSection>(contents: &str) -> Option<Str
 
 /// The line and column (1-based) of `key = ...` in table `[id]` of config
 /// text `contents`, else of the table's header; `None` without the header.
+/// The header is matched as the exact line `[id]` (no quoted index, no
+/// trailing comment) and the key as a plain `key = ...` line; anything else
+/// falls back to the header, then to `None`.
 fn key_position(contents: &str, id: &str, key: Option<&str>) -> Option<(usize, usize)> {
     let header = format!("[{id}]");
     let lines: Vec<&str> = contents.lines().collect();

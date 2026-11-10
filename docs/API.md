@@ -272,9 +272,11 @@ and turning it off then on again each begin a new history. Live [`actor_status`]
 only `status`; a client applies the same rules to them to keep `state` and
 the red time current.
 
-Telemetry keys are merged from two sources with no overlap:
+Telemetry keys are merged from two sources; no key means two things, and an
+actor sends each key from one source only:
 - **Device-reported** (from `device_telemetry`): `ready`, `battery_pct`, `tilt`,
-  `roll`, `temp_c`, `external_power`
+  `roll`, `temp_c`, `external_power`, and a device driver's own state keys
+  (the mock's `radar_mode`, `tracking_mode`)
 - **Actor-framework** (from `actor_status`): `detection_mode`, `radar_mode`, `device_info`,
   `shot_count`, `tracking_mode`, `phase`
 - **Integration actors**: `club`, `handed`, `name`, `error`
@@ -2073,7 +2075,7 @@ as applied.
 | `400 Bad Request` | a Mevo section it writes has a `launch_only_spin` below 0, above 1000 or not finite (`"mevo.0: launch_only_spin must be 0 to 1000 rpm per mph, not -5"`) |
 | `400 Bad Request` | a launch monitor section it writes has an `impact_lead_s` below 0, above 5 or not finite (`"square.0: impact_lead_s 6 is outside 0 to 5 s"`) |
 | `400 Bad Request` | a camera section it writes has a `latency_s` below 0, above 10 or not finite (`"camera.0: latency_s 11 is outside 0 to 10 s"`) |
-| `400 Bad Request` | a section it writes has a device driver setting the driver refuses, named by card and field (`"mock_monitor.0: shot_interval_s: must be 0 to 86400"`) |
+| `400 Bad Request` | a section it writes changes its device driver settings into ones the driver refuses, named by card and field (`"mock_monitor.0: shot_interval_s: must be 0 to 86400"`); a section whose saved driver settings are refused still saves when it keeps them as they are (its name, `enabled`, `impact_lead_s`, ...) |
 | `400 Bad Request` | a camera section it writes has a `rotation_deg` other than 0, 90, 180 or 270 (`"camera.0: rotation_deg 45 is not 0, 90, 180 or 270"`), or a `yaw_deg` or `pitch_deg` outside -30 to 30 or not finite (`"camera.0: yaw_deg 40 is outside -30 to 30"`) |
 | `400 Bad Request` | a camera section it writes has no `camera` (`"camera.0: no camera picked"`) or a `mode` that is neither `auto` nor `WIDTHxHEIGHT@FPS` |
 | `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
@@ -2696,8 +2698,10 @@ telemetry updates (battery, tilt, temperature).
 
 **Ownership split**: `device_telemetry` carries what the device reports about
 itself. Actor/connection lifecycle (status enum, mode, shooting) is conveyed
-separately via `actor_status`. The two event types have no overlapping
-telemetry keys.
+separately via `actor_status`. No key means two things in the two event
+types; a launch monitor on a device driver reports its own state keys here
+(the mock's `radar_mode` and `tracking_mode`), which other launch monitors
+send on `actor_status`.
 
 ```json
 {
@@ -2856,8 +2860,9 @@ and integrations) when their connection status or actor-framework state changes.
 
 **Ownership split**: `actor_status` carries what flighthook knows about the
 actor (connection lifecycle, operational mode). Device-reported state (ready,
-battery, tilt, temp) is conveyed separately via `device_telemetry`. The two
-event types have no overlapping telemetry keys.
+battery, tilt, temp) is conveyed separately via `device_telemetry`. No key
+means two things in the two event types, and an actor sends each key in one
+of them only (see `device_telemetry`).
 
 ```json
 {

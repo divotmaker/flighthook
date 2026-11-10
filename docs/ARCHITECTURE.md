@@ -753,8 +753,14 @@ Mode and hand are global state, not per-device.
 
 ### DeviceTelemetry / ActorStatus split
 
-Device state and actor lifecycle are conveyed via two separate event variants
-with **no overlapping telemetry keys**:
+Device state and actor lifecycle are conveyed via two separate event variants.
+**No key means two things**, and an actor sends each key through one of the
+two only. The device's own state goes in `DeviceTelemetry`: a launch monitor
+on a device driver reports its state keys there, `radar_mode` and
+`tracking_mode` included (the mock does), where the older actors send them
+on `ActorStatus`. The web layer merges both into one map per actor, so a card
+reads the same either way; an FRP client on `/frp` sees such keys in
+`device_telemetry` for the driver-based devices only.
 
 - **`DeviceTelemetry`** (FRP-compliant) — what the device reports about itself.
   Emitted any time a device-reported value changes. Carries identity
@@ -763,7 +769,8 @@ with **no overlapping telemetry keys**:
   detection where applicable).
 
   Standard telemetry keys: `ready`, `battery_pct`, `tilt`, `roll`, `temp_c`,
-  `external_power`.
+  `external_power`; a device driver may add its own state keys (the mock's
+  `radar_mode`, `tracking_mode`).
 
 - **`ActorStatus`** (flighthook extension) — what flighthook knows about the
   actor/connection. Carries a typed status enum and actor-framework telemetry.
@@ -1487,9 +1494,20 @@ next to them, so the file and the REST JSON hold one flat table per card;
 every driver field is left out while at its default, so a default section
 writes what it wrote before. `FlighthookConfig::device_error()` runs every
 card's `DriverConfig::validate` and names the card and the field
-(`mock_monitor.0: shot_interval_s: must be 0 to 86400`): a save that
-fails it is `400`; a file that fails it loads as written, logs the error
-and that card does not start (its card shows the error). A type error in a
+(`mock_monitor.0: shot_interval_s: must be 0 to 86400`, cards in number
+order). A save that changes a card's driver settings into refused ones is
+`400` (`changed_device_error` against the saved config); a save that keeps
+a card's refused settings as they are goes through, so the card still
+saves its other fields and its on/off switch. A file that fails it loads
+as written, logs the error and that card does not start (its card shows the
+error until it is fixed). The card form follows the same rule: the refusal
+shows under the card's fields, and only a change into refused settings
+disables Save.
+
+**Rule: every field a driver's `validate()` can refuse is editable on that
+card**, so a refused value can always be fixed from the UI. Each card on a
+device driver is checked against it when it moves onto `DriverActor`. (The
+mock's driver fields are file and API only.) A type error in a
 driver field, which serde reads through the flattened buffer, is located by
 re-reading each section into the driver's config, so the load error names
 the key's line. Tests keep host keys and driver keys apart and check that a
@@ -1509,7 +1527,10 @@ and `shots_allowed` (the round policy), and polls for 50 ms. A session
 error releases held launches, sends `ready=false` and then Reconnecting;
 the driver's `retry_delay` (its own alerts, an SDK `Backoff`) is slept with
 the bus drained; `None` gives up with Disconnected and the error. A stop
-closes the session (`close`) and ends Disconnected. `stop_wait()` is
+closes the session (`close`) and ends Disconnected. A panic in the driver
+(any of its calls) is caught on the actor's thread: `ready=false`, then
+Disconnected with `error = "the device driver failed; press Reconnect"`,
+and the thread ends, so a card never stays Connected over a dead driver. `stop_wait()` is
 `D::STOP_WAIT`; a driver whose device takes one connection at a time
 (`exclusive`) is not replaceable while stopping.
 
@@ -1518,12 +1539,12 @@ closes the session (`close`) and ends Disconnected. `stop_wait()` is
 | Driver event | Bus |
 |---|---|
 | `shot_trigger` | `ShotTrigger` (with the driver's timestamp) through `RoundPolicy::send_if_allowed`; opens the raw capture window at the trigger's time; refused, the whole shot is dropped |
-| `launch` | held until the shot's `flight_result` or `shot_finished`; then `on_frp` (with the flight result in view), the simulation once (the driver's fixed mode, else the live mode) and `Launch` with `derived`, then `FlightResult` |
+| `launch` | held until the shot's `flight_result` or `shot_finished`; then `on_frp` (with the flight result in view), the simulation once (the driver's fixed mode, else the live mode, or the mode the hook set in `HookCtx::mode`) and `Launch` with `derived`, then `FlightResult` |
 | `flight_result` | releases the held launch; one that comes first waits for its launch |
 | `club_path`, `face_impact`, `alert` | `ClubPath`, `FaceImpact`, `Alert` |
 | `shot_finished` | `ShotFinished` with the shot's raw frames (`"<kind> device has no wire protocol"` without a raw profile), then the card's `shot_count` |
 | `device_telemetry` | merged into the session's map and published in full |
-| `raw_frame` | numbered per device id across sessions, a hex line at the `audit` target, recorded for the export ([raw capture](#raw-capture-and-shot-export)); never on the bus |
+| `raw_frame` | numbered per device id across sessions (frames of the first connect, before the id is known, number on into it), a hex line at the `audit` target, recorded for the export ([raw capture](#raw-capture-and-shot-export)); never on the bus |
 | `Phase` | the card's `phase` |
 | `Log` | tracing; trace lines at the `audit` target |
 | `ShotDiscarded` | the pre-roll is cleared |
@@ -1536,6 +1557,10 @@ shot) is dropped.
 host field only is Applied; a driver change that `restart_needed` calls
 live (and that validates) is Applied and handed to the running driver;
 anything else, a refused config or a removed section is RestartRequired.
+The actor's thread takes an Applied section at its next pass whatever it is
+doing: between session polls, before each connect, every 100 ms of a retry
+delay and while it waits for its stop, so a change takes effect at the next
+shot or connect (the hooks see the new section at once).
 
 ## Cameras and replay (beta)
 
