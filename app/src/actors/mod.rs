@@ -55,6 +55,10 @@ pub const MAX_STOP_WAIT: Duration = exputt::STOP_WAIT;
 const _: () = assert!(STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
 const _: () = assert!(square::STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
 const _: () = assert!(
+    <tenover::driver::R10 as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+        <= MAX_STOP_WAIT.as_millis()
+);
+const _: () = assert!(
     <flightrelay::mock::MockDriver as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
@@ -192,12 +196,7 @@ pub fn resolve_actors(
         actors.push(ResolvedActor {
             id,
             name: section.name.clone(),
-            actor: Box::new(r10::R10Actor {
-                initial_mode: mode,
-                // The R10 protocol carries tee distance in yards.
-                #[allow(clippy::cast_possible_truncation)]
-                tee_range_yards: section.range.map(|d| d.as_yards() as f32),
-            }),
+            actor: Box::new(r10::R10Actor::new(section.clone())),
         });
     }
 

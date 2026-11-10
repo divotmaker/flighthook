@@ -1529,6 +1529,7 @@ dependencies = [
  "flightrelay",
  "serde",
  "serde_json",
+ "tenover",
  "tungstenite 0.26.2",
 ]
 
@@ -4269,14 +4270,14 @@ dependencies = [
 
 [[package]]
 name = "tenover"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "583c635e7fab0141de24b7c6a0d9ad98ead50c10a6909e7f2f279239e4d85449"
+version = "0.4.1"
 dependencies = [
  "btleplug",
+ "flightrelay",
  "libc",
  "prost 0.13.5",
  "prost-build",
+ "serde",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",

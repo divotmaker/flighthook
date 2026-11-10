@@ -616,6 +616,12 @@ struct Sink<D: DeviceDriver, H: Hooks<D>> {
     status: ActorStatus,
     /// The session's device telemetry, merged.
     telemetry: HashMap<String, String>,
+    /// A connect is running: device telemetry is merged and goes out with
+    /// the session's identity once it connects.
+    connecting: bool,
+    /// The card's `phase` was set during this connect (cleared when the
+    /// session connects).
+    phase_shown: bool,
     /// The session's raw capture, for a driver with a raw profile.
     capture: Option<RawCapture>,
     /// The next raw frame number per FRP device id, across sessions.
@@ -691,6 +697,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             device: None,
             status: ActorStatus::Starting,
             telemetry: HashMap::new(),
+            connecting: false,
+            phase_shown: false,
             capture: None,
             seqs: HashMap::new(),
             held: HashMap::new(),
@@ -722,6 +730,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     /// A connect is about to start: a new session's telemetry and capture.
     fn begin_session(&mut self) {
         self.telemetry.clear();
+        self.connecting = true;
         self.capture = self.info.raw.as_ref().map(|p| {
             RawCapture::new(RawCaptureConfig {
                 transport: p.transport,
@@ -735,9 +744,11 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     }
 
     /// A session connected as `identity`: Connected, with the card text and
-    /// the shot count, then the device's identity (and `source`, which the
-    /// bus sender stamps) before any shot.
+    /// the shot count (and the connect's `phase` removed), then the device's
+    /// identity (and `source`, which the bus sender stamps) with the
+    /// telemetry the driver sent while connecting, before any shot.
     fn connected(&mut self, identity: &DeviceIdentity) {
+        self.connecting = false;
         // Frames sent while the first connect ran were numbered under the
         // actor's id; the device's numbers go on from there.
         if !self.seqs.contains_key(&identity.device)
@@ -747,13 +758,15 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         }
         self.device = Some(identity.device.clone());
         info!("{}: connected to {}", self.actor, identity.label());
-        self.status(
-            ActorStatus::Connected,
-            HashMap::from([
-                ("device_info".into(), identity.label()),
-                ("shot_count".into(), self.shot_count.to_string()),
-            ]),
-        );
+        let mut telemetry = HashMap::from([
+            ("device_info".into(), identity.label()),
+            ("shot_count".into(), self.shot_count.to_string()),
+        ]);
+        // An empty value removes the key: the phases were the connect's.
+        if std::mem::take(&mut self.phase_shown) {
+            telemetry.insert("phase".into(), String::new());
+        }
+        self.status(ActorStatus::Connected, telemetry);
         self.send(FlighthookEvent::DeviceTelemetry {
             manufacturer: identity.manufacturer.clone(),
             model: identity.model.clone(),
@@ -809,6 +822,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         match event {
             DeviceEvent::Frp(event) => self.frp(event),
             DeviceEvent::Phase(phase) => {
+                self.phase_shown |= self.connecting;
                 self.send(FlighthookEvent::ActorStatus {
                     status: self.status,
                     telemetry: HashMap::from([("phase".into(), phase.to_owned())]),
@@ -919,6 +933,10 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
                 ..
             } => {
                 self.telemetry.extend(telemetry.unwrap_or_default());
+                // While connecting, it goes out with the identity.
+                if self.connecting {
+                    return;
+                }
                 self.send(FlighthookEvent::DeviceTelemetry {
                     manufacturer,
                     model,
@@ -1874,6 +1892,50 @@ mod tests {
         assert_eq!(sink.seqs["FAKE-1"], 3);
     }
 
+    /// Telemetry a driver sends while it connects goes out with the
+    /// identity once the session connects (so with its device id), and the
+    /// connect's `phase` leaves the card then; a connect without a phase
+    /// sends no `phase` key.
+    #[test]
+    fn a_connects_telemetry_goes_out_with_the_identity() {
+        let ready = || {
+            frp(FrpEvent::DeviceTelemetry {
+                manufacturer: None,
+                model: None,
+                firmware: None,
+                source: None,
+                telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
+            })
+        };
+        let (_dir, mut sink, mut rx, _w) = connecting_sink::<FakeHooks>("");
+        sink.handle(DeviceEvent::Phase("handshaking"));
+        sink.handle(ready());
+        let seen = drain(&mut rx);
+        assert_eq!(kinds(&seen), ["status"], "the phase only");
+        sink.connected(&DeviceIdentity::new("FAKE-1").with_model("Eagle"));
+        let seen = drain(&mut rx);
+        assert_eq!(kinds(&seen), ["status", "telemetry"]);
+        assert!(
+            matches!(&seen[0].event, FlighthookEvent::ActorStatus { status: ActorStatus::Connected, telemetry }
+            if telemetry["phase"].is_empty())
+        );
+        assert!(
+            matches!(&seen[1].event, FlighthookEvent::DeviceTelemetry { model: Some(m), telemetry: Some(t), .. }
+            if m == "Eagle" && t["ready"] == "false")
+        );
+        assert!(seen.iter().all(|m| m.device.as_deref() == Some("FAKE-1")));
+        sink.handle(ready());
+        assert_eq!(kinds(&drain(&mut rx)), ["telemetry"], "connected: at once");
+
+        sink.begin_session();
+        sink.connected(&DeviceIdentity::new("FAKE-1"));
+        let seen = drain(&mut rx);
+        assert!(
+            matches!(&seen[0].event, FlighthookEvent::ActorStatus { telemetry, .. }
+            if !telemetry.contains_key("phase"))
+        );
+    }
+
     /// A discarded shot's frames leave the pre-roll.
     #[test]
     fn a_discarded_shot_clears_the_pre_roll() {
@@ -2340,6 +2402,7 @@ mod tests {
     #[test]
     fn every_cards_source_is_its_drivers() {
         source_matches::<flightrelay::mock::MockDriver, crate::actors::mock::MockHooks>();
+        source_matches::<tenover::driver::R10, crate::actors::r10::R10Hooks>();
         source_matches::<FakeDriver, FakeHooks>();
     }
 
@@ -2464,6 +2527,24 @@ mod tests {
                 ]
                 .map(String::from)
             )
+        );
+
+        let r10 = flighthook::R10Section {
+            name: "R10".into(),
+            enabled: false,
+            impact_lead_s: Some(2.5),
+            driver: flighthook::R10Config::default(),
+        };
+        let full = flighthook::R10Section {
+            driver: flighthook::R10Config {
+                range: Some(flighthook::Distance::Feet(7.0)),
+            },
+            ..r10.clone()
+        };
+        keys_apart(&r10, &full);
+        assert_eq!(
+            driver_keys::<flighthook::R10Config>(),
+            BTreeSet::from(["range".to_owned()])
         );
     }
 }

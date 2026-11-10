@@ -514,7 +514,7 @@ mod tests {
         let shot = private_shot();
         let native: ShotExport =
             serde_json::from_str(&jsonl_line(&shot, "t", None, true)).expect("parses");
-        assert_eq!(native.schema, 2);
+        assert_eq!(native.schema, flighthook::EXPORT_SCHEMA);
         assert_eq!(native.data, shot.data);
         assert_eq!(native.exported_at, "t");
 

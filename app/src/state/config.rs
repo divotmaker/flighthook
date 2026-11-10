@@ -260,6 +260,7 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
             None => {
                 let e = located_error(contents, e);
                 let fault = driver_type_error::<flighthook::MockMonitorSection>(contents)
+                    .or_else(|| driver_type_error::<flighthook::R10Section>(contents))
                     .unwrap_or_else(|| fault(contents, &e));
                 tracing::warn!("failed to parse {}: {fault}", path.display());
                 Err(fault)
@@ -1226,6 +1227,86 @@ full_monitor = "mevo.0"
         assert_eq!(
             toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
             config
+        );
+    }
+
+    /// An R10 section as flighthook 0.1.24 saved it (range, camera timing,
+    /// a second card that is off) loads into the same values, the range now
+    /// in the driver's settings, and the file is not rewritten.
+    #[test]
+    fn an_r10_section_file_from_0_1_24_loads_unchanged() {
+        let text = "default_units = \"imperial\"\n\
+                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
+                    putting_clubs = [\"PT\"]\n\
+                    \n\
+                    [r10.0]\n\
+                    name = \"Garmin R10\"\n\
+                    range = \"7ft\"\n\
+                    impact_lead_s = 2.5\n\
+                    \n\
+                    [r10.1]\n\
+                    name = \"Bay 2\"\n\
+                    enabled = false\n\
+                    range = \"2.1m\"\n";
+        let (dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        let first = &config.r10["0"];
+        assert_eq!(first.name, "Garmin R10");
+        assert_eq!(first.driver.range, Some(flighthook::Distance::Feet(7.0)));
+        assert_eq!(first.impact_lead_s, Some(2.5));
+        assert!(first.enabled);
+        let second = &config.r10["1"];
+        assert!(!second.enabled);
+        assert_eq!(second.driver.range, Some(flighthook::Distance::Meters(2.1)));
+        assert_eq!(config.device_error(), None);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            text,
+            "not rewritten"
+        );
+        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        let saved = toml::to_string_pretty(&config).expect("toml");
+        assert!(
+            saved
+                .contains("[r10.0]\nname = \"Garmin R10\"\nimpact_lead_s = 2.5\nrange = \"7ft\"\n"),
+            "{saved}"
+        );
+        assert_eq!(
+            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            config
+        );
+    }
+
+    /// A range the R10 driver refuses (0 or less) loads as written and names
+    /// the card, which does not start; a range of the wrong type names its
+    /// key's line.
+    #[test]
+    fn a_refused_r10_range_loads_and_is_reported() {
+        let text = "[r10.0]\nname = \"Garmin R10\"\nrange = \"0ft\"\n";
+        let (_dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        assert_eq!(
+            config.r10["0"].driver.range,
+            Some(flighthook::Distance::Feet(0.0))
+        );
+        assert_eq!(
+            config.device_error().as_deref(),
+            Some("r10.0: range: must be a distance greater than 0")
+        );
+
+        let text = "[r10.0]\n\
+                    name = \"Garmin R10\"\n\
+                    \n\
+                    [r10.2]\n\
+                    name = \"Bay 2\"\n\
+                    range = 7\n";
+        let error = kept_error(text);
+        assert!(
+            error.error.starts_with("line 6, column 1: r10.2: range: "),
+            "{}",
+            error.error
         );
     }
 

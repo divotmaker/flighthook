@@ -1114,6 +1114,9 @@ fn invalid_driver_setting(saved: &FlighthookConfig, action: &ConfigAction) -> Op
             saved.mock_monitor.get(index),
             &format!("mock_monitor.{index}"),
         ),
+        ConfigAction::UpsertR10 { index, section } => {
+            section.changed_driver_error(saved.r10.get(index), &format!("r10.{index}"))
+        }
         _ => None,
     }
 }
@@ -2824,6 +2827,49 @@ mod group_tests {
                     save_settings(&state, scope, body.clone(), Duration::from_millis(50)).await;
                 assert_eq!(res.err().map(|e| e.0), Some(StatusCode::GATEWAY_TIMEOUT));
             }
+        }
+    }
+
+    /// A save with an R10 range the driver refuses (0 or less, not finite)
+    /// is 400 and saves nothing, whole and scoped; a range greater than 0
+    /// and no range pass.
+    #[tokio::test]
+    async fn settings_save_with_a_refused_r10_range_is_400() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.r10.insert("0".into(), flighthook::R10Section::default());
+        });
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        for bad in [
+            flighthook::Distance::Feet(0.0),
+            flighthook::Distance::Meters(-1.0),
+            flighthook::Distance::Feet(f64::INFINITY),
+        ] {
+            let mut body = live.clone();
+            body.r10.get_mut("0").unwrap().driver.range = Some(bad);
+            for scope in [None, Some("r10.0")] {
+                let (status, Json(error)) =
+                    save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                        .await
+                        .expect_err("rejected");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} {scope:?}");
+                assert_eq!(
+                    error["error"],
+                    "r10.0: range: must be a distance greater than 0"
+                );
+            }
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+        for ok in [Some(flighthook::Distance::Feet(7.0)), None] {
+            let mut body = live.clone();
+            body.r10.get_mut("0").unwrap().driver.range = ok;
+            let action = ConfigAction::UpsertR10 {
+                index: "0".into(),
+                section: body.r10["0"].clone(),
+            };
+            assert_eq!(invalid_driver_setting(&live, &action), None, "{ok:?}");
         }
     }
 

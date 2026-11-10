@@ -20,7 +20,9 @@ gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
 ironsight = { version = "0.6.0", features = ["serde"] }
-tenover = "0.4.0"
+# The R10's device driver (`driver`: `tenover::driver::R10`).
+# LOCAL path until tenover 0.5.0 is released
+tenover = { path = "../../../10over/10over", features = ["driver"] }
 flighthook = { path = "../lib", features = ["clap"] }
 # FRP's forwarding rules for the `/frp` endpoint (`ForwardFilter`), the
 # device driver contract the launch monitor actors run on (`driver`) and the
@@ -86,7 +88,8 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 # ironsight's test support: a scripted device and recorded result frames.
 ironsight = { version = "0.6.0", features = ["serde", "testing"] }
 # tenover's test support: GFDI frame builders with synthetic identity.
-tenover = { version = "0.4.0", features = ["testing"] }
+# LOCAL path until tenover 0.5.0 is released
+tenover = { path = "../../../10over/10over", features = ["driver", "testing"] }
 # allsquare's test support: notification fixtures and encoders.
 allsquare = { version = "0.3.0", features = ["serde", "testing"] }
 # threeputt's test support: an in-process mock device and sample putts.

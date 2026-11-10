@@ -123,7 +123,10 @@ address = "127.0.0.1:921"
   Read on every shot, so a change applies without a restart; omitted from
   the config at the default
 - R10 sections show name and Monitor-to-Ball (`range`, sent to the device as
-  its tee distance; BLE auto-discovery, no address field)
+  its tee distance; BLE auto-discovery, no address field). `range` is the R10
+  driver's setting (tenover's `Config`, flattened into the section); a range
+  that isn't greater than 0 is refused (the card shows why and Save stays
+  off; a save is `400`; from the file, the card does not start)
 - ExPutt sections show name and an optional IP Address (blank finds the
   device on the network); the putting hand follows the game's handedness
 - Mock sections show only name and Camera timing; the mock driver's settings
@@ -231,7 +234,7 @@ pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball
 pub enum CameraMode { Standard, Fusion, RawFusion }
 pub enum FlightScopeEnvironment { LimitedFlight, Outdoor }
 pub enum SpinSource { D4, E8, Auto }
-pub struct R10Section { pub name: String, pub range: Option<Distance> }
+pub struct R10Section { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: R10Config }  // tenover's Config: range: Option<Distance>
 pub struct SquareSection { pub name: String, pub address: Option<String>, pub club: Option<Club>, pub advanced_spin: Option<bool>, pub discard_non_putting_zero_spin: Option<bool> }
 pub struct ExPuttSection { pub name: String, pub address: Option<String> }
 pub struct MockMonitorSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: MockConfig }  // flightrelay's MockConfig
@@ -618,7 +621,6 @@ the ring and every cap.
 | --- | --- | --- | --- | --- | --- | --- |
 | FlightScope | ironsight `set_on_recv` / `set_on_send` (the same hooks log hex and keep the last D4) | BALL TRIGGER to the device re-armed, both directions | what ironsight classifies as identity-bearing (`protocol::carries_identity`): status/keepalive, device and product info, DSP query, network config, WiFi scan, calibration, sensor activation, time sync, AVR config query | 8 | 256 | 128 KiB (PRC, club PRC, speed profile) |
 | Square Golf | `Tap<T>` around the allsquare transport; characteristic reads are never recorded | pre-roll through the shot event; enabled after the identity exchange | heartbeats and acks, query reply | 64 | 64 | 0 |
-| R10 | `Tap<T>` around the tenover transport; a per-direction tenover `capture::IdentityFilter` holds each chunk until the GFDI frames it carries are complete and classified | pre-roll through the shot event; enabled at `HandshakeComplete` | what tenover classifies as identity-bearing: every chunk carrying part of a device information, FIT/file transfer or authentication frame, an ACK of one, or a frame that does not decode | 256 | 256 | 0 |
 | ExPutt | none: the putt's 16 values, comma-separated, as one text record (`transport = "exputt-wifi"`) | the putt | none | - | 1 | 0 |
 | Open Connect | the inbound JSON text and our reply | the one message | none | - | - | - |
 | Mock | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
@@ -629,7 +631,12 @@ message, cleared of identity by the driver, stored with the driver's `label`
 as it gave it (no `type`, `src`, `dst` or `channel`), `hex` (or `text` for a
 text protocol), and placed in time by the frame's own timestamp. Pre-roll,
 caps and the bulk budget come from the driver's raw profile. The mock has no
-wire protocol and records none.
+wire protocol and records none. The R10 (tenover, `transport = "r10-ble"`)
+records one frame per GFDI message after the handshake, labeled
+`notify <type>` / `write <type>`, pre-roll 256, at most 256 frames, no bulk
+data; tenover withholds every message that carries the device's identity or
+keys, every one it cannot classify and everything before the handshake
+finished (those reach the audit log only, at trace level).
 
 The web layer keeps each shot as a `StoredShot` (`app/src/actors/web/mod.rs`):
 when `shot_trigger` arrived, a `ShotContext` snapshot taken then (device kind,
@@ -990,8 +997,10 @@ failed attempt, capped at 15s (3s for the Open Connect client, a loopback/LAN
 TCP connect). The Open Connect client, Square Golf and ExPutt actors restart at 1s after a connection
 that lasted at least 10s; one that drops sooner counts as a failed attempt, so
 a link that keeps connecting and dropping still backs off to the cap. The
-Open Connect server restarts at 1s after a successful bind. The Mevo and R10
-actors keep the grown delay. Every actor polls its shutdown flag during the
+Open Connect server restarts at 1s after a successful bind. A card on a
+device driver (the R10, the mock) waits the delay its driver asks for: the R10
+uses the SDK's `Backoff`, 1 s per failed attempt up to 15 s, back to 1 s after a
+session of at least 10 s. The Mevo actor keeps the grown delay. Every actor polls its shutdown flag during the
 backoff wait (the Open Connect server during its bind retry delay too), so
 stopping one never waits out the delay. The Mevo and Open Connect client TCP
 connects (up to 5s) run on a thread of their own: a stop ends the actor at
@@ -1131,7 +1140,7 @@ What a stop does, by actor:
 | Pureplay | always: 50 ms reads, 2s write timeout, the connect on its own thread | a write in progress (2s) |
 | Open Connect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
 | Square Golf | in a session or a backoff wait: it disarms the device, then disconnects it, with BlueZ and with btleplug | the scan and connect inside allsquare (up to 20s scan + 20s service resolution on Linux) |
-| Garmin R10 | in a session or a backoff wait | the scan and connect inside tenover |
+| Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
 | ExPutt | measuring (100 ms event wait, the session closes at once) or waiting to reconnect | a session start (up to 17s: connect and greeting, two handshake replies, mat search) |
 | Mock monitor | always (50 ms polls; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
 | Random club | always (100 ms loop) | -- |
@@ -1146,11 +1155,22 @@ What a stop does, by actor:
 
 Post-shot cycle: `Connected(radar_mode=idle)` -> `Starting` (re-arm) -> `Connected(radar_mode=armed)`.
 
-**R10 actor**: BLE auto-discovery via `tenover::BleTransport::auto_connect()`.
-Emits `Starting` while scanning/connecting, `Connected` after handshake
-completes. Emits `DeviceTelemetry` with `manufacturer: "Garmin"`,
-`model: "R10"`. Telemetry keys: `ready`, `tilt`, `roll`, `device_state`
-(`waiting` | `recording` | `processing`). Uses BLE address as FRP device ID.
+**R10 card**: tenover's device driver (`tenover::driver::R10`) on
+`DriverActor` (`actors::r10::R10Hooks`: section `R10Section`, source `R10`, no
+processing of its own). The driver finds a paired R10 over BLE (`phase:
+discovering`), runs the handshake (`phase: handshaking`, at most 10 s from its
+start), then the card is `Connected` (`device_info` "Garmin R10 (<address>)")
+with `device_telemetry` `manufacturer: "Garmin"`, `model: "R10"`. It sends the
+card's `range` as the tee distance once the device wakes (a changed range
+restarts the card). Telemetry keys: `ready`, `tilt`, `roll`, `device_state`
+(`waiting` | `recording` | `processing`); a device error is an alert with its
+tilt as `tilt`/`roll`. A shot is trigger, `launch` (total spin and axis plus
+back/side spin, all measured; a total of 0 has no axis), `club_path` when the
+club was tracked, `shot_finished`, then `ready=false`; the R10 has no wall
+clock, so the trigger carries no timestamp. Commands are ignored (no mode,
+hand or club on the R10). The BLE address is the FRP device id. On Windows
+and macOS closing the session disconnects the R10 (at most 4 s); on Linux the
+BlueZ link is left up.
 
 **ExPutt actor**: runs a `threeputt::Session` on its own thread. With no
 address it waits for the device to announce itself on the network
@@ -1480,13 +1500,14 @@ NotReady/Disconnected until the monitor's next status or its next
 ## Device drivers
 
 A launch monitor card can run on a flightrelay device driver
-(`flightrelay::driver::DeviceDriver`): the mock does today
-(`flightrelay::mock::MockDriver`). The driver owns the device (connect,
+(`flightrelay::driver::DeviceDriver`): the R10 (`tenover::driver::R10`) and
+the mock (`flightrelay::mock::MockDriver`) do today. The driver owns the device (connect,
 session, shots, telemetry, raw frames); `actors::driver::DriverActor<D, H>`
 is the host around it, one thread per card. What a card adds is its
 `Hooks<D>`: its config section (`H::Section`, a lib `DeviceSection`), its
 shot source (`H::SOURCE`) and optional processing (`on_frp`, `action`).
-The mock's are `actors::mock::MockHooks` (none of its own).
+The R10's are `actors::r10::R10Hooks` and the mock's
+`actors::mock::MockHooks` (neither has processing of its own).
 
 **Config.** A `DeviceSection` is flighthook's own fields (`name`,
 `enabled`, `impact_lead_s`) with the driver's config `#[serde(flatten)]`ed
@@ -1543,9 +1564,9 @@ and the thread ends, so a card never stays Connected over a dead driver. `stop_w
 | `flight_result` | releases the held launch; one that comes first waits for its launch |
 | `club_path`, `face_impact`, `alert` | `ClubPath`, `FaceImpact`, `Alert` |
 | `shot_finished` | `ShotFinished` with the shot's raw frames (`"<kind> device has no wire protocol"` without a raw profile), then the card's `shot_count` |
-| `device_telemetry` | merged into the session's map and published in full |
+| `device_telemetry` | merged into the session's map and published in full; during a connect only merged, and published with the identity when the session connects |
 | `raw_frame` | numbered per device id across sessions (frames of the first connect, before the id is known, number on into it), a hex line at the `audit` target, recorded for the export ([raw capture](#raw-capture-and-shot-export)); never on the bus |
-| `Phase` | the card's `phase` |
+| `Phase` | the card's `phase`; the Connected status removes a phase set during the connect (`phase: ""`) |
 | `Log` | tracing; trace lines at the `audit` target |
 | `ShotDiscarded` | the pre-roll is cleared |
 

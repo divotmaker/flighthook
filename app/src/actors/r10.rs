@@ -1,884 +1,152 @@
-use std::collections::HashMap;
-use std::io;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+//! The Garmin R10 card: tenover's device driver ([`R10`]) on
+//! [`DriverActor`].
+//!
+//! The driver owns the device: it finds a paired R10 over BLE, runs the
+//! handshake (10 s at most), sends the card's tee distance (`range`) once
+//! the device wakes, and reports readiness, device state, tilt, device
+//! errors and shots. The card adds its section ([`R10Section`]) and its
+//! shot source; it has no processing of its own. A changed range takes a
+//! new session (a restart).
 
-use tenover::ble::BleTransport;
-use tenover::capture::IdentityFilter;
-use tenover::{Client, Event};
-use tracing::{debug, info, warn};
+use flighthook::R10Section;
+use tenover::driver::R10;
 
-use super::{Actor, ReconfigureOutcome};
-use crate::bus::{BusReceiver, BusSender, PollError};
-use crate::raw_capture::{self, RawCapture, RawCaptureConfig};
-use crate::sim;
-use crate::state::SystemState;
+use crate::actors::driver::{DriverActor, Hooks};
+use crate::actors::provenance::ShotSource;
 
-use flighthook::{
-    ActorStatus, ClubData, FlighthookEvent, FlighthookMessage, Launch, RawDir, RawRecord, Severity,
-    ShotDetectionMode, ShotKey, Velocity,
-};
+/// The R10 card: no processing of its own.
+#[derive(Debug, Default)]
+pub struct R10Hooks;
 
-/// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
-const MIN_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(15);
-
-/// Garmin R10 BLE actor. Connects via BLE auto-discovery, runs the
-/// MultiLink/GFDI/protobuf handshake, and processes shots.
-pub struct R10Actor {
-    pub initial_mode: ShotDetectionMode,
-    /// Tee distance to push to the device after wake-up, in yards — the unit
-    /// the R10 protocol expects. `None` leaves the device's own setting alone.
-    pub tee_range_yards: Option<f32>,
+impl Hooks<R10> for R10Hooks {
+    type Section = R10Section;
+    const SOURCE: ShotSource = ShotSource::R10;
 }
 
-impl Actor for R10Actor {
-    /// A launch monitor flighthook reads directly.
-    fn source(&self) -> Option<crate::actors::provenance::ShotSource> {
-        Some(crate::actors::provenance::ShotSource::R10)
-    }
-
-    fn start(
-        &self,
-        state: Arc<SystemState>,
-        sender: BusSender,
-        receiver: BusReceiver,
-    ) -> std::thread::JoinHandle<()> {
-        let initial_mode = self.initial_mode;
-        let tee_range_yards = self.tee_range_yards;
-        let thread_name = format!("device:{}", sender.actor_id());
-
-        std::thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
-                run(&state, initial_mode, tee_range_yards, sender, receiver);
-            })
-            .expect("failed to spawn r10 thread")
-    }
-
-    fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
-        let actor_id = sender.actor_id();
-        let Some((_, index)) = actor_id.split_once('.') else {
-            return ReconfigureOutcome::Applied;
-        };
-
-        let snap = state.system.snapshot();
-        match snap.r10.get(index) {
-            // Tee distance is pushed once, right after the device wakes up, so
-            // a change only takes effect on the next connection.
-            Some(section) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let yards = section.range.map(|d| d.as_yards() as f32);
-                if yards == self.tee_range_yards {
-                    ReconfigureOutcome::Applied
-                } else {
-                    ReconfigureOutcome::RestartRequired
-                }
-            }
-            None => ReconfigureOutcome::RestartRequired, // section removed
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Raw capture
-// ---------------------------------------------------------------------------
-
-/// Raw capture for one R10 connection. Chunks are recorded as they cross the
-/// transport, MultiLink handle byte included. The pre-roll holds the shot
-/// message and the device's replays of it at any MTU.
-fn raw_capture_config() -> RawCaptureConfig {
-    RawCaptureConfig {
-        transport: "r10-ble",
-        pre_roll_frames: 256,
-        max_frames: 256,
-        max_bulk_bytes: 0,
-        exclude: raw_capture::exclude_none,
-        is_bulk: raw_capture::no_bulk,
-    }
-}
-
-/// Transport wrapper that records chunks for the shot export. The capture
-/// starts disabled and is enabled once the handshake (which carries the
-/// device's unit ID) is complete; after that, chunks of identity-bearing
-/// GFDI messages are filtered out by type.
-struct Tap<T> {
-    inner: T,
-    capture: RawCapture,
-    rx: IdentityFilter<(Instant, RawRecord)>,
-    tx: IdentityFilter<(Instant, RawRecord)>,
-}
-
-impl<T> Tap<T> {
-    fn new(inner: T) -> Self {
-        let mut capture = RawCapture::new(raw_capture_config());
-        capture.set_enabled(false);
-        Self {
-            inner,
-            capture,
-            rx: IdentityFilter::new(),
-            tx: IdentityFilter::new(),
-        }
-    }
-
-    /// Record a GFDI data chunk once its frames are classified.
-    fn record(&mut self, dir: RawDir, channel: &str, data: &[u8]) {
-        let rec = RawRecord {
-            channel: Some(channel.into()),
-            ..RawRecord::binary(dir, data)
-        };
-        let filter = match dir {
-            RawDir::Rx => &mut self.rx,
-            RawDir::Tx => &mut self.tx,
-        };
-        for (at, rec) in filter.feed(data, (Instant::now(), rec)) {
-            self.capture.push_at(rec, at);
-        }
-    }
-}
-
-impl<T: tenover::Transport> tenover::Transport for Tap<T> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.record(RawDir::Rx, "notify", &buf[..n]);
-        }
-        Ok(n)
-    }
-
-    fn write(&mut self, data: &[u8]) -> Result<(), io::Error> {
-        self.inner.write(data)?;
-        self.record(RawDir::Tx, "write", data);
-        Ok(())
-    }
-
-    /// MultiLink control plane (service registration): no GFDI frames.
-    fn write_register(&mut self, data: &[u8]) -> Result<(), io::Error> {
-        self.inner.write_register(data)?;
-        self.capture.push(RawRecord {
-            channel: Some("register".into()),
-            ..RawRecord::binary(RawDir::Tx, data)
-        });
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn emit_device_status(sender: &BusSender, status: ActorStatus, telemetry: HashMap<String, String>) {
-    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-        status,
-        telemetry,
-    }));
-}
-
-fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>) {
-    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-        severity,
-        message: message.into(),
-    }));
-}
-
-// ---------------------------------------------------------------------------
-// Protocol type -> bus type conversion helpers
-// ---------------------------------------------------------------------------
-
-/// The R10 measures total spin and spin axis; tenover also hands back the
-/// back/side components of the same spin, so both FRP spin pairs are sent,
-/// all four as measured values. A total of 0 has no axis.
-fn ball_from_r10(b: &tenover::proto::BallData) -> Launch {
-    #[allow(clippy::cast_possible_truncation)]
-    let total_spin = b.total_spin.round() as i32;
-    Launch {
-        launch_speed: Some(Velocity::MetersPerSecond(f64::from(b.ball_speed))),
-        launch_elevation: Some(f64::from(b.launch_angle)),
-        launch_azimuth: Some(f64::from(b.launch_direction)),
-        // R10 doesn't compute carry, apex, flight time or roll.
-        #[allow(clippy::cast_possible_truncation)]
-        backspin_rpm: Some(b.backspin.round() as i32),
-        #[allow(clippy::cast_possible_truncation)]
-        sidespin_rpm: Some(b.sidespin.round() as i32),
-        total_spin_rpm: Some(total_spin),
-        spin_axis: (total_spin != 0).then_some(f64::from(b.spin_axis)),
-    }
-}
-
-fn club_from_r10(c: &tenover::proto::ClubData) -> ClubData {
-    ClubData {
-        club_speed: Some(Velocity::MetersPerSecond(f64::from(c.club_head_speed))),
-        club_speed_post: None,
-        path: Some(f64::from(c.path_angle)),
-        attack_angle: Some(f64::from(c.attack_angle)),
-        face_angle: Some(f64::from(c.face_angle)),
-        dynamic_loft: None,
-        smash_factor: None,
-        swing_plane_horizontal: None,
-        swing_plane_vertical: None,
-        club_offset: None,
-        club_height: None,
-        ..ClubData::default()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Run loop
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::needless_pass_by_value)]
-fn run(
-    state: &SystemState,
-    _initial_mode: ShotDetectionMode,
-    tee_range_yards: Option<f32>,
-    sender: BusSender,
-    mut receiver: BusReceiver,
-) {
-    let mut backoff = MIN_BACKOFF;
-    let mut ever_connected = false;
-    let mut device_id: Option<String> = None;
-
-    loop {
-        if receiver.poll().is_err() {
-            break;
-        }
-
-        emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
-
-        match connect_and_run(
-            state,
-            &sender,
-            &mut receiver,
-            &mut ever_connected,
-            &mut device_id,
-            tee_range_yards,
-        ) {
-            Ok(()) => break,
-            Err(e) => {
-                warn!("session error: {e}");
-                emit_alert(
-                    &sender,
-                    Severity::Warn,
-                    format!("R10 connection error: {e}"),
-                );
-                let backoff_status = if ever_connected {
-                    ActorStatus::Reconnecting
-                } else {
-                    ActorStatus::Starting
-                };
-                // Not ready before the status changes: the status drops what
-                // the card held, so nothing of the lost device is left to
-                // report after it.
-                if let Some(dev) = device_id.as_deref() {
-                    sender.send(
-                        FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                            manufacturer: None,
-                            model: None,
-                            firmware: None,
-                            source: None,
-                            telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
-                        })
-                        .device(dev),
-                    );
-                }
-                emit_device_status(&sender, backoff_status, HashMap::new());
-
-                let verb = if ever_connected {
-                    "Reconnecting"
-                } else {
-                    "Retrying"
-                };
-                info!("{} in {}s", verb.to_lowercase(), backoff.as_secs());
-
-                let deadline = Instant::now() + backoff;
-                while Instant::now() < deadline {
-                    if receiver.poll().is_err() {
-                        emit_device_status(&sender, ActorStatus::Disconnected, HashMap::new());
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-                backoff = (backoff + Duration::from_secs(1)).min(MAX_BACKOFF);
-            }
-        }
-    }
-
-    emit_device_status(&sender, ActorStatus::Disconnected, HashMap::new());
-}
-
-// ---------------------------------------------------------------------------
-// Session lifecycle
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_lines)]
-fn connect_and_run(
-    state: &SystemState,
-    sender: &BusSender,
-    receiver: &mut BusReceiver,
-    ever_connected: &mut bool,
-    device_id: &mut Option<String>,
-    tee_range_yards: Option<f32>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 1. BLE connect
-    info!("searching for Garmin R10...");
-    let transport = BleTransport::auto_connect()?;
-    *ever_connected = true;
-
-    let addr = transport.device_address().to_string();
-    let mtu = transport.mtu();
-    info!("connected to R10 at {addr} (mtu={mtu})");
-
-    // Capture BLE address as FRP device identity
-    *device_id = Some(addr.clone());
-
-    // 2. Create client and start registration
-    let mut client = Client::new(Tap::new(transport), mtu.into());
-    client.start()?;
-
-    // 3. Event loop state
-    let mut shot_counter: u32 = 0;
-    let mut idle_count: u32 = 0;
-    let mut device_telemetry: HashMap<String, String> = HashMap::new();
-
-    loop {
-        // ==============================================================
-        // Phase 1: Drain bus commands
-        // ==============================================================
-        loop {
-            match receiver.poll() {
-                Err(PollError::Shutdown) => {
-                    drop(client);
-                    return Ok(());
-                }
-                Ok(None) => break,
-                Ok(Some(msg)) => {
-                    // R10 doesn't support mode switching — just log
-                    if let FlighthookEvent::SetDetectionMode {
-                        mode: Some(new_mode),
-                        ..
-                    } = msg.event
-                    {
-                        debug!("mode change to {new_mode:?} (ignored — R10 has no mode control)");
-                    }
-                }
-            }
-        }
-
-        // ==============================================================
-        // Phase 2: Drive R10 client
-        // ==============================================================
-        match client.poll() {
-            Ok(Some(event)) => {
-                idle_count = 0;
-
-                match event {
-                    Event::Registered { handle } => {
-                        info!("MultiLink registered (handle={handle})");
-                    }
-
-                    Event::HandshakeComplete => {
-                        info!("handshake complete");
-                        // The unit ID traveled in the handshake; capture
-                        // from here on.
-                        client.transport_mut().capture.set_enabled(true);
-                        emit_device_status(
-                            sender,
-                            ActorStatus::Connected,
-                            HashMap::from([
-                                ("device_info".into(), format!("Garmin R10 ({addr})")),
-                                ("shot_count".into(), shot_counter.to_string()),
-                            ]),
-                        );
-
-                        // Emit identity DeviceTelemetry
-                        device_telemetry.insert("ready".into(), "false".into());
-                        device_telemetry.insert("tilt".into(), "ok".into());
-                        device_telemetry.insert("roll".into(), "ok".into());
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                manufacturer: Some("Garmin".into()),
-                                model: Some("R10".into()),
-                                firmware: None,
-                                source: None,
-                                telemetry: Some(device_telemetry.clone()),
-                            })
-                            .device(&addr),
-                        );
-                    }
-
-                    Event::Ready => {
-                        info!("armed — waiting for shots");
-                        device_telemetry.insert("ready".into(), "true".into());
-                        device_telemetry.insert("device_state".into(), "waiting".into());
-                        device_telemetry.insert("tilt".into(), "ok".into());
-                        device_telemetry.insert("roll".into(), "ok".into());
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                manufacturer: None,
-                                model: None,
-                                firmware: None,
-                                source: None,
-                                telemetry: Some(device_telemetry.clone()),
-                            })
-                            .device(&addr),
-                        );
-                    }
-
-                    Event::Shot(shot) => {
-                        shot_counter += 1;
-                        let key = ShotKey {
-                            shot_id: uuid::Uuid::new_v4().to_string(),
-                            shot_number: shot_counter,
-                        };
-                        info!("shot #{} (device_id={})", key.shot_number, shot.shot_id);
-                        client.transport_mut().capture.mark_trigger();
-
-                        emit_device_status(
-                            sender,
-                            ActorStatus::Connected,
-                            HashMap::from([("shot_count".into(), shot_counter.to_string())]),
-                        );
-
-                        // Emit ShotTrigger
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()))
-                                .device(&addr),
-                        );
-
-                        // Emit the launch if ball data present
-                        if let Some(ref ball) = shot.ball {
-                            let bf = ball_from_r10(ball);
-                            info!(
-                                "  ball: {:.1}mph VLA={:.1} HLA={:.1} back={:.0}rpm side={:.0}rpm",
-                                bf.launch_speed.map_or(0.0, Velocity::as_mph),
-                                bf.launch_elevation.unwrap_or(0.0),
-                                bf.launch_azimuth.unwrap_or(0.0),
-                                bf.backspin_rpm.unwrap_or(0),
-                                bf.sidespin_rpm.unwrap_or(0),
-                            );
-                            for event in sim::launch_events(state, key.clone(), bf, None) {
-                                sender.send(FlighthookMessage::new(event).device(&addr));
-                            }
-                        }
-
-                        // Emit ClubPath if club data present
-                        if let Some(ref club) = shot.club {
-                            let cd = club_from_r10(club);
-                            info!(
-                                "  club: {:.1}mph face={:.1} path={:.1} AoA={:.1}",
-                                cd.club_speed.map_or(0.0, Velocity::as_mph),
-                                cd.face_angle.unwrap_or(0.0),
-                                cd.path.unwrap_or(0.0),
-                                cd.attack_angle.unwrap_or(0.0),
-                            );
-                            sender.send(
-                                FlighthookMessage::new(FlighthookEvent::ClubPath {
-                                    key: key.clone(),
-                                    club: Box::new(cd),
-                                })
-                                .device(&addr),
-                            );
-                        }
-
-                        // Emit ShotFinished
-                        let raw = client.transport_mut().capture.take();
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::ShotFinished {
-                                key,
-                                raw: Some(Box::new(raw)),
-                            })
-                            .device(&addr),
-                        );
-
-                        // R10 auto-returns to WAITING after processing
-                        device_telemetry.insert("ready".into(), "false".into());
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                manufacturer: None,
-                                model: None,
-                                firmware: None,
-                                source: None,
-                                telemetry: Some(device_telemetry.clone()),
-                            })
-                            .device(&addr),
-                        );
-                    }
-
-                    Event::StateChange(state) => {
-                        // Only surface user-relevant states as telemetry.
-                        // Standby and NoiseCheck are transient internal
-                        // states that flicker during shot retransmits.
-                        let label = match state {
-                            tenover::proto::DeviceState::Waiting => Some("waiting"),
-                            tenover::proto::DeviceState::Recording => Some("recording"),
-                            tenover::proto::DeviceState::Processing => Some("processing"),
-                            _ => None,
-                        };
-                        debug!("device state: {state:?}");
-                        if let Some(label) = label {
-                            device_telemetry.insert("device_state".into(), label.into());
-                            sender.send(
-                                FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                    manufacturer: None,
-                                    model: None,
-                                    firmware: None,
-                                    source: None,
-                                    telemetry: Some(device_telemetry.clone()),
-                                })
-                                .device(&addr),
-                            );
-                        }
-                    }
-
-                    Event::DeviceError(err) => {
-                        let severity = match err.severity {
-                            tenover::proto::ErrorSeverity::Warning => Severity::Warn,
-                            tenover::proto::ErrorSeverity::Serious
-                            | tenover::proto::ErrorSeverity::Fatal => Severity::Error,
-                        };
-                        let mut message = format!("R10: {:?}", err.code);
-                        if let Some((roll, pitch)) = err.tilt {
-                            use std::fmt::Write;
-                            let _ = write!(message, " (roll={roll:.1}, pitch={pitch:.1})");
-                            device_telemetry.insert("tilt".into(), format!("{pitch:.1}"));
-                            device_telemetry.insert("roll".into(), format!("{roll:.1}"));
-                        }
-                        warn!("{message}");
-                        emit_alert(sender, severity, &message);
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                manufacturer: None,
-                                model: None,
-                                firmware: None,
-                                source: None,
-                                telemetry: Some(device_telemetry.clone()),
-                            })
-                            .device(&addr),
-                        );
-                    }
-
-                    // The device is awake, so it will accept its environment
-                    // settings (tenover's SEQUENCE.md step 15). Skipped
-                    // entirely when unset, which leaves whatever tee distance
-                    // the device already had.
-                    Event::WakeResult { .. } => {
-                        if let Some(yards) = tee_range_yards {
-                            let config = tenover::proto::Environment {
-                                tee_distance_yd: Some(yards),
-                                ..tenover::proto::Environment::default()
-                            };
-                            if let Err(e) = client.send_environment(&config) {
-                                warn!("failed to send tee distance: {e}");
-                            } else {
-                                debug!("sent tee distance {yards:.1} yd");
-                            }
-                        }
-                    }
-
-                    Event::EnvironmentResult { success } => {
-                        if success {
-                            info!(
-                                "device accepted tee distance {:.1} yd",
-                                tee_range_yards.unwrap_or_default()
-                            );
-                        } else {
-                            warn!("device rejected the tee distance");
-                        }
-                    }
-
-                    // Protocol ack with nothing for the bus to carry.
-                    Event::Subscribed { .. } => {}
-                }
-            }
-
-            Ok(None) => {
-                idle_count += 1;
-                if idle_count >= 3 {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-
-            Err(tenover::Error::Transport(e)) => {
-                info!("BLE transport error: {e}");
-                return Err(Box::new(tenover::Error::Transport(e)));
-            }
-            Err(e) => {
-                warn!("protocol error: {e}");
-                emit_alert(sender, Severity::Warn, format!("R10 protocol error: {e}"));
-            }
-        }
-    }
-}
+/// The R10 actor (`r10.N`).
+pub type R10Actor = DriverActor<R10, R10Hooks>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tenover::Transport;
-    use tenover::gfdi::{
-        MSG_DEVICE_INFO, MSG_PROTOBUF_REQUEST as REQUEST, MSG_PROTOBUF_RESPONSE as RESPONSE,
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    use flighthook::{ActorStatus, FlighthookEvent, FlighthookMessage, R10Config};
+    use flightrelay::config::ConfigError;
+    use flightrelay::driver::{
+        Backoff, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
+        NoAction, SessionEnd,
     };
-    use tenover::testing::{self, encode_frame as wire, with_handle};
+    use serde_json::{Value, json};
+    use tenover::driver::R10Session;
+    use tokio::sync::broadcast;
 
-    /// MultiLink handle the fake device uses.
-    const HANDLE: u8 = 0x05;
+    use super::*;
+    use crate::actors::web::tests::TempDir;
+    use crate::state::SystemState;
 
-    /// Transport that serves queued chunks and accepts every write.
+    // -- The scripted R10 session --------------------------------------------
+
+    /// MultiLink handle the scripted device grants.
+    const EQ_HANDLE: u8 = 0x05;
+    /// The scripted device's BLE address (synthetic).
+    const EQ_ADDRESS: &str = "F5:D1:00:00:00:01";
+    /// Reads that find nothing between two batches of the script.
+    const EQ_GAP_READS: u32 = 4;
+
+    /// What the scripted device has left to send, batch by batch.
     #[derive(Default)]
-    struct FakeTransport {
-        chunks: std::collections::VecDeque<Vec<u8>>,
+    struct EqWire {
+        batches: VecDeque<VecDeque<Vec<u8>>>,
+        gap: u32,
     }
 
-    impl Transport for FakeTransport {
-        fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-            let Some(c) = self.chunks.pop_front() else {
-                return Err(io::ErrorKind::WouldBlock.into());
-            };
-            buf[..c.len()].copy_from_slice(&c);
-            Ok(c.len())
+    /// A transport playing [`eq_script`]: each batch's chunks back to back,
+    /// a few empty reads between batches, then the device is gone (a
+    /// transport error). Writes are taken and dropped.
+    #[derive(Clone, Default)]
+    struct EqFake(Arc<Mutex<EqWire>>);
+
+    impl EqFake {
+        fn new() -> Self {
+            let fake = Self::default();
+            fake.0.lock().unwrap().batches = eq_script().into_iter().map(Into::into).collect();
+            fake
+        }
+    }
+
+    impl tenover::Transport for EqFake {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+            let mut w = self.0.lock().unwrap();
+            loop {
+                let Some(batch) = w.batches.front_mut() else {
+                    return Err(std::io::ErrorKind::NotConnected.into());
+                };
+                if let Some(chunk) = batch.pop_front() {
+                    buf[..chunk.len()].copy_from_slice(&chunk);
+                    return Ok(chunk.len());
+                }
+                if w.gap < EQ_GAP_READS {
+                    w.gap += 1;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                w.gap = 0;
+                w.batches.pop_front();
+            }
         }
 
-        fn write(&mut self, _data: &[u8]) -> Result<(), io::Error> {
+        fn write(&mut self, _data: &[u8]) -> Result<(), std::io::Error> {
             Ok(())
         }
 
-        fn write_register(&mut self, _data: &[u8]) -> Result<(), io::Error> {
+        fn write_register(&mut self, _data: &[u8]) -> Result<(), std::io::Error> {
             Ok(())
         }
     }
 
-    /// `bytes` split into MTU-sized chunks, each led by the handle byte.
-    fn chunks(bytes: &[u8], mtu: usize) -> Vec<Vec<u8>> {
-        testing::chunks(HANDLE, bytes, mtu)
+    /// One message from the device, split at MTU 20.
+    fn eq_msg(frame: &[u8]) -> Vec<Vec<u8>> {
+        tenover::testing::chunks(EQ_HANDLE, frame, 20)
     }
 
-    fn tap_with(rx: Vec<Vec<u8>>) -> Tap<FakeTransport> {
-        let mut tap = Tap::new(FakeTransport {
-            chunks: rx.into_iter().collect(),
-        });
-        tap.capture.set_enabled(true);
-        tap
+    fn eq_envelope(envelope: &[u8]) -> Vec<Vec<u8>> {
+        eq_msg(&tenover::testing::protobuf_frame(envelope))
     }
 
-    fn read_all(tap: &mut Tap<FakeTransport>) {
-        let mut buf = [0u8; 256];
-        while tap.read(&mut buf).is_ok() {}
-    }
-
-    #[test]
-    fn chunks_before_enable_are_dropped() {
-        let mut tap = Tap::new(FakeTransport {
-            chunks: chunks(&wire(RESPONSE, b"shot"), 64).into_iter().collect(),
-        });
-        read_all(&mut tap);
-        tap.write(&chunks(&wire(REQUEST, b"req"), 64)[0])
-            .expect("write");
-        tap.write_register(&[0x00, 0x01]).expect("register");
-        tap.capture.mark_trigger();
-        assert!(tap.capture.take().frames.is_empty());
-    }
-
-    #[test]
-    fn channels_are_labeled() {
-        let rx = with_handle(HANDLE, &wire(RESPONSE, &[0x10, 0x20]));
-        let tx = with_handle(HANDLE, &wire(REQUEST, &[0x30]));
-        let mut tap = tap_with(vec![rx.clone()]);
-        read_all(&mut tap);
-        tap.write(&tx).expect("write");
-        tap.write_register(&[0x00, 0x04]).expect("register");
-        tap.capture.mark_trigger();
-        let raw = tap.capture.take();
-        let got: Vec<(RawDir, &str, &str)> = raw
-            .frames
-            .iter()
-            .map(|r| {
-                (
-                    r.dir,
-                    r.channel.as_deref().unwrap_or(""),
-                    r.hex.as_deref().unwrap_or(""),
-                )
-            })
-            .collect();
-        let (rx, tx) = (flighthook::hex_lower(&rx), flighthook::hex_lower(&tx));
-        assert_eq!(
-            got,
-            [
-                (RawDir::Rx, "notify", rx.as_str()),
-                (RawDir::Tx, "write", tx.as_str()),
-                (RawDir::Tx, "register", "0004"),
-            ]
-        );
-        assert!(raw.frames.iter().all(|r| r.r#type.is_none()));
-        assert_eq!(raw.transport, "r10-ble");
-    }
-
-    #[test]
-    fn pre_roll_is_bounded() {
-        let rx = (0..300u16)
-            .map(|i| with_handle(HANDLE, &wire(RESPONSE, &i.to_be_bytes())))
-            .collect();
-        let mut tap = tap_with(rx);
-        read_all(&mut tap);
-        tap.capture.mark_trigger();
-        let raw = tap.capture.take();
-        assert_eq!(raw.frames.len(), 256);
-        let first = with_handle(HANDLE, &wire(RESPONSE, &44u16.to_be_bytes()));
-        assert_eq!(raw.frames[0].hex, Some(flighthook::hex_lower(&first)));
-    }
-
-    #[test]
-    fn device_info_after_the_handshake_is_never_captured() {
-        // A shot message, a repeated device information message and another
-        // shot message, packed back to back and split at MTU 20 so chunks
-        // straddle frames.
-        let (shot1, info, shot2) = (
-            wire(RESPONSE, &[0x11; 30]),
-            testing::device_info_frame(),
-            wire(RESPONSE, &[0x22; 30]),
-        );
-        let stream = [shot1.clone(), info.clone(), shot2].concat();
-        let rx = chunks(&stream, 20);
-        let mut tap = tap_with(rx.clone());
-        read_all(&mut tap);
-        // Our reply to it, and the ACK of a shot message.
-        for chunk in chunks(&testing::ack_frame(MSG_DEVICE_INFO, 0, &[0xAA, 0xBB]), 20) {
-            tap.write(&chunk).expect("write");
-        }
-        let shot_ack = with_handle(HANDLE, &testing::ack_frame(RESPONSE, 0, &[]));
-        tap.write(&shot_ack).expect("write");
-        tap.capture.mark_trigger();
-        let raw = tap.capture.take();
-
-        // Exactly the chunks holding no byte of the device information frame
-        // (its COBS bytes and closing delimiter) are kept, in order.
-        let info_bytes = shot1.len() + 1..shot1.len() + info.len();
-        let expected: Vec<String> = rx
-            .iter()
-            .enumerate()
-            .filter(|(k, _)| {
-                let (lo, hi) = (k * 19, (k + 1) * 19);
-                hi <= info_bytes.start || lo >= info_bytes.end
-            })
-            .map(|(_, c)| flighthook::hex_lower(c))
-            .collect();
-        assert!(expected.len() >= 4 && expected.len() < rx.len());
-        let got: Vec<String> = raw
-            .frames
-            .iter()
-            .filter(|r| r.dir == RawDir::Rx)
-            .filter_map(|r| r.hex.clone())
-            .collect();
-        assert_eq!(got, expected);
-        let tx: Vec<String> = raw
-            .frames
-            .iter()
-            .filter(|r| r.dir == RawDir::Tx)
-            .filter_map(|r| r.hex.clone())
-            .collect();
-        assert_eq!(
-            tx,
-            [flighthook::hex_lower(&shot_ack)],
-            "ACK of device information dropped"
-        );
-
-        let all = raw
-            .frames
-            .iter()
-            .filter_map(|r| r.hex.as_deref())
-            .collect::<String>();
-        assert!(
-            !all.contains(&flighthook::hex_lower(
-                &testing::DEVICE_INFO_UNIT_ID.to_le_bytes()
-            )),
-            "unit ID leaked"
-        );
-        assert!(
-            !all.contains(&flighthook::hex_lower(testing::DEVICE_INFO_NAME.as_bytes())),
-            "name leaked"
-        );
-    }
-
-    #[test]
-    fn unclassifiable_frames_are_excluded() {
-        let mut bad = wire(RESPONSE, b"shot");
-        let n = bad.len();
-        bad[n - 2] ^= 0x01; // corrupt the CRC
-        let mut tap = tap_with(vec![with_handle(HANDLE, &bad)]);
-        read_all(&mut tap);
-        tap.capture.mark_trigger();
-        assert!(tap.capture.take().frames.is_empty());
-    }
-
-    fn r10_ball(total_spin: f32, spin_axis: f32) -> tenover::proto::BallData {
-        let axis = spin_axis.to_radians();
-        tenover::proto::BallData {
-            launch_angle: 14.0,
-            launch_direction: 1.5,
-            ball_speed: 60.0,
-            spin_axis,
-            total_spin,
-            backspin: total_spin * axis.cos(),
-            sidespin: total_spin * axis.sin(),
-            spin_calc_type: tenover::proto::SpinCalcType::Measured,
-        }
-    }
-
-    /// The R10's measured total spin and axis pass through with the
-    /// components, and the two pairs agree. Positive axis = curves right,
-    /// with positive sidespin.
-    #[test]
-    fn r10_sends_total_spin_and_axis() {
-        for axis in [8.0_f32, -8.0] {
-            let bf = ball_from_r10(&r10_ball(3231.0, axis));
-            assert_eq!(bf.total_spin_rpm, Some(3231));
-            assert_eq!(bf.spin_axis, Some(f64::from(axis)));
-            let side = bf.sidespin_rpm.expect("side");
-            assert_eq!(side.signum(), axis.signum() as i32, "{axis}: {side}");
-            let mut components = Launch {
-                backspin_rpm: bf.backspin_rpm,
-                sidespin_rpm: bf.sidespin_rpm,
-                ..Launch::default()
-            };
-            components.complete_spin();
-            assert_eq!(components.total_spin_rpm, bf.total_spin_rpm);
-            assert!((components.spin_axis.unwrap() - f64::from(axis)).abs() < 0.05);
-        }
-    }
-
-    /// The back and side spin tenover hands back are the measured spin in
-    /// the other pair, not a model's values: a tournament round keeps all
-    /// four.
-    #[test]
-    fn a_round_keeps_all_four_r10_spin_values() {
-        let round = crate::state::round::RoundPolicy::default();
-        let guard = round
-            .begin_round(&crate::state::round::RoundRequest {
-                holder: "Pureplay",
-                feeds: &[],
-            })
-            .expect("accepted");
-        let ball = ball_from_r10(&r10_ball(3231.0, 8.0));
-        let shot = flighthook::ShotData {
-            launch: Some(ball.clone()),
-            provenance: Some(crate::actors::provenance::ShotSource::R10.provenance()),
-            ..flighthook::ShotData::default()
-        };
-        assert_eq!(shot.unmeasured_fields().count(), 0);
-        let certified = guard.certify(&shot).expect("measured");
-        assert_eq!(certified.shot().launch.as_ref(), Some(&ball));
-        assert!(ball.backspin_rpm.is_some() && ball.sidespin_rpm.is_some());
-    }
-
-    #[test]
-    fn r10_zero_spin_has_no_axis() {
-        let bf = ball_from_r10(&r10_ball(0.0, 12.0));
-        assert_eq!(bf.total_spin_rpm, Some(0));
-        assert_eq!(bf.spin_axis, None);
+    /// The session the harness plays: handshake, subscribe, wake (the tee
+    /// distance goes out), armed, recording, processing, a full shot, armed
+    /// again, a shot with no spin, a device error with its tilt, a warmup
+    /// shot without club data; then the device is gone.
+    fn eq_script() -> Vec<Vec<Vec<u8>>> {
+        use tenover::testing as t;
+        let handshake = [
+            vec![t::register_response(EQ_HANDLE)],
+            eq_msg(&t::device_info_frame()),
+            eq_msg(&t::configuration_frame()),
+            eq_msg(&t::ack_frame(tenover::gfdi::MSG_CONFIGURATION, 0, &[])),
+        ]
+        .concat();
+        vec![
+            handshake,
+            eq_envelope(&t::subscribe_result_envelope(true)),
+            eq_envelope(&t::wake_result_envelope(0)),
+            eq_envelope(&t::environment_result_envelope(true)),
+            eq_envelope(&t::state_envelope(2)),
+            eq_envelope(&t::state_envelope(3)),
+            eq_envelope(&t::state_envelope(4)),
+            eq_envelope(EQ_SHOT_FULL),
+            eq_envelope(&t::state_envelope(2)),
+            eq_envelope(&t::shot_envelope(3, 0.0, 12.0)),
+            eq_envelope(&t::error_envelope(3, 0, Some((4.5, -6.25)))),
+            eq_envelope(EQ_SHOT_WARMUP),
+        ]
     }
 
     /// tenover's golden shot messages (its `wire_golden` fixtures), as the
     /// R10 sends them: a regular shot with every ball, club and swing value,
     /// and a warmup shot with measured spin and no club data.
-    const R10_SHOT_FULL: &[u8] = &[
+    const EQ_SHOT_FULL: &[u8] = &[
         0xf2, 0x01, 0x53, 0x1a, 0x51, 0x08, 0x08, 0xca, 0x3e, 0x4c, 0x12, 0x4a, 0x08, 0x2a, 0x10,
         0x01, 0x1a, 0x1d, 0x0d, 0x00, 0x00, 0x48, 0x41, 0x15, 0x9a, 0x99, 0x99, 0xbf, 0x1d, 0x00,
         0x00, 0x86, 0x42, 0x25, 0x00, 0x00, 0xa0, 0x40, 0x2d, 0x00, 0x00, 0x2f, 0x45, 0x30, 0x00,
@@ -886,27 +154,583 @@ mod tests {
         0x00, 0x00, 0x00, 0xc0, 0x25, 0x00, 0x00, 0x60, 0xc0, 0x2a, 0x0f, 0x08, 0xe8, 0x07, 0x10,
         0xdc, 0x0b, 0x18, 0x88, 0x0e, 0x20, 0x98, 0x11, 0x28, 0xc4, 0x13,
     ];
-    const R10_SHOT_WARMUP: &[u8] = &[
+    const EQ_SHOT_WARMUP: &[u8] = &[
         0xf2, 0x01, 0x2c, 0x1a, 0x2a, 0x08, 0x08, 0xca, 0x3e, 0x25, 0x12, 0x23, 0x08, 0x07, 0x10,
         0x00, 0x1a, 0x1d, 0x0d, 0x00, 0x00, 0xf2, 0x41, 0x15, 0x00, 0x00, 0x20, 0x40, 0x1d, 0x00,
         0x00, 0xcc, 0x41, 0x25, 0x00, 0x00, 0x20, 0xc1, 0x2d, 0x00, 0x80, 0xbb, 0x45, 0x30, 0x03,
         0x38, 0x02,
     ];
 
-    /// Every output's numbers for the R10's shot messages, decoded by
-    /// tenover and converted as the actor does.
+    /// The R10 section the harness runs with (7 ft range: the tee distance
+    /// goes out at the wake).
+    fn eq_section_json() -> &'static str {
+        r#"{"name":"Garmin R10","range":"7ft"}"#
+    }
+
+    // -- tenover's driver over the scripted device --------------------------
+
+    /// Scripted devices waiting for a driver, by the card's range (its
+    /// value's bits, 0 for none): each test runs with its own range.
+    static DEVICES: LazyLock<Mutex<HashMap<u64, VecDeque<EqFake>>>> = LazyLock::new(Mutex::default);
+
+    fn range_key(config: &R10Config) -> u64 {
+        config.range.map_or(0, |d| d.value().to_bits())
+    }
+
+    /// tenover's [`R10`] with its BLE scan replaced by the scripted devices
+    /// queued for its range: a connect runs the real handshake and session
+    /// over the next one, and waits for its stop when none is left.
+    struct ScriptedR10 {
+        inner: R10,
+        devices: VecDeque<EqFake>,
+    }
+
+    struct ScriptedSession(R10Session<EqFake>);
+
+    impl DeviceDriver for ScriptedR10 {
+        type Config = R10Config;
+        type Error = tenover::driver::Error;
+        type Action = NoAction;
+        type Session = ScriptedSession;
+        const STOP_WAIT: Duration = R10::STOP_WAIT;
+
+        fn info(config: &R10Config) -> DriverInfo {
+            R10::info(config)
+        }
+
+        fn new(config: R10Config) -> Result<Self, ConfigError> {
+            let devices = DEVICES
+                .lock()
+                .unwrap()
+                .remove(&range_key(&config))
+                .unwrap_or_default();
+            Ok(Self {
+                inner: R10::new(config)?,
+                devices,
+            })
+        }
+
+        fn config(&self) -> &R10Config {
+            self.inner.config()
+        }
+
+        fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ScriptedSession, Self::Error> {
+            ctx.tick()?;
+            ctx.out.phase("discovering");
+            match self.devices.pop_front() {
+                Some(device) => Ok(ScriptedSession(
+                    self.inner.connect_with(ctx, device, EQ_ADDRESS)?,
+                )),
+                None => loop {
+                    ctx.tick()?;
+                    std::thread::sleep(Duration::from_millis(20));
+                },
+            }
+        }
+
+        fn retry_delay(
+            &mut self,
+            ended: &SessionEnd<'_, Self::Error>,
+            backoff: &mut Backoff,
+            out: &mut Events<'_>,
+        ) -> Option<Duration> {
+            self.inner.retry_delay(ended, backoff, out)
+        }
+
+        fn apply_config(&mut self, new: &R10Config) {
+            self.inner.apply_config(new);
+        }
+    }
+
+    impl DeviceSession for ScriptedSession {
+        type Driver = ScriptedR10;
+
+        fn poll(
+            &mut self,
+            timeout: Duration,
+            out: &mut Events<'_>,
+        ) -> Result<(), tenover::driver::Error> {
+            self.0.poll(timeout, out)
+        }
+
+        fn identity(&self) -> &DeviceIdentity {
+            self.0.identity()
+        }
+
+        fn close(self, out: &mut Events<'_>) -> Result<(), tenover::driver::Error> {
+            self.0.close(out)
+        }
+    }
+
+    impl Hooks<ScriptedR10> for R10Hooks {
+        type Section = R10Section;
+        const SOURCE: ShotSource = ShotSource::R10;
+    }
+
+    /// A running R10 card (`r10.0`) on a scripted device, and the bus.
+    struct Card {
+        _dir: TempDir,
+        state: Arc<SystemState>,
+        rx: broadcast::Receiver<FlighthookMessage>,
+    }
+
+    impl Card {
+        fn start(section: &R10Section, device: EqFake) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "flighthook-r10-test-{}",
+                crate::state::config::generate_id()
+            ));
+            let (state, _writer) = SystemState::new(dir.join("config.toml"));
+            state.system.update(|c| {
+                c.r10.insert("0".into(), section.clone());
+            });
+            let state = Arc::new(state);
+            DEVICES
+                .lock()
+                .unwrap()
+                .insert(range_key(&section.driver), VecDeque::from([device]));
+            let (tx, rx) = broadcast::channel(1024);
+            crate::actors::start_actor(
+                "r10.0".into(),
+                Box::new(DriverActor::<ScriptedR10, R10Hooks>::new(section.clone())),
+                &state,
+                &tx,
+            );
+            Self {
+                _dir: TempDir(dir),
+                state,
+                rx,
+            }
+        }
+
+        /// Messages of `r10.0` until one matches `want`, within 10 s.
+        fn until(
+            &mut self,
+            mut want: impl FnMut(&FlighthookMessage) -> bool,
+        ) -> Vec<FlighthookMessage> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut seen = Vec::new();
+            loop {
+                assert!(Instant::now() < deadline, "timed out: {} seen", seen.len());
+                match self.rx.try_recv() {
+                    Ok(m) if m.actor == "r10.0" => {
+                        let done = want(&m);
+                        seen.push(m);
+                        if done {
+                            return seen;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        }
+
+        /// The whole scripted session: every message up to the
+        /// Disconnected after the stop that follows the lost connection.
+        fn session(&mut self) -> Vec<FlighthookMessage> {
+            let mut seen = self.until(|m| is_status(m, ActorStatus::Reconnecting));
+            assert_eq!(
+                self.state.stop_and_wait("r10.0"),
+                crate::state::Stopped::Exited
+            );
+            seen.extend(self.until(|m| is_status(m, ActorStatus::Disconnected)));
+            seen
+        }
+    }
+
+    fn is_status(m: &FlighthookMessage, want: ActorStatus) -> bool {
+        matches!(&m.event, FlighthookEvent::ActorStatus { status, .. } if *status == want)
+    }
+
+    fn section(range: Option<flighthook::Distance>) -> R10Section {
+        R10Section {
+            driver: R10Config { range },
+            ..R10Section::default()
+        }
+    }
+
+    /// A device that arms and makes the one shot `envelope`.
+    fn one_shot(envelope: &[u8]) -> EqFake {
+        let mut script = eq_script();
+        script.truncate(5);
+        script.push(eq_envelope(envelope));
+        let fake = EqFake::default();
+        fake.0.lock().unwrap().batches = script.into_iter().map(Into::into).collect();
+        fake
+    }
+
+    /// The bus messages of a card on `device` up to its first shot's end.
+    fn first_shot(feet: f64, device: EqFake) -> Vec<FlighthookMessage> {
+        let mut card = Card::start(&section(Some(flighthook::Distance::Feet(feet))), device);
+        let messages = card.until(|m| matches!(m.event, FlighthookEvent::ShotFinished { .. }));
+        card.state.stop_and_wait("r10.0");
+        messages
+    }
+
+    // -- The equivalence harness ---------------------------------------------
+
+    /// The bus messages and export lines of flighthook a6db5ec's R10 actor
+    /// (its own BLE session code on tenover's client) for [`eq_script`],
+    /// recorded with this file's scripted device.
+    const OLD_BUS: &str = include_str!("../testdata/r10_old_session.jsonl");
+    const OLD_EXPORT: &str = include_str!("../testdata/r10_old_export.jsonl");
+
+    fn lines(text: &str) -> Vec<Value> {
+        text.lines()
+            .map(|l| serde_json::from_str(l).expect("a recorded line"))
+            .collect()
+    }
+
+    /// `messages` with their shot and group ids numbered in order of
+    /// appearance (the ids are random), and each shot's raw frames taken
+    /// out (compared on their own): the shot's frames in order.
+    fn normalized(mut messages: Vec<Value>) -> (Vec<Value>, Vec<Vec<Value>>) {
+        let mut ids: HashMap<String, String> = HashMap::new();
+        let mut raws = Vec::new();
+        for m in &mut messages {
+            renumber(m, &mut ids);
+            let at = if m.pointer("/event/raw").is_some() {
+                "/event/raw"
+            } else {
+                "/raw"
+            };
+            if let Some(raw) = m.pointer_mut(at)
+                && raw.is_object()
+            {
+                raws.push(raw["frames"].as_array().cloned().unwrap_or_default());
+                *raw = json!({ "transport": raw["transport"] });
+            }
+        }
+        (messages, raws)
+    }
+
+    /// Replace every UUID string under `v` by its number of appearance.
+    fn renumber(v: &mut Value, ids: &mut HashMap<String, String>) {
+        match v {
+            Value::String(s) if s.len() == 36 && s.matches('-').count() == 4 => {
+                let n = ids.len();
+                *s = ids
+                    .entry(s.clone())
+                    .or_insert_with(|| format!("id-{n}"))
+                    .clone();
+            }
+            Value::Array(a) => a.iter_mut().for_each(|v| renumber(v, ids)),
+            Value::Object(o) => o.values_mut().for_each(|v| renumber(v, ids)),
+            _ => {}
+        }
+    }
+
+    fn kind(m: &Value) -> &str {
+        m["event"]["kind"].as_str().unwrap_or("")
+    }
+
+    fn status_message(status: &str, telemetry: Value) -> Value {
+        json!({ "actor": "r10.0", "event": { "kind": "actor_status", "status": status, "telemetry": telemetry } })
+    }
+
+    /// What the recorded actor's `messages` become on `DriverActor` with
+    /// tenover's driver: each change is one of design §7.3's rows for the
+    /// R10, or a rule of `DriverActor` accepted in steps 1 and 2.
+    fn expected_from_old(old: &[Value]) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        let mut i = 0;
+        let mut device: Option<Value> = None;
+        while i < old.len() {
+            let mut m = old[i].clone();
+            let status = m["event"]["status"].as_str().unwrap_or("").to_owned();
+            match kind(&m) {
+                // §7.3 #8: the driver's connect phases show on the card
+                // while it connects.
+                "actor_status" if status == "starting" => {
+                    out.push(m);
+                    out.push(status_message(
+                        "starting",
+                        json!({ "phase": "discovering" }),
+                    ));
+                    out.push(status_message(
+                        "starting",
+                        json!({ "phase": "handshaking" }),
+                    ));
+                    i += 1;
+                    continue;
+                }
+                // §7.3 #8: Connected removes the connect's phase; from here
+                // on every message carries the session's device id (the
+                // sink's rule, step 2).
+                "actor_status" if status == "connected" && device.is_none() => {
+                    m["event"]["telemetry"]["phase"] = json!("");
+                    device = Some(old[i + 1]["device"].clone());
+                }
+                // Steps 1/2: a shot's `shot_count` goes out after its
+                // `shot_finished`, and its launch is held until the shot
+                // ends (no flight result from an R10), so it follows the
+                // club data.
+                "actor_status" if m["event"]["telemetry"].get("shot_count").is_some() => {
+                    let end = (i..old.len())
+                        .find(|&j| kind(&old[j]) == "shot_finished")
+                        .expect("the shot's end");
+                    let launch = old[i + 1..end]
+                        .iter()
+                        .find(|x| kind(x) == "launch")
+                        .cloned();
+                    for x in &old[i + 1..end] {
+                        if kind(x) != "launch" {
+                            out.push(x.clone());
+                        }
+                    }
+                    out.extend(launch);
+                    out.push(old[end].clone());
+                    out.push(m);
+                    i = end + 1;
+                    continue;
+                }
+                // tenover sends a device error's tilt telemetry before its
+                // alert (the recorded actor: alert first).
+                "alert"
+                    if old
+                        .get(i + 1)
+                        .is_some_and(|x| kind(x) == "device_telemetry")
+                        && m["event"]["message"]
+                            .as_str()
+                            .is_some_and(|s| s.starts_with("R10: ")) =>
+                {
+                    out.push(old[i + 1].clone());
+                    out.push(m);
+                    i += 2;
+                    continue;
+                }
+                // Step 2: a lost session sends `ready=false` with the rest
+                // of the session's telemetry, then Reconnecting, then the
+                // driver's per-attempt alert.
+                "alert"
+                    if m["event"]["message"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("R10 connection error")) =>
+                {
+                    let mut lost = old[i + 1].clone();
+                    let mut merged = out
+                        .iter()
+                        .rev()
+                        .find(|x| kind(x) == "device_telemetry")
+                        .map_or_else(|| json!({}), |x| x["event"]["telemetry"].clone());
+                    merged["ready"] = json!("false");
+                    lost["event"]["telemetry"] = merged;
+                    out.push(lost);
+                    out.push(old[i + 2].clone());
+                    out.push(m);
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+            out.push(m);
+            i += 1;
+        }
+        if let Some(device) = device {
+            let from = out
+                .iter()
+                .position(|m| kind(m) == "actor_status" && m["event"]["status"] == "connected")
+                .expect("connected");
+            for m in &mut out[from..] {
+                m["device"] = device.clone();
+            }
+        }
+        out
+    }
+
+    /// The protocol messages in the recorded actor's BLE chunks of direction
+    /// `dir` (each led by the MultiLink handle, messages COBS framed between
+    /// zero bytes), as hex.
+    fn messages_in_chunks(frames: &[Value], dir: &str) -> Vec<String> {
+        let mut stream = Vec::new();
+        for f in frames.iter().filter(|f| f["dir"] == dir) {
+            let bytes = hex(f["hex"].as_str().expect("hex"));
+            stream.extend_from_slice(&bytes[1..]);
+        }
+        stream
+            .split(|b| *b == 0)
+            .filter(|piece| !piece.is_empty())
+            .map(|piece| flighthook::hex_lower(&tenover::cobs::decode(piece).expect("cobs")))
+            .collect()
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// §7.3 #1: each shot's raw records hold the same protocol messages as
+    /// the recorded actor's BLE chunks, one record per message, labeled
+    /// `notify <type>` / `write <type>` instead of a `channel`.
+    fn assert_raw_matches(old: &[Vec<Value>], new: &[Vec<Value>]) {
+        assert_eq!(old.len(), new.len(), "shots with raw frames");
+        for (n, (old, new)) in old.iter().zip(new).enumerate() {
+            for (dir, prefix) in [("rx", "notify "), ("tx", "write ")] {
+                let want = messages_in_chunks(old, dir);
+                let got: Vec<String> = new
+                    .iter()
+                    .filter(|f| f["dir"] == dir)
+                    .map(|f| f["hex"].as_str().expect("hex").to_owned())
+                    .collect();
+                assert_eq!(got, want, "shot {n} {dir}");
+                for f in new.iter().filter(|f| f["dir"] == dir) {
+                    let label = f["label"].as_str().expect("a label");
+                    assert!(label.starts_with(prefix), "shot {n}: {label}");
+                    assert!(f.get("channel").is_none() && f.get("type").is_none());
+                }
+            }
+            assert!(old.iter().all(|f| f.get("label").is_none()));
+        }
+    }
+
+    /// Design §7.2's equivalence harness: the recorded R10 actor and
+    /// the R10 card on tenover's driver, fed the same scripted device, put
+    /// the same messages on the bus and export the same shots, except for
+    /// the differences `expected_from_old` lists (design §7.3 rows 1 and 8
+    /// and `DriverActor`'s accepted rules); the raw records hold the same
+    /// protocol messages per shot (§7.3 #1), the tee distance among them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_r10_card_matches_the_recorded_actor() {
+        let section: R10Section = serde_json::from_str(eq_section_json()).expect("section");
+        let mut card = Card::start(&section, EqFake::new());
+        let seen = card.session();
+
+        let (old, old_raws) = normalized(lines(OLD_BUS));
+        let (new, new_raws) = normalized(
+            seen.iter()
+                .map(|m| serde_json::to_value(m).expect("json"))
+                .collect(),
+        );
+        let expected = expected_from_old(&old);
+        for (n, (want, got)) in expected.iter().zip(&new).enumerate() {
+            assert_eq!(got, want, "message {n}");
+        }
+        assert_eq!(
+            new.len(),
+            expected.len(),
+            "{:?}",
+            new.iter().map(kind).collect::<Vec<_>>()
+        );
+        assert_raw_matches(&old_raws, &new_raws);
+        let launches: Vec<&Value> = new.iter().filter(|m| kind(m) == "launch").collect();
+        assert_eq!(launches[1]["event"]["launch"]["total_spin_rpm"], 0);
+        assert!(
+            launches[1]["event"]["launch"].get("spin_axis").is_none(),
+            "a total of 0 has no axis"
+        );
+        let environment = tenover::proto::build_environment_request(&tenover::proto::Environment {
+            tee_distance_yd: section.driver.tee_distance_yd(),
+            ..tenover::proto::Environment::default()
+        });
+        assert!(
+            new_raws[0].iter().any(|f| f["dir"] == "tx"
+                && f["hex"]
+                    .as_str()
+                    .is_some_and(|h| h.contains(&flighthook::hex_lower(&environment)))),
+            "the tee distance went out at the wake"
+        );
+
+        // The export: the same lines but for the schema (§7.3 #1) and the
+        // raw records (compared above).
+        let config = card.state.system.snapshot();
+        let export = crate::actors::web::tests::export_lines(&config, &seen).await;
+        let (old_export, old_export_raws) = normalized(lines(OLD_EXPORT));
+        let (new_export, new_export_raws) = normalized(
+            export
+                .iter()
+                .map(|l| serde_json::from_str(l).expect("json"))
+                .collect(),
+        );
+        assert_eq!(new_export.len(), old_export.len());
+        for (mut want, got) in old_export.into_iter().zip(new_export) {
+            assert_eq!(want["schema"], 2);
+            want["schema"] = json!(flighthook::EXPORT_SCHEMA);
+            want["time"] = got["time"].clone();
+            assert_eq!(got, want);
+        }
+        assert_raw_matches(&old_export_raws, &new_export_raws);
+    }
+
+    /// A range the driver refuses (from the file) keeps the card from
+    /// starting and shows on it (design §7.3 #6, #15); the card still stops
+    /// at once.
+    #[test]
+    fn a_refused_range_shows_on_the_card() {
+        let mut card = Card::start(
+            &section(Some(flighthook::Distance::Feet(0.0))),
+            EqFake::new(),
+        );
+        let seen = card.until(|m| is_status(m, ActorStatus::Disconnected));
+        assert_eq!(seen.len(), 1, "no Starting, no connect");
+        assert!(
+            matches!(&seen[0].event, FlighthookEvent::ActorStatus { telemetry, .. }
+            if telemetry["error"] == "range: must be a distance greater than 0")
+        );
+        let at = Instant::now();
+        assert_eq!(
+            card.state.stop_and_wait("r10.0"),
+            crate::state::Stopped::Exited
+        );
+        assert!(at.elapsed() < Duration::from_secs(2));
+    }
+
+    // -- Shot values and outputs ---------------------------------------------
+
+    /// Every output's numbers for the R10's shot messages (tenover's golden
+    /// shots), through the card on tenover's driver.
     #[test]
     fn outputs_keep_their_numbers() {
-        for (case, frame) in [("r10", R10_SHOT_FULL), ("r10_warmup", R10_SHOT_WARMUP)] {
-            let tenover::proto::EnvelopeEvent::Shot(shot) =
-                tenover::proto::decode_envelope(frame).expect("decodes")
-            else {
-                panic!("{case}: not a shot");
-            };
-            let ball = ball_from_r10(shot.ball.as_ref().expect("ball"));
-            let club = shot.club.as_ref().map(club_from_r10);
-            let messages = crate::test_ball::device_shot("r10.0", ball, None, club, None, None);
+        for (case, envelope, feet) in [
+            ("r10", EQ_SHOT_FULL, 6.0),
+            ("r10_warmup", EQ_SHOT_WARMUP, 6.5),
+        ] {
+            let messages = first_shot(feet, one_shot(envelope));
             crate::test_ball::assert_outputs_pinned(case, &messages);
         }
+    }
+
+    /// The R10 measures total spin and axis; the back and side spin tenover
+    /// hands back are the same spin in the other pair, not a model's: the
+    /// bus launch carries all four, they agree, and a tournament round
+    /// keeps them as measured.
+    #[test]
+    fn a_round_keeps_all_four_r10_spin_values() {
+        let messages = first_shot(5.0, one_shot(EQ_SHOT_FULL));
+        let launch = messages
+            .iter()
+            .find_map(|m| match &m.event {
+                FlighthookEvent::Launch { launch, .. } => Some((**launch).clone()),
+                _ => None,
+            })
+            .expect("a launch");
+        assert_eq!(launch.total_spin_rpm, Some(2800));
+        assert_eq!(launch.spin_axis, Some(5.0));
+        let mut components = flighthook::Launch {
+            backspin_rpm: launch.backspin_rpm,
+            sidespin_rpm: launch.sidespin_rpm,
+            ..flighthook::Launch::default()
+        };
+        components.complete_spin();
+        assert_eq!(components.total_spin_rpm, launch.total_spin_rpm);
+        assert!((components.spin_axis.expect("axis") - 5.0).abs() < 0.05);
+
+        let round = crate::state::round::RoundPolicy::default();
+        let guard = round
+            .begin_round(&crate::state::round::RoundRequest {
+                holder: "Pureplay",
+                feeds: &[],
+            })
+            .expect("accepted");
+        let shot = flighthook::ShotData {
+            launch: Some(launch.clone()),
+            provenance: Some(ShotSource::R10.provenance()),
+            ..flighthook::ShotData::default()
+        };
+        assert_eq!(shot.unmeasured_fields().count(), 0);
+        let certified = guard.certify(&shot).expect("measured");
+        assert_eq!(certified.shot().launch.as_ref(), Some(&launch));
     }
 }

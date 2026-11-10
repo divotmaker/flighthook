@@ -1356,7 +1356,7 @@ running flighthook.
 
 ```json
 {
-  "schema": 2,
+  "schema": 3,
   "flighthook_version": "0.1.25",
   "exported_at": "2026-10-25T21:04:11.123Z",
   "time": "2026-10-25T20:58:03.412Z",
@@ -1396,11 +1396,15 @@ running flighthook.
 }
 ```
 
-- `schema`: export format version (`2`). Bumped when a field changes meaning.
-  Schema 2 has the launch and the device's flight values in `data.launch` and
-  `data.flight`; a schema 1 line has both in one `data.ball` block. The
-  `flighthook` crate's `ShotExport` reads either into the schema 2 shape
-  (`ball`'s flight values become a `flight` with `basis` `"modeled"`).
+- `schema`: export format version (`3`). Bumped when a field changes meaning.
+  Schema 3: the raw records of a device on a device driver (the R10, the
+  mock) carry `label` instead of `type`, `src`, `dst` and `channel`, one record
+  per protocol message (the R10: one GFDI message per record, not one BLE
+  chunk). Schema 2 has the launch and the device's flight values in
+  `data.launch` and `data.flight`; a schema 1 line has both in one
+  `data.ball` block. The `flighthook` crate's `ShotExport` reads schema 1
+  into the schema 2 shape (`ball`'s flight values become a `flight` with
+  `basis` `"modeled"`) and schema 2 and 3 lines as they are.
 - `time`: when `shot_trigger` reached the web layer (host clock, RFC 3339 UTC).
 - `device`: `kind` (`flightscope`, `square_golf`, `garmin_r10`, `exputt`,
   `openconnect`, `mock`) plus manufacturer, model and firmware as the device reported them.
@@ -1791,7 +1795,11 @@ Full persisted config (mirrors `config.toml`).
 - R10 sections have `name` and an optional `range`: the distance from the
   device to the ball (unit-tagged, e.g. `"7ft"`), sent to the R10 as its tee
   distance once it wakes up; when absent the device keeps the distance it
-  has. No address (BLE auto-discovery)
+  has. No address (BLE auto-discovery). `range` is the R10 driver's setting:
+  it must be greater than 0 (a save with `"0ft"` or a negative distance is
+  `400` `"r10.0: range: must be a distance greater than 0"`; a file holding
+  one loads, and that card does not start and shows the error). A changed
+  range restarts the card
 - `use_estimated` on Mevo sections controls whether estimated (E8) ball flights
   are emitted when no full (D4) result arrives (defaults to `false`). With it
   off, a shot the device only estimated (e.g. a flight too short to read in
@@ -2075,7 +2083,7 @@ as applied.
 | `400 Bad Request` | a Mevo section it writes has a `launch_only_spin` below 0, above 1000 or not finite (`"mevo.0: launch_only_spin must be 0 to 1000 rpm per mph, not -5"`) |
 | `400 Bad Request` | a launch monitor section it writes has an `impact_lead_s` below 0, above 5 or not finite (`"square.0: impact_lead_s 6 is outside 0 to 5 s"`) |
 | `400 Bad Request` | a camera section it writes has a `latency_s` below 0, above 10 or not finite (`"camera.0: latency_s 11 is outside 0 to 10 s"`) |
-| `400 Bad Request` | a section it writes changes its device driver settings into ones the driver refuses, named by card and field (`"mock_monitor.0: shot_interval_s: must be 0 to 86400"`); a section whose saved driver settings are refused still saves when it keeps them as they are (its name, `enabled`, `impact_lead_s`, ...) |
+| `400 Bad Request` | a section it writes changes its device driver settings into ones the driver refuses, named by card and field (`"mock_monitor.0: shot_interval_s: must be 0 to 86400"`, `"r10.0: range: must be a distance greater than 0"`); a section whose saved driver settings are refused still saves when it keeps them as they are (its name, `enabled`, `impact_lead_s`, ...) |
 | `400 Bad Request` | a camera section it writes has a `rotation_deg` other than 0, 90, 180 or 270 (`"camera.0: rotation_deg 45 is not 0, 90, 180 or 270"`), or a `yaw_deg` or `pitch_deg` outside -30 to 30 or not finite (`"camera.0: yaw_deg 40 is outside -30 to 30"`) |
 | `400 Bad Request` | a camera section it writes has no `camera` (`"camera.0: no camera picked"`) or a `mode` that is neither `auto` nor `WIDTHxHEIGHT@FPS` |
 | `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
@@ -2668,12 +2676,14 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
     - `t_ms`: milliseconds relative to the shot trigger (negative = before it)
     - `dir`: `rx` (device → flighthook) or `tx` (flighthook → device)
     - `type`: message type, e.g. `"0xD4"` (FlightScope) or the first byte of
-      a BLE notification or command type; absent for R10 chunks and JSON
+      a BLE notification or command type; absent for JSON
     - `src` / `dst`: FlightScope bus addresses (`APP`, `AVR`, `DSP`, `PI`)
-    - `channel`: `notify`, `cmd`, `write`, `register` (BLE) or `tcp`
+    - `channel`: `notify`, `cmd` (BLE) or `tcp`
     - `label`: the device driver's own name for the frame, stored as it gave
       it; a frame from a device driver carries this instead of `type`,
-      `src`, `dst` and `channel`
+      `src`, `dst` and `channel`. R10: `notify <message type>` /
+      `write <message type>` (the type in hex), one record per protocol
+      message (`hex`: the whole message as the driver framed it)
     - `hex`: payload as lowercase hex (binary protocols; FlightScope: the
       unstuffed payload without header or checksum)
     - `text`: payload text (JSON protocols)
@@ -2895,6 +2905,9 @@ and `ready` come as `device_telemetry`, and it reports its model (`Mock Launch
 Monitor`) there.
 The ExPutt adds `shot_count` and `phase` (`discovering`, `connecting`,
 `measuring`).
+The R10 adds `shot_count` (shots finished since the card started) and, while
+it connects, `phase` (`discovering`, `handshaking`; the `connected` status
+removes it with `"phase": ""`); `device_info` is `Garmin R10 (<address>)`.
 Integration actors: `club`, `handed`, `name`, `error`.
 
 An `openconnect_client` sets `error` when this flighthook's own

@@ -1965,6 +1965,26 @@ pub(crate) mod tests {
         assert_eq!(rows["video"][1]["swing"], true);
     }
 
+    /// The shot export's JSONL lines (exported at "t", native units, raw
+    /// frames included) for the shots `messages` complete, with `config` in
+    /// effect, as the web layer stores them.
+    pub(crate) async fn export_lines(
+        config: &flighthook::FlighthookConfig,
+        messages: &[FlighthookMessage],
+    ) -> Vec<String> {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| *c = config.clone());
+        let mut acc = PendingShots::new();
+        for msg in messages {
+            apply_bus_event(&state, msg, &mut acc).await;
+        }
+        let shots = state.shots.read().await;
+        shots
+            .iter()
+            .map(|s| super::export::jsonl_line(s, "t", None, true))
+            .collect()
+    }
+
     pub(crate) async fn feed(state: &WebState, actor: &str, events: Vec<FlighthookEvent>) {
         let mut acc = PendingShots::new();
         for event in events {

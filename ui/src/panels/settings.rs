@@ -361,10 +361,14 @@ impl DeviceFormEntry {
             tee_height_unit: "inches".into(),
             // Blank means "unset" — the device keeps its own tee distance.
             range_val: s
+                .driver
                 .range
                 .map(|d| format_distance_value(d.value()))
                 .unwrap_or_default(),
-            range_unit: s.range.map_or("feet".into(), |d| d.unit_key().to_string()),
+            range_unit: s
+                .driver
+                .range
+                .map_or("feet".into(), |d| d.unit_key().to_string()),
             surface_height_val: "0".into(),
             surface_height_unit: "inches".into(),
             track_pct: "80".into(),
@@ -379,7 +383,7 @@ impl DeviceFormEntry {
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
-            saved_driver: None,
+            saved_driver: serde_json::to_value(&s.driver).ok(),
             cam: Box::default(),
             dirty: false,
         }
@@ -548,6 +552,7 @@ impl DeviceFormEntry {
     pub(crate) fn driver_error(&self) -> Option<String> {
         match self.monitor_type.as_str() {
             "mock_monitor" => self.mock.validate().err().map(|e| e.to_string()),
+            "r10" => self.r10_config().validate().err().map(|e| e.to_string()),
             _ => None,
         }
     }
@@ -557,7 +562,20 @@ impl DeviceFormEntry {
     fn driver_json(&self) -> Option<serde_json::Value> {
         match self.monitor_type.as_str() {
             "mock_monitor" => serde_json::to_value(&self.mock).ok(),
+            "r10" => serde_json::to_value(self.r10_config()).ok(),
             _ => None,
+        }
+    }
+
+    /// The R10 driver's settings from the form: the range as typed, blank
+    /// (or not a number) for none.
+    pub(crate) fn r10_config(&self) -> flighthook::R10Config {
+        flighthook::R10Config {
+            range: self
+                .range_val
+                .parse::<f64>()
+                .ok()
+                .map(|v| Distance::from_value_and_unit(v, &self.range_unit)),
         }
     }
 
@@ -2219,12 +2237,8 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         R10Section {
                             name: dev.name.clone(),
                             enabled: dev.enabled,
-                            range: dev
-                                .range_val
-                                .parse::<f64>()
-                                .ok()
-                                .map(|v| Distance::from_value_and_unit(v, &dev.range_unit)),
                             impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
+                            driver: dev.r10_config(),
                         },
                     );
                 }
@@ -4191,7 +4205,7 @@ mod tests {
         MockMonitorSection, RandomClubSection, SimSurface, SimulationSection, SpinSource,
         UnitSystem,
     };
-    use flighthook::{MockConfig, SimMode};
+    use flighthook::{MockConfig, R10Section, SimMode};
 
     #[test]
     fn settings_are_requested_at_most_every_two_seconds_until_loaded() {
@@ -4771,6 +4785,75 @@ mod tests {
         dev.mock.arm_delay_s = MockConfig::default().arm_delay_s;
         dev.mock.shot_interval_s = 10.0;
         assert!(super::actor_valid(&form.actors[0]), "fixed");
+    }
+
+    /// The R10 card's Monitor-to-Ball is the R10 driver's `range`: a value
+    /// the driver refuses (0 or less) shows under the card's fields and
+    /// keeps a changed card from saving, blank means none, and a saved
+    /// refused range still lets the card save its name.
+    #[test]
+    fn the_r10_range_is_validated_by_its_driver() {
+        let mut cfg = FlighthookConfig::default();
+        cfg.r10.insert(
+            "0".into(),
+            R10Section {
+                driver: flighthook::R10Config {
+                    range: Some(Distance::Feet(7.0)),
+                },
+                ..R10Section::default()
+            },
+        );
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert_eq!(
+            (dev.range_val.as_str(), dev.range_unit.as_str()),
+            ("7", "feet")
+        );
+        assert_eq!(dev.driver_error(), None);
+        for bad in ["0", "-2"] {
+            let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+                panic!("not a device");
+            };
+            dev.range_val = bad.into();
+            assert_eq!(
+                dev.driver_error().as_deref(),
+                Some("range: must be a distance greater than 0"),
+                "{bad}"
+            );
+            assert!(!super::actor_valid(&form.actors[0]), "{bad}");
+        }
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        dev.range_val = String::new();
+        assert_eq!(dev.driver_error(), None);
+        assert!(super::actor_valid(&form.actors[0]));
+        assert_eq!(
+            form.build_actor_request("r10.0").r10["0"].driver.range,
+            None
+        );
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        dev.range_val = "2.5".into();
+        dev.range_unit = "meters".into();
+        assert_eq!(
+            form.build_actor_request("r10.0").r10["0"].driver.range,
+            Some(Distance::Meters(2.5))
+        );
+
+        cfg.r10.get_mut("0").unwrap().driver.range = Some(Distance::Feet(0.0));
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert!(dev.driver_error().is_some(), "shown");
+        dev.name = "Bay 1".into();
+        assert!(super::actor_valid(&form.actors[0]), "a rename saves");
     }
 
     #[test]

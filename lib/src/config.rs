@@ -4,6 +4,7 @@ use flightrelay::config::DriverConfig;
 use flightrelay::mock::MockConfig;
 use flightrelay::units::{Distance, Velocity};
 use serde::{Deserialize, Serialize};
+use tenover::config::Config as R10Config;
 
 use crate::game_state::Club;
 use crate::group::ShotGrouping;
@@ -1500,7 +1501,7 @@ impl MevoSection {
     }
 }
 
-/// A Garmin R10 BLE device instance.
+/// A Garmin R10 BLE device instance (tenover's device driver).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct R10Section {
     #[serde(default)]
@@ -1510,19 +1511,31 @@ pub struct R10Section {
     /// file then.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
-    /// Distance from the device to the tee, sent to the R10 as its tee
-    /// distance once it wakes up. Garmin recommends placing the R10 6-8 ft
-    /// behind the ball.
-    ///
-    /// When absent, no tee distance is sent and the device keeps whatever tee
-    /// distance was last set on it (e.g. by the Garmin Golf app).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range: Option<Distance>,
     /// Seconds before the shot's report that the swing's impact happened, for
     /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
     /// device's default ([`impact_lead_default_s`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact_lead_s: Option<f64>,
+    /// The R10 driver's settings: `range`, the distance from the device to
+    /// the tee, sent to the R10 as its tee distance once it wakes up (must be
+    /// greater than 0; absent leaves the device's own tee distance alone;
+    /// Garmin recommends 6-8 ft behind the ball). Left out of the file while
+    /// unset.
+    #[serde(flatten)]
+    pub driver: R10Config,
+}
+
+impl DeviceSection for R10Section {
+    type Driver = R10Config;
+    const KIND: &'static str = "r10";
+
+    fn driver(&self) -> &R10Config {
+        &self.driver
+    }
+
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
+        &config.r10
+    }
 }
 
 /// A Square Golf Omni BLE device instance.
@@ -2009,6 +2022,7 @@ impl FlighthookConfig {
     #[must_use]
     pub fn device_error(&self) -> Option<String> {
         first_driver_error::<MockMonitorSection>(self, None)
+            .or_else(|| first_driver_error::<R10Section>(self, None))
     }
 
     /// [`device_error`](Self::device_error) for saving this config over
@@ -2018,6 +2032,7 @@ impl FlighthookConfig {
     #[must_use]
     pub fn changed_device_error(&self, saved: &FlighthookConfig) -> Option<String> {
         first_driver_error::<MockMonitorSection>(self, Some(saved))
+            .or_else(|| first_driver_error::<R10Section>(self, Some(saved)))
     }
 
     /// Look up the detection mode for a club based on the configured mapping.
@@ -2112,9 +2127,9 @@ impl Default for R10Section {
         Self {
             name: "Garmin R10".into(),
             enabled: true,
-            // Absent: leave the device's own tee distance untouched.
-            range: None,
             impact_lead_s: None,
+            // No range: leave the device's own tee distance untouched.
+            driver: R10Config::default(),
         }
     }
 }
@@ -3773,5 +3788,74 @@ mod mock_section_tests {
             config.device_error().as_deref(),
             Some("mock_monitor.2: shot_interval_s: must be 0 to 86400")
         );
+    }
+}
+
+#[cfg(test)]
+mod r10_section_tests {
+    use super::*;
+
+    /// An R10 section as flighthook 0.1.24 wrote it reads into the same
+    /// values, the range now in the driver's settings, and writes back the
+    /// same JSON; a default section writes only its name, and the range is
+    /// left out while unset.
+    #[test]
+    fn a_saved_r10_section_reads_and_writes_as_before() {
+        for (json, range) in [
+            (
+                r#"{"name":"Garmin R10","range":"7ft","impact_lead_s":2.5}"#,
+                Some(Distance::Feet(7.0)),
+            ),
+            (
+                r#"{"name":"Bay 2","enabled":false,"range":"2.5m"}"#,
+                Some(Distance::Meters(2.5)),
+            ),
+            (r#"{"name":"Garmin R10"}"#, None),
+        ] {
+            let section: R10Section = serde_json::from_str(json).unwrap();
+            assert_eq!(section.driver.range, range, "{json}");
+            let back = serde_json::to_value(&section).unwrap();
+            assert_eq!(
+                back,
+                serde_json::from_str::<serde_json::Value>(json).unwrap()
+            );
+        }
+        let section: R10Section =
+            serde_json::from_str(r#"{"name":"Garmin R10","range":"7ft","impact_lead_s":2.5}"#)
+                .unwrap();
+        assert_eq!(section.impact_lead_s, Some(2.5));
+        assert!(section.enabled);
+        assert_eq!(
+            serde_json::to_string(&R10Section::default()).unwrap(),
+            r#"{"name":"Garmin R10"}"#
+        );
+    }
+
+    /// The R10 driver refuses a range that isn't greater than 0, and the
+    /// card and field are named; a save that keeps such a stored range is
+    /// not refused.
+    #[test]
+    fn a_range_of_zero_is_refused() {
+        let mut config = FlighthookConfig::default();
+        config.r10.insert("0".into(), R10Section::default());
+        assert_eq!(config.device_error(), None);
+        for bad in [
+            Distance::Feet(0.0),
+            Distance::Meters(-2.0),
+            Distance::Feet(f64::NAN),
+        ] {
+            config.r10.get_mut("0").unwrap().driver.range = Some(bad);
+            assert_eq!(
+                config.device_error().as_deref(),
+                Some("r10.0: range: must be a distance greater than 0")
+            );
+            let saved = config.clone();
+            config.r10.get_mut("0").unwrap().name = "Renamed".into();
+            assert_eq!(config.changed_device_error(&saved), None);
+            config.r10.get_mut("0").unwrap().driver.range = Some(Distance::Feet(-1.0));
+            assert!(config.changed_device_error(&saved).is_some());
+        }
+        config.r10.get_mut("0").unwrap().driver.range = Some(Distance::Feet(7.0));
+        assert_eq!(config.device_error(), None);
     }
 }
