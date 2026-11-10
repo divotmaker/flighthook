@@ -33,6 +33,7 @@ Other useful events on the same connection:
 - `device_telemetry` -- device-reported state (ready, battery, tilt, temp, identity)
 - `actor_status` -- actor/connection lifecycle (status enum, mode, radar_mode)
 - `hand_info` -- the player's hand, set by the simulator, the UI or the API
+- `round_state` -- a tournament round started or ended
 - `set_detection_mode` -- detection mode, handedness and/or club change (all optional, latched)
 - `shot_group` -- which [set](#get-apishotsgroups) a finished shot joined
   (and so its club); the shot's `/api/shots` element carries the same
@@ -218,6 +219,12 @@ numbered in index order (`Open Connect 1`, `Open Connect 2`).
   and `{"error": "..."}` when the copy can't be made; the file and the field
   stay. The dashboard reads it with the rest of the status at startup and
   again after every settings change.
+- `round`: present only while a tournament round is active (an output such
+  as Pureplay holds one in strict mode): `{"active": true, "holder":
+  "Pureplay"}`, `holder` being the holding output's card name. During a
+  round only measured shots and values count for the holder, and Auto-chip
+  and the mock launch monitor make no shots. Same state as the
+  [`round_state`](#round_state) event
 - `status`: `"starting"` | `"disconnected"` | `"connected"` | `"reconnecting"`,
   the actor's latest [`actor_status`](#actor_status)
 - `telemetry`: actor-specific key/value pairs (all string values)
@@ -228,7 +235,11 @@ numbered in index order (`Open Connect 1`, `Open Connect 2`).
     restarted by a config change;
   - `"connected"`: `status` is `connected`;
   - `"reconnecting"`: `connected` since it started, and has since lost the
-    connection (any other status).
+    connection (any other status);
+  - `"disabled"`: the card is turned off (its config section has
+    `enabled = false`, see [Turning a card off](#turning-a-card-off)). No
+    actor runs: `status` is `disconnected`, `telemetry` is empty and
+    `red_for_ms` is `0`. Not an error state.
 - `red_for_ms`: milliseconds the `reconnecting` state stays an alert (red),
   counted from when the reply was built: what is left of the 10 minutes
   (600000 ms) after the most recent change from `connected` to any other
@@ -240,8 +251,8 @@ numbered in index order (`Open Connect 1`, `Open Connect 2`).
 The server keeps each actor's history for as long as it runs, whoever is
 connected: a dashboard opened five minutes after a loss still gets
 `reconnecting` with about five minutes of `red_for_ms`. A `starting` status,
-a restart from a config change and removing the actor (then adding it again)
-each begin a new history. Live [`actor_status`](#actor_status) events carry
+a restart from a config change, removing the actor (then adding it again)
+and turning it off then on again each begin a new history. Live [`actor_status`](#actor_status) events carry
 only `status`; a client applies the same rules to them to keep `state` and
 the red time current.
 
@@ -251,7 +262,8 @@ Telemetry keys are merged from two sources with no overlap:
 - **Actor-framework** (from `actor_status`): `detection_mode`, `radar_mode`, `device_info`,
   `shot_count`, `tracking_mode`, `phase`
 - **Integration actors**: `club`, `handed`, `name`, `error`
-- **Open Connect clients** (GSPro, Muni Golf, generic; from `actor_status`):
+- **Open Connect clients** (GSPro, Pureplay, Muni Golf, generic; from
+  `actor_status`):
   `address` (the simulator's, `127.0.0.1:921`), `last_shot` (the
   `ShotNumber` the simulator got last and the local time it was sent,
   `#12 at 16:41:07`), and for the current connection only `shots_sent`
@@ -261,7 +273,7 @@ Telemetry keys are merged from two sources with no overlap:
   player information. When the connection ends, `shots_sent`,
   `monitor_ready`, `response`, `club` and `handed` are removed; `address`
   and `last_shot` stay
-- **Pureplay outputs** (beta; from `actor_status`): `address` (Pureplay's,
+- **Pureplay Connect outputs** (alpha; from `actor_status`): `address` (Pureplay's,
   `127.0.0.1:9760`), `last_shot` (the ShotId Pureplay got last and the local
   time it was sent, `#4 at 16:41:07`), and for the current link only
   `shots_sent` (`4`), `ready_state` (the ready state last sent, `ready` |
@@ -384,8 +396,8 @@ With `?units=imperial`:
 - `ball`: `BallFlight` or `null`. Launch conditions and distances, exactly as
   the device measured them, except on a shot flagged `derived.spin_estimated`:
   its spin is flighthook's estimate, and the device's 0 carry, apex and flight
-  time are left out; and the values `derived.computed` lists, which the
-  device actor worked out or filled in. All fields are `Option`.
+  time are left out; and any value `derived.computed` lists, which comes
+  from a model rather than the device's readings. All fields are `Option`.
   Velocity fields are unit-tagged strings (`"67.2mps"`, `"150.3mph"`).
   Distance fields are unit-tagged strings (`"180.5m"`, `"197.4yd"`).
 - `derived`: `DerivedFlight` or absent. Values simulated for fields the device
@@ -407,6 +419,12 @@ With `?units=imperial`:
   triggered; absent when unknown. Face impact is the same for either hand;
   a face-on drawing of it puts a right-hander's toe on the left and a
   left-hander's on the right.
+- `provenance`: where the shot comes from, by the type of the actor that
+  emitted it (see [Provenance](#provenance)): `"measured"` (a launch monitor
+  measured it: one flighthook reads, or one whose app sends its shots to
+  the Open Connect input) or `"virtual"` (the mock launch monitor,
+  Auto-chip). Absent on a shot stored without it; a tournament round counts
+  such a shot as not measured.
 - `video` (beta): the cameras' clips of the shot, one per camera, omitted
   when there are none. Each is a `ShotVideo`, the fields of
   [`shot_video`](#shot_video) plus `camera`, the camera's actor ID:
@@ -1165,7 +1183,7 @@ listing the codes when the club is unknown.
 Emits `club_info` on the bus (actor `web`). The detection mode is derived from
 the club as for GSPro (`chipping_clubs` → chipping, `putting_clubs` →
 putting, else full), and when it differs from the open set's club, the next
-shot starts a new [set](#get-apishotsgroups). While an OpenConnect client is
+shot starts a new [set](#get-apishotsgroups). While an Open Connect client is
 connected, the simulator's next player message replaces the selection: the
 simulator (e.g. GSPro) is the club authority while it runs.
 
@@ -1191,7 +1209,7 @@ Emits `hand_info` on the bus (actor `web`), like a hand from GSPro. The
 system actor stores it and, when it differs from the hand in effect, sends
 the devices that follow the player's hand (Square Golf, ExPutt) a
 `set_detection_mode` with `handed`; the Open Connect server tells its monitor
-too. While an OpenConnect client is connected, the UI's hand control is
+too. While an Open Connect client is connected, the UI's hand control is
 read-only, as the club picker is, because the simulator's next player message
 replaces the hand.
 
@@ -1230,8 +1248,9 @@ monitors that miss short chips).
 body for any other distance. `409 Conflict` with a JSON `{"error"}` body when
 Auto-chip is turned off (`[simulation]` `auto_chip` is `false`, the default; the error is
 `"Auto-chip is disabled in settings"`, and no shot is sent or numbered), while
-a Pureplay output is in a strict-mode (tournament) round (`"Auto-chip is off
-during a Pureplay strict-mode round"`, nothing sent or numbered either), or
+a tournament round is active (`"Auto-chip is off during a Pureplay
+strict-mode round"`, nothing sent or numbered either; see
+[`round_state`](#round_state)), or
 when the `[simulation]` altitude or temperature is out of range. A body that is not
 `{"yards": <non-negative integer>}` is `422 Unprocessable Entity`, and a
 missing `Content-Type: application/json` `415 Unsupported Media Type`.
@@ -1255,7 +1274,7 @@ total are the chip's only results), and [`shot_finished`](#shot_finished)
 [`GET /api/shots`](#get-apishots), the shot sets and the
 [export](#get-apishotsexport) (device kind `autochip`, `settings.detection_mode`
 `"chipping"`), and every
-OpenConnect client sends it to its simulator, and every Pureplay output to
+Open Connect client sends it to its simulator, and every Pureplay output to
 Pureplay: Auto-chip shots are taken whatever monitor `full_monitor`,
 `chipping_monitor` and `putting_monitor` route to.
 
@@ -1360,7 +1379,7 @@ running flighthook.
   shot whose simulated results replace the device's, and
   `data.derived.spin_estimated` one whose spin flighthook estimated.
 - `data`: exactly the `/api/shots` element for this shot (`ShotData`),
-  including `metrics`.
+  including `metrics` and `provenance`.
   `data.shot_id`, `data.club_selected` and `data.group`, when set, equal the
   top-level fields, and `data.handed` equals `settings.handed`.
 - `raw`: `ShotRaw` (see [shot_finished](#shot_finished)).
@@ -1545,6 +1564,7 @@ up to a minute.
 | `400 Bad Request` | `id` is a camera, the web server or another actor that is not a launch monitor or output |
 | `404 Not Found` | no launch monitor or output in the saved settings has that ID |
 | `409 Conflict` | a reconnect of the same actor is already in flight (`"a reconnect of 'mevo.0' is already in progress"`) |
+| `409 Conflict` | the actor is turned off (`"'mevo.0' is off"`) |
 | `409 Conflict` | the actor was removed, or its saved settings cannot start it, after the request was checked |
 | `504 Gateway Timeout` | flighthook is shutting down: the command was not processed |
 
@@ -1658,7 +1678,7 @@ Full persisted config (mirrors `config.toml`).
   "mock_monitor": {},
   "openconnect_server": {
     "0": {
-      "name": "OpenConnect Server",
+      "name": "Open Connect Server",
       "bind": "0.0.0.0:921"
     }
   },
@@ -1737,9 +1757,10 @@ Full persisted config (mirrors `config.toml`).
   response when unset
 - `spin_source` on Mevo sections is `d4` (default), `e8`, or `auto`, and
   applies to a FlightScope Xi only. `d4` reports the Xi's final spin, which is
-  what FS Golf displays. `e8` reports the Xi's second spin value, with the
-  spin axis from `d4` when the shot has club data and 0 otherwise, and falls
-  back to `d4` when the shot has no E8 spin; on chips and pitches `e8` isn't
+  what FS Golf displays. `e8` reports the Xi's second spin value, split by
+  the spin axis from `d4` when the shot has club data, and as the total
+  alone (no axis, no back/side components) otherwise, and falls back to
+  `d4` when the shot has no E8 spin; on chips and pitches `e8` isn't
   measured, so choose it knowingly. `auto` is `e8` when
   flighthook is in Full mode, and `d4` otherwise -- a chip hit while flighthook
   is still in Full mode gets `e8`'s speed-scaled value. See
@@ -1758,6 +1779,13 @@ Full persisted config (mirrors `config.toml`).
   the actor
 - ExPutt sections have `name` and an optional `address`: the device's IP
   address (no port). When absent the device is found on the local network.
+- Every launch monitor, camera and output section (`mevo`, `r10`, `square`,
+  `exputt`, `mock_monitor`, `openconnect_server`, `camera`,
+  `openconnect_client`, `pureplay`, `random_club`) takes `enabled`: `true`
+  (the default) runs its actor, `false` turns the card off, keeping its
+  section and settings. Omitted while `true`, so a config written before the
+  field existed is unchanged; only `enabled = false` is written. Web server
+  sections have no `enabled`. See [Turning a card off](#turning-a-card-off)
 - Every launch monitor section (`mevo`, `r10`, `square`, `exputt`,
   `mock_monitor`, `openconnect_server`) takes an optional `impact_lead_s`:
   seconds, 0 to 5, from the ball's impact to the monitor's `shot_trigger`,
@@ -1807,8 +1835,8 @@ Full persisted config (mirrors `config.toml`).
   club is known: after the monitor's first message and on every change. The
   hand is left out until it is known, and the mini driver goes out as `DR`
 - `openconnect_client` sections are **outputs**: each dials `address` (default
-  `127.0.0.1:921`), a simulator that accepts GSPro Open Connect V1 — GSPro on
-  921, Muni Golf on 9210 — and sends it every shot. `full_monitor`,
+  `127.0.0.1:921`), a simulator that accepts GSPro Open Connect V1 — GSPro
+  and Pureplay on 921, Muni Golf on 9210 — and sends it every shot. `full_monitor`,
   `chipping_monitor` and `putting_monitor` take a launch monitor's actor ID
   and accept shots in that mode from it alone; absent accepts any monitor.
   [Auto-chip](#post-apiauto-chip) shots are accepted whatever they name.
@@ -1818,7 +1846,7 @@ Full persisted config (mirrors `config.toml`).
   The count starts over when the client itself restarts: a
   [Reconnect](#post-apiactorsidreconnect) of it, a save that restarts it, or
   a flighthook restart
-- `pureplay` sections (beta) are **outputs**: each dials `address` (default
+- `pureplay` sections (alpha) are **outputs**: each dials `address` (default
   `127.0.0.1:9760`), Pureplay, and sends it every shot over Pureplay
   Connect, numbered from 1 on each connection. `full_monitor`,
   `chipping_monitor` and `putting_monitor` route as for `openconnect_client`,
@@ -1948,7 +1976,37 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 
 - `restarted`: actors that were stopped and recreated (e.g. address changed).
   Omitted when empty.
-- `stopped`: actors that were removed from the config. Omitted when empty.
+- `stopped`: actors that were removed from the config or turned off.
+  Omitted when empty.
+
+#### Turning a card off
+
+A section with `enabled = false` runs no actor; its card stays, with its
+settings, and its [state](#connectionstate) is `disabled`. A save that turns
+a running actor off stops it by the same rules as a removal (see
+[config timeout](#config-timeout)) and lists it in `stopped`; one that turns
+it on starts it like a new actor and lists it in `started` of the
+`config_outcome`. Changing other settings of a card that is off starts
+nothing. The dashboard's on/off switch in each card header saves this way:
+a `scope` of that actor, with only its `enabled` changed.
+
+One card per address may be on. Two cards of a type conflict when their
+addresses collide: the same host and port (`localhost` is `127.0.0.1`, a blank
+address is the type's default), or, for an Open Connect server, the same port
+with overlapping bind addresses (`0.0.0.0` overlaps all). A section that is
+off holds no address, so duplicates can exist while at most one is on. A save
+that turns a section on, or adds one that is on, while an enabled section of
+its type has its address is refused with `409` (see below) and saves
+nothing. A save that edits a section that is already on onto a held address
+is applied and writes that section `enabled = false`, so it is listed in
+`stopped`. A config file that holds two enabled sections on one address loads
+the first (by numeric index) as it is and the later ones off, with a warning
+in the log; `enabled = false` is written by the next save.
+
+An actor that is off is not a shot source: it sends no shots, and is
+neither counted nor refused as a feed by a tournament round. It has no
+battery in the header and adds nothing to readiness: an output routed to a
+monitor that is off is not ready, as with a monitor that is not configured.
 
 **Errors**: a JSON body `{"error": "<reason>"}`; the save is not reported
 as applied.
@@ -1965,6 +2023,7 @@ as applied.
 | `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
 | `400 Bad Request` | a whole-config, `global` or `body_tracking` save has a `body_tracking` value out of range (`"body_tracking: min_score 2 is outside 0 to 1"`) |
 | `400 Bad Request` | a whole-config, `global` or `player` save has a `player.height` outside 100 to 250 or not finite (`"player: height 99 is outside 100 to 250 cm"`) |
+| `409 Conflict` | the save turns on a section, or adds one that is on, at an address an enabled section of the same type has (`"An Open Connect card already uses 127.0.0.1:921"`); nothing is saved |
 | `504 Gateway Timeout` | SystemActor did not answer within 22 s (see below) |
 
 A body that is not a valid `FlighthookConfig` is rejected by the JSON
@@ -2072,7 +2131,11 @@ Before streaming begins, the client must complete a handshake:
   - `mode`: the detection mode or `null`
   - `handed`: the player's hand (`"rh"` | `"lh"`) or `null`
 
-3. **Server streams** `FlighthookMessage` events (described below).
+3. **Server replays** the last `actor_status` and `device_telemetry` of
+   every actor, then sends the current [`round_state`](#round_state),
+   active or not.
+
+4. **Server streams** `FlighthookMessage` events (described below).
 
 Messages sent before the `start` handshake (except `close`) are ignored.
 
@@ -2098,6 +2161,10 @@ messages use the FRP envelope shape:
   lifecycle and device telemetry events; absent on system/config events.
 - `raw_payload`: optional. Binary payloads are lowercase hex strings (no spaces).
   Text payloads (e.g. GSPro JSON) are included as-is. Omitted when not applicable.
+- `provenance`: on a `shot_trigger` only: what stands behind the shot it
+  starts (see [Provenance](#provenance)), set by flighthook from the type of
+  the actor that emits it. Omitted on every other message, and on triggers
+  from a source flighthook does not know. Flighthook extension field.
 - `event`: the typed event, tagged by `"kind"`. FRP-only consumers silently
   ignore unknown `kind` values per spec.
 
@@ -2190,11 +2257,11 @@ Which fields each device sends:
 
 | Device | `carry_offline` | `descent_angle` | `total_spin_rpm` + `spin_axis` |
 | --- | --- | --- | --- |
-| FlightScope full result (`D4`) | yes (landing position) | yes (landing velocity) | no (components only) |
+| FlightScope full result (`D4`) | yes (landing position) | yes (landing velocity) | no (components only); the total alone, no components, when an Xi's **Spin source (Xi)** uses E8 and the shot has no club data |
 | FlightScope estimate (`E8`) | yes | no | no (backspin only) |
 | Garmin R10 | no | no | yes, with the components |
 | Square Golf Omni | no | no | yes, with the components |
-| Open Connect | no | no | yes: the pair the monitor sent, the other computed from it |
+| Open Connect | no | no | yes: the pair the monitor sent, and the same spin in the other pair |
 
 `total_offline`, `club_path.spin_loft` and `club_path.low_point_distance` are
 passed through by flighthook but no supported device reports them. Values a
@@ -2230,21 +2297,28 @@ a FlightScope result with launch data but no spin
 spin stays under `ball` and is sent to GSPro like a measured one.
 
 `"computed"` lists the values under `ball` (or the shot's face impact) that
-the device actor computed from other readings or filled in, rather than the
-device reporting them; they stay where they are and go to GSPro as before.
-Names are FRP field names: `launch_elevation`, `backspin_rpm`,
-`sidespin_rpm`, `total_spin_rpm`, `spin_axis`, and `impact_vertical` for the
-face impact's `vertical`. Today: the Garmin R10's `backspin_rpm` and
-`sidespin_rpm` (worked out from its total spin and axis), the Xi's
-`backspin_rpm` and `sidespin_rpm` when **Spin source (Xi)** combines the E8
-total with an axis, the ExPutt's `launch_elevation` (always 0), the Square
-Golf Omni's `impact_vertical` (it includes the club's offset from the
-sticker to the face center), and for the OpenConnect input the spin pair the
-monitor did not send. The Pureplay output leaves these out in strict mode.
+come from a model (aerodynamic, flight or otherwise) rather than from the
+device's readings; they stay where they are and go to GSPro as before. A
+plain translation of a reading is not computed: the other spin pair worked
+out from the one a device reports (the Garmin R10's back and side spin, the
+Open Connect input's completed pair, the Xi's E8 total split by its axis), a
+unit or sign conversion, or a calibration offset (the Square Golf Omni's
+vertical face impact). Names are FRP field names: `launch_elevation`,
+`backspin_rpm`, `sidespin_rpm`, `total_spin_rpm`, `spin_axis`, and
+`impact_vertical` for the face impact's `vertical`. No supported device
+sets it. A tournament round leaves these out, and with `spin_estimated` all
+four spin values (Pureplay's strict mode).
+
+A value a device does not measure is left out, never sent as a placeholder:
+the ExPutt sends no `launch_elevation`, and an Xi shot whose E8 total has no
+axis to go with it sends `total_spin_rpm` alone. An output that needs the
+field fills its own default (GSPro gets a VLA of 0, and such a total as
+backspin with axis 0).
 
 A ground ball is rolled, not flown: a shot whose measured apex is 0, or,
-from a device that reports no apex, whose launch angle is at most 0.5°,
-whatever the device, club or detection mode. Carry, apex and flight time are
+from a device that reports no apex, whose launch angle is at most 0.5° or
+that reports neither a launch angle nor any spin (the ExPutt), whatever the
+device, club or detection mode. Carry, apex and flight time are
 0 (the device's 0s stay measured), there is no `descent_angle`, and roll and
 total come from a roll from the tee, from the launch speed and direction (a
 measured total, or a measured roll as the total, wins). With a carry of 0 the
@@ -2290,7 +2364,7 @@ A launch-monitor-only device such as the Square Golf Omni gets the full set:
 | `path` | FlightPath | Simulated ball path, tee to rest (see below) |
 | `replaces_measured` | bool | `true` when these values replace the device's results (`[simulation] mode` was `"force"` when the shot was simulated): every result field is simulated and takes precedence over `ball`. Omitted when false |
 | `spin_estimated` | bool | `true` when `ball.backspin_rpm` and `ball.sidespin_rpm` are flighthook's estimate, not measured. Set with or without the simulation. Omitted when false |
-| `computed` | array of string | The measured-block values the device actor computed or filled in (see above). Set with or without the simulation. Omitted when empty |
+| `computed` | array of string | The measured-block values that come from a model (see above). Set with or without the simulation. Omitted when empty |
 
 Every field is optional. Offline values are absolute: + is right of the target
 line for every golfer, as in `launch_azimuth`. Where the device measures carry
@@ -2533,6 +2607,33 @@ ID).
 
 ---
 
+##### round_state
+
+A tournament round started or ended. Emitted by the system (actor
+`system`) whenever the round policy changes, and sent to every WebSocket
+client after the init handshake. While a round is active, the output holding
+it (Pureplay in strict mode) takes only shots a launch monitor measured,
+without the values that are not the device's reading; its ready state counts
+only measured launch monitors; and Auto-chip and the mock launch monitor make
+no shots. The dashboard shows a **Tournament** banner under the header and
+disables the Auto-chip chip.
+
+```json
+{
+  "actor": "system",
+  "event": {
+    "kind": "round_state",
+    "round": { "active": true, "holder": "Pureplay" }
+  }
+}
+```
+
+- `round.active`: whether a round is active
+- `round.holder`: the card name of the output holding the round; omitted
+  when none is active (`{"active": false}`)
+
+---
+
 ##### set_detection_mode
 
 FRP controller command. Sets the shot detection mode, player handedness and/or
@@ -2614,9 +2715,9 @@ Integration actors: `club`, `handed`, `name`, `error`.
 An `openconnect_client` sets `error` when this flighthook's own
 `openconnect_server` refused its connection (the client points at the server,
 which would loop shots back into flighthook): `Refused by this flighthook's
-own OpenConnect Server "<server name>": this address points at it, which would
+own Open Connect Server "<server name>": this address points at it, which would
 loop shots back. Use the simulator's port instead.` The server raises an
-`alert`: `Refused OpenConnect Client "<client name>" from <peer>: it is this
+`alert`: `Refused Open Connect Client "<client name>" from <peer>: it is this
 flighthook's own client, which would loop shots back. Point it at the
 simulator's port.` The client reports `connected` once a connection has lasted
 1 s, and clears `error` (`""`) then, when an attempt fails another way, and
@@ -2975,7 +3076,7 @@ unknown club code or mode is ignored.
 
 ### ConnectionState
 
-`"connecting"` | `"connected"` | `"reconnecting"` (see
+`"connecting"` | `"connected"` | `"reconnecting"` | `"disabled"` (see
 [`GET /api/status`](#get-apistatus) for how it is derived)
 
 ### ShotDetectionMode
@@ -2985,6 +3086,13 @@ unknown club code or mode is ignored.
 ### Handedness
 
 `"rh"` | `"lh"`
+
+### Provenance
+
+`"measured"` | `"virtual"`: a launch monitor measured the shot, either one
+flighthook reads directly (FlightScope, Garmin R10, Square Golf, ExPutt) or
+one whose own app sends its shots to the Open Connect input; no launch
+monitor measured the shot (the mock launch monitor, Auto-chip).
 
 ### CameraPosition
 

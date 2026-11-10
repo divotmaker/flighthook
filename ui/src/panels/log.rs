@@ -31,6 +31,7 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "shot_group",
     "config_command",
     "config_outcome",
+    "round_state",
 ];
 
 /// Filter groups for the dropdown.
@@ -71,7 +72,12 @@ const FILTER_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "System",
-        &["actor_status", "config_command", "config_outcome"],
+        &[
+            "actor_status",
+            "config_command",
+            "config_outcome",
+            "round_state",
+        ],
     ),
     ("Alert", &["alert_error", "alert_warn", "alert_critical"]),
 ];
@@ -88,6 +94,7 @@ pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
         FlighthookEvent::PlayerInfo { .. } => "player_info",
         FlighthookEvent::ClubInfo { .. } => "club_info",
         FlighthookEvent::HandInfo { .. } => "hand_info",
+        FlighthookEvent::RoundState { .. } => "round_state",
         FlighthookEvent::SetDetectionMode { .. } => "set_detection_mode",
         FlighthookEvent::ActorStatus { .. } => "actor_status",
         FlighthookEvent::ConfigCommand { .. } => "config_command",
@@ -166,6 +173,10 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
         }
         FlighthookEvent::ClubInfo { club_info } => format!("club={}", club_info.club),
         FlighthookEvent::HandInfo { hand_info } => format!("hand={}", hand_code(hand_info.handed)),
+        FlighthookEvent::RoundState { round } => match &round.holder {
+            Some(holder) => format!("round held by {holder}"),
+            None => "no round".into(),
+        },
         FlighthookEvent::SetDetectionMode { mode, handed, club } => {
             let parts: Vec<String> = [
                 mode.map(|m| format!("{m:?}")),

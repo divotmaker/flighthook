@@ -1,8 +1,8 @@
 //! GSPro Open Connect V1 client: the `openconnect_client` actor.
 //!
 //! Subscribes to the unified bus for shot data and forwards it over TCP to a
-//! simulator that accepts Open Connect: GSPro (port 921), Muni Golf (9210),
-//! or any other. Emits PlayerInfo/ClubInfo/HandInfo for player, club and
+//! simulator that accepts Open Connect: GSPro and Pureplay (port 921), Muni
+//! Golf (9210), or any other. Emits PlayerInfo/ClubInfo/HandInfo for player, club and
 //! hand changes and ActorStatus for connection status. Reconnects with linear backoff on failure.
 //!
 //! The bus is drained the whole time, connected or not. Every shot that
@@ -30,7 +30,7 @@ pub(crate) mod proto;
 
 use proto::*;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -75,9 +75,31 @@ pub struct GsProRouting {
     pub putting_monitor: Option<String>,
 }
 
+impl GsProRouting {
+    /// The launch monitors whose shots this routing passes in any detection
+    /// mode, by actor ID: each mode's routed monitor, and for a mode routed
+    /// to "Any" every monitor in `any`.
+    pub fn feeds<'a>(&'a self, any: BTreeSet<&'a str>) -> BTreeSet<&'a str> {
+        let mut feeds = BTreeSet::new();
+        for routed in [
+            &self.full_monitor,
+            &self.chipping_monitor,
+            &self.putting_monitor,
+        ] {
+            match routed {
+                Some(id) => {
+                    feeds.insert(id.as_str());
+                }
+                None => feeds.extend(any.iter().copied()),
+            }
+        }
+        feeds
+    }
+}
+
 /// Open Connect client actor (`openconnect_client.N`). Connects to a
-/// simulator that accepts GSPro Open Connect V1 (GSPro on port 921, Muni Golf
-/// on 9210; TCP, JSON), forwards shot data, and handles heartbeats.
+/// simulator that accepts GSPro Open Connect V1 (GSPro and Pureplay on port
+/// 921, Muni Golf on 9210; TCP, JSON), forwards shot data, and handles heartbeats.
 pub struct GsProActor {
     pub addr: SocketAddr,
     pub routing: GsProRouting,
@@ -484,7 +506,8 @@ impl Relay {
     fn handle(&mut self, msg: FlighthookMessage, now: Instant) {
         match msg.event {
             FlighthookEvent::ShotTrigger { ref key } => {
-                let acc = ShotAccumulator::new(msg.actor.clone(), key.clone());
+                let acc = ShotAccumulator::new(msg.actor.clone(), key.clone())
+                    .with_provenance(msg.provenance);
                 self.accumulators
                     .insert((msg.actor.clone(), key.clone()), acc);
             }
@@ -1139,6 +1162,7 @@ mod tests {
             "0".into(),
             flighthook::ExPuttSection {
                 name: "ExPutt".into(),
+                enabled: true,
                 address: None,
                 impact_lead_s: None,
             },

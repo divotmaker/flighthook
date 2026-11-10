@@ -110,6 +110,34 @@ fn new_actor(name: String) -> ActorStatusResponse {
     ActorStatusResponse::new(name, ActorStatus::Disconnected)
 }
 
+/// Bring `actors` in line with the sections `disabled` (from
+/// `FlighthookConfig::disabled_actors`) lists as off: each such actor shows
+/// as Disabled, with nothing held, and one that is on again but has not
+/// started a new instance yet shows as a new actor. `names` are the
+/// configured ones ([`actor_names`]). Returns the actors made Disabled.
+fn follow_disabled(
+    actors: &mut HashMap<String, ActorStatusResponse>,
+    names: &HashMap<String, String>,
+    disabled: &[String],
+) -> Vec<String> {
+    let mut turned_off = Vec::new();
+    for (id, name) in names {
+        let off = disabled.contains(id);
+        match actors.get(id) {
+            Some(a) if a.is_disabled() == off => {}
+            None if !off => {}
+            _ if off => {
+                actors.insert(id.clone(), ActorStatusResponse::disabled(name.clone()));
+                turned_off.push(id.clone());
+            }
+            _ => {
+                actors.insert(id.clone(), new_actor(name.clone()));
+            }
+        }
+    }
+    turned_off
+}
+
 /// Give each actor in `actors` its name from `names` (from
 /// [`actor_names`]); an actor `names` leaves out keeps its own.
 fn rename_actors(
@@ -327,13 +355,15 @@ async fn run(
     bus_rx: broadcast::Receiver<FlighthookMessage>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    // Pre-populate per-actor state from config
+    // Pre-populate per-actor state from config: a card that is off shows
+    // as Disabled.
     let snap = root.system.snapshot();
     let names = actor_names(&snap);
     let mut actors = HashMap::new();
     for (id, name) in &names {
         actors.insert(id.clone(), new_actor(name.clone()));
     }
+    follow_disabled(&mut actors, &names, &snap.disabled_actors());
 
     let groups = initial_groups(&root);
     let state = Arc::new(WebState {
@@ -786,7 +816,8 @@ async fn apply_bus_event(
             };
             let context = shot_context(state, msg, club).await;
             let pending = PendingShot {
-                acc: ShotAccumulator::new(msg.actor.clone(), key.clone()),
+                acc: ShotAccumulator::new(msg.actor.clone(), key.clone())
+                    .with_provenance(msg.provenance),
                 received_at: Utc::now(),
                 context,
                 group,
@@ -993,7 +1024,9 @@ async fn apply_bus_event(
         } => {
             // Names come from the config, and a rename is applied without a
             // restart: every outcome refreshes them.
-            let names = actor_names(&state.root.system.snapshot());
+            let snap = state.root.system.snapshot();
+            let names = actor_names(&snap);
+            let disabled = snap.disabled_actors();
             let mut actors = state.actors.write().await;
             rename_actors(&mut actors, &names);
             if !started.is_empty() || !stopped.is_empty() || !restarted.is_empty() {
@@ -1013,17 +1046,21 @@ async fn apply_bus_event(
                         entry.restart(now);
                     }
                 }
-                // Remove stopped actors
+                // Remove stopped actors; one turned off stays, Disabled
+                // (below).
                 for id in stopped {
                     actors.remove(id);
                 }
-                drop(actors);
-                // Clean up cached messages for stopped actors
-                for id in stopped {
-                    state.cached_actor_status.write().await.remove(id);
-                    state.cached_device_telemetry.write().await.remove(id);
-                    state.device_identity.write().await.remove(id);
-                }
+            }
+            // A card turned off shows as Disabled, whether or not an
+            // instance of it was running.
+            let turned_off = follow_disabled(&mut actors, &names, &disabled);
+            drop(actors);
+            // Clean up cached messages for stopped actors
+            for id in stopped.iter().chain(&turned_off) {
+                state.cached_actor_status.write().await.remove(id);
+                state.cached_device_telemetry.write().await.remove(id);
+                state.device_identity.write().await.remove(id);
             }
         }
         FlighthookEvent::DeviceTelemetry {
@@ -1097,8 +1134,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::state::GameStateWriter;
     use flighthook::{
-        BallFlight, ClubInfo, DerivedFlight, Distance, MevoSection, RawDir, RawRecord,
-        ShotGrouping, Velocity,
+        BallFlight, ClubInfo, ConnectionState, DerivedFlight, Distance, MevoSection, RawDir,
+        RawRecord, ShotGrouping, Velocity,
     };
 
     /// Removes the directory on drop, so a failing assertion doesn't leak it.
@@ -1585,6 +1622,55 @@ pub(crate) mod tests {
             .unwrap_or_default()
     }
 
+    /// A stored shot keeps the provenance its trigger carried; one whose
+    /// trigger had none is stored without it.
+    #[tokio::test]
+    async fn a_stored_shot_keeps_its_provenance() {
+        let (state, _writer, _dir) = test_state();
+        let mut pending = PendingShots::new();
+        for (n, actor, provenance) in [
+            (1, "square.0", Some(flighthook::Provenance::Measured)),
+            (2, "mock_monitor.0", Some(flighthook::Provenance::Virtual)),
+            (3, "square.0", None),
+        ] {
+            let key = ShotKey {
+                shot_id: format!("uuid-{n}"),
+                shot_number: n,
+            };
+            let mut trigger =
+                FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() })
+                    .actor(actor);
+            trigger.provenance = provenance;
+            apply_bus_event(&state, &trigger, &mut pending).await;
+            for event in [
+                FlighthookEvent::BallFlight {
+                    key: key.clone(),
+                    ball: Box::new(ball()),
+                    derived: None,
+                },
+                FlighthookEvent::ShotFinished { key, raw: None },
+            ] {
+                let msg = FlighthookMessage::new(event).actor(actor);
+                apply_bus_event(&state, &msg, &mut pending).await;
+            }
+        }
+        let stored: Vec<_> = state
+            .shots
+            .read()
+            .await
+            .iter()
+            .map(|s| (s.key.shot_number, s.data.provenance))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                (1, Some(flighthook::Provenance::Measured)),
+                (2, Some(flighthook::Provenance::Virtual)),
+                (3, None),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn shot_video_stamps_every_listed_shot_pending_or_stored() {
         let (state, _writer, _dir) = test_state();
@@ -1818,6 +1904,7 @@ pub(crate) mod tests {
                 "0".into(),
                 MevoSection {
                     name: "Range Mevo".into(),
+                    enabled: true,
                     address: Some("10.0.0.7:5100".into()),
                     ball_type: Some(1),
                     tee_height: None,
@@ -2597,6 +2684,87 @@ pub(crate) mod tests {
         assert!(!events[0].1.open, "the 7-iron set closes");
         assert_eq!(events[1].1.club, Some(Club::Driver));
         assert!(events[1].1.manual && events[1].1.open);
+    }
+
+    /// A card turned off shows Disabled, with nothing held and never red,
+    /// even right after losing its connection; turned on, the new
+    /// instance's statuses take over.
+    #[tokio::test]
+    async fn a_card_turned_off_shows_disabled_and_never_red() {
+        let (state, _writer, _dir) = test_state();
+        let id = "mock_monitor.0";
+        let set = |enabled: bool| {
+            state.root.system.update(|c| {
+                c.mock_monitor.insert(
+                    "0".into(),
+                    flighthook::MockMonitorSection {
+                        name: "Mock".into(),
+                        enabled,
+                        impact_lead_s: None,
+                    },
+                );
+            });
+        };
+        let outcome = |stopped: &[&str], started: &[&str]| FlighthookEvent::ConfigOutcome {
+            request_id: None,
+            restarted: Vec::new(),
+            stopped: stopped.iter().map(|s| (*s).to_owned()).collect(),
+            started: started.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        let shown = |state: &WebState| {
+            let names = actor_names(&state.root.system.snapshot());
+            let actors = state.actors.try_read().expect("not locked");
+            actor_statuses(&actors, &names, state.now_ms())
+        };
+        set(true);
+        let mut up = Updater::new(&state);
+        up.send("system", outcome(&[], &[id])).await;
+        for status in [
+            ActorStatus::Starting,
+            ActorStatus::Connected,
+            ActorStatus::Reconnecting,
+        ] {
+            up.status(id, status).await;
+        }
+        assert!(shown(&state)[id].red_for_ms > 0, "red after the drop");
+
+        set(false);
+        up.send("system", outcome(&[id], &[])).await;
+        let off = &shown(&state)[id];
+        assert_eq!(off.state, ConnectionState::Disabled);
+        assert_eq!(off.red_for_ms, 0);
+        assert_eq!(off.name, "Mock");
+        assert!(off.telemetry.is_empty());
+        assert!(!state.cached_actor_status.read().await.contains_key(id));
+
+        set(true);
+        up.status(id, ActorStatus::Starting).await;
+        up.send("system", outcome(&[], &[id])).await;
+        assert_eq!(shown(&state)[id].state, ConnectionState::Connecting);
+    }
+
+    /// The web server starts with the cards that are off already Disabled.
+    #[test]
+    fn cards_off_at_startup_are_disabled() {
+        let mut names = HashMap::new();
+        names.insert("mock_monitor.0".to_owned(), "Mock".to_owned());
+        names.insert("mevo.0".to_owned(), "Mevo".to_owned());
+        let mut actors: HashMap<String, ActorStatusResponse> = names
+            .iter()
+            .map(|(id, name)| (id.clone(), new_actor(name.clone())))
+            .collect();
+        let off = follow_disabled(&mut actors, &names, &["mock_monitor.0".to_owned()]);
+        assert_eq!(off, ["mock_monitor.0"]);
+        assert!(actors["mock_monitor.0"].is_disabled());
+        assert!(!actors["mevo.0"].is_disabled());
+        // Nothing changes when called again.
+        assert!(follow_disabled(&mut actors, &names, &["mock_monitor.0".to_owned()]).is_empty());
+        // On again, before any new instance spoke: a new actor.
+        assert!(follow_disabled(&mut actors, &names, &[]).is_empty());
+        assert_eq!(
+            actors["mock_monitor.0"].state(),
+            ConnectionState::Connecting
+        );
     }
 
     #[tokio::test]

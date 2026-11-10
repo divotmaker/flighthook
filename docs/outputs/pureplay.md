@@ -1,12 +1,27 @@
-# Pureplay (beta)
+# Pureplay
 
 flighthook sends shots to [Pureplay](https://github.com/PureplayGolf/Pureplay-Connect)
-over **Pureplay Connect**, Pureplay's open launch monitor protocol. Pureplay
-listens on TCP port 9760 and flighthook connects to it, so to Pureplay
-flighthook is the launch monitor. Any launch monitor flighthook supports can
-then play in Pureplay.
+in one of two ways, each an entry in the Devices tab's Outputs **+** menu:
 
-This output is **beta**: it follows the published protocol (version 1) and
+- **Pureplay (Open Connect)**: Pureplay also accepts GSPro Open Connect on
+  TCP port 921, the same port as GSPro. This entry adds the same card as
+  GSPro (Open Connect): an Open Connect card at `127.0.0.1:921`, which sends
+  to whichever simulator listens on that port. If that card exists, the entry
+  adds a second one that starts off (only one card per address can be on);
+  the card you have already reaches Pureplay. Use it for regular play. It
+  has no tournament mode.
+- **Pureplay (Pureplay Connect)** (alpha): Pureplay's own open launch monitor
+  protocol, described on the rest of this page. Tournament mode needs it: a
+  round whose score is recorded asks for strict mode, which only this output
+  provides (see [Tournament (strict) mode](#tournament-strict-mode)).
+
+## Pureplay Connect (alpha)
+
+Pureplay listens for Pureplay Connect on TCP port 9760 and flighthook
+connects to it, so to Pureplay flighthook is the launch monitor. Any launch
+monitor flighthook supports can then play in Pureplay.
+
+This output is **alpha**: it follows the published protocol (version 1) and
 is tested against a protocol-level mock of Pureplay, not yet against
 Pureplay itself.
 
@@ -14,10 +29,11 @@ Pureplay itself.
 
 1. Start Pureplay.
 2. In flighthook's Devices tab, open the **+** after Outputs and pick
-   **Pureplay**. The card starts with Pureplay's default address,
-   `127.0.0.1:9760` (Pureplay on the same computer). Change the address if
-   Pureplay runs on another computer, pick the launch monitor for each mode
-   if you have more than one (see [Routing](#routing)), and **Save**.
+   **Pureplay (Pureplay Connect)**. The card, named Pureplay Connect, starts
+   with Pureplay's default address, `127.0.0.1:9760` (Pureplay on the same
+   computer). Change the address if Pureplay runs on another computer, pick
+   the launch monitor for each mode if you have more than one (see
+   [Routing](#routing)), and **Save**.
 3. The card turns green (**CONNECTED**) once Pureplay has answered
    flighthook's handshake. If Pureplay is not running yet the card stays
    yellow and flighthook keeps trying every few seconds.
@@ -26,7 +42,7 @@ In the config file:
 
 ```toml
 [pureplay.0]
-name = "Pureplay"
+name = "Pureplay Connect"
 address = "127.0.0.1:9760"
 # full_monitor = "mevo.0"       # optional: route full-swing shots from one monitor
 # chipping_monitor = "mevo.0"   # optional: route chipping shots
@@ -97,9 +113,9 @@ also the same for both hands, so nothing changes with the player's hand.
   flighthook follows, exactly as with a connected simulator: the club and
   hand in flighthook's header follow Pureplay and can't be changed there
   while Pureplay is connected, and the club picks the detection mode as
-  usual (Chipping and Putting clubs). The Pureplay card shows the club and
-  hand it set. A club number this version of the protocol does not define is
-  ignored.
+  usual (Chipping and Putting clubs). The Pureplay Connect card shows the
+  club and hand it set. A club number this version of the protocol does not
+  define is ignored.
 - **Arm / disarm, ball type and distance to the target**: received and
   logged. flighthook does not change the launch monitor's settings for them.
 - **Strict mode** (an event or tournament round): see
@@ -110,51 +126,57 @@ also the same for both hands, so nothing changes with the player's hand.
 When Pureplay starts a round whose score is recorded (an event or a
 tournament), it asks flighthook for strict mode. While strict mode is on,
 flighthook sends Pureplay **only values a physical launch monitor measured
-for that shot**. Anything virtual, relayed from another app, estimated,
-computed, filled in or calibrated is either left out (sent as not
-measured) or, when a whole launch monitor cannot meet that, strict mode is
-refused. Strict mode is beta.
+for that shot**. Anything virtual, or estimated or computed with a model,
+is either left out (sent as not measured) or, when a whole launch monitor
+cannot meet that, strict mode is refused. A plain translation of a
+reading counts as measured: the other spin pair worked out from the one a
+device reports, a unit or sign conversion, a calibration offset. Strict
+mode is alpha.
 
-Every launch monitor flighthook supports falls into one of three classes:
+Every launch monitor flighthook supports falls into one of two classes:
 
 | Class | Launch monitors | In strict mode |
 |---|---|---|
-| Measured | FlightScope Mevo, Mevo+ and Xi; Square Golf Omni; Garmin R10; ExPutt RG | allowed |
+| Measured | FlightScope Mevo, Mevo+ and Xi; Square Golf Omni; Garmin R10; ExPutt RG; the Open Connect input (shots a launch monitor's own app sends to flighthook) | allowed |
 | Virtual | the mock launch monitor; Auto-chip | not allowed |
-| Relayed | the OpenConnect input (shots another app sends to flighthook) | not allowed |
 
 - **Accepting a round**: flighthook accepts strict mode only when every
   launch monitor this output takes shots from is a measured one: the
   monitor picked for each detection mode, or with "Any" every configured
-  launch monitor. Otherwise it refuses and tells Pureplay why, naming the
+  launch monitor. A launch monitor turned off with its card's switch
+  doesn't count. Otherwise it refuses and tells Pureplay why, naming the
   device (for example "Mock is a virtual launch monitor"); Pureplay then
   closes the connection, and flighthook shows the reason as a warning. With
   no launch monitor at all, strict mode is accepted: nothing could be sent.
-  To play a round, route only measured monitors to the Pureplay card (or
-  remove the others).
+  To play a round, route only measured monitors to the Pureplay Connect
+  card (or turn the others off).
 - **During a round**: shots from a launch monitor that is not a measured
   one (for example one that connects after the round started, under "Any")
-  are not sent. Measured monitors keep working.
+  are not sent, and the ready state Pureplay sees comes from the measured
+  monitors only. Measured monitors keep working.
 - **Values left out** (sent as not measured, so Pureplay fills them in or
   goes without):
   - spin flighthook estimated for a FlightScope chip that came back without
-    spin;
-  - the Garmin R10's back and side spin, which are worked out from the total
-    spin and spin axis it measures (total spin and spin axis are sent);
-  - the Xi's back and side spin when its **Spin source (Xi)** setting
-    combines the E8 total with an axis (set it to D4 for rounds to keep
-    spin);
-  - the ExPutt's launch angle, which the device does not measure (flighthook
-    uses 0);
-  - the Square Golf Omni's vertical face impact, which includes the
-    per-club offset from the club sticker to the face center (horizontal
-    impact is sent).
+    spin.
 
-  Smash factor goes out only when the launch monitor measured it, and
-  flighthook's simulated values are never sent, in or out of strict mode.
+  A value a launch monitor does not measure is never sent, in or out of
+  strict mode: the ExPutt's launch angle, and the spin axis and back and
+  side spin of an Xi shot whose **Spin source (Xi)** uses E8 on a shot with
+  no club data (the E8 total spin is sent alone). Kept, because they are
+  the device's readings: all four of the Garmin R10's spin values, the
+  Square Golf Omni's vertical face impact with its per-club offset, the
+  Xi's E8 total split by D4's axis, and both spin pairs from the
+  Open Connect input. Smash factor goes out only when the launch monitor
+  measured it, and flighthook's simulated values are never sent, in or out
+  of strict mode.
 - **Auto-chip is off** while Pureplay has a round in progress: it does not
-  fire, and the header's Auto-chip control is shown disabled. It returns to
-  your setting when the round ends or the connection to Pureplay drops.
+  fire, and the header's Auto-chip control is shown disabled. The mock
+  launch monitor makes no shots either. Both return when the round ends or
+  the connection to Pureplay drops.
+- **The Tournament banner**: while a round is in progress, a slim
+  **Tournament** banner shows under the header, so it is clear why some
+  things are disabled. Hovering it names the output holding the round and
+  says what it means. It goes when the round ends or the connection drops.
 - The card's `strict_mode` shows whether a round is in progress. Every new
   connection starts with strict mode off; Pureplay turns it on again when a
   round is still running.
@@ -162,11 +184,12 @@ Every launch monitor flighthook supports falls into one of three classes:
 ## Routing
 
 The Full Monitor, Chipping Monitor and Putting Monitor fields work as on an
-OpenConnect Client card: each picks the launch monitor whose shots go to
+Open Connect Client card: each picks the launch monitor whose shots go to
 Pureplay in that detection mode, and "Any" accepts every monitor. The
 monitor picked for the current mode is also the one whose ready state,
 connection and battery Pureplay sees. With "Any", Pureplay sees the best
-state among all launch monitors (ready if any is ready).
+state among all launch monitors (ready if any is ready); during a
+tournament round, among the measured ones only.
 
 ## The card
 

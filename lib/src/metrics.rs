@@ -114,6 +114,30 @@ fn spin(ball: &BallFlight) -> (Option<i32>, Option<f64>) {
     (spin.total_spin_rpm, finite(spin.spin_axis))
 }
 
+/// The ball's back and side spin, for a consumer that reads the spin as
+/// components: the ones the device reported, else its total split by its
+/// spin axis. A total with no axis is all backspin and gives no sidespin;
+/// a consumer that needs one fills its own default.
+#[must_use]
+pub fn spin_components(ball: &BallFlight) -> (Option<i32>, Option<i32>) {
+    if ball.backspin_rpm.is_some() || ball.sidespin_rpm.is_some() {
+        return (ball.backspin_rpm, ball.sidespin_rpm);
+    }
+    let Some(total) = ball.total_spin_rpm else {
+        return (None, None);
+    };
+    let Some(axis) = finite(ball.spin_axis) else {
+        return (Some(total), None);
+    };
+    let mut spin = BallFlight {
+        total_spin_rpm: Some(total),
+        spin_axis: Some(axis),
+        ..BallFlight::default()
+    };
+    spin.complete_spin();
+    (spin.backspin_rpm, spin.sidespin_rpm)
+}
+
 /// `face_angle − path`.
 fn face_to_path(club: &ClubData) -> Option<f64> {
     Some(finite(club.face_angle)? - finite(club.path)?)
@@ -182,6 +206,27 @@ mod tests {
         // A total alone still counts as reported: no second total is made up.
         ball.spin_axis = None;
         assert!(ShotMetrics::compute(Some(&ball), None).is_none());
+    }
+
+    /// The device's components as they are; else the total split by its
+    /// axis; a total with no axis is all backspin with no sidespin.
+    #[test]
+    fn spin_components_read_either_pair() {
+        let ball = components(Some(3200), Some(-450));
+        assert_eq!(spin_components(&ball), (Some(3200), Some(-450)));
+        let total = |total, axis| BallFlight {
+            total_spin_rpm: total,
+            spin_axis: axis,
+            ..BallFlight::default()
+        };
+        let (back, side) = spin_components(&total(Some(3231), Some(-8.0)));
+        assert_eq!((back, side), (Some(3200), Some(-450)));
+        assert_eq!(
+            spin_components(&total(Some(6897), None)),
+            (Some(6897), None)
+        );
+        assert_eq!(spin_components(&total(None, Some(3.0))), (None, None));
+        assert_eq!(spin_components(&BallFlight::default()), (None, None));
     }
 
     #[test]

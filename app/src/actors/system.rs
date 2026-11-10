@@ -272,6 +272,7 @@ fn finish(
     plan: Plan,
 ) {
     let mut resolved = resolve_actors(&state.system.snapshot(), state.game.snapshot().mode);
+    let configured: Vec<String> = resolved.iter().map(|ra| ra.id.clone()).collect();
     let mut restarted = Vec::new();
     let mut stopped = plan.stopped;
     let mut started = Vec::new();
@@ -282,7 +283,11 @@ fn finish(
         };
         state.end_settling(&id);
         if then == Then::Remove {
-            tracing::info!("config reload: stopped removed actor '{id}'");
+            if state.system.snapshot().actor_enabled(&id) {
+                tracing::info!("config reload: stopped removed actor '{id}'");
+            } else {
+                tracing::info!("config reload: stopped '{id}', turned off");
+            }
             stopped.push(id.clone());
         }
         // Removed meanwhile: it stays stopped.
@@ -311,6 +316,10 @@ fn finish(
                 }
             }
         }
+    }
+    // A removed shot source feeds no output.
+    for id in stopped.iter().filter(|id| !configured.contains(id)) {
+        state.round.forget_source(id);
     }
     sender.send(FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
         request_id: plan.request_id,
@@ -507,7 +516,7 @@ pub(crate) fn reconnect_target(
 
 /// What a reconnect of `id` would start, or why it cannot run now: not a
 /// launch monitor or output, its old connection still closing, a command
-/// already restarting it, or its settings cannot start it.
+/// already restarting it, turned off, or its settings cannot start it.
 fn reconnect_check(state: &SystemState, id: &str) -> Result<ResolvedActor, String> {
     let config = state.system.snapshot();
     let id = reconnect_target(&config, id).map_err(|r| r.message().to_owned())?;
@@ -516,6 +525,9 @@ fn reconnect_check(state: &SystemState, id: &str) -> Result<ResolvedActor, Strin
     }
     if state.is_settling(&id) {
         return Err(format!("'{id}' is already restarting"));
+    }
+    if !config.actor_enabled(&id) {
+        return Err(format!("'{id}' is off"));
     }
     resolve_actors(&config, state.game.snapshot().mode)
         .into_iter()
@@ -784,6 +796,7 @@ fn apply_config_command(
 
     // Determine scope for actor reconciliation
     let scope: Option<String>;
+    let before = state.system.snapshot();
 
     match action.as_ref() {
         ConfigAction::ReplaceAll { config } => {
@@ -992,11 +1005,32 @@ fn apply_config_command(
         }
     }
 
+    turn_off_clashing(state, &before);
     follow_clip_dir(state, sender, &clip_dir);
 
     // Reconcile actors (webserver included — its reconfigure() handles bind changes)
     let plan = apply_config_reload(state, bus_tx, request_id.clone(), scope.as_deref());
     waits.run(state, bus_tx, sender, plan);
+}
+
+/// After a save over `before`: turn off, and save as off, every enabled card
+/// whose address another enabled card of its type holds. A card whose
+/// address or switch the save changed loses to the cards it did not touch,
+/// so editing a card onto a held address turns that card off.
+fn turn_off_clashing(state: &SystemState, before: &FlighthookConfig) {
+    let mut config = state.system.snapshot();
+    let clashes = config.demote_clashing(Some(before));
+    for clash in &clashes {
+        tracing::warn!(
+            "'{}' is off: {} ('{}' holds it)",
+            clash.id,
+            clash.message(),
+            clash.holder
+        );
+    }
+    if !clashes.is_empty() {
+        state.system.replace(config);
+    }
 }
 
 /// Apply config command `event` as the system actor does and wait for it
@@ -1266,6 +1300,7 @@ mod tests {
                 "0".into(),
                 flighthook::MockMonitorSection {
                     name: "Mock".into(),
+                    enabled: true,
                     impact_lead_s: None,
                 },
             );
@@ -1318,6 +1353,7 @@ mod tests {
         // An address no actor can start on, so the reconcile starts nothing.
         let live_client = flighthook::OpenConnectClientSection {
             name: "Saved elsewhere".into(),
+            enabled: true,
             address: Some("not an address".into()),
             full_monitor: None,
             chipping_monitor: None,
@@ -1598,6 +1634,7 @@ mod tests {
                 "0".into(),
                 flighthook::MockMonitorSection {
                     name: "Mock".into(),
+                    enabled: true,
                     impact_lead_s: None,
                 },
             );
@@ -1659,6 +1696,7 @@ mod tests {
     fn mock(name: &str) -> flighthook::MockMonitorSection {
         flighthook::MockMonitorSection {
             name: name.into(),
+            enabled: true,
             impact_lead_s: None,
         }
     }
@@ -1758,6 +1796,7 @@ mod tests {
                 "0".into(),
                 flighthook::RandomClubSection {
                     name: "Random club".into(),
+                    enabled: true,
                 },
             );
         });
@@ -1965,6 +2004,7 @@ mod tests {
                 "0".into(),
                 flighthook::OpenConnectServerSection {
                     name: "Uneekor".into(),
+                    enabled: true,
                     bind: Some("127.0.0.1:0".into()),
                     impact_lead_s: None,
                 },
@@ -2279,6 +2319,12 @@ mod tests {
             with_stubborn(&[("0", stubborn(400, false)), ("1", stubborn(400, true))]);
         let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
         for n in ["0", "1"] {
+            state.round.register_source(
+                &format!("mock_monitor.{n}"),
+                crate::actors::provenance::ShotSource::MockMonitor,
+            );
+        }
+        for n in ["0", "1"] {
             run_config_command(
                 &FlighthookEvent::ConfigCommand {
                     request_id: Some(format!("remove-{n}")),
@@ -2295,6 +2341,9 @@ mod tests {
         assert_eq!(outcome_of(&seen, "remove-0").1, ["mock_monitor.0"]);
         assert_eq!(outcome_of(&seen, "remove-1").1, ["mock_monitor.1"]);
         assert!(state.actor_ids().is_empty(), "both unregistered");
+        for id in ["mock_monitor.0", "mock_monitor.1"] {
+            assert_eq!(state.round.source(id), None, "{id} is not a source");
+        }
         assert!(
             state.is_closing("mock_monitor.0"),
             "the one holding its device"
@@ -2316,6 +2365,212 @@ mod tests {
                 .any(|m| matches!(m.event, FlighthookEvent::ConfigOutcome { .. })),
             "no restart"
         );
+    }
+
+    /// Upsert `mock_monitor.N` named `name`, on or off, through the command
+    /// handler as `request_id`. Returns what it emitted.
+    fn switch_mock(
+        state: &Arc<SystemState>,
+        bus_tx: &broadcast::Sender<FlighthookMessage>,
+        rx: &mut broadcast::Receiver<FlighthookMessage>,
+        n: &str,
+        enabled: bool,
+        request_id: &str,
+    ) -> Vec<FlighthookMessage> {
+        let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
+        run_config_command(
+            &FlighthookEvent::ConfigCommand {
+                request_id: Some(request_id.into()),
+                action: Box::new(ConfigAction::UpsertMockMonitor {
+                    index: n.into(),
+                    section: flighthook::MockMonitorSection {
+                        enabled,
+                        ..mock("Mock")
+                    },
+                }),
+            },
+            state,
+            bus_tx,
+            &sender,
+        );
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Turning a card off stops its actor as a removal does, keeping its
+    /// section; turning it on starts it like a new card. The other actors
+    /// are left alone, and a card that is off cannot be reconnected.
+    #[test]
+    fn turning_a_card_off_stops_it_and_on_starts_it_again() {
+        let (_dir, state, bus_tx, mut rx) = running(|c| {
+            c.mock_monitor.insert("0".into(), mock("Mock"));
+            c.mock_monitor.insert("1".into(), mock("Other"));
+        });
+        let id = "mock_monitor.0";
+        let other = state.actor_thread("mock_monitor.1");
+        assert!(state.actor_thread(id).is_some());
+
+        let seen = switch_mock(&state, &bus_tx, &mut rx, "0", false, "off");
+        let (restarted, stopped, started) = outcome_of(&seen, "off");
+        assert!(restarted.is_empty() && started.is_empty());
+        assert_eq!(stopped, [id]);
+        assert!(!state.actor_ids().iter().any(|a| a == id), "not running");
+        assert!(!state.is_closing(id));
+        let config = state.system.snapshot();
+        assert!(!config.mock_monitor["0"].enabled, "the section stays, off");
+        assert_eq!(config.disabled_actors(), [id]);
+        assert_eq!(state.actor_thread("mock_monitor.1"), other, "left alone");
+
+        // Off: a reconnect starts nothing and says why.
+        let (restarted, _) = reconnect_through_command(&state, &bus_tx, &mut rx, id);
+        assert!(restarted.is_empty());
+        assert_eq!(not_reconnected(&state, id), format!("'{id}' is off"));
+        assert!(!state.actor_ids().iter().any(|a| a == id));
+        // A save of its other settings while off starts nothing either.
+        let seen = switch_mock(&state, &bus_tx, &mut rx, "0", false, "rename");
+        let (restarted, stopped, started) = outcome_of(&seen, "rename");
+        assert!(restarted.is_empty() && stopped.is_empty() && started.is_empty());
+
+        let seen = switch_mock(&state, &bus_tx, &mut rx, "0", true, "on");
+        let (restarted, stopped, started) = outcome_of(&seen, "on");
+        assert!(restarted.is_empty() && stopped.is_empty());
+        assert_eq!(started, [id]);
+        assert!(state.actor_thread(id).is_some(), "running again");
+        until(&mut rx, "a status from the new instance", |m| {
+            m.actor == id && matches!(m.event, FlighthookEvent::ActorStatus { .. })
+        });
+        assert!(state.system.snapshot().disabled_actors().is_empty());
+        assert_eq!(state.actor_thread("mock_monitor.1"), other);
+        stop_all(&state);
+    }
+
+    /// A card that is off is not started with the others.
+    #[test]
+    fn a_card_that_is_off_is_not_started() {
+        let (_dir, state, _bus_tx, _rx) = running(|c| {
+            c.mock_monitor.insert(
+                "0".into(),
+                flighthook::MockMonitorSection {
+                    enabled: false,
+                    ..mock("Mock")
+                },
+            );
+            c.mock_monitor.insert("1".into(), mock("Other"));
+        });
+        assert_eq!(state.actor_ids(), ["mock_monitor.1"]);
+        stop_all(&state);
+    }
+
+    fn open_connect(address: &str, enabled: bool) -> flighthook::OpenConnectClientSection {
+        flighthook::OpenConnectClientSection {
+            name: "Open Connect".into(),
+            enabled,
+            address: Some(address.into()),
+            full_monitor: None,
+            chipping_monitor: None,
+            putting_monitor: None,
+        }
+    }
+
+    fn upsert_open_connect(
+        state: &Arc<SystemState>,
+        bus_tx: &broadcast::Sender<FlighthookMessage>,
+        rx: &mut broadcast::Receiver<FlighthookMessage>,
+        n: &str,
+        section: flighthook::OpenConnectClientSection,
+        request_id: &str,
+    ) -> Vec<FlighthookMessage> {
+        let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
+        run_config_command(
+            &FlighthookEvent::ConfigCommand {
+                request_id: Some(request_id.into()),
+                action: Box::new(ConfigAction::UpsertOpenConnectClient {
+                    index: n.into(),
+                    section,
+                }),
+            },
+            state,
+            bus_tx,
+            &sender,
+        );
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Editing a card that is on onto an address another enabled card of its
+    /// type has saves the edit and turns that card off (written
+    /// `enabled = false`, its actor stopped); the other card keeps running.
+    /// Moving to a free address leaves it on.
+    #[test]
+    fn editing_a_card_onto_a_held_address_saves_it_off() {
+        let (dir, state, bus_tx, mut rx) = running(|c| {
+            c.openconnect_client
+                .insert("0".into(), open_connect("127.0.0.1:1", true));
+            c.openconnect_client
+                .insert("1".into(), open_connect("127.0.0.1:2", true));
+        });
+        let other = state.actor_thread("openconnect_client.0");
+        assert!(other.is_some() && state.actor_thread("openconnect_client.1").is_some());
+
+        // A free address: still on, restarted for the new address.
+        let seen = upsert_open_connect(
+            &state,
+            &bus_tx,
+            &mut rx,
+            "1",
+            open_connect("127.0.0.1:3", true),
+            "free",
+        );
+        let (restarted, stopped, _) = outcome_of(&seen, "free");
+        assert_eq!(restarted, ["openconnect_client.1"]);
+        assert!(stopped.is_empty());
+        assert!(state.system.snapshot().openconnect_client["1"].enabled);
+
+        // The first card's address, spelled another way: saved, and off.
+        let seen = upsert_open_connect(
+            &state,
+            &bus_tx,
+            &mut rx,
+            "1",
+            open_connect("localhost:1", true),
+            "held",
+        );
+        let (restarted, stopped, started) = outcome_of(&seen, "held");
+        assert!(restarted.is_empty() && started.is_empty());
+        assert_eq!(stopped, ["openconnect_client.1"]);
+        let config = state.system.snapshot();
+        assert!(!config.openconnect_client["1"].enabled);
+        assert_eq!(
+            config.openconnect_client["1"].address.as_deref(),
+            Some("localhost:1"),
+            "the edit is kept"
+        );
+        assert!(config.openconnect_client["0"].enabled);
+        assert_eq!(config.disabled_actors(), ["openconnect_client.1"]);
+        assert_eq!(state.actor_thread("openconnect_client.0"), other);
+        assert!(state.actor_thread("openconnect_client.1").is_none());
+        let written = std::fs::read_to_string(dir.0.join("config.toml")).expect("config file");
+        assert_eq!(written.matches("enabled = false").count(), 1, "{written}");
+        stop_all(&state);
+    }
+
+    /// Turning off an actor still holding its device follows the removal
+    /// rules: it is retired, and nothing starts once it has ended.
+    #[test]
+    fn turning_off_an_actor_holding_its_device_starts_nothing_when_it_ends() {
+        let (_dir, state, bus_tx, mut rx) = with_stubborn(&[("0", stubborn(400, false))]);
+        let id = "mock_monitor.0";
+        let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
+        let seen = switch_mock(&state, &bus_tx, &mut rx, "0", false, "off");
+        assert_eq!(outcome_of(&seen, "off").1, [id]);
+        assert!(state.actor_ids().is_empty(), "unregistered");
+        assert!(state.is_closing(id), "the one holding its device");
+        wait_until("closed", || {
+            restart_closed(&state, &bus_tx, &sender);
+            !state.is_closing(id)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(state.actor_ids().is_empty(), "off: not started again");
+        let seen: Vec<FlighthookMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(!late(&seen), "it does not speak after being turned off");
     }
 
     /// A full save stops what it restarts together: the stop waits
@@ -2655,6 +2910,7 @@ mod tests {
         assert!(restarted.is_empty() && stopped.is_empty() && started.is_empty());
         assert!(state.actor_ids().iter().all(|a| a != id));
         assert!(!statuses(&seen, id).contains(&ActorStatus::Starting));
+        assert_eq!(state.round.source(id), None, "not a shot source");
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         stop_all(&state);
     }
@@ -2752,6 +3008,7 @@ mod tests {
                 "0".into(),
                 flighthook::OpenConnectServerSection {
                     name: "Uneekor".into(),
+                    enabled: true,
                     bind: Some(bind.to_string()),
                     impact_lead_s: None,
                 },
@@ -2783,6 +3040,7 @@ mod tests {
                 "0".into(),
                 flighthook::OpenConnectServerSection {
                     name: "Uneekor".into(),
+                    enabled: true,
                     bind: Some(bind.to_string()),
                     impact_lead_s: None,
                 },
@@ -2868,6 +3126,7 @@ mod tests {
                 "0".into(),
                 flighthook::OpenConnectServerSection {
                     name: "Uneekor".into(),
+                    enabled: true,
                     bind: Some(bind.to_string()),
                     impact_lead_s: None,
                 },
@@ -2963,6 +3222,7 @@ mod tests {
                 "0".into(),
                 flighthook::RandomClubSection {
                     name: "Random club".into(),
+                    enabled: true,
                 },
             );
         });

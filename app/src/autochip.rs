@@ -26,11 +26,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::broadcast;
 use tracing::info;
 
+use crate::actors::provenance::ShotSource;
 use crate::sim;
 use crate::state::SystemState;
 
-/// Why Auto-chip does not fire during a strict-mode round.
-pub(crate) const STRICT_ROUND: &str = "Auto-chip is off during a Pureplay strict-mode round";
+/// Why Auto-chip does not fire during a tournament round.
+pub(crate) const ROUND_ACTIVE: &str = "Auto-chip is off during a Pureplay strict-mode round";
 
 /// Launch angle of every Auto-chip, degrees.
 pub(crate) const LAUNCH_ELEVATION_DEG: f64 = 28.0;
@@ -45,13 +46,13 @@ const MAX_SPEED_MPH: f64 = 60.0;
 /// The solver stops once the speed bracket is this narrow, mph.
 const SPEED_TOLERANCE_MPH: f64 = 1e-4;
 
-/// Why no chip could be sent: Auto-chip is off for a strict-mode round, or
+/// Why no chip could be sent: Auto-chip is off for a tournament round, or
 /// no speed could be solved for the distance.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SolveError {
-    /// A Pureplay link is in strict mode (a recorded round), which takes
-    /// measured shots only ([`SystemState::strict_rounds`]).
-    StrictRound,
+    /// A tournament round is active, which takes measured shots only: the
+    /// round policy turns virtual producers off ([`SystemState::round`]).
+    RoundActive,
     /// The `[simulation]` environment is invalid (the reason).
     Environment(String),
     /// The target is not positive and finite.
@@ -63,7 +64,7 @@ pub(crate) enum SolveError {
 impl std::fmt::Display for SolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::StrictRound => write!(f, "{STRICT_ROUND}"),
+            Self::RoundActive => write!(f, "{ROUND_ACTIVE}"),
             Self::Environment(e) => write!(f, "simulation environment invalid: {e}"),
             Self::Distance => write!(f, "distance must be positive"),
             Self::Unreachable => write!(f, "no ball speed gives that distance"),
@@ -147,33 +148,49 @@ pub(crate) fn solve_speed(yards: f64, cfg: &SimulationSection) -> Result<f64, So
 /// settings, as the next shot of [`AUTO_CHIP_ACTOR`]: `shots` counts the
 /// Auto-chip shots sent, and is advanced only once the solve has succeeded,
 /// so a chip that is not sent takes no number. Blocks for the solve (some
-/// tens of simulations). Returns the shot's key and ball. Sends nothing
-/// while a Pureplay link is in strict mode.
+/// tens of simulations). Returns the shot's key and ball. Auto-chip is a
+/// virtual producer: it registers as one and sends nothing while a round is
+/// active. It asks before the solve, and takes the number and sends the
+/// trigger in one step with the policy after it
+/// ([`RoundPolicy::send_if_allowed`](crate::state::round::RoundPolicy::send_if_allowed)),
+/// so a round that begins during the solve stops the chip.
 pub(crate) fn send(
     state: &SystemState,
     bus: &broadcast::Sender<FlighthookMessage>,
     yards: u32,
     shots: &AtomicU32,
 ) -> Result<(ShotKey, BallFlight), SolveError> {
-    if state.strict_rounds.any() {
-        return Err(SolveError::StrictRound);
+    let source = ShotSource::AutoChip;
+    state.round.register_source(AUTO_CHIP_ACTOR, source);
+    if !state.round.allows(source.provenance()) {
+        return Err(SolveError::RoundActive);
     }
     let cfg = state.system.simulation();
     let speed = solve_speed(f64::from(yards), &cfg)?;
-    let shot_number = shots.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    let key = ShotKey {
-        shot_id: uuid::Uuid::new_v4().to_string(),
-        shot_number,
-    };
     let ball = ball(speed);
-    info!(
-        "auto-chip shot #{shot_number}: {yards}yd ball={speed:.2}mph VLA={LAUNCH_ELEVATION_DEG:.1} backspin={}rpm",
-        backspin_rpm(speed),
-    );
+    let key = state
+        .round
+        .send_if_allowed(source.provenance(), || {
+            let shot_number = shots.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            let key = ShotKey {
+                shot_id: uuid::Uuid::new_v4().to_string(),
+                shot_number,
+            };
+            info!(
+                "auto-chip shot #{shot_number}: {yards}yd ball={speed:.2}mph VLA={LAUNCH_ELEVATION_DEG:.1} backspin={}rpm",
+                backspin_rpm(speed),
+            );
+            let _ = bus.send(
+                FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() })
+                    .actor(AUTO_CHIP_ACTOR)
+                    .provenance(source.provenance()),
+            );
+            key
+        })
+        .ok_or(SolveError::RoundActive)?;
     let send = |event| {
         let _ = bus.send(FlighthookMessage::new(event).actor(AUTO_CHIP_ACTOR));
     };
-    send(FlighthookEvent::ShotTrigger { key: key.clone() });
     send(sim::simulated_ball_flight_event(
         &cfg,
         key.clone(),
@@ -294,11 +311,22 @@ mod tests {
         assert_eq!(key.shot_number, 7);
 
         let mut events = Vec::new();
+        let mut provenance = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             assert_eq!(msg.actor, AUTO_CHIP_ACTOR);
+            provenance.push(msg.provenance);
             events.push(msg.event);
         }
         assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(
+            provenance,
+            [Some(flighthook::Provenance::Virtual), None, None],
+            "the trigger declares the chip virtual"
+        );
+        assert_eq!(
+            state.round.source(AUTO_CHIP_ACTOR),
+            Some(ShotSource::AutoChip)
+        );
         assert!(matches!(&events[0], FlighthookEvent::ShotTrigger { key: k } if *k == key));
         let FlighthookEvent::BallFlight {
             key: k,

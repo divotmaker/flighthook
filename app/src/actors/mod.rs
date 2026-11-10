@@ -88,6 +88,13 @@ pub trait Actor: Send + Sync {
     fn reconfigure(&self, _state: &Arc<SystemState>, _sender: &BusSender) -> ReconfigureOutcome {
         ReconfigureOutcome::Applied
     }
+
+    /// The shot source this actor is, `None` for an actor that puts no shots
+    /// on the bus. [`start_actor`] records it in the round policy and has
+    /// the actor's bus sender stamp its provenance on every shot trigger.
+    fn source(&self) -> Option<provenance::ShotSource> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +113,8 @@ pub struct ResolvedActor {
 /// Iterates all config sections (webserver, mevo, mock_monitor,
 /// openconnect_client, pureplay, random_club, ...) and constructs the appropriate
 /// concrete actor for each, webservers first.
-/// Invalid addresses are logged and skipped.
+/// Invalid addresses are logged and skipped, and so is every section that is
+/// off (`enabled = false`): it keeps its card and runs no actor.
 ///
 /// `current_mode` is the active detection mode from game state. Falls back
 /// to `Full` when no mode has been set yet (e.g. first startup).
@@ -240,7 +248,7 @@ pub fn resolve_actors(
         });
     }
 
-    // OpenConnect servers (inbound launch monitors: Uneekor, Foresight, ...)
+    // Open Connect servers (inbound launch monitors: Uneekor, Foresight, ...)
     for (index, section) in &config.openconnect_server {
         let id = global_id("openconnect_server", index);
         let bind_str = section.bind.as_deref().unwrap_or("0.0.0.0:921");
@@ -258,7 +266,7 @@ pub fn resolve_actors(
         }
     }
 
-    // Open Connect clients (GSPro, Muni Golf, ...)
+    // Open Connect clients (GSPro, Pureplay, Muni Golf, ...)
     for (index, section) in &config.openconnect_client {
         let id = global_id("openconnect_client", index);
         let addr_str = section.address.as_deref().unwrap_or("127.0.0.1:921");
@@ -332,6 +340,8 @@ pub fn resolve_actors(
         });
     }
 
+    let disabled = config.disabled_actors();
+    actors.retain(|a| !disabled.contains(&a.id));
     actors
 }
 
@@ -343,7 +353,11 @@ pub fn start_actor(
     bus_tx: &broadcast::Sender<flighthook::FlighthookMessage>,
 ) {
     let shutdown = Arc::new(AtomicBool::new(false));
-    let sender = BusSender::new(id.clone(), bus_tx.clone(), Arc::clone(&shutdown));
+    let mut sender = BusSender::new(id.clone(), bus_tx.clone(), Arc::clone(&shutdown));
+    if let Some(source) = actor.source() {
+        state.round.register_source(&id, source);
+        sender = sender.with_provenance(source.provenance());
+    }
     let muted = sender.muted();
     let receiver = sender.subscribe();
     let thread = actor.start(Arc::clone(state), sender, receiver);
@@ -481,6 +495,86 @@ fn openconnect_names(
 mod tests {
     use super::*;
 
+    /// An actor of source type `source` that triggers one shot on start.
+    struct Shooter(Option<provenance::ShotSource>);
+
+    impl Actor for Shooter {
+        fn start(
+            &self,
+            _state: Arc<SystemState>,
+            sender: BusSender,
+            _receiver: BusReceiver,
+        ) -> JoinHandle<()> {
+            std::thread::spawn(move || {
+                let key = flighthook::ShotKey {
+                    shot_id: "s".into(),
+                    shot_number: 1,
+                };
+                sender.send(flighthook::FlighthookMessage::new(
+                    flighthook::FlighthookEvent::ShotTrigger { key: key.clone() },
+                ));
+                sender.send(flighthook::FlighthookMessage::new(
+                    flighthook::FlighthookEvent::ShotFinished { key, raw: None },
+                ));
+            })
+        }
+
+        fn source(&self) -> Option<provenance::ShotSource> {
+            self.0
+        }
+    }
+
+    /// `start_actor` records the source type an actor declares and stamps
+    /// its class on the actor's shot triggers, and nothing else: whatever
+    /// its ID says. An actor that is not a shot source stamps nothing.
+    #[test]
+    fn a_shot_takes_its_provenance_from_the_type_the_actor_started_as() {
+        use provenance::ShotSource;
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-provenance-test-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, _writer) = SystemState::new(dir.join("config.toml"));
+        let state = Arc::new(state);
+        let (tx, mut rx) = broadcast::channel(64);
+        let started = ShotSource::ALL
+            .into_iter()
+            .map(Some)
+            .chain([None])
+            .enumerate()
+            .map(|(i, source)| {
+                // IDs that say nothing about the type.
+                let id = format!("device.{i}");
+                start_actor(id.clone(), Box::new(Shooter(source)), &state, &tx);
+                (id, source)
+            })
+            .collect::<Vec<_>>();
+        for (id, source) in &started {
+            assert_eq!(state.round.source(id), *source, "{id}");
+        }
+        let mut triggers = HashMap::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while triggers.len() < started.len() {
+            assert!(std::time::Instant::now() < deadline, "{triggers:?}");
+            match rx.try_recv() {
+                Ok(msg) => match msg.event {
+                    flighthook::FlighthookEvent::ShotTrigger { .. } => {
+                        triggers.insert(msg.actor, msg.provenance);
+                    }
+                    _ => assert_eq!(msg.provenance, None, "only the trigger"),
+                },
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        for (id, source) in started {
+            assert_eq!(triggers[&id], source.map(ShotSource::provenance), "{id}");
+        }
+        assert_eq!(
+            state.stop_all_and_wait(Duration::from_secs(2)),
+            Vec::<String>::new()
+        );
+    }
+
     #[test]
     fn a_connect_returns_the_stream() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -557,6 +651,7 @@ mod tests {
                 (*index).to_owned(),
                 flighthook::OpenConnectServerSection {
                     name: (*name).to_owned(),
+                    enabled: true,
                     bind: None,
                     impact_lead_s: None,
                 },
@@ -588,10 +683,10 @@ mod tests {
         assert_eq!(names["openconnect_server.10"], "Open Connect 2");
         assert_eq!(names["openconnect_server.3"], "Bay");
         let names = actor_names(&with_openconnect(&[
-            ("0", "OpenConnect Server"),
-            ("1", "OpenConnect Server"),
+            ("0", "Open Connect Server"),
+            ("1", "Open Connect Server"),
         ]));
-        assert_eq!(names["openconnect_server.0"], "OpenConnect Server 1");
-        assert_eq!(names["openconnect_server.1"], "OpenConnect Server 2");
+        assert_eq!(names["openconnect_server.0"], "Open Connect Server 1");
+        assert_eq!(names["openconnect_server.1"], "Open Connect Server 2");
     }
 }

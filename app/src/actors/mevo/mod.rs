@@ -31,8 +31,8 @@ use settings::fusion_cam_config;
 
 use flighthook::{
     ActorStatus, BallFlight, CameraMode, ClubData, Distance, FlighthookEvent, FlighthookMessage,
-    RawDir, RawRecord, Severity, ShotDetectionMode, ShotField, ShotKey, ShotRaw, SpinSource,
-    Velocity, hex_lower,
+    RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw, SpinSource, Velocity,
+    hex_lower,
 };
 
 /// No events for this long → treat as disconnected.
@@ -72,6 +72,11 @@ pub struct MevoActor {
 }
 
 impl Actor for MevoActor {
+    /// A launch monitor flighthook reads directly.
+    fn source(&self) -> Option<crate::actors::provenance::ShotSource> {
+        Some(crate::actors::provenance::ShotSource::Mevo)
+    }
+
     fn start(
         &self,
         state: Arc<SystemState>,
@@ -513,14 +518,11 @@ fn on_shot_datum(
             let held_club = results.accept_d4();
             let mut ball = ball_from_d4(&d4);
             let mut spin_source = "D4";
-            let mut computed: &[ShotField] = &[];
             if model == DeviceModel::Xi {
                 let source = live_spin_source(state, sender.actor_id()).unwrap_or(ctx.spin_source);
                 let (spin, label) = xi_spin(source, mode, &d4, results.e8.as_ref());
-                if let Some((back, side)) = spin {
-                    ball.backspin_rpm = Some(back);
-                    ball.sidespin_rpm = Some(side);
-                    computed = &XI_E8_COMPUTED;
+                if let Some(spin) = spin {
+                    spin.apply(&mut ball);
                 }
                 spin_source = label;
             }
@@ -531,7 +533,7 @@ fn on_shot_datum(
                 spin_source = "estimate";
             }
             info!(
-                "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm spin={spin_source}",
+                "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm total={:.0}rpm spin={spin_source}",
                 key.shot_number,
                 ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
                 ball.launch_elevation.unwrap_or(0.0),
@@ -539,12 +541,12 @@ fn on_shot_datum(
                 ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
                 ball.backspin_rpm.unwrap_or(0),
                 ball.sidespin_rpm.unwrap_or(0),
+                ball.total_spin_rpm.unwrap_or(0),
             );
             let mut event = sim::ball_flight_event_in_mode(state, key.clone(), ball, Some(mode));
             if estimated {
                 mark_spin_estimated(&mut event);
             }
-            sim::mark_computed(&mut event, computed);
             let msg = FlighthookMessage::new(event);
             sender.send(stamp_device(msg, device_id));
             if let Some(club) = held_club {
@@ -1319,7 +1321,7 @@ fn launch_only(d4: &FlightResult) -> bool {
 /// times the ball speed in mph, rounded. `None` (keep the ball's spin) when
 /// `rpm_per_mph` is not above 0 or not a valid `launch_only_spin`
 /// ([`MevoSection::launch_only_spin_valid`](flighthook::MevoSection::launch_only_spin_valid)),
-/// in Putting mode, when the ball has backspin or sidespin, or when its speed
+/// in Putting mode, when the ball has any spin, or when its speed
 /// is not positive or the product is out of range for an rpm.
 fn launch_only_spin(ball: &BallFlight, rpm_per_mph: f64, mode: ShotDetectionMode) -> Option<i32> {
     if !(flighthook::MevoSection::launch_only_spin_valid(rpm_per_mph) && rpm_per_mph > 0.0)
@@ -1327,7 +1329,10 @@ fn launch_only_spin(ball: &BallFlight, rpm_per_mph: f64, mode: ShotDetectionMode
     {
         return None;
     }
-    if ball.backspin_rpm.unwrap_or(0) != 0 || ball.sidespin_rpm.unwrap_or(0) != 0 {
+    if ball.backspin_rpm.unwrap_or(0) != 0
+        || ball.sidespin_rpm.unwrap_or(0) != 0
+        || ball.total_spin_rpm.unwrap_or(0) != 0
+    {
         return None;
     }
     let mph = ball.launch_speed?.as_mph();
@@ -1407,22 +1412,42 @@ fn live_launch_only_spin(state: &SystemState, actor_id: &str) -> Option<f64> {
     state.system.mevo_launch_only_spin(index)
 }
 
-/// The values an Xi spin from [`xi_spin`] puts on the ball that the device
-/// does not report: back and side spin worked out from the E8 total and an
-/// axis taken from D4 (or 0).
-const XI_E8_COMPUTED: [ShotField; 2] = [ShotField::BackspinRpm, ShotField::SidespinRpm];
+/// The spin an Xi shot sends instead of D4's ([`xi_spin`]). Both are the
+/// device's readings: splitting the E8 total by D4's axis only expresses it
+/// in the other spin pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XiSpin {
+    /// Back and FRP side spin: the E8 total split by D4's axis.
+    Components(i32, i32),
+    /// The E8 total alone: the shot has no axis to split it by, so no axis
+    /// and no components are sent.
+    Total(i32),
+}
 
-/// Xi spin for `source`: the (backspin, FRP sidespin) to use
-/// instead of D4's, or `None` to keep D4's, plus a label naming the source
-/// for the shot log.
+impl XiSpin {
+    /// Put this spin on `ball` in place of D4's.
+    fn apply(self, ball: &mut BallFlight) {
+        let (back, side, total) = match self {
+            Self::Components(back, side) => (Some(back), Some(side), None),
+            Self::Total(total) => (None, None, Some(total)),
+        };
+        ball.backspin_rpm = back;
+        ball.sidespin_rpm = side;
+        ball.total_spin_rpm = total;
+        ball.spin_axis = None;
+    }
+}
+
+/// Xi spin for `source`: the spin to use instead of D4's, or `None` to keep
+/// D4's, plus a label naming the source for the shot log.
 ///
-/// `D4` keeps D4. `E8` takes the total spin from the E8 backspin. The spin
-/// axis comes from D4 only when the shot carries club data (club speed plus
-/// attack angle or path) and D4's backspin is positive; D4's axis then
-/// follows face-to-path. Otherwise the axis is 0. The axis is clamped to ±90°
-/// so backspin never turns negative. `E8` keeps D4 when there is no E8
-/// backspin, since that is a missing value, not a measurement. Sidespin keeps
-/// the sign flip of [`ball_from_d4`].
+/// `D4` keeps D4. `E8` takes the total spin from the E8 backspin. When the
+/// shot carries club data (club speed plus attack angle or path) and D4's
+/// backspin is positive, the total is split by D4's spin axis, which then
+/// follows face-to-path; the axis is clamped to ±90° so backspin never turns
+/// negative. Otherwise the shot has no axis, and only the total is sent.
+/// `E8` keeps D4 when there is no E8 backspin, since that is a missing value,
+/// not a measurement. Sidespin keeps the sign flip of [`ball_from_d4`].
 ///
 /// `Auto` applies the `E8` rule when `mode` (flighthook's detection mode at
 /// shot time) is `Full`, and otherwise keeps D4 exactly like `D4`. Either
@@ -1433,7 +1458,7 @@ fn xi_spin(
     mode: ShotDetectionMode,
     d4: &FlightResult,
     e8: Option<&FlightResultV1>,
-) -> (Option<(i32, i32)>, &'static str) {
+) -> (Option<XiSpin>, &'static str) {
     match source {
         SpinSource::D4 => (None, "D4"),
         SpinSource::E8 => xi_spin_e8(d4, e8),
@@ -1455,34 +1480,25 @@ fn shot_mode(
     at_trigger.unwrap_or(current)
 }
 
-/// The `E8` rule: total spin from the E8 backspin, with the spin axis from
-/// D4 when the shot has club data, falling back to D4 when there is no E8
+/// The `E8` rule: total spin from the E8 backspin, split by D4's spin axis
+/// when the shot has club data, falling back to D4 when there is no E8
 /// backspin.
-fn xi_spin_e8(
-    d4: &FlightResult,
-    e8: Option<&FlightResultV1>,
-) -> (Option<(i32, i32)>, &'static str) {
+fn xi_spin_e8(d4: &FlightResult, e8: Option<&FlightResultV1>) -> (Option<XiSpin>, &'static str) {
     let Some(e8) = e8.filter(|e8| e8.backspin_rpm > 0) else {
         return (None, "D4 (no E8 spin)");
     };
-    let total = f64::from(e8.backspin_rpm);
     let has_club_data =
         d4.clubhead_speed > 0.0 && (d4.club_attack_angle != 0.0 || d4.club_strike_direction != 0.0);
-    let axis = if has_club_data && d4.backspin_rpm > 0 {
-        f64::from(d4.sidespin_rpm)
-            .atan2(f64::from(d4.backspin_rpm))
-            .clamp(-FRAC_PI_2, FRAC_PI_2)
-    } else {
-        0.0
-    };
+    if !(has_club_data && d4.backspin_rpm > 0) {
+        return (Some(XiSpin::Total(e8.backspin_rpm)), "E8 total, no axis");
+    }
+    let total = f64::from(e8.backspin_rpm);
+    let axis = f64::from(d4.sidespin_rpm)
+        .atan2(f64::from(d4.backspin_rpm))
+        .clamp(-FRAC_PI_2, FRAC_PI_2);
     let back = (total * axis.cos()).round() as i32;
     let side = -(total * axis.sin()).round() as i32;
-    let label = if side == 0 {
-        "E8 total, axis 0"
-    } else {
-        "E8 total, D4 axis"
-    };
-    (Some((back, side)), label)
+    (Some(XiSpin::Components(back, side)), "E8 total, D4 axis")
 }
 
 /// Appends " (auto)" to one of [`xi_spin_e8`]'s labels, for the `Auto` source
@@ -1490,7 +1506,7 @@ fn xi_spin_e8(
 fn auto_label(label: &'static str) -> &'static str {
     match label {
         "D4 (no E8 spin)" => "D4 (no E8 spin) (auto)",
-        "E8 total, axis 0" => "E8 total, axis 0 (auto)",
+        "E8 total, no axis" => "E8 total, no axis (auto)",
         "E8 total, D4 axis" => "E8 total, D4 axis (auto)",
         _ => "D4 (auto)",
     }
@@ -1579,7 +1595,9 @@ mod tests {
         assert_eq!((d4.backspin_rpm, d4.sidespin_rpm), (7127, -652));
         assert_eq!(e8.backspin_rpm, 7157);
         let (spin, label) = xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8));
-        let (back, side) = spin.unwrap();
+        let Some(XiSpin::Components(back, side)) = spin else {
+            panic!("not split: {spin:?}");
+        };
         assert_eq!(label, "E8 total, D4 axis");
         // Same axis as D4 (sidespin negated for FRP), total from E8.
         assert_eq!((back, side), (7127, 652));
@@ -1589,13 +1607,25 @@ mod tests {
         assert!((axis - 5.2).abs() < 0.05, "axis {axis}");
     }
 
+    /// Without club data the shot has no axis: the E8 total goes out alone.
     #[test]
-    fn xi_spin_axis_zero_without_club_data() {
+    fn xi_spin_is_the_total_alone_without_club_data() {
         let (d4, e8) = shot_without_club_data();
         assert_eq!((d4.backspin_rpm, d4.sidespin_rpm), (2756, 1464));
         assert_eq!(
             xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)),
-            (Some((6897, 0)), "E8 total, axis 0")
+            (Some(XiSpin::Total(6897)), "E8 total, no axis")
+        );
+        let mut ball = ball_from_d4(&d4);
+        XiSpin::Total(6897).apply(&mut ball);
+        assert_eq!(
+            (
+                ball.backspin_rpm,
+                ball.sidespin_rpm,
+                ball.total_spin_rpm,
+                ball.spin_axis
+            ),
+            (None, None, Some(6897), None)
         );
     }
 
@@ -1626,7 +1656,7 @@ mod tests {
         e8.backspin_rpm = 2500;
         assert_eq!(
             xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)).0,
-            Some((2500, 0))
+            Some(XiSpin::Total(2500))
         );
     }
 
@@ -1638,7 +1668,10 @@ mod tests {
         assert_eq!(mode, ShotDetectionMode::Full);
         assert_eq!(
             xi_spin(SpinSource::Auto, mode, &d4, Some(&e8)),
-            (Some((7127, 652)), "E8 total, D4 axis (auto)")
+            (
+                Some(XiSpin::Components(7127, 652)),
+                "E8 total, D4 axis (auto)"
+            )
         );
         // Triggered in Chipping, switched to Full mid-shot: D4 stays.
         let mode = shot_mode(Some(ShotDetectionMode::Chipping), ShotDetectionMode::Full);
@@ -1658,7 +1691,10 @@ mod tests {
         let (d4, e8) = shot_with_club_data();
         assert_eq!(
             xi_spin(SpinSource::Auto, ShotDetectionMode::Full, &d4, Some(&e8)),
-            (Some((7127, 652)), "E8 total, D4 axis (auto)")
+            (
+                Some(XiSpin::Components(7127, 652)),
+                "E8 total, D4 axis (auto)"
+            )
         );
     }
 
@@ -1919,14 +1955,14 @@ mod tests {
     }
 
     #[test]
-    fn xi_spin_axis_zero_without_d4_backspin() {
+    fn xi_spin_is_the_total_alone_without_d4_backspin() {
         let (mut d4, e8) = shot_with_club_data();
         assert!(d4.clubhead_speed > 0.0);
         for back in [0, -1200] {
             d4.backspin_rpm = back;
             assert_eq!(
                 xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)),
-                (Some((7157, 0)), "E8 total, axis 0"),
+                (Some(XiSpin::Total(7157)), "E8 total, no axis"),
                 "D4 backspin {back}"
             );
         }
@@ -2947,52 +2983,74 @@ mod tests {
         panic!("no ball flight sent");
     }
 
-    /// With the Xi's Spin source E8, the back and side spin worked out from
-    /// the E8 total and D4's axis are marked computed; with D4 nothing is.
+    /// What an Xi shot puts on the bus for its spin, and the computed marks
+    /// it carries, for `source` and the D4/E8 pair.
+    fn xi_ball(
+        source: SpinSource,
+        (d4, e8): (FlightResult, FlightResultV1),
+    ) -> (BallFlight, Vec<flighthook::ShotField>) {
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-mevo-test-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, _writer) = SystemState::new(dir.join("config.toml"));
+        let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel(16);
+        let sender = BusSender::new("mevo.0".into(), bus_tx, Arc::default());
+        let device_id = None;
+        let result_raw = RefCell::new(ResultRaw::default());
+        let ctx = ShotContext {
+            state: &state,
+            sender: &sender,
+            device_id: &device_id,
+            model: DeviceModel::Xi,
+            spin_source: source,
+            launch_only_spin: flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
+            result_raw: &result_raw,
+        };
+        let key = ShotKey {
+            shot_id: "e8".into(),
+            shot_number: 1,
+        };
+        let mut results = ShotResults::default();
+        let mode = ShotDetectionMode::Full;
+        on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::FlightV1(e8));
+        on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::Flight(d4));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::iter::from_fn(|| bus_rx.try_recv().ok())
+            .find_map(|msg| match msg.event {
+                FlighthookEvent::BallFlight { ball, derived, .. } => {
+                    Some((*ball, derived.map(|d| d.computed).unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .expect("a ball flight")
+    }
+
+    /// With the Xi's Spin source E8 the spin is the device's reading either
+    /// way, so nothing is marked computed: with club data the E8 total goes
+    /// out split by D4's axis; without it, the total alone, with no axis
+    /// and no components. With D4, D4's spin goes out.
     #[test]
-    fn an_xi_e8_spin_is_marked_computed() {
-        for (source, want) in [
-            (SpinSource::E8, &XI_E8_COMPUTED[..]),
-            (SpinSource::D4, &[][..]),
-        ] {
-            let dir = std::env::temp_dir().join(format!(
-                "flighthook-mevo-test-{}",
-                crate::state::config::generate_id()
-            ));
-            let (state, _writer) = SystemState::new(dir.join("config.toml"));
-            let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel(16);
-            let sender = BusSender::new("mevo.0".into(), bus_tx, Arc::default());
-            let device_id = None;
-            let result_raw = RefCell::new(ResultRaw::default());
-            let ctx = ShotContext {
-                state: &state,
-                sender: &sender,
-                device_id: &device_id,
-                model: DeviceModel::Xi,
-                spin_source: source,
-                launch_only_spin: flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
-                result_raw: &result_raw,
-            };
-            let key = ShotKey {
-                shot_id: "e8".into(),
-                shot_number: 1,
-            };
-            let (d4, e8) = shot_with_club_data();
-            let mut results = ShotResults::default();
-            let mode = ShotDetectionMode::Full;
-            on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::FlightV1(e8));
-            on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::Flight(d4));
-            let _ = std::fs::remove_dir_all(&dir);
-            let computed = std::iter::from_fn(|| bus_rx.try_recv().ok())
-                .find_map(|msg| match msg.event {
-                    FlighthookEvent::BallFlight { derived, .. } => {
-                        Some(derived.map(|d| d.computed).unwrap_or_default())
-                    }
-                    _ => None,
-                })
-                .expect("a ball flight");
-            assert_eq!(computed, want, "{source:?}");
-        }
+    fn an_xi_e8_spin_is_measured_and_has_no_placeholder_axis() {
+        let spin = |b: &BallFlight| {
+            (
+                b.backspin_rpm,
+                b.sidespin_rpm,
+                b.total_spin_rpm,
+                b.spin_axis,
+            )
+        };
+        let (ball, computed) = xi_ball(SpinSource::E8, shot_with_club_data());
+        assert_eq!(spin(&ball), (Some(7127), Some(652), None, None));
+        assert!(computed.is_empty(), "{computed:?}");
+
+        let (ball, computed) = xi_ball(SpinSource::E8, shot_without_club_data());
+        assert_eq!(spin(&ball), (None, None, Some(6897), None));
+        assert!(computed.is_empty(), "{computed:?}");
+
+        let (ball, computed) = xi_ball(SpinSource::D4, shot_without_club_data());
+        assert_eq!(spin(&ball), (Some(2756), Some(-1464), None, None));
+        assert!(computed.is_empty(), "{computed:?}");
     }
 
     /// The Xi's launch-only chip gets the default 100 rpm per mph of

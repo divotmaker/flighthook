@@ -3,7 +3,7 @@ pub mod clips;
 pub mod config;
 mod game;
 pub mod local_clients;
-pub mod strict;
+pub mod round;
 
 pub use game::{GameState, GameStateWriter};
 
@@ -20,7 +20,7 @@ use cameras::Cameras;
 use clips::ClipStore;
 use config::SystemConfig;
 use local_clients::LocalClients;
-use strict::StrictRounds;
+use round::RoundPolicy;
 
 /// Root entry point for all managed application state.
 ///
@@ -31,9 +31,8 @@ pub struct SystemState {
     /// This process's connected Open Connect clients, which its Open Connect
     /// servers refuse.
     pub local_clients: Arc<LocalClients>,
-    /// The Pureplay links in strict mode: Auto-chip does not fire while any
-    /// is held.
-    pub strict_rounds: StrictRounds,
+    /// The tournament round policy, and every shot source's type.
+    pub round: RoundPolicy,
     /// The replay clips on disk, shared by the camera actors (beta).
     pub clips: ClipStore,
     /// The camera actors' latest frames and the camera list (beta).
@@ -131,7 +130,7 @@ impl SystemState {
                 system: SystemConfig::new(config_path),
                 game,
                 local_clients: Arc::default(),
-                strict_rounds: StrictRounds::default(),
+                round: RoundPolicy::default(),
                 clips: ClipStore::default(),
                 cameras: Cameras::default(),
                 pose: body_tracking(),

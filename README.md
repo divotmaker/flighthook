@@ -24,12 +24,12 @@ Each device links to its setup notes, quirks, and config reference.
 | [Square Golf Omni](docs/devices/square-golf.md)      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Supported        |
 | [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
 | ExPutt RG                                            | WiFi                    | [threeputt](https://crates.io/crates/threeputt) | Alpha            |
-| [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (OpenConnect server)                   | Alpha (untested) |
+| [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (Open Connect server)                  | Alpha (untested) |
 
-Uneekor connects through the **OpenConnect server** actor, which accepts shots
+Uneekor connects through the **Open Connect server** actor, which accepts shots
 from any launch monitor that speaks GSPro Open Connect as a client — Foresight,
 SkyTrak and MLM2PRO also emit it. Add it from the Launch monitors (+) menu:
-**Uneekor (OpenConnect)**, or **OpenConnect Server** for any other monitor.
+**Uneekor (Open Connect)**, or **Open Connect Server** for any other monitor.
 
 ### Cameras
 
@@ -45,23 +45,31 @@ macOS yet.
 
 ### Simulation Software
 
-| Software  | Protocol              | Driver                        | Status           |
-| --------- | --------------------- | ----------------------------- | ---------------- |
-| GSPro     | TCP (JSON, port 921)  | built-in (OpenConnect client) | Supported        |
-| Muni Golf | TCP (JSON, port 9210) | built-in (OpenConnect client) | Alpha (untested) |
-| [Pureplay](docs/outputs/pureplay.md) | TCP (binary, port 9760) | built-in (Pureplay Connect) | Beta |
+| Software                             | Protocol                | Driver                         | Status           |
+| ------------------------------------ | ----------------------- | ------------------------------ | ---------------- |
+| GSPro                                | TCP (JSON, port 921)    | built-in (Open Connect client) | Supported        |
+| [Pureplay](docs/outputs/pureplay.md) | TCP (JSON, port 921)    | built-in (Open Connect client) | Beta             |
+| Muni Golf                            | TCP (JSON, port 9210)   | built-in (Open Connect client) | Alpha (untested) |
+| [Pureplay](docs/outputs/pureplay.md) | TCP (binary, port 9760) | built-in (Pureplay Connect)    | Alpha            |
 
-Simulators are reached through the **OpenConnect client** output, which sends
-shots to any simulator that accepts GSPro Open Connect. The OpenConnect client
+Simulators are reached through the **Open Connect client** output, which sends
+shots to any simulator that accepts GSPro Open Connect. The Open Connect client
 and server are the two halves of the same protocol. Add one from the Outputs
-(+) menu: **GSPro (OpenConnect)**, **Muni Golf (OpenConnect)**, or
-**OpenConnect Client** for any other simulator.
+(+) menu: **GSPro (Open Connect)** and **Pureplay (Open Connect)** add the
+same card, named Open Connect, at `127.0.0.1:921`; it works with whichever
+simulator listens on that port, GSPro or Pureplay. **Muni Golf (Open
+Connect)** adds one at `127.0.0.1:9210`. For any other simulator, change a
+card's address. Only one card per address can be on: a menu entry always
+adds its card, but a card added at an address another card of its type is
+using starts off (Disabled), and its switch stays locked until you change its
+address to a free one, so you can set it up for a different port.
 
-Pureplay has its own output, **Pureplay** in the same menu, which speaks
-Pureplay's open Pureplay Connect protocol: shots go out with only the values
-the device measured, and Pureplay sets flighthook's club and hand. Tournament
-rounds take shots from measured launch monitors only. See
-[Pureplay](docs/outputs/pureplay.md).
+Pureplay also has an output of its own (alpha), **Pureplay (Pureplay
+Connect)** in the same menu, which speaks Pureplay's open Pureplay Connect
+protocol: shots go out with only the values the device measured, and
+Pureplay sets flighthook's club and hand. Tournament rounds need this output
+and take shots from measured launch monitors only; the Open Connect card has
+no tournament mode. See [Pureplay](docs/outputs/pureplay.md).
 
 ### Custom Integrations
 
@@ -75,7 +83,7 @@ serves it at `ws://<host>:5880/frp` and negotiates the spec version on connect,
 currently `0.1.0`.
 
 Whatever the monitor is — a Mevo+ over its binary TCP protocol, an R10 over BLE,
-a Uneekor over OpenConnect — it is normalized into the same FRP event stream, so
+a Uneekor over Open Connect — it is normalized into the same FRP event stream, so
 a consumer is written once rather than per device.
 
 The shot lifecycle events (`shot_trigger`, `ball_flight`, `club_path`,
@@ -132,7 +140,7 @@ Terminal. Allow it.
 - The player's hand (**RH | LH**, in the header beside the club picker) comes
   from the simulator, or from the dashboard when no simulator is connected. The
   Square Golf Omni and the ExPutt follow it, and monitors connected to the
-  OpenConnect server are told the hand and club
+  Open Connect server are told the hand and club
 - Battery icons in the header for connected devices that report a charge
   (Mevo+, Square Golf Omni): red under 20 %, hover for the device and percentage
 - Simulated carry, apex, descent, offline, roll and total for launch monitors that
@@ -212,10 +220,12 @@ flat fairway, sea level and 25 °C by default.
   total minus the carry.
 - A shot is flown only when the device reports all five launch values, the
   ball speed is above 0, the launch angle is between 0° and 90°, and the
-  launch direction is within ±90°. A shot with no spin reading (back and side
-  both 0) is not flown. A slow, low chip with some lift flies.
+  launch direction is within ±90°. A total spin reported with no back and
+  side components flies as that backspin. A shot with no spin reading (back
+  and side both 0) is not flown. A slow, low chip with some lift flies.
 - A ground ball is rolled, not flown: a shot whose measured apex is 0, or,
-  from a device that reports no apex, one launched at 0.5° or less. Putts and
+  from a device that reports no apex, one launched at 0.5° or less, or one
+  with neither a launch angle nor any spin (a putting mat). Putts and
   bladed shots alike, whatever the club or detection mode. Carry, apex and
   flight time are 0, and roll and total come from a roll from the tee, from
   the ball speed and direction (a measured total wins). In Putting mode the
@@ -451,7 +461,7 @@ with radar launch monitors that miss short chips.
   the configured surface, comes to rest at the chosen distance (carry plus
   roll). The simulator runs its own physics on that launch, so its green
   speed changes the actual roll.
-- It goes to every connected OpenConnect Client and Pureplay output,
+- It goes to every connected Open Connect Client and Pureplay Connect output,
   whatever launch monitor each detection mode is routed to. The button is
   disabled until one is connected, and while Pureplay has a strict-mode
   (tournament) round in progress, when Auto-chip does not fire at all.
@@ -475,6 +485,9 @@ do. The **+** after Launch monitors, Cameras or Outputs adds one. There is one w
 server: it can be edited (its bind address) but not removed or added.
 **Reconnect** on a launch monitor or output card closes its connection and
 starts it again from its saved settings, without restarting flighthook.
+The switch next to a card's name turns that device off or on at once,
+keeping its settings: a device that is off doesn't run, sends no shots and
+shows **DISABLED**.
 
 Each card's badge and left stripe show its connection:
 
@@ -484,7 +497,8 @@ Each card's badge and left stripe show its connection:
 - **RECONNECTING**: it was connected and lost the connection. Red for 10
   minutes after the loss, then yellow. This applies to every card, outputs
   included: a simulator that closes, a monitor that drops, a launch monitor
-  that disconnects from the OpenConnect server.
+  that disconnects from the Open Connect server.
+- **DISABLED** (gray): turned off with its switch. Not an error.
 
 The Devices tab shows a red dot while any card is red.
 
@@ -571,7 +585,7 @@ name = "Muni Golf"
 address = "127.0.0.1:9210"
 
 [pureplay.0]
-name = "Pureplay"
+name = "Pureplay Connect"
 address = "127.0.0.1:9760"
 ```
 

@@ -21,16 +21,21 @@ pub enum ConnectionState {
     Connected,
     /// Connected since it last started, and has since lost the connection.
     Reconnecting,
+    /// Turned off in the settings (`enabled = false`): no actor runs. Not an
+    /// error and never red.
+    Disabled,
 }
 
 impl ConnectionState {
-    /// The badge label: `CONNECTING`, `CONNECTED` or `RECONNECTING`.
+    /// The badge label: `CONNECTING`, `CONNECTED`, `RECONNECTING` or
+    /// `DISABLED`.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Connecting => "CONNECTING",
             Self::Connected => "CONNECTED",
             Self::Reconnecting => "RECONNECTING",
+            Self::Disabled => "DISABLED",
         }
     }
 }
@@ -41,14 +46,15 @@ impl std::fmt::Display for ConnectionState {
             Self::Connecting => write!(f, "connecting"),
             Self::Connected => write!(f, "connected"),
             Self::Reconnecting => write!(f, "reconnecting"),
+            Self::Disabled => write!(f, "disabled"),
         }
     }
 }
 
 /// An actor's statuses since it last started: whether it has been Connected
-/// and until when its last lost connection is an alert. Times are
-/// milliseconds on a monotonic clock the caller picks; only differences
-/// between them matter.
+/// and until when its last lost connection is an alert, or that it is
+/// turned off. Times are milliseconds on a monotonic clock the caller picks;
+/// only differences between them matter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StatusHistory {
     /// The latest status seen.
@@ -57,6 +63,8 @@ pub struct StatusHistory {
     connected: bool,
     /// When the alert for the last Connected → not-connected change ends.
     alert_until: Option<u64>,
+    /// Turned off in the settings: no actor runs until a new instance starts.
+    disabled: bool,
 }
 
 impl StatusHistory {
@@ -69,15 +77,32 @@ impl StatusHistory {
         red_for_ms: u64,
         now_ms: u64,
     ) -> Self {
+        if state == ConnectionState::Disabled {
+            return Self::off(status);
+        }
         Self {
             last: Some(status),
             connected: status == ActorStatus::Connected || state != ConnectionState::Connecting,
             alert_until: (red_for_ms > 0).then(|| now_ms.saturating_add(red_for_ms)),
+            disabled: false,
+        }
+    }
+
+    /// The history of an actor turned off in the settings, whose last
+    /// status was `status`: Disabled until a new instance starts.
+    #[must_use]
+    pub fn off(status: ActorStatus) -> Self {
+        Self {
+            last: Some(status),
+            connected: false,
+            alert_until: None,
+            disabled: true,
         }
     }
 
     /// Record a status reported at `now_ms`. `Starting` begins a new
-    /// history; leaving `Connected` starts a new alert window.
+    /// history, so an actor turned on again is no longer Disabled; leaving
+    /// `Connected` starts a new alert window.
     pub fn observe(&mut self, status: ActorStatus, now_ms: u64) {
         match status {
             ActorStatus::Starting => *self = Self::default(),
@@ -98,13 +123,16 @@ impl StatusHistory {
             last: self.last,
             connected: self.last == Some(ActorStatus::Connected),
             alert_until: None,
+            disabled: self.disabled,
         };
     }
 
     /// The state to show.
     #[must_use]
     pub fn state(&self) -> ConnectionState {
-        if self.last == Some(ActorStatus::Connected) {
+        if self.disabled {
+            ConnectionState::Disabled
+        } else if self.last == Some(ActorStatus::Connected) {
             ConnectionState::Connected
         } else if self.connected {
             ConnectionState::Reconnecting
@@ -258,9 +286,35 @@ mod tests {
         assert_eq!(ConnectionState::Connecting.label(), "CONNECTING");
         assert_eq!(ConnectionState::Connected.label(), "CONNECTED");
         assert_eq!(ConnectionState::Reconnecting.label(), "RECONNECTING");
+        assert_eq!(ConnectionState::Disabled.label(), "DISABLED");
         assert_eq!(
             serde_json::to_string(&ConnectionState::Reconnecting).unwrap(),
             r#""reconnecting""#
         );
+        assert_eq!(
+            serde_json::to_string(&ConnectionState::Disabled).unwrap(),
+            r#""disabled""#
+        );
+    }
+
+    #[test]
+    fn disabled_is_never_red_and_ends_with_a_new_start() {
+        // Turned off right after losing its connection: no alert.
+        let mut h = StatusHistory::off(ActorStatus::Reconnecting);
+        assert_eq!(h.state(), ConnectionState::Disabled);
+        assert!(!h.red(0));
+        assert_eq!(h.red_for_ms(0), 0);
+        // A late status from the old instance changes nothing.
+        h.observe(ActorStatus::Disconnected, MIN);
+        h.restart();
+        assert_eq!(h.state(), ConnectionState::Disabled);
+        // Turned on: the new instance's first status.
+        h.observe(ActorStatus::Starting, 2 * MIN);
+        assert_eq!(h.state(), ConnectionState::Connecting);
+        // A reply's Disabled state reads back as Disabled.
+        let got =
+            StatusHistory::received(ActorStatus::Disconnected, ConnectionState::Disabled, 0, 0);
+        assert_eq!(got.state(), ConnectionState::Disabled);
+        assert!(!got.red(0));
     }
 }

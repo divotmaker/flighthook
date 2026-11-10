@@ -758,6 +758,7 @@ fn card_metrics(
     let ball: &BallFlight = shot.ball.as_ref().unwrap_or(&no_ball);
     let club: &ClubData = shot.club.as_ref().unwrap_or(&no_club);
     let d: &DerivedFlight = shot.derived.as_ref().unwrap_or(&no_derived);
+    let (backspin, sidespin) = flighthook::spin_components(ball);
     let v = |x: Option<Distance>| x.map(|x| x.value());
     let measured = |x: Option<f64>| x.map(|x| (x, false));
 
@@ -778,7 +779,7 @@ fn card_metrics(
             false,
         ),
         Metric::measured("Launch", "\u{b0}", ball.launch_elevation, 1),
-        Metric::new("Backspin", "rpm", spin(ball.backspin_rpm, d), 0, false),
+        Metric::new("Backspin", "rpm", spin(backspin, d), 0, false),
     ];
     let groups = [
         (
@@ -791,7 +792,7 @@ fn card_metrics(
                     1,
                     signs::side,
                 ),
-                Metric::worded("Sidespin", "rpm", spin(ball.sidespin_rpm, d), 0, |v| {
+                Metric::worded("Sidespin", "rpm", spin(sidespin, d), 0, |v| {
                     signs::sidespin(v, handed)
                 }),
             ],
@@ -4802,20 +4803,23 @@ fn table_cells(
     let d = shot.derived.as_ref().unwrap_or(&no_derived);
     let v = |x: Option<Distance>| x.map(|x| x.value());
     match shot.ball.as_ref() {
-        Some(f) => cells.extend([
-            Text(opt_f(f.launch_speed.map(|v| v.value()), 1)),
-            Text(opt_f(f.launch_elevation, 1)),
-            Text(opt_f(f.launch_azimuth, 1)),
-            Picked(pick(v(f.carry_distance), v(d.carry_distance)), false),
-            Picked(pick(v(f.max_height), v(d.max_height)), false),
-            Picked(pick(v(f.carry_offline), v(d.carry_offline)), true),
-            Picked(pick(f.descent_angle, d.descent_angle), false),
-            Picked(pick(v(f.roll_distance), v(d.roll_distance)), true),
-            Picked(pick(v(f.total_distance), v(d.total_distance)), false),
-            Picked(pick(v(f.total_offline), v(d.total_offline)), true),
-            Spin(spin(f.backspin_rpm, d)),
-            Spin(spin(f.sidespin_rpm, d)),
-        ]),
+        Some(f) => cells.extend({
+            let (backspin, sidespin) = flighthook::spin_components(f);
+            [
+                Text(opt_f(f.launch_speed.map(|v| v.value()), 1)),
+                Text(opt_f(f.launch_elevation, 1)),
+                Text(opt_f(f.launch_azimuth, 1)),
+                Picked(pick(v(f.carry_distance), v(d.carry_distance)), false),
+                Picked(pick(v(f.max_height), v(d.max_height)), false),
+                Picked(pick(v(f.carry_offline), v(d.carry_offline)), true),
+                Picked(pick(f.descent_angle, d.descent_angle), false),
+                Picked(pick(v(f.roll_distance), v(d.roll_distance)), true),
+                Picked(pick(v(f.total_distance), v(d.total_distance)), false),
+                Picked(pick(v(f.total_offline), v(d.total_offline)), true),
+                Spin(spin(backspin, d)),
+                Spin(spin(sidespin, d)),
+            ]
+        }),
         None => cells.extend((0..BALL_COLUMNS).map(|_| Text("-".to_owned()))),
     }
     match shot.club.as_ref() {
@@ -7006,6 +7010,27 @@ mod tests {
         assert_eq!(
             table_cells(&none, None, None, false)[name("Back")],
             Spin(None)
+        );
+
+        // A total spin with no axis and no components: all of it shows as
+        // backspin, and no sidespin is made up.
+        let mut total_only = measured.clone();
+        let ball = total_only.ball.as_mut().unwrap();
+        (ball.backspin_rpm, ball.sidespin_rpm) = (None, None);
+        (ball.total_spin_rpm, ball.spin_axis) = (Some(6897), None);
+        assert_eq!(card_text(&total_only, "Backspin"), ("6897".into(), false));
+        assert_eq!(card_text(&total_only, "Sidespin").0, "\u{2013}", "missing");
+        let cells = table_cells(&total_only, None, None, false);
+        assert_eq!(cells[name("Back")], Spin(Some((6897.0, false))));
+        assert_eq!(cells[name("Side")], Spin(None));
+
+        // A putt with no launch angle shows none.
+        let mut putt = measured.clone();
+        putt.ball.as_mut().unwrap().launch_elevation = None;
+        assert_eq!(card_text(&putt, "Launch").0, "\u{2013}", "missing");
+        assert_eq!(
+            table_cells(&putt, None, None, false)[name("VLA")],
+            TableCell::Text("-".into())
         );
     }
 

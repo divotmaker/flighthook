@@ -212,11 +212,11 @@ pub struct FlighthookConfig {
     pub mock_monitor: std::collections::HashMap<String, MockMonitorSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub openconnect_server: std::collections::HashMap<String, OpenConnectServerSection>,
-    /// Open Connect clients: outputs that dial a simulator (GSPro, Muni
-    /// Golf, ...).
+    /// Open Connect clients: outputs that dial a simulator (GSPro, Pureplay,
+    /// Muni Golf, ...).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub openconnect_client: std::collections::HashMap<String, OpenConnectClientSection>,
-    /// Pureplay outputs (beta): dial Pureplay over Pureplay Connect.
+    /// Pureplay outputs (alpha): dial Pureplay over Pureplay Connect.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub pureplay: std::collections::HashMap<String, PureplaySection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -965,6 +965,11 @@ impl CameraPosition {
 pub struct CameraSection {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// The camera's stable id, from the camera list (`GET /api/cameras`):
     /// it survives replugging into the same USB port and reboots.
     /// [`CameraSection::TEST_PATTERN`] is a generated test picture.
@@ -1022,6 +1027,7 @@ impl Default for CameraSection {
     fn default() -> Self {
         Self {
             name: "Camera".into(),
+            enabled: true,
             camera: String::new(),
             camera_name: None,
             position: CameraPosition::default(),
@@ -1404,6 +1410,11 @@ impl SpinSource {
 pub struct MevoSection {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     pub address: Option<String>,
     pub ball_type: Option<u8>,
     pub tee_height: Option<Distance>,
@@ -1492,6 +1503,11 @@ impl MevoSection {
 pub struct R10Section {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// Distance from the device to the tee, sent to the R10 as its tee
     /// distance once it wakes up. Garmin recommends placing the R10 6-8 ft
     /// behind the ball.
@@ -1515,6 +1531,11 @@ pub struct R10Section {
 pub struct SquareSection {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// BLE address to connect to. When absent, the first device advertising the
     /// `SquareGolf` name prefix is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1568,6 +1589,11 @@ pub struct SquareSection {
 pub struct ExPuttSection {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// IP address of the device. When absent, the device is found on the
     /// local network automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1588,6 +1614,11 @@ fn is_none_or_empty_map(m: &Option<std::collections::BTreeMap<String, f64>>) -> 
 pub struct MockMonitorSection {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// Seconds before the shot's report that the swing's impact happened, for
     /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
     /// device's default ([`impact_lead_default_s`]).
@@ -1595,7 +1626,7 @@ pub struct MockMonitorSection {
     pub impact_lead_s: Option<f64>,
 }
 
-/// An OpenConnect server instance — a *launch monitor*, not an integration.
+/// An Open Connect server instance — a *launch monitor*, not an integration.
 ///
 /// Accepts inbound shot data from monitors that speak GSPro Open Connect V1 as
 /// a client (Uneekor, Foresight, SkyTrak, MLM2PRO, …). This is the inverse of
@@ -1609,6 +1640,11 @@ pub struct MockMonitorSection {
 pub struct OpenConnectServerSection {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// Bind address. Defaults to `0.0.0.0:921`.
     pub bind: Option<String>,
     /// Seconds before the shot's report that the swing's impact happened, for
@@ -1618,15 +1654,20 @@ pub struct OpenConnectServerSection {
     pub impact_lead_s: Option<f64>,
 }
 
-/// An OpenConnect client instance — an *output*.
+/// An Open Connect client instance — an *output*.
 ///
-/// Dials a simulator that accepts GSPro Open Connect V1 (GSPro on port 921,
-/// Muni Golf on 9210) and sends it every shot. This is the inverse of
+/// Dials a simulator that accepts GSPro Open Connect V1 (GSPro and Pureplay
+/// on port 921, Muni Golf on 9210) and sends it every shot. This is the inverse of
 /// [`OpenConnectServerSection`], which accepts shots from a launch monitor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenConnectClientSection {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// Simulator address. Defaults to `127.0.0.1:921`.
     pub address: Option<String>,
     /// Actor ID for full-swing shots (e.g. "mevo.0"). None = accept from any monitor.
@@ -1644,7 +1685,7 @@ pub struct OpenConnectClientSection {
 #[deprecated(note = "use OpenConnectClientSection")]
 pub type GsProSection = OpenConnectClientSection;
 
-/// A Pureplay output instance (beta).
+/// A Pureplay output instance (alpha).
 ///
 /// Dials Pureplay (port 9760) and sends it every routed shot over the
 /// Pureplay Connect protocol, taking its club, hand and strict-mode
@@ -1653,6 +1694,11 @@ pub type GsProSection = OpenConnectClientSection;
 pub struct PureplaySection {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     /// Pureplay's address. Defaults to `127.0.0.1:9760`.
     pub address: Option<String>,
     /// Actor ID for full-swing shots (e.g. "mevo.0"). None = accept from any monitor.
@@ -1671,6 +1717,11 @@ pub struct PureplaySection {
 pub struct RandomClubSection {
     #[serde(default)]
     pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
 }
 
 /// Seconds before the report of a shot that a clip assumes the swing's impact
@@ -1761,6 +1812,55 @@ impl FlighthookConfig {
             |s| s.impact_lead_s,
         );
         out
+    }
+
+    /// The actor IDs (e.g. `mevo.0`) of every section that is off
+    /// (`enabled = false`), sorted. Such a section keeps its card and its
+    /// settings and runs no actor.
+    #[must_use]
+    pub fn disabled_actors(&self) -> Vec<String> {
+        fn off<T>(
+            out: &mut Vec<String>,
+            kind: &str,
+            map: &std::collections::HashMap<String, T>,
+            enabled: impl Fn(&T) -> bool,
+        ) {
+            out.extend(
+                map.iter()
+                    .filter(|(_, s)| !enabled(s))
+                    .map(|(i, _)| format!("{kind}.{i}")),
+            );
+        }
+        let mut out = Vec::new();
+        off(&mut out, "mevo", &self.mevo, |s| s.enabled);
+        off(&mut out, "r10", &self.r10, |s| s.enabled);
+        off(&mut out, "square", &self.square, |s| s.enabled);
+        off(&mut out, "exputt", &self.exputt, |s| s.enabled);
+        off(&mut out, "mock_monitor", &self.mock_monitor, |s| s.enabled);
+        off(
+            &mut out,
+            "openconnect_server",
+            &self.openconnect_server,
+            |s| s.enabled,
+        );
+        off(
+            &mut out,
+            "openconnect_client",
+            &self.openconnect_client,
+            |s| s.enabled,
+        );
+        off(&mut out, "pureplay", &self.pureplay, |s| s.enabled);
+        off(&mut out, "random_club", &self.random_club, |s| s.enabled);
+        off(&mut out, "camera", &self.camera, |s| s.enabled);
+        out.sort();
+        out
+    }
+
+    /// Whether actor `actor_id` (e.g. `mevo.0`) may run: false only for a
+    /// configured section that is off.
+    #[must_use]
+    pub fn actor_enabled(&self, actor_id: &str) -> bool {
+        !self.disabled_actors().iter().any(|id| id == actor_id)
     }
 
     /// The `impact_lead_s` configured on launch monitor `actor_id` (e.g.
@@ -1875,6 +1975,7 @@ impl Default for MevoSection {
     fn default() -> Self {
         Self {
             name: "Mevo WiFi".into(),
+            enabled: true,
             address: Some("192.168.2.1:5100".into()),
             ball_type: Some(1),
             tee_height: Some(Distance::Inches(1.5)),
@@ -1895,6 +1996,7 @@ impl Default for R10Section {
     fn default() -> Self {
         Self {
             name: "Garmin R10".into(),
+            enabled: true,
             // Absent: leave the device's own tee distance untouched.
             range: None,
             impact_lead_s: None,
@@ -1906,6 +2008,7 @@ impl Default for SquareSection {
     fn default() -> Self {
         Self {
             name: "Square Golf Omni".into(),
+            enabled: true,
             // Auto-discover by name prefix.
             address: None,
             club: None,
@@ -1921,6 +2024,7 @@ impl Default for ExPuttSection {
     fn default() -> Self {
         Self {
             name: "ExPutt".into(),
+            enabled: true,
             // Found on the network automatically.
             address: None,
             impact_lead_s: None,
@@ -1931,7 +2035,8 @@ impl Default for ExPuttSection {
 impl Default for OpenConnectServerSection {
     fn default() -> Self {
         Self {
-            name: "OpenConnect Server".into(),
+            name: "Open Connect Server".into(),
+            enabled: true,
             bind: Some("0.0.0.0:921".into()),
             impact_lead_s: None,
         }
@@ -1942,6 +2047,7 @@ impl Default for OpenConnectClientSection {
     fn default() -> Self {
         Self {
             name: "GSPro".into(),
+            enabled: true,
             address: Some("127.0.0.1:921".into()),
             full_monitor: None,
             chipping_monitor: None,
@@ -1954,6 +2060,7 @@ impl Default for PureplaySection {
     fn default() -> Self {
         Self {
             name: "Pureplay".into(),
+            enabled: true,
             address: Some("127.0.0.1:9760".into()),
             full_monitor: None,
             chipping_monitor: None,
@@ -2501,15 +2608,18 @@ mod openconnect_client_tests {
             square: one(SquareSection::default()),
             exputt: one(ExPuttSection {
                 name: "Putting".into(),
+                enabled: true,
                 address: Some("192.168.1.50".into()),
                 impact_lead_s: None,
             }),
             mock_monitor: one(MockMonitorSection {
                 name: "Mock".into(),
+                enabled: true,
                 impact_lead_s: None,
             }),
             openconnect_server: one(OpenConnectServerSection {
                 name: "Uneekor".into(),
+                enabled: true,
                 bind: Some("0.0.0.0:921".into()),
                 impact_lead_s: None,
             }),
@@ -2527,9 +2637,11 @@ mod openconnect_client_tests {
             }),
             random_club: one(RandomClubSection {
                 name: "Clubs".into(),
+                enabled: true,
             }),
             camera: one(CameraSection {
                 name: "Face".into(),
+                enabled: true,
                 camera: "usb-0000:00:14.0-1/HD Pro Webcam C920".into(),
                 camera_name: Some("HD Pro Webcam C920".into()),
                 position: CameraPosition::Overhead,
@@ -2561,6 +2673,7 @@ mod openconnect_client_tests {
             "4".into(),
             OpenConnectClientSection {
                 name: "Bay".into(),
+                enabled: true,
                 address: Some("10.0.0.5:921".into()),
                 full_monitor: None,
                 chipping_monitor: None,
@@ -2737,6 +2850,7 @@ mod camera_tests {
             assert_eq!(position.key(), key);
             let section = CameraSection {
                 name: "DTL".into(),
+                enabled: true,
                 camera: "/dev/v4l/by-id/usb-cam-video-index0".into(),
                 camera_name: Some("HD Pro Webcam C920".into()),
                 position,
@@ -2939,6 +3053,47 @@ mod latency_tests {
         }
         let error = config.latency_error().expect("error");
         assert!(error.starts_with("camera.1: latency_s 11 "), "{error}");
+    }
+
+    #[test]
+    fn enabled_defaults_on_and_is_written_only_when_off() {
+        let text = r#"{
+            "mevo": {"0": {"name": "Mevo", "address": "192.168.2.1:5100"}},
+            "r10": {"0": {"name": "R10"}},
+            "square": {"0": {"name": "Omni"}},
+            "exputt": {"0": {"name": "ExPutt"}},
+            "mock_monitor": {"0": {"name": "Mock"}},
+            "openconnect_server": {"0": {"name": "Uneekor"}},
+            "openconnect_client": {"0": {"name": "Open Connect"}},
+            "pureplay": {"0": {"name": "Pureplay Connect"}},
+            "random_club": {"0": {"name": "Random"}},
+            "camera": {"0": {"name": "Camera"}}
+        }"#;
+        let mut config: FlighthookConfig = serde_json::from_str(text).expect("de");
+        assert!(config.disabled_actors().is_empty(), "absent is on");
+        let json = serde_json::to_string(&config).expect("ser");
+        assert!(!json.contains("enabled"), "{json}");
+
+        config.mock_monitor.get_mut("0").unwrap().enabled = false;
+        config.openconnect_client.get_mut("0").unwrap().enabled = false;
+        config.camera.get_mut("0").unwrap().enabled = false;
+        assert_eq!(
+            config.disabled_actors(),
+            ["camera.0", "mock_monitor.0", "openconnect_client.0"]
+        );
+        assert!(!config.actor_enabled("mock_monitor.0"));
+        assert!(config.actor_enabled("mevo.0"));
+        assert!(config.actor_enabled("webserver.0"), "not a toggled type");
+        assert!(config.actor_enabled("mevo.7"), "not configured");
+        let json = serde_json::to_string(&config).expect("ser");
+        assert_eq!(json.matches(r#""enabled":false"#).count(), 3, "{json}");
+        assert!(!json.contains(r#""enabled":true"#), "{json}");
+        let back: FlighthookConfig = serde_json::from_str(&json).expect("de");
+        assert_eq!(back.disabled_actors(), config.disabled_actors());
+        // Written on: read as on.
+        let on: MockMonitorSection =
+            serde_json::from_str(r#"{"name":"Mock","enabled":true}"#).expect("de");
+        assert!(on.enabled);
     }
 
     #[test]

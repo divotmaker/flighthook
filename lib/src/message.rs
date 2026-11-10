@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::{Handedness, ShotDetectionMode};
 use std::collections::HashMap;
 
-use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRaw};
+use crate::{
+    ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, Provenance, RoundState, ShotRaw,
+};
 use crate::{
     BodyTrackingSection, CameraPosition, CameraSection, ExPuttSection, FlighthookConfig,
     MevoSection, MockMonitorSection, OpenConnectClientSection, OpenConnectServerSection,
@@ -59,6 +61,11 @@ pub struct FlighthookMessage {
     pub device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_payload: Option<RawPayload>,
+    /// What stands behind the shot a `shot_trigger` starts: set by flighthook
+    /// on the triggers of every shot source, from the type of the actor that
+    /// emits it, and absent on every other message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
     pub event: FlighthookEvent,
 }
 
@@ -71,8 +78,14 @@ impl FlighthookMessage {
             actor: String::new(),
             device: None,
             raw_payload: None,
+            provenance: None,
             event: event.into(),
         }
+    }
+
+    pub fn provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 
     pub fn actor(mut self, actor: impl Into<String>) -> Self {
@@ -239,6 +252,9 @@ pub enum FlighthookEvent {
     ClubInfo { club_info: ClubInfo },
     /// Player handedness update.
     HandInfo { hand_info: HandInfo },
+    /// The tournament round started or ended (its holder changed). Emitted
+    /// by the system when the round policy changes.
+    RoundState { round: RoundState },
     /// Config mutation request (emitted by POST handler, processed by SystemActor).
     ConfigCommand {
         /// Opaque correlation ID for request-reply pattern.
@@ -444,6 +460,7 @@ mod tests {
             index: "0".into(),
             section: ExPuttSection {
                 name: "ExPutt".into(),
+                enabled: true,
                 address: Some("192.168.1.50".into()),
                 impact_lead_s: None,
             },
@@ -465,6 +482,7 @@ mod tests {
             actor: "mevo.0".into(),
             device: Some("FS-M2-XXXXXX".into()),
             raw_payload: None,
+            provenance: None,
             event: FlighthookEvent::DeviceTelemetry {
                 manufacturer: Some("FlightScope".into()),
                 model: None,
@@ -484,6 +502,7 @@ mod tests {
             actor: "webserver.0".into(),
             device: None,
             raw_payload: None,
+            provenance: None,
             event: FlighthookEvent::ActorStatus {
                 status: crate::ActorStatus::Connected,
                 telemetry: HashMap::from([("bind".into(), "0.0.0.0:5880".into())]),
@@ -502,6 +521,7 @@ mod tests {
             actor: "mevo.0".into(),
             device: Some("FS-M2-XXXXXX".into()),
             raw_payload: None,
+            provenance: None,
             event: FlighthookEvent::ShotFinished {
                 key: ShotKey {
                     shot_id: "abc".into(),
@@ -523,6 +543,7 @@ mod tests {
             actor: "system".into(),
             device: None,
             raw_payload: None,
+            provenance: None,
             event: FlighthookEvent::ActorStatus {
                 status: crate::ActorStatus::Connected,
                 telemetry: HashMap::new(),
@@ -546,6 +567,7 @@ mod tests {
             actor: "web".into(),
             device: None,
             raw_payload: None,
+            provenance: None,
             event,
         }
     }
@@ -888,6 +910,7 @@ mod tests {
             index: "1".into(),
             section: CameraSection {
                 name: "Face".into(),
+                enabled: true,
                 camera: "test-pattern".into(),
                 camera_name: None,
                 position: CameraPosition::GolferFront,

@@ -58,6 +58,9 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) id: String,
     pub(crate) monitor_type: String, // "mevo" | "mock_monitor"
     pub(crate) name: String,
+    /// Whether the card is on (`enabled`): the saved value, which the
+    /// header switch saves at once.
+    pub(crate) enabled: bool,
     pub(crate) address: String,
     pub(crate) ball_type: u8,
     pub(crate) tee_height_val: String,
@@ -307,6 +310,7 @@ impl DeviceFormEntry {
             id: id.into(),
             monitor_type: "mevo".into(),
             name: s.name.clone(),
+            enabled: s.enabled,
             address: s.address.clone().unwrap_or_default(),
             ball_type: s.ball_type.unwrap_or(1),
             tee_height_val: format_distance_value(tee.value()),
@@ -336,6 +340,7 @@ impl DeviceFormEntry {
             id: id.into(),
             monitor_type: "r10".into(),
             name: s.name.clone(),
+            enabled: s.enabled,
             address: String::new(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
@@ -369,6 +374,7 @@ impl DeviceFormEntry {
             id: id.into(),
             monitor_type: "square".into(),
             name: s.name.clone(),
+            enabled: s.enabled,
             address: s.address.clone().unwrap_or_default(),
             discard_zero_spin: s.discard_non_putting_zero_spin.unwrap_or(true),
             square_club: s.club.clone(),
@@ -398,6 +404,7 @@ impl DeviceFormEntry {
             id: id.into(),
             monitor_type: "exputt".into(),
             name: s.name.clone(),
+            enabled: s.enabled,
             address: s.address.clone().unwrap_or_default(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
@@ -427,6 +434,7 @@ impl DeviceFormEntry {
             id: id.into(),
             monitor_type: "openconnect_server".into(),
             name: s.name.clone(),
+            enabled: s.enabled,
             address: s.bind.clone().unwrap_or_default(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
@@ -456,6 +464,7 @@ impl DeviceFormEntry {
             id: id.into(),
             monitor_type: "mock_monitor".into(),
             name: s.name.clone(),
+            enabled: s.enabled,
             address: String::new(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
@@ -484,6 +493,7 @@ impl DeviceFormEntry {
         Self {
             monitor_type: "camera".into(),
             name: s.name.clone(),
+            enabled: s.enabled,
             cam: Box::new(CameraFields {
                 id: s.camera.clone(),
                 name: s.camera_name.clone(),
@@ -498,6 +508,7 @@ impl DeviceFormEntry {
                 id,
                 &MockMonitorSection {
                     name: String::new(),
+                    enabled: true,
                     impact_lead_s: None,
                 },
             )
@@ -570,6 +581,8 @@ pub(crate) struct IntegrationFormEntry {
     pub(crate) id: String,
     pub(crate) integration_type: String, // "openconnect_client" | "pureplay" | "random_club" | "webserver"
     pub(crate) name: String,
+    /// Whether the card is on (`enabled`); always on for a web server.
+    pub(crate) enabled: bool,
     pub(crate) address: String,
     /// Routing: actor ID for full-swing monitor, or empty = "Any".
     pub(crate) full_monitor: String,
@@ -619,14 +632,14 @@ impl ActorFormEntry {
                 "r10" => "R10",
                 "square" => "Square Golf Omni",
                 "exputt" => "ExPutt",
-                "openconnect_server" => "OpenConnect Server",
+                "openconnect_server" => "Open Connect Server",
                 "mock_monitor" => "Mock",
                 "camera" => "Camera",
                 _ => &d.monitor_type,
             },
             ActorFormEntry::Integration(i) => match i.integration_type.as_str() {
-                "openconnect_client" => "OpenConnect Client",
-                "pureplay" => "Pureplay",
+                "openconnect_client" => "Open Connect Client",
+                "pureplay" => "Pureplay Connect",
                 "random_club" => "Random Club",
                 "webserver" => "Web Server",
                 _ => &i.integration_type,
@@ -656,10 +669,10 @@ impl ActorFormEntry {
             },
             ActorFormEntry::Integration(i) => match i.integration_type.as_str() {
                 "openconnect_client" => {
-                    "Sends shots to a simulator that accepts GSPro Open Connect (GSPro on 921, Muni Golf on 9210) — connects via TCP"
+                    "Sends shots to a simulator that accepts GSPro Open Connect (GSPro and Pureplay on 921, Muni Golf on 9210) — connects via TCP"
                 }
                 "pureplay" => {
-                    "Sends shots to Pureplay over Pureplay Connect (port 9760) and takes its club and hand (beta) — connects via TCP"
+                    "Sends shots to Pureplay over Pureplay Connect (port 9760) and takes its club and hand — connects via TCP"
                 }
                 "random_club" => "Cycles through clubs automatically on each shot",
                 "webserver" => "HTTP/WebSocket server for the dashboard UI and API",
@@ -674,6 +687,14 @@ impl ActorFormEntry {
         match self {
             ActorFormEntry::Device(d) => &d.monitor_type,
             ActorFormEntry::Integration(i) => &i.integration_type,
+        }
+    }
+
+    /// Turn the card on or off in the form.
+    fn set_enabled(&mut self, on: bool) {
+        match self {
+            ActorFormEntry::Device(d) => d.enabled = on,
+            ActorFormEntry::Integration(i) => i.enabled = on,
         }
     }
 
@@ -714,6 +735,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             id: id.clone(),
             monitor_type: type_key.into(),
             name: name.into(),
+            enabled: true,
             address: address.into(),
             ball_type,
             tee_height_val: "1.5".into(),
@@ -742,6 +764,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             id: id.clone(),
             integration_type: type_key.into(),
             name: name.into(),
+            enabled: true,
             address: address.into(),
             full_monitor: String::new(),
             chipping_monitor: String::new(),
@@ -1243,6 +1266,7 @@ fn actor_entries(s: &FlighthookConfig) -> Vec<ActorFormEntry> {
             id: id.clone(),
             integration_type: "openconnect_client".into(),
             name: section.name.clone(),
+            enabled: section.enabled,
             address: section.address.clone().unwrap_or_default(),
             full_monitor: section.full_monitor.clone().unwrap_or_default(),
             chipping_monitor: section.chipping_monitor.clone().unwrap_or_default(),
@@ -1255,6 +1279,7 @@ fn actor_entries(s: &FlighthookConfig) -> Vec<ActorFormEntry> {
             id: id.clone(),
             integration_type: "pureplay".into(),
             name: section.name.clone(),
+            enabled: section.enabled,
             address: section.address.clone().unwrap_or_default(),
             full_monitor: section.full_monitor.clone().unwrap_or_default(),
             chipping_monitor: section.chipping_monitor.clone().unwrap_or_default(),
@@ -1267,6 +1292,7 @@ fn actor_entries(s: &FlighthookConfig) -> Vec<ActorFormEntry> {
             id: id.clone(),
             integration_type: "random_club".into(),
             name: section.name.clone(),
+            enabled: section.enabled,
             address: String::new(),
             full_monitor: String::new(),
             chipping_monitor: String::new(),
@@ -1279,6 +1305,7 @@ fn actor_entries(s: &FlighthookConfig) -> Vec<ActorFormEntry> {
             id: id.clone(),
             integration_type: "webserver".into(),
             name: section.name.clone(),
+            enabled: true,
             address: section.bind.clone(),
             full_monitor: String::new(),
             chipping_monitor: String::new(),
@@ -1518,6 +1545,14 @@ impl SettingsForm {
         let id = next_index(&existing);
         let entry = new_actor_entry(preset, id)?;
         let global_id = entry.global_id();
+        // A duplicate may be created, but not enabled: it starts off when an
+        // enabled card of its type has its address.
+        let mut probe = self.saved_config();
+        apply_actor_to_config(&mut probe, &entry);
+        let mut entry = entry;
+        if probe.address_clash(&global_id).is_some() {
+            entry.set_enabled(false);
+        }
         self.actors.push(entry);
         Some(global_id)
     }
@@ -1543,6 +1578,12 @@ impl SettingsForm {
         self.save.is_some()
     }
 
+    /// The save that is out: what it writes and its request body.
+    #[cfg(test)]
+    pub(crate) fn posted(&self) -> Option<(&SaveTarget, &FlighthookConfig)> {
+        self.save.as_ref().map(|s| (&s.target, &s.posted))
+    }
+
     /// The saved cameras, as of the last load or save: actor ID and section,
     /// by index.
     pub(crate) fn saved_cameras(&self) -> Vec<(String, CameraSection)> {
@@ -1557,6 +1598,14 @@ impl SettingsForm {
             .into_iter()
             .map(|(index, section)| (format!("camera.{index}"), section.clone()))
             .collect()
+    }
+
+    /// The saved cameras that are on ([`Self::saved_cameras`] without the
+    /// ones turned off): the ones that record and have a live picture.
+    pub(crate) fn cameras_on(&self) -> Vec<(String, CameraSection)> {
+        let mut cameras = self.saved_cameras();
+        cameras.retain(|(_, section)| section.enabled);
+        cameras
     }
 
     /// The rotation camera `actor` (e.g. `camera.0`) is shown with, in
@@ -1814,10 +1863,52 @@ impl SettingsForm {
     pub(crate) fn build_actor_request(&self, global_id: &str) -> FlighthookConfig {
         let mut config = self.saved_config();
         if let Some(idx) = self.position(global_id) {
+            let live = config.clone();
             apply_actor_to_config(&mut config, &self.actors[idx]);
+            // A card saved on an address another enabled card has is saved
+            // off.
+            config.demote_clashing(Some(&live));
         }
         config
     }
+
+    /// Why card `global_id`, which is off in the saved settings, cannot be
+    /// turned on: an enabled card of its type has its address. `None` for a
+    /// card that is on, or that has no clash.
+    pub(crate) fn enable_clash(&self, global_id: &str) -> Option<flighthook::AddressClash> {
+        let saved = self.original_config.as_ref()?;
+        (!saved.actor_enabled(global_id))
+            .then(|| saved.address_clash(global_id))
+            .flatten()
+    }
+    /// Whether card `global_id` is off: in the save that is out, else in
+    /// the saved settings. False for a card the settings don't hold.
+    pub(crate) fn turned_off(&self, global_id: &str) -> bool {
+        self.save
+            .as_ref()
+            .map(|s| &s.posted)
+            .or(self.original_config.as_ref())
+            .is_some_and(|c| c.disabled_actors().iter().any(|id| id == global_id))
+    }
+
+    /// Record a save that turns card `global_id` on or off and nothing
+    /// else, scoped to it, and return its request body: the saved settings
+    /// with only that card's `enabled` changed. `None` for a card that has
+    /// no such switch or that the saved settings don't hold.
+    pub(crate) fn begin_enable(&mut self, global_id: &str, on: bool) -> Option<FlighthookConfig> {
+        let mut posted = self.saved_config();
+        if !posted.set_actor_enabled(global_id, on) {
+            return None;
+        }
+        self.begin_save_with(SaveTarget::Actor(global_id.to_owned()), posted.clone());
+        Some(posted)
+    }
+}
+
+/// Whether a card of actor type `type_key` has the on/off switch: every
+/// launch monitor, camera and output, not the web server.
+pub(crate) fn switchable(type_key: &str) -> bool {
+    type_key != "webserver"
 }
 
 /// Whether `a` and `b` hold the same global settings.
@@ -1995,6 +2086,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         MevoSection {
                             name: dev.name.clone(),
+                            enabled: dev.enabled,
                             address: if dev.address.is_empty() {
                                 None
                             } else {
@@ -2030,6 +2122,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         flighthook::SquareSection {
                             name: dev.name.clone(),
+                            enabled: dev.enabled,
                             address: if dev.address.trim().is_empty() {
                                 None
                             } else {
@@ -2050,6 +2143,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         flighthook::ExPuttSection {
                             name: dev.name.clone(),
+                            enabled: dev.enabled,
                             address: if dev.address.trim().is_empty() {
                                 None
                             } else {
@@ -2064,6 +2158,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         R10Section {
                             name: dev.name.clone(),
+                            enabled: dev.enabled,
                             range: dev
                                 .range_val
                                 .parse::<f64>()
@@ -2078,6 +2173,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         flighthook::OpenConnectServerSection {
                             name: dev.name.clone(),
+                            enabled: dev.enabled,
                             bind: if dev.address.is_empty() {
                                 None
                             } else {
@@ -2092,6 +2188,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         MockMonitorSection {
                             name: dev.name.clone(),
+                            enabled: dev.enabled,
                             impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
                         },
                     );
@@ -2101,6 +2198,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         dev.id.clone(),
                         CameraSection {
                             name: dev.name.clone(),
+                            enabled: dev.enabled,
                             camera: dev.cam.id.trim().to_string(),
                             camera_name: dev.cam.name.clone(),
                             position: dev.cam.position,
@@ -2124,6 +2222,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         entry.id.clone(),
                         OpenConnectClientSection {
                             name: entry.name.clone(),
+                            enabled: entry.enabled,
                             address: if entry.address.is_empty() {
                                 None
                             } else {
@@ -2153,6 +2252,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         entry.id.clone(),
                         PureplaySection {
                             name: entry.name.clone(),
+                            enabled: entry.enabled,
                             address: set(&entry.address),
                             full_monitor: set(&entry.full_monitor),
                             chipping_monitor: set(&entry.chipping_monitor),
@@ -2165,6 +2265,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         entry.id.clone(),
                         RandomClubSection {
                             name: entry.name.clone(),
+                            enabled: entry.enabled,
                         },
                     );
                 }
@@ -2304,11 +2405,41 @@ pub(crate) fn card_header<R>(
     hover: Option<&str>,
     buttons: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    card_header_with(ui, key, title, tag, hover, None, buttons).0
+}
+
+/// The on/off switch of a card header: whether the card is on, and whether
+/// the switch takes input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeaderSwitch {
+    pub(crate) on: bool,
+    pub(crate) enabled: bool,
+    /// Why the card cannot be turned on: an enabled card of its type has its
+    /// address. Shown on hover while the switch is locked.
+    pub(crate) clash: Option<String>,
+}
+
+/// [`card_header`] with an optional on/off `switch` right after the title,
+/// which keeps its size like the buttons (hover "Turn off" / "Turn on",
+/// mark `enabled:<key>`). Returns what `buttons` returned and whether the
+/// switch was flipped.
+pub(crate) fn card_header_with<R>(
+    ui: &mut egui::Ui,
+    key: &str,
+    title: &str,
+    tag: Option<(&str, TagPlace)>,
+    hover: Option<&str>,
+    switch: Option<HeaderSwitch>,
+    buttons: impl FnOnce(&mut egui::Ui) -> R,
+) -> (R, bool) {
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let result = buttons(ui);
             let gap = ui.spacing().item_spacing.x;
-            let room = ui.available_width();
+            let switch_room = switch
+                .as_ref()
+                .map_or(0.0, |_| theme::ON_OFF_SWITCH.x + gap);
+            let room = ui.available_width() - switch_room;
             let tag = tag.and_then(|(t, place)| {
                 let full = tag_width(ui, t);
                 let width = full.min(room - TITLE_MIN_WIDTH - gap);
@@ -2323,31 +2454,49 @@ pub(crate) fn card_header<R>(
                 Some((text, TagPlace::Title, width)) => tag_after_title = Some((text, width)),
                 None => {}
             }
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let title_width =
-                    ui.available_width() - tag_after_title.map_or(0.0, |(_, width)| width + gap);
-                ui.scope(|ui| {
-                    ui.set_max_width(title_width.max(TITLE_MIN_WIDTH));
-                    let title = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(title)
-                                .strong()
-                                .size(16.0)
-                                .color(theme::HEADING),
-                        )
-                        .truncate(),
-                    );
-                    devices::mark(ui, || format!("title:{key}"), &title);
-                    if let Some(hover) = hover {
-                        title.on_hover_text(hover);
+            let flipped = ui
+                .with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let title_width = ui.available_width()
+                        - switch_room
+                        - tag_after_title.map_or(0.0, |(_, width)| width + gap);
+                    ui.scope(|ui| {
+                        ui.set_max_width(title_width.max(TITLE_MIN_WIDTH));
+                        let title = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(title)
+                                    .strong()
+                                    .size(16.0)
+                                    .color(theme::HEADING),
+                            )
+                            .truncate(),
+                        );
+                        devices::mark(ui, || format!("title:{key}"), &title);
+                        if let Some(hover) = hover {
+                            title.on_hover_text(hover);
+                        }
+                    });
+                    let flipped = switch.as_ref().is_some_and(|switch| {
+                        let response = ui
+                            .add_enabled_ui(switch.enabled, |ui| {
+                                theme::on_off_switch(ui, switch.on)
+                            })
+                            .inner
+                            .on_hover_text(if switch.on { "Turn off" } else { "Turn on" });
+                        let response = match &switch.clash {
+                            Some(clash) => response.on_disabled_hover_text(clash),
+                            None => response,
+                        };
+                        devices::mark(ui, || format!("enabled:{key}"), &response);
+                        response.clicked()
+                    });
+                    if let Some((text, width)) = tag_after_title {
+                        let tag = type_tag(ui, text, hover, width);
+                        devices::mark(ui, || format!("tag:{key}"), &tag);
                     }
-                });
-                if let Some((text, width)) = tag_after_title {
-                    let tag = type_tag(ui, text, hover, width);
-                    devices::mark(ui, || format!("tag:{key}"), &tag);
-                }
-            });
-            result
+                    flipped
+                })
+                .inner;
+            (result, flipped)
         })
         .inner
     })
@@ -4016,6 +4165,7 @@ mod tests {
             "0".into(),
             MockMonitorSection {
                 name: "Mock Monitor".into(),
+                enabled: true,
                 impact_lead_s: None,
             },
         );
@@ -4023,6 +4173,7 @@ mod tests {
             "0".into(),
             RandomClubSection {
                 name: "Random Club".into(),
+                enabled: true,
             },
         );
         let mut loaded = SettingsForm::default();
@@ -4202,7 +4353,7 @@ mod tests {
             e.dirty = true;
         }
         assert!(!form.cancel_actor(i));
-        assert_eq!(form.actors[i].name(), "GSPro");
+        assert_eq!(form.actors[i].name(), "Open Connect");
         assert_eq!(form.actors.len(), saved_count + 1);
     }
 

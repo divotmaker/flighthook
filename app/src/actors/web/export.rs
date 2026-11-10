@@ -377,6 +377,7 @@ mod tests {
             "0".into(),
             MevoSection {
                 name: "My Mevo".into(),
+                enabled: true,
                 address: Some(ADDR.into()),
                 ball_type: Some(1),
                 tee_height: None,

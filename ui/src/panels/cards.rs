@@ -160,15 +160,15 @@ const LAUNCH_MONITOR_PRESETS: &[AddPreset] = &[
     preset("Square Golf Omni", "square", "Square Golf Omni", ""),
     preset("ExPutt", "exputt", "ExPutt", ""),
     preset(
-        "Uneekor (OpenConnect)",
+        "Uneekor (Open Connect)",
         "openconnect_server",
         "Uneekor",
         "0.0.0.0:921",
     ),
     preset(
-        "OpenConnect Server",
+        "Open Connect Server",
         "openconnect_server",
-        "OpenConnect Server",
+        "Open Connect Server",
         "0.0.0.0:921",
     ),
 ];
@@ -177,24 +177,29 @@ const CAMERA_PRESETS: &[AddPreset] = &[preset("Camera", "camera", "Camera", "")]
 
 const OUTPUT_PRESETS: &[AddPreset] = &[
     preset(
-        "GSPro (OpenConnect)",
+        "GSPro (Open Connect)",
         "openconnect_client",
-        "GSPro",
+        "Open Connect",
         "127.0.0.1:921",
     ),
     preset(
-        "Muni Golf (OpenConnect)",
+        "Pureplay (Open Connect)",
+        "openconnect_client",
+        "Open Connect",
+        "127.0.0.1:921",
+    ),
+    preset(
+        "Muni Golf (Open Connect)",
         "openconnect_client",
         "Muni Golf",
         "127.0.0.1:9210",
     ),
     preset(
-        "OpenConnect Client",
-        "openconnect_client",
-        "OpenConnect Client",
-        "127.0.0.1:921",
+        "Pureplay (Pureplay Connect)",
+        "pureplay",
+        "Pureplay Connect",
+        "127.0.0.1:9760",
     ),
-    preset("Pureplay", "pureplay", "Pureplay", "127.0.0.1:9760"),
 ];
 
 /// What a group's (+) menu offers, in menu order.
@@ -256,7 +261,7 @@ pub(crate) fn add_heading(
             let mut picked = None;
             egui::Popup::menu(&add).show(|ui| {
                 for preset in add_options(group) {
-                    let item = ui.button(preset.label);
+                    let item = ui.add(egui::Button::new(preset.label));
                     devices::mark(
                         ui,
                         || format!("add:{}:{}", group.title(), preset.label),
@@ -470,15 +475,15 @@ mod tests {
                 ("Square Golf Omni", "square", "Square Golf Omni", ""),
                 ("ExPutt", "exputt", "ExPutt", ""),
                 (
-                    "Uneekor (OpenConnect)",
+                    "Uneekor (Open Connect)",
                     "openconnect_server",
                     "Uneekor",
                     "0.0.0.0:921"
                 ),
                 (
-                    "OpenConnect Server",
+                    "Open Connect Server",
                     "openconnect_server",
-                    "OpenConnect Server",
+                    "Open Connect Server",
                     "0.0.0.0:921"
                 ),
             ]
@@ -491,24 +496,29 @@ mod tests {
             entries(CardGroup::Outputs),
             [
                 (
-                    "GSPro (OpenConnect)",
+                    "GSPro (Open Connect)",
                     "openconnect_client",
-                    "GSPro",
+                    "Open Connect",
                     "127.0.0.1:921"
                 ),
                 (
-                    "Muni Golf (OpenConnect)",
+                    "Pureplay (Open Connect)",
+                    "openconnect_client",
+                    "Open Connect",
+                    "127.0.0.1:921"
+                ),
+                (
+                    "Muni Golf (Open Connect)",
                     "openconnect_client",
                     "Muni Golf",
                     "127.0.0.1:9210"
                 ),
                 (
-                    "OpenConnect Client",
-                    "openconnect_client",
-                    "OpenConnect Client",
-                    "127.0.0.1:921"
+                    "Pureplay (Pureplay Connect)",
+                    "pureplay",
+                    "Pureplay Connect",
+                    "127.0.0.1:9760"
                 ),
-                ("Pureplay", "pureplay", "Pureplay", "127.0.0.1:9760"),
             ]
         );
         assert!(

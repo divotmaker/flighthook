@@ -122,6 +122,7 @@ pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusRespon
         cameras_supported: crate::state::cameras::supported(),
         clip_dir: Some(clip_dir.display().to_string()),
         config_error: state.root.system.load_error(),
+        round: state.root.round.state(),
     })
 }
 
@@ -807,9 +808,9 @@ pub async fn get_shot_groups(State(state): State<Arc<WebState>>) -> Json<ShotGro
 /// surface ([`crate::autochip`]); the shot goes on the bus as actor
 /// [`flighthook::AUTO_CHIP_ACTOR`], so every output forwards it and it is
 /// stored like a device's shot. 409 when Auto-chip is disabled in the
-/// settings (`[simulation] auto_chip`), a Pureplay link is in strict mode
-/// (a recorded round) or the simulation environment is invalid, 400 for any
-/// other distance; all with a JSON `{"error"}` body.
+/// settings (`[simulation] auto_chip`), a tournament round is active (the
+/// round policy turns Auto-chip off) or the simulation environment is
+/// invalid, 400 for any other distance; all with a JSON `{"error"}` body.
 pub async fn post_auto_chip(
     State(state): State<Arc<WebState>>,
     Json(body): Json<AutoChipRequest>,
@@ -818,12 +819,6 @@ pub async fn post_auto_chip(
         return Err(settings_error(
             StatusCode::CONFLICT,
             "Auto-chip is disabled in settings",
-        ));
-    }
-    if state.root.strict_rounds.any() {
-        return Err(settings_error(
-            StatusCode::CONFLICT,
-            crate::autochip::STRICT_ROUND,
         ));
     }
     let yards = body.yards;
@@ -969,6 +964,51 @@ fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction>
         "camera" => upsert!(camera, UpsertCamera),
         _ => return None,
     })
+}
+
+/// Why a save (`scope`, over the `live` config) of `new_config` is refused
+/// with `409`, or `None`: it turns a card on, or adds one that is on, while
+/// an enabled card of the same type has its address
+/// ([`FlighthookConfig::address_clash`]). Editing a card that is on onto a
+/// held address is no refusal; the system actor saves that card as off.
+fn enable_refusal(
+    live: &FlighthookConfig,
+    scope: Option<&str>,
+    new_config: &FlighthookConfig,
+) -> Option<String> {
+    let after = match scope {
+        None => new_config.clone(),
+        Some("global" | "body_tracking" | "player") => return None,
+        Some(scope) => {
+            let scope = crate::state::config::canonical_id(scope);
+            let (prefix, index) = scope.split_once('.')?;
+            let mut after = live.clone();
+            macro_rules! copy {
+                ($section:ident) => {
+                    match new_config.$section.get(index) {
+                        Some(section) => {
+                            after.$section.insert(index.to_owned(), section.clone());
+                        }
+                        None => return None,
+                    }
+                };
+            }
+            match prefix {
+                "mevo" => copy!(mevo),
+                "square" => copy!(square),
+                "exputt" => copy!(exputt),
+                "openconnect_server" => copy!(openconnect_server),
+                "openconnect_client" => copy!(openconnect_client),
+                "pureplay" => copy!(pureplay),
+                _ => return None,
+            }
+            after
+        }
+    };
+    after
+        .enable_clashes(live)
+        .first()
+        .map(flighthook::AddressClash::message)
 }
 
 /// Why `action` breaks the one-web-server rule, against the `live` config:
@@ -1147,6 +1187,7 @@ async fn save_settings(
     new_config: FlighthookConfig,
     timeout: Duration,
 ) -> Result<Json<PostSettingsResponse>, SettingsError> {
+    let refusal = enable_refusal(&state.root.system.snapshot(), scope, &new_config);
     let action = match scope {
         None => ConfigAction::ReplaceAll {
             config: Box::new(new_config),
@@ -1182,6 +1223,10 @@ async fn save_settings(
     if let Some(reason) = invalid_setting(&action) {
         tracing::warn!("config update: {reason}, ignoring request");
         return Err(settings_error(StatusCode::BAD_REQUEST, &reason));
+    }
+    if let Some(reason) = refusal {
+        tracing::warn!("config update: {reason}, ignoring request");
+        return Err(settings_error(StatusCode::CONFLICT, &reason));
     }
     // A config file that failed to load is copied aside before the first
     // save replaces it; without the copy nothing is saved.
@@ -2190,14 +2235,21 @@ mod group_tests {
         assert_eq!(resp.shot_number, 1);
     }
 
-    /// While a Pureplay link is in strict mode no chip fires, neither
-    /// through the route nor through `autochip::send`; once it ends the
-    /// user's setting applies again.
+    /// While a tournament round is active no chip fires, neither through
+    /// the route nor through `autochip::send`; once it ends the user's
+    /// setting applies again.
     #[tokio::test]
     async fn auto_chip_does_not_fire_during_a_strict_round() {
         let (state, _writer, _dir) = test_state();
         state.root.system.update(|c| c.simulation.auto_chip = true);
-        state.root.strict_rounds.hold("pureplay.0");
+        let round = state
+            .root
+            .round
+            .begin_round(&crate::state::round::RoundRequest {
+                holder: "Pureplay",
+                feeds: &[],
+            })
+            .expect("a round");
         let state = Arc::new(state);
         let mut rx = state.bus_tx.subscribe();
         let (status, Json(body)) = post_auto_chip(
@@ -2213,7 +2265,7 @@ mod group_tests {
         );
         assert_eq!(
             crate::autochip::send(&state.root, &state.bus_tx, 3, &state.auto_chip_shots),
-            Err(crate::autochip::SolveError::StrictRound)
+            Err(crate::autochip::SolveError::RoundActive)
         );
         assert!(rx.try_recv().is_err(), "nothing emitted");
         assert_eq!(
@@ -2224,7 +2276,7 @@ mod group_tests {
             "no number taken"
         );
 
-        state.root.strict_rounds.release("pureplay.0");
+        drop(round);
         let Json(resp) = post_auto_chip(
             State(Arc::clone(&state)),
             Json(AutoChipRequest { yards: 3 }),
@@ -2480,6 +2532,68 @@ mod group_tests {
         assert_eq!(state.root.system.snapshot(), live, "nothing saved");
     }
 
+    /// Turning on, or adding as on, a card whose address an enabled card of
+    /// its type has is `409` with the reason and saves nothing, for the
+    /// whole config and for the card's scope. A card that is off, or on a
+    /// free address, saves.
+    #[tokio::test]
+    async fn settings_save_that_enables_a_duplicate_address_is_409() {
+        let (state, _writer, _dir) = test_state();
+        let client = |address: &str, enabled| flighthook::OpenConnectClientSection {
+            name: "Open Connect".into(),
+            enabled,
+            address: Some(address.into()),
+            full_monitor: None,
+            chipping_monitor: None,
+            putting_monitor: None,
+        };
+        state.root.system.update(|c| {
+            c.openconnect_client
+                .insert("0".into(), client("127.0.0.1:921", true));
+            c.openconnect_client
+                .insert("1".into(), client("localhost:921", false));
+        });
+        let live = state.root.system.snapshot();
+        let mut on = live.clone();
+        on.openconnect_client.get_mut("1").unwrap().enabled = true;
+        let mut added = live.clone();
+        added
+            .openconnect_client
+            .insert("2".into(), client("127.0.0.1:921", true));
+        let mut rx = state.bus_tx.subscribe();
+        for (scope, body) in [
+            (None, on.clone()),
+            (Some("openconnect_client.1"), on),
+            (Some("openconnect_client.2"), added.clone()),
+            (None, added),
+        ] {
+            let (status, Json(error)) =
+                save_settings(&state, scope, body, Duration::from_millis(50))
+                    .await
+                    .expect_err("refused");
+            assert_eq!(status, StatusCode::CONFLICT, "{scope:?}");
+            assert_eq!(
+                error["error"], "An Open Connect card already uses 127.0.0.1:921",
+                "{scope:?}"
+            );
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+
+        // A card that stays off, and one turned on at a free address, save
+        // (here the command times out: no system actor runs).
+        let mut free = live.clone();
+        free.openconnect_client.get_mut("1").unwrap().address = Some("127.0.0.1:9210".into());
+        free.openconnect_client.get_mut("1").unwrap().enabled = true;
+        for (scope, body) in [
+            (Some("openconnect_client.1"), live.clone()),
+            (Some("openconnect_client.1"), free),
+        ] {
+            let res = save_settings(&state, scope, body, Duration::from_millis(50)).await;
+            assert_eq!(res.err().map(|e| e.0), Some(StatusCode::GATEWAY_TIMEOUT));
+        }
+    }
+
     /// A whole-config or `mevo.N`-scoped save with a `launch_only_spin` below
     /// 0, above 1000 or non-finite is 400 and saves nothing; a global save
     /// does not write Mevo sections, so it is not checked.
@@ -2558,6 +2672,7 @@ mod group_tests {
                 "0".into(),
                 flighthook::MockMonitorSection {
                     name: "Mock".into(),
+                    enabled: true,
                     impact_lead_s: None,
                 },
             );
@@ -3178,6 +3293,33 @@ mod group_tests {
         (state, path, dir)
     }
 
+    /// The status carries the round while one is active, with its holder,
+    /// and leaves it out otherwise.
+    #[tokio::test]
+    async fn get_status_carries_the_round_while_one_is_active() {
+        let (state, _writer, _dir) = test_state();
+        let state = Arc::new(state);
+        let json =
+            serde_json::to_value(get_status(State(Arc::clone(&state))).await.0).expect("ser");
+        assert!(json.get("round").is_none(), "{json}");
+        let round = state
+            .root
+            .round
+            .begin_round(&crate::state::round::RoundRequest {
+                holder: "Pureplay",
+                feeds: &[],
+            })
+            .expect("a round");
+        let json =
+            serde_json::to_value(get_status(State(Arc::clone(&state))).await.0).expect("ser");
+        assert_eq!(
+            json["round"],
+            serde_json::json!({"active": true, "holder": "Pureplay"})
+        );
+        drop(round);
+        assert!(!get_status(State(state)).await.0.round.active);
+    }
+
     #[tokio::test]
     async fn get_status_carries_the_config_error_until_a_save_backs_the_file_up() {
         let (state, _writer, _dir) = test_state();
@@ -3300,6 +3442,7 @@ mod reconnect_tests {
                 "0".into(),
                 flighthook::MockMonitorSection {
                     name: "Mock".into(),
+                    enabled: true,
                     impact_lead_s: None,
                 },
             );

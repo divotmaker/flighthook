@@ -15,8 +15,8 @@ Types for the TOML config file and unit-aware value handling.
 | `CameraMode`         | `Standard` / `Fusion` / `RawFusion` — Fusion modes request club data from a Mevo                 |
 | `R10Section`         | Garmin R10 device instance (BLE auto-discovery, name only)                                       |
 | `SquareSection`      | Square Golf Omni device instance (address, club, advanced spin, zero-spin rejection)             |
-| `OpenConnectServerSection` | OpenConnect server: GSPro Open Connect ingest listener (bind address)                      |
-| `OpenConnectClientSection` | OpenConnect client: dials a simulator such as GSPro or Muni Golf (address, per-mode monitor routing) |
+| `OpenConnectServerSection` | Open Connect server: GSPro Open Connect ingest listener (bind address)                      |
+| `OpenConnectClientSection` | Open Connect client: dials a simulator such as GSPro, Pureplay or Muni Golf (address, per-mode monitor routing) |
 | `MockMonitorSection` | Mock launch monitor instance                                                                     |
 | `RandomClubSection`  | Random club cycling integration instance                                                         |
 | `ShotDetectionMode`  | `Full` / `Putting` / `Chipping`                                                                  |

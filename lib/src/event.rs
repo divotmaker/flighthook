@@ -43,7 +43,7 @@ use crate::{Club, Handedness, ShotKey, ShotMetrics, ShotRaw, ShotVideo, UnitSyst
 /// [`spin_estimated`](Self::spin_estimated) marks a spin in [`BallFlight`]
 /// that flighthook estimated rather than the device measured, and
 /// [`computed`](Self::computed) the values in the shot's measured blocks
-/// that the device actor computed or filled in.
+/// that come from a model rather than the device's readings.
 ///
 /// Non-exhaustive so fields can be added; build one with
 /// `DerivedFlight::default()` and assign the fields.
@@ -102,12 +102,13 @@ pub struct DerivedFlight {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spin_estimated: bool,
     /// Values in the shot's measured blocks ([`BallFlight`], `ClubData`,
-    /// `FaceImpact`) that the device actor or its driver computed from
-    /// other readings or filled in, rather than the device reporting them:
-    /// for example back and side spin worked out from a measured total and
-    /// axis. The values stay where outputs read them; this list only marks
-    /// their source. Set on its own (every other field empty) when the shot
-    /// was not simulated. Omitted on the wire when empty.
+    /// `FaceImpact`) that come from a model (aerodynamic, flight or
+    /// otherwise) rather than from the device's readings. A plain
+    /// translation of a reading is not computed: converting between the two
+    /// spin pairs, a unit or sign conversion, a calibration offset. The
+    /// values stay where outputs read them; this list only marks their
+    /// source. Set on its own (every other field empty) when the shot was
+    /// not simulated. Omitted on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub computed: Vec<ShotField>,
 }
@@ -133,6 +134,44 @@ pub enum ShotField {
     SpinAxis,
     /// `FaceImpact.vertical`.
     ImpactVertical,
+}
+
+/// Where a shot comes from: a physical launch monitor that measured it, or
+/// no device at all.
+///
+/// Set once, when the shot enters flighthook, from the type of the actor
+/// that emits it ([`ShotData::provenance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    /// A physical launch monitor measured the shot: one a flighthook driver
+    /// reads, or one that sends its shots to the Open Connect input.
+    Measured,
+    /// No physical launch monitor measured the shot: the mock launch
+    /// monitor, Auto-chip, and any simulated or replayed source.
+    Virtual,
+}
+
+/// A tournament round: while one is active, the output holding it takes
+/// only measured shots and values, and virtual shot sources (Auto-chip, the
+/// mock launch monitor) are off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundState {
+    /// A round is active.
+    #[serde(default)]
+    pub active: bool,
+    /// The display name of the output holding the round (its card name).
+    /// Absent when no round is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+}
+
+impl RoundState {
+    /// Whether no round is active.
+    #[must_use]
+    pub fn is_inactive(&self) -> bool {
+        !self.active
+    }
 }
 
 /// A simulated ball path from the tee to rest.
@@ -270,13 +309,87 @@ pub struct ShotData {
     /// export.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub video: Vec<ShotVideo>,
+    /// What stands behind the shot, from the type of the actor that emitted
+    /// it. Absent on shots stored without it; a tournament round counts
+    /// those as not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
 }
+
+/// The four spin values, all unmeasured when flighthook estimated the spin.
+const SPIN_FIELDS: [ShotField; 4] = [
+    ShotField::TotalSpinRpm,
+    ShotField::BackspinRpm,
+    ShotField::SidespinRpm,
+    ShotField::SpinAxis,
+];
 
 impl ShotData {
     /// True when the device reported ball, club or impact data.
     #[must_use]
     pub fn has_data(&self) -> bool {
         self.ball.is_some() || self.club.is_some() || self.impact.is_some()
+    }
+
+    /// The values in the measured blocks that are not the device's reading:
+    /// those marked [`DerivedFlight::computed`], and all four spin values
+    /// when [`DerivedFlight::spin_estimated`] is set. Each field once.
+    ///
+    /// The answer comes from those two marks today; when FRP carries a
+    /// per-block list of computed values, it comes from that list instead,
+    /// and this stays the one question to ask.
+    pub fn unmeasured_fields(&self) -> impl Iterator<Item = ShotField> + '_ {
+        let derived = self.derived.as_ref();
+        let estimated = derived.is_some_and(|d| d.spin_estimated);
+        let computed = derived.map_or(&[][..], |d| d.computed.as_slice());
+        let mut fields: Vec<ShotField> = Vec::new();
+        for f in computed
+            .iter()
+            .copied()
+            .chain(SPIN_FIELDS.into_iter().filter(move |_| estimated))
+        {
+            if !fields.contains(&f) {
+                fields.push(f);
+            }
+        }
+        fields.into_iter()
+    }
+
+    /// Remove `field`'s value from the measured blocks.
+    pub fn clear_field(&mut self, field: ShotField) {
+        let ball = self.ball.as_mut();
+        match field {
+            ShotField::LaunchElevation => {
+                if let Some(b) = ball {
+                    b.launch_elevation = None;
+                }
+            }
+            ShotField::BackspinRpm => {
+                if let Some(b) = ball {
+                    b.backspin_rpm = None;
+                }
+            }
+            ShotField::SidespinRpm => {
+                if let Some(b) = ball {
+                    b.sidespin_rpm = None;
+                }
+            }
+            ShotField::TotalSpinRpm => {
+                if let Some(b) = ball {
+                    b.total_spin_rpm = None;
+                }
+            }
+            ShotField::SpinAxis => {
+                if let Some(b) = ball {
+                    b.spin_axis = None;
+                }
+            }
+            ShotField::ImpactVertical => {
+                if let Some(i) = self.impact.as_mut() {
+                    i.vertical = None;
+                }
+            }
+        }
     }
 
     /// Convert all distance and velocity fields to the given unit system.
@@ -337,6 +450,7 @@ impl ShotData {
             group: self.group.clone(),
             handed: self.handed,
             video: self.video.clone(),
+            provenance: self.provenance,
         }
     }
 
@@ -392,6 +506,7 @@ impl ShotData {
             group: self.group.clone(),
             handed: self.handed,
             video: self.video.clone(),
+            provenance: self.provenance,
         }
     }
 }
@@ -440,6 +555,7 @@ pub struct ShotAccumulator {
     impact: Option<FaceImpact>,
     derived: Option<DerivedFlight>,
     raw: Option<ShotRaw>,
+    provenance: Option<Provenance>,
 }
 
 impl ShotAccumulator {
@@ -453,7 +569,16 @@ impl ShotAccumulator {
             impact: None,
             derived: None,
             raw: None,
+            provenance: None,
         }
+    }
+
+    /// The shot's provenance, from its trigger's envelope
+    /// ([`FlighthookMessage::provenance`](crate::FlighthookMessage)).
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Option<Provenance>) -> Self {
+        self.provenance = provenance;
+        self
     }
 
     /// Record ball flight data.
@@ -503,6 +628,7 @@ impl ShotAccumulator {
             impact: self.impact,
             derived: self.derived,
             metrics,
+            provenance: self.provenance,
             ..ShotData::default()
         };
         (Some(shot), self.raw)
@@ -550,7 +676,8 @@ impl ShotAggregator {
     pub fn feed(&mut self, msg: &crate::FlighthookMessage) -> Option<ShotData> {
         match &msg.event {
             crate::FlighthookEvent::ShotTrigger { key } => {
-                let acc = ShotAccumulator::new(msg.actor.clone(), key.clone());
+                let acc = ShotAccumulator::new(msg.actor.clone(), key.clone())
+                    .with_provenance(msg.provenance);
                 self.pending.insert((msg.actor.clone(), key.clone()), acc);
                 None
             }
@@ -620,6 +747,7 @@ mod tests {
             actor: "square.0".into(),
             device: Some("SquareGolf-A1B2".into()),
             raw_payload: Some(RawPayload::Binary(vec![0x11, 0x02, 0x00, 0x2a, 0xff])),
+            provenance: None,
             event: FlighthookEvent::BallFlight {
                 key: key(),
                 ball: Box::new(ball()),
@@ -697,6 +825,7 @@ mod tests {
             actor: "square.0".into(),
             device: Some("SquareGolf-A1B2".into()),
             raw_payload: None,
+            provenance: None,
             event: FlighthookEvent::ShotFinished {
                 key: key(),
                 raw: None,
@@ -719,6 +848,7 @@ mod tests {
             actor: "square.0".into(),
             device: None,
             raw_payload: None,
+            provenance: None,
             event: FlighthookEvent::ShotFinished {
                 key: key(),
                 raw: Some(Box::new(raw())),
@@ -756,6 +886,7 @@ mod tests {
             actor: "square.0".into(),
             device: None,
             raw_payload: None,
+            provenance: None,
             event,
         };
         agg.feed(&msg(FlighthookEvent::ShotTrigger { key: key() }));
@@ -923,6 +1054,159 @@ mod tests {
         assert_eq!(back.derived, Some(derived()));
     }
 
+    /// `unmeasured_fields` names the computed marks and, for an estimated
+    /// spin, all four spin values, each once; `clear_field` removes each.
+    #[test]
+    fn unmeasured_fields_join_both_marks() {
+        let mut shot = ShotData {
+            ball: Some(BallFlight {
+                total_spin_rpm: Some(2500),
+                spin_axis: Some(3.0),
+                backspin_rpm: Some(2490),
+                sidespin_rpm: Some(130),
+                ..ball()
+            }),
+            impact: Some(FaceImpact {
+                lateral: Some(Distance::Millimeters(3.0)),
+                vertical: Some(Distance::Millimeters(-4.0)),
+            }),
+            ..ShotData::default()
+        };
+        assert_eq!(shot.unmeasured_fields().count(), 0);
+        let mut marked = None;
+        DerivedFlight::mark_computed(
+            &mut marked,
+            &[ShotField::SidespinRpm, ShotField::ImpactVertical],
+        );
+        shot.derived = marked.map(|d| *d);
+        assert_eq!(
+            shot.unmeasured_fields().collect::<Vec<_>>(),
+            [ShotField::SidespinRpm, ShotField::ImpactVertical]
+        );
+        if let Some(d) = shot.derived.as_mut() {
+            d.spin_estimated = true;
+        }
+        assert_eq!(
+            shot.unmeasured_fields().collect::<Vec<_>>(),
+            [
+                ShotField::SidespinRpm,
+                ShotField::ImpactVertical,
+                ShotField::TotalSpinRpm,
+                ShotField::BackspinRpm,
+                ShotField::SpinAxis,
+            ]
+        );
+
+        let fields: Vec<ShotField> = shot.unmeasured_fields().collect();
+        for f in fields {
+            shot.clear_field(f);
+        }
+        let b = shot.ball.as_ref().expect("ball");
+        assert_eq!(
+            (
+                b.total_spin_rpm,
+                b.spin_axis,
+                b.backspin_rpm,
+                b.sidespin_rpm
+            ),
+            (None, None, None, None)
+        );
+        assert_eq!(b.launch_elevation, Some(17.0), "untouched");
+        let i = shot.impact.as_ref().expect("impact");
+        assert_eq!(
+            (i.lateral, i.vertical),
+            (Some(Distance::Millimeters(3.0)), None)
+        );
+        shot.clear_field(ShotField::LaunchElevation);
+        assert_eq!(shot.ball.and_then(|b| b.launch_elevation), None);
+    }
+
+    /// A shot's provenance is omitted when absent, so a shot stored without
+    /// it reads back as `None`; set, it round-trips in snake case.
+    #[test]
+    fn provenance_is_optional_on_a_shot() {
+        let old: ShotData =
+            serde_json::from_str(r#"{"actor":"mevo.0","shot_number":3}"#).expect("old shot");
+        assert_eq!(old.provenance, None);
+        assert!(
+            serde_json::to_value(&old)
+                .expect("ser")
+                .get("provenance")
+                .is_none()
+        );
+        let shot = ShotData {
+            provenance: Some(Provenance::Virtual),
+            ..old
+        };
+        let json = serde_json::to_value(&shot).expect("ser");
+        assert_eq!(json["provenance"], "virtual");
+        assert_eq!(serde_json::from_value::<ShotData>(json).expect("de"), shot);
+        assert_eq!(
+            shot.to_unit_system(UnitSystem::Metric).provenance,
+            Some(Provenance::Virtual)
+        );
+        assert_eq!(
+            serde_json::to_value(Provenance::Measured).expect("ser"),
+            "measured"
+        );
+    }
+
+    /// The aggregator takes a shot's provenance from its trigger's envelope.
+    #[test]
+    fn the_trigger_envelope_sets_the_shot_provenance() {
+        let mut agg = ShotAggregator::new();
+        let trigger = FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key() })
+            .actor("square.0")
+            .provenance(Provenance::Measured);
+        let json = serde_json::to_value(&trigger).expect("ser");
+        assert_eq!(json["provenance"], "measured");
+        let msg = |event| FlighthookMessage::new(event).actor("square.0");
+        assert!(
+            serde_json::to_value(msg(FlighthookEvent::NewShotGroup))
+                .expect("ser")
+                .get("provenance")
+                .is_none()
+        );
+        agg.feed(&trigger);
+        agg.feed(&msg(FlighthookEvent::BallFlight {
+            key: key(),
+            ball: Box::new(ball()),
+            derived: None,
+        }));
+        let shot = agg
+            .feed(&msg(FlighthookEvent::ShotFinished {
+                key: key(),
+                raw: None,
+            }))
+            .expect("shot");
+        assert_eq!(shot.provenance, Some(Provenance::Measured));
+    }
+
+    #[test]
+    fn round_state_is_omitted_from_the_status_while_inactive() {
+        let inactive = RoundState::default();
+        assert!(inactive.is_inactive());
+        assert_eq!(
+            serde_json::to_value(&inactive).expect("ser"),
+            serde_json::json!({"active": false})
+        );
+        let round = RoundState {
+            active: true,
+            holder: Some("Pureplay".into()),
+        };
+        let event = FlighthookEvent::RoundState {
+            round: round.clone(),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).expect("ser"),
+            serde_json::json!({"kind": "round_state", "round": {"active": true, "holder": "Pureplay"}})
+        );
+        let status: crate::StatusResponse =
+            serde_json::from_str(r#"{"actors":{},"round":{"active":true,"holder":"Pureplay"}}"#)
+                .expect("de");
+        assert_eq!(status.round, round);
+    }
+
     #[test]
     fn computed_marks_are_omitted_when_empty_and_round_trip() {
         let json = serde_json::to_value(shot(Some(derived()))).expect("ser");
@@ -1077,6 +1361,7 @@ mod tests {
             actor: "square.0".into(),
             device: None,
             raw_payload: None,
+            provenance: None,
             event,
         };
         assert!(

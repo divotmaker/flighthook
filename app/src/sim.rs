@@ -43,8 +43,8 @@ use dimple::ground::{BallState, GroundModel, GroundResult, Surface, Termination}
 use dimple::stats::ShotStats;
 use dimple::trajectory::{ShotInput, ShotResult, simulate_shot};
 use flighthook::{
-    BallFlight, DerivedFlight, Distance, FlightPath, FlighthookEvent, ShotDetectionMode, ShotField,
-    ShotKey, SimMode, SimSurface, SimulationSection,
+    BallFlight, DerivedFlight, Distance, FlightPath, FlighthookEvent, ShotDetectionMode, ShotKey,
+    SimMode, SimSurface, SimulationSection,
 };
 use glam::DVec3;
 use tracing::{debug, info, warn};
@@ -68,14 +68,19 @@ pub(crate) fn should_simulate(cfg: &SimulationSection) -> bool {
 
 /// Whether a shot is a ground ball, rolled rather than flown: its measured
 /// apex is 0 (finite, within [`GROUND_MAX_APEX_M`]), or it has no measured
-/// apex and a launch angle above -90 and at most [`GROUND_MAX_LAUNCH_DEG`].
-/// The device, club and detection mode play no part.
+/// apex and a launch angle above -90 and at most [`GROUND_MAX_LAUNCH_DEG`],
+/// or neither a launch angle nor any spin (a putt measured along the ground,
+/// as a putting mat reports it). The device, club and detection mode play no
+/// part.
 fn is_ground_ball(ball: &BallFlight) -> bool {
     match ball.max_height.map(Distance::as_meters) {
         Some(apex) => apex.is_finite() && apex.abs() <= GROUND_MAX_APEX_M,
-        None => ball
-            .launch_elevation
-            .is_some_and(|vla| vla > -90.0 && vla <= GROUND_MAX_LAUNCH_DEG),
+        None => match ball.launch_elevation {
+            Some(vla) => vla > -90.0 && vla <= GROUND_MAX_LAUNCH_DEG,
+            None => [ball.backspin_rpm, ball.sidespin_rpm, ball.total_spin_rpm]
+                .iter()
+                .all(Option::is_none),
+        },
     }
 }
 
@@ -104,14 +109,19 @@ fn ground_surface(configured: SimSurface, mode: Option<ShotDetectionMode>) -> Su
 /// assumed for a device that does not report it, but zero on both spin axes
 /// is treated as a missing reading rather than a knuckleball: a struck ball
 /// always spins, so a source with no spin measurement (e.g. an Open Connect
-/// monitor that sends no `BackSpin`/`SideSpin`) reports exactly this.
+/// monitor that sends no `BackSpin`/`SideSpin`) reports exactly this. A
+/// total spin with no axis is flown as backspin with no sidespin.
 fn shot_input(ball: &BallFlight) -> Result<ShotInput, &'static str> {
+    let (back, side) = match flighthook::spin_components(ball) {
+        (Some(back), None) if ball.total_spin_rpm.is_some() => (Some(back), Some(0)),
+        pair => pair,
+    };
     let (Some(speed), Some(vla), Some(hla), Some(back), Some(side)) = (
         ball.launch_speed,
         ball.launch_elevation,
         ball.launch_azimuth,
-        ball.backspin_rpm,
-        ball.sidespin_rpm,
+        back,
+        side,
     ) else {
         return Err("launch data incomplete");
     };
@@ -1149,16 +1159,6 @@ fn warn_invalid_environment(cfg: &SimulationSection, env_err: Option<&str>) {
     }
 }
 
-/// Mark `fields` of a `BallFlight` event as computed by the device actor
-/// ([`DerivedFlight::computed`]), adding a derived block that holds only
-/// the marks when the shot was not simulated. Any other event is left as
-/// it is.
-pub(crate) fn mark_computed(event: &mut FlighthookEvent, fields: &[ShotField]) {
-    if let FlighthookEvent::BallFlight { derived, .. } = event {
-        DerivedFlight::mark_computed(derived, fields);
-    }
-}
-
 /// Build the `BallFlight` bus event for a measured ball taken in the
 /// current detection mode (the live game mode); see
 /// [`ball_flight_event_in_mode`].
@@ -1289,39 +1289,6 @@ mod tests {
             shot_id: "abc".into(),
             shot_number: 1,
         }
-    }
-
-    /// Marks land in the simulated block when there is one, and in a block
-    /// of their own when the shot was not simulated; the ball is untouched.
-    #[test]
-    fn computed_marks_ride_on_the_ball_flight_event() {
-        let marks = [ShotField::BackspinRpm, ShotField::SidespinRpm];
-        let mut simulated = simulated_ball_flight_event(&cfg(), key(), square_like(), None);
-        mark_computed(&mut simulated, &marks);
-        let FlighthookEvent::BallFlight { ball, derived, .. } = simulated else {
-            panic!("ball flight");
-        };
-        assert_eq!(*ball, square_like());
-        let d = derived.expect("simulated");
-        assert!(d.carry_distance.is_some(), "the simulation is kept");
-        assert_eq!(d.computed, marks);
-
-        let off = state_with(SimulationSection {
-            mode: SimMode::Off,
-            ..cfg()
-        });
-        let mut plain = ball_flight_event(&off.state, key(), square_like());
-        mark_computed(&mut plain, &marks);
-        let FlighthookEvent::BallFlight { derived, .. } = plain else {
-            panic!("ball flight");
-        };
-        let d = derived.expect("a block holding only the marks");
-        assert_eq!(d.computed, marks);
-        assert_eq!(d.carry_distance, None);
-
-        let mut other = FlighthookEvent::ShotTrigger { key: key() };
-        mark_computed(&mut other, &marks);
-        assert!(matches!(other, FlighthookEvent::ShotTrigger { .. }));
     }
 
     // -- 1. Measured value wins ------------------------------------------------
@@ -1621,6 +1588,23 @@ mod tests {
         }
     }
 
+    /// A total spin with no axis (no components) flies as that backspin
+    /// with no sidespin; with an axis, it is split by it.
+    #[test]
+    fn a_total_spin_alone_flies_as_backspin() {
+        let mut b = ball(150.0, 12.0, 1.0, 0, 0);
+        b.backspin_rpm = None;
+        b.sidespin_rpm = None;
+        b.total_spin_rpm = Some(3000);
+        let input = shot_input(&b).expect("simulatable");
+        assert_eq!((input.backspin_rpm, input.sidespin_rpm), (3000.0, 0.0));
+        assert!(derive(&b, &cfg()).is_some());
+        b.spin_axis = Some(10.0);
+        let input = shot_input(&b).expect("simulatable");
+        assert!((input.backspin_rpm - 2954.0).abs() < 1.0);
+        assert!((input.sidespin_rpm - 521.0).abs() < 1.0);
+    }
+
     #[test]
     fn slow_low_launches_with_lift_fly() {
         for (speed, vla) in [
@@ -1674,6 +1658,12 @@ mod tests {
         }
         let mut no_angle = ball(60.0, 0.0, 0.0, 3000, 0);
         no_angle.launch_elevation = None;
+        assert!(!is_ground_ball(&no_angle));
+        // No launch angle and no spin at all: a putt measured on the ground.
+        no_angle.backspin_rpm = None;
+        no_angle.sidespin_rpm = None;
+        assert!(is_ground_ball(&no_angle));
+        no_angle.total_spin_rpm = Some(0);
         assert!(!is_ground_ball(&no_angle));
     }
 

@@ -4,7 +4,7 @@
 simulated Open Connect client, but has not yet been run against real Uneekor
 hardware.
 
-Uneekor is supported through the **OpenConnect server** actor rather than a
+Uneekor is supported through the **Open Connect server** actor rather than a
 native driver. Uneekor's own software already pushes shots as a
 [GSPro Open Connect V1](https://gsprogolf.com/GSProConnectV1.html) client, so
 flighthook listens and accepts them.
@@ -24,9 +24,9 @@ This is a bridge, not a driver. Uneekor's PC software has to be running.
 
 Spin arrives one of two ways depending on the monitor: explicit back/side
 components, or a total plus a spin axis. Both are handled, and both FRP pairs
-go onto the bus: the one the monitor sent, and the other computed from it (a
-total and axis decomposed into back/side, or back/side combined into a total
-and axis).
+go onto the bus: the one the monitor sent, and the same spin in the other
+pair (a total and axis decomposed into back/side, or back/side combined into
+a total and axis). Both count as the monitor's reading.
 
 Values the monitor doesn't send (apex, flight time, descent, offline, roll,
 total, and carry when absent) are simulated from the launch, as for every
@@ -49,8 +49,8 @@ Check what your unit has before buying anything.
 
 ## Configuration
 
-Add it from the Devices tab: Launch monitors (+) → **Uneekor (OpenConnect)**
-(or the generic **OpenConnect Server**, for any other Open Connect monitor),
+Add it from the Devices tab: Launch monitors (+) → **Uneekor (Open Connect)**
+(or the generic **Open Connect Server**, for any other Open Connect monitor),
 which creates this section:
 
 ```toml
@@ -95,8 +95,8 @@ GSPro listens on 921 too, but its port is movable. Edit
 ```
 
 to start GSPConnect on **922**, which frees 921 for flighthook and lets
-everything run on one machine. flighthook's OpenConnect server takes the
-Uneekor's shots on 921 and its OpenConnect client passes them on to GSPro on
+everything run on one machine. flighthook's Open Connect server takes the
+Uneekor's shots on 921 and its Open Connect client passes them on to GSPro on
 922:
 
 ```text
@@ -121,10 +121,10 @@ The client's address must be GSPro's port (922 here), not the server's. A
 client aimed at flighthook's own server (e.g. `127.0.0.1:921` with the
 server bound to `0.0.0.0:921`) would send every shot straight back into
 flighthook, round and round. flighthook refuses that connection. The server
-raises an error alert in the Log, "Refused OpenConnect Client "<name>" from
+raises an error alert in the Log, "Refused Open Connect Client "<name>" from
 <address>: it is this flighthook's own client, which would loop shots
 back…". The client's card and the banner above the tabs say "Refused by this
-flighthook's own OpenConnect Server "<name>": this address points at it…",
+flighthook's own Open Connect Server "<name>": this address points at it…",
 and the card stays at CONNECTING. Fix the client's address; the error
 clears once it connects elsewhere.
 

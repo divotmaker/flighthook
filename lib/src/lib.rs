@@ -1,3 +1,4 @@
+mod address;
 mod api;
 #[cfg(feature = "client")]
 mod client;
@@ -14,6 +15,7 @@ mod pose;
 mod stats;
 mod video;
 
+pub use address::*;
 pub use api::*;
 #[cfg(feature = "client")]
 pub use client::*;

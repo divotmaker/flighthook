@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::broadcast;
 
-use flighthook::FlighthookMessage;
+use flighthook::{FlighthookEvent, FlighthookMessage, Provenance};
 
 // ---------------------------------------------------------------------------
 // PollError
@@ -23,7 +23,8 @@ pub enum PollError {
 // BusSender
 // ---------------------------------------------------------------------------
 
-/// Cloneable sender that auto-stamps `actor` on every outbound message.
+/// Cloneable sender that auto-stamps `actor` on every outbound message, and
+/// the actor's provenance on every shot trigger when it is a shot source.
 pub struct BusSender {
     actor_id: String,
     inner: broadcast::Sender<FlighthookMessage>,
@@ -31,6 +32,9 @@ pub struct BusSender {
     /// Set once a new instance of the actor has replaced this one: what this
     /// one still sends is dropped, so it never speaks for its successor.
     muted: Arc<AtomicBool>,
+    /// The class of the shots the actor triggers, `None` for an actor that
+    /// is not a shot source.
+    provenance: Option<Provenance>,
 }
 
 impl BusSender {
@@ -44,7 +48,16 @@ impl BusSender {
             inner,
             shutdown,
             muted: Arc::default(),
+            provenance: None,
         }
+    }
+
+    /// This sender stamps `provenance` on every shot trigger it sends: the
+    /// class of the shot source it speaks for, from the actor's type.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 
     /// The flag that silences this sender and its clones.
@@ -63,13 +76,19 @@ impl BusSender {
         &self.inner
     }
 
-    /// Send a message, auto-stamping actor from the actor ID. Nothing is
-    /// sent once the sender is muted.
+    /// Send a message, auto-stamping actor from the actor ID, and on a shot
+    /// trigger the sender's provenance. Nothing is sent once the sender is
+    /// muted.
     pub fn send(&self, mut msg: FlighthookMessage) {
         if self.muted.load(Ordering::Relaxed) {
             return;
         }
         msg.actor = self.actor_id.clone();
+        if let (Some(provenance), FlighthookEvent::ShotTrigger { .. }) =
+            (self.provenance, &msg.event)
+        {
+            msg.provenance = Some(provenance);
+        }
         let _ = self.inner.send(msg);
     }
 
@@ -90,6 +109,7 @@ impl Clone for BusSender {
             inner: self.inner.clone(),
             shutdown: Arc::clone(&self.shutdown),
             muted: Arc::clone(&self.muted),
+            provenance: self.provenance,
         }
     }
 }

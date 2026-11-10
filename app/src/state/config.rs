@@ -165,8 +165,9 @@ pub fn load(path: &Path) -> (FlighthookConfig, Option<flighthook::ConfigLoadErro
     };
     match std::fs::read_to_string(path) {
         Ok(contents) => match parse(path, &contents) {
-            Ok(config) => {
+            Ok(mut config) => {
                 bring_up_to_date(path, &contents, &config);
+                turn_off_clashing(path, &mut config);
                 (config, None)
             }
             Err(error) => (FlighthookConfig::default(), Some(failed(error))),
@@ -181,6 +182,22 @@ pub fn load(path: &Path) -> (FlighthookConfig, Option<flighthook::ConfigLoadErro
             tracing::warn!("failed to read {}: {e}", path.display());
             (FlighthookConfig::default(), Some(failed(e.to_string())))
         }
+    }
+}
+
+/// Turn off, in `config` loaded from `path`, every enabled card whose
+/// address an enabled card of its type earlier in index order already holds,
+/// logging one warning per card. The file is left as it is: the next save
+/// writes `enabled = false` for these cards with everything else.
+fn turn_off_clashing(path: &Path, config: &mut FlighthookConfig) {
+    for clash in config.demote_clashing(None) {
+        tracing::warn!(
+            "{}: '{}' is off: {} ('{}' holds it)",
+            path.display(),
+            clash.id,
+            clash.message(),
+            clash.holder
+        );
     }
 }
 
@@ -1369,6 +1386,72 @@ full_monitor = "mevo.0"
             std::fs::read_to_string(&path).expect("read"),
             GOLDEN_DEFAULT_TOML
         );
+    }
+
+    /// A card that is on writes no `enabled`; one that is off writes
+    /// `enabled = false` in its own table, and a file holding it loads
+    /// untouched.
+    #[test]
+    fn enabled_is_written_only_when_off_and_such_a_file_is_left_alone() {
+        let c: FlighthookConfig = toml::from_str(EVERY_SECTION_TOML).expect("parses");
+        assert!(c.disabled_actors().is_empty(), "absent is on");
+        assert!(!toml::to_string_pretty(&c).expect("ser").contains("enabled"));
+
+        let mut off = c.clone();
+        let (index, mock) = off.mock_monitor.iter_mut().next().expect("a mock");
+        mock.enabled = false;
+        let table = format!("[mock_monitor.{index}]");
+        let out = toml::to_string_pretty(&off).expect("ser");
+        assert_eq!(out.matches("enabled").count(), 1, "{out}");
+        let at = out.find(&table).expect("mock table");
+        let rest = &out[at..];
+        let end = rest[table.len()..]
+            .find("\n[")
+            .map_or(rest.len(), |e| e + table.len());
+        assert!(rest[..end].contains("enabled = false\n"), "{out}");
+
+        let (dir, path) = config_dir(&out);
+        let loaded = load(&path).0;
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), out);
+        assert_eq!(files(&dir.0), ["config.toml"]);
+        assert_eq!(loaded, off);
+    }
+
+    /// A file with two enabled cards on one address: the first in index
+    /// order keeps running, the later ones load off. The file itself is left
+    /// as it is; the next save writes `enabled = false` for them.
+    #[test]
+    fn a_file_with_two_enabled_cards_on_one_address_loads_the_later_one_off() {
+        let contents = format!(
+            r#"{GOLDEN_DEFAULT_TOML}
+[openconnect_client.2]
+name = "Open Connect"
+address = "localhost:921"
+
+[openconnect_client.1]
+name = "GSPro"
+
+[openconnect_client.3]
+name = "Muni Golf"
+address = "127.0.0.1:9210"
+"#
+        );
+        let (dir, path) = config_dir(&contents);
+        let system = SystemConfig::new(path.clone());
+        let config = system.snapshot();
+        assert!(config.openconnect_client["1"].enabled, "first in order");
+        assert!(!config.openconnect_client["2"].enabled);
+        assert!(config.openconnect_client["3"].enabled, "another port");
+        assert_eq!(config.disabled_actors(), ["openconnect_client.2"]);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), contents);
+        assert_eq!(files(&dir.0), ["config.toml"], "no rewrite, no backup");
+
+        // Any save writes the card off with everything else.
+        system.update(|_| {});
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(written.matches("enabled = false").count(), 1, "{written}");
+        let again = SystemConfig::new(path).snapshot();
+        assert_eq!(again, config);
     }
 
     #[test]

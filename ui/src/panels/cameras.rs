@@ -470,7 +470,7 @@ impl FlighthookApp {
             self.live.clear();
             return;
         }
-        let cameras = self.settings.saved_cameras();
+        let cameras = self.settings.cameras_on();
         self.live
             .retain(|actor, _| cameras.iter().any(|(id, _)| id == actor));
         for (actor, _) in cameras {
@@ -530,7 +530,7 @@ impl FlighthookApp {
         let ctx = ui.ctx().clone();
         self.fetch_live_frames(&ctx);
         self.sync_last_shot(&ctx);
-        let cameras = self.settings.saved_cameras();
+        let cameras = self.settings.cameras_on();
         if cameras.is_empty() {
             return;
         }
@@ -1125,9 +1125,10 @@ impl FlighthookApp {
     }
 
     /// For shot row `i`, which has no clips: each saved camera's column
-    /// with its status where the picture would be.
+    /// with its status where the picture would be, for the cameras that are
+    /// on.
     fn render_clip_status(&mut self, ui: &mut egui::Ui, i: usize) {
-        let cameras = self.settings.saved_cameras();
+        let cameras = self.settings.cameras_on();
         if cameras.is_empty() {
             return;
         }

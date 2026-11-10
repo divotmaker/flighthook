@@ -6,12 +6,13 @@ use crate::types::{ActorStatusResponse, ConnectionState};
 /// Stripe and badge color for an actor at `now_ms`: green when Connected,
 /// yellow while Connecting, red while Reconnecting within
 /// [`RECONNECT_ALERT_MS`](crate::types::RECONNECT_ALERT_MS) of the lost
-/// connection and yellow after that.
+/// connection and yellow after that, gray when Disabled.
 pub(crate) fn status_color(actor: &ActorStatusResponse, now_ms: u64) -> egui::Color32 {
     match actor.state() {
         ConnectionState::Connected => theme::STATUS_OK,
         ConnectionState::Reconnecting if actor.red(now_ms) => theme::STATUS_DOWN,
         ConnectionState::Connecting | ConnectionState::Reconnecting => theme::STATUS_PENDING,
+        ConnectionState::Disabled => theme::STATUS_OFF,
     }
 }
 
@@ -90,9 +91,9 @@ pub(crate) fn has_telemetry(actor: &ActorStatusResponse) -> bool {
 }
 
 /// The body of a card with no telemetry to show, centered in it: a check in
-/// a ring once the actor is Connected, otherwise
-/// a loading spinner in `color` (the card's status color) going round,
-/// redrawn about 60 times a second while it is on screen.
+/// a ring once the actor is Connected, a muted "Disabled" while it is turned
+/// off, otherwise a loading spinner in `color` (the card's status color)
+/// going round, redrawn about 60 times a second while it is on screen.
 pub(crate) fn no_telemetry(
     ui: &mut egui::Ui,
     id: &str,
@@ -110,7 +111,16 @@ pub(crate) fn no_telemetry(
         return;
     }
     let center = rect.center();
-    if actor.state() == ConnectionState::Connected {
+    if actor.state() == ConnectionState::Disabled {
+        ui.painter().text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            "Disabled",
+            egui::FontId::proportional(15.0),
+            theme::STATUS_OFF,
+        );
+        devices::mark(ui, || format!("disabled:{id}"), &response);
+    } else if actor.state() == ConnectionState::Connected {
         theme::connected_ring(ui.painter(), center);
         devices::mark(ui, || format!("connected_icon:{id}"), &response);
     } else {

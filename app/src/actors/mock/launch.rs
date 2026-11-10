@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 use tracing::info;
 
 use crate::actors::Actor;
+use crate::actors::provenance::ShotSource;
 use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::sim;
 use crate::state::SystemState;
+use crate::state::round::RoundPolicy;
 use flighthook::{
     ActorStatus, BallFlight, ClubData, Distance, FlighthookEvent, FlighthookMessage,
     ShotDetectionMode, ShotKey, ShotRaw, Velocity,
@@ -37,12 +39,55 @@ enum Phase {
     PostShot { since: Instant },
 }
 
+/// What became of a shot the mock was due to make.
+#[derive(Debug, PartialEq, Eq)]
+enum Fired<T> {
+    /// It was made: what the send returned.
+    Sent(T),
+    /// A tournament round is active, so it was not made. `logged` is true
+    /// the first time in the round, when the mock says so in the log.
+    Held { logged: bool },
+}
+
+/// The mock's shots during tournament rounds: none, with one log line per
+/// round saying so.
+#[derive(Debug, Default)]
+struct RoundPause {
+    /// A shot has been held since the last one was made.
+    holding: bool,
+}
+
+impl RoundPause {
+    /// Make a shot with `send`, which puts its trigger on the bus, unless a
+    /// round is active ([`RoundPolicy::send_if_allowed`]).
+    fn fire<T>(&mut self, round: &RoundPolicy, send: impl FnOnce() -> T) -> Fired<T> {
+        match round.send_if_allowed(ShotSource::MockMonitor.provenance(), send) {
+            Some(sent) => {
+                self.holding = false;
+                Fired::Sent(sent)
+            }
+            None => {
+                let logged = !std::mem::replace(&mut self.holding, true);
+                if logged {
+                    info!("mock: no shots during the tournament round");
+                }
+                Fired::Held { logged }
+            }
+        }
+    }
+}
+
 /// Mock launch monitor actor. Generates random shots at a fixed interval.
 pub struct MockLaunchActor {
     pub initial_mode: ShotDetectionMode,
 }
 
 impl Actor for MockLaunchActor {
+    /// A virtual launch monitor: its random shots are no device's reading.
+    fn source(&self) -> Option<ShotSource> {
+        Some(ShotSource::MockMonitor)
+    }
+
     fn start(
         &self,
         state: Arc<SystemState>,
@@ -98,6 +143,7 @@ fn run(
 ) {
     let mut current_mode = initial_mode;
     let mut shot_count: u32 = 0;
+    let mut pause = RoundPause::default();
     let mut phase = Phase::Idle {
         since: Instant::now(),
     };
@@ -187,75 +233,81 @@ fn run(
                     since: Instant::now(),
                 };
             }
+            // A virtual producer: no shot while a tournament round is active.
             Phase::Ready { since } if since.elapsed() >= SHOT_INTERVAL => {
-                shot_count += 1;
+                let fired = pause.fire(&state.round, || {
+                    let n = shot_count + 1;
+                    let key = ShotKey {
+                        shot_id: uuid::Uuid::new_v4().to_string(),
+                        shot_number: n,
+                    };
+                    let (ball, club) = generate_shot(n, current_mode);
 
-                let key = ShotKey {
-                    shot_id: uuid::Uuid::new_v4().to_string(),
-                    shot_number: shot_count,
-                };
-                let (ball, club) = generate_shot(shot_count, current_mode);
+                    let ball_mph = ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0);
+                    let carry_yd = ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0);
+                    info!(
+                        "mock shot #{}: ball={:.1}mph VLA={:.1} carry={:.1}yd",
+                        n,
+                        ball_mph,
+                        ball.launch_elevation.unwrap_or(0.0),
+                        carry_yd,
+                    );
 
-                let ball_mph = ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0);
-                let carry_yd = ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0);
-                info!(
-                    "mock shot #{}: ball={:.1}mph VLA={:.1} carry={:.1}yd",
-                    shot_count,
-                    ball_mph,
-                    ball.launch_elevation.unwrap_or(0.0),
-                    carry_yd,
-                );
-
-                // Disarm
-                sender.send(
-                    FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                        manufacturer: None,
-                        model: None,
-                        firmware: None,
-                        telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
-                    })
-                    .device(device_id.as_str()),
-                );
-                sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-                    status: ActorStatus::Connected,
-                    telemetry: telemetry(shot_count, current_mode, "idle"),
-                }));
-
-                // Shot lifecycle
-                sender.send(
-                    FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() })
+                    // Disarm
+                    sender.send(
+                        FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
+                            manufacturer: None,
+                            model: None,
+                            firmware: None,
+                            telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
+                        })
                         .device(device_id.as_str()),
-                );
-                sender.send(
-                    FlighthookMessage::new(sim::ball_flight_event(state, key.clone(), ball))
-                        .device(device_id.as_str()),
-                );
-                sender.send(
-                    FlighthookMessage::new(FlighthookEvent::ClubPath {
-                        key: key.clone(),
-                        club: Box::new(club),
-                    })
-                    .device(device_id.as_str()),
-                );
-                sender.send(
-                    FlighthookMessage::new(FlighthookEvent::ShotFinished {
-                        key,
-                        raw: Some(Box::new(ShotRaw {
-                            transport: "none".into(),
-                            unavailable: Some("mock device has no wire protocol".into()),
-                            ..ShotRaw::default()
-                        })),
-                    })
-                    .device(device_id.as_str()),
-                );
+                    );
+                    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                        status: ActorStatus::Connected,
+                        telemetry: telemetry(n, current_mode, "idle"),
+                    }));
 
-                sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-                    status: ActorStatus::Connected,
-                    telemetry: telemetry(shot_count, current_mode, "idle"),
-                }));
-                phase = Phase::PostShot {
-                    since: Instant::now(),
-                };
+                    // Shot lifecycle
+                    sender.send(
+                        FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() })
+                            .device(device_id.as_str()),
+                    );
+                    (n, key, ball, club)
+                });
+                if let Fired::Sent((n, key, ball, club)) = fired {
+                    shot_count = n;
+                    sender.send(
+                        FlighthookMessage::new(sim::ball_flight_event(state, key.clone(), ball))
+                            .device(device_id.as_str()),
+                    );
+                    sender.send(
+                        FlighthookMessage::new(FlighthookEvent::ClubPath {
+                            key: key.clone(),
+                            club: Box::new(club),
+                        })
+                        .device(device_id.as_str()),
+                    );
+                    sender.send(
+                        FlighthookMessage::new(FlighthookEvent::ShotFinished {
+                            key,
+                            raw: Some(Box::new(ShotRaw {
+                                transport: "none".into(),
+                                unavailable: Some("mock device has no wire protocol".into()),
+                                ..ShotRaw::default()
+                            })),
+                        })
+                        .device(device_id.as_str()),
+                    );
+
+                    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                        status: ActorStatus::Connected,
+                        telemetry: telemetry(shot_count, current_mode, "idle"),
+                    }));
+                    phase = Phase::PostShot {
+                        since: Instant::now(),
+                    };
+                }
             }
             Phase::PostShot { since } if since.elapsed() >= POST_SHOT_DELAY => {
                 info!("mock: re-arming");
@@ -345,4 +397,46 @@ fn generate_shot(n: u32, mode: ShotDetectionMode) -> (BallFlight, ClubData) {
     };
 
     (ball, club)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::round::RoundRequest;
+
+    /// During a round the mock makes no shot and says so once in the log;
+    /// once the round ends its next shot goes out, and the next round is
+    /// logged again.
+    #[test]
+    fn the_mock_holds_its_shots_during_a_round_and_logs_it_once() {
+        let round = RoundPolicy::default();
+        let mut pause = RoundPause::default();
+        let begin = || {
+            round
+                .begin_round(&RoundRequest {
+                    holder: "Pureplay",
+                    feeds: &[],
+                })
+                .expect("accepted")
+        };
+        assert_eq!(pause.fire(&round, || 1), Fired::Sent(1));
+
+        let guard = begin();
+        let mut sent = false;
+        assert_eq!(
+            pause.fire(&round, || sent = true),
+            Fired::Held { logged: true }
+        );
+        assert_eq!(
+            pause.fire(&round, || sent = true),
+            Fired::Held { logged: false },
+            "one line per round"
+        );
+        assert!(!sent, "no trigger during the round");
+        drop(guard);
+        assert_eq!(pause.fire(&round, || 2), Fired::Sent(2));
+
+        let _guard = begin();
+        assert_eq!(pause.fire(&round, || 3), Fired::Held { logged: true });
+    }
 }

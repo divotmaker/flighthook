@@ -70,7 +70,7 @@ const REFUSAL_BURST_GAP: Duration = Duration::from_secs(30);
 /// refuses it. The UI shows it after the client's name.
 fn refusal_error(server: &str) -> String {
     format!(
-        "Refused by this flighthook's own OpenConnect Server \"{server}\": this \
+        "Refused by this flighthook's own Open Connect Server \"{server}\": this \
          address points at it, which would loop shots back. Use the simulator's \
          port instead."
     )
@@ -80,7 +80,7 @@ fn refusal_error(server: &str) -> String {
 /// connecting from `peer`. The Log shows it after the server's name.
 fn refusal_alert(client: &str, peer: SocketAddr) -> String {
     format!(
-        "Refused OpenConnect Client \"{client}\" from {peer}: it is this \
+        "Refused Open Connect Client \"{client}\" from {peer}: it is this \
          flighthook's own client, which would loop shots back. Point it at the \
          simulator's port."
     )
@@ -147,6 +147,12 @@ pub struct OpenConnectServerActor {
 }
 
 impl Actor for OpenConnectServerActor {
+    /// A measured source: a launch monitor's own app sends it the shots that
+    /// monitor measured.
+    fn source(&self) -> Option<crate::actors::provenance::ShotSource> {
+        Some(crate::actors::provenance::ShotSource::OpenConnectServer)
+    }
+
     fn start(
         &self,
         state: Arc<SystemState>,
@@ -215,7 +221,7 @@ fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: B
                 );
                 sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                     severity: Severity::Error,
-                    message: format!("OpenConnect server could not bind {bind}: {e}"),
+                    message: format!("Open Connect server could not bind {bind}: {e}"),
                 }));
                 let deadline = Instant::now() + backoff;
                 while let Some(left) = deadline.checked_duration_since(Instant::now()) {
@@ -378,7 +384,7 @@ fn serve(
                     );
                     sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                         severity: Severity::Warn,
-                        message: "OpenConnect peer sent unparsable data, dropping connection"
+                        message: "Open Connect peer sent unparsable data, dropping connection"
                             .into(),
                     }));
                     return;
@@ -394,7 +400,7 @@ fn serve(
                 tracing::warn!("openconnect server: {peer_addr} read error: {e}");
                 sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                     severity: Severity::Warn,
-                    message: format!("OpenConnect read error: {e}"),
+                    message: format!("Open Connect read error: {e}"),
                 }));
                 return;
             }
@@ -491,7 +497,7 @@ fn drain(
                 tracing::warn!("openconnect server: malformed message: {e}");
                 sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
                     severity: Severity::Warn,
-                    message: format!("OpenConnect parse error: {e}"),
+                    message: format!("Open Connect parse error: {e}"),
                 }));
                 buf.clear();
                 return true;
@@ -555,7 +561,7 @@ fn handle(
         );
     }
 
-    let is_shot = !msg.shot_data_options.is_heart_beat && msg.shot_data_options.contains_ball_data;
+    let is_shot = is_shot(&msg.shot_data_options);
 
     let reply = api::GsProResponse::ok(if is_shot {
         "Shot received"
@@ -613,7 +619,18 @@ fn shot_raw(request: &str, reply: Option<&str>) -> ShotRaw {
     }
 }
 
-/// Publish the standard shot lifecycle for one Open Connect shot message.
+/// Whether a message is a shot: not a heartbeat, and it says it carries
+/// ball data. Open Connect sends every field of its fixed schema, so a
+/// block the message does not say it carries holds zeros, not readings:
+/// a message without ball data is no shot, and a shot's club data
+/// ([`emit_shot`]) is taken only when the message says it carries some.
+fn is_shot(options: &api::ShotDataOptions) -> bool {
+    !options.is_heart_beat && options.contains_ball_data
+}
+
+/// Publish the standard shot lifecycle for one Open Connect shot message
+/// ([`is_shot`]): the ball data, and the club data and face impact when the
+/// message says it carries club data, each value as the monitor sent it.
 fn emit_shot(
     state: &SystemState,
     msg: &api::GsProMessage,
@@ -643,8 +660,7 @@ fn emit_shot(
             .raw(payload.clone())
             .device(device),
     );
-    let mut event = sim::ball_flight_event(state, key.clone(), ball);
-    sim::mark_computed(&mut event, &mapper::computed_spin(msg));
+    let event = sim::ball_flight_event(state, key.clone(), ball);
     sender.send(
         FlighthookMessage::new(event)
             .raw(payload.clone())
@@ -814,29 +830,72 @@ mod tests {
     }
 
     /// The spin pair the monitor did not send is completed from the one it
-    /// did, and marked computed.
+    /// did: the same reading in the other pair, so nothing is marked
+    /// computed.
     #[test]
-    fn the_completed_spin_pair_is_marked_computed() {
-        use flighthook::ShotField;
-        let computed = |request| {
-            ingested(request, flighthook::Handedness::Right)
-                .derived
-                .expect("derived")
-                .computed
-        };
-        assert_eq!(
-            computed(LATERAL_SHOTS[0]),
-            [ShotField::TotalSpinRpm, ShotField::SpinAxis],
-            "components sent"
-        );
-        assert_eq!(
-            computed(LATERAL_SHOTS[1]),
-            [ShotField::BackspinRpm, ShotField::SidespinRpm],
-            "total and axis sent"
-        );
+    fn the_completed_spin_pair_is_measured() {
+        for request in LATERAL_SHOTS {
+            let shot = ingested(request, flighthook::Handedness::Right);
+            let ball = shot.ball.as_ref().expect("ball");
+            assert!(ball.backspin_rpm.is_some() && ball.total_spin_rpm.is_some());
+            assert_eq!(shot.unmeasured_fields().count(), 0, "{request}");
+        }
     }
 
-    /// A GSPro-protocol monitor relayed through flighthook comes out as it
+    /// Only a message that is no heartbeat and says it carries ball data is
+    /// a shot.
+    #[test]
+    fn a_shot_is_a_message_with_ball_data() {
+        let options = |ball, heartbeat| api::ShotDataOptions {
+            contains_ball_data: ball,
+            is_heart_beat: heartbeat,
+            ..api::ShotDataOptions::default()
+        };
+        assert!(is_shot(&options(true, false)));
+        assert!(!is_shot(&options(false, false)), "the ball block is zeros");
+        assert!(!is_shot(&options(true, true)));
+        let msg: api::GsProMessage = serde_json::from_str(HEARTBEAT).expect("parses");
+        assert!(!is_shot(&msg.shot_data_options));
+    }
+
+    /// A shot that does not say it carries club data puts no club data and
+    /// no face impact on the bus, whatever its ClubData block holds; one
+    /// that does keeps the block's values as the monitor sent them, zeros
+    /// included (a face impact of 0/0 is no reading, as always).
+    #[test]
+    fn club_data_follows_the_message_flag() {
+        const NO_CLUB: &str = r#"{"DeviceID":"TestLM","Units":"Yards","ShotNumber":9,"APIversion":"1","BallData":{"Speed":120.0,"BackSpin":2800.0,"SideSpin":-300.0,"HLA":1.0,"VLA":14.0},"ClubData":{"Speed":0.0,"Path":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Loft":0.0,"HorizontalFaceImpact":0.0,"VerticalFaceImpact":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":false}}"#;
+        let shot = ingested(NO_CLUB, flighthook::Handedness::Right);
+        assert!(shot.ball.is_some());
+        assert_eq!((shot.club, shot.impact), (None, None));
+
+        let with_values =
+            NO_CLUB.replace(r#""Speed":0.0,"Path":0.0"#, r#""Speed":90.0,"Path":2.0"#);
+        let shot = ingested(&with_values, flighthook::Handedness::Right);
+        assert_eq!(shot.club, None, "values without the flag are not taken");
+
+        let flagged = NO_CLUB.replace(r#""ContainsClubData":false"#, r#""ContainsClubData":true"#);
+        let shot = ingested(&flagged, flighthook::Handedness::Right);
+        let club = shot.club.expect("club data");
+        assert_eq!(
+            (
+                club.club_speed,
+                club.path,
+                club.attack_angle,
+                club.face_angle
+            ),
+            (
+                Some(flighthook::Velocity::MilesPerHour(0.0)),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0)
+            ),
+            "as reported"
+        );
+        assert_eq!(shot.impact, None);
+    }
+
+    /// A GSPro-protocol monitor passed on through flighthook comes out as it
     /// went in, for both hands: ingest, then the GSPro bridge's mapping.
     #[test]
     fn ingest_then_gspro_output_round_trips_for_both_hands() {
@@ -889,6 +948,7 @@ mod tests {
                     "0".into(),
                     flighthook::OpenConnectServerSection {
                         name: "Uneekor".into(),
+                        enabled: true,
                         bind: bind.map(str::to_string),
                         impact_lead_s: None,
                     },
@@ -966,6 +1026,7 @@ mod tests {
                     "0".into(),
                     flighthook::OpenConnectServerSection {
                         name: "Bay Uneekor".into(),
+                        enabled: true,
                         bind: None,
                         impact_lead_s: None,
                     },
@@ -1115,7 +1176,7 @@ mod tests {
             .to_string();
         assert_eq!(
             error,
-            "Refused by this flighthook's own OpenConnect Server \"Bay Uneekor\": this \
+            "Refused by this flighthook's own Open Connect Server \"Bay Uneekor\": this \
              address points at it, which would loop shots back. Use the simulator's \
              port instead."
         );
@@ -1158,7 +1219,7 @@ mod tests {
         let (start, end) = alerts[0]
             .split_once(" from 127.0.0.1:")
             .expect("the peer address");
-        assert_eq!(start, "Refused OpenConnect Client \"Bay GSPro\"");
+        assert_eq!(start, "Refused Open Connect Client \"Bay GSPro\"");
         assert!(
             end.ends_with(
                 ": it is this flighthook's own client, which would loop shots back. \

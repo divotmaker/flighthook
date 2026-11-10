@@ -13,8 +13,9 @@ system first, then start flighthook.
 
 The R10 measures total spin and spin axis. flighthook sends both, as FRP
 `total_spin_rpm` and `spin_axis` (+ = tilted right, curves the ball right),
-along with the backspin and sidespin components computed from them. A total
-of 0 has no axis.
+along with the same spin as backspin and sidespin components. All four are
+the R10's reading, so a tournament round keeps them. A total of 0 has no
+axis.
 
 ## Carry and total (beta, simulated)
 

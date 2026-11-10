@@ -16,7 +16,7 @@ use crate::state::SystemState;
 
 use flighthook::{
     ActorStatus, BallFlight, ClubData, FlighthookEvent, FlighthookMessage, RawDir, RawRecord,
-    Severity, ShotDetectionMode, ShotField, ShotKey, Velocity,
+    Severity, ShotDetectionMode, ShotKey, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
@@ -33,6 +33,11 @@ pub struct R10Actor {
 }
 
 impl Actor for R10Actor {
+    /// A launch monitor flighthook reads directly.
+    fn source(&self) -> Option<crate::actors::provenance::ShotSource> {
+        Some(crate::actors::provenance::ShotSource::R10)
+    }
+
     fn start(
         &self,
         state: Arc<SystemState>,
@@ -180,14 +185,9 @@ fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>
 // Protocol type -> bus type conversion helpers
 // ---------------------------------------------------------------------------
 
-/// The values of [`ball_from_r10`] the R10 does not report: tenover
-/// computes back and side spin from the measured total and axis.
-const R10_COMPUTED: [ShotField; 2] = [ShotField::BackspinRpm, ShotField::SidespinRpm];
-
 /// The R10 measures total spin and spin axis; tenover also hands back the
-/// back/side components computed from them, so both FRP spin pairs are sent
-/// and the components are marked computed ([`R10_COMPUTED`]). A total of 0
-/// has no axis.
+/// back/side components of the same spin, so both FRP spin pairs are sent,
+/// all four as measured values. A total of 0 has no axis.
 fn ball_from_r10(b: &tenover::proto::BallData) -> BallFlight {
     #[allow(clippy::cast_possible_truncation)]
     let total_spin = b.total_spin.round() as i32;
@@ -456,8 +456,7 @@ fn connect_and_run(
                                 bf.backspin_rpm.unwrap_or(0),
                                 bf.sidespin_rpm.unwrap_or(0),
                             );
-                            let mut event = sim::ball_flight_event(state, key.clone(), bf);
-                            sim::mark_computed(&mut event, &R10_COMPUTED);
+                            let event = sim::ball_flight_event(state, key.clone(), bf);
                             sender.send(FlighthookMessage::new(event).device(&addr));
                         }
 
@@ -841,16 +840,28 @@ mod tests {
         }
     }
 
-    /// The R10 reports total spin and axis; the components tenover works
-    /// out from them are the ones marked computed.
+    /// The back and side spin tenover hands back are the measured spin in
+    /// the other pair, not a model's values: a tournament round keeps all
+    /// four.
     #[test]
-    fn r10_marks_its_spin_components_computed() {
-        assert_eq!(
-            R10_COMPUTED,
-            [ShotField::BackspinRpm, ShotField::SidespinRpm]
-        );
-        let bf = ball_from_r10(&r10_ball(3231.0, 8.0));
-        assert!(bf.backspin_rpm.is_some() && bf.sidespin_rpm.is_some());
+    fn a_round_keeps_all_four_r10_spin_values() {
+        let round = crate::state::round::RoundPolicy::default();
+        let guard = round
+            .begin_round(&crate::state::round::RoundRequest {
+                holder: "Pureplay",
+                feeds: &[],
+            })
+            .expect("accepted");
+        let ball = ball_from_r10(&r10_ball(3231.0, 8.0));
+        let shot = flighthook::ShotData {
+            ball: Some(ball.clone()),
+            provenance: Some(crate::actors::provenance::ShotSource::R10.provenance()),
+            ..flighthook::ShotData::default()
+        };
+        assert_eq!(shot.unmeasured_fields().count(), 0);
+        let certified = guard.certify(&shot).expect("measured");
+        assert_eq!(certified.shot().ball.as_ref(), Some(&ball));
+        assert!(ball.backspin_rpm.is_some() && ball.sidespin_rpm.is_some());
     }
 
     #[test]

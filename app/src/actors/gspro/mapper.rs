@@ -13,14 +13,16 @@ pub fn map_shot(shot: &ShotData) -> GsProMessage {
     let contains_ball = shot.ball.is_some();
 
     // Ball data: extract from Option<BallFlight>, zero-fill missing fields.
+    // A total spin with no axis goes out as backspin with no sidespin.
     let (speed, vla, hla, carry_distance, bs, ss) = if let Some(ref b) = shot.ball {
+        let (back, side) = flighthook::spin_components(b);
         (
             b.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
             b.launch_elevation.unwrap_or(0.0),
             b.launch_azimuth.unwrap_or(0.0),
             b.carry_distance.map(|d| d.as_yards()),
-            b.backspin_rpm.unwrap_or(0) as f64,
-            b.sidespin_rpm.unwrap_or(0) as f64,
+            back.unwrap_or(0) as f64,
+            side.unwrap_or(0) as f64,
         )
     } else {
         (0.0, 0.0, 0.0, None, 0.0, 0.0)
@@ -272,6 +274,29 @@ pub(super) mod tests {
         ] {
             assert!(json.contains(field), "ClubData missing {field} in {json}");
         }
+    }
+
+    /// A total spin with no axis and no components (the Xi's E8 total on a
+    /// shot without club data) goes out as backspin with axis 0.
+    #[test]
+    fn a_total_spin_alone_goes_out_as_backspin() {
+        let shot = ShotData {
+            actor: "mevo.0".into(),
+            shot_number: 3,
+            ball: Some(BallFlight {
+                launch_speed: Some(Velocity::MetersPerSecond(60.0)),
+                launch_elevation: Some(14.0),
+                launch_azimuth: Some(1.0),
+                total_spin_rpm: Some(6897),
+                ..BallFlight::default()
+            }),
+            ..ShotData::default()
+        };
+        let b = map_shot(&shot).ball_data;
+        assert_eq!(
+            (b.total_spin, b.back_spin, b.side_spin, b.spin_axis),
+            (6897.0, 6897.0, 0.0, 0.0)
+        );
     }
 
     /// A launch-only chip with the estimated backspin goes out as that total

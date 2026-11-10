@@ -207,6 +207,8 @@ enum CardAction {
     RefreshCameras,
     /// Stop the actor and start it again.
     Reconnect,
+    /// Turn the card on (`true`) or off, saved at once.
+    Enable(bool),
 }
 
 /// How a device card is drawn.
@@ -232,6 +234,9 @@ struct CardView<'a> {
     /// A camera card's rotation, clockwise degrees, for its still frame:
     /// the card's own setting, saved or not.
     rotation: u16,
+    /// The header's on/off switch; none on a web server's card or a card
+    /// the settings don't hold.
+    switch: Option<settings::HeaderSwitch>,
 }
 
 /// One device card. Its header holds the name on the left and, on the
@@ -243,8 +248,10 @@ struct CardView<'a> {
 /// on a launch monitor's or output's card (disabled while one is in flight
 /// and while the tab is locked), then Find mat on an ExPutt's, enabled while
 /// it is connected, and Still frame on a camera's (`still`), whose frame
-/// shows in the body. The left stripe is the actor's status color, dim while
-/// it is not running.
+/// shows in the body. An on/off switch sits right of the name on both sides
+/// (`view.switch`); while the card is off its state is Disabled and
+/// Reconnect is disabled. The left stripe is the actor's status color, dim
+/// while it is not running.
 fn device_card(
     ui: &mut egui::Ui,
     id: &str,
@@ -285,35 +292,46 @@ fn device_card(
         let mut action = None;
         let ui = card.top();
         let tag = tag.as_deref().map(|t| (t, settings::TagPlace::Buttons));
-        settings::card_header(ui, id, &title, tag, hover.as_deref(), |ui| {
-            if dirty {
-                action = match settings::save_cancel(ui, id, view.can_save, view.saving) {
-                    Some(Pending::Save) => Some(CardAction::Save),
-                    Some(Pending::Cancel) => Some(CardAction::Cancel),
-                    None => None,
-                };
-                return;
-            }
-            if form.is_some() {
-                let selected = CardMode::ALL.iter().position(|m| *m == mode).unwrap_or(0);
-                let labels = CardMode::ALL.map(CardMode::label);
-                let toggle = ui
-                    .add_enabled_ui(view.editable, |ui| {
-                        theme::segmented_sized(ui, &labels, selected, None, 11.0)
-                    })
-                    .inner;
-                mark(ui, || format!("toggle:{id}"), &toggle.response);
-                if let Some(i) = toggle.inner {
-                    action = Some(CardAction::Mode(CardMode::ALL[i]));
+        let (_, flipped) = settings::card_header_with(
+            ui,
+            id,
+            &title,
+            tag,
+            hover.as_deref(),
+            view.switch.clone(),
+            |ui| {
+                if dirty {
+                    action = match settings::save_cancel(ui, id, view.can_save, view.saving) {
+                        Some(Pending::Save) => Some(CardAction::Save),
+                        Some(Pending::Cancel) => Some(CardAction::Cancel),
+                        None => None,
+                    };
+                    return;
                 }
-            }
-            if mode == CardMode::Telemetry
-                && let Some(actor) = view.telemetry
-            {
-                let badge = theme::badge(ui, actor.state().label(), accent);
-                mark(ui, || format!("badge:{id}"), &badge);
-            }
-        });
+                if form.is_some() {
+                    let selected = CardMode::ALL.iter().position(|m| *m == mode).unwrap_or(0);
+                    let labels = CardMode::ALL.map(CardMode::label);
+                    let toggle = ui
+                        .add_enabled_ui(view.editable, |ui| {
+                            theme::segmented_sized(ui, &labels, selected, None, 11.0)
+                        })
+                        .inner;
+                    mark(ui, || format!("toggle:{id}"), &toggle.response);
+                    if let Some(i) = toggle.inner {
+                        action = Some(CardAction::Mode(CardMode::ALL[i]));
+                    }
+                }
+                if mode == CardMode::Telemetry
+                    && let Some(actor) = view.telemetry
+                {
+                    let badge = theme::badge(ui, actor.state().label(), accent);
+                    mark(ui, || format!("badge:{id}"), &badge);
+                }
+            },
+        );
+        if flipped && let Some(switch) = view.switch.as_ref() {
+            action = Some(CardAction::Enable(!switch.on));
+        }
         if dirty {
             settings::lock_hint(ui);
         }
@@ -339,6 +357,7 @@ fn device_card(
             }
             _ => {
                 let reconnect = cards::reconnectable(entry_type(id));
+                let off = view.telemetry.is_some_and(ActorStatusResponse::is_disabled);
                 let find_mat = entry_type(id) == "exputt";
                 let connected = view
                     .telemetry
@@ -365,7 +384,7 @@ fn device_card(
                                 ui,
                                 "Reconnect",
                                 &format!("reconnect:{id}"),
-                                view.editable && !view.reconnecting,
+                                view.editable && !view.reconnecting && !off,
                             )
                         {
                             action = Some(CardAction::Reconnect);
@@ -508,6 +527,22 @@ impl FlighthookApp {
             .filter(|e| e.target.scope() == Some(card.id.as_str()))
             .map(|e| e.message.clone());
         let saved_rotation = self.camera_rotation(&card.id);
+        // Off in the saved settings, or in the save turning it off: shown
+        // Disabled at once, before the server has stopped it.
+        let off = self.settings.turned_off(&card.id);
+        let disabled = off
+            .then(|| self.actors.get(&card.id))
+            .filter(|a| a.is_none_or(|a| !a.is_disabled()))
+            .map(|a| {
+                let name = a.map(|a| a.name.clone()).unwrap_or_default();
+                ActorStatusResponse::disabled(name)
+            });
+        // A card that is off cannot be turned on while an enabled card of its
+        // type has its address.
+        let clash = off
+            .then(|| self.settings.enable_clash(&card.id))
+            .flatten()
+            .map(|c| c.message());
         let form = card.form.and_then(|idx| self.settings.actors.get_mut(idx));
         let dirty = form.as_ref().is_some_and(|f| f.dirty());
         let still = (entry_type(&card.id) == "camera")
@@ -529,9 +564,21 @@ impl FlighthookApp {
             }
             _ => saved_rotation,
         };
+        let switch = form
+            .as_ref()
+            .filter(|_| settings::switchable(entry_type(&card.id)))
+            .map(|_| settings::HeaderSwitch {
+                on: !off,
+                enabled: !locked && !saving && clash.is_none(),
+                clash,
+            });
         let view = CardView {
             rotation,
-            telemetry: failed.as_ref().or_else(|| self.actors.get(&card.id)),
+            switch,
+            telemetry: failed
+                .as_ref()
+                .or(disabled.as_ref())
+                .or_else(|| self.actors.get(&card.id)),
             now_ms: self.now_ms,
             mode: self.card_modes.get(&card.id),
             editable: (!locked || dirty) && !saving,
@@ -557,6 +604,7 @@ impl FlighthookApp {
             (CardAction::Mode(mode), _) => self.card_modes.set(id, mode),
             (CardAction::FindMat, _) => net::post_find_mat(ctx, id),
             (CardAction::Reconnect, _) => self.reconnect(ctx, id),
+            (CardAction::Enable(on), _) => self.set_enabled(ctx, id, on),
             (CardAction::Still, _) => {
                 #[cfg(not(test))]
                 net::fetch_still(ctx, &self.pending, id);
@@ -589,6 +637,20 @@ impl FlighthookApp {
         net::post_reconnect(ctx, &self.pending, id);
         #[cfg(test)]
         let _ = ctx;
+    }
+
+    /// Turn card `id` on or off: a save of only that, scoped to it, posted
+    /// at once.
+    pub(crate) fn set_enabled(&mut self, ctx: &egui::Context, id: &str, on: bool) {
+        if self.settings.locked() {
+            return;
+        }
+        if let Some(posted) = self.settings.begin_enable(id, on) {
+            #[cfg(not(test))]
+            net::post_settings(ctx, &self.pending, &posted, Some(id));
+            #[cfg(test)]
+            let _ = (ctx, posted);
+        }
     }
 
     /// Ask the server for its camera list again.
@@ -686,7 +748,8 @@ mod tests {
     use crate::panels::settings::{GeneralCard, SettingsForm};
     use crate::panels::{TABS, Tab, next_alert_change, tab_alert};
     use crate::types::{
-        ActorStatus, ConnectionState, FlighthookConfig, RECONNECT_ALERT_MS, UnitSystem,
+        ActorStatus, ConnectionState, FlighthookConfig, FlighthookEvent, FlighthookMessage,
+        RECONNECT_ALERT_MS, UnitSystem,
     };
     use egui::{Color32, Event, Key, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 
@@ -704,8 +767,8 @@ mod tests {
         let mut form = SettingsForm::default();
         form.load_from(&FlighthookConfig::default());
         let _ = form.add_actor("mevo");
-        let _ = form.add_preset(output_preset("GSPro (OpenConnect)"));
-        let _ = form.add_preset(output_preset("Muni Golf (OpenConnect)"));
+        let _ = form.add_preset(output_preset("GSPro (Open Connect)"));
+        let _ = form.add_preset(output_preset("Muni Golf (Open Connect)"));
         form.to_request()
     }
 
@@ -915,7 +978,7 @@ mod tests {
             .get_mut("openconnect_client.0")
             .unwrap()
             .telemetry
-            .insert("error".into(), "OpenConnect Server: refused ...".into());
+            .insert("error".into(), "Open Connect Server: refused ...".into());
         assert_eq!(tab_alert(&app.actors, 2), None);
 
         // A lost connection lights it for ten minutes, whatever the actor:
@@ -1050,6 +1113,137 @@ mod tests {
                 theme::STATUS_PENDING
             )
         );
+    }
+
+    /// [`app`] with `openconnect_client.1` (Muni Golf) turned off in the
+    /// saved settings, its actor `status` as the UI holds it.
+    fn app_with_muni_off(status: ActorStatusResponse) -> FlighthookApp {
+        let mut app = app();
+        let mut config = app.settings.to_request();
+        config.openconnect_client.get_mut("1").unwrap().enabled = false;
+        settings_reply(&mut app, &config);
+        app.actors.insert("openconnect_client.1".into(), status);
+        app
+    }
+
+    /// A card that is off reads DISABLED in gray on its badge and stripe,
+    /// says "Disabled" in its body instead of the spinner, has Reconnect
+    /// disabled, and is never an alert: no red, no tab dot, no error.
+    #[test]
+    fn a_card_turned_off_is_disabled_in_gray_and_never_an_alert() {
+        let id = "openconnect_client.1";
+        let screen = Screen::new();
+        // The server's Disabled entry, or (before it arrives) the actor as
+        // last seen: red after losing its connection. Both read Disabled.
+        let mut lost = ActorStatusResponse::new("Muni Golf", ActorStatus::Connected);
+        lost.observe(ActorStatus::Reconnecting, 1_000);
+        for status in [ActorStatusResponse::disabled("Muni Golf"), lost] {
+            let mut app = app_with_muni_off(status);
+            app.now_ms = 2_000;
+            let (marks, shapes) = screen.painted(&mut app, Vec::new());
+            assert_eq!(
+                badge_look(&marks, &shapes, id),
+                ("DISABLED".into(), theme::STATUS_OFF, theme::STATUS_OFF)
+            );
+            assert_ne!(theme::STATUS_OFF, theme::STATUS_DOWN);
+            assert_ne!(theme::STATUS_OFF, theme::STATUS_PENDING);
+            assert!(marks.contains_key(&format!("disabled:{id}")));
+            assert!(!marks.contains_key(&format!("spinner:{id}")));
+            assert!(!enabled(&marks, &format!("reconnect:{id}")));
+            assert!(enabled(&marks, "reconnect:openconnect_client.0"));
+            assert!(enabled(&marks, &format!("enabled:{id}")));
+            assert!(enabled(&marks, "enabled:openconnect_client.0"));
+            assert!(enabled(&marks, "enabled:mevo.0"));
+            assert!(!marks.contains_key("enabled:webserver.0"), "no switch");
+            assert!(!marks.contains_key(&format!("error:{id}")));
+        }
+        let app = app_with_muni_off(ActorStatusResponse::disabled("Muni Golf"));
+        assert_eq!(tab_alert(&app.actors, 2_000), None);
+        assert!(!app.actors[id].telemetry.contains_key("error"));
+        // Its settings stay editable on the Settings side.
+        let mut app = app;
+        app.card_modes.set(id, CardMode::Settings);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, &format!("enabled:{id}")));
+        assert!(enabled(&marks, &format!("toggle:{id}")));
+        assert!(enabled(&marks, &format!("remove:{id}")));
+    }
+
+    /// The switch saves at once, scoped to its card and carrying only the
+    /// new `enabled`; the card reads Disabled while the save is out, and
+    /// every switch waits for it.
+    #[test]
+    fn the_switch_saves_its_card_alone_at_once() {
+        let id = "openconnect_client.1";
+        let screen = Screen::new();
+        let mut app = app();
+        let before = app.settings.to_request();
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, &format!("enabled:{id}"));
+        let (target, posted) = app.settings.posted().expect("a save is out");
+        assert_eq!(*target, SaveTarget::Actor(id.into()));
+        let mut want = before.clone();
+        want.openconnect_client.get_mut("1").unwrap().enabled = false;
+        assert_eq!(*posted, want, "only its enabled changes");
+        assert!(!app.settings.dirty(), "no Save or Cancel");
+        assert!(!marks.contains_key(&format!("save:{id}")));
+        let (marks, shapes) = screen.painted(&mut app, Vec::new());
+        assert_eq!(badge_look(&marks, &shapes, id).0, "DISABLED");
+        for other in [id, "openconnect_client.0", "mevo.0"] {
+            assert!(!enabled(&marks, &format!("enabled:{other}")), "{other}");
+        }
+
+        reply(&mut app, Ok(()));
+        assert!(!app.settings.saving());
+        assert!(app.settings.turned_off(id));
+        let saved = app.settings.to_request();
+        assert_eq!(saved, want);
+        // The server stops it: the UI shows it Disabled, not gone.
+        app.handle_bus_event(
+            FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
+                request_id: None,
+                restarted: Vec::new(),
+                stopped: vec![id.into()],
+                started: Vec::new(),
+            })
+            .actor("system"),
+        );
+        assert!(app.actors[id].is_disabled());
+        assert_eq!(app.actors[id].name, "Muni Golf");
+
+        // On again: the same, the other way.
+        let marks = screen.frame(&mut app, Vec::new());
+        screen.click_mark(&mut app, &marks, &format!("enabled:{id}"));
+        let (_, posted) = app.settings.posted().expect("a save is out");
+        assert_eq!(*posted, before);
+        reply(&mut app, Ok(()));
+        assert!(!app.settings.turned_off(id));
+        // The new instance's first status ends Disabled.
+        app.handle_bus_event(
+            FlighthookMessage::new(FlighthookEvent::ActorStatus {
+                status: ActorStatus::Starting,
+                telemetry: HashMap::new(),
+            })
+            .actor(id),
+        );
+        assert!(!app.actors[id].is_disabled());
+    }
+
+    /// The switch is locked while another card has unsaved edits, and
+    /// while its own has, like the card's other header controls.
+    #[test]
+    fn the_switch_is_locked_while_a_card_is_dirty() {
+        let screen = Screen::new();
+        let mut app = app();
+        app.card_modes.set("mevo.0", CardMode::Settings);
+        edit_name(&mut app, "mevo.0");
+        let marks = screen.frame(&mut app, Vec::new());
+        for id in ["mevo.0", "openconnect_client.0", "openconnect_client.1"] {
+            assert!(!enabled(&marks, &format!("enabled:{id}")), "{id}");
+        }
+        let _ = screen.click_mark(&mut app, &marks, "enabled:openconnect_client.1");
+        assert!(app.settings.posted().is_none(), "nothing saved");
+        assert!(!app.settings.turned_off("openconnect_client.1"));
     }
 
     #[test]
@@ -1247,7 +1441,7 @@ mod tests {
         );
         let marks = screen.click_mark(&mut app, &marks, "add:Outputs");
         assert!(
-            !marks.contains_key("add:Outputs:GSPro (OpenConnect)"),
+            !marks.contains_key("add:Outputs:GSPro (Open Connect)"),
             "no menu"
         );
 
@@ -1344,6 +1538,9 @@ mod tests {
     fn a_new_card_opens_dirty_in_settings_and_cancel_removes_it() {
         let screen = Screen::new();
         let mut app = app();
+        // The saved Muni Golf runs on another PC, so the menu offers
+        // Muni Golf on this one.
+        integration(&mut app, "openconnect_client.1").address = "192.168.1.30:9210".into();
         let before = app.settings.actors.len();
         let marks = screen.frame(&mut app, Vec::new());
         assert!(enabled(&marks, "add:Outputs"));
@@ -1357,19 +1554,19 @@ mod tests {
         assert_eq!(
             offered,
             [
-                "GSPro (OpenConnect)",
-                "Muni Golf (OpenConnect)",
-                "OpenConnect Client",
-                "Pureplay",
+                "GSPro (Open Connect)",
+                "Muni Golf (Open Connect)",
+                "Pureplay (Open Connect)",
+                "Pureplay (Pureplay Connect)",
             ],
             "the menu offers exactly these"
         );
-        let marks = screen.click_mark(&mut app, &marks, "add:Outputs:Muni Golf (OpenConnect)");
+        let marks = screen.click_mark(&mut app, &marks, "add:Outputs:Muni Golf (Open Connect)");
         assert_eq!(app.settings.actors.len(), before + 1);
         let new = &app.settings.actors[before];
         assert_eq!(new.global_id(), "openconnect_client.2");
         assert_eq!(new.name(), "Muni Golf");
-        assert_eq!(new.type_label(), "OpenConnect Client");
+        assert_eq!(new.type_label(), "Open Connect Client");
         let ActorFormEntry::Integration(entry) = new else {
             panic!("an Open Connect client is an integration entry");
         };
@@ -1380,7 +1577,7 @@ mod tests {
             CardMode::Settings
         );
         assert!(
-            !marks.contains_key("add:Outputs:Muni Golf (OpenConnect)"),
+            !marks.contains_key("add:Outputs:Muni Golf (Open Connect)"),
             "the menu closes"
         );
         assert!(enabled(&marks, "save:openconnect_client.2"));
@@ -1405,18 +1602,305 @@ mod tests {
         assert!(enabled(&marks, "tabs"));
     }
 
-    /// The Pureplay entry adds a card with Pureplay's address and the
-    /// routing dropdowns; it saves as a `pureplay` section.
+    /// [`app`] without its two Open Connect clients: a Mevo alone.
+    fn app_without_outputs() -> FlighthookApp {
+        let mut app = app();
+        app.settings
+            .actors
+            .retain(|a| a.type_key() != "openconnect_client");
+        app.actors
+            .retain(|id, _| !id.starts_with("openconnect_client."));
+        app
+    }
+
+    /// The GSPro (Open Connect) and Pureplay (Open Connect) entries both add
+    /// the same card: an Open Connect client named Open Connect at
+    /// `127.0.0.1:921`.
     #[test]
-    fn an_added_pureplay_output_saves_its_address_and_routing() {
+    fn both_921_entries_add_one_open_connect_card() {
+        let screen = Screen::new();
+        for label in ["GSPro (Open Connect)", "Pureplay (Open Connect)"] {
+            let mut app = app_without_outputs();
+            let marks = screen.frame(&mut app, Vec::new());
+            let marks = screen.click_mark(&mut app, &marks, "add:Outputs");
+            assert!(enabled(&marks, &format!("add:Outputs:{label}")), "{label}");
+            let _ = screen.click_mark(&mut app, &marks, &format!("add:Outputs:{label}"));
+            let new = &app.settings.actors[form_index(&app, "openconnect_client.0")];
+            assert_eq!(new.name(), "Open Connect", "{label}");
+            assert_eq!(new.type_label(), "Open Connect Client", "{label}");
+            assert!(new.dirty(), "{label}");
+            assert_eq!(
+                integration(&mut app, "openconnect_client.0").address,
+                "127.0.0.1:921",
+                "{label}"
+            );
+            assert!(
+                app.settings
+                    .actors
+                    .iter()
+                    .all(|a| a.type_key() != "pureplay"),
+                "no Pureplay Connect output from {label}"
+            );
+            let config = app.settings.to_request();
+            assert_eq!(config.openconnect_client["0"].name, "Open Connect");
+            assert_eq!(
+                config.openconnect_client["0"].address.as_deref(),
+                Some("127.0.0.1:921")
+            );
+            assert!(config.pureplay.is_empty());
+        }
+    }
+
+    /// [`app_without_outputs`] with a saved Open Connect card
+    /// (`openconnect_client.0`, on, `127.0.0.1:921`), connected.
+    fn app_with_open_connect() -> FlighthookApp {
+        let mut app = app_without_outputs();
+        let mut config = app.settings.to_request();
+        config.openconnect_client.insert(
+            "0".into(),
+            flighthook::OpenConnectClientSection {
+                name: "Open Connect".into(),
+                enabled: true,
+                address: Some("127.0.0.1:921".into()),
+                full_monitor: None,
+                chipping_monitor: None,
+                putting_monitor: None,
+            },
+        );
+        settings_reply(&mut app, &config);
+        app.actors.insert(
+            "openconnect_client.0".into(),
+            ActorStatusResponse::new("Open Connect", ActorStatus::Connected),
+        );
+        app
+    }
+
+    /// Add the Outputs preset `label` through the (+) menu and save the new
+    /// card; the server answers with the posted settings. Returns the
+    /// posted config.
+    fn add_and_save(
+        screen: &Screen,
+        app: &mut FlighthookApp,
+        label: &str,
+        id: &str,
+    ) -> FlighthookConfig {
+        let marks = screen.frame(app, Vec::new());
+        let marks = screen.click_mark(app, &marks, "add:Outputs");
+        let marks = screen.click_mark(app, &marks, &format!("add:Outputs:{label}"));
+        let _ = screen.click_mark(app, &marks, &format!("save:{id}"));
+        let posted = app.settings.posted().expect("a save is out").1.clone();
+        reply(app, Ok(()));
+        settings_reply(app, &posted);
+        app.card_modes.set(id, CardMode::Telemetry);
+        posted
+    }
+
+    /// No (+) menu entry is ever disabled for a duplicate address: with an
+    /// Open Connect card at `127.0.0.1:921`, all four Outputs entries take
+    /// clicks, and GSPro (Open Connect) adds a second Open Connect card.
+    #[test]
+    fn no_menu_entry_is_disabled_for_a_duplicate_address() {
+        let screen = Screen::new();
+        let mut app = app_with_open_connect();
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, "add:Outputs");
+        for label in [
+            "GSPro (Open Connect)",
+            "Pureplay (Open Connect)",
+            "Muni Golf (Open Connect)",
+            "Pureplay (Pureplay Connect)",
+        ] {
+            assert!(enabled(&marks, &format!("add:Outputs:{label}")), "{label}");
+        }
+        let _ = screen.click_mark(&mut app, &marks, "add:Outputs:GSPro (Open Connect)");
+        let new = &app.settings.actors[form_index(&app, "openconnect_client.1")];
+        assert_eq!(new.name(), "Open Connect");
+        assert_eq!(
+            integration(&mut app, "openconnect_client.1").address,
+            "127.0.0.1:921"
+        );
+    }
+
+    /// A duplicate is created off: no error, no alert, a Disabled card whose
+    /// switch is locked with the reason on hover. The card on the address
+    /// keeps running and its switch works.
+    #[test]
+    fn a_duplicate_is_created_off_with_its_switch_locked() {
+        let (id, holder) = ("openconnect_client.1", "openconnect_client.0");
+        let screen = Screen::new();
+        let mut app = app_with_open_connect();
+        for label in ["GSPro (Open Connect)", "Pureplay (Open Connect)"] {
+            let mut app = app_with_open_connect();
+            let marks = screen.frame(&mut app, Vec::new());
+            let marks = screen.click_mark(&mut app, &marks, "add:Outputs");
+            let _ = screen.click_mark(&mut app, &marks, &format!("add:Outputs:{label}"));
+            assert!(
+                !app.settings.to_request().openconnect_client[id.rsplit('.').next().unwrap()]
+                    .enabled,
+                "{label}: created off"
+            );
+        }
+
+        let posted = add_and_save(&screen, &mut app, "GSPro (Open Connect)", id);
+        assert!(!posted.openconnect_client["1"].enabled, "saved off");
+        assert!(posted.openconnect_client["0"].enabled);
+        assert_eq!(app.settings.to_request(), posted);
+        assert!(!app.settings.saving() && !app.settings.dirty());
+
+        app.now_ms = 2_000;
+        let (marks, shapes) = screen.painted(&mut app, Vec::new());
+        assert_eq!(
+            badge_look(&marks, &shapes, id),
+            ("DISABLED".into(), theme::STATUS_OFF, theme::STATUS_OFF)
+        );
+        assert_eq!(tab_alert(&app.actors, 2_000), None, "no alert");
+        assert!(!marks.contains_key(&format!("error:{id}")));
+        assert!(!enabled(&marks, &format!("enabled:{id}")), "locked");
+        assert!(enabled(&marks, &format!("enabled:{holder}")));
+        let _ = screen.click_mark(&mut app, &marks, &format!("enabled:{id}"));
+        assert!(
+            app.settings.posted().is_none(),
+            "a click on it saves nothing"
+        );
+        assert!(app.settings.turned_off(id));
+        assert_eq!(
+            app.settings.enable_clash(id).map(|c| c.message()),
+            Some("An Open Connect card already uses 127.0.0.1:921".into())
+        );
+        assert_eq!(app.settings.enable_clash(holder), None);
+    }
+
+    /// The locked switch says why on hover.
+    #[test]
+    fn the_locked_switch_names_the_card_that_holds_the_address() {
+        let screen = Screen::new();
+        let mut app = app_with_open_connect();
+        let _ = add_and_save(
+            &screen,
+            &mut app,
+            "GSPro (Open Connect)",
+            "openconnect_client.1",
+        );
+        screen.0.style_mut(|s| {
+            s.interaction.tooltip_delay = 0.0;
+            s.interaction.show_tooltips_only_when_still = false;
+        });
+        let marks = screen.frame(&mut app, Vec::new());
+        let at = marks["enabled:openconnect_client.1"].0.center();
+        screen.frame(&mut app, vec![Event::PointerMoved(at)]);
+        for _ in 0..3 {
+            screen.frame(&mut app, Vec::new());
+        }
+        let texts = screen.texts(&mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "An Open Connect card already uses 127.0.0.1:921"),
+            "{texts:?}"
+        );
+        // The card on the address shows the plain hover.
+        let at = marks["enabled:openconnect_client.0"].0.center();
+        screen.frame(&mut app, vec![Event::PointerMoved(at)]);
+        for _ in 0..3 {
+            screen.frame(&mut app, Vec::new());
+        }
+        let texts = screen.texts(&mut app);
+        assert!(texts.iter().any(|t| t == "Turn off"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("already uses")));
+    }
+
+    /// After the duplicate's address is edited to a free one and saved, its
+    /// switch takes input and turns it on; the save carries only `enabled`.
+    #[test]
+    fn a_duplicate_can_be_turned_on_after_moving_to_a_free_address() {
+        let id = "openconnect_client.1";
+        let screen = Screen::new();
+        let mut app = app_with_open_connect();
+        let _ = add_and_save(&screen, &mut app, "GSPro (Open Connect)", id);
+
+        app.card_modes.set(id, CardMode::Settings);
+        integration(&mut app, id).address = "127.0.0.1:9210".into();
+        let idx = form_index(&app, id);
+        app.settings.actors[idx].set_dirty(true);
+        let marks = screen.frame(&mut app, Vec::new());
+        let _ = screen.click_mark(&mut app, &marks, &format!("save:{id}"));
+        let posted = app.settings.posted().expect("a save is out").1.clone();
+        assert_eq!(
+            posted.openconnect_client["1"].address.as_deref(),
+            Some("127.0.0.1:9210")
+        );
+        assert!(!posted.openconnect_client["1"].enabled, "still off");
+        reply(&mut app, Ok(()));
+        settings_reply(&mut app, &posted);
+
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, &format!("enabled:{id}")), "unlocked");
+        assert_eq!(app.settings.enable_clash(id), None);
+        let _ = screen.click_mark(&mut app, &marks, &format!("enabled:{id}"));
+        let (target, turned_on) = app.settings.posted().expect("a save is out");
+        assert_eq!(*target, SaveTarget::Actor(id.into()));
+        let mut want = posted.clone();
+        want.openconnect_client.get_mut("1").unwrap().enabled = true;
+        assert_eq!(*turned_on, want);
+    }
+
+    /// Saving an enabled card with its address edited onto a held one writes
+    /// it off, keeping the edit and leaving the holder on; a new card made
+    /// on a free address and edited onto a held one before its first save
+    /// does the same.
+    #[test]
+    fn editing_an_address_onto_a_held_one_saves_the_card_off() {
+        let screen = Screen::new();
+        let mut app = app();
+        let id = "openconnect_client.1";
+        app.card_modes.set(id, CardMode::Settings);
+        integration(&mut app, id).address = "127.0.0.1:921".into();
+        let idx = form_index(&app, id);
+        app.settings.actors[idx].set_dirty(true);
+        let marks = screen.frame(&mut app, Vec::new());
+        let _ = screen.click_mark(&mut app, &marks, &format!("save:{id}"));
+        let (target, posted) = app.settings.posted().expect("a save is out");
+        assert_eq!(*target, SaveTarget::Actor(id.into()));
+        assert!(!posted.openconnect_client["1"].enabled, "saved off");
+        assert_eq!(
+            posted.openconnect_client["1"].address.as_deref(),
+            Some("127.0.0.1:921")
+        );
+        assert!(posted.openconnect_client["0"].enabled, "the holder is on");
+        let posted = posted.clone();
+        reply(&mut app, Ok(()));
+        settings_reply(&mut app, &posted);
+        assert!(app.settings.turned_off(id));
+        assert!(app.settings.enable_clash(id).is_some());
+
+        // A new card on a free address is on; edited onto a held one before
+        // it is saved, it is saved off.
+        let mut app = app_with_open_connect();
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, "add:Outputs");
+        let _ = screen.click_mark(&mut app, &marks, "add:Outputs:Muni Golf (Open Connect)");
+        let id = "openconnect_client.1";
+        assert!(app.settings.to_request().openconnect_client["1"].enabled);
+        integration(&mut app, id).address = "127.0.0.1:921".into();
+        let marks = screen.frame(&mut app, Vec::new());
+        let _ = screen.click_mark(&mut app, &marks, &format!("save:{id}"));
+        let (_, posted) = app.settings.posted().expect("a save is out");
+        assert!(!posted.openconnect_client["1"].enabled);
+    }
+
+    /// The Pureplay (Pureplay Connect) entry adds a `pureplay` card named
+    /// Pureplay Connect with Pureplay's address and the routing dropdowns;
+    /// it saves as a `pureplay` section.
+    #[test]
+    fn an_added_pureplay_connect_output_saves_its_address_and_routing() {
         let screen = Screen::new();
         let mut app = app();
         let marks = screen.frame(&mut app, Vec::new());
         let marks = screen.click_mark(&mut app, &marks, "add:Outputs");
-        let marks = screen.click_mark(&mut app, &marks, "add:Outputs:Pureplay");
+        let marks = screen.click_mark(&mut app, &marks, "add:Outputs:Pureplay (Pureplay Connect)");
         let new = &app.settings.actors[form_index(&app, "pureplay.0")];
-        assert_eq!(new.name(), "Pureplay");
-        assert_eq!(new.type_label(), "Pureplay");
+        assert_eq!(new.name(), "Pureplay Connect");
+        assert_eq!(new.type_label(), "Pureplay Connect");
         assert!(new.dirty());
         assert_eq!(
             integration(&mut app, "pureplay.0").address,
@@ -1433,7 +1917,8 @@ mod tests {
         assert_eq!(
             config.pureplay["0"],
             crate::types::PureplaySection {
-                name: "Pureplay".into(),
+                name: "Pureplay Connect".into(),
+                enabled: true,
                 address: Some("192.168.1.20:9760".into()),
                 full_monitor: None,
                 chipping_monitor: None,
@@ -1496,17 +1981,17 @@ mod tests {
         let mut app = app();
         let marks = screen.frame(&mut app, Vec::new());
         let marks = screen.click_mark(&mut app, &marks, "add:Launch monitors");
-        for label in ["Uneekor (OpenConnect)", "OpenConnect Server"] {
+        for label in ["Uneekor (Open Connect)", "Open Connect Server"] {
             assert!(
                 marks.contains_key(&format!("add:Launch monitors:{label}")),
                 "the menu offers {label}"
             );
         }
-        let marks = screen.click_mark(&mut app, &marks, "add:Launch monitors:OpenConnect Server");
+        let marks = screen.click_mark(&mut app, &marks, "add:Launch monitors:Open Connect Server");
         let id = "openconnect_server.0";
         let entry = &app.settings.actors[form_index(&app, id)];
-        assert_eq!(entry.name(), "OpenConnect Server");
-        assert_eq!(entry.type_label(), "OpenConnect Server");
+        assert_eq!(entry.name(), "Open Connect Server");
+        assert_eq!(entry.type_label(), "Open Connect Server");
         assert_eq!(device(&mut app, id).address, "0.0.0.0:921");
         assert!(enabled(&marks, &format!("bind:{id}")));
         assert!(enabled(&marks, &format!("save:{id}")));
@@ -1591,6 +2076,7 @@ mod tests {
             "0".into(),
             flighthook::ExPuttSection {
                 name: "ExPutt".into(),
+                enabled: true,
                 address: None,
                 impact_lead_s: None,
             },
@@ -1652,6 +2138,7 @@ mod tests {
             "0".into(),
             flighthook::OpenConnectServerSection {
                 name: "Uneekor".into(),
+                enabled: true,
                 bind: Some("0.0.0.0:9921".into()),
                 impact_lead_s: None,
             },
@@ -2003,31 +2490,37 @@ mod tests {
         let entry = &app.settings.actors[form_index(&app, "webserver.0")];
         assert_eq!(entry.type_label(), "Web Server");
 
-        // The generic presets at their default names, in any case.
-        for (menu, preset, id) in [
-            (
-                "add:Launch monitors",
-                "OpenConnect Server",
-                "openconnect_server.1",
-            ),
-            ("add:Outputs", "OpenConnect Client", "openconnect_client.2"),
-        ] {
-            let marks = screen.frame(&mut app, Vec::new());
-            let marks = screen.click_mark(&mut app, &marks, menu);
-            screen.click_mark(&mut app, &marks, &format!("{menu}:{preset}"));
-            let marks = screen.frame(&mut app, Vec::new());
-            assert!(marks.contains_key(&format!("title:{id}")), "{id}");
-            assert!(!marks.contains_key(&format!("tag:{id}")), "{id}");
-            let idx = form_index(&app, id);
-            match &mut app.settings.actors[idx] {
-                ActorFormEntry::Device(d) => d.name = preset.to_uppercase(),
-                ActorFormEntry::Integration(i) => i.name = preset.to_lowercase(),
-            }
-            let marks = screen.frame(&mut app, Vec::new());
-            assert!(!marks.contains_key(&format!("tag:{id}")), "{id}");
-            let marks = screen.click_mark(&mut app, &marks, &format!("cancel:{id}"));
-            assert!(!marks.keys().any(|k| k.ends_with(id)), "{id}");
-        }
+        // The generic preset at its default name, in any case.
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, "add:Launch monitors");
+        assert!(enabled(&marks, "add:Launch monitors:Open Connect Server"));
+        let escape = Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        screen.frame(&mut app, vec![escape]);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("add:Launch monitors:Open Connect Server"));
+        device(&mut app, "openconnect_server.0").address = "0.0.0.0:922".into();
+        let (menu, preset, id) = (
+            "add:Launch monitors",
+            "Open Connect Server",
+            "openconnect_server.1",
+        );
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, menu);
+        screen.click_mark(&mut app, &marks, &format!("{menu}:{preset}"));
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(marks.contains_key(&format!("title:{id}")));
+        assert!(!marks.contains_key(&format!("tag:{id}")));
+        device(&mut app, id).name = preset.to_uppercase();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key(&format!("tag:{id}")));
+        let marks = screen.click_mark(&mut app, &marks, &format!("cancel:{id}"));
+        assert!(!marks.keys().any(|k| k.ends_with(id)));
     }
 
     #[test]
@@ -2211,7 +2704,7 @@ mod tests {
         let marks = screen.click_mark(&mut app, &marks, "cancel:openconnect_client.0");
         assert_eq!(
             app.settings.actors[form_index(&app, "openconnect_client.0")].name(),
-            "GSPro"
+            "Open Connect"
         );
         assert!(!marks.contains_key("error:openconnect_client.0"));
         assert!(enabled(&marks, "tabs"));
@@ -2350,6 +2843,7 @@ mod tests {
                 cameras_supported: false,
                 clip_dir: None,
                 config_error: None,
+                round: Default::default(),
             });
             app.apply_pending();
         }
@@ -2419,7 +2913,7 @@ mod tests {
         assert!(app.settings.position("openconnect_client.0").is_some());
 
         // A card that slips in while the removal is out.
-        app.add_device(output_preset("GSPro (OpenConnect)"));
+        app.add_device(output_preset("GSPro (Open Connect)"));
         reply(&mut app, Ok(()));
         assert_eq!(app.settings.position("openconnect_client.0"), None);
         assert_eq!(
@@ -2583,6 +3077,7 @@ mod tests {
                 "0".into(),
                 flighthook::MockMonitorSection {
                     name: "Mock".into(),
+                    enabled: true,
                     impact_lead_s: None,
                 },
             )),
@@ -3614,6 +4109,7 @@ mod tests {
             "0".into(),
             flighthook::MockMonitorSection {
                 name: "Mock".into(),
+                enabled: true,
                 impact_lead_s: None,
             },
         );
@@ -3635,6 +4131,7 @@ mod tests {
             "0".into(),
             flighthook::RandomClubSection {
                 name: "Random club".into(),
+                enabled: true,
             },
         );
         app.settings.load_from(&config);

@@ -4,7 +4,8 @@
 //!   1. Client sends:  `{ "kind": "start", "version": ["0.1.0"], "name": "My Dashboard" }`
 //!   2. Server negotiates version (highest mutually supported)
 //!   3. Server sends:  `{ "kind": "init", "version": "0.1.0", "actor_id": "ws.abc123", "global_state": { ... } }`
-//!   4. Server streams `FlighthookMessage` events
+//!   4. Server replays the last status and telemetry of every actor and the
+//!      current `round_state`, then streams `FlighthookMessage` events
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -112,8 +113,20 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
         }
     }
 
-    // Phase 3: Stream bus events + receive commands
+    // Phase 3: Stream bus events + receive commands. Subscribed before the
+    // round is sent, so a change after it still arrives.
     let mut bus_rx = state.bus_tx.subscribe();
+
+    // The tournament round as it is now, active or not.
+    let round = FlighthookMessage::new(FlighthookEvent::RoundState {
+        round: state.root.round.state(),
+    })
+    .actor("system");
+    if let Ok(json) = serde_json::to_string(&round)
+        && ws_tx.send(Message::text(json)).await.is_err()
+    {
+        return;
+    }
 
     let mut send_task = tokio::spawn(async move {
         loop {

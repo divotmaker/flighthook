@@ -22,7 +22,7 @@ use crate::state::SystemState;
 
 use flighthook::{
     ActorStatus, BallFlight, ClubData, FlighthookEvent, FlighthookMessage, Handedness, RawDir,
-    RawRecord, Severity, ShotDetectionMode, ShotField, ShotKey, ShotRaw, Velocity,
+    RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per failed attempt, capped at 15s,
@@ -127,6 +127,11 @@ pub(crate) fn parse_address(address: Option<&str>) -> Result<Option<IpAddr>, Str
 }
 
 impl Actor for ExPuttActor {
+    /// A launch monitor flighthook reads directly.
+    fn source(&self) -> Option<crate::actors::provenance::ShotSource> {
+        Some(crate::actors::provenance::ShotSource::ExPutt)
+    }
+
     fn start(
         &self,
         state: Arc<SystemState>,
@@ -540,17 +545,13 @@ fn hand_of(handed: Option<Handedness>) -> Hand {
 // Protocol type -> bus type conversion helpers
 // ---------------------------------------------------------------------------
 
-/// The value of [`ball_from_putt`] the device does not measure: the
-/// vertical launch, filled in as 0.
-const PUTT_COMPUTED: [ShotField; 1] = [ShotField::LaunchElevation];
-
 /// Ball data of a putt: ball speed and launch direction, rolled along the
-/// ground (vertical launch 0, marked computed: [`PUTT_COMPUTED`]). The
-/// device measures no spin, so none is reported.
+/// ground by the simulation. The device measures no vertical launch and no
+/// spin, so neither is reported.
 fn ball_from_putt(putt: &PuttResult) -> BallFlight {
     BallFlight {
         launch_speed: Some(Velocity::MetersPerSecond(putt.ball_speed_mps)),
-        launch_elevation: Some(0.0),
+        launch_elevation: None,
         // Both are positive to the right of the target line.
         launch_azimuth: Some(putt.launch_direction_deg),
         ..BallFlight::default()
@@ -1025,9 +1026,8 @@ fn emit_putt(
     sender.send(
         FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() }).device(device),
     );
-    let mut event =
+    let event =
         sim::ball_flight_event_in_mode(state, key.clone(), ball, Some(ShotDetectionMode::Putting));
-    sim::mark_computed(&mut event, &PUTT_COMPUTED);
     sender.send(FlighthookMessage::new(event).device(device));
     if let Some(club) = club {
         sender.send(
@@ -1382,13 +1382,14 @@ mod tests {
         assert!((ball.launch_speed.unwrap().as_mps() - 2.50).abs() < 0.01);
         assert_eq!(ball.launch_azimuth, Some(expected.launch_direction_deg));
         assert!(ball.launch_azimuth.unwrap() > 1.4, "R1.4 is positive");
-        assert_eq!(ball.launch_elevation, Some(0.0));
+        // Neither a launch angle nor spin is measured, so neither is sent,
+        // and nothing is marked computed.
+        assert_eq!(ball.launch_elevation, None);
         assert_eq!(ball.backspin_rpm, None);
         assert_eq!(ball.sidespin_rpm, None);
         assert_eq!(ball.total_spin_rpm, None);
-        // The 0 launch angle is filled in, and marked so.
         let derived = shot.derived.as_ref().expect("derived");
-        assert_eq!(derived.computed, [flighthook::ShotField::LaunchElevation]);
+        assert!(derived.computed.is_empty(), "{:?}", derived.computed);
 
         let club = shot.club.as_ref().expect("club data");
         assert_eq!(club.path, expected.path_deg);
@@ -1699,6 +1700,7 @@ mod tests {
                     "0".into(),
                     flighthook::ExPuttSection {
                         name: "ExPutt".into(),
+                        enabled: true,
                         address: address.map(str::to_string),
                         impact_lead_s: None,
                     },
@@ -1739,7 +1741,7 @@ mod tests {
             .collect()
     }
 
-    /// Readiness an OpenConnect client routing putts to the ExPutt reports in
+    /// Readiness an Open Connect client routing putts to the ExPutt reports in
     /// Putting mode after `seen`.
     fn gspro_ready(seen: &[FlighthookMessage]) -> bool {
         let routing = GsProRouting {

@@ -78,6 +78,8 @@ pub(crate) const VEIL_HOVER: Color32 = Color32::from_rgba_premultiplied(26, 26, 
 pub(crate) const STATUS_OK: Color32 = ACCENT;
 pub(crate) const STATUS_PENDING: Color32 = GOLD;
 pub(crate) const STATUS_DOWN: Color32 = DANGER;
+/// A card turned off: neutral, never an alert.
+pub(crate) const STATUS_OFF: Color32 = TEXT_MUTED;
 
 /// Corner radius of cards and panels.
 pub(crate) const CARD_RADIUS: u8 = 10;
@@ -504,6 +506,54 @@ pub(crate) fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Resp
     );
     ui.painter().galley(pos, galley, color);
     response
+}
+
+/// Size of [`on_off_switch`].
+pub(crate) const ON_OFF_SWITCH: egui::Vec2 = egui::vec2(30.0, 16.0);
+
+/// A compact on/off switch: a rounded track, accent while `on`, with a knob
+/// at its right end while on and its left end while off. Dimmed and inert
+/// in a disabled `ui`; the response is clicked when it is flipped.
+pub(crate) fn on_off_switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let sense = egui::Sense::click();
+    let (rect, response) = ui.allocate_exact_size(ON_OFF_SWITCH, sense);
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let dim = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+    let (track, edge) = if on {
+        (ACCENT, ACCENT)
+    } else {
+        (SURFACE_HOVER, TEXT_DIM)
+    };
+    let edge = if enabled && response.hovered() {
+        if on { ACCENT_BRIGHT } else { TEXT_MUTED }
+    } else {
+        edge
+    };
+    let radius = CornerRadius::same((rect.height() / 2.0) as u8);
+    ui.painter().rect(
+        rect,
+        radius,
+        dim(track),
+        Stroke::new(1.0, dim(edge)),
+        egui::StrokeKind::Inside,
+    );
+    let knob = rect.height() / 2.0 - 3.0;
+    let x = if on {
+        rect.right() - 3.0 - knob
+    } else {
+        rect.left() + 3.0 + knob
+    };
+    let color = if on { ON_ACCENT } else { TEXT_MUTED };
+    ui.painter()
+        .circle_filled(egui::pos2(x, rect.center().y), knob, dim(color));
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }
 
 /// Diameter of [`loading_ring`] and [`connected_ring`] at 1x.

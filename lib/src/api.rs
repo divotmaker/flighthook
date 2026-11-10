@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActorStatus, Club, ConnectionState, Handedness, ShotDetectionMode, ShotGroupInfo, ShotGrouping,
-    StatusHistory,
+    ActorStatus, Club, ConnectionState, Handedness, RoundState, ShotDetectionMode, ShotGroupInfo,
+    ShotGrouping, StatusHistory,
 };
 
 /// GET /api/status response.
@@ -34,6 +34,10 @@ pub struct StatusResponse {
     /// read, or after a save has replaced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_error: Option<ConfigLoadError>,
+    /// The tournament round: whether one is active, and which output holds
+    /// it. Omitted when no round is active.
+    #[serde(default, skip_serializing_if = "RoundState::is_inactive")]
+    pub round: RoundState,
 }
 
 /// A config file the app could not use at startup, so it runs on the
@@ -86,6 +90,30 @@ impl ActorStatusResponse {
         };
         actor.observe(status, 0);
         actor
+    }
+
+    /// An actor named `name` that is turned off in the settings: status
+    /// `Disconnected`, state [`ConnectionState::Disabled`], no telemetry,
+    /// never red. A `Starting` status (a new instance) ends it.
+    #[must_use]
+    pub fn disabled(name: impl Into<String>) -> Self {
+        let status = ActorStatus::Disconnected;
+        let mut actor = Self {
+            name: name.into(),
+            status,
+            telemetry: HashMap::new(),
+            state: ConnectionState::Disabled,
+            red_for_ms: 0,
+            history: StatusHistory::off(status),
+        };
+        actor.stamp(0);
+        actor
+    }
+
+    /// Whether the actor is turned off in the settings.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.history.state() == ConnectionState::Disabled
     }
 
     /// Record a status the actor reported at `now_ms` (see
@@ -397,6 +425,26 @@ mod tests {
         a.apply_status(ActorStatus::Disconnected, &HashMap::new(), 1_000);
         assert_eq!(a.state(), ConnectionState::Reconnecting);
         assert!(a.red(1_001));
+    }
+
+    #[test]
+    fn a_disabled_actor_reads_disabled_until_a_new_instance_starts() {
+        let a = ActorStatusResponse::disabled("Mock");
+        assert!(a.is_disabled());
+        assert_eq!(a.state, ConnectionState::Disabled);
+        assert_eq!(a.red_for_ms, 0);
+        assert!(!a.red(0));
+        let json = serde_json::to_value(&a).unwrap();
+        assert_eq!(json["state"], "disabled");
+        assert_eq!(json["status"], "disconnected");
+        // A reply read back keeps it, as the UI receives it.
+        let mut got: ActorStatusResponse = serde_json::from_value(json).unwrap();
+        got.received(10);
+        assert!(got.is_disabled());
+        // Turned on: the new instance's Starting ends it.
+        got.apply_status(ActorStatus::Starting, &HashMap::new(), 20);
+        assert!(!got.is_disabled());
+        assert_eq!(got.state, ConnectionState::Connecting);
     }
 
     #[test]

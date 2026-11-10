@@ -1,25 +1,15 @@
-//! Where a shot comes from, and whether a recorded round can count it.
+//! Where a shot comes from: a launch monitor that measured it, or no
+//! device at all.
 //!
-//! Every actor that puts shots on the bus is a [`ShotSource`], and every
-//! source has a [`Provenance`]. Both are single exhaustive matches, so a new
-//! source type does not compile until it is given a class. Pureplay's strict
-//! mode (a tournament round) takes shots from [`Provenance::Measured`]
-//! sources only.
+//! Every actor type that puts shots on the bus is a [`ShotSource`], and every
+//! source has a [`Provenance`]. [`ShotSource::provenance`] is the single
+//! exhaustive match, so a new source type does not compile until it is given
+//! a class. An actor declares its source ([`Actor::source`](super::Actor));
+//! when it starts, its bus sender stamps that class on every shot it
+//! triggers, and the round policy records the source by actor ID
+//! ([`RoundPolicy`](crate::state::round::RoundPolicy)).
 
-/// What stands behind a source's shots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Provenance {
-    /// A flighthook driver reads a physical launch monitor directly.
-    Measured,
-    /// No physical launch monitor measured the shot: the mock launch
-    /// monitor, Auto-chip, and any simulated or replayed source. The
-    /// trackball launch monitor (a stroke turned into a shot) is virtual
-    /// too, and goes here when it is added.
-    Virtual,
-    /// The shot came from another application, so flighthook cannot vouch
-    /// for the device that measured it: the Open Connect input.
-    Relayed,
-}
+pub use flighthook::Provenance;
 
 /// A type of actor that puts shots on the bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +33,7 @@ pub enum ShotSource {
 
 impl ShotSource {
     /// Every source type.
+    #[cfg(test)]
     pub const ALL: [ShotSource; 7] = [
         Self::Mevo,
         Self::R10,
@@ -53,42 +44,17 @@ impl ShotSource {
         Self::AutoChip,
     ];
 
-    /// The source of actor `actor` (an actor ID such as `mevo.0`, or
-    /// [`flighthook::AUTO_CHIP_ACTOR`]); `None` for an actor that is not a
-    /// shot source.
-    #[must_use]
-    pub fn of(actor: &str) -> Option<Self> {
-        if actor == flighthook::AUTO_CHIP_ACTOR {
-            return Some(Self::AutoChip);
-        }
-        let (type_key, _) = actor.split_once('.')?;
-        Self::ALL
-            .into_iter()
-            .find(|s| s.type_key() == Some(type_key))
-    }
-
-    /// The config section and actor ID prefix of a configured source;
-    /// `None` for Auto-chip, which has no section and a fixed actor ID.
-    #[must_use]
-    pub fn type_key(self) -> Option<&'static str> {
-        match self {
-            Self::Mevo => Some("mevo"),
-            Self::R10 => Some("r10"),
-            Self::Square => Some("square"),
-            Self::ExPutt => Some("exputt"),
-            Self::MockMonitor => Some("mock_monitor"),
-            Self::OpenConnectServer => Some("openconnect_server"),
-            Self::AutoChip => None,
-        }
-    }
-
-    /// What stands behind this source's shots.
+    /// Where this source's shots come from. The Open Connect input is
+    /// measured: a launch monitor's own app sends it the shots that monitor
+    /// measured. The trackball launch monitor (a stroke turned into a shot)
+    /// is virtual, and goes with the mock and Auto-chip when it is added.
     #[must_use]
     pub fn provenance(self) -> Provenance {
         match self {
-            Self::Mevo | Self::R10 | Self::Square | Self::ExPutt => Provenance::Measured,
+            Self::Mevo | Self::R10 | Self::Square | Self::ExPutt | Self::OpenConnectServer => {
+                Provenance::Measured
+            }
             Self::MockMonitor | Self::AutoChip => Provenance::Virtual,
-            Self::OpenConnectServer => Provenance::Relayed,
         }
     }
 
@@ -96,20 +62,15 @@ impl ShotSource {
     /// status and readiness of its own); Auto-chip is not.
     #[must_use]
     pub fn is_launch_monitor(self) -> bool {
-        self.type_key().is_some()
-    }
-}
-
-/// Why a shot from `actor`, a source that is not measured (or not a known
-/// source), cannot count in a recorded round; `None` when it can. `name` is
-/// the actor's display name.
-#[must_use]
-pub fn not_measured_reason(actor: &str, name: &str) -> Option<String> {
-    match ShotSource::of(actor).map(ShotSource::provenance) {
-        Some(Provenance::Measured) => None,
-        Some(Provenance::Virtual) => Some(format!("{name} is a virtual launch monitor")),
-        Some(Provenance::Relayed) => Some(format!("{name} relays shots from another app")),
-        None => Some(format!("{name} is not a launch monitor flighthook reads")),
+        match self {
+            Self::Mevo
+            | Self::R10
+            | Self::Square
+            | Self::ExPutt
+            | Self::MockMonitor
+            | Self::OpenConnectServer => true,
+            Self::AutoChip => false,
+        }
     }
 }
 
@@ -117,40 +78,31 @@ pub fn not_measured_reason(actor: &str, name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Each source's class, and its actor IDs found back.
     #[test]
     fn every_source_has_a_class() {
-        use Provenance::{Measured, Relayed, Virtual};
-        let classes: Vec<(ShotSource, Provenance)> = ShotSource::ALL
+        use Provenance::{Measured, Virtual};
+        let classes: Vec<(ShotSource, Provenance, bool)> = ShotSource::ALL
             .into_iter()
-            .map(|s| (s, s.provenance()))
+            .map(|s| (s, s.provenance(), s.is_launch_monitor()))
             .collect();
         assert_eq!(
             classes,
             [
-                (ShotSource::Mevo, Measured),
-                (ShotSource::R10, Measured),
-                (ShotSource::Square, Measured),
-                (ShotSource::ExPutt, Measured),
-                (ShotSource::MockMonitor, Virtual),
-                (ShotSource::OpenConnectServer, Relayed),
-                (ShotSource::AutoChip, Virtual),
+                (ShotSource::Mevo, Measured, true),
+                (ShotSource::R10, Measured, true),
+                (ShotSource::Square, Measured, true),
+                (ShotSource::ExPutt, Measured, true),
+                (ShotSource::MockMonitor, Virtual, true),
+                (ShotSource::OpenConnectServer, Measured, true),
+                (ShotSource::AutoChip, Virtual, false),
             ]
         );
-        for source in ShotSource::ALL {
-            let actor = match source.type_key() {
-                Some(t) => format!("{t}.3"),
-                None => flighthook::AUTO_CHIP_ACTOR.to_owned(),
-            };
-            assert_eq!(ShotSource::of(&actor), Some(source), "{actor}");
-        }
-        assert!(!ShotSource::AutoChip.is_launch_monitor());
-        assert!(ShotSource::MockMonitor.is_launch_monitor());
     }
 
-    /// Every actor a config can create is either a shot source or one of
-    /// the types that put no shots on the bus: a new type has to be sorted
-    /// into one or the other.
+    /// Every actor a config can create either declares the shot source it
+    /// starts as or is one of the types that put no shots on the bus: a new
+    /// type has to be sorted into one or the other. Every launch monitor
+    /// source has a config section.
     #[test]
     fn every_configurable_actor_is_classified() {
         use flighthook::{
@@ -181,6 +133,7 @@ mod tests {
             "0".into(),
             MockMonitorSection {
                 name: String::new(),
+                enabled: true,
                 impact_lead_s: None,
             },
         );
@@ -197,54 +150,40 @@ mod tests {
             "0".into(),
             RandomClubSection {
                 name: String::new(),
+                enabled: true,
             },
         );
         config.camera.insert("0".into(), CameraSection::default());
 
-        let ids: Vec<String> = super::super::resolve_actors(&config, None)
-            .into_iter()
-            .map(|a| a.id)
-            .collect();
-        let types: Vec<&str> = ids
-            .iter()
-            .filter_map(|id| id.split_once('.').map(|(t, _)| t))
-            .collect();
-        assert_eq!(types.len(), 11, "one actor per section: {ids:?}");
-        for id in &ids {
-            let (t, _) = id.split_once('.').expect("type.index");
+        let resolved = super::super::resolve_actors(&config, None);
+        assert_eq!(resolved.len(), 11, "one actor per section");
+        let mut sources = Vec::new();
+        for ra in &resolved {
+            let (section, _) = ra.id.split_once('.').expect("type.index");
+            let source = ra.actor.source();
             assert!(
-                ShotSource::of(id).is_some() != NOT_SOURCES.contains(&t),
-                "{id}: classify it as a shot source or list it as none"
+                source.is_some() != NOT_SOURCES.contains(&section),
+                "{}: declare its shot source or list it as none",
+                ra.id
+            );
+            sources.extend(source.map(|s| (section, s)));
+        }
+        assert_eq!(
+            sources,
+            [
+                ("mevo", ShotSource::Mevo),
+                ("r10", ShotSource::R10),
+                ("square", ShotSource::Square),
+                ("exputt", ShotSource::ExPutt),
+                ("mock_monitor", ShotSource::MockMonitor),
+                ("openconnect_server", ShotSource::OpenConnectServer),
+            ]
+        );
+        for source in ShotSource::ALL {
+            assert!(
+                !source.is_launch_monitor() || sources.iter().any(|(_, s)| *s == source),
+                "{source:?} has a config section"
             );
         }
-        for source in ShotSource::ALL {
-            if let Some(t) = source.type_key() {
-                assert!(types.contains(&t), "{t} has a config section");
-            }
-        }
-    }
-
-    #[test]
-    fn the_reason_names_the_device_and_its_class() {
-        assert_eq!(not_measured_reason("mevo.0", "Mevo+"), None);
-        assert_eq!(not_measured_reason("r10.0", "R10"), None);
-        assert_eq!(not_measured_reason("square.0", "Omni"), None);
-        assert_eq!(not_measured_reason("exputt.0", "ExPutt"), None);
-        assert_eq!(
-            not_measured_reason("mock_monitor.0", "Mock").as_deref(),
-            Some("Mock is a virtual launch monitor")
-        );
-        assert_eq!(
-            not_measured_reason(flighthook::AUTO_CHIP_ACTOR, "Auto-chip").as_deref(),
-            Some("Auto-chip is a virtual launch monitor")
-        );
-        assert_eq!(
-            not_measured_reason("openconnect_server.0", "OpenConnect input").as_deref(),
-            Some("OpenConnect input relays shots from another app")
-        );
-        assert_eq!(
-            not_measured_reason("thing.0", "Thing").as_deref(),
-            Some("Thing is not a launch monitor flighthook reads")
-        );
     }
 }

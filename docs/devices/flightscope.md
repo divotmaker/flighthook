@@ -326,7 +326,7 @@ choosing `e8` there means choosing that value knowingly.
 | Value | Total spin | Spin axis |
 | --- | --- | --- |
 | `d4` (default) | D4's backspin, as reported | As reported |
-| `e8` | E8's backspin; D4's when the shot has no E8 spin | From D4 when the shot has club data (club speed plus attack angle or path), otherwise 0; D4's when the shot has no E8 spin |
+| `e8` | E8's backspin; D4's when the shot has no E8 spin | From D4 when the shot has club data (club speed plus attack angle or path), and the total is sent split into backspin and sidespin by it; otherwise none: the total is sent alone, with no back/side components. D4's when the shot has no E8 spin |
 | `auto` | E8 when flighthook is in Full mode, D4 otherwise | Same as whichever of the above applies |
 
 `d4` matches FS Golf. `e8` is steadier on full swings. `auto` gets `e8`'s
