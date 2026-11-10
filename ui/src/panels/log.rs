@@ -10,7 +10,8 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "alert_warn",
     "alert_critical",
     "shot_trigger",
-    "ball_flight",
+    "launch",
+    "flight_result",
     "club_path",
     "face_impact",
     "shot_finished",
@@ -40,7 +41,8 @@ const FILTER_GROUPS: &[(&str, &[&str])] = &[
         "Launch Monitor",
         &[
             "shot_trigger",
-            "ball_flight",
+            "launch",
+            "flight_result",
             "club_path",
             "face_impact",
             "shot_finished",
@@ -86,7 +88,8 @@ const FILTER_GROUPS: &[(&str, &[&str])] = &[
 pub(crate) fn message_type(event: &FlighthookEvent) -> &'static str {
     match event {
         FlighthookEvent::ShotTrigger { .. } => "shot_trigger",
-        FlighthookEvent::BallFlight { .. } => "ball_flight",
+        FlighthookEvent::Launch { .. } => "launch",
+        FlighthookEvent::FlightResult { .. } => "flight_result",
         FlighthookEvent::ClubPath { .. } => "club_path",
         FlighthookEvent::FaceImpact { .. } => "face_impact",
         FlighthookEvent::ShotFinished { .. } => "shot_finished",
@@ -135,9 +138,10 @@ fn shot_numbers(keys: &[crate::types::ShotKey]) -> String {
 /// Debug representation of the inner event (unwraps envelope layers).
 pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
     match event {
-        FlighthookEvent::ShotTrigger { key } => format!("trigger #{}", key.shot_number),
-        FlighthookEvent::BallFlight { key, .. } => {
-            format!("ball #{}", key.shot_number)
+        FlighthookEvent::ShotTrigger { key, .. } => format!("trigger #{}", key.shot_number),
+        FlighthookEvent::Launch { key, .. } => format!("launch #{}", key.shot_number),
+        FlighthookEvent::FlightResult { key, flight } => {
+            format!("flight #{} ({})", key.shot_number, flight.basis)
         }
         FlighthookEvent::ClubPath { key, .. } => format!("club #{}", key.shot_number),
         FlighthookEvent::FaceImpact { key, .. } => format!("impact #{}", key.shot_number),
@@ -406,6 +410,34 @@ impl FlighthookApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The log's kind names are the events' serde `kind` tags, so the
+    /// filter matches what the wire says.
+    #[test]
+    fn shot_kinds_are_the_wire_kinds() {
+        use crate::types::{Basis, FlightResult, Launch, ShotKey};
+        let key = ShotKey {
+            shot_id: "s".into(),
+            shot_number: 1,
+        };
+        for event in [
+            FlighthookEvent::shot_trigger(key.clone()),
+            FlighthookEvent::Launch {
+                key: key.clone(),
+                launch: Box::new(Launch::default()),
+                derived: None,
+            },
+            FlighthookEvent::FlightResult {
+                key: key.clone(),
+                flight: Box::new(FlightResult::new(Basis::Tracked)),
+            },
+        ] {
+            let json = serde_json::to_value(&event).expect("ser");
+            assert_eq!(json["kind"], message_type(&event));
+            assert!(MESSAGE_TYPES.contains(&message_type(&event)));
+        }
+        assert!(!MESSAGE_TYPES.contains(&"ball_flight"));
+    }
 
     #[test]
     fn every_kind_is_in_exactly_one_filter_group() {

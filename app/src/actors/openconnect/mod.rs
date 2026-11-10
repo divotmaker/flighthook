@@ -532,6 +532,7 @@ fn handle(
                 manufacturer: None,
                 model: Some(msg.device_id.clone()),
                 firmware: None,
+                source: None,
                 telemetry: None,
             })
             .device(device.as_str()),
@@ -547,6 +548,7 @@ fn handle(
                 manufacturer: None,
                 model: None,
                 firmware: None,
+                source: None,
                 telemetry: Some(HashMap::from([
                     ("ready".into(), ready.to_string()),
                     (
@@ -644,7 +646,7 @@ fn emit_shot(
         shot_number: msg.shot_number,
     };
 
-    let ball = mapper::map_ball(msg);
+    let ball = mapper::map_launch(msg);
     tracing::info!(
         "openconnect <- shot #{}: {:.1}mph VLA={:.1} HLA={:.1} spin={:?}/{:?}",
         msg.shot_number,
@@ -656,16 +658,17 @@ fn emit_shot(
     );
 
     sender.send(
-        FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() })
+        FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()))
             .raw(payload.clone())
             .device(device),
     );
-    let event = sim::ball_flight_event(state, key.clone(), ball);
-    sender.send(
-        FlighthookMessage::new(event)
-            .raw(payload.clone())
-            .device(device),
-    );
+    for event in sim::launch_events(state, key.clone(), ball, mapper::map_flight(msg)) {
+        sender.send(
+            FlighthookMessage::new(event)
+                .raw(payload.clone())
+                .device(device),
+        );
+    }
 
     if msg.shot_data_options.contains_club_data {
         sender.send(
@@ -778,13 +781,17 @@ mod tests {
         let mut acc = None;
         while let Ok(m) = rx.try_recv() {
             match m.event {
-                FlighthookEvent::ShotTrigger { key } => {
+                FlighthookEvent::ShotTrigger { key, .. } => {
                     acc = Some(flighthook::ShotAccumulator::new(m.actor, key));
                 }
-                FlighthookEvent::BallFlight { ball, derived, .. } => {
+                FlighthookEvent::Launch {
+                    launch, derived, ..
+                } => {
                     let acc = acc.as_mut().expect("trigger first");
-                    acc.set_ball(*ball);
-                    acc.set_derived(derived.map(|d| *d));
+                    acc.set_launch(*launch, derived.map(|d| *d));
+                }
+                FlighthookEvent::FlightResult { flight, .. } => {
+                    acc.as_mut().expect("trigger first").set_flight(*flight);
                 }
                 FlighthookEvent::ClubPath { club, .. } => {
                     acc.as_mut().expect("trigger first").set_club(*club);
@@ -813,18 +820,19 @@ mod tests {
         for request in LATERAL_SHOTS {
             let rh = ingested(request, flighthook::Handedness::Right);
             let lh = ingested(request, flighthook::Handedness::Left);
-            assert_eq!(lh.ball, rh.ball, "{request}");
+            assert_eq!(lh.launch, rh.launch, "{request}");
+            assert_eq!(lh.flight, rh.flight, "{request}");
             assert_eq!(lh.club, rh.club, "{request}");
             assert_eq!(lh.impact, rh.impact, "{request}");
         }
         let rh = ingested(LATERAL_SHOTS[0], flighthook::Handedness::Right);
-        let (ball, club) = (rh.ball.expect("ball"), rh.club.expect("club"));
+        let (ball, club) = (rh.launch.expect("launch"), rh.club.expect("club"));
         assert_eq!(ball.launch_azimuth, Some(4.2));
         assert_eq!(ball.sidespin_rpm, Some(-650));
         assert_eq!(club.face_angle, Some(2.1));
         assert_eq!(club.path, Some(-3.4));
         let rh = ingested(LATERAL_SHOTS[1], flighthook::Handedness::Right);
-        let ball = rh.ball.expect("ball");
+        let ball = rh.launch.expect("launch");
         assert_eq!(ball.sidespin_rpm, Some(-2500));
         assert_eq!(ball.spin_axis, Some(-30.0));
     }
@@ -836,7 +844,7 @@ mod tests {
     fn the_completed_spin_pair_is_measured() {
         for request in LATERAL_SHOTS {
             let shot = ingested(request, flighthook::Handedness::Right);
-            let ball = shot.ball.as_ref().expect("ball");
+            let ball = shot.launch.as_ref().expect("launch");
             assert!(ball.backspin_rpm.is_some() && ball.total_spin_rpm.is_some());
             assert_eq!(shot.unmeasured_fields().count(), 0, "{request}");
         }
@@ -866,7 +874,7 @@ mod tests {
     fn club_data_follows_the_message_flag() {
         const NO_CLUB: &str = r#"{"DeviceID":"TestLM","Units":"Yards","ShotNumber":9,"APIversion":"1","BallData":{"Speed":120.0,"BackSpin":2800.0,"SideSpin":-300.0,"HLA":1.0,"VLA":14.0},"ClubData":{"Speed":0.0,"Path":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Loft":0.0,"HorizontalFaceImpact":0.0,"VerticalFaceImpact":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":false}}"#;
         let shot = ingested(NO_CLUB, flighthook::Handedness::Right);
-        assert!(shot.ball.is_some());
+        assert!(shot.launch.is_some());
         assert_eq!((shot.club, shot.impact), (None, None));
 
         let with_values =
@@ -1187,12 +1195,12 @@ mod tests {
             shot_id: "s1".into(),
             shot_number: 1,
         };
-        monitor.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
+        monitor.send(FlighthookMessage::new(FlighthookEvent::shot_trigger(
+            key.clone(),
+        )));
+        monitor.send(FlighthookMessage::new(FlighthookEvent::Launch {
             key: key.clone(),
-        }));
-        monitor.send(FlighthookMessage::new(FlighthookEvent::BallFlight {
-            key: key.clone(),
-            ball: Box::new(flighthook::BallFlight {
+            launch: Box::new(flighthook::Launch {
                 launch_speed: Some(flighthook::Velocity::MilesPerHour(100.0)),
                 launch_elevation: Some(14.0),
                 launch_azimuth: Some(1.0),
@@ -1706,6 +1714,40 @@ mod tests {
             );
             drop(monitor);
             rig.until("the server listening again", |m| listening(m).is_some());
+        }
+    }
+
+    /// Every output's numbers for shots from the Open Connect input: one
+    /// with spin components, one with a total and axis and a carry.
+    #[test]
+    fn outputs_keep_their_numbers() {
+        const WITH_CARRY: &str = r#"{"DeviceID":"TestLM","Units":"Yards","ShotNumber":9,"APIversion":"1","BallData":{"Speed":110.0,"SpinAxis":6.0,"TotalSpin":4200.0,"HLA":-1.5,"VLA":16.0,"CarryDistance":172.5},"ClubData":{"Speed":82.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":false}}"#;
+        for (case, request) in [
+            ("openconnect_components", LATERAL_SHOTS[0]),
+            ("openconnect_total_and_carry", WITH_CARRY),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "flighthook-oc-test-{}",
+                crate::state::config::generate_id()
+            ));
+            let (state, _writer) = SystemState::new(dir.join("config.toml"));
+            let (tx, mut rx) = broadcast::channel(16);
+            let sender = BusSender::new(
+                "openconnect_server.0".into(),
+                tx,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let msg: api::GsProMessage = serde_json::from_str(request).expect("parses");
+            emit_shot(
+                &state,
+                &msg,
+                &RawPayload::Text(request.into()),
+                shot_raw(request, None),
+                &sender,
+            );
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let _ = std::fs::remove_dir_all(dir);
+            crate::test_ball::assert_outputs_pinned(case, &messages);
         }
     }
 }

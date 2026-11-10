@@ -79,17 +79,20 @@ flighthook exposes a REST + WebSocket API on the event bus, so any external soft
 
 The WebSocket API speaks the [Flight Relay Protocol](https://github.com/flightrelay/spec)
 (FRP) — an open, vendor-neutral protocol for launch monitor shot data. flighthook
-serves it at `ws://<host>:5880/frp` and negotiates the spec version on connect,
-currently `0.1.0`.
+serves it at `ws://<host>:5880/frp` and negotiates the spec version on connect:
+FRP `0.2.0`.
 
 Whatever the monitor is — a Mevo+ over its binary TCP protocol, an R10 over BLE,
 a Uneekor over Open Connect — it is normalized into the same FRP event stream, so
 a consumer is written once rather than per device.
 
-The shot lifecycle events (`shot_trigger`, `ball_flight`, `club_path`,
-`face_impact`, `shot_finished`) and the device events (`device_telemetry`,
-`alert`) are FRP-compliant and use the spec's own field shapes; the types come
-from the [`flightrelay`](https://crates.io/crates/flightrelay) crate. flighthook
+The shot lifecycle events (`shot_trigger`, `launch`, `flight_result`,
+`club_path`, `face_impact`, `shot_finished`) and the device events
+(`device_telemetry`, `alert`) are FRP-compliant and use the spec's own field
+shapes; the types come from the [`flightrelay`](https://crates.io/crates/flightrelay)
+crate. `launch` carries only measured values; a device's carry, apex and the
+rest come in `flight_result` with the basis they were obtained on, and for a
+shot whose device sent none flighthook adds its own simulated one. flighthook
 adds its own event kinds alongside them (player, club and hand info, config
 commands, actor status, shot groups, camera clips), which FRP-only consumers
 ignore per spec.
@@ -198,7 +201,7 @@ flat fairway, sea level and 25 °C by default.
   time, descent, offline, roll, total) from the simulation of its measured
   launch, for every device; `derived` carries all of them, flagged
   `replaces_measured`, and they take precedence over the device's. The
-  device's own results are kept, unchanged, under `ball` and in the export,
+  device's own results are kept, unchanged, under `flight` and in the export,
   and GSPro still receives the device's data. Launch values (ball speed,
   launch angles, spin, club data) are never replaced. A shot that can't be
   simulated keeps the device's results.
@@ -280,8 +283,8 @@ measured, with the formulas of the Flight Relay Protocol's "Derived Values":
 
 Each is present only when its inputs were measured; total spin, spin axis
 and spin loft only when the device did not report them itself (then they are
-in the shot's `ball` or `club`, read those first). They are computed from
-the values the device actor sent under `ball` and `club` (the device's
+in the shot's `launch` or `club`, read those first). They are computed from
+the values the device actor sent under `launch`, `flight` and `club` (the device's
 readings, or for Open Connect the spin pair completed from the one the
 monitor sent), never from the simulation. They are in the API
 (`metrics` on [`/api/shots`](docs/API.md#get-apishots)) and the export.

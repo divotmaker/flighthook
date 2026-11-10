@@ -6,17 +6,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use flightrelay::types::{BallFlight, ClubData};
+use flightrelay::types::{ClubData, FlightResult, Launch};
 use flightrelay::units::Distance;
 
-/// Values flighthook computes from the measured [`BallFlight`] and
-/// [`ClubData`] of a shot.
+/// Values flighthook computes from the measured [`Launch`], the device's
+/// [`FlightResult`] and the [`ClubData`] of a shot.
 ///
-/// Each field is present only when every input it needs was measured, and
+/// Each field is present only when every input it needs was reported, and
 /// the spin values and spin loft only when the device did not report them
-/// itself. A value under `ball` or `club` was sent by the device actor: the
-/// device's reading, or for Open Connect the spin pair completed from the
-/// one the monitor sent. A value here is computed from those. Nothing here
+/// itself. A value under `launch`, `flight` or `club` was sent by the device
+/// actor: the device's reading, or for Open Connect the spin pair completed
+/// from the one the monitor sent. A value here is computed from those. Nothing here
 /// comes from the simulation
 /// ([`DerivedFlight`](crate::DerivedFlight)). Lateral values are absolute:
 /// positive = right of the target line, as in `launch_azimuth`.
@@ -52,14 +52,18 @@ pub struct ShotMetrics {
 }
 
 impl ShotMetrics {
-    /// Compute the metrics whose inputs `ball` and `club` carry. `None` when
-    /// there are none.
+    /// Compute the metrics whose inputs `launch`, `flight` and `club`
+    /// carry. `None` when there are none.
     #[must_use]
-    pub fn compute(ball: Option<&BallFlight>, club: Option<&ClubData>) -> Option<Self> {
+    pub fn compute(
+        launch: Option<&Launch>,
+        flight: Option<&FlightResult>,
+        club: Option<&ClubData>,
+    ) -> Option<Self> {
         let mut m = Self::default();
-        if let Some(ball) = ball {
-            (m.total_spin_rpm, m.spin_axis) = spin(ball);
-            m.curve = curve(ball);
+        if let Some(launch) = launch {
+            (m.total_spin_rpm, m.spin_axis) = spin(launch);
+            m.curve = flight.and_then(|f| curve(launch, f));
         }
         if let Some(club) = club {
             m.face_to_path = face_to_path(club);
@@ -100,15 +104,15 @@ fn finite(v: Option<f64>) -> Option<f64> {
 
 /// Total spin and axis from the spin components, when the device reported
 /// both components and neither total nor axis (FRP's spin relations, via
-/// [`BallFlight::complete_spin`]).
-fn spin(ball: &BallFlight) -> (Option<i32>, Option<f64>) {
-    if ball.total_spin_rpm.is_some() || ball.spin_axis.is_some() {
+/// [`Launch::complete_spin`]).
+fn spin(launch: &Launch) -> (Option<i32>, Option<f64>) {
+    if launch.total_spin_rpm.is_some() || launch.spin_axis.is_some() {
         return (None, None);
     }
-    let mut spin = BallFlight {
-        backspin_rpm: ball.backspin_rpm,
-        sidespin_rpm: ball.sidespin_rpm,
-        ..BallFlight::default()
+    let mut spin = Launch {
+        backspin_rpm: launch.backspin_rpm,
+        sidespin_rpm: launch.sidespin_rpm,
+        ..Launch::default()
     };
     spin.complete_spin();
     (spin.total_spin_rpm, finite(spin.spin_axis))
@@ -119,20 +123,20 @@ fn spin(ball: &BallFlight) -> (Option<i32>, Option<f64>) {
 /// spin axis. A total with no axis is all backspin and gives no sidespin;
 /// a consumer that needs one fills its own default.
 #[must_use]
-pub fn spin_components(ball: &BallFlight) -> (Option<i32>, Option<i32>) {
-    if ball.backspin_rpm.is_some() || ball.sidespin_rpm.is_some() {
-        return (ball.backspin_rpm, ball.sidespin_rpm);
+pub fn spin_components(launch: &Launch) -> (Option<i32>, Option<i32>) {
+    if launch.backspin_rpm.is_some() || launch.sidespin_rpm.is_some() {
+        return (launch.backspin_rpm, launch.sidespin_rpm);
     }
-    let Some(total) = ball.total_spin_rpm else {
+    let Some(total) = launch.total_spin_rpm else {
         return (None, None);
     };
-    let Some(axis) = finite(ball.spin_axis) else {
+    let Some(axis) = finite(launch.spin_axis) else {
         return (Some(total), None);
     };
-    let mut spin = BallFlight {
+    let mut spin = Launch {
         total_spin_rpm: Some(total),
         spin_axis: Some(axis),
-        ..BallFlight::default()
+        ..Launch::default()
     };
     spin.complete_spin();
     (spin.backspin_rpm, spin.sidespin_rpm)
@@ -151,11 +155,12 @@ fn spin_loft(club: &ClubData) -> Option<f64> {
     Some(finite(club.dynamic_loft)? - finite(club.attack_angle)?)
 }
 
-/// `carry_offline − carry_distance × tan(launch_azimuth)`, in meters.
-fn curve(ball: &BallFlight) -> Option<Distance> {
-    let offline = finite(ball.carry_offline.map(Distance::as_meters))?;
-    let carry = finite(ball.carry_distance.map(Distance::as_meters))?;
-    let azimuth = finite(ball.launch_azimuth).filter(|a| a.abs() < 90.0)?;
+/// `carry_offline − carry_distance × tan(launch_azimuth)`, in meters: the
+/// device's landing against the measured start line.
+fn curve(launch: &Launch, flight: &FlightResult) -> Option<Distance> {
+    let offline = finite(flight.carry_offline.map(Distance::as_meters))?;
+    let carry = finite(flight.carry_distance.map(Distance::as_meters))?;
+    let azimuth = finite(launch.launch_azimuth).filter(|a| a.abs() < 90.0)?;
     let curve = offline - carry * azimuth.to_radians().tan();
     curve.is_finite().then_some(Distance::Meters(curve))
 }
@@ -168,23 +173,26 @@ mod tests {
         (a - b).abs() < 1e-9
     }
 
-    fn components(back: Option<i32>, side: Option<i32>) -> BallFlight {
-        BallFlight {
+    use flightrelay::types::Basis;
+
+    fn components(back: Option<i32>, side: Option<i32>) -> Launch {
+        Launch {
             backspin_rpm: back,
             sidespin_rpm: side,
-            ..BallFlight::default()
+            ..Launch::default()
         }
     }
 
     #[test]
     fn spin_from_components_signs() {
         // Rightward sidespin tilts the axis right (+), leftward left (−).
-        let m = ShotMetrics::compute(Some(&components(Some(3200), Some(450))), None).unwrap();
+        let m = ShotMetrics::compute(Some(&components(Some(3200), Some(450))), None, None).unwrap();
         assert_eq!(m.total_spin_rpm, Some(3231));
         let axis = m.spin_axis.unwrap();
         assert!((axis - 8.0047).abs() < 1e-3, "{axis}");
 
-        let m = ShotMetrics::compute(Some(&components(Some(3200), Some(-450))), None).unwrap();
+        let m =
+            ShotMetrics::compute(Some(&components(Some(3200), Some(-450))), None, None).unwrap();
         assert_eq!(m.total_spin_rpm, Some(3231));
         let axis = m.spin_axis.unwrap();
         assert!((axis + 8.0047).abs() < 1e-3, "{axis}");
@@ -192,9 +200,9 @@ mod tests {
 
     #[test]
     fn spin_omitted_unless_both_components() {
-        assert!(ShotMetrics::compute(Some(&components(Some(3200), None)), None).is_none());
-        assert!(ShotMetrics::compute(Some(&components(None, Some(-450))), None).is_none());
-        assert!(ShotMetrics::compute(Some(&components(None, None)), None).is_none());
+        assert!(ShotMetrics::compute(Some(&components(Some(3200), None)), None, None).is_none());
+        assert!(ShotMetrics::compute(Some(&components(None, Some(-450))), None, None).is_none());
+        assert!(ShotMetrics::compute(Some(&components(None, None)), None, None).is_none());
     }
 
     #[test]
@@ -202,10 +210,10 @@ mod tests {
         let mut ball = components(Some(3200), Some(-450));
         ball.total_spin_rpm = Some(3231);
         ball.spin_axis = Some(-8.0);
-        assert!(ShotMetrics::compute(Some(&ball), None).is_none());
+        assert!(ShotMetrics::compute(Some(&ball), None, None).is_none());
         // A total alone still counts as reported: no second total is made up.
         ball.spin_axis = None;
-        assert!(ShotMetrics::compute(Some(&ball), None).is_none());
+        assert!(ShotMetrics::compute(Some(&ball), None, None).is_none());
     }
 
     /// The device's components as they are; else the total split by its
@@ -214,10 +222,10 @@ mod tests {
     fn spin_components_read_either_pair() {
         let ball = components(Some(3200), Some(-450));
         assert_eq!(spin_components(&ball), (Some(3200), Some(-450)));
-        let total = |total, axis| BallFlight {
+        let total = |total, axis| Launch {
             total_spin_rpm: total,
             spin_axis: axis,
-            ..BallFlight::default()
+            ..Launch::default()
         };
         let (back, side) = spin_components(&total(Some(3231), Some(-8.0)));
         assert_eq!((back, side), (Some(3200), Some(-450)));
@@ -226,12 +234,12 @@ mod tests {
             (Some(6897), None)
         );
         assert_eq!(spin_components(&total(None, Some(3.0))), (None, None));
-        assert_eq!(spin_components(&BallFlight::default()), (None, None));
+        assert_eq!(spin_components(&Launch::default()), (None, None));
     }
 
     #[test]
     fn zero_spin_has_a_total_and_no_axis() {
-        let m = ShotMetrics::compute(Some(&components(Some(0), Some(0))), None).unwrap();
+        let m = ShotMetrics::compute(Some(&components(Some(0), Some(0))), None, None).unwrap();
         assert_eq!(m.total_spin_rpm, Some(0));
         assert_eq!(m.spin_axis, None);
     }
@@ -247,18 +255,18 @@ mod tests {
     #[test]
     fn face_to_path_signs() {
         // Face open to an in-to-out path: face right of path.
-        let m = ShotMetrics::compute(None, Some(&club(Some(1.2), Some(-2.1)))).unwrap();
+        let m = ShotMetrics::compute(None, None, Some(&club(Some(1.2), Some(-2.1)))).unwrap();
         assert!(close(m.face_to_path.unwrap(), 3.3));
         // Face closed to the path: face left of path.
-        let m = ShotMetrics::compute(None, Some(&club(Some(-1.0), Some(2.5)))).unwrap();
+        let m = ShotMetrics::compute(None, None, Some(&club(Some(-1.0), Some(2.5)))).unwrap();
         assert!(close(m.face_to_path.unwrap(), -3.5));
     }
 
     #[test]
     fn face_to_path_omitted_without_both_inputs() {
-        assert!(ShotMetrics::compute(None, Some(&club(Some(1.2), None))).is_none());
-        assert!(ShotMetrics::compute(None, Some(&club(None, Some(-2.1)))).is_none());
-        assert!(ShotMetrics::compute(None, Some(&club(Some(f64::NAN), Some(1.0)))).is_none());
+        assert!(ShotMetrics::compute(None, None, Some(&club(Some(1.2), None))).is_none());
+        assert!(ShotMetrics::compute(None, None, Some(&club(None, Some(-2.1)))).is_none());
+        assert!(ShotMetrics::compute(None, None, Some(&club(Some(f64::NAN), Some(1.0)))).is_none());
     }
 
     fn lofts(dynamic: Option<f64>, attack: Option<f64>) -> ClubData {
@@ -272,9 +280,9 @@ mod tests {
     #[test]
     fn spin_loft_approximation() {
         // Hitting down adds to the spin loft, hitting up takes from it.
-        let m = ShotMetrics::compute(None, Some(&lofts(Some(18.4), Some(-3.5)))).unwrap();
+        let m = ShotMetrics::compute(None, None, Some(&lofts(Some(18.4), Some(-3.5)))).unwrap();
         assert!(close(m.spin_loft.unwrap(), 21.9));
-        let m = ShotMetrics::compute(None, Some(&lofts(Some(12.0), Some(4.0)))).unwrap();
+        let m = ShotMetrics::compute(None, None, Some(&lofts(Some(12.0), Some(4.0)))).unwrap();
         assert!(close(m.spin_loft.unwrap(), 8.0));
     }
 
@@ -282,22 +290,30 @@ mod tests {
     fn spin_loft_omitted_when_measured_or_inputs_missing() {
         let mut c = lofts(Some(18.4), Some(-3.5));
         c.spin_loft = Some(22.1);
-        assert!(ShotMetrics::compute(None, Some(&c)).is_none());
-        assert!(ShotMetrics::compute(None, Some(&lofts(Some(18.4), None))).is_none());
-        assert!(ShotMetrics::compute(None, Some(&lofts(None, Some(-3.5)))).is_none());
+        assert!(ShotMetrics::compute(None, None, Some(&c)).is_none());
+        assert!(ShotMetrics::compute(None, None, Some(&lofts(Some(18.4), None))).is_none());
+        assert!(ShotMetrics::compute(None, None, Some(&lofts(None, Some(-3.5)))).is_none());
     }
 
-    fn flight(offline: Option<f64>, carry: Option<f64>, azimuth: Option<f64>) -> BallFlight {
-        BallFlight {
+    fn flight(
+        offline: Option<f64>,
+        carry: Option<f64>,
+        azimuth: Option<f64>,
+    ) -> (Launch, FlightResult) {
+        let launch = Launch {
+            launch_azimuth: azimuth,
+            ..Launch::default()
+        };
+        let flight = FlightResult {
             carry_offline: offline.map(Distance::Meters),
             carry_distance: carry.map(Distance::Meters),
-            launch_azimuth: azimuth,
-            ..BallFlight::default()
-        }
+            ..FlightResult::new(Basis::Modeled)
+        };
+        (launch, flight)
     }
 
-    fn curve_m(ball: &BallFlight) -> Option<f64> {
-        ShotMetrics::compute(Some(ball), None)?
+    fn curve_m((launch, flight): &(Launch, FlightResult)) -> Option<f64> {
+        ShotMetrics::compute(Some(launch), Some(flight), None)?
             .curve
             .map(Distance::as_meters)
     }
@@ -322,13 +338,18 @@ mod tests {
     #[test]
     fn curve_converts_units_first() {
         // 5 yd offline on a 100 m carry launched straight: curve 5 yd = 4.572 m.
-        let ball = BallFlight {
-            carry_offline: Some(Distance::Yards(5.0)),
-            carry_distance: Some(Distance::Meters(100.0)),
-            launch_azimuth: Some(0.0),
-            ..BallFlight::default()
-        };
-        assert!(close(curve_m(&ball).unwrap(), 4.572));
+        let shot = (
+            Launch {
+                launch_azimuth: Some(0.0),
+                ..Launch::default()
+            },
+            FlightResult {
+                carry_offline: Some(Distance::Yards(5.0)),
+                carry_distance: Some(Distance::Meters(100.0)),
+                ..FlightResult::new(Basis::Modeled)
+            },
+        );
+        assert!(close(curve_m(&shot).unwrap(), 4.572));
     }
 
     #[test]
@@ -341,15 +362,19 @@ mod tests {
 
     #[test]
     fn nothing_to_compute_is_none() {
-        assert!(ShotMetrics::compute(None, None).is_none());
-        assert!(ShotMetrics::compute(Some(&BallFlight::default()), None).is_none());
-        assert!(ShotMetrics::compute(None, Some(&ClubData::default())).is_none());
+        assert!(ShotMetrics::compute(None, None, None).is_none());
+        assert!(ShotMetrics::compute(Some(&Launch::default()), None, None).is_none());
+        // A flight result without a launch has no start line to curve from.
+        let (_, flight) = flight(Some(12.0), Some(100.0), Some(5.0));
+        assert!(ShotMetrics::compute(None, Some(&flight), None).is_none());
+        assert!(ShotMetrics::compute(None, None, Some(&ClubData::default())).is_none());
     }
 
     #[test]
     fn serializes_only_present_fields() {
         let m = ShotMetrics::compute(
             Some(&components(Some(3200), Some(-450))),
+            None,
             Some(&club(Some(1.5), Some(-1.0))),
         )
         .unwrap();

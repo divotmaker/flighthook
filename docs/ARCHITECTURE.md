@@ -319,14 +319,16 @@ are flat struct variants with named fields (no wrapper types).
 ```rust
 pub enum FlighthookEvent {
     // -- FRP-compliant shot lifecycle (correlated by ShotKey) --
-    ShotTrigger { key: ShotKey },
-    BallFlight { key: ShotKey, ball: Box<BallFlight>, derived: Option<Box<DerivedFlight>> },
+    ShotTrigger { key: ShotKey, timestamp: Option<u64> },
+    Launch { key: ShotKey, launch: Box<Launch>, derived: Option<Box<DerivedFlight>> },
+    FlightResult { key: ShotKey, flight: Box<FlightResult> },
     ClubPath { key: ShotKey, club: Box<ClubData> },
     FaceImpact { key: ShotKey, impact: Box<FaceImpact> },
     ShotFinished { key: ShotKey, raw: Option<Box<ShotRaw>> },
 
     // -- FRP: Device status --
-    DeviceTelemetry { manufacturer: Option<String>, model: Option<String>, firmware: Option<String>, telemetry: Option<HashMap<String, String>> },
+    DeviceTelemetry { manufacturer: Option<String>, model: Option<String>, firmware: Option<String>,
+                      source: Option<Provenance>, telemetry: Option<HashMap<String, String>> },
     Alert { severity: Severity, message: String },
 
     // -- FRP: Controller commands --
@@ -352,9 +354,18 @@ pub enum FlighthookEvent {
 }
 ```
 
-Match variants with `..` (e.g. `FlighthookEvent::BallFlight { key, ball, .. }`)
+Match variants with `..` (e.g. `FlighthookEvent::Launch { key, launch, .. }`)
 unless every field is needed, so a field added to a variant does not break the
-pattern.
+pattern. Build a trigger with `FlighthookEvent::shot_trigger(key)`.
+
+The FRP variants mirror FRP 0.2.0 one to one (`launch`, `flight_result`,
+`shot_trigger` with its optional `timestamp`, `device_telemetry` with its
+`source`); `Launch`, `FlightResult`, `ClubData` and `FaceImpact` are the
+`flightrelay` crate's types. `derived` on `Launch` and `raw` on
+`ShotFinished` are flighthook extension fields. `DeviceTelemetry.source` is
+stamped by the actor's `BusSender` from its shot source's provenance
+(`measured` / `virtual`, the FRP values); a trigger's `timestamp` is the
+device's strike time when the device reports one (none does yet).
 
 ### ShotKey -- shot lifecycle correlation
 
@@ -366,11 +377,23 @@ pub struct ShotKey {
 ```
 
 Shot data arrives as correlated events sharing a `ShotKey` and `actor`:
-`ShotTrigger` -> `BallFlight` / `ClubPath` / `FaceImpact` (any order) -> `ShotFinished`. Consumers
-use `ShotAccumulator` to collect events into a final `ShotData`
-(`set_ball` for the measured `BallFlight`, `set_derived` for its `derived` block).
-When it finishes the shot, the accumulator computes `ShotData.metrics`
-(`ShotMetrics`, lib `metrics.rs`) from the measured ball and club data.
+`ShotTrigger` -> `Launch` / `FlightResult` / `ClubPath` / `FaceImpact` (any
+order) -> `ShotFinished`. Consumers use `ShotAggregator` (lib `event.rs`) to
+collect events into a final `ShotData` (`launch`, the device's `flight`,
+`club`, `impact`, and `derived` from the launch event), with FRP's shot
+lifecycle rules: a shot keeps the first event of each kind, a shot that has
+not finished 30 s (`SHOT_TIMEOUT`, FRP's accumulator timeout) after its
+trigger is discarded, and events of a finished or discarded shot are ignored
+for another 30 s. `feed_at(msg, now)` returns the finished shot's
+`ShotAccumulator` (so a consumer can add the raw frames), `feed(msg)` the
+finished `ShotData`. The GSPro bridge, the Pureplay output and the web layer
+each keep one. When it finishes the shot, the accumulator computes
+`ShotData.metrics` (`ShotMetrics`, lib `metrics.rs`) from the measured
+launch, the device's flight result and the club data.
+
+`ShotData` reads the shape with one `ball` block (launch and flight values
+together, export schema 1): the launch values go to `launch`, the flight
+values to a `flight` with `basis: modeled`.
 
 ### Shot metrics
 
@@ -379,12 +402,13 @@ and "Derived Values" once, for every consumer that assembles shots (the web
 layer's history and export, the GSPro bridge, `ShotAggregator` users):
 
 - total spin and spin axis from backspin and sidespin, via the SDK's
-  `BallFlight::complete_spin`, only when the device sent both components and
+  `Launch::complete_spin`, only when the device sent both components and
   neither total nor axis (a total of 0 has no axis);
 - face to path, `face_angle − path`;
 - spin loft, the `dynamic_loft − attack_angle` approximation, only when the
   device sent no `spin_loft`;
-- curve, `carry_offline − carry_distance × tan(launch_azimuth)`, in meters.
+- curve, `carry_offline − carry_distance × tan(launch_azimuth)`, in meters,
+  from the device's flight result and the launch.
 
 Each field needs every input measured and finite; `metrics` is `None` when no
 field is set. `derived` is never an input: the metrics describe the device's
@@ -394,13 +418,14 @@ converts with the unit system like the rest of `ShotData`.
 
 ### Simulated values (beta)
 
-The `BallFlight` event's `derived` field carries values flighthook simulated
+The `Launch` event's `derived` field carries values flighthook simulated
 for fields the device did not report: carry, apex, flight time, descent angle,
 carry/roll/total offline, roll and total (`DerivedFlight`, lib crate). A
-measured `carry_offline` or `descent_angle` (FlightScope) is not simulated
-over, except under `force`. `ball`
-is never modified, so a field's location says where it came from: under
-`ball` it was measured, under `derived` it was simulated. A field set in both
+device's `carry_offline` or `descent_angle` (FlightScope) is not simulated
+over, except under `force`. The device's `launch` and `flight` are never
+modified, so a field's location says where it came from: under `launch` it
+was measured, under `flight` the device reported it, under `derived` it was
+simulated. A field set in both
 (a measured 0 carry or flight time on a shot that flies, a ground ball's 0
 carry, apex and flight time over a device's other reading, both below, or any
 result field under `force`) is shown with its `derived` value. `ShotData.derived` carries the same block after
@@ -412,12 +437,12 @@ report, `force` every result field. Under `force` the simulated
 results replace the device's for every device: `derive` treats nothing as measured,
 fills every result field in `derived` and sets
 `DerivedFlight::replaces_measured`, and every consumer gives those values
-precedence over `ball`. `ball` is still never modified, so the device's
+precedence over `flight`. `flight` is still never modified, so the device's
 results stay on the wire, in `/api/shots` and in the export. The flag is per
 shot, set from the settings in effect when the shot was simulated; a shot
 that can't be simulated gets no `derived` and shows the device's values.
 Launch values (speed, angles, spin, club data) are never replaced.
-`DerivedFlight::spin_estimated` marks the spin in `ball` as flighthook's
+`DerivedFlight::spin_estimated` marks the spin in `launch` as flighthook's
 estimate (the mevo actor's launch-only chips); the actor sets it after the
 simulation, on a `derived` that holds only the flag when the shot was not
 simulated, so `derive` never sees it. `DerivedFlight::computed`
@@ -443,10 +468,11 @@ fields), and the round policy is the only reader
 The simulation runs in `app/src/sim.rs` with the
 [dimple](https://crates.io/crates/dimple) crate, an app-only dependency (the
 lib crate and the WASM UI never link it). Every device actor builds its
-`BallFlight` event through `sim::ball_flight_event` (the Mevo+/Xi through
-`sim::ball_flight_event_in_mode`, passing the detection mode captured at the
-shot's trigger), on the device thread, so the event already carries `derived` when it reaches the bus, before
-`ShotFinished`. It costs a few milliseconds per shot. A shot is simulated only
+`Launch` event (and the `FlightResult` event after it, when the device
+reported flight values) through `sim::launch_events` (the Mevo+/Xi and the
+ExPutt through `sim::launch_events_in_mode`, passing the detection mode
+captured at the shot's trigger), on the device thread, so the launch already
+carries `derived` when it reaches the bus, before `ShotFinished`. It costs a few milliseconds per shot. A shot is simulated only
 when:
 
 - `[simulation] mode` is not `off`;
@@ -497,7 +523,7 @@ counted as measured. This holds under `on` and `force` for every device.
 **Zero readings.** On a shot that flies (not a ground ball), a measured
 carry or flight time of exactly 0 is not a reading (the Mevo+ sends them
 with every shot, 0 when it has none). It counts as not measured: `derived`
-carries the simulated value, alongside the 0 left untouched in `ball`, and
+carries the simulated value, alongside the 0 left untouched in `flight`, and
 the path is fitted only to the values the device really measured.
 
 `derived.path` (`FlightPath`) is the simulated ball path from the tee to rest:
@@ -559,8 +585,8 @@ WebSocket event, `/api/shots` and the JSONL export, and is not in the CSV.
 
 The device actor reads the `[simulation]` section from `SystemConfig` for every
 shot, so settings changes apply on the next shot with no actor restart. The
-GSPro mapper reads `shot.ball` only, so GSPro output does not change in any
-simulation mode. The console gets one `sim (estimated, beta): ...`
+GSPro mapper reads `shot.launch` and the device's carry in `shot.flight`
+only, so GSPro output does not change in any simulation mode. The console gets one `sim (estimated, beta): ...`
 line under the device's ball line (ending in `replaces_measured` when set); it is a derived summary, not wire data, so the hex-first audit rules do
 not apply to it.
 
@@ -651,7 +677,7 @@ a UUID v4 `id`, a per-run display `number`, `session`, `club`, `started_at`,
 
 | Bus event | Effect |
 | --- | --- |
-| `shot_trigger` | the device's earlier unfinished shots end uncounted; then `assign`: the open set when its club is the trigger-time club (or it is empty), else a new set; held on the `PendingShot` |
+| `shot_trigger` | the device's other unfinished shots end uncounted (a repeat of the trigger changes nothing); then `assign`: the open set when its club is the trigger-time club (or it is empty), else a new set; held on the `PendingShot`. A shot unfinished 30 s after its trigger ends uncounted too (`ShotAggregator`) |
 | `actor_status` other than `connected` | the device's unfinished shots end uncounted; the open set stays open |
 | `shot_finished` | the shot is stamped and `finish` counts it when it has data; a shot with no data and no raw frames still ends its assignment |
 | a shot leaves the 1000-shot history | `release`: count down; a closed set at zero is dropped |
@@ -1253,7 +1279,8 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   shot the round policy certified (`map_certified`), to BallData and, when
   any club value or face impact was measured, ClubData with the same ShotId.
   A ValidMask bit is set only for a value present (and finite) in the shot's
-  measured blocks (`ball`, `club`, `impact`); `derived` is never read. A
+  measured blocks (`launch`, `club`, `impact`); `flight` and `derived` are
+  never read. A
   certified shot has its unmeasured values removed, so they go out with the
   bit clear (0.0).
   Nothing is computed (no total/axis from the components, no smash factor):
@@ -1269,7 +1296,8 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
 - `mod.rs` runs the link like the Open Connect client runs its connection:
   the detection mode starts as the game state's at `start` and follows
   `SetDetectionMode`, the bus is drained the whole time (shots still
-  unfinished a minute after their trigger are let go), the same backoff (1 s, +1 s, cap 3 s,
+  unfinished 30 s after their trigger are let go, the shared `ShotAggregator`
+  rule), the same backoff (1 s, +1 s, cap 3 s,
   reset after a 10 s link), the same per-mode routing (`GsProRouting`,
   `gspro::shot_matches_routing`, Auto-chip always accepted), shots queued
   only while the link is up and dropped when older than 5 s. A link: TCP
@@ -2254,15 +2282,47 @@ completeness and dropped frames; how many shots' clips were removed).
 
 WS connection at `/frp`, three-phase handshake with version negotiation:
 
-1. Client sends: `{ "kind": "start", "version": ["0.1.0"], "name": "My Dashboard" }`
-2. Server negotiates version (highest mutually supported). If no compatible
-   version, sends a `critical` alert and closes the connection.
-3. Server responds: `{ "kind": "init", "version": "0.1.0", "actor_id": "ws.a1b2c3d4", "global_state": { ... } }`
-4. Server streams `FlighthookMessage` events (serialized directly as JSON)
+1. Client sends: `{ "kind": "start", "version": ["0.2.0"], "name": "My Dashboard" }`
+2. Server accepts its FRP version (`FRP_VERSION`, the `flightrelay` crate's
+   `SPEC_VERSION`) when the client proposes it. If not, it sends a
+   `critical` alert and closes the connection. A `raw_frames` request is
+   ignored: flighthook sends no raw frames.
+3. Server responds: `{ "kind": "init", "version": "0.2.0", "actor_id": "ws.a1b2c3d4", "global_state": { ... } }`
+4. Server streams `FlighthookMessage` events (serialized directly as JSON),
+   each passed through the connection's `FrpOutput` (`web/frp_out.rs`)
 
-Supported FRP versions: `0.1.0`. A client that offers no mutually supported
-version — including one that sends no `version` array — receives a `critical`
-alert and is disconnected.
+Supported FRP version: `0.2.0`, and only that one. A client that does not
+offer it — including one that sends no `version` array — receives a
+`critical` alert and is disconnected. The dashboard proposes `FRP_VERSION`
+(`ui/src/net.rs`), and `FlighthookClient` (lib `client.rs`) does the same.
+
+`FrpOutput` applies FRP 0.2.0's forwarding rules per connection, the
+dashboard's included (it builds its shot rows from this stream):
+
+- flightrelay's `ForwardFilter` drops repeats: a shot event once per (FRP
+  device, shot id, kind) within 30 s; `device_telemetry` only when it
+  changes something; a device's alert once per message within 30 s. The FRP
+  device is the message's `device`, else its `actor`. flighthook's own
+  alerts (no `device`) and its extension events pass unchanged. An
+  `actor_status` other than Connected makes the filter forget the actor's
+  devices (`ForwardFilter::forget_device`), so a reconnected device's
+  telemetry reaches the dashboard again after it dropped the lost
+  connection's values.
+- The launch goes out measured-only: `flighthook::measured_launch` moves the
+  values `derived` marks (the spin when `spin_estimated`, any launch field in
+  `computed`) out of it; `derived` stays on the event.
+- flighthook adds its own flight result for a shot whose device sent none:
+  built from the launch event's `derived` (`DerivedFlight::flight_result`:
+  `basis: modeled`, `model` `FLIGHT_MODEL` = `"flighthook simulation
+  (dimple)"`, every derived flight value, the moved launch values in
+  `assumed`) and sent when the shot's `shot_finished` arrives, before it,
+  only if `ForwardFilter` passes it (no `flight_result` was forwarded for the
+  shot). Nothing to send (no simulated value, nothing assumed) sends none.
+- The dashboard (`ShotRow::apply_flight`) keeps a device's flight result in
+  the row's `flight`; from flighthook's own (`flighthook::is_flighthook_flight`)
+  it only fills the launch's missing values from `assumed`, so the row is the
+  shot `/api/shots` serves (estimated spin in `launch`, simulated values in
+  `derived`).
 
 Bus events are serialized using the FRP envelope shape with `kind` inside
 `event`. Consumers filter by `event.kind`.
@@ -3171,7 +3231,7 @@ On the server (`app/src/autochip.rs`), `solve_speed` bisects the ball speed
 environment and surface and `BallModel::TOUR`, rests at the chosen total
 for a straight 28° launch with backspin `round(DEFAULT_LAUNCH_ONLY_SPIN ×
 mph)` and no sidespin; the total rises with speed. `send` emits
-`ShotTrigger`, `sim::simulated_ball_flight_event(.., Some(Chipping))`
+`ShotTrigger`, `sim::simulated_launch_events(.., Some(Chipping))`
 (simulated whatever `[simulation] mode`, `off` included) and `ShotFinished`
 as actor `autochip` (`flighthook::AUTO_CHIP_ACTOR`), keyed by a fresh UUID
 and the next `WebState::auto_chip_shots`, from `spawn_blocking`; the counter
@@ -3556,7 +3616,7 @@ The word starts at the unit's size and shrinks (to 9 pt) to fit its card;
 only when that is not enough does that card's numeral shrink. The Table
 keeps signed numbers. A table cell shows the simulated
 value in italics with the same hover, else the measured one plainly, else a
-dash. Backspin and Sidespin (card and column) always show the `ball` value,
+dash. Backspin and Sidespin (card and column) always show the `launch` value,
 styled as simulated (`SIM` tag, italics) when `derived.spin_estimated` is
 set. Derived wins when both are present: the server sets a field in both
 only when the simulated value is the one to show (a `force` shot's

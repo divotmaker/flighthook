@@ -11,8 +11,8 @@ use chrono::SecondsFormat;
 use super::StoredShot;
 use crate::raw_capture::scrub_text;
 use flighthook::{
-    Distance, EXPORT_SCHEMA, ExportDevice, ExportSettings, FlightScopeEnvironment, ShotExport,
-    UnitSystem, Velocity,
+    Basis, Distance, EXPORT_SCHEMA, ExportDevice, ExportSettings, FlightResult,
+    FlightScopeEnvironment, ShotExport, UnitSystem, Velocity,
 };
 
 /// Build the JSONL record for one shot. `units` converts `data` (native
@@ -254,7 +254,11 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
     let i = |v: Option<i32>| v.map(|v| v.to_string());
 
     let data = &line.data;
-    let b = data.ball.clone().unwrap_or_default();
+    let b = data.launch.clone().unwrap_or_default();
+    let fl = data
+        .flight
+        .clone()
+        .unwrap_or_else(|| FlightResult::new(Basis::Modeled));
     let d = data.derived.clone().unwrap_or_default();
     let c = data.club.clone().unwrap_or_default();
     let m = data.impact.clone().unwrap_or_default();
@@ -280,14 +284,14 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
         i(b.sidespin_rpm),
         i(b.total_spin_rpm),
         f(b.spin_axis),
-        dist(b.carry_distance),
-        dist(b.carry_offline),
-        dist(b.total_distance),
-        dist(b.total_offline),
-        dist(b.roll_distance),
-        height(b.max_height),
-        f(b.flight_time),
-        f(b.descent_angle),
+        dist(fl.carry_distance),
+        dist(fl.carry_offline),
+        dist(fl.total_distance),
+        dist(fl.total_offline),
+        dist(fl.roll_distance),
+        height(fl.max_height),
+        f(fl.flight_time),
+        f(fl.descent_angle),
         dist(d.carry_distance),
         dist(d.carry_offline),
         height(d.max_height),
@@ -350,25 +354,41 @@ mod tests {
     use super::super::tests::{feed, test_state};
     use super::super::{ShotContext, StoredShot, device_section};
     use super::*;
+    use crate::test_ball::Ball;
     use flighthook::{
-        BallFlight, ClubData, DerivedFlight, FaceImpact, FlighthookConfig, FlighthookEvent,
-        MevoSection, RawDir, RawRecord, ShotData, ShotKey, ShotMetrics, ShotRaw,
+        ClubData, DerivedFlight, FaceImpact, FlighthookConfig, FlighthookEvent, MevoSection,
+        RawDir, RawRecord, ShotData, ShotKey, ShotMetrics, ShotRaw,
     };
 
     const SSID: &str = "FS M2-123456";
     const ADDR: &str = "192.168.2.1:5100";
     const BLE: &str = "02:00:00:AB:CD:01";
 
-    fn ball() -> BallFlight {
-        BallFlight {
+    fn ball() -> Ball {
+        Ball {
             launch_speed: Some(Velocity::MetersPerSecond(40.0)),
             launch_elevation: Some(20.0),
             launch_azimuth: Some(-1.5),
             carry_distance: Some(Distance::Meters(100.0)),
             backspin_rpm: Some(6000),
             sidespin_rpm: None,
-            ..BallFlight::default()
+            ..Ball::default()
         }
+    }
+
+    /// The `Launch` and `FlightResult` events of [`ball`].
+    fn ball_events(key: &ShotKey) -> [FlighthookEvent; 2] {
+        [
+            FlighthookEvent::Launch {
+                key: key.clone(),
+                launch: Box::new(ball().launch()),
+                derived: None,
+            },
+            FlighthookEvent::FlightResult {
+                key: key.clone(),
+                flight: Box::new(ball().flight().expect("carry")),
+            },
+        ]
     }
 
     fn mevo_config() -> FlighthookConfig {
@@ -419,7 +439,8 @@ mod tests {
             data: ShotData {
                 actor: "mevo.0".into(),
                 shot_number: 1,
-                ball: Some(ball()),
+                launch: Some(ball().launch()),
+                flight: ball().flight(),
                 club: None,
                 impact: None,
                 derived: None,
@@ -493,7 +514,7 @@ mod tests {
         let shot = private_shot();
         let native: ShotExport =
             serde_json::from_str(&jsonl_line(&shot, "t", None, true)).expect("parses");
-        assert_eq!(native.schema, 1);
+        assert_eq!(native.schema, 2);
         assert_eq!(native.data, shot.data);
         assert_eq!(native.exported_at, "t");
 
@@ -504,9 +525,13 @@ mod tests {
             imperial.data,
             shot.data.to_unit_system(UnitSystem::Imperial)
         );
-        let ball = imperial.data.ball.expect("ball");
-        assert!(matches!(ball.launch_speed, Some(Velocity::MilesPerHour(_))));
-        assert!(matches!(ball.carry_distance, Some(Distance::Yards(_))));
+        let launch = imperial.data.launch.expect("launch");
+        let flight = imperial.data.flight.expect("flight");
+        assert!(matches!(
+            launch.launch_speed,
+            Some(Velocity::MilesPerHour(_))
+        ));
+        assert!(matches!(flight.carry_distance, Some(Distance::Yards(_))));
         assert!(imperial.raw.is_none());
     }
 
@@ -561,8 +586,12 @@ mod tests {
         let mut shot = private_shot();
         let mut b = ball();
         b.sidespin_rpm = Some(-200);
-        shot.data.ball = Some(b.clone());
-        shot.data.derived = crate::sim::derive(&b, &flighthook::SimulationSection::default());
+        b.put_on(&mut shot.data);
+        shot.data.derived = crate::sim::derive(
+            &b.launch(),
+            b.flight().as_ref(),
+            &flighthook::SimulationSection::default(),
+        );
         assert!(shot.data.derived.as_ref().is_some_and(|d| d.path.is_some()));
 
         let line: serde_json::Value =
@@ -597,8 +626,8 @@ mod tests {
         let mut shot = private_shot();
         let mut b = ball();
         b.sidespin_rpm = Some(-200);
-        shot.data.ball = Some(b.clone());
-        shot.data.derived = crate::sim::derive(&b, &replacing);
+        b.put_on(&mut shot.data);
+        shot.data.derived = crate::sim::derive(&b.launch(), b.flight().as_ref(), &replacing);
         shot.context.simulation = replacing;
         let sim_carry = shot
             .data
@@ -612,7 +641,8 @@ mod tests {
         assert_eq!(line["data"]["derived"]["replaces_measured"], true, "{line}");
         assert_eq!(line["settings"]["simulation"]["mode"], "force", "{line}");
         assert!(line["settings"]["simulation"].get("enabled").is_none());
-        assert_eq!(line["data"]["ball"]["carry_distance"], "100m", "{line}");
+        assert_eq!(line["data"]["flight"]["carry_distance"], "100m", "{line}");
+        assert_eq!(line["data"]["flight"]["basis"], "modeled", "{line}");
 
         // CSV keeps its columns: the device's carry and the simulated carry.
         let row = to_csv_row(&shot, UnitSystem::Metric);
@@ -662,14 +692,15 @@ mod tests {
     #[test]
     fn csv_has_new_shot_field_and_metrics_columns() {
         let mut shot = private_shot();
-        shot.data.ball = Some(BallFlight {
+        Ball {
             carry_offline: Some(Distance::Meters(-2.5)),
             total_offline: Some(Distance::Meters(-3.0)),
             descent_angle: Some(44.5),
             total_spin_rpm: Some(6100),
             spin_axis: Some(-4.0),
             ..ball()
-        });
+        }
+        .put_on(&mut shot.data);
         shot.data.club = Some(ClubData {
             spin_loft: Some(23.5),
             low_point_distance: Some(Distance::Meters(0.0254)),
@@ -728,7 +759,7 @@ mod tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::ShotTrigger { key: key.clone() },
+                FlighthookEvent::shot_trigger(key.clone()),
                 FlighthookEvent::ClubPath {
                     key: key.clone(),
                     club: Box::new(ClubData {
@@ -773,12 +804,9 @@ mod tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::ShotTrigger { key: key.clone() },
-                FlighthookEvent::BallFlight {
-                    key: key.clone(),
-                    ball: Box::new(ball()),
-                    derived: None,
-                },
+                FlighthookEvent::shot_trigger(key.clone()),
+                ball_events(&key)[0].clone(),
+                ball_events(&key)[1].clone(),
                 FlighthookEvent::ClubPath {
                     key: key.clone(),
                     club: Box::new(ClubData::default()),
@@ -815,12 +843,13 @@ mod tests {
                 &state,
                 "mevo.0",
                 vec![
-                    FlighthookEvent::ShotTrigger { key: key.clone() },
-                    FlighthookEvent::BallFlight {
+                    FlighthookEvent::shot_trigger(key.clone()),
+                    FlighthookEvent::Launch {
                         key: key.clone(),
-                        ball: Box::new(ball()),
+                        launch: Box::new(ball().launch()),
                         derived: derived.map(Box::new),
                     },
+                    ball_events(&key)[1].clone(),
                     FlighthookEvent::ShotFinished { key, raw: None },
                 ],
             )
@@ -867,12 +896,9 @@ mod tests {
                 &state,
                 actor,
                 vec![
-                    FlighthookEvent::ShotTrigger { key: key.clone() },
-                    FlighthookEvent::BallFlight {
-                        key: key.clone(),
-                        ball: Box::new(ball()),
-                        derived: None,
-                    },
+                    FlighthookEvent::shot_trigger(key.clone()),
+                    ball_events(&key)[0].clone(),
+                    ball_events(&key)[1].clone(),
                     FlighthookEvent::ShotFinished { key, raw: None },
                 ],
             )

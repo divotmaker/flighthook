@@ -8,15 +8,15 @@
 //!
 //! All messages use the FRP envelope shape with `kind` inside `event`:
 //! ```json
-//! { "actor": "mevo.0", "device": "FS-M2-XXXXXX", "event": { "kind": "ball_flight", ... } }
+//! { "actor": "mevo.0", "device": "FS-M2-XXXXXX", "event": { "kind": "launch", ... } }
 //! ```
 //!
 //! `actor` is a flighthook extension (actor framework ID). `device` is the
 //! FRP device identifier (present on device events, absent on extensions).
 //! FRP consumers silently ignore unknown `kind` values and extra fields per spec.
 //!
-//! FRP-compliant events: `ShotTrigger`, `BallFlight`, `ClubPath`, `FaceImpact`,
-//! `ShotFinished`, `DeviceTelemetry`, `Alert`, `SetDetectionMode`.
+//! FRP-compliant events: `ShotTrigger`, `Launch`, `FlightResult`, `ClubPath`,
+//! `FaceImpact`, `ShotFinished`, `DeviceTelemetry`, `Alert`, `SetDetectionMode`.
 //! Flighthook extensions: everything else.
 
 use std::fmt;
@@ -27,7 +27,8 @@ use crate::{Handedness, ShotDetectionMode};
 use std::collections::HashMap;
 
 use crate::{
-    ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, Provenance, RoundState, ShotRaw,
+    ActorStatus, ClubData, DerivedFlight, FaceImpact, FlightResult, Launch, Provenance, RoundState,
+    ShotRaw,
 };
 use crate::{
     BodyTrackingSection, CameraPosition, CameraSection, ExPuttSection, FlighthookConfig,
@@ -165,8 +166,8 @@ pub use flightrelay::ShotKey;
 
 /// The typed event payload carried by a `FlighthookMessage`.
 ///
-/// FRP-compliant events: `ShotTrigger`, `BallFlight`, `ClubPath`, `FaceImpact`,
-/// `ShotFinished`, `DeviceTelemetry`, `Alert`.
+/// FRP-compliant events: `ShotTrigger`, `Launch`, `FlightResult`, `ClubPath`,
+/// `FaceImpact`, `ShotFinished`, `DeviceTelemetry`, `Alert`.
 ///
 /// Flighthook extensions: everything else. FRP-only consumers silently ignore
 /// unknown `kind` values per spec.
@@ -175,17 +176,33 @@ pub use flightrelay::ShotKey;
 pub enum FlighthookEvent {
     // -- FRP: Shot lifecycle (correlated by ShotKey + device) --
     /// Ball strike detected. Emitted immediately — no data yet.
-    ShotTrigger { key: ShotKey },
-    /// Ball flight data available.
     ///
-    /// `ball` is exactly what the device measured. `derived` carries values
-    /// flighthook simulated for fields the device did not report (beta); it
-    /// is a flighthook extension field, which FRP consumers ignore.
-    BallFlight {
+    /// `timestamp` is when the device detected the strike, in milliseconds
+    /// since the Unix epoch (UTC), when the device reports it. Omitted on the
+    /// wire when absent.
+    ShotTrigger {
         key: ShotKey,
-        ball: Box<BallFlight>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<u64>,
+    },
+    /// The ball's launch: what the device measured.
+    ///
+    /// `launch` holds the measured launch values only; the device's flight
+    /// values come in a [`FlightResult`](Self::FlightResult) event. `derived`
+    /// carries values flighthook simulated for what the device did not
+    /// report (beta); it is a flighthook extension field, which FRP
+    /// consumers ignore.
+    Launch {
+        key: ShotKey,
+        launch: Box<Launch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         derived: Option<Box<DerivedFlight>>,
+    },
+    /// Results of the ball's flight as the device reported them, with the
+    /// `basis` they were obtained on. At most one per shot.
+    FlightResult {
+        key: ShotKey,
+        flight: Box<FlightResult>,
     },
     /// Club path data available.
     ClubPath { key: ShotKey, club: Box<ClubData> },
@@ -214,6 +231,10 @@ pub enum FlighthookEvent {
     ///
     /// Actor/connection lifecycle (status enum, mode, shooting) is conveyed
     /// separately via `ActorStatus`. The two variants have no overlapping keys.
+    ///
+    /// `source` is FRP's device `source`: where the device's shots originate.
+    /// flighthook sets it on the telemetry of every shot source, from the
+    /// type of the actor that emits it; absent means unknown.
     DeviceTelemetry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manufacturer: Option<String>,
@@ -221,6 +242,8 @@ pub enum FlighthookEvent {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         firmware: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<Provenance>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         telemetry: Option<HashMap<String, String>>,
     },
@@ -340,6 +363,15 @@ pub enum FlighthookEvent {
 }
 
 impl FlighthookEvent {
+    /// A shot trigger with no timestamp.
+    #[must_use]
+    pub fn shot_trigger(key: ShotKey) -> Self {
+        Self::ShotTrigger {
+            key,
+            timestamp: None,
+        }
+    }
+
     /// Returns true if this is an ActorStatus event containing telemetry
     /// (battery_pct key in state map). Used for heartbeat filtering in audit.
     pub fn is_actor_status_with_telemetry(&self) -> bool {
@@ -487,6 +519,7 @@ mod tests {
                 manufacturer: Some("FlightScope".into()),
                 model: None,
                 firmware: None,
+                source: None,
                 telemetry: None,
             },
         };

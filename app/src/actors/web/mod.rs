@@ -1,6 +1,7 @@
 //! Axum web server — REST endpoints + WebSocket event streaming.
 
 pub mod export;
+mod frp_out;
 pub mod groups;
 pub mod routes;
 pub mod types;
@@ -10,6 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 
@@ -23,7 +25,7 @@ use crate::bus::{BusReceiver, BusSender};
 use crate::state::SystemState;
 use flighthook::{
     ActorStatus, ActorStatusResponse, Club, ExportDevice, FlighthookConfig, FlighthookEvent,
-    FlighthookMessage, GroupKey, GroupedShot, Handedness, ShotAccumulator, ShotData,
+    FlighthookMessage, GroupKey, GroupedShot, Handedness, ShotAggregator, ShotData,
     ShotDetectionMode, ShotGroupInfo, ShotKey, ShotRaw, ShotVideo, SimulationSection,
 };
 use groups::GroupState;
@@ -93,9 +95,9 @@ pub struct ShotContext {
     pub scrub: Vec<String>,
 }
 
-/// A shot between `shot_trigger` and `shot_finished`.
+/// What the web layer keeps for a shot between `shot_trigger` and
+/// `shot_finished`, next to its data in [`PendingShots`].
 pub(crate) struct PendingShot {
-    acc: ShotAccumulator,
     received_at: DateTime<Utc>,
     context: ShotContext,
     /// Set assigned at the trigger.
@@ -104,7 +106,65 @@ pub(crate) struct PendingShot {
     video: Vec<ShotVideo>,
 }
 
-pub(crate) type PendingShots = HashMap<(String, ShotKey), PendingShot>;
+/// The shots between `shot_trigger` and `shot_finished`: their data,
+/// assembled with FRP's shot lifecycle rules (first event of each kind, the
+/// 30 s timeout, closed shots ignored), and the web layer's own per-shot
+/// state, both by actor and shot id.
+#[derive(Default)]
+pub(crate) struct PendingShots {
+    data: ShotAggregator,
+    shots: HashMap<(String, String), PendingShot>,
+}
+
+impl PendingShots {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every pending shot's state, with its actor and shot id.
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&(String, String), &mut PendingShot)> {
+        self.shots.iter_mut()
+    }
+
+    /// End `actor`'s pending shots, except the shot `keep` (a shot id), and
+    /// return their sets.
+    fn discard_actor(&mut self, actor: &str, keep: Option<&str>, now: Instant) -> Vec<String> {
+        let ended: Vec<(String, String)> = self
+            .shots
+            .keys()
+            .filter(|(a, id)| a == actor && Some(id.as_str()) != keep)
+            .cloned()
+            .collect();
+        ended
+            .into_iter()
+            .filter_map(|id| {
+                self.data.discard(&id.0, &id.1, now);
+                self.shots.remove(&id).map(|p| p.group)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.shots.is_empty() && self.data.pending_count() == 0
+    }
+
+    /// The actor and shot id of every pending shot.
+    #[cfg(test)]
+    fn keys(&self) -> impl Iterator<Item = &(String, String)> {
+        self.shots.keys()
+    }
+
+    /// End the pending shots that have not finished within the shot timeout,
+    /// and return their sets.
+    fn discard_expired(&mut self, now: Instant) -> Vec<String> {
+        self.data
+            .discard_expired_at(now)
+            .into_iter()
+            .filter_map(|(actor, key)| self.shots.remove(&(actor, key.shot_id)).map(|p| p.group))
+            .collect()
+    }
+}
 
 fn new_actor(name: String) -> ActorStatusResponse {
     ActorStatusResponse::new(name, ActorStatus::Disconnected)
@@ -671,11 +731,18 @@ fn store_shot(
 
 /// End `actor`'s pending shots uncounted, emitting the group records that
 /// changed.
-async fn drop_pending(state: &WebState, accumulators: &mut PendingShots, actor: &str) {
-    let groups: Vec<String> = accumulators
-        .extract_if(|(a, _), _| a == actor)
-        .map(|(_, p)| p.group)
-        .collect();
+async fn drop_pending(
+    state: &WebState,
+    accumulators: &mut PendingShots,
+    actor: &str,
+    keep: Option<&str>,
+) {
+    let groups = accumulators.discard_actor(actor, keep, Instant::now());
+    finish_uncounted(state, groups).await;
+}
+
+/// Finish the sets `groups` of shots that ended without data.
+async fn finish_uncounted(state: &WebState, groups: Vec<String>) {
     if groups.is_empty() {
         return;
     }
@@ -709,8 +776,8 @@ fn stamp_video(
         }
         None => list.clear(),
     };
-    for ((_, key), p) in pending.iter_mut() {
-        if key.shot_id == shot_id {
+    for ((_, id), p) in pending.iter_mut() {
+        if id == shot_id {
             apply(&mut p.video);
         }
     }
@@ -750,8 +817,8 @@ fn mark_video(
             set(video);
         }
     };
-    for ((_, key), p) in pending.iter_mut() {
-        if key.shot_id == shot_id {
+    for ((_, id), p) in pending.iter_mut() {
+        if id == shot_id {
             apply(&mut p.video);
         }
     }
@@ -765,6 +832,9 @@ async fn apply_bus_event(
     msg: &FlighthookMessage,
     accumulators: &mut PendingShots,
 ) {
+    let now = Instant::now();
+    let expired = accumulators.discard_expired(now);
+    finish_uncounted(state, expired).await;
     match &msg.event {
         FlighthookEvent::ActorStatus { status, telemetry } => {
             let mut actors = state.actors.write().await;
@@ -794,13 +864,21 @@ async fn apply_bus_event(
             }
             // Out of session, the device finishes none of its pending shots.
             if *status != ActorStatus::Connected {
-                drop_pending(state, accumulators, &msg.actor).await;
+                drop_pending(state, accumulators, &msg.actor, None).await;
             }
         }
-        FlighthookEvent::ShotTrigger { key } => {
-            // A device runs one shot at a time: a new trigger (or a repeat of
-            // the same one) ends its earlier unfinished shots uncounted.
-            drop_pending(state, accumulators, &msg.actor).await;
+        FlighthookEvent::ShotTrigger { key, .. } => {
+            // A device runs one shot at a time: a new trigger ends its
+            // earlier unfinished shots uncounted. A repeat of a trigger
+            // changes nothing: a shot keeps its first.
+            drop_pending(state, accumulators, &msg.actor, Some(&key.shot_id)).await;
+            let id = (msg.actor.clone(), key.shot_id.clone());
+            accumulators.data.feed_at(msg, now);
+            if accumulators.shots.contains_key(&id)
+                || !accumulators.data.is_pending(&msg.actor, &key.shot_id)
+            {
+                return;
+            }
             // The set and the stored shot's club are decided now, from the
             // club the sets last saw on the bus, so commands and club
             // changes during the flight apply to the next shot.
@@ -816,44 +894,36 @@ async fn apply_bus_event(
             };
             let context = shot_context(state, msg, club).await;
             let pending = PendingShot {
-                acc: ShotAccumulator::new(msg.actor.clone(), key.clone())
-                    .with_provenance(msg.provenance),
                 received_at: Utc::now(),
                 context,
                 group,
                 video: Vec::new(),
             };
-            accumulators.insert((msg.actor.clone(), key.clone()), pending);
+            accumulators.shots.insert(id, pending);
             for group in changes {
                 emit_group(state, group, None);
             }
         }
-        FlighthookEvent::BallFlight {
-            key, ball, derived, ..
-        } => {
-            if let Some(p) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
-                p.acc.set_ball(*ball.clone());
-                p.acc.set_derived(derived.as_deref().cloned());
-            }
-        }
-        FlighthookEvent::FaceImpact { key, impact } => {
-            if let Some(p) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
-                p.acc.set_impact(*impact.clone());
-            }
-        }
-        FlighthookEvent::ClubPath { key, club } => {
-            if let Some(p) = accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
-                p.acc.set_club(*club.clone());
-            }
+        FlighthookEvent::Launch { .. }
+        | FlighthookEvent::FlightResult { .. }
+        | FlighthookEvent::FaceImpact { .. }
+        | FlighthookEvent::ClubPath { .. } => {
+            accumulators.data.feed_at(msg, now);
         }
         FlighthookEvent::ShotFinished { key, raw } => {
-            let Some(PendingShot {
-                mut acc,
-                received_at,
-                context,
-                group,
-                video,
-            }) = accumulators.remove(&(msg.actor.clone(), key.clone()))
+            let finished = accumulators.data.feed_at(msg, now);
+            let pending = accumulators
+                .shots
+                .remove(&(msg.actor.clone(), key.shot_id.clone()));
+            let (
+                Some(mut acc),
+                Some(PendingShot {
+                    received_at,
+                    context,
+                    group,
+                    video,
+                }),
+            ) = (finished, pending)
             else {
                 return;
             };
@@ -1009,7 +1079,7 @@ async fn apply_bus_event(
             // Shots in flight belong to the history being cleared: they end
             // here, so a late `shot_finished` finds nothing to store. No
             // `shot_group` is emitted; UIs clear on this event.
-            accumulators.clear();
+            *accumulators = PendingShots::new();
             let mut groups = state.groups.write().await;
             groups.clear();
             let mut shots = state.shots.write().await;
@@ -1068,6 +1138,7 @@ async fn apply_bus_event(
             model,
             firmware,
             telemetry,
+            ..
         } if manufacturer.is_some() || model.is_some() || firmware.is_some() => {
             {
                 let mut ids = state.device_identity.write().await;
@@ -1134,8 +1205,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::state::GameStateWriter;
     use flighthook::{
-        BallFlight, ClubInfo, ConnectionState, DerivedFlight, Distance, MevoSection, RawDir,
-        RawRecord, ShotGrouping, Velocity,
+        ClubInfo, ConnectionState, DerivedFlight, Distance, Launch, MevoSection, RawDir, RawRecord,
+        ShotGrouping, Velocity,
     };
 
     /// Removes the directory on drop, so a failing assertion doesn't leak it.
@@ -1171,6 +1242,7 @@ pub(crate) mod tests {
                 manufacturer: Some("FlightScope".into()),
                 model: Some("Mevo+".into()),
                 firmware: None,
+                source: None,
                 telemetry: Some(kv(&[("ready", "true"), ("battery_pct", "80")])),
             },
         )
@@ -1181,6 +1253,7 @@ pub(crate) mod tests {
                 manufacturer: None,
                 model: None,
                 firmware: None,
+                source: None,
                 telemetry: Some(kv(&[("tilt", "ok")])),
             },
         )
@@ -1638,14 +1711,13 @@ pub(crate) mod tests {
                 shot_number: n,
             };
             let mut trigger =
-                FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() })
-                    .actor(actor);
+                FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone())).actor(actor);
             trigger.provenance = provenance;
             apply_bus_event(&state, &trigger, &mut pending).await;
             for event in [
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::Launch {
                     key: key.clone(),
-                    ball: Box::new(ball()),
+                    launch: Box::new(ball()),
                     derived: None,
                 },
                 FlighthookEvent::ShotFinished { key, raw: None },
@@ -1688,12 +1760,12 @@ pub(crate) mod tests {
             apply_bus_event(&state, &msg, &mut pending).await;
         };
         // a: stored before its clip; b (another device): still pending.
-        apply("mevo.0", FlighthookEvent::ShotTrigger { key: a.clone() }).await;
+        apply("mevo.0", FlighthookEvent::shot_trigger(a.clone())).await;
         apply(
             "mevo.0",
-            FlighthookEvent::BallFlight {
+            FlighthookEvent::Launch {
                 key: a.clone(),
-                ball: Box::new(ball()),
+                launch: Box::new(ball()),
                 derived: None,
             },
         )
@@ -1706,12 +1778,12 @@ pub(crate) mod tests {
             },
         )
         .await;
-        apply("r10.0", FlighthookEvent::ShotTrigger { key: b.clone() }).await;
+        apply("r10.0", FlighthookEvent::shot_trigger(b.clone())).await;
         apply(
             "r10.0",
-            FlighthookEvent::BallFlight {
+            FlighthookEvent::Launch {
                 key: b.clone(),
-                ball: Box::new(ball()),
+                launch: Box::new(ball()),
                 derived: None,
             },
         )
@@ -1782,12 +1854,12 @@ pub(crate) mod tests {
             let msg = FlighthookMessage::new(event).actor(actor);
             apply_bus_event(&state, &msg, &mut pending).await;
         };
-        apply("mevo.0", FlighthookEvent::ShotTrigger { key: a.clone() }).await;
+        apply("mevo.0", FlighthookEvent::shot_trigger(a.clone())).await;
         apply(
             "mevo.0",
-            FlighthookEvent::BallFlight {
+            FlighthookEvent::Launch {
                 key: a.clone(),
-                ball: Box::new(ball()),
+                launch: Box::new(ball()),
                 derived: None,
             },
         )
@@ -1857,11 +1929,11 @@ pub(crate) mod tests {
         }
     }
 
-    fn ball() -> BallFlight {
-        BallFlight {
+    fn ball() -> Launch {
+        Launch {
             launch_speed: Some(Velocity::MetersPerSecond(40.0)),
             launch_elevation: Some(20.0),
-            ..BallFlight::default()
+            ..Launch::default()
         }
     }
 
@@ -1874,10 +1946,10 @@ pub(crate) mod tests {
             &state,
             "square.0",
             vec![
-                FlighthookEvent::ShotTrigger { key: key(1) },
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::shot_trigger(key(1)),
+                FlighthookEvent::Launch {
                     key: key(1),
-                    ball: Box::new(BallFlight::default()),
+                    launch: Box::new(Launch::default()),
                     derived: Some(Box::new(derived.clone())),
                 },
                 FlighthookEvent::ShotFinished {
@@ -1926,6 +1998,7 @@ pub(crate) mod tests {
                 manufacturer: Some("FlightScope".into()),
                 model: Some("Xi".into()),
                 firmware: None,
+                source: None,
                 telemetry: None,
             })
             .actor("mevo.0"),
@@ -1948,7 +2021,7 @@ pub(crate) mod tests {
         apply_bus_event(&state, &club(Club::Iron8), &mut acc).await;
         apply_bus_event(
             &state,
-            &msg(FlighthookEvent::ShotTrigger { key: key(1) }),
+            &msg(FlighthookEvent::shot_trigger(key(1))),
             &mut acc,
         )
         .await;
@@ -1956,9 +2029,9 @@ pub(crate) mod tests {
         writer.set_club_info(ClubInfo { club: Club::Driver });
         apply_bus_event(&state, &club(Club::Driver), &mut acc).await;
         for event in [
-            FlighthookEvent::BallFlight {
+            FlighthookEvent::Launch {
                 key: key(1),
-                ball: Box::new(ball()),
+                launch: Box::new(ball()),
                 derived: None,
             },
             FlighthookEvent::ShotFinished {
@@ -2009,12 +2082,12 @@ pub(crate) mod tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::ShotTrigger { key: key(1) },
+                FlighthookEvent::shot_trigger(key(1)),
                 FlighthookEvent::ShotFinished {
                     key: key(1),
                     raw: Some(Box::new(raw(2, 8))),
                 },
-                FlighthookEvent::ShotTrigger { key: key(2) },
+                FlighthookEvent::shot_trigger(key(2)),
                 FlighthookEvent::ShotFinished {
                     key: key(2),
                     raw: None,
@@ -2047,10 +2120,10 @@ pub(crate) mod tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::ShotTrigger { key: key(1) },
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::shot_trigger(key(1)),
+                FlighthookEvent::Launch {
                     key: key(1),
-                    ball: Box::new(ball()),
+                    launch: Box::new(ball()),
                     derived: None,
                 },
                 FlighthookEvent::ShotFinished {
@@ -2089,7 +2162,7 @@ pub(crate) mod tests {
             data: ShotData {
                 actor: "mevo.0".into(),
                 shot_number: n,
-                ball: Some(ball()),
+                launch: Some(ball()),
                 club: None,
                 impact: None,
                 derived: None,
@@ -2185,16 +2258,16 @@ pub(crate) mod tests {
         }
 
         async fn trigger_as(&mut self, actor: &str, key: ShotKey) {
-            self.send(actor, FlighthookEvent::ShotTrigger { key }).await;
+            self.send(actor, FlighthookEvent::shot_trigger(key)).await;
         }
 
         /// Ball data, then the finish.
         async fn finish_as(&mut self, actor: &str, key: ShotKey) {
             self.send(
                 actor,
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::Launch {
                     key: key.clone(),
-                    ball: Box::new(ball()),
+                    launch: Box::new(ball()),
                     derived: None,
                 },
             )
@@ -2448,9 +2521,9 @@ pub(crate) mod tests {
         up.trigger(2).await;
         up.send(
             "mevo.0",
-            FlighthookEvent::BallFlight {
+            FlighthookEvent::Launch {
                 key: key(2),
-                ball: Box::new(ball()),
+                launch: Box::new(ball()),
                 derived: None,
             },
         )
@@ -2907,7 +2980,7 @@ pub(crate) mod tests {
         up.trigger(1).await;
         up.shot(2).await;
         // Another device's shot in flight is not this device's to end.
-        up.send("square.0", FlighthookEvent::ShotTrigger { key: key(7) })
+        up.send("square.0", FlighthookEvent::shot_trigger(key(7)))
             .await;
         up.trigger(3).await;
         up.send(

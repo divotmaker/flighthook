@@ -13,7 +13,7 @@ pub use flighthook::{
     // API types
     ActorStatusResponse,
     AutoChipRequest,
-    BallFlight,
+    Basis,
     BodyTrackingMode,
     BodyTrackingSection,
     CameraListEntry,
@@ -34,6 +34,7 @@ pub use flighthook::{
     FaceImpact,
     FindMatRequest,
     FlightPath,
+    FlightResult,
     FlightScopeEnvironment,
     FlighthookConfig,
     FlighthookEvent,
@@ -42,6 +43,7 @@ pub use flighthook::{
     HandInfo,
     HandRequest,
     Handedness,
+    Launch,
     LivePose,
     LivePosture,
     MevoSection,
@@ -86,14 +88,17 @@ pub use flighthook::{
 // ---------------------------------------------------------------------------
 
 /// A shot row in the UI grid. Created on `ShotTrigger` with just the key,
-/// then populated as `BallFlight`, `ClubPath` and `FaceImpact` events
-/// arrive.
+/// then populated as `Launch`, `FlightResult`, `ClubPath` and `FaceImpact`
+/// events arrive.
 #[derive(Debug, Clone)]
 pub struct ShotRow {
     pub actor: String,
     pub shot_id: String,
     pub shot_number: u32,
-    pub ball: Option<BallFlight>,
+    /// The measured launch.
+    pub launch: Option<Launch>,
+    /// The device's flight result (carry, total, apex ...), when it sent one.
+    pub flight: Option<FlightResult>,
     pub club: Option<ClubData>,
     /// Where the ball met the club face (golfer-relative, never mirrored).
     pub impact: Option<FaceImpact>,
@@ -113,12 +118,35 @@ pub struct ShotRow {
 }
 
 impl ShotRow {
+    /// Take in a `flight_result` of this shot. A device's goes in
+    /// [`flight`](Self::flight), the first one kept. flighthook's own
+    /// ([`flighthook::is_flighthook_flight`], added on its FRP output when the
+    /// device sent none) repeats the simulated values the row already holds
+    /// in `derived`; only its `assumed` launch is taken, for the estimated
+    /// spin that the measured launch leaves out, so the row matches the shot
+    /// `/api/shots` serves.
+    pub fn apply_flight(&mut self, flight: FlightResult) {
+        if flighthook::is_flighthook_flight(&flight) {
+            if let Some(launch) = self.launch.as_mut() {
+                launch.fill_assumed(&flight);
+            }
+        } else {
+            self.flight.get_or_insert(flight);
+        }
+    }
+
+    /// Whether the device reported launch, flight or club data for the shot.
+    pub fn has_data(&self) -> bool {
+        self.launch.is_some() || self.flight.is_some() || self.club.is_some()
+    }
+
     /// Convert all distance and velocity fields to the given unit system.
     pub fn to_unit_system(&self, system: UnitSystem) -> ShotRow {
         // Delegate to ShotData conversion for the populated fields. Face
         // impact is millimeters in every unit system and is kept as it is.
         let tmp = ShotData {
-            ball: self.ball.clone(),
+            launch: self.launch.clone(),
+            flight: self.flight.clone(),
             club: self.club.clone(),
             derived: self.derived.clone(),
             ..ShotData::default()
@@ -128,7 +156,8 @@ impl ShotRow {
             actor: self.actor.clone(),
             shot_id: self.shot_id.clone(),
             shot_number: self.shot_number,
-            ball: converted.ball,
+            launch: converted.launch,
+            flight: converted.flight,
             club: converted.club,
             impact: self.impact.clone(),
             derived: converted.derived,
@@ -141,13 +170,29 @@ impl ShotRow {
     }
 }
 
+#[cfg(test)]
+impl ShotRow {
+    /// The row's launch, an empty one put in when there is none.
+    pub fn launch_mut(&mut self) -> &mut Launch {
+        self.launch.get_or_insert_with(Launch::default)
+    }
+
+    /// The row's device flight result, an empty modeled one put in when
+    /// there is none.
+    pub fn flight_mut(&mut self) -> &mut FlightResult {
+        self.flight
+            .get_or_insert_with(|| FlightResult::new(Basis::Modeled))
+    }
+}
+
 impl From<ShotData> for ShotRow {
     fn from(shot: ShotData) -> Self {
         Self {
             actor: shot.actor,
             shot_id: shot.shot_id.unwrap_or_default(),
             shot_number: shot.shot_number,
-            ball: shot.ball,
+            launch: shot.launch,
+            flight: shot.flight,
             club: shot.club,
             impact: shot.impact,
             derived: shot.derived,

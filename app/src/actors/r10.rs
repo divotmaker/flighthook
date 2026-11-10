@@ -15,8 +15,8 @@ use crate::sim;
 use crate::state::SystemState;
 
 use flighthook::{
-    ActorStatus, BallFlight, ClubData, FlighthookEvent, FlighthookMessage, RawDir, RawRecord,
-    Severity, ShotDetectionMode, ShotKey, Velocity,
+    ActorStatus, ClubData, FlighthookEvent, FlighthookMessage, Launch, RawDir, RawRecord, Severity,
+    ShotDetectionMode, ShotKey, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
@@ -188,10 +188,10 @@ fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>
 /// The R10 measures total spin and spin axis; tenover also hands back the
 /// back/side components of the same spin, so both FRP spin pairs are sent,
 /// all four as measured values. A total of 0 has no axis.
-fn ball_from_r10(b: &tenover::proto::BallData) -> BallFlight {
+fn ball_from_r10(b: &tenover::proto::BallData) -> Launch {
     #[allow(clippy::cast_possible_truncation)]
     let total_spin = b.total_spin.round() as i32;
-    BallFlight {
+    Launch {
         launch_speed: Some(Velocity::MetersPerSecond(f64::from(b.ball_speed))),
         launch_elevation: Some(f64::from(b.launch_angle)),
         launch_azimuth: Some(f64::from(b.launch_direction)),
@@ -202,7 +202,6 @@ fn ball_from_r10(b: &tenover::proto::BallData) -> BallFlight {
         sidespin_rpm: Some(b.sidespin.round() as i32),
         total_spin_rpm: Some(total_spin),
         spin_axis: (total_spin != 0).then_some(f64::from(b.spin_axis)),
-        ..BallFlight::default()
     }
 }
 
@@ -276,6 +275,7 @@ fn run(
                             manufacturer: None,
                             model: None,
                             firmware: None,
+                            source: None,
                             telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
                         })
                         .device(dev),
@@ -399,6 +399,7 @@ fn connect_and_run(
                                 manufacturer: Some("Garmin".into()),
                                 model: Some("R10".into()),
                                 firmware: None,
+                                source: None,
                                 telemetry: Some(device_telemetry.clone()),
                             })
                             .device(&addr),
@@ -416,6 +417,7 @@ fn connect_and_run(
                                 manufacturer: None,
                                 model: None,
                                 firmware: None,
+                                source: None,
                                 telemetry: Some(device_telemetry.clone()),
                             })
                             .device(&addr),
@@ -439,13 +441,11 @@ fn connect_and_run(
 
                         // Emit ShotTrigger
                         sender.send(
-                            FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-                                key: key.clone(),
-                            })
-                            .device(&addr),
+                            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()))
+                                .device(&addr),
                         );
 
-                        // Emit BallFlight if ball data present
+                        // Emit the launch if ball data present
                         if let Some(ref ball) = shot.ball {
                             let bf = ball_from_r10(ball);
                             info!(
@@ -456,8 +456,9 @@ fn connect_and_run(
                                 bf.backspin_rpm.unwrap_or(0),
                                 bf.sidespin_rpm.unwrap_or(0),
                             );
-                            let event = sim::ball_flight_event(state, key.clone(), bf);
-                            sender.send(FlighthookMessage::new(event).device(&addr));
+                            for event in sim::launch_events(state, key.clone(), bf, None) {
+                                sender.send(FlighthookMessage::new(event).device(&addr));
+                            }
                         }
 
                         // Emit ClubPath if club data present
@@ -496,6 +497,7 @@ fn connect_and_run(
                                 manufacturer: None,
                                 model: None,
                                 firmware: None,
+                                source: None,
                                 telemetry: Some(device_telemetry.clone()),
                             })
                             .device(&addr),
@@ -520,6 +522,7 @@ fn connect_and_run(
                                     manufacturer: None,
                                     model: None,
                                     firmware: None,
+                                    source: None,
                                     telemetry: Some(device_telemetry.clone()),
                                 })
                                 .device(&addr),
@@ -547,6 +550,7 @@ fn connect_and_run(
                                 manufacturer: None,
                                 model: None,
                                 firmware: None,
+                                source: None,
                                 telemetry: Some(device_telemetry.clone()),
                             })
                             .device(&addr),
@@ -829,10 +833,10 @@ mod tests {
             assert_eq!(bf.spin_axis, Some(f64::from(axis)));
             let side = bf.sidespin_rpm.expect("side");
             assert_eq!(side.signum(), axis.signum() as i32, "{axis}: {side}");
-            let mut components = BallFlight {
+            let mut components = Launch {
                 backspin_rpm: bf.backspin_rpm,
                 sidespin_rpm: bf.sidespin_rpm,
-                ..BallFlight::default()
+                ..Launch::default()
             };
             components.complete_spin();
             assert_eq!(components.total_spin_rpm, bf.total_spin_rpm);
@@ -854,13 +858,13 @@ mod tests {
             .expect("accepted");
         let ball = ball_from_r10(&r10_ball(3231.0, 8.0));
         let shot = flighthook::ShotData {
-            ball: Some(ball.clone()),
+            launch: Some(ball.clone()),
             provenance: Some(crate::actors::provenance::ShotSource::R10.provenance()),
             ..flighthook::ShotData::default()
         };
         assert_eq!(shot.unmeasured_fields().count(), 0);
         let certified = guard.certify(&shot).expect("measured");
-        assert_eq!(certified.shot().ball.as_ref(), Some(&ball));
+        assert_eq!(certified.shot().launch.as_ref(), Some(&ball));
         assert!(ball.backspin_rpm.is_some() && ball.sidespin_rpm.is_some());
     }
 
@@ -869,5 +873,13 @@ mod tests {
         let bf = ball_from_r10(&r10_ball(0.0, 12.0));
         assert_eq!(bf.total_spin_rpm, Some(0));
         assert_eq!(bf.spin_axis, None);
+    }
+
+    /// Every output's numbers for an R10 shot.
+    #[test]
+    fn outputs_keep_their_numbers() {
+        let ball = ball_from_r10(&r10_ball(3231.0, 8.0));
+        let messages = crate::test_ball::device_shot("r10.0", ball, None, None, None);
+        crate::test_ball::assert_outputs_pinned("r10", &messages);
     }
 }

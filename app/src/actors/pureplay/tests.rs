@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use super::codec::{BallData, ClubData, Frame, kind};
 use super::*;
 use crate::actors::provenance::ShotSource;
-use flighthook::{BallFlight, DerivedFlight, Velocity};
+use flighthook::{DerivedFlight, Launch, SHOT_TIMEOUT, ShotKey, Velocity};
 
 /// Longest any test waits for one thing before failing.
 const WAIT: Duration = Duration::from_secs(5);
@@ -20,17 +20,23 @@ fn key(n: u32) -> ShotKey {
     }
 }
 
-/// Put `shot`'s lifecycle on the bus from `monitor`: trigger, ball (with
-/// its simulated block), club, impact, finished.
+/// Put `shot`'s lifecycle on the bus from `monitor`: trigger, launch (with
+/// its simulated block), flight result, club, impact, finished.
 fn emit(monitor: &BusSender, n: u32, shot: &ShotData) {
-    monitor.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-        key: key(n),
-    }));
-    if let Some(ball) = &shot.ball {
-        monitor.send(FlighthookMessage::new(FlighthookEvent::BallFlight {
+    monitor.send(FlighthookMessage::new(FlighthookEvent::shot_trigger(key(
+        n,
+    ))));
+    if let Some(launch) = &shot.launch {
+        monitor.send(FlighthookMessage::new(FlighthookEvent::Launch {
             key: key(n),
-            ball: Box::new(ball.clone()),
+            launch: Box::new(launch.clone()),
             derived: shot.derived.clone().map(Box::new),
+        }));
+    }
+    if let Some(flight) = &shot.flight {
+        monitor.send(FlighthookMessage::new(FlighthookEvent::FlightResult {
+            key: key(n),
+            flight: Box::new(flight.clone()),
         }));
     }
     if let Some(club) = &shot.club {
@@ -63,6 +69,7 @@ fn device_telemetry(monitor: &BusSender, pairs: &[(&str, &str)]) {
         manufacturer: None,
         model: None,
         firmware: None,
+        source: None,
         telemetry: Some(
             pairs
                 .iter()
@@ -77,13 +84,13 @@ fn estimated_spin_shot() -> ShotData {
     let mut derived = DerivedFlight::default();
     derived.spin_estimated = true;
     ShotData {
-        ball: Some(BallFlight {
+        launch: Some(Launch {
             launch_speed: Some(Velocity::MilesPerHour(20.0)),
             launch_elevation: Some(30.0),
             launch_azimuth: Some(0.5),
             backspin_rpm: Some(2000),
             sidespin_rpm: Some(0),
-            ..BallFlight::default()
+            ..Launch::default()
         }),
         derived: Some(derived),
         ..ShotData::default()
@@ -182,9 +189,9 @@ fn ready_state_follows_the_monitor_through_a_shot() {
     relay.drain(&mut rx).expect("bus");
     assert_eq!(relay.ready_state(Instant::now(), None), ReadyState::Ready);
 
-    monitor.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-        key: key(1),
-    }));
+    monitor.send(FlighthookMessage::new(FlighthookEvent::shot_trigger(key(
+        1,
+    ))));
     relay.drain(&mut rx).expect("bus");
     let triggered = Instant::now();
     assert_eq!(relay.ready_state(triggered, None), ReadyState::Processing);
@@ -268,29 +275,26 @@ fn a_monitor_error_ends_with_the_session_that_had_it() {
     assert_eq!(relay.connection_state(None), ConnectionState::Connecting);
 }
 
-/// A shot that never finishes is let go at a trigger a minute later.
+/// A shot that never finishes is let go after FRP's shot timeout.
 #[test]
 fn unfinished_shots_are_let_go() {
     let mut relay = new_relay(GsProRouting::default());
     let trigger = |n| {
-        let mut msg = FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key(n) });
+        let mut msg = FlighthookMessage::new(FlighthookEvent::shot_trigger(key(n)));
         msg.actor = "square.0".into();
         msg
     };
     let start = Instant::now();
     relay.handle(trigger(1), start);
     relay.handle(trigger(2), start + Duration::from_secs(1));
-    assert_eq!(relay.accumulators.len(), 2);
+    assert_eq!(relay.shots.pending_count(), 2);
     relay.handle(
         trigger(3),
-        start + UNFINISHED_SHOT + Duration::from_millis(500),
+        start + SHOT_TIMEOUT + Duration::from_millis(500),
     );
-    let mut left: Vec<u32> = relay
-        .accumulators
-        .keys()
-        .map(|(_, k)| k.shot_number)
+    let left: Vec<u32> = (1..=3)
+        .filter(|&n| relay.shots.is_pending("square.0", &key(n).shot_id))
         .collect();
-    left.sort_unstable();
     assert_eq!(left, [2, 3]);
 }
 

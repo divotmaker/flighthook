@@ -43,8 +43,7 @@ use crate::bus::{BusReceiver, BusSender, PollError};
 use crate::state::SystemState;
 use crate::state::local_clients::LocalClients;
 use flighthook::{
-    ActorStatus, FlighthookEvent, FlighthookMessage, ShotAccumulator, ShotData, ShotDetectionMode,
-    ShotKey,
+    ActorStatus, FlighthookEvent, FlighthookMessage, ShotAggregator, ShotData, ShotDetectionMode,
 };
 
 /// Bridge-internal error type.
@@ -458,8 +457,8 @@ struct Relay {
     mode: ShotDetectionMode,
     monitor_state: HashMap<String, bool>,
     readiness_changed: bool,
-    /// Per-actor shot accumulators, keyed by (actor, shot_key).
-    accumulators: HashMap<(String, ShotKey), ShotAccumulator>,
+    /// Shots in flight, by actor and shot id.
+    shots: ShotAggregator,
     /// Shots finished while connected, oldest first.
     outbox: VecDeque<PendingShot>,
     /// The `ShotNumber` handed out last ([`Relay::next_shot`]), 0 before the
@@ -475,7 +474,7 @@ impl Relay {
             mode: ShotDetectionMode::Full,
             monitor_state: HashMap::new(),
             readiness_changed: false,
-            accumulators: HashMap::new(),
+            shots: ShotAggregator::new(),
             outbox: VecDeque::new(),
             last_number: 0,
         }
@@ -504,36 +503,12 @@ impl Relay {
     }
 
     fn handle(&mut self, msg: FlighthookMessage, now: Instant) {
+        // The shot events assemble here; `derived` is not sent: GSPro
+        // simulates the flight itself.
+        let finished = self.shots.feed_at(&msg, now);
         match msg.event {
-            FlighthookEvent::ShotTrigger { ref key } => {
-                let acc = ShotAccumulator::new(msg.actor.clone(), key.clone())
-                    .with_provenance(msg.provenance);
-                self.accumulators
-                    .insert((msg.actor.clone(), key.clone()), acc);
-            }
-            // `derived` is ignored: GSPro simulates the flight itself.
-            FlighthookEvent::BallFlight {
-                ref key, ref ball, ..
-            } => {
-                if let Some(acc) = self.accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
-                    acc.set_ball(*ball.clone());
-                }
-            }
-            FlighthookEvent::FaceImpact {
-                ref key,
-                ref impact,
-            } => {
-                if let Some(acc) = self.accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
-                    acc.set_impact(*impact.clone());
-                }
-            }
-            FlighthookEvent::ClubPath { ref key, ref club } => {
-                if let Some(acc) = self.accumulators.get_mut(&(msg.actor.clone(), key.clone())) {
-                    acc.set_club(*club.clone());
-                }
-            }
             FlighthookEvent::ShotFinished { ref key, .. } => {
-                if let Some(acc) = self.accumulators.remove(&(msg.actor.clone(), key.clone())) {
+                if let Some(acc) = finished {
                     if !shot_matches_routing(&self.routing, self.mode, &msg.actor) {
                         tracing::debug!(
                             "gspro bridge: skipping shot #{} from '{}' (routed to {:?} for mode {:?})",
@@ -919,6 +894,7 @@ fn send_shots(
 
 #[cfg(test)]
 mod tests {
+    use flighthook::ShotKey;
     use std::io::ErrorKind;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -942,19 +918,24 @@ mod tests {
     /// Put a complete shot from `mevo.0` on the bus: trigger, the
     /// mapper's golden launch-only ball, finished.
     fn emit_shot(monitor: &BusSender, n: u32) {
+        emit_shot_as(monitor, key(n));
+    }
+
+    /// [`emit_shot`] with the shot key `key`.
+    fn emit_shot_as(monitor: &BusSender, key: ShotKey) {
         let ball = mapper::tests::square_like_shot(None)
-            .ball
+            .launch
             .expect("golden shot has ball data");
-        monitor.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-            key: key(n),
-        }));
-        monitor.send(FlighthookMessage::new(FlighthookEvent::BallFlight {
-            key: key(n),
-            ball: Box::new(ball),
+        monitor.send(FlighthookMessage::new(FlighthookEvent::shot_trigger(
+            key.clone(),
+        )));
+        monitor.send(FlighthookMessage::new(FlighthookEvent::Launch {
+            key: key.clone(),
+            launch: Box::new(ball),
             derived: None,
         }));
         monitor.send(FlighthookMessage::new(FlighthookEvent::ShotFinished {
-            key: key(n),
+            key,
             raw: None,
         }));
     }
@@ -1049,8 +1030,15 @@ mod tests {
         assert_eq!(sent_numbers(&mut relay, Instant::now()), [1, 2, 3]);
         relay.disconnect();
         relay.connect(Instant::now());
+        // The device counts from 1 again; its new shots have new ids.
         for n in 1..=4 {
-            emit_shot(&monitor, n);
+            emit_shot_as(
+                &monitor,
+                ShotKey {
+                    shot_id: format!("again-{n}"),
+                    shot_number: n,
+                },
+            );
         }
         relay.drain(&mut receiver).expect("bus open");
         assert_eq!(sent_numbers(&mut relay, Instant::now()), [4, 5, 6, 7]);

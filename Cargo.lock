@@ -1547,6 +1547,7 @@ dependencies = [
  "egui",
  "flighthook",
  "flighthook-ui",
+ "flightrelay",
  "futures-util",
  "glam",
  "image",
@@ -1595,9 +1596,9 @@ dependencies = [
 
 [[package]]
 name = "flightrelay"
-version = "0.4.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "189642b8a5a84cdcd80abe29d1cb5d92401a1bf468d89a437e9b3b118f1fcc32"
+checksum = "6bb4f82cfb6e82e0de958c04571d8921e0a380d07f92fbac42c0519b1842cc05"
 dependencies = [
  "serde",
  "serde_json",

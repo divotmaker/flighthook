@@ -65,7 +65,7 @@ pub fn map_certified(shot: &CertifiedShot, shot_id: u32) -> Option<ShotFrames> {
 /// data.
 #[must_use]
 pub fn map_shot(shot: &ShotData, shot_id: u32) -> Option<ShotFrames> {
-    let b = shot.ball.as_ref()?;
+    let b = shot.launch.as_ref()?;
     let mut valid = 0;
     let mut ball = BallData {
         shot_id,
@@ -214,8 +214,8 @@ pub fn club_from_pureplay(n: u8) -> Option<Club> {
 pub(super) mod tests {
     use super::*;
     use flighthook::{
-        BallFlight, ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, Provenance,
-        ShotField, Velocity,
+        Basis, ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, FlightResult, Launch,
+        Provenance, ShotField, Velocity,
     };
 
     /// Map `shot` as a tournament round sends it: certified by a held
@@ -241,7 +241,7 @@ pub(super) mod tests {
         ShotData {
             actor: "square.0".into(),
             shot_number: 3,
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 launch_speed: Some(Velocity::MetersPerSecond(64.0)),
                 launch_elevation: Some(12.5),
                 launch_azimuth: Some(-1.5),
@@ -249,9 +249,11 @@ pub(super) mod tests {
                 sidespin_rpm: Some(-300),
                 total_spin_rpm: Some(2468),
                 spin_axis: Some(-6.98),
-                // Device-reported carry: Pureplay has no field for it.
+            }),
+            // Device-reported carry: Pureplay has no field for it.
+            flight: Some(FlightResult {
                 carry_distance: Some(Distance::Meters(150.0)),
-                ..BallFlight::default()
+                ..FlightResult::new(Basis::Modeled)
             }),
             club: Some(FhClubData {
                 club_speed: Some(Velocity::MetersPerSecond(47.5)),
@@ -275,13 +277,13 @@ pub(super) mod tests {
         ShotData {
             actor: "mevo.0".into(),
             shot_number: 4,
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 launch_speed: Some(Velocity::MilesPerHour(100.0)),
                 launch_elevation: Some(14.0),
                 launch_azimuth: Some(2.0),
                 backspin_rpm: Some(5000),
                 sidespin_rpm: Some(400),
-                ..BallFlight::default()
+                ..Launch::default()
             }),
             ..ShotData::default()
         }
@@ -372,7 +374,7 @@ pub(super) mod tests {
     #[test]
     fn simulated_values_are_never_sent() {
         let mut shot = ball_only_shot();
-        let ball = shot.ball.as_mut().expect("ball");
+        let ball = shot.launch.as_mut().expect("launch");
         ball.backspin_rpm = None;
         ball.sidespin_rpm = None;
         ball.launch_elevation = None;
@@ -387,7 +389,7 @@ pub(super) mod tests {
     #[test]
     fn non_finite_values_are_not_marked() {
         let mut shot = ball_only_shot();
-        shot.ball.as_mut().expect("ball").launch_azimuth = Some(f64::NAN);
+        shot.launch.as_mut().expect("launch").launch_azimuth = Some(f64::NAN);
         let f = map_shot(&shot, 1).expect("frames");
         assert_eq!(f.ball.valid & BallData::HLA, 0);
         assert_eq!(f.ball.hla, 0.0);
@@ -396,15 +398,19 @@ pub(super) mod tests {
     #[test]
     fn a_shot_without_ball_data_sends_nothing() {
         let mut shot = full_shot();
-        shot.ball = None;
-        assert_eq!(map_shot(&shot, 1), None);
-        shot.ball = Some(BallFlight::default());
+        shot.launch = None;
+        assert_eq!(
+            map_shot(&shot, 1),
+            None,
+            "the flight result alone is not sent"
+        );
+        shot.launch = Some(Launch::default());
         assert_eq!(map_shot(&shot, 1), None);
     }
 
     fn estimated_spin_shot() -> ShotData {
         let mut shot = ball_only_shot();
-        let ball = shot.ball.as_mut().expect("ball");
+        let ball = shot.launch.as_mut().expect("launch");
         ball.backspin_rpm = Some(2400);
         ball.sidespin_rpm = Some(0);
         let mut derived = DerivedFlight::default();
@@ -550,7 +556,7 @@ pub(super) mod tests {
     fn side_spin_goes_out_with_flighthooks_sign() {
         assert_eq!(side_spin(600), 600.0 * SIDE_SPIN_SIGN);
         let mut shot = ball_only_shot();
-        shot.ball.as_mut().expect("ball").sidespin_rpm = Some(600);
+        shot.launch.as_mut().expect("launch").sidespin_rpm = Some(600);
         let f = map_shot(&shot, 1).expect("frames");
         assert_eq!(f.ball.side_spin_rpm, 600.0);
         let full = map_shot(&full_shot(), 1).expect("frames");

@@ -198,7 +198,7 @@ fn ends(shot: &ShotRow, units: UnitSystem) -> Ends {
             d.as_meters()
         }
     };
-    let ball = shot.ball.as_ref();
+    let flight = shot.flight.as_ref();
     let derived = shot.derived.as_ref();
     let spot = |measured: (Option<Distance>, Option<Distance>),
                 sim: (Option<Distance>, Option<Distance>)| {
@@ -216,8 +216,8 @@ fn ends(shot: &ShotRow, units: UnitSystem) -> Ends {
     };
     let landing = spot(
         (
-            ball.and_then(|b| b.carry_distance),
-            ball.and_then(|b| b.carry_offline),
+            flight.and_then(|f| f.carry_distance),
+            flight.and_then(|f| f.carry_offline),
         ),
         (
             derived.and_then(|d| d.carry_distance),
@@ -226,8 +226,8 @@ fn ends(shot: &ShotRow, units: UnitSystem) -> Ends {
     );
     let rest = spot(
         (
-            ball.and_then(|b| b.total_distance),
-            ball.and_then(|b| b.total_offline),
+            flight.and_then(|f| f.total_distance),
+            flight.and_then(|f| f.total_offline),
         ),
         (
             derived.and_then(|d| d.total_distance),
@@ -1035,7 +1035,9 @@ impl FlighthookApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{BallFlight, Club, DerivedFlight, FlightPath, ShotGroupInfo};
+    use crate::types::{
+        Basis, Club, DerivedFlight, FlightPath, FlightResult, Launch, ShotGroupInfo,
+    };
 
     fn set(id: &str, number: u32, club: Club, session: u32) -> ShotGroupInfo {
         ShotGroupInfo {
@@ -1098,7 +1100,8 @@ mod tests {
             actor: actor.into(),
             shot_id: format!("id{n}"),
             shot_number: n,
-            ball: Some(BallFlight::default()),
+            launch: Some(Launch::default()),
+            flight: None,
             club: None,
             impact: None,
             derived: Some(d),
@@ -1113,9 +1116,10 @@ mod tests {
     /// A shot with a measured carry and nothing else: no lateral.
     fn no_lateral(n: u32, group: &str) -> ShotRow {
         ShotRow {
-            ball: Some(BallFlight {
+            launch: Some(Launch::default()),
+            flight: Some(FlightResult {
                 carry_distance: Some(Distance::Meters(140.0)),
-                ..Default::default()
+                ..FlightResult::new(Basis::Modeled)
             }),
             derived: None,
             ..shot(n, "mevo.0", group, 140.0, 0.0)
@@ -1328,9 +1332,9 @@ mod tests {
 
         // A carry in both: the simulated one wins, with or without force.
         // Measured only: the measured one.
-        scalars.ball = Some(BallFlight {
+        scalars.flight = Some(FlightResult {
             carry_distance: Some(Distance::Meters(140.0)),
-            ..Default::default()
+            ..FlightResult::new(Basis::Modeled)
         });
         let down = |s: &ShotRow| {
             let p = ends(s, UnitSystem::Metric).at(Points::Carry).unwrap();

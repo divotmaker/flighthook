@@ -30,10 +30,14 @@ use crate::state::SystemState;
 use settings::fusion_cam_config;
 
 use flighthook::{
-    ActorStatus, BallFlight, CameraMode, ClubData, Distance, FlighthookEvent, FlighthookMessage,
+    ActorStatus, Basis, CameraMode, ClubData, Distance, FlighthookEvent, FlighthookMessage, Launch,
     RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw, SpinSource, Velocity,
     hex_lower,
 };
+
+/// The device's flight values for one shot, as flighthook's bus carries them
+/// (ironsight's own `FlightResult` is the D4 frame).
+type Flight = flighthook::FlightResult;
 
 /// No events for this long → treat as disconnected.
 const STALE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -516,7 +520,8 @@ fn on_shot_datum(
         }
         ShotDatum::Flight(d4) => {
             let held_club = results.accept_d4();
-            let mut ball = ball_from_d4(&d4);
+            let (mut ball, flight) = shot_from_d4(&d4);
+            let mut flight = Some(flight);
             let mut spin_source = "D4";
             if model == DeviceModel::Xi {
                 let source = live_spin_source(state, sender.actor_id()).unwrap_or(ctx.spin_source);
@@ -528,7 +533,8 @@ fn on_shot_datum(
             }
             let rpm_per_mph =
                 live_launch_only_spin(state, sender.actor_id()).unwrap_or(ctx.launch_only_spin);
-            let estimated = estimate_launch_only_spin(&mut ball, &d4, rpm_per_mph, mode);
+            let estimated =
+                estimate_launch_only_spin(&mut ball, &mut flight, &d4, rpm_per_mph, mode);
             if estimated {
                 spin_source = "estimate";
             }
@@ -538,17 +544,19 @@ fn on_shot_datum(
                 ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
                 ball.launch_elevation.unwrap_or(0.0),
                 ball.launch_azimuth.unwrap_or(0.0),
-                ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
+                carry_yards(flight.as_ref()),
                 ball.backspin_rpm.unwrap_or(0),
                 ball.sidespin_rpm.unwrap_or(0),
                 ball.total_spin_rpm.unwrap_or(0),
             );
-            let mut event = sim::ball_flight_event_in_mode(state, key.clone(), ball, Some(mode));
+            let mut events =
+                sim::launch_events_in_mode(state, key.clone(), ball, flight, Some(mode));
             if estimated {
-                mark_spin_estimated(&mut event);
+                mark_spin_estimated(&mut events);
             }
-            let msg = FlighthookMessage::new(event);
-            sender.send(stamp_device(msg, device_id));
+            for event in events {
+                sender.send(stamp_device(FlighthookMessage::new(event), device_id));
+            }
             if let Some(club) = held_club {
                 send_club(sender, device_id, key, club);
             }
@@ -564,7 +572,7 @@ fn on_shot_datum(
         }
         ShotDatum::Spin(_) => {
             // Spin axis / total spin are derived from backspin + sidespin in
-            // BallFlight; EF is redundant.
+            // the launch; EF is redundant.
         }
     }
 }
@@ -605,22 +613,20 @@ fn finish_shot(
     match outcome {
         ShotOutcome::Measured => {}
         ShotOutcome::Estimated(e8) => {
-            let ball = ball_from_e8(&e8);
+            let (ball, flight) = shot_from_e8(&e8);
             info!(
                 "shot #{} (E8): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd",
                 key.shot_number,
                 ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
                 ball.launch_elevation.unwrap_or(0.0),
                 ball.launch_azimuth.unwrap_or(0.0),
-                ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0),
+                carry_yards(Some(&flight)),
             );
-            let msg = FlighthookMessage::new(sim::ball_flight_event_in_mode(
-                state,
-                key.clone(),
-                ball,
-                Some(mode),
-            ));
-            sender.send(stamp_device(msg, device_id));
+            for event in
+                sim::launch_events_in_mode(state, key.clone(), ball, Some(flight), Some(mode))
+            {
+                sender.send(stamp_device(FlighthookMessage::new(event), device_id));
+            }
         }
         ShotOutcome::Skipped => {
             info!(
@@ -706,6 +712,7 @@ fn try_emit_device_telemetry(
             manufacturer: None,
             model: None,
             firmware: None,
+            source: None,
             telemetry: Some(telemetry.clone()),
         })
         .device(dev),
@@ -1017,6 +1024,7 @@ fn connect_and_run(
                                     manufacturer: Some("FlightScope".into()),
                                     model: Some(device_model),
                                     firmware,
+                                    source: None,
                                     telemetry: Some(device_telemetry.clone()),
                                 })
                                 .device(dev),
@@ -1094,9 +1102,8 @@ fn connect_and_run(
                         };
                         debug!("ball trigger detected — shot_id={}", key.shot_id);
                         capture.borrow_mut().mark_trigger();
-                        let msg = FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-                            key: key.clone(),
-                        });
+                        let msg =
+                            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()));
                         sender.send(stamp_device(msg, device_id));
                         current_shot_key = Some(key);
                         shot_results = ShotResults::default();
@@ -1266,14 +1273,28 @@ fn connect_and_run(
 // Protocol type → bus type conversion helpers
 // ---------------------------------------------------------------------------
 
-fn ball_from_d4(d4: &FlightResult) -> BallFlight {
+/// The shot log's carry in yards: the device's, else 0.
+fn carry_yards(flight: Option<&Flight>) -> f64 {
+    flight
+        .and_then(|f| f.carry_distance)
+        .map_or(0.0, |d| d.as_yards())
+}
+
+/// A D4's measured launch and its flight values. The flight values come from
+/// the device's own flight model, so their basis is [`Basis::Modeled`].
+fn shot_from_d4(d4: &FlightResult) -> (Launch, Flight) {
     // ironsight reports azimuth and sidespin positive = left; FRP positive =
     // right, so both are negated.
     let flew = flew(d4.carry_distance, d4.flight_time, d4.max_height);
-    BallFlight {
+    let launch = Launch {
         launch_speed: Some(Velocity::MetersPerSecond(d4.launch_speed)),
         launch_elevation: Some(d4.launch_elevation),
         launch_azimuth: Some(-d4.launch_azimuth),
+        backspin_rpm: Some(d4.backspin_rpm),
+        sidespin_rpm: Some(-d4.sidespin_rpm),
+        ..Launch::default()
+    };
+    let flight = Flight {
         carry_distance: Some(Distance::Meters(d4.carry_distance)),
         carry_offline: flew
             .then(|| finite(-d4.landing_position[2]))
@@ -1282,10 +1303,9 @@ fn ball_from_d4(d4: &FlightResult) -> BallFlight {
         max_height: Some(Distance::Meters(d4.max_height)),
         flight_time: Some(d4.flight_time),
         descent_angle: flew.then(|| descent_angle(d4.landing_velocity)).flatten(),
-        backspin_rpm: Some(d4.backspin_rpm),
-        sidespin_rpm: Some(-d4.sidespin_rpm),
-        ..BallFlight::default()
-    }
+        ..Flight::new(Basis::Modeled)
+    };
+    (launch, flight)
 }
 
 /// Whether a flight result describes a ball in flight: positive, finite
@@ -1323,7 +1343,7 @@ fn launch_only(d4: &FlightResult) -> bool {
 /// ([`MevoSection::launch_only_spin_valid`](flighthook::MevoSection::launch_only_spin_valid)),
 /// in Putting mode, when the ball has any spin, or when its speed
 /// is not positive or the product is out of range for an rpm.
-fn launch_only_spin(ball: &BallFlight, rpm_per_mph: f64, mode: ShotDetectionMode) -> Option<i32> {
+fn launch_only_spin(ball: &Launch, rpm_per_mph: f64, mode: ShotDetectionMode) -> Option<i32> {
     if !(flighthook::MevoSection::launch_only_spin_valid(rpm_per_mph) && rpm_per_mph > 0.0)
         || mode == ShotDetectionMode::Putting
     {
@@ -1348,15 +1368,18 @@ fn launch_only_spin(ball: &BallFlight, rpm_per_mph: f64, mode: ShotDetectionMode
 }
 
 /// Give `ball`, from the launch-only `d4` ([`launch_only`]), the estimated
-/// backspin [`launch_only_spin`] and no sidespin, and unset its carry, apex
-/// and flight time: the device computed none, so the simulation flies the
-/// shot from its launch and that spin. Returns whether the estimate was
-/// applied. When it is not (`d4` is not launch-only, the estimate is off or
-/// declines, or the spin, after the Xi's spin source, is not 0/0), `ball` is
-/// left as it is: a D4 with no flight keeps its 0 carry, apex and flight time
-/// and is rolled as a ground ball.
+/// backspin [`launch_only_spin`] and no sidespin, and unset the carry, apex
+/// and flight time of its `flight` (leaving no flight result, since a
+/// launch-only D4 has no other flight value): the device computed none, so
+/// the simulation flies the shot from its launch and that spin. Returns
+/// whether the estimate was applied. When it is not (`d4` is not
+/// launch-only, the estimate is off or declines, or the spin, after the Xi's
+/// spin source, is not 0/0), `ball` and `flight` are left as they are: a D4
+/// with no flight keeps its 0 carry, apex and flight time and is rolled as a
+/// ground ball.
 fn estimate_launch_only_spin(
-    ball: &mut BallFlight,
+    ball: &mut Launch,
+    flight: &mut Option<Flight>,
     d4: &FlightResult,
     rpm_per_mph: f64,
     mode: ShotDetectionMode,
@@ -1369,19 +1392,26 @@ fn estimate_launch_only_spin(
     };
     ball.backspin_rpm = Some(back);
     ball.sidespin_rpm = Some(0);
-    ball.carry_distance = None;
-    ball.max_height = None;
-    ball.flight_time = None;
+    if let Some(f) = flight.as_mut() {
+        f.carry_distance = None;
+        f.max_height = None;
+        f.flight_time = None;
+    }
+    if flight.as_ref() == Some(&Flight::new(Basis::Modeled)) {
+        *flight = None;
+    }
     true
 }
 
-/// Mark a `BallFlight` event's spin as flighthook's estimate
+/// Mark the spin of a shot's `Launch` event as flighthook's estimate
 /// ([`DerivedFlight::spin_estimated`](flighthook::DerivedFlight::spin_estimated)),
 /// adding a derived block that holds only the flag when the shot was not
 /// simulated.
-fn mark_spin_estimated(event: &mut FlighthookEvent) {
-    if let FlighthookEvent::BallFlight { derived, .. } = event {
-        derived.get_or_insert_with(Box::default).spin_estimated = true;
+fn mark_spin_estimated(events: &mut [FlighthookEvent]) {
+    for event in events {
+        if let FlighthookEvent::Launch { derived, .. } = event {
+            derived.get_or_insert_with(Box::default).spin_estimated = true;
+        }
     }
 }
 
@@ -1426,7 +1456,7 @@ enum XiSpin {
 
 impl XiSpin {
     /// Put this spin on `ball` in place of D4's.
-    fn apply(self, ball: &mut BallFlight) {
+    fn apply(self, ball: &mut Launch) {
         let (back, side, total) = match self {
             Self::Components(back, side) => (Some(back), Some(side), None),
             Self::Total(total) => (None, None, Some(total)),
@@ -1447,7 +1477,7 @@ impl XiSpin {
 /// follows face-to-path; the axis is clamped to ±90° so backspin never turns
 /// negative. Otherwise the shot has no axis, and only the total is sent.
 /// `E8` keeps D4 when there is no E8 backspin, since that is a missing value,
-/// not a measurement. Sidespin keeps the sign flip of [`ball_from_d4`].
+/// not a measurement. Sidespin keeps the sign flip of [`shot_from_d4`].
 ///
 /// `Auto` applies the `E8` rule when `mode` (flighthook's detection mode at
 /// shot time) is `Full`, and otherwise keeps D4 exactly like `D4`. Either
@@ -1512,14 +1542,21 @@ fn auto_label(label: &'static str) -> &'static str {
     }
 }
 
-fn ball_from_e8(e8: &FlightResultV1) -> BallFlight {
+/// An E8's measured launch and its flight values, [`Basis::Modeled`] as for
+/// a D4 ([`shot_from_d4`]).
+fn shot_from_e8(e8: &FlightResultV1) -> (Launch, Flight) {
     // ironsight reports azimuth positive = left; FRP positive = right, so it
     // is negated.
     let flew = flew(e8.distance, e8.flight_time, e8.height);
-    BallFlight {
+    let launch = Launch {
         launch_speed: Some(Velocity::MetersPerSecond(e8.ball_velocity)),
         launch_elevation: Some(e8.elevation),
         launch_azimuth: Some(-e8.azimuth),
+        backspin_rpm: Some(e8.backspin_rpm),
+        sidespin_rpm: None, // always zero in E8 — None, not Some(0)
+        ..Launch::default()
+    };
+    let flight = Flight {
         carry_distance: Some(Distance::Meters(e8.distance)),
         carry_offline: flew
             .then(|| finite(-e8.lateral))
@@ -1527,10 +1564,9 @@ fn ball_from_e8(e8: &FlightResultV1) -> BallFlight {
             .map(Distance::Meters),
         max_height: Some(Distance::Meters(e8.height)),
         flight_time: Some(e8.flight_time),
-        backspin_rpm: Some(e8.backspin_rpm),
-        sidespin_rpm: None, // always zero in E8 — None, not Some(0)
-        ..BallFlight::default()
-    }
+        ..Flight::new(Basis::Modeled)
+    };
+    (launch, flight)
 }
 
 fn club_from_ed(ed: &ironsight::protocol::shot::ClubResult) -> ClubData {
@@ -1555,9 +1591,71 @@ fn club_from_ed(ed: &ironsight::protocol::shot::ClubResult) -> ClubData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_ball::Ball;
     use ironsight::protocol::TYPE_CLUB_RESULT;
     use ironsight::protocol::shot::ClubResult;
     use ironsight::testing::{FakeDevice, Shot, fixtures};
+
+    // The conversions and spin rules under test, on a test shot block: the
+    // launch and the device's flight values side by side.
+
+    fn ball_from_d4(d4: &FlightResult) -> Ball {
+        let (launch, flight) = shot_from_d4(d4);
+        Ball::of(Some(&launch), Some(&flight))
+    }
+
+    fn ball_from_e8(e8: &FlightResultV1) -> Ball {
+        let (launch, flight) = shot_from_e8(e8);
+        Ball::of(Some(&launch), Some(&flight))
+    }
+
+    fn launch_only_spin(b: &Ball, rpm_per_mph: f64, mode: ShotDetectionMode) -> Option<i32> {
+        super::launch_only_spin(&b.launch(), rpm_per_mph, mode)
+    }
+
+    fn estimate_launch_only_spin(
+        b: &mut Ball,
+        d4: &FlightResult,
+        rpm_per_mph: f64,
+        mode: ShotDetectionMode,
+    ) -> bool {
+        let (mut launch, mut flight) = (b.launch(), b.flight());
+        let estimated =
+            super::estimate_launch_only_spin(&mut launch, &mut flight, d4, rpm_per_mph, mode);
+        *b = Ball::of(Some(&launch), flight.as_ref());
+        estimated
+    }
+
+    /// Apply `spin` to the launch of `b`.
+    fn apply_spin(spin: XiSpin, b: &mut Ball) {
+        let mut launch = b.launch();
+        spin.apply(&mut launch);
+        *b = Ball::of(Some(&launch), b.flight().as_ref());
+    }
+
+    /// The shot block the `Launch` and `FlightResult` events in `events`
+    /// carry, with the launch's simulated values.
+    fn ball_of(
+        events: impl IntoIterator<Item = FlighthookEvent>,
+    ) -> Option<(Ball, Option<flighthook::DerivedFlight>)> {
+        let mut launch = None;
+        let mut flight = None;
+        let mut sim = None;
+        for event in events {
+            match event {
+                FlighthookEvent::Launch {
+                    launch: l, derived, ..
+                } => {
+                    launch = Some(*l);
+                    sim = derived.map(|d| *d);
+                }
+                FlighthookEvent::FlightResult { flight: f, .. } => flight = Some(*f),
+                _ => {}
+            }
+        }
+        let launch = launch?;
+        Some((Ball::of(Some(&launch), flight.as_ref()), sim))
+    }
 
     #[test]
     fn xi_chipping_and_putting_share_a_session() {
@@ -1617,7 +1715,7 @@ mod tests {
             (Some(XiSpin::Total(6897)), "E8 total, no axis")
         );
         let mut ball = ball_from_d4(&d4);
-        XiSpin::Total(6897).apply(&mut ball);
+        apply_spin(XiSpin::Total(6897), &mut ball);
         assert_eq!(
             (
                 ball.backspin_rpm,
@@ -2244,9 +2342,7 @@ mod tests {
                             shot_number: u32::try_from(i + 1).expect("shot number"),
                         };
                         sender.send(stamp_device(
-                            FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-                                key: key.clone(),
-                            }),
+                            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone())),
                             &device_id,
                         ));
                         current = Some((key, ShotResults::default()));
@@ -2284,7 +2380,9 @@ mod tests {
                     shots.push(Vec::new());
                     "trigger"
                 }
-                FlighthookEvent::BallFlight { .. } => "ball",
+                FlighthookEvent::Launch { .. } => "ball",
+                // Counted with its launch, which it follows.
+                FlighthookEvent::FlightResult { .. } => continue,
                 FlighthookEvent::ClubPath { .. } => "club",
                 FlighthookEvent::Alert { .. } => "alert",
                 FlighthookEvent::ShotFinished { .. } => "finished",
@@ -2344,11 +2442,14 @@ mod tests {
         let mut acc: Option<ShotAccumulator> = None;
         for msg in messages {
             match &msg.event {
-                FlighthookEvent::ShotTrigger { key } => {
+                FlighthookEvent::ShotTrigger { key, .. } => {
                     acc = Some(ShotAccumulator::new(msg.actor.clone(), key.clone()));
                 }
-                FlighthookEvent::BallFlight { ball, .. } => {
-                    acc.as_mut().expect("acc").set_ball(*ball.clone());
+                FlighthookEvent::Launch { launch, .. } => {
+                    acc.as_mut().expect("acc").set_launch(*launch.clone(), None);
+                }
+                FlighthookEvent::FlightResult { flight, .. } => {
+                    acc.as_mut().expect("acc").set_flight(*flight.clone());
                 }
                 FlighthookEvent::ClubPath { club, .. } => {
                     acc.as_mut().expect("acc").set_club(*club.clone());
@@ -2477,7 +2578,8 @@ mod tests {
         let shot = &sent[0];
         assert_eq!(shot.shot_number, 2);
         let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
-        let ball = shot.ball.as_ref().expect("ball");
+        let ball = &Ball::of(shot.launch.as_ref(), shot.flight.as_ref());
+        assert!(shot.launch.is_some() && shot.flight.is_some());
         assert!(close(ball.launch_speed.unwrap().as_mph(), 40.141_888_3));
         assert!(close(ball.launch_elevation.unwrap(), 30.948));
         assert!(close(ball.launch_azimuth.unwrap(), -3.958));
@@ -2578,7 +2680,7 @@ mod tests {
             shot_number: 1,
         };
         sender.send(stamp_device(
-            FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() }),
+            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone())),
             &device_id,
         ));
         let mut results = ShotResults::default();
@@ -2653,7 +2755,7 @@ mod tests {
             assert_eq!(club_paths(&messages), std::slice::from_ref(&club));
             let sent = completed_shots(&messages);
             assert_eq!(sent.len(), 1);
-            assert!(sent[0].ball.is_some());
+            assert!(sent[0].launch.is_some());
             assert_eq!(sent[0].club.as_ref(), Some(&club));
         }
     }
@@ -2711,14 +2813,14 @@ mod tests {
     }
 
     /// A ball with launch data only: `mph` at 22.8 deg, spin `back`/`side`.
-    fn launch_only_ball(mph: f64, back: i32, side: i32) -> BallFlight {
-        BallFlight {
+    fn launch_only_ball(mph: f64, back: i32, side: i32) -> Ball {
+        Ball {
             launch_speed: Some(Velocity::MilesPerHour(mph)),
             launch_elevation: Some(22.8),
             launch_azimuth: Some(-0.856),
             backspin_rpm: Some(back),
             sidespin_rpm: Some(side),
-            ..BallFlight::default()
+            ..Ball::default()
         }
     }
 
@@ -2755,7 +2857,7 @@ mod tests {
             Some(1570)
         );
         // Absent spin is no spin reading too.
-        let b = BallFlight {
+        let b = Ball {
             backspin_rpm: None,
             sidespin_rpm: None,
             ..launch_only_ball(15.7, 0, 0)
@@ -2796,7 +2898,7 @@ mod tests {
                 "{speed}"
             );
         }
-        let b = BallFlight {
+        let b = Ball {
             launch_speed: None,
             ..launch_only_ball(15.7, 0, 0)
         };
@@ -2932,7 +3034,7 @@ mod tests {
         mode: ShotDetectionMode,
         section: Option<flighthook::MevoSection>,
         d4: FlightResult,
-    ) -> (BallFlight, Option<flighthook::DerivedFlight>) {
+    ) -> (Ball, Option<flighthook::DerivedFlight>) {
         handle_d4_with(model, mode, section, flighthook::SimMode::On, d4)
     }
 
@@ -2943,7 +3045,7 @@ mod tests {
         section: Option<flighthook::MevoSection>,
         sim: flighthook::SimMode,
         d4: FlightResult,
-    ) -> (BallFlight, Option<flighthook::DerivedFlight>) {
+    ) -> (Ball, Option<flighthook::DerivedFlight>) {
         let dir = std::env::temp_dir().join(format!(
             "flighthook-mevo-test-{}",
             crate::state::config::generate_id()
@@ -2975,12 +3077,8 @@ mod tests {
         let mut results = ShotResults::default();
         on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::Flight(d4));
         let _ = std::fs::remove_dir_all(&dir);
-        while let Ok(msg) = bus_rx.try_recv() {
-            if let FlighthookEvent::BallFlight { ball, derived, .. } = msg.event {
-                return (*ball, derived.map(|d| *d));
-            }
-        }
-        panic!("no ball flight sent");
+        ball_of(std::iter::from_fn(|| bus_rx.try_recv().ok()).map(|m| m.event))
+            .expect("no launch sent")
     }
 
     /// What an Xi shot puts on the bus for its spin, and the computed marks
@@ -2988,7 +3086,7 @@ mod tests {
     fn xi_ball(
         source: SpinSource,
         (d4, e8): (FlightResult, FlightResultV1),
-    ) -> (BallFlight, Vec<flighthook::ShotField>) {
+    ) -> (Ball, Vec<flighthook::ShotField>) {
         let dir = std::env::temp_dir().join(format!(
             "flighthook-mevo-test-{}",
             crate::state::config::generate_id()
@@ -3016,14 +3114,10 @@ mod tests {
         on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::FlightV1(e8));
         on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::Flight(d4));
         let _ = std::fs::remove_dir_all(&dir);
-        std::iter::from_fn(|| bus_rx.try_recv().ok())
-            .find_map(|msg| match msg.event {
-                FlighthookEvent::BallFlight { ball, derived, .. } => {
-                    Some((*ball, derived.map(|d| d.computed).unwrap_or_default()))
-                }
-                _ => None,
-            })
-            .expect("a ball flight")
+        let (ball, derived) =
+            ball_of(std::iter::from_fn(|| bus_rx.try_recv().ok()).map(|m| m.event))
+                .expect("a launch");
+        (ball, derived.map(|d| d.computed).unwrap_or_default())
     }
 
     /// With the Xi's Spin source E8 the spin is the device's reading either
@@ -3032,7 +3126,7 @@ mod tests {
     /// and no components. With D4, D4's spin goes out.
     #[test]
     fn an_xi_e8_spin_is_measured_and_has_no_placeholder_axis() {
-        let spin = |b: &BallFlight| {
+        let spin = |b: &Ball| {
             (
                 b.backspin_rpm,
                 b.sidespin_rpm,
@@ -3198,6 +3292,49 @@ mod tests {
                 d4.clone(),
             );
             assert_eq!(derived, None, "{model:?}");
+        }
+    }
+
+    /// Every output's numbers for a Mevo and an Xi shot: a full swing from
+    /// each, a launch-only Xi chip with flighthook's spin estimate, and a
+    /// Mevo shot sent from its early result.
+    #[test]
+    fn outputs_keep_their_numbers() {
+        let d4 = || FlightResult::decode(fixtures::XI_SHOT_D4).unwrap();
+        let e8 = || FlightResultV1::decode(fixtures::XI_SHOT_E8).unwrap();
+        let ed = || ClubResult::decode(fixtures::XI_SHOT_ED).unwrap();
+        for (case, model, datums, use_estimated) in [
+            (
+                "xi_full_swing",
+                DeviceModel::Xi,
+                vec![
+                    ShotDatum::FlightV1(e8()),
+                    ShotDatum::Flight(d4()),
+                    ShotDatum::Club(ed()),
+                ],
+                false,
+            ),
+            (
+                "mevo_full_swing",
+                DeviceModel::Mevo,
+                vec![ShotDatum::Flight(d4()), ShotDatum::Club(ed())],
+                false,
+            ),
+            (
+                "xi_launch_only_chip",
+                DeviceModel::Xi,
+                vec![ShotDatum::Flight(launch_only_d4())],
+                false,
+            ),
+            (
+                "mevo_e8_fallback",
+                DeviceModel::Mevo,
+                vec![ShotDatum::FlightV1(e8())],
+                true,
+            ),
+        ] {
+            let messages = replay_datums(model, datums, use_estimated);
+            crate::test_ball::assert_outputs_pinned(case, &messages);
         }
     }
 }

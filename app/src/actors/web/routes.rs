@@ -1736,7 +1736,7 @@ mod tests {
 #[cfg(test)]
 mod convert_tests {
     use super::*;
-    use flighthook::{BallFlight, DerivedFlight, Distance, ShotData, Velocity};
+    use flighthook::{DerivedFlight, Distance, Launch, ShotData, Velocity};
 
     fn shot() -> ShotData {
         let mut derived = DerivedFlight::default();
@@ -1750,18 +1750,13 @@ mod convert_tests {
         ShotData {
             actor: "square.0".into(),
             shot_number: 3,
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 launch_speed: Some(Velocity::MetersPerSecond(53.6)),
                 launch_elevation: Some(17.0),
                 launch_azimuth: Some(-1.2),
-                carry_distance: None,
-                total_distance: None,
-                roll_distance: None,
-                max_height: None,
-                flight_time: None,
                 backspin_rpm: Some(6500),
                 sidespin_rpm: Some(-300),
-                ..BallFlight::default()
+                ..Launch::default()
             }),
             club: None,
             impact: None,
@@ -1844,7 +1839,7 @@ mod convert_tests {
 mod shot_fields_tests {
     use super::super::tests::{feed, test_state};
     use super::*;
-    use flighthook::{BallFlight, ClubData, Distance, ShotKey, Velocity};
+    use flighthook::{Basis, ClubData, Distance, FlightResult, Launch, ShotKey, Velocity};
 
     async fn shots_json(state: &Arc<WebState>, units: Option<&str>) -> serde_json::Value {
         let Json(shots) = get_shots(
@@ -1868,16 +1863,19 @@ mod shot_fields_tests {
             shot_id: "lat".into(),
             shot_number: 4,
         };
-        let ball = BallFlight {
+        let ball = Launch {
             launch_speed: Some(Velocity::MetersPerSecond(40.0)),
             launch_azimuth: Some(2.0),
             launch_elevation: Some(20.0),
+            backspin_rpm: Some(6000),
+            sidespin_rpm: Some(-800),
+            ..Launch::default()
+        };
+        let flight = FlightResult {
             carry_distance: Some(Distance::Meters(100.0)),
             carry_offline: Some(Distance::Meters(-1.5)),
             descent_angle: Some(44.2),
-            backspin_rpm: Some(6000),
-            sidespin_rpm: Some(-800),
-            ..BallFlight::default()
+            ..FlightResult::new(Basis::Modeled)
         };
         let club = ClubData {
             path: Some(3.0),
@@ -1890,11 +1888,15 @@ mod shot_fields_tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::ShotTrigger { key: key.clone() },
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::shot_trigger(key.clone()),
+                FlighthookEvent::Launch {
                     key: key.clone(),
-                    ball: Box::new(ball),
+                    launch: Box::new(ball),
                     derived: None,
+                },
+                FlighthookEvent::FlightResult {
+                    key: key.clone(),
+                    flight: Box::new(flight),
                 },
                 FlighthookEvent::ClubPath {
                     key: key.clone(),
@@ -1907,8 +1909,10 @@ mod shot_fields_tests {
 
         let json = shots_json(&state, None).await;
         let shot = &json[0];
-        assert_eq!(shot["ball"]["carry_offline"], "-1.5m", "{shot}");
-        assert_eq!(shot["ball"]["descent_angle"], 44.2, "{shot}");
+        assert_eq!(shot["flight"]["carry_offline"], "-1.5m", "{shot}");
+        assert_eq!(shot["flight"]["descent_angle"], 44.2, "{shot}");
+        assert_eq!(shot["flight"]["basis"], "modeled", "{shot}");
+        assert!(shot.get("ball").is_none(), "{shot}");
         let m = &shot["metrics"];
         assert_eq!(m["total_spin_rpm"], 6053, "{m}");
         let axis = m["spin_axis"].as_f64().expect("axis");
@@ -1925,7 +1929,7 @@ mod shot_fields_tests {
         let json = shots_json(&state, Some("imperial")).await;
         let shot = &json[0];
         let offline: Distance =
-            serde_json::from_value(shot["ball"]["carry_offline"].clone()).expect("offline");
+            serde_json::from_value(shot["flight"]["carry_offline"].clone()).expect("offline");
         assert!(matches!(offline, Distance::Yards(v) if (v + 1.640_42).abs() < 1e-4));
         let curve: Distance =
             serde_json::from_value(shot["metrics"]["curve"].clone()).expect("curve");
@@ -1947,13 +1951,13 @@ mod shot_fields_tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::ShotTrigger { key: key.clone() },
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::shot_trigger(key.clone()),
+                FlighthookEvent::Launch {
                     key: key.clone(),
-                    ball: Box::new(BallFlight {
+                    launch: Box::new(Launch {
                         launch_speed: Some(Velocity::MetersPerSecond(40.0)),
                         backspin_rpm: Some(6000),
-                        ..BallFlight::default()
+                        ..Launch::default()
                     }),
                     derived: None,
                 },
@@ -1971,7 +1975,7 @@ mod shot_fields_tests {
 mod group_tests {
     use super::super::tests::{TempDir, feed, test_state, web_state};
     use super::*;
-    use flighthook::{BallFlight, Handedness, ShotGrouping, ShotKey, Velocity};
+    use flighthook::{Handedness, Launch, ShotGrouping, ShotKey, Velocity};
 
     fn next_event(rx: &mut broadcast::Receiver<FlighthookMessage>) -> FlighthookMessage {
         rx.try_recv().expect("a bus message")
@@ -2415,12 +2419,12 @@ mod group_tests {
                 shot_number: n,
             };
             vec![
-                FlighthookEvent::ShotTrigger { key: key.clone() },
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::shot_trigger(key.clone()),
+                FlighthookEvent::Launch {
                     key: key.clone(),
-                    ball: Box::new(BallFlight {
+                    launch: Box::new(Launch {
                         launch_speed: Some(Velocity::MetersPerSecond(40.0)),
-                        ..BallFlight::default()
+                        ..Launch::default()
                     }),
                     derived: None,
                 },
@@ -3143,12 +3147,12 @@ mod group_tests {
                 FlighthookEvent::ClubInfo {
                     club_info: ClubInfo { club: Club::Iron7 },
                 },
-                FlighthookEvent::ShotTrigger { key: key.clone() },
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::shot_trigger(key.clone()),
+                FlighthookEvent::Launch {
                     key: key.clone(),
-                    ball: Box::new(BallFlight {
+                    launch: Box::new(Launch {
                         launch_speed: Some(Velocity::MetersPerSecond(40.0)),
-                        ..BallFlight::default()
+                        ..Launch::default()
                     }),
                     derived: None,
                 },
@@ -3220,12 +3224,12 @@ mod group_tests {
                 FlighthookEvent::ClubInfo {
                     club_info: ClubInfo { club: Club::Iron7 },
                 },
-                FlighthookEvent::ShotTrigger { key: key.clone() },
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::shot_trigger(key.clone()),
+                FlighthookEvent::Launch {
                     key: key.clone(),
-                    ball: Box::new(BallFlight {
+                    launch: Box::new(Launch {
                         launch_speed: Some(Velocity::MetersPerSecond(40.0)),
-                        ..BallFlight::default()
+                        ..Launch::default()
                     }),
                     derived: None,
                 },

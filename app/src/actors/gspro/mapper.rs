@@ -10,17 +10,21 @@ use flighthook::ShotData;
 /// FaceToTarget and Path with the same signs, so they are sent as they are,
 /// whatever the player's handedness.
 pub fn map_shot(shot: &ShotData) -> GsProMessage {
-    let contains_ball = shot.ball.is_some();
+    let contains_ball = shot.launch.is_some();
 
-    // Ball data: extract from Option<BallFlight>, zero-fill missing fields.
-    // A total spin with no axis goes out as backspin with no sidespin.
-    let (speed, vla, hla, carry_distance, bs, ss) = if let Some(ref b) = shot.ball {
+    // Ball data: the launch, zero-filling missing fields, and the device's
+    // carry. A total spin with no axis goes out as backspin with no
+    // sidespin.
+    let (speed, vla, hla, carry_distance, bs, ss) = if let Some(ref b) = shot.launch {
         let (back, side) = flighthook::spin_components(b);
         (
             b.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
             b.launch_elevation.unwrap_or(0.0),
             b.launch_azimuth.unwrap_or(0.0),
-            b.carry_distance.map(|d| d.as_yards()),
+            shot.flight
+                .as_ref()
+                .and_then(|f| f.carry_distance)
+                .map(|d| d.as_yards()),
             back.unwrap_or(0) as f64,
             side.unwrap_or(0) as f64,
         )
@@ -103,24 +107,19 @@ pub fn map_shot(shot: &ShotData) -> GsProMessage {
 pub(super) mod tests {
     use super::*;
     use flighthook::{
-        BallFlight, ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, FlightPath,
-        ShotData, Velocity,
+        ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, FlightPath, Launch, ShotData,
+        Velocity,
     };
 
     fn shot_with_impact(lateral_mm: f64, vertical_mm: f64) -> ShotData {
         ShotData {
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 launch_speed: Some(Velocity::MetersPerSecond(3.30)),
                 launch_elevation: Some(32.51),
                 launch_azimuth: Some(7.39),
-                carry_distance: None,
-                total_distance: None,
-                roll_distance: None,
-                max_height: None,
-                flight_time: None,
                 backspin_rpm: Some(621),
                 sidespin_rpm: Some(-87),
-                ..BallFlight::default()
+                ..Launch::default()
             }),
             club: Some(FhClubData {
                 club_speed: Some(Velocity::MetersPerSecond(3.26)),
@@ -152,18 +151,13 @@ pub(super) mod tests {
         ShotData {
             actor: "square.0".into(),
             shot_number: 12,
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 launch_speed: Some(Velocity::MetersPerSecond(53.6)),
                 launch_elevation: Some(17.0),
                 launch_azimuth: Some(-1.2),
-                carry_distance: None,
-                total_distance: None,
-                roll_distance: None,
-                max_height: None,
-                flight_time: None,
                 backspin_rpm: Some(6500),
                 sidespin_rpm: Some(-300),
-                ..BallFlight::default()
+                ..Launch::default()
             }),
             club: None,
             impact: None,
@@ -201,9 +195,10 @@ pub(super) mod tests {
         derived.total_distance = Some(Distance::Meters(154.6));
         derived.replaces_measured = true;
         let mut measured = square_like_shot(None);
-        if let Some(b) = measured.ball.as_mut() {
-            b.carry_distance = Some(Distance::Yards(171.0));
-        }
+        measured.flight = Some(flighthook::FlightResult {
+            carry_distance: Some(Distance::Yards(171.0)),
+            ..flighthook::FlightResult::new(flighthook::Basis::Modeled)
+        });
         let replacing = ShotData {
             derived: Some(derived),
             ..measured.clone()
@@ -283,12 +278,12 @@ pub(super) mod tests {
         let shot = ShotData {
             actor: "mevo.0".into(),
             shot_number: 3,
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 launch_speed: Some(Velocity::MetersPerSecond(60.0)),
                 launch_elevation: Some(14.0),
                 launch_azimuth: Some(1.0),
                 total_spin_rpm: Some(6897),
-                ..BallFlight::default()
+                ..Launch::default()
             }),
             ..ShotData::default()
         };
@@ -307,13 +302,13 @@ pub(super) mod tests {
         let chip = |back: Option<i32>, side: Option<i32>| ShotData {
             actor: "mevo.0".into(),
             shot_number: 3,
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 launch_speed: Some(Velocity::MetersPerSecond(7.019)),
                 launch_elevation: Some(22.8),
                 launch_azimuth: Some(-0.856),
                 backspin_rpm: back,
                 sidespin_rpm: side,
-                ..BallFlight::default()
+                ..Launch::default()
             }),
             ..ShotData::default()
         };

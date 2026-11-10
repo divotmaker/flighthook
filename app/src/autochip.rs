@@ -18,8 +18,8 @@ use dimple::aero::BallModel;
 use dimple::ground::Termination;
 use dimple::trajectory::{ShotInput, simulate_shot};
 use flighthook::{
-    AUTO_CHIP_ACTOR, BallFlight, FlighthookEvent, FlighthookMessage, MevoSection,
-    ShotDetectionMode, ShotKey, ShotRaw, SimulationSection, Velocity,
+    AUTO_CHIP_ACTOR, FlighthookEvent, FlighthookMessage, Launch, MevoSection, ShotDetectionMode,
+    ShotKey, ShotRaw, SimulationSection, Velocity,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -81,14 +81,14 @@ pub(crate) fn backspin_rpm(speed_mph: f64) -> i32 {
 
 /// The launch flighthook sends for a chip at `speed_mph`: straight, at
 /// [`LAUNCH_ELEVATION_DEG`], with [`backspin_rpm`] and no sidespin.
-pub(crate) fn ball(speed_mph: f64) -> BallFlight {
-    BallFlight {
+pub(crate) fn ball(speed_mph: f64) -> Launch {
+    Launch {
         launch_speed: Some(Velocity::MilesPerHour(speed_mph)),
         launch_elevation: Some(LAUNCH_ELEVATION_DEG),
         launch_azimuth: Some(0.0),
         backspin_rpm: Some(backspin_rpm(speed_mph)),
         sidespin_rpm: Some(0),
-        ..BallFlight::default()
+        ..Launch::default()
     }
 }
 
@@ -159,7 +159,7 @@ pub(crate) fn send(
     bus: &broadcast::Sender<FlighthookMessage>,
     yards: u32,
     shots: &AtomicU32,
-) -> Result<(ShotKey, BallFlight), SolveError> {
+) -> Result<(ShotKey, Launch), SolveError> {
     let source = ShotSource::AutoChip;
     state.round.register_source(AUTO_CHIP_ACTOR, source);
     if !state.round.allows(source.provenance()) {
@@ -181,7 +181,7 @@ pub(crate) fn send(
                 backspin_rpm(speed),
             );
             let _ = bus.send(
-                FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() })
+                FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()))
                     .actor(AUTO_CHIP_ACTOR)
                     .provenance(source.provenance()),
             );
@@ -191,12 +191,15 @@ pub(crate) fn send(
     let send = |event| {
         let _ = bus.send(FlighthookMessage::new(event).actor(AUTO_CHIP_ACTOR));
     };
-    send(sim::simulated_ball_flight_event(
+    for event in sim::simulated_launch_events(
         &cfg,
         key.clone(),
         ball.clone(),
+        None,
         Some(ShotDetectionMode::Chipping),
-    ));
+    ) {
+        send(event);
+    }
     send(FlighthookEvent::ShotFinished {
         key: key.clone(),
         raw: Some(Box::new(ShotRaw {
@@ -215,7 +218,7 @@ mod tests {
 
     /// The total the shot pipeline shows for a chip at `speed_mph`, yards.
     fn derived_total_yd(speed_mph: f64, cfg: &SimulationSection) -> f64 {
-        sim::derive(&ball(speed_mph), cfg)
+        sim::derive(&ball(speed_mph), None, cfg)
             .and_then(|d| d.total_distance)
             .map(Distance::as_yards)
             .expect("a simulated total")
@@ -269,8 +272,6 @@ mod tests {
         assert_eq!(b.launch_azimuth, Some(0.0));
         assert_eq!(b.backspin_rpm, Some(725));
         assert_eq!(b.sidespin_rpm, Some(0));
-        assert_eq!(b.carry_distance, None);
-        assert_eq!(b.total_distance, None);
         assert_eq!(backspin_rpm(7.254), 725);
         assert_eq!(backspin_rpm(7.256), 726);
     }
@@ -327,14 +328,14 @@ mod tests {
             state.round.source(AUTO_CHIP_ACTOR),
             Some(ShotSource::AutoChip)
         );
-        assert!(matches!(&events[0], FlighthookEvent::ShotTrigger { key: k } if *k == key));
-        let FlighthookEvent::BallFlight {
+        assert!(matches!(&events[0], FlighthookEvent::ShotTrigger { key: k, .. } if *k == key));
+        let FlighthookEvent::Launch {
             key: k,
-            ball: b,
+            launch: b,
             derived,
         } = &events[1]
         else {
-            panic!("not a ball flight: {:?}", events[1]);
+            panic!("not a launch: {:?}", events[1]);
         };
         assert_eq!(*k, key);
         assert_eq!(**b, ball);
@@ -368,7 +369,7 @@ mod tests {
         send(&state, &tx, 3, &AtomicU32::new(0)).expect("sent");
         let derived = std::iter::from_fn(|| rx.try_recv().ok())
             .find_map(|msg| match msg.event {
-                FlighthookEvent::BallFlight { derived, .. } => Some(derived),
+                FlighthookEvent::Launch { derived, .. } => Some(derived),
                 _ => None,
             })
             .expect("a ball flight")
@@ -414,7 +415,7 @@ mod tests {
         let cfg = SimulationSection::default();
         for yards in AUTO_CHIP_YARDS {
             let speed = solve_speed(f64::from(yards), &cfg).expect("solved");
-            let d = sim::derive(&ball(speed), &cfg).expect("derived");
+            let d = sim::derive(&ball(speed), None, &cfg).expect("derived");
             println!(
                 "{yards} yd: {speed:.3} mph, backspin {} rpm, carry {:.2} yd, roll {:.2} yd, total {:.3} yd",
                 backspin_rpm(speed),
@@ -423,5 +424,20 @@ mod tests {
                 d.total_distance.expect("total").as_yards(),
             );
         }
+    }
+
+    /// Every output's numbers for an Auto-chip.
+    #[test]
+    fn outputs_keep_their_numbers() {
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-autochip-test-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, _writer) = SystemState::new(dir.join("config.toml"));
+        let (tx, mut rx) = broadcast::channel(16);
+        send(&state, &tx, 5, &AtomicU32::new(0)).expect("sent");
+        let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let _ = std::fs::remove_dir_all(dir);
+        crate::test_ball::assert_outputs_pinned("auto_chip", &messages);
     }
 }

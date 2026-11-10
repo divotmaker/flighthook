@@ -984,11 +984,20 @@ pub fn connect_ws() -> Option<(ewebsock::WsSender, ewebsock::WsReceiver)> {
     }
 }
 
+/// The `start` the dashboard sends: it proposes the FRP version flighthook
+/// speaks ([`flighthook::FRP_VERSION`]).
+fn ws_start() -> String {
+    serde_json::json!({
+        "kind": "start",
+        "version": [flighthook::FRP_VERSION],
+        "name": "Flighthook Dashboard",
+    })
+    .to_string()
+}
+
 /// Send the init handshake after the WebSocket is confirmed open.
 pub fn send_ws_start(tx: &mut ewebsock::WsSender) {
-    tx.send(ewebsock::WsMessage::Text(
-        r#"{"kind":"start","version":["0.1.0"],"name":"Flighthook Dashboard"}"#.into(),
-    ));
+    tx.send(ewebsock::WsMessage::Text(ws_start()));
 }
 
 /// Result from polling the WebSocket.
@@ -1043,7 +1052,7 @@ pub fn poll_ws(rx: &mut ewebsock::WsReceiver) -> (Vec<WsPollEvent>, u64) {
 }
 
 /// Parse a WS init response:
-/// `{ "kind": "init", "version": "0.1.0", "actor_id": "...", "global_state": {...} }`
+/// `{ "kind": "init", "version": "0.2.0", "actor_id": "...", "global_state": {...} }`
 fn parse_init_response(text: &str) -> Option<WsPollEvent> {
     #[derive(serde::Deserialize)]
     struct InitMsg {
@@ -1066,9 +1075,19 @@ fn parse_init_response(text: &str) -> Option<WsPollEvent> {
 mod tests {
     use super::*;
 
+    /// The dashboard proposes the FRP version its server speaks.
+    #[test]
+    fn start_proposes_frp_0_2_0() {
+        let start: serde_json::Value = serde_json::from_str(&ws_start()).expect("json");
+        assert_eq!(start["kind"], "start");
+        assert_eq!(start["version"], serde_json::json!(["0.2.0"]));
+        assert_eq!(start["name"], "Flighthook Dashboard");
+        assert_eq!(flighthook::FRP_VERSION, "0.2.0");
+    }
+
     #[test]
     fn init_carries_the_global_club() {
-        let text = r#"{"kind":"init","version":"0.1.0","actor_id":"ws.1",
+        let text = r#"{"kind":"init","version":"0.2.0","actor_id":"ws.1",
             "global_state":{"player_info":null,"club_info":{"club":"7I"},"mode":"full","handed":null}}"#;
         let Some(WsPollEvent::Init {
             actor_id,
@@ -1092,7 +1111,7 @@ mod tests {
     fn the_hand_round_trips_on_the_wire() {
         use crate::types::{FlighthookEvent, HandInfo};
 
-        let init = r#"{"kind":"init","version":"0.1.0","actor_id":"ws.1",
+        let init = r#"{"kind":"init","version":"0.2.0","actor_id":"ws.1",
             "global_state":{"player_info":null,"club_info":null,"mode":null,"handed":"lh"}}"#;
         let Some(WsPollEvent::Init { global_state, .. }) = parse_init_response(init) else {
             panic!("not an init");

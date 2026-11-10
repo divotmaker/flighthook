@@ -11,16 +11,22 @@ shots in real time.
 Shot data arrives as a sequence of correlated events sharing a `ShotKey`:
 
 1. `shot_trigger` -- ball strike detected (no data yet)
-2. `ball_flight` -- ball flight data (speed, angles, distances, spin), plus
-   `derived` values flighthook simulated for fields the device didn't report,
-   or for every result field under `[simulation] mode = "force"` (beta; see
-   [ball_flight](#ball_flight))
-3. `club_path` -- club data (speed, path, attack angle, face angle, loft)
-4. `face_impact` -- face impact location
-5. `shot_finished` -- shot complete, accumulators should finalize
+2. `launch` -- the measured launch (speed, angles, spin), plus `derived`
+   values flighthook simulated for what the device didn't report, or for
+   every result field under `[simulation] mode = "force"` (beta; see
+   [launch](#launch))
+3. `flight_result` -- the device's flight values (carry, apex, flight time
+   and so on) with the `basis` they were obtained on; flighthook's own
+   simulated result when the device sent none (see
+   [flight_result](#flight_result))
+4. `club_path` -- club data (speed, path, attack angle, face angle, loft)
+5. `face_impact` -- face impact location
+6. `shot_finished` -- shot complete, accumulators should finalize
 
-Use the `ShotAccumulator` pattern (or wait for `shot_finished`) to collect the
-full shot. All `BallFlight` and `ClubData` fields are `Option` (matching FRP spec).
+The shot's events between its trigger and its finish may arrive in any order.
+Use the `ShotAggregator` pattern (or wait for `shot_finished`) to collect the
+full shot. All `Launch`, `FlightResult` and `ClubData` fields are `Option`
+(matching the FRP spec), except a flight result's `basis`.
 
 Velocities and distances are unit-tagged strings (e.g. `"67.2mps"`,
 `"180.5m"`). To convert to a standard unit system without parsing suffixes
@@ -50,7 +56,7 @@ Other useful events on the same connection:
 ```bash
 # Stream shots with websocat + jq (install: cargo install websocat)
 # Send the init handshake, keep stdin open to hold the connection, filter for shot events
-(echo '{"kind":"start","version":["0.1.0"],"name":"cli"}'; cat) | \
+(echo '{"kind":"start","version":["0.2.0"],"name":"cli"}'; cat) | \
   websocat ws://localhost:5880/frp | \
   jq 'select(.event.kind == "shot_finished")'
 ```
@@ -70,30 +76,34 @@ import json, websockets, asyncio
 async def main():
     async with websockets.connect("ws://localhost:5880/frp") as ws:
         # Init handshake
-        await ws.send(json.dumps({"kind": "start", "version": ["0.1.0"], "name": "my-dashboard"}))
+        await ws.send(json.dumps({"kind": "start", "version": ["0.2.0"], "name": "my-dashboard"}))
         init = json.loads(await ws.recv())
         print(f"Connected: actor_id={init['actor_id']}")
 
         # Accumulate shot data
-        shots = {}  # key: (actor, shot_id) -> {ball, club}
+        shots = {}  # key: (actor, shot_id) -> {launch, flight, club}
         async for raw in ws:
             msg = json.loads(raw)
             ev = msg["event"]
             kind = ev["kind"]
+            if "key" not in ev:
+                continue
+            key = (msg["actor"], ev["key"]["shot_id"])
 
-            if kind == "ball_flight":
-                key = (msg["actor"], ev["key"]["shot_id"])
-                shots[key] = {"ball": ev["ball"]}
-            elif kind == "club_path":
-                key = (msg["actor"], ev["key"]["shot_id"])
-                if key in shots:
-                    shots[key]["club"] = ev["club"]
+            if kind == "shot_trigger":
+                shots[key] = {}
+            elif kind == "launch" and key in shots:
+                shots[key]["launch"] = ev["launch"]
+            elif kind == "flight_result" and key in shots:
+                shots[key]["flight"] = ev["flight"]
+            elif kind == "club_path" and key in shots:
+                shots[key]["club"] = ev["club"]
             elif kind == "shot_finished":
-                key = (msg["actor"], ev["key"]["shot_id"])
                 shot = shots.pop(key, None)
                 if shot:
                     print(f"Shot #{ev['key']['shot_number']}: "
-                          f"speed={shot['ball']['launch_speed']}")
+                          f"speed={shot.get('launch', {}).get('launch_speed')} "
+                          f"carry={shot.get('flight', {}).get('carry_distance')}")
 
 asyncio.run(main())
 ```
@@ -105,7 +115,7 @@ const ws = new WebSocket("ws://localhost:5880/frp");
 const shots = new Map();
 
 ws.onopen = () => {
-  ws.send(JSON.stringify({ kind: "start", version: ["0.1.0"], name: "my-dashboard" }));
+  ws.send(JSON.stringify({ kind: "start", version: ["0.2.0"], name: "my-dashboard" }));
 };
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
@@ -117,8 +127,14 @@ ws.onmessage = (e) => {
   const key = event.key ? `${actor}:${event.key.shot_id}` : null;
 
   switch (event.kind) {
-    case "ball_flight":
-      shots.set(key, { ball: event.ball });
+    case "shot_trigger":
+      shots.set(key, {});
+      break;
+    case "launch":
+      if (shots.has(key)) shots.get(key).launch = event.launch;
+      break;
+    case "flight_result":
+      if (shots.has(key)) shots.get(key).flight = event.flight;
       break;
     case "club_path":
       if (shots.has(key)) shots.get(key).club = event.club;
@@ -126,7 +142,7 @@ ws.onmessage = (e) => {
     case "shot_finished":
       const shot = shots.get(key);
       shots.delete(key);
-      if (shot) console.log(`Shot #${event.key.shot_number}`, shot.ball);
+      if (shot) console.log(`Shot #${event.key.shot_number}`, shot.launch, shot.flight);
       break;
   }
 };
@@ -318,17 +334,20 @@ produced no data for (no ball, club or impact) are kept for the
     "club_selected": "7I",
     "group": "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
     "handed": "rh",
-    "ball": {
+    "launch": {
       "launch_speed": "67.2mps",
       "launch_azimuth": -1.3,
       "launch_elevation": 14.2,
+      "backspin_rpm": 3200,
+      "sidespin_rpm": -450
+    },
+    "flight": {
+      "basis": "modeled",
       "carry_distance": "180.5m",
       "carry_offline": "-7.6m",
       "max_height": "28.3m",
       "flight_time": 6.4,
-      "descent_angle": 48.2,
-      "backspin_rpm": 3200,
-      "sidespin_rpm": -450
+      "descent_angle": 48.2
     },
     "derived": {
       "roll_distance": "11.2m",
@@ -366,8 +385,11 @@ With `?units=imperial`:
 
 ```json
 {
-  "ball": {
-    "launch_speed": "150.3mph",
+  "launch": {
+    "launch_speed": "150.3mph"
+  },
+  "flight": {
+    "basis": "modeled",
     "carry_distance": "197.4yd",
     "carry_offline": "-8.3yd",
     "max_height": "92.8ft"
@@ -393,23 +415,33 @@ With `?units=imperial`:
 }
 ```
 
-- `ball`: `BallFlight` or `null`. Launch conditions and distances, exactly as
-  the device measured them, except on a shot flagged `derived.spin_estimated`:
-  its spin is flighthook's estimate, and the device's 0 carry, apex and flight
-  time are left out; and any value `derived.computed` lists, which comes
-  from a model rather than the device's readings. All fields are `Option`.
-  Velocity fields are unit-tagged strings (`"67.2mps"`, `"150.3mph"`).
-  Distance fields are unit-tagged strings (`"180.5m"`, `"197.4yd"`).
+- `launch`: `Launch` or absent. The launch (speed, angles, spin), exactly as
+  the device measured it, except on a shot flagged `derived.spin_estimated`:
+  its spin is flighthook's estimate; and any value `derived.computed` lists,
+  which comes from a model rather than the device's readings. All fields are
+  `Option`. Velocity fields are unit-tagged strings (`"67.2mps"`,
+  `"150.3mph"`). See [launch](#launch) for the fields.
+- `flight`: `FlightResult` or absent. The device's flight values (carry,
+  offline, total, roll, apex, flight time, descent), with the `basis` they
+  were obtained on; see [flight_result](#flight_result). Absent when the
+  device reported none (a launch-only device; a launch-only chip, whose 0
+  carry, apex and flight time are no reading). Distance fields are
+  unit-tagged strings (`"180.5m"`, `"197.4yd"`).
 - `derived`: `DerivedFlight` or absent. Values simulated for fields the device
-  didn't report, or for every result field under `mode = "force"` (beta); see [ball_flight](#ball_flight) for the fields.
-  Converted by `?units=` like `ball` (distances to yards/meters, `max_height`
+  didn't report, or for every result field under `mode = "force"` (beta); see [launch](#launch) for the fields.
+  Converted by `?units=` like `flight` (distances to yards/meters, `max_height`
   to feet/meters); `path`, when present, is always meters/seconds and is
   never converted.
+
+A shot stored in the shape with one `ball` block (launch and flight values
+together) reads back with them split into `launch` and a modeled `flight`,
+for example in `POST /api/shots/convert`.
 - `club`: `ClubData` or `null`. Club head data. All fields are `Option`.
 - `impact`: `FaceImpact` or `null`. Face impact location.
 - `metrics`: `ShotMetrics` or absent. Values computed from the measured
-  `ball` and `club` when the shot finished (see [Shot metrics](#shot-metrics)).
-  `curve` is converted by `?units=` like `ball`.
+  `launch`, the device's `flight` and `club` when the shot finished (see
+  [Shot metrics](#shot-metrics)). `curve` is converted by `?units=` like
+  `flight`.
 - `shot_id`: the shot's `key.shot_id` from its lifecycle events.
 - `club_selected`: club in play when the shot was triggered (`PT` for an
   ExPutt shot); absent when none was selected.
@@ -465,8 +497,9 @@ With `?units=imperial`:
 
 #### Shot metrics
 
-`metrics` holds values flighthook computes from the shot's measured `ball`
-and `club` when the shot finishes, so consumers don't each compute them. The
+`metrics` holds values flighthook computes from the shot's measured `launch`,
+the device's `flight` and `club` when the shot finishes, so consumers don't
+each compute them. The
 formulas and signs are the Flight Relay Protocol's spin relations and
 "Derived Values":
 
@@ -476,15 +509,15 @@ formulas and signs are the Flight Relay Protocol's spin relations and
 | `spin_axis` | number (deg) | `atan2(sidespin_rpm, backspin_rpm)`; + = tilted right, curves the ball right | as `total_spin_rpm`, and the total is not 0 |
 | `face_to_path` | number (deg) | `face_angle − path`; + = face right of the club path | the device sent both |
 | `spin_loft` | number (deg) | `dynamic_loft − attack_angle`, an approximation of the measured 3D spin loft | the device sent both and no `spin_loft` of its own |
-| `curve` | Distance | `carry_offline − carry_distance × tan(launch_azimuth)`, in a common unit; + = curved right | the device sent all three |
+| `curve` | Distance | `carry_offline − carry_distance × tan(launch_azimuth)`, in a common unit; + = curved right | the device sent all three (carry and its offline in `flight`) |
 
 Each field is absent when an input is missing (or not a finite number), and
 `metrics` is absent when no field is present. Every input is a measured
 value: `derived` (the simulation) is never used, so a shot without a measured
 `carry_offline` has no `curve`. When the device reports total spin and axis
-itself (R10, Square Golf, Open Connect), they are under `ball`, not here; the
-same goes for a measured `spin_loft` under `club`. To show total spin and
-spin axis for any device, read `ball.total_spin_rpm` and `ball.spin_axis`
+itself (R10, Square Golf, Open Connect), they are under `launch`, not here;
+the same goes for a measured `spin_loft` under `club`. To show total spin and
+spin axis for any device, read `launch.total_spin_rpm` and `launch.spin_axis`
 first, else `metrics.total_spin_rpm` and `metrics.spin_axis`; likewise
 `club.spin_loft`, else `metrics.spin_loft`. Lateral values are
 absolute: + is right of the target line for every golfer. `metrics` is on
@@ -1046,8 +1079,8 @@ the Shots tab's default view (see [POST /api/shots/grouping](#post-apishotsgroup
 A shot is assigned its set when it **triggers**, using the club in play at
 that moment, and joins it when it finishes with data. A club change or a New
 set during a flight applies to the next shot. A shot that never finishes
-(the device triggers again first, or drops out with any status but
-`connected`) leaves its set uncounted. A device that disconnects and
+(the device triggers another shot first, drops out with any status but
+`connected`, or 30 s pass) leaves its set uncounted. A device that disconnects and
 reconnects keeps the open set: its next shot with the same club joins it.
 
 **Response** `200 OK` -- `ShotGroupsResponse`:
@@ -1267,7 +1300,7 @@ shows depends on its own ground (e.g. its green speed).
 The shot goes on the bus as actor `autochip` (no `device`), numbered from 1
 in this run of flighthook (a request that fails takes no number), with the
 shot lifecycle a launch monitor emits: [`shot_trigger`](#shot_trigger),
-[`ball_flight`](#ball_flight) with `derived` simulated as for a shot in
+[`launch`](#launch) with `derived` simulated as for a shot in
 chipping mode (also with `[simulation] mode = "off"`: the simulated carry and
 total are the chip's only results), and [`shot_finished`](#shot_finished)
 (its `raw` has `transport` `"none"`). So it appears in
@@ -1308,8 +1341,8 @@ disk.
 - `Cache-Control: no-store`
 
 With no shots stored, the body is empty (CSV: the header row only). Shots the
-device produced no data for are included: their `data` has no `ball`, `club`,
-`impact` or `group`, and `raw` shows what the device sent.
+device produced no data for are included: their `data` has no `launch`,
+`flight`, `club`, `impact` or `group`, and `raw` shows what the device sent.
 
 Camera clips are never exported: `data` carries no `video`, and nothing
 names a camera. Swing video shows the player; it stays on the computer
@@ -1319,8 +1352,8 @@ running flighthook.
 
 ```json
 {
-  "schema": 1,
-  "flighthook_version": "0.1.14",
+  "schema": 2,
+  "flighthook_version": "0.1.25",
   "exported_at": "2026-10-25T21:04:11.123Z",
   "time": "2026-10-25T20:58:03.412Z",
   "actor": "mevo.0",
@@ -1342,7 +1375,8 @@ running flighthook.
     "club_selected": "8I",
     "group": "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
     "handed": "rh",
-    "ball": { "launch_speed": "37.9mps", "launch_azimuth": -3.1, "launch_elevation": 23.9, "carry_distance": "95.2m", "backspin_rpm": 6897, "sidespin_rpm": 0 },
+    "launch": { "launch_speed": "37.9mps", "launch_azimuth": -3.1, "launch_elevation": 23.9, "backspin_rpm": 6897, "sidespin_rpm": 0 },
+    "flight": { "basis": "modeled", "carry_distance": "95.2m" },
     "club": { "club_speed": "31.2mps", "path": 1.1, "attack_angle": -9.8, "face_angle": 0.4 }
   },
   "raw": {
@@ -1358,7 +1392,11 @@ running flighthook.
 }
 ```
 
-- `schema`: export format version (`1`). Bumped when a field changes meaning.
+- `schema`: export format version (`2`). Bumped when a field changes meaning.
+  Schema 2 has the launch and the device's flight values in `data.launch` and
+  `data.flight`; a schema 1 line has both in one `data.ball` block. The
+  `flighthook` crate's `ShotExport` reads either into the schema 2 shape
+  (`ball`'s flight values become a `flight` with `basis` `"modeled"`).
 - `time`: when `shot_trigger` reached the web layer (host clock, RFC 3339 UTC).
 - `device`: `kind` (`flightscope`, `square_golf`, `garmin_r10`, `exputt`,
   `openconnect`, `mock`) plus manufacturer, model and firmware as the device reported them.
@@ -1389,8 +1427,8 @@ missing value. Units are fixed per column and named in the header (imperial:
 mph, yd, ft for heights, in for club offset/height/low point; metric: mps,
 m). Face impact is always mm. `environment` is the FlightScope environment in
 effect (configured value, else the default). `group` is the set id (empty when
-the shot has no data). Unprefixed columns are the device's measured values
-(`ball`, `club`, `impact`); `sim_*` columns are the `derived` block and
+the shot has no data). Unprefixed columns are the device's values (`launch`,
+`flight`, `club`, `impact`); `sim_*` columns are the `derived` block and
 `metrics_*` columns the [shot metrics](#shot-metrics). With `[simulation]
 mode = "force"`, a shot can have both a device column (`carry_*`) and its
 `sim_*` column filled; the CSV does not say which one takes precedence (the
@@ -1447,15 +1485,18 @@ unit-tagged strings and re-implement conversion math.
 {
   "actor": "mevo.0",
   "shot_number": 42,
-  "ball": {
+  "launch": {
     "launch_speed": "67.2mps",
     "launch_azimuth": -1.3,
     "launch_elevation": 14.2,
-    "carry_distance": "180.5m",
-    "max_height": "28.3m",
-    "total_distance": "195.0m",
     "backspin_rpm": 3200,
     "sidespin_rpm": -450
+  },
+  "flight": {
+    "basis": "modeled",
+    "carry_distance": "180.5m",
+    "max_height": "28.3m",
+    "total_distance": "195.0m"
   },
   "club": {
     "club_speed": "42.1mps",
@@ -1472,8 +1513,11 @@ unit-tagged strings and re-implement conversion math.
 
 ```json
 {
-  "ball": {
-    "launch_speed": "150.3mph",
+  "launch": {
+    "launch_speed": "150.3mph"
+  },
+  "flight": {
+    "basis": "modeled",
     "carry_distance": "197.4yd",
     "max_height": "92.8ft",
     "total_distance": "213.3yd"
@@ -1733,7 +1777,7 @@ Full persisted config (mirrors `config.toml`).
   Settings → Simulation (useful with radar launch monitors that miss short chips). With `"mode": "force"`, every simulated shot's results
   (carry, apex, flight time, descent, offline, roll, total) come from the
   simulation for every device, and its `derived` block carries all of them
-  with `replaces_measured: true`; the device's own results stay under `ball`.
+  with `replaces_measured: true`; the device's own results stay under `flight`.
   Launch values are never replaced. `simulation` is **omitted while every
   setting is at its default**; an absent `simulation` means the defaults.
   Every key is optional when posting. An out-of-range altitude or temperature
@@ -2079,11 +2123,12 @@ Text-frame JSON messages in both directions.
 ### FRP Version Negotiation
 
 The server performs FRP version negotiation on the `start` handshake. The client
-sends an array of supported versions; the server selects the highest mutually
-supported version. If no compatible version exists, the server sends a `critical`
-alert and closes the connection.
+sends an array of supported versions; the server accepts its own FRP version
+when the array has it. If not, the server sends a `critical` alert and closes
+the connection.
 
-Currently supported versions: `0.1.0`.
+flighthook speaks FRP `0.2.0` (the `flightrelay` crate's `SPEC_VERSION`), and
+only that version.
 
 ### Init Handshake (FRP-compliant)
 
@@ -2094,7 +2139,7 @@ Before streaming begins, the client must complete a handshake:
 ```json
 {
   "kind": "start",
-  "version": ["0.1.0"],
+  "version": ["0.2.0"],
   "name": "My Dashboard"
 }
 ```
@@ -2103,13 +2148,14 @@ Before streaming begins, the client must complete a handshake:
 - `version` (required): array of supported FRP versions
 - `name` (optional): human-readable client identifier for server-side logging.
   Defaults to `"anonymous"` if empty or omitted.
+- `raw_frames` (optional): ignored. flighthook sends no `raw_frame` events.
 
 2. **Server responds** with an `init` message:
 
 ```json
 {
   "kind": "init",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "actor_id": "ws.a1b2c3d4",
   "global_state": {
     "player_info": null,
@@ -2138,6 +2184,35 @@ Before streaming begins, the client must complete a handshake:
 4. **Server streams** `FlighthookMessage` events (described below).
 
 Messages sent before the `start` handshake (except `close`) are ignored.
+
+### Forwarding
+
+flighthook forwards its devices' shots to every `/frp` client, the
+dashboard included, with FRP 0.2.0's forwarding rules:
+
+- A shot event (`shot_trigger`, `launch`, `flight_result`, `club_path`,
+  `face_impact`, `shot_finished`) goes out once per device, shot and kind
+  within 30 s; a repeat is dropped.
+- `device_telemetry` goes out when it changes something the device last
+  reported (the replay on connect always goes out). When the device's
+  `actor_status` leaves `connected`, this is forgotten: its next session's
+  telemetry goes out in full.
+- A device's `alert` goes out once per identical message within 30 s.
+  flighthook's own alerts (no `device`) and its extension events always go
+  out.
+- `launch` holds only measured values: a value flighthook estimated (the
+  spin of a [launch-only chip](devices/flightscope.md#launch-only-chips-beta),
+  `derived.spin_estimated`) is left out of it, and goes out in flighthook's
+  own `flight_result` instead (next point).
+- For a shot whose device sent no `flight_result`, flighthook sends its own
+  when it simulated the shot: just before the shot's `shot_finished`, with
+  `basis` `"modeled"`, `model` `"flighthook simulation (dimple)"`, the
+  simulated flight values, and in `assumed` the launch values it estimated.
+  See [flight_result](#flight_result).
+
+`/api/shots` and the export serve the shot as flighthook holds it: the
+estimated spin in `launch`, marked by `derived.spin_estimated`, and the
+simulated values in `derived`.
 
 ---
 
@@ -2194,29 +2269,31 @@ Ball strike detected. Emitted immediately by the launch monitor -- no data yet.
 
 - `key.shot_id`: UUID v4 string, globally unique across sessions
 - `key.shot_number`: session-level monotonic counter from the launch monitor
+- `timestamp` (optional): when the device detected the strike, milliseconds
+  since the Unix epoch (UTC), by the device's clock. No supported device
+  reports one yet, so it is absent.
+
+A shot that has not finished within 30 s of its trigger is dropped: its
+later events are ignored (FRP's accumulator timeout).
 
 ---
 
-##### ball_flight
+##### launch
 
-Ball flight data available. May arrive before or after `club_path`.
+The ball's launch, as the device measured it. May arrive before or after
+`flight_result` and `club_path`.
 
 ```json
 {
   "actor": "mevo.0",
   "device": "FS-M2-XXXXXX",
   "event": {
-    "kind": "ball_flight",
+    "kind": "launch",
     "key": { "shot_id": "550e8400-...", "shot_number": 42 },
-    "ball": {
+    "launch": {
       "launch_speed": "67.2mps",
       "launch_azimuth": -1.3,
       "launch_elevation": 14.2,
-      "carry_distance": "180.5m",
-      "carry_offline": "-7.6m",
-      "max_height": "28.3m",
-      "flight_time": 6.4,
-      "descent_angle": 48.2,
       "backspin_rpm": 3200,
       "sidespin_rpm": -450
     },
@@ -2230,14 +2307,56 @@ Ball flight data available. May arrive before or after `club_path`.
 }
 ```
 
-All `BallFlight` fields are `Option`. Missing fields are omitted from the JSON.
-`ball` is FRP's `BallFlight`, as the device measured it:
+All `Launch` fields are `Option`. Missing fields are omitted from the JSON.
+`launch` is FRP's `Launch`:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `launch_speed` | Velocity | Ball speed at launch |
 | `launch_azimuth` | number (deg) | Horizontal launch angle, + right of the target line |
 | `launch_elevation` | number (deg) | Vertical launch angle |
+| `backspin_rpm` | integer | Backspin, + = backspin, − = topspin |
+| `sidespin_rpm` | integer | Sidespin, + = curves the ball right |
+| `total_spin_rpm` | integer | Total spin, never negative |
+| `spin_axis` | number (deg) | Spin axis tilt, + = tilted right (curves the ball right); absent when the total is 0 |
+
+Lateral values are absolute: + is right of the target line for every golfer.
+On the bus and in `/api/shots`, the spin of a shot flagged
+`derived.spin_estimated` is flighthook's estimate; on `/frp` such a spin is
+left out of `launch` (see [Forwarding](#forwarding)).
+
+##### flight_result
+
+The ball's flight: where it landed, where it came to rest, and how it flew.
+At most one per shot; may arrive before or after `launch` and `club_path`.
+
+```json
+{
+  "actor": "mevo.0",
+  "device": "FS-M2-XXXXXX",
+  "event": {
+    "kind": "flight_result",
+    "key": { "shot_id": "550e8400-...", "shot_number": 42 },
+    "flight": {
+      "basis": "modeled",
+      "carry_distance": "180.5m",
+      "carry_offline": "-7.6m",
+      "max_height": "28.3m",
+      "flight_time": 6.4,
+      "descent_angle": 48.2
+    }
+  }
+}
+```
+
+`flight` is FRP's `FlightResult`. `basis` is required: `"tracked"` (the
+device followed the ball's flight) or `"modeled"` (a flight model produced
+the values, the device's own included). Every other field is optional:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `basis` | string | `"tracked"` or `"modeled"` |
+| `model` | string | Name of the flight model, when known |
 | `carry_distance` | Distance | Tee to landing |
 | `carry_offline` | Distance | Landing point right (+) or left (−) of the target line |
 | `total_distance` | Distance | Tee to rest |
@@ -2246,16 +2365,41 @@ All `BallFlight` fields are `Option`. Missing fields are omitted from the JSON.
 | `max_height` | Distance | Apex |
 | `flight_time` | number (s) | Launch to landing |
 | `descent_angle` | number (deg) | Angle below horizontal at landing |
-| `backspin_rpm` | integer | Backspin, + = backspin, − = topspin |
-| `sidespin_rpm` | integer | Sidespin, + = curves the ball right |
-| `total_spin_rpm` | integer | Total spin, never negative |
-| `spin_axis` | number (deg) | Spin axis tilt, + = tilted right (curves the ball right); absent when the total is 0 |
+| `assumed` | object | Launch values a `modeled` result assumed because the shot's `launch` lacks them (same fields as `launch`) |
 
-Lateral values are absolute: + is right of the target line for every golfer.
 `carry_offline` and `descent_angle` are absent for a ball that did not fly.
-Which fields each device sends:
+A device's flight values go out with `basis` `"modeled"`: FlightScope's come
+from its own flight model, and an Open Connect monitor's carry is not known
+to be tracked. A device that sends no flight values (R10, Square Golf,
+ExPutt) sends no `flight_result`; nor does a FlightScope launch-only chip.
 
-| Device | `carry_offline` | `descent_angle` | `total_spin_rpm` + `spin_axis` |
+flighthook adds its own `flight_result` on `/frp` for a shot whose device
+sent none and that it simulated (see [Forwarding](#forwarding)): `"basis":
+"modeled"`, `"model": "flighthook simulation (dimple)"`, the `derived`
+flight values, and the estimated spin of a launch-only chip in `assumed`:
+
+```json
+"flight": {
+  "basis": "modeled",
+  "model": "flighthook simulation (dimple)",
+  "carry_distance": "11.9m",
+  "carry_offline": "-0.2m",
+  "total_distance": "14.6m",
+  "total_offline": "-0.2m",
+  "roll_distance": "2.7m",
+  "max_height": "1.6m",
+  "flight_time": 1.1,
+  "descent_angle": 36.1,
+  "assumed": { "backspin_rpm": 1570, "sidespin_rpm": 0 }
+}
+```
+
+It is never on the bus or in `/api/shots`, which keep the simulated values in
+`derived`.
+
+Which launch and flight fields each device sends:
+
+| Device | `flight.carry_offline` | `flight.descent_angle` | `launch.total_spin_rpm` + `launch.spin_axis` |
 | --- | --- | --- | --- |
 | FlightScope full result (`D4`) | yes (landing position) | yes (landing velocity) | no (components only); the total alone, no components, when an Xi's **Spin source (Xi)** uses E8 and the shot has no club data |
 | FlightScope estimate (`E8`) | yes | no | no (backspin only) |
@@ -2270,8 +2414,9 @@ device doesn't send, flighthook may compute from the ones it does: see
 
 **`derived` (beta)** is a flighthook extension: values simulated from the
 measured launch with the [dimple](https://crates.io/crates/dimple) ball-flight
-model, for fields the device did not report. Every field under `ball` is
-measured; every field under `derived` is simulated. A measured
+model, for fields the device did not report. Every field under `launch` is
+measured and every field under `flight` is the device's; every field under
+`derived` is simulated. A measured
 `carry_offline` or `descent_angle` keeps the field out of `derived` (except
 under `force`). A field is in both only
 when the `derived` value is the one to show: a measured carry or flight time
@@ -2281,7 +2426,7 @@ for any carry, apex or flight time the device measured other than exactly 0. Wit
 `[simulation] mode = "force"`, `derived` carries
 every result field whether or not the device measured it, plus
 `"replaces_measured": true`: a consumer shows the `derived` values in place of
-the measured ones, which stay unchanged under `ball`. FRP consumers ignore
+the device's, which stay unchanged under `flight`. FRP consumers ignore
 `derived` as an unknown field. It is absent when `[simulation] mode` is
 `"off"` or when the launch can't be simulated — including a shot with no
 spin reading (back and side both 0) — see the README's "Simulated values"
@@ -2290,13 +2435,14 @@ always has one: `"derived": {"spin_estimated": true}` when it was not
 simulated, and so does a shot with `computed` values (`"derived":
 {"computed": [...]}`). It is never sent to GSPro.
 
-`"spin_estimated": true` marks the spin under `ball` (`backspin_rpm`,
+`"spin_estimated": true` marks the spin under `launch` (`backspin_rpm`,
 `sidespin_rpm`) as flighthook's estimate rather than the device's reading:
 a FlightScope result with launch data but no spin
 ([Launch-only chips](devices/flightscope.md#launch-only-chips-beta)). The
-spin stays under `ball` and is sent to GSPro like a measured one.
+spin stays under `launch` and is sent to GSPro like a measured one; `/frp`
+sends it in `assumed` instead ([Forwarding](#forwarding)).
 
-`"computed"` lists the values under `ball` (or the shot's face impact) that
+`"computed"` lists the values under `launch` (or the shot's face impact) that
 come from a model (aerodynamic, flight or otherwise) rather than from the
 device's readings; they stay where they are and go to GSPro as before. A
 plain translation of a reading is not computed: the other spin pair worked
@@ -2330,7 +2476,7 @@ is a green, else `"green"`) and on the configured `surface` otherwise.
 A launch-monitor-only device such as the Square Golf Omni gets the full set:
 
 ```json
-"ball": {
+"launch": {
   "launch_speed": "53.6mps",
   "launch_azimuth": -1.2,
   "launch_elevation": 17.0,
@@ -2362,8 +2508,8 @@ A launch-monitor-only device such as the Square Golf Omni gets the full set:
 | `total_distance` | Distance | Tee to rest. Only when the device didn't report total, or `replaces_measured` |
 | `total_offline` | Distance | Rest position right (+) or left (−) of the target line |
 | `path` | FlightPath | Simulated ball path, tee to rest (see below) |
-| `replaces_measured` | bool | `true` when these values replace the device's results (`[simulation] mode` was `"force"` when the shot was simulated): every result field is simulated and takes precedence over `ball`. Omitted when false |
-| `spin_estimated` | bool | `true` when `ball.backspin_rpm` and `ball.sidespin_rpm` are flighthook's estimate, not measured. Set with or without the simulation. Omitted when false |
+| `replaces_measured` | bool | `true` when these values replace the device's results (`[simulation] mode` was `"force"` when the shot was simulated): every result field is simulated and takes precedence over `flight`. Omitted when false |
+| `spin_estimated` | bool | `true` when `launch.backspin_rpm` and `launch.sidespin_rpm` are flighthook's estimate, not measured. Set with or without the simulation. Omitted when false |
 | `computed` | array of string | The measured-block values that come from a model (see above). Set with or without the simulation. Omitted when empty |
 
 Every field is optional. Offline values are absolute: + is right of the target
@@ -2403,7 +2549,7 @@ dozen points per shot, rounded to centimeters and milliseconds.
 
 ##### club_path
 
-Club path data available. May arrive before or after `ball_flight`.
+Club path data available. May arrive before or after `launch`.
 
 ```json
 {
@@ -2536,6 +2682,7 @@ telemetry keys.
     "kind": "device_telemetry",
     "manufacturer": "FlightScope",
     "model": "XXXXXXXX, H/W: XXXX v1.0, F/W: 1.00",
+    "source": "measured",
     "telemetry": {
       "ready": "true"
     }
@@ -2544,6 +2691,10 @@ telemetry keys.
 ```
 
 - `manufacturer`, `model`, `firmware`: optional identity fields (present on first emission)
+- `source`: FRP's device source, where the device's shots originate:
+  `"measured"` or `"virtual"`, the shot source's [provenance](#provenance),
+  set by flighthook from the actor's type on every `device_telemetry` of a
+  shot source. Absent (unknown) on telemetry from anything else.
 - `telemetry`: optional key/value map. Standard keys: `"ready"`, `"battery_pct"`,
   `"tilt"`, `"roll"`, `"temp_c"`, `"external_power"`
 

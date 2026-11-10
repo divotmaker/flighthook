@@ -495,7 +495,8 @@ fn openconnect_names(
 mod tests {
     use super::*;
 
-    /// An actor of source type `source` that triggers one shot on start.
+    /// An actor of source type `source` that sends its device telemetry and
+    /// triggers one shot on start.
     struct Shooter(Option<provenance::ShotSource>);
 
     impl Actor for Shooter {
@@ -511,7 +512,16 @@ mod tests {
                     shot_number: 1,
                 };
                 sender.send(flighthook::FlighthookMessage::new(
-                    flighthook::FlighthookEvent::ShotTrigger { key: key.clone() },
+                    flighthook::FlighthookEvent::DeviceTelemetry {
+                        manufacturer: Some("Birdie Labs".into()),
+                        model: None,
+                        firmware: None,
+                        source: None,
+                        telemetry: None,
+                    },
+                ));
+                sender.send(flighthook::FlighthookMessage::new(
+                    flighthook::FlighthookEvent::shot_trigger(key.clone()),
                 ));
                 sender.send(flighthook::FlighthookMessage::new(
                     flighthook::FlighthookEvent::ShotFinished { key, raw: None },
@@ -525,8 +535,9 @@ mod tests {
     }
 
     /// `start_actor` records the source type an actor declares and stamps
-    /// its class on the actor's shot triggers, and nothing else: whatever
-    /// its ID says. An actor that is not a shot source stamps nothing.
+    /// its class on the actor's shot triggers and as its device telemetry's
+    /// `source`, and nothing else: whatever its ID says. An actor that is
+    /// not a shot source stamps nothing.
     #[test]
     fn a_shot_takes_its_provenance_from_the_type_the_actor_started_as() {
         use provenance::ShotSource;
@@ -553,13 +564,18 @@ mod tests {
             assert_eq!(state.round.source(id), *source, "{id}");
         }
         let mut triggers = HashMap::new();
+        let mut sources = HashMap::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while triggers.len() < started.len() {
+        while triggers.len() < started.len() || sources.len() < started.len() {
             assert!(std::time::Instant::now() < deadline, "{triggers:?}");
             match rx.try_recv() {
                 Ok(msg) => match msg.event {
                     flighthook::FlighthookEvent::ShotTrigger { .. } => {
                         triggers.insert(msg.actor, msg.provenance);
+                    }
+                    flighthook::FlighthookEvent::DeviceTelemetry { source, .. } => {
+                        assert_eq!(msg.provenance, None, "only the trigger");
+                        sources.insert(msg.actor, source);
                     }
                     _ => assert_eq!(msg.provenance, None, "only the trigger"),
                 },
@@ -568,6 +584,7 @@ mod tests {
         }
         for (id, source) in started {
             assert_eq!(triggers[&id], source.map(ShotSource::provenance), "{id}");
+            assert_eq!(sources[&id], source.map(ShotSource::provenance), "{id}");
         }
         assert_eq!(
             state.stop_all_and_wait(Duration::from_secs(2)),

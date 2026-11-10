@@ -20,6 +20,8 @@ mod raw_capture;
 mod screens;
 mod sim;
 mod state;
+#[cfg(test)]
+mod test_ball;
 
 use actors::Actor;
 use bus::BusSender;

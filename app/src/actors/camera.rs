@@ -811,7 +811,7 @@ fn drain_bus(
             Err(PollError::Shutdown) => return false,
             Ok(None) => return true,
             Ok(Some(msg)) => {
-                if let FlighthookEvent::ShotTrigger { key } = &msg.event {
+                if let FlighthookEvent::ShotTrigger { key, .. } = &msg.event {
                     // Stamped on arrival: FRP triggers carry no time.
                     let at = clock::now_ns();
                     #[cfg(debug_assertions)]
@@ -1079,7 +1079,7 @@ mod tests {
     use crate::actors::web::WebActor;
     use crate::actors::web::tests::TempDir;
     use crate::actors::{Actor, start_actor};
-    use flighthook::{BallFlight, Velocity};
+    use flighthook::{Launch, Velocity};
 
     /// A system state over a scratch config file holding `config`.
     fn state_with(config: &str) -> (TempDir, SystemState) {
@@ -1877,14 +1877,14 @@ mod tests {
                 shot_number: n,
             };
             let monitor = self.sender(actor);
-            monitor.send(FlighthookMessage::new(FlighthookEvent::ShotTrigger {
+            monitor.send(FlighthookMessage::new(FlighthookEvent::shot_trigger(
+                key.clone(),
+            )));
+            monitor.send(FlighthookMessage::new(FlighthookEvent::Launch {
                 key: key.clone(),
-            }));
-            monitor.send(FlighthookMessage::new(FlighthookEvent::BallFlight {
-                key: key.clone(),
-                ball: Box::new(BallFlight {
+                launch: Box::new(Launch {
                     launch_speed: Some(Velocity::MilesPerHour(100.0 + f64::from(n))),
-                    ..BallFlight::default()
+                    ..Launch::default()
                 }),
                 derived: None,
             }));

@@ -24,7 +24,8 @@ pub enum PollError {
 // ---------------------------------------------------------------------------
 
 /// Cloneable sender that auto-stamps `actor` on every outbound message, and
-/// the actor's provenance on every shot trigger when it is a shot source.
+/// when the actor is a shot source its provenance on every shot trigger and
+/// as the `source` of every device telemetry.
 pub struct BusSender {
     actor_id: String,
     inner: broadcast::Sender<FlighthookMessage>,
@@ -52,8 +53,9 @@ impl BusSender {
         }
     }
 
-    /// This sender stamps `provenance` on every shot trigger it sends: the
-    /// class of the shot source it speaks for, from the actor's type.
+    /// This sender stamps `provenance` on every shot trigger it sends, and as
+    /// the `source` of every device telemetry: the class of the shot source
+    /// it speaks for, from the actor's type.
     #[must_use]
     pub fn with_provenance(mut self, provenance: Provenance) -> Self {
         self.provenance = Some(provenance);
@@ -76,18 +78,21 @@ impl BusSender {
         &self.inner
     }
 
-    /// Send a message, auto-stamping actor from the actor ID, and on a shot
-    /// trigger the sender's provenance. Nothing is sent once the sender is
+    /// Send a message, auto-stamping actor from the actor ID, and the
+    /// sender's provenance on a shot trigger and as a device telemetry's
+    /// `source` (FRP's device source). Nothing is sent once the sender is
     /// muted.
     pub fn send(&self, mut msg: FlighthookMessage) {
         if self.muted.load(Ordering::Relaxed) {
             return;
         }
         msg.actor = self.actor_id.clone();
-        if let (Some(provenance), FlighthookEvent::ShotTrigger { .. }) =
-            (self.provenance, &msg.event)
-        {
-            msg.provenance = Some(provenance);
+        if let Some(provenance) = self.provenance {
+            match &mut msg.event {
+                FlighthookEvent::ShotTrigger { .. } => msg.provenance = Some(provenance),
+                FlighthookEvent::DeviceTelemetry { source, .. } => *source = Some(provenance),
+                _ => {}
+            }
         }
         let _ = self.inner.send(msg);
     }

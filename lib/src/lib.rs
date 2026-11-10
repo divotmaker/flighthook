@@ -33,7 +33,7 @@ pub use stats::*;
 pub use video::*;
 
 // Re-export flightrelay types used throughout flighthook.
-pub use flightrelay::types::{BallFlight, ClubData, FaceImpact};
+pub use flightrelay::types::{AssumedLaunch, Basis, ClubData, FaceImpact, FlightResult, Launch};
 pub use flightrelay::units::{Distance, Velocity};
 pub use flightrelay::{DEFAULT_PATH as FRP_PATH, DEFAULT_PORT as FRP_PORT, DEFAULT_URL as FRP_URL};
 pub use flightrelay::{Handedness, SPEC_VERSION as FRP_VERSION, Severity};

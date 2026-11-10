@@ -11,8 +11,8 @@ use crate::groups::{
 use crate::net;
 use crate::theme;
 use crate::types::{
-    ActorStatus, ActorStatusResponse, BallFlight, Club, ClubData, DerivedFlight, Distance,
-    Handedness, ShotGroupInfo, ShotGrouping, ShotRow, Stats, UnitSystem, Velocity,
+    ActorStatus, ActorStatusResponse, Basis, Club, ClubData, DerivedFlight, Distance, FlightResult,
+    Handedness, Launch, ShotGroupInfo, ShotGrouping, ShotRow, Stats, UnitSystem, Velocity,
 };
 
 /// Format an optional f64 with the given precision, or "-" if None.
@@ -563,7 +563,7 @@ fn shot_total(shots: &[ShotRow], filter: Option<&str>) -> usize {
 pub(super) fn latest_index(shots: &[ShotRow], filter: Option<&str>) -> Option<usize> {
     shots
         .iter()
-        .rposition(|s| (s.ball.is_some() || s.club.is_some()) && chart::in_filter(&s.actor, filter))
+        .rposition(|s| s.has_data() && chart::in_filter(&s.actor, filter))
 }
 
 /// The chip on the shot header.
@@ -755,7 +755,9 @@ fn card_metrics(
     let height = if imperial { "ft" } else { "m" };
     // Borrowed: this runs per card per frame.
     let (no_ball, no_club, no_derived) = Default::default();
-    let ball: &BallFlight = shot.ball.as_ref().unwrap_or(&no_ball);
+    let no_flight = FlightResult::new(Basis::Modeled);
+    let ball: &Launch = shot.launch.as_ref().unwrap_or(&no_ball);
+    let f: &FlightResult = shot.flight.as_ref().unwrap_or(&no_flight);
     let club: &ClubData = shot.club.as_ref().unwrap_or(&no_club);
     let d: &DerivedFlight = shot.derived.as_ref().unwrap_or(&no_derived);
     let (backspin, sidespin) = flighthook::spin_components(ball);
@@ -767,14 +769,14 @@ fn card_metrics(
         Metric::new(
             "Carry",
             dist,
-            pick(v(ball.carry_distance), v(d.carry_distance)),
+            pick(v(f.carry_distance), v(d.carry_distance)),
             1,
             false,
         ),
         Metric::new(
             "Total",
             dist,
-            pick(v(ball.total_distance), v(d.total_distance)),
+            pick(v(f.total_distance), v(d.total_distance)),
             1,
             false,
         ),
@@ -803,28 +805,28 @@ fn card_metrics(
                 Metric::new(
                     "Apex",
                     height,
-                    pick(v(ball.max_height), v(d.max_height)),
+                    pick(v(f.max_height), v(d.max_height)),
                     1,
                     false,
                 ),
                 Metric::worded(
                     "Offline",
                     dist,
-                    pick(v(ball.carry_offline), v(d.carry_offline)),
+                    pick(v(f.carry_offline), v(d.carry_offline)),
                     1,
                     signs::side,
                 ),
                 Metric::new(
                     "Descent",
                     "\u{b0}",
-                    pick(ball.descent_angle, d.descent_angle),
+                    pick(f.descent_angle, d.descent_angle),
                     1,
                     false,
                 ),
                 Metric::new(
                     "Roll",
                     dist,
-                    pick(v(ball.roll_distance), v(d.roll_distance)),
+                    pick(v(f.roll_distance), v(d.roll_distance)),
                     1,
                     true,
                 ),
@@ -1948,19 +1950,19 @@ impl BarKind {
     /// picked by [`pick`]; lateral is the carry offline, picked the same way
     /// (+ = right of the target line).
     fn value(self, shot: &ShotRow, imperial: bool) -> Option<f64> {
-        let ball = shot.ball.as_ref();
+        let flight = shot.flight.as_ref();
         let derived = shot.derived.as_ref();
         let (measured, simulated) = match self {
             BarKind::Total => (
-                ball.and_then(|b| b.total_distance),
+                flight.and_then(|f| f.total_distance),
                 derived.and_then(|d| d.total_distance),
             ),
             BarKind::Carry => (
-                ball.and_then(|b| b.carry_distance),
+                flight.and_then(|f| f.carry_distance),
                 derived.and_then(|d| d.carry_distance),
             ),
             BarKind::Lateral => (
-                ball.and_then(|b| b.carry_offline),
+                flight.and_then(|f| f.carry_offline),
                 derived.and_then(|d| d.carry_offline),
             ),
         };
@@ -2010,7 +2012,7 @@ fn bar_values<'a>(
         rows: 0,
     };
     for row in rows {
-        if row.ball.is_none() && row.club.is_none() {
+        if !row.has_data() {
             continue;
         }
         out.rows += 1;
@@ -2206,7 +2208,7 @@ fn bars_title(
     let with_data: Vec<&ShotRow> = members
         .iter()
         .filter_map(|&i| shots.get(i))
-        .filter(|r| r.ball.is_some() || r.club.is_some())
+        .filter(|r| r.has_data())
         .collect();
     match view {
         ShotGrouping::None => None,
@@ -2951,7 +2953,7 @@ fn runs<'a>(shots: &'a [ShotRow], groups: &ShotGroups, filter: Option<&str>) -> 
         if !chart::in_filter(&row.actor, filter) {
             continue;
         }
-        if row.ball.is_some() || row.club.is_some() {
+        if row.has_data() {
             let group = row.group.as_deref().filter(|id| groups.get(id).is_some());
             if runs.last().is_none_or(|r| r.group != Some(group)) {
                 runs.push(Run {
@@ -3290,8 +3292,9 @@ impl ListEntry {
     /// `shot` already converted to the display unit system.
     fn new(shot: &ShotRow, device: Option<&str>, imperial: bool) -> Self {
         let dist = if imperial { "yd" } else { "m" };
-        let (no_ball, no_derived) = Default::default();
-        let ball: &BallFlight = shot.ball.as_ref().unwrap_or(&no_ball);
+        let no_derived = DerivedFlight::default();
+        let no_flight = FlightResult::new(Basis::Modeled);
+        let f: &FlightResult = shot.flight.as_ref().unwrap_or(&no_flight);
         let d: &DerivedFlight = shot.derived.as_ref().unwrap_or(&no_derived);
         let v = |x: Option<Distance>| x.map(|x| x.value());
         Self {
@@ -3300,19 +3303,19 @@ impl ListEntry {
             carry: Metric::new(
                 "Carry",
                 dist,
-                pick(v(ball.carry_distance), v(d.carry_distance)),
+                pick(v(f.carry_distance), v(d.carry_distance)),
                 1,
                 false,
             ),
             total: Metric::new(
                 "Total",
                 dist,
-                pick(v(ball.total_distance), v(d.total_distance)),
+                pick(v(f.total_distance), v(d.total_distance)),
                 1,
                 false,
             ),
-            has_data: shot.ball.is_some() || shot.club.is_some(),
-            no_read: shot.finished && shot.ball.is_none() && shot.club.is_none(),
+            has_data: shot.has_data(),
+            no_read: shot.finished && !shot.has_data(),
         }
     }
 }
@@ -4802,13 +4805,18 @@ fn table_cells(
     let no_derived = DerivedFlight::default();
     let d = shot.derived.as_ref().unwrap_or(&no_derived);
     let v = |x: Option<Distance>| x.map(|x| x.value());
-    match shot.ball.as_ref() {
-        Some(f) => cells.extend({
-            let (backspin, sidespin) = flighthook::spin_components(f);
+    let no_launch = Launch::default();
+    let no_flight = FlightResult::new(Basis::Modeled);
+    match (shot.launch.as_ref(), shot.flight.as_ref()) {
+        (None, None) => cells.extend((0..BALL_COLUMNS).map(|_| Text("-".to_owned()))),
+        (l, f) => cells.extend({
+            let l = l.unwrap_or(&no_launch);
+            let f = f.unwrap_or(&no_flight);
+            let (backspin, sidespin) = flighthook::spin_components(l);
             [
-                Text(opt_f(f.launch_speed.map(|v| v.value()), 1)),
-                Text(opt_f(f.launch_elevation, 1)),
-                Text(opt_f(f.launch_azimuth, 1)),
+                Text(opt_f(l.launch_speed.map(|v| v.value()), 1)),
+                Text(opt_f(l.launch_elevation, 1)),
+                Text(opt_f(l.launch_azimuth, 1)),
                 Picked(pick(v(f.carry_distance), v(d.carry_distance)), false),
                 Picked(pick(v(f.max_height), v(d.max_height)), false),
                 Picked(pick(v(f.carry_offline), v(d.carry_offline)), true),
@@ -4820,11 +4828,10 @@ fn table_cells(
                 Spin(spin(sidespin, d)),
             ]
         }),
-        None => cells.extend((0..BALL_COLUMNS).map(|_| Text("-".to_owned()))),
     }
     match shot.club.as_ref() {
         Some(c) => {
-            let ball_speed = shot.ball.as_ref().and_then(|b| b.launch_speed);
+            let ball_speed = shot.launch.as_ref().and_then(|b| b.launch_speed);
             cells.extend([
                 Text(opt_f(c.club_speed.map(|v| v.value()), 1)),
                 Text(opt_f(c.path, 1)),
@@ -4943,14 +4950,15 @@ fn fill_cell(ui: &egui::Ui, color: egui::Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::BallFlight;
+    use crate::types::Launch;
 
     fn row(n: u32, with_ball: bool) -> ShotRow {
         ShotRow {
             actor: "mock_monitor.0".into(),
             shot_id: format!("id{n}"),
             shot_number: n,
-            ball: with_ball.then(BallFlight::default),
+            launch: with_ball.then(Launch::default),
+            flight: None,
             club: None,
             impact: None,
             derived: None,
@@ -5043,7 +5051,7 @@ mod tests {
         focus.observe(&shots, None, 10.0);
         assert_eq!(focus.strength(10.0), 0.0);
 
-        shots[1].ball = Some(BallFlight::default());
+        shots[1].launch = Some(Launch::default());
         focus.observe(&shots, None, 11.0);
         assert_eq!(focus.strength(11.0), 1.0);
         let mid = focus.strength(11.0 + PULSE_SECS / 2.0);
@@ -5117,7 +5125,7 @@ mod tests {
         assert_eq!(focus.index(&shots, None), Some(0));
 
         // The new shot's data lands: the view jumps to it, glowing.
-        shots[2].ball = Some(BallFlight::default());
+        shots[2].launch = Some(Launch::default());
         focus.observe(&shots, None, 2.0);
         assert_eq!(focus.index(&shots, None), Some(2));
         assert!(focus.following(&shots, None));
@@ -6002,17 +6010,18 @@ mod tests {
         d: (Option<f64>, Option<f64>, Option<f64>),
     ) -> ShotRow {
         let yd = |v: Option<f64>| v.map(Distance::Yards);
-        let ball = BallFlight {
+        let flight = FlightResult {
             total_distance: yd(m.0),
             carry_distance: yd(m.1),
-            ..Default::default()
+            ..FlightResult::new(Basis::Modeled)
         };
         let mut derived = crate::types::DerivedFlight::default();
         derived.total_distance = yd(d.0);
         derived.carry_distance = yd(d.1);
         derived.carry_offline = yd(d.2);
         ShotRow {
-            ball: Some(ball),
+            launch: Some(Launch::default()),
+            flight: Some(flight),
             derived: Some(derived),
             group: Some("a".into()),
             ..row(n, true)
@@ -6898,7 +6907,7 @@ mod tests {
             (None, Some(171.0)),
             (Some(180.0), Some(165.0), Some(2.0)),
         );
-        shot.ball.as_mut().unwrap().max_height = Some(Distance::Feet(30.0));
+        shot.flight_mut().max_height = Some(Distance::Feet(30.0));
         shot.derived.as_mut().unwrap().replaces_measured = replaces;
         shot
     }
@@ -6940,9 +6949,9 @@ mod tests {
         // The device sent carry 12 yd, apex 1 ft and 0.4 s on a bladed
         // shot; the server rolled it: carry, apex and flight time 0.
         let mut shot = flight(1, (None, Some(12.0)), (Some(9.0), Some(0.0), Some(0.0)));
-        let ball = shot.ball.as_mut().unwrap();
-        ball.max_height = Some(Distance::Feet(1.0));
-        ball.flight_time = Some(0.4);
+        let flight = shot.flight_mut();
+        flight.max_height = Some(Distance::Feet(1.0));
+        flight.flight_time = Some(0.4);
         let d = shot.derived.as_mut().unwrap();
         d.max_height = Some(Distance::Feet(0.0));
         d.flight_time = Some(0.0);
@@ -6965,7 +6974,7 @@ mod tests {
         derived.carry_distance = Some(Distance::Yards(3.9));
         derived.spin_estimated = true;
         ShotRow {
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 launch_speed: Some(Velocity::MilesPerHour(15.7)),
                 launch_elevation: Some(22.8),
                 launch_azimuth: Some(-0.9),
@@ -7005,7 +7014,7 @@ mod tests {
         }
         // No spin reading: missing, as before.
         let mut none = measured.clone();
-        none.ball.as_mut().unwrap().backspin_rpm = None;
+        none.launch_mut().backspin_rpm = None;
         assert!(card_metrics(&none, true, Handedness::Right).0[4].source == Source::Missing);
         assert_eq!(
             table_cells(&none, None, None, false)[name("Back")],
@@ -7015,7 +7024,7 @@ mod tests {
         // A total spin with no axis and no components: all of it shows as
         // backspin, and no sidespin is made up.
         let mut total_only = measured.clone();
-        let ball = total_only.ball.as_mut().unwrap();
+        let ball = total_only.launch_mut();
         (ball.backspin_rpm, ball.sidespin_rpm) = (None, None);
         (ball.total_spin_rpm, ball.spin_axis) = (Some(6897), None);
         assert_eq!(card_text(&total_only, "Backspin"), ("6897".into(), false));
@@ -7026,7 +7035,7 @@ mod tests {
 
         // A putt with no launch angle shows none.
         let mut putt = measured.clone();
-        putt.ball.as_mut().unwrap().launch_elevation = None;
+        putt.launch_mut().launch_elevation = None;
         assert_eq!(card_text(&putt, "Launch").0, "\u{2013}", "missing");
         assert_eq!(
             table_cells(&putt, None, None, false)[name("VLA")],
@@ -7056,7 +7065,8 @@ mod tests {
             let mut app = cards_app();
             let chip = estimated_spin_chip(0);
             let latest = app.shots.last_mut().expect("shots");
-            latest.ball = chip.ball;
+            latest.launch = chip.launch;
+            latest.flight = chip.flight;
             latest.derived = chip.derived;
             latest.derived.as_mut().expect("derived").spin_estimated = spin_estimated;
             app
@@ -7185,7 +7195,7 @@ mod tests {
     #[test]
     fn apex_card_is_labeled_feet_in_imperial_and_meters_in_metric() {
         let mut shot = row(1, true);
-        shot.ball.as_mut().unwrap().max_height = Some(Distance::Meters(31.2));
+        shot.flight_mut().max_height = Some(Distance::Meters(31.2));
 
         let imperial = shot.to_unit_system(UnitSystem::Imperial);
         let (_, groups) = card_metrics(&imperial, true, Handedness::Right);
@@ -7205,10 +7215,10 @@ mod tests {
     #[test]
     fn measured_offline_and_descent_feed_cards_table_and_bars() {
         let mut shot = row(1, true);
-        let ball = shot.ball.as_mut().unwrap();
-        ball.carry_offline = Some(Distance::Yards(-4.2));
-        ball.total_offline = Some(Distance::Yards(-5.0));
-        ball.descent_angle = Some(43.1);
+        let flight = shot.flight_mut();
+        flight.carry_offline = Some(Distance::Yards(-4.2));
+        flight.total_offline = Some(Distance::Yards(-5.0));
+        flight.descent_angle = Some(43.1);
 
         let (_, groups) = card_metrics(&shot, true, Handedness::Right);
         let card = |label: &str| {
@@ -7836,14 +7846,17 @@ mod tests {
         (0..1000_u32)
             .map(|n| {
                 let carry = 130.0 + f64::from(n % 17);
-                let ball = BallFlight {
+                let ball = Launch {
                     launch_speed: Some(Velocity::MilesPerHour(118.0 + f64::from(n % 7))),
                     launch_elevation: Some(16.5),
                     launch_azimuth: Some(f64::from(n % 9) - 4.0),
-                    carry_distance: Some(yd(carry)),
                     backspin_rpm: Some(6200),
                     sidespin_rpm: Some(-300),
                     ..Default::default()
+                };
+                let flight = FlightResult {
+                    carry_distance: Some(yd(carry)),
+                    ..FlightResult::new(Basis::Modeled)
                 };
                 let mut derived = DerivedFlight::default();
                 derived.max_height = Some(yd(31.0));
@@ -7854,7 +7867,8 @@ mod tests {
                 derived.total_offline = Some(yd(3.1));
                 ShotRow {
                     actor: if n % 2 == 0 { "mevo.0" } else { "square.0" }.into(),
-                    ball: Some(ball),
+                    launch: Some(ball),
+                    flight: Some(flight),
                     derived: Some(derived),
                     club_selected: Some(Club::Iron7),
                     ..row(n, true)
@@ -8141,13 +8155,13 @@ mod tests {
     /// A shot with every directional value set to `sign` × a value.
     fn signed_shot(sign: f64) -> ShotRow {
         let mut shot = row(1, true);
-        let ball = shot.ball.as_mut().unwrap();
+        let ball = shot.launch_mut();
         ball.launch_azimuth = Some(2.4 * sign);
         // Rounds to 0 for the near-zero signs.
         #[allow(clippy::cast_possible_truncation)]
         let sidespin = (644.0 * sign).round() as i32;
         ball.sidespin_rpm = Some(sidespin);
-        ball.carry_offline = Some(Distance::Yards(22.4 * sign));
+        shot.flight_mut().carry_offline = Some(Distance::Yards(22.4 * sign));
         shot.club = Some(ClubData {
             path: Some(1.2 * sign),
             attack_angle: Some(0.9 * sign),
@@ -8240,7 +8254,7 @@ mod tests {
         shot.club.as_mut().unwrap().path = Some(-10.8);
         shot.club.as_mut().unwrap().face_angle = Some(-10.8);
         shot.club.as_mut().unwrap().attack_angle = Some(-10.8);
-        shot.ball.as_mut().unwrap().sidespin_rpm = Some(-1644);
+        shot.launch_mut().sidespin_rpm = Some(-1644);
         let (_, groups) = card_metrics(&shot, true, Handedness::Right);
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             let painter = ctx.layer_painter(egui::LayerId::background());

@@ -670,7 +670,7 @@ impl FlighthookApp {
                     }
                 }
             }
-            FlighthookEvent::ShotTrigger { key } => {
+            FlighthookEvent::ShotTrigger { key, .. } => {
                 // The server stamps the club game state has at the trigger,
                 // which is the club this UI shows (the putter for a putting
                 // device); `shot_group` confirms it.
@@ -683,7 +683,8 @@ impl FlighthookApp {
                     actor: actor.clone(),
                     shot_id: key.shot_id.clone(),
                     shot_number: key.shot_number,
-                    ball: None,
+                    launch: None,
+                    flight: None,
                     club: None,
                     impact: None,
                     derived: None,
@@ -768,11 +769,21 @@ impl FlighthookApp {
                     self.replay = None;
                 }
             }
-            FlighthookEvent::BallFlight { key, ball, derived } => {
+            FlighthookEvent::Launch {
+                key,
+                launch,
+                derived,
+            } => {
                 if let Some(i) = groups::find_row(&self.shots, &actor, &key) {
                     let row = &mut self.shots[i];
-                    row.ball = Some(*ball);
+                    row.launch = Some(*launch);
                     row.derived = derived.map(|d| *d);
+                    self.shots_rev += 1;
+                }
+            }
+            FlighthookEvent::FlightResult { key, flight } => {
+                if let Some(i) = groups::find_row(&self.shots, &actor, &key) {
+                    self.shots[i].apply_flight(*flight);
                     self.shots_rev += 1;
                 }
             }
@@ -1635,6 +1646,87 @@ mod tests {
         ActorStatusResponse::new("", status)
     }
 
+    /// A row takes the launch and a device's flight result as they come.
+    /// flighthook's own flight result (sent when the device sent none) only
+    /// gives back the estimated spin its launch left out, so the row is the
+    /// shot `/api/shots` serves.
+    #[test]
+    fn a_row_takes_the_device_flight_and_only_the_spin_of_flighthooks_own() {
+        use crate::types::{
+            Basis, DerivedFlight, Distance, FlightResult, Launch, ShotKey, Velocity,
+        };
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        let key = |n| ShotKey {
+            shot_id: format!("s{n}"),
+            shot_number: n,
+        };
+        let send = |app: &mut FlighthookApp, event| {
+            app.handle_bus_event(FlighthookMessage::new(event).actor("mevo.0"));
+        };
+        let launch = Launch {
+            launch_speed: Some(Velocity::MilesPerHour(20.0)),
+            launch_elevation: Some(30.0),
+            launch_azimuth: Some(0.5),
+            ..Launch::default()
+        };
+        let mut estimated = DerivedFlight::default();
+        estimated.carry_distance = Some(Distance::Meters(14.0));
+        estimated.spin_estimated = true;
+        let own = estimated
+            .flight_result(Some(flighthook::AssumedLaunch {
+                backspin_rpm: Some(2000),
+                sidespin_rpm: Some(0),
+                ..flighthook::AssumedLaunch::default()
+            }))
+            .expect("own flight");
+
+        send(&mut app, FlighthookEvent::shot_trigger(key(1)));
+        send(
+            &mut app,
+            FlighthookEvent::Launch {
+                key: key(1),
+                launch: Box::new(launch.clone()),
+                derived: Some(Box::new(estimated.clone())),
+            },
+        );
+        send(
+            &mut app,
+            FlighthookEvent::FlightResult {
+                key: key(1),
+                flight: Box::new(own),
+            },
+        );
+        let row = &app.shots[0];
+        assert_eq!(row.flight, None, "flighthook's own values stay in derived");
+        let l = row.launch.as_ref().expect("launch");
+        assert_eq!((l.backspin_rpm, l.sidespin_rpm), (Some(2000), Some(0)));
+        assert_eq!(l.launch_speed, launch.launch_speed);
+        assert_eq!(row.derived.as_ref(), Some(&estimated));
+
+        let device = FlightResult {
+            carry_distance: Some(Distance::Meters(150.0)),
+            ..FlightResult::new(Basis::Modeled)
+        };
+        send(&mut app, FlighthookEvent::shot_trigger(key(2)));
+        send(
+            &mut app,
+            FlighthookEvent::Launch {
+                key: key(2),
+                launch: Box::new(launch.clone()),
+                derived: None,
+            },
+        );
+        send(
+            &mut app,
+            FlighthookEvent::FlightResult {
+                key: key(2),
+                flight: Box::new(device.clone()),
+            },
+        );
+        assert_eq!(app.shots[1].flight, Some(device));
+        assert_eq!(app.shots[1].launch, Some(launch));
+    }
+
     /// One pass of the main content on a 1600×900 screen. Returns the
     /// marked controls.
     fn content_marks(
@@ -2075,6 +2167,7 @@ mod tests {
                 manufacturer: None,
                 model: None,
                 firmware: None,
+                source: None,
                 telemetry: Some(
                     pairs
                         .iter()
@@ -2176,7 +2269,7 @@ mod tests {
 
     #[test]
     fn ws_reconnect_refetch_keeps_the_sets_and_tells_repeated_shot_numbers_apart() {
-        use crate::types::{BallFlight, ShotGrouping, ShotGroupsResponse};
+        use crate::types::{Launch, ShotGrouping, ShotGroupsResponse};
         use flighthook::{GroupedShot, ShotData, ShotGroupInfo, ShotKey};
 
         let set = |id: &str, number, club, open, shots| ShotGroupInfo {
@@ -2193,7 +2286,8 @@ mod tests {
         let stored = |n, id: &str, group: &str| ShotData {
             actor: "mevo.0".into(),
             shot_number: n,
-            ball: Some(BallFlight::default()),
+            launch: Some(Launch::default()),
+            flight: None,
             shot_id: Some(id.into()),
             club_selected: Some(Club::Iron7),
             group: Some(group.into()),
@@ -2224,12 +2318,12 @@ mod tests {
             );
         };
         let shot = |app: &mut FlighthookApp, key: ShotKey, group| {
-            device(app, FlighthookEvent::ShotTrigger { key: key.clone() });
+            device(app, FlighthookEvent::shot_trigger(key.clone()));
             device(
                 app,
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::Launch {
                     key: key.clone(),
-                    ball: Box::new(BallFlight::default()),
+                    launch: Box::new(Launch::default()),
                     derived: None,
                 },
             );
@@ -2318,7 +2412,7 @@ mod tests {
 
     #[test]
     fn shots_rev_bumps_at_every_shot_change_and_keys_the_caches() {
-        use crate::types::{BallFlight, ClubData, ShotGrouping, ShotGroupsResponse};
+        use crate::types::{ClubData, Launch, ShotGrouping, ShotGroupsResponse};
         use flighthook::{GroupedShot, ShotData, ShotGroupInfo, ShotKey};
 
         let mut app = FlighthookApp::with_pending(net::new_pending());
@@ -2336,7 +2430,8 @@ mod tests {
         app.pending.lock().expect("lock").shots = Some(vec![ShotData {
             actor: "mevo.0".into(),
             shot_number: 9,
-            ball: Some(BallFlight::default()),
+            launch: Some(Launch::default()),
+            flight: None,
             ..ShotData::default()
         }]);
         app.apply_pending();
@@ -2352,13 +2447,13 @@ mod tests {
         let device = |app: &mut FlighthookApp, event| {
             app.handle_bus_event(FlighthookMessage::new(event).actor("square.0"));
         };
-        device(&mut app, FlighthookEvent::ShotTrigger { key: key.clone() });
+        device(&mut app, FlighthookEvent::shot_trigger(key.clone()));
         bumped(&app, "trigger");
         device(
             &mut app,
-            FlighthookEvent::BallFlight {
+            FlighthookEvent::Launch {
                 key: key.clone(),
-                ball: Box::new(BallFlight::default()),
+                launch: Box::new(Launch::default()),
                 derived: None,
             },
         );
@@ -2438,13 +2533,14 @@ mod tests {
 
     #[test]
     fn clear_history_on_the_bus_empties_the_shots_tab() {
-        use crate::types::{BallFlight, ShotGrouping, ShotGroupsResponse};
+        use crate::types::{Launch, ShotGrouping, ShotGroupsResponse};
         use flighthook::{ShotData, ShotGroupInfo};
 
         let stored = |actor: &str, n| ShotData {
             actor: actor.into(),
             shot_number: n,
-            ball: Some(BallFlight::default()),
+            launch: Some(Launch::default()),
+            flight: None,
             group: Some("s1".into()),
             ..ShotData::default()
         };
@@ -2482,10 +2578,10 @@ mod tests {
             shot_number: 3,
         };
         for event in [
-            FlighthookEvent::ShotTrigger { key: live.clone() },
-            FlighthookEvent::BallFlight {
+            FlighthookEvent::shot_trigger(live.clone()),
+            FlighthookEvent::Launch {
                 key: live,
-                ball: Box::new(BallFlight::default()),
+                launch: Box::new(Launch::default()),
                 derived: None,
             },
         ] {
@@ -2524,12 +2620,10 @@ mod tests {
 
         // The next shot starts afresh.
         app.handle_bus_event(
-            FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-                key: flighthook::ShotKey {
-                    shot_id: "n1".into(),
-                    shot_number: 1,
-                },
-            })
+            FlighthookMessage::new(FlighthookEvent::shot_trigger(flighthook::ShotKey {
+                shot_id: "n1".into(),
+                shot_number: 1,
+            }))
             .actor("mevo.0"),
         );
         assert_eq!(app.shots.len(), 1);
@@ -2550,12 +2644,10 @@ mod tests {
         app.apply_pending();
         for n in 1..=3 {
             app.handle_bus_event(
-                FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-                    key: flighthook::ShotKey {
-                        shot_id: format!("s{n}"),
-                        shot_number: n,
-                    },
-                })
+                FlighthookMessage::new(FlighthookEvent::shot_trigger(flighthook::ShotKey {
+                    shot_id: format!("s{n}"),
+                    shot_number: n,
+                }))
                 .actor("mevo.0"),
             );
         }
@@ -2588,13 +2680,14 @@ mod tests {
 
     #[test]
     fn replies_requested_before_a_clear_or_new_session_are_dropped() {
-        use crate::types::{BallFlight, ShotGrouping, ShotGroupsResponse};
+        use crate::types::{Launch, ShotGrouping, ShotGroupsResponse};
         use flighthook::{ShotData, ShotGroupInfo};
 
         let stored = |n| ShotData {
             actor: "mevo.0".into(),
             shot_number: n,
-            ball: Some(BallFlight::default()),
+            launch: Some(Launch::default()),
+            flight: None,
             group: Some("s1".into()),
             ..ShotData::default()
         };
@@ -2672,13 +2765,14 @@ mod tests {
 
     #[test]
     fn device_filter_falls_back_to_all_when_its_device_leaves() {
-        use crate::types::BallFlight;
+        use crate::types::Launch;
         use flighthook::ShotData;
 
         let stored = |actor: &str, n| ShotData {
             actor: actor.into(),
             shot_number: n,
-            ball: Some(BallFlight::default()),
+            launch: Some(Launch::default()),
+            flight: None,
             ..ShotData::default()
         };
         let mut app = FlighthookApp::with_pending(net::new_pending());
@@ -2748,7 +2842,7 @@ mod tests {
         let device = |app: &mut FlighthookApp, event| {
             app.handle_bus_event(FlighthookMessage::new(event).actor("square.0"));
         };
-        device(&mut app, FlighthookEvent::ShotTrigger { key: key.clone() });
+        device(&mut app, FlighthookEvent::shot_trigger(key.clone()));
         assert_eq!(app.shots[0].handed, Some(Handedness::Left));
         let rev = app.shots_rev;
         let impact = FaceImpact {
@@ -2813,7 +2907,7 @@ mod tests {
             ("mevo.0", key("c", 2)),
         ] {
             app.handle_bus_event(
-                FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: k }).actor(actor),
+                FlighthookMessage::new(FlighthookEvent::shot_trigger(k)).actor(actor),
             );
         }
         // The clip lands before either shot finished.
@@ -2880,7 +2974,7 @@ mod tests {
         let mut app = FlighthookApp::with_pending(net::new_pending());
         for (actor, id) in [("mevo.0", "a"), ("mevo.1", "b")] {
             app.handle_bus_event(
-                FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key(id) }).actor(actor),
+                FlighthookMessage::new(FlighthookEvent::shot_trigger(key(id))).actor(actor),
             );
             app.handle_bus_event(
                 FlighthookMessage::new(FlighthookEvent::ShotVideo {

@@ -18,8 +18,8 @@ use crate::sim;
 use crate::state::SystemState;
 use crate::state::round::RoundPolicy;
 use flighthook::{
-    ActorStatus, BallFlight, ClubData, Distance, FlighthookEvent, FlighthookMessage,
-    ShotDetectionMode, ShotKey, ShotRaw, Velocity,
+    ActorStatus, Basis, ClubData, Distance, FlightResult, FlighthookEvent, FlighthookMessage,
+    Launch, ShotDetectionMode, ShotKey, ShotRaw, Velocity,
 };
 
 const SHOT_INTERVAL: Duration = Duration::from_secs(30);
@@ -157,6 +157,7 @@ fn run(
             manufacturer: None,
             model: None,
             firmware: None,
+            source: None,
             telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
         })
         .device(device_id.as_str()),
@@ -206,6 +207,7 @@ fn run(
                         manufacturer: None,
                         model: None,
                         firmware: None,
+                        source: None,
                         telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
                     })
                     .device(device_id.as_str()),
@@ -225,6 +227,7 @@ fn run(
                         manufacturer: None,
                         model: None,
                         firmware: None,
+                        source: None,
                         telemetry: Some(HashMap::from([("ready".into(), "true".into())])),
                     })
                     .device(device_id.as_str()),
@@ -241,10 +244,10 @@ fn run(
                         shot_id: uuid::Uuid::new_v4().to_string(),
                         shot_number: n,
                     };
-                    let (ball, club) = generate_shot(n, current_mode);
+                    let (ball, flight, club) = generate_shot(n, current_mode);
 
                     let ball_mph = ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0);
-                    let carry_yd = ball.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0);
+                    let carry_yd = flight.carry_distance.map(|d| d.as_yards()).unwrap_or(0.0);
                     info!(
                         "mock shot #{}: ball={:.1}mph VLA={:.1} carry={:.1}yd",
                         n,
@@ -259,6 +262,7 @@ fn run(
                             manufacturer: None,
                             model: None,
                             firmware: None,
+                            source: None,
                             telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
                         })
                         .device(device_id.as_str()),
@@ -270,17 +274,16 @@ fn run(
 
                     // Shot lifecycle
                     sender.send(
-                        FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() })
+                        FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()))
                             .device(device_id.as_str()),
                     );
-                    (n, key, ball, club)
+                    (n, key, ball, flight, club)
                 });
-                if let Fired::Sent((n, key, ball, club)) = fired {
+                if let Fired::Sent((n, key, ball, flight, club)) = fired {
                     shot_count = n;
-                    sender.send(
-                        FlighthookMessage::new(sim::ball_flight_event(state, key.clone(), ball))
-                            .device(device_id.as_str()),
-                    );
+                    for event in sim::launch_events(state, key.clone(), ball, Some(flight)) {
+                        sender.send(FlighthookMessage::new(event).device(device_id.as_str()));
+                    }
                     sender.send(
                         FlighthookMessage::new(FlighthookEvent::ClubPath {
                             key: key.clone(),
@@ -322,7 +325,9 @@ fn run(
     }
 }
 
-fn generate_shot(n: u32, mode: ShotDetectionMode) -> (BallFlight, ClubData) {
+/// A made-up shot: its launch, its flight values (from no real model, so
+/// [`Basis::Modeled`]) and its club data.
+fn generate_shot(n: u32, mode: ShotDetectionMode) -> (Launch, FlightResult, ClubData) {
     let v = (n as f64 * 0.7).sin(); // -1..1 variation seed
 
     let (ball_speed, vla, hla, carry, height, backspin, sidespin, club_speed, aoa, loft) =
@@ -368,18 +373,21 @@ fn generate_shot(n: u32, mode: ShotDetectionMode) -> (BallFlight, ClubData) {
     let face_angle = hla * 0.7;
     let path = hla * 0.4;
 
-    let ball = BallFlight {
+    let ball = Launch {
         launch_speed: Some(Velocity::MetersPerSecond(ball_speed)),
         launch_elevation: Some(vla),
         launch_azimuth: Some(hla),
+        backspin_rpm: Some(backspin as i32),
+        sidespin_rpm: Some(sidespin as i32),
+        ..Launch::default()
+    };
+    let flight = FlightResult {
         carry_distance: Some(Distance::Meters(carry)),
         total_distance: Some(Distance::Meters(carry * 1.1)),
         max_height: Some(Distance::Meters(height)),
         flight_time: Some(5.0),
         roll_distance: Some(Distance::Meters(carry * 0.1)),
-        backspin_rpm: Some(backspin as i32),
-        sidespin_rpm: Some(sidespin as i32),
-        ..BallFlight::default()
+        ..FlightResult::new(Basis::Modeled)
     };
     let club = ClubData {
         club_speed: Some(Velocity::MetersPerSecond(club_speed)),
@@ -396,7 +404,7 @@ fn generate_shot(n: u32, mode: ShotDetectionMode) -> (BallFlight, ClubData) {
         ..ClubData::default()
     };
 
-    (ball, club)
+    (ball, flight, club)
 }
 
 #[cfg(test)]
@@ -438,5 +446,25 @@ mod tests {
 
         let _guard = begin();
         assert_eq!(pause.fire(&round, || 3), Fired::Held { logged: true });
+    }
+
+    /// Every output's numbers for a mock shot in each detection mode.
+    #[test]
+    fn outputs_keep_their_numbers() {
+        for (case, mode) in [
+            ("mock_full", ShotDetectionMode::Full),
+            ("mock_chipping", ShotDetectionMode::Chipping),
+            ("mock_putting", ShotDetectionMode::Putting),
+        ] {
+            let (ball, flight, club) = generate_shot(3, mode);
+            let messages = crate::test_ball::device_shot(
+                "mock_monitor.0",
+                ball,
+                Some(flight),
+                Some(club),
+                Some(mode),
+            );
+            crate::test_ball::assert_outputs_pinned(case, &messages);
+        }
     }
 }

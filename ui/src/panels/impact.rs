@@ -1361,7 +1361,8 @@ mod tests {
             actor: "square.0".into(),
             shot_id: format!("s{n}"),
             shot_number: n,
-            ball: None,
+            launch: None,
+            flight: None,
             club: None,
             impact: (impact.0.is_some() || impact.1.is_some()).then(|| FaceImpact {
                 lateral: impact.0.map(Distance::Millimeters),

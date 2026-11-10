@@ -1,12 +1,15 @@
 //! Shared domain types used across the unified bus, the actors, and the UI.
 //!
-//! Shot data types (`BallFlight`, `ClubData`, `FaceImpact`) are re-exported
-//! from the `flightrelay` crate. This module defines the composed `ShotData`
-//! and accumulator types built on top of them.
+//! Shot data types (`Launch`, `FlightResult`, `ClubData`, `FaceImpact`) are
+//! re-exported from the `flightrelay` crate. This module defines the composed
+//! `ShotData` and accumulator types built on top of them.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use flightrelay::types::{BallFlight, ClubData, FaceImpact};
+use flightrelay::types::{AssumedLaunch, Basis, ClubData, FaceImpact, FlightResult, Launch};
 use flightrelay::units::{Distance, Velocity};
 
 use crate::{Club, Handedness, ShotKey, ShotMetrics, ShotRaw, ShotVideo, UnitSystem};
@@ -17,9 +20,9 @@ use crate::{Club, Handedness, ShotKey, ShotMetrics, ShotRaw, ShotVideo, UnitSyst
 
 /// Values flighthook simulated from the measured launch (beta).
 ///
-/// By default present only for fields the device did not report: a value
-/// under [`BallFlight`] is measured and a value here is simulated. A field
-/// set in both is shown with the value here: on a shot that flies, a
+/// By default present only for fields the device did not report: a value in
+/// the device's flight result ([`ShotData::flight`]) is the device's and a
+/// value here is simulated. A field set in both is shown with the value here: on a shot that flies, a
 /// measured carry or flight time of exactly 0 is not a reading, so it is
 /// simulated next to the untouched 0. A ground ball (a measured apex of 0,
 /// or no measured apex and a launch angle of at most 0.5 deg) is rolled,
@@ -37,11 +40,11 @@ use crate::{Club, Handedness, ShotKey, ShotMetrics, ShotRaw, ShotVideo, UnitSyst
 /// When [`replaces_measured`](Self::replaces_measured) is set (the
 /// `[simulation] mode = "force"` setting), every result field is the
 /// simulation's, whether or not the device measured it, and these values
-/// take precedence over the measured ones in [`BallFlight`], which are kept
+/// take precedence over the device's in [`ShotData::flight`], which are kept
 /// unchanged.
 ///
-/// [`spin_estimated`](Self::spin_estimated) marks a spin in [`BallFlight`]
-/// that flighthook estimated rather than the device measured, and
+/// [`spin_estimated`](Self::spin_estimated) marks a spin in the shot's
+/// [`Launch`] that flighthook estimated rather than the device measured, and
 /// [`computed`](Self::computed) the values in the shot's measured blocks
 /// that come from a model rather than the device's readings.
 ///
@@ -87,21 +90,23 @@ pub struct DerivedFlight {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<FlightPath>,
     /// True when these values replace the device's results: every result
-    /// field above is simulated and takes precedence over the measured
-    /// value in [`BallFlight`]. Set per shot when the `[simulation] mode`
+    /// field above is simulated and takes precedence over the device's
+    /// value in [`ShotData::flight`]. Set per shot when the `[simulation] mode`
     /// in effect when the shot was simulated is `force`.
     /// Omitted on the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replaces_measured: bool,
-    /// True when the spin in [`BallFlight`] (`backspin_rpm`, `sidespin_rpm`)
-    /// is flighthook's estimate, not the device's reading: a FlightScope
-    /// result with launch data but no spin and no flight. The spin stays in
-    /// `BallFlight`, where outputs read it; this flag only marks its source.
+    /// True when the spin in the shot's [`Launch`] (`backspin_rpm`,
+    /// `sidespin_rpm`) is flighthook's estimate, not the device's reading: a
+    /// FlightScope result with launch data but no spin and no flight. The
+    /// spin stays in the launch, where outputs read it; this flag only marks
+    /// its source. flighthook's FRP output sends it as the `assumed` spin of
+    /// its own modeled flight result instead.
     /// Set on its own (every other field empty) when the shot was not
     /// simulated. Omitted on the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spin_estimated: bool,
-    /// Values in the shot's measured blocks ([`BallFlight`], `ClubData`,
+    /// Values in the shot's measured blocks ([`Launch`], `ClubData`,
     /// `FaceImpact`) that come from a model (aerodynamic, flight or
     /// otherwise) rather than from the device's readings. A plain
     /// translation of a reading is not computed: converting between the two
@@ -122,15 +127,15 @@ pub struct DerivedFlight {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ShotField {
-    /// `BallFlight.launch_elevation`.
+    /// `Launch.launch_elevation`.
     LaunchElevation,
-    /// `BallFlight.backspin_rpm`.
+    /// `Launch.backspin_rpm`.
     BackspinRpm,
-    /// `BallFlight.sidespin_rpm`.
+    /// `Launch.sidespin_rpm`.
     SidespinRpm,
-    /// `BallFlight.total_spin_rpm`.
+    /// `Launch.total_spin_rpm`.
     TotalSpinRpm,
-    /// `BallFlight.spin_axis`.
+    /// `Launch.spin_axis`.
     SpinAxis,
     /// `FaceImpact.vertical`.
     ImpactVertical,
@@ -189,7 +194,82 @@ pub struct FlightPath {
     pub ground: Vec<[f64; 4]>,
 }
 
+/// The `model` of the flight result flighthook adds on its FRP output for a
+/// shot whose device sent none: flighthook's simulation
+/// ([`DerivedFlight::flight_result`]).
+pub const FLIGHT_MODEL: &str = "flighthook simulation (dimple)";
+
+/// Whether `flight` is the flight result flighthook adds on its FRP output:
+/// [`Basis::Modeled`] by its own simulation ([`FLIGHT_MODEL`]).
+#[must_use]
+pub fn is_flighthook_flight(flight: &FlightResult) -> bool {
+    flight.basis == Basis::Modeled && flight.model.as_deref() == Some(FLIGHT_MODEL)
+}
+
+/// `launch` with the values `derived` marks as not measured
+/// ([`DerivedFlight::computed`], and the spin when
+/// [`DerivedFlight::spin_estimated`] is set) moved out: the measured launch
+/// and the moved values, `None` when nothing was moved. This is the launch
+/// flighthook's FRP output sends, and the moved values go out as the
+/// `assumed` launch of its own flight result.
+#[must_use]
+pub fn measured_launch(
+    launch: &Launch,
+    derived: Option<&DerivedFlight>,
+) -> (Launch, Option<AssumedLaunch>) {
+    let Some(d) = derived else {
+        return (launch.clone(), None);
+    };
+    let unmeasured =
+        |f: ShotField| d.computed.contains(&f) || (d.spin_estimated && SPIN_FIELDS.contains(&f));
+    let mut measured = launch.clone();
+    let mut assumed = AssumedLaunch::default();
+    if unmeasured(ShotField::LaunchElevation) {
+        assumed.launch_elevation = measured.launch_elevation.take();
+    }
+    if unmeasured(ShotField::BackspinRpm) {
+        assumed.backspin_rpm = measured.backspin_rpm.take();
+    }
+    if unmeasured(ShotField::SidespinRpm) {
+        assumed.sidespin_rpm = measured.sidespin_rpm.take();
+    }
+    if unmeasured(ShotField::TotalSpinRpm) {
+        assumed.total_spin_rpm = measured.total_spin_rpm.take();
+    }
+    if unmeasured(ShotField::SpinAxis) {
+        assumed.spin_axis = measured.spin_axis.take();
+    }
+    (measured, (!assumed.is_empty()).then_some(assumed))
+}
+
 impl DerivedFlight {
+    /// flighthook's own flight result from these simulated values:
+    /// [`Basis::Modeled`], [`FLIGHT_MODEL`], every flight value here, and
+    /// `assumed` holding the launch values the shot's measured launch lacks
+    /// that the values rest on ([`measured_launch`]). `None` when there is
+    /// nothing to send: no flight value and nothing assumed.
+    #[must_use]
+    pub fn flight_result(&self, assumed: Option<AssumedLaunch>) -> Option<FlightResult> {
+        let flight = FlightResult {
+            model: Some(FLIGHT_MODEL.to_owned()),
+            carry_distance: self.carry_distance,
+            carry_offline: self.carry_offline,
+            total_distance: self.total_distance,
+            total_offline: self.total_offline,
+            roll_distance: self.roll_distance,
+            max_height: self.max_height,
+            flight_time: self.flight_time,
+            descent_angle: self.descent_angle,
+            assumed: assumed.filter(|a| !a.is_empty()),
+            ..FlightResult::new(Basis::Modeled)
+        };
+        let empty = FlightResult {
+            model: Some(FLIGHT_MODEL.to_owned()),
+            ..FlightResult::new(Basis::Modeled)
+        };
+        (flight != empty).then_some(flight)
+    }
+
     /// True when no field is set.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -217,7 +297,7 @@ impl DerivedFlight {
         }
     }
 
-    /// Convert distances to yards (heights to feet, as for [`BallFlight`]).
+    /// Convert distances to yards (heights to feet, as for [`ShotData`]).
     /// `path` is always meters/seconds and is carried over unchanged.
     #[must_use]
     pub fn to_imperial(&self) -> DerivedFlight {
@@ -268,16 +348,31 @@ impl DerivedFlight {
 
 /// One shot as stored and served by the web layer (`/api/shots`).
 ///
-/// `shot_id`, `club_selected`, `group`, `handed` and `video` are set by the
-/// web layer on stored shots and are omitted on the wire when absent. Build one with
-/// `ShotData::default()` and struct-update syntax.
+/// `launch` is the measured launch and `flight` the device's flight result,
+/// as the device sent them (FRP's `launch` and `flight_result`); `derived`
+/// holds what flighthook simulated. `shot_id`, `club_selected`, `group`,
+/// `handed` and `video` are set by the web layer on stored shots and are
+/// omitted on the wire when absent. Build one with `ShotData::default()`
+/// and struct-update syntax.
+///
+/// Reading also accepts the shape with a `ball` block in place of `launch`,
+/// whose flight values (carry, total, apex and so on) become a `flight` with
+/// [`Basis::Modeled`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "ShotDataWire")]
 pub struct ShotData {
     #[serde(default)]
     pub actor: String,
     pub shot_number: u32,
+    /// The measured launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ball: Option<BallFlight>,
+    pub launch: Option<Launch>,
+    /// The device's flight result: carry, total, apex and the rest as the
+    /// device reported them, with the basis they were obtained on. Absent
+    /// when the device reported none; flighthook's own simulated values are
+    /// in `derived`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flight: Option<FlightResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club: Option<ClubData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -285,9 +380,9 @@ pub struct ShotData {
     /// Simulated values for fields the device did not report (beta).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived: Option<DerivedFlight>,
-    /// Values computed from the measured `ball` and `club` (spin total and
-    /// axis, face to path, spin loft, curve). Set when the shot is
-    /// assembled ([`ShotAccumulator`]).
+    /// Values computed from the measured `launch`, the device's `flight` and
+    /// `club` (spin total and axis, face to path, spin loft, curve). Set
+    /// when the shot is assembled ([`ShotAccumulator`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<ShotMetrics>,
     /// Shot id from the device actor's `ShotKey`.
@@ -316,6 +411,106 @@ pub struct ShotData {
     pub provenance: Option<Provenance>,
 }
 
+/// [`ShotData`] as read: `launch` may be a `ball` block that also holds the
+/// device's flight values.
+#[derive(Deserialize)]
+struct ShotDataWire {
+    #[serde(default)]
+    actor: String,
+    shot_number: u32,
+    #[serde(default, alias = "ball")]
+    launch: Option<LaunchWire>,
+    #[serde(default)]
+    flight: Option<FlightResult>,
+    #[serde(default)]
+    club: Option<ClubData>,
+    #[serde(default)]
+    impact: Option<FaceImpact>,
+    #[serde(default)]
+    derived: Option<DerivedFlight>,
+    #[serde(default)]
+    metrics: Option<ShotMetrics>,
+    #[serde(default)]
+    shot_id: Option<String>,
+    #[serde(default)]
+    club_selected: Option<Club>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    handed: Option<Handedness>,
+    #[serde(default)]
+    video: Vec<ShotVideo>,
+    #[serde(default)]
+    provenance: Option<Provenance>,
+}
+
+/// A `launch` block as read: the launch values, plus the flight values a
+/// `ball` block carries next to them.
+#[derive(Deserialize)]
+struct LaunchWire {
+    #[serde(flatten)]
+    launch: Launch,
+    #[serde(default)]
+    carry_distance: Option<Distance>,
+    #[serde(default)]
+    carry_offline: Option<Distance>,
+    #[serde(default)]
+    total_distance: Option<Distance>,
+    #[serde(default)]
+    total_offline: Option<Distance>,
+    #[serde(default)]
+    roll_distance: Option<Distance>,
+    #[serde(default)]
+    max_height: Option<Distance>,
+    #[serde(default)]
+    flight_time: Option<f64>,
+    #[serde(default)]
+    descent_angle: Option<f64>,
+}
+
+impl LaunchWire {
+    /// The flight values next to the launch, as a [`Basis::Modeled`] flight
+    /// result; `None` when there are none.
+    fn flight(&self) -> Option<FlightResult> {
+        let flight = FlightResult {
+            carry_distance: self.carry_distance,
+            carry_offline: self.carry_offline,
+            total_distance: self.total_distance,
+            total_offline: self.total_offline,
+            roll_distance: self.roll_distance,
+            max_height: self.max_height,
+            flight_time: self.flight_time,
+            descent_angle: self.descent_angle,
+            ..FlightResult::new(Basis::Modeled)
+        };
+        (flight != FlightResult::new(Basis::Modeled)).then_some(flight)
+    }
+}
+
+impl From<ShotDataWire> for ShotData {
+    fn from(w: ShotDataWire) -> Self {
+        let flight = w
+            .flight
+            .or_else(|| w.launch.as_ref().and_then(LaunchWire::flight));
+        ShotData {
+            actor: w.actor,
+            shot_number: w.shot_number,
+            launch: w.launch.map(|l| l.launch),
+            flight,
+            club: w.club,
+            impact: w.impact,
+            derived: w.derived,
+            metrics: w.metrics,
+            shot_id: w.shot_id,
+            club_selected: w.club_selected,
+            group: w.group,
+            handed: w.handed,
+            video: w.video,
+            provenance: w.provenance,
+        }
+    }
+}
+
 /// The four spin values, all unmeasured when flighthook estimated the spin.
 const SPIN_FIELDS: [ShotField; 4] = [
     ShotField::TotalSpinRpm,
@@ -325,19 +520,18 @@ const SPIN_FIELDS: [ShotField; 4] = [
 ];
 
 impl ShotData {
-    /// True when the device reported ball, club or impact data.
+    /// True when the device reported launch, flight, club or impact data.
     #[must_use]
     pub fn has_data(&self) -> bool {
-        self.ball.is_some() || self.club.is_some() || self.impact.is_some()
+        self.launch.is_some()
+            || self.flight.is_some()
+            || self.club.is_some()
+            || self.impact.is_some()
     }
 
     /// The values in the measured blocks that are not the device's reading:
     /// those marked [`DerivedFlight::computed`], and all four spin values
     /// when [`DerivedFlight::spin_estimated`] is set. Each field once.
-    ///
-    /// The answer comes from those two marks today; when FRP carries a
-    /// per-block list of computed values, it comes from that list instead,
-    /// and this stays the one question to ask.
     pub fn unmeasured_fields(&self) -> impl Iterator<Item = ShotField> + '_ {
         let derived = self.derived.as_ref();
         let estimated = derived.is_some_and(|d| d.spin_estimated);
@@ -357,31 +551,31 @@ impl ShotData {
 
     /// Remove `field`'s value from the measured blocks.
     pub fn clear_field(&mut self, field: ShotField) {
-        let ball = self.ball.as_mut();
+        let launch = self.launch.as_mut();
         match field {
             ShotField::LaunchElevation => {
-                if let Some(b) = ball {
-                    b.launch_elevation = None;
+                if let Some(l) = launch {
+                    l.launch_elevation = None;
                 }
             }
             ShotField::BackspinRpm => {
-                if let Some(b) = ball {
-                    b.backspin_rpm = None;
+                if let Some(l) = launch {
+                    l.backspin_rpm = None;
                 }
             }
             ShotField::SidespinRpm => {
-                if let Some(b) = ball {
-                    b.sidespin_rpm = None;
+                if let Some(l) = launch {
+                    l.sidespin_rpm = None;
                 }
             }
             ShotField::TotalSpinRpm => {
-                if let Some(b) = ball {
-                    b.total_spin_rpm = None;
+                if let Some(l) = launch {
+                    l.total_spin_rpm = None;
                 }
             }
             ShotField::SpinAxis => {
-                if let Some(b) = ball {
-                    b.spin_axis = None;
+                if let Some(l) = launch {
+                    l.spin_axis = None;
                 }
             }
             ShotField::ImpactVertical => {
@@ -401,22 +595,19 @@ impl ShotData {
     }
 
     fn to_imperial(&self) -> ShotData {
-        let ball = self.ball.as_ref().map(|b| BallFlight {
-            launch_speed: b.launch_speed.map(|v| Velocity::MilesPerHour(v.as_mph())),
-            launch_elevation: b.launch_elevation,
-            launch_azimuth: b.launch_azimuth,
-            carry_distance: b.carry_distance.map(|d| Distance::Yards(d.as_yards())),
-            carry_offline: b.carry_offline.map(|d| Distance::Yards(d.as_yards())),
-            total_distance: b.total_distance.map(|d| Distance::Yards(d.as_yards())),
-            total_offline: b.total_offline.map(|d| Distance::Yards(d.as_yards())),
-            max_height: b.max_height.map(|d| Distance::Feet(d.as_feet())),
-            flight_time: b.flight_time,
-            descent_angle: b.descent_angle,
-            roll_distance: b.roll_distance.map(|d| Distance::Yards(d.as_yards())),
-            backspin_rpm: b.backspin_rpm,
-            sidespin_rpm: b.sidespin_rpm,
-            total_spin_rpm: b.total_spin_rpm,
-            spin_axis: b.spin_axis,
+        let launch = self.launch.as_ref().map(|l| Launch {
+            launch_speed: l.launch_speed.map(|v| Velocity::MilesPerHour(v.as_mph())),
+            ..l.clone()
+        });
+        let yd = |d: Option<Distance>| d.map(|d| Distance::Yards(d.as_yards()));
+        let flight = self.flight.as_ref().map(|f| FlightResult {
+            carry_distance: yd(f.carry_distance),
+            carry_offline: yd(f.carry_offline),
+            total_distance: yd(f.total_distance),
+            total_offline: yd(f.total_offline),
+            roll_distance: yd(f.roll_distance),
+            max_height: f.max_height.map(|d| Distance::Feet(d.as_feet())),
+            ..f.clone()
         });
         let club = self.club.as_ref().map(|c| ClubData {
             club_speed: c.club_speed.map(|v| Velocity::MilesPerHour(v.as_mph())),
@@ -440,7 +631,8 @@ impl ShotData {
         ShotData {
             actor: self.actor.clone(),
             shot_number: self.shot_number,
-            ball,
+            launch,
+            flight,
             club,
             impact: self.impact.clone(),
             derived: self.derived.as_ref().map(DerivedFlight::to_imperial),
@@ -455,24 +647,21 @@ impl ShotData {
     }
 
     fn to_metric(&self) -> ShotData {
-        let ball = self.ball.as_ref().map(|b| BallFlight {
-            launch_speed: b
+        let launch = self.launch.as_ref().map(|l| Launch {
+            launch_speed: l
                 .launch_speed
                 .map(|v| Velocity::MetersPerSecond(v.as_mps())),
-            launch_elevation: b.launch_elevation,
-            launch_azimuth: b.launch_azimuth,
-            carry_distance: b.carry_distance.map(|d| Distance::Meters(d.as_meters())),
-            carry_offline: b.carry_offline.map(|d| Distance::Meters(d.as_meters())),
-            total_distance: b.total_distance.map(|d| Distance::Meters(d.as_meters())),
-            total_offline: b.total_offline.map(|d| Distance::Meters(d.as_meters())),
-            max_height: b.max_height.map(|d| Distance::Meters(d.as_meters())),
-            flight_time: b.flight_time,
-            descent_angle: b.descent_angle,
-            roll_distance: b.roll_distance.map(|d| Distance::Meters(d.as_meters())),
-            backspin_rpm: b.backspin_rpm,
-            sidespin_rpm: b.sidespin_rpm,
-            total_spin_rpm: b.total_spin_rpm,
-            spin_axis: b.spin_axis,
+            ..l.clone()
+        });
+        let m = |d: Option<Distance>| d.map(|d| Distance::Meters(d.as_meters()));
+        let flight = self.flight.as_ref().map(|f| FlightResult {
+            carry_distance: m(f.carry_distance),
+            carry_offline: m(f.carry_offline),
+            total_distance: m(f.total_distance),
+            total_offline: m(f.total_offline),
+            roll_distance: m(f.roll_distance),
+            max_height: m(f.max_height),
+            ..f.clone()
         });
         let club = self.club.as_ref().map(|c| ClubData {
             club_speed: c.club_speed.map(|v| Velocity::MetersPerSecond(v.as_mps())),
@@ -496,7 +685,8 @@ impl ShotData {
         ShotData {
             actor: self.actor.clone(),
             shot_number: self.shot_number,
-            ball,
+            launch,
+            flight,
             club,
             impact: self.impact.clone(),
             derived: self.derived.as_ref().map(DerivedFlight::to_metric),
@@ -540,17 +730,19 @@ impl std::fmt::Display for ActorStatus {
 // ShotAccumulator — consumer-side shot assembly
 // ---------------------------------------------------------------------------
 
-/// Collects shot lifecycle events (`BallFlight`, `ClubPath`, `FaceImpact`)
-/// and produces a complete [`ShotData`] on `ShotFinished`, plus the raw
-/// device frames that came with it.
+/// Collects shot lifecycle events (`Launch`, `FlightResult`, `ClubPath`,
+/// `FaceImpact`) and produces a complete [`ShotData`] on `ShotFinished`,
+/// plus the raw device frames that came with it.
 ///
-/// Used by consumers that need all shot fields together (GSPro bridge,
-/// web shot cache, UI shot grid). Keyed by `(actor, ShotKey)`.
+/// A shot keeps the first event of each kind and ignores a repeat. Used by
+/// consumers that need all shot fields together, usually through a
+/// [`ShotAggregator`].
 #[derive(Debug)]
 pub struct ShotAccumulator {
     pub actor: String,
     pub key: ShotKey,
-    ball: Option<BallFlight>,
+    launch: Option<Launch>,
+    flight: Option<FlightResult>,
     club: Option<ClubData>,
     impact: Option<FaceImpact>,
     derived: Option<DerivedFlight>,
@@ -564,7 +756,8 @@ impl ShotAccumulator {
         Self {
             actor,
             key,
-            ball: None,
+            launch: None,
+            flight: None,
             club: None,
             impact: None,
             derived: None,
@@ -581,24 +774,32 @@ impl ShotAccumulator {
         self
     }
 
-    /// Record ball flight data.
-    pub fn set_ball(&mut self, ball: BallFlight) {
-        self.ball = Some(ball);
-    }
-
-    /// Record the simulated values that came with the ball flight.
-    pub fn set_derived(&mut self, derived: Option<DerivedFlight>) {
+    /// Record the launch and the simulated values that came with it. A shot
+    /// keeps the first launch it receives; returns whether this one was
+    /// kept.
+    pub fn set_launch(&mut self, launch: Launch, derived: Option<DerivedFlight>) -> bool {
+        if self.launch.is_some() {
+            return false;
+        }
+        self.launch = Some(launch);
         self.derived = derived;
+        true
     }
 
-    /// Record club path data.
+    /// Record the device's flight result. A shot keeps the first one it
+    /// receives.
+    pub fn set_flight(&mut self, flight: FlightResult) {
+        self.flight.get_or_insert(flight);
+    }
+
+    /// Record club path data. A shot keeps the first it receives.
     pub fn set_club(&mut self, club: ClubData) {
-        self.club = Some(club);
+        self.club.get_or_insert(club);
     }
 
-    /// Record face impact data.
+    /// Record face impact data. A shot keeps the first it receives.
     pub fn set_impact(&mut self, impact: FaceImpact) {
-        self.impact = Some(impact);
+        self.impact.get_or_insert(impact);
     }
 
     /// Record the raw device frames that came with `ShotFinished`.
@@ -613,17 +814,26 @@ impl ShotAccumulator {
 
     /// Finalize into the decoded shot and its raw frames. The shot is `None`
     /// if no data arrived at all; the raw frames are kept either way. The
-    /// shot's [`metrics`](ShotData::metrics) are computed from its ball and
-    /// club data.
+    /// shot's [`metrics`](ShotData::metrics) are computed from its launch,
+    /// flight result and club data.
     pub fn into_parts(self) -> (Option<ShotData>, Option<ShotRaw>) {
-        if self.ball.is_none() && self.club.is_none() && self.impact.is_none() {
+        if self.launch.is_none()
+            && self.flight.is_none()
+            && self.club.is_none()
+            && self.impact.is_none()
+        {
             return (None, self.raw);
         }
-        let metrics = ShotMetrics::compute(self.ball.as_ref(), self.club.as_ref());
+        let metrics = ShotMetrics::compute(
+            self.launch.as_ref(),
+            self.flight.as_ref(),
+            self.club.as_ref(),
+        );
         let shot = ShotData {
             actor: self.actor,
             shot_number: self.key.shot_number,
-            ball: self.ball,
+            launch: self.launch,
+            flight: self.flight,
             club: self.club,
             impact: self.impact,
             derived: self.derived,
@@ -633,17 +843,49 @@ impl ShotAccumulator {
         };
         (Some(shot), self.raw)
     }
+
+    /// Feed one shot event of this shot (anything but its trigger and
+    /// finish), keeping the first of each kind.
+    fn feed(&mut self, event: &crate::FlighthookEvent) {
+        use crate::FlighthookEvent;
+        match event {
+            FlighthookEvent::Launch {
+                launch, derived, ..
+            } => {
+                self.set_launch(*launch.clone(), derived.as_deref().cloned());
+            }
+            FlighthookEvent::FlightResult { flight, .. } => self.set_flight(*flight.clone()),
+            FlighthookEvent::ClubPath { club, .. } => self.set_club(*club.clone()),
+            FlighthookEvent::FaceImpact { impact, .. } => self.set_impact(*impact.clone()),
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // ShotAggregator — feed FlighthookMessages, get complete ShotData out
 // ---------------------------------------------------------------------------
 
-/// High-level shot collector that manages multiple in-flight shots.
+/// How long a shot may take from `shot_trigger` to `shot_finished` before a
+/// [`ShotAggregator`] discards it: FRP's accumulator timeout.
+pub const SHOT_TIMEOUT: Duration = flightrelay::DEFAULT_SHOT_TIMEOUT;
+
+/// High-level shot collector that manages multiple in-flight shots, keyed
+/// by actor and shot id, with FRP's shot lifecycle rules.
 ///
 /// Feed [`FlighthookMessage`](crate::FlighthookMessage) events via
 /// [`feed`](Self::feed) and receive complete [`ShotData`] when a shot
 /// lifecycle finishes.
+///
+/// - A shot keeps the first `launch`, `flight_result`, `club_path` and
+///   `face_impact` it receives and ignores a repeat; a second `shot_trigger`
+///   for a shot in flight is ignored too.
+/// - A shot that has not finished within the timeout of its `shot_trigger`
+///   ([`SHOT_TIMEOUT`] unless set with [`with_timeout`](Self::with_timeout))
+///   is discarded, never emitted.
+/// - Events for a shot that finished or was discarded are ignored for one
+///   more timeout, so a late `shot_finished` or a repeat never starts or
+///   finishes a shot again.
 ///
 /// ```ignore
 /// # use flighthook::{ShotAggregator, FlighthookClient, FlighthookEvent};
@@ -653,59 +895,147 @@ impl ShotAccumulator {
 /// loop {
 ///     let msg = client.recv().unwrap();
 ///     // Match event variants with `..` so new fields don't break the pattern.
-///     if let FlighthookEvent::BallFlight { key, .. } = &msg.event {
-///         println!("ball flight for shot #{}", key.shot_number);
+///     if let FlighthookEvent::Launch { key, .. } = &msg.event {
+///         println!("launch for shot #{}", key.shot_number);
 ///     }
 ///     if let Some(shot) = shots.feed(&msg) {
-///         println!("shot #{}: {:?} {:?}", shot.shot_number, shot.ball, shot.derived);
+///         println!("shot #{}: {:?} {:?}", shot.shot_number, shot.launch, shot.flight);
 ///     }
 /// }
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ShotAggregator {
-    pending: std::collections::HashMap<(String, ShotKey), ShotAccumulator>,
+    timeout: Duration,
+    /// Shots in flight by (actor, shot id), with the time of their trigger.
+    pending: HashMap<(String, String), (Instant, ShotAccumulator)>,
+    /// Shots finished or discarded, with the time they closed.
+    closed: HashMap<(String, String), Instant>,
+}
+
+impl Default for ShotAggregator {
+    fn default() -> Self {
+        Self {
+            timeout: SHOT_TIMEOUT,
+            pending: HashMap::new(),
+            closed: HashMap::new(),
+        }
+    }
 }
 
 impl ShotAggregator {
+    /// An aggregator with the [`SHOT_TIMEOUT`].
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets how long a shot may take from `shot_trigger` to `shot_finished`
+    /// before it is discarded.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The accumulator timeout.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Process a bus message. Returns a completed [`ShotData`] when a
-    /// `ShotFinished` event finalizes an accumulated shot.
+    /// `ShotFinished` event finalizes an accumulated shot that has data.
+    ///
+    /// Reads the clock, which `wasm32-unknown-unknown` lacks; there, use
+    /// [`feed_at`](Self::feed_at).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn feed(&mut self, msg: &crate::FlighthookMessage) -> Option<ShotData> {
+        self.feed_at(msg, Instant::now())?.finish()
+    }
+
+    /// Process a bus message received at `now`. Returns the shot's
+    /// accumulator when a `ShotFinished` event finalizes a shot in flight,
+    /// for the caller to add its raw frames to and finish.
+    pub fn feed_at(
+        &mut self,
+        msg: &crate::FlighthookMessage,
+        now: Instant,
+    ) -> Option<ShotAccumulator> {
+        use crate::FlighthookEvent;
+        self.discard_expired_at(now);
+        let key = match &msg.event {
+            FlighthookEvent::ShotTrigger { key, .. }
+            | FlighthookEvent::Launch { key, .. }
+            | FlighthookEvent::FlightResult { key, .. }
+            | FlighthookEvent::ClubPath { key, .. }
+            | FlighthookEvent::FaceImpact { key, .. }
+            | FlighthookEvent::ShotFinished { key, .. } => key,
+            _ => return None,
+        };
+        let id = (msg.actor.clone(), key.shot_id.clone());
         match &msg.event {
-            crate::FlighthookEvent::ShotTrigger { key } => {
-                let acc = ShotAccumulator::new(msg.actor.clone(), key.clone())
-                    .with_provenance(msg.provenance);
-                self.pending.insert((msg.actor.clone(), key.clone()), acc);
-                None
-            }
-            crate::FlighthookEvent::BallFlight { key, ball, derived } => {
-                if let Some(acc) = self.pending.get_mut(&(msg.actor.clone(), key.clone())) {
-                    acc.set_ball(*ball.clone());
-                    acc.set_derived(derived.as_deref().cloned());
+            FlighthookEvent::ShotTrigger { .. } => {
+                if !self.closed.contains_key(&id) && !self.pending.contains_key(&id) {
+                    let acc = ShotAccumulator::new(msg.actor.clone(), key.clone())
+                        .with_provenance(msg.provenance);
+                    self.pending.insert(id, (now, acc));
                 }
                 None
             }
-            crate::FlighthookEvent::ClubPath { key, club } => {
-                if let Some(acc) = self.pending.get_mut(&(msg.actor.clone(), key.clone())) {
-                    acc.set_club(*club.clone());
+            FlighthookEvent::ShotFinished { .. } => {
+                let (_, acc) = self.pending.remove(&id)?;
+                self.closed.insert(id, now);
+                Some(acc)
+            }
+            event => {
+                if let Some((_, acc)) = self.pending.get_mut(&id) {
+                    acc.feed(event);
                 }
                 None
             }
-            crate::FlighthookEvent::FaceImpact { key, impact } => {
-                if let Some(acc) = self.pending.get_mut(&(msg.actor.clone(), key.clone())) {
-                    acc.set_impact(*impact.clone());
-                }
-                None
-            }
-            crate::FlighthookEvent::ShotFinished { key, .. } => self
-                .pending
-                .remove(&(msg.actor.clone(), key.clone()))?
-                .finish(),
-            _ => None,
         }
+    }
+
+    /// Whether the shot `shot_id` of `actor` is in flight: triggered, not
+    /// yet finished or discarded.
+    #[must_use]
+    pub fn is_pending(&self, actor: &str, shot_id: &str) -> bool {
+        self.pending
+            .contains_key(&(actor.to_owned(), shot_id.to_owned()))
+    }
+
+    /// Discard the shot `shot_id` of `actor` if it is in flight. Its later
+    /// events are ignored. Returns whether it was in flight.
+    pub fn discard(&mut self, actor: &str, shot_id: &str, now: Instant) -> bool {
+        let id = (actor.to_owned(), shot_id.to_owned());
+        if self.pending.remove(&id).is_none() {
+            return false;
+        }
+        self.closed.insert(id, now);
+        true
+    }
+
+    /// Discard every shot that has not finished within the timeout of its
+    /// `shot_trigger` at `now`, and return their actors and keys. Their
+    /// later events are ignored. Every [`feed_at`](Self::feed_at) does this
+    /// first.
+    pub fn discard_expired_at(&mut self, now: Instant) -> Vec<(String, ShotKey)> {
+        let timeout = self.timeout;
+        self.closed
+            .retain(|_, closed| now.saturating_duration_since(*closed) <= timeout);
+        let expired: Vec<(String, String)> = self
+            .pending
+            .iter()
+            .filter(|(_, (at, _))| now.saturating_duration_since(*at) > timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut discarded = Vec::with_capacity(expired.len());
+        for id in expired {
+            if let Some((_, acc)) = self.pending.remove(&id) {
+                discarded.push((acc.actor, acc.key));
+            }
+            self.closed.insert(id, now);
+        }
+        discarded
     }
 
     /// Number of shots currently being accumulated.
@@ -719,19 +1049,23 @@ mod tests {
     use super::*;
     use crate::{FlighthookEvent, FlighthookMessage, RawPayload};
 
-    fn ball() -> BallFlight {
-        BallFlight {
+    fn ball() -> Launch {
+        Launch {
             launch_speed: Some(Velocity::MetersPerSecond(53.6)),
             launch_elevation: Some(17.0),
             launch_azimuth: Some(-1.2),
-            carry_distance: None,
-            total_distance: None,
-            roll_distance: None,
-            max_height: None,
-            flight_time: None,
             backspin_rpm: Some(6500),
             sidespin_rpm: Some(-300),
-            ..BallFlight::default()
+            ..Launch::default()
+        }
+    }
+
+    fn device_flight() -> FlightResult {
+        FlightResult {
+            carry_distance: Some(Distance::Meters(220.4)),
+            max_height: Some(Distance::Meters(31.2)),
+            flight_time: Some(6.4),
+            ..FlightResult::new(Basis::Modeled)
         }
     }
 
@@ -742,15 +1076,15 @@ mod tests {
         }
     }
 
-    fn ball_flight_message(derived: Option<DerivedFlight>) -> FlighthookMessage {
+    fn launch_message(derived: Option<DerivedFlight>) -> FlighthookMessage {
         FlighthookMessage {
             actor: "square.0".into(),
             device: Some("SquareGolf-A1B2".into()),
             raw_payload: Some(RawPayload::Binary(vec![0x11, 0x02, 0x00, 0x2a, 0xff])),
             provenance: None,
-            event: FlighthookEvent::BallFlight {
+            event: FlighthookEvent::Launch {
                 key: key(),
-                ball: Box::new(ball()),
+                launch: Box::new(ball()),
                 derived: derived.map(Box::new),
             },
         }
@@ -760,12 +1094,8 @@ mod tests {
         ShotData {
             actor: "mevo.0".into(),
             shot_number: 7,
-            ball: Some(BallFlight {
-                carry_distance: Some(Distance::Meters(220.4)),
-                max_height: Some(Distance::Meters(31.2)),
-                flight_time: Some(6.4),
-                ..ball()
-            }),
+            launch: Some(ball()),
+            flight: Some(device_flight()),
             club: Some(ClubData {
                 club_speed: Some(Velocity::MetersPerSecond(44.7)),
                 club_speed_post: None,
@@ -802,9 +1132,13 @@ mod tests {
     }
 
     // Wire format with no derived values; must stay byte-identical.
-    const GOLDEN_BALL_FLIGHT: &str = r#"{"actor":"square.0","device":"SquareGolf-A1B2","raw_payload":"1102002aff","event":{"kind":"ball_flight","key":{"shot_id":"7f8e2d1c","shot_number":12},"ball":{"launch_speed":"53.6mps","launch_azimuth":-1.2,"launch_elevation":17.0,"backspin_rpm":6500,"sidespin_rpm":-300}}}"#;
-    const GOLDEN_SHOT: &str = r#"{"actor":"mevo.0","shot_number":7,"ball":{"launch_speed":"53.6mps","launch_azimuth":-1.2,"launch_elevation":17.0,"carry_distance":"220.4m","max_height":"31.2m","flight_time":6.4,"backspin_rpm":6500,"sidespin_rpm":-300},"club":{"club_speed":"44.7mps","path":1.5,"attack_angle":-2.0,"face_angle":0.5,"dynamic_loft":18.0,"smash_factor":1.2},"impact":{"lateral":"-4mm","vertical":"2.5mm"}}"#;
-    const GOLDEN_SHOT_IMPERIAL: &str = r#"{"actor":"mevo.0","shot_number":7,"ball":{"launch_speed":"119.89998400000002mph","launch_azimuth":-1.2,"launch_elevation":17.0,"carry_distance":"241.03237095363082yd","max_height":"102.36220472440944ft","flight_time":6.4,"backspin_rpm":6500,"sidespin_rpm":-300},"club":{"club_speed":"99.99121800000002mph","path":1.5,"attack_angle":-2.0,"face_angle":0.5,"dynamic_loft":18.0,"smash_factor":1.2},"impact":{"lateral":"-4mm","vertical":"2.5mm"}}"#;
+    const GOLDEN_LAUNCH: &str = r#"{"actor":"square.0","device":"SquareGolf-A1B2","raw_payload":"1102002aff","event":{"kind":"launch","key":{"shot_id":"7f8e2d1c","shot_number":12},"launch":{"launch_speed":"53.6mps","launch_azimuth":-1.2,"launch_elevation":17.0,"backspin_rpm":6500,"sidespin_rpm":-300}}}"#;
+    const GOLDEN_FLIGHT_RESULT: &str = r#"{"actor":"mevo.0","device":"FS-M2-XXXXXX","event":{"kind":"flight_result","key":{"shot_id":"7f8e2d1c","shot_number":12},"flight":{"basis":"modeled","carry_distance":"220.4m","max_height":"31.2m","flight_time":6.4}}}"#;
+    const GOLDEN_SHOT: &str = r#"{"actor":"mevo.0","shot_number":7,"launch":{"launch_speed":"53.6mps","launch_azimuth":-1.2,"launch_elevation":17.0,"backspin_rpm":6500,"sidespin_rpm":-300},"flight":{"basis":"modeled","carry_distance":"220.4m","max_height":"31.2m","flight_time":6.4},"club":{"club_speed":"44.7mps","path":1.5,"attack_angle":-2.0,"face_angle":0.5,"dynamic_loft":18.0,"smash_factor":1.2},"impact":{"lateral":"-4mm","vertical":"2.5mm"}}"#;
+    const GOLDEN_SHOT_IMPERIAL: &str = r#"{"actor":"mevo.0","shot_number":7,"launch":{"launch_speed":"119.89998400000002mph","launch_azimuth":-1.2,"launch_elevation":17.0,"backspin_rpm":6500,"sidespin_rpm":-300},"flight":{"basis":"modeled","carry_distance":"241.03237095363082yd","max_height":"102.36220472440944ft","flight_time":6.4},"club":{"club_speed":"99.99121800000002mph","path":1.5,"attack_angle":-2.0,"face_angle":0.5,"dynamic_loft":18.0,"smash_factor":1.2},"impact":{"lateral":"-4mm","vertical":"2.5mm"}}"#;
+    /// [`GOLDEN_SHOT`] in the shape stored before `launch` and `flight`:
+    /// one `ball` block with the device's carry, apex and flight time.
+    const STORED_BALL_SHOT: &str = r#"{"actor":"mevo.0","shot_number":7,"ball":{"launch_speed":"53.6mps","launch_azimuth":-1.2,"launch_elevation":17.0,"carry_distance":"220.4m","max_height":"31.2m","flight_time":6.4,"backspin_rpm":6500,"sidespin_rpm":-300},"club":{"club_speed":"44.7mps","path":1.5,"attack_angle":-2.0,"face_angle":0.5,"dynamic_loft":18.0,"smash_factor":1.2},"impact":{"lateral":"-4mm","vertical":"2.5mm"}}"#;
 
     const GOLDEN_SHOT_FINISHED: &str = r#"{"actor":"square.0","device":"SquareGolf-A1B2","event":{"kind":"shot_finished","key":{"shot_id":"7f8e2d1c","shot_number":12}}}"#;
 
@@ -866,10 +1200,10 @@ mod tests {
     #[test]
     fn into_parts_keeps_raw_with_and_without_data() {
         let mut acc = ShotAccumulator::new("square.0".into(), key());
-        acc.set_ball(ball());
+        acc.set_launch(ball(), None);
         acc.set_raw(Some(raw()));
         let (shot, r) = acc.into_parts();
-        assert_eq!(shot.expect("data").ball, Some(ball()));
+        assert_eq!(shot.expect("data").launch, Some(ball()));
         assert_eq!(r, Some(raw()));
 
         let mut acc = ShotAccumulator::new("square.0".into(), key());
@@ -889,10 +1223,10 @@ mod tests {
             provenance: None,
             event,
         };
-        agg.feed(&msg(FlighthookEvent::ShotTrigger { key: key() }));
-        agg.feed(&msg(FlighthookEvent::BallFlight {
+        agg.feed(&msg(FlighthookEvent::shot_trigger(key())));
+        agg.feed(&msg(FlighthookEvent::Launch {
             key: key(),
-            ball: Box::new(ball()),
+            launch: Box::new(ball()),
             derived: None,
         }));
         let shot = agg
@@ -901,14 +1235,14 @@ mod tests {
                 raw: Some(Box::new(raw())),
             }))
             .expect("finished");
-        assert_eq!(shot.ball, Some(ball()));
+        assert_eq!(shot.launch, Some(ball()));
         assert_eq!(agg.pending_count(), 0);
     }
 
     #[test]
     fn finished_shot_carries_its_metrics() {
         let mut acc = ShotAccumulator::new("mevo.0".into(), key());
-        acc.set_ball(ball());
+        acc.set_launch(ball(), None);
         acc.set_club(ClubData {
             face_angle: Some(0.5),
             path: Some(1.5),
@@ -934,13 +1268,16 @@ mod tests {
     #[test]
     fn unit_conversion_covers_the_new_shot_fields() {
         let mut s = shot(None);
-        s.ball = Some(BallFlight {
-            carry_offline: Some(Distance::Meters(-9.144)),
-            total_offline: Some(Distance::Meters(9.144)),
-            descent_angle: Some(44.0),
+        s.launch = Some(Launch {
             total_spin_rpm: Some(6507),
             spin_axis: Some(-2.6),
             ..ball()
+        });
+        s.flight = Some(FlightResult {
+            carry_offline: Some(Distance::Meters(-9.144)),
+            total_offline: Some(Distance::Meters(9.144)),
+            descent_angle: Some(44.0),
+            ..device_flight()
         });
         s.club = Some(ClubData {
             spin_loft: Some(20.0),
@@ -954,12 +1291,14 @@ mod tests {
         let close = |d: Option<Distance>, v: f64| (d.expect("present").value() - v).abs() < 1e-9;
 
         let imp = s.to_unit_system(UnitSystem::Imperial);
-        let b = imp.ball.as_ref().expect("ball");
-        assert!(matches!(b.carry_offline, Some(Distance::Yards(_))));
-        assert!(close(b.carry_offline, -10.0) && close(b.total_offline, 10.0));
+        let f = imp.flight.as_ref().expect("flight");
+        let l = imp.launch.as_ref().expect("launch");
+        assert!(matches!(f.carry_offline, Some(Distance::Yards(_))));
+        assert!(matches!(l.launch_speed, Some(Velocity::MilesPerHour(_))));
+        assert!(close(f.carry_offline, -10.0) && close(f.total_offline, 10.0));
         assert_eq!(
-            (b.descent_angle, b.total_spin_rpm, b.spin_axis),
-            (Some(44.0), Some(6507), Some(-2.6))
+            (f.descent_angle, l.total_spin_rpm, l.spin_axis, f.basis),
+            (Some(44.0), Some(6507), Some(-2.6), Basis::Modeled)
         );
         let c = imp.club.as_ref().expect("club");
         assert!(matches!(c.low_point_distance, Some(Distance::Inches(_))));
@@ -969,9 +1308,10 @@ mod tests {
         assert!(matches!(curve, Some(Distance::Yards(_))) && close(curve, 10.0));
 
         let met = imp.to_unit_system(UnitSystem::Metric);
-        let b = met.ball.as_ref().expect("ball");
-        assert!(matches!(b.total_offline, Some(Distance::Meters(_))));
-        assert!(close(b.carry_offline, -9.144));
+        let f = met.flight.as_ref().expect("flight");
+        assert!(matches!(f.total_offline, Some(Distance::Meters(_))));
+        assert!(matches!(f.max_height, Some(Distance::Meters(_))));
+        assert!(close(f.carry_offline, -9.144));
         assert!(close(
             met.club.as_ref().expect("club").low_point_distance,
             0.0254
@@ -980,20 +1320,95 @@ mod tests {
     }
 
     #[test]
-    fn has_data_needs_ball_club_or_impact() {
+    fn has_data_needs_launch_flight_club_or_impact() {
         let mut s = shot(None);
         assert!(s.has_data());
-        s.ball = None;
+        s.launch = None;
         s.club = None;
-        assert!(s.has_data());
         s.impact = None;
+        assert!(s.has_data(), "the flight result alone");
+        s.flight = None;
         assert!(!s.has_data());
+        s.impact = shot(None).impact;
+        assert!(s.has_data());
     }
 
     #[test]
-    fn ball_flight_without_derived_is_unchanged_on_the_wire() {
-        let json = serde_json::to_string(&ball_flight_message(None)).expect("serializes");
-        assert_eq!(json, GOLDEN_BALL_FLIGHT);
+    fn launch_without_derived_is_unchanged_on_the_wire() {
+        let json = serde_json::to_string(&launch_message(None)).expect("serializes");
+        assert_eq!(json, GOLDEN_LAUNCH);
+    }
+
+    #[test]
+    fn flight_result_round_trips_with_its_basis() {
+        let msg = FlighthookMessage {
+            actor: "mevo.0".into(),
+            device: Some("FS-M2-XXXXXX".into()),
+            raw_payload: None,
+            provenance: None,
+            event: FlighthookEvent::FlightResult {
+                key: key(),
+                flight: Box::new(device_flight()),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&msg).expect("ser"),
+            GOLDEN_FLIGHT_RESULT
+        );
+        let back: FlighthookMessage = serde_json::from_str(GOLDEN_FLIGHT_RESULT).expect("de");
+        let FlighthookEvent::FlightResult { flight, .. } = back.event else {
+            panic!("not a flight result");
+        };
+        assert_eq!(*flight, device_flight());
+        // The same event parses as FRP's.
+        let frp = flightrelay::FrpMessage::parse(GOLDEN_FLIGHT_RESULT).expect("frp");
+        let flightrelay::FrpMessage::Envelope(env) = frp else {
+            panic!("not an envelope");
+        };
+        assert!(matches!(
+            env.event,
+            flightrelay::FrpEvent::FlightResult { ref flight, .. } if *flight == device_flight()
+        ));
+    }
+
+    /// flighthook's launch and trigger events are FRP's, with flighthook's
+    /// extension fields on top.
+    #[test]
+    fn launch_and_trigger_parse_as_frp() {
+        let frp = flightrelay::FrpMessage::parse(GOLDEN_LAUNCH).expect("frp");
+        let flightrelay::FrpMessage::Envelope(env) = frp else {
+            panic!("not an envelope");
+        };
+        assert_eq!(env.device, "SquareGolf-A1B2");
+        assert!(matches!(
+            env.event,
+            flightrelay::FrpEvent::Launch { ref launch, .. } if *launch == ball()
+        ));
+        let trigger = FlighthookMessage {
+            actor: "square.0".into(),
+            device: Some("SquareGolf-A1B2".into()),
+            raw_payload: None,
+            provenance: Some(Provenance::Measured),
+            event: FlighthookEvent::ShotTrigger {
+                key: key(),
+                timestamp: Some(1_762_538_400_000),
+            },
+        };
+        let json = serde_json::to_string(&trigger).expect("ser");
+        let flightrelay::FrpMessage::Envelope(env) =
+            flightrelay::FrpMessage::parse(&json).expect("frp")
+        else {
+            panic!("not an envelope");
+        };
+        assert!(matches!(
+            env.event,
+            flightrelay::FrpEvent::ShotTrigger {
+                timestamp: Some(1_762_538_400_000),
+                ..
+            }
+        ));
+        let plain = serde_json::to_value(FlighthookEvent::shot_trigger(key())).expect("ser");
+        assert!(plain.get("timestamp").is_none(), "{plain}");
     }
 
     #[test]
@@ -1010,27 +1425,27 @@ mod tests {
     }
 
     #[test]
-    fn derived_is_a_sibling_of_ball() {
-        let json = serde_json::to_value(ball_flight_message(Some(derived()))).expect("ser");
-        assert_eq!(json["event"]["kind"], "ball_flight");
+    fn derived_is_a_sibling_of_launch() {
+        let json = serde_json::to_value(launch_message(Some(derived()))).expect("ser");
+        assert_eq!(json["event"]["kind"], "launch");
         assert_eq!(json["event"]["derived"]["carry_offline"], "-5.5m");
         assert_eq!(json["event"]["derived"]["descent_angle"], 41.3);
         assert!(json["event"]["derived"].get("carry_distance").is_none());
         // The measured block is exactly what it was.
-        let golden: serde_json::Value = serde_json::from_str(GOLDEN_BALL_FLIGHT).expect("golden");
-        assert_eq!(json["event"]["ball"], golden["event"]["ball"]);
+        let golden: serde_json::Value = serde_json::from_str(GOLDEN_LAUNCH).expect("golden");
+        assert_eq!(json["event"]["launch"], golden["event"]["launch"]);
     }
 
     #[test]
-    fn old_shape_json_parses_with_no_derived() {
-        let msg: FlighthookMessage = serde_json::from_str(GOLDEN_BALL_FLIGHT).expect("parses");
-        let FlighthookEvent::BallFlight {
-            ball: b, derived, ..
+    fn json_without_derived_parses_with_no_derived() {
+        let msg: FlighthookMessage = serde_json::from_str(GOLDEN_LAUNCH).expect("parses");
+        let FlighthookEvent::Launch {
+            launch: l, derived, ..
         } = msg.event
         else {
-            panic!("not a ball flight");
+            panic!("not a launch");
         };
-        assert_eq!(*b, ball());
+        assert_eq!(*l, ball());
         assert_eq!(derived, None);
 
         let s: ShotData = serde_json::from_str(GOLDEN_SHOT).expect("parses");
@@ -1038,13 +1453,59 @@ mod tests {
         assert_eq!(s.shot_number, 7);
     }
 
+    /// A shot stored with one `ball` block reads into `launch` and a modeled
+    /// `flight`, and is written back in the new shape.
+    #[test]
+    fn a_stored_ball_block_reads_into_launch_and_flight() {
+        let old: ShotData = serde_json::from_str(STORED_BALL_SHOT).expect("old shape");
+        assert_eq!(old, shot(None));
+        assert_eq!(serde_json::to_string(&old).expect("ser"), GOLDEN_SHOT);
+
+        // Launch values only: no flight result is made up.
+        let launch_only: ShotData = serde_json::from_str(
+            r#"{"shot_number":2,"ball":{"launch_speed":"53.6mps","backspin_rpm":0}}"#,
+        )
+        .expect("de");
+        assert_eq!(launch_only.flight, None);
+        assert_eq!(
+            launch_only.launch.and_then(|l| l.backspin_rpm),
+            Some(0),
+            "a launch value of 0 stays"
+        );
+
+        // Every flight value a ball block carried.
+        let full: ShotData = serde_json::from_str(
+            r#"{"shot_number":3,"ball":{"carry_distance":"150m","carry_offline":"-2m","total_distance":"170m","total_offline":"-3m","roll_distance":"20m","max_height":"30m","flight_time":6.0,"descent_angle":45.0}}"#,
+        )
+        .expect("de");
+        assert_eq!(full.launch, Some(Launch::default()));
+        assert_eq!(
+            full.flight,
+            Some(FlightResult {
+                carry_distance: Some(Distance::Meters(150.0)),
+                carry_offline: Some(Distance::Meters(-2.0)),
+                total_distance: Some(Distance::Meters(170.0)),
+                total_offline: Some(Distance::Meters(-3.0)),
+                roll_distance: Some(Distance::Meters(20.0)),
+                max_height: Some(Distance::Meters(30.0)),
+                flight_time: Some(6.0),
+                descent_angle: Some(45.0),
+                ..FlightResult::new(Basis::Modeled)
+            })
+        );
+
+        // A shot with neither block is unchanged.
+        let empty: ShotData = serde_json::from_str(r#"{"shot_number":4}"#).expect("de");
+        assert_eq!((empty.launch, empty.flight), (None, None));
+    }
+
     #[test]
     fn derived_round_trips() {
-        let msg = ball_flight_message(Some(derived()));
+        let msg = launch_message(Some(derived()));
         let back: FlighthookMessage =
             serde_json::from_str(&serde_json::to_string(&msg).expect("ser")).expect("de");
-        let FlighthookEvent::BallFlight { derived: d, .. } = back.event else {
-            panic!("not a ball flight");
+        let FlighthookEvent::Launch { derived: d, .. } = back.event else {
+            panic!("not a launch");
         };
         assert_eq!(d.as_deref(), Some(&derived()));
 
@@ -1059,7 +1520,7 @@ mod tests {
     #[test]
     fn unmeasured_fields_join_both_marks() {
         let mut shot = ShotData {
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 total_spin_rpm: Some(2500),
                 spin_axis: Some(3.0),
                 backspin_rpm: Some(2490),
@@ -1101,7 +1562,7 @@ mod tests {
         for f in fields {
             shot.clear_field(f);
         }
-        let b = shot.ball.as_ref().expect("ball");
+        let b = shot.launch.as_ref().expect("launch");
         assert_eq!(
             (
                 b.total_spin_rpm,
@@ -1118,7 +1579,7 @@ mod tests {
             (Some(Distance::Millimeters(3.0)), None)
         );
         shot.clear_field(ShotField::LaunchElevation);
-        assert_eq!(shot.ball.and_then(|b| b.launch_elevation), None);
+        assert_eq!(shot.launch.and_then(|b| b.launch_elevation), None);
     }
 
     /// A shot's provenance is omitted when absent, so a shot stored without
@@ -1155,7 +1616,7 @@ mod tests {
     #[test]
     fn the_trigger_envelope_sets_the_shot_provenance() {
         let mut agg = ShotAggregator::new();
-        let trigger = FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key() })
+        let trigger = FlighthookMessage::new(FlighthookEvent::shot_trigger(key()))
             .actor("square.0")
             .provenance(Provenance::Measured);
         let json = serde_json::to_value(&trigger).expect("ser");
@@ -1168,9 +1629,9 @@ mod tests {
                 .is_none()
         );
         agg.feed(&trigger);
-        agg.feed(&msg(FlighthookEvent::BallFlight {
+        agg.feed(&msg(FlighthookEvent::Launch {
             key: key(),
-            ball: Box::new(ball()),
+            launch: Box::new(ball()),
             derived: None,
         }));
         let shot = agg
@@ -1265,17 +1726,17 @@ mod tests {
             ..DerivedFlight::default()
         };
         assert!(!alone.is_empty());
-        let msg = ball_flight_message(Some(alone.clone()));
+        let msg = launch_message(Some(alone.clone()));
         let json = serde_json::to_value(&msg).expect("ser");
         assert_eq!(
             json["event"]["derived"],
             serde_json::json!({"spin_estimated": true})
         );
-        let golden: serde_json::Value = serde_json::from_str(GOLDEN_BALL_FLIGHT).expect("golden");
-        assert_eq!(json["event"]["ball"], golden["event"]["ball"]);
+        let golden: serde_json::Value = serde_json::from_str(GOLDEN_LAUNCH).expect("golden");
+        assert_eq!(json["event"]["launch"], golden["event"]["launch"]);
         let back: FlighthookMessage = serde_json::from_value(json).expect("de");
-        let FlighthookEvent::BallFlight { derived: back, .. } = back.event else {
-            panic!("not a ball flight");
+        let FlighthookEvent::Launch { derived: back, .. } = back.event else {
+            panic!("not a launch");
         };
         assert_eq!(back.as_deref(), Some(&alone));
 
@@ -1287,12 +1748,14 @@ mod tests {
                 shot_number: 1,
             },
         );
-        acc.set_ball(BallFlight {
-            backspin_rpm: Some(1570),
-            sidespin_rpm: Some(0),
-            ..BallFlight::default()
-        });
-        acc.set_derived(Some(alone));
+        acc.set_launch(
+            Launch {
+                backspin_rpm: Some(1570),
+                sidespin_rpm: Some(0),
+                ..Launch::default()
+            },
+            Some(alone),
+        );
         let shot = acc.finish().expect("shot");
         assert!(shot.derived.as_ref().is_some_and(|d| d.spin_estimated));
         for system in [UnitSystem::Imperial, UnitSystem::Metric] {
@@ -1319,12 +1782,12 @@ mod tests {
         assert!(d.to_imperial().replaces_measured);
         assert!(d.to_metric().replaces_measured);
 
-        let msg = ball_flight_message(Some(d));
+        let msg = launch_message(Some(d));
         let json = serde_json::to_value(&msg).expect("ser");
         assert_eq!(json["event"]["derived"]["replaces_measured"], true);
         // The measured block is unchanged.
-        let golden: serde_json::Value = serde_json::from_str(GOLDEN_BALL_FLIGHT).expect("golden");
-        assert_eq!(json["event"]["ball"], golden["event"]["ball"]);
+        let golden: serde_json::Value = serde_json::from_str(GOLDEN_LAUNCH).expect("golden");
+        assert_eq!(json["event"]["launch"], golden["event"]["launch"]);
     }
 
     #[test]
@@ -1365,13 +1828,13 @@ mod tests {
             event,
         };
         assert!(
-            agg.feed(&msg(FlighthookEvent::ShotTrigger { key: key() }))
+            agg.feed(&msg(FlighthookEvent::shot_trigger(key())))
                 .is_none()
         );
         assert!(
-            agg.feed(&msg(FlighthookEvent::BallFlight {
+            agg.feed(&msg(FlighthookEvent::Launch {
                 key: key(),
-                ball: Box::new(ball()),
+                launch: Box::new(ball()),
                 derived: Some(Box::new(derived())),
             }))
             .is_none()
@@ -1382,14 +1845,14 @@ mod tests {
                 raw: None,
             }))
             .expect("finished");
-        assert_eq!(shot.ball, Some(ball()));
+        assert_eq!(shot.launch, Some(ball()));
         assert_eq!(shot.derived, Some(derived()));
     }
 
     #[test]
     fn accumulator_without_derived_finishes_with_none() {
         let mut acc = ShotAccumulator::new("r10.0".into(), key());
-        acc.set_ball(ball());
+        acc.set_launch(ball(), None);
         let shot = acc.finish().expect("finished");
         assert_eq!(shot.derived, None);
     }
@@ -1452,13 +1915,13 @@ mod tests {
         let back: DerivedFlight = serde_json::from_value(json).expect("de");
         assert_eq!(back, d);
 
-        // Nested under a ball_flight bus message (the FRP output path):
-        // `path` rides along as a sibling of the other derived fields.
-        let msg = ball_flight_message(Some(d.clone()));
+        // Nested under a launch bus message (the FRP output path): `path`
+        // rides along as a sibling of the other derived fields.
+        let msg = launch_message(Some(d.clone()));
         let back: FlighthookMessage =
             serde_json::from_str(&serde_json::to_string(&msg).expect("ser")).expect("de");
-        let FlighthookEvent::BallFlight { derived: got, .. } = back.event else {
-            panic!("not a ball flight");
+        let FlighthookEvent::Launch { derived: got, .. } = back.event else {
+            panic!("not a launch");
         };
         assert_eq!(got.as_deref(), Some(&d));
 
@@ -1604,10 +2067,208 @@ mod tests {
     #[test]
     fn accumulator_leaves_stamped_fields_unset() {
         let mut acc = ShotAccumulator::new("mevo.0".into(), key());
-        acc.set_ball(ball());
+        acc.set_launch(ball(), None);
         let shot = acc.finish().expect("finished");
         assert_eq!(shot.shot_id, None);
         assert_eq!(shot.club_selected, None);
         assert_eq!(shot.group, None);
+    }
+
+    fn bus(event: FlighthookEvent) -> FlighthookMessage {
+        FlighthookMessage::new(event).actor("mevo.0")
+    }
+
+    fn launch_event(launch: Launch) -> FlighthookEvent {
+        FlighthookEvent::Launch {
+            key: key(),
+            launch: Box::new(launch),
+            derived: None,
+        }
+    }
+
+    /// A shot keeps the first event of each kind: a repeated trigger, launch,
+    /// flight result, club path or face impact changes nothing.
+    #[test]
+    fn the_aggregator_keeps_the_first_event_of_each_kind() {
+        let t0 = Instant::now();
+        let mut agg = ShotAggregator::new();
+        let other = Launch {
+            launch_speed: Some(Velocity::MetersPerSecond(10.0)),
+            ..Launch::default()
+        };
+        let club = |speed| ClubData {
+            club_speed: Some(Velocity::MetersPerSecond(speed)),
+            ..ClubData::default()
+        };
+        let impact = |mm| FaceImpact {
+            lateral: Some(Distance::Millimeters(mm)),
+            vertical: None,
+        };
+        let second_flight = FlightResult {
+            carry_distance: Some(Distance::Meters(1.0)),
+            ..FlightResult::new(Basis::Tracked)
+        };
+        for event in [
+            FlighthookEvent::shot_trigger(key()),
+            launch_event(ball()),
+            FlighthookEvent::shot_trigger(key()),
+            launch_event(other),
+            FlighthookEvent::FlightResult {
+                key: key(),
+                flight: Box::new(device_flight()),
+            },
+            FlighthookEvent::FlightResult {
+                key: key(),
+                flight: Box::new(second_flight),
+            },
+            FlighthookEvent::ClubPath {
+                key: key(),
+                club: Box::new(club(40.0)),
+            },
+            FlighthookEvent::ClubPath {
+                key: key(),
+                club: Box::new(club(10.0)),
+            },
+            FlighthookEvent::FaceImpact {
+                key: key(),
+                impact: Box::new(impact(3.0)),
+            },
+            FlighthookEvent::FaceImpact {
+                key: key(),
+                impact: Box::new(impact(-9.0)),
+            },
+        ] {
+            assert!(agg.feed_at(&bus(event), t0).is_none());
+        }
+        let shot = agg
+            .feed_at(
+                &bus(FlighthookEvent::ShotFinished {
+                    key: key(),
+                    raw: None,
+                }),
+                t0,
+            )
+            .expect("finished")
+            .finish()
+            .expect("data");
+        assert_eq!(shot.launch, Some(ball()));
+        assert_eq!(shot.flight, Some(device_flight()));
+        assert_eq!(shot.club, Some(club(40.0)));
+        assert_eq!(shot.impact, Some(impact(3.0)));
+        // Metrics read the device's flight (curve needs its carry offline,
+        // which this one lacks) and the launch's spin.
+        assert_eq!(shot.metrics.and_then(|m| m.total_spin_rpm), Some(6507));
+    }
+
+    /// A shot that has not finished within the timeout is discarded: its
+    /// late `shot_finished` is ignored, and so is any event of a finished or
+    /// discarded shot for one more timeout.
+    #[test]
+    fn the_aggregator_discards_a_shot_after_the_timeout() {
+        let t0 = Instant::now();
+        let mut agg = ShotAggregator::new();
+        assert_eq!(agg.timeout(), Duration::from_secs(30));
+        agg.feed_at(&bus(FlighthookEvent::shot_trigger(key())), t0);
+        agg.feed_at(&bus(launch_event(ball())), t0);
+        assert!(agg.is_pending("mevo.0", &key().shot_id));
+        let late = t0 + SHOT_TIMEOUT + Duration::from_millis(1);
+        let discarded = agg.discard_expired_at(late);
+        assert_eq!(discarded, [("mevo.0".to_owned(), key())]);
+        let finished = bus(FlighthookEvent::ShotFinished {
+            key: key(),
+            raw: None,
+        });
+        assert!(agg.feed_at(&finished, late).is_none(), "discarded");
+        // A repeat of its trigger within the next timeout starts nothing.
+        agg.feed_at(&bus(FlighthookEvent::shot_trigger(key())), late);
+        assert_eq!(agg.pending_count(), 0);
+        // After it, the shot id may start a shot again.
+        let much_later = late + SHOT_TIMEOUT + Duration::from_millis(1);
+        agg.feed_at(&bus(FlighthookEvent::shot_trigger(key())), much_later);
+        assert_eq!(agg.pending_count(), 1);
+
+        // Within the timeout the shot finishes; a second finish is ignored.
+        let mut agg = ShotAggregator::new().with_timeout(Duration::from_secs(5));
+        agg.feed_at(&bus(FlighthookEvent::shot_trigger(key())), t0);
+        let within = t0 + Duration::from_secs(5);
+        assert!(agg.feed_at(&finished, within).is_some());
+        assert!(agg.feed_at(&finished, within).is_none());
+        agg.feed_at(&bus(FlighthookEvent::shot_trigger(key())), within);
+        assert_eq!(agg.pending_count(), 0, "a finished shot does not restart");
+    }
+
+    /// Shots are kept apart by actor and shot id; `discard` closes one.
+    #[test]
+    fn the_aggregator_keys_shots_by_actor_and_shot_id() {
+        let t0 = Instant::now();
+        let mut agg = ShotAggregator::new();
+        let from = |actor: &str, event| FlighthookMessage::new(event).actor(actor);
+        agg.feed_at(&from("mevo.0", FlighthookEvent::shot_trigger(key())), t0);
+        agg.feed_at(&from("r10.0", FlighthookEvent::shot_trigger(key())), t0);
+        assert_eq!(agg.pending_count(), 2);
+        assert!(agg.discard("r10.0", &key().shot_id, t0));
+        assert!(!agg.discard("r10.0", &key().shot_id, t0));
+        let finished = FlighthookEvent::ShotFinished {
+            key: key(),
+            raw: None,
+        };
+        assert!(agg.feed_at(&from("r10.0", finished.clone()), t0).is_none());
+        let acc = agg.feed_at(&from("mevo.0", finished), t0).expect("mevo");
+        assert_eq!(acc.actor, "mevo.0");
+    }
+
+    /// The launch flighthook's FRP output sends leaves out what derived marks
+    /// as not measured, and its own flight result assumes those values.
+    #[test]
+    fn an_estimated_spin_moves_to_the_assumed_launch_of_flighthooks_flight() {
+        let launch = Launch {
+            backspin_rpm: Some(1570),
+            sidespin_rpm: Some(0),
+            ..ball()
+        };
+        assert_eq!(measured_launch(&launch, None), (launch.clone(), None));
+        let plain = derived();
+        assert_eq!(
+            measured_launch(&launch, Some(&plain)),
+            (launch.clone(), None)
+        );
+
+        let estimated = DerivedFlight {
+            spin_estimated: true,
+            carry_distance: Some(Distance::Meters(14.2)),
+            ..derived()
+        };
+        let (measured, assumed) = measured_launch(&launch, Some(&estimated));
+        assert_eq!((measured.backspin_rpm, measured.sidespin_rpm), (None, None));
+        assert_eq!(measured.launch_speed, launch.launch_speed);
+        let assumed = assumed.expect("assumed");
+        assert_eq!(
+            (
+                assumed.backspin_rpm,
+                assumed.sidespin_rpm,
+                assumed.total_spin_rpm
+            ),
+            (Some(1570), Some(0), None)
+        );
+
+        let flight = estimated.flight_result(Some(assumed)).expect("flight");
+        assert!(is_flighthook_flight(&flight));
+        assert_eq!(flight.carry_distance, Some(Distance::Meters(14.2)));
+        assert_eq!(flight.total_distance, estimated.total_distance);
+        assert_eq!(flight.descent_angle, Some(41.3));
+        // A controller that flies the ball gets the estimate back.
+        let mut flown = measured.clone();
+        flown.fill_assumed(&flight);
+        assert_eq!(flown, launch);
+        // Nothing simulated and nothing assumed: no flight result.
+        assert_eq!(DerivedFlight::default().flight_result(None), None);
+        // A computed launch angle moves too.
+        let mut marked = None;
+        DerivedFlight::mark_computed(&mut marked, &[ShotField::LaunchElevation]);
+        let (m, a) = measured_launch(&launch, marked.as_deref());
+        assert_eq!(m.launch_elevation, None);
+        assert_eq!(a.and_then(|a| a.launch_elevation), Some(17.0));
+        // A device's own flight result is not flighthook's.
+        assert!(!is_flighthook_flight(&device_flight()));
     }
 }

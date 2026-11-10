@@ -1,11 +1,17 @@
 //! WebSocket handler — FRP-compliant init handshake + unified bus event streaming.
 //!
-//! Protocol (FRP-compliant with flighthook extensions):
-//!   1. Client sends:  `{ "kind": "start", "version": ["0.1.0"], "name": "My Dashboard" }`
-//!   2. Server negotiates version (highest mutually supported)
-//!   3. Server sends:  `{ "kind": "init", "version": "0.1.0", "actor_id": "ws.abc123", "global_state": { ... } }`
+//! Protocol (FRP 0.2.0 with flighthook extensions):
+//!   1. Client sends:  `{ "kind": "start", "version": ["0.2.0"], "name": "My Dashboard" }`
+//!   2. Server accepts its FRP version ([`FRP_VERSION`]) when the client
+//!      proposes it; otherwise it sends a `critical` alert and closes
+//!   3. Server sends:  `{ "kind": "init", "version": "0.2.0", "actor_id": "ws.abc123", "global_state": { ... } }`
 //!   4. Server replays the last status and telemetry of every actor and the
-//!      current `round_state`, then streams `FlighthookMessage` events
+//!      current `round_state`, then streams `FlighthookMessage` events,
+//!      with FRP's forwarding rules applied to the FRP ones
+//!      ([`frp_out`](super::frp_out))
+//!
+//! A `raw_frames` request in `start` is ignored: flighthook sends no raw
+//! frames.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -15,6 +21,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 
+use super::frp_out::FrpOutput;
 use super::{WebState, emit_telemetry};
 use crate::state::SystemState;
 use crate::state::config;
@@ -89,6 +96,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
         return;
     }
 
+    // FRP's forwarding rules for this connection, from the replay on.
+    let mut output = FrpOutput::new();
+
     // Replay cached ActorStatus messages (last per actor)
     {
         let cache = state.cached_actor_status.read().await;
@@ -104,8 +114,8 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
     // Replay cached DeviceTelemetry messages (last per actor)
     {
         let cache = state.cached_device_telemetry.read().await;
-        for msg in cache.values() {
-            if let Ok(json) = serde_json::to_string(msg)
+        for msg in cache.values().flat_map(|m| output.forward(m)) {
+            if let Ok(json) = serde_json::to_string(&msg)
                 && ws_tx.send(Message::text(json)).await.is_err()
             {
                 return;
@@ -132,10 +142,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
         loop {
             match bus_rx.recv().await {
                 Ok(msg) => {
-                    if let Ok(json) = serde_json::to_string(&msg)
-                        && ws_tx.send(Message::text(json)).await.is_err()
-                    {
-                        break;
+                    for out in output.forward(&msg) {
+                        if let Ok(json) = serde_json::to_string(&out)
+                            && ws_tx.send(Message::text(json)).await.is_err()
+                        {
+                            return;
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -182,13 +194,15 @@ struct StartResult {
     version: Option<String>,
 }
 
-/// Supported FRP versions, in ascending order.
+/// Supported FRP versions: exactly the one FRP version flighthook
+/// implements.
 const SUPPORTED_VERSIONS: &[&str] = &[FRP_VERSION];
 
 /// Parse a "start" handshake message and negotiate the FRP version.
 ///
-/// Expects `{"kind": "start", "version": ["0.1.0"], "name": "..."}`.
-/// Selects the highest mutually supported version from the client's array.
+/// Expects `{"kind": "start", "version": ["0.2.0"], "name": "..."}`.
+/// Selects flighthook's FRP version when the client's array has it. Other
+/// fields, such as `raw_frames`, are ignored.
 fn parse_start_message(text: &str) -> Option<StartResult> {
     #[derive(serde::Deserialize)]
     struct StartMsg {
@@ -395,5 +409,25 @@ mod tests {
         assert!(run(r#"{"cmd":"mode","mode":"by_club"}"#).is_none());
         assert!(run(r#"{"cmd":"nope"}"#).is_none());
         assert!(run("not json").is_none());
+    }
+
+    /// The handshake accepts FRP 0.2.0 and nothing else; a `raw_frames`
+    /// request is ignored.
+    #[test]
+    fn start_negotiates_frp_0_2_0_only() {
+        assert_eq!(FRP_VERSION, "0.2.0");
+        let ok = parse_start_message(
+            r#"{"kind":"start","version":["0.2.0"],"name":"Sim","raw_frames":true}"#,
+        )
+        .expect("start");
+        assert_eq!(ok.version.as_deref(), Some("0.2.0"));
+        assert_eq!(ok.name, "Sim");
+        let old = parse_start_message(r#"{"kind":"start","version":["0.1.0"]}"#).expect("start");
+        assert_eq!(old.version, None);
+        assert_eq!(old.name, "anonymous");
+        let both =
+            parse_start_message(r#"{"kind":"start","version":["0.1.0","0.2.0"]}"#).expect("start");
+        assert_eq!(both.version.as_deref(), Some("0.2.0"));
+        assert!(parse_start_message(r#"{"kind":"init","version":"0.2.0"}"#).is_none());
     }
 }

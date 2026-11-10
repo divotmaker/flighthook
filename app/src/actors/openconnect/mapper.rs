@@ -7,7 +7,7 @@
 //! so HLA, SideSpin, SpinAxis, FaceToTarget and Path are taken as they are.
 
 use super::super::gspro::api;
-use flighthook::{BallFlight, ClubData, Distance, FaceImpact, Velocity};
+use flighthook::{Basis, ClubData, Distance, FaceImpact, FlightResult, Launch, Velocity};
 
 /// Distance unit selected by the message's `Units` field.
 ///
@@ -45,7 +45,7 @@ fn spin(ball: &api::BallData) -> Spin {
     }
 }
 
-/// Map the ball half of an Open Connect message.
+/// Map the launch in the ball half of an Open Connect message.
 ///
 /// HLA, SideSpin and SpinAxis keep their signs (positive = right of the
 /// target line).
@@ -53,16 +53,14 @@ fn spin(ball: &api::BallData) -> Spin {
 /// Both FRP spin pairs are sent: the pair the monitor populated, and the
 /// same spin expressed in the other pair, so both are the monitor's
 /// reading. A total and axis are decomposed from the unrounded total;
-/// components are completed with [`BallFlight::complete_spin`].
-pub fn map_ball(msg: &api::GsProMessage) -> BallFlight {
+/// components are completed with [`Launch::complete_spin`].
+pub fn map_launch(msg: &api::GsProMessage) -> Launch {
     let b = &msg.ball_data;
-    let mut ball = BallFlight {
+    let mut ball = Launch {
         launch_speed: Some(Velocity::MilesPerHour(b.speed)),
         launch_elevation: Some(b.vla),
         launch_azimuth: Some(b.hla),
-        carry_distance: b.carry_distance.map(|c| distance(&msg.units, c)),
-        // Open Connect carries no total/apex/flight-time/roll fields.
-        ..BallFlight::default()
+        ..Launch::default()
     };
     match spin(b) {
         Spin::Components(back, side) => {
@@ -79,6 +77,18 @@ pub fn map_ball(msg: &api::GsProMessage) -> BallFlight {
         }
     }
     ball
+}
+
+/// The monitor's flight values in the ball half of an Open Connect message:
+/// its carry, the only one Open Connect carries (no total, apex, flight time
+/// or roll). Whether the monitor tracked or modeled it is not known, so its
+/// basis is [`Basis::Modeled`]. `None` without a carry.
+pub fn map_flight(msg: &api::GsProMessage) -> Option<FlightResult> {
+    let carry = msg.ball_data.carry_distance?;
+    Some(FlightResult {
+        carry_distance: Some(distance(&msg.units, carry)),
+        ..FlightResult::new(Basis::Modeled)
+    })
 }
 
 /// Map the club half of an Open Connect message.
@@ -151,7 +161,7 @@ mod tests {
         m.ball_data.side_spin = -450.0;
         m.ball_data.total_spin = 3033.0;
         m.ball_data.spin_axis = -8.5;
-        let ball = map_ball(&m);
+        let ball = map_launch(&m);
         assert_eq!(ball.backspin_rpm, Some(3000));
         assert_eq!(ball.sidespin_rpm, Some(-450));
         // Total and axis are completed from the components.
@@ -165,7 +175,7 @@ mod tests {
         let mut m = msg();
         m.ball_data.total_spin = 5000.0;
         m.ball_data.spin_axis = 30.0;
-        let ball = map_ball(&m);
+        let ball = map_launch(&m);
         assert_eq!(ball.backspin_rpm, Some(4330)); // 5000 * cos(30°)
         assert_eq!(ball.sidespin_rpm, Some(2500)); // 5000 * sin(30°)
         assert_eq!(ball.total_spin_rpm, Some(5000));
@@ -174,7 +184,7 @@ mod tests {
 
     #[test]
     fn zero_spin_stays_zero() {
-        let ball = map_ball(&msg());
+        let ball = map_launch(&msg());
         assert_eq!(ball.backspin_rpm, Some(0));
         assert_eq!(ball.sidespin_rpm, Some(0));
         assert_eq!(ball.total_spin_rpm, Some(0));
@@ -184,12 +194,15 @@ mod tests {
     #[test]
     fn units_field_selects_carry_unit() {
         let mut m = msg();
+        let carry = |m: &api::GsProMessage| map_flight(m).and_then(|f| f.carry_distance);
+        assert_eq!(map_flight(&m), None, "no carry, no flight result");
         m.ball_data.carry_distance = Some(200.0);
-        assert_eq!(map_ball(&m).carry_distance, Some(Distance::Yards(200.0)));
+        assert_eq!(carry(&m), Some(Distance::Yards(200.0)));
+        assert_eq!(map_flight(&m).map(|f| f.basis), Some(Basis::Modeled));
         m.units = "Meters".into();
-        assert_eq!(map_ball(&m).carry_distance, Some(Distance::Meters(200.0)));
+        assert_eq!(carry(&m), Some(Distance::Meters(200.0)));
         m.units = String::new();
-        assert_eq!(map_ball(&m).carry_distance, Some(Distance::Yards(200.0)));
+        assert_eq!(carry(&m), Some(Distance::Yards(200.0)));
     }
 
     #[test]
@@ -213,7 +226,7 @@ mod tests {
         m.ball_data.speed = 150.0;
         m.club_data.speed = 100.0;
         assert_eq!(
-            map_ball(&m).launch_speed,
+            map_launch(&m).launch_speed,
             Some(Velocity::MilesPerHour(150.0))
         );
         assert_eq!(map_club(&m).club_speed, Some(Velocity::MilesPerHour(100.0)));
@@ -240,7 +253,7 @@ mod tests {
         let mut m = msg();
         m.ball_data.total_spin = 3250.5;
         m.ball_data.spin_axis = 10.0;
-        let ball = map_ball(&m);
+        let ball = map_launch(&m);
         // 3250.5·cos(10°) = 3201.12, 3250.5·sin(10°) = 564.45.
         assert_eq!(ball.backspin_rpm, Some(3201));
         assert_eq!(ball.sidespin_rpm, Some(564));
@@ -249,7 +262,7 @@ mod tests {
 
         let shot = ShotData {
             actor: "openconnect_server.0".into(),
-            ball: Some(ball),
+            launch: Some(ball),
             ..ShotData::default()
         };
         let out = super::super::super::gspro::mapper::map_shot(&shot);
@@ -267,7 +280,7 @@ mod tests {
     #[test]
     fn lateral_fields_keep_their_signs() {
         let m = lateral_msg();
-        let ball = map_ball(&m);
+        let ball = map_launch(&m);
         assert_eq!(ball.launch_azimuth, Some(4.2));
         assert_eq!(ball.sidespin_rpm, Some(-650));
         assert!(ball.spin_axis.expect("axis") < 0.0);
@@ -278,12 +291,12 @@ mod tests {
         let mut m = msg();
         m.ball_data.total_spin = 5000.0;
         m.ball_data.spin_axis = -30.0;
-        let ball = map_ball(&m);
+        let ball = map_launch(&m);
         assert_eq!(ball.sidespin_rpm, Some(-2500));
         assert_eq!(ball.spin_axis, Some(-30.0));
     }
 
-    /// Ingest (`map_ball`/`map_club`) is the exact inverse of
+    /// Ingest (`map_launch`/`map_club`) is the exact inverse of
     /// `gspro::mapper::map_shot`: running a message through both reproduces
     /// its lateral values. The actor-level tests in `openconnect::tests`
     /// check the same for both hands.
@@ -293,7 +306,7 @@ mod tests {
         let shot = ShotData {
             actor: "openconnect_server.0".into(),
             shot_number: m.shot_number,
-            ball: Some(map_ball(&m)),
+            launch: Some(map_launch(&m)),
             club: Some(map_club(&m)),
             impact: None,
             derived: None,

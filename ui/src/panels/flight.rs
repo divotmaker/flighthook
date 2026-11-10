@@ -96,7 +96,7 @@ pub(super) struct Readings {
 
 pub(super) fn readings(shot: &ShotRow, units: UnitSystem) -> Readings {
     let imperial = units == UnitSystem::Imperial;
-    let ball = shot.ball.as_ref();
+    let flight = shot.flight.as_ref();
     let derived = shot.derived.as_ref();
     let dist = |d: Distance| {
         if imperial {
@@ -112,17 +112,17 @@ pub(super) fn readings(shot: &ShotRow, units: UnitSystem) -> Readings {
         };
     Readings {
         carry: read(
-            ball.and_then(|b| b.carry_distance),
+            flight.and_then(|f| f.carry_distance),
             derived.and_then(|d| d.carry_distance),
             &dist,
         ),
         total: read(
-            ball.and_then(|b| b.total_distance),
+            flight.and_then(|f| f.total_distance),
             derived.and_then(|d| d.total_distance),
             &dist,
         ),
         apex: read(
-            ball.and_then(|b| b.max_height),
+            flight.and_then(|f| f.max_height),
             derived.and_then(|d| d.max_height),
             &height,
         ),
@@ -1084,7 +1084,7 @@ impl FlighthookApp {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::types::{BallFlight, Club, DerivedFlight, ShotGroupInfo};
+    use crate::types::{Basis, Club, DerivedFlight, FlightResult, Launch, ShotGroupInfo};
 
     fn set(id: &str, number: u32, club: Club, session: u32) -> ShotGroupInfo {
         ShotGroupInfo {
@@ -1146,7 +1146,8 @@ pub(super) mod tests {
             actor: actor.into(),
             shot_id: format!("id{n}"),
             shot_number: n,
-            ball: Some(BallFlight::default()),
+            launch: Some(Launch::default()),
+            flight: None,
             club: None,
             impact: None,
             derived: Some(derived(
@@ -1165,13 +1166,14 @@ pub(super) mod tests {
 
     /// A shot with a measured carry and total but no path.
     fn no_path(n: u32, carry: f64, total: f64) -> ShotRow {
-        let ball = BallFlight {
+        let flight = FlightResult {
             carry_distance: Some(Distance::Meters(carry)),
             total_distance: Some(Distance::Meters(total)),
-            ..Default::default()
+            ..FlightResult::new(Basis::Modeled)
         };
         ShotRow {
-            ball: Some(ball),
+            launch: Some(Launch::default()),
+            flight: Some(flight),
             derived: None,
             ..shot(n, "mevo.0", "b")
         }
@@ -1397,7 +1399,7 @@ pub(super) mod tests {
                 let mut shots = shots.clone();
                 // A measured value no device sends, with no path.
                 shots[6] = no_path(7, v, v);
-                shots[6].ball.as_mut().unwrap().max_height = Some(Distance::Meters(v));
+                shots[6].flight_mut().max_height = Some(Distance::Meters(v));
                 let scene = build_scene(&input(&shots, &g, &m, 7, &[], units));
                 let (x, y) = domain(&scene);
                 assert!(x.is_finite() && y.is_finite(), "{v}");
@@ -1743,7 +1745,7 @@ pub(super) mod tests {
             .map(|s| ground_ball(s.shot_number, &s.actor, s.group.as_deref().unwrap(), 4.0))
             .collect();
         // #8 before its ball flight arrives: nothing to draw.
-        shots[7].ball = None;
+        shots[7].launch = None;
         shots[7].derived = None;
         assert!(!drawable(&shots[7]));
         let m = members(&shots, &g, ShotGrouping::BySet, 7, None);

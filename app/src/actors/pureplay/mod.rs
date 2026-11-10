@@ -64,8 +64,8 @@ use crate::state::SystemState;
 use crate::state::round::{RoundGuard, RoundPolicy, RoundRequest, not_measured_reason};
 use codec::{ConnectionState, FrameReader, Message, ReadyState};
 use flighthook::{
-    ActorStatus, ClubInfo, FlighthookEvent, FlighthookMessage, HandInfo, Severity, ShotAccumulator,
-    ShotData, ShotDetectionMode, ShotKey,
+    ActorStatus, ClubInfo, FlighthookEvent, FlighthookMessage, HandInfo, Severity, ShotAggregator,
+    ShotData, ShotDetectionMode,
 };
 
 /// Pureplay's default address.
@@ -210,10 +210,6 @@ const HELLO_TIMEOUT: Duration = if cfg!(test) {
 /// Longest a launch monitor counts as processing a shot after its trigger
 /// when the shot never finishes.
 const PROCESSING_LIMIT: Duration = Duration::from_secs(10);
-
-/// Longest a shot's data is kept waiting for its finish after the trigger;
-/// older unfinished shots are let go at the next trigger.
-const UNFINISHED_SHOT: Duration = Duration::from_secs(60);
 
 /// Errors from Pureplay closer together than this are one burst, alerted
 /// once: a host that answers every connect with an Error and closes does so
@@ -469,8 +465,8 @@ struct Relay {
     round: RoundPolicy,
     mode: ShotDetectionMode,
     monitors: HashMap<String, Monitor>,
-    /// Shots being put together, with when each was triggered.
-    accumulators: HashMap<(String, ShotKey), (Instant, ShotAccumulator)>,
+    /// Shots being put together.
+    shots: ShotAggregator,
     outbox: VecDeque<PendingShot>,
     /// When the link's handshake finished, `None` while there is no link.
     connected_at: Option<Instant>,
@@ -495,7 +491,7 @@ impl Relay {
             round,
             mode: ShotDetectionMode::Full,
             monitors: HashMap::new(),
-            accumulators: HashMap::new(),
+            shots: ShotAggregator::new(),
             outbox: VecDeque::new(),
             connected_at: None,
             last_host_error: None,
@@ -573,40 +569,20 @@ impl Relay {
     }
 
     fn handle(&mut self, msg: FlighthookMessage, now: Instant) {
+        // `derived` is read only for its marks of unmeasured values.
+        let finished = self.shots.feed_at(&msg, now);
         let actor = msg.actor;
         match msg.event {
-            FlighthookEvent::ShotTrigger { key } => {
+            FlighthookEvent::ShotTrigger { .. } => {
                 if let Some(m) = self.monitor(&actor) {
                     m.processing_since = Some(now);
-                }
-                self.accumulators
-                    .retain(|_, (at, _)| now.saturating_duration_since(*at) < UNFINISHED_SHOT);
-                let acc = ShotAccumulator::new(actor.clone(), key.clone())
-                    .with_provenance(msg.provenance);
-                self.accumulators.insert((actor, key), (now, acc));
-            }
-            FlighthookEvent::BallFlight { key, ball, derived } => {
-                if let Some((_, acc)) = self.accumulators.get_mut(&(actor, key)) {
-                    acc.set_ball(*ball);
-                    // Read only for its marks of unmeasured values.
-                    acc.set_derived(derived.map(|d| *d));
-                }
-            }
-            FlighthookEvent::ClubPath { key, club } => {
-                if let Some((_, acc)) = self.accumulators.get_mut(&(actor, key)) {
-                    acc.set_club(*club);
-                }
-            }
-            FlighthookEvent::FaceImpact { key, impact } => {
-                if let Some((_, acc)) = self.accumulators.get_mut(&(actor, key)) {
-                    acc.set_impact(*impact);
                 }
             }
             FlighthookEvent::ShotFinished { key, .. } => {
                 if let Some(m) = self.monitor(&actor) {
                     m.processing_since = None;
                 }
-                let Some((_, acc)) = self.accumulators.remove(&(actor.clone(), key.clone())) else {
+                let Some(acc) = finished else {
                     return;
                 };
                 if !shot_matches_routing(&self.routing, self.mode, &actor) {

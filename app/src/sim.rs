@@ -7,8 +7,8 @@
 //! measured values win, so [`derive`] only emits a field when the device left
 //! it empty; `force` makes [`derive`] emit every result field and flag the
 //! block `replaces_measured`, so the simulated results take precedence over
-//! the device's. Either way the device's `BallFlight` is never modified, and
-//! GSPro never sees these values.
+//! the device's. Either way the device's launch and flight result are never
+//! modified, and GSPro never sees these values.
 //!
 //! `derived.path` carries the simulated ball path, fitted to the values the
 //! device measured ([`anchor_path`]; nothing counts as measured under
@@ -32,8 +32,11 @@
 //! target line, origin at the tee. Positive `z` is right, the sign of FRP's
 //! launch direction and of every `*_offline` value.
 //!
-//! Device actors call [`ball_flight_event`] to build every `BallFlight` bus
-//! event, so the event leaves the actor already carrying `derived`.
+//! The values a device measured are its launch; its flight values (carry,
+//! apex and so on) come in its flight result. Device actors call
+//! [`launch_events`] to build every `Launch` bus event (and the
+//! `FlightResult` event after it when the device sent flight values), so the
+//! launch leaves the actor already carrying `derived`.
 
 use std::sync::Mutex;
 
@@ -43,8 +46,8 @@ use dimple::ground::{BallState, GroundModel, GroundResult, Surface, Termination}
 use dimple::stats::ShotStats;
 use dimple::trajectory::{ShotInput, ShotResult, simulate_shot};
 use flighthook::{
-    BallFlight, DerivedFlight, Distance, FlightPath, FlighthookEvent, ShotDetectionMode, ShotKey,
-    SimMode, SimSurface, SimulationSection,
+    DerivedFlight, Distance, FlightPath, FlightResult, FlighthookEvent, Launch, ShotDetectionMode,
+    ShotKey, SimMode, SimSurface, SimulationSection,
 };
 use glam::DVec3;
 use tracing::{debug, info, warn};
@@ -66,20 +69,24 @@ pub(crate) fn should_simulate(cfg: &SimulationSection) -> bool {
     cfg.mode != SimMode::Off
 }
 
-/// Whether a shot is a ground ball, rolled rather than flown: its measured
-/// apex is 0 (finite, within [`GROUND_MAX_APEX_M`]), or it has no measured
-/// apex and a launch angle above -90 and at most [`GROUND_MAX_LAUNCH_DEG`],
-/// or neither a launch angle nor any spin (a putt measured along the ground,
-/// as a putting mat reports it). The device, club and detection mode play no
+/// Whether a shot is a ground ball, rolled rather than flown: the device's
+/// apex is 0 (finite, within [`GROUND_MAX_APEX_M`]), or it reported no apex
+/// and a launch angle above -90 and at most [`GROUND_MAX_LAUNCH_DEG`], or
+/// neither a launch angle nor any spin (a putt measured along the ground, as
+/// a putting mat reports it). The device, club and detection mode play no
 /// part.
-fn is_ground_ball(ball: &BallFlight) -> bool {
-    match ball.max_height.map(Distance::as_meters) {
+fn is_ground_ball(launch: &Launch, flight: Option<&FlightResult>) -> bool {
+    match flight.and_then(|f| f.max_height).map(Distance::as_meters) {
         Some(apex) => apex.is_finite() && apex.abs() <= GROUND_MAX_APEX_M,
-        None => match ball.launch_elevation {
+        None => match launch.launch_elevation {
             Some(vla) => vla > -90.0 && vla <= GROUND_MAX_LAUNCH_DEG,
-            None => [ball.backspin_rpm, ball.sidespin_rpm, ball.total_spin_rpm]
-                .iter()
-                .all(Option::is_none),
+            None => [
+                launch.backspin_rpm,
+                launch.sidespin_rpm,
+                launch.total_spin_rpm,
+            ]
+            .iter()
+            .all(Option::is_none),
         },
     }
 }
@@ -111,7 +118,7 @@ fn ground_surface(configured: SimSurface, mode: Option<ShotDetectionMode>) -> Su
 /// always spins, so a source with no spin measurement (e.g. an Open Connect
 /// monitor that sends no `BackSpin`/`SideSpin`) reports exactly this. A
 /// total spin with no axis is flown as backspin with no sidespin.
-fn shot_input(ball: &BallFlight) -> Result<ShotInput, &'static str> {
+fn shot_input(ball: &Launch) -> Result<ShotInput, &'static str> {
     let (back, side) = match flighthook::spin_components(ball) {
         (Some(back), None) if ball.total_spin_rpm.is_some() => (Some(back), Some(0)),
         pair => pair,
@@ -151,8 +158,9 @@ fn shot_input(ball: &BallFlight) -> Result<ShotInput, &'static str> {
     })
 }
 
-/// Simulate `ball` under `cfg` and return the values the device did not
-/// report, or `None` when the launch or environment can't be simulated.
+/// Simulate the device's `launch` under `cfg` and return the values the
+/// device did not report in its `flight` result, or `None` when the launch
+/// or environment can't be simulated.
 ///
 /// Where the device reports carry (or roll), the simulated total is that
 /// measured carry plus the simulated roll, so carry + roll = total holds for
@@ -168,19 +176,30 @@ fn shot_input(ball: &BallFlight) -> Result<ShotInput, &'static str> {
 /// ([`derive_ground_ball`]).
 ///
 /// Test-only convenience with no detection mode: production code computes
-/// the environment error once per shot in [`ball_flight_event_in_mode`] and
+/// the environment error once per shot in [`launch_events_in_mode`] and
 /// calls [`derive_with_error`] directly, since it already needs that error
 /// for the log-once warning.
 #[cfg(test)]
-pub(crate) fn derive(ball: &BallFlight, cfg: &SimulationSection) -> Option<DerivedFlight> {
-    derive_with_error(ball, cfg, None, cfg.environment_error().as_deref())
+pub(crate) fn derive(
+    launch: &Launch,
+    flight: Option<&FlightResult>,
+    cfg: &SimulationSection,
+) -> Option<DerivedFlight> {
+    derive_with_error(
+        launch,
+        flight,
+        cfg,
+        None,
+        cfg.environment_error().as_deref(),
+    )
 }
 
 /// Like [`derive`], for a shot taken in detection mode `mode`, taking the
 /// environment error already computed by the caller instead of recomputing
 /// it. The mode only picks a ground ball's surface ([`ground_surface`]).
 fn derive_with_error(
-    ball: &BallFlight,
+    launch: &Launch,
+    flight: Option<&FlightResult>,
     cfg: &SimulationSection,
     mode: Option<ShotDetectionMode>,
     env_err: Option<&str>,
@@ -188,10 +207,10 @@ fn derive_with_error(
     if env_err.is_some() {
         return None;
     }
-    if is_ground_ball(ball) {
-        return derive_ground_ball(ball, cfg, ground_surface(cfg.surface, mode));
+    if is_ground_ball(launch, flight) {
+        return derive_ground_ball(launch, flight, cfg, ground_surface(cfg.surface, mode));
     }
-    let input = match shot_input(ball) {
+    let input = match shot_input(launch) {
         Ok(input) => input,
         Err(reason) => {
             debug!("not simulated: {reason}");
@@ -220,7 +239,7 @@ fn derive_with_error(
     let measured = if force {
         Measured::default()
     } else {
-        Measured::from_ball(ball).without_zero_flight()
+        Measured::from_shot(launch, flight).without_zero_flight()
     };
     let anchored = finite_path(anchor_path(&raw, &measured));
 
@@ -318,7 +337,7 @@ fn finite_path(anchored: Result<FullPath, &'static str>) -> Option<FullPath> {
 /// right), or why it cannot be rolled. Speed must be finite and positive and
 /// the direction finite and within 90 deg; launch angle and spin are not
 /// used.
-fn ground_input(ball: &BallFlight) -> Result<(f64, f64), &'static str> {
+fn ground_input(ball: &Launch) -> Result<(f64, f64), &'static str> {
     let (Some(speed), Some(hla)) = (ball.launch_speed, ball.launch_azimuth) else {
         return Err("ground ball speed or direction missing");
     };
@@ -346,11 +365,12 @@ fn ground_input(ball: &BallFlight) -> Result<(f64, f64), &'static str> {
 /// The displayed total is the measured total, else the measured roll, else
 /// the simulated roll, and roll and total offlines are the rest's `z`.
 fn derive_ground_ball(
-    ball: &BallFlight,
+    launch: &Launch,
+    flight: Option<&FlightResult>,
     cfg: &SimulationSection,
     surface: Surface,
 ) -> Option<DerivedFlight> {
-    let (speed, hla) = match ground_input(ball) {
+    let (speed, hla) = match ground_input(launch) {
         Ok(launch) => launch,
         Err(reason) => {
             debug!("not simulated: {reason}");
@@ -372,7 +392,7 @@ fn derive_ground_ball(
     let measured = if force {
         Measured::default()
     } else {
-        Measured::from_ball(ball)
+        Measured::from_shot(launch, flight)
     };
     let anchored = finite_path(anchor_ground_ball(&raw, &measured));
 
@@ -506,8 +526,8 @@ fn nearest_time(points: &[[f64; 4]], t: f64) -> Option<usize> {
     }
 }
 
-/// The values the device measured that the path is fitted to, meters and
-/// seconds.
+/// The values the device reported that the path is fitted to, meters and
+/// seconds: its flight result, and its launch direction.
 #[derive(Debug, Clone, Copy, Default)]
 struct Measured {
     carry: Option<f64>,
@@ -524,19 +544,26 @@ struct Measured {
 }
 
 impl Measured {
-    fn from_ball(ball: &BallFlight) -> Self {
+    fn from_shot(launch: &Launch, flight: Option<&FlightResult>) -> Self {
+        let azimuth = launch.launch_azimuth;
+        let Some(f) = flight else {
+            return Self {
+                azimuth,
+                ..Self::default()
+            };
+        };
         Self {
-            carry: ball.carry_distance.map(Distance::as_meters),
-            offline: ball
+            carry: f.carry_distance.map(Distance::as_meters),
+            offline: f
                 .carry_offline
                 .map(Distance::as_meters)
                 .filter(|v| v.is_finite()),
-            azimuth: ball.launch_azimuth,
-            apex: ball.max_height.map(Distance::as_meters),
-            flight_time: ball.flight_time,
-            descent: ball.descent_angle.filter(|v| v.is_finite()),
-            total: ball.total_distance.map(Distance::as_meters),
-            roll: ball.roll_distance.map(Distance::as_meters),
+            azimuth,
+            apex: f.max_height.map(Distance::as_meters),
+            flight_time: f.flight_time,
+            descent: f.descent_angle.filter(|v| v.is_finite()),
+            total: f.total_distance.map(Distance::as_meters),
+            roll: f.roll_distance.map(Distance::as_meters),
         }
     }
 
@@ -1159,71 +1186,122 @@ fn warn_invalid_environment(cfg: &SimulationSection, env_err: Option<&str>) {
     }
 }
 
-/// Build the `BallFlight` bus event for a measured ball taken in the
-/// current detection mode (the live game mode); see
-/// [`ball_flight_event_in_mode`].
-pub(crate) fn ball_flight_event(
+/// Build the bus events for a device's measured `launch` and its `flight`
+/// result, taken in the current detection mode (the live game mode); see
+/// [`launch_events_in_mode`].
+pub(crate) fn launch_events(
     state: &SystemState,
     key: ShotKey,
-    ball: BallFlight,
-) -> FlighthookEvent {
+    launch: Launch,
+    flight: Option<FlightResult>,
+) -> Vec<FlighthookEvent> {
     let mode = state.game.snapshot().mode;
-    ball_flight_event_in_mode(state, key, ball, mode)
+    launch_events_in_mode(state, key, launch, flight, mode)
 }
 
-/// Build the `BallFlight` bus event for a measured ball taken in detection
-/// mode `mode`: reads the live `[simulation]` settings, simulates the
-/// missing values (every result value under `force`; a roll for a ground
-/// ball, on the green in Putting mode), and logs the `sim` line under the
-/// device's own ball line. For a device that captures the mode at its
-/// trigger, `mode` is that capture.
-pub(crate) fn ball_flight_event_in_mode(
+/// Build the bus events for a device's measured `launch` and its `flight`
+/// result, taken in detection mode `mode`: the `Launch` event, then the
+/// `FlightResult` event when the device sent one. Reads the live
+/// `[simulation]` settings, simulates the missing values into the launch's
+/// `derived` (every result value under `force`; a roll for a ground ball, on
+/// the green in Putting mode), and logs the `sim` line under the device's
+/// own ball line. For a device that captures the mode at its trigger, `mode`
+/// is that capture.
+pub(crate) fn launch_events_in_mode(
     state: &SystemState,
     key: ShotKey,
-    ball: BallFlight,
+    launch: Launch,
+    flight: Option<FlightResult>,
     mode: Option<ShotDetectionMode>,
-) -> FlighthookEvent {
+) -> Vec<FlighthookEvent> {
     let cfg = state.system.simulation();
     if should_simulate(&cfg) {
-        simulated_ball_flight_event(&cfg, key, ball, mode)
+        simulated_launch_events(&cfg, key, launch, flight, mode)
     } else {
-        FlighthookEvent::BallFlight {
-            key,
-            ball: Box::new(ball),
-            derived: None,
-        }
+        events(key, launch, None, flight)
     }
 }
 
-/// Like [`ball_flight_event_in_mode`] under `cfg`, but simulated whatever
+/// Like [`launch_events_in_mode`] under `cfg`, but simulated whatever
 /// `cfg.mode` (`off` included): for a shot that is wholly flighthook's own,
 /// such as an Auto-chip, whose results exist only as simulated values.
-pub(crate) fn simulated_ball_flight_event(
+pub(crate) fn simulated_launch_events(
     cfg: &SimulationSection,
     key: ShotKey,
-    ball: BallFlight,
+    launch: Launch,
+    flight: Option<FlightResult>,
     mode: Option<ShotDetectionMode>,
-) -> FlighthookEvent {
+) -> Vec<FlighthookEvent> {
     let env_err = cfg.environment_error();
     warn_invalid_environment(cfg, env_err.as_deref());
-    let derived = derive_with_error(&ball, cfg, mode, env_err.as_deref());
+    let derived = derive_with_error(&launch, flight.as_ref(), cfg, mode, env_err.as_deref());
     if let Some(ref d) = derived {
         info!("  {}", log_line(d));
     }
-    FlighthookEvent::BallFlight {
-        key,
-        ball: Box::new(ball),
+    events(key, launch, derived, flight)
+}
+
+/// The `Launch` event, then the `FlightResult` event when there is one.
+fn events(
+    key: ShotKey,
+    launch: Launch,
+    derived: Option<DerivedFlight>,
+    flight: Option<FlightResult>,
+) -> Vec<FlighthookEvent> {
+    let mut events = vec![FlighthookEvent::Launch {
+        key: key.clone(),
+        launch: Box::new(launch),
         derived: derived.map(Box::new),
+    }];
+    if let Some(flight) = flight {
+        events.push(FlighthookEvent::FlightResult {
+            key,
+            flight: Box::new(flight),
+        });
     }
+    events
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_ball::Ball;
     use flighthook::{Club, Velocity};
 
-    fn ball(speed_mph: f64, vla: f64, hla: f64, back: i32, side: i32) -> BallFlight {
-        BallFlight {
+    // The functions under test, taking a test shot block.
+
+    fn derive(b: &Ball, cfg: &SimulationSection) -> Option<DerivedFlight> {
+        super::derive(&b.launch(), b.flight().as_ref(), cfg)
+    }
+
+    fn is_ground_ball(b: &Ball) -> bool {
+        super::is_ground_ball(&b.launch(), b.flight().as_ref())
+    }
+
+    fn shot_input(b: &Ball) -> Result<ShotInput, &'static str> {
+        super::shot_input(&b.launch())
+    }
+
+    fn measured(b: &Ball) -> Measured {
+        Measured::from_shot(&b.launch(), b.flight().as_ref())
+    }
+
+    /// The `Launch` event of `b` (its first event).
+    fn ball_flight_event(state: &SystemState, key: ShotKey, b: Ball) -> FlighthookEvent {
+        launch_events(state, key, b.launch(), b.flight()).remove(0)
+    }
+
+    fn ball_flight_event_in_mode(
+        state: &SystemState,
+        key: ShotKey,
+        b: Ball,
+        mode: Option<ShotDetectionMode>,
+    ) -> FlighthookEvent {
+        launch_events_in_mode(state, key, b.launch(), b.flight(), mode).remove(0)
+    }
+
+    fn ball(speed_mph: f64, vla: f64, hla: f64, back: i32, side: i32) -> Ball {
+        Ball {
             launch_speed: Some(Velocity::MilesPerHour(speed_mph)),
             launch_elevation: Some(vla),
             launch_azimuth: Some(hla),
@@ -1234,16 +1312,16 @@ mod tests {
             flight_time: None,
             backspin_rpm: Some(back),
             sidespin_rpm: Some(side),
-            ..BallFlight::default()
+            ..Ball::default()
         }
     }
 
     /// A Square/R10-like launch: launch data only.
-    fn square_like() -> BallFlight {
+    fn square_like() -> Ball {
         ball(120.0, 17.0, -1.2, 6500, -300)
     }
 
-    fn from_input(i: &ShotInput) -> BallFlight {
+    fn from_input(i: &ShotInput) -> Ball {
         #[allow(clippy::cast_possible_truncation)]
         ball(
             i.ball_speed_mph,
@@ -1346,7 +1424,7 @@ mod tests {
         }
     }
 
-    fn fully_measured() -> BallFlight {
+    fn fully_measured() -> Ball {
         let mut b = ball(150.0, 12.0, 0.8, 2900, -350);
         b.carry_distance = Some(Distance::Yards(241.0));
         b.total_distance = Some(Distance::Yards(265.0));
@@ -1415,10 +1493,7 @@ mod tests {
             ..cfg()
         });
         let ev = ball_flight_event(&t.state, key(), fully_measured());
-        assert!(matches!(
-            ev,
-            FlighthookEvent::BallFlight { derived: None, .. }
-        ));
+        assert!(matches!(ev, FlighthookEvent::Launch { derived: None, .. }));
         // No spin reading: no `derived`, so consumers show the device values.
         let mut no_spin = fully_measured();
         no_spin.backspin_rpm = Some(0);
@@ -1433,17 +1508,42 @@ mod tests {
         let t = state_with(cfg());
         let b = square_like();
         let ev = ball_flight_event(&t.state, key(), b.clone());
-        let FlighthookEvent::BallFlight {
-            ball: out, derived, ..
+        let FlighthookEvent::Launch {
+            launch: out,
+            derived,
+            ..
         } = &ev
         else {
-            panic!("not a ball flight: {ev:?}");
+            panic!("not a launch: {ev:?}");
         };
-        assert_eq!(**out, b);
+        assert_eq!(**out, b.launch());
         assert!(derived.is_some());
         let json = serde_json::to_value(&ev).expect("serializes");
         assert!(json["derived"]["carry_distance"].is_string(), "{json}");
-        assert!(json["ball"].get("carry_distance").is_none(), "{json}");
+        assert!(json["launch"].get("carry_distance").is_none(), "{json}");
+        // A launch-only device sends no flight result.
+        let events = launch_events(&t.state, key(), b.launch(), b.flight());
+        assert_eq!(events.len(), 1);
+    }
+
+    /// The device's flight result goes on the bus as it came, after the
+    /// launch, whatever was simulated.
+    #[test]
+    fn the_device_flight_result_follows_the_launch_unchanged() {
+        for sim in [cfg(), forced()] {
+            let t = state_with(sim);
+            let b = fully_measured();
+            let events = launch_events(&t.state, key(), b.launch(), b.flight());
+            let [
+                FlighthookEvent::Launch { launch, .. },
+                FlighthookEvent::FlightResult { flight, .. },
+            ] = &events[..]
+            else {
+                panic!("not a launch and a flight result: {events:?}");
+            };
+            assert_eq!(**launch, b.launch());
+            assert_eq!(Some(&**flight), b.flight().as_ref());
+        }
     }
 
     #[test]
@@ -1451,19 +1551,21 @@ mod tests {
         let t = state_with(forced());
         let b = fully_measured();
         let ev = ball_flight_event(&t.state, key(), b.clone());
-        let FlighthookEvent::BallFlight {
-            ball: out, derived, ..
+        let FlighthookEvent::Launch {
+            launch: out,
+            derived,
+            ..
         } = &ev
         else {
-            panic!("not a ball flight: {ev:?}");
+            panic!("not a launch: {ev:?}");
         };
-        assert_eq!(**out, b);
+        assert_eq!(**out, b.launch());
         assert!(derived.as_ref().is_some_and(|d| d.replaces_measured));
         let json = serde_json::to_value(&ev).expect("serializes");
         assert_eq!(json["derived"]["replaces_measured"], true, "{json}");
         assert_eq!(
-            json["ball"],
-            serde_json::to_value(&b).expect("serializes"),
+            json["launch"],
+            serde_json::to_value(b.launch()).expect("serializes"),
             "{json}"
         );
     }
@@ -1474,17 +1576,14 @@ mod tests {
         let on = ball_flight_event(&t.state, key(), square_like());
         assert!(matches!(
             on,
-            FlighthookEvent::BallFlight {
+            FlighthookEvent::Launch {
                 derived: Some(_),
                 ..
             }
         ));
         t.state.system.update(|c| c.simulation.mode = SimMode::Off);
         let off = ball_flight_event(&t.state, key(), square_like());
-        assert!(matches!(
-            off,
-            FlighthookEvent::BallFlight { derived: None, .. }
-        ));
+        assert!(matches!(off, FlighthookEvent::Launch { derived: None, .. }));
     }
 
     // -- 3. Sign mapping, pinned by observable direction -----------------------
@@ -1638,7 +1737,7 @@ mod tests {
 
     #[test]
     fn a_ground_ball_is_a_zero_apex_or_no_lift() {
-        let with_apex = |apex: f64, vla: f64| BallFlight {
+        let with_apex = |apex: f64, vla: f64| Ball {
             max_height: Some(Distance::Meters(apex)),
             ..ball(60.0, vla, 0.0, 3000, 0)
         };
@@ -1685,9 +1784,9 @@ mod tests {
         assert_scalars_on_the_path(&b, &putting);
     }
 
-    /// The `derived` block of a `BallFlight` event.
+    /// The `derived` block of a `Ball` event.
     fn event_derived(ev: &FlighthookEvent) -> DerivedFlight {
-        let FlighthookEvent::BallFlight { derived, .. } = ev else {
+        let FlighthookEvent::Launch { derived, .. } = ev else {
             panic!("not a ball flight: {ev:?}");
         };
         *derived.clone().expect("derived")
@@ -1857,7 +1956,7 @@ mod tests {
     // -- 11. Path anchoring -----------------------------------------------------
 
     /// The raw simulated path for `b` under the default settings.
-    fn raw_path(b: &BallFlight) -> FullPath {
+    fn raw_path(b: &Ball) -> FullPath {
         let c = cfg();
         let env = Environment {
             altitude_m: c.altitude.as_meters(),
@@ -1941,7 +2040,7 @@ mod tests {
         }
     }
 
-    fn straight_shot() -> BallFlight {
+    fn straight_shot() -> Ball {
         ball(150.0, 12.5, 3.0, 3200, 0)
     }
 
@@ -1978,7 +2077,7 @@ mod tests {
             let raw = raw_path(&b);
             let carry = sim_carry(&raw) * scale;
             b.carry_distance = Some(Distance::Meters(carry));
-            let fit = anchor_path(&raw, &Measured::from_ball(&b)).expect("path");
+            let fit = anchor_path(&raw, &measured(&b)).expect("path");
             let d = derive(&b, &cfg()).expect("simulated");
             let total = m(d.total_distance);
             assert!((total - (carry + sim_total(&raw) - sim_carry(&raw))).abs() < 1e-9);
@@ -2014,7 +2113,7 @@ mod tests {
         let (apex, time) = (apex_sim * 1.1, time_sim + 0.4);
         b.max_height = Some(Distance::Meters(apex));
         b.flight_time = Some(time);
-        let fit = anchor_path(&raw, &Measured::from_ball(&b)).expect("path");
+        let fit = anchor_path(&raw, &measured(&b)).expect("path");
         let peak = fit.flight.iter().map(|p| p[2]).fold(f64::MIN, f64::max);
         assert_eq!(peak, apex);
         assert_eq!(fit.flight.last().expect("landing")[0], time);
@@ -2045,7 +2144,7 @@ mod tests {
         b.carry_distance = Some(Distance::Meters(carry));
         b.total_distance = Some(Distance::Meters(carry + roll));
         b.roll_distance = Some(Distance::Meters(roll));
-        let fit = anchor_path(&raw, &Measured::from_ball(&b)).expect("path");
+        let fit = anchor_path(&raw, &measured(&b)).expect("path");
         assert_pinned(&fit.flight, &fit.ground, carry, Some(carry + roll), 1e-9);
         assert_eq!(fit.ground.len(), raw.ground.len(), "fitted, not straight");
         assert_eq!(hops(&fit.ground), hops(&raw.ground));
@@ -2063,7 +2162,7 @@ mod tests {
         let carry = sim_carry(&raw);
         b.carry_distance = Some(Distance::Meters(carry));
         b.total_distance = Some(Distance::Meters(carry - 2.0));
-        let fit = anchor_path(&raw, &Measured::from_ball(&b)).expect("path");
+        let fit = anchor_path(&raw, &measured(&b)).expect("path");
         assert_eq!(fit.ground.len(), 2);
         assert!(fit.contacts.is_empty());
         assert_pinned(&fit.flight, &fit.ground, carry, Some(carry - 2.0), 1e-9);
@@ -2294,7 +2393,7 @@ mod tests {
     /// Every scalar shown equals the path's: landing radius = carry, peak =
     /// apex, landing time = flight time, rest radius = total, and the
     /// offlines are the landing and rest `z` (to the path's cm/ms rounding).
-    fn assert_scalars_on_the_path(b: &BallFlight, d: &DerivedFlight) {
+    fn assert_scalars_on_the_path(b: &Ball, d: &DerivedFlight) {
         let p = d.path.as_ref().expect("path");
         let landing = *p.flight.last().expect("landing");
         let rest = *p.ground.last().expect("rest");
@@ -2317,7 +2416,7 @@ mod tests {
     }
 
     /// A Mevo-style full shot: carry, apex and flight time measured.
-    fn mevo_like() -> BallFlight {
+    fn mevo_like() -> Ball {
         let mut b = straight_shot();
         let plain = derive(&b, &cfg()).expect("simulated");
         b.carry_distance = Some(Distance::Meters(m(plain.carry_distance) * 1.03));
@@ -2366,8 +2465,8 @@ mod tests {
     }
 
     /// A Mevo-style bladed shot: carry, apex and time read 0.
-    fn bladed(speed_mps: f64, hla: f64) -> BallFlight {
-        BallFlight {
+    fn bladed(speed_mps: f64, hla: f64) -> Ball {
+        Ball {
             launch_speed: Some(Velocity::MetersPerSecond(speed_mps)),
             launch_elevation: Some(2.0),
             launch_azimuth: Some(hla),
@@ -2378,13 +2477,13 @@ mod tests {
             flight_time: Some(0.0),
             backspin_rpm: Some(0),
             sidespin_rpm: Some(0),
-            ..BallFlight::default()
+            ..Ball::default()
         }
     }
 
     /// A ground ball's path: the tee alone as the flight, and a roll from
     /// the tee to the total on the launch bearing.
-    fn assert_rolls_from_the_tee(b: &BallFlight, d: &DerivedFlight) {
+    fn assert_rolls_from_the_tee(b: &Ball, d: &DerivedFlight) {
         let p = d.path.as_ref().expect("path");
         assert_eq!(p.flight, vec![[0.0; 4]]);
         assert_eq!(p.ground[0], [0.0; 4]);
@@ -2410,10 +2509,10 @@ mod tests {
         t.writer
             .set_club_info(flighthook::ClubInfo { club: Club::Iron7 });
         let ev = ball_flight_event(&t.state, key(), b.clone());
-        let FlighthookEvent::BallFlight { ball: out, .. } = &ev else {
-            panic!("not a ball flight");
+        let FlighthookEvent::Launch { launch: out, .. } = &ev else {
+            panic!("not a launch");
         };
-        assert_eq!(**out, b);
+        assert_eq!(**out, b.launch());
         let d = event_derived(&ev);
         // Not rule 1: nothing is flown, and the measured carry and time
         // give way to the ground ball's 0.
@@ -2424,7 +2523,7 @@ mod tests {
         assert_rolls_from_the_tee(&b, &d);
         // It rolls as the same launch with every zero measured does.
         let rolled = derive(
-            &BallFlight {
+            &Ball {
                 launch_speed: b.launch_speed,
                 launch_azimuth: b.launch_azimuth,
                 ..bladed(1.0, 0.0)
@@ -2447,10 +2546,10 @@ mod tests {
             t.writer.set_mode(mode);
             let b = bladed(3.0, 1.5);
             let ev = ball_flight_event(&t.state, key(), b.clone());
-            let FlighthookEvent::BallFlight { ball: out, .. } = &ev else {
-                panic!("not a ball flight");
+            let FlighthookEvent::Launch { launch: out, .. } = &ev else {
+                panic!("not a launch");
             };
-            assert_eq!(**out, b);
+            assert_eq!(**out, b.launch());
             let d = event_derived(&ev);
             // The measured zeros are real for a ground ball: not simulated.
             assert_eq!(d.carry_distance, None);
@@ -2695,11 +2794,11 @@ mod tests {
         b.backspin_rpm = None;
         assert!(derive(&b, &cfg()).is_some());
         for bad in [
-            BallFlight {
+            Ball {
                 launch_speed: None,
                 ..bladed(3.0, 0.0)
             },
-            BallFlight {
+            Ball {
                 launch_azimuth: None,
                 ..bladed(3.0, 0.0)
             },
@@ -2919,7 +3018,7 @@ mod tests {
         let mut b = fully_measured();
         b.carry_offline = Some(Distance::Meters(f64::NAN));
         b.descent_angle = Some(f64::INFINITY);
-        let m = Measured::from_ball(&b);
+        let m = measured(&b);
         assert!(m.offline.is_none() && m.descent.is_none());
         let d = derive(&b, &cfg()).expect("simulated");
         let plain = derive(&fully_measured(), &cfg()).expect("simulated");
@@ -2930,18 +3029,18 @@ mod tests {
     }
 
     /// The raw path for `b` and its fit to `b`'s measured values.
-    fn fitted(b: &BallFlight) -> (FullPath, FullPath) {
+    fn fitted(b: &Ball) -> (FullPath, FullPath) {
         let raw = raw_path(b);
-        let fit = anchor_path(&raw, &Measured::from_ball(b)).expect("path");
+        let fit = anchor_path(&raw, &measured(b)).expect("path");
         (raw, fit)
     }
 
     /// The displayed total for `b` without its offline: the rest radius of
     /// the path fitted to everything else.
-    fn total_without_offline(raw: &FullPath, b: &BallFlight) -> f64 {
+    fn total_without_offline(raw: &FullPath, b: &Ball) -> f64 {
         let m = Measured {
             offline: None,
-            ..Measured::from_ball(b)
+            ..measured(b)
         };
         sim_total(&anchor_path(raw, &m).expect("path"))
     }
@@ -3094,7 +3193,7 @@ mod tests {
         let scale = (offline - x_fit * azimuth.to_radians().tan()) / curve;
         assert!(scale > MAX_CURVE_SCALE, "{scale}");
         b.carry_offline = Some(Distance::Meters(offline));
-        let fit = anchor_path(&raw, &Measured::from_ball(&b)).expect("path");
+        let fit = anchor_path(&raw, &measured(&b)).expect("path");
         assert_offline_fit(
             &raw,
             &fit,

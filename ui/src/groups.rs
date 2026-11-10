@@ -228,16 +228,13 @@ impl ShotGroups {
         }
         self.observed = Some(club);
         self.seq += 1;
-        let after = shots
-            .iter()
-            .rfind(|r| r.ball.is_some() || r.club.is_some())
-            .map(|r| {
-                let key = ShotKey {
-                    shot_id: r.shot_id.clone(),
-                    shot_number: r.shot_number,
-                };
-                (r.actor.clone(), key)
-            });
+        let after = shots.iter().rfind(|r| r.has_data()).map(|r| {
+            let key = ShotKey {
+                shot_id: r.shot_id.clone(),
+                shot_number: r.shot_number,
+            };
+            (r.actor.clone(), key)
+        });
         let selection = Selection {
             club,
             after,
@@ -381,13 +378,13 @@ fn ungrouped_after_grouped(shots: &[ShotRow]) -> bool {
     };
     shots[first..]
         .iter()
-        .any(|r| r.group.is_none() && (r.ball.is_some() || r.club.is_some()))
+        .any(|r| r.group.is_none() && r.has_data())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::BallFlight;
+    use crate::types::Launch;
 
     fn info(id: &str, number: u32, open: bool, shots: u32) -> ShotGroupInfo {
         ShotGroupInfo {
@@ -408,7 +405,8 @@ mod tests {
             actor: "mevo.0".into(),
             shot_id: id.into(),
             shot_number: n,
-            ball: Some(BallFlight::default()),
+            launch: Some(Launch::default()),
+            flight: None,
             club: None,
             impact: None,
             derived: None,
@@ -602,7 +600,7 @@ mod tests {
         // pending row (no data yet) is not missing anything.
         let mut shots = vec![row(1, "s1"), row(2, "s2"), row(3, "s3"), row(4, "s4")];
         shots[1].group = Some("a".into());
-        shots[2].ball = None;
+        shots[2].launch = None;
         let ev = g.apply(
             "webserver.0",
             info("a", 1, true, 2),
@@ -740,7 +738,7 @@ mod tests {
     fn selections_sit_after_the_newest_row_with_data() {
         let mut g = served(vec![]);
         let mut shots = vec![row(1, "s1"), row(2, "s2"), row(3, "s3")];
-        shots[2].ball = None;
+        shots[2].launch = None;
         // Before any row; then after s2, the newest row with data, though
         // a pending row is newer.
         g.observe_club(Some(Club::Iron7), &[]);

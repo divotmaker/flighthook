@@ -21,7 +21,7 @@ use crate::sim;
 use crate::state::SystemState;
 
 use flighthook::{
-    ActorStatus, BallFlight, ClubData, FlighthookEvent, FlighthookMessage, Handedness, RawDir,
+    ActorStatus, ClubData, FlighthookEvent, FlighthookMessage, Handedness, Launch, RawDir,
     RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw, Velocity,
 };
 
@@ -526,6 +526,7 @@ fn send_telemetry(sender: &BusSender, device: &str, telemetry: &HashMap<String, 
             manufacturer: None,
             model: None,
             firmware: None,
+            source: None,
             telemetry: Some(telemetry.clone()),
         })
         .device(device),
@@ -548,13 +549,13 @@ fn hand_of(handed: Option<Handedness>) -> Hand {
 /// Ball data of a putt: ball speed and launch direction, rolled along the
 /// ground by the simulation. The device measures no vertical launch and no
 /// spin, so neither is reported.
-fn ball_from_putt(putt: &PuttResult) -> BallFlight {
-    BallFlight {
+fn ball_from_putt(putt: &PuttResult) -> Launch {
+    Launch {
         launch_speed: Some(Velocity::MetersPerSecond(putt.ball_speed_mps)),
         launch_elevation: None,
         // Both are positive to the right of the target line.
         launch_azimuth: Some(putt.launch_direction_deg),
-        ..BallFlight::default()
+        ..Launch::default()
     }
 }
 
@@ -781,6 +782,7 @@ fn connect_and_run(
             manufacturer: None,
             model: Some(MODEL.into()),
             firmware,
+            source: None,
             telemetry: Some(telemetry.clone()),
         })
         .device(&name),
@@ -1023,12 +1025,16 @@ fn emit_putt(
         ActorStatus::Connected,
         HashMap::from([("shot_count".into(), shot_counter.to_string())]),
     );
-    sender.send(
-        FlighthookMessage::new(FlighthookEvent::ShotTrigger { key: key.clone() }).device(device),
-    );
-    let event =
-        sim::ball_flight_event_in_mode(state, key.clone(), ball, Some(ShotDetectionMode::Putting));
-    sender.send(FlighthookMessage::new(event).device(device));
+    sender.send(FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone())).device(device));
+    for event in sim::launch_events_in_mode(
+        state,
+        key.clone(),
+        ball,
+        None,
+        Some(ShotDetectionMode::Putting),
+    ) {
+        sender.send(FlighthookMessage::new(event).device(device));
+    }
     if let Some(club) = club {
         sender.send(
             FlighthookMessage::new(FlighthookEvent::ClubPath {
@@ -1284,21 +1290,21 @@ mod tests {
 
     /// The shot the events add up to, as the bridges accumulate it.
     fn accumulate(events: &[FlighthookEvent]) -> ShotData {
-        let FlighthookEvent::ShotTrigger { key } = &events[0] else {
+        let FlighthookEvent::ShotTrigger { key, .. } = &events[0] else {
             panic!("starts with a trigger: {events:?}");
         };
         let mut acc = ShotAccumulator::new("exputt.0".into(), key.clone());
         for e in events {
             match e {
-                FlighthookEvent::BallFlight {
+                FlighthookEvent::Launch {
                     key: k,
-                    ball,
+                    launch,
                     derived,
                 } => {
                     assert_eq!(k, key);
-                    acc.set_ball(*ball.clone());
-                    acc.set_derived(derived.as_deref().cloned());
+                    acc.set_launch(*launch.clone(), derived.as_deref().cloned());
                 }
+                FlighthookEvent::FlightResult { .. } => panic!("a putt has no flight result"),
                 FlighthookEvent::ClubPath { key: k, club } => {
                     assert_eq!(k, key);
                     acc.set_club(*club.clone());
@@ -1374,7 +1380,7 @@ mod tests {
         let expected = putt(PUTT_RESULT_FULL);
         let shot = accumulate(&events);
 
-        let ball = shot.ball.as_ref().expect("ball");
+        let ball = shot.launch.as_ref().expect("launch");
         assert_eq!(
             ball.launch_speed,
             Some(Velocity::MetersPerSecond(expected.ball_speed_mps))
@@ -1428,7 +1434,7 @@ mod tests {
 
         mock.push_event(PUTT_RESULT_PULLED);
         let shot = accumulate(&h.next_shot());
-        let ball = shot.ball.as_ref().expect("ball");
+        let ball = shot.launch.as_ref().expect("launch");
         assert!(ball.launch_azimuth.unwrap() < -10.0, "L10.3 is negative");
         let club = shot.club.as_ref().expect("club");
         assert!(club.path.unwrap() < -5.0 && club.face_angle.unwrap() < -10.0);
@@ -1459,7 +1465,7 @@ mod tests {
         let expected = putt(PUTT_RESULT_BALL_ONLY);
         let shot = accumulate(&events);
         assert!(shot.club.is_none());
-        let ball = shot.ball.as_ref().expect("ball");
+        let ball = shot.launch.as_ref().expect("launch");
         assert_eq!(
             ball.launch_speed,
             Some(Velocity::MetersPerSecond(expected.ball_speed_mps))
@@ -1495,7 +1501,7 @@ mod tests {
     fn mock_putt(mock: &MockDevice, h: &mut Harness, number: u32) {
         mock.push_event(PUTT_RESULT_FULL);
         let events = h.next_shot();
-        let FlighthookEvent::ShotTrigger { key } = &events[0] else {
+        let FlighthookEvent::ShotTrigger { key, .. } = &events[0] else {
             unreachable!()
         };
         assert_eq!(key.shot_number, number);
@@ -2525,5 +2531,19 @@ mod tests {
         let took = stopped.elapsed();
         assert!(took < h.reply_timeout + Duration::from_secs(1), "{took:?}");
         assert!(took < ExPuttActor { address: None }.stop_wait(), "{took:?}");
+    }
+
+    /// Every output's numbers for an ExPutt putt.
+    #[test]
+    fn outputs_keep_their_numbers() {
+        let p = putt(PUTT_RESULT_FULL);
+        let messages = crate::test_ball::device_shot(
+            "exputt.0",
+            ball_from_putt(&p),
+            None,
+            club_from_putt(&p),
+            Some(ShotDetectionMode::Putting),
+        );
+        crate::test_ball::assert_outputs_pinned("exputt", &messages);
     }
 }

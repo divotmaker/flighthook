@@ -271,8 +271,9 @@ impl Drop for RoundGuard {
 
 /// A shot as it counts in a round: measured, with only the device's
 /// readings. Every value [`ShotData::unmeasured_fields`] names is removed,
-/// and so are flighthook's own values (`derived`, `metrics`). Only a held
-/// round makes one ([`RoundGuard::certify`]).
+/// and so are the device's flight result (FRP's measured-only rule: a
+/// round takes no `flight_result`) and flighthook's own values (`derived`,
+/// `metrics`). Only a held round makes one ([`RoundGuard::certify`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CertifiedShot(ShotData);
 
@@ -293,6 +294,7 @@ fn certify(shot: &ShotData) -> Option<CertifiedShot> {
     for field in shot.unmeasured_fields() {
         certified.clear_field(field);
     }
+    certified.flight = None;
     certified.derived = None;
     certified.metrics = None;
     Some(CertifiedShot(certified))
@@ -302,7 +304,8 @@ fn certify(shot: &ShotData) -> Option<CertifiedShot> {
 mod tests {
     use super::*;
     use flighthook::{
-        BallFlight, ClubData, DerivedFlight, Distance, FaceImpact, ShotField, ShotMetrics, Velocity,
+        Basis, ClubData, DerivedFlight, Distance, FaceImpact, FlightResult, Launch, ShotField,
+        ShotMetrics, Velocity,
     };
 
     /// A policy that knows the usual sources.
@@ -533,7 +536,7 @@ mod tests {
         }
         ShotData {
             actor: "r10.0".into(),
-            ball: Some(BallFlight {
+            launch: Some(Launch {
                 launch_speed: Some(Velocity::MetersPerSecond(60.0)),
                 launch_elevation: Some(14.0),
                 launch_azimuth: Some(1.0),
@@ -541,7 +544,10 @@ mod tests {
                 sidespin_rpm: Some(-300),
                 total_spin_rpm: Some(2419),
                 spin_axis: Some(-7.1),
-                ..BallFlight::default()
+            }),
+            flight: Some(FlightResult {
+                carry_distance: Some(Distance::Meters(148.0)),
+                ..FlightResult::new(Basis::Modeled)
             }),
             club: Some(ClubData {
                 club_speed: Some(Velocity::MetersPerSecond(40.0)),
@@ -563,13 +569,14 @@ mod tests {
         let shot = marked_shot();
         let certified = certify(&shot).expect("measured");
         let mut want = shot.clone();
-        if let Some(b) = want.ball.as_mut() {
+        if let Some(b) = want.launch.as_mut() {
             b.backspin_rpm = None;
             b.sidespin_rpm = None;
         }
         if let Some(i) = want.impact.as_mut() {
             i.vertical = None;
         }
+        want.flight = None;
         want.derived = None;
         want.metrics = None;
         assert_eq!(certified.shot(), &want);
@@ -579,7 +586,7 @@ mod tests {
         let mut derived = DerivedFlight::default();
         derived.spin_estimated = true;
         estimated.derived = Some(derived);
-        let ball = certify(&estimated).expect("measured").shot().ball.clone();
+        let ball = certify(&estimated).expect("measured").shot().launch.clone();
         let ball = ball.expect("ball");
         assert_eq!(
             (
@@ -596,7 +603,12 @@ mod tests {
         let mut clean = shot.clone();
         clean.derived = None;
         let certified = certify(&clean).expect("measured");
-        assert_eq!(certified.shot().ball, clean.ball);
+        assert_eq!(certified.shot().launch, clean.launch);
+        assert_eq!(
+            certified.shot().flight,
+            None,
+            "a round takes no flight result"
+        );
         assert_eq!(certified.shot().impact, clean.impact);
     }
 

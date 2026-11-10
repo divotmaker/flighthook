@@ -11,7 +11,12 @@ use serde::{Deserialize, Serialize};
 use crate::{Club, Handedness, ShotData, ShotDetectionMode, SimulationSection};
 
 /// Export format version. Bumped when a field changes meaning.
-pub const EXPORT_SCHEMA: u32 = 1;
+///
+/// Schema 2: `data` carries the measured launch in `launch` and the device's
+/// flight values in `flight` (FRP 0.2.0's `launch` and `flight_result`).
+/// Schema 1 lines held both in one `ball` block; [`ShotExport`] reads them
+/// into the schema 2 shape.
+pub const EXPORT_SCHEMA: u32 = 2;
 
 /// Direction of a raw frame relative to flighthook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,7 +193,7 @@ pub struct ShotExport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BallFlight, Velocity};
+    use crate::{Basis, Distance, FlightResult, Launch, Velocity};
 
     fn record() -> RawRecord {
         RawRecord {
@@ -229,9 +234,9 @@ mod tests {
             data: ShotData {
                 actor: "mevo.0".into(),
                 shot_number: 3,
-                ball: Some(BallFlight {
+                launch: Some(Launch {
                     launch_speed: Some(Velocity::MetersPerSecond(40.0)),
-                    ..BallFlight::default()
+                    ..Launch::default()
                 }),
                 ..ShotData::default()
             },
@@ -240,9 +245,58 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_one() {
-        assert_eq!(EXPORT_SCHEMA, 1);
-        assert_eq!(export(None).schema, 1);
+    fn schema_is_two() {
+        assert_eq!(EXPORT_SCHEMA, 2);
+        assert_eq!(export(None).schema, 2);
+    }
+
+    /// A schema 1 line, with launch and flight values in one `ball` block,
+    /// reads into the schema 2 shape: the launch values in `launch`, the
+    /// device's flight values in a modeled `flight`. Everything else is
+    /// unchanged.
+    #[test]
+    fn a_schema_1_line_reads_into_the_launch_and_flight_shape() {
+        let line = r#"{"schema":1,"flighthook_version":"0.1.24","exported_at":"2026-01-01T00:00:01.000Z","time":"2026-01-01T00:00:00.000Z","actor":"mevo.0","shot_id":"abc","shot_number":3,"device":{"kind":"flightscope","manufacturer":"FlightScope"},"club_selected":"7I","settings":{"device":{"ball_type":1},"simulation":{},"detection_mode":"full"},"data":{"actor":"mevo.0","shot_number":3,"ball":{"launch_speed":"40mps","launch_azimuth":-1.5,"launch_elevation":18.0,"carry_distance":"150.2m","carry_offline":"-3.1m","max_height":"28m","flight_time":5.9,"descent_angle":44.0,"backspin_rpm":6200,"sidespin_rpm":-310,"total_spin_rpm":6208,"spin_axis":-2.9},"club":{"club_speed":"35mps"},"derived":{"roll_distance":"9.5m"},"shot_id":"abc","club_selected":"7I"},"raw":{"transport":"flightscope-tcp","frames":[{"t_ms":-3,"dir":"rx","type":"0xD4","src":"AVR","dst":"APP","hex":"9c00ab"}]}}"#;
+        let old: ShotExport = serde_json::from_str(line).expect("schema 1 line");
+        assert_eq!(old.schema, 1);
+        let data = &old.data;
+        assert_eq!(
+            data.launch,
+            Some(Launch {
+                launch_speed: Some(Velocity::MetersPerSecond(40.0)),
+                launch_azimuth: Some(-1.5),
+                launch_elevation: Some(18.0),
+                backspin_rpm: Some(6200),
+                sidespin_rpm: Some(-310),
+                total_spin_rpm: Some(6208),
+                spin_axis: Some(-2.9),
+            })
+        );
+        assert_eq!(
+            data.flight,
+            Some(FlightResult {
+                carry_distance: Some(Distance::Meters(150.2)),
+                carry_offline: Some(Distance::Meters(-3.1)),
+                max_height: Some(Distance::Meters(28.0)),
+                flight_time: Some(5.9),
+                descent_angle: Some(44.0),
+                ..FlightResult::new(Basis::Modeled)
+            })
+        );
+        assert!(data.club.is_some());
+        assert_eq!(
+            data.derived.as_ref().and_then(|d| d.roll_distance),
+            Some(Distance::Meters(9.5))
+        );
+        assert_eq!(data.club_selected, Some(Club::Iron7));
+        assert_eq!(old.raw.expect("raw").frames.len(), 1);
+        // Written back, it has the schema 2 shape.
+        let json = serde_json::to_value(&old.data).expect("ser");
+        assert!(json.get("ball").is_none(), "{json}");
+        assert_eq!(json["launch"]["launch_speed"], "40mps");
+        assert_eq!(json["flight"]["basis"], "modeled");
+        assert_eq!(json["flight"]["carry_distance"], "150.2m");
+        assert!(json["launch"].get("carry_distance").is_none(), "{json}");
     }
 
     #[test]

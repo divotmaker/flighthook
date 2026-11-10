@@ -14,8 +14,8 @@ use crate::sim;
 use crate::state::SystemState;
 
 use flighthook::{
-    ActorStatus, BallFlight, Club, ClubData, Distance, FaceImpact, FlighthookEvent,
-    FlighthookMessage, Handedness, RawDir, RawRecord, Severity, ShotKey, Velocity,
+    ActorStatus, Club, ClubData, Distance, FaceImpact, FlighthookEvent, FlighthookMessage,
+    Handedness, Launch, RawDir, RawRecord, Severity, ShotKey, Velocity,
 };
 
 /// Reconnect backoff bounds (linear: +1s per failed attempt, capped at 15s,
@@ -382,8 +382,8 @@ fn is_zero_spin_misread(b: &allsquare::BallMetrics, club: Club, enabled: bool) -
     b.total_spin == 0 && b.back_spin == 0 && b.side_spin == 0
 }
 
-fn ball_from_square(b: &allsquare::BallMetrics) -> BallFlight {
-    BallFlight {
+fn ball_from_square(b: &allsquare::BallMetrics) -> Launch {
+    Launch {
         launch_speed: Some(Velocity::MetersPerSecond(b.speed)),
         launch_elevation: Some(b.launch_angle),
         launch_azimuth: Some(b.direction),
@@ -398,7 +398,6 @@ fn ball_from_square(b: &allsquare::BallMetrics) -> BallFlight {
         // it is negated too. A total of 0 has no axis.
         total_spin_rpm: Some(i32::from(b.total_spin)),
         spin_axis: (b.total_spin != 0).then_some(-b.spin_axis),
-        ..BallFlight::default()
     }
 }
 
@@ -508,6 +507,7 @@ fn run(
                             manufacturer: None,
                             model: None,
                             firmware: None,
+                            source: None,
                             telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
                         })
                         .device(dev),
@@ -724,6 +724,7 @@ fn run_session<T: allsquare::Transport + Release>(
                                     Some(model.clone())
                                 },
                                 firmware: Some(firmware.lm.clone()),
+                                source: None,
                                 telemetry: Some(device_telemetry.clone()),
                             })
                             .device(&name),
@@ -755,6 +756,7 @@ fn run_session<T: allsquare::Transport + Release>(
                                 manufacturer: None,
                                 model: None,
                                 firmware: None,
+                                source: None,
                                 telemetry: Some(device_telemetry.clone()),
                             })
                             .device(&name),
@@ -769,6 +771,7 @@ fn run_session<T: allsquare::Transport + Release>(
                                 manufacturer: None,
                                 model: None,
                                 firmware: None,
+                                source: None,
                                 telemetry: Some(device_telemetry.clone()),
                             })
                             .device(&name),
@@ -803,6 +806,7 @@ fn run_session<T: allsquare::Transport + Release>(
                                     manufacturer: None,
                                     model: None,
                                     firmware: None,
+                                    source: None,
                                     telemetry: Some(device_telemetry.clone()),
                                 })
                                 .device(&name),
@@ -826,10 +830,8 @@ fn run_session<T: allsquare::Transport + Release>(
                         );
 
                         sender.send(
-                            FlighthookMessage::new(FlighthookEvent::ShotTrigger {
-                                key: key.clone(),
-                            })
-                            .device(&name),
+                            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()))
+                                .device(&name),
                         );
 
                         let bf = ball_from_square(&ball);
@@ -841,8 +843,9 @@ fn run_session<T: allsquare::Transport + Release>(
                             bf.backspin_rpm.unwrap_or(0),
                             bf.sidespin_rpm.unwrap_or(0),
                         );
-                        let event = sim::ball_flight_event(state, key.clone(), bf);
-                        sender.send(FlighthookMessage::new(event).device(&name));
+                        for event in sim::launch_events(state, key.clone(), bf, None) {
+                            sender.send(FlighthookMessage::new(event).device(&name));
+                        }
 
                         // Club data is absent when the device could not track
                         // the sticker — a putt, or a mishit it declined.
@@ -1021,7 +1024,7 @@ mod tests {
             ..testing::ball_metrics()
         };
         let cfg = flighthook::SimulationSection::default();
-        let d = sim::derive(&ball_from_square(&fade), &cfg).expect("simulated");
+        let d = sim::derive(&ball_from_square(&fade), None, &cfg).expect("simulated");
         let off = d.carry_offline.expect("offline").as_meters();
         assert!(off > 0.0, "{off}");
 
@@ -1035,7 +1038,7 @@ mod tests {
             side_spin: -600,
             ..fade
         };
-        let d = sim::derive(&ball_from_square(&straight), &cfg).expect("simulated");
+        let d = sim::derive(&ball_from_square(&straight), None, &cfg).expect("simulated");
         let off = d.carry_offline.expect("offline").as_meters();
         assert!(off > 0.0, "{off}");
     }
@@ -1438,10 +1441,10 @@ mod tests {
         let bf = ball_from_square(&fade);
         assert_eq!(bf.total_spin_rpm, Some(627));
         assert_eq!(bf.spin_axis, Some(8.0), "device -8 (right) -> FRP +8");
-        let mut components = BallFlight {
+        let mut components = Launch {
             backspin_rpm: bf.backspin_rpm,
             sidespin_rpm: bf.sidespin_rpm,
-            ..BallFlight::default()
+            ..Launch::default()
         };
         components.complete_spin();
         assert_eq!(components.total_spin_rpm, Some(627));
@@ -1752,5 +1755,14 @@ mod tests {
         let took = stopped.elapsed();
         assert!(took < Duration::from_secs(1), "{took:?}");
         assert!(released.load(Ordering::SeqCst), "the link is ended");
+    }
+
+    /// Every output's numbers for a Square shot with club data.
+    #[test]
+    fn outputs_keep_their_numbers() {
+        let ball = ball_from_square(&testing::ball_metrics());
+        let club = club_from_square(&ClubMetrics::default());
+        let messages = crate::test_ball::device_shot("square.0", ball, None, Some(club), None);
+        crate::test_ball::assert_outputs_pinned("square", &messages);
     }
 }

@@ -2708,7 +2708,7 @@ mod tests {
         let mut app = app_with_shots(2);
         let mut trigger = shot_row(3, &[]);
         trigger.actor = "mock_monitor.1".into();
-        trigger.ball = None;
+        trigger.launch = None;
         app.shots.push(trigger);
         app.shots_rev += 1;
         app.device_filter = Some("mock_monitor.1".into());
@@ -4236,7 +4236,8 @@ mod tests {
             actor: "mock_monitor.0".into(),
             shot_id: format!("id{n}"),
             shot_number: n,
-            ball: Some(flighthook::BallFlight::default()),
+            launch: Some(flighthook::Launch::default()),
+            flight: None,
             club: None,
             impact: None,
             derived: None,

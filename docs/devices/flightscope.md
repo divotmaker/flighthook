@@ -74,7 +74,7 @@ logged with its hex, and the shot is handled as if no full result arrived.
   reading **No read**, the same as a
   [shot the device didn't read](#shots-the-device-didnt-read). It is still in
   the [shot export](#shot-export) with its raw frames.
-- `true` — emit the estimated flight as `BallFlight`.
+- `true` — emit the estimate as the shot's `launch` and `flight_result`.
 
 Estimated shots may be missing club data and sidespin. Set
 `use_estimated = true` in the device section (or tick **Use Estimated Shots**
@@ -87,7 +87,8 @@ with zero ball speed and no full result, and club data with zero club speed.
 flighthook treats that as a missed read, not a 0 mph shot:
 
 - No ball flight and no club data are sent for the shot, so it does not
-  reach GSPro, FRP consumers get no `ball_flight` or `club_path` for it, and
+  reach GSPro, FRP consumers get no `launch`, `flight_result` or `club_path`
+  for it, and
   it is left out of `/api/shots` and the shot sets.
 - A warning alert is raised, e.g. `Shot #3: Xi didn't track the ball (no
   read)` (`Mevo` on a Mevo+ or Mevo Gen2), and the estimate is logged with
@@ -104,7 +105,9 @@ Both flight results report where the ball landed (the estimate's landing is
 an early estimate, and can differ from the full result's), and flighthook
 sends it as FRP `carry_offline`: the landing point's distance right (+) or left (−) of
 the target line, absolute (the same sense as `launch_azimuth`, for both
-hands). A full result (`D4`) also reports the ball's velocity at landing,
+hands), in the shot's `flight_result` (`basis` `"modeled"`: the device's own
+flight model) with its carry, apex and flight time. A full result (`D4`)
+also reports the ball's velocity at landing,
 which gives `descent_angle`, the angle below horizontal at landing. An
 estimate (`E8`) has no landing velocity, so no descent angle. Neither is sent
 for a ball that did not fly (a carry, flight time or apex of 0). With the
@@ -147,7 +150,10 @@ the launch and that spin, and GSPro gets the estimated spin with a spin axis
 of 0. The shot's log line
 shows `spin=estimate`. The dashboard shows the spin as simulated (a `SIM`
 tag on the Backspin and Sidespin cards, italics in the table), and the API
-and export flag it `spin_estimated`.
+and export flag it `spin_estimated`. On the FRP stream (`/frp`) the shot's
+`launch` carries no spin (it was not measured) and flighthook's own
+`flight_result` carries the simulated carry and total with the estimated
+spin in `assumed` (see [Forwarding](../API.md#forwarding)).
 
 - `launch_only_spin = 0` turns it off. Such a shot is then reported as the
   device sent it: spin 0, carry, apex and flight time 0, rolled as a ground

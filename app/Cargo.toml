@@ -22,6 +22,9 @@ gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 ironsight = { version = "0.6.0", features = ["serde"] }
 tenover = "0.4.0"
 flighthook = { path = "../lib", features = ["clap"] }
+# FRP's forwarding rules for the `/frp` endpoint (`ForwardFilter`); the same
+# crate the lib re-exports its types from.
+flightrelay = { version = "0.5", features = ["device"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
