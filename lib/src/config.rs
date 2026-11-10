@@ -6,6 +6,7 @@ use flightrelay::mock::MockConfig;
 use flightrelay::units::{Distance, Velocity};
 use serde::{Deserialize, Serialize};
 use tenover::config::Config as R10Config;
+use threeputt::config::Config as ExPuttConfig;
 
 use crate::game_state::Club;
 use crate::group::ShotGrouping;
@@ -1583,8 +1584,9 @@ impl DeviceSection for SquareSection {
     }
 }
 
-/// An ExPutt RG putting device instance, reached over WiFi. The device must
-/// be in its mobile mode on the same network.
+/// An ExPutt RG putting device instance, reached over WiFi (threeputt's
+/// device driver). The device must be in its mobile mode on the same
+/// network.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExPuttSection {
     #[serde(default)]
@@ -1594,15 +1596,29 @@ pub struct ExPuttSection {
     /// file then.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
-    /// IP address of the device. When absent, the device is found on the
-    /// local network automatically.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<String>,
-    /// Seconds before the shot's report that the swing's impact happened, for
-    /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
-    /// device's default ([`impact_lead_default_s`]).
+    /// Seconds before the shot's trigger time that the stroke's impact
+    /// happened, for the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`].
+    /// Absent uses the device's default ([`impact_lead_default_s`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact_lead_s: Option<f64>,
+    /// The ExPutt driver's settings: `address`, the device's IP address
+    /// (unset or blank finds the device on the local network; anything else
+    /// must be an IP address). Left out of the file while unset.
+    #[serde(flatten)]
+    pub driver: ExPuttConfig,
+}
+
+impl DeviceSection for ExPuttSection {
+    type Driver = ExPuttConfig;
+    const KIND: &'static str = "exputt";
+
+    fn driver(&self) -> &ExPuttConfig {
+        &self.driver
+    }
+
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
+        &config.exputt
+    }
 }
 
 /// The config section of a card whose device runs on a flightrelay device
@@ -1825,21 +1841,39 @@ pub const MAX_IMPACT_LEAD_S: f64 = 5.0;
 
 /// The default impact lead of the launch monitor type `prefix` (the part of
 /// an actor ID before the dot, e.g. `mevo`), seconds: how long before the
-/// monitor's `shot_trigger` the ball was struck. `None` for Auto-chip, which
-/// is not a swing. Any other source is a launch monitor and gets
-/// [`DEFAULT_IMPACT_LEAD_S`] unless a value is better known.
+/// time of the monitor's `shot_trigger` the ball was struck. A trigger's
+/// time is its `timestamp` when it carries one, else its arrival. `None`
+/// for Auto-chip, which is not a swing. Any other source is a launch
+/// monitor and gets [`DEFAULT_IMPACT_LEAD_S`] unless a value is better
+/// known.
 #[must_use]
 pub fn impact_lead_default_s(prefix: &str) -> Option<f64> {
     match prefix {
         crate::api::AUTO_CHIP_ACTOR => None,
-        // Reports at impact.
-        "mevo" | "mock_monitor" => Some(0.0),
+        // Reports at impact, or dates its trigger at the strike.
+        "mevo" | "mock_monitor" | "exputt" => Some(0.0),
         "square" => Some(1.0),
         "r10" => Some(2.0),
         "openconnect_server" => Some(2.5),
         _ => Some(DEFAULT_IMPACT_LEAD_S),
     }
 }
+
+/// How long after the time its `shot_trigger` carries a launch monitor of
+/// type `prefix` can deliver it, seconds: the cameras keep that much more
+/// history, so a clip still reaches back to the stroke. The ExPutt dates
+/// its trigger at the strike and sends it with the putt's result, seconds
+/// later; the others send it at once.
+#[must_use]
+pub fn trigger_delay_s(prefix: &str) -> f64 {
+    match prefix {
+        "exputt" => MAX_TRIGGER_DELAY_S,
+        _ => 0.0,
+    }
+}
+
+/// Longest [`trigger_delay_s`], seconds.
+pub const MAX_TRIGGER_DELAY_S: f64 = 5.0;
 
 /// Whether `v`, a section's `impact_lead_s`, is acceptable: absent, or finite
 /// and from 0 to [`MAX_IMPACT_LEAD_S`].
@@ -2005,6 +2039,7 @@ impl FlighthookConfig {
         first_driver_error::<MockMonitorSection>(self, None)
             .or_else(|| first_driver_error::<R10Section>(self, None))
             .or_else(|| first_driver_error::<SquareSection>(self, None))
+            .or_else(|| first_driver_error::<ExPuttSection>(self, None))
     }
 
     /// [`device_error`](Self::device_error) for saving this config over
@@ -2016,6 +2051,7 @@ impl FlighthookConfig {
         first_driver_error::<MockMonitorSection>(self, Some(saved))
             .or_else(|| first_driver_error::<R10Section>(self, Some(saved)))
             .or_else(|| first_driver_error::<SquareSection>(self, Some(saved)))
+            .or_else(|| first_driver_error::<ExPuttSection>(self, Some(saved)))
     }
 
     /// Look up the detection mode for a club based on the configured mapping.
@@ -2135,9 +2171,9 @@ impl Default for ExPuttSection {
         Self {
             name: "ExPutt".into(),
             enabled: true,
-            // Found on the network automatically.
-            address: None,
             impact_lead_s: None,
+            // Found on the network automatically.
+            driver: ExPuttConfig::default(),
         }
     }
 }
@@ -2757,8 +2793,10 @@ mod openconnect_client_tests {
             exputt: one(ExPuttSection {
                 name: "Putting".into(),
                 enabled: true,
-                address: Some("192.168.1.50".into()),
                 impact_lead_s: None,
+                driver: ExPuttConfig {
+                    address: Some("192.168.1.50".into()),
+                },
             }),
             mock_monitor: one(MockMonitorSection {
                 name: "Mock".into(),
@@ -3057,7 +3095,7 @@ mod impact_lead_tests {
             ("mevo", 0.0),
             ("mock_monitor", 0.0),
             ("square", 1.0),
-            ("exputt", 1.5),
+            ("exputt", 0.0),
             ("r10", 2.0),
             ("openconnect_server", 2.5),
             // A kind added later, or one without a better-known value.
@@ -3067,6 +3105,20 @@ mod impact_lead_tests {
         }
         assert_eq!(DEFAULT_IMPACT_LEAD_S, 1.5);
         assert_eq!(impact_lead_default_s(AUTO_CHIP_ACTOR), None);
+    }
+
+    #[test]
+    fn only_the_exputt_delivers_its_trigger_late() {
+        assert_eq!(trigger_delay_s("exputt"), MAX_TRIGGER_DELAY_S);
+        for prefix in [
+            "mevo",
+            "mock_monitor",
+            "square",
+            "r10",
+            "openconnect_server",
+        ] {
+            assert_eq!(trigger_delay_s(prefix), 0.0, "{prefix}");
+        }
     }
 
     #[test]
@@ -3875,5 +3927,68 @@ mod r10_section_tests {
         }
         config.r10.get_mut("0").unwrap().driver.range = Some(Distance::Feet(7.0));
         assert_eq!(config.device_error(), None);
+    }
+}
+
+#[cfg(test)]
+mod exputt_section_tests {
+    use super::*;
+
+    /// An ExPutt section as flighthook 0.1.24 wrote it reads into the same
+    /// values, the address now in the driver's settings, and writes back the
+    /// same JSON; a default section writes only its name, and the address is
+    /// left out while unset.
+    #[test]
+    fn a_saved_exputt_section_reads_and_writes_as_before() {
+        for (json, address) in [
+            (
+                r#"{"name":"ExPutt","address":"192.168.1.50","impact_lead_s":0.5}"#,
+                Some("192.168.1.50"),
+            ),
+            (r#"{"name":"Practice","enabled":false}"#, None),
+            (r#"{"name":"ExPutt"}"#, None),
+        ] {
+            let section: ExPuttSection = serde_json::from_str(json).unwrap();
+            assert_eq!(section.driver.address.as_deref(), address, "{json}");
+            let back = serde_json::to_value(&section).unwrap();
+            assert_eq!(
+                back,
+                serde_json::from_str::<serde_json::Value>(json).unwrap()
+            );
+        }
+        let section: ExPuttSection = serde_json::from_str(
+            r#"{"name":"ExPutt","address":"192.168.1.50","impact_lead_s":0.5}"#,
+        )
+        .unwrap();
+        assert_eq!(section.impact_lead_s, Some(0.5));
+        assert!(section.enabled);
+        assert_eq!(
+            serde_json::to_string(&ExPuttSection::default()).unwrap(),
+            r#"{"name":"ExPutt"}"#
+        );
+    }
+
+    /// The ExPutt driver refuses an address that is not an IP (blank finds
+    /// the device), and the card and field are named; a save that keeps
+    /// such a stored address is not refused.
+    #[test]
+    fn an_address_that_is_not_an_ip_is_refused() {
+        let mut config = FlighthookConfig::default();
+        config.exputt.insert("0".into(), ExPuttSection::default());
+        for fine in ["", "  ", "10.0.0.7", " 10.0.0.7 ", "fe80::1"] {
+            config.exputt.get_mut("0").unwrap().driver.address = Some(fine.into());
+            assert_eq!(config.device_error(), None, "{fine:?}");
+        }
+        for bad in ["exputt.local", "10.0.0.7:8889"] {
+            config.exputt.get_mut("0").unwrap().driver.address = Some(bad.into());
+            let error = config.device_error().expect("refused");
+            assert!(error.starts_with("exputt.0: address: "), "{error}");
+            assert!(error.contains(bad), "{error}");
+            let saved = config.clone();
+            config.exputt.get_mut("0").unwrap().name = "Renamed".into();
+            assert_eq!(config.changed_device_error(&saved), None);
+            config.exputt.get_mut("0").unwrap().driver.address = Some("putter".into());
+            assert!(config.changed_device_error(&saved).is_some());
+        }
     }
 }

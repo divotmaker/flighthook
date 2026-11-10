@@ -262,6 +262,7 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
                 let fault = driver_type_error::<flighthook::MockMonitorSection>(contents)
                     .or_else(|| driver_type_error::<flighthook::R10Section>(contents))
                     .or_else(|| driver_type_error::<flighthook::SquareSection>(contents))
+                    .or_else(|| driver_type_error::<flighthook::ExPuttSection>(contents))
                     .unwrap_or_else(|| fault(contents, &e));
                 tracing::warn!("failed to parse {}: {fault}", path.display());
                 Err(fault)
@@ -670,15 +671,20 @@ impl SystemConfig {
         flighthook::impact_lead_in_effect_s(prefix, configured)
     }
 
-    /// The longest impact lead in effect over the configured launch
-    /// monitors, seconds (0 with none).
-    pub fn longest_impact_lead_s(&self) -> f64 {
+    /// How far before a trigger's arrival the cameras' history has to
+    /// reach for the configured launch monitors, seconds (0 with none): the
+    /// largest impact lead in effect plus the monitor type's trigger delay
+    /// ([`flighthook::trigger_delay_s`]).
+    pub fn longest_reach_s(&self) -> f64 {
         self.inner
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .launch_monitor_leads()
             .into_iter()
-            .filter_map(|(kind, _, lead)| flighthook::impact_lead_in_effect_s(kind, lead))
+            .filter_map(|(kind, _, lead)| {
+                flighthook::impact_lead_in_effect_s(kind, lead)
+                    .map(|lead| lead + flighthook::trigger_delay_s(kind))
+            })
             .fold(0.0, f64::max)
     }
 
@@ -1077,7 +1083,7 @@ bind = "0.0.0.0:5880"
         let cfg = SystemConfig::new(path);
         assert!(cfg.snapshot().impact_lead_error().is_some());
         assert_eq!(cfg.impact_lead_s("square.0"), Some(1.0));
-        assert_eq!(cfg.longest_impact_lead_s(), 1.0);
+        assert_eq!(cfg.longest_reach_s(), 1.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1416,6 +1422,90 @@ full_monitor = "mevo.0"
         let error = kept_error(text);
         assert!(
             error.error.starts_with("line 6, column 1: r10.2: range: "),
+            "{}",
+            error.error
+        );
+    }
+
+    /// ExPutt sections as flighthook 0.1.24 saved them (an address and a
+    /// camera timing, a second card that is off and finds its device) load
+    /// into the same values, the address now in the driver's settings, and
+    /// the file is not rewritten.
+    #[test]
+    fn an_exputt_section_file_from_0_1_24_loads_unchanged() {
+        let text = "default_units = \"imperial\"\n\
+                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
+                    putting_clubs = [\"PT\"]\n\
+                    \n\
+                    [exputt.0]\n\
+                    name = \"ExPutt\"\n\
+                    address = \"192.168.1.50\"\n\
+                    impact_lead_s = 0.75\n\
+                    \n\
+                    [exputt.1]\n\
+                    name = \"Practice\"\n\
+                    enabled = false\n";
+        let (dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        let first = &config.exputt["0"];
+        assert_eq!(first.name, "ExPutt");
+        assert_eq!(first.driver.address.as_deref(), Some("192.168.1.50"));
+        assert_eq!(first.impact_lead_s, Some(0.75));
+        assert!(first.enabled);
+        let second = &config.exputt["1"];
+        assert!(!second.enabled);
+        assert_eq!(second.driver.address, None);
+        assert_eq!(config.device_error(), None);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            text,
+            "not rewritten"
+        );
+        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        let saved = toml::to_string_pretty(&config).expect("toml");
+        assert!(
+            saved.contains(
+                "[exputt.0]\nname = \"ExPutt\"\nimpact_lead_s = 0.75\naddress = \"192.168.1.50\"\n"
+            ),
+            "{saved}"
+        );
+        assert_eq!(
+            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            config
+        );
+    }
+
+    /// An ExPutt address the driver refuses (not an IP) loads as written and
+    /// names the card, which does not start; an address of the wrong type
+    /// names its key's line.
+    #[test]
+    fn a_refused_exputt_address_loads_and_is_reported() {
+        let text = "[exputt.0]\nname = \"ExPutt\"\naddress = \"exputt.local\"\n";
+        let (_dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        assert_eq!(
+            config.exputt["0"].driver.address.as_deref(),
+            Some("exputt.local")
+        );
+        let refused = config.device_error().expect("refused");
+        assert!(
+            refused.starts_with("exputt.0: address: ") && refused.contains("exputt.local"),
+            "{refused}"
+        );
+
+        let text = "[exputt.0]\n\
+                    name = \"ExPutt\"\n\
+                    \n\
+                    [exputt.3]\n\
+                    name = \"Practice\"\n\
+                    address = 50\n";
+        let error = kept_error(text);
+        assert!(
+            error
+                .error
+                .starts_with("line 6, column 1: exputt.3: address: "),
             "{}",
             error.error
         );

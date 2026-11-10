@@ -41,3 +41,4 @@ pub use flightrelay::units::{Distance, Velocity};
 pub use flightrelay::{DEFAULT_PATH as FRP_PATH, DEFAULT_PORT as FRP_PORT, DEFAULT_URL as FRP_URL};
 pub use flightrelay::{Handedness, SPEC_VERSION as FRP_VERSION, Severity};
 pub use tenover::config::Config as R10Config;
+pub use threeputt::config::Config as ExPuttConfig;

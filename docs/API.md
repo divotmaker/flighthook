@@ -1399,9 +1399,10 @@ running flighthook.
 
 - `schema`: export format version (`3`). Bumped when a field changes meaning.
   Schema 3: the raw records of a device on a device driver (the R10, the
-  mock) carry `label` instead of `type`, `src`, `dst` and `channel`, one record
-  per protocol message (the R10: one GFDI message per record, not one BLE
-  chunk). Schema 2 has the launch and the device's flight values in
+  Square Golf, the ExPutt) carry `label` instead of `type`, `src`, `dst` and
+  `channel`, one record per protocol message (the R10: one GFDI message per
+  record, not one BLE chunk; the ExPutt: each message of the session as its
+  JSON text, not the putt's values re-joined). Schema 2 has the launch and the device's flight values in
   `data.launch` and `data.flight`; a schema 1 line has both in one
   `data.ball` block. The `flighthook` crate's `ShotExport` reads schema 1
   into the schema 2 shape (`ball`'s flight values become a `flight` with
@@ -1568,8 +1569,8 @@ mat button sends it.
 Emits `find_mat` (`{"kind":"find_mat","target":"exputt.0"}`, actor `web`) on
 the bus. A connected ExPutt then reports `ready` false and `device_state`
 `finding mat`, `mat found` and `ready` as the device works. An ExPutt acts on
-it once connected; while it looks for the device or waits to reconnect, it
-drops the command.
+it once connected (one sent while it connects runs once the session is up);
+one sent while it waits to reconnect is dropped.
 
 ---
 
@@ -1847,8 +1848,14 @@ Full persisted config (mirrors `config.toml`).
   [Launch-only chips](devices/flightscope.md#launch-only-chips-beta). Omitted
   while at the default. Changes apply from the next shot without restarting
   the actor
-- ExPutt sections have `name` and an optional `address`: the device's IP
-  address (no port). When absent the device is found on the local network.
+- ExPutt sections have `name` and an optional `address`, the ExPutt
+  driver's setting: the device's IP address (no port). When absent or blank
+  the device is found on the local network. Omitted while unset. A save that
+  changes it into anything else (a host name, an address with a port) is
+  rejected with `400` (`"exputt.0: address: \"exputt.local\" is not an IP
+  address; leave it blank to find the device on the network"`); a config
+  file holding one loads, and that card does not start and shows the error.
+  A change restarts the card
 - `mock_monitor` sections have `name` and the mock launch monitor's
   settings, each omitted while at its default: `shot_interval_s` (30, the
   seconds from the ball being ready to the shot), `arm_delay_s` (2, from
@@ -1869,8 +1876,9 @@ Full persisted config (mirrors `config.toml`).
   `mock_monitor`, `openconnect_server`) takes an optional `impact_lead_s`:
   seconds, 0 to 5, from the ball's impact to the monitor's `shot_trigger`,
   used to place the cameras' clips (beta). Omitted when unset, which uses the
-  device's default (FlightScope and mock 0, Square 1, R10 2, Open Connect
-  2.5, ExPutt and any other 1.5). A save with a value below 0, above 5 or not
+  device's default (FlightScope, ExPutt and mock 0, Square 1, R10 2, Open
+  Connect 2.5, any other 1.5). The ExPutt dates its trigger at the strike,
+  so its timing counts from the strike, not from the putt's report. A save with a value below 0, above 5 or not
   finite is rejected with `400`; one outside that range in the config file is
   ignored. Changes apply from the next shot without restarting anything
 - `camera` sections take an optional `latency_s`: seconds, 0 to 10, a frame is
@@ -2309,8 +2317,11 @@ Ball strike detected. Emitted immediately by the launch monitor -- no data yet.
 - `key.shot_id`: UUID v4 string, globally unique across sessions
 - `key.shot_number`: session-level monotonic counter from the launch monitor
 - `timestamp` (optional): when the device detected the strike, milliseconds
-  since the Unix epoch (UTC), by the device's clock. The mock launch
-  monitor sends one; no other device reports one yet.
+  since the Unix epoch (UTC). The mock launch monitor sends one; the Square
+  Golf sends the arrival of the ball notification; the ExPutt sends the
+  arrival of the device's strike message (when it reported one since it was
+  last ready), and its trigger comes with the putt's result, seconds after
+  that time. The cameras date a trigger by it.
 
 A shot that has not finished within 45 s of its trigger (flighthook's
 accumulator timeout, longer than any device driver's own deadline for a
@@ -2684,7 +2695,7 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
 - `raw` (flighthook extension, omitted when absent): `ShotRaw`, the device
   frames captured for this shot. FRP consumers ignore it.
   - `transport`: `flightscope-tcp`, `square-ble`, `r10-ble`, `exputt-wifi`
-    (one text record: the putt's 16 values, comma-separated),
+    (`text` records: the session's messages as JSON text),
     `openconnect-json`, or `none` (mock).
   - `frames`: `RawRecord[]`, in arrival order:
     - `t_ms`: milliseconds relative to the shot trigger (negative = before it)
@@ -2700,7 +2711,10 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
       message (`hex`: the whole message as the driver framed it). Square
       Golf: `notify 11 02` (a notification's family and type byte in the
       `0x11` family; `notify 91` for the other families, family byte only)
-      and `cmd 87` (a command's type byte)
+      and `cmd 87` (a command's type byte). ExPutt: the message's name
+      (`PuttResult`, `PuttShot`, `PuttReady`, `Test`, `N_OK`, `N_ALIVE`,
+      `resyncToMat`, `PM_API_MatchBegin`, ...), both directions, as `text`;
+      the putt's own result is the `PuttResult` among its shot's records
     - `hex`: payload as lowercase hex (binary protocols; FlightScope: the
       unstuffed payload without header or checksum)
     - `text`: payload text (JSON protocols)
@@ -2920,8 +2934,9 @@ Common keys for launch monitors: `detection_mode`, `radar_mode`, `device_info`.
 The mock launch monitor adds `shot_count`; its `tracking_mode`, `radar_mode`
 and `ready` come as `device_telemetry`, and it reports its model (`Mock Launch
 Monitor`) there.
-The ExPutt adds `shot_count` and `phase` (`discovering`, `connecting`,
-`measuring`).
+The ExPutt adds `shot_count` (shots finished since the card started) and
+`phase` (`discovering`, `connecting`, then `measuring`, which the
+`connected` status keeps); `device_info` is `ExPutt RG (<ip>)`.
 The R10 adds `shot_count` (shots finished since the card started) and, while
 it connects, `phase` (`discovering`, `handshaking`; the `connected` status
 removes it with `"phase": ""`); `device_info` is `Garmin R10 (<address>)`.
@@ -3108,14 +3123,14 @@ on the bus. Flighthook extension event.
 - `position`: where the camera stands ([`CameraPosition`](#cameraposition)).
 - `duration_ms`: first frame to last.
 - `fps`: frames per second captured over the clip.
-- `trigger_offset_ms`: when the first `shot_trigger` arrived, after the
-  clip's first frame.
+- `trigger_offset_ms`: the first `shot_trigger`'s time (its `timestamp`
+  when it carries one, else its arrival), after the clip's first frame.
 - `impact_offset_ms`: the estimated impact, after the first frame (negative
-  when it precedes the clip). Only a FlightScope triggers at impact; other
-  launch monitors report the shot once it is measured, so the impact is
-  estimated a fixed time before their trigger (beta estimates: Square Golf
-  1 s, ExPutt 1.5 s, R10 2 s, Open Connect 2.5 s). With two monitors it is
-  the first trigger's.
+  when it precedes the clip). A FlightScope triggers at impact and the
+  ExPutt's trigger is dated at the strike; other launch monitors report the
+  shot once it is measured, so the impact is estimated a fixed time before
+  their trigger (beta estimates: Square Golf 1 s, R10 2 s, Open Connect
+  2.5 s). With two monitors it is the first trigger's.
 - `complete`: the whole clip was captured with no frames missing at the
   trigger or the impact. `false` when the camera stopped first.
 - `dropped`: frames missing inside the clip.

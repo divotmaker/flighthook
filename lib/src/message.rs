@@ -485,6 +485,7 @@ pub enum ConfigAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExPuttConfig;
 
     #[test]
     fn exputt_upsert_round_trips_as_upsert_exputt() {
@@ -493,8 +494,10 @@ mod tests {
             section: ExPuttSection {
                 name: "ExPutt".into(),
                 enabled: true,
-                address: Some("192.168.1.50".into()),
                 impact_lead_s: None,
+                driver: ExPuttConfig {
+                    address: Some("192.168.1.50".into()),
+                },
             },
         };
         let json = serde_json::to_string(&action).expect("ser");
@@ -504,7 +507,7 @@ mod tests {
         );
         let back: ConfigAction = serde_json::from_str(&json).expect("de");
         assert!(
-            matches!(back, ConfigAction::UpsertExPutt { section, .. } if section.address.is_some())
+            matches!(back, ConfigAction::UpsertExPutt { section, .. } if section.driver.address.is_some())
         );
     }
 

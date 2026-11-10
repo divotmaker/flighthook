@@ -183,13 +183,6 @@ pub(crate) fn is_ble_address(s: &str) -> bool {
     mac || hex_groups(s, '-', &[8, 4, 4, 4, 12]) || advertised_name
 }
 
-/// Whether an optional IP address field is acceptable: blank or an IP
-/// address (no port).
-fn is_ip_or_blank(s: &str) -> bool {
-    let s = s.trim();
-    s.is_empty() || s.parse::<std::net::IpAddr>().is_ok()
-}
-
 /// Clubs with their own Square Golf face impact calibration: every club the
 /// device has a code for except the putter, which has no vertical estimate.
 /// The device is armed with the nearest of these for any other club.
@@ -424,7 +417,7 @@ impl DeviceFormEntry {
             monitor_type: "exputt".into(),
             name: s.name.clone(),
             enabled: s.enabled,
-            address: s.address.clone().unwrap_or_default(),
+            address: s.driver.address.clone().unwrap_or_default(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
             tee_height_unit: "inches".into(),
@@ -443,7 +436,7 @@ impl DeviceFormEntry {
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
-            saved_driver: None,
+            saved_driver: serde_json::to_value(&s.driver).ok(),
             cam: Box::default(),
             dirty: false,
         }
@@ -548,6 +541,7 @@ impl DeviceFormEntry {
             "mock_monitor" => self.mock.validate().err().map(|e| e.to_string()),
             "r10" => self.r10_config().validate().err().map(|e| e.to_string()),
             "square" => self.square_config().validate().err().map(|e| e.to_string()),
+            "exputt" => self.exputt_config().validate().err().map(|e| e.to_string()),
             _ => None,
         }
     }
@@ -559,6 +553,7 @@ impl DeviceFormEntry {
             "mock_monitor" => serde_json::to_value(&self.mock).ok(),
             "r10" => serde_json::to_value(self.r10_config()).ok(),
             "square" => serde_json::to_value(self.square_config()).ok(),
+            "exputt" => serde_json::to_value(self.exputt_config()).ok(),
             _ => None,
         }
     }
@@ -572,6 +567,15 @@ impl DeviceFormEntry {
                 .parse::<f64>()
                 .ok()
                 .map(|v| Distance::from_value_and_unit(v, &self.range_unit)),
+        }
+    }
+
+    /// The ExPutt driver's settings from the form: the IP address as typed
+    /// (trimmed), blank for none (the device is found on the network).
+    pub(crate) fn exputt_config(&self) -> flighthook::ExPuttConfig {
+        let address = self.address.trim();
+        flighthook::ExPuttConfig {
+            address: (!address.is_empty()).then(|| address.to_owned()),
         }
     }
 
@@ -2131,10 +2135,6 @@ pub(crate) fn actor_valid(actor: &ActorFormEntry) -> bool {
             if dev.has_ble_address() && !ble.is_empty() && !is_ble_address(ble) {
                 return false;
             }
-            // An IP address is optional — blank finds the device.
-            if dev.has_ip_address() && !is_ip_or_blank(&dev.address) {
-                return false;
-            }
             if dev.is_mevo() && launch_only_spin_value(&dev.launch_only_spin).is_none() {
                 return false;
             }
@@ -2230,12 +2230,8 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         flighthook::ExPuttSection {
                             name: dev.name.clone(),
                             enabled: dev.enabled,
-                            address: if dev.address.trim().is_empty() {
-                                None
-                            } else {
-                                Some(dev.address.trim().to_string())
-                            },
                             impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
+                            driver: dev.exputt_config(),
                         },
                     );
                 }
@@ -2797,9 +2793,6 @@ pub(crate) fn actor_fields(
                         dev.dirty = true;
                     }
                 });
-                if !is_ip_or_blank(&dev.address) {
-                    field_error(ui, "Invalid IP address");
-                }
             }
 
             if dev.is_square() {
@@ -4793,6 +4786,67 @@ mod tests {
         dev.mock.arm_delay_s = MockConfig::default().arm_delay_s;
         dev.mock.shot_interval_s = 10.0;
         assert!(super::actor_valid(&form.actors[0]), "fixed");
+    }
+
+    /// The ExPutt card's IP Address is the ExPutt driver's `address`: one
+    /// the driver refuses (not an IP) shows under the card's fields and
+    /// keeps a changed card from saving, blank finds the device, and a
+    /// saved refused address still lets the card save its name.
+    #[test]
+    fn the_exputt_address_is_validated_by_its_driver() {
+        let mut cfg = FlighthookConfig::default();
+        cfg.exputt.insert(
+            "0".into(),
+            flighthook::ExPuttSection {
+                driver: flighthook::ExPuttConfig {
+                    address: Some("exputt.local".into()),
+                },
+                ..flighthook::ExPuttSection::default()
+            },
+        );
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert_eq!(dev.address, "exputt.local");
+        let error = dev.driver_error().expect("shown");
+        assert!(
+            error.starts_with("address: ") && error.contains("exputt.local"),
+            "{error}"
+        );
+        dev.name = "Renamed".into();
+        dev.dirty = true;
+        assert!(super::actor_valid(&form.actors[0]), "a rename saves");
+        let saved = form.build_actor_request("exputt.0");
+        assert_eq!(saved.exputt["0"].name, "Renamed");
+        assert_eq!(
+            saved.exputt["0"].driver.address.as_deref(),
+            Some("exputt.local")
+        );
+        for bad in ["putter", "192.168.1.50:8889"] {
+            let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+                panic!("not a device");
+            };
+            dev.address = bad.into();
+            assert!(dev.driver_error().is_some(), "{bad}");
+            assert!(!super::actor_valid(&form.actors[0]), "{bad}");
+        }
+        for (typed, address) in [("", None), (" 10.0.0.7 ", Some("10.0.0.7"))] {
+            let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+                panic!("not a device");
+            };
+            dev.address = typed.into();
+            assert_eq!(dev.driver_error(), None, "{typed:?}");
+            assert!(super::actor_valid(&form.actors[0]), "{typed:?}");
+            assert_eq!(
+                form.build_actor_request("exputt.0").exputt["0"]
+                    .driver
+                    .address
+                    .as_deref(),
+                address
+            );
+        }
     }
 
     /// The R10 card's Monitor-to-Ball is the R10 driver's `range`: a value

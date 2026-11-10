@@ -49,7 +49,8 @@ pub const STOP_WAIT: Duration = Duration::from_secs(3);
 /// The longest [`Actor::stop_wait`] of any actor: the ExPutt's. A config
 /// command stops the actors it restarts or removes together, so this bounds
 /// how long it waits for them.
-pub const MAX_STOP_WAIT: Duration = exputt::STOP_WAIT;
+pub const MAX_STOP_WAIT: Duration =
+    <threeputt::driver::ExPutt as flightrelay::driver::DeviceDriver>::STOP_WAIT;
 
 const _: () = assert!(STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
 const _: () = assert!(
@@ -215,18 +216,11 @@ pub fn resolve_actors(
     // ExPutt putting devices
     for (index, section) in &config.exputt {
         let id = global_id("exputt", index);
-        match exputt::parse_address(section.address.as_deref()) {
-            Ok(address) => {
-                actors.push(ResolvedActor {
-                    id,
-                    name: section.name.clone(),
-                    actor: Box::new(exputt::ExPuttActor { address }),
-                });
-            }
-            Err(e) => {
-                tracing::warn!("device '{id}': {e}");
-            }
-        }
+        actors.push(ResolvedActor {
+            id,
+            name: section.name.clone(),
+            actor: Box::new(exputt::ExPuttActor::new(section.clone())),
+        });
     }
 
     // Mock monitors

@@ -2052,6 +2052,7 @@ mod tests {
         assert!(enabled(&marks, &format!("save:{id}")));
         let address = |app: &FlighthookApp| {
             app.settings.build_actor_request(id).exputt["0"]
+                .driver
                 .address
                 .clone()
         };
@@ -2076,9 +2077,7 @@ mod tests {
             "0".into(),
             flighthook::ExPuttSection {
                 name: "ExPutt".into(),
-                enabled: true,
-                address: None,
-                impact_lead_s: None,
+                ..flighthook::ExPuttSection::default()
             },
         );
         app.settings.load_from(&config);
@@ -3059,7 +3058,7 @@ mod tests {
         ("mevo", "0"),
         ("r10", "2"),
         ("square", "1"),
-        ("exputt", "1.5"),
+        ("exputt", "0"),
         ("mock_monitor", "0"),
         ("openconnect_server", "2.5"),
     ];

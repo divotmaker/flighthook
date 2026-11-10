@@ -1150,9 +1150,7 @@ mod tests {
             "0".into(),
             flighthook::ExPuttSection {
                 name: "ExPutt".into(),
-                enabled: true,
-                address: None,
-                impact_lead_s: None,
+                ..flighthook::ExPuttSection::default()
             },
         );
         assert!(putting_routing_warning(&config, &any).is_some());

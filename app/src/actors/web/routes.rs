@@ -1120,6 +1120,9 @@ fn invalid_driver_setting(saved: &FlighthookConfig, action: &ConfigAction) -> Op
         ConfigAction::UpsertSquare { index, section } => {
             section.changed_driver_error(saved.square.get(index), &format!("square.{index}"))
         }
+        ConfigAction::UpsertExPutt { index, section } => {
+            section.changed_driver_error(saved.exputt.get(index), &format!("exputt.{index}"))
+        }
         _ => None,
     }
 }
@@ -2876,6 +2879,45 @@ mod group_tests {
         }
     }
 
+    /// A save that changes an ExPutt's address into one that is not an IP
+    /// is refused, whole or scoped, before anything is emitted; blank (find
+    /// the device) and an IP address pass.
+    #[tokio::test]
+    async fn settings_save_with_a_refused_exputt_address_is_400() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.exputt
+                .insert("0".into(), flighthook::ExPuttSection::default());
+        });
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        for bad in ["exputt.local", "192.168.1.50:8889"] {
+            let mut body = live.clone();
+            body.exputt.get_mut("0").unwrap().driver.address = Some(bad.into());
+            for scope in [None, Some("exputt.0")] {
+                let (status, Json(error)) =
+                    save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                        .await
+                        .expect_err("rejected");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} {scope:?}");
+                let error = error["error"].as_str().expect("text");
+                assert!(error.starts_with("exputt.0: address: "), "{error}");
+                assert!(error.contains(bad), "{error}");
+            }
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+        for ok in [Some("192.168.1.50"), Some(" "), None] {
+            let mut body = live.clone();
+            body.exputt.get_mut("0").unwrap().driver.address = ok.map(str::to_owned);
+            let action = ConfigAction::UpsertExPutt {
+                index: "0".into(),
+                section: body.exputt["0"].clone(),
+            };
+            assert_eq!(invalid_driver_setting(&live, &action), None, "{ok:?}");
+        }
+    }
+
     /// The Square driver reads its settings leniently (an unknown club or a
     /// negative calibration is ignored with a warning when the device
     /// connects), so a save never refuses them, whole or scoped.
@@ -3863,7 +3905,7 @@ mod reconnect_tests {
     #[test]
     fn the_config_timeout_outlasts_the_longest_stop_wait() {
         use crate::actors::{MAX_STOP_WAIT, STOP_WAIT};
-        let exputt = crate::actors::exputt::ExPuttActor { address: None };
+        let exputt = crate::actors::exputt::ExPuttActor::new(flighthook::ExPuttSection::default());
         assert_eq!(exputt.stop_wait(), MAX_STOP_WAIT);
         let square = crate::actors::square::SquareActor::new(flighthook::SquareSection::default());
         for wait in [STOP_WAIT, square.stop_wait()] {

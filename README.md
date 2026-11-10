@@ -397,7 +397,8 @@ without an offline are left out.
 
 With a USB camera added on the Devices tab (Windows and Linux; not macOS
 yet), flighthook records a clip of every shot, from a few seconds before the
-impact to just after the launch monitor reports it. A shot with clips gets a
+impact to just after the launch monitor reports it (the ExPutt: just after
+the strike). A shot with clips gets a
 **Replay** button on its header in Cards and in a column of the Table.
 Replay opens playing, with the cameras side by side and a scrubber that
 marks the impact (gold) and where playback starts (green, 2 s before the
@@ -405,8 +406,9 @@ impact by default). It loops until you turn **Loop** off; pause, step frame
 by frame, slow it to ½, ¼ or ⅛, or download a camera's clip as an AVI with
 the download icon next to its name.
 
-- Only FlightScope monitors report a shot at impact. For the others the
-  impact is estimated a fixed time before their report (beta); each monitor
+- FlightScope monitors report a shot at impact, and the ExPutt dates each
+  putt at its strike. For the others the impact is estimated a fixed time
+  before their report (beta); each monitor
   has a default, and **Camera timing** on its card's Settings side changes
   it. See [Cameras](docs/devices/cameras.md#when-a-clip-starts-and-ends).
 - A camera mounted on its side gets a **Rotation** (90° or 270°) on its card's

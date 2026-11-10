@@ -128,7 +128,11 @@ address = "127.0.0.1:921"
   that isn't greater than 0 is refused (the card shows why and Save stays
   off; a save is `400`; from the file, the card does not start)
 - ExPutt sections show name and an optional IP Address (blank finds the
-  device on the network); the putting hand follows the game's handedness
+  device on the network); the putting hand follows the game's handedness.
+  `address` is the ExPutt driver's setting (threeputt's `Config`, flattened
+  into the section); one that is not an IP address is refused (the card
+  shows why and Save stays off; a save is `400`; from the file, the card
+  does not start)
 - Mock sections show only name and Camera timing; the mock driver's settings
   are set in the file or through the API
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `openconnect_client.0`)
@@ -236,7 +240,7 @@ pub enum FlightScopeEnvironment { LimitedFlight, Outdoor }
 pub enum SpinSource { D4, E8, Auto }
 pub struct R10Section { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: R10Config }  // tenover's Config: range: Option<Distance>
 pub struct SquareSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: SquareConfig }  // allsquare's Config: address: Option<String>, club: String ("7I"), advanced_spin: bool (true), discard_non_putting_zero_spin: bool (true), dot_bottom_to_face_center_mm: BTreeMap<String, f64>
-pub struct ExPuttSection { pub name: String, pub address: Option<String> }
+pub struct ExPuttSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: ExPuttConfig }  // threeputt's Config: address: Option<String>
 pub struct MockMonitorSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: MockConfig }  // flightrelay's MockConfig
 pub struct OpenConnectServerSection { pub name: String, pub bind: Option<String> }
 pub struct OpenConnectClientSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
@@ -481,9 +485,10 @@ The simulation runs in `app/src/sim.rs` with the
 [dimple](https://crates.io/crates/dimple) crate, an app-only dependency (the
 lib crate and the WASM UI never link it). Every device actor builds its
 `Launch` event (and the `FlightResult` event after it, when the device
-reported flight values) through `sim::launch_events` (the Mevo+/Xi and the
-ExPutt through `sim::launch_events_in_mode`, passing the detection mode
-captured at the shot's trigger), on the device thread, so the launch already
+reported flight values) through `sim::launch_events` (the Mevo+/Xi through
+`sim::launch_events_in_mode`, passing the detection mode captured at the
+shot's trigger; a card on a device driver passes its driver's fixed mode,
+the ExPutt's Putting, else the live mode), on the device thread, so the launch already
 carries `derived` when it reaches the bus, before `ShotFinished`. It costs a few milliseconds per shot. A shot is simulated only
 when:
 
@@ -620,7 +625,6 @@ the ring and every cap.
 | Device | Hook | Window | Excluded | Pre-roll | Max frames | Max bulk bytes |
 | --- | --- | --- | --- | --- | --- | --- |
 | FlightScope | ironsight `set_on_recv` / `set_on_send` (the same hooks log hex and keep the last D4) | BALL TRIGGER to the device re-armed, both directions | what ironsight classifies as identity-bearing (`protocol::carries_identity`): status/keepalive, device and product info, DSP query, network config, WiFi scan, calibration, sensor activation, time sync, AVR config query | 8 | 256 | 128 KiB (PRC, club PRC, speed profile) |
-| ExPutt | none: the putt's 16 values, comma-separated, as one text record (`transport = "exputt-wifi"`) | the putt | none | - | 1 | 0 |
 | Open Connect | the inbound JSON text and our reply | the one message | none | - | - | - |
 | Mock | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
 
@@ -643,7 +647,13 @@ for the others) or `cmd 87` (the command's type byte), pre-roll 64, at most
 64 frames, no bulk data; characteristic reads, where the identity lives, are
 never frames, and allsquare withholds heartbeats and their acks, the status
 query and its reply, and every notification it does not recognize (audit
-log only, at trace level).
+log only, at trace level). The ExPutt (threeputt, `transport =
+"exputt-wifi"`, text) records every message of the session as the JSON text
+that crossed the socket, both ways, labeled with its name (`PuttResult`,
+`PuttShot`, `Test`, `N_ALIVE`, `resyncToMat`, ...), pre-roll 64, at most 64
+frames, no bulk data; the putt's own result is among its shot's frames.
+Camera images (the player's surroundings) and messages threeputt does not
+recognize are never frames (audit log only, at trace level).
 
 The web layer keeps each shot as a `StoredShot` (`app/src/actors/web/mod.rs`):
 when `shot_trigger` arrived, a `ShotContext` snapshot taken then (device kind,
@@ -1002,13 +1012,14 @@ receipt on its own clock), then applies live `actor_status` events and
 
 All actors use linear backoff on connection failure: starts at 1s, adds 1s per
 failed attempt, capped at 15s (3s for the Open Connect client, a loopback/LAN
-TCP connect). The Open Connect client and ExPutt actors restart at 1s after a connection
+TCP connect). The Open Connect client actor restarts at 1s after a connection
 that lasted at least 10s; one that drops sooner counts as a failed attempt, so
 a link that keeps connecting and dropping still backs off to the cap. The
 Open Connect server restarts at 1s after a successful bind. A card on a
-device driver (the R10, the Square Golf, the mock) waits the delay its driver
-asks for: the R10 and the Square Golf use the SDK's `Backoff`, 1 s per failed
-attempt up to 15 s, back to 1 s after a session of at least 10 s. The Mevo actor keeps the grown delay. Every actor polls its shutdown flag during the
+device driver (the R10, the Square Golf, the ExPutt, the mock) waits the
+delay its driver asks for: the R10 and the Square Golf use the SDK's
+`Backoff`, 1 s per failed attempt up to 15 s, back to 1 s after a session of
+at least 10 s; the ExPutt adjusts the same backoff (below). The Mevo actor keeps the grown delay. Every actor polls its shutdown flag during the
 backoff wait (the Open Connect server during its bind retry delay too), so
 stopping one never waits out the delay. The Mevo and Open Connect client TCP
 connects (up to 5s) run on a thread of their own: a stop ends the actor at
@@ -1016,10 +1027,10 @@ once, and a connect that completes afterward closes again. The ExPutt's
 session start cannot be cut short: the TCP connect and the device's greeting
 (up to 3s each), its two handshake replies (up to 3s each) and its mat search
 (up to 5s).
-The ExPutt caps its first 3 reconnect delays at 1s after a session that was
-measuring, then uses the shared backoff. After a session lost to silence it
-waits 15s before the first attempt and leaves at least 15s between attempts
-until a session succeeds again; it makes one attempt at a time.
+The ExPutt driver caps its first 3 reconnect delays at 1s after a session
+that was measuring, then uses the backoff. After a session lost to silence
+it waits 15s before the first attempt and leaves at least 15s between
+attempts until a session succeeds again; it makes one attempt at a time.
 
 ### Reconnect
 
@@ -1150,7 +1161,7 @@ What a stop does, by actor:
 | Open Connect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
 | Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
 | Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
-| ExPutt | measuring (100 ms event wait, the session closes at once) or waiting to reconnect | a session start (up to 17s: connect and greeting, two handshake replies, mat search) |
+| ExPutt | discovering (250 ms slices), measuring (100 ms event wait, the session closes at once) or waiting to reconnect | the driver's `STOP_WAIT` (18 s: a session start of up to 17 s, which cannot be cut short: connect and greeting, two handshake replies, mat search; then the close) |
 | Mock monitor | always (50 ms polls; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
 | Random club | always (100 ms loop) | -- |
 
@@ -1211,42 +1222,53 @@ card. The advertised name is the FRP device id. Closing disarms the Omni
 and disconnects it on both backends (it takes one central at a time), so
 the card is exclusive: a new instance waits for the old one to close.
 
-**ExPutt actor**: runs a `threeputt::Session` on its own thread. With no
-address it waits for the device to announce itself on the network
-(`actor_status` `starting`, `phase: discovering`), then connects (`phase:
-connecting`) and starts measuring with the putting hand from the game state
-(`connected`, `phase: measuring`). The device card's Find mat button
-(`POST /api/find-mat`, a `FindMat` bus command) has the device locate the mat
-again without reconnecting: `ready` is false until the device is ready again.
-A handedness change (from any source, via the system actor's
-`SetDetectionMode { handed }`) starts a new round with the new hand,
-which locates the mat the same way. Mat searches are at least 10 s apart (the
-one at session start counts): requests inside that time are folded into one
-search with the latest hand, run when it ends, and a hand changed back to the
-one in effect needs none; `ready` is false while one waits.
-Emits `DeviceTelemetry` with `model: "ExPutt RG"` (and the device software
-version as `firmware` when it was discovered). Telemetry keys: `ready` (true when the device is ready for a
-putt, false from a strike until it is ready again, and false when the
-connection is lost, before `reconnecting`), `device_state` (`finding mat` |
-`mat found` | `ready` | `ball struck`; a putt result changes neither key).
-After 30 s of discovery without finding the device, one `alert` (`warn`)
-suggests entering its IP address on the device card.
-FRP device ID `"ExPutt RG (<ip>)"`. Each putt is a shot: ball speed, launch
-direction as `launch_azimuth`, `launch_elevation` 0, no spin; `ClubPath` with
-path and face angle when the putter was tracked, none otherwise; simulated in
-Putting mode (rolled on the green). The web layer files it with club `PT` and
-detection mode Putting whatever club is in play. The session is closed on
-stop; a closed connection, or no event for 90 s (120 s after a strike, until
-the putt's result or the device is ready again), reconnects with backoff. A
-quiet spell past 10 s logs one warning and makes `ready` false until the
-device sends again (then it is what the device last reported). When
-connection attempts get no answer from a device that accepts them, and
-the first such attempt of an outage is 2 minutes old, one `alert` (`warn`)
-says the ExPutt is not answering and suggests turning it off and on again;
-it is sent once until a session succeeds, and the per-attempt error alerts
-stop meanwhile (attempts that fail another way do not restart the clock).
-`ShotFinished.raw` carries the putt's 16 values as one text record (transport
-`exputt-wifi`).
+**ExPutt card**: threeputt's device driver (`threeputt::driver::ExPutt`) on
+`DriverActor` (`actors::exputt::ExPuttHooks`: section `ExPuttSection`, source
+`ExPutt`; its `action` turns a `FindMat` for this card into the driver's
+`Action::FindMat`). With no address the driver waits for the device to
+announce itself on the network (`phase: discovering`, 250 ms at a time), then
+connects (`phase: connecting`) and starts measuring with the latched hand
+(the game state's, right-handed when unknown; `phase: measuring`, which the
+`Connected` status keeps). The card is then `Connected` (`device_info`
+"ExPutt RG (<ip>)", which is also the FRP device id) with `device_telemetry`
+`model: "ExPutt RG"` (and the device software version as `firmware` when it
+was discovered). The device card's Find mat button (`POST /api/find-mat`, a
+`FindMat` bus command) has the device locate the mat again without
+reconnecting; one pressed while the card has no session is dropped. A
+handedness change (from any source, via the system actor's
+`SetDetectionMode { handed }`) starts a new round with the new hand, which
+locates the mat the same way; the detection mode and the club do not apply.
+Mat searches are at least 10 s apart (the one at session start counts):
+requests inside that time are folded into one search with the latest hand,
+run when it ends, and a hand changed back to the one in effect needs none;
+`ready` is false while one waits. Telemetry keys: `ready` (true when the
+device is ready for a putt, false from a strike until it is ready again, and
+false when the connection is lost, before `reconnecting`), `device_state`
+(`finding mat` | `mat found` | `ready` | `ball struck`; a putt result
+changes neither key). After 30 s of discovery without finding the device,
+one `alert` (`warn`) suggests entering its IP address on the device card
+(the driver's hint, worded for the card by the card's `on_frp`). Each putt
+is a shot:
+trigger (timestamped with the arrival of the device's strike message when one
+came since it was last ready, so the cameras date the putt at its stroke),
+`launch` (ball speed, launch direction as `launch_azimuth`; no launch
+elevation and no spin, which the device does not measure), `club_path` with
+path and face angle when the putter was tracked, `shot_finished`. Putts are
+simulated in Putting mode (the driver's fixed mode, rolled on the green)
+whatever the game's mode, and the web layer files them with club `PT` and
+detection mode Putting whatever club is in play. Shot numbers continue
+across reconnects. Stopping ends the match and closes the session; the
+device takes one connection at a time, so the card is exclusive. A closed
+connection, or no event for 90 s (120 s after a strike, until the putt's
+result or the device is ready again), ends the session; a quiet spell past
+10 s logs one warning and makes `ready` false until the device sends again
+(then it is what the device last reported). Each failed attempt is an
+`alert` (`warn`, "ExPutt error: ..."); when attempts get no answer from a
+device that accepts them and the first such attempt of an outage is 2
+minutes old, one `alert` (`warn`) says the ExPutt is not answering and
+suggests turning it off and on again, and the per-attempt alerts stop until
+a session succeeds (attempts that fail another way do not restart the
+clock). The reconnect delays are in [Connection state](#connection-state) above.
 
 An Open Connect client logs a warning at start when an ExPutt is configured
 and its Putting Monitor is unset (Any).
@@ -1540,15 +1562,18 @@ NotReady/Disconnected until the monitor's next status or its next
 
 A launch monitor card can run on a flightrelay device driver
 (`flightrelay::driver::DeviceDriver`): the R10 (`tenover::driver::R10`), the
-Square Golf Omni (`allsquare::driver::Omni`) and the mock
-(`flightrelay::mock::MockDriver`) do today. The driver owns the device (connect,
+Square Golf Omni (`allsquare::driver::Omni`), the ExPutt
+(`threeputt::driver::ExPutt`) and the mock (`flightrelay::mock::MockDriver`)
+do today. The driver owns the device (connect,
 session, shots, telemetry, raw frames); `actors::driver::DriverActor<D, H>`
 is the host around it, one thread per card. What a card adds is its
 `Hooks<D>`: its config section (`H::Section`, a lib `DeviceSection`), its
 shot source (`H::SOURCE`) and optional processing (`on_frp`, `action`).
 The R10's are `actors::r10::R10Hooks`, the Square Golf's
-`actors::square::SquareHooks` and the mock's `actors::mock::MockHooks` (none
-has processing of its own).
+`actors::square::SquareHooks`, the ExPutt's `actors::exputt::ExPuttHooks`
+(its `action` is Find mat, its `on_frp` puts the driver's discovery hint in
+the card's words) and the mock's `actors::mock::MockHooks` (no processing of
+their own).
 
 **Config.** A `DeviceSection` is flighthook's own fields (`name`,
 `enabled`, `impact_lead_s`) with the driver's config `#[serde(flatten)]`ed
@@ -1580,7 +1605,9 @@ the error as the card's `error` and the actor waits for its stop. Then
 Starting (once), and per attempt `connect` with a `ConnectCtx` whose host
 is the actor: `tick()` drains the bus into the latched command (game
 state's mode, hand and club at start; `set_detection_mode` and `club_info`
-afterwards) and queues the card's actions. A session: Connected with
+afterwards) and queues the card's actions (actions still queued when a
+connect starts were asked while no session ran, and are dropped). A
+session: Connected with
 `device_info` (the identity's label) and `shot_count`, then a
 `device_telemetry` with the identity (and `source`, stamped by the bus
 sender) before any shot; each pass drains the bus into one `command` (the
@@ -1608,7 +1635,7 @@ and the thread ends, so a card never stays Connected over a dead driver. `stop_w
 | `shot_finished` | `ShotFinished` with the shot's raw frames (`"<kind> device has no wire protocol"` without a raw profile), then the card's `shot_count` |
 | `device_telemetry` | merged into the session's map and published in full; during a connect only merged, and published with the identity when the session connects |
 | `raw_frame` | numbered per device id across sessions (frames of the first connect, before the id is known, number on into it), a hex line at the `audit` target, recorded for the export ([raw capture](#raw-capture-and-shot-export)); never on the bus |
-| `Phase` | the card's `phase`; the Connected status removes a phase set during the connect (`phase: ""`) |
+| `Phase` | the card's `phase`; the Connected status removes a phase set during the connect (`phase: ""`), unless the connect's last phase was `measuring` (the session's own phase in the driver contract's list), which it keeps |
 | `Log` | tracing; trace lines at the `audit` target |
 | `ShotDiscarded` | the pre-roll is cleared |
 
@@ -1884,8 +1911,9 @@ that delivers late (a buffered network stream). Every frame's host
 timestamp, which the platform sets to its arrival, becomes
 `arrival − latency` (`camera::Restamp`; saturating at 0, the device time
 moves with it) before it reaches the `ClipRecorder`; the still slot carries
-no time and takes the frame as it is. Triggers are stamped when read, so
-frames, triggers and impact estimates share real time: the clip window, the
+no time and takes the frame as it is. Triggers are dated in real time too
+(their timestamp, or when read), so frames, triggers and impact estimates
+share real time: the clip window, the
 sidecar times and the replay's sync between cameras need nothing else. The
 latency is read from the live config on every capture pass (`reconfigure` is
 `Applied` for a latency-only change; the camera is not reopened).
@@ -1943,16 +1971,21 @@ the frames of a window's end arrive `L` after it, and a plain wall clock
 would finish (or discard, for want of the impact frame) any clip of a
 camera more than about `stall` behind. A clip of a camera with latency
 therefore finishes `L` later. The ring holds the dated frames, which stop
-`L` short of a trigger's time, so the history (pre-roll + longest impact
-lead + 0.5 s) needs nothing for the latency.
+`L` short of a trigger's time, so the history (pre-roll + longest reach +
+0.5 s) needs nothing for the latency.
 
 ### Triggers
 
-A `shot_trigger` from a launch monitor is stamped with the host monotonic
-clock (`stance::clock::now_ns`) when the actor reads it: FRP
-triggers carry no time. The actor reads the bus at least every 10 ms while
-capturing, so a stamp lags the trigger's arrival by 10 ms at most (100 ms
-while the camera is being reopened, when there are no frames to cut). The
+A `shot_trigger` from a launch monitor is dated on the host monotonic
+clock (`stance::clock::now_ns`): at its `timestamp` (UTC ms, the strike) when
+it carries one (`camera::trigger_time`; a timestamp ahead of the host's UTC
+clock counts as now), else when the actor reads it. The ExPutt's triggers
+carry the arrival of the device's strike message and reach the bus with the
+putt's result, seconds later; the Square Golf's carry the arrival of the
+ball notification, which is when they reach the bus too. The actor reads the
+bus at least every 10 ms while capturing, so a stamp on arrival lags the
+trigger by 10 ms at most (100 ms while the camera is being reopened, when
+there are no frames to cut). The
 trigger also records the clip store's generation (see below). A repeat of a shot the actor has seen (same actor
 and `shot_id`, among the last 64) is dropped; the recorder counts every
 trigger. The trigger's impact lead (`camera::impact_lead`, beta estimates) is read
@@ -1966,17 +1999,20 @@ applies to the next shot; neither the camera nor the monitor restarts
 | Source | Default impact lead |
 | --- | --- |
 | `mevo`, `mock_monitor` | 0 |
+| `exputt` | 0 (its trigger is dated at the strike) |
 | `square` | 1000 ms |
-| `exputt` | 1500 ms |
 | `r10` | 2000 ms |
 | `openconnect_server` | 2500 ms |
 | any other launch monitor (`DEFAULT_IMPACT_LEAD_S`) | 1500 ms |
 | `autochip` | not recorded |
 
 Pre- and post-roll come from the live `[replay]` section at every trigger;
-the recorder's history is the pre-roll plus the longest impact lead in
-effect over the configured launch monitors (settings and defaults, at most
-5 s) plus 0.5 s. It is re-applied at every trigger, so a setting raised
+the recorder's history is the pre-roll plus the longest reach in effect over
+the configured launch monitors plus 0.5 s: a monitor's reach is its impact
+lead (setting or default, at most 5 s) plus its type's trigger delay
+(`flighthook::trigger_delay_s`: 5 s for the ExPutt, whose trigger arrives
+seconds after the strike it is dated at; 0 for the others). A trigger dated
+further back than the history starts its clip at the oldest frame kept. It is re-applied at every trigger, so a setting raised
 above the history takes effect at its next shot. The lead used is recorded
 in the clip's `shot.json`. The
 recorder's rules (stance): the window is `[impact − pre_roll,

@@ -158,7 +158,7 @@ impl FlighthookConfig {
             (s.enabled, s.driver.address.as_deref())
         });
         push(&mut out, "exputt", &self.exputt, |s| {
-            (s.enabled, s.address.as_deref())
+            (s.enabled, s.driver.address.as_deref())
         });
         push(
             &mut out,

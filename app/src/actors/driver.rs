@@ -15,7 +15,9 @@
 //! - **The bus in.** `set_detection_mode` and `club_info` become the
 //!   latched [`DeviceCommand`] (also during a connect, through
 //!   [`ConnectHost::tick`]) and the session's commands; the card's
-//!   [`Hooks::action`] matches become session actions.
+//!   [`Hooks::action`] matches become session actions (one asked while no
+//!   session runs is dropped when the next connect starts; one asked during
+//!   a connect reaches the session it opens).
 //! - **The bus out** ([`Sink`]): every [`DeviceEvent`] goes on the bus as
 //!   flighthook's event with the session's device id. A shot's `launch` is
 //!   held until its `flight_result` or its `shot_finished`, so the
@@ -65,6 +67,11 @@ const IDLE_SLICE: Duration = Duration::from_millis(100);
 
 /// The card's error after the device driver panicked.
 const DRIVER_FAILED: &str = "the device driver failed; press Reconnect";
+
+/// The phase of a running session in the device driver contract's list
+/// (`DeviceEvent::Phase`). A driver that sets it as the last step of its
+/// connect keeps it on the card while Connected.
+const SESSION_PHASE: &str = "measuring";
 
 // ---------------------------------------------------------------------------
 // Hooks
@@ -304,6 +311,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                 break;
             }
             take_update(&self.updates, sink, Some(&mut driver));
+            // Device actions asked while no session ran were for no device.
+            host.actions.clear();
             sink.begin_session();
             flags.set_shots_allowed(sink.shots_allowed());
             let connected = {
@@ -626,9 +635,9 @@ struct Sink<D: DeviceDriver, H: Hooks<D>> {
     /// A connect is running: device telemetry is merged and goes out with
     /// the session's identity once it connects.
     connecting: bool,
-    /// The card's `phase` was set during this connect (cleared when the
+    /// The `phase` last set during this connect, if any (cleared when the
     /// session connects).
-    phase_shown: bool,
+    phase_shown: Option<&'static str>,
     /// The session's raw capture, for a driver with a raw profile.
     capture: Option<RawCapture>,
     /// The next raw frame number per FRP device id, across sessions.
@@ -705,7 +714,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             status: ActorStatus::Starting,
             telemetry: HashMap::new(),
             connecting: false,
-            phase_shown: false,
+            phase_shown: None,
             capture: None,
             seqs: HashMap::new(),
             held: HashMap::new(),
@@ -751,9 +760,11 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     }
 
     /// A session connected as `identity`: Connected, with the card text and
-    /// the shot count (and the connect's `phase` removed), then the device's
-    /// identity (and `source`, which the bus sender stamps) with the
-    /// telemetry the driver sent while connecting, before any shot.
+    /// the shot count (and the connect's `phase` removed, unless the driver
+    /// ended its connect on [`SESSION_PHASE`], which describes the session),
+    /// then the device's identity (and `source`, which the bus sender
+    /// stamps) with the telemetry the driver sent while connecting, before
+    /// any shot.
     fn connected(&mut self, identity: &DeviceIdentity) {
         self.connecting = false;
         // Frames sent while the first connect ran were numbered under the
@@ -770,8 +781,14 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             ("shot_count".into(), self.shot_count.to_string()),
         ]);
         // An empty value removes the key: the phases were the connect's.
-        if std::mem::take(&mut self.phase_shown) {
-            telemetry.insert("phase".into(), String::new());
+        match self.phase_shown.take() {
+            Some(SESSION_PHASE) => {
+                telemetry.insert("phase".into(), SESSION_PHASE.into());
+            }
+            Some(_) => {
+                telemetry.insert("phase".into(), String::new());
+            }
+            None => {}
         }
         self.status(ActorStatus::Connected, telemetry);
         self.send(FlighthookEvent::DeviceTelemetry {
@@ -829,7 +846,9 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         match event {
             DeviceEvent::Frp(event) => self.frp(event),
             DeviceEvent::Phase(phase) => {
-                self.phase_shown |= self.connecting;
+                if self.connecting {
+                    self.phase_shown = Some(phase);
+                }
                 self.send(FlighthookEvent::ActorStatus {
                     status: self.status,
                     telemetry: HashMap::from([("phase".into(), phase.to_owned())]),
@@ -2411,6 +2430,7 @@ mod tests {
         source_matches::<flightrelay::mock::MockDriver, crate::actors::mock::MockHooks>();
         source_matches::<tenover::driver::R10, crate::actors::r10::R10Hooks>();
         source_matches::<allsquare::driver::Omni, crate::actors::square::SquareHooks>();
+        source_matches::<threeputt::driver::ExPutt, crate::actors::exputt::ExPuttHooks>();
         source_matches::<FakeDriver, FakeHooks>();
     }
 
@@ -2589,6 +2609,24 @@ mod tests {
                 ]
                 .map(String::from)
             )
+        );
+
+        let exputt = flighthook::ExPuttSection {
+            name: "ExPutt".into(),
+            enabled: false,
+            impact_lead_s: Some(0.5),
+            driver: flighthook::ExPuttConfig::default(),
+        };
+        let full = flighthook::ExPuttSection {
+            driver: flighthook::ExPuttConfig {
+                address: Some("192.168.1.50".into()),
+            },
+            ..exputt.clone()
+        };
+        keys_apart(&exputt, &full);
+        assert_eq!(
+            driver_keys::<flighthook::ExPuttConfig>(),
+            BTreeSet::from(["address".to_owned()])
         );
     }
 }

@@ -3,12 +3,16 @@
 //! One actor per `[camera.N]`. It runs a stance [`Capture`] (the
 //! camera on its own thread, frames into a bounded ring) and feeds every
 //! frame to a [`ClipRecorder`], which keeps the pre-roll. Each launch
-//! monitor's `shot_trigger` on the bus becomes a recorder trigger, stamped
+//! monitor's `shot_trigger` on the bus becomes a recorder trigger, dated by
+//! the trigger's own `timestamp` when it carries one (the strike), else
 //! when the actor reads it (the bus is read before the frames on every
 //! pass, and a pass waits at most [`FRAME_WAIT`] for frames, so a stamp is
 //! at most that late), with the impact estimated
 //! [`impact_lead`] earlier: the monitor's own `impact_lead_s` setting, else
 //! the default for that kind of monitor, both read live at every trigger.
+//! The history reaches back over the longest lead plus the trigger delay of
+//! the monitors' types ([`longest_reach`]), so a trigger dated at a strike
+//! seconds before it arrived (the ExPutt's) still finds its frames.
 //! Pre- and post-roll come from the live `[replay]` section the same way.
 //! A camera that delivers late (a buffered network stream) has a `latency_s`:
 //! every frame is dated that much earlier than it arrived ([`Restamp`]), so
@@ -56,10 +60,11 @@ use crate::state::SystemState;
 use crate::state::clips::{self, ClipShot};
 use flighthook::{
     ActorStatus, BodyTrackingMode, CameraSection, FlighthookEvent, FlighthookMessage,
-    MAX_IMPACT_LEAD_S, MAX_LATENCY_S, ReplaySection, Severity, ShotKey, ShotVideo,
+    MAX_IMPACT_LEAD_S, MAX_LATENCY_S, MAX_TRIGGER_DELAY_S, ReplaySection, Severity, ShotKey,
+    ShotVideo,
 };
 
-/// Recorder history beyond the pre-roll and the longest impact lead.
+/// Recorder history beyond the pre-roll and the longest reach.
 const BUFFER_MARGIN: Duration = Duration::from_millis(500);
 
 /// Longest a capture pass waits for frames before it reads the bus again:
@@ -108,8 +113,19 @@ pub(crate) fn impact_lead(state: &SystemState, actor: &str) -> Option<Duration> 
 
 /// A lead in seconds as a duration, clamped to the valid range.
 fn lead(seconds: f64) -> Duration {
+    clamped(seconds, MAX_IMPACT_LEAD_S)
+}
+
+/// A reach in seconds (a lead plus a trigger delay) as a duration, clamped
+/// to the valid range.
+fn reach(seconds: f64) -> Duration {
+    clamped(seconds, MAX_IMPACT_LEAD_S + MAX_TRIGGER_DELAY_S)
+}
+
+/// `seconds` as a duration, clamped to 0..=`max` (0 when not finite).
+fn clamped(seconds: f64, max: f64) -> Duration {
     let s = if seconds.is_finite() {
-        seconds.clamp(0.0, MAX_IMPACT_LEAD_S)
+        seconds.clamp(0.0, max)
     } else {
         0.0
     };
@@ -353,26 +369,44 @@ fn frame_clock(now_ns: u64, latency: Duration) -> u64 {
 }
 
 /// The recorder settings for `replay`: its rolls, and history for the
-/// pre-roll plus `longest_lead`, the longest impact lead in effect. Frames
-/// are dated by capture time, so a camera's latency adds nothing to it.
+/// pre-roll plus `longest_reach`, how far before a trigger's arrival its
+/// impact can lie ([`longest_reach`]). Frames are dated by capture time, so
+/// a camera's latency adds nothing to it.
 fn recorder_config(
     replay: &ReplaySection,
-    longest_lead: Duration,
+    longest_reach: Duration,
     fps: Option<f64>,
 ) -> RecorderConfig {
     let pre_roll = roll(replay.pre_roll_s);
     RecorderConfig {
         pre_roll,
         post_roll: roll(replay.post_roll_s),
-        buffer: pre_roll + longest_lead + BUFFER_MARGIN,
+        buffer: pre_roll + longest_reach + BUFFER_MARGIN,
         fps,
         ..RecorderConfig::default()
     }
 }
 
-/// The longest impact lead in effect over the configured launch monitors.
-fn longest_lead(state: &SystemState) -> Duration {
-    lead(state.system.longest_impact_lead_s())
+/// How far before a trigger's arrival its impact can lie, over the
+/// configured launch monitors: the longest impact lead in effect plus the
+/// monitor type's trigger delay (`flighthook::trigger_delay_s`).
+fn longest_reach(state: &SystemState) -> Duration {
+    reach(state.system.longest_reach_s())
+}
+
+/// When a trigger read at `now_ns` (host monotonic clock) happened: its
+/// `timestamp` (UTC ms) on the same clock, else `now_ns`. A timestamp
+/// ahead of the host's UTC clock counts as now.
+fn trigger_time(now_ns: u64, timestamp: Option<u64>) -> u64 {
+    let Some(timestamp) = timestamp else {
+        return now_ns;
+    };
+    let utc_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(timestamp);
+    now_ns.saturating_sub(utc_ms.saturating_sub(timestamp).saturating_mul(1_000_000))
 }
 
 /// A roll in seconds as a duration, clamped to the valid range.
@@ -529,7 +563,7 @@ fn run(state: &Arc<SystemState>, section: &CameraSection, sender: &BusSender, mu
     let actor = sender.actor_id().to_owned();
     let mut recorder: ClipRecorder<Tag> = ClipRecorder::new(recorder_config(
         &state.system.replay(),
-        longest_lead(state),
+        longest_reach(state),
         None,
     ));
     let mut seen = SeenTriggers::default();
@@ -811,11 +845,18 @@ fn drain_bus(
             Err(PollError::Shutdown) => return false,
             Ok(None) => return true,
             Ok(Some(msg)) => {
-                if let FlighthookEvent::ShotTrigger { key, .. } = &msg.event {
-                    // Stamped on arrival: FRP triggers carry no time.
-                    let at = clock::now_ns();
-                    #[cfg(debug_assertions)]
-                    let at = crate::screens::trigger_ns(at);
+                if let FlighthookEvent::ShotTrigger { key, timestamp } = &msg.event {
+                    // The strike's time when the trigger carries one, else
+                    // its arrival.
+                    let at = match timestamp {
+                        Some(_) => trigger_time(clock::now_ns(), *timestamp),
+                        None => {
+                            let at = clock::now_ns();
+                            #[cfg(debug_assertions)]
+                            let at = crate::screens::trigger_ns(at);
+                            at
+                        }
+                    };
                     trigger(state, recorder, seen, &msg.actor, key, at);
                 }
             }
@@ -823,7 +864,7 @@ fn drain_bus(
     }
 }
 
-/// Apply `source`'s trigger for shot `key`, read at `at_ns`. Auto-chip,
+/// Apply `source`'s trigger for shot `key`, dated `at_ns`. Auto-chip,
 /// and repeats are ignored. The lead and the rolls come from the live config
 /// (the source's `impact_lead_s`, the `[replay]` section).
 fn trigger(
@@ -842,17 +883,17 @@ fn trigger(
         return;
     }
     let replay = state.system.replay();
-    // The history covers this monitor's lead even if its section is gone.
+    // The history covers this monitor's reach even if its section is gone.
+    let prefix = source.split_once('.').map_or(source, |(p, _)| p);
     let mut config = recorder_config(
         &replay,
-        longest_lead(state).max(lead),
+        longest_reach(state).max(lead + reach(flighthook::trigger_delay_s(prefix))),
         recorder.config().fps,
     );
     config.merge_window = recorder.config().merge_window;
     if config.buffer != recorder.config().buffer {
         recorder.set_config(config.clone());
     }
-    let prefix = source.split_once('.').map_or(source, |(p, _)| p);
     let shot = ClipShot {
         key: key.clone(),
         device: crate::actors::web::device_kind(prefix).to_owned(),
@@ -1106,7 +1147,7 @@ mod tests {
         assert_eq!(ms(&state, "mevo.0"), Some(0));
         assert_eq!(ms(&state, "mock_monitor.3"), Some(0));
         assert_eq!(ms(&state, "square.0"), Some(1000));
-        assert_eq!(ms(&state, "exputt.0"), Some(1500));
+        assert_eq!(ms(&state, "exputt.0"), Some(0));
         assert_eq!(ms(&state, "r10.1"), Some(2000));
         assert_eq!(ms(&state, "openconnect_server.0"), Some(2500));
         // A launch monitor kind without a better-known value.
@@ -1160,7 +1201,7 @@ mod tests {
         let (_dir, state) = state_with("[mevo.0]\nname = \"Mevo\"\n");
         let mut recorder: ClipRecorder<Tag> = ClipRecorder::new(recorder_config(
             &state.system.replay(),
-            longest_lead(&state),
+            longest_reach(&state),
             None,
         ));
         let mut seen = SeenTriggers::default();
@@ -1211,25 +1252,25 @@ mod tests {
         let (_dir, state) =
             state_with("[mevo.0]\nname = \"Mevo\"\n\n[square.0]\nname = \"Omni\"\n");
         // Defaults only: Square's 1 s is the longest.
-        assert_eq!(longest_lead(&state), Duration::from_secs(1));
+        assert_eq!(longest_reach(&state), Duration::from_secs(1));
         state.system.update(|c| {
             c.mevo.get_mut("0").unwrap().impact_lead_s = Some(3.5);
         });
-        assert_eq!(longest_lead(&state), Duration::from_millis(3500));
+        assert_eq!(longest_reach(&state), Duration::from_millis(3500));
         // A setting above the maximum is not in effect.
         state.system.update(|c| {
             c.mevo.get_mut("0").unwrap().impact_lead_s = Some(8.0);
         });
-        assert_eq!(longest_lead(&state), Duration::from_secs(1));
+        assert_eq!(longest_reach(&state), Duration::from_secs(1));
         // With no monitor configured there is no lead to cover.
         let (_dir2, empty) = state_with("");
-        assert_eq!(longest_lead(&empty), Duration::ZERO);
+        assert_eq!(longest_reach(&empty), Duration::ZERO);
 
         // The recorder grows its history when a setting grows, at the next
         // trigger, and never lets a lead outrun it.
         let replay = state.system.replay();
         let mut recorder: ClipRecorder<Tag> =
-            ClipRecorder::new(recorder_config(&replay, longest_lead(&state), None));
+            ClipRecorder::new(recorder_config(&replay, longest_reach(&state), None));
         let before = recorder.config().buffer;
         state.system.update(|c| {
             c.square.get_mut("0").unwrap().impact_lead_s = Some(5.0);
@@ -1252,6 +1293,87 @@ mod tests {
 
     fn millis(ms: u64) -> Duration {
         Duration::from_millis(ms)
+    }
+
+    /// A trigger with a `timestamp` (the strike, UTC ms) is dated then on
+    /// the host clock; one without, when it is read; a timestamp ahead of
+    /// the host's UTC clock counts as now.
+    #[test]
+    fn a_trigger_is_dated_by_its_timestamp() {
+        let utc_ms = || {
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_millis(),
+            )
+            .expect("ms")
+        };
+        let now = 100_000 * MS;
+        assert_eq!(trigger_time(now, None), now);
+        let at = trigger_time(now, Some(utc_ms() - 3400));
+        let early = now - at;
+        assert!(
+            (3400 * MS..=3450 * MS).contains(&early),
+            "{} ms",
+            early / MS
+        );
+        assert_eq!(trigger_time(now, Some(utc_ms() + 60_000)), now);
+        // Older than the host clock reaches: the clock's start.
+        assert_eq!(trigger_time(MS, Some(utc_ms() - 3400)), 0);
+    }
+
+    /// The ExPutt dates its trigger at the strike and sends it with the
+    /// putt's result, seconds later: the history reaches back over its
+    /// trigger delay, so a putt reported 3.4 s after its strike still gets
+    /// its whole pre-roll, with the impact at the strike.
+    #[test]
+    fn an_exputt_clip_reaches_back_to_its_strike() {
+        let (_dir, state) = state_with("[exputt.0]\nname = \"Putt\"\n");
+        assert_eq!(ms(&state, "exputt.0"), Some(0));
+        assert_eq!(
+            longest_reach(&state),
+            Duration::from_secs_f64(flighthook::MAX_TRIGGER_DELAY_S)
+        );
+        let replay = state.system.replay();
+        let mut recorder: ClipRecorder<Tag> =
+            ClipRecorder::new(recorder_config(&replay, longest_reach(&state), Some(100.0)));
+        assert_eq!(
+            recorder.config().buffer,
+            roll(replay.pre_roll_s) + Duration::from_secs(5) + BUFFER_MARGIN
+        );
+        // 12 s of frames at 100 fps; the result arrives at 12 s, its strike
+        // was at 8.6 s.
+        let mut events = Vec::new();
+        for i in 0..=1200 {
+            events.extend(recorder.push(at(i * 10 * MS, None)));
+        }
+        assert!(events.is_empty());
+        let mut seen = SeenTriggers::default();
+        let key = ShotKey {
+            shot_id: "putt".into(),
+            shot_number: 1,
+        };
+        trigger(
+            &state,
+            &mut recorder,
+            &mut seen,
+            "exputt.0",
+            &key,
+            8600 * MS,
+        );
+        let mut i = 1201;
+        while events.is_empty() {
+            events.extend(recorder.push(at(i * 10 * MS, None)));
+            i += 1;
+        }
+        let [RecorderEvent::Finished(clip)] = events.as_slice() else {
+            panic!("one clip: {events:?}");
+        };
+        assert_eq!(clip.impact_ns, 8600 * MS);
+        assert!(!clip.short_buffer);
+        let pre_roll = u64::try_from(roll(replay.pre_roll_s).as_nanos()).expect("ns");
+        assert_eq!(clip.frames[0].host_ns, 8600 * MS - pre_roll);
     }
 
     #[test]

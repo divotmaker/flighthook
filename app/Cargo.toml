@@ -51,8 +51,9 @@ dimple = "0.0.7"
 # dimple's vector type, for a ground ball's starting `BallState`; must match the
 # glam version dimple uses (already in the tree through it).
 glam = "0.32"
-# ExPutt RG putting device.
-threeputt = "0.0.3"
+# The ExPutt RG's device driver (`driver`: `threeputt::driver::ExPutt`).
+# LOCAL path until threeputt 0.1.0 is released
+threeputt = { path = "../../../3putt/3putt", features = ["driver"] }
 # Swing cameras: capture, pre-roll and trigger-cut MJPEG clips; `pose` is
 # body tracking (RTMPose on the CPU), `pose-download` fetches its models.
 stance = { path = "../../../stance/stance", features = ["pose", "pose-download"] }
@@ -96,8 +97,10 @@ tenover = { path = "../../../10over/10over", features = ["driver", "testing"] }
 # driver's connect over a scripted link.
 # LOCAL path until allsquare 0.4.0 is released
 allsquare = { path = "../../../allsquare/allsquare", features = ["driver", "testing"] }
-# threeputt's test support: an in-process mock device and sample putts.
-threeputt = { version = "0.0.3", features = ["testing"] }
+# threeputt's test support: an in-process mock device, sample putts and the
+# driver's test timings.
+# LOCAL path until threeputt 0.1.0 is released
+threeputt = { path = "../../../3putt/3putt", features = ["driver", "testing"] }
 # Encodes the numbered test frames of the body tracking tests (already in the
 # tree through stance).
 jpeg-encoder = "0.7"
