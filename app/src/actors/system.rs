@@ -1853,8 +1853,9 @@ mod tests {
                 "{id} was not stopped"
             );
         }
-        // The new instance runs: it reports itself connected.
-        until(&mut rx, "the new instance", |m| {
+        // The new instance runs: it reports itself connected, possibly
+        // before the command's outcome.
+        let connected = |m: &FlighthookMessage| {
             m.actor == "mock_monitor.0"
                 && matches!(
                     m.event,
@@ -1863,7 +1864,23 @@ mod tests {
                         ..
                     }
                 )
-        });
+        };
+        let start = seen
+            .iter()
+            .rposition(|m| {
+                m.actor == "mock_monitor.0"
+                    && matches!(
+                        m.event,
+                        FlighthookEvent::ActorStatus {
+                            status: ActorStatus::Starting,
+                            ..
+                        }
+                    )
+            })
+            .expect("a new start");
+        if !seen[start..].iter().any(connected) {
+            until(&mut rx, "the new instance", connected);
+        }
         stop_all(&state);
     }
 
