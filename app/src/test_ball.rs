@@ -144,13 +144,15 @@ pub(crate) fn assert_outputs_pinned(case: &str, messages: &[flighthook::Flightho
 }
 
 /// A shot on the bus as a device actor `actor` sends it: trigger, launch
-/// (simulated under the default settings, in detection mode `mode`), the
-/// device's flight result, club data, finished.
+/// (simulated under the default settings, in detection mode `mode`, else the
+/// game's mode as the actor reads it), the device's flight result, club
+/// data, face impact, finished.
 pub(crate) fn device_shot(
     actor: &str,
     launch: Launch,
     flight: Option<FlightResult>,
     club: Option<flighthook::ClubData>,
+    impact: Option<flighthook::FaceImpact>,
     mode: Option<flighthook::ShotDetectionMode>,
 ) -> Vec<flighthook::FlighthookMessage> {
     use flighthook::{FlighthookEvent, FlighthookMessage, ShotKey};
@@ -159,6 +161,7 @@ pub(crate) fn device_shot(
         crate::state::config::generate_id()
     ));
     let (state, _writer) = crate::state::SystemState::new(dir.join("config.toml"));
+    let mode = mode.or(state.game.snapshot().mode);
     let key = ShotKey {
         shot_id: "pin".into(),
         shot_number: 1,
@@ -175,6 +178,12 @@ pub(crate) fn device_shot(
         events.push(FlighthookEvent::ClubPath {
             key: key.clone(),
             club: Box::new(club),
+        });
+    }
+    if let Some(impact) = impact {
+        events.push(FlighthookEvent::FaceImpact {
+            key: key.clone(),
+            impact: Box::new(impact),
         });
     }
     events.push(FlighthookEvent::ShotFinished { key, raw: None });

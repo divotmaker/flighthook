@@ -867,8 +867,13 @@ impl ShotAccumulator {
 // ---------------------------------------------------------------------------
 
 /// How long a shot may take from `shot_trigger` to `shot_finished` before a
-/// [`ShotAggregator`] discards it: FRP's accumulator timeout.
-pub const SHOT_TIMEOUT: Duration = flightrelay::DEFAULT_SHOT_TIMEOUT;
+/// [`ShotAggregator`] discards it: 45 s, flighthook's own accumulator timeout
+/// (FRP lets a controller choose it; its default is 30 s).
+///
+/// It is longer than any device driver's own deadline for a shot, so a slow
+/// shot the driver still completes reaches every output: ironsight gives up
+/// on a Mevo or Xi shot the device has not processed 30 s after its trigger.
+pub const SHOT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// High-level shot collector that manages multiple in-flight shots, keyed
 /// by actor and shot id, with FRP's shot lifecycle rules.
@@ -2167,7 +2172,7 @@ mod tests {
     fn the_aggregator_discards_a_shot_after_the_timeout() {
         let t0 = Instant::now();
         let mut agg = ShotAggregator::new();
-        assert_eq!(agg.timeout(), Duration::from_secs(30));
+        assert_eq!(agg.timeout(), Duration::from_secs(45));
         agg.feed_at(&bus(FlighthookEvent::shot_trigger(key())), t0);
         agg.feed_at(&bus(launch_event(ball())), t0);
         assert!(agg.is_pending("mevo.0", &key().shot_id));

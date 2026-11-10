@@ -5,9 +5,10 @@
 //! connection passes the bus through one [`FrpOutput`]:
 //!
 //! - **Duplicates are dropped** with flightrelay's `ForwardFilter`: a shot
-//!   event passes once per (device, shot id, kind) within FRP's 30 s window,
-//!   `device_telemetry` only when it changes something, and an alert of a
-//!   device once per identical message within the window. When an actor's
+//!   event passes once per (device, shot id, kind) within the window
+//!   ([`SHOT_TIMEOUT`](flighthook::SHOT_TIMEOUT), flighthook's accumulator
+//!   timeout, so a repeat of a shot flighthook still holds never passes),
+//!   and `device_telemetry` only when it changes something. When an actor's
 //!   status leaves Connected (or it starts again), what was forwarded for its
 //!   devices is forgotten, as a client forgets what it held: the next
 //!   session's telemetry goes out in full.
@@ -22,13 +23,18 @@
 //!   `flight_result` was forwarded for the shot.
 //!
 //! Every other bus event, flighthook's extensions included, passes unchanged.
-//! flighthook sends no `raw_frame`.
+//! Alerts pass every time, a device's too: each one is raised anew by one of
+//! flighthook's actors, and flighthook takes no FRP events in, so none can
+//! come back around a loop. flighthook sends no `raw_frame`.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use flighthook::{ActorStatus, FlightResult, FlighthookEvent, FlighthookMessage, measured_launch};
-use flightrelay::{ForwardFilter, FrpEnvelope, FrpEvent, FrpMessage};
+use flighthook::{
+    ActorStatus, FlightResult, FlighthookEvent, FlighthookMessage, Provenance, SHOT_TIMEOUT,
+    measured_launch,
+};
+use flightrelay::{ForwardFilter, FrpEnvelope, FrpEvent, Source};
 
 /// One `/frp` connection's forwarding state.
 pub(crate) struct FrpOutput {
@@ -43,7 +49,7 @@ pub(crate) struct FrpOutput {
 impl FrpOutput {
     pub(crate) fn new() -> Self {
         Self {
-            filter: ForwardFilter::new(),
+            filter: ForwardFilter::new().with_window(SHOT_TIMEOUT),
             own: HashMap::new(),
             devices: HashMap::new(),
         }
@@ -131,21 +137,12 @@ impl FrpOutput {
                     Vec::new()
                 }
             }
-            // An alert of a device is deduplicated; flighthook's own alerts
-            // (no device) pass.
-            FlighthookEvent::Alert { .. } if msg.device.is_some() => {
-                if self.passes(msg) {
-                    vec![msg.clone()]
-                } else {
-                    Vec::new()
-                }
-            }
             _ => vec![msg.clone()],
         }
     }
 
     /// Whether `msg`, an FRP event, passes the forward filter (and is then
-    /// recorded as forwarded). One that does not read as FRP does not pass.
+    /// recorded as forwarded). A message that is no FRP event does not pass.
     fn passes(&mut self, msg: &FlighthookMessage) -> bool {
         frp_envelope(msg).is_some_and(|env| self.filter.should_forward(&env))
     }
@@ -156,15 +153,55 @@ fn frp_device(msg: &FlighthookMessage) -> String {
     msg.device.clone().unwrap_or_else(|| msg.actor.clone())
 }
 
-/// `msg` as FRP reads it, with [`frp_device`] as its device; `None` when
-/// it is not an FRP event.
+/// `msg` as its FRP envelope, with [`frp_device`] as its device; `None`
+/// when it is no FRP event. flighthook's extension fields (`actor`, `derived`,
+/// the raw frames) are not part of it.
 fn frp_envelope(msg: &FlighthookMessage) -> Option<FrpEnvelope> {
-    let mut json = serde_json::to_value(msg).ok()?;
-    json["device"] = serde_json::Value::String(frp_device(msg));
-    match FrpMessage::parse(&json.to_string()).ok()? {
-        FrpMessage::Envelope(env) if !matches!(env.event, FrpEvent::Unknown) => Some(env),
-        _ => None,
-    }
+    let event = match &msg.event {
+        FlighthookEvent::ShotTrigger { key, timestamp } => FrpEvent::ShotTrigger {
+            key: key.clone(),
+            timestamp: *timestamp,
+        },
+        FlighthookEvent::Launch { key, launch, .. } => FrpEvent::Launch {
+            key: key.clone(),
+            launch: (**launch).clone(),
+        },
+        FlighthookEvent::FlightResult { key, flight } => FrpEvent::FlightResult {
+            key: key.clone(),
+            flight: (**flight).clone(),
+        },
+        FlighthookEvent::ClubPath { key, club } => FrpEvent::ClubPath {
+            key: key.clone(),
+            club: (**club).clone(),
+        },
+        FlighthookEvent::FaceImpact { key, impact } => FrpEvent::FaceImpact {
+            key: key.clone(),
+            impact: (**impact).clone(),
+        },
+        FlighthookEvent::ShotFinished { key, .. } => FrpEvent::ShotFinished { key: key.clone() },
+        FlighthookEvent::DeviceTelemetry {
+            manufacturer,
+            model,
+            firmware,
+            source,
+            telemetry,
+        } => FrpEvent::DeviceTelemetry {
+            manufacturer: manufacturer.clone(),
+            model: model.clone(),
+            firmware: firmware.clone(),
+            source: source.map(|p| match p {
+                Provenance::Measured => Source::Measured,
+                Provenance::Virtual => Source::Virtual,
+            }),
+            telemetry: telemetry.clone(),
+        },
+        FlighthookEvent::Alert { severity, message } => FrpEvent::Alert {
+            severity: *severity,
+            message: message.clone(),
+        },
+        _ => return None,
+    };
+    Some(FrpEnvelope::new(frp_device(msg), event))
 }
 
 #[cfg(test)]
@@ -174,6 +211,7 @@ mod tests {
         ActorStatus, Basis, DerivedFlight, Distance, FLIGHT_MODEL, Launch, Provenance, Severity,
         ShotKey, Velocity,
     };
+    use flightrelay::FrpMessage;
     use std::collections::HashMap;
 
     fn key(n: u32) -> ShotKey {
@@ -390,10 +428,11 @@ mod tests {
         assert_eq!(out.forward_at(&battery, t0).len(), 1, "a new session");
     }
 
-    /// flighthook's extensions and its own alerts pass unchanged; a device's
-    /// repeated alert is dropped.
+    /// flighthook's extensions and every alert pass unchanged: a device
+    /// that raises the same alert twice shows it twice, as each one is raised
+    /// anew.
     #[test]
-    fn extensions_pass_and_device_alerts_are_deduplicated() {
+    fn extensions_and_alerts_pass_every_time() {
         let mut out = FrpOutput::new();
         let t0 = Instant::now();
         let ext = FlighthookMessage::new(FlighthookEvent::NewShotGroup).actor("ws.1");
@@ -418,6 +457,168 @@ mod tests {
             message: "Shot #3: no read".into(),
         });
         assert_eq!(out.forward_at(&device, t0).len(), 1);
-        assert!(out.forward_at(&device, t0).is_empty());
+        assert_eq!(out.forward_at(&device, t0).len(), 1, "raised again");
+    }
+
+    /// A repeat of a shot is dropped for as long as flighthook holds a shot,
+    /// which is longer than FRP's 30 s default.
+    #[test]
+    fn the_window_is_flighthooks_shot_timeout() {
+        let out = FrpOutput::new();
+        assert_eq!(out.filter.window(), SHOT_TIMEOUT);
+        assert!(SHOT_TIMEOUT > flightrelay::DEFAULT_SHOT_TIMEOUT);
+    }
+
+    /// The envelope the filter keys on reads, on the wire, as the one an FRP
+    /// peer reads from the message as sent, for every FRP event, also with
+    /// flighthook's extension fields and odd values on it.
+    #[test]
+    fn the_filters_envelope_is_the_one_on_the_wire() {
+        let raw = flighthook::ShotRaw {
+            transport: "tcp".into(),
+            frames: vec![flighthook::RawRecord::binary(
+                flighthook::RawDir::Rx,
+                &[0xc0, 0xff, 0xee],
+            )],
+            ..flighthook::ShotRaw::default()
+        };
+        let odd = Launch {
+            launch_speed: Some(Velocity::MetersPerSecond(f64::NAN)),
+            launch_azimuth: Some(f64::NAN),
+            ..chip()
+        };
+        let messages = [
+            from_device(FlighthookEvent::ShotTrigger {
+                key: key(1),
+                timestamp: Some(1_762_500_000_000),
+            })
+            .provenance(Provenance::Measured),
+            launch(1, chip(), Some(simulated(true))),
+            launch(1, odd, None),
+            launch(1, Launch::default(), None),
+            from_device(FlighthookEvent::FlightResult {
+                key: key(1),
+                flight: Box::new(flighthook::FlightResult {
+                    carry_distance: Some(Distance::Meters(f64::NAN)),
+                    ..flighthook::FlightResult::new(Basis::Modeled)
+                }),
+            }),
+            from_device(FlighthookEvent::ClubPath {
+                key: key(1),
+                club: Box::new(flighthook::ClubData::default()),
+            }),
+            from_device(FlighthookEvent::FaceImpact {
+                key: key(1),
+                impact: Box::new(flighthook::FaceImpact::default()),
+            }),
+            from_device(FlighthookEvent::ShotFinished {
+                key: key(1),
+                raw: Some(Box::new(raw)),
+            }),
+            from_device(FlighthookEvent::DeviceTelemetry {
+                manufacturer: Some("FlightScope".into()),
+                model: None,
+                firmware: None,
+                source: Some(Provenance::Virtual),
+                telemetry: Some(HashMap::from([("ready".into(), "true".into())])),
+            }),
+            FlighthookMessage::new(FlighthookEvent::Alert {
+                severity: Severity::Warn,
+                message: "no device".into(),
+            })
+            .actor("gspro.0"),
+        ];
+        for msg in &messages {
+            let mut json = serde_json::to_value(msg).expect("ser");
+            json["device"] = serde_json::Value::String(frp_device(msg));
+            let FrpMessage::Envelope(wire) = FrpMessage::parse(&json.to_string()).expect("frp")
+            else {
+                panic!("not an envelope: {json}");
+            };
+            let ours = frp_envelope(msg).expect("an FRP event");
+            let FrpMessage::Envelope(ours) =
+                FrpMessage::parse(&serde_json::to_string(&ours).expect("ser")).expect("frp")
+            else {
+                panic!("not an envelope");
+            };
+            // NaN never equals itself: compare the envelopes as JSON.
+            assert_eq!(
+                serde_json::to_string(&ours).expect("ser"),
+                serde_json::to_string(&wire).expect("ser"),
+                "{json}"
+            );
+        }
+        let ext = FlighthookMessage::new(FlighthookEvent::NewShotGroup).actor("ws.1");
+        assert!(frp_envelope(&ext).is_none());
+    }
+
+    /// Auto-chip goes out as an FRP device: every envelope carries its
+    /// `device` id, and a `device_telemetry` declaring `source: virtual`
+    /// comes before its first shot event. The next chip's declaration
+    /// changes nothing and is dropped.
+    #[test]
+    fn auto_chip_has_a_device_and_declares_its_source_first() {
+        use std::sync::atomic::AtomicU32;
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-frp-autochip-test-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, _writer) = crate::state::SystemState::new(dir.join("config.toml"));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let chips = AtomicU32::new(0);
+        let mut out = FrpOutput::new();
+        let mut chip = || {
+            crate::autochip::send(&state, &tx, 3, &chips).expect("sent");
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .flat_map(|m| out.forward(&m))
+                .map(|m| {
+                    let json = serde_json::to_string(&m).expect("ser");
+                    match FrpMessage::parse(&json).expect("frp") {
+                        FrpMessage::Envelope(env) => env,
+                        FrpMessage::Protocol(_) => panic!("not an envelope: {json}"),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = chip();
+        let second = chip();
+        let _ = std::fs::remove_dir_all(dir);
+        let kinds = |envs: &[FrpEnvelope]| {
+            envs.iter()
+                .map(|e| {
+                    serde_json::to_value(&e.event).expect("ser")["kind"]
+                        .as_str()
+                        .expect("kind")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds(&first),
+            [
+                "device_telemetry",
+                "shot_trigger",
+                "launch",
+                "flight_result",
+                "shot_finished"
+            ]
+        );
+        assert!(matches!(
+            first[0].event,
+            FrpEvent::DeviceTelemetry {
+                source: Some(Source::Virtual),
+                ..
+            }
+        ));
+        assert_eq!(
+            kinds(&second),
+            ["shot_trigger", "launch", "flight_result", "shot_finished"]
+        );
+        assert!(
+            first
+                .iter()
+                .chain(&second)
+                .all(|e| e.device == flighthook::AUTO_CHIP_ACTOR)
+        );
     }
 }

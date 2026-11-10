@@ -382,9 +382,10 @@ order) -> `ShotFinished`. Consumers use `ShotAggregator` (lib `event.rs`) to
 collect events into a final `ShotData` (`launch`, the device's `flight`,
 `club`, `impact`, and `derived` from the launch event), with FRP's shot
 lifecycle rules: a shot keeps the first event of each kind, a shot that has
-not finished 30 s (`SHOT_TIMEOUT`, FRP's accumulator timeout) after its
-trigger is discarded, and events of a finished or discarded shot are ignored
-for another 30 s. `feed_at(msg, now)` returns the finished shot's
+not finished 45 s (`SHOT_TIMEOUT`, flighthook's accumulator timeout; FRP's
+default is 30 s, and a driver's own shot deadline, ironsight's 30 s, must
+expire first) after its trigger is discarded, and events of a finished or
+discarded shot are ignored for another 45 s. `feed_at(msg, now)` returns the finished shot's
 `ShotAccumulator` (so a consumer can add the raw frames), `feed(msg)` the
 finished `ShotData`. The GSPro bridge, the Pureplay output and the web layer
 each keep one. When it finishes the shot, the accumulator computes
@@ -682,7 +683,7 @@ a UUID v4 `id`, a per-run display `number`, `session`, `club`, `started_at`,
 
 | Bus event | Effect |
 | --- | --- |
-| `shot_trigger` | the device's other unfinished shots end uncounted (a repeat of the trigger changes nothing); then `assign`: the open set when its club is the trigger-time club (or it is empty), else a new set; held on the `PendingShot`. A shot unfinished 30 s after its trigger ends uncounted too (`ShotAggregator`) |
+| `shot_trigger` | the device's other unfinished shots end uncounted (a repeat of the trigger changes nothing); then `assign`: the open set when its club is the trigger-time club (or it is empty), else a new set; held on the `PendingShot`. A shot unfinished 45 s after its trigger ends uncounted too (`ShotAggregator`) |
 | `actor_status` other than `connected` | the device's unfinished shots end uncounted; the open set stays open |
 | `shot_finished` | the shot is stamped and `finish` counts it when it has data; a shot with no data and no raw frames still ends its assignment |
 | a shot leaves the 1000-shot history | `release`: count down; a closed set at zero is dropped |
@@ -1303,7 +1304,7 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
 - `mod.rs` runs the link like the Open Connect client runs its connection:
   the detection mode starts as the game state's at `start` and follows
   `SetDetectionMode`, the bus is drained the whole time (shots still
-  unfinished 30 s after their trigger are let go, the shared `ShotAggregator`
+  unfinished 45 s after their trigger are let go, the shared `ShotAggregator`
   rule), the same backoff (1 s, +1 s, cap 3 s,
   reset after a 10 s link), the same per-mode routing (`GsProRouting`,
   `gspro::shot_matches_routing`, Auto-chip always accepted), shots queued
@@ -2294,7 +2295,14 @@ WS connection at `/frp`, three-phase handshake with version negotiation:
    `SPEC_VERSION`) when the client proposes it. If not, it sends a
    `critical` alert and closes the connection. A `raw_frames` request is
    ignored: flighthook sends no raw frames.
-3. Server responds: `{ "kind": "init", "version": "0.2.0", "actor_id": "ws.a1b2c3d4", "global_state": { ... } }`
+3. Server responds: `{ "kind": "init", "version": "0.2.0", "actor_id": "ws.a1b2c3d4", "global_state": { ... } }`,
+   then replays each actor's last `actor_status` and its device's current
+   state as one `device_telemetry` (`ws::telemetry_replay`): the web layer
+   keeps `cached_device_telemetry` merged per actor
+   (`merge_device_telemetry`: every identity field, `source` and
+   `telemetry` key at its latest value; a message for another device id
+   replaces the entry), so a device that sends its identity and its keys
+   apart is replayed whole. Then the current `round_state`.
 4. Server streams `FlighthookMessage` events (serialized directly as JSON),
    each passed through the connection's `FrpOutput` (`web/frp_out.rs`)
 
@@ -2307,10 +2315,14 @@ offer it — including one that sends no `version` array — receives a
 dashboard's included (it builds its shot rows from this stream):
 
 - flightrelay's `ForwardFilter` drops repeats: a shot event once per (FRP
-  device, shot id, kind) within 30 s; `device_telemetry` only when it
-  changes something; a device's alert once per message within 30 s. The FRP
-  device is the message's `device`, else its `actor`. flighthook's own
-  alerts (no `device`) and its extension events pass unchanged. An
+  device, shot id, kind) within its window, `SHOT_TIMEOUT` (45 s, so no
+  repeat of a shot the consumers still hold passes); `device_telemetry`
+  only when it changes something. The filter reads each message as its FRP
+  envelope built directly from the bus event (`frp_envelope`, no JSON round
+  trip). The FRP device is the message's `device`, else its `actor`. Alerts
+  pass every time, a device's too (each is raised anew by an actor, and
+  flighthook takes no FRP events in, so nothing can come back around a
+  loop), and so do flighthook's extension events. An
   `actor_status` other than Connected makes the filter forget the actor's
   devices (`ForwardFilter::forget_device`), so a reconnected device's
   telemetry reaches the dashboard again after it dropped the lost
@@ -3240,7 +3252,9 @@ for a straight 28° launch with backspin `round(DEFAULT_LAUNCH_ONLY_SPIN ×
 mph)` and no sidespin; the total rises with speed. `send` emits
 `ShotTrigger`, `sim::simulated_launch_events(.., Some(Chipping))`
 (simulated whatever `[simulation] mode`, `off` included) and `ShotFinished`
-as actor `autochip` (`flighthook::AUTO_CHIP_ACTOR`), keyed by a fresh UUID
+as actor and FRP `device` `autochip` (`flighthook::AUTO_CHIP_ACTOR`), right
+after a `DeviceTelemetry` carrying only `source: virtual` (so an FRP client
+learns the device's source before its first shot), keyed by a fresh UUID
 and the next `WebState::auto_chip_shots`, from `spawn_blocking`; the counter
 moves only once the solve has succeeded. `shot_context` stamps an Auto-chip's
 `detection_mode` Chipping, whatever the game mode. The UI labels the actor

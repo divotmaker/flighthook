@@ -5,7 +5,8 @@
 //!   2. Server accepts its FRP version ([`FRP_VERSION`]) when the client
 //!      proposes it; otherwise it sends a `critical` alert and closes
 //!   3. Server sends:  `{ "kind": "init", "version": "0.2.0", "actor_id": "ws.abc123", "global_state": { ... } }`
-//!   4. Server replays the last status and telemetry of every actor and the
+//!   4. Server replays the last status of every actor, each device's current
+//!      telemetry state (every field and key at its latest value) and the
 //!      current `round_state`, then streams `FlighthookMessage` events,
 //!      with FRP's forwarding rules applied to the FRP ones
 //!      ([`frp_out`](super::frp_out))
@@ -111,15 +112,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
         }
     }
 
-    // Replay cached DeviceTelemetry messages (last per actor)
-    {
-        let cache = state.cached_device_telemetry.read().await;
-        for msg in cache.values().flat_map(|m| output.forward(m)) {
-            if let Ok(json) = serde_json::to_string(&msg)
-                && ws_tx.send(Message::text(json)).await.is_err()
-            {
-                return;
-            }
+    // Replay each actor's current device state
+    for msg in telemetry_replay(&state, &mut output).await {
+        if let Ok(json) = serde_json::to_string(&msg)
+            && ws_tx.send(Message::text(json)).await.is_err()
+        {
+            return;
         }
     }
 
@@ -185,6 +183,18 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>) {
         client_name,
         actor_id
     );
+}
+
+/// The `device_telemetry` replayed to a client that just connected, through
+/// its connection's `output`: one message per actor with the device's
+/// current state, every field and telemetry key at its latest value (the
+/// web layer merges them as they arrive).
+pub(super) async fn telemetry_replay(
+    state: &WebState,
+    output: &mut FrpOutput,
+) -> Vec<FlighthookMessage> {
+    let held = state.cached_device_telemetry.read().await;
+    held.values().flat_map(|m| output.forward(m)).collect()
 }
 
 /// Parsed result from a "start" handshake message.

@@ -2166,7 +2166,15 @@ mod group_tests {
                 .into_iter()
                 .filter(|m| m.actor != state.actor_id)
                 .collect();
-            assert_eq!(msgs.len(), 3, "{msgs:?}");
+            // The source declaration, then trigger, launch, finished.
+            assert_eq!(msgs.len(), 4, "{msgs:?}");
+            assert!(matches!(
+                msgs[0].event,
+                FlighthookEvent::DeviceTelemetry {
+                    source: Some(flighthook::Provenance::Virtual),
+                    ..
+                }
+            ));
             let mut pending = super::super::PendingShots::new();
             for msg in &msgs {
                 assert_eq!(msg.actor, flighthook::AUTO_CHIP_ACTOR);

@@ -1757,12 +1757,67 @@ mod tests {
         assert!(released.load(Ordering::SeqCst), "the link is ended");
     }
 
-    /// Every output's numbers for a Square shot with club data.
+    /// Every output's numbers for an Omni shot with club data and face
+    /// impact, through the Omni's sign flips: the fade chip of the tests
+    /// above, and a full swing.
     #[test]
     fn outputs_keep_their_numbers() {
-        let ball = ball_from_square(&testing::ball_metrics());
-        let club = club_from_square(&ClubMetrics::default());
-        let messages = crate::test_ball::device_shot("square.0", ball, None, Some(club), None);
-        crate::test_ball::assert_outputs_pinned("square", &messages);
+        let chip = (
+            allsquare::BallMetrics {
+                speed: 3.30,
+                launch_angle: 32.51,
+                direction: 7.39,
+                total_spin: 627,
+                spin_axis: -8.00,
+                back_spin: 621,
+                side_spin: -87,
+                ..testing::ball_metrics()
+            },
+            ClubMetrics {
+                mask: 0xff,
+                path: Some(2.15),
+                face_angle: Some(4.62),
+                attack_angle: Some(-3.18),
+                dynamic_loft: Some(38.4),
+                impact_horizontal: Some(-6.5),
+                impact_vertical: Some(2.25),
+                club_speed: Some(3.02),
+                smash_factor: Some(1.09),
+            },
+        );
+        let full_swing = (
+            allsquare::BallMetrics {
+                speed: 60.0,
+                launch_angle: 14.0,
+                direction: -1.2,
+                total_spin: 3059,
+                spin_axis: -11.31,
+                back_spin: 3000,
+                side_spin: -600,
+                ..testing::ball_metrics()
+            },
+            ClubMetrics {
+                mask: 0xff,
+                path: Some(-2.4),
+                face_angle: Some(-0.8),
+                attack_angle: Some(-1.6),
+                dynamic_loft: Some(17.9),
+                impact_horizontal: Some(3.5),
+                impact_vertical: Some(-4.0),
+                club_speed: Some(41.4),
+                smash_factor: Some(1.45),
+            },
+        );
+        for (case, (ball, club)) in [("square", chip), ("square_full_swing", full_swing)] {
+            let messages = crate::test_ball::device_shot(
+                "square.0",
+                ball_from_square(&ball),
+                None,
+                Some(club_from_square(&club)),
+                face_impact_from_square(&club),
+                None,
+            );
+            crate::test_ball::assert_outputs_pinned(case, &messages);
+        }
     }
 }

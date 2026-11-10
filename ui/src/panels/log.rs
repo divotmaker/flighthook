@@ -140,9 +140,10 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
     match event {
         FlighthookEvent::ShotTrigger { key, .. } => format!("trigger #{}", key.shot_number),
         FlighthookEvent::Launch { key, .. } => format!("launch #{}", key.shot_number),
-        FlighthookEvent::FlightResult { key, flight } => {
-            format!("flight #{} ({})", key.shot_number, flight.basis)
-        }
+        FlighthookEvent::FlightResult { key, flight } => match &flight.model {
+            Some(model) => format!("flight #{} ({}, {model})", key.shot_number, flight.basis),
+            None => format!("flight #{} ({})", key.shot_number, flight.basis),
+        },
         FlighthookEvent::ClubPath { key, .. } => format!("club #{}", key.shot_number),
         FlighthookEvent::FaceImpact { key, .. } => format!("impact #{}", key.shot_number),
         FlighthookEvent::ShotFinished { key, raw } => match raw {
@@ -156,6 +157,7 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
         FlighthookEvent::DeviceTelemetry {
             manufacturer,
             model,
+            source,
             telemetry,
             ..
         } => {
@@ -165,6 +167,16 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
             {
                 let ready = tel.get("ready").map(|v| v.as_str()).unwrap_or("?");
                 return format!("ready={ready}");
+            }
+            // A device that declares only its source, e.g. Auto-chip.
+            if manufacturer.is_none()
+                && model.is_none()
+                && let Some(source) = source
+            {
+                return match source {
+                    flighthook::Provenance::Measured => "source=measured".into(),
+                    flighthook::Provenance::Virtual => "source=virtual".into(),
+                };
             }
             format!(
                 "device: {} {}",
@@ -504,6 +516,40 @@ mod tests {
         );
         let changed = FlighthookEvent::ShotGroup { group, shot: None };
         assert_eq!(event_debug(&changed), "set 3 7I (4 shots, open)");
+    }
+
+    /// A flight result names its basis, and its model when it has one, so
+    /// flighthook's own result reads apart from a device's; a device that
+    /// declares only its source shows it.
+    #[test]
+    fn flight_results_name_their_model_and_a_lone_source_shows() {
+        use crate::types::ShotKey;
+        let key = ShotKey {
+            shot_id: "s".into(),
+            shot_number: 5,
+        };
+        let device = flighthook::FlightResult::new(flighthook::Basis::Modeled);
+        let own = flighthook::FlightResult {
+            model: Some(flighthook::FLIGHT_MODEL.into()),
+            ..device.clone()
+        };
+        let flight = |flight| FlighthookEvent::FlightResult {
+            key: key.clone(),
+            flight: Box::new(flight),
+        };
+        assert_eq!(event_debug(&flight(device)), "flight #5 (modeled)");
+        assert_eq!(
+            event_debug(&flight(own)),
+            "flight #5 (modeled, flighthook simulation (dimple))"
+        );
+        let source = FlighthookEvent::DeviceTelemetry {
+            manufacturer: None,
+            model: None,
+            firmware: None,
+            source: Some(flighthook::Provenance::Virtual),
+            telemetry: None,
+        };
+        assert_eq!(event_debug(&source), "source=virtual");
     }
 
     #[test]

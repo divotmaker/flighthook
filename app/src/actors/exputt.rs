@@ -2533,17 +2533,25 @@ mod tests {
         assert!(took < ExPuttActor { address: None }.stop_wait(), "{took:?}");
     }
 
-    /// Every output's numbers for an ExPutt putt.
+    /// Every output's numbers for threeputt's recorded putts, a straight
+    /// one and a pulled one, as the actor emits them.
     #[test]
     fn outputs_keep_their_numbers() {
-        let p = putt(PUTT_RESULT_FULL);
-        let messages = crate::test_ball::device_shot(
-            "exputt.0",
-            ball_from_putt(&p),
-            None,
-            club_from_putt(&p),
-            Some(ShotDetectionMode::Putting),
-        );
-        crate::test_ball::assert_outputs_pinned("exputt", &messages);
+        for (case, line) in [
+            ("exputt", PUTT_RESULT_FULL),
+            ("exputt_pulled", PUTT_RESULT_PULLED),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "flighthook-exputt-pin-{}",
+                crate::state::config::generate_id()
+            ));
+            let (state, _writer) = SystemState::new(dir.join("config.toml"));
+            let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+            let sender = BusSender::new("exputt.0".into(), tx, Arc::default());
+            emit_putt(&state, &sender, "ExPutt (test)", &putt(line), &mut 0);
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let _ = std::fs::remove_dir_all(dir);
+            crate::test_ball::assert_outputs_pinned(case, &messages);
+        }
     }
 }

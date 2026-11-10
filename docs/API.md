@@ -1080,7 +1080,7 @@ A shot is assigned its set when it **triggers**, using the club in play at
 that moment, and joins it when it finishes with data. A club change or a New
 set during a flight applies to the next shot. A shot that never finishes
 (the device triggers another shot first, drops out with any status but
-`connected`, or 30 s pass) leaves its set uncounted. A device that disconnects and
+`connected`, or 45 s pass) leaves its set uncounted. A device that disconnects and
 reconnects keeps the open set: its next shot with the same club joins it.
 
 **Response** `200 OK` -- `ShotGroupsResponse`:
@@ -1297,9 +1297,11 @@ settings that is about 4.4 mph for 1 yd, 7.8 mph for 3 yd and 10.4 mph for
 5 yd. The simulator runs its own physics on the launch, so the distance it
 shows depends on its own ground (e.g. its green speed).
 
-The shot goes on the bus as actor `autochip` (no `device`), numbered from 1
-in this run of flighthook (a request that fails takes no number), with the
-shot lifecycle a launch monitor emits: [`shot_trigger`](#shot_trigger),
+The shot goes on the bus as actor and `device` `autochip`, numbered from 1
+in this run of flighthook (a request that fails takes no number), after a
+[`device_telemetry`](#device_telemetry) that carries only `source`
+`"virtual"`, with the shot lifecycle a launch monitor emits:
+[`shot_trigger`](#shot_trigger),
 [`launch`](#launch) with `derived` simulated as for a shot in
 chipping mode (also with `[simulation] mode = "off"`: the simulated carry and
 total are the chip's only results), and [`shot_finished`](#shot_finished)
@@ -2177,9 +2179,11 @@ Before streaming begins, the client must complete a handshake:
   - `mode`: the detection mode or `null`
   - `handed`: the player's hand (`"rh"` | `"lh"`) or `null`
 
-3. **Server replays** the last `actor_status` and `device_telemetry` of
-   every actor, then sends the current [`round_state`](#round_state),
-   active or not.
+3. **Server replays** the last `actor_status` of every actor and one
+   `device_telemetry` per device with its current state (every identity
+   field, `source` and `telemetry` key at its latest value, however many
+   messages the device sent them in), then sends the current
+   [`round_state`](#round_state), active or not.
 
 4. **Server streams** `FlighthookMessage` events (described below).
 
@@ -2192,14 +2196,15 @@ dashboard included, with FRP 0.2.0's forwarding rules:
 
 - A shot event (`shot_trigger`, `launch`, `flight_result`, `club_path`,
   `face_impact`, `shot_finished`) goes out once per device, shot and kind
-  within 30 s; a repeat is dropped.
+  within 45 s, flighthook's accumulator timeout; a repeat is dropped.
 - `device_telemetry` goes out when it changes something the device last
-  reported (the replay on connect always goes out). When the device's
+  reported. The replay on connect is the device's current state (every
+  field and key at its latest value) and always goes out. When the device's
   `actor_status` leaves `connected`, this is forgotten: its next session's
   telemetry goes out in full.
-- A device's `alert` goes out once per identical message within 30 s.
-  flighthook's own alerts (no `device`) and its extension events always go
-  out.
+- Alerts and flighthook's extension events always go out, a device's
+  repeated alert too: each one is raised anew by flighthook, which takes no
+  FRP events in.
 - `launch` holds only measured values: a value flighthook estimated (the
   spin of a [launch-only chip](devices/flightscope.md#launch-only-chips-beta),
   `derived.spin_estimated`) is left out of it, and goes out in flighthook's
@@ -2273,8 +2278,10 @@ Ball strike detected. Emitted immediately by the launch monitor -- no data yet.
   since the Unix epoch (UTC), by the device's clock. No supported device
   reports one yet, so it is absent.
 
-A shot that has not finished within 30 s of its trigger is dropped: its
-later events are ignored (FRP's accumulator timeout).
+A shot that has not finished within 45 s of its trigger (flighthook's
+accumulator timeout, longer than any device driver's own deadline for a
+shot) is dropped by flighthook's shot history and outputs; its later events
+are still forwarded on this stream.
 
 ---
 
@@ -2699,7 +2706,9 @@ telemetry keys.
 - `source`: FRP's device source, where the device's shots originate:
   `"measured"` or `"virtual"`, the shot source's [provenance](#provenance),
   set by flighthook from the actor's type on every `device_telemetry` of a
-  shot source. Absent (unknown) on telemetry from anything else.
+  shot source. Absent (unknown) on telemetry from anything else. Auto-chip
+  (device `autochip`) sends one with `source` `"virtual"` alone before each
+  chip.
 - `telemetry`: optional key/value map. Standard keys: `"ready"`, `"battery_pct"`,
   `"tilt"`, `"roll"`, `"temp_c"`, `"external_power"`
 

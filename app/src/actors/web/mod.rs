@@ -107,9 +107,10 @@ pub(crate) struct PendingShot {
 }
 
 /// The shots between `shot_trigger` and `shot_finished`: their data,
-/// assembled with FRP's shot lifecycle rules (first event of each kind, the
-/// 30 s timeout, closed shots ignored), and the web layer's own per-shot
-/// state, both by actor and shot id.
+/// assembled with FRP's shot lifecycle rules (first event of each kind,
+/// flighthook's [`SHOT_TIMEOUT`](flighthook::SHOT_TIMEOUT), closed shots
+/// ignored), and the web layer's own per-shot state, both by actor and shot
+/// id.
 #[derive(Default)]
 pub(crate) struct PendingShots {
     data: ShotAggregator,
@@ -247,7 +248,9 @@ pub struct WebState {
     pub device_identity: RwLock<HashMap<String, ExportDevice>>,
     /// Last `ActorStatus` message per actor — replayed to new WS clients.
     pub cached_actor_status: RwLock<HashMap<String, FlighthookMessage>>,
-    /// Last `DeviceTelemetry` message per actor — replayed to new WS clients.
+    /// Each actor's current device state as one `DeviceTelemetry` message,
+    /// every field and telemetry key at its latest value
+    /// ([`merge_device_telemetry`]) — replayed to new WS clients.
     pub cached_device_telemetry: RwLock<HashMap<String, FlighthookMessage>>,
     pub addr: SocketAddr,
     pub actor_id: String,
@@ -729,6 +732,61 @@ fn store_shot(
     evicted
 }
 
+/// Merge the `DeviceTelemetry` message `msg` into its actor's entry of
+/// `held`, the actor's current device state: every field and telemetry key
+/// at its latest value. A device that sends its identity and its keys in
+/// separate messages is replayed with all of them. A merged entry carries no
+/// raw payload. A message for another device id than the one held replaces
+/// the entry.
+fn merge_device_telemetry(held: &mut HashMap<String, FlighthookMessage>, msg: &FlighthookMessage) {
+    let Some(current) = held
+        .get_mut(&msg.actor)
+        .filter(|current| current.device == msg.device)
+    else {
+        held.insert(msg.actor.clone(), msg.clone());
+        return;
+    };
+    if let (
+        FlighthookEvent::DeviceTelemetry {
+            manufacturer,
+            model,
+            firmware,
+            source,
+            telemetry,
+        },
+        FlighthookEvent::DeviceTelemetry {
+            manufacturer: new_manufacturer,
+            model: new_model,
+            firmware: new_firmware,
+            source: new_source,
+            telemetry: new_telemetry,
+        },
+    ) = (&mut current.event, &msg.event)
+    {
+        for (field, new) in [
+            (manufacturer, new_manufacturer),
+            (model, new_model),
+            (firmware, new_firmware),
+        ] {
+            if new.is_some() {
+                field.clone_from(new);
+            }
+        }
+        if new_source.is_some() {
+            *source = *new_source;
+        }
+        if let Some(new) = new_telemetry {
+            telemetry
+                .get_or_insert_with(HashMap::new)
+                .extend(new.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        // The merged state is no single wire message.
+        current.raw_payload = None;
+    } else {
+        *current = msg.clone();
+    }
+}
+
 /// End `actor`'s pending shots uncounted, emitting the group records that
 /// changed.
 async fn drop_pending(
@@ -1161,11 +1219,7 @@ async fn apply_bus_event(
                     }
                 }
             }
-            state
-                .cached_device_telemetry
-                .write()
-                .await
-                .insert(msg.actor.clone(), msg.clone());
+            merge_device_telemetry(&mut *state.cached_device_telemetry.write().await, msg);
         }
         FlighthookEvent::DeviceTelemetry {
             telemetry: Some(tel),
@@ -1177,22 +1231,14 @@ async fn apply_bus_event(
                     actor.telemetry.insert(k.clone(), v.clone());
                 }
             }
-            // Cache the raw message for WS replay
-            state
-                .cached_device_telemetry
-                .write()
-                .await
-                .insert(msg.actor.clone(), msg.clone());
+            // Held for the WS replay
+            merge_device_telemetry(&mut *state.cached_device_telemetry.write().await, msg);
         }
         FlighthookEvent::DeviceTelemetry {
             telemetry: None, ..
         } => {
-            // Cache identity-only DeviceTelemetry too
-            state
-                .cached_device_telemetry
-                .write()
-                .await
-                .insert(msg.actor.clone(), msg.clone());
+            // Identity-only DeviceTelemetry too (e.g. a `source` alone)
+            merge_device_telemetry(&mut *state.cached_device_telemetry.write().await, msg);
         }
         // Alert, SetDetectionMode, ConfigCommand, ShotGroup — no web state
         // update needed
@@ -3350,5 +3396,67 @@ pub(crate) mod tests {
             "A's dropped shot is not stored"
         );
         assert!(up.pending.is_empty());
+    }
+
+    /// A device that sends its identity, its `source` and its keys in
+    /// separate messages is replayed to a client that connects later with
+    /// all of them in one `device_telemetry`, every key at its latest value.
+    /// A message for another device id starts over.
+    #[tokio::test]
+    async fn a_late_client_gets_the_devices_merged_telemetry() {
+        let (state, _writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        let telemetry = |manufacturer: Option<&str>,
+                         source: Option<flighthook::Provenance>,
+                         pairs: &[(&str, &str)]| {
+            FlighthookEvent::DeviceTelemetry {
+                manufacturer: manufacturer.map(str::to_owned),
+                model: None,
+                firmware: None,
+                source,
+                telemetry: (!pairs.is_empty()).then(|| kv(pairs)),
+            }
+        };
+        up.send("mock_monitor.0", telemetry(Some("Mock"), None, &[]))
+            .await;
+        up.send(
+            "mock_monitor.0",
+            telemetry(None, Some(flighthook::Provenance::Virtual), &[]),
+        )
+        .await;
+        up.send(
+            "mock_monitor.0",
+            telemetry(None, None, &[("ready", "false"), ("battery_pct", "80")]),
+        )
+        .await;
+        up.send(
+            "mock_monitor.0",
+            telemetry(None, None, &[("ready", "true")]),
+        )
+        .await;
+
+        let mut output = super::frp_out::FrpOutput::new();
+        let replay = super::ws::telemetry_replay(&state, &mut output).await;
+        assert_eq!(replay.len(), 1);
+        let json = |event: &FlighthookEvent| serde_json::to_value(event).expect("ser");
+        assert_eq!(
+            json(&replay[0].event),
+            json(&FlighthookEvent::DeviceTelemetry {
+                manufacturer: Some("Mock".into()),
+                model: None,
+                firmware: None,
+                source: Some(flighthook::Provenance::Virtual),
+                telemetry: Some(kv(&[("ready", "true"), ("battery_pct", "80")])),
+            })
+        );
+
+        let other = FlighthookMessage::new(telemetry(None, None, &[("ready", "false")]))
+            .actor("mock_monitor.0")
+            .device("another");
+        apply_bus_event(&state, &other, &mut up.pending).await;
+        let replay =
+            super::ws::telemetry_replay(&state, &mut super::frp_out::FrpOutput::new()).await;
+        assert_eq!(replay.len(), 1);
+        assert_eq!(json(&replay[0].event), json(&other.event));
     }
 }

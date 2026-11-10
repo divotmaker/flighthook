@@ -8,9 +8,12 @@
 //! configured surface, rests at the chosen total distance (carry + roll).
 //!
 //! [`send`] puts the shot on the bus as the virtual device
-//! [`AUTO_CHIP_ACTOR`], with the same lifecycle a device emits (trigger,
-//! ball flight with the simulated values, finished; no club data), so the
-//! outputs forward it and the web layer stores it like any shot. The chip is
+//! [`AUTO_CHIP_ACTOR`] (its actor and its FRP `device` id), with the same
+//! lifecycle a device emits (trigger, ball flight with the simulated values,
+//! finished; no club data), so the outputs forward it and the web layer
+//! stores it like any shot. Before each chip it sends a `device_telemetry`
+//! that declares its `source` as virtual, so an FRP client knows what the
+//! device is before its first shot. The chip is
 //! wholly flighthook's, so its ball flight always carries the simulated
 //! values, whatever the `[simulation]` mode.
 
@@ -180,16 +183,22 @@ pub(crate) fn send(
                 "auto-chip shot #{shot_number}: {yards}yd ball={speed:.2}mph VLA={LAUNCH_ELEVATION_DEG:.1} backspin={}rpm",
                 backspin_rpm(speed),
             );
+            let _ = bus.send(from_auto_chip(FlighthookEvent::DeviceTelemetry {
+                manufacturer: None,
+                model: None,
+                firmware: None,
+                source: Some(source.provenance()),
+                telemetry: None,
+            }));
             let _ = bus.send(
-                FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()))
-                    .actor(AUTO_CHIP_ACTOR)
+                from_auto_chip(FlighthookEvent::shot_trigger(key.clone()))
                     .provenance(source.provenance()),
             );
             key
         })
         .ok_or(SolveError::RoundActive)?;
     let send = |event| {
-        let _ = bus.send(FlighthookMessage::new(event).actor(AUTO_CHIP_ACTOR));
+        let _ = bus.send(from_auto_chip(event));
     };
     for event in sim::simulated_launch_events(
         &cfg,
@@ -209,6 +218,14 @@ pub(crate) fn send(
         })),
     });
     Ok((key, ball))
+}
+
+/// `event` as a message of the Auto-chip device: its actor and its FRP
+/// device id are both [`AUTO_CHIP_ACTOR`].
+fn from_auto_chip(event: FlighthookEvent) -> FlighthookMessage {
+    FlighthookMessage::new(event)
+        .actor(AUTO_CHIP_ACTOR)
+        .device(AUTO_CHIP_ACTOR)
 }
 
 #[cfg(test)]
@@ -297,9 +314,10 @@ mod tests {
         assert_eq!(solve_speed(1e-6, &cfg), Ok(MIN_SPEED_MPH));
     }
 
-    /// `send` puts trigger, ball flight (with the simulated total, in
-    /// Chipping mode, no club) and finished on the bus as the Auto-chip
-    /// actor, all under one key.
+    /// `send` puts the device telemetry declaring the chip virtual, then
+    /// trigger, launch (with the simulated total, in Chipping mode, no club)
+    /// and finished on the bus as the Auto-chip actor and device, the shot's
+    /// events under one key.
     #[test]
     fn send_emits_a_full_shot_lifecycle_as_auto_chip() {
         let dir = std::env::temp_dir().join(format!(
@@ -315,13 +333,24 @@ mod tests {
         let mut provenance = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             assert_eq!(msg.actor, AUTO_CHIP_ACTOR);
+            assert_eq!(msg.device.as_deref(), Some(AUTO_CHIP_ACTOR));
             provenance.push(msg.provenance);
             events.push(msg.event);
         }
-        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert!(matches!(
+            events.remove(0),
+            FlighthookEvent::DeviceTelemetry {
+                manufacturer: None,
+                model: None,
+                firmware: None,
+                source: Some(flighthook::Provenance::Virtual),
+                telemetry: None,
+            }
+        ));
         assert_eq!(
             provenance,
-            [Some(flighthook::Provenance::Virtual), None, None],
+            [None, Some(flighthook::Provenance::Virtual), None, None],
             "the trigger declares the chip virtual"
         );
         assert_eq!(

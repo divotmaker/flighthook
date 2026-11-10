@@ -448,7 +448,8 @@ mod tests {
         assert_eq!(pause.fire(&round, || 3), Fired::Held { logged: true });
     }
 
-    /// Every output's numbers for a mock shot in each detection mode.
+    /// Every output's numbers for a mock shot in each detection mode, from
+    /// the mock's own shot generator.
     #[test]
     fn outputs_keep_their_numbers() {
         for (case, mode) in [
@@ -462,6 +463,7 @@ mod tests {
                 ball,
                 Some(flight),
                 Some(club),
+                None,
                 Some(mode),
             );
             crate::test_ball::assert_outputs_pinned(case, &messages);
