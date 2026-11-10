@@ -340,7 +340,10 @@ mod tests {
 
     fn section(range: Option<flighthook::Distance>) -> R10Section {
         R10Section {
-            driver: R10Config { range },
+            driver: R10Config {
+                range,
+                ..R10Config::default()
+            },
             ..R10Section::default()
         }
     }
@@ -534,6 +537,42 @@ mod tests {
         out
     }
 
+    /// The recorded actor passed the device's spin tilt through with its
+    /// sign (+ = left); tenover's driver decodes it as FRP's + = right. Flip
+    /// the recorded sidespin and axis of a launch `l` that has spin, and
+    /// return whether it had any.
+    fn flip_recorded_spin(l: &mut Value) -> bool {
+        let spun = spun(l);
+        if spun {
+            for k in ["sidespin_rpm", "spin_axis"] {
+                if let Some(v) = l[k].as_f64() {
+                    l[k] = if l[k].is_i64() {
+                        json!(-l[k].as_i64().expect("int"))
+                    } else {
+                        json!(-v)
+                    };
+                }
+            }
+        }
+        spun
+    }
+
+    fn spun(launch: &Value) -> bool {
+        launch["total_spin_rpm"].as_i64().is_some_and(|t| t != 0)
+    }
+
+    /// A spun launch's simulated flight follows the corrected spin, so it is
+    /// compared by the output pins (`outputs_keep_their_numbers`), not here.
+    fn without_spun_flight(mut m: Value) -> Value {
+        if kind(&m) == "launch"
+            && spun(&m["event"]["launch"])
+            && let Some(event) = m["event"].as_object_mut()
+        {
+            event.remove("derived");
+        }
+        m
+    }
+
     /// The protocol messages in the recorded actor's BLE chunks of direction
     /// `dir` (each led by the MultiLink handle, messages COBS framed between
     /// zero bytes), as hex.
@@ -599,9 +638,16 @@ mod tests {
                 .map(|m| serde_json::to_value(m).expect("json"))
                 .collect(),
         );
-        let expected = expected_from_old(&old);
+        let mut expected = expected_from_old(&old);
+        for m in expected.iter_mut().filter(|m| kind(m) == "launch") {
+            flip_recorded_spin(&mut m["event"]["launch"]);
+        }
         for (n, (want, got)) in expected.iter().zip(&new).enumerate() {
-            assert_eq!(got, want, "message {n}");
+            assert_eq!(
+                without_spun_flight(got.clone()),
+                without_spun_flight(want.clone()),
+                "message {n}"
+            );
         }
         assert_eq!(
             new.len(),
@@ -640,10 +686,18 @@ mod tests {
                 .collect(),
         );
         assert_eq!(new_export.len(), old_export.len());
-        for (mut want, got) in old_export.into_iter().zip(new_export) {
+        for (mut want, mut got) in old_export.into_iter().zip(new_export) {
             assert_eq!(want["schema"], 2);
             want["schema"] = json!(flighthook::EXPORT_SCHEMA);
             want["time"] = got["time"].clone();
+            if flip_recorded_spin(&mut want["data"]["launch"]) {
+                for line in [&mut want, &mut got] {
+                    if let Some(data) = line["data"].as_object_mut() {
+                        data.remove("derived");
+                        data.remove("metrics");
+                    }
+                }
+            }
             assert_eq!(got, want);
         }
         assert_raw_matches(&old_export_raws, &new_export_raws);
@@ -702,7 +756,8 @@ mod tests {
             })
             .expect("a launch");
         assert_eq!(launch.total_spin_rpm, Some(2800));
-        assert_eq!(launch.spin_axis, Some(5.0));
+        // The golden shot's wire tilt of 5 is 5° left.
+        assert_eq!(launch.spin_axis, Some(-5.0));
         let mut components = flighthook::Launch {
             backspin_rpm: launch.backspin_rpm,
             sidespin_rpm: launch.sidespin_rpm,
@@ -710,7 +765,7 @@ mod tests {
         };
         components.complete_spin();
         assert_eq!(components.total_spin_rpm, launch.total_spin_rpm);
-        assert!((components.spin_axis.expect("axis") - 5.0).abs() < 0.05);
+        assert!((components.spin_axis.expect("axis") + 5.0).abs() < 0.05);
 
         let round = crate::state::round::RoundPolicy::default();
         let guard = round
