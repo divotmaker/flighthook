@@ -14,7 +14,9 @@ clap = ["dep:clap"]
 client = ["dep:tungstenite"]
 
 [dependencies]
-flightrelay = "0.5"
+# `config`: the driver settings contract (`DriverConfig`) the device
+# sections embed; adds no dependencies.
+flightrelay = { version = "0.5", features = ["config"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"], optional = true }

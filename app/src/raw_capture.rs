@@ -55,7 +55,8 @@ struct Window {
 /// Raw frame recorder for one device connection.
 pub struct RawCapture {
     cfg: RawCaptureConfig,
-    ring: VecDeque<(Instant, RawRecord)>,
+    /// Frames before the trigger, each with whether it is bulk.
+    ring: VecDeque<(Instant, RawRecord, bool)>,
     window: Option<Window>,
     enabled: bool,
 }
@@ -82,19 +83,33 @@ impl RawCapture {
         if !self.enabled || (self.cfg.exclude)(&rec) {
             return;
         }
+        let bulk = (self.cfg.is_bulk)(&rec);
+        self.record(rec, at, bulk);
+    }
+
+    /// Record one frame that crossed the transport at `at`, already cleared
+    /// for capture and classified by its source: `bulk` charges it to the
+    /// bulk byte budget instead of the frame cap. The config's `exclude` and
+    /// `is_bulk` are not asked.
+    pub fn push_classified(&mut self, rec: RawRecord, at: Instant, bulk: bool) {
+        if self.enabled {
+            self.record(rec, at, bulk);
+        }
+    }
+
+    fn record(&mut self, rec: RawRecord, at: Instant, bulk: bool) {
         if self.window.is_some() {
-            self.admit(rec, at);
+            self.admit(rec, at, bulk);
         } else if self.cfg.pre_roll_frames > 0 {
             if self.ring.len() == self.cfg.pre_roll_frames {
                 self.ring.pop_front();
             }
-            self.ring.push_back((at, rec));
+            self.ring.push_back((at, rec, bulk));
         }
     }
 
     /// Append a frame to the open window, subject to the per-shot caps.
-    fn admit(&mut self, rec: RawRecord, at: Instant) {
-        let bulk = (self.cfg.is_bulk)(&rec);
+    fn admit(&mut self, rec: RawRecord, at: Instant, bulk: bool) {
         let len = rec.payload_len();
         let (max_frames, max_bulk) = (self.cfg.max_frames, self.cfg.max_bulk_bytes);
         let Some(w) = self.window.as_mut() else {
@@ -123,7 +138,8 @@ impl RawCapture {
         self.mark_trigger_at(Instant::now());
     }
 
-    fn mark_trigger_at(&mut self, at: Instant) {
+    /// Open the shot window as of `at`, the moment of the trigger.
+    pub fn mark_trigger_at(&mut self, at: Instant) {
         if let Some(stale) = self.window.take() {
             tracing::debug!(
                 "raw capture: discarding an unfinished shot window ({} frames)",
@@ -137,8 +153,8 @@ impl RawCapture {
             bulk_bytes: 0,
             dropped: 0,
         });
-        for (t, rec) in std::mem::take(&mut self.ring) {
-            self.admit(rec, t);
+        for (t, rec, bulk) in std::mem::take(&mut self.ring) {
+            self.admit(rec, t, bulk);
         }
     }
 

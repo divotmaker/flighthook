@@ -1,5 +1,6 @@
 use std::fmt;
 
+use flightrelay::config::DriverConfig;
 use flightrelay::units::{Distance, Velocity};
 use serde::{Deserialize, Serialize};
 
@@ -1607,6 +1608,36 @@ pub struct ExPuttSection {
 
 fn is_none_or_empty_map(m: &Option<std::collections::BTreeMap<String, f64>>) -> bool {
     m.as_ref().is_none_or(std::collections::BTreeMap::is_empty)
+}
+
+/// The config section of a card whose device runs on a flightrelay device
+/// driver: flighthook's own fields (`name`, `enabled`, `impact_lead_s`, ...)
+/// with the driver's settings flattened next to them, so the file and the
+/// REST JSON hold one flat table per card. No driver key has the name of a
+/// host field.
+pub trait DeviceSection:
+    Serialize + serde::de::DeserializeOwned + Clone + PartialEq + fmt::Debug + Send + Sync + 'static
+{
+    /// The driver's settings.
+    type Driver: DriverConfig;
+
+    /// The section type's key in the config, e.g. `mock_monitor`.
+    const KIND: &'static str;
+
+    /// The driver's settings in this section.
+    fn driver(&self) -> &Self::Driver;
+
+    /// The sections of this type in `config`, by index.
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self>;
+
+    /// Why this section's driver settings are not usable, as
+    /// `"<id>: <field>: <reason>"` for the section with ID `id` (e.g.
+    /// `mock_monitor.0`), or `None` when the driver accepts them
+    /// ([`DriverConfig::validate`]).
+    #[must_use]
+    fn driver_error(&self, id: &str) -> Option<String> {
+        self.driver().validate().err().map(|e| format!("{id}: {e}"))
+    }
 }
 
 /// A mock launch monitor instance.

@@ -50,6 +50,11 @@ pub struct RawRecord {
     /// `"register"`, TCP `"tcp"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// The device driver's own name for the frame, e.g. `"notify 11"`,
+    /// stored as the driver gave it. Frames from a flightrelay device driver
+    /// carry this instead of `type`, `src`, `dst` and `channel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Payload bytes as lowercase hex, no separators (binary protocols).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hex: Option<String>,
@@ -70,6 +75,7 @@ impl RawRecord {
             src: None,
             dst: None,
             channel: None,
+            label: None,
             hex: Some(hex_lower(bytes)),
             text: None,
         }
@@ -85,6 +91,7 @@ impl RawRecord {
             src: None,
             dst: None,
             channel: None,
+            label: None,
             hex: None,
             text: Some(text.into()),
         }
@@ -203,6 +210,7 @@ mod tests {
             src: Some("DSP".into()),
             dst: Some("APP".into()),
             channel: None,
+            label: None,
             hex: Some(hex_lower(&[0x9C, 0x00, 0xAB])),
             text: None,
         }

@@ -445,6 +445,7 @@ fn attach_raw_capture<S: Read + Write>(
             src: Some(env.src.to_string()),
             dst: Some("APP".into()),
             channel: None,
+            label: None,
             hex: Some(hex_lower(&env.raw)),
             text: None,
         });
