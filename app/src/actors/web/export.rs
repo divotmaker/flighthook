@@ -99,7 +99,7 @@ pub fn jsonl_line(
         }
         Err(e) => {
             tracing::warn!(
-                "shot export: could not serialise shot {}: {e}",
+                "shot export: could not serialize shot {}: {e}",
                 line.shot_id
             );
             String::new()
@@ -477,6 +477,8 @@ mod tests {
             dropped: 0,
             pose: false,
             swing: false,
+            rotation: 0,
+            analyzed_with: None,
         }];
         for units in [None, Some(UnitSystem::Imperial), Some(UnitSystem::Metric)] {
             let line = jsonl_line(&shot, "t", units, true);

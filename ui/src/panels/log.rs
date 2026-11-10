@@ -232,7 +232,7 @@ pub(crate) fn event_debug(event: &FlighthookEvent) -> String {
             1 => "clip of 1 shot removed".into(),
             n => format!("clips of {n} shots removed"),
         },
-        FlighthookEvent::ShotPose { keys } => {
+        FlighthookEvent::ShotPose { keys, .. } => {
             format!("body tracking of clip {} done", shot_numbers(keys))
         }
         FlighthookEvent::ShotSwing { keys } => {
@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_clips_are_summarised_in_their_own_group() {
+    fn camera_clips_are_summarized_in_their_own_group() {
         use crate::types::{CameraPosition, ShotKey};
         let key = |n: u32| ShotKey {
             shot_id: format!("s{n}"),
@@ -503,7 +503,10 @@ mod tests {
                 "shot_swing"
             ]
         );
-        let pose = FlighthookEvent::ShotPose { keys: vec![key(4)] };
+        let pose = FlighthookEvent::ShotPose {
+            keys: vec![key(4)],
+            rotation: 90,
+        };
         assert_eq!(message_type(&pose), "shot_pose");
         assert_eq!(event_debug(&pose), "body tracking of clip #4 done");
         let swing = FlighthookEvent::ShotSwing {
@@ -514,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn hand_info_is_a_game_event_summarised_as_the_hand() {
+    fn hand_info_is_a_game_event_summarized_as_the_hand() {
         use crate::types::{HandInfo, Handedness};
         for (handed, summary) in [
             (Handedness::Left, "hand=LH"),

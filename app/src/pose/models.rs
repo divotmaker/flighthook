@@ -100,7 +100,7 @@ pub trait Source: Send + Sync {
     fn verified(&self, spec: &ModelSpec, dir: &Path) -> bool;
 
     /// Download `spec` into `dir`, reporting progress and stopping once
-    /// `cancel` is set (`stance::Error::Cancelled`), its partial file
+    /// `cancel` is set (`stance::Error::Canceled`), its partial file
     /// deleted.
     ///
     /// # Errors
@@ -469,7 +469,7 @@ impl Models {
 
     /// Stop the download running, if any: its partial file is deleted as
     /// soon as its thread notices (between two reads). Returns whether one
-    /// was running. A cancelled download leaves no failure behind.
+    /// was running. A canceled download leaves no failure behind.
     pub fn cancel_download(&self) -> bool {
         let mut slot = self.download.lock().unwrap_or_else(|e| e.into_inner());
         slot.failed = None;
@@ -478,7 +478,7 @@ impl Models {
         };
         running.cancel.store(true, Ordering::SeqCst);
         info!(
-            "body tracking: download of {} cancelled",
+            "body tracking: download of {} canceled",
             running.model.label()
         );
         true
@@ -617,7 +617,7 @@ struct Download {
 }
 
 impl Download {
-    /// Update this download's entry with `f`, unless it was cancelled (the
+    /// Update this download's entry with `f`, unless it was canceled (the
     /// slot then holds no download, or a later one).
     fn update(&self, f: impl FnOnce(&mut Running)) {
         let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -663,8 +663,8 @@ impl Download {
                 spec.sha256
             );
         }
-        let cancelled =
-            self.cancel.load(Ordering::SeqCst) || matches!(result, Err(stance::Error::Cancelled));
+        let canceled =
+            self.cancel.load(Ordering::SeqCst) || matches!(result, Err(stance::Error::Canceled));
         let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         let ours = slot
             .running
@@ -674,7 +674,7 @@ impl Download {
             slot.running = None;
         }
         match result {
-            _ if cancelled => debug!("body tracking: the cancelled download stopped"),
+            _ if canceled => debug!("body tracking: the canceled download stopped"),
             Ok(()) => {
                 info!(
                     "body tracking: {} downloaded in {:.1} s",
@@ -740,7 +740,7 @@ fn mb(bytes: u64) -> f64 {
 
 /// A stand-in for the official sources (tests): a file counts as verified
 /// when it holds [`Fake::CONTENT`]; a download writes it in steps into a
-/// `<file>.part-fake` file, honouring the cancel flag, or fails.
+/// `<file>.part-fake` file, honoring the cancel flag, or fails.
 #[cfg(test)]
 pub mod fake {
     use super::*;
@@ -821,7 +821,7 @@ pub mod fake {
                 std::thread::sleep(self.step);
                 if cancel.load(Ordering::SeqCst) {
                     let _ = std::fs::remove_file(&part);
-                    return Err(stance::Error::Cancelled);
+                    return Err(stance::Error::Canceled);
                 }
                 let outcome = self
                     .outcome
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_download_removes_its_partial_file_and_leaves_no_failure() {
+    fn a_canceled_download_removes_its_partial_file_and_leaves_no_failure() {
         let dir = temp_dir("cancel");
         let fake = Fake::new(1000, Duration::from_millis(5));
         let models = Models::new(dir.clone(), fake.clone());

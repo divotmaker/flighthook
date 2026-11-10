@@ -422,7 +422,7 @@ impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
     }
 }
 
-/// The centre of a `src`-sized picture (width, height) cut to the aspect of
+/// The center of a `src`-sized picture (width, height) cut to the aspect of
 /// `dst`: `[x, y, width, height]` in source pixels.
 pub(crate) fn crop(src: [usize; 2], dst: [usize; 2]) -> [usize; 4] {
     let [sw, sh] = src;
@@ -885,7 +885,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_crop_keeps_the_centre_at_the_card_aspect() {
+    fn a_crop_keeps_the_center_at_the_card_aspect() {
         // A 16:9 picture into a square card: the sides go.
         assert_eq!(crop([1280, 720], [200, 200]), [280, 0, 720, 720]);
         // Into a tall card (1:2): narrower still.
@@ -904,7 +904,7 @@ pub(crate) mod tests {
                 let aspect = |a: usize, b: usize| a as f64 / b as f64;
                 let error = (aspect(w, h) - aspect(dst[0], dst[1])).abs() * h as f64;
                 assert!(error <= 1.0, "{src:?} {dst:?}: {w}x{h}");
-                // Centred.
+                // Centered.
                 assert!((src[0] - w) / 2 == x && (src[1] - h) / 2 == y);
             }
         }

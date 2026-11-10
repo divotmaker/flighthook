@@ -10,8 +10,8 @@
 //!
 //! The swing analysis's body shifts from address don't depend on the hand
 //! either: the sideways ones (hip sway, head sway) are measured along the
-//! target line, + towards the target for either hand; hip depth is measured
-//! down the line, + towards the ball; head height is + up.
+//! target line, + toward the target for either hand; hip depth is measured
+//! down the line, + toward the ball; head height is + up.
 //!
 //! A value of exactly 0 has no word.
 
@@ -93,6 +93,30 @@ pub(crate) fn rise(v: f64) -> Option<&'static str> {
     by_sign(v, "Up", "Down")
 }
 
+/// A turn graded against its band (+ open, toward the target, for either
+/// hand): `Open` or `Closed`.
+pub(crate) fn turn(v: f64) -> Option<&'static str> {
+    by_sign(v, "Open", "Closed")
+}
+
+/// The word for a graded value's direction off its band, from its key
+/// (`open`, `toward_ball`, `less`, ...).
+pub(crate) fn direction(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "open" => "Open",
+        "closed" => "Closed",
+        "toward" => "Toward",
+        "away" => "Away",
+        "up" => "Up",
+        "down" => "Down",
+        "toward_ball" => "Toward ball",
+        "back" => "Back",
+        "more" => "More",
+        "less" => "Less",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +180,35 @@ mod tests {
         assert_eq!(rise(-0.04), Some("Down"));
         assert_eq!(rise(0.0), None);
         assert_eq!(rise(-0.0), None);
+    }
+
+    #[test]
+    fn a_graded_turn_is_open_or_closed_for_both_hands() {
+        assert_eq!(turn(38.0), Some("Open"));
+        assert_eq!(turn(-40.0), Some("Closed"));
+        assert_eq!(turn(0.0), None);
+    }
+
+    #[test]
+    fn every_direction_off_a_band_has_its_word() {
+        let words: Vec<_> = [
+            "open",
+            "closed",
+            "toward",
+            "away",
+            "up",
+            "down",
+            "toward_ball",
+            "back",
+            "more",
+            "less",
+        ]
+        .iter()
+        .map(|k| direction(k))
+        .collect();
+        assert!(words.iter().all(Option::is_some), "{words:?}");
+        assert_eq!(direction("toward_ball"), Some("Toward ball"));
+        assert_eq!(direction("sideways"), None);
     }
 
     #[test]

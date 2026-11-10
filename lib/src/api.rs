@@ -66,7 +66,7 @@ pub struct ActorStatusResponse {
     /// left of the alert after a lost connection, else 0.
     #[serde(default)]
     pub red_for_ms: u64,
-    /// This process's record of the actor's statuses. Not serialised: a
+    /// This process's record of the actor's statuses. Not serialized: a
     /// reply carries it as `state` and `red_for_ms`.
     #[serde(skip)]
     history: StatusHistory,

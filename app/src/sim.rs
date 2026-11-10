@@ -147,7 +147,7 @@ fn shot_input(ball: &BallFlight) -> Result<ShotInput, &'static str> {
 /// Where the device reports carry (or roll), the simulated total is that
 /// measured carry plus the simulated roll, so carry + roll = total holds for
 /// the values a consumer displays. The path is simulated, fitted to the
-/// measured values ([`anchor_path`]), decimated and rounded to centimetres
+/// measured values ([`anchor_path`]), decimated and rounded to centimeters
 /// and milliseconds; the offlines are its landing and rest `z`.
 ///
 /// With [`SimMode::Force`], nothing the device reported counts as
@@ -408,7 +408,7 @@ fn derive_ground_ball(
 
 /// A full-resolution path in the frame `sim` reads every scalar from, the
 /// same as [`FlightPath`]: points are `[t, x, y, z]`, seconds since launch,
-/// metres downrange, metres up, metres right of the target line (FRP's
+/// meters downrange, meters up, meters right of the target line (FRP's
 /// positive = right, so a point's `z` has the sign of `carry_offline`),
 /// origin at the tee.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -473,7 +473,7 @@ impl FullPath {
     }
 
     /// The path as sent: decimated and rounded to milliseconds and
-    /// centimetres.
+    /// centimeters.
     fn decimated(&self) -> FlightPath {
         FlightPath {
             flight: round_points(&decimate_flight(&self.flight)),
@@ -496,7 +496,7 @@ fn nearest_time(points: &[[f64; 4]], t: f64) -> Option<usize> {
     }
 }
 
-/// The values the device measured that the path is fitted to, metres and
+/// The values the device measured that the path is fitted to, meters and
 /// seconds.
 #[derive(Debug, Clone, Copy, Default)]
 struct Measured {
@@ -1064,7 +1064,7 @@ fn reinsert(out: &mut [[f64; 4]], point: [f64; 4]) {
     out[i] = point;
 }
 
-/// Round to milliseconds and centimetres, dropping a point whose rounded
+/// Round to milliseconds and centimeters, dropping a point whose rounded
 /// time does not advance (the last point is kept in place of the one before
 /// it).
 fn round_points(points: &[[f64; 4]]) -> Vec<[f64; 4]> {

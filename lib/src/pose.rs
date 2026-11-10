@@ -18,7 +18,7 @@ pub const HALPE26: &str = "halpe26";
 pub const HALPE26_KEYPOINTS: usize = 26;
 
 /// The Halpe-26 bones to draw, as pairs of keypoint indices: legs to the hip
-/// centre, head and neck, arms from the neck, the face, and each foot from
+/// center, head and neck, arms from the neck, the face, and each foot from
 /// its ankle.
 pub const HALPE26_BONES: [(usize, usize); 27] = [
     (15, 13),
@@ -57,14 +57,14 @@ pub enum BodySide {
     Left,
     /// The golfer's right.
     Right,
-    /// On the midline: nose, head, neck, hip centre.
+    /// On the midline: nose, head, neck, hip center.
     Center,
 }
 
 /// The side of Halpe-26 keypoint `i`: among the 17 COCO points the odd
 /// indices after the nose are the left side and the even ones the right;
 /// among the six foot points (20 to 25) the even ones are the left; head
-/// (17), neck (18), hip centre (19) and the nose are on the midline.
+/// (17), neck (18), hip center (19) and the nose are on the midline.
 #[must_use]
 pub fn halpe26_side(i: usize) -> BodySide {
     match i {
@@ -125,7 +125,7 @@ pub struct LivePosture {
     pub view: SwingView,
     /// Spine (hips to shoulders) from vertical: face-on the sideways tilt,
     /// positive with the shoulders away from the target; down the line the
-    /// forward bend, positive towards the ball.
+    /// forward bend, positive toward the ball.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spine_angle: Option<f32>,
     /// Shoulder line from horizontal, positive with the lead shoulder
@@ -282,7 +282,7 @@ impl SwingReportFile {
 pub struct SwingScale {
     /// The torso length at address in pixels: the `torso` unit.
     pub torso_px: f64,
-    /// Centimetres per pixel, when the golfer's height was given.
+    /// Centimeters per pixel, when the golfer's height was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cm_per_px: Option<f64>,
 }
@@ -337,7 +337,7 @@ pub struct SwingMetricSeries {
     pub values: Vec<Option<f64>>,
 }
 
-/// A metric's value at one frame (and its centimetres, for a `torso`
+/// A metric's value at one frame (and its centimeters, for a `torso`
 /// metric when the golfer's height was given).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwingSample {
@@ -463,8 +463,14 @@ pub struct SwingEventsFile {
     pub address: Option<SwingEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub takeaway: Option<SwingEvent>,
+    /// The lead arm parallel to the ground in the backswing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_parallel_back: Option<SwingEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top: Option<SwingEvent>,
+    /// The lead arm parallel to the ground in the downswing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_parallel_down: Option<SwingEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact: Option<SwingEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -477,14 +483,29 @@ pub struct SwingEventsFile {
 impl SwingEventsFile {
     /// The events in swing order with their names.
     #[must_use]
-    pub fn named(&self) -> [(&'static str, Option<SwingEvent>); 5] {
+    pub fn named(&self) -> [(&'static str, Option<SwingEvent>); 7] {
         [
             ("Address", self.address),
             ("Takeaway", self.takeaway),
+            ("Lead arm back", self.arm_parallel_back),
             ("Top", self.top),
+            ("Lead arm down", self.arm_parallel_down),
             ("Impact", self.impact),
             ("Finish", self.finish),
         ]
+    }
+
+    /// The event at key position `position` ([`SwingPosition`]).
+    #[must_use]
+    pub fn at(&self, position: SwingPosition) -> Option<SwingEvent> {
+        match position {
+            SwingPosition::Address => self.address,
+            SwingPosition::ArmParallelBack => self.arm_parallel_back,
+            SwingPosition::Top => self.top,
+            SwingPosition::ArmParallelDown => self.arm_parallel_down,
+            SwingPosition::Impact => self.impact,
+            SwingPosition::Finish => self.finish,
+        }
     }
 }
 
@@ -508,7 +529,7 @@ pub struct SwingMetric {
     /// The value at each key position.
     #[serde(default)]
     pub values: SwingPositions,
-    /// A `torso` metric's values in centimetres, when the golfer's height
+    /// A `torso` metric's values in centimeters, when the golfer's height
     /// was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cm: Option<SwingPositions>,
@@ -520,12 +541,85 @@ pub struct SwingMetric {
 pub struct SwingPositions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<f64>,
+    /// The lead arm parallel to the ground in the backswing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_parallel_back: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top: Option<f64>,
+    /// The lead arm parallel to the ground in the downswing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_parallel_down: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish: Option<f64>,
+}
+
+impl SwingPositions {
+    /// The value at key position `position`.
+    #[must_use]
+    pub fn at(&self, position: SwingPosition) -> Option<f64> {
+        match position {
+            SwingPosition::Address => self.address,
+            SwingPosition::ArmParallelBack => self.arm_parallel_back,
+            SwingPosition::Top => self.top,
+            SwingPosition::ArmParallelDown => self.arm_parallel_down,
+            SwingPosition::Impact => self.impact,
+            SwingPosition::Finish => self.finish,
+        }
+    }
+}
+
+/// A key position of a swing, in swing order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwingPosition {
+    Address,
+    /// The lead arm parallel to the ground in the backswing.
+    ArmParallelBack,
+    Top,
+    /// The lead arm parallel to the ground in the downswing.
+    ArmParallelDown,
+    Impact,
+    Finish,
+}
+
+impl SwingPosition {
+    /// Every key position, in swing order.
+    pub const ALL: [Self; 6] = [
+        Self::Address,
+        Self::ArmParallelBack,
+        Self::Top,
+        Self::ArmParallelDown,
+        Self::Impact,
+        Self::Finish,
+    ];
+
+    /// Stable key, as reports and grades name it (`arm_parallel_back`).
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Address => "address",
+            Self::ArmParallelBack => "arm_parallel_back",
+            Self::Top => "top",
+            Self::ArmParallelDown => "arm_parallel_down",
+            Self::Impact => "impact",
+            Self::Finish => "finish",
+        }
+    }
+
+    /// Its name on screen.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Address => "Address",
+            Self::ArmParallelBack => "Lead arm back",
+            Self::Top => "Top",
+            Self::ArmParallelDown => "Lead arm down",
+            Self::Impact => "Impact",
+            Self::Finish => "Finish",
+        }
+    }
 }
 
 /// Where body tracking's model files are (`GET
@@ -722,12 +816,13 @@ mod swing_tests {
             "height_cm":180.0,"scale":{"torso_px":200.0,"cm_per_px":0.25},
             "smoothing":{"min_score":0.3,"max_gap_ns":150000000,"cutoff_hz":8.0,"order":2},
             "events":{"address":{"t_ns":1000000000,"frame":120,"confidence":0.8},
+              "arm_parallel_back":{"t_ns":1600000000,"frame":192,"confidence":0.7},
               "top":{"t_ns":1850000000,"frame":222,"confidence":0.9},
               "impact":{"t_ns":2150000000,"frame":258,"confidence":0.9},
               "impact_source":"refined"},
             "tempo":{"backswing_ns":841666667,"downswing_ns":300000000,"ratio":2.81},
             "metrics":[{"id":"hip_sway","view":"face_on","unit":"torso",
-              "values":{"top":-0.05,"impact":0.12},"cm":{"top":-2.5,"impact":6.0},"confidence":0.8},
+              "values":{"arm_parallel_down":0.08,"top":-0.05,"impact":0.12},"cm":{"top":-2.5,"impact":6.0},"confidence":0.8},
               {"id":"some_new_metric","view":null,"unit":"degrees","values":{"impact":3.0},"confidence":0.5}]}"#;
         let r: SwingReportFile = serde_json::from_str(json).unwrap();
         assert_eq!(r.view, Some(SwingView::FaceOn));
@@ -736,7 +831,30 @@ mod swing_tests {
         assert_eq!(r.height_cm, Some(180.0));
         assert!(r.events.takeaway.is_none());
         assert_eq!(r.events.top.map(|e| e.t_ns), Some(1_850_000_000));
-        assert_eq!(r.events.named()[3].0, "Impact");
+        assert_eq!(r.events.named()[5].0, "Impact");
+        assert_eq!(
+            r.events.at(SwingPosition::ArmParallelBack).map(|e| e.t_ns),
+            Some(1_600_000_000)
+        );
+        assert!(r.events.at(SwingPosition::ArmParallelDown).is_none());
+        assert_eq!(
+            r.metrics[0].values.at(SwingPosition::ArmParallelDown),
+            Some(0.08)
+        );
+        for p in SwingPosition::ALL {
+            assert_eq!(serde_json::to_value(p).unwrap(), p.key());
+        }
+        assert_eq!(
+            SwingPosition::ALL.map(SwingPosition::label),
+            [
+                "Address",
+                "Lead arm back",
+                "Top",
+                "Lead arm down",
+                "Impact",
+                "Finish"
+            ]
+        );
         assert!((r.tempo.unwrap().ratio - 2.81).abs() < 1e-9);
         assert_eq!(r.metrics.len(), 2);
         assert_eq!(r.metrics[0].id, "hip_sway");
@@ -840,7 +958,7 @@ mod swing_tests {
         assert_eq!(r.series.frame_at(31), None);
         let s = r.sample("hip_turn", 20).unwrap();
         assert_eq!((s.unit.as_str(), s.value, s.cm), ("degrees", 40.0, None));
-        // A torso share with its centimetres from the scale.
+        // A torso share with its centimeters from the scale.
         let s = r.sample("hip_sway", 21).unwrap();
         assert_eq!((s.value, s.cm), (-0.02, Some(-0.02 * 200.0 * 0.25)));
         assert!(r.sample("hip_turn", 0).is_none(), "no value at that frame");

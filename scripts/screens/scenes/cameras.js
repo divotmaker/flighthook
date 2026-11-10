@@ -1,9 +1,9 @@
 'use strict';
 // screens/cameras.png: Shots tab, Cameras pane. Two cameras play the CC0
 // swing clips (face-on and down-the-line, see lib/footage.js) through
-// flighthook's `clip:` camera, body tracking is Live, and two shots come
-// from an Open Connect launch monitor. Shot #2 is shown with both clips
-// paused on the impact tick. Body tracking starts Historical (a clip is
+// flighthook's `clip:` camera, body tracking is Live, and two driver shots
+// come from an Open Connect launch monitor. Shot #2 is shown with both clips
+// paused on the impact tick, its numbers colored against the tour bands. Body tracking starts Historical (a clip is
 // tracked when it is first viewed) and turns Live before shot #2, so only
 // shot #2's clips are tracked: shot #1's are never shown.
 //
@@ -19,13 +19,13 @@ const { Monitor } = require('../lib/openconnect');
 const BALL = { Speed: 150.0, VLA: 12.0, HLA: 1.0, TotalSpin: 2800.0, SpinAxis: 2.0 };
 const CAMERAS = ['camera.0', 'camera.1'];
 
-/** Wait until shot `n` has both cameras' clips (`analysed`: with keypoints and swing analysis). */
-async function clips(fh, n, analysed) {
-  return until(`shot ${n}'s clips${analysed ? ', tracked and analysed' : ''}`, async () => {
+/** Wait until shot `n` has both cameras' clips (`analyzed`: with keypoints and swing analysis). */
+async function clips(fh, n, analyzed) {
+  return until(`shot ${n}'s clips${analyzed ? ', tracked and analyzed' : ''}`, async () => {
     const shots = await fh.get('/api/shots?limit=50');
     const shot = shots.find((s) => s.shot_number === n);
     const video = (shot && shot.video) || [];
-    return CAMERAS.every((c) => video.some((v) => v.camera === c && (!analysed || (v.pose && v.swing))));
+    return CAMERAS.every((c) => video.some((v) => v.camera === c && (!analyzed || (v.pose && v.swing))));
   }, { timeoutMs: 180000, everyMs: 250 });
 }
 
@@ -102,6 +102,8 @@ latency_s = 0.0
       const { actors } = await fh.get('/api/status');
       return CAMERAS.every((c) => actors[c] && actors[c].status === 'connected');
     });
+    // The club picks the bands the swing numbers are graded against.
+    await fh.post('/api/club', { club: 'DR' });
     const monitor = new Monitor(ctx.ports.monitor, { deviceId: 'Harness' });
     ctx.cleanup.push(() => monitor.close());
     await monitor.connect();

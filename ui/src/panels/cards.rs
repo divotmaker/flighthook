@@ -378,6 +378,7 @@ mod tests {
             random_club: _,
             replay: _,
             body_tracking: _,
+            player: _,
             camera: _,
         } = flighthook::FlighthookConfig::default();
         for key in [

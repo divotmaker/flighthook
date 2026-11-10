@@ -45,6 +45,20 @@ pub struct ShotVideo {
     /// false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub swing: bool,
+    /// The camera's rotation, clockwise degrees (0, 90, 180 or 270), that
+    /// the body tracking of the clip was done with: its keypoints are in
+    /// the frame turned by it. Omitted at 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation: u16,
+    /// The version of the body tracking library that tracked the clip.
+    /// Omitted until the clip is tracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_with: Option<String>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_zero(v: &u16) -> bool {
+    *v == 0
 }
 
 /// `GET /api/cameras`: the cameras this computer has.

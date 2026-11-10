@@ -695,7 +695,7 @@ fn connect_and_run(
         Err(e) => {
             tracing::debug!(
                 "gspro bridge: no local address ({e}); our own Open Connect server \
-                 cannot recognise this connection"
+                 cannot recognize this connection"
             );
             None
         }

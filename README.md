@@ -75,7 +75,7 @@ serves it at `ws://<host>:5880/frp` and negotiates the spec version on connect,
 currently `0.1.0`.
 
 Whatever the monitor is — a Mevo+ over its binary TCP protocol, an R10 over BLE,
-a Uneekor over OpenConnect — it is normalised into the same FRP event stream, so
+a Uneekor over OpenConnect — it is normalized into the same FRP event stream, so
 a consumer is written once rather than per device.
 
 The shot lifecycle events (`shot_trigger`, `ball_flight`, `club_path`,
@@ -155,10 +155,13 @@ Terminal. Allow it.
 - Body tracking: the golfer's skeleton drawn over the replays, with each
   swing's tempo (averaged over the cameras), key moments and body angles,
   and the hip turn, shoulder turn, hip sway and spine at the frame on screen,
+  colored against published tour (or amateur) averages, with a fade and a
+  draw band for the numbers that depend on the shot's shape,
   found on this computer's CPU with RTMPose; Off (the default), Historical (a clip is
   tracked the first time it is viewed, which keeps the CPU free while you
   play) or Live (every camera live and every clip as it is recorded), set
-  on the Devices tab's Body tracking card; its models (about 76 MB) are
+  on the Devices tab's Body tracking card (the player's sex and height on the
+  Player card); its models (about 76 MB) are
   downloaded only after you confirm it, with the download's progress on
   screen (alpha) — see
   [Body tracking](docs/devices/cameras.md#body-tracking-alpha)
@@ -337,7 +340,7 @@ Open Connect monitors that send it), a **face impact** card (beta) joins the
 row: the club face of the shown shot's club, drawn as the ball sees
 it (toe on the left for a right-hander, mirrored for a left-hander), with
 the shown shot as a gold dot, the rest of its set or club as dots, and a
-readout such as `4 toe · 2 low` in millimetres. The **Table**
+readout such as `4 toe · 2 low` in millimeters. The **Table**
 has Impact H and Impact V columns in the same words. Directional cards show
 the size of the value with a word for its side: L / R, Draw / Fade,
 In-to-out / Out-to-in, Up / Down, Open / Closed, read for the golfer's
@@ -361,17 +364,17 @@ screen without scrolling.
 The **Flight** chart (beta) draws the simulated ball flights side on, as
 smooth curves through the simulated path that keep each bounce's corner: the
 shown shot in gold with its apex,
-carry and total labelled above their marks, the rest of its set (By set) or club (By club)
+carry and total labeled above their marks, the rest of its set (By set) or club (By club)
 bright, and the session's other shots faint behind them; None draws the
 shown shot alone. With two or more devices and the filter on All, the paths
-are coloured by device. A ground ball is drawn as its roll along the ground
+are colored by device. A ground ball is drawn as its roll along the ground
 from the tee to rest; a set of only ground balls gets a short distance axis.
 Shots without a simulated path get ticks at their carry and total. Hover a path for its numbers; click it to show that shot.
 
 The **Dispersion** chart (beta) shows the same shots from above, on equal scales with the tee at the
 bottom: where each came to rest (**Total**, the default) or landed
 (**Carry**), the shown shot in gold with its roll, and a dispersion ellipse
-over the bright shots, one per device when they are coloured by device.
+over the bright shots, one per device when they are colored by device.
 The ellipse holds about 86 % of a normal pattern (**2σ**, the default) or
 95 % (**95 %**); hover it for its size. A shot is placed by its simulated
 path, else by its carry or total and offline (measured or simulated); shots
@@ -393,6 +396,10 @@ the download icon next to its name.
   impact is estimated a fixed time before their report (beta); each monitor
   has a default, and **Camera timing** on its card's Settings side changes
   it. See [Cameras](docs/devices/cameras.md#when-a-clip-starts-and-ends).
+- A camera mounted on its side gets a **Rotation** (90° or 270°) on its card's
+  Settings side: the picture is turned upright everywhere it is shown and
+  tracked, so a face-on camera fits the whole swing from about 2 m (6 ft).
+  See [Cameras](docs/devices/cameras.md#rotation-yaw-and-pitch).
 - Clips are kept on disk, the newest 20 by default: about 2 GB for two
   720p 120 fps cameras. The Devices tab's Replay card sets how many and
   shows the folder; `clip_dir` under `[replay]` in the config file moves it.
@@ -401,13 +408,22 @@ the download icon next to its name.
   [Second screen](#second-screen-on-a-tablet-or-phone)).
 
 With body tracking on, each clip shows its pose skeleton and swing data, and
-the scrubber marks the swing's address, takeaway, top and finish (hover a
-mark for its name, click it to jump there). Under the tempo, a row of tiles
+the scrubber marks the swing's address, takeaway, lead arm back, top, lead
+arm down and finish (hover a mark for its name, click it to jump there). Under the tempo, a row of tiles
 shows the body at the frame on screen: hip turn, shoulder turn, hip sway,
 head sway, forward bend and hip depth. They follow the replay as it
 plays, steps or is scrubbed. Hip sway and head sway read as a distance
 toward or away from the target, e.g. `3.8 in Toward`, and hip depth as a
-distance toward the ball or back, e.g. `0.8 in Back`:
+distance toward the ball or back, e.g. `0.8 in Back`.
+
+The numbers are colored against published tour averages (**Tour | Amateur**
+in the toolbar picks the bands): aqua inside the band, blue inside the fade
+band only and green inside the draw band only for the numbers that depend on
+the shot's shape, yellow near, red far, always with words; a line under the
+tiles names each one off its band. Tiles color on a key moment's frame, such
+as the impact tick, and with Live on a Last shot strip under the live
+pictures shows the newest shot at impact. See
+[Bands and colors](docs/devices/cameras.md#bands-and-colors):
 
 ![Cameras](./screens/cameras.png "Cameras")
 
@@ -527,8 +543,8 @@ club = "7i"                    # club selected on connect
 advanced_spin = true           # device's advanced spin measurement
 discard_non_putting_zero_spin = true   # drop 0-spin misreads (putts exempt)
 
-# optional per-club face impact calibration, in mm (bottom of sticker dot to face centre)
-[square.0.dot_bottom_to_face_centre_mm]
+# optional per-club face impact calibration, in mm (bottom of sticker dot to face center)
+[square.0.dot_bottom_to_face_center_mm]
 DR = 15.0
 
 [r10.0]
@@ -682,7 +698,7 @@ To run with a mock device, point `--config` at a TOML file with
   [Body tracking](docs/devices/cameras.md#body-tracking-alpha).
 - Icons: [Codicons](https://github.com/microsoft/vscode-codicons) by Microsoft,
   [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The font ships
-  unmodified as `ui/assets/fonts/codicon.ttf`; version, source and licence
+  unmodified as `ui/assets/fonts/codicon.ttf`; version, source and license
   text are in `ui/assets/fonts/codicon-LICENSE.txt`.
 
 ---

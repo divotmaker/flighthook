@@ -248,7 +248,7 @@ impl FrameReader {
         frame
     }
 
-    /// The bytes skipped while resynchronising since the last call.
+    /// The bytes skipped while resynchronizing since the last call.
     pub fn take_dropped(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.dropped)
     }
@@ -464,7 +464,7 @@ pub enum Message {
     SetBallType {
         ball_type: u8,
     },
-    /// Distance from the ball to the coming shot's target, metres; 0 or
+    /// Distance from the ball to the coming shot's target, meters; 0 or
     /// less, or NaN, means unknown.
     SetShotContext {
         distance_to_target_m: f32,

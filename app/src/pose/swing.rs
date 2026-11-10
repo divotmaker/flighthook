@@ -103,7 +103,7 @@ pub struct SwingWritten {
     pub impact_shift_ns: Option<i64>,
 }
 
-/// Analyse the swing in `track` (the keypoints of clip `avi`) and write
+/// Analyze the swing in `track` (the keypoints of clip `avi`) and write
 /// `<camera>.swing.json` beside the clip. `Ok(None)` when the camera's
 /// position gets no swing analysis. A confident handedness guess that
 /// disagrees with the player's hand is logged (a mirrored webcam picture
@@ -293,7 +293,7 @@ pub(crate) mod tests {
         k[16] = at(270.0, 390.0);
         k[17] = at(300.0, 85.0); // head
         k[18] = at(300.0, 140.0); // neck
-        k[19] = at(300.0, 250.0); // hip centre
+        k[19] = at(300.0, 250.0); // hip center
         for (i, x) in [(20, 340.0), (21, 260.0), (22, 345.0), (23, 255.0)] {
             k[i] = at(x, 398.0);
         }
@@ -337,6 +337,7 @@ pub(crate) mod tests {
             detector: "fake".into(),
             width: 600,
             height: 480,
+            rotation: stance::pose::Rotation::None,
             frames,
         }
     }
@@ -379,7 +380,7 @@ pub(crate) mod tests {
             mirrored: false,
         };
         let written = write_report("camera.0", &track, &avi, &input)
-            .expect("analysed")
+            .expect("analyzed")
             .expect("face-on gets a report");
         let path = written.path.clone();
         assert_eq!(path, dir.0.join("camera.0.swing.json"));

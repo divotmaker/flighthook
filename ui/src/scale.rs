@@ -37,7 +37,7 @@ const TOLERANCE: f32 = 0.005;
 /// Highest effective pixel ratio in the browser.
 const WEB_MAX_PIXELS_PER_POINT: f32 = 2.0;
 /// The automatic zoom is rounded down to a multiple of `1 / GRID`, so a
-/// window being resized changes it (and re-rasterises the text) only now and
+/// window being resized changes it (and re-rasterizes the text) only now and
 /// then, and the rounded zoom still fits the design size.
 const GRID: f32 = 32.0;
 

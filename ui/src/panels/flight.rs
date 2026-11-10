@@ -6,7 +6,7 @@
 //!
 //! - **Gold**: the shown shot, with its apex, landing and rest marked. The
 //!   latest shot draws on during the new-shot pulse.
-//! - **Bright**: the view's other members (`chart::members_for`), coloured
+//! - **Bright**: the view's other members (`chart::members_for`), colored
 //!   per device when every device is shown and there are two or more.
 //! - **Faint**: the rest of the current session, newest [`FAINT_CAP`],
 //!   for context. The view `none` draws the shown shot alone.
@@ -61,9 +61,9 @@ const M_PER_FT: f64 = 0.3048;
 // Units and readings
 // ---------------------------------------------------------------------------
 
-/// Display units per metre on the distance and height axes: yd and ft
+/// Display units per meter on the distance and height axes: yd and ft
 /// imperial, m and m metric.
-pub(super) fn per_metre(units: UnitSystem) -> (f64, f64) {
+pub(super) fn per_meter(units: UnitSystem) -> (f64, f64) {
     match units {
         UnitSystem::Imperial => (1.0 / M_PER_YD, 1.0 / M_PER_FT),
         UnitSystem::Metric => (1.0, 1.0),
@@ -78,7 +78,7 @@ pub(super) fn unit_labels(units: UnitSystem) -> (&'static str, &'static str) {
     }
 }
 
-/// Chart point of a path point `[t, x, y, z]` (metres): path distance from
+/// Chart point of a path point `[t, x, y, z]` (meters): path distance from
 /// the tee and height, in display units.
 fn side_point(p: &[f64; 4], k: (f64, f64)) -> [f64; 2] {
     [p[1].hypot(p[3]) * k.0, p[2] * k.1]
@@ -243,7 +243,7 @@ enum Level {
 struct Trace {
     index: usize,
     level: Level,
-    colour: Color32,
+    color: Color32,
     flight: Curve,
     /// Empty when the ground phase did not reach rest.
     ground: Curve,
@@ -304,7 +304,7 @@ const MARK_ROOM: f32 = APEX_RISE + MARK_BOX_H + MARK_MARGIN;
 /// Where the gold shot's apex, carry and total labels go, as their boxes
 /// (padding included), given the points they label and their text sizes.
 ///
-/// Each box is centred on its point's x, its bottom [`MARK_RISE`] above a
+/// Each box is centered on its point's x, its bottom [`MARK_RISE`] above a
 /// carry or total point and [`APEX_RISE`] above the apex. When the carry
 /// and total boxes would come closer than [`MARK_GAP`], total stays and
 /// carry lifts one row. An apex box that would meet either lifts above the
@@ -387,7 +387,7 @@ fn plot_rect(size: Vec2) -> Rect {
 /// Largest distance and height `shot` reaches, in display units. Values
 /// that are not [`chart::plausible`] are left out.
 fn extent(shot: &ShotRow, units: UnitSystem) -> (f64, f64) {
-    let k = per_metre(units);
+    let k = per_meter(units);
     let r = readings(shot, units);
     let fit = |v: f64| if chart::plausible(v) { v } else { 0.0 };
     let mut x = fit(r.carry.unwrap_or(0.0)).max(fit(r.total.unwrap_or(0.0)));
@@ -415,7 +415,7 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         size,
     } = *input;
     let drawn = drawn_sets(shots, groups, view, members, shown, device, drawable);
-    let k = per_metre(units);
+    let k = per_meter(units);
 
     // Scales over the bright shots, else the faint ones.
     let bright: Vec<usize> = drawn
@@ -469,7 +469,7 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
     let x_ticks = tick_labels(&proj.x, distance_axis.step, X_TICK_MIN_PX, domain.0);
     let y_ticks = tick_labels(&proj.y, height_axis.step, Y_TICK_MIN_PX, domain.1);
 
-    let colour_of = |s: &ShotRow| chart::shot_colour(devices, device, &s.actor);
+    let color_of = |s: &ShotRow| chart::shot_color(devices, device, &s.actor);
     let ground_y = proj.y.map(0.0);
     let mut traces = Vec::new();
     let mut ticks = Vec::new();
@@ -519,7 +519,7 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
                 traces.push(Trace {
                     index,
                     level,
-                    colour: colour_of(shot),
+                    color: color_of(shot),
                     flight,
                     ground,
                     rolled,
@@ -561,7 +561,7 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
 }
 
 /// Height of the gold `shot`'s apex on its drawn path, in display units
-/// (`k` per metre); none for a shot without a flight drawn.
+/// (`k` per meter); none for a shot without a flight drawn.
 fn gold_top(shot: Option<&ShotRow>, k: (f64, f64)) -> Option<f64> {
     let p = path(shot?)?;
     if rolls(p) {
@@ -765,7 +765,7 @@ fn paint(
         let (air, roll) = strokes(t.rolled, &t.flight.points, &t.ground.points);
         match t.level {
             Level::Faint => {
-                let c = t.colour.gamma_multiply(FAINT_ALPHA);
+                let c = t.color.gamma_multiply(FAINT_ALPHA);
                 clip.line(moved(air, origin), Stroke::new(1.5, c));
                 if roll.len() >= 2 {
                     clip.line(moved(roll, origin), Stroke::new(1.0, c));
@@ -773,9 +773,9 @@ fn paint(
             }
             Level::Bright => {
                 let c = if lit {
-                    theme::mix(t.colour, theme::TEXT, 0.35)
+                    theme::mix(t.color, theme::TEXT, 0.35)
                 } else {
-                    t.colour
+                    t.color
                 };
                 let w = if lit { 1.0 } else { 0.0 };
                 clip.line(moved(air, origin), Stroke::new(2.0 + w, c));
@@ -794,16 +794,16 @@ fn paint(
         }
     }
     for tick in &scene.ticks {
-        let colour = match (tick.level, tick.total) {
+        let color = match (tick.level, tick.total) {
             (Level::Faint, _) => theme::TEXT_MUTED.gamma_multiply(FAINT_ALPHA),
             (Level::Bright, false) => theme::TEXT_MUTED,
             (Level::Bright, true) => theme::TEXT_DIM,
             (Level::Gold, _) => theme::GOLD,
         };
-        let colour = if hovered == Some(tick.index) && tick.level == Level::Bright {
+        let color = if hovered == Some(tick.index) && tick.level == Level::Bright {
             theme::TEXT
         } else {
-            colour
+            color
         };
         let at = tick.at + origin;
         // A gold tick appears with its label during the draw-on.
@@ -813,7 +813,7 @@ fn paint(
             &scene.marks.carry
         };
         if tick.level != Level::Gold || mark.as_ref().is_none_or(|m| m.2 <= shown_t) {
-            clip.vline(at.x, (at.y - TICK_H)..=at.y, Stroke::new(1.0, colour));
+            clip.vline(at.x, (at.y - TICK_H)..=at.y, Stroke::new(1.0, color));
         }
     }
 
@@ -852,13 +852,13 @@ fn paint(
     // The gold shot's labels, placed together whether or not the draw-on
     // has reached them yet, so none moves when another appears.
     let marks = [&scene.marks.apex, &scene.marks.carry, &scene.marks.total];
-    let colours = [theme::GOLD, theme::TEXT, theme::TEXT];
+    let colors = [theme::GOLD, theme::TEXT, theme::TEXT];
     let galleys = std::array::from_fn::<_, 3, _>(|i| {
         marks[i].as_ref().map(|(_, text, _)| {
             painter.layout_no_wrap(
                 text.clone(),
                 egui::FontId::proportional(MARK_FONT),
-                colours[i],
+                colors[i],
             )
         })
     });
@@ -877,13 +877,12 @@ fn paint(
             Stroke::new(1.5, theme::GOLD),
         );
     }
-    for ((mark, galley), (rect, colour)) in marks.iter().zip(galleys).zip(boxes.iter().zip(colours))
-    {
+    for ((mark, galley), (rect, color)) in marks.iter().zip(galleys).zip(boxes.iter().zip(colors)) {
         if let (Some((_, _, t)), Some(galley), Some(rect)) = (mark, galley, rect)
             && *t <= shown_t
         {
             painter.rect_filled(*rect, 3.0, theme::BG);
-            painter.galley(rect.min + MARK_PAD, galley, colour);
+            painter.galley(rect.min + MARK_PAD, galley, color);
         }
     }
 }
@@ -1114,7 +1113,7 @@ pub(super) mod tests {
         g
     }
 
-    /// A path landing `carry` metres out with an apex of `apex` metres,
+    /// A path landing `carry` meters out with an apex of `apex` meters,
     /// rolling on to `total`.
     fn flight_path(carry: f64, apex: f64, total: f64) -> FlightPath {
         FlightPath {
@@ -1179,7 +1178,7 @@ pub(super) mod tests {
     }
 
     /// A ground ball's path: the tee alone as its flight, then a roll to
-    /// `total` metres, `lateral` metres right.
+    /// `total` meters, `lateral` meters right.
     fn roll_path(total: f64, lateral: f64) -> FlightPath {
         let at = |f: f64| [4.0 * f, total * f, 0.0, lateral * f];
         FlightPath {
@@ -1188,7 +1187,7 @@ pub(super) mod tests {
         }
     }
 
-    /// `shot(n, actor, group)` as a ground ball rolling `total` metres:
+    /// `shot(n, actor, group)` as a ground ball rolling `total` meters:
     /// carry, apex and flight time 0.
     fn ground_ball(n: u32, actor: &str, group: &str, total: f64) -> ShotRow {
         let mut d = derived(Some(roll_path(total, 0.2)), 0.0, total, 0.0);
@@ -1506,18 +1505,18 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn bright_paths_take_device_colours_with_every_device_shown() {
+    fn bright_paths_take_device_colors_with_every_device_shown() {
         let (shots, g) = history();
         let devices = chart::device_ids(&shots);
         let m = members(&shots, &g, ShotGrouping::BySet, 7, None);
         let scene = build_scene(&input(&shots, &g, &m, 7, &devices, UnitSystem::Metric));
-        let colour = |i: usize| scene.traces.iter().find(|t| t.index == i).unwrap().colour;
-        assert_eq!(colour(5), theme::DEVICE_COLOURS[0]);
-        assert_eq!(colour(6), theme::DEVICE_COLOURS[1]);
+        let color = |i: usize| scene.traces.iter().find(|t| t.index == i).unwrap().color;
+        assert_eq!(color(5), theme::DEVICE_COLORS[0]);
+        assert_eq!(color(6), theme::DEVICE_COLORS[1]);
         // One device, or a filter: accent.
         let scene = build_scene(&input(&shots, &g, &m, 7, &devices[..1], UnitSystem::Metric));
-        let colour = |i: usize| scene.traces.iter().find(|t| t.index == i).unwrap().colour;
-        assert_eq!(colour(6), theme::ACCENT);
+        let color = |i: usize| scene.traces.iter().find(|t| t.index == i).unwrap().color;
+        assert_eq!(color(6), theme::ACCENT);
     }
 
     #[test]
@@ -1563,7 +1562,7 @@ pub(super) mod tests {
             traces: vec![Trace {
                 index: faint.index,
                 level: Level::Faint,
-                colour: faint.colour,
+                color: faint.color,
                 flight: faint.flight.clone(),
                 ground: faint.ground.clone(),
                 rolled: faint.rolled,
@@ -1587,7 +1586,7 @@ pub(super) mod tests {
             .iter()
             .find(|t| t.level == Level::Gold)
             .unwrap();
-        let k = per_metre(UnitSystem::Metric);
+        let k = per_meter(UnitSystem::Metric);
         for (curve, samples) in [(&gold.flight, &p.flight), (&gold.ground, &p.ground)] {
             for q in samples {
                 let [d, h] = side_point(q, k);
@@ -1686,7 +1685,7 @@ pub(super) mod tests {
         assert!((gold.dots[0].x - rest).abs() < 1e-3);
         assert_eq!(trace(5).level, Level::Bright);
         assert_eq!(trace(2).level, Level::Faint);
-        // The gold shot is labelled with its total only.
+        // The gold shot is labeled with its total only.
         assert!(scene.marks.apex.is_none() && scene.marks.carry.is_none());
         let (at, text, t) = scene.marks.total.as_ref().unwrap();
         assert_eq!((text.as_str(), *t), ("5", 4.0));
@@ -1877,8 +1876,8 @@ pub(super) mod tests {
     }
 
     /// A decimated 7-iron path as the server sends it (15 flight points,
-    /// three hops then the roll), scaled to land at `carry` metres with an
-    /// apex of `apex` metres, `lateral` metres right at the rest.
+    /// three hops then the roll), scaled to land at `carry` meters with an
+    /// apex of `apex` meters, `lateral` meters right at the rest.
     pub(in crate::panels) fn realistic_path(carry: f64, apex: f64, lateral: f64) -> FlightPath {
         const FLIGHT: [[f64; 4]; 15] = [
             [0.0, 0.0, 0.0, 0.0],
@@ -2008,7 +2007,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn labels_sit_centred_above_their_marks() {
+    fn labels_sit_centered_above_their_marks() {
         let plot = label_plot();
         let (apex, carry, total) = (pos2(300.0, 60.0), pos2(400.0, 200.0), pos2(470.0, 200.0));
         let [a, c, t] = place_marks([Some(apex), Some(carry), Some(total)], SIZES, plot);
@@ -2031,7 +2030,7 @@ pub(super) mod tests {
             let points = [None, Some(pos2(carry_x, 200.0)), Some(pos2(total_x, 200.0))];
             let [_, c, t] = place_marks(points, SIZES, plot);
             let (c, t) = (c.unwrap(), t.unwrap());
-            // Total stays on its dot; carry is a row up, still centred.
+            // Total stays on its dot; carry is a row up, still centered.
             assert!((t.bottom() - (200.0 - MARK_RISE)).abs() < 1e-3);
             assert!((c.bottom() - (t.top() - LIFT_GAP)).abs() < 1e-3);
             assert!((c.center().x - carry_x).abs() < 1e-3);

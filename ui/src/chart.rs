@@ -1,4 +1,4 @@
-//! Chart maths for the Flight (side) and Dispersion (overhead) views and the
+//! Chart math for the Flight (side) and Dispersion (overhead) views and the
 //! range bars: axis domains and ticks, chart-to-screen projections, the
 //! dispersion ellipse, smooth path curves and their draw-on prefix,
 //! hit-testing, the device
@@ -86,7 +86,7 @@ pub(crate) const SIDE_DISTANCE: AxisSpec = AxisSpec {
 };
 
 /// Side view, horizontal, when every shot sizing it is a ground ball: a
-/// roll of a few yards or metres fills the plot.
+/// roll of a few yards or meters fills the plot.
 pub(crate) const SIDE_DISTANCE_SHORT: AxisSpec = AxisSpec {
     margin: 1.06,
     step: 5.0,
@@ -127,7 +127,7 @@ pub(crate) const OVERHEAD_LATERAL: AxisSpec = AxisSpec {
 };
 
 /// Tick spacing for an axis drawn at `px_per_unit`: `step`, doubled until
-/// neighbouring ticks are at least `min_px` apart. A zero, negative or
+/// neighboring ticks are at least `min_px` apart. A zero, negative or
 /// non-finite `step` or `px_per_unit` gives `f64::INFINITY`: no ticks.
 #[must_use]
 pub(crate) fn tick_step(step: f64, px_per_unit: f32, min_px: f32) -> f64 {
@@ -244,7 +244,7 @@ impl Projection {
         }
     }
 
-    /// Equal scales on both axes with the origin at the bottom centre of the
+    /// Equal scales on both axes with the origin at the bottom center of the
     /// rect: `-x_half..=x_half` and `0..=y_max` both fit, and the axis with
     /// room to spare shows a wider domain.
     #[must_use]
@@ -370,7 +370,7 @@ pub(crate) struct Ellipse {
 }
 
 /// The covariance ellipse of size factor `k` ([`ELLIPSE_K_2SIGMA`] or
-/// [`ELLIPSE_K_95`]) of the finite points in `points`: centred on their
+/// [`ELLIPSE_K_95`]) of the finite points in `points`: centered on their
 /// mean, axes along the eigenvectors of their sample covariance, semi-axes
 /// `k · √λ`, each at least
 /// [`ELLIPSE_MIN_SEMI_AXIS`]. `None` with fewer than
@@ -565,7 +565,7 @@ pub(crate) fn spline(points: &[(Pos2, f64)]) -> Curve {
 }
 
 /// The point before `end` on the parabola through `end`, `next` and
-/// `after` (equally spaced), so an end segment bends like its neighbours: a
+/// `after` (equally spaced), so an end segment bends like its neighbors: a
 /// hop's three points give a parabola, steep off the ground and flat at
 /// the top.
 fn beyond(end: Pos2, next: Pos2, after: Pos2) -> Pos2 {
@@ -614,7 +614,7 @@ impl Segment {
 /// The stretches of a ground segment (`[t, x, y, z]`) between consecutive
 /// points on the ground ([`ON_GROUND_M`]): one per hop, and one per step of
 /// the roll. Each runs from one ground point to the next, inclusive, so
-/// neighbours share their end point. Empty for fewer than two points.
+/// neighbors share their end point. Empty for fewer than two points.
 #[must_use]
 pub(crate) fn ground_pieces(points: &[[f64; 4]]) -> Vec<std::ops::RangeInclusive<usize>> {
     let Some(last) = points.len().checked_sub(1).filter(|&l| l > 0) else {
@@ -743,7 +743,7 @@ pub(crate) fn inside_polygon(polygon: &[Pos2], p: Pos2) -> bool {
 /// The distinct, non-empty actor ids in `shots` that statistics are kept
 /// for (every one but the Auto-chip source, [`is_auto_chip`]), sorted: the
 /// device filter's options, the range bars' per-device bands and the
-/// charts' device colours. Ids are compared exactly, so a row without an
+/// charts' device colors. Ids are compared exactly, so a row without an
 /// actor never merges two devices.
 #[must_use]
 pub(crate) fn device_ids(shots: &[ShotRow]) -> Vec<String> {
@@ -757,32 +757,32 @@ pub(crate) fn device_ids(shots: &[ShotRow]) -> Vec<String> {
     ids
 }
 
-/// Colour of the device `id` among `ids` (as from [`device_ids`]):
-/// [`theme::DEVICE_COLOURS`] in order, then `TEXT_MUTED` for any further or
+/// Color of the device `id` among `ids` (as from [`device_ids`]):
+/// [`theme::DEVICE_COLORS`] in order, then `TEXT_MUTED` for any further or
 /// unknown device.
 #[must_use]
-pub(crate) fn device_colour(ids: &[String], id: &str) -> Color32 {
+pub(crate) fn device_color(ids: &[String], id: &str) -> Color32 {
     ids.iter()
         .position(|d| d == id)
-        .and_then(|i| theme::DEVICE_COLOURS.get(i).copied())
+        .and_then(|i| theme::DEVICE_COLORS.get(i).copied())
         .unwrap_or(theme::TEXT_MUTED)
 }
 
-/// Whether a chart over `devices` with the device filter `filter` colours
+/// Whether a chart over `devices` with the device filter `filter` colors
 /// its shots by device: every device shown, and two or more of them.
 #[must_use]
 pub(crate) fn by_device(devices: &[String], filter: Option<&str>) -> bool {
     filter.is_none() && devices.len() >= 2
 }
 
-/// Colour of a shot from `actor` in a chart over `devices` with the device
-/// filter `filter`: its device's colour when the chart colours by device
+/// Color of a shot from `actor` in a chart over `devices` with the device
+/// filter `filter`: its device's color when the chart colors by device
 /// ([`by_device`]), else the accent. The Flight and Dispersion charts and
-/// the face impact panel all colour their shots by this rule.
+/// the face impact panel all color their shots by this rule.
 #[must_use]
-pub(crate) fn shot_colour(devices: &[String], filter: Option<&str>, actor: &str) -> Color32 {
+pub(crate) fn shot_color(devices: &[String], filter: Option<&str>, actor: &str) -> Color32 {
     if by_device(devices, filter) {
-        device_colour(devices, actor)
+        device_color(devices, actor)
     } else {
         theme::ACCENT
     }
@@ -1324,22 +1324,22 @@ mod tests {
             OVERHEAD_LATERAL.domain_max(8.0),
             OVERHEAD_DOWNRANGE.domain_max(190.0),
         );
-        let centre = proj.to_screen(e.center[0], e.center[1]);
-        // The polygon vertex farthest from the centre is a major-axis end;
-        // take the one to the right of the centre.
+        let center = proj.to_screen(e.center[0], e.center[1]);
+        // The polygon vertex farthest from the center is a major-axis end;
+        // take the one to the right of the center.
         let far = ellipse_points(&e, ELLIPSE_SEGMENTS)
             .iter()
             .map(|p| proj.to_screen(p[0], p[1]))
-            .filter(|p| p.x > centre.x)
-            .max_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)))
+            .filter(|p| p.x > center.x)
+            .max_by(|a, b| a.distance(center).total_cmp(&b.distance(center)))
             .unwrap();
-        // Screen y grows downward: top-right means right of and above the centre.
+        // Screen y grows downward: top-right means right of and above the center.
         assert!(
-            far.x > centre.x && far.y < centre.y,
-            "{far:?} vs {centre:?}"
+            far.x > center.x && far.y < center.y,
+            "{far:?} vs {center:?}"
         );
         // And the long axis is closer to vertical than horizontal here.
-        assert!(centre.y - far.y > far.x - centre.x);
+        assert!(center.y - far.y > far.x - center.x);
     }
 
     // -- smooth curves and the draw-on --
@@ -1567,7 +1567,7 @@ mod tests {
     }
 
     /// A path with a flight and two hops before a short roll: landing at
-    /// x 100, contacts at 104 and 106, rest at 110 (metres).
+    /// x 100, contacts at 104 and 106, rest at 110 (meters).
     fn bouncing_path() -> FlightPath {
         FlightPath {
             flight: vec![
@@ -1600,7 +1600,7 @@ mod tests {
     #[test]
     fn smooth_path_keeps_the_contacts_and_their_corners() {
         let p = bouncing_path();
-        // 10 px per metre across, 20 px per metre up, ground at y 200.
+        // 10 px per meter across, 20 px per meter up, ground at y 200.
         let project = |q: &[f64; 4]| Pos2::new(q[1] as f32 * 10.0, 200.0 - q[2] as f32 * 20.0);
         let (flight, ground) = smooth_path(&p, project);
         assert!(finite(&flight) && finite(&ground));
@@ -1777,33 +1777,33 @@ mod tests {
     }
 
     #[test]
-    fn device_colours_follow_the_sorted_ids() {
+    fn device_colors_follow_the_sorted_ids() {
         let ids: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
-        assert_eq!(device_colour(&ids, "a"), theme::ACCENT);
-        assert_eq!(device_colour(&ids, "b"), theme::HEADING);
-        assert_eq!(device_colour(&ids, "c"), theme::LOG_ACTOR);
-        assert_eq!(device_colour(&ids, "d"), theme::TEAL);
-        assert_eq!(device_colour(&ids, "e"), theme::TEXT_MUTED);
-        assert_eq!(device_colour(&ids, "zz"), theme::TEXT_MUTED);
-        for c in theme::DEVICE_COLOURS {
+        assert_eq!(device_color(&ids, "a"), theme::ACCENT);
+        assert_eq!(device_color(&ids, "b"), theme::HEADING);
+        assert_eq!(device_color(&ids, "c"), theme::LOG_ACTOR);
+        assert_eq!(device_color(&ids, "d"), theme::TEAL);
+        assert_eq!(device_color(&ids, "e"), theme::TEXT_MUTED);
+        assert_eq!(device_color(&ids, "zz"), theme::TEXT_MUTED);
+        for c in theme::DEVICE_COLORS {
             assert_ne!(c, theme::GOLD);
             assert_ne!(c, theme::DANGER);
         }
     }
 
     #[test]
-    fn shots_take_device_colours_only_with_every_device_of_several_shown() {
+    fn shots_take_device_colors_only_with_every_device_of_several_shown() {
         let two: Vec<String> = ["a", "b"].map(String::from).to_vec();
         assert!(by_device(&two, None));
-        assert_eq!(shot_colour(&two, None, "a"), theme::DEVICE_COLOURS[0]);
-        assert_eq!(shot_colour(&two, None, "b"), theme::DEVICE_COLOURS[1]);
+        assert_eq!(shot_color(&two, None, "a"), theme::DEVICE_COLORS[0]);
+        assert_eq!(shot_color(&two, None, "b"), theme::DEVICE_COLORS[1]);
         // A device filter, or one device: the accent, whatever the device's
-        // own colour.
+        // own color.
         assert!(!by_device(&two, Some("b")));
-        assert_eq!(shot_colour(&two, Some("b"), "b"), theme::ACCENT);
+        assert_eq!(shot_color(&two, Some("b"), "b"), theme::ACCENT);
         let one = vec!["b".to_owned()];
         assert!(!by_device(&one, None));
-        assert_eq!(shot_colour(&one, None, "b"), theme::ACCENT);
+        assert_eq!(shot_color(&one, None, "b"), theme::ACCENT);
     }
 
     #[test]
@@ -1825,7 +1825,7 @@ mod tests {
         assert!(approx(ELLIPSE_K_95, k95, 1e-3));
         assert!(approx(ellipse_coverage_pct(ELLIPSE_K_95), 95.0, 0.01));
         assert!(approx(ellipse_coverage_pct(ELLIPSE_K_2SIGMA), 86.47, 0.01));
-        // The semi-axes scale with k; centre and angle do not move.
+        // The semi-axes scale with k; center and angle do not move.
         let pts = rotate(&cross(10.0, 5.0), 20.0);
         let two = ellipse_from_points(&pts, ELLIPSE_K_2SIGMA).unwrap();
         let ninety_five = ellipse_from_points(&pts, ELLIPSE_K_95).unwrap();

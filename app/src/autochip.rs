@@ -35,7 +35,7 @@ pub(crate) const STRICT_ROUND: &str = "Auto-chip is off during a Pureplay strict
 /// Launch angle of every Auto-chip, degrees.
 pub(crate) const LAUNCH_ELEVATION_DEG: f64 = 28.0;
 
-/// Metres in a yard.
+/// Meters in a yard.
 const M_PER_YD: f64 = 0.9144;
 
 /// Lowest ball speed the solver tries, mph.
@@ -91,7 +91,7 @@ pub(crate) fn ball(speed_mph: f64) -> BallFlight {
     }
 }
 
-/// The simulated total (carry + roll), metres, of a chip at `speed_mph`
+/// The simulated total (carry + roll), meters, of a chip at `speed_mph`
 /// under `cfg`, or `None` when the ball does not come to rest.
 fn simulated_total_m(speed_mph: f64, cfg: &SimulationSection) -> Option<f64> {
     let input = ShotInput {

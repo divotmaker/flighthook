@@ -69,7 +69,7 @@ the repository mounted at the same path.
 | --- | --- | --- |
 | `shots.js` | `shots.png` | Shots tab, Cards view: a 12-shot 7-iron session from one Open Connect monitor, GSPro connected, a camera recording with video off on the shot cards |
 | `cameras.js` | `cameras.png` | Shots tab, Cameras pane: two cameras playing the swing clips, body tracking Live, shot #2 paused on the impact mark |
-| `devices.js` | `devices.png`, `devices-settings.png` | Devices tab with a Mock and an Open Connect monitor, a test-pattern camera and GSPro; then the camera card's Settings side |
+| `devices.js` | `devices.png`, `devices-settings.png` | Devices tab with a Mock and an Open Connect monitor, a test-pattern camera and GSPro; then the camera card's Settings side, its Rotation in sight under the camera |
 | `multi-monitor-routing.js` | `multi-monitor-routing.png` | A GSPro output's card routing full swings, chips and putts to different monitors |
 
 ## What keeps the pictures the same
@@ -77,7 +77,7 @@ the repository mounted at the same path.
 - **Test seams** in flighthook, compiled only in debug-assertions builds and
   read from the environment:
   - `FLIGHTHOOK_SCREENS_GRID_MS`: a time grid. A camera playing a clip puts the
-    clip's labelled impact on a multiple of it, and every shot trigger is
+    clip's labeled impact on a multiple of it, and every shot trigger is
     stamped at the next multiple, so a shot's clips hold the same frames and
     impact whenever the shot arrives.
   - `FLIGHTHOOK_SCREENS_CLOCK`: the time of day telemetry shows (GSPro's last
@@ -101,7 +101,7 @@ the repository mounted at the same path.
 
 The pictures are the same for one machine and toolchain. Another CPU,
 ffmpeg or Chromium version can move pixels (video decoding, body tracking
-maths, rasterising), so regenerate and commit from one machine rather than
+math, rasterizing), so regenerate and commit from one machine rather than
 comparing across machines.
 
 ## Adding a scene

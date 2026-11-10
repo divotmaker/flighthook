@@ -319,7 +319,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// The chip sits in the header right of the Club picker, on its centre
+    /// The chip sits in the header right of the Club picker, on its center
     /// line, and is gone from the Shots toolbar; with the setting off, or
     /// before the settings have loaded, there is no chip at all.
     #[test]

@@ -10,14 +10,14 @@ Microsoft Corporation, redistributed unmodified.
             (package/dist/codicon.ttf; the v0.0.46-24 release of
             microsoft/vscode-codicons)
   SHA-256:  3819e4ae4b87350e7c37a5d8f24e71ada2f1f2ee58f7ce5ebc1f88e3c8c38c80
-  Licence:  Creative Commons Attribution 4.0 International (CC BY 4.0)
+  License:  Creative Commons Attribution 4.0 International (CC BY 4.0)
             https://creativecommons.org/licenses/by/4.0/legalcode
 
-Copyright (c) Microsoft Corporation. The licence does not grant rights to
+Copyright (c) Microsoft Corporation. The license does not grant rights to
 use any Microsoft names, logos or trademarks.
 
 flighthook draws the icon glyphs from this font in its dashboard. The full
-licence text follows as upstream ships it; its last line, crediting the Git
+license text follows as upstream ships it; its last line, crediting the Git
 logo, is part of that text.
 
 -----------------------------------------------------------------------

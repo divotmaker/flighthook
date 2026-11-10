@@ -61,8 +61,12 @@ address = "127.0.0.1:921"
   like `[simulation]`
 - `[body_tracking]` -- body tracking on the cameras' pictures (alpha:
   `mode`, `model`, `min_score`, `smoothing`, `detect_every`,
-  `golfer_height`, `show_skeleton`), each field
+  `show_skeleton`), each field
   omitted at its default and the section with them (see
+  [Body tracking](#body-tracking-alpha))
+- `[player]` -- facts about the player for the swing analysis (`sex`:
+  `male` (default) | `female`; `height`: cm, 100 to 250, unset by default),
+  each field omitted at its default and the section with them (see
   [Body tracking](#body-tracking-alpha))
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
 - Radar settings (ball_type, tee_height, etc.) are per-mevo only. A Mevo+ gets
@@ -140,7 +144,7 @@ and whitespace never count. When they differ, the file is brought up to date:
 
 Any difference rewrites the file, including values the file spells out at
 their defaults where the save leaves them out and keys the config doesn't
-read: a deliberate one-time normalisation. The rewritten text is the save
+read: a deliberate one-time normalization. The rewritten text is the save
 format, which parses back to the same config, so the next start finds no
 difference. A failed backup or rewrite logs a warning and the app
 runs on the config it loaded. Every save (`save_to`) uses the same atomic
@@ -232,7 +236,7 @@ pub struct StatusResponse { pub actors: HashMap<String, ActorStatusResponse>, pu
 pub struct ActorStatusResponse {
     pub name: String, pub status: ActorStatus, pub telemetry: HashMap<String, String>,
     pub state: ConnectionState, pub red_for_ms: u64,  // derived, see "Connection state" below
-    /* private, not serialised: StatusHistory */
+    /* private, not serialized: StatusHistory */
 }
 pub struct PostSettingsResponse { pub restarted: Vec<String>, pub stopped: Vec<String> }
 pub struct ModeRequest { pub mode: ShotDetectionMode }
@@ -372,7 +376,7 @@ layer's history and export, the GSPro bridge, `ShotAggregator` users):
 - face to path, `face_angle − path`;
 - spin loft, the `dynamic_loft − attack_angle` approximation, only when the
   device sent no `spin_loft`;
-- curve, `carry_offline − carry_distance × tan(launch_azimuth)`, in metres.
+- curve, `carry_offline − carry_distance × tan(launch_azimuth)`, in meters.
 
 Each field needs every input measured and finite; `metrics` is `None` when no
 field is set. `derived` is never an input: the metrics describe the device's
@@ -477,7 +481,7 @@ carries the simulated value, alongside the 0 left untouched in `ball`, and
 the path is fitted only to the values the device really measured.
 
 `derived.path` (`FlightPath`) is the simulated ball path from the tee to rest:
-`[t, x, y, z]` points in seconds and metres (downrange, up, right of the target
+`[t, x, y, z]` points in seconds and meters (downrange, up, right of the target
 line), split into `flight` (tee to landing) and `ground` (landing to rest,
 empty when the ball did not reach rest). A ground ball's `flight` is the tee
 alone, `[[0, 0, 0, 0]]`, and its `ground` the roll from the tee. It is fitted to the
@@ -529,7 +533,7 @@ landing, rest and the contacts and peaks of hops over 5 cm are kept and the
 rest thinned by Ramer-Douglas-Peucker at 0.25 m, while the segment fits under
 its cap (40 flight and 24 ground points); above the cap the segment is
 resampled uniformly in time, keeping its ends (the flight also keeps its
-apex). Points are rounded to centimetres and milliseconds: about 0.7 KB of
+apex). Points are rounded to centimeters and milliseconds: about 0.7 KB of
 JSON per path on average, at most 64 points. It is never converted between unit systems, rides on the
 WebSocket event, `/api/shots` and the JSONL export, and is not in the CSV.
 
@@ -571,7 +575,7 @@ on the bus, which is also the club its sets use; mode and handedness from
 game state; the
 device's config section without `name`/`address`/`bind`; the `[simulation]`
 section; identity strings to scrub), the `ShotData`, and the `ShotRaw`. A
-shot with raw frames but no decoded data is stored too; `/api/shots` serialises
+shot with raw frames but no decoded data is stored too; `/api/shots` serializes
 `data` only and leaves those out, so its JSON is unchanged. Raw frames share
 a 16 MiB session memory budget across the 1000-shot history, each frame
 charged its hex (two characters per payload byte) or text length plus 256
@@ -580,7 +584,7 @@ frames first (`unavailable = "evicted: session raw budget"`),
 and decoded data stays until the shot leaves the history.
 
 `GET /api/shots/export` (`web/export.rs`, see docs/API.md) streams one JSONL
-`ShotExport` or CSV row per stored shot. It never serialises the FRP `device`
+`ShotExport` or CSV row per stored shot. It never serializes the FRP `device`
 ID, actor names, telemetry or configured addresses, and replaces identity
 strings in text payloads and device labels with `<redacted>`; hex is never
 rewritten, which is why identity frames are excluded at capture.
@@ -767,6 +771,7 @@ pub enum ConfigAction {
     Remove { id: String },                          // "mevo.0", "openconnect_client.1", "webserver.0", etc.; "gspro.N" = "openconnect_client.N"
     SetShotGrouping { mode: ShotGrouping },         // POST /api/shots/grouping, WS `grouping`
     SetBodyTracking { section: BodyTrackingSection },  // POST /api/settings?scope=body_tracking
+    SetPlayer { section: PlayerSection },              // POST /api/settings?scope=player
     Reconnect { id: String },                       // POST /api/actors/{id}/reconnect
 }
 
@@ -871,7 +876,7 @@ What the dashboard shows is not the raw `ActorStatus` but a `ConnectionState`
 last started. Every actor is treated alike (launch monitors, outputs, the
 OpenConnect server, the web server):
 
-| ConnectionState | When | Colour |
+| ConnectionState | When | Color |
 | --------------- | ---- | ------ |
 | Connecting      | Not `Connected` since it started, or since a config change restarted it | yellow |
 | Connected       | `ActorStatus` is `Connected` | green |
@@ -883,7 +888,7 @@ Another loss while already Reconnecting keeps the window; a new `Connected`
 then a loss starts it again. A `Starting` status begins a new history, and so
 does a restart (`ConfigOutcome.restarted`: only whether it is `Connected` now
 is kept). Removing an actor drops its entry, so one added again starts fresh.
-An `error` telemetry value does not affect the state or its colour. Times are
+An `error` telemetry value does not affect the state or its color. Times are
 milliseconds on a monotonic clock each side picks: the web layer's
 `WebState::now_ms` (from `WebState::epoch`), the UI's frame input time.
 
@@ -905,7 +910,7 @@ actors keep the grown delay. Every actor polls its shutdown flag during the
 backoff wait (the OpenConnect server during its bind retry delay too), so
 stopping one never waits out the delay. The Mevo and OpenConnect client TCP
 connects (up to 5s) run on a thread of their own: a stop ends the actor at
-once, and a connect that completes afterwards closes again. The ExPutt's
+once, and a connect that completes afterward closes again. The ExPutt's
 session start cannot be cut short: the TCP connect and the device's greeting
 (up to 3s each), its two handshake replies (up to 3s each) and its mat search
 (up to 5s).
@@ -1213,7 +1218,7 @@ listens on TCP 9760, flighthook is the device and connects. The user guide is
   type → Error code 0, and the link carries on.
 - Audit log (`audit` target): every frame sent and received as its type and
   full frame hex, then the decoded message; bytes skipped while
-  resynchronising, as hex.
+  resynchronizing, as hex.
 
 Tournament (strict) mode. Rule: while it is on for a link, flighthook sends
 only values a physical launch monitor measured for that shot.
@@ -1261,7 +1266,7 @@ Pureplay telemetry (`ActorStatus`, each key only when it changes):
 
 As for the OpenConnect client, a connection refused or closed is a status,
 never an `error` or an alert, and `club`/`handed` are removed when the link
-ends. The state of a launch monitor is learnt only from its own bus events,
+ends. The state of a launch monitor is learned only from its own bus events,
 so an output that starts while a monitor is already connected reports it
 NotReady/Disconnected until the monitor's next status or its next
 `ready=true`.
@@ -1356,8 +1361,11 @@ storage under `shots_pane`): Data | Cameras is the parent, Cards | Table
 the way Data is shown. Right of it the Cards | Table switch shows while
 Data is showing; while the Cameras pane shows (`cameras_pane_shown`) an
 on/off **Live** switch takes its slot (`render_live_toggle`,
-`theme::switch_pill`, `live_selected`) and the Cards | Table choice is kept
-for Data. One helper says what the tab lays out,
+`theme::switch_pill`, `live_selected`), followed by the **Tour | Amateur**
+reference picker (`render_reference_picker`, `theme::segmented_pills`,
+`FlighthookApp::body_reference`, kept in local UI storage under
+`body_reference`; marks `body_reference`, `body_reference:<key>`), and the
+Cards | Table choice is kept for Data. One helper says what the tab lays out,
 `FlighthookApp::shots_layout` -> `ShotsLayout` `Cards | Table | Cameras`
 (Cameras whenever the pane is chosen, whatever the view); the panel, the
 toolbar's legend and the card clips all go by it. With Cameras picked the
@@ -1377,6 +1385,20 @@ latest shot again (any pin dropped) and Live is turned on exactly when
 there is then no shot to show under the device filter. Clear history marks
 the pane as not shown, so a pane on screen turns Live on.
 
+- **Live's Last shot strip** (`panels/last_shot.rs`, alpha): while Live
+  shows, `sync_last_shot` follows the newest shot under the device filter
+  (`shots::latest_index`) with a `LastShot` (its own request number from
+  `replay_seq`): each camera's `.swing.json` once its `video[].swing` is
+  set, then its grades, again on a new `grades_key` (`Fetch::Swing` /
+  `Fetch::Grades` through `net::fetch_swing` / `net::fetch_grades`; replies
+  routed by number through `LiveStrip::find_mut`). It is shown once a camera
+  found a swing and its grades are in (`ready`), and keeps showing until the
+  next shot's is (`LiveStrip { shown, next }`); nothing while body tracking
+  is Off. `render_last_shot` (mark `live_last_shot`, `LAST_SHOT_H` reserved
+  under the pictures before the column width is fitted): the title
+  (`Last shot · #12 · DR`), the tempo tiles and the six body tiles from the
+  same `tempo_values` / `frame_tiles`, each camera at its own impact event
+  (so graded), and the miss line. No clip is fetched.
 - **A shot** (`render_shot_cameras`): the shot's header (number, LATEST /
   Back to latest, Replay), then the inline player (`FlighthookApp::
   shot_player`, a `replay::ReplayView` made `with_swing`, kept while the
@@ -1384,8 +1406,9 @@ the pane as not shown, so a pane on screen turns Live on.
   picture at most 62 % of the pane's height, the replay's scrubber and
   transport across them, looping from the start point with the skeleton.
   Besides the green start tick and the gold impact tick, the scrubber has a
-  small grey tick for each swing event the reports found other than impact
-  (`swing_markers` in `panels/replay.rs`: address, takeaway, top, finish),
+  small gray tick for each swing event the reports found other than impact
+  (`swing_markers` in `panels/replay.rs`: address, takeaway, lead arm back,
+  top, lead arm down, finish),
   at the mean over the cameras that found it of the camera's clip start plus
   the event's `t_ns` (the impact tick's time base); an event no report found
   has none, and none shows with body tracking Off or while no report has a
@@ -1412,16 +1435,19 @@ the pane as not shown, so a pane on screen turns Live on.
   returns, per column, `Track::shown_t_ns` (the sidecar `t_ns` of
   `Track::frame_at(playhead)`, `None` before the clip's first frame or after
   its last); `SwingReportFile::sample(id, t_ns)` takes the nearest series
-  frame (none outside the series) and the centimetres from `scale`. Several
+  frame (none outside the series) and the centimeters from `scale`. Several
   reports of one view average; a tile with no value is a dash. Formatting is
-  the metrics table's (`metric_shown`). Then under each column that
-  camera's metrics at address, top and impact
-  (degrees whole; `torso` metrics in inches or centimetres by the Units
+  the metrics table's (`metric_shown`). A line under the tiles names the
+  tiles off their band (see **Grades** below). Then under each column that
+  camera's metrics at address, top, impact and finish, and lead arm back and
+  lead arm down too in a column 560 points or wider (`table_positions`; a
+  heading that doesn't fit its column takes two lines)
+  (degrees whole; `torso` metrics in inches or centimeters by the Units
   switch when the report has `cm`, else as a share of the torso). The
   shifts from address show their magnitude and a direction word
   (`direction_word`, none when the value shows as 0): `hip_sway` and
-  `head_lateral` (signed towards the target) from `signs::target`
-  (`Toward` / `Away`), `early_extension` (signed towards the ball) from
+  `head_lateral` (signed toward the target) from `signs::target`
+  (`Toward` / `Away`), `early_extension` (signed toward the ball) from
   `signs::ball` (`Toward ball` / `Back`) and `head_vertical` (signed up)
   from `signs::rise` (`Up` / `Down`), painted after the
   value on its baseline at the Cards view's sign-word size, shrinking to the
@@ -1429,7 +1455,42 @@ the pane as not shown, so a pane on screen turns Live on.
   and the table). A report
   whose `impact_source` is `given` (no swing found near the impact) shows
   only the line "No swing found in this clip" there, in the clip status
-  lines' style. The table has Hip turn and Shoulder turn and leaves out
+  lines' style. Over a Golfer Front camera's numbers, when its saved
+  `|yaw_deg|` is 5 or more, one muted line (mark `yaw_warning:<camera>`):
+  `Camera 7° off square: one-camera turn and sway are approximate` (the yaw's
+  size, rounded).
+  **Grades** (alpha): once a column's swing report is in, the player
+  fetches `GET /api/shots/{shot_id}/grades/{camera}` (`Fetch::Grades`,
+  `ReplayReply::Grades`), and again whenever the saved Player card changes
+  (`SettingsForm::grades_key`, `ReplayView::set_grades_key`; the grades
+  shown stay until the new ones arrive); `PlayerColumn::grades`. The pane
+  reads the picked reference's `ReferenceGrades` and colors by `Fit`
+  (`grade_color`: `theme::GRADE_BOTH` aqua = `TEAL`, `GRADE_FADE` blue
+  (120, 170, 255, apart from `HEADING`), `GRADE_DRAW` green = `ACCENT`,
+  `GRADE_NEAR` yellow = `GOLD`, `GRADE_FAR` red = `DANGER`; ungraded stays
+  `TEXT`; `worded_value` lays text out uncolored and the painter gives the
+  color). Tiles (`Swing { report, t_ns, grades }`, `frame_tiles`,
+  `tempo_values`): a frame tile is graded only when its camera's frame is a
+  key event's frame of that report or one frame either side
+  (`key_position`, by series frame), with that position's grade; several
+  cameras' tile takes the grade they share (`shared_grade`: all graded, same
+  fit), else none; the tempo tiles take the face-on cameras' shared grade,
+  else the first camera's in column order (Backswing is never graded).
+  `graded_shown`: a graded turn's word is `signs::turn` (Open/Closed) of the
+  signed value, a shift keeps its own word, any other value off its band
+  takes `signs::direction` of the grade's `direction`. The miss line
+  (`miss_entries`, `miss_job`, `miss_line`, mark `frame_misses`; 13 pt, at
+  most two lines) lists the tempo and frame tiles off their band (not
+  `Both`): the tile's name muted, then the grade's `word` in its fit's
+  color, joined by ` · `; while the shot has grades a line's height is kept
+  even when it is empty, so the tables hold still as the playhead crosses a
+  key frame. Table cells (`metric_rows` -> `Cell { shown, grade, worded }`)
+  are colored by their position's grade; a graded cell's hover text
+  (`band_tip`, `band_text`; marks `cell:<camera>:<row>:<col>`) is the
+  reference and its band (fade and draw bands for the shape-linked rows,
+  inches in the Units system, rounded after the conversion), the value as a
+  tile reads it, and the words.
+  The table has Hip turn and Shoulder turn and leaves out
   `hip_width_proxy` and `loss_of_posture` (the Forward bend row's change
   from address), which stay in the file. The UI reads the file through
   lenient mirror types (`SwingReportFile`, with `scale` and `series`; a
@@ -1447,7 +1508,7 @@ the pane as not shown, so a pane on screen turns Live on.
   frame is decoded (`ensure_huffman` + zune-jpeg) into the view's texture on
   the next update, and only a frame asks for a repaint. A failed request
   waits 1 s. The views exist only while Live is on screen (the Shots tab,
-  the Cameras pane in either view, Live on, the window not minimised, not a
+  the Cameras pane in either view, Live on, the window not minimized, not a
   hidden browser tab); otherwise they are dropped and their late replies
   ignored.
   A camera that is not Connected shows its Devices card's badge and `error`
@@ -1474,6 +1535,45 @@ frames, triggers and impact estimates share real time: the clip window, the
 sidecar times and the replay's sync between cameras need nothing else. The
 latency is read from the live config on every capture pass (`reconfigure` is
 `Applied` for a latency-only change; the camera is not reopened).
+
+### Rotation, yaw and pitch
+
+`[camera.N] rotation_deg` (`u16`: 0, 90, 180 or 270, serde-omitted at 0),
+`yaw_deg` and `pitch_deg` (`Option<f64>`, -30 to 30 degrees, serde-omitted
+when unset = 0) are validated like `latency_s`: `rotation_error` /
+`yaw_error` / `pitch_error`, all four reported by `CameraSection::error(id)`
+and `FlighthookConfig::camera_error()` (the first camera by index), `400` on
+save, not in effect (0, a warning in the log) from the file. `reconfigure`
+is `Applied` for a change of any of them. Clips are stored as the camera
+sends them; the rotation is metadata applied where a frame is analyzed or
+drawn:
+
+- **Clip pass**: `pose::clips::clip_config(model, rotation)` puts
+  `SystemConfig::camera_rotation(actor)` (the value in effect at the time
+  the clip runs) in stance's `PoseConfig::rotation`; stance turns every
+  decoded frame before detection, and the track's keypoints and
+  `width`/`height` are in the turned frame (the track records it).
+  `ClipStore::set_pose(slot, camera, rotation)` records that rotation and
+  `stance::VERSION` on the camera's `ShotVideo` (`rotation`,
+  `analyzed_with`, kept in `shot.json`); `shot_pose` carries the rotation.
+- **Live**: `LiveSettings.rotation` (read per frame); the worker makes a new
+  tracker when it changes, built with `PoseConfig::rotation`, so stance's
+  tracker turns each live image before detecting; the `X-Pose` keypoints
+  and the posture's frame width are the turned frame's.
+- **Display**: the JPEGs on the wire are unrotated. The UI takes each
+  camera's rotation from the saved config it holds
+  (`SettingsForm::saved_rotation`; a clip whose camera is no longer
+  configured uses the rotation it was tracked with) and paints the texture
+  turned about its center (`pose::paint_turned`: `egui::Image::rotate` in
+  the rect of the unturned size, `turned_size` swapping width and height for
+  90/270) in the live view, the replay, the inline player, the shot cards
+  (frames cut to the turned card's shape first) and the device card's still
+  frame (with the card's unsaved rotation). `Fit` takes the turned
+  `(width, height)`, so the skeleton lands on the turned picture.
+
+Yaw and pitch are not used by any measurement or grade. The Cameras pane
+shows one line over a Golfer Front camera's swing numbers when its
+`|yaw_deg|` is 5 or more (`cameras::yaw_warning`).
 
 The recorder takes frames in strictly increasing time and ignores one that
 is not newer than the newest it holds, so `Restamp` passes on only frames
@@ -1569,7 +1669,7 @@ When a config change moves `clip_dir`, the system actor calls
 files stay), keeps clips still being written until they finish, indexes the
 new folder like at startup, and the shots that lost their clips go out in
 one `shot_video_removed` from `system`. Clips in an earlier folder are never
-deleted by flighthook afterwards.
+deleted by flighthook afterward.
 
 ### Web
 
@@ -1577,8 +1677,8 @@ Each web server stamps a `shot_video` onto the shots it names, found by
 `shot_id` whatever actor took them: a pending shot keeps it until
 `shot_finished`, a stored shot gets it in `data.video` (one entry per camera,
 replacing that camera's earlier one). `shot_video_removed` clears `video` on
-its shots, `shot_pose` sets `pose` on its camera's entry and `shot_swing`
-sets `swing`. Routes
+its shots, `shot_pose` sets `pose`, `rotation` and `analyzed_with` on its
+camera's entry and `shot_swing` sets `swing`. Routes
 (`web/routes.rs`):
 
 - `GET /api/shots/{shot_id}/video`: the clip's finished cameras
@@ -1610,7 +1710,14 @@ sets `swing`. Routes
 - `POST /api/shots/{shot_id}/video/{camera}/analyze`: track that clip now
   for a viewer (`pose::clips::request`): `202 {"state":"queued"}`, `200
   {"state":"done"}` when its keypoints are there, `409` in Off mode, `404`
-  without the clip.
+  without the clip. `?force=1` first clears the clip's analysis
+  (`ClipStore::clear_analysis`: deletes `<camera>.pose.json` and
+  `<camera>.swing.json`, clears `pose`/`swing`/`rotation`/`analyzed_with`
+  and rewrites `shot.json`; `web::forget_analysis` clears the stored rows)
+  and queues it again.
+- `GET /api/shots/{shot_id}/grades/{camera}`: the camera's swing numbers
+  graded against the bands, computed per request (see **Grades** under
+  Body tracking); `404` until its swing file is served.
 - `GET /api/status`: `cameras_supported` (`stance::camera::SUPPORTED`)
   and `clip_dir`.
 
@@ -1625,7 +1732,7 @@ keypoints in that box (tract, pure Rust, no native libraries); and golf
 numbers measured on them by stance's golf analysis (`stance::golf`): each
 recorded swing's events, tempo and metrics, and the live posture. The code
 is `app/src/pose/` (`models.rs`, `live.rs`, `clips.rs`, `priority.rs`,
-`swing.rs`, the one module that calls `stance::golf`), held in `SystemState::pose`. `[body_tracking]` is read live
+`swing.rs` and `grades.rs`, the modules that call `stance::golf`), held in `SystemState::pose`. `[body_tracking]` is read live
 through `SystemConfig::body_tracking()` (out-of-range values at their
 defaults): no change restarts a camera.
 
@@ -1636,7 +1743,6 @@ defaults): no change restarts a camera.
 | `min_score` | 0.3 | 0 to 1 | drawing (UI): keypoints below it are hidden |
 | `smoothing` | 1.0 | 0 (off), or 0.1 to 10 Hz | live only: One Euro cutoff at rest |
 | `detect_every` | 10 | 1 to 60 | live only: frames between detections |
-| `golfer_height` | unset | 100 to 250 cm | swing analysis: distances in cm |
 | `show_skeleton` | true | true \| false | drawing (UI): the skeleton over the live views, the clips and the replay |
 
 Out-of-range values are refused with `400` on save (`BodyTrackingSection::error`)
@@ -1647,9 +1753,21 @@ enum like `model`: an unknown value is an invalid body (the JSON extractor's
 `historical`; a section with neither is `off`. Only `mode` is written, so
 such a file is brought up to date with a backup at load, and a config
 without the section stays byte-identical. The Body
-tracking card (General) edits every field (`golfer_height` typed in inches
-with imperial default units, centimetres with metric; stored in
-centimetres), saved with the General cards. Turning body tracking on from
+tracking card (General) edits every field, saved with the General cards.
+
+The player's facts are `[player]` (`PlayerSection`, read live through
+`SystemConfig::player()`, a height out of range is none): `sex` (`male` |
+`female`, for the tour averages) and `height` (100 to 250 cm: the swing
+analysis' distances in cm). The Player card (General) edits both (height
+typed in inches with imperial default units, centimeters with metric),
+saved with the General cards; `POST /api/settings?scope=player`
+(`SetPlayer`) writes the section alone. `[body_tracking] golfer_height` is
+read by `BodyTrackingRaw` into the hidden, never-serialized
+`BodyTrackingSection::legacy_golfer_height` (left out of equality), and
+`FlighthookConfig`'s `Deserialize` moves it to `player.height` when that is
+unset; since it is never written, a file holding it is rewritten once at
+load with a backup (see [Loading and migration](#loading-and-migration)). A
+`scope=body_tracking` save carrying it saves the section without it. Turning body tracking on from
 Off saves the mode at once through
 `POST /api/settings?scope=body_tracking` (`SetBodyTracking`: that section
 alone, so it never writes another setting).
@@ -1721,7 +1839,7 @@ finishes, every `Missing` or `Failed` model entry is dropped, so the next
 mid-download, is deleted before the next download. Tests never reach the
 network: `SystemState` in tests has an empty models folder of its own and a
 stand-in source (`models::fake`), which writes a placeholder file in steps,
-honours the cancel flag and can be made to fail.
+honors the cancel flag and can be made to fail.
 
 **Live** (`pose::live`). While a camera's live view is watched and body
 tracking is in Live mode, the camera actor runs a worker thread `pose:camera.N` and
@@ -1794,9 +1912,13 @@ flag however it ends. Then `PoseTrack::write_beside` writes
 `<clip folder>/<camera>.pose.json`: one entry per clip frame on the sidecar's
 time base (`t_ns`), raw keypoints (no smoothing), empty where nobody was
 found. `ClipStore::set_pose` then marks the camera's `ShotVideo` (`pose:
-true`, kept in `shot.json`) and the queue sends one `shot_pose { keys }`
-with the camera as its actor, straight on the bus (a fact about files, sent
-even if the camera actor has been restarted since). A clip pruned or
+true`, the rotation and `analyzed_with`, kept in `shot.json`) and the queue
+sends one `shot_pose { keys, rotation }` with the camera as its actor,
+straight on the bus (a fact about files, sent even if the camera actor has
+been restarted since). One info line per clip gives the pass's size and
+wall time: `body tracking: <camera> shot <id>: <frames> frames in <s> s
+(<threads> threads) · <ms> ms a frame, golfer on <n> frames` (`<id>` the
+clip's first shot). A clip pruned or
 cleared while it ran keeps no pose file. Pose files are deleted with their
 clip folder (pruning, Clear history).
 
@@ -1808,7 +1930,7 @@ the shot (the game's hand when the camera saw the trigger, carried with the
 recorder's tag; right-handed when unknown), the clip's estimated impact (the
 sidecar's `impact_ns`, the launch monitor's impact shifted by its camera
 timing, when it falls inside the clip's frames: at or after the first, at
-or before the last), `golfer_height`, and whether the
+or before the last), the player's height (`SystemConfig::player()`), and whether the
 camera's picture is mirrored (`swing::mirrored`, the one place a mirror
 setting plugs in; no camera is mirrored yet). stance takes the impact as a
 prior: it moves it to the hands' low point within 0.3 s (`refined`), or,
@@ -1826,6 +1948,24 @@ the camera's `ShotVideo` (`swing: true`, kept in `shot.json`) and one
 use (fewer than three frames with the golfer) leaves no swing file (logged
 at info). `GET /api/shots/{shot_id}/video/{camera}.swing.json` serves it
 with the `.avi` rules; swing files go with their clip folder.
+
+**Grades.** `GET /api/shots/{shot_id}/grades/{camera}` (`get_shot_grades`)
+grades a camera's swing file per request, never stored: `pose::grades::
+grade_file` reads it (`SwingReport::read`; `404` while the file isn't
+served) and grades it with stance's built-in band table
+(`stance::golf::norms`, `Norms::builtin`, `grade_report` + `grade_tempo`)
+for the tour and the amateur reference. The context: the club class from
+the stored shot's `club_selected` (`Club::class`, lib `ClubClass` mapped to
+stance's; a putter or no club grades nothing), the sex from
+`SystemConfig::player()`, and the height: when the report has the upright
+torso length, its `scale.cm_per_px` is recomputed from the Player card's
+height now (none without one, so stance assumes 177 / 164 cm) and the
+analysis-time `cm` dropped. A report whose impact was `given` grades only
+its tempo. Each stance `Grade` becomes a lib `MetricGrade` (`grades.rs` in
+lib: `BodyGrades`, `ReferenceGrades`, `ReferenceKind`, `Fit`, `Side`); its
+`word` is stance's `fit_word()` without stance's own name for the metric, so
+the UI puts its own label first. The hand is reported, not used: every
+stance metric is target-relative.
 
 **UI.** The Live view draws each view's pose (the one that came with the
 picture on screen) into the picture's rect with `ui/src/pose.rs`: the frame
@@ -1845,7 +1985,14 @@ the player and the replay send one analyze request per clip without `pose`
 (`Fetch::Analyze`, once per view); the answer only matters when it is `200`
 (done already: the files are fetched at once), otherwise `shot_pose` and
 `shot_swing` bring them as for a recorded clip, and until then the clip
-plays without them, as while any clip is tracked.
+plays without them, as while any clip is tracked. A clip keeps the tracking
+it was given. When the Cameras pane shows a shot with a clip tracked
+(`pose`) at a `rotation` other than its camera's saved one
+(`cameras::retrack_due`), it posts `analyze?force=1` once per (shot,
+camera) per session (`FlighthookApp::retracked`) and drops that clip's pose
+and analysis from the row and the player (`types::forget_analysis`,
+`ReplayView::forget_analysis`) until `shot_pose` and `shot_swing` bring the
+new ones.
 With `show_skeleton` false no skeleton is drawn anywhere (Live, the
 Cameras pane's player, the replay); the poses are still fetched and the
 swing numbers shown. In Live mode a line under the live views reads out the
@@ -2068,10 +2215,12 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
   `error` body when it doesn't come).
 - **Global settings** -- `POST /api/settings?scope=global` emits
   `ReplaceGlobal`: units, chipping/putting clubs, default view, simulation,
-  replay and body tracking from the body, every actor section of the live
-  config kept.
+  replay, body tracking and player from the body, every actor section of the
+  live config kept.
 - **Body tracking** -- `POST /api/settings?scope=body_tracking` emits
   `SetBodyTracking`: the body's `[body_tracking]` alone.
+- **Player** -- `POST /api/settings?scope=player` emits `SetPlayer`: the
+  body's `[player]` alone, no actor reconciled.
 - **Per-section upserts** -- `POST /api/settings?scope=<id>` emits a scoped
   `ConfigAction` variant (e.g. `UpsertMevo`), writing only that section and
   reconciling only that actor. A scope naming a section the body omits emits
@@ -2164,7 +2313,7 @@ more rows than fit (see [Card height](#card-height)).
   GENERAL
   | Global                           [API Docs] | Simulation [beta]
   | Units:             [Imperial v]             | Simulation:   [On v]  (Off | On | Force)
-  | Default shot view: [By set | By club | None]| Altitude:     [0] [ft v]   (greyed while Off)
+  | Default shot view: [By set | By club | None]| Altitude:     [0] [ft v]   (grayed while Off)
   | Chipping Clubs:    [PW GW SW LW]            | Temperature:  [77] °F      (°C when Metric)
   | Putting Clubs:     [PT]                     | Surface:      [Fairway v]
   | Web Server [CONNECTED] [Telemetry|Settings]
@@ -2205,7 +2354,7 @@ Groups and order (`ui/src/panels/cards.rs`):
 
 | Group | Cards, in order | (+) offers |
 |---|---|---|
-| General | Global card, Simulation card, Replay card, `webserver` | -- (no (+)) |
+| General | Global card, Simulation card, Replay card, Body tracking card, Player card, `webserver` | -- (no (+)) |
 | Launch monitors | `mevo`, `r10`, `square`, `exputt`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, ExPutt, Uneekor (OpenConnect), OpenConnect Server |
 | Cameras | `camera` | Camera (only while `/api/status` says `cameras_supported`; without it the group shows the cameras already configured and no (+)) |
 | Outputs | `openconnect_client`, `pureplay`, `random_club` (and any type the UI does not know) | GSPro (OpenConnect), Muni Golf (OpenConnect), OpenConnect Client, Pureplay |
@@ -2275,7 +2424,7 @@ left out once it would be cut to a stub. The toggle flips the card body:
   on hover (a Square Golf Omni's `device_info`, for one). With no row to
   show, the body shows the actor's state in its middle instead, 48 points
   across: a spinner (a faint ring with an arc going round it) in the card's
-  status colour while the actor is starting, connecting or reconnecting, and
+  status color while the actor is starting, connecting or reconnecting, and
   a check in a ring in the connected green once it is connected
   (`monitoring::no_telemetry`, `theme::loading_ring` / `connected_ring`). It
   goes as soon as a row arrives; a camera's still frame takes its place too.
@@ -2329,10 +2478,10 @@ Settings side and a camera card showing a still frame scroll.
 
 Every card is exactly its grid column's width, on both sides: long names in
 the header and in text fields, and long entries in a dropdown, are cut short
-inside the card rather than widening it over its neighbour or the cards
+inside the card rather than widening it over its neighbor or the cards
 under it.
 
-The coloured stripe down the left edge of a card is the colour of the actor's
+The colored stripe down the left edge of a card is the color of the actor's
 connection state (the badge's), on both sides, dim while the actor is not running (unsaved, or not
 started yet). The General cards' stripe is the heading blue; they have no
 toggle (settings only).
@@ -2411,20 +2560,26 @@ displayed).
   [`GET /api/cameras`](API.md#get-apicameras), fetched the first time a
   camera card shows its settings, with a refresh icon; a camera another card
   uses reads "(in use by camera.N)", a saved camera that is not connected
-  "(not connected)"), Position, and Video mode (Auto or one of the picked
+  "(not connected)"), Position, Video mode (Auto or one of the picked
   camera's modes, `1280×720 @ 120`; a saved mode the list lacks stays
-  selectable). Save needs a camera and a mode. They are left out of the
+  selectable), in this order: Camera, Rotation (`0° | 90° | 180° | 270°`
+  pills, marks `camera_rotation:<id>` and `camera_rotation:<id>:<deg>`;
+  right under the camera, so it shows without scrolling at the fixed card
+  height), Position, Video mode, Latency, Yaw (`camera_yaw:<id>`, with the
+  sign in words under it) and Pitch (`camera_pitch:<id>`), the angles' range
+  under them while out of range. The body scrolls to Yaw and Pitch. Save needs a camera, a mode
+  and every value in range. They are left out of the
   Open Connect clients' routing dropdowns. The Telemetry side ends in
   **Still frame**, enabled while the camera is connected: it fetches
   [`GET /api/cameras/{actor}/still`](API.md#get-apicamerasactorstill) and
-  shows the frame at the card's width (decoded like the replay's frames)
+  shows the frame at the card's width (decoded like the replay's frames),
+  turned by the card's rotation
 - The Body tracking card (alpha, General, after Replay) holds every
   `[body_tracking]` field, in this order: Mode (`mode`, Off | Historical |
   Live, pills like Model's), Model (`model`, RTMPose-m | RTMPose-s), Show
   skeleton (`show_skeleton`, a checkbox), Minimum score (`min_score`),
-  Smoothing (`smoothing`, Hz), Detect every (`detect_every`, frames) and
-  Golfer height (in inches with imperial default units, centimetres with
-  metric, converted when the units change; empty is none). Every field
+  Smoothing (`smoothing`, Hz) and Detect every (`detect_every`, frames).
+  Every field
   shows in every mode; each number is checked like the server's
   (`BodyTrackingSection::error`, one field at a time) with its range under
   it while out of range, and a field left as loaded saves its loaded value
@@ -2439,7 +2594,7 @@ displayed).
   `?scope=body_tracking`, one at a time, the newest winning) and shown on the
   card. `missing` or `failed`: an `egui::Modal` dialog lists the missing
   files (label, MB, host), the total in whole MB, the models folder and that
-  body tracking runs locally afterwards, with **Download** and **Cancel**
+  body tracking runs locally afterward, with **Download** and **Cancel**
   (Cancel, Escape or the backdrop: nothing saved). Download saves the mode,
   `POST`s the download and turns the modal into the progress overlay: a bar
   per file and an overall bar with MB done/total, the current host, and
@@ -2452,6 +2607,12 @@ displayed).
   model per on-period the first time something needs the models (a shot's
   clips in the Cameras pane, Live in Live mode, Replay); its Cancel leaves
   the mode as it is. No hover text
+- The Player card (General, after Body tracking) holds `[player]`: Sex
+  (Men's | Women's pills, marks `player_sex`, `player_sex:male|female`) and
+  Height (`player_height`; inches with imperial default units, centimeters
+  with metric, converted when the units change; empty is none; its range
+  under it while out of range, checked by `PlayerSection::error`). It saves
+  and cancels with the other General cards (`scope=global`)
 - The Replay card (beta, General) holds `[replay]`: Keep clips, Pre-roll,
   Post-roll and Start before impact in seconds, a **Show video on shot
   cards** checkbox (`shot_cards`), and the clip folder,
@@ -2527,7 +2688,7 @@ The tab bar is a segmented control, the same look as the mode selector beside
 it (`theme::segmented`). While any card is red (an actor of any kind lost
 its connection less than 10 minutes ago, see
 [Connection state](#connection-state)), the Devices segment carries a small
-red notification dot at the top centre, overlapping its top edge, whatever its
+red notification dot at the top center, overlapping its top edge, whatever its
 selection state. Nothing else lights it: not an actor that has not connected
 since it started, and not an `error` in an actor's telemetry, which shows on
 its card and in the error banner instead. The UI asks for a repaint when the
@@ -2617,7 +2778,7 @@ values in italics (`ShotsView::shows_simulated_legend`). The chosen view
 The **device filter** (`DEVICE [All | <device>…]`, its own group after the
 units, styled like them) shows in both views, in every grouping, while the
 session's shots come from two or more devices (`device_options`); each
-device is labelled by `chart::device_label`. It lasts for the session
+device is labeled by `chart::device_label`. It lasts for the session
 (`FlighthookApp::device_filter`) and falls back to All when its device
 leaves the history. One filter applies to everything on the Shots tab,
 through one predicate (`chart::in_filter`): the shot list and its section
@@ -2625,7 +2786,7 @@ counts, the shot on show, the Table's rows, the view's members (range bars,
 stats and face impact cards, Flight, Dispersion) and the charts' faint
 shots. An Auto-chip is no device, so a filter hides it like any other
 device's shot. With All, the bars, Flight and Dispersion keep their device
-colours and sub-bands. The JSONL/CSV export and the server are not
+colors and sub-bands. The JSONL/CSV export and the server are not
 filtered: the export is always the whole session. Every cache that depends
 on the filter holds it in its key: the members (`chart::MembersKey`, and so
 the chart scenes) and the Table's rows (`FlighthookApp::filtered_rows`, on
@@ -2637,12 +2798,12 @@ every size follows from the window's, so the layout holds still until the
 window changes.
 With the window at least 1200 px wide, **Dispersion** fills a full-height
 column on the right, 24 % of the window's width (260-420 px), in both views,
-and Cards has **Flight** along the bottom of its centre column (between the
+and Cards has **Flight** along the bottom of its center column (between the
 shot list and the Dispersion column), 30 % of the window's height (180-320
 px). Narrower, Cards puts Dispersion in the bottom row beside Flight (62 % of
 the row for Flight, 38 % for Dispersion, widened to at least 312 px, up to
 half the row, so its header keeps to one row), so the cards keep the
-centre's width; the row is 27 % of the window's height (210-320 px). Narrow
+center's width; the row is 27 % of the window's height (210-320 px). Narrow
 Table puts Dispersion under the table, 35 % of the window's height (266-400
 px). The floors hold a Dispersion plot (inside its label gutters) of at
 least 144 px in the Cards row, the most the cards leave at 1024×768, and
@@ -2766,7 +2927,7 @@ older one) and lose it on `shot_video_removed`.
 
 The chip opens the replay, an `egui::Modal` over the Shots tab
 (`ui/src/panels/replay.rs`, logic in `ui/src/replay.rs`): the shot's cameras
-side by side, each labelled with its card's name and position and followed
+side by side, each labeled with its card's name and position and followed
 by a download icon (Codicons `download`, hover "Download"; the `.avi`); a scrubber with the start point as a green tick
 and the estimated impact as a gold tick; play/pause; previous/next frame;
 speed 1× · ½ · ¼ · ⅛; a Loop toggle (on whenever a replay opens, UI state only). Close, Escape
@@ -2840,7 +3001,7 @@ The server sets count an Auto-chip like any shot. The UI keeps it out of
 every statistic through one predicate, `chart::is_auto_chip`: it is never a
 view member (`chart::members_for`), so the range bars, stats and face impact cards,
 dispersion ellipse and flight set overlay leave it out; it is not in
-`chart::device_ids`, so it has no device filter option, band or colour; and
+`chart::device_ids`, so it has no device filter option, band or color; and
 list and range-bar headers count a set as `chart::set_shot_count` (the
 set's `shots` less its Auto-chip rows). It stays in the shot list under its
 set, in the Table and on the Cards; shown, it is the charts' gold shot
@@ -2863,18 +3024,18 @@ card gets at least 96 px; otherwise in two columns two cards wide (Ball over
 Flight, then Club) when that leaves 96 px; otherwise they stack with their
 cards wrapping. Detail cards stay shorter than the headline cards.
 
-The centre column always tries to show everything above the panel under
+The center column always tries to show everything above the panel under
 it (`cards_layout`, from the height between the toolbar and that panel,
 every frame). With room to spare, the cards grow with the height up to a
 limit and the spare height is split above and below. Short of room, every
 height in the column (the header line, headline and detail cards, the
-range bar rows, label lines and gaps) shrinks towards a compact size by
+range bar rows, label lines and gaps) shrinks toward a compact size by
 the same share, just enough to fit; card padding and labels shrink with
 the cards. The compact sizes keep the numerals readable: headline cards
 68 px tall with numerals of at least 28 px, detail cards 52 px with at least
 18 px, bar rows 26 px. At 1920×1080, 1600×900, 1440×900, 1280×800 and
 1024×768 every card fits with no scrolling, with the shot list at its
-default width or at the widest it opens at. Only a shorter centre (e.g.
+default width or at the widest it opens at. Only a shorter center (e.g.
 900×700) scrolls: then the cards stay at their compact sizes, a solid scroll
 bar shows beside them, and the column ends a chart gap below the last row so
 it clears the panel when scrolled to the end. Numerals shrink to fit their
@@ -2894,14 +3055,14 @@ legend on the right; when the title and the legend (with its device chips)
 don't both fit on the line, the legend moves to a row of its own under the
 title (`legend_place`), so the two never overlap. The device filter (in the
 toolbar, above) applies before the view; with All and two or more devices,
-each bar's band splits into one sub-band per device, coloured by device. The
+each bar's band splits into one sub-band per device, colored by device. The
 members are cached on `chart::MembersKey` (shot and set revisions, view,
 device filter, shown shot, club in play) by
 `FlighthookApp::refresh_members`, which the bars, the stats and face impact
 cards, Flight and Dispersion all take them from. Each bar is
 drawn on a track, painted in this order: the set's range as a translucent
 accent band with its min and max beside it; the median as a hollow white
-ring sitting on the track's centre line, its radius just inside the track's
+ring sitting on the track's center line, its radius just inside the track's
 height; the average as a filled gold dot (full-strength `theme::GOLD`),
 sized to sit inside the ring (filling it when the two coincide), with a thin
 dark halo so it reads against the band; and, on top of everything, the
@@ -2911,7 +3072,7 @@ every marker therefore reads as a white ring filled with a gold dot, with a
 gold line through it poking out above and below. Total and Carry share one
 domain, the set's extent padded by 15 % of its range and at least 10 yd (9 m) a side,
 so roll reads as the offset between the bands; the track's ends carry no
-numbers (only the band's own min and max are labelled). Lateral is symmetric
+numbers (only the band's own min and max are labeled). Lateral is symmetric
 about the target line (a tick at 0) out to 1.2× the widest value, and at least ±6
 units. A single shot draws a 16 px pip, wide enough that it still peeks out
 past the ring and dot. Total and Carry are picked like the cards' values
@@ -2968,7 +3129,7 @@ cards' label style. Under it, a table: column headers `AVG`, `MED`, `SD` in
 small muted capitals, then one row per bar in bar order, named like the bars
 (`TOTAL`, `CARRY`, `LATERAL`) with the unit in small muted text. The values
 are printed like the bars' (`StatsRow`): average and median as whole yards
-or metres, lateral to a tenth with its side (`3.2 L`), the standard
+or meters, lateral to a tenth with its side (`3.2 L`), the standard
 deviation to a tenth; a value the row lacks is an em dash (every column
 when the bar has no values, the SD with only one), and when only k of the n
 shots with data have the value, a small muted `k/n` ends the row. With room
@@ -2986,7 +3147,7 @@ font and size) and, under it, the shown shot's clip from that camera:
 playing at 1×, looping from the replay's start point (`[replay]
 start_before_impact_s` before the impact, `replay::start_point`) to the end
 of the last frame, starting once the frame at the start point is in. Each
-frame is cut to the card body's aspect about its centre (no letterbox) and
+frame is cut to the card body's aspect about its center (no letterbox) and
 scaled by box averaging (nearest when scaling up) to the body's pixel size
 (`ctx.pixels_per_point()`, each side rounded up to an even number). Nothing else is drawn on the
 picture. Without a clip of the shown shot from that camera (still recording,
@@ -3028,25 +3189,25 @@ handedness, else the game state's, else right). Face impact itself is
 golfer-relative and never mirrored. The outline is one of six generic
 families by club (driver and mini driver; fairway woods; hybrids; irons
 1I-9I, PW and an unknown club; wedges GW, SW, LW; putter), each a closed
-chain of cubic Béziers in face millimetres with the origin at the face
-centre (the midpoint of both chords through it). Each family is scaled on
+chain of cubic Béziers in face millimeters with the origin at the face
+center (the midpoint of both chords through it). Each family is scaled on
 its own to fill the panel (`FaceView::fit`, the one place the scale is set:
 the whole silhouette, hosel included, as large as fits 94 % of the plot's
-width and 86 % of its height, centred), so the families are not drawn to
+width and 86 % of its height, centered), so the families are not drawn to
 one scale: a wood and a hybrid look about the same size. The cubics are
 flattened in screen space by Wang's formula to within 0.1 pt, and the face
 is filled with a triangle mesh (ear clipping, built once per family and
 scale, since egui fills only convex paths) with the outline stroked over it.
-Inside: a dashed crosshair at the face centre; the view's other members
+Inside: a dashed crosshair at the face center; the view's other members
 (the bars' members, after the device filter) as small dots, accent or in
-device colours by the same rule as the Flight and Dispersion charts; the
+device colors by the same rule as the Flight and Dispersion charts; the
 shown shot as a gold dot, or a gold line across the face when only one
 axis was read. The shown shot
 is marked only when it is a member, as on the bars; otherwise there is no
 gold mark and the readout is `-`.
 A mark off the face is drawn as a ring, pulled into the panel when it is
 off it. The readout above the face reads `4 toe · 2 low` in whole
-millimetres (`-` when the shown shot has no reading), 12.5 pt, shrinking to
+millimeters (`-` when the shown shot has no reading), 12.5 pt, shrinking to
 10 pt in a narrow panel and cut short with an ellipsis only if it is still
 too wide there; TOE, HEEL and mm sit under
 the face's ends. Hovering a dot shows its shot (`#5282 · 7I`, the device
@@ -3081,7 +3242,7 @@ frame:
 
 - **Gold**: the shown shot, over a dark halo, with a tick and label at its
   apex and dots at its landing and rest. Its apex (gold, with its unit),
-  carry and total are labelled at 14 pt on a background box, each centred
+  carry and total are labeled at 14 pt on a background box, each centered
   above the point it labels (`flight::place_marks`): carry and total 7 pt
   above the ground line, the apex over its tick. When the carry and total
   boxes would come within 6 pt of each other (a short roll, or a wedge that
@@ -3092,8 +3253,8 @@ frame:
   still on the step. It is drawn only when it is a member, as on the bars.
   The header repeats its apex, carry and total.
 - **Bright**: the view's other members (By set: the shown shot's set; By
-  club: that club's shots in its session), in accent, or coloured by device
-  (`theme::DEVICE_COLOURS`) when the filter is on All and there are two or
+  club: that club's shots in its session), in accent, or colored by device
+  (`theme::DEVICE_COLORS`) when the filter is on All and there are two or
   more devices, with their landing and rest dots.
 - **Faint**: the other shots of the current session, from the filtered
   device, newest 200, at 14 % alpha, for context. They do not set the
@@ -3102,9 +3263,9 @@ frame:
 
 A ground ball (`flight::rolls`: a path whose flight is the tee alone and
 whose ground segment is the roll) is drawn as a line along the ground from
-the tee to rest, with the flight's stroke and colour rules (gold for the
+the tee to rest, with the flight's stroke and color rules (gold for the
 shown shot, bright, faint), a rest dot but no landing dot, and, in gold, only
-its total labelled; it is hovered and clicked like any path and draws on
+its total labeled; it is hovered and clicked like any path and draws on
 along the roll. A shot without a path to draw (no simulation: no spin
 reading, simulation off) gets 6 px ticks on the ground line at its displayed
 carry and total, picked like the cards' values (`pick`); a path without a
@@ -3129,9 +3290,9 @@ session only: `Total | Carry`
 (default Total: rest positions; Carry: landing points) and `2σ | 95 %`
 (the ellipse size, default 2σ), on a second row when the panel is too
 narrow for one. The axes are equal (one yard across is one yard up), with
-the tee at the bottom centre, downrange up and right to the right
+the tee at the bottom center, downrange up and right to the right
 (target-relative for both hands, like offline), in yd or m; distance
-rings about the tee every 25 (thinned below 60 px) are labelled where they
+rings about the tee every 25 (thinned below 60 px) are labeled where they
 meet the plot's left edge, a dashed target line runs up the middle, and
 lateral ticks with `L`/`R` sit along the bottom. The domain is 1.08 × the
 furthest point rounded up to 25 (at least 50) by 1.3 × the widest lateral
@@ -3148,14 +3309,14 @@ out.
 The drawn sets are Flight's (`flight::drawn_sets`): **gold** is the shown
 shot when it is a member, a 5 px dot over a halo with its roll drawn as a
 gold line from the landing to the rest; **bright** are the view's other
-members, in accent or coloured by device when the filter is on All with two
+members, in accent or colored by device when the filter is on All with two
 or more devices; **faint** the rest of the current session from the
 filtered device, newest 200, at 18 % alpha, clipped and not setting the
 scale; **None** draws the shown shot alone. In Table view the panel is
 built around the latest shot of the filtered device (its rows cannot be
 picked). One covariance ellipse covers the
 bright and gold points (three or more), or with the filter on All and two
-or more devices one per device in its colour: centred on the mean, axes
+or more devices one per device in its color: centered on the mean, axes
 along the eigenvectors of the sample covariance (n − 1), semi-axes k·√λ
 with k = 2 for 2σ (about 86 % of a 2D normal pattern) or 2.448 for 95 %
 (`chart::ELLIPSE_K_2SIGMA`, `chart::ELLIPSE_K_95`), each at least 1 yd or
@@ -3189,8 +3350,8 @@ it shows, else `#`) is inset so the latest row's gold stripe on the left edge
 never covers its text. The Club column is the club selected when the
 shot was triggered (`-` when none), with the shot's set number on hover (`Set 3`).
 After Smash, **Impact H** and **Impact V** give face impact in whole
-millimetres with a side word (`4 toe`, `6 heel`, `2 high`, `5 low`; `0`
-under half a millimetre; `-` without a reading), the same in both unit
+millimeters with a side word (`4 toe`, `6 heel`, `2 high`, `5 low`; `0`
+under half a millimeter; `-` without a reading), the same in both unit
 systems. Both views show a "waiting for the first shot" message
 until there is one.
 
@@ -3220,7 +3381,7 @@ Imperial/Metric toggle. When the
 device reports no smash factor, the Smash card and table column show ball
 speed over club speed when both are known; this is display only, and the bus,
 GSPro output and export carry the device's value. When a new shot arrives the
-cards glow with the accent colour, a few pixels wide and following their
+cards glow with the accent color, a few pixels wide and following their
 rounded corners, and the table's latest row gets an accent outline; both fade
 over 1.5 s.
 

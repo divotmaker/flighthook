@@ -19,7 +19,7 @@
 //!   a repaint; it is decoded on the next screen update into the view's
 //!   texture, and the keypoints and posture that came with it (`X-Pose`) are
 //!   drawn with that picture, so they always match it. The loops run only
-//!   while Live is on screen: elsewhere, or with the window minimised or
+//!   while Live is on screen: elsewhere, or with the window minimized or
 //!   the browser tab hidden, the views are dropped, and the server stops
 //!   updating the live frames a few seconds later.
 //!
@@ -39,6 +39,10 @@ use crate::types::{
     BodyTrackingMode, BodyTrackingSection, CameraPosition, CameraSection, ConnectionState,
     Handedness, LivePose, LivePosture, SwingReportFile, SwingTempo, SwingView, UnitSystem,
 };
+use flighthook::{Fit, MetricGrade, ReferenceGrades, ReferenceKind, SwingPosition};
+
+/// Space over the Last shot strip.
+const LAST_SHOT_GAP: f32 = 10.0;
 
 /// How long a view waits after a failed request before the next (s).
 const RETRY_S: f64 = 1.0;
@@ -318,7 +322,7 @@ impl LiveView {
     }
 }
 
-/// Whether the app's window is on screen: not minimised, and in a browser
+/// Whether the app's window is on screen: not minimized, and in a browser
 /// not a hidden tab.
 fn page_visible(ctx: &egui::Context) -> bool {
     let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
@@ -520,9 +524,12 @@ impl FlighthookApp {
     /// Live: the saved cameras side by side, each with its name and position
     /// over its live picture, and in Live mode its posture under it and the
     /// readout line under them all; in the other modes the pictures alone.
+    /// Under the pictures, the newest shot's Last shot strip once its swing
+    /// is analyzed ([`last_shot`](crate::panels::last_shot)).
     fn render_live(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.fetch_live_frames(&ctx);
+        self.sync_last_shot(&ctx);
         let cameras = self.settings.saved_cameras();
         if cameras.is_empty() {
             return;
@@ -546,6 +553,11 @@ impl FlighthookApp {
         let below = if tracking { READOUT_H + spacing } else { 0.0 }
             + if postures {
                 TILES_H + 2.0 * spacing
+            } else {
+                0.0
+            }
+            + if self.live_strip.shown().is_some() {
+                crate::panels::last_shot::LAST_SHOT_H + LAST_SHOT_GAP + spacing
             } else {
                 0.0
             };
@@ -580,6 +592,15 @@ impl FlighthookApp {
                 );
             }
         });
+        if self.live_strip.shown().is_some() {
+            ui.add_space(LAST_SHOT_GAP);
+            // Placed as the pictures' row is, so it lines up under them.
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                ui.add_space(((available.x - row) / 2.0 - GAP).max(0.0));
+                self.render_last_shot(ui, row);
+            });
+        }
         if !tracking {
             return;
         }
@@ -613,17 +634,30 @@ impl FlighthookApp {
         readout(&self.body_tracking(), &readings)
     }
 
-    /// Height over width of camera `actor`'s picture: the frame shown, else
-    /// the resolution it reports, else 16:9.
+    /// Height over width of camera `actor`'s picture, turned by its
+    /// rotation: the frame shown, else the resolution it reports, else
+    /// 16:9.
     fn camera_aspect(&self, actor: &str) -> f32 {
-        self.live
+        let aspect = self
+            .live
             .get(actor)
             .and_then(LiveView::aspect)
             .or_else(|| {
                 let telemetry = &self.actors.get(actor)?.telemetry;
                 resolution_aspect(telemetry.get("resolution")?)
             })
-            .unwrap_or(DEFAULT_ASPECT)
+            .unwrap_or(DEFAULT_ASPECT);
+        if crate::pose::quarter_turn(self.camera_rotation(actor)) {
+            1.0 / aspect
+        } else {
+            aspect
+        }
+    }
+
+    /// The rotation camera `actor`'s pictures are shown with, clockwise
+    /// degrees: its saved setting, 0 for a camera not configured.
+    pub(crate) fn camera_rotation(&self, actor: &str) -> u16 {
+        self.settings.saved_rotation(actor).unwrap_or(0)
     }
 
     /// One camera's column, `width` wide: its heading, then its live
@@ -654,12 +688,20 @@ impl FlighthookApp {
             .get_mut(actor)
             .and_then(|view| view.texture(&ctx, actor).cloned())
             .filter(|_| connected);
+        let rotation = flighthook::rotation_in_effect_deg(section.rotation_deg);
         let shown = match &texture {
             Some(tex) => {
-                let size = tex.size_vec2();
+                let size = crate::pose::turned_size(tex.size_vec2(), rotation);
                 let scale = if size.x > 0.0 { width / size.x } else { 1.0 };
-                let shown = ui.add(egui::Image::new((tex.id(), size * scale)));
-                self.pose_over(ui, actor, shown.rect, tex.size());
+                let (rect, shown) = ui.allocate_exact_size(size * scale, egui::Sense::hover());
+                crate::pose::paint_turned(ui, tex.id(), rect, rotation, egui::CornerRadius::ZERO);
+                let [w, h] = tex.size();
+                let frame = crate::pose::turned(
+                    u32::try_from(w).unwrap_or(u32::MAX),
+                    u32::try_from(h).unwrap_or(u32::MAX),
+                    rotation,
+                );
+                self.pose_over(ui, actor, shown.rect, frame);
                 shown
             }
             None => {
@@ -676,10 +718,11 @@ impl FlighthookApp {
         devices::mark(ui, || format!("camera_live:{actor}"), &shown);
     }
 
-    /// Body tracking over camera `actor`'s picture in `rect` (a `size`
-    /// pixel frame): the skeleton found on it, unless `B` turned it off,
-    /// or while the models are not ready, what they are doing.
-    fn pose_over(&self, ui: &egui::Ui, actor: &str, rect: egui::Rect, size: [usize; 2]) {
+    /// Body tracking over camera `actor`'s picture in `rect` (a `frame`
+    /// = `[width, height]` pixel picture, turned upright): the skeleton
+    /// found on it, unless the skeleton is hidden, or while the models are
+    /// not ready, what they are doing.
+    fn pose_over(&self, ui: &egui::Ui, actor: &str, rect: egui::Rect, frame: [u32; 2]) {
         let Some(view) = self.live.get(actor) else {
             return;
         };
@@ -695,7 +738,6 @@ impl FlighthookApp {
         let Some(pose) = view.shown_pose.as_ref().filter(|_| settings.show_skeleton) else {
             return;
         };
-        let frame = size.map(|v| u32::try_from(v).unwrap_or(u32::MAX));
         crate::pose::paint(
             &ui.painter_at(rect),
             frame,
@@ -738,7 +780,7 @@ fn status_over(
     status: &crate::types::ActorStatusResponse,
     now_ms: u64,
 ) -> egui::Response {
-    let colour = monitoring::status_color(status, now_ms);
+    let color = monitoring::status_color(status, now_ms);
     let error = status
         .telemetry
         .get("error")
@@ -752,7 +794,7 @@ fn status_over(
     );
     let height = 24.0 + if error.is_some() { 24.0 } else { 0.0 };
     child.add_space(((inner.height() - height) / 2.0).max(0.0));
-    let badge = theme::badge(&mut child, status.state().label(), colour);
+    let badge = theme::badge(&mut child, status.state().label(), color);
     if let Some(error) = error {
         child.add_space(6.0);
         child.label(
@@ -851,6 +893,56 @@ impl FlighthookApp {
     }
 }
 
+impl FlighthookApp {
+    /// The toolbar's reference picker, while the Cameras pane shows: which
+    /// population's bands the swing numbers are colored against (marks
+    /// `body_reference`, `body_reference:<key>`). Kept on this device.
+    pub(crate) fn render_reference_picker(&mut self, ui: &mut egui::Ui) -> bool {
+        if !self.cameras_pane_shown() {
+            return false;
+        }
+        let selected = ReferenceKind::ALL
+            .iter()
+            .position(|r| *r == self.body_reference)
+            .unwrap_or(0);
+        let labels = ReferenceKind::ALL.map(ReferenceKind::label);
+        let picker = theme::segmented_pills(ui, &labels, selected, None, theme::PILL_FONT);
+        devices::mark(ui, || "body_reference".to_owned(), &picker.response);
+        let (clicked, pills) = picker.inner;
+        for (reference, pill) in ReferenceKind::ALL.iter().zip(&pills) {
+            devices::mark(ui, || format!("body_reference:{}", reference.key()), pill);
+        }
+        if let Some(i) = clicked {
+            self.set_body_reference(ReferenceKind::ALL[i]);
+        }
+        true
+    }
+
+    /// Color the swing numbers against `reference`'s bands, and keep the
+    /// choice on this device.
+    pub(crate) fn set_body_reference(&mut self, reference: ReferenceKind) {
+        self.body_reference = reference;
+        crate::local::store(REFERENCE_KEY, reference.key());
+    }
+}
+
+/// Column `c`'s grades against `reference`, once fetched.
+fn column_grades(c: &replay::PlayerColumn, reference: ReferenceKind) -> Option<&ReferenceGrades> {
+    c.grades.as_deref()?.reference(reference)
+}
+
+/// Where the reference picker's choice is kept.
+const REFERENCE_KEY: &str = "body_reference";
+
+/// The reference kept on this device, Tour when there is none.
+pub(crate) fn stored_reference() -> ReferenceKind {
+    let kept = crate::local::load(REFERENCE_KEY);
+    ReferenceKind::ALL
+        .into_iter()
+        .find(|r| kept.as_deref() == Some(r.key()))
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // A shot's cameras
 // ---------------------------------------------------------------------------
@@ -883,7 +975,9 @@ impl FlighthookApp {
             return;
         }
         self.sync_shot_player(&ctx, i);
+        self.retrack_turned_clips(&ctx, i);
         let imperial = self.units() == UnitSystem::Imperial;
+        let reference = self.body_reference;
         // A solid bar, beside the columns rather than over them.
         ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         egui::ScrollArea::vertical()
@@ -894,31 +988,46 @@ impl FlighthookApp {
                     return;
                 };
                 ui.add_space(12.0);
-                // One tempo for the shot, across its cameras' columns.
-                let found: Vec<&SwingReportFile> = layout
+                // Each camera's swing, at the frame it shows, graded
+                // against the picked reference.
+                let grades = |c| column_grades(c, reference);
+                let swings: Vec<Swing> = layout
                     .columns
                     .iter()
-                    .filter_map(|c| c.swing.as_deref())
-                    .filter(|r| r.swing_found())
+                    .filter_map(|c| {
+                        Some(Swing {
+                            report: c.swing.as_deref()?,
+                            t_ns: c.frame_t_ns,
+                            grades: grades(c),
+                        })
+                    })
+                    .filter(|s| s.report.swing_found())
                     .collect();
-                if !found.is_empty() {
+                if !swings.is_empty() {
                     let n = layout.columns.len() as f32;
                     let row = layout.columns.first().map_or(0.0, |c| c.width) * n
                         + layout.gap * (n - 1.0);
+                    // One tempo for the shot, across its cameras' columns.
+                    let tempo = tempo_values(&swings);
                     ui.horizontal_top(|ui| {
                         ui.add_space(layout.pad);
-                        tempo_row(ui, &found, row);
+                        tempo_row(ui, &tempo, row);
                     });
                     // The body at the frame each camera shows.
-                    let at: Vec<(&SwingReportFile, Option<u64>)> = layout
-                        .columns
-                        .iter()
-                        .filter_map(|c| Some((c.swing.as_deref()?, c.frame_t_ns)))
-                        .filter(|(r, _)| r.swing_found())
-                        .collect();
+                    let frame = frame_tiles(&swings, imperial);
                     ui.horizontal_top(|ui| {
                         ui.add_space(layout.pad);
-                        frame_row(ui, &frame_tiles(&at, imperial), row);
+                        frame_row(ui, &frame, row);
+                    });
+                    let mut misses = miss_entries(&tempo);
+                    misses.extend(miss_entries(&frame));
+                    let graded = swings.iter().any(|s| {
+                        s.grades
+                            .is_some_and(|g| !g.grades.is_empty() || !g.tempo.is_empty())
+                    });
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(layout.pad);
+                        miss_line(ui, &misses, row, graded);
                     });
                 }
                 ui.horizontal_top(|ui| {
@@ -934,8 +1043,24 @@ impl FlighthookApp {
                                 ui.set_width(column.width);
                                 if let Some(report) = &column.swing {
                                     let panel = if report.swing_found() {
+                                        if let Some(text) = self.yaw_warning(&column.camera) {
+                                            let line = muted_line(ui, &text, column.width);
+                                            devices::mark(
+                                                ui,
+                                                || format!("yaw_warning:{}", column.camera),
+                                                &line,
+                                            );
+                                        }
                                         ui.scope(|ui| {
-                                            swing_metrics(ui, report, imperial, column.width);
+                                            swing_metrics(
+                                                ui,
+                                                &column.camera,
+                                                report,
+                                                imperial,
+                                                column.width,
+                                                grades(column),
+                                                reference,
+                                            );
                                         })
                                         .response
                                     } else {
@@ -953,6 +1078,50 @@ impl FlighthookApp {
                 });
                 ui.add_space(8.0);
             });
+    }
+
+    /// Ask once per session for each of shot row `i`'s clips tracked with
+    /// a rotation other than its camera's now to be tracked again
+    /// ([`retrack_due`]); its old keypoints and analysis are dropped
+    /// meanwhile. Nothing while body tracking is off.
+    fn retrack_turned_clips(&mut self, ctx: &egui::Context, i: usize) {
+        if !self.body_tracking().mode.is_on() {
+            return;
+        }
+        let Some(shot) = self.shots.get(i) else {
+            return;
+        };
+        let shot_id = shot.shot_id.clone();
+        let due = retrack_due(
+            shot,
+            |camera| self.settings.saved_rotation(camera),
+            &self.retracked,
+        );
+        for camera in due {
+            self.retracked.insert((shot_id.clone(), camera.clone()));
+            #[cfg(not(test))]
+            crate::net::post_retrack(ctx, &shot_id, &camera);
+            #[cfg(test)]
+            let _ = ctx;
+            if crate::types::forget_analysis(&mut self.shots, &shot_id, &camera) {
+                self.shots_rev += 1;
+            }
+            if let Some(player) = self.shot_player.as_mut().filter(|p| p.shot_id() == shot_id) {
+                player.forget_analysis(&camera);
+            }
+        }
+    }
+
+    /// The line over camera `camera`'s swing analysis when it is a Golfer
+    /// Front camera pointing [`YAW_WARNING_DEG`] or more off square
+    /// ([`yaw_warning`]).
+    fn yaw_warning(&self, camera: &str) -> Option<String> {
+        let (_, section) = self
+            .settings
+            .saved_cameras()
+            .into_iter()
+            .find(|(actor, _)| actor == camera)?;
+        yaw_warning(section.position, section.yaw_deg)
     }
 
     /// For shot row `i`, which has no clips: each saved camera's column
@@ -1018,6 +1187,60 @@ impl FlighthookApp {
 pub(crate) const NO_SWING: &str = "No swing found in this clip";
 
 /// The [`NO_SWING`] line, `width` wide, in the clip status lines' style.
+/// Degrees off square from which a Golfer Front camera's one-camera turn
+/// and sway are flagged as approximate.
+pub(crate) const YAW_WARNING_DEG: f64 = 5.0;
+
+/// The line flagging a Golfer Front camera `yaw` degrees off square, at
+/// [`YAW_WARNING_DEG`] or more either way; `None` for any other camera or a
+/// smaller (or invalid) yaw.
+pub(crate) fn yaw_warning(position: CameraPosition, yaw: Option<f64>) -> Option<String> {
+    let yaw = flighthook::camera_angle_in_effect_deg(yaw).abs();
+    (position == CameraPosition::GolferFront && yaw >= YAW_WARNING_DEG).then(|| {
+        format!(
+            "Camera {}° off square: one-camera turn and sway are approximate",
+            yaw.round()
+        )
+    })
+}
+
+/// The cameras of `shot` whose clip was tracked with a rotation other than
+/// the camera's now (`rotation_of`; `None` for a camera no longer
+/// configured, which is left alone) and not asked about yet (`asked`, by
+/// (shot ID, camera)).
+pub(crate) fn retrack_due(
+    shot: &crate::types::ShotRow,
+    rotation_of: impl Fn(&str) -> Option<u16>,
+    asked: &std::collections::HashSet<(String, String)>,
+) -> Vec<String> {
+    shot.video
+        .iter()
+        .filter(|v| v.pose)
+        .filter(|v| rotation_of(&v.camera).is_some_and(|r| r != v.rotation))
+        .filter(|v| !asked.contains(&(shot.shot_id.clone(), v.camera.clone())))
+        .map(|v| v.camera.clone())
+        .collect()
+}
+
+/// A muted line of `text`, `width` wide, wrapped.
+fn muted_line(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .size(14.0)
+                        .color(theme::TEXT_MUTED),
+                )
+                .wrap(),
+            )
+        },
+    )
+    .inner
+}
+
 fn no_swing_line(ui: &mut egui::Ui, width: f32) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, TABLE_ROW_H), egui::Sense::hover());
@@ -1061,18 +1284,19 @@ fn pane_title(ui: &mut egui::Ui, title: &str) -> egui::Response {
 /// A row of number tiles across `width`: each a name over its value.
 /// Returns the row.
 fn number_tiles(ui: &mut egui::Ui, tiles: &[(&str, String)], width: f32) -> egui::Response {
-    let tiles: Vec<(&str, &str, Option<&str>)> = tiles
+    let tiles: Vec<(&str, &str, Option<&str>, egui::Color32)> = tiles
         .iter()
-        .map(|(name, value)| (*name, value.as_str(), None))
+        .map(|(name, value)| (*name, value.as_str(), None, theme::TEXT))
         .collect();
     worded_tiles(ui, &tiles, width)
 }
 
 /// A row of number tiles across `width`: each a name over its value, and
-/// the value's direction word after it when it has one. Returns the row.
+/// the value's direction word after it when it has one, both in the
+/// value's color. Returns the row.
 fn worded_tiles(
     ui: &mut egui::Ui,
-    tiles: &[(&str, &str, Option<&str>)],
+    tiles: &[(&str, &str, Option<&str>, egui::Color32)],
     width: f32,
 ) -> egui::Response {
     let height = TILES_H - 8.0;
@@ -1081,7 +1305,7 @@ fn worded_tiles(
         return response;
     }
     let painter = ui.painter_at(rect);
-    for ((name, value, word), tile) in tiles.iter().zip(tile_rects(rect, tiles.len())) {
+    for ((name, value, word, color), tile) in tiles.iter().zip(tile_rects(rect, tiles.len())) {
         painter.rect_filled(tile, 6.0, theme::SURFACE);
         let name = painter.layout_no_wrap(
             name.to_uppercase(),
@@ -1095,9 +1319,9 @@ fn worded_tiles(
         );
         let (value, word) = worded_value(&painter, value, *word, 18.0, tile.width() - 16.0);
         let at = egui::pos2(tile.left() + 8.0, tile.bottom() - value.size().y - 4.0);
-        painter.galley(at, value, theme::TEXT);
+        painter.galley(at, value, *color);
         if let Some((word, offset)) = word {
-            painter.galley(at + offset, word, theme::TEXT);
+            painter.galley(at + offset, word, *color);
         }
     }
     response
@@ -1107,7 +1331,8 @@ fn worded_tiles(
 /// on the same baseline, fitted into `room` as the Cards view fits its sign
 /// words: the word starts at the cards' small size and shrinks to their
 /// floor first, and only then does the numeral shrink. Returns the value
-/// and the word with its offset from the value's top-left corner.
+/// and the word with its offset from the value's top-left corner, to paint
+/// in their color.
 fn worded_value(
     painter: &egui::Painter,
     text: &str,
@@ -1118,11 +1343,12 @@ fn worded_value(
     std::sync::Arc<egui::Galley>,
     Option<(std::sync::Arc<egui::Galley>, egui::Vec2)>,
 ) {
+    // Laid out without a color: the painter gives each its own.
     let layout = |text: &str, size: f32| {
         painter.layout_no_wrap(
             text.to_owned(),
             egui::FontId::proportional(size),
-            theme::TEXT,
+            egui::Color32::PLACEHOLDER,
         )
     };
     let mut size = size;
@@ -1227,6 +1453,89 @@ fn ms(ns: u64) -> String {
     format!("{} ms", (ns as f64 / 1e6).round())
 }
 
+/// The color of a value graded `fit`: aqua inside its band (inside both
+/// the fade and the draw band of a shot-shape band), blue inside the fade
+/// band only, green inside the draw band only, yellow near, red far.
+pub(crate) fn grade_color(fit: Fit) -> egui::Color32 {
+    match fit {
+        Fit::Both => theme::GRADE_BOTH,
+        Fit::Fade => theme::GRADE_FADE,
+        Fit::Draw => theme::GRADE_DRAW,
+        Fit::Near => theme::GRADE_NEAR,
+        Fit::Far => theme::GRADE_FAR,
+    }
+}
+
+/// One camera's swing analysis as the shot's tiles read it: its report,
+/// the frame it shows (its time after the clip's first frame, `None`
+/// outside the clip) and its grades against the picked reference.
+#[derive(Clone, Copy)]
+pub(crate) struct Swing<'a> {
+    pub(crate) report: &'a SwingReportFile,
+    pub(crate) t_ns: Option<u64>,
+    pub(crate) grades: Option<&'a ReferenceGrades>,
+}
+
+/// The key position whose event is at the frame of `report` at `t_ns`, or
+/// one frame either side of it; `None` elsewhere.
+pub(crate) fn key_position(report: &SwingReportFile, t_ns: u64) -> Option<SwingPosition> {
+    let at = report.series.frame_at(t_ns)?;
+    SwingPosition::ALL
+        .into_iter()
+        .filter_map(|p| {
+            let frame = report.series.frame_at(report.events.at(p)?.t_ns)?;
+            let apart = frame.abs_diff(at);
+            (apart <= 1).then_some((apart, p))
+        })
+        .min_by_key(|(apart, _)| *apart)
+        .map(|(_, p)| p)
+}
+
+/// The one grade a tile shows for several cameras' `grades` of it: theirs
+/// when every camera has one and they agree, else none.
+fn shared_grade<'a>(
+    mut grades: impl Iterator<Item = Option<&'a MetricGrade>>,
+) -> Option<MetricGrade> {
+    let first = grades.next()??;
+    grades
+        .all(|g| g.is_some_and(|g| g.fit == first.fit))
+        .then(|| first.clone())
+}
+
+/// Whether metric `id` is a turn: it reads `Open` or `Closed` when graded.
+fn is_turn(id: &str) -> bool {
+    matches!(id, "hip_turn" | "shoulder_turn")
+}
+
+/// A graded value's tile on screen: its own text and direction word; a
+/// graded turn reads `Open` or `Closed`, and any other value off its band
+/// that has no direction word of its own takes the word of the side it is
+/// off on ("29° Less").
+pub(crate) fn graded_shown(
+    id: &str,
+    unit: &str,
+    v: f64,
+    cm: Option<f64>,
+    imperial: bool,
+    grade: Option<&MetricGrade>,
+) -> Shown {
+    let mut shown = metric_shown(id, unit, v, cm, imperial);
+    let Some(grade) = grade else {
+        return shown;
+    };
+    shown.color = grade_color(grade.fit);
+    if direction_word(id).is_none() {
+        shown.word = if is_turn(id) {
+            signs::turn(grade.value)
+        } else if grade.fit == Fit::Both {
+            None
+        } else {
+            grade.direction.as_deref().and_then(signs::direction)
+        };
+    }
+    shown
+}
+
 /// The tempo tiles of a shot: the ratio, the backswing and the downswing,
 /// averaged over the `reports` that carry a tempo (the cameras see one
 /// swing). The backswing and downswing are the means of the cameras'
@@ -1247,6 +1556,46 @@ pub(crate) fn tempo_tiles(reports: &[&SwingReportFile]) -> Vec<(&'static str, St
             ("Downswing", NONE.to_owned()),
         ],
     }
+}
+
+/// The tempo tiles of a shot ([`tempo_tiles`]) with the ratio's and the
+/// downswing's grades. The tiles average the cameras, the grades are per
+/// camera: a tile takes the face-on cameras' grade (none when two disagree),
+/// or the first camera's in column order when no face-on camera has one.
+pub(crate) fn tempo_values<'a>(swings: &[Swing<'a>]) -> Vec<FrameValue> {
+    let reports: Vec<&SwingReportFile> = swings.iter().map(|s| s.report).collect();
+    let timed: Vec<&Swing> = swings.iter().filter(|s| s.report.tempo.is_some()).collect();
+    let grade = |id: &str| {
+        let of = |s: &&Swing<'a>| s.grades.and_then(move |g| g.grade(id, "swing"));
+        let face_on: Vec<&&Swing> = timed
+            .iter()
+            .filter(|s| s.report.view == Some(SwingView::FaceOn))
+            .collect();
+        if face_on.iter().any(|s| of(s).is_some()) {
+            shared_grade(face_on.iter().map(|s| of(s)))
+        } else {
+            timed.iter().find_map(of).cloned()
+        }
+    };
+    tempo_tiles(&reports)
+        .into_iter()
+        .map(|(label, text)| {
+            let id = match label {
+                "Tempo" => "tempo_ratio",
+                "Downswing" => "downswing_time",
+                _ => "backswing",
+            };
+            let grade = (text != NONE).then(|| grade(id)).flatten();
+            FrameValue {
+                id,
+                label,
+                color: grade.as_ref().map_or(theme::TEXT, |g| grade_color(g.fit)),
+                text,
+                word: None,
+                grade,
+            }
+        })
+        .collect()
 }
 
 /// The tempo of one swing seen by several cameras: the mean durations and
@@ -1300,9 +1649,9 @@ pub(crate) fn metric_label(id: &str) -> String {
     known.to_owned()
 }
 
-/// A value `v` of a metric in `unit` (and its centimetres `cm`, when the
+/// A value `v` of a metric in `unit` (and its centimeters `cm`, when the
 /// golfer's height was given) on screen: degrees whole, distances in inches
-/// or centimetres when known, else as a share of the torso length, ratios
+/// or centimeters when known, else as a share of the torso length, ratios
 /// to 0.01.
 pub(crate) fn metric_text(unit: &str, v: f64, cm: Option<f64>, imperial: bool) -> String {
     match unit {
@@ -1318,8 +1667,8 @@ pub(crate) fn metric_text(unit: &str, v: f64, cm: Option<f64>, imperial: bool) -
 
 /// The word for the direction of a metric shown as a distance and a word
 /// instead of a sign: the body's shifts from address. Hip sway and head
-/// sway are measured towards the target ([`signs::target`]), hip depth
-/// towards the ball ([`signs::ball`]) and head height up ([`signs::rise`]).
+/// sway are measured toward the target ([`signs::target`]), hip depth
+/// toward the ball ([`signs::ball`]) and head height up ([`signs::rise`]).
 fn direction_word(id: &str) -> Option<fn(f64) -> Option<&'static str>> {
     match id {
         "hip_sway" | "head_lateral" => Some(signs::target),
@@ -1329,12 +1678,13 @@ fn direction_word(id: &str) -> Option<fn(f64) -> Option<&'static str>> {
     }
 }
 
-/// A metric's value on screen: its text and, for a shift from address, the
-/// word for its direction.
+/// A metric's value on screen: its text, for a shift from address the word
+/// for its direction, and its color (its grade's, else plain).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Shown {
     pub(crate) text: String,
     pub(crate) word: Option<&'static str>,
+    pub(crate) color: egui::Color32,
 }
 
 impl Shown {
@@ -1343,20 +1693,22 @@ impl Shown {
         Self {
             text: NONE.to_owned(),
             word: None,
+            color: theme::TEXT,
         }
     }
 }
 
-/// Metric `id`'s value `v` in `unit` (and its centimetres `cm`) on screen,
+/// Metric `id`'s value `v` in `unit` (and its centimeters `cm`) on screen,
 /// as [`metric_text`] writes it; a shift from address ([`direction_word`])
 /// shows its distance with the word for its direction instead of a sign
 /// (`Toward` / `Away`, `Toward ball` / `Back`, `Up` / `Down`), and no word
-/// when the distance shows as 0.
+/// when the distance shows as 0. Plain (ungraded).
 pub(crate) fn metric_shown(id: &str, unit: &str, v: f64, cm: Option<f64>, imperial: bool) -> Shown {
     let Some(direction) = direction_word(id) else {
         return Shown {
             text: metric_text(unit, v, cm, imperial),
             word: None,
+            color: theme::TEXT,
         };
     };
     let text = metric_text(unit, v.abs(), cm.map(f64::abs), imperial);
@@ -1364,6 +1716,7 @@ pub(crate) fn metric_shown(id: &str, unit: &str, v: f64, cm: Option<f64>, imperi
     Shown {
         word: if zero { None } else { direction(v) },
         text,
+        color: theme::TEXT,
     }
 }
 
@@ -1372,38 +1725,145 @@ pub(crate) fn metric_shown(id: &str, unit: &str, v: f64, cm: Option<f64>, imperi
 /// address, which its own row shows).
 const NOT_IN_TABLE: &[&str] = &["hip_width_proxy", "loss_of_posture"];
 
-/// The metrics table: each metric measured at address, top or impact, with
-/// its value at each (a dash where it was not measured).
-pub(crate) fn metric_rows(report: &SwingReportFile, imperial: bool) -> Vec<(String, [Shown; 3])> {
+/// The metrics table's positions in a column `width` wide: address, top,
+/// impact and finish, and from [`WIDE_TABLE`] the lead arm parallel back
+/// and down too.
+pub(crate) fn table_positions(width: f32) -> &'static [SwingPosition] {
+    const NARROW: [SwingPosition; 4] = [
+        SwingPosition::Address,
+        SwingPosition::Top,
+        SwingPosition::Impact,
+        SwingPosition::Finish,
+    ];
+    if width >= WIDE_TABLE {
+        &SwingPosition::ALL
+    } else {
+        &NARROW
+    }
+}
+
+/// Column width from which the metrics table shows the lead arm
+/// positions.
+pub(crate) const WIDE_TABLE: f32 = 560.0;
+
+/// A cell of the metrics table: its value on screen (colored by its
+/// grade), its grade, and the value as a tile reads it ([`graded_shown`],
+/// for the hover text).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Cell {
+    pub(crate) shown: Shown,
+    pub(crate) grade: Option<MetricGrade>,
+    pub(crate) worded: Shown,
+}
+
+/// The metrics table: each metric measured at any of `positions`, with its
+/// value at each (a dash where it was not measured), colored by its grade
+/// in `grades`.
+pub(crate) fn metric_rows(
+    report: &SwingReportFile,
+    imperial: bool,
+    positions: &[SwingPosition],
+    grades: Option<&ReferenceGrades>,
+) -> Vec<(String, Vec<Cell>)> {
     report
         .metrics
         .iter()
         .filter(|m| !NOT_IN_TABLE.contains(&m.id.as_str()))
         .filter_map(|m| {
-            let at = |pick: fn(&crate::types::SwingPositions) -> Option<f64>| {
-                pick(&m.values).map(|v| {
-                    let cm = m.cm.as_ref().and_then(pick);
-                    metric_shown(&m.id, &m.unit, v, cm, imperial)
+            let cells: Vec<Option<Cell>> = positions
+                .iter()
+                .map(|&p| {
+                    let v = m.values.at(p)?;
+                    let cm = m.cm.as_ref().and_then(|c| c.at(p));
+                    let grade = grades.and_then(|g| g.grade(&m.id, p.key())).cloned();
+                    let worded = graded_shown(&m.id, &m.unit, v, cm, imperial, grade.as_ref());
+                    let shown = Shown {
+                        color: worded.color,
+                        ..metric_shown(&m.id, &m.unit, v, cm, imperial)
+                    };
+                    Some(Cell {
+                        shown,
+                        grade,
+                        worded,
+                    })
                 })
-            };
-            let values = [at(|p| p.address), at(|p| p.top), at(|p| p.impact)];
-            values.iter().any(Option::is_some).then(|| {
+                .collect();
+            cells.iter().any(Option::is_some).then(|| {
                 (
                     metric_label(&m.id),
-                    values.map(|v| v.unwrap_or_else(Shown::none)),
+                    cells
+                        .into_iter()
+                        .map(|c| {
+                            c.unwrap_or_else(|| Cell {
+                                shown: Shown::none(),
+                                grade: None,
+                                worded: Shown::none(),
+                            })
+                        })
+                        .collect(),
                 )
             })
         })
         .collect()
 }
 
+/// A band `low`–`high` in `unit` on screen: degrees whole, inches to 0.1
+/// (centimeters to 0.1 in metric units, rounded after the conversion),
+/// seconds to 0.01, ratios to 0.1.
+pub(crate) fn band_text(low: f64, high: f64, unit: &str, imperial: bool) -> String {
+    match unit {
+        "degrees" => format!("{}\u{2013}{}\u{b0}", fixed(low, 0), fixed(high, 0)),
+        "inches" if imperial => format!("{}\u{2013}{} in", fixed(low, 1), fixed(high, 1)),
+        "inches" => format!(
+            "{}\u{2013}{} cm",
+            fixed(low * 2.54, 1),
+            fixed(high * 2.54, 1)
+        ),
+        "seconds" => format!("{}\u{2013}{} s", fixed(low, 2), fixed(high, 2)),
+        _ => format!("{}\u{2013}{}", fixed(low, 1), fixed(high, 1)),
+    }
+}
+
+/// A graded cell's hover text: the reference and its band (the fade and
+/// the draw band of a shot-shape band), the value as its tile reads it
+/// (`shown`), and the words for a value off the band.
+pub(crate) fn band_tip(
+    reference: ReferenceKind,
+    grade: &MetricGrade,
+    shown: &Shown,
+    imperial: bool,
+) -> String {
+    let band = |b: [f64; 2]| band_text(b[0], b[1], &grade.unit, imperial);
+    let mut parts = vec![match (grade.fade, grade.draw) {
+        (None, None) => format!("{} {}", reference.label(), band([grade.low, grade.high])),
+        (fade, draw) => {
+            let mut s = reference.label().to_owned();
+            if let Some(f) = fade {
+                s.push_str(&format!(" \u{b7} fade {}", band(f)));
+            }
+            if let Some(d) = draw {
+                s.push_str(&format!(" \u{b7} draw {}", band(d)));
+            }
+            s
+        }
+    }];
+    parts.push(match shown.word {
+        Some(word) => format!("{} {word}", shown.text),
+        None => shown.text.clone(),
+    });
+    if let Some(word) = &grade.word {
+        parts.push(word.clone());
+    }
+    parts.join(" \u{b7} ")
+}
+
 /// Height of a row of the swing tables.
 const TABLE_ROW_H: f32 = 22.0;
 
-/// A shot's tempo tiles across `width`, once for all its cameras: the
-/// average of the `reports` that carry a tempo (see [`tempo_tiles`]).
-fn tempo_row(ui: &mut egui::Ui, reports: &[&SwingReportFile], width: f32) {
-    let tempo = number_tiles(ui, &tempo_tiles(reports), width);
+/// A shot's tempo tiles across `width`, once for all its cameras
+/// ([`tempo_values`]).
+fn tempo_row(ui: &mut egui::Ui, tiles: &[FrameValue], width: f32) {
+    let tempo = value_tiles(ui, tiles, width);
     devices::mark(ui, || "swing_tempo".to_owned(), &tempo);
 }
 
@@ -1456,29 +1916,30 @@ const SPINE_FACE_ON: FrameTile = FrameTile {
     id: "lateral_spine_tilt",
 };
 
-/// One tile's content: the metric's id, its name and its value on screen
-/// (with a shift's direction word).
+/// One tile's content: the metric's id, its name, its value on screen
+/// (with a direction word) in its grade's color, and its grade.
 pub(crate) struct FrameValue {
     pub(crate) id: &'static str,
     pub(crate) label: &'static str,
     pub(crate) text: String,
     pub(crate) word: Option<&'static str>,
+    pub(crate) color: egui::Color32,
+    pub(crate) grade: Option<MetricGrade>,
 }
 
 /// The body at the replay's position: per tile, the metric from each
 /// camera whose report is of the tile's view, at the frame that camera
-/// shows (`at`: each report with its frame's time after the clip's first
-/// frame, `None` outside the clip), the mean when several have a value. A
-/// dash where none has. The spine is the down-the-line forward bend, or the
-/// face-on side bend when no report is down the line. Values read as in the metrics
-/// table.
-pub(crate) fn frame_tiles(
-    at: &[(&SwingReportFile, Option<u64>)],
-    imperial: bool,
-) -> Vec<FrameValue> {
-    let down_the_line = at
+/// shows, the mean when several have a value. A dash where none has. The
+/// spine is the down-the-line forward bend, or the face-on side bend when
+/// no report is down the line. Values read as in the metrics table.
+///
+/// A tile is graded only where the frame shown is a key position's (or
+/// next to it, [`key_position`]): with that position's grade, the grade the
+/// cameras showing it share ([`shared_grade`]). Elsewhere it is plain.
+pub(crate) fn frame_tiles(swings: &[Swing], imperial: bool) -> Vec<FrameValue> {
+    let down_the_line = swings
         .iter()
-        .any(|(r, _)| r.view == Some(SwingView::DownTheLine));
+        .any(|s| s.report.view == Some(SwingView::DownTheLine));
     FRAME_TILES
         .iter()
         .map(|tile| {
@@ -1487,22 +1948,31 @@ pub(crate) fn frame_tiles(
             } else {
                 tile
             };
-            let samples: Vec<_> = at
+            let samples: Vec<_> = swings
                 .iter()
-                .filter(|(r, _)| r.view == Some(tile.view))
-                .filter_map(|(r, t)| r.sample(tile.id, (*t)?))
+                .filter(|s| s.report.view == Some(tile.view))
+                .filter_map(|s| {
+                    let t = s.t_ns?;
+                    let sample = s.report.sample(tile.id, t)?;
+                    let grade =
+                        key_position(s.report, t).and_then(|p| s.grades?.grade(tile.id, p.key()));
+                    Some((sample, grade))
+                })
                 .collect();
-            let shown = match samples.as_slice() {
-                [] => Shown::none(),
-                [first, ..] => {
+            let (shown, grade) = match samples.as_slice() {
+                [] => (Shown::none(), None),
+                [(first, _), ..] => {
                     let n = samples.len() as f64;
-                    let value = samples.iter().map(|s| s.value).sum::<f64>() / n;
+                    let value = samples.iter().map(|(s, _)| s.value).sum::<f64>() / n;
                     let cm = samples
                         .iter()
-                        .map(|s| s.cm)
+                        .map(|(s, _)| s.cm)
                         .sum::<Option<f64>>()
                         .map(|sum| sum / n);
-                    metric_shown(tile.id, &first.unit, value, cm, imperial)
+                    let grade = shared_grade(samples.iter().map(|(_, g)| *g));
+                    let shown =
+                        graded_shown(tile.id, &first.unit, value, cm, imperial, grade.as_ref());
+                    (shown, grade)
                 }
             };
             FrameValue {
@@ -1510,6 +1980,8 @@ pub(crate) fn frame_tiles(
                 label: tile.label,
                 text: shown.text,
                 word: shown.word,
+                color: shown.color,
+                grade,
             }
         })
         .collect()
@@ -1518,11 +1990,7 @@ pub(crate) fn frame_tiles(
 /// The selected-frame tiles across `width`, under the tempo row (marks
 /// `frame_metrics`, and `frame_metric:<id>` per tile).
 fn frame_row(ui: &mut egui::Ui, tiles: &[FrameValue], width: f32) {
-    let shown: Vec<(&str, &str, Option<&str>)> = tiles
-        .iter()
-        .map(|t| (t.label, t.text.as_str(), t.word))
-        .collect();
-    let row = worded_tiles(ui, &shown, width);
+    let row = value_tiles(ui, tiles, width);
     devices::mark(ui, || "frame_metrics".to_owned(), &row);
     if cfg!(test) {
         for (tile, rect) in tiles.iter().zip(tile_rects(row.rect, tiles.len())) {
@@ -1532,77 +2000,207 @@ fn frame_row(ui: &mut egui::Ui, tiles: &[FrameValue], width: f32) {
     }
 }
 
-/// One camera's swing metrics, `width` wide: its body measurements at
-/// address, top and impact (they depend on the view). Nothing when none was
-/// measured.
-fn swing_metrics(ui: &mut egui::Ui, report: &SwingReportFile, imperial: bool, width: f32) {
-    let metrics = metric_rows(report, imperial);
+/// `tiles` across `width`, each value in its color.
+pub(crate) fn value_tiles(ui: &mut egui::Ui, tiles: &[FrameValue], width: f32) -> egui::Response {
+    let shown: Vec<(&str, &str, Option<&str>, egui::Color32)> = tiles
+        .iter()
+        .map(|t| (t.label, t.text.as_str(), t.word, t.color))
+        .collect();
+    worded_tiles(ui, &shown, width)
+}
+
+/// The miss line's entries: each tile off its band (graded, not
+/// [`Fit::Both`]) with its name, its words and its fit.
+pub(crate) fn miss_entries(tiles: &[FrameValue]) -> Vec<(&'static str, String, Fit)> {
+    tiles
+        .iter()
+        .filter_map(|t| {
+            let grade = t.grade.as_ref().filter(|g| g.fit != Fit::Both)?;
+            Some((t.label, grade.word.clone()?, grade.fit))
+        })
+        .collect()
+}
+
+/// Size of the miss line's text.
+const MISS_SIZE: f32 = 13.0;
+
+/// The miss line's text: each entry's name muted and its words in its fit's
+/// color, joined by middle dots.
+pub(crate) fn miss_job(entries: &[(&str, String, Fit)], width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let format = |color| egui::TextFormat {
+        font_id: egui::FontId::proportional(MISS_SIZE),
+        color,
+        ..Default::default()
+    };
+    for (k, (label, words, fit)) in entries.iter().enumerate() {
+        if k > 0 {
+            job.append(" \u{b7} ", 0.0, format(theme::TEXT_MUTED));
+        }
+        job.append(label, 0.0, format(theme::TEXT_MUTED));
+        job.append(&format!(" {words}"), 0.0, format(grade_color(*fit)));
+    }
+    job.wrap.max_width = width;
+    job.wrap.max_rows = 2;
+    job
+}
+
+/// The miss line under the tiles, `width` wide: the tiles off their band
+/// ([`miss_entries`]), at most two lines. With none, a line's height is
+/// kept empty while the shot has grades (`reserve`), so the tables below
+/// hold still as the playhead passes a key position. Mark `frame_misses`.
+pub(crate) fn miss_line(
+    ui: &mut egui::Ui,
+    entries: &[(&str, String, Fit)],
+    width: f32,
+    reserve: bool,
+) {
+    if entries.is_empty() && !reserve {
+        return;
+    }
+    let galley = ui.fonts_mut(|f| f.layout_job(miss_job(entries, width)));
+    let line = ui.fonts_mut(|f| f.row_height(&egui::FontId::proportional(MISS_SIZE)));
+    let height = galley.size().y.max(line) + 6.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    if !entries.is_empty() {
+        ui.painter()
+            .galley(rect.left_top() + egui::vec2(0.0, 4.0), galley, theme::TEXT);
+    }
+    devices::mark(ui, || "frame_misses".to_owned(), &response);
+}
+
+/// One camera's swing metrics, `width` wide: its body measurements at the
+/// key positions the width has room for ([`table_positions`]), colored by
+/// their grades against `reference` (`grades`), each graded cell's band and
+/// words on hover. Nothing when none was measured.
+fn swing_metrics(
+    ui: &mut egui::Ui,
+    camera: &str,
+    report: &SwingReportFile,
+    imperial: bool,
+    width: f32,
+    grades: Option<&ReferenceGrades>,
+    reference: ReferenceKind,
+) {
+    let positions = table_positions(width);
+    let metrics = metric_rows(report, imperial, positions, grades);
     if metrics.is_empty() {
         return;
     }
     ui.add_space(8.0);
-    let name_w = (width * 0.31).max(90.0);
-    let value_w = ((width - name_w) / 3.0).max(1.0);
-    let columns: Vec<(f32, f32)> = (0..3)
+    let n = positions.len() as f32;
+    let share = if positions.len() > 4 { 0.22 } else { 0.27 };
+    let name_w = (width * share).max(100.0);
+    let value_w = ((width - name_w) / n).max(1.0);
+    let columns: Vec<(f32, f32)> = (0..positions.len())
         .map(|i| (name_w + i as f32 * value_w, value_w))
         .collect();
     let rows: Vec<TableRow> = metrics
         .iter()
-        .map(|(name, v)| {
+        .map(|(name, cells)| {
             (
                 Some(name.as_str()),
-                v.iter().map(|s| (s.text.as_str(), s.word)).collect(),
+                cells
+                    .iter()
+                    .map(|c| TableCell {
+                        text: c.shown.text.as_str(),
+                        word: c.shown.word,
+                        color: c.shown.color,
+                        tip: c
+                            .grade
+                            .as_ref()
+                            .map(|g| band_tip(reference, g, &c.worded, imperial)),
+                    })
+                    .collect(),
             )
         })
         .collect();
-    table(
-        ui,
-        width,
-        &columns,
-        Some(&["Address", "Top", "Impact"]),
-        &rows,
-    );
+    let heading: Vec<&str> = positions.iter().map(|p| p.label()).collect();
+    table(ui, camera, width, &columns, Some(&heading), &rows);
 }
 
-/// A row of [`table`]: its name, if any, and its values, each with its
-/// direction word, if any.
-type TableRow<'a> = (Option<&'a str>, Vec<(&'a str, Option<&'a str>)>);
+/// A cell of [`table`]: its value, its direction word (if any), its color
+/// and its hover text (if any).
+struct TableCell<'a> {
+    text: &'a str,
+    word: Option<&'a str>,
+    color: egui::Color32,
+    tip: Option<String>,
+}
+
+/// A row of [`table`]: its name, if any, and its cells.
+type TableRow<'a> = (Option<&'a str>, Vec<TableCell<'a>>);
+
+/// A heading over a column `room` wide, in small capitals: one line, or two
+/// split at a space when it doesn't fit on one.
+fn heading_lines(painter: &egui::Painter, heading: &str, room: f32) -> Vec<String> {
+    let upper = heading.to_uppercase();
+    let width = |s: &str| {
+        painter
+            .layout_no_wrap(
+                s.to_owned(),
+                egui::FontId::proportional(10.0),
+                theme::TEXT_MUTED,
+            )
+            .size()
+            .x
+    };
+    if width(&upper) <= room {
+        return vec![upper];
+    }
+    match upper.rsplit_once(' ') {
+        Some((first, second)) => vec![first.to_owned(), second.to_owned()],
+        None => vec![upper],
+    }
+}
 
 /// A table `width` wide: an optional heading row of small capitals over
 /// `columns` (left edge and width of each value column), then `rows`, each
-/// an optional name at the left edge and its values (each with its
-/// direction word, if any), on alternate stripes.
+/// an optional name at the left edge and its cells (each with its direction
+/// word, if any, in its color, and its hover text), on alternate stripes.
+/// `salt` keeps its hover areas apart from another table's.
 fn table(
     ui: &mut egui::Ui,
+    salt: &str,
     width: f32,
     columns: &[(f32, f32)],
     heading: Option<&[&str]>,
     rows: &[TableRow],
 ) {
-    let head_h = if heading.is_some() { 16.0 } else { 0.0 };
+    let painter = ui.painter().clone();
+    let headings: Vec<Vec<String>> = heading.map_or_else(Vec::new, |h| {
+        columns
+            .iter()
+            .zip(h)
+            .map(|((_, w), h)| heading_lines(&painter, h, w - 8.0))
+            .collect()
+    });
+    let lines = headings.iter().map(Vec::len).max().unwrap_or(0);
+    let head_h = match lines {
+        0 => 0.0,
+        1 => 16.0,
+        _ => 28.0,
+    };
     let height = head_h + rows.len() as f32 * TABLE_ROW_H;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
     let painter = ui.painter_at(rect);
-    let text = |at: egui::Pos2, s: &str, size: f32, colour: egui::Color32, upper: bool| {
-        let s = if upper {
-            s.to_uppercase()
-        } else {
-            s.to_owned()
-        };
-        let galley = painter.layout_no_wrap(s, egui::FontId::proportional(size), colour);
+    let text = |at: egui::Pos2, s: &str, size: f32, color: egui::Color32| {
+        let galley = painter.layout_no_wrap(s.to_owned(), egui::FontId::proportional(size), color);
         let y = at.y - galley.size().y / 2.0;
-        painter.galley(egui::pos2(at.x, y), galley, colour);
+        painter.galley(egui::pos2(at.x, y), galley, color);
     };
-    if let Some(heading) = heading {
-        for ((left, _), h) in columns.iter().zip(heading) {
-            let at = egui::pos2(rect.left() + left + 8.0, rect.top() + head_h / 2.0);
-            text(at, h, 10.0, theme::TEXT_MUTED, true);
+    for ((left, _), lines) in columns.iter().zip(&headings) {
+        let line_h = 12.0;
+        let top = rect.top() + head_h / 2.0 - (lines.len() as f32 - 1.0) * line_h / 2.0;
+        for (k, line) in lines.iter().enumerate() {
+            let at = egui::pos2(rect.left() + left + 8.0, top + k as f32 * line_h);
+            text(at, line, 10.0, theme::TEXT_MUTED);
         }
     }
-    for (k, (name, values)) in rows.iter().enumerate() {
+    for (k, (name, cells)) in rows.iter().enumerate() {
         let top = rect.top() + head_h + k as f32 * TABLE_ROW_H;
         let row =
             egui::Rect::from_min_size(egui::pos2(rect.left(), top), egui::vec2(width, TABLE_ROW_H));
@@ -1616,15 +2214,23 @@ fn table(
                 name,
                 13.0,
                 theme::TEXT_MUTED,
-                false,
             );
         }
-        for ((left, column_w), (v, word)) in columns.iter().zip(values) {
-            let (value, word) = worded_value(&painter, v, *word, 14.0, column_w - 12.0);
+        for (j, ((left, column_w), cell)) in columns.iter().zip(cells).enumerate() {
+            let (value, word) = worded_value(&painter, cell.text, cell.word, 14.0, column_w - 12.0);
             let at = egui::pos2(rect.left() + left + 8.0, y - value.size().y / 2.0);
-            painter.galley(at, value, theme::TEXT);
+            painter.galley(at, value, cell.color);
             if let Some((word, offset)) = word {
-                painter.galley(at + offset, word, theme::TEXT);
+                painter.galley(at + offset, word, cell.color);
+            }
+            if let Some(tip) = &cell.tip {
+                let area = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + left, top),
+                    egui::vec2(*column_w, TABLE_ROW_H),
+                );
+                let hover = ui.interact(area, ui.id().with((salt, k, j)), egui::Sense::hover());
+                devices::mark(ui, || format!("cell:{salt}:{k}:{j}"), &hover);
+                hover.on_hover_text(tip);
             }
         }
     }
@@ -1697,12 +2303,13 @@ mod tests {
 
     /// Draws the tab bar and the active tab's panel (the Shots tab, or
     /// nothing), as the app does; keeps what the last frame painted as text
-    /// and the centres of the circles it painted.
+    /// and the centers of the circles it painted.
     struct Screen(
         egui::Context,
         egui::Vec2,
         std::cell::RefCell<Vec<String>>,
         std::cell::RefCell<Vec<Pos2>>,
+        std::cell::RefCell<Vec<(String, egui::Color32)>>,
     );
 
     impl Screen {
@@ -1716,6 +2323,7 @@ mod tests {
             Self(
                 ctx,
                 vec2(w, h),
+                std::cell::RefCell::default(),
                 std::cell::RefCell::default(),
                 std::cell::RefCell::default(),
             )
@@ -1743,6 +2351,7 @@ mod tests {
             });
             *self.2.borrow_mut() = painted_texts(&out.shapes);
             *self.3.borrow_mut() = painted_circles(&out.shapes);
+            *self.4.borrow_mut() = painted_colored(&out.shapes);
             self.0
                 .data(|d| d.get_temp::<Marks>(egui::Id::NULL))
                 .unwrap_or_default()
@@ -1751,6 +2360,15 @@ mod tests {
         /// What the last frame painted as text.
         fn texts(&self) -> Vec<String> {
             self.2.borrow().clone()
+        }
+
+        /// The color of the last frame's text `text` (the first painted).
+        fn color_of(&self, text: &str) -> Option<egui::Color32> {
+            self.4
+                .borrow()
+                .iter()
+                .find(|(t, _)| t == text)
+                .map(|(_, c)| *c)
         }
 
         /// How many circles the last frame painted inside `rect`.
@@ -2379,6 +2997,9 @@ mod tests {
         // One: limited by the height.
         let w = column_width(1, panel, 9.0 / 16.0);
         assert!((w * 9.0 / 16.0 + HEADING_H - 900.0).abs() < 0.01);
+        // A portrait camera (16:9 on its side): limited by the height.
+        let w = column_width(2, panel, 16.0 / 9.0);
+        assert!((w * 16.0 / 9.0 + HEADING_H - 900.0).abs() < 0.01);
         assert_eq!(resolution_aspect("1280x720"), Some(0.5625));
         assert_eq!(resolution_aspect("640x0"), None);
         assert_eq!(resolution_aspect(""), None);
@@ -2612,7 +3233,7 @@ mod tests {
         );
         // Body-relative without the golfer's height; a finish-only metric
         // has no row.
-        let rows = strings(&metric_rows(&r, true));
+        let rows = strings(&rows3(&r, true));
         assert_eq!(
             rows,
             [
@@ -2638,18 +3259,18 @@ mod tests {
                 ),
             ]
         );
-        // With the height: inches in imperial, centimetres in metric.
+        // With the height: inches in imperial, centimeters in metric.
         let r = report(true);
         assert_eq!(
-            strings(&metric_rows(&r, true))[0].1,
+            strings(&rows3(&r, true))[0].1,
             [NONE, "1.0 in Away", "2.4 in Toward"]
         );
         assert_eq!(
-            strings(&metric_rows(&r, false))[0].1,
+            strings(&rows3(&r, false))[0].1,
             [NONE, "2.5 cm Away", "6.1 cm Toward"]
         );
         assert_eq!(
-            strings(&metric_rows(&r, false))[1].1[0],
+            strings(&rows3(&r, false))[1].1[0],
             "8\u{b0}",
             "angles are units-free"
         );
@@ -2692,7 +3313,7 @@ mod tests {
               {"id":"shoulder_turn","unit":"degrees","values":{"top":70.0,"impact":30.0}}]}"#,
         )
         .unwrap();
-        let rows = strings(&metric_rows(&r, true));
+        let rows = strings(&rows3(&r, true));
         let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["Hip turn", "Shoulder turn"]);
         assert_eq!(rows[0].1, [NONE, "37°", "26°"]);
@@ -2704,7 +3325,7 @@ mod tests {
         )
         .unwrap();
         assert!(r.metrics.iter().any(|m| m.id == "loss_of_posture"), "read");
-        let rows = strings(&metric_rows(&r, true));
+        let rows = strings(&rows3(&r, true));
         let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -2714,14 +3335,33 @@ mod tests {
         assert_eq!(rows[1].1, [NONE, "0% torso", "4% torso Back"]);
     }
 
-    /// Table rows as text, each value with its direction word after it.
-    fn strings(rows: &[(String, [Shown; 3])]) -> Vec<(String, [String; 3])> {
+    /// The table rows at address, top and impact, ungraded.
+    fn rows3(r: &SwingReportFile, imperial: bool) -> Vec<(String, Vec<Cell>)> {
+        use SwingPosition::{Address, Impact, Top};
+        metric_rows(r, imperial, &[Address, Top, Impact], None)
+    }
+
+    /// Three-column table rows as text, each value with its direction word
+    /// after it.
+    fn strings(rows: &[(String, Vec<Cell>)]) -> Vec<(String, [String; 3])> {
         rows.iter()
-            .map(|(name, values)| {
-                (
-                    name.clone(),
-                    values.clone().map(|v| joined(&v.text, v.word)),
-                )
+            .map(|(name, cells)| {
+                let texts: Vec<String> = cells
+                    .iter()
+                    .map(|c| joined(&c.shown.text, c.shown.word))
+                    .collect();
+                (name.clone(), texts.try_into().expect("three columns"))
+            })
+            .collect()
+    }
+
+    /// Each report at the frame it shows, ungraded.
+    fn plain<'a>(at: &[(&'a SwingReportFile, Option<u64>)]) -> Vec<Swing<'a>> {
+        at.iter()
+            .map(|&(report, t_ns)| Swing {
+                report,
+                t_ns,
+                grades: None,
             })
             .collect()
     }
@@ -2747,7 +3387,7 @@ mod tests {
         assert_eq!(shown("hip_sway", 0.0, Some(0.0), true), "0.0 in");
         assert_eq!(shown("hip_sway", -0.001, Some(-0.05), true), "0.0 in");
         assert_eq!(shown("head_lateral", 0.004, None, true), "0% torso");
-        // Hip depth: towards the ball or back from it.
+        // Hip depth: toward the ball or back from it.
         assert_eq!(
             shown("early_extension", -0.02, Some(-2.032), true),
             "0.8 in Back"
@@ -2775,7 +3415,8 @@ mod tests {
             metric_shown("lateral_spine_tilt", "degrees", -3.6, None, true),
             Shown {
                 text: "-4\u{b0}".to_owned(),
-                word: None
+                word: None,
+                color: theme::TEXT,
             }
         );
 
@@ -2790,7 +3431,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            strings(&metric_rows(&r, true)),
+            strings(&rows3(&r, true)),
             [
                 (
                     "Hip sway".to_owned(),
@@ -2825,10 +3466,10 @@ mod tests {
               {"id":"hip_turn","unit":"degrees","values":[0.0,1.0]}]}}"#,
         )
         .unwrap();
-        let rows = strings(&metric_rows(&r, true));
+        let rows = strings(&rows3(&r, true));
         let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["Hip turn"], "no Sway or Slide row");
-        let texts = frame_texts(&frame_tiles(&[(&r, Some(16_666_667))], true));
+        let texts = frame_texts(&frame_tiles(&plain(&[(&r, Some(16_666_667))]), true));
         assert_eq!(texts[0], ("Hip turn", "1°".to_owned()));
         assert_eq!(texts[2], ("Hip sway", NONE.to_owned()));
     }
@@ -2873,7 +3514,7 @@ mod tests {
     }
 
     /// The test hip sway at frame `i`: from address (frame 60) away from
-    /// the target to the top (frame 150, -0.036), then towards it (impact,
+    /// the target to the top (frame 150, -0.036), then toward it (impact,
     /// frame 180: 0.054).
     fn hip_sway_at(i: u64) -> f64 {
         let i = i as f64;
@@ -2900,7 +3541,7 @@ mod tests {
     }
 
     /// The test hip depth at frame `i`: 0 at address (frame 60), back from
-    /// the ball before it, towards the ball after it (frame 150: 0.036).
+    /// the ball before it, toward the ball after it (frame 150: 0.036).
     fn hip_depth_at(i: u64) -> f64 {
         (i as f64 - 60.0) * 0.0004
     }
@@ -2930,7 +3571,7 @@ mod tests {
         let (fo, dtl) = (face_on_series(true), down_the_line_series());
         let at = |i: u64| Some(i * FRAME_NS);
         // Two cameras at frame 150: four tiles face-on, two down the line.
-        let tiles = frame_tiles(&[(&fo, at(150)), (&dtl, at(150))], false);
+        let tiles = frame_tiles(&plain(&[(&fo, at(150)), (&dtl, at(150))]), false);
         assert_eq!(
             frame_texts(&tiles),
             vec![
@@ -2955,58 +3596,58 @@ mod tests {
             ]
         );
         // Imperial, and each camera at its own frame.
-        let tiles = frame_tiles(&[(&fo, at(100)), (&dtl, at(260))], true);
+        let tiles = frame_tiles(&plain(&[(&fo, at(100)), (&dtl, at(260))]), true);
         let texts = frame_texts(&tiles);
         assert_eq!(texts[0].1, "10°");
         assert_eq!(texts[2].1, "0.3 in Away", "-0.016 × 50 cm = -0.8 cm");
         assert_eq!(texts[4].1, "33°");
         assert_eq!(texts[5].1, "8% torso Toward ball");
         // Between two frames: the nearest one.
-        let tiles = frame_tiles(&[(&fo, Some(100 * FRAME_NS + 3))], false);
+        let tiles = frame_tiles(&plain(&[(&fo, Some(100 * FRAME_NS + 3))]), false);
         assert_eq!(tiles[0].text, "10°");
 
         // One face-on camera: the spine tile is its side bend, hip depth a
         // dash; one down-the-line camera: the face-on tiles are dashes.
-        let texts = frame_texts(&frame_tiles(&[(&fo, at(150))], false));
+        let texts = frame_texts(&frame_tiles(&plain(&[(&fo, at(150))]), false));
         assert_eq!(texts.len(), 6);
         assert_eq!(texts[4], ("Side bend", "7°".to_owned()));
         assert_eq!(texts[5], ("Hip depth", NONE.to_owned()));
-        let texts = frame_texts(&frame_tiles(&[(&dtl, at(150))], false));
+        let texts = frame_texts(&frame_tiles(&plain(&[(&dtl, at(150))]), false));
         assert!(texts[..4].iter().all(|(_, v)| v == NONE), "{texts:?}");
         assert_eq!(texts[4], ("Forward bend", "32°".to_owned()));
 
         // Outside a camera's clip, or past its series: dashes for its tiles.
-        let texts = frame_texts(&frame_tiles(&[(&fo, None), (&dtl, at(150))], false));
+        let texts = frame_texts(&frame_tiles(&plain(&[(&fo, None), (&dtl, at(150))]), false));
         assert!(texts[..4].iter().all(|(_, v)| v == NONE));
         assert_eq!(texts[5].1, "4% torso Toward ball");
-        let texts = frame_texts(&frame_tiles(&[(&fo, at(400))], false));
+        let texts = frame_texts(&frame_tiles(&plain(&[(&fo, at(400))]), false));
         assert!(texts.iter().all(|(_, v)| v == NONE));
 
         // Two face-on cameras: the mean.
         let other = series_report("face_on", &[("hip_turn", "degrees", |_| 25.0)], false);
-        let tiles = frame_tiles(&[(&fo, at(150)), (&other, at(150))], false);
+        let tiles = frame_tiles(&plain(&[(&fo, at(150)), (&other, at(150))]), false);
         assert_eq!(tiles[0].text, "20°");
         // Without the golfer's height, distances are shares of the torso.
-        let tiles = frame_tiles(&[(&face_on_series(false), at(150))], false);
+        let tiles = frame_tiles(&plain(&[(&face_on_series(false), at(150))]), false);
         assert_eq!(joined(&tiles[2].text, tiles[2].word), "4% torso Away");
 
-        // Each side of address: away before the top, towards the target at
+        // Each side of address: away before the top, toward the target at
         // impact, no word at address.
         let sway = |i: u64| {
-            frame_texts(&frame_tiles(&[(&fo, at(i))], false))[2]
+            frame_texts(&frame_tiles(&plain(&[(&fo, at(i))]), false))[2]
                 .1
                 .clone()
         };
         assert_eq!(sway(150), "1.8 cm Away");
         assert_eq!(sway(180), "2.7 cm Toward");
         assert_eq!(sway(60), "0.0 cm");
-        let imperial = frame_texts(&frame_tiles(&[(&fo, at(180))], true));
+        let imperial = frame_texts(&frame_tiles(&plain(&[(&fo, at(180))]), true));
         assert_eq!(imperial[2].1, "1.1 in Toward");
 
-        // Hip depth each side of address: back before it, towards the ball
+        // Hip depth each side of address: back before it, toward the ball
         // after it, no word at address.
         let depth = |i: u64| {
-            frame_texts(&frame_tiles(&[(&dtl, at(i))], false))[5]
+            frame_texts(&frame_tiles(&plain(&[(&dtl, at(i))]), false))[5]
                 .1
                 .clone()
         };
@@ -3015,7 +3656,7 @@ mod tests {
         assert_eq!(depth(180), "5% torso Toward ball");
 
         // A report without a series (an earlier file): dashes.
-        let texts = frame_texts(&frame_tiles(&[(&report(true), at(150))], false));
+        let texts = frame_texts(&frame_tiles(&plain(&[(&report(true), at(150))]), false));
         assert!(texts.iter().all(|(_, v)| v == NONE));
         assert!(frame_tiles(&[], false).iter().all(|t| t.text == NONE));
     }
@@ -3133,7 +3774,7 @@ mod tests {
         for name in ["HEAD SWAY", "FORWARD BEND", "HIP DEPTH"] {
             assert!(texts.contains(&name.to_owned()), "{name}: {texts:?}");
         }
-        // At impact the hips have moved towards the target and the ball; at
+        // At impact the hips have moved toward the target and the ball; at
         // address no word; before it, back from the ball.
         seek_to_frame(&mut app, 180);
         screen.frame(&mut app, Vec::new());
@@ -3399,6 +4040,196 @@ mod tests {
         assert!(marks.contains_key("posture:camera.1"));
     }
 
+    /// `app(cameras, true)` with `edit` applied to its saved config.
+    fn app_with(cameras: &[u32], edit: impl FnOnce(&mut FlighthookConfig)) -> FlighthookApp {
+        let mut app = app(cameras, true);
+        let mut saved = config(cameras);
+        edit(&mut saved);
+        app.settings.load_from(&saved);
+        app
+    }
+
+    #[test]
+    fn a_portrait_live_view_is_drawn_upright_with_its_skeleton_on_it() {
+        for (rotation, portrait) in [(0, false), (90, true), (180, false), (270, true)] {
+            let screen = Screen::new();
+            let mut app = app_with(&[0], |c| {
+                c.camera.get_mut("0").unwrap().rotation_deg = rotation
+            });
+            assert_eq!(app.camera_rotation("camera.0"), rotation);
+            app.select_live();
+            screen.frame(&mut app, Vec::new());
+            let id = app.live["camera.0"].id;
+            // A 64×48 frame, the skeleton found on the upright 48×64 one
+            // when turned.
+            app.live_replies(
+                vec![(
+                    id,
+                    LiveReply::Frame {
+                        seq: 1,
+                        jpeg: frame_jpeg(),
+                        pose: Some(pose(40.0)),
+                        state: PoseState {
+                            state: "ready".into(),
+                            error: None,
+                        },
+                    },
+                )],
+                1.0,
+            );
+            screen.frame(&mut app, Vec::new());
+            let marks = screen.frame(&mut app, Vec::new());
+            let picture = marks["camera_live:camera.0"].0;
+            let aspect = picture.height() / picture.width();
+            let want = if portrait { 64.0 / 48.0 } else { 48.0 / 64.0 };
+            assert!((aspect - want).abs() < 0.02, "{rotation}: {aspect}");
+            assert!(
+                (app.camera_aspect("camera.0") - want).abs() < 0.02,
+                "{rotation}: the column is laid out for the turned picture"
+            );
+            assert!(screen.circles_in(picture) > 0, "{rotation}: the skeleton");
+        }
+    }
+
+    #[test]
+    fn a_clip_tracked_at_another_rotation_is_tracked_again_once() {
+        let screen = Screen::new();
+        let mut app = app_with(&[0, 1], |c| {
+            c.camera.get_mut("0").unwrap().rotation_deg = 90
+        });
+        app.shots = vec![shot_row(1, &["camera.0", "camera.1"])];
+        app.shots_rev += 1;
+        app.set_shots_pane(ShotsPane::Cameras);
+        screen.frame(&mut app, Vec::new());
+        // camera.0 was tracked unturned and is turned now; camera.1 matches.
+        assert_eq!(
+            app.retracked,
+            std::collections::HashSet::from([("id1".to_owned(), "camera.0".to_owned())])
+        );
+        let video = &app.shots[0].video;
+        assert!(!video[0].pose && !video[0].swing, "dropped meanwhile");
+        assert!(video[1].pose && video[1].swing);
+        let player = app.shot_player.as_ref().expect("the inline player");
+        assert!(!player.wants_swing_of("camera.0"));
+        assert!(player.wants_swing_of("camera.1"));
+        // An old pass finishing at the old rotation is not asked about
+        // again this session.
+        assert!(crate::types::mark_pose(
+            &mut app.shots,
+            &[ShotKey {
+                shot_id: "id1".into(),
+                shot_number: 1,
+            }],
+            "camera.0",
+            0,
+        ));
+        screen.frame(&mut app, Vec::new());
+        assert_eq!(app.retracked.len(), 1);
+        assert!(app.shots[0].video[0].pose, "kept");
+        // Tracked at the camera's rotation: nothing to do.
+        let mut fresh = app_with(&[0, 1], |c| {
+            c.camera.get_mut("0").unwrap().rotation_deg = 90
+        });
+        let mut row = shot_row(2, &["camera.0", "camera.1"]);
+        row.video[0].rotation = 90;
+        fresh.shots = vec![row];
+        fresh.shots_rev += 1;
+        fresh.set_shots_pane(ShotsPane::Cameras);
+        screen.frame(&mut fresh, Vec::new());
+        assert!(fresh.retracked.is_empty());
+        // Body tracking off: nothing either.
+        let mut off = app_with(&[0], |c| {
+            c.camera.get_mut("0").unwrap().rotation_deg = 90;
+            c.body_tracking.mode = BodyTrackingMode::Off;
+        });
+        off.shots = vec![shot_row(3, &["camera.0"])];
+        off.shots_rev += 1;
+        off.set_shots_pane(ShotsPane::Cameras);
+        screen.frame(&mut off, Vec::new());
+        assert!(off.retracked.is_empty());
+    }
+
+    #[test]
+    fn only_tracked_clips_of_configured_cameras_at_another_rotation_are_due() {
+        let mut row = shot_row(1, &["camera.0", "camera.1", "camera.2"]);
+        row.video[1].pose = false;
+        let rotation_of = |camera: &str| match camera {
+            "camera.0" | "camera.1" => Some(270),
+            _ => None,
+        };
+        let none = std::collections::HashSet::new();
+        // camera.1 has no keypoints yet; camera.2 is not configured.
+        assert_eq!(retrack_due(&row, rotation_of, &none), ["camera.0"]);
+        let asked = std::collections::HashSet::from([("id1".to_owned(), "camera.0".to_owned())]);
+        assert!(retrack_due(&row, rotation_of, &asked).is_empty());
+        row.video[0].rotation = 270;
+        assert!(retrack_due(&row, rotation_of, &none).is_empty());
+    }
+
+    #[test]
+    fn a_golfer_front_camera_five_degrees_off_square_is_flagged() {
+        let line = "Camera 7° off square: one-camera turn and sway are approximate";
+        let front = CameraPosition::GolferFront;
+        assert_eq!(yaw_warning(front, Some(7.2)).as_deref(), Some(line));
+        assert_eq!(yaw_warning(front, Some(-6.6)).as_deref(), Some(line));
+        assert!(yaw_warning(front, Some(5.0)).is_some());
+        assert!(yaw_warning(front, Some(-5.0)).is_some());
+        assert_eq!(yaw_warning(front, Some(4.9)), None);
+        assert_eq!(yaw_warning(front, None), None);
+        assert_eq!(
+            yaw_warning(front, Some(40.0)),
+            None,
+            "out of range: not in effect"
+        );
+        for other in [
+            CameraPosition::TargetLine,
+            CameraPosition::GolferBack,
+            CameraPosition::Overhead,
+        ] {
+            assert_eq!(yaw_warning(other, Some(20.0)), None);
+        }
+    }
+
+    #[test]
+    fn the_yaw_line_sits_over_the_golfer_front_cameras_analysis_only() {
+        let screen = Screen::new();
+        let mut app = app_with(&[0, 1], |c| {
+            c.camera.get_mut("0").unwrap().yaw_deg = Some(-8.0);
+            c.camera.get_mut("1").unwrap().yaw_deg = Some(12.0);
+        });
+        app.shots = vec![shot_row(1, &["camera.0", "camera.1"])];
+        app.shots_rev += 1;
+        app.set_shots_pane(ShotsPane::Cameras);
+        screen.frame(&mut app, Vec::new());
+        give_report(&mut app, "camera.0", report(false));
+        give_report(&mut app, "camera.1", report(false));
+        let marks = screen.frame(&mut app, Vec::new());
+        let line = marks["yaw_warning:camera.0"].0;
+        let swing = marks["swing:camera.0"].0;
+        assert!(line.bottom() <= swing.top() + 0.5, "above its table");
+        assert!(
+            line.right() <= marks["swing:camera.1"].0.left(),
+            "in its column"
+        );
+        assert!(
+            screen
+                .texts()
+                .iter()
+                .any(|t| t == "Camera 8° off square: one-camera turn and sway are approximate")
+        );
+        assert!(!marks.contains_key("yaw_warning:camera.1"), "target line");
+        // Square enough: no line.
+        let mut square = app_with(&[0], |c| c.camera.get_mut("0").unwrap().yaw_deg = Some(3.0));
+        square.shots = vec![shot_row(2, &["camera.0"])];
+        square.shots_rev += 1;
+        square.set_shots_pane(ShotsPane::Cameras);
+        screen.frame(&mut square, Vec::new());
+        give_report(&mut square, "camera.0", report(false));
+        let marks = screen.frame(&mut square, Vec::new());
+        assert!(marks.contains_key("swing:camera.0"));
+        assert!(!marks.contains_key("yaw_warning:camera.0"));
+    }
+
     fn shot_row(n: u32, cameras: &[&str]) -> ShotRow {
         ShotRow {
             actor: "mock_monitor.0".into(),
@@ -3429,6 +4260,8 @@ mod tests {
                     dropped: 0,
                     pose: true,
                     swing: true,
+                    rotation: 0,
+                    analyzed_with: None,
                 })
                 .collect(),
         }
@@ -3866,18 +4699,47 @@ mod tests {
     }
 
     fn painted_circles(shapes: &[egui::epaint::ClippedShape]) -> Vec<Pos2> {
-        fn collect(shape: &egui::Shape, centres: &mut Vec<Pos2>) {
+        fn collect(shape: &egui::Shape, centers: &mut Vec<Pos2>) {
             match shape {
-                egui::Shape::Circle(c) => centres.push(c.center),
-                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, centres)),
+                egui::Shape::Circle(c) => centers.push(c.center),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, centers)),
                 _ => {}
             }
         }
-        let mut centres = Vec::new();
+        let mut centers = Vec::new();
         for clipped in shapes {
-            collect(&clipped.shape, &mut centres);
+            collect(&clipped.shape, &mut centers);
         }
-        centres
+        centers
+    }
+
+    /// Each text painted with the color it shows in.
+    fn painted_colored(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    let own = t
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(t.fallback_color, |s| s.format.color);
+                    let color = if own == egui::Color32::PLACEHOLDER {
+                        t.fallback_color
+                    } else {
+                        own
+                    };
+                    texts.push((t.galley.text().to_owned(), color));
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, texts)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
     }
 
     fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
@@ -4028,17 +4890,17 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    tempo_row(ui, &[&r], 600.0);
-                    swing_metrics(ui, &r, true, 600.0);
+                    tempo_row(ui, &tempo_values(&plain(&[(&r, None)])), 600.0);
+                    swing_metrics(ui, "camera.0", &r, true, 600.0, None, ReferenceKind::Tour);
                 });
             },
         );
         let texts = painted_texts(&out.shapes);
-        for gone in [
-            "TAKEAWAY", "FINISH", "-1.15 s", "-0.30 s", "0.00 s", "+0.65 s",
-        ] {
+        for gone in ["TAKEAWAY", "-1.15 s", "-0.30 s", "0.00 s", "+0.65 s"] {
             assert!(!texts.iter().any(|t| t == gone), "{gone}: {texts:?}");
         }
+        // Finish is the table's column, once.
+        assert_eq!(texts.iter().filter(|t| *t == "FINISH").count(), 1);
         // The tempo tiles and the metrics table are still there.
         for kept in [
             "2.5 : 1",
@@ -4056,6 +4918,629 @@ mod tests {
                 texts.iter().any(|t| t.eq_ignore_ascii_case(kept)),
                 "{kept}: {texts:?}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Grades: colors, words, key positions, the reference
+    // -----------------------------------------------------------------------
+
+    /// A grade of `id` at `position` with `fit`, its value and its words.
+    fn grade_of(id: &str, position: &str, fit: Fit, value: f64, word: Option<&str>) -> MetricGrade {
+        let side = match fit {
+            Fit::Both => flighthook::Side::On,
+            _ if value < 0.0 => flighthook::Side::Low,
+            _ => flighthook::Side::High,
+        };
+        MetricGrade {
+            id: id.into(),
+            position: position.into(),
+            value,
+            unit: "degrees".into(),
+            low: 33.0,
+            high: 43.0,
+            fade: None,
+            draw: None,
+            z: 0.0,
+            z_fade: None,
+            z_draw: None,
+            fit,
+            side,
+            direction: (fit != Fit::Both).then(|| "less".to_owned()),
+            word: word.map(str::to_owned),
+            proxy_sd: false,
+            assumed_scale: false,
+            club_fallback: false,
+            sex_fallback: false,
+            confidence: 0.9,
+        }
+    }
+
+    fn reference_grades(
+        reference: ReferenceKind,
+        grades: Vec<MetricGrade>,
+        tempo: Vec<MetricGrade>,
+    ) -> ReferenceGrades {
+        ReferenceGrades {
+            reference,
+            grades,
+            tempo,
+        }
+    }
+
+    #[test]
+    fn the_five_fits_have_five_colors_apart_from_plain_text() {
+        let fits = [Fit::Both, Fit::Fade, Fit::Draw, Fit::Near, Fit::Far];
+        let colors: Vec<egui::Color32> = fits.iter().map(|f| grade_color(*f)).collect();
+        assert_eq!(
+            colors,
+            [
+                theme::GRADE_BOTH,
+                theme::GRADE_FADE,
+                theme::GRADE_DRAW,
+                theme::GRADE_NEAR,
+                theme::GRADE_FAR
+            ]
+        );
+        for (i, a) in colors.iter().enumerate() {
+            assert_ne!(*a, theme::TEXT);
+            for b in &colors[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // The fade blue is not the headings' blue.
+        assert_ne!(theme::GRADE_FADE, theme::HEADING);
+    }
+
+    #[test]
+    fn a_graded_value_takes_its_color_and_its_word() {
+        let shown = |id, unit, v, cm, g: Option<&MetricGrade>| {
+            let s = graded_shown(id, unit, v, cm, true, g);
+            (joined(&s.text, s.word), s.color)
+        };
+        // Ungraded: plain, as before, a turn without a word.
+        assert_eq!(
+            shown("hip_turn", "degrees", 44.0, None, None),
+            ("44°".to_owned(), theme::TEXT)
+        );
+        // A graded turn reads Open or Closed by its signed value, in every fit.
+        for fit in [Fit::Both, Fit::Fade, Fit::Draw, Fit::Near, Fit::Far] {
+            let g = grade_of(
+                "hip_turn",
+                "impact",
+                fit,
+                44.0,
+                Some("more open: fade side"),
+            );
+            assert_eq!(
+                shown("hip_turn", "degrees", 44.0, None, Some(&g)),
+                ("44° Open".to_owned(), grade_color(fit)),
+                "{fit:?}"
+            );
+        }
+        let closed = grade_of("shoulder_turn", "impact", Fit::Near, -12.0, None);
+        assert_eq!(
+            shown("shoulder_turn", "degrees", 12.0, None, Some(&closed)).0,
+            "12° Closed"
+        );
+        // A shift keeps its own word from address in its color.
+        let g = grade_of(
+            "hip_sway",
+            "impact",
+            Fit::Fade,
+            2.1,
+            Some("further away from the target: fade side"),
+        );
+        assert_eq!(
+            shown("hip_sway", "torso", 0.05, Some(5.334), Some(&g)),
+            ("2.1 in Toward".to_owned(), theme::GRADE_FADE)
+        );
+        // Anything else off its band takes its side's word; inside, none.
+        let g = grade_of(
+            "spine_forward_bend",
+            "impact",
+            Fit::Near,
+            29.0,
+            Some("less than tour: stood up"),
+        );
+        assert_eq!(
+            shown("spine_forward_bend", "degrees", 29.0, None, Some(&g)),
+            ("29° Less".to_owned(), theme::GRADE_NEAR)
+        );
+        let g = grade_of("spine_forward_bend", "impact", Fit::Both, 35.0, None);
+        assert_eq!(
+            shown("spine_forward_bend", "degrees", 35.0, None, Some(&g)),
+            ("35°".to_owned(), theme::GRADE_BOTH)
+        );
+    }
+
+    #[test]
+    fn a_tile_is_colored_only_on_a_key_positions_frame() {
+        let fo = face_on_series(true);
+        // The one-camera turn has a grade at impact only; hip sway at the top.
+        let tour = reference_grades(
+            ReferenceKind::Tour,
+            vec![
+                grade_of(
+                    "hip_turn",
+                    "impact",
+                    Fit::Fade,
+                    18.0,
+                    Some("more open: fade side"),
+                ),
+                grade_of(
+                    "hip_sway",
+                    "top",
+                    Fit::Near,
+                    -1.8,
+                    Some("further away from the target than tour: sway"),
+                ),
+            ],
+            Vec::new(),
+        );
+        let tiles_at = |frame: u64| {
+            frame_tiles(
+                &[Swing {
+                    report: &fo,
+                    t_ns: Some(frame * FRAME_NS),
+                    grades: Some(&tour),
+                }],
+                false,
+            )
+        };
+        // On the impact frame and one frame either side: the turn is
+        // colored with its word; the hip sway (no impact grade) is plain.
+        for frame in [179, 180, 181] {
+            let tiles = tiles_at(frame);
+            assert_eq!(tiles[0].color, theme::GRADE_FADE, "{frame}");
+            assert_eq!(tiles[0].word, Some("Open"), "{frame}");
+            assert!(tiles[0].grade.is_some());
+            assert_eq!(tiles[2].color, theme::TEXT, "{frame}");
+            assert!(tiles[2].grade.is_none());
+        }
+        // Two frames off: plain, no word.
+        for frame in [178, 182, 250] {
+            let tiles = tiles_at(frame);
+            assert!(
+                tiles
+                    .iter()
+                    .all(|t| t.color == theme::TEXT && t.grade.is_none()),
+                "{frame}"
+            );
+            assert_eq!(tiles[0].word, None, "{frame}");
+        }
+        // On the top: the one-camera turn is not graded there, the hip sway
+        // is.
+        let tiles = tiles_at(150);
+        assert_eq!((tiles[0].color, tiles[0].word), (theme::TEXT, None));
+        assert_eq!(tiles[2].color, theme::GRADE_NEAR);
+        assert_eq!(key_position(&fo, 150 * FRAME_NS), Some(SwingPosition::Top));
+        assert_eq!(
+            key_position(&fo, 60 * FRAME_NS),
+            Some(SwingPosition::Address)
+        );
+        assert_eq!(key_position(&fo, 100 * FRAME_NS), None);
+        // Without grades nothing is colored.
+        let plain_tiles = frame_tiles(&plain(&[(&fo, Some(180 * FRAME_NS))]), false);
+        assert!(plain_tiles.iter().all(|t| t.color == theme::TEXT));
+    }
+
+    #[test]
+    fn averaged_tiles_take_the_grade_the_cameras_share() {
+        let (a, b) = (face_on_series(true), face_on_series(true));
+        let fade = |fit| {
+            reference_grades(
+                ReferenceKind::Tour,
+                vec![grade_of("hip_turn", "impact", fit, 18.0, Some("words"))],
+                vec![grade_of("tempo_ratio", "swing", fit, 3.0, Some("words"))],
+            )
+        };
+        let (g1, g2, g3) = (fade(Fit::Fade), fade(Fit::Fade), fade(Fit::Near));
+        let at = Some(180 * FRAME_NS);
+        let swing = |report, grades| Swing {
+            report,
+            t_ns: at,
+            grades: Some(grades),
+        };
+        // Two face-on cameras that agree: the color; that disagree: none.
+        let agree = frame_tiles(&[swing(&a, &g1), swing(&b, &g2)], false);
+        assert_eq!(agree[0].color, theme::GRADE_FADE);
+        let differ = frame_tiles(&[swing(&a, &g1), swing(&b, &g3)], false);
+        assert_eq!(differ[0].color, theme::TEXT);
+        assert!(differ[0].grade.is_none());
+        // One of them without grades: none either.
+        let half = frame_tiles(
+            &[
+                swing(&a, &g1),
+                Swing {
+                    report: &b,
+                    t_ns: at,
+                    grades: None,
+                },
+            ],
+            false,
+        );
+        assert_eq!(half[0].color, theme::TEXT);
+        // The tempo: the face-on camera's grade over another view's; the
+        // first camera's when no face-on camera has one.
+        let dtl = down_the_line_series();
+        let tempo = tempo_values(&[swing(&dtl, &g3), swing(&a, &g1)]);
+        assert_eq!(
+            tempo.iter().map(|t| t.color).collect::<Vec<_>>(),
+            [theme::GRADE_FADE, theme::TEXT, theme::TEXT],
+            "ratio graded, backswing never, downswing not in these grades"
+        );
+        let tempo = tempo_values(&[
+            swing(&dtl, &g3),
+            Swing {
+                report: &a,
+                t_ns: at,
+                grades: None,
+            },
+        ]);
+        assert_eq!(tempo[0].color, theme::GRADE_NEAR);
+        let tempo = tempo_values(&[swing(&a, &g1), swing(&b, &g3)]);
+        assert_eq!(tempo[0].color, theme::TEXT, "two face-on cameras disagree");
+    }
+
+    #[test]
+    fn the_miss_line_lists_the_tiles_off_their_band() {
+        let tile = |label, grade: Option<MetricGrade>| FrameValue {
+            id: "x",
+            label,
+            text: "1".into(),
+            word: None,
+            color: theme::TEXT,
+            grade,
+        };
+        let tiles = [
+            tile(
+                "Hip turn",
+                Some(grade_of(
+                    "hip_turn",
+                    "impact",
+                    Fit::Fade,
+                    44.0,
+                    Some("more open: fade side"),
+                )),
+            ),
+            tile(
+                "Shoulder turn",
+                Some(grade_of("shoulder_turn", "impact", Fit::Both, 31.0, None)),
+            ),
+            tile("Head sway", None),
+            tile(
+                "Forward bend",
+                Some(grade_of(
+                    "spine_forward_bend",
+                    "impact",
+                    Fit::Far,
+                    20.0,
+                    Some("less than tour: stood up, early extension pattern"),
+                )),
+            ),
+        ];
+        let entries = miss_entries(&tiles);
+        assert_eq!(
+            entries,
+            [
+                ("Hip turn", "more open: fade side".to_owned(), Fit::Fade),
+                (
+                    "Forward bend",
+                    "less than tour: stood up, early extension pattern".to_owned(),
+                    Fit::Far
+                ),
+            ]
+        );
+        let job = miss_job(&entries, 400.0);
+        assert_eq!(
+            job.text,
+            "Hip turn more open: fade side \u{b7} Forward bend less than tour: stood up, early extension pattern"
+        );
+        // Names muted, words in their fit's color.
+        let colors: Vec<egui::Color32> = job.sections.iter().map(|s| s.format.color).collect();
+        assert_eq!(
+            colors,
+            [
+                theme::TEXT_MUTED,
+                theme::GRADE_FADE,
+                theme::TEXT_MUTED,
+                theme::TEXT_MUTED,
+                theme::GRADE_FAR
+            ]
+        );
+        assert_eq!(job.wrap.max_rows, 2, "two lines at most");
+        assert!(
+            miss_entries(&tiles[1..3]).is_empty(),
+            "all inside or ungraded"
+        );
+    }
+
+    #[test]
+    fn a_cells_hover_names_the_band_in_the_units() {
+        assert_eq!(band_text(33.0, 43.0, "degrees", true), "33\u{2013}43\u{b0}");
+        assert_eq!(band_text(1.5, 5.5, "inches", true), "1.5\u{2013}5.5 in");
+        // Rounded after the conversion.
+        assert_eq!(band_text(1.5, 5.5, "inches", false), "3.8\u{2013}14.0 cm");
+        assert_eq!(band_text(0.2, 0.3, "seconds", true), "0.20\u{2013}0.30 s");
+        assert_eq!(band_text(2.5, 3.5, "ratio", true), "2.5\u{2013}3.5");
+        let mut hips = grade_of(
+            "hip_turn",
+            "impact",
+            Fit::Near,
+            48.0,
+            Some("more open than tour: fade or slice pattern"),
+        );
+        hips.fade = Some([36.0, 46.0]);
+        hips.draw = Some([30.0, 40.0]);
+        let shown = graded_shown("hip_turn", "degrees", 48.0, None, true, Some(&hips));
+        assert_eq!(
+            band_tip(ReferenceKind::Tour, &hips, &shown, true),
+            "Tour \u{b7} fade 36\u{2013}46\u{b0} \u{b7} draw 30\u{2013}40\u{b0} \u{b7} 48\u{b0} Open \u{b7} more open than tour: fade or slice pattern"
+        );
+        let bend = grade_of("spine_forward_bend", "impact", Fit::Both, 35.0, None);
+        let shown = graded_shown(
+            "spine_forward_bend",
+            "degrees",
+            35.0,
+            None,
+            true,
+            Some(&bend),
+        );
+        assert_eq!(
+            band_tip(ReferenceKind::Amateur, &bend, &shown, true),
+            "Amateur 33\u{2013}43\u{b0} \u{b7} 35\u{b0}"
+        );
+    }
+
+    #[test]
+    fn the_table_colors_its_graded_cells_and_widens_to_the_lead_arm_positions() {
+        assert_eq!(table_positions(WIDE_TABLE - 1.0).len(), 4);
+        assert_eq!(table_positions(WIDE_TABLE), SwingPosition::ALL.as_slice());
+        assert_eq!(
+            table_positions(400.0)
+                .iter()
+                .map(|p| p.label())
+                .collect::<Vec<_>>(),
+            ["Address", "Top", "Impact", "Finish"]
+        );
+        let r = report(false);
+        let tour = reference_grades(
+            ReferenceKind::Tour,
+            vec![grade_of(
+                "lateral_spine_tilt",
+                "impact",
+                Fit::Draw,
+                21.2,
+                Some("more: draw side"),
+            )],
+            Vec::new(),
+        );
+        let rows = metric_rows(&r, true, table_positions(400.0), Some(&tour));
+        let side_bend = &rows.iter().find(|(n, _)| n == "Side bend").unwrap().1;
+        let colors: Vec<_> = side_bend.iter().map(|c| c.shown.color).collect();
+        assert_eq!(
+            colors,
+            [theme::TEXT, theme::TEXT, theme::GRADE_DRAW, theme::TEXT],
+            "only the graded cell"
+        );
+        // The cell keeps the table's own text; its hover has the words.
+        assert_eq!(side_bend[2].shown.text, "21\u{b0}");
+        assert_eq!(side_bend[2].shown.word, None);
+        assert_eq!(side_bend[2].worded.word, Some("Less"));
+        // The finish column: the shoulder tilt's finish-only value.
+        let tilt = &rows.iter().find(|(n, _)| n == "Shoulder tilt").unwrap().1;
+        assert_eq!(tilt[3].shown.text, "30\u{b0}");
+    }
+
+    fn give_grades(app: &mut FlighthookApp, camera: &str, grades: flighthook::BodyGrades) {
+        let player = app.shot_player.as_mut().expect("a player");
+        let seq = player.seq();
+        player.reply(crate::net::ReplayReply::Grades {
+            replay: seq,
+            camera: camera.to_owned(),
+            result: Ok(grades),
+        });
+    }
+
+    /// Grades of camera `camera`: the hip turn at impact against tour (a
+    /// fade) and against amateurs (near).
+    fn hip_grades(camera: &str) -> flighthook::BodyGrades {
+        flighthook::BodyGrades {
+            shot_id: "id1".into(),
+            camera: camera.into(),
+            club_class: Some(flighthook::ClubClass::Driver),
+            sex: flighthook::Sex::Male,
+            hand: Handedness::Right,
+            references: vec![
+                reference_grades(
+                    ReferenceKind::Tour,
+                    vec![grade_of(
+                        "hip_turn",
+                        "impact",
+                        Fit::Fade,
+                        18.0,
+                        Some("more open: fade side"),
+                    )],
+                    Vec::new(),
+                ),
+                reference_grades(
+                    ReferenceKind::Amateur,
+                    vec![grade_of(
+                        "hip_turn",
+                        "impact",
+                        Fit::Near,
+                        18.0,
+                        Some("more open than amateurs: fade or slice pattern"),
+                    )],
+                    Vec::new(),
+                ),
+            ],
+        }
+    }
+
+    /// A shot of a `hand` golfer in the Cameras pane with the face-on
+    /// camera's report, clip and grades, paused on the impact frame.
+    fn graded_shot(hand: Handedness) -> (Screen, FlighthookApp) {
+        let screen = Screen::new();
+        let mut app = app(&[0], true);
+        app.set_body_reference(ReferenceKind::Tour);
+        let mut row = shot_row(1, &["camera.0"]);
+        row.handed = Some(hand);
+        app.shots = vec![row];
+        app.shots_rev += 1;
+        app.set_shots_pane(ShotsPane::Cameras);
+        screen.frame(&mut app, Vec::new());
+        give_report(&mut app, "camera.0", face_on_series(true));
+        give_sidecar(&mut app, "camera.0");
+        give_grades(&mut app, "camera.0", hip_grades("camera.0"));
+        screen.frame(&mut app, Vec::new());
+        seek_to_frame(&mut app, 180);
+        screen.frame(&mut app, Vec::new());
+        (screen, app)
+    }
+
+    #[test]
+    fn the_reference_picker_switches_the_colors_and_is_kept() {
+        let (screen, mut app) = graded_shot(Handedness::Right);
+        let marks = screen.frame(&mut app, Vec::new());
+        // Beside the Live switch, in the toolbar.
+        let (live, picker) = (marks["live_toggle"].0, marks["body_reference"].0);
+        assert!(picker.left() > live.right() && (picker.center().y - live.center().y).abs() < 2.0);
+        assert!(
+            screen.texts().iter().any(|t| t == "Tour")
+                && screen.texts().iter().any(|t| t == "Amateur")
+        );
+        assert!(
+            !screen.texts().iter().any(|t| t == "Mine"),
+            "not before personal bands"
+        );
+        // Tour: the hips in the fade band, blue, with the turn's word and the
+        // miss line.
+        assert_eq!(screen.color_of("18°"), Some(theme::GRADE_FADE));
+        assert_eq!(screen.color_of("Open"), Some(theme::GRADE_FADE));
+        assert!(marks.contains_key("frame_misses"));
+        assert!(
+            screen
+                .texts()
+                .iter()
+                .any(|t| t.contains("Hip turn more open: fade side")),
+            "{:?}",
+            screen.texts()
+        );
+        // Amateur: yellow, its own words.
+        let at = marks["body_reference:amateur"].0.center();
+        screen.click(&mut app, at);
+        assert_eq!(app.body_reference, ReferenceKind::Amateur);
+        assert_eq!(
+            stored_reference(),
+            ReferenceKind::Amateur,
+            "kept on this device"
+        );
+        screen.frame(&mut app, Vec::new());
+        assert_eq!(screen.color_of("18°"), Some(theme::GRADE_NEAR));
+        assert!(screen.texts().iter().any(|t| t.contains("than amateurs")));
+        // Off the key position: plain, and the miss line's words go.
+        seek_to_frame(&mut app, 120);
+        screen.frame(&mut app, Vec::new());
+        assert_eq!(screen.color_of("12°"), Some(theme::TEXT));
+        assert!(!screen.texts().iter().any(|t| t.contains("than amateurs")));
+        app.set_body_reference(ReferenceKind::Tour);
+        // Not in the Data pane.
+        app.set_shots_pane(ShotsPane::Data);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("body_reference"));
+    }
+
+    #[test]
+    fn a_left_handed_golfers_tiles_read_the_same() {
+        let (right, mut rh) = graded_shot(Handedness::Right);
+        let (left, mut lh) = graded_shot(Handedness::Left);
+        right.frame(&mut rh, Vec::new());
+        left.frame(&mut lh, Vec::new());
+        assert_eq!(row_values(&right), row_values(&left));
+        for text in ["18°", "Open"] {
+            assert_eq!(right.color_of(text), left.color_of(text), "{text}");
+        }
+    }
+
+    /// Answer the Last shot strip being fetched: camera `camera`'s swing
+    /// report and its grades.
+    fn answer_strip(
+        app: &mut FlighthookApp,
+        screen: &Screen,
+        camera: &str,
+        report: SwingReportFile,
+    ) {
+        screen.frame(app, Vec::new());
+        let seq = app.live_strip.next_seq().expect("a strip being fetched");
+        let strip = app.live_strip.find_mut(seq).unwrap();
+        assert!(strip.reply(crate::net::ReplayReply::Swing {
+            replay: seq,
+            camera: camera.to_owned(),
+            result: Ok(report),
+        }));
+        screen.frame(app, Vec::new());
+        let strip = app.live_strip.find_mut(seq).unwrap();
+        assert!(strip.reply(crate::net::ReplayReply::Grades {
+            replay: seq,
+            camera: camera.to_owned(),
+            result: Ok(hip_grades(camera)),
+        }));
+    }
+
+    #[test]
+    fn live_shows_the_last_shots_swing_under_the_pictures_until_the_next_one_is_in() {
+        for (w, h) in [(1600.0, 900.0), (1024.0, 768.0)] {
+            let screen = Screen::sized(w, h);
+            let mut app = app(&[0], true);
+            set_mode(&mut app, BodyTrackingMode::Live);
+            app.set_body_reference(ReferenceKind::Tour);
+            app.shots = vec![shot_row(1, &["camera.0"])];
+            app.shots_rev += 1;
+            app.set_shots_pane(ShotsPane::Cameras);
+            app.select_live();
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(marks.contains_key("camera_live:camera.0"));
+            assert!(
+                !marks.contains_key("live_last_shot"),
+                "nothing before the swing"
+            );
+            answer_strip(&mut app, &screen, "camera.0", face_on_series(true));
+            let marks = screen.frame(&mut app, Vec::new());
+            let strip = marks["live_last_shot"].0;
+            let picture = marks["camera_live:camera.0"].0;
+            assert!(strip.top() >= picture.bottom(), "under the pictures");
+            assert!(
+                (strip.left() - picture.left()).abs() < 0.5,
+                "{strip:?} {picture:?}"
+            );
+            assert!(strip.bottom() <= h, "on screen at {w}x{h}");
+            let readout = marks["pose_readout"].0;
+            assert!(readout.top() >= strip.bottom() && readout.bottom() <= h);
+            assert!(screen.texts().iter().any(|t| t == "Last shot \u{b7} #1"));
+            // The body at impact (frame 180), colored, with the misses.
+            assert_eq!(screen.color_of("18°"), Some(theme::GRADE_FADE));
+            assert!(
+                screen
+                    .texts()
+                    .iter()
+                    .any(|t| t.contains("Hip turn more open: fade side"))
+            );
+            // The next shot: the strip stays until its swing is in.
+            app.shots.push(shot_row(2, &["camera.0"]));
+            app.shots_rev += 1;
+            screen.frame(&mut app, Vec::new());
+            assert!(app.live_selected, "a new shot keeps Live");
+            assert!(screen.texts().iter().any(|t| t == "Last shot \u{b7} #1"));
+            answer_strip(&mut app, &screen, "camera.0", face_on_series(false));
+            screen.frame(&mut app, Vec::new());
+            assert!(screen.texts().iter().any(|t| t == "Last shot \u{b7} #2"));
+            assert!(!screen.texts().iter().any(|t| t == "Last shot \u{b7} #1"));
+            // Body tracking off: no strip.
+            set_mode(&mut app, BodyTrackingMode::Off);
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(!marks.contains_key("live_last_shot"));
         }
     }
 

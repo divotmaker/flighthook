@@ -197,7 +197,7 @@ pub fn resolve_actors(
             .and_then(Club::from_code)
             .unwrap_or(Club::Iron7);
         let impact_calibration =
-            square::build_impact_calibration(section.dot_bottom_to_face_centre_mm.as_ref());
+            square::build_impact_calibration(section.dot_bottom_to_face_center_mm.as_ref());
         actors.push(ResolvedActor {
             id,
             name: section.name.clone(),

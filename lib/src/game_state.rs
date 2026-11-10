@@ -227,6 +227,22 @@ impl Club {
         }
     }
 
+    /// The class of this club the swing analysis compares with: the driver
+    /// and mini driver are [`ClubClass::Driver`], every wood, hybrid and iron
+    /// [`ClubClass::MidIron`], PW/GW/SW/LW [`ClubClass::Wedge`], and the
+    /// putter has none.
+    #[must_use]
+    pub fn class(&self) -> Option<ClubClass> {
+        match self {
+            Club::Driver | Club::MiniDriver => Some(ClubClass::Driver),
+            Club::PitchingWedge | Club::GapWedge | Club::SandWedge | Club::LobWedge => {
+                Some(ClubClass::Wedge)
+            }
+            Club::Putter => None,
+            _ => Some(ClubClass::MidIron),
+        }
+    }
+
     /// Map this club to a shot detection mode.
     ///
     /// Putter → Putting, wedges (GW/SW/LW) → Chipping, everything else → Full.
@@ -237,6 +253,18 @@ impl Club {
             _ => ShotDetectionMode::Full,
         }
     }
+}
+
+/// A class of clubs with one set of swing averages ([`Club::class`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClubClass {
+    /// The driver and the mini driver.
+    Driver,
+    /// Every wood, hybrid and iron.
+    MidIron,
+    /// The wedges: PW, GW, SW and LW.
+    Wedge,
 }
 
 impl fmt::Display for Club {
@@ -532,5 +560,29 @@ mod tests {
             assert_eq!(club.mode(), ShotDetectionMode::Chipping, "{club}");
         }
         assert_eq!(Club::Putter.mode(), ShotDetectionMode::Putting);
+    }
+
+    #[test]
+    fn class_per_club() {
+        for club in Club::ALL {
+            let code = club.to_string();
+            let expected = match code.as_str() {
+                "DR" | "MD" => Some(ClubClass::Driver),
+                "PW" | "GW" | "SW" | "LW" => Some(ClubClass::Wedge),
+                "PT" => None,
+                c if c.ends_with('W') || c.ends_with('H') || c.ends_with('I') => {
+                    Some(ClubClass::MidIron)
+                }
+                c => panic!("unclassified club {c}"),
+            };
+            assert_eq!(club.class(), expected, "{code}");
+        }
+        assert_eq!(Club::Wood3.class(), Some(ClubClass::MidIron));
+        assert_eq!(Club::Hybrid4.class(), Some(ClubClass::MidIron));
+        assert_eq!(Club::Iron7.class(), Some(ClubClass::MidIron));
+        assert_eq!(
+            serde_json::to_value(ClubClass::MidIron).unwrap(),
+            serde_json::json!("mid_iron")
+        );
     }
 }

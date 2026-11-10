@@ -57,8 +57,8 @@ fn raw_held_bytes(raw: &ShotRaw) -> usize {
 /// `ShotRaw.unavailable` for a shot whose frames were evicted.
 pub const RAW_EVICTED: &str = "evicted: session raw budget";
 
-/// Everything the web layer keeps per shot. `/api/shots` serialises `data`
-/// only; the export serialises all of it.
+/// Everything the web layer keeps per shot. `/api/shots` serializes `data`
+/// only; the export serializes all of it.
 #[derive(Debug, Clone)]
 pub struct StoredShot {
     /// When `shot_trigger` reached the web layer.
@@ -401,6 +401,10 @@ async fn run(
             post(routes::post_analyze_clip),
         )
         .route(
+            "/api/shots/{shot_id}/grades/{camera}",
+            get(routes::get_shot_grades),
+        )
+        .route(
             "/api/body_tracking/models",
             get(routes::get_body_tracking_models),
         )
@@ -686,13 +690,30 @@ fn stamp_video(
 }
 
 /// Mark camera `camera`'s clip of shot `shot_id` with `set` (body tracked,
-/// swing analysed), pending or stored, whatever device took the shot.
+/// swing analyzed), pending or stored, whatever device took the shot.
+/// Forget what the stored shots `keys` say about camera `camera`'s body
+/// tracking and swing analysis: its clip is being tracked again.
+pub(crate) async fn forget_analysis(state: &WebState, keys: &[ShotKey], camera: &str) {
+    let mut shots = state.shots.write().await;
+    for stored in shots
+        .iter_mut()
+        .filter(|s| keys.iter().any(|k| k.shot_id == s.key.shot_id))
+    {
+        for video in stored.data.video.iter_mut().filter(|v| v.camera == camera) {
+            video.pose = false;
+            video.swing = false;
+            video.rotation = 0;
+            video.analyzed_with = None;
+        }
+    }
+}
+
 fn mark_video(
     shots: &mut VecDeque<StoredShot>,
     pending: &mut PendingShots,
     shot_id: &str,
     camera: &str,
-    set: fn(&mut ShotVideo),
+    set: impl Fn(&mut ShotVideo),
 ) {
     let apply = |list: &mut Vec<ShotVideo>| {
         for video in list.iter_mut().filter(|v| v.camera == camera) {
@@ -909,6 +930,8 @@ async fn apply_bus_event(
                 dropped: *dropped,
                 pose: false,
                 swing: false,
+                rotation: 0,
+                analyzed_with: None,
             };
             let mut shots = state.shots.write().await;
             for key in keys {
@@ -921,11 +944,13 @@ async fn apply_bus_event(
                 stamp_video(&mut shots, accumulators, &key.shot_id, None);
             }
         }
-        FlighthookEvent::ShotPose { keys } => {
+        FlighthookEvent::ShotPose { keys, rotation } => {
             let mut shots = state.shots.write().await;
             for key in keys {
                 mark_video(&mut shots, accumulators, &key.shot_id, &msg.actor, |v| {
                     v.pose = true;
+                    v.rotation = *rotation;
+                    v.analyzed_with = Some(stance::VERSION.to_owned());
                 });
             }
         }
@@ -1688,6 +1713,7 @@ pub(crate) mod tests {
             "camera.1",
             FlighthookEvent::ShotPose {
                 keys: vec![a.clone()],
+                rotation: 0,
             },
         )
         .await;
@@ -1712,6 +1738,7 @@ pub(crate) mod tests {
             "camera.0",
             FlighthookEvent::ShotPose {
                 keys: vec![a.clone()],
+                rotation: 0,
             },
         )
         .await;
@@ -2349,7 +2376,7 @@ pub(crate) mod tests {
         assert!(state.shots.read().await.is_empty(), "nothing stored");
         assert!(state.groups.read().await.list().is_empty());
         assert!(group_events(&mut rx).is_empty(), "no set comes back");
-        // A dropout afterwards has nothing to end.
+        // A dropout afterward has nothing to end.
         up.reconnect("mevo.0").await;
         assert!(group_events(&mut rx).is_empty());
 

@@ -82,7 +82,7 @@ pub struct DerivedFlight {
     /// values (the raw simulation when `replaces_measured` is set) and
     /// decimated to a few dozen points. Present only when the shot was
     /// simulated, same conditions as the rest of `DerivedFlight`. Always
-    /// metres and seconds, regardless of the unit system of the other
+    /// meters and seconds, regardless of the unit system of the other
     /// fields: `to_imperial`/`to_metric` leave it unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<FlightPath>,
@@ -137,8 +137,8 @@ pub enum ShotField {
 
 /// A simulated ball path from the tee to rest.
 ///
-/// Points are `[t, x, y, z]`: seconds since launch, metres downrange, metres
-/// up, metres right of the target line, origin at the tee. Always metres and
+/// Points are `[t, x, y, z]`: seconds since launch, meters downrange, meters
+/// up, meters right of the target line, origin at the tee. Always meters and
 /// seconds, independent of the unit system of the rest of the shot.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FlightPath {
@@ -179,7 +179,7 @@ impl DerivedFlight {
     }
 
     /// Convert distances to yards (heights to feet, as for [`BallFlight`]).
-    /// `path` is always metres/seconds and is carried over unchanged.
+    /// `path` is always meters/seconds and is carried over unchanged.
     #[must_use]
     pub fn to_imperial(&self) -> DerivedFlight {
         let yd = |d: Option<Distance>| d.map(|d| Distance::Yards(d.as_yards()));
@@ -200,7 +200,7 @@ impl DerivedFlight {
         }
     }
 
-    /// Convert all distances to meters. `path` is always metres/seconds and
+    /// Convert all distances to meters. `path` is always meters/seconds and
     /// is carried over unchanged.
     #[must_use]
     pub fn to_metric(&self) -> DerivedFlight {
@@ -1251,6 +1251,8 @@ mod tests {
                 dropped: 0,
                 pose: false,
                 swing: false,
+                rotation: 0,
+                analyzed_with: None,
             }],
             ..stamped()
         };
@@ -1264,6 +1266,19 @@ mod tests {
         for system in [UnitSystem::Imperial, UnitSystem::Metric] {
             assert_eq!(shot.to_unit_system(system).video, shot.video);
         }
+        let mut tracked = shot.video[0].clone();
+        tracked.pose = true;
+        tracked.rotation = 90;
+        tracked.analyzed_with = Some("0.0.4".into());
+        let json = serde_json::to_string(&tracked).expect("ser");
+        assert!(
+            json.ends_with(r#""dropped":0,"pose":true,"rotation":90,"analyzed_with":"0.0.4"}"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ShotVideo>(&json).expect("de"),
+            tracked
+        );
     }
 
     #[test]

@@ -1,7 +1,8 @@
 'use strict';
 // screens/devices.png and screens/devices-settings.png: the Devices tab with
 // a Mock and an Open Connect launch monitor (a Uneekor), a test-pattern
-// camera and GSPro; then the same with the camera card on its Settings side.
+// camera and GSPro; then the same with the camera card on its Settings side,
+// its Rotation in sight under the camera.
 //
 // The cards show ports, so this scene uses fixed ones. The Uneekor sends six
 // 7-iron shots; the Mock's first shot comes 33 s after it starts, so the
@@ -66,6 +67,7 @@ name = "Golfer Back"
 camera = "test-pattern"
 position = "golfer_back"
 mode = "auto"
+rotation_deg = 90
 
 [openconnect_client.0]
 name = "GSPro"

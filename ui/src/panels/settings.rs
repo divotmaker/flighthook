@@ -11,7 +11,7 @@ use crate::types::{
     OpenConnectClientSection, PureplaySection, R10Section, RandomClubSection, ReplaySection,
     ShotGrouping, SimSurface, SimulationSection, SpinSource, UnitSystem, WebserverSection,
 };
-use flighthook::{BodyTrackingMode, BodyTrackingSection, PoseModel, SimMode};
+use flighthook::{BodyTrackingMode, BodyTrackingSection, PlayerSection, PoseModel, Sex, SimMode};
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
     ("inches", "in"),
@@ -88,7 +88,7 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) square_club: Option<String>,
     pub(crate) square_advanced_spin: Option<bool>,
     /// Square Golf: per-club face impact calibration override, in mm from
-    /// the bottom of the sticker dot down to face centre. Keyed by club; blank means "use
+    /// the bottom of the sticker dot down to face center. Keyed by club; blank means "use
     /// allsquare's default" for that club. The putter is excluded — it has
     /// no vertical impact estimate.
     pub(crate) square_impact_mm: std::collections::HashMap<Club, String>,
@@ -110,6 +110,12 @@ pub(crate) struct CameraFields {
     pub(crate) mode: String,
     /// Seconds a frame is old when it arrives, as typed. Blank means 0.
     pub(crate) latency: String,
+    /// Clockwise quarter turns, degrees: 0, 90, 180 or 270.
+    pub(crate) rotation: u16,
+    /// Degrees the camera points off square, as typed. Blank means 0.
+    pub(crate) yaw: String,
+    /// Degrees the camera tilts down, as typed. Blank means 0.
+    pub(crate) pitch: String,
 }
 
 impl Default for CameraFields {
@@ -120,6 +126,9 @@ impl Default for CameraFields {
             position: CameraPosition::default(),
             mode: CameraSection::AUTO_MODE.to_owned(),
             latency: String::new(),
+            rotation: 0,
+            yaw: String::new(),
+            pitch: String::new(),
         }
     }
 }
@@ -252,12 +261,26 @@ fn latency_value(s: &str) -> Option<Option<f64>> {
         .map(Some)
 }
 
+/// The `yaw_deg` or `pitch_deg` a camera form field holds: `Some(None)` when
+/// blank (0), `Some(Some(deg))` for a number from -30 to 30, `None` when it
+/// is neither.
+fn angle_value(s: &str) -> Option<Option<f64>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(None);
+    }
+    s.parse::<f64>()
+        .ok()
+        .filter(|v| flighthook::camera_angle_valid(Some(*v)))
+        .map(Some)
+}
+
 /// A section's `impact_lead_s` as the form field shows it.
 fn impact_lead_text(v: Option<f64>) -> String {
     v.map(format_distance_value).unwrap_or_default()
 }
 
-/// Build the `dot_bottom_to_face_centre_mm` config map from the form: non-blank
+/// Build the `dot_bottom_to_face_center_mm` config map from the form: non-blank
 /// entries only, keyed by club code. Returns `None` when no overrides are set.
 fn impact_mm_to_config(
     form: &std::collections::HashMap<Club, String>,
@@ -350,7 +373,7 @@ impl DeviceFormEntry {
             discard_zero_spin: s.discard_non_putting_zero_spin.unwrap_or(true),
             square_club: s.club.clone(),
             square_advanced_spin: s.advanced_spin,
-            square_impact_mm: impact_mm_form(s.dot_bottom_to_face_centre_mm.as_ref()),
+            square_impact_mm: impact_mm_form(s.dot_bottom_to_face_center_mm.as_ref()),
             ball_type: 0,
             tee_height_val: "1.5".into(),
             tee_height_unit: "inches".into(),
@@ -467,6 +490,9 @@ impl DeviceFormEntry {
                 position: s.position,
                 mode: s.mode.clone(),
                 latency: impact_lead_text(s.latency_s),
+                rotation: s.rotation_deg,
+                yaw: impact_lead_text(s.yaw_deg),
+                pitch: impact_lead_text(s.pitch_deg),
             }),
             ..Self::from_mock(
                 id,
@@ -986,10 +1012,7 @@ impl ReplayForm {
 /// Form state for the `[body_tracking]` section (alpha): every field of the
 /// Body tracking card.
 ///
-/// A number field left as loaded saves its loaded value exactly. The height
-/// is edited in inches when `inches` is set (imperial default units),
-/// centimetres otherwise, and stored in centimetres rounded to 0.1. Empty
-/// is no height.
+/// A number field left as loaded saves its loaded value exactly.
 #[derive(Clone, Default)]
 pub(crate) struct BodyTrackingForm {
     pub(crate) mode: BodyTrackingMode,
@@ -998,14 +1021,11 @@ pub(crate) struct BodyTrackingForm {
     pub(crate) min_score: String,
     pub(crate) smoothing: String,
     pub(crate) detect_every: String,
-    pub(crate) golfer_height: String,
-    pub(crate) inches: bool,
     loaded: BodyTrackingSection,
 }
 
 impl BodyTrackingForm {
-    pub(crate) fn from_section(s: &BodyTrackingSection, units: UnitSystem) -> Self {
-        let inches = units == UnitSystem::Imperial;
+    pub(crate) fn from_section(s: &BodyTrackingSection) -> Self {
         Self {
             mode: s.mode,
             model: s.model,
@@ -1013,8 +1033,6 @@ impl BodyTrackingForm {
             min_score: format_distance_value(s.min_score),
             smoothing: format_distance_value(s.smoothing),
             detect_every: s.detect_every.to_string(),
-            golfer_height: Self::height_text(s.golfer_height, inches),
-            inches,
             loaded: s.clone(),
         }
     }
@@ -1057,10 +1075,50 @@ impl BodyTrackingForm {
         Self::valid(|s| s.detect_every = v).then_some(v)
     }
 
-    /// Whether the height is empty or a number in range.
-    fn golfer_height_valid(&self) -> bool {
-        self.golfer_height_cm()
-            .is_some_and(|cm| Self::valid(|s| s.golfer_height = cm))
+    /// The section to save, or `None` while a field is unparsable or out
+    /// of range.
+    pub(crate) fn to_section(&self) -> Option<BodyTrackingSection> {
+        let s = BodyTrackingSection {
+            mode: self.mode,
+            model: self.model,
+            min_score: self.min_score_value()?,
+            smoothing: self.smoothing_value()?,
+            detect_every: self.detect_every_value()?,
+            show_skeleton: self.show_skeleton,
+            legacy_golfer_height: None,
+        };
+        s.error().is_none().then_some(s)
+    }
+
+    /// The section to save, falling back to the loaded one while invalid.
+    fn to_section_or_loaded(&self) -> BodyTrackingSection {
+        self.to_section().unwrap_or_else(|| self.loaded.clone())
+    }
+}
+
+/// Form state for the `[player]` section: the Player card.
+///
+/// The height is edited in inches when `inches` is set (imperial default
+/// units), centimeters otherwise, and stored in centimeters rounded to 0.1.
+/// Empty is no height; a height left as loaded saves its loaded value
+/// exactly.
+#[derive(Clone, Default)]
+pub(crate) struct PlayerForm {
+    pub(crate) sex: Sex,
+    pub(crate) height: String,
+    pub(crate) inches: bool,
+    loaded: PlayerSection,
+}
+
+impl PlayerForm {
+    pub(crate) fn from_section(s: &PlayerSection, units: UnitSystem) -> Self {
+        let inches = units == UnitSystem::Imperial;
+        Self {
+            sex: s.sex,
+            height: Self::height_text(s.height, inches),
+            inches,
+            loaded: s.clone(),
+        }
     }
 
     fn height_text(cm: Option<f64>, inches: bool) -> String {
@@ -1080,19 +1138,19 @@ impl BodyTrackingForm {
         if inches == self.inches {
             return;
         }
-        if let Some(cm) = self.golfer_height_cm() {
-            self.golfer_height = Self::height_text(cm, inches);
+        if let Some(cm) = self.height_cm() {
+            self.height = Self::height_text(cm, inches);
         }
         self.inches = inches;
     }
 
-    /// The height to save in centimetres (`Some(None)`: no height), or
+    /// The height to save in centimeters (`Some(None)`: no height), or
     /// `None` while the text is not a number.
-    fn golfer_height_cm(&self) -> Option<Option<f64>> {
-        if self.golfer_height == Self::height_text(self.loaded.golfer_height, self.inches) {
-            return Some(self.loaded.golfer_height);
+    fn height_cm(&self) -> Option<Option<f64>> {
+        if self.height == Self::height_text(self.loaded.height, self.inches) {
+            return Some(self.loaded.height);
         }
-        let text = self.golfer_height.trim();
+        let text = self.height.trim();
         if text.is_empty() {
             return Some(None);
         }
@@ -1101,23 +1159,30 @@ impl BodyTrackingForm {
         Some(Some((cm * 10.0).round() / 10.0))
     }
 
-    /// The section to save, or `None` while a field is unparsable or out
+    /// Whether the height is empty or a number in range.
+    pub(crate) fn height_valid(&self) -> bool {
+        self.height_cm().is_some_and(|height| {
+            PlayerSection {
+                height,
+                ..PlayerSection::default()
+            }
+            .error()
+            .is_none()
+        })
+    }
+
+    /// The section to save, or `None` while the height is unparsable or out
     /// of range.
-    pub(crate) fn to_section(&self) -> Option<BodyTrackingSection> {
-        let s = BodyTrackingSection {
-            mode: self.mode,
-            model: self.model,
-            min_score: self.min_score_value()?,
-            smoothing: self.smoothing_value()?,
-            detect_every: self.detect_every_value()?,
-            golfer_height: self.golfer_height_cm()?,
-            show_skeleton: self.show_skeleton,
+    pub(crate) fn to_section(&self) -> Option<PlayerSection> {
+        let s = PlayerSection {
+            sex: self.sex,
+            height: self.height_cm()?,
         };
         s.error().is_none().then_some(s)
     }
 
     /// The section to save, falling back to the loaded one while invalid.
-    fn to_section_or_loaded(&self) -> BodyTrackingSection {
+    fn to_section_or_loaded(&self) -> PlayerSection {
         self.to_section().unwrap_or_else(|| self.loaded.clone())
     }
 }
@@ -1232,6 +1297,7 @@ pub(crate) enum GeneralCard {
     Simulation,
     Replay,
     BodyTracking,
+    Player,
 }
 
 /// Settings form state.
@@ -1244,12 +1310,13 @@ pub(crate) struct SettingsForm {
     pub(crate) simulation: SimulationForm,
     pub(crate) replay: ReplayForm,
     pub(crate) body_tracking: BodyTrackingForm,
-    /// The Global, Simulation, Replay and Body tracking cards (one save)
-    /// have unsaved edits.
+    pub(crate) player: PlayerForm,
+    /// The Global, Simulation, Replay, Body tracking and Player cards (one
+    /// save) have unsaved edits.
     pub(crate) global_dirty: bool,
     /// Which of the cards the unsaved Global edits were made on, by
     /// [`GeneralCard`]; meaningful only while `global_dirty`.
-    general_edited: [bool; 4],
+    general_edited: [bool; 5],
     pub(crate) actors: Vec<ActorFormEntry>,
     pub(crate) loaded: bool,
     /// The save posted and not answered yet.
@@ -1280,12 +1347,10 @@ impl Default for SettingsForm {
             putting_clubs: flighthook::default_putting_clubs(),
             simulation: SimulationForm::default(),
             replay: ReplayForm::default(),
-            body_tracking: BodyTrackingForm::from_section(
-                &BodyTrackingSection::default(),
-                UnitSystem::default(),
-            ),
+            body_tracking: BodyTrackingForm::from_section(&BodyTrackingSection::default()),
+            player: PlayerForm::from_section(&PlayerSection::default(), UnitSystem::default()),
             global_dirty: false,
-            general_edited: [false; 4],
+            general_edited: [false; 5],
             actors: Vec::new(),
             loaded: false,
             save: None,
@@ -1335,8 +1400,9 @@ impl SettingsForm {
             self.putting_clubs = s.putting_clubs.clone();
             self.simulation = SimulationForm::from_section(&s.simulation, s.default_units);
             self.replay = ReplayForm::from_section(&s.replay);
-            self.body_tracking = BodyTrackingForm::from_section(&s.body_tracking, s.default_units);
-            self.general_edited = [false; 4];
+            self.body_tracking = BodyTrackingForm::from_section(&s.body_tracking);
+            self.player = PlayerForm::from_section(&s.player, s.default_units);
+            self.general_edited = [false; 5];
         }
 
         let edited: Vec<ActorFormEntry> = std::mem::take(&mut self.actors)
@@ -1381,12 +1447,13 @@ impl SettingsForm {
         }
     }
 
-    /// Whether the General cards can be saved: the simulation, replay and
-    /// body tracking fields are in range.
+    /// Whether the General cards can be saved: the simulation, replay,
+    /// body tracking and player fields are in range.
     pub(crate) fn general_valid(&self) -> bool {
         self.simulation.to_section().is_some()
             && self.replay.to_section().is_some()
             && self.body_tracking.to_section().is_some()
+            && self.player.to_section().is_some()
     }
 
     /// Clubs on the Global card are limited to the Chipping/Putting
@@ -1420,6 +1487,7 @@ impl SettingsForm {
             simulation: self.simulation.to_section_or_loaded(),
             replay: self.replay.to_section_or_loaded(),
             body_tracking: self.body_tracking.to_section_or_loaded(),
+            player: self.player.to_section_or_loaded(),
             webserver: HashMap::new(),
             mevo: HashMap::new(),
             r10: HashMap::new(),
@@ -1489,6 +1557,24 @@ impl SettingsForm {
             .into_iter()
             .map(|(index, section)| (format!("camera.{index}"), section.clone()))
             .collect()
+    }
+
+    /// The rotation camera `actor` (e.g. `camera.0`) is shown with, in
+    /// clockwise degrees: its saved `rotation_deg` in effect. `None` until
+    /// the settings load, and for a camera that is not configured.
+    /// What a shot's grades depend on besides its clip: the saved Player
+    /// card (sex and height). Empty before the settings load.
+    pub(crate) fn grades_key(&self) -> String {
+        self.original_config
+            .as_ref()
+            .map(|c| format!("{:?}", c.player.in_effect()))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn saved_rotation(&self, actor: &str) -> Option<u16> {
+        let index = actor.strip_prefix("camera.")?;
+        let section = self.original_config.as_ref()?.camera.get(index)?;
+        Some(flighthook::rotation_in_effect_deg(section.rotation_deg))
     }
 
     /// Whether the Devices tab is locked: something has unsaved edits, or a
@@ -1584,7 +1670,7 @@ impl SettingsForm {
     /// Record an edit on a General card.
     pub(crate) fn mark_general(&mut self, card: GeneralCard) {
         if !self.global_dirty {
-            self.general_edited = [false; 4];
+            self.general_edited = [false; 5];
         }
         self.general_edited[card as usize] = true;
         self.global_dirty = true;
@@ -1602,11 +1688,13 @@ impl SettingsForm {
                 self.general_edited[GeneralCard::Global as usize]
                     || !(self.general_edited[GeneralCard::Simulation as usize]
                         || self.general_edited[GeneralCard::Replay as usize]
-                        || self.general_edited[GeneralCard::BodyTracking as usize])
+                        || self.general_edited[GeneralCard::BodyTracking as usize]
+                        || self.general_edited[GeneralCard::Player as usize])
             }
-            GeneralCard::Simulation | GeneralCard::Replay | GeneralCard::BodyTracking => {
-                self.general_edited[card as usize]
-            }
+            GeneralCard::Simulation
+            | GeneralCard::Replay
+            | GeneralCard::BodyTracking
+            | GeneralCard::Player => self.general_edited[card as usize],
         }
     }
 
@@ -1619,10 +1707,10 @@ impl SettingsForm {
         self.putting_clubs = saved.putting_clubs.clone();
         self.simulation = SimulationForm::from_section(&saved.simulation, saved.default_units);
         self.replay = ReplayForm::from_section(&saved.replay);
-        self.body_tracking =
-            BodyTrackingForm::from_section(&saved.body_tracking, saved.default_units);
+        self.body_tracking = BodyTrackingForm::from_section(&saved.body_tracking);
+        self.player = PlayerForm::from_section(&saved.player, saved.default_units);
         self.global_dirty = false;
-        self.general_edited = [false; 4];
+        self.general_edited = [false; 5];
         if self.save_error.as_ref().map(|e| &e.target) == Some(&SaveTarget::Global) {
             self.save_error = None;
         }
@@ -1684,6 +1772,7 @@ impl SettingsForm {
         config.simulation = self.simulation.to_section_or_loaded();
         config.replay = self.replay.to_section_or_loaded();
         config.body_tracking = self.body_tracking.to_section_or_loaded();
+        config.player = self.player.to_section_or_loaded();
         config
     }
 
@@ -1740,6 +1829,7 @@ fn global_matches(a: &FlighthookConfig, b: &FlighthookConfig) -> bool {
         && a.simulation == b.simulation
         && a.replay == b.replay
         && a.body_tracking == b.body_tracking
+        && a.player == b.player
 }
 
 /// Copy `from`'s global settings into `to`.
@@ -1751,6 +1841,7 @@ fn copy_global(to: &mut FlighthookConfig, from: &FlighthookConfig) {
     to.simulation = from.simulation.clone();
     to.replay = from.replay.clone();
     to.body_tracking = from.body_tracking.clone();
+    to.player = from.player.clone();
 }
 
 /// Set `to`'s section for actor `global_id` to `from`'s: copied, or removed
@@ -1869,7 +1960,10 @@ pub(crate) fn actor_valid(actor: &ActorFormEntry) -> bool {
             if dev.is_camera()
                 && (dev.cam.id.trim().is_empty()
                     || !video_mode_valid(&dev.cam.mode)
-                    || latency_value(&dev.cam.latency).is_none())
+                    || latency_value(&dev.cam.latency).is_none()
+                    || !flighthook::rotation_valid(dev.cam.rotation)
+                    || angle_value(&dev.cam.yaw).is_none()
+                    || angle_value(&dev.cam.pitch).is_none())
             {
                 return false;
             }
@@ -1944,7 +2038,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             club: dev.square_club.clone(),
                             advanced_spin: dev.square_advanced_spin,
                             discard_non_putting_zero_spin: Some(dev.discard_zero_spin),
-                            dot_bottom_to_face_centre_mm: impact_mm_to_config(
+                            dot_bottom_to_face_center_mm: impact_mm_to_config(
                                 &dev.square_impact_mm,
                             ),
                             impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
@@ -2012,6 +2106,9 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             position: dev.cam.position,
                             mode: dev.cam.mode.trim().to_string(),
                             latency_s: latency_value(&dev.cam.latency).flatten(),
+                            rotation_deg: dev.cam.rotation,
+                            yaw_deg: angle_value(&dev.cam.yaw).flatten(),
+                            pitch_deg: angle_value(&dev.cam.pitch).flatten(),
                         },
                     );
                 }
@@ -2119,6 +2216,22 @@ fn field_error(ui: &mut egui::Ui, text: &str) {
     ui.horizontal(|ui| {
         field_indent(ui);
         ui.label(egui::RichText::new(text).color(theme::DANGER).size(11.0));
+    });
+}
+
+/// A muted hint on its own row under a field, lined up with it, wrapped to
+/// the card.
+fn field_hint(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal(|ui| {
+        field_indent(ui);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(text)
+                    .color(theme::TEXT_MUTED)
+                    .size(11.0),
+            )
+            .wrap(),
+        );
     });
 }
 
@@ -2486,7 +2599,7 @@ pub(crate) fn actor_fields(
                             ui.label(
                                 egui::RichText::new(
                                     "Distance from the bottom edge of the club \
-                                     sticker's dot down to face centre, in mm. \
+                                     sticker's dot down to face center, in mm. \
                                      Blank uses the built-in default for that club.",
                                 )
                                 .size(11.0)
@@ -2923,8 +3036,9 @@ fn camera_timing_field(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width
     }
 }
 
-/// A camera card's Camera, Position, Video mode and Latency fields. Returns
-/// whether the camera list was asked to refresh.
+/// A camera card's fields: Camera, then Rotation (in sight without
+/// scrolling, for a quick setup), Position, Video mode, Latency, Yaw and
+/// Pitch. Returns whether the camera list was asked to refresh.
 fn camera_fields(
     ui: &mut egui::Ui,
     dev: &mut DeviceFormEntry,
@@ -2994,6 +3108,35 @@ fn camera_fields(
     }
     if let Some(error) = picked.and_then(|e| e.error.as_deref()) {
         field_error(ui, error);
+    }
+
+    ui.horizontal(|ui| {
+        field_label(ui, "Rotation:").on_hover_text(
+            "Turns the camera's picture clockwise before it is shown and tracked, for a \
+             camera mounted on its side. Clips are stored as the camera sends them.",
+        );
+        let rotations = flighthook::CAMERA_ROTATIONS;
+        let labels = rotations.map(|r| format!("{r}°"));
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let selected = rotations
+            .iter()
+            .position(|r| *r == dev.cam.rotation)
+            .unwrap_or(usize::MAX);
+        let toggle = theme::segmented_pills(ui, &labels, selected, None, theme::PILL_FONT);
+        devices::mark(ui, || format!("camera_rotation:{own}"), &toggle.response);
+        let (clicked, pills) = toggle.inner;
+        for (rotation, pill) in rotations.iter().zip(&pills) {
+            devices::mark(ui, || format!("camera_rotation:{own}:{rotation}"), pill);
+        }
+        if let Some(rotation) = clicked.map(|i| rotations[i])
+            && rotation != dev.cam.rotation
+        {
+            dev.cam.rotation = rotation;
+            dev.dirty = true;
+        }
+    });
+    if !flighthook::rotation_valid(dev.cam.rotation) {
+        field_error(ui, "0°, 90°, 180° or 270°");
     }
 
     ui.horizontal(|ui| {
@@ -3077,6 +3220,45 @@ fn camera_fields(
             &format!("Must be a number, 0 to {}", flighthook::MAX_LATENCY_S),
         );
     }
+
+    let max = flighthook::MAX_CAMERA_ANGLE_DEG;
+    for (label, key, text, hint) in [
+        (
+            "Yaw:",
+            "camera_yaw",
+            &mut dev.cam.yaw,
+            "How far the camera points off square, in degrees.",
+        ),
+        (
+            "Pitch:",
+            "camera_pitch",
+            &mut dev.cam.pitch,
+            "How far the camera tilts down from level, in degrees.",
+        ),
+    ] {
+        ui.horizontal(|ui| {
+            field_label(ui, label).on_hover_text(hint);
+            let field = ui.add(
+                egui::TextEdit::singleline(text)
+                    .desired_width(field_width - TEXT_EDIT_MARGIN)
+                    .hint_text("0"),
+            );
+            devices::mark(ui, || format!("{key}:{own}"), &field);
+            if field.changed() {
+                dev.dirty = true;
+            }
+            ui.label("°");
+        });
+        if angle_value(text).is_none() {
+            field_error(ui, &format!("Must be a number, -{max} to {max}"));
+        }
+        if key == "camera_yaw" {
+            field_hint(
+                ui,
+                "Positive: the camera points to the right of the target line for a right-hander",
+            );
+        }
+    }
     refresh
 }
 
@@ -3112,7 +3294,7 @@ impl FlighthookApp {
             .simulation
             .set_fahrenheit(units == UnitSystem::Imperial);
         self.settings
-            .body_tracking
+            .player
             .set_inches(units == UnitSystem::Imperial);
         self.settings.mark_general(GeneralCard::Global);
     }
@@ -3133,6 +3315,7 @@ impl FlighthookApp {
             GeneralCard::Simulation => "simulation",
             GeneralCard::Replay => "replay",
             GeneralCard::BodyTracking => "body_tracking",
+            GeneralCard::Player => "player",
         };
         let can_save = self.settings.general_valid();
         match save_cancel(ui, key, can_save, self.settings.saving()) {
@@ -3214,7 +3397,7 @@ impl FlighthookApp {
             devices::mark(ui, || "units".to_owned(), &combo.response);
         });
         // A fixed row height, the segmented control's, so the label
-        // centres on it.
+        // centers on it.
         let row = egui::vec2(ui.available_width(), 36.0);
         ui.allocate_ui_with_layout(row, egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 field_label(ui, "Default shot view:").on_hover_text("Which view the Shots tab opens in. Sets are always recorded; this only changes how they're shown.");
@@ -3371,7 +3554,7 @@ impl FlighthookApp {
                 lock_hint(ui);
                 self.general_error(ui, "body_tracking");
             }
-            // Seven rows: no space above the first and a point less between
+            // Six rows: no space above the first and a point less between
             // them than on the other cards, so they fit the card's height.
             card.body(false, |ui| {
                 ui.spacing_mut().item_spacing.y -= 1.0;
@@ -3382,7 +3565,7 @@ impl FlighthookApp {
     }
 
     /// The Body tracking card's fields: Mode, Model, Show skeleton, Minimum
-    /// score, Smoothing, Detect every and Golfer height, each with its range
+    /// score, Smoothing and Detect every, each with its range
     /// under it while out of range. Turning body tracking on from Off goes
     /// through the model download
     /// prompt ([`FlighthookApp::turn_body_tracking_on`]), which saves the
@@ -3486,21 +3669,78 @@ impl FlighthookApp {
                 &format!("1 to {}", BodyTrackingSection::MAX_DETECT_EVERY),
             );
         }
+        if changed {
+            self.settings.mark_general(GeneralCard::BodyTracking);
+        }
+        if let Some(mode) = turn_on {
+            let ctx = ui.ctx().clone();
+            self.turn_body_tracking_on(&ctx, mode);
+        }
+    }
+
+    /// The Player card: facts about the player the swing analysis uses,
+    /// saved with the Global card. Its edit controls are disabled unless
+    /// `editable`.
+    pub(crate) fn render_player_card(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        editable: bool,
+    ) {
+        let card = devices::fixed_card(ui, "player", theme::HEADING, |card| {
+            let ui = card.top();
+            let dirty = card_header(ui, "player", "Player", None, None, |ui| {
+                self.general_buttons(ctx, ui, GeneralCard::Player)
+            });
+            if dirty {
+                lock_hint(ui);
+                self.general_error(ui, "player");
+            }
+            card.body(false, |ui| {
+                ui.add_space(6.0);
+                ui.add_enabled_ui(editable, |ui| self.player_fields(ui));
+            });
+        });
+        devices::mark(ui, || "card:player".to_owned(), &card.response);
+    }
+
+    /// The Player card's fields: Sex and Height, the height's range under
+    /// it while out of range.
+    fn player_fields(&mut self, ui: &mut egui::Ui) {
+        let (field_width, _) = field_widths(ui);
+        let form = &mut self.settings.player;
+        let mut changed = false;
         ui.horizontal(|ui| {
-            field_label(ui, "Golfer height:");
+            field_label(ui, "Sex:").on_hover_text("Men's or women's tour averages");
+            let all = Sex::all();
+            let labels = all.map(Sex::label);
+            let selected = all.iter().position(|s| *s == form.sex).unwrap_or(0);
+            let toggle = theme::segmented_pills(ui, &labels, selected, None, theme::PILL_FONT);
+            devices::mark(ui, || "player_sex".to_owned(), &toggle.response);
+            let (clicked, pills) = toggle.inner;
+            for (sex, pill) in all.iter().zip(&pills) {
+                devices::mark(ui, || format!("player_sex:{}", sex.key()), pill);
+            }
+            if let Some(i) = clicked {
+                changed |= all[i] != form.sex;
+                form.sex = all[i];
+            }
+        });
+        ui.horizontal(|ui| {
+            field_label(ui, "Height:").on_hover_text(
+                "With the height, swing measurements that are distances are shown in \
+                 inches or centimeters.",
+            );
             let field = ui.add(
-                egui::TextEdit::singleline(&mut form.golfer_height)
+                egui::TextEdit::singleline(&mut form.height)
                     .desired_width(field_width - TEXT_EDIT_MARGIN),
             );
-            devices::mark(ui, || "body_tracking_height".to_owned(), &field);
+            devices::mark(ui, || "player_height".to_owned(), &field);
             changed |= field.changed();
             ui.label(form.height_unit());
         });
-        if !form.golfer_height_valid() {
-            let (min, max) = (
-                BodyTrackingSection::MIN_GOLFER_HEIGHT_CM,
-                BodyTrackingSection::MAX_GOLFER_HEIGHT_CM,
-            );
+        if !form.height_valid() {
+            let (min, max) = (PlayerSection::MIN_HEIGHT_CM, PlayerSection::MAX_HEIGHT_CM);
             field_error(
                 ui,
                 &if form.inches {
@@ -3515,11 +3755,7 @@ impl FlighthookApp {
             );
         }
         if changed {
-            self.settings.mark_general(GeneralCard::BodyTracking);
-        }
-        if let Some(mode) = turn_on {
-            let ctx = ui.ctx().clone();
-            self.turn_body_tracking_on(&ctx, mode);
+            self.settings.mark_general(GeneralCard::Player);
         }
     }
 

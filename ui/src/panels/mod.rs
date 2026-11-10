@@ -7,6 +7,7 @@ pub(crate) mod devices;
 pub(crate) mod dispersion;
 pub(crate) mod flight;
 pub(crate) mod impact;
+pub(crate) mod last_shot;
 pub(crate) mod log;
 pub(crate) mod monitoring;
 pub(crate) mod replay;

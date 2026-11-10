@@ -197,12 +197,20 @@ pub struct FlighthookApp {
     /// Live is on (the Cameras pane's Live switch): the pane shows the
     /// live views.
     pub(crate) live_selected: bool,
+    /// Which population's bands the Cameras pane colors the swing numbers
+    /// against (the toolbar's reference picker), kept on this device.
+    pub(crate) body_reference: flighthook::ReferenceKind,
+    /// The Cameras pane's Last shot strip under the live pictures.
+    pub(crate) live_strip: crate::panels::last_shot::LiveStrip,
     /// The Cameras pane was on screen at the last
     /// [`FlighthookApp::sync_cameras_pane`]: coming on screen picks Live or
     /// the latest shot.
     pub(crate) cameras_pane_was_shown: bool,
     /// The Cameras pane's player of the shown shot's clips.
     pub(crate) shot_player: Option<crate::panels::replay::ReplayView>,
+    /// The (shot ID, camera) clips asked to be tracked again this session
+    /// because their camera's rotation changed since they were tracked.
+    pub(crate) retracked: HashSet<(String, String)>,
     /// The Cameras pane's live views, by camera actor ID, while Live is on
     /// screen.
     pub(crate) live: crate::panels::cameras::LiveViews,
@@ -233,7 +241,7 @@ impl FlighthookApp {
 
         // Settings at once, for wizard detection. Status, shots and sets are
         // fetched on the first update(), with the WebSocket connection,
-        // which is deferred to give the page time to stabilise on iOS
+        // which is deferred to give the page time to stabilize on iOS
         // Safari before opening a second connection.
         net::fetch_settings(&cc.egui_ctx, &pending);
 
@@ -318,8 +326,11 @@ impl FlighthookApp {
             card_clips: HashMap::new(),
             shots_pane: crate::panels::cameras::ShotsPane::stored(),
             live_selected: false,
+            body_reference: crate::panels::cameras::stored_reference(),
+            live_strip: crate::panels::last_shot::LiveStrip::default(),
             cameras_pane_was_shown: false,
             shot_player: None,
+            retracked: HashSet::new(),
             live: HashMap::new(),
             live_seq: 0,
             tuning: crate::panels::cameras::Tuning::default(),
@@ -456,6 +467,8 @@ impl FlighthookApp {
                 view.reply(reply);
             } else if let Some(card) = self.card_clips.values_mut().find(|c| c.seq() == seq) {
                 card.reply(reply);
+            } else if let Some(strip) = self.live_strip.find_mut(seq) {
+                strip.reply(reply);
             }
         }
     }
@@ -681,13 +694,15 @@ impl FlighthookApp {
                     dropped,
                     pose: false,
                     swing: false,
+                    rotation: 0,
+                    analyzed_with: None,
                 };
                 if crate::types::stamp_video(&mut self.shots, &keys, &video) {
                     self.shots_rev += 1;
                 }
             }
-            FlighthookEvent::ShotPose { keys } => {
-                if crate::types::mark_pose(&mut self.shots, &keys, &actor) {
+            FlighthookEvent::ShotPose { keys, rotation } => {
+                if crate::types::mark_pose(&mut self.shots, &keys, &actor, rotation) {
                     self.shots_rev += 1;
                 }
                 // The open players draw it once they have the keypoints.
@@ -957,7 +972,7 @@ impl FlighthookApp {
                             )
                             .on_hover_text(
                                 "Uneekor's own software pushes shots to flighthook over GSPro \
-                                 Open Connect. Needs a Uneekor third-party licence, and \
+                                 Open Connect. Needs a Uneekor third-party license, and \
                                  flighthook binds port 921 — to run GSPro on the same host, \
                                  move it to 922 with OpenAPIUseAltPort.",
                             );
@@ -1155,7 +1170,7 @@ impl FlighthookApp {
         let mut picked = None;
         let mut chip = None;
         // Laid out at the header row's height so the label and the pill
-        // centre on one line.
+        // center on one line.
         let size = egui::vec2(ui.available_width(), row_height);
         let row = egui::Layout::left_to_right(egui::Align::Center);
         ui.allocate_ui_with_layout(size, row, |ui| {
@@ -1754,7 +1769,7 @@ mod tests {
     fn hand_control_is_read_only_only_while_a_simulator_is_connected() {
         use egui::{Event, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 
-        // Click along the control's centre line; the hand a click picks, if
+        // Click along the control's center line; the hand a click picks, if
         // any.
         let click_across = |read_only: bool| {
             let ctx = egui::Context::default();
@@ -2659,7 +2674,7 @@ mod tests {
         assert_eq!(app.shots[0].impact, Some(impact.clone()));
 
         // Rows from `/api/shots` keep both, and a unit change leaves the
-        // impact as sent (it is read in millimetres everywhere).
+        // impact as sent (it is read in millimeters everywhere).
         let row = ShotRow::from(ShotData {
             actor: "square.0".into(),
             shot_number: 2,
@@ -2819,6 +2834,8 @@ mod tests {
             dropped: 3,
             pose: false,
             swing: false,
+            rotation: 0,
+            analyzed_with: None,
         };
         let row: ShotData = serde_json::from_value(serde_json::json!({
             "actor": "mevo.0", "shot_number": 4, "shot_id": "s4",

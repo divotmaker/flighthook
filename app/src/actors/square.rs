@@ -86,7 +86,7 @@ impl Actor for SquareActor {
             // Address, club and spin mode are applied at connect time.
             Some(section) => {
                 let impact_calibration =
-                    build_impact_calibration(section.dot_bottom_to_face_centre_mm.as_ref());
+                    build_impact_calibration(section.dot_bottom_to_face_center_mm.as_ref());
                 if section.address == self.address && impact_calibration == self.impact_calibration
                 {
                     ReconfigureOutcome::Applied
@@ -114,19 +114,19 @@ pub(crate) fn build_impact_calibration(
     };
     for (key, &mm) in overrides {
         let Some(club) = Club::from_code(key) else {
-            warn!("square: unknown club '{key}' in dot_bottom_to_face_centre_mm, ignoring");
+            warn!("square: unknown club '{key}' in dot_bottom_to_face_center_mm, ignoring");
             continue;
         };
         let Some(club) = allsquare_club(club) else {
             warn!(
                 "square: Square Golf has no code for '{key}'; it is armed as {}, whose \
-                 calibration applies; ignoring its dot_bottom_to_face_centre_mm",
+                 calibration applies; ignoring its dot_bottom_to_face_center_mm",
                 to_allsquare_club(club).to_string().to_uppercase()
             );
             continue;
         };
         if !mm.is_finite() || mm < 0.0 {
-            warn!("square: invalid dot_bottom_to_face_centre_mm for '{key}': {mm}, ignoring");
+            warn!("square: invalid dot_bottom_to_face_center_mm for '{key}': {mm}, ignoring");
             continue;
         }
         cal.set_dot_bottom_to_face_centre_mm(club, Some(mm));
@@ -418,7 +418,7 @@ fn club_from_square(c: &allsquare::ClubMetrics) -> ClubData {
 
 /// The values of a shot the Omni does not report as it measured them: the
 /// vertical face impact is the device's reading from the club sticker's dot
-/// plus allsquare's per-club offset to the face centre (fitted defaults, or
+/// plus allsquare's per-club offset to the face center (fitted defaults, or
 /// the user's calibration).
 fn square_computed(club: Option<&allsquare::ClubMetrics>) -> &'static [ShotField] {
     if club.is_some_and(|c| c.impact_vertical.is_some()) {
@@ -428,9 +428,9 @@ fn square_computed(club: Option<&allsquare::ClubMetrics>) -> &'static [ShotField
     }
 }
 
-/// Impact location as millimetres from face centre, if the device measured it.
+/// Impact location as millimeters from face center, if the device measured it.
 ///
-/// allsquare reports both axes from face centre (beta calibration, with the
+/// allsquare reports both axes from face center (beta calibration, with the
 /// vertical offset taken from the armed club). Lateral is negated: the device
 /// reports negative toward the toe, FRP defines positive toward the toe.
 fn face_impact_from_square(c: &allsquare::ClubMetrics) -> Option<FaceImpact> {
@@ -953,7 +953,7 @@ mod tests {
     }
 
     /// A shot's vertical impact carries allsquare's offset to the face
-    /// centre, so it is marked computed; lateral and the rest are not.
+    /// center, so it is marked computed; lateral and the rest are not.
     #[test]
     fn the_calibrated_impact_height_is_marked_computed() {
         let c = allsquare::ClubMetrics {

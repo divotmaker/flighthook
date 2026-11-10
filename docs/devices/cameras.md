@@ -35,6 +35,9 @@ with a replay button. Capture uses the
    the resolution, the frame rate achieved and dropped frames.
 4. **Still frame** on the Telemetry side shows the camera's current picture,
    for aiming it.
+5. For a camera on its side, set its **Rotation**; for one that doesn't face
+   the golfer square on, its **Yaw** and **Pitch** (see
+   [Rotation, yaw and pitch](#rotation-yaw-and-pitch)).
 
 Add one card per camera. Clip settings are on the **Replay** card under
 General.
@@ -47,6 +50,9 @@ camera_name = "HD Pro Webcam C920"
 position = "golfer_front"  # target_line | golfer_front | golfer_back | overhead
 mode = "auto"              # or e.g. "1280x720@120"
 # latency_s = 0            # seconds a frame is old when it arrives, 0 to 10; see Camera latency
+# rotation_deg = 0         # 0, 90, 180 or 270: turns the picture clockwise
+# yaw_deg = 0              # degrees off square, -30 to 30
+# pitch_deg = 0            # degrees tilted down from level, -30 to 30
 
 # optional; shown at its defaults
 [replay]
@@ -75,6 +81,40 @@ warning when it uses one.
 | Overhead | above the golfer, looking down |
 
 The position labels the camera in the replay and in each clip's `shot.json`.
+
+## Rotation, yaw and pitch
+
+The camera's card has three more fields on its **Settings** side:
+**Rotation** right under the camera, so a quick setup needs no scrolling,
+and **Yaw** and **Pitch** under **Latency**. Each applies as soon as the card
+is saved; the camera keeps recording.
+
+- **Rotation** (`0° | 90° | 180° | 270°`, `rotation_deg`) turns the camera's
+  picture clockwise. A swing is taller than it is wide, so a face-on camera
+  on its side fits the whole swing at about 2 m (6 ft) from the golfer, where
+  an upright one needs about 3 m (10 ft). The picture is turned everywhere it
+  is shown: the live view, the replay, the Cameras pane, the shot cards and
+  the still frame. Body tracking works on the turned picture. Clips are
+  stored as the camera sends them; the rotation is applied when they are
+  played and tracked.
+- **Yaw** (`yaw_deg`) is how far the camera points off square, in degrees,
+  -30 to 30. Positive: the camera points to the right of the target line for
+  a right-hander, for a Golfer Front and a Target Line camera alike.
+- **Pitch** (`pitch_deg`) is how far the camera tilts down from level, in
+  degrees, -30 to 30.
+
+Empty Yaw and Pitch are 0. A value out of range shows its range under the
+field and the card can't be saved; in the config file it is not used (a
+warning in the log).
+
+One camera measures turns and sways as they look from where it stands, so a
+Golfer Front camera 5° or more off square shows one line over its swing
+numbers: `Camera 7° off square: one-camera turn and sway are approximate`.
+
+Close to the golfer the picture's perspective changes little when the golfer
+is in the middle of it: about a degree on the turns at 2 m. A golfer off to
+one side of the picture reads turned by about that offset over the distance,
+so 7.5 cm off the middle at 2 m reads about 2° more open or closed.
 
 ## Replay
 
@@ -137,18 +177,23 @@ where its picture would be: **Waiting for the clip** for the newest shot
 older one, and a camera that is not connected shows its status as on its
 Devices card. The page scrolls when the numbers don't fit under the clips.
 
-**Live.** Turn on **Live** to see every camera live, side by side, labelled
+**Live.** Turn on **Live** to see every camera live, side by side, labeled
 with its name and position, at up to 15 frames a second. With body tracking
 in Live mode, each picture also has the golfer's skeleton and posture (see
 [Live posture](#live-posture)) and a line under them reads out the
 settings (see [Settings](#settings)); in the other modes it shows the
-pictures alone. A new shot doesn't take you
+pictures alone. Under the pictures, a **Last shot** strip shows the newest
+shot's swing once it is analyzed (in Live mode every clip is, a few seconds
+after the shot): its number and club, the tempo, the six body tiles at each
+camera's impact, colored, and the line naming the ones off their band (see
+[Bands and colors](#bands-and-colors)). It stays until the next shot's
+swing is in. A new shot doesn't take you
 off Live; turn **Live** off (back to the shot the list shows), pick a shot,
 or switch to **Data** to leave it. A camera that is not connected shows its
 status as on its Devices card.
 
 The live pictures are fetched only while Live is on and on screen:
-another tab, the Table view, a minimised window or a hidden browser tab
+another tab, the Table view, a minimized window or a hidden browser tab
 stops them, and the cameras stop preparing live frames a few seconds later.
 Recording clips is not affected either way.
 
@@ -210,7 +255,7 @@ checks whether its models are on this computer:
   `download.openmmlab.com` and the YOLOX-Tiny person detector from
   `github.com`, their sizes (about 76 MB in all with RTMPose-m, 43 MB with
   RTMPose-s), and the folder they are kept in, and that body tracking runs
-  entirely on this computer afterwards. **Cancel** leaves body tracking off
+  entirely on this computer afterward. **Cancel** leaves body tracking off
   and saves nothing. **Download** saves the mode and starts the download.
 
 While it downloads, a window shows a bar for each file and one for the
@@ -264,7 +309,7 @@ shows it under the clip in the Cameras pane. A camera at **Golfer Back** or
   frame or is scrubbed: **Hip turn**, **Shoulder turn**, **Hip sway** (how
   far the hips moved sideways since address), **Head sway** (how far the
   head moved sideways since address) from the face-on camera, and
-  **Forward bend** and **Hip depth** (how far the hips moved towards the
+  **Forward bend** and **Hip depth** (how far the hips moved toward the
   ball since address) from the down-the-line camera.
   Each camera is read at the frame its own picture shows. Without a
   down-the-line camera the spine tile is the face-on **Side bend**; a tile
@@ -279,17 +324,20 @@ shows it under the clip in the Cameras pane. A camera at **Golfer Back** or
   no word.
 - **Metrics tables:** under each clip, its camera's metrics, below the
   tiles.
-- **Swing events:** address, takeaway, top, impact and finish. They are
+- **Swing events:** address, takeaway, lead arm back (the lead arm parallel
+  to the ground in the backswing), top, lead arm down (the same in the
+  downswing), impact and finish. They are
   marked on the scrubber, not listed: impact is the gold tick, and the
-  others are small grey ticks (hover one for its name, click it to jump to
+  others are small gray ticks (hover one for its name, click it to jump to
   it). A tick sits at the average of the times the cameras found that event
   at, or at the one camera's time when only one found it, and there is none
   for an event no camera found. flighthook starts from the
   launch monitor's impact, moved by its
   [camera timing](#setting-the-camera-timing), and takes impact where the
   golfer's hands bottom out within 0.3 s of it.
-- **Metrics** at address, top and impact, for the camera's view. A dash is
-  a value not measured at that point.
+- **Metrics** at address, top, impact and finish, for the camera's view,
+  and at lead arm back and lead arm down too when the clip's column is wide
+  (560 points or more). A dash is a value not measured at that point.
 
 When the hands show no swing within 0.3 s of the launch monitor's impact,
 the clip shows **No swing found in this clip** instead of numbers. That
@@ -319,14 +367,14 @@ much.
 
 | Down-the-line metric | What it is |
 | --- | --- |
-| Forward bend | the spine (hips to shoulders) from vertical, leaning towards the ball |
-| Hip depth | how far the hips (their midpoint) moved towards the ball or back from it since address, at the top and impact |
+| Forward bend | the spine (hips to shoulders) from vertical, leaning toward the ball |
+| Hip depth | how far the hips (their midpoint) moved toward the ball or back from it since address, at the top and impact |
 | Lead knee flex, Trail knee flex | how far the knee is bent, 0° straight |
 | Trail elbow | the trail arm's angle at the elbow, 180° straight |
 | Hand height | how high the hands are above the trail shoulder, at the top |
 
 Every number is a **2D estimate from one camera**: an angle or a distance
-in that camera's picture, not in 3D. A move towards or away from the camera
+in that camera's picture, not in 3D. A move toward or away from the camera
 doesn't show, and a turn shows only as a narrower body. The camera's aim
 matters: face-on square to the target line, down the line along it.
 
@@ -349,15 +397,83 @@ limits:
 - A width wider than at address has no turn: no value.
 
 Distances are a share of the golfer's torso length (`5% torso`). With the
-**Golfer height** set on the Body tracking card, they are in inches or
-centimetres, following the Units switch. The height is entered in inches
-with Imperial default units and in centimetres with Metric, and kept in
-centimetres (`golfer_height`, 100 to 250).
+**Height** set on the Player card (see [Player](#player)), they are in
+inches or centimeters, following the Units switch.
+
+Over a Golfer Front camera's numbers, a line says when the camera points 5°
+or more off square (see [Rotation, yaw and pitch](#rotation-yaw-and-pitch)).
 
 The swing is measured for the hand the shot was hit with. If the swing
 looks clearly like the other hand's, flighthook logs a warning: a camera
 whose picture is mirrored (many webcams mirror by default) makes a
 right-hander look left-handed.
+
+### Bands and colors
+
+The swing numbers are colored by how they compare with **published tour
+averages**: Sportsbox AI's tour tables, GEARS tour data, K-Vest PGA norms
+and published swing studies, collected in stance's
+[band table](https://github.com/divotmaker/stance/blob/main/docs/NORMS.md).
+Each band is an average ± one spread (SD) for a metric at a key position,
+for the club the shot was hit with (driver; woods, hybrids and irons;
+wedges, which use the iron bands where there is no wedge band) and the
+player's sex on the Player card (see [Player](#player)). A putter or a shot
+without a club is not colored.
+
+**Tour | Amateur**, next to the **Live** switch in the toolbar while the
+Cameras pane shows, picks the bands: tour players, or mid-handicap amateur
+golfers (fewer metrics have amateur bands). The choice is kept on this
+computer or browser.
+
+Four numbers at impact depend on the shot's shape: hip turn, shoulder turn,
+shoulder tilt and hip sway. A fade swing has the hips and shoulders a little
+more open at impact than a draw swing, so these have two bands, a fade band
+and a draw band, each the average moved a little one way (3° for the turns
+and the shoulder tilt, 0.75 in for the hip sway; an inference from the
+studies, not a measured band). The color says which band a number is in:
+
+| Color | Means |
+| --- | --- |
+| Aqua | inside the band: for the four shape numbers, inside both the fade and the draw band |
+| Blue | inside the fade band only: good for a fade |
+| Green | inside the draw band only: good for a draw |
+| Yellow | outside, within 2 SDs of the nearer band |
+| Red | further out |
+
+Every other number has one band and reads aqua, yellow or red. A number
+without a band stays white.
+
+**The words.** A color never stands alone:
+
+- A tile keeps its number and its word in the color: a graded turn reads
+  **Open** or **Closed** (`39° Open`), a move from address keeps its own word
+  (`3.9 in Toward`), and any other number off its band gets the word for its
+  side (`29° Less`).
+- Under the tiles, one line names each tile off its band and why: blue and
+  green say which side (`Hip turn more open: fade side`), yellow and red what
+  that miss tends to produce (`Head sway further away from the target than
+  tour: head falls back, flip`). The line is empty when every tile is inside.
+- In the metrics tables the number is colored; hover it for its band and
+  words: `Tour · fade 36–46° · draw 30–40° · 44° Open · more open: fade side`.
+  Bands in inches follow the Units switch (rounded after the conversion).
+
+**When.** A band belongs to a key position (address, lead arm back, top, lead
+arm down, impact, finish), so a tile is colored when the frame on screen is
+the frame of one of those events of that camera's swing, or one frame either
+side: pause on the impact tick, or step onto the top, and the tiles color;
+elsewhere they are white. The tables and the tempo are always colored, and
+so is the Live view's Last shot strip, which shows impact. A
+tile that averages two cameras takes the color they share, and none when
+they differ; the tempo takes the face-on camera's.
+
+**What is not colored.** A turn measured by one camera is colored at impact
+only: at the top one camera reads it well short of its 3D value (see
+[Swing analysis](#swing-analysis)), so it would be red for everyone. The side
+bend at the finish has a band but is not colored yet. Distances are put into
+inches with the Player card's height, or a typical height for the sex (177 cm
+men, 164 cm women) without one, so set it. Each number is still a one-camera
+estimate, compared with averages mostly measured in 3D: read the colors as
+a guide, not a verdict.
 
 ### Live posture
 
@@ -385,7 +501,6 @@ in this order, saved with its **Save** like the other General cards:
 | **Minimum score** | the score a point needs to be drawn, 0 to 1 (default 0.3); higher hides more of the uncertain points |
 | **Smoothing** | smoothing of the live skeleton, in Hz: 0 is off, else 0.1 to 10 (default 1). Lower is steadier at address and lags more in the swing |
 | **Detect every** | how often the live view looks for the golfer afresh, 1 to 60 frames (default 10); in between it follows them from the last frame |
-| **Golfer height** | in inches or centimetres, as the Units setting (see [Swing analysis](#swing-analysis)) |
 
 The fields show in every mode. A value out of range shows its range under
 the field, and the card can't be saved until it is fixed.
@@ -411,7 +526,6 @@ min_score = 0.3        # 0 to 1
 smoothing = 1.0        # 0 (off), or 0.1 to 10
 detect_every = 10      # 1 to 60
 show_skeleton = true   # or false
-# golfer_height = 180  # cm, 100 to 250; not set by default
 ```
 
 A value out of range is refused when saved, and the default is used (with a
@@ -423,17 +537,38 @@ before the modes may hold `enabled` instead of `mode`: `enabled = false`
 reads as `off` and `enabled = true` as `historical`, and the file is
 rewritten with `mode` (the original kept beside it as a backup).
 
+### Player
+
+The **Player** card under General holds facts about the player, saved with
+its **Save** like the other General cards:
+
+| Field | Does |
+| --- | --- |
+| **Sex** | Men's (default) or Women's: whose tour averages the swing is compared with |
+| **Height** | the player's height, in inches with Imperial default units and centimeters with Metric, 100 to 250 cm; with it, swing distances are in inches or centimeters (see [Swing analysis](#swing-analysis)). Empty is no height |
+
+```toml
+[player]          # left out while at its defaults
+sex = "female"    # "male" (default) or "female"
+height = 180      # cm, 100 to 250; not set by default
+```
+
+A height out of range is refused when saved, and not used (a warning in the
+log) when it is in the config file. A config file with `golfer_height` in
+`[body_tracking]` loads it as the player's height, and the file is rewritten
+with `[player] height` (the original kept beside it as a backup).
+
 ### Models
 
 Body tracking runs two models on this computer's CPU:
 
-| Model | Finds | Size | Licence |
+| Model | Finds | Size | License |
 | --- | --- | --- | --- |
 | RTMPose-m (default) or RTMPose-s, Halpe-26, by OpenMMLab | the 26 points of the golfer | 56 MB / 23 MB | Apache-2.0 |
 | YOLOX-Tiny, by Megvii | where the golfer is in the picture | 20 MB | Apache-2.0 |
 
 RTMPose-s is lighter and faster, RTMPose-m steadier on a blurred
-downswing. The RTMPose weights are OpenMMLab's own release, labelled
+downswing. The RTMPose weights are OpenMMLab's own release, labeled
 Apache-2.0; they were trained on public pose datasets whose terms are mixed,
 some of them research-only.
 
@@ -496,7 +631,14 @@ a simulator on the same computer:
 On the 7900X with RTMPose-m that is about 11 ms of wall time a frame, so
 2.1 s for a 6 s, 30 fps clip (180 frames, 1080×1080), 2.9 s for 260
 frames at 720×720, and 5.1 s for a 2 s, 240 fps clip (460 frames); a
-computer with fewer cores takes longer, in proportion. While a clip is
+computer with fewer cores takes longer, in proportion. Each clip tracked
+logs one line with its frames, wall time and threads, to compare computers:
+
+```text
+body tracking: camera.0 shot 550e8400-e29b-41d4-a716-446655440000: 240 frames in 2.3 s (12 threads) · 9.6 ms a frame, golfer on 238 frames
+```
+
+While a clip is
 tracked it keeps those cores busy whenever nothing at normal priority wants
 them. In Historical mode that is how long a clip's first view waits for
 its skeleton and numbers. If more clips wait than are kept on disk, the one
@@ -511,6 +653,16 @@ down-the-line clip also gets a `<camera>.swing.json`: its swing events,
 tempo and metrics, and every metric at every frame (about 55 KB for a
 560-frame face-on clip). Both are deleted with their clip, by pruning
 and by **Clear history**, and neither is in the export.
+
+A clip keeps the tracking it was given: a newer flighthook does not track it
+again by itself. Each clip's `shot.json` entry records the camera's
+rotation and the body tracking version it was tracked with. When the
+Cameras pane shows a clip tracked with another rotation than its camera's
+now, it has the clip tracked again (once per clip until the app is
+reloaded); the old skeleton and numbers go, and the clip shows the tracking
+state until the new ones are in.
+[`POST .../analyze?force=1`](../API.md#post-apishotsshot_idvideocameraanalyze)
+tracks any clip again.
 
 ### Privacy
 

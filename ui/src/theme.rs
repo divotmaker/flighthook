@@ -49,19 +49,32 @@ pub(crate) const DANGER: Color32 = Color32::from_rgb(243, 91, 99);
 pub(crate) const HEADING: Color32 = Color32::from_rgb(158, 196, 255);
 /// Actor names in the log.
 pub(crate) const LOG_ACTOR: Color32 = Color32::from_rgb(190, 170, 235);
-/// Fourth device colour.
+/// Fourth device color.
 pub(crate) const TEAL: Color32 = Color32::from_rgb(64, 200, 210);
 
-/// Colours of the first four devices in a session, by sorted actor id. Never
+/// Swing numbers inside their band (inside both the fade and the draw band
+/// of a shot-shape band): aqua.
+pub(crate) const GRADE_BOTH: Color32 = TEAL;
+/// Inside the fade band only: a blue more saturated than [`HEADING`], so
+/// it stays apart from [`GRADE_BOTH`].
+pub(crate) const GRADE_FADE: Color32 = Color32::from_rgb(120, 170, 255);
+/// Inside the draw band only: green.
+pub(crate) const GRADE_DRAW: Color32 = ACCENT;
+/// Outside, within 2 SD of the nearer band: yellow.
+pub(crate) const GRADE_NEAR: Color32 = GOLD;
+/// Further out: red.
+pub(crate) const GRADE_FAR: Color32 = DANGER;
+
+/// Colors of the first four devices in a session, by sorted actor id. Never
 /// gold (this shot) or red (errors).
-pub(crate) const DEVICE_COLOURS: [Color32; 4] = [ACCENT, HEADING, LOG_ACTOR, TEAL];
+pub(crate) const DEVICE_COLORS: [Color32; 4] = [ACCENT, HEADING, LOG_ACTOR, TEAL];
 
 /// Translucent neutral fill of an idle pill, segmented track or badge.
 pub(crate) const VEIL: Color32 = Color32::from_rgba_premultiplied(12, 12, 12, 12);
 /// Translucent neutral fill of a hovered pill.
 pub(crate) const VEIL_HOVER: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
 
-/// Status colours for the Telemetry badges.
+/// Status colors for the Telemetry badges.
 pub(crate) const STATUS_OK: Color32 = ACCENT;
 pub(crate) const STATUS_PENDING: Color32 = GOLD;
 pub(crate) const STATUS_DOWN: Color32 = DANGER;
@@ -178,7 +191,7 @@ pub(crate) fn card() -> egui::Frame {
         .inner_margin(Margin::same(12))
 }
 
-/// A [`card`] the width of `ui` and exactly `height` tall, with a coloured
+/// A [`card`] the width of `ui` and exactly `height` tall, with a colored
 /// stripe down its left edge: the Devices tab's cards. The contents are
 /// given the card's inner height to fill, and no more.
 pub(crate) fn accent_card<R>(
@@ -216,7 +229,7 @@ pub(crate) fn pill(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Respo
     pill_with(ui, selected, text, VEIL, egui::Vec2::ZERO, PILL_FONT)
 }
 
-/// A [`pill`] at least `min_size` big, with the label centred: a larger
+/// A [`pill`] at least `min_size` big, with the label centered: a larger
 /// touch target, or pills of equal width in a grid.
 pub(crate) fn pill_sized(
     ui: &mut egui::Ui,
@@ -261,7 +274,7 @@ fn pill_with(
     min_size: egui::Vec2,
     font_size: f32,
 ) -> egui::Response {
-    // Placeholder colour: the label colour is picked once the hover state
+    // Placeholder color: the label color is picked once the hover state
     // is known.
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
@@ -295,7 +308,7 @@ fn pill_with(
 
 /// A row of pills inside a translucent track, one selected. Returns the
 /// index of a clicked, unselected option. `alert` names an option that
-/// carries a small red notification dot at the top centre of its segment,
+/// carries a small red notification dot at the top center of its segment,
 /// overlapping its top edge, whatever its selection state.
 pub(crate) fn segmented(
     ui: &mut egui::Ui,
@@ -368,7 +381,7 @@ pub(crate) fn segmented_pills(
 }
 
 /// A single on/off pill in a [`segmented`] track, so it stands as tall as
-/// one: `text` after a `dot` of that colour, accent filled while `on`.
+/// one: `text` after a `dot` of that color, accent filled while `on`.
 /// The inner response is the pill's; the outer one covers the track.
 pub(crate) fn switch_pill(
     ui: &mut egui::Ui,
@@ -466,7 +479,7 @@ pub(crate) fn segmented_fill(
     clicked
 }
 
-/// A status badge: neutral translucent pill with a coloured outline, dot
+/// A status badge: neutral translucent pill with a colored outline, dot
 /// and label.
 pub(crate) fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
     let galley = ui
@@ -510,7 +523,7 @@ fn round_line(painter: &egui::Painter, points: Vec<egui::Pos2>, color: Color32, 
     painter.add(egui::Shape::line(points, Stroke::new(width, color)));
 }
 
-/// A loading spinner [`STATUS_RING`] across centred on `center`, at `time`
+/// A loading spinner [`STATUS_RING`] across centered on `center`, at `time`
 /// seconds: a faint ring with an arc in `color` going round it, growing and
 /// shrinking as it goes. The caller asks for the next frame.
 pub(crate) fn loading_ring(painter: &egui::Painter, center: egui::Pos2, color: Color32, time: f64) {
@@ -536,7 +549,7 @@ pub(crate) fn loading_ring(painter: &egui::Painter, center: egui::Pos2, color: C
     round_line(painter, points, color, STATUS_RING_STROKE);
 }
 
-/// A connected mark [`STATUS_RING`] across centred on `center`: a check in
+/// A connected mark [`STATUS_RING`] across centered on `center`: a check in
 /// a ring, in the connected green. It does not move.
 pub(crate) fn connected_ring(painter: &egui::Painter, center: egui::Pos2) {
     let radius = (STATUS_RING - STATUS_RING_STROKE) / 2.0;

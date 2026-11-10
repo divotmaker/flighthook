@@ -149,6 +149,12 @@ pub(crate) enum ReplayReply {
         camera: String,
         result: Result<types::SwingReportFile, String>,
     },
+    /// A camera's swing numbers graded against the bands.
+    Grades {
+        replay: u64,
+        camera: String,
+        result: Result<flighthook::BodyGrades, String>,
+    },
     /// The answer to asking for a camera's clip to be tracked: `done` when
     /// its keypoints were there already.
     Analyzed {
@@ -166,6 +172,7 @@ impl ReplayReply {
             | Self::Frames { replay, .. }
             | Self::Pose { replay, .. }
             | Self::Swing { replay, .. }
+            | Self::Grades { replay, .. }
             | Self::Analyzed { replay, .. } => *replay,
         }
     }
@@ -602,6 +609,38 @@ pub(crate) fn fetch_pose(
     });
 }
 
+/// Fetch the grades of `shot_id`'s swing numbers from `camera`
+/// (`GET /api/shots/{shot_id}/grades/{camera}`), for replay `replay`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn fetch_grades(
+    ctx: &egui::Context,
+    pending: &PendingHandle,
+    replay: u64,
+    shot_id: &str,
+    camera: &str,
+) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let camera = camera.to_owned();
+    let url = grades_url(shot_id, &camera);
+    ehttp::fetch(ehttp::Request::get(&url), move |result| {
+        let result = json_reply(result);
+        if let Ok(mut p) = pending.lock() {
+            p.replay.push(ReplayReply::Grades {
+                replay,
+                camera,
+                result,
+            });
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// The URL of `shot_id`'s grades from `camera`.
+pub(crate) fn grades_url(shot_id: &str, camera: &str) -> String {
+    format!("{}/api/shots/{shot_id}/grades/{camera}", api_base())
+}
+
 /// Fetch the swing analysis of `shot_id`'s clip from `camera`
 /// (`<camera>.swing.json`), for replay `replay`.
 #[cfg_attr(test, allow(dead_code))]
@@ -656,6 +695,24 @@ pub(crate) fn post_analyze(
         }
         ctx.request_repaint();
     });
+}
+
+/// Ask the server to delete `shot_id`'s body tracking and swing analysis
+/// of the clip from `camera` and track it again
+/// (`POST .../video/{camera}/analyze?force=1`). Its keypoints follow with
+/// `shot_pose`; the reply is not needed.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn post_retrack(ctx: &egui::Context, shot_id: &str, camera: &str) {
+    let ctx = ctx.clone();
+    ehttp::fetch(
+        ehttp::Request::post(retrack_url(shot_id, camera), Vec::new()),
+        move |_| ctx.request_repaint(),
+    );
+}
+
+/// The URL that asks for `shot_id`'s clip from `camera` to be tracked again.
+pub(crate) fn retrack_url(shot_id: &str, camera: &str) -> String {
+    format!("{}?force=1", analyze_url(shot_id, camera))
 }
 
 /// Send `call` about body tracking's model files; its reply goes into
@@ -1104,6 +1161,9 @@ mod tests {
         ))));
         assert!(!analyze_done(&Err("offline".into())));
         assert!(analyze_url("s1", "camera.0").ends_with("/api/shots/s1/video/camera.0/analyze"));
+        assert!(
+            retrack_url("s1", "camera.0").ends_with("/api/shots/s1/video/camera.0/analyze?force=1")
+        );
     }
 
     #[test]

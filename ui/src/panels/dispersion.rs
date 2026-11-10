@@ -2,19 +2,19 @@
 //! (Total) or landed (Carry), right of or under the Cards or Table view
 //! (`shots::chart_slots`).
 //!
-//! Equal scales on both axes, the tee at the bottom centre, downrange up
+//! Equal scales on both axes, the tee at the bottom center, downrange up
 //! and right to the right, with distance rings and a target line.
 //!
 //! - **Gold**: the shown shot, with its roll drawn from the landing to the
 //!   rest. The latest shot flies out from the tee during the new-shot pulse.
-//! - **Bright**: the view's other members (`chart::members_for`), coloured
+//! - **Bright**: the view's other members (`chart::members_for`), colored
 //!   per device when every device is shown and there are two or more.
 //! - **Faint**: the rest of the current session, newest
 //!   [`flight::FAINT_CAP`], for context. The view `none` draws the shown
 //!   shot alone.
 //!
 //! One covariance ellipse (2σ or 95 %) over the view's members (bright and
-//! gold), or one per device in its colour, with a gold cross at each mean.
+//! gold), or one per device in its color, with a gold cross at each mean.
 //! A shown Auto-chip is drawn gold but is never a member. A point is the
 //! path's landing or rest when the shot has a simulated path, else its
 //! carry or total with the simulated offline; shots with neither are left
@@ -174,7 +174,7 @@ impl Ends {
 /// distance from the tee and the offline, picked the same way, the lateral;
 /// an end without both is unknown.
 fn ends(shot: &ShotRow, units: UnitSystem) -> Ends {
-    let k = flight::per_metre(units).0;
+    let k = flight::per_meter(units).0;
     if let Some(p) = flight::path(shot) {
         let top = |q: &[f64; 4]| Spot {
             lateral: q[3] * k,
@@ -275,7 +275,7 @@ enum Level {
 struct Dot {
     index: usize,
     level: Level,
-    colour: Color32,
+    color: Color32,
     at: Pos2,
     /// The plotted lateral, in display units.
     lateral: f64,
@@ -285,12 +285,12 @@ struct Dot {
 #[derive(Debug)]
 struct Oval {
     ellipse: Ellipse,
-    colour: Color32,
+    color: Color32,
     /// The device it covers, when there is one per device.
     device: Option<String>,
     polygon: Vec<Pos2>,
     /// The mean, on screen.
-    centre: Pos2,
+    center: Pos2,
 }
 
 /// A distance ring and the label where it meets the plot's left edge.
@@ -349,7 +349,7 @@ pub(super) fn header_height(width: f32) -> f32 {
 }
 
 /// The plot inside an allocation of `area`: the whole of it, or in a wide
-/// area a plot [`MAX_ASPECT`] times as wide as it is tall, centred, so the
+/// area a plot [`MAX_ASPECT`] times as wide as it is tall, centered, so the
 /// equal axes keep a useful scale.
 fn plot_rect(area: Vec2) -> Rect {
     let min = pos2(LEFT_GUTTER, TOP_PAD);
@@ -364,7 +364,7 @@ fn plot_rect(area: Vec2) -> Rect {
 }
 
 /// Distance rings every `step` out to the far corner of the plot, as arcs
-/// about the tee clipped to the lateral domain `x_hi`, labelled where they
+/// about the tee clipped to the lateral domain `x_hi`, labeled where they
 /// meet the plot's left edge.
 fn rings(proj: &Projection, step: f64) -> Vec<Ring> {
     let (_, x_hi) = proj.x.domain();
@@ -459,9 +459,9 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         .collect();
 
     let by_device = chart::by_device(devices, device);
-    let colour_of = |i: usize| {
+    let color_of = |i: usize| {
         shots.get(i).map_or(theme::ACCENT, |s| {
-            chart::shot_colour(devices, device, &s.actor)
+            chart::shot_color(devices, device, &s.actor)
         })
     };
     let to_screen = |s: Spot| proj.to_screen(s.lateral, s.down);
@@ -469,7 +469,7 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         move |&(index, s): &(usize, Spot)| Dot {
             index,
             level,
-            colour: colour_of(index),
+            color: color_of(index),
             at: to_screen(s),
             lateral: s.lateral,
         }
@@ -484,7 +484,7 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         (Some(_), Some(e)) => e.roll.iter().map(|s| to_screen(*s)).collect(),
         _ => Vec::new(),
     };
-    let k = flight::per_metre(units).0;
+    let k = flight::per_meter(units).0;
     let track = gold
         .and_then(|(i, _)| shots.get(i))
         .and_then(flight::path)
@@ -506,7 +506,7 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
                     .filter(|(i, _)| shots.get(*i).is_some_and(|s| &s.actor == d))
                     .map(|(_, s)| [s.lateral, s.down])
                     .collect();
-                (Some(d.clone()), chart::device_colour(devices, d), pts)
+                (Some(d.clone()), chart::device_color(devices, d), pts)
             })
             .collect()
     } else {
@@ -518,16 +518,16 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
     };
     let ovals = clusters
         .into_iter()
-        .filter_map(|(device, colour, pts)| {
+        .filter_map(|(device, color, pts)| {
             let ellipse = chart::ellipse_from_points(&pts, size.k())?;
             let polygon = chart::ellipse_points(&ellipse, chart::ELLIPSE_SEGMENTS)
                 .into_iter()
                 .map(|p| proj.to_screen(p[0], p[1]))
                 .collect();
             Some(Oval {
-                centre: proj.to_screen(ellipse.center[0], ellipse.center[1]),
+                center: proj.to_screen(ellipse.center[0], ellipse.center[1]),
                 ellipse,
-                colour,
+                color,
                 device,
                 polygon,
             })
@@ -650,9 +650,9 @@ fn paint(
             );
         }
     }
-    let centre_x = origin.x + scene.proj.x.map(0.0);
+    let center_x = origin.x + scene.proj.x.map(0.0);
     clip.extend(egui::Shape::dashed_line(
-        &[pos2(centre_x, plot.bottom()), pos2(centre_x, plot.top())],
+        &[pos2(center_x, plot.bottom()), pos2(center_x, plot.top())],
         Stroke::new(1.0, theme::BORDER),
         3.0,
         3.0,
@@ -662,7 +662,7 @@ fn paint(
         plot.bottom(),
         Stroke::new(1.0, theme::BORDER),
     );
-    let tee = pos2(centre_x, plot.bottom());
+    let tee = pos2(center_x, plot.bottom());
     painter.add(egui::Shape::convex_polygon(
         vec![
             tee + vec2(-4.0, 0.0),
@@ -702,27 +702,27 @@ fn paint(
     }
 
     for d in scene.dots.iter().filter(|d| d.level == Level::Faint) {
-        clip.circle_filled(d.at + origin, FAINT_R, d.colour.gamma_multiply(FAINT_ALPHA));
+        clip.circle_filled(d.at + origin, FAINT_R, d.color.gamma_multiply(FAINT_ALPHA));
     }
     for (n, o) in scene.ovals.iter().enumerate() {
         let polygon = moved(&o.polygon, origin);
         clip.add(egui::Shape::convex_polygon(
             polygon.clone(),
-            o.colour.gamma_multiply(FILL_ALPHA),
+            o.color.gamma_multiply(FILL_ALPHA),
             Stroke::NONE,
         ));
         let outline = if hover == Some(Hover::Oval(n)) {
-            Stroke::new(1.5, o.colour)
+            Stroke::new(1.5, o.color)
         } else {
-            Stroke::new(1.0, o.colour.gamma_multiply(OUTLINE_ALPHA))
+            Stroke::new(1.0, o.color.gamma_multiply(OUTLINE_ALPHA))
         };
         clip.add(egui::Shape::closed_line(polygon, outline));
     }
     for d in scene.dots.iter().filter(|d| d.level == Level::Bright) {
         let (c, r) = if hover == Some(Hover::Shot(d.index)) {
-            (theme::mix(d.colour, theme::TEXT, 0.35), BRIGHT_R + 1.0)
+            (theme::mix(d.color, theme::TEXT, 0.35), BRIGHT_R + 1.0)
         } else {
-            (d.colour, BRIGHT_R)
+            (d.color, BRIGHT_R)
         };
         clip.circle_filled(d.at + origin, r, c);
     }
@@ -736,7 +736,7 @@ fn paint(
         (Stroke::new(2.0, theme::GOLD), 1.0),
     ] {
         for o in &scene.ovals {
-            let c = o.centre + origin;
+            let c = o.center + origin;
             for (a, b) in arms {
                 clip.line_segment([c + a * reach, c + b * reach], stroke);
             }
@@ -1064,8 +1064,8 @@ mod tests {
         g
     }
 
-    /// A path landing `carry` metres downrange and `lateral` metres right,
-    /// rolling straight on to `total` metres downrange (no ground segment
+    /// A path landing `carry` meters downrange and `lateral` meters right,
+    /// rolling straight on to `total` meters downrange (no ground segment
     /// when `total` is not past `carry`).
     fn flight_path(carry: f64, lateral: f64, total: f64) -> FlightPath {
         FlightPath {
@@ -1207,7 +1207,7 @@ mod tests {
                         scene
                             .ovals
                             .iter()
-                            .flat_map(|o| o.polygon.iter().chain([&o.centre])),
+                            .flat_map(|o| o.polygon.iter().chain([&o.center])),
                     )
                     .chain(scene.rings.iter().flat_map(|r| &r.arc));
                 for p in screen {
@@ -1354,12 +1354,12 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_area_centres_a_plot_of_bounded_aspect() {
+    fn a_wide_area_centers_a_plot_of_bounded_aspect() {
         // A tall column: the whole area.
         let tall = plot_rect(vec2(306.0, 700.0));
         assert_eq!(tall.left(), LEFT_GUTTER);
         assert_eq!(tall.right(), 306.0 - RIGHT_PAD);
-        // A wide strip under a narrow Table: centred, 1.25 times as wide as
+        // A wide strip under a narrow Table: centered, 1.25 times as wide as
         // tall, so the lateral scale stays near the downrange one.
         let area = vec2(1000.0, 200.0);
         let wide = plot_rect(area);
@@ -1382,13 +1382,13 @@ mod tests {
     }
 
     #[test]
-    fn overhead_axes_are_equal_with_the_tee_at_the_bottom_centre() {
+    fn overhead_axes_are_equal_with_the_tee_at_the_bottom_center() {
         let (shots, g) = history();
         let m = members(&shots, &g, ShotGrouping::BySet, 7, None);
         let s = build_scene(&input(&shots, &g, &m, 7, &[]));
         // One unit across is one unit up.
         assert!((s.proj.x.px_per_unit() - s.proj.y.px_per_unit()).abs() < 1e-4);
-        // Tee at the bottom centre; downrange up, right to the right.
+        // Tee at the bottom center; downrange up, right to the right.
         assert_eq!(s.proj.to_screen(0.0, 0.0), s.plot.center_bottom());
         let right = dot(&s, 6).at; // 5 m right, 145 m carry, 6 m right at rest
         let left = dot(&s, 5).at; // 4 m left
@@ -1398,14 +1398,14 @@ mod tests {
         // The bright rests fit: 160 m × 1.08 → 175 m at least.
         assert!(s.proj.y.domain().1 >= 175.0);
         assert!(s.proj.x.domain().1 >= 15.0);
-        // Rings every 25 m (thinned by pitch), labelled at the left edge.
+        // Rings every 25 m (thinned by pitch), labeled at the left edge.
         assert!(s.rings.len() >= 4);
         assert!(s.rings.iter().any(|r| r.label.is_some()));
         // Lateral ticks are symmetric about the target line.
         let xs: Vec<f32> = s.lateral_ticks.iter().map(|t| t.0).collect();
-        let centre = s.plot.center().x;
+        let center = s.plot.center().x;
         for x in &xs {
-            assert!(xs.iter().any(|y| (centre - x - (y - centre)).abs() < 1e-3));
+            assert!(xs.iter().any(|y| (center - x - (y - center)).abs() < 1e-3));
         }
     }
 
@@ -1461,22 +1461,22 @@ mod tests {
             .collect();
         let devices = chart::device_ids(&shots);
         let m = members(&shots, &g, ShotGrouping::BySet, 6, None);
-        // Every device shown, two devices: one ellipse each, in its colour.
+        // Every device shown, two devices: one ellipse each, in its color.
         let s = build_scene(&input(&shots, &g, &m, 6, &devices));
         let ovals: Vec<(Option<&str>, Color32, usize)> = s
             .ovals
             .iter()
-            .map(|o| (o.device.as_deref(), o.colour, o.ellipse.n))
+            .map(|o| (o.device.as_deref(), o.color, o.ellipse.n))
             .collect();
         assert_eq!(
             ovals,
             vec![
-                (Some("mevo.0"), theme::DEVICE_COLOURS[0], 4),
-                (Some("square.0"), theme::DEVICE_COLOURS[1], 3),
+                (Some("mevo.0"), theme::DEVICE_COLORS[0], 4),
+                (Some("square.0"), theme::DEVICE_COLORS[1], 3),
             ]
         );
-        assert_eq!(dot(&s, 1).colour, theme::DEVICE_COLOURS[1]);
-        // One device's points only: one ellipse in the accent colour.
+        assert_eq!(dot(&s, 1).color, theme::DEVICE_COLORS[1]);
+        // One device's points only: one ellipse in the accent color.
         let mevo = members(&shots, &g, ShotGrouping::BySet, 6, Some("mevo.0"));
         let s = build_scene(&SceneInput {
             device: Some("mevo.0"),
@@ -1484,7 +1484,7 @@ mod tests {
         });
         assert_eq!(s.ovals.len(), 1);
         assert_eq!(
-            (s.ovals[0].device.as_deref(), s.ovals[0].colour),
+            (s.ovals[0].device.as_deref(), s.ovals[0].color),
             (None, theme::ACCENT)
         );
         // Fewer than three points of a device: no ellipse for it.
@@ -1619,7 +1619,7 @@ mod tests {
         let inside = o
             .polygon
             .iter()
-            .map(|p| o.centre + (*p - o.centre) * 0.9)
+            .map(|p| o.center + (*p - o.center) * 0.9)
             .find(|p| s.dots.iter().all(|d| d.at.distance(*p) > DOT_HIT))
             .unwrap();
         assert_eq!(hit(&s, inside), Some(Hover::Oval(0)));
@@ -1637,7 +1637,7 @@ mod tests {
         let (flight, ground) = s.track.as_ref().unwrap();
         // The track is a smooth curve through the path's points.
         let p = flight::path(&shots[7]).unwrap();
-        let k = flight::per_metre(UnitSystem::Metric).0;
+        let k = flight::per_meter(UnitSystem::Metric).0;
         for q in p.flight.iter().chain(&p.ground) {
             let at = s.proj.to_screen(q[3] * k, q[1] * k);
             assert!(flight.points.contains(&at) || ground.points.contains(&at));

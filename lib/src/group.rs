@@ -33,7 +33,7 @@ impl ShotGrouping {
 /// Open Connect v1 carries no golfer identity), so it is always `None`, and a
 /// golfer picker can fill it without a wire change.
 ///
-/// Not serialised; derived from a [`ShotGroupInfo`] with
+/// Not serialized; derived from a [`ShotGroupInfo`] with
 /// [`ShotGroupInfo::key`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct GroupKey {

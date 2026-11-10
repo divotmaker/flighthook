@@ -83,7 +83,7 @@ impl ShotMetrics {
         }
     }
 
-    /// Convert `curve` to metres.
+    /// Convert `curve` to meters.
     #[must_use]
     pub fn to_metric(&self) -> ShotMetrics {
         ShotMetrics {
@@ -127,7 +127,7 @@ fn spin_loft(club: &ClubData) -> Option<f64> {
     Some(finite(club.dynamic_loft)? - finite(club.attack_angle)?)
 }
 
-/// `carry_offline − carry_distance × tan(launch_azimuth)`, in metres.
+/// `carry_offline − carry_distance × tan(launch_azimuth)`, in meters.
 fn curve(ball: &BallFlight) -> Option<Distance> {
     let offline = finite(ball.carry_offline.map(Distance::as_meters))?;
     let carry = finite(ball.carry_distance.map(Distance::as_meters))?;
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn serialises_only_present_fields() {
+    fn serializes_only_present_fields() {
         let m = ShotMetrics::compute(
             Some(&components(Some(3200), Some(-450))),
             Some(&club(Some(1.5), Some(-1.0))),

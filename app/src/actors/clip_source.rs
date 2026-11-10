@@ -6,7 +6,7 @@
 //! frame stamped afresh on the host clock as it is delivered, so the actor
 //! records, goes live and tracks bodies on it as on a real camera. With the
 //! screenshot grid on ([`crate::screens`]), each loop starts so that the
-//! clip's labelled impact lands on the grid, with no frames in between.
+//! clip's labeled impact lands on the grid, with no frames in between.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,7 +24,7 @@ pub struct LoopingClip {
     format: Format,
     /// Host time of the last frame delivered.
     last_ns: Option<u64>,
-    /// With the screenshot grid on: the grid step and the clip's labelled
+    /// With the screenshot grid on: the grid step and the clip's labeled
     /// impact (ns after its first frame), which every loop puts on the grid.
     grid: Option<(u64, u64)>,
 }

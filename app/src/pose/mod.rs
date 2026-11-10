@@ -31,6 +31,7 @@
 //! in the UI ([`models::Models::download`]).
 
 pub mod clips;
+pub mod grades;
 pub mod live;
 pub mod models;
 pub mod priority;

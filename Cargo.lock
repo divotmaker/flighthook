@@ -1555,7 +1555,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
- "stance",
+ "stance 0.0.4",
  "tenover",
  "threeputt",
  "tokio",
@@ -1586,7 +1586,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
- "stance",
+ "stance 0.0.3",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -4141,6 +4141,18 @@ name = "stance"
 version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b528c11f2ae358b6a729403c7b3edc92898db31cb6c18e535f3ec1042e0ec6"
+dependencies = [
+ "jpeg-encoder",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "stance"
+version = "0.0.4"
 dependencies = [
  "jpeg-encoder",
  "libc",

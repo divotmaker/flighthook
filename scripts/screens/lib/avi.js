@@ -50,7 +50,7 @@ function header({ width, height, fpsNum, fpsDen, frames, maxFrame, riffSize, mov
  * @param {number} o.height
  * @param {number} o.fps       nominal frame rate (an integer)
  * @param {number[]} o.tNs     each frame's time after the first, ns
- * @param {number} o.impactNs  the labelled impact, ns after the first frame
+ * @param {number} o.impactNs  the labeled impact, ns after the first frame
  */
 function writeClip(stem, jpegs, { width, height, fps, tNs, impactNs }) {
   const body = [];

@@ -30,7 +30,7 @@ receives the launch data only.
 `GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
 each shot with the BLE chunks behind it: up to 256 chunks before the shot
 event (the shot message and its replays), as hex with the MultiLink handle
-byte, labelled `notify`, `write` or `register`. Chunks are recorded as they
+byte, labeled `notify`, `write` or `register`. Chunks are recorded as they
 arrived, not reassembled.
 
 Never captured: anything before the handshake completes, which is where the

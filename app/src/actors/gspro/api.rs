@@ -69,7 +69,7 @@ pub struct ClubData {
     pub path: f64,
     /// Club speed after impact. Not measured by any supported device.
     pub speed_at_impact: f64,
-    /// Face impact height, mm. Positive = above centre.
+    /// Face impact height, mm. Positive = above center.
     pub vertical_face_impact: f64,
     /// Face impact lateral offset, mm. Positive = toward the toe.
     pub horizontal_face_impact: f64,
@@ -116,7 +116,7 @@ pub struct GsProResponse {
 }
 
 impl GsProResponse {
-    /// A bare `200 OK` acknowledgement. Open Connect clients wait for this
+    /// A bare `200 OK` acknowledgment. Open Connect clients wait for this
     /// after each message and will stall or disconnect without it.
     pub fn ok(message: &str) -> Self {
         Self {

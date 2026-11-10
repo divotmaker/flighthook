@@ -953,7 +953,7 @@ fn connect_and_run(
                 (None, None)
             }
             Event::Unknown { packet_id, comment } => {
-                debug!("unrecognised event {packet_id}: {comment:?}");
+                debug!("unrecognized event {packet_id}: {comment:?}");
                 (None, None)
             }
             other => {

@@ -347,22 +347,104 @@ pub async fn get_shot_video_file(
     }
 }
 
+/// GET /api/shots/{shot_id}/grades/{camera} — camera `camera`'s swing
+/// numbers of the shot graded against the bands from published tour
+/// averages, for every reference ([`flighthook::BodyGrades`]): computed
+/// from the clip's swing analysis, the shot's club and the Player card as
+/// they are now, never stored. `404` until the swing analysis is done;
+/// errors carry `{"error": "..."}`.
+pub async fn get_shot_grades(
+    State(state): State<Arc<WebState>>,
+    Path((shot_id, camera)): Path<(String, String)>,
+) -> Response {
+    use crate::pose::grades::{GradeInput, grade_file};
+    let missing = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no swing analysis from '{camera}' for shot '{shot_id}'")
+            })),
+        )
+            .into_response()
+    };
+    let Some(path) = state.root.clips.file(&shot_id, &camera, "swing.json") else {
+        return missing();
+    };
+    let (club, hand) = {
+        let shots = state.shots.read().await;
+        shots
+            .iter()
+            .rev()
+            .find(|s| s.key.shot_id == shot_id)
+            .map_or((None, None), |s| {
+                (
+                    s.data.club_selected.or(s.context.club_selected),
+                    s.data.handed.or(s.context.handed),
+                )
+            })
+    };
+    let input = GradeInput {
+        club,
+        hand,
+        player: state.root.system.player(),
+    };
+    let (shot, cam) = (shot_id.clone(), camera.clone());
+    match tokio::task::spawn_blocking(move || grade_file(&path, &shot, &cam, input)).await {
+        Ok(Some(grades)) => Json(grades).into_response(),
+        Ok(None) => missing(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// The query of `POST /api/shots/{shot_id}/video/{camera}/analyze`.
+#[derive(Debug, Default, Deserialize)]
+pub struct AnalyzeQuery {
+    /// `1` (or `true`): delete the clip's body tracking and swing analysis
+    /// and track it again.
+    pub force: Option<String>,
+}
+
+impl AnalyzeQuery {
+    /// Whether the clip is tracked again even when it is done.
+    pub fn forced(&self) -> bool {
+        matches!(self.force.as_deref(), Some("1" | "true"))
+    }
+}
+
 /// POST /api/shots/{shot_id}/video/{camera}/analyze — track camera
 /// `camera`'s clip of the shot now (body tracking, for a viewer), unless it
 /// is done or already queued ([`crate::pose::clips::request`]): `202
 /// {"state":"queued"}` (its `shot_pose`, then `shot_swing`, follow on the
 /// bus), `200 {"state":"done"}` when its keypoints are there, `409` while
 /// body tracking is off, `404` when the shot has no clip from the camera;
-/// errors carry `{"error": "..."}`.
+/// errors carry `{"error": "..."}`. With `?force=1` a clip that is done has
+/// its body tracking and swing analysis deleted and is queued again (`202`).
 pub async fn post_analyze_clip(
     State(state): State<Arc<WebState>>,
     Path((shot_id, camera)): Path<(String, String)>,
+    Query(query): Query<AnalyzeQuery>,
 ) -> Response {
     use crate::pose::clips::{Requested, request};
     let root = Arc::clone(&state.root);
     let bus = state.bus_tx.clone();
     let (shot, cam) = (shot_id.clone(), camera.clone());
-    let requested = tokio::task::spawn_blocking(move || request(&root, &shot, &cam, &bus)).await;
+    let force = query.forced();
+    if force && state.root.system.body_tracking().mode.is_on() {
+        let keys: Option<Vec<flighthook::ShotKey>> = state
+            .root
+            .clips
+            .camera_clip(&shot_id, &camera)
+            .map(|clip| clip.shots.into_iter().map(|s| s.key).collect());
+        if let Some(keys) = keys {
+            super::forget_analysis(&state, &keys, &camera).await;
+        }
+    }
+    let requested =
+        tokio::task::spawn_blocking(move || request(&root, &shot, &cam, force, &bus)).await;
     let json = |status: StatusCode, body: serde_json::Value| (status, Json(body)).into_response();
     match requested {
         Ok(Requested::Queued) => json(
@@ -927,11 +1009,13 @@ fn webserver_violation(live: &FlighthookConfig, action: &ConfigAction) -> Option
 /// in a Mevo section the action writes, a camera section without a camera
 /// or with a video mode that is neither `auto` nor `WIDTHxHEIGHT@FPS`, a
 /// launch monitor `impact_lead_s` outside 0 to
-/// [`MAX_IMPACT_LEAD_S`](flighthook::MAX_IMPACT_LEAD_S), a camera `latency_s`
-/// outside 0 to [`MAX_LATENCY_S`](flighthook::MAX_LATENCY_S), a
+/// [`MAX_IMPACT_LEAD_S`](flighthook::MAX_IMPACT_LEAD_S), a camera setting
+/// out of range ([`CameraSection::error`](flighthook::CameraSection::error):
+/// `latency_s`, `rotation_deg`, `yaw_deg`, `pitch_deg`), a
 /// `[replay]` value out of range ([`ReplaySection::error`](flighthook::ReplaySection::error)),
-/// or a `[body_tracking]` one
-/// ([`BodyTrackingSection::error`](flighthook::BodyTrackingSection::error)).
+/// a `[body_tracking]` one
+/// ([`BodyTrackingSection::error`](flighthook::BodyTrackingSection::error)),
+/// or a `[player]` one ([`PlayerSection::error`](flighthook::PlayerSection::error)).
 fn invalid_setting(action: &ConfigAction) -> Option<String> {
     if let ConfigAction::ReplaceAll { config } | ConfigAction::ReplaceGlobal { config } = action {
         if let Some(error) = config.replay.error() {
@@ -940,11 +1024,19 @@ fn invalid_setting(action: &ConfigAction) -> Option<String> {
         if let Some(error) = config.body_tracking.error() {
             return Some(format!("body_tracking: {error}"));
         }
+        if let Some(error) = config.player.error() {
+            return Some(format!("player: {error}"));
+        }
     }
     if let ConfigAction::SetBodyTracking { section } = action
         && let Some(error) = section.error()
     {
         return Some(format!("body_tracking: {error}"));
+    }
+    if let ConfigAction::SetPlayer { section } = action
+        && let Some(error) = section.error()
+    {
+        return Some(format!("player: {error}"));
     }
     let cameras: Vec<(&String, &flighthook::CameraSection)> = match action {
         ConfigAction::ReplaceAll { config } => config.camera.iter().collect(),
@@ -962,19 +1054,18 @@ fn invalid_setting(action: &ConfigAction) -> Option<String> {
     if let Some(error) = invalid_impact_lead(action) {
         return Some(error);
     }
-    if let Some(error) = invalid_latency(action) {
+    if let Some(error) = invalid_camera_setting(action) {
         return Some(error);
     }
     invalid_mevo_setting(action)
 }
 
-/// [`invalid_setting`] for a camera's `latency_s`.
-fn invalid_latency(action: &ConfigAction) -> Option<String> {
+/// [`invalid_setting`] for a camera's `latency_s`, `rotation_deg`, `yaw_deg`
+/// and `pitch_deg`.
+fn invalid_camera_setting(action: &ConfigAction) -> Option<String> {
     match action {
-        ConfigAction::ReplaceAll { config } => config.latency_error(),
-        ConfigAction::UpsertCamera { index, section } => {
-            flighthook::latency_error(&format!("camera.{index}"), section.latency_s)
-        }
+        ConfigAction::ReplaceAll { config } => config.camera_error(),
+        ConfigAction::UpsertCamera { index, section } => section.error(&format!("camera.{index}")),
         _ => None,
     }
 }
@@ -1026,7 +1117,7 @@ fn invalid_mevo_setting(action: &ConfigAction) -> Option<String> {
 /// written and only that actor is reconciled. `?scope=global` writes only the
 /// global settings, keeping every actor section of the live config.
 /// `?scope=body_tracking` writes only `[body_tracking]` and reconciles no
-/// actor. Without a scope the whole config is replaced and every actor is
+/// actor; `?scope=player` likewise writes only `[player]`. Without a scope the whole config is replaced and every actor is
 /// reconciled.
 ///
 /// An unknown scope, a removed web server, a second web server or an
@@ -1065,6 +1156,9 @@ async fn save_settings(
         },
         Some("body_tracking") => ConfigAction::SetBodyTracking {
             section: new_config.body_tracking,
+        },
+        Some("player") => ConfigAction::SetPlayer {
+            section: new_config.player,
         },
         Some(scope) => match scoped_action(scope, &new_config) {
             Some(action) => action,
@@ -1660,6 +1754,8 @@ mod convert_tests {
             dropped: 0,
             pose: false,
             swing: false,
+            rotation: 0,
+            analyzed_with: None,
         }];
         for units in ["imperial", "metric"] {
             assert!(
@@ -2565,6 +2661,145 @@ mod group_tests {
             };
             assert_eq!(invalid_setting(&upsert), None, "{ok:?}");
         }
+    }
+
+    /// A camera `rotation_deg` other than 0/90/180/270, or a `yaw_deg` or
+    /// `pitch_deg` outside -30 to 30, is 400 and saves nothing, in a
+    /// whole-config and a scoped save.
+    #[tokio::test]
+    async fn settings_save_with_an_invalid_camera_rotation_or_angle_is_400() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.camera.insert(
+                "0".into(),
+                flighthook::CameraSection {
+                    camera: flighthook::CameraSection::TEST_PATTERN.into(),
+                    ..flighthook::CameraSection::default()
+                },
+            );
+        });
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        type Set = fn(&mut flighthook::CameraSection);
+        let cases: [(Set, &str); 4] = [
+            (
+                |c| c.rotation_deg = 45,
+                "camera.0: rotation_deg 45 is not 0, 90, 180 or 270",
+            ),
+            (
+                |c| c.yaw_deg = Some(40.0),
+                "camera.0: yaw_deg 40 is outside -30 to 30",
+            ),
+            (
+                |c| c.pitch_deg = Some(-31.0),
+                "camera.0: pitch_deg -31 is outside -30 to 30",
+            ),
+            (
+                |c| c.yaw_deg = Some(f64::NAN),
+                "camera.0: yaw_deg NaN is outside -30 to 30",
+            ),
+        ];
+        for (set, message) in cases {
+            let mut body = live.clone();
+            set(body.camera.get_mut("0").unwrap());
+            for scope in [None, Some("camera.0")] {
+                let (status, Json(error)) =
+                    save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                        .await
+                        .expect_err("rejected");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{message} {scope:?}");
+                assert_eq!(error["error"], message);
+            }
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+        for rotation in [0, 90, 180, 270] {
+            let mut body = live.clone();
+            let camera = body.camera.get_mut("0").unwrap();
+            camera.rotation_deg = rotation;
+            camera.yaw_deg = Some(-30.0);
+            camera.pitch_deg = Some(30.0);
+            let upsert = ConfigAction::UpsertCamera {
+                index: "0".into(),
+                section: body.camera["0"].clone(),
+            };
+            assert_eq!(invalid_setting(&upsert), None, "{rotation}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_player_save_writes_that_section_alone() {
+        let (state, _writer, _dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let mut body = state.root.system.snapshot();
+        body.default_units = flighthook::UnitSystem::Metric;
+        body.player = flighthook::PlayerSection {
+            sex: flighthook::Sex::Female,
+            height: Some(168.0),
+        };
+        let _ = save_settings(
+            &state,
+            Some("player"),
+            body.clone(),
+            Duration::from_millis(10),
+        )
+        .await;
+        let msg = next_event(&mut rx);
+        let FlighthookEvent::ConfigCommand { action, .. } = &msg.event else {
+            panic!("not a config command: {:?}", msg.event);
+        };
+        assert!(matches!(
+            action.as_ref(),
+            ConfigAction::SetPlayer { section } if *section == body.player
+        ));
+        let before = state.root.system.snapshot();
+        let sender =
+            crate::bus::BusSender::new("system".into(), state.bus_tx.clone(), Arc::default());
+        crate::actors::system::run_config_command(&msg.event, &state.root, &state.bus_tx, &sender);
+        let after = state.root.system.snapshot();
+        assert_eq!(after.player, body.player);
+        assert_eq!(after.default_units, before.default_units);
+        // A height out of range is refused, here and in a global save.
+        body.player.height = Some(99.0);
+        for scope in ["player", "global"] {
+            let (status, Json(error)) =
+                save_settings(&state, Some(scope), body.clone(), Duration::from_millis(10))
+                    .await
+                    .expect_err("refused");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"], "player: height 99 is outside 100 to 250 cm");
+        }
+    }
+
+    /// An old UI's body tracking save that still carries `golfer_height`
+    /// is accepted, and the height is not written back into the section.
+    #[tokio::test]
+    async fn a_body_tracking_save_with_a_golfer_height_drops_it() {
+        let (state, _writer, dir) = test_state();
+        let mut rx = state.bus_tx.subscribe();
+        let body: FlighthookConfig = serde_json::from_str(
+            r#"{"body_tracking":{"mode":"historical","golfer_height":182.5}}"#,
+        )
+        .expect("body");
+        let _ = save_settings(
+            &state,
+            Some("body_tracking"),
+            body,
+            Duration::from_millis(10),
+        )
+        .await;
+        let msg = next_event(&mut rx);
+        let sender =
+            crate::bus::BusSender::new("system".into(), state.bus_tx.clone(), Arc::default());
+        crate::actors::system::run_config_command(&msg.event, &state.root, &state.bus_tx, &sender);
+        let after = state.root.system.snapshot();
+        assert_eq!(
+            after.body_tracking.mode,
+            flighthook::BodyTrackingMode::Historical
+        );
+        assert_eq!(after.player.height, None, "only [body_tracking] is written");
+        let text = std::fs::read_to_string(dir.0.join("config.toml")).expect("config");
+        assert!(!text.contains("golfer_height"), "{text}");
     }
 
     #[tokio::test]
@@ -3655,7 +3890,7 @@ mod body_tracking_models_tests {
             read(post_body_tracking_models_download(State(Arc::clone(&state))).await).await;
         assert_eq!(code, StatusCode::ACCEPTED);
         assert_eq!(again.state, ModelFilesState::Downloading);
-        // Cancelled: missing at once, the partial file goes.
+        // Canceled: missing at once, the partial file goes.
         let (code, m) =
             read(delete_body_tracking_models_download(State(Arc::clone(&state))).await).await;
         assert_eq!(code, StatusCode::OK);
@@ -3677,7 +3912,7 @@ mod body_tracking_models_tests {
             0,
             "no partial file left"
         );
-        // Cancelling with nothing running is fine.
+        // Canceling with nothing running is fine.
         let (code, _) =
             read(delete_body_tracking_models_download(State(Arc::clone(&state))).await).await;
         assert_eq!(code, StatusCode::OK);

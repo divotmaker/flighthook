@@ -799,6 +799,7 @@ fn apply_config_command(
                 p.simulation = config.simulation.clone();
                 p.replay = config.replay.clone();
                 p.body_tracking = config.body_tracking.clone();
+                p.player = config.player.clone();
             });
             scope = None;
         }
@@ -942,6 +943,18 @@ fn apply_config_command(
             // Body tracking is read live everywhere: persist it and
             // reconcile nothing.
             state.system.update(|p| p.body_tracking = section.clone());
+            sender.send(FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
+                request_id: request_id.clone(),
+                restarted: Vec::new(),
+                stopped: Vec::new(),
+                started: Vec::new(),
+            }));
+            return;
+        }
+        ConfigAction::SetPlayer { section } => {
+            // The player's settings are read at each swing analysis:
+            // persist them and reconcile nothing.
+            state.system.update(|p| p.player = section.clone());
             sender.send(FlighthookMessage::new(FlighthookEvent::ConfigOutcome {
                 request_id: request_id.clone(),
                 restarted: Vec::new(),
@@ -1371,6 +1384,56 @@ mod tests {
     }
 
     #[test]
+    fn replace_global_and_set_player_take_the_player_settings() {
+        let (_dir, state, _writer, sender, _rx) = game();
+        let state = Arc::new(state);
+        let mut body = state.system.snapshot();
+        body.player = flighthook::PlayerSection {
+            sex: flighthook::Sex::Female,
+            height: Some(165.0),
+        };
+        run_config_command(
+            &FlighthookEvent::ConfigCommand {
+                request_id: None,
+                action: Box::new(ConfigAction::ReplaceGlobal {
+                    config: Box::new(body.clone()),
+                }),
+            },
+            &state,
+            sender.raw_sender(),
+            &sender,
+        );
+        assert_eq!(state.system.player(), body.player);
+        let mut rx = sender.subscribe();
+        let section = flighthook::PlayerSection {
+            sex: flighthook::Sex::Male,
+            height: Some(190.0),
+        };
+        run_config_command(
+            &FlighthookEvent::ConfigCommand {
+                request_id: Some("req-player".into()),
+                action: Box::new(ConfigAction::SetPlayer {
+                    section: section.clone(),
+                }),
+            },
+            &state,
+            sender.raw_sender(),
+            &sender,
+        );
+        assert_eq!(state.system.player(), section);
+        assert_eq!(state.system.snapshot().player, section, "persisted");
+        let outcome = std::iter::from_fn(|| rx.poll().ok().flatten()).find_map(|m| match m.event {
+            FlighthookEvent::ConfigOutcome {
+                request_id,
+                restarted,
+                ..
+            } => Some((request_id, restarted)),
+            _ => None,
+        });
+        assert_eq!(outcome, Some((Some("req-player".into()), Vec::new())));
+    }
+
+    #[test]
     fn a_camera_section_is_upserted_and_removed_with_its_actor() {
         let (_dir, state, _writer, sender, _rx) = game();
         let state = Arc::new(state);
@@ -1439,6 +1502,8 @@ mod tests {
             dropped: 0,
             pose: false,
             swing: false,
+            rotation: 0,
+            analyzed_with: None,
         };
         assert!(state.clips.finish(&slot, video, 20).kept);
 
@@ -1494,6 +1559,8 @@ mod tests {
             dropped: 0,
             pose: false,
             swing: false,
+            rotation: 0,
+            analyzed_with: None,
         };
         assert!(state.clips.finish(&slot, video, 20).kept);
         assert_eq!(state.clips.videos("a").len(), 1);

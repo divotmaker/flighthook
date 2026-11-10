@@ -5,7 +5,7 @@
 //! the impact reads as ("4 toe", "2 low"), and the Cards view's face panel.
 //!
 //! Face impact is golfer-relative (FRP: `lateral` + toward the toe,
-//! `vertical` + above the face centre) and is never mirrored for a
+//! `vertical` + above the face center) and is never mirrored for a
 //! left-hander; only the drawing is.
 
 use std::cell::RefCell;
@@ -24,8 +24,8 @@ use crate::types::{Club, FaceImpact, Handedness, ShotRow};
 // ---------------------------------------------------------------------------
 
 // Every outline below is a generic club-face silhouette, not any brand's
-// head: a closed chain of cubic Béziers in face millimetres, origin at the
-// face centre (the midpoint of both the horizontal and the vertical chord
+// head: a closed chain of cubic Béziers in face millimeters, origin at the
+// face center (the midpoint of both the horizontal and the vertical chord
 // through it), +x toward the toe, +y up, walked counter-clockwise. Stored
 // flat: the start point, then `c1, c2, end` per segment; the last end is
 // the start. Straight runs have their handles at the thirds.
@@ -306,16 +306,16 @@ impl FaceFamily {
     }
 }
 
-/// An outline's sizes in face millimetres.
+/// An outline's sizes in face millimeters.
 #[derive(Debug, Clone)]
 struct Geometry {
     /// Bounding box of the whole silhouette, hosel included:
     /// `[min x, min y, max x, max y]`.
     bbox: [f32; 4],
-    /// Where the horizontal line through the face centre enters and leaves
+    /// Where the horizontal line through the face center enters and leaves
     /// the outline (heel, toe).
     across: (f32, f32),
-    /// Where the vertical line through the face centre enters and leaves
+    /// Where the vertical line through the face center enters and leaves
     /// it (bottom, top).
     up: (f32, f32),
     /// The outline flattened finely, for inside tests.
@@ -395,7 +395,7 @@ fn bezier(seg: &[[f32; 2]], t: f32) -> [f32; 2] {
 
 /// The closed chain of cubics `points` flattened for drawing at `k`
 /// points per mm: uniform steps in `t` per segment (see [`steps`]), in face
-/// millimetres, without repeating the start at the end.
+/// millimeters, without repeating the start at the end.
 fn flatten(points: &[[f32; 2]], k: f32) -> Vec<[f32; 2]> {
     let mut out = Vec::new();
     for seg in points.windows(4).step_by(3) {
@@ -478,7 +478,7 @@ fn triangulate(p: &[[f32; 2]]) -> Vec<u32> {
 /// triangles.
 #[derive(Debug)]
 struct Outline {
-    /// Face millimetres.
+    /// Face millimeters.
     points: Vec<[f32; 2]>,
     indices: Vec<u32>,
 }
@@ -513,18 +513,18 @@ fn outline(family: FaceFamily, k: f32) -> Rc<Outline> {
 /// Share of the plot's width and height a face may fill.
 const FIT_WIDTH: f32 = 0.94;
 const FIT_HEIGHT: f32 = 0.86;
-/// How far (points) the silhouette's centre sits below the plot's middle:
+/// How far (points) the silhouette's center sits below the plot's middle:
 /// the face hangs a touch nearer its TOE / HEEL line than the readout.
 const FIT_DROP: f32 = 2.0;
 
-/// Where a face is drawn: face millimetres to screen points.
+/// Where a face is drawn: face millimeters to screen points.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FaceView {
     pub(crate) family: FaceFamily,
-    /// Points per millimetre.
+    /// Points per millimeter.
     pub(crate) k: f32,
-    /// The face centre on screen.
-    pub(crate) centre: Pos2,
+    /// The face center on screen.
+    pub(crate) center: Pos2,
     /// -1 when the toe is on the left (a right-hander), +1 mirrored.
     side: f32,
 }
@@ -538,8 +538,8 @@ impl FaceView {
     /// width and [`FIT_HEIGHT`] of its height, `k = min(FIT_WIDTH · w /
     /// bbox w, FIT_HEIGHT · h / bbox h)` points per mm. So every face fills
     /// the panel, and two families are not drawn to one scale: a wood and a
-    /// hybrid look about the same size. The silhouette is centred, its
-    /// centre [`FIT_DROP`] below the plot's middle.
+    /// hybrid look about the same size. The silhouette is centered, its
+    /// center [`FIT_DROP`] below the plot's middle.
     pub(crate) fn fit(plot: Rect, family: FaceFamily, handed: Handedness) -> Self {
         let [x0, y0, x1, y1] = family.geometry().bbox;
         let k = (FIT_WIDTH * plot.width() / (x1 - x0)).min(FIT_HEIGHT * plot.height() / (y1 - y0));
@@ -549,14 +549,14 @@ impl FaceView {
             Handedness::Left => 1.0,
         };
         let middle = plot.center();
-        let centre = pos2(
+        let center = pos2(
             middle.x - side * f32::midpoint(x0, x1) * k,
             middle.y + FIT_DROP + f32::midpoint(y0, y1) * k,
         );
         Self {
             family,
             k,
-            centre,
+            center,
             side,
         }
     }
@@ -564,8 +564,8 @@ impl FaceView {
     /// Screen point of `lat` mm toward the toe and `vert` mm up.
     pub(crate) fn to_screen(self, lat: f32, vert: f32) -> Pos2 {
         pos2(
-            self.centre.x + self.side * lat * self.k,
-            self.centre.y - vert * self.k,
+            self.center.x + self.side * lat * self.k,
+            self.center.y - vert * self.k,
         )
     }
 
@@ -583,11 +583,11 @@ impl FaceView {
     }
 
     /// The face filled: a mesh over the outline's triangles.
-    fn fill(&self, colour: Color32) -> egui::Mesh {
+    fn fill(&self, color: Color32) -> egui::Mesh {
         let outline = outline(self.family, self.k);
         let mut mesh = egui::Mesh::default();
         for &p in &outline.points {
-            mesh.colored_vertex(self.map(p), colour);
+            mesh.colored_vertex(self.map(p), color);
         }
         mesh.indices.clone_from(&outline.indices);
         mesh
@@ -603,13 +603,13 @@ fn on_face(family: FaceFamily, lat: f32, vert: f32) -> bool {
 // Words
 // ---------------------------------------------------------------------------
 
-/// Signed millimetres of a reading, when finite.
+/// Signed millimeters of a reading, when finite.
 fn mm(d: Option<flighthook::Distance>) -> Option<f64> {
     d.map(flighthook::Distance::as_millimeters)
         .filter(|v| v.is_finite())
 }
 
-/// `impact`'s lateral (+ toe) and vertical (+ high) millimetres.
+/// `impact`'s lateral (+ toe) and vertical (+ high) millimeters.
 pub(crate) fn impact_mm(impact: Option<&FaceImpact>) -> (Option<f64>, Option<f64>) {
     impact.map_or((None, None), |i| (mm(i.lateral), mm(i.vertical)))
 }
@@ -620,8 +620,8 @@ pub(crate) fn has_impact(shot: &ShotRow) -> bool {
     lat.is_some() || vert.is_some()
 }
 
-/// Whole millimetres and a side word: `4 toe`, `6 heel`; `0` under half
-/// a millimetre. `unit` goes between the number and the word.
+/// Whole millimeters and a side word: `4 toe`, `6 heel`; `0` under half
+/// a millimeter. `unit` goes between the number and the word.
 fn side_words(v: f64, unit: &str, positive: &str, negative: &str) -> String {
     let whole = v.abs().round();
     if whole == 0.0 {
@@ -698,7 +698,7 @@ pub(crate) struct Dot {
     pub(crate) index: usize,
     pub(crate) lat: f64,
     pub(crate) vert: f64,
-    pub(crate) colour: Color32,
+    pub(crate) color: Color32,
     /// The hover text.
     pub(crate) hover: String,
 }
@@ -733,8 +733,8 @@ impl FacePanel {
     /// The panel for the shown shot `shots[shown]` among `members`
     /// (indices into `shots`, the range bars' members). The face is the
     /// shown shot's club's, else `club`'s; the hand is the shown shot's,
-    /// else `handed`, else right. `colour` and `device` give a member's dot
-    /// colour and the device name its hover carries.
+    /// else `handed`, else right. `color` and `device` give a member's dot
+    /// color and the device name its hover carries.
     ///
     /// The shown shot is marked only when it is a member, as on the range
     /// bars and the charts: when the device filter leaves it out, the panel
@@ -745,7 +745,7 @@ impl FacePanel {
         shown: usize,
         club: Option<Club>,
         handed: Option<Handedness>,
-        colour: impl Fn(&ShotRow) -> Color32,
+        color: impl Fn(&ShotRow) -> Color32,
         device: impl Fn(&ShotRow) -> Option<String>,
     ) -> Self {
         let row = shots.get(shown);
@@ -776,7 +776,7 @@ impl FacePanel {
                     index: i,
                     lat: a,
                     vert: b,
-                    colour: colour(r),
+                    color: color(r),
                     hover: hover(r, Some(a), Some(b)),
                 });
             }
@@ -800,12 +800,12 @@ pub(crate) fn readout_galley(
     painter: &egui::Painter,
     text: &str,
     width: f32,
-    colour: Color32,
+    color: Color32,
 ) -> std::sync::Arc<egui::Galley> {
     let mut size = READOUT_FONT;
     loop {
         let galley =
-            painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), colour);
+            painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), color);
         if galley.size().x <= width {
             return galley;
         }
@@ -817,7 +817,7 @@ pub(crate) fn readout_galley(
     let mut job = egui::text::LayoutJob::simple_singleline(
         text.to_owned(),
         egui::FontId::proportional(READOUT_MIN),
-        colour,
+        color,
     );
     job.wrap = egui::text::TextWrapping::truncate_at_width(width);
     painter.layout_job(job)
@@ -847,12 +847,12 @@ fn mark_at(view: FaceView, plot: Rect, lat: f64, vert: f64) -> (Pos2, bool) {
 }
 
 /// A dot, filled when it is on the face and a ring when it is off it.
-fn paint_dot(painter: &egui::Painter, at: Pos2, r: f32, halo: f32, colour: Color32, on: bool) {
+fn paint_dot(painter: &egui::Painter, at: Pos2, r: f32, halo: f32, color: Color32, on: bool) {
     painter.circle_filled(at, halo, theme::BG_DEEP);
     if on {
-        painter.circle_filled(at, r, colour);
+        painter.circle_filled(at, r, color);
     } else {
-        painter.circle_stroke(at, r - 0.75, Stroke::new(1.5, colour));
+        painter.circle_stroke(at, r - 0.75, Stroke::new(1.5, color));
     }
 }
 
@@ -861,14 +861,14 @@ fn caps(
     painter: &egui::Painter,
     text: &str,
     size: f32,
-    colour: Color32,
+    color: Color32,
 ) -> std::sync::Arc<egui::Galley> {
     use egui::text::{LayoutJob, TextFormat};
     painter.layout_job(LayoutJob::single_section(
         text.to_uppercase(),
         TextFormat {
             font_id: egui::FontId::proportional(size),
-            color: colour,
+            color,
             extra_letter_spacing: 0.6,
             ..Default::default()
         },
@@ -899,15 +899,15 @@ fn hit(view: FaceView, plot: Rect, panel: &FacePanel, pointer: Pos2) -> Option<(
 }
 
 /// Paint the face of `view` in the panel at `rect`: the fill, the face
-/// centre's crosshair, the outline, then TOE and HEEL under the face's
+/// center's crosshair, the outline, then TOE and HEEL under the face's
 /// ends with mm between them.
 fn paint_face(painter: &egui::Painter, rect: Rect, view: FaceView) {
     let geometry = view.family.geometry();
     let face = theme::mix(theme::SURFACE, theme::SURFACE_HOVER, 0.75);
-    let outline_colour = theme::mix(theme::TEXT_DIM, theme::TEXT_MUTED, 0.4);
+    let outline_color = theme::mix(theme::TEXT_DIM, theme::TEXT_MUTED, 0.4);
     painter.add(egui::Shape::mesh(view.fill(face)));
 
-    // The face centre's crosshair, inside the face.
+    // The face center's crosshair, inside the face.
     let (heel, toe) = geometry.across;
     let (bottom, top) = geometry.up;
     let dash = Stroke::new(1.0, theme::mix(face, theme::TEXT_DIM, 0.9));
@@ -925,7 +925,7 @@ fn paint_face(painter: &egui::Painter, rect: Rect, view: FaceView) {
     }
     painter.add(egui::Shape::closed_line(
         view.outline_points(),
-        Stroke::new(OUTLINE_W, outline_colour),
+        Stroke::new(OUTLINE_W, outline_color),
     ));
 
     // TOE and HEEL under the face's ends, mm between them.
@@ -954,7 +954,7 @@ fn paint_marks(painter: &egui::Painter, view: FaceView, plot: Rect, panel: &Face
     let (bottom, top) = view.family.geometry().up;
     for d in &panel.dots {
         let (at, on) = mark_at(view, plot, d.lat, d.vert);
-        paint_dot(painter, at, DOT_R, DOT_HALO_R, d.colour, on);
+        paint_dot(painter, at, DOT_R, DOT_HALO_R, d.color, on);
     }
     if let Some((_, lat, vert)) = panel.shown {
         let line = match (lat, vert) {
@@ -1006,9 +1006,9 @@ pub(crate) fn label_galley(
     painter: &egui::Painter,
     text: &str,
     width: f32,
-    colour: Color32,
+    color: Color32,
 ) -> std::sync::Arc<egui::Galley> {
-    readout_galley(painter, &text.to_uppercase(), width, colour)
+    readout_galley(painter, &text.to_uppercase(), width, color)
 }
 
 /// A click on the face panel.
@@ -1031,16 +1031,16 @@ pub(crate) fn paint_face_panel(ui: &egui::Ui, rect: Rect, panel: &FacePanel) -> 
     paint_card(painter, rect);
 
     // Readout.
-    let colour = if panel.shown.is_some() {
+    let color = if panel.shown.is_some() {
         theme::TEXT
     } else {
         theme::TEXT_DIM
     };
-    let text = readout_galley(painter, &panel.readout, rect.width() - 2.0 * PAD, colour);
+    let text = readout_galley(painter, &panel.readout, rect.width() - 2.0 * PAD, color);
     painter.galley(
         pos2(rect.center().x - text.size().x / 2.0, rect.top() + 8.0),
         text,
-        colour,
+        color,
     );
 
     let plot = plot_rect(rect);
@@ -1140,12 +1140,12 @@ mod tests {
     }
 
     #[test]
-    fn outlines_are_closed_smooth_and_centred() {
+    fn outlines_are_closed_smooth_and_centered() {
         for family in FaceFamily::ALL {
             let p = family.control_points();
             assert_eq!(p.len() % 3, 1, "{family:?}");
             assert_eq!(p.first(), p.last(), "{family:?}: closed");
-            // The face centre is the midpoint of both chords through it.
+            // The face center is the midpoint of both chords through it.
             let g = family.geometry();
             assert!((g.across.0 + g.across.1).abs() / 2.0 < 0.05, "{family:?}");
             assert!((g.up.0 + g.up.1).abs() / 2.0 < 0.05, "{family:?}");
@@ -1251,13 +1251,13 @@ mod tests {
     }
 
     #[test]
-    fn the_face_centre_lands_on_the_frame_centre() {
+    fn the_face_center_lands_on_the_frame_center() {
         for family in FaceFamily::ALL {
             for handed in [Handedness::Right, Handedness::Left] {
                 let view = FaceView::fit(plot(), family, handed);
-                let centre = view.to_screen(0.0, 0.0);
-                assert_eq!(centre, view.centre);
-                assert!(plot().contains(centre), "{family:?}");
+                let center = view.to_screen(0.0, 0.0);
+                assert_eq!(center, view.center);
+                assert!(plot().contains(center), "{family:?}");
                 // The midpoints of the face's two chords on screen.
                 let g = family.geometry();
                 let across = f32::midpoint(
@@ -1266,8 +1266,8 @@ mod tests {
                 );
                 let up =
                     f32::midpoint(view.to_screen(0.0, g.up.0).y, view.to_screen(0.0, g.up.1).y);
-                assert!((across - centre.x).abs() < 0.1, "{family:?} {handed:?}");
-                assert!((up - centre.y).abs() < 0.1, "{family:?} {handed:?}");
+                assert!((across - center.x).abs() < 0.1, "{family:?} {handed:?}");
+                assert!((up - center.y).abs() < 0.1, "{family:?} {handed:?}");
                 // The whole silhouette fits the plot.
                 let [x0, y0, x1, y1] = g.bbox;
                 for (x, y) in [(x0, y0), (x1, y1), (x0, y1), (x1, y0)] {
@@ -1313,11 +1313,11 @@ mod tests {
             let rh = FaceView::fit(p, family, Handedness::Right);
             let lh = FaceView::fit(p, family, Handedness::Left);
             // Toe to the left for a right-hander, to the right mirrored.
-            assert!(rh.to_screen(10.0, 0.0).x < rh.centre.x);
-            assert!(lh.to_screen(10.0, 0.0).x > lh.centre.x);
+            assert!(rh.to_screen(10.0, 0.0).x < rh.center.x);
+            assert!(lh.to_screen(10.0, 0.0).x > lh.center.x);
             // High is up for both.
-            assert!(rh.to_screen(0.0, 5.0).y < rh.centre.y);
-            assert!(lh.to_screen(0.0, 5.0).y < lh.centre.y);
+            assert!(rh.to_screen(0.0, 5.0).y < rh.center.y);
+            assert!(lh.to_screen(0.0, 5.0).y < lh.center.y);
             let (a, b) = (rh.outline_points(), lh.outline_points());
             assert_eq!(a.len(), b.len());
             for (a, b) in a.iter().zip(&b) {
@@ -1328,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn impact_reads_as_whole_millimetres_and_side_words() {
+    fn impact_reads_as_whole_millimeters_and_side_words() {
         assert_eq!(
             impact_words(Some(4.4), Some(-2.2)),
             ("4 toe".to_owned(), "2 low".to_owned())
@@ -1346,7 +1346,7 @@ mod tests {
             "4 mm toe \u{b7} 2 mm low"
         );
         assert_eq!(impact_hover(Some(0.2), None), "0 mm");
-        // Any unit reads in millimetres, negatives kept.
+        // Any unit reads in millimeters, negatives kept.
         let i = FaceImpact {
             lateral: Some(Distance::Inches(-0.31)),
             vertical: Some(Distance::Millimeters(2.0)),
@@ -1482,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn face_dots_take_the_charts_device_colours_and_follow_the_device_filter() {
+    fn face_dots_take_the_charts_device_colors_and_follow_the_device_filter() {
         let mut shots: Vec<ShotRow> = (1..=6)
             .map(|n| row(n, (Some(f64::from(n)), Some(-f64::from(n)))))
             .collect();
@@ -1502,24 +1502,24 @@ mod tests {
                 shown,
                 None,
                 None,
-                |s| chart::shot_colour(&ids, filter, &s.actor),
+                |s| chart::shot_color(&ids, filter, &s.actor),
                 |s| Some(s.actor.clone()),
             )
         };
-        // Every device shown: each dot in its device's colour.
+        // Every device shown: each dot in its device's color.
         let p = build(None, 4);
         assert_eq!(p.dots.len(), 5);
         for d in &p.dots {
-            let colour = chart::device_colour(&ids, &shots[d.index].actor);
-            assert_eq!(d.colour, colour, "#{}", d.index);
+            let color = chart::device_color(&ids, &shots[d.index].actor);
+            assert_eq!(d.color, color, "#{}", d.index);
         }
-        assert!(p.dots.iter().any(|d| d.colour == theme::DEVICE_COLOURS[1]));
+        assert!(p.dots.iter().any(|d| d.color == theme::DEVICE_COLORS[1]));
         assert!(p.dots[0].hover.contains("square.0"));
         assert_eq!(p.shown, Some((4, Some(5.0), Some(-5.0))));
         // Filtered to the Mevo: its dots alone, in the accent.
         let p = build(Some("mevo.0"), 3);
         assert_eq!(p.dots.iter().map(|d| d.index).collect::<Vec<_>>(), [1, 5]);
-        assert!(p.dots.iter().all(|d| d.colour == theme::ACCENT));
+        assert!(p.dots.iter().all(|d| d.color == theme::ACCENT));
         assert_eq!(p.shown, Some((3, Some(4.0), Some(-4.0))));
         // The shown shot filtered out: no gold mark and no reading, as on
         // the bars; the members still show as dots.

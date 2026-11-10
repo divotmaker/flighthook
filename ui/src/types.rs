@@ -115,7 +115,7 @@ impl ShotRow {
     /// Convert all distance and velocity fields to the given unit system.
     pub fn to_unit_system(&self, system: UnitSystem) -> ShotRow {
         // Delegate to ShotData conversion for the populated fields. Face
-        // impact is millimetres in every unit system and is kept as it is.
+        // impact is millimeters in every unit system and is kept as it is.
         let tmp = ShotData {
             ball: self.ball.clone(),
             club: self.club.clone(),
@@ -177,13 +177,42 @@ pub fn stamp_video(rows: &mut [ShotRow], keys: &[ShotKey], video: &ShotVideo) ->
 }
 
 /// Mark camera `camera`'s clip of the rows whose shot is in `keys` as body
-/// tracked: its keypoints can be fetched. Returns whether a row changed.
-pub fn mark_pose(rows: &mut [ShotRow], keys: &[ShotKey], camera: &str) -> bool {
-    mark_video(rows, keys, camera, |v| &mut v.pose)
+/// tracked with the camera turned by `rotation` degrees: its keypoints can
+/// be fetched. Returns whether a row changed.
+pub fn mark_pose(rows: &mut [ShotRow], keys: &[ShotKey], camera: &str, rotation: u16) -> bool {
+    let mut changed = mark_video(rows, keys, camera, |v| &mut v.pose);
+    for row in rows
+        .iter_mut()
+        .filter(|r| !r.shot_id.is_empty() && keys.iter().any(|k| k.shot_id == r.shot_id))
+    {
+        for video in row.video.iter_mut().filter(|v| v.camera == camera) {
+            changed |= video.rotation != rotation;
+            video.rotation = rotation;
+        }
+    }
+    changed
+}
+
+/// Forget camera `camera`'s body tracking and swing analysis of shot
+/// `shot_id`'s rows: its clip is being tracked again. Returns whether a row
+/// changed.
+pub fn forget_analysis(rows: &mut [ShotRow], shot_id: &str, camera: &str) -> bool {
+    let mut changed = false;
+    for row in rows
+        .iter_mut()
+        .filter(|r| !r.shot_id.is_empty() && r.shot_id == shot_id)
+    {
+        for video in row.video.iter_mut().filter(|v| v.camera == camera) {
+            changed |= video.pose || video.swing;
+            video.pose = false;
+            video.swing = false;
+        }
+    }
+    changed
 }
 
 /// Mark camera `camera`'s clip of the rows whose shot is in `keys` as swing
-/// analysed: its report can be fetched. Returns whether a row changed.
+/// analyzed: its report can be fetched. Returns whether a row changed.
 pub fn mark_swing(rows: &mut [ShotRow], keys: &[ShotKey], camera: &str) -> bool {
     mark_video(rows, keys, camera, |v| &mut v.swing)
 }

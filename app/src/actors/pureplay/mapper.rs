@@ -11,7 +11,7 @@
 //! Signs need no change: flighthook's lateral values are absolute (positive
 //! = right of the target line for both hands), as Pureplay's HLA, SpinAxis,
 //! FaceAngle and ClubPath are; face impact is golfer-relative on both sides
-//! (lateral positive toward the toe, vertical positive above centre), so
+//! (lateral positive toward the toe, vertical positive above center), so
 //! ImpactPointX/Y take it as it is for either hand. Pureplay Connect v1 does
 //! not define SideSpin's sign: it goes out with flighthook's (positive =
 //! curves right) through [`side_spin`], the one place that sets it.

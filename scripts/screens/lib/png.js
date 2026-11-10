@@ -23,9 +23,9 @@ function decode(buf) {
   const ihdr = parts.find((c) => c.type === 'IHDR').data;
   const width = ihdr.readUInt32BE(0);
   const height = ihdr.readUInt32BE(4);
-  const [depth, colour, , , interlace] = ihdr.subarray(8, 13);
-  const channels = { 2: 3, 6: 4 }[colour];
-  if (depth !== 8 || !channels || interlace) throw new Error(`unsupported PNG (depth ${depth}, colour ${colour})`);
+  const [depth, color, , , interlace] = ihdr.subarray(8, 13);
+  const channels = { 2: 3, 6: 4 }[color];
+  if (depth !== 8 || !channels || interlace) throw new Error(`unsupported PNG (depth ${depth}, color ${color})`);
   const raw = zlib.inflateSync(Buffer.concat(parts.filter((c) => c.type === 'IDAT').map((c) => c.data)));
   const stride = width * channels;
   const data = Buffer.alloc(stride * height);

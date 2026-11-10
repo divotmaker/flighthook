@@ -162,6 +162,9 @@ pub fn putting_club_options() -> &'static [Club] {
 /// input and read as `openconnect_client` sections with the same index. When
 /// both name the same index, the `openconnect_client` section is used.
 /// Output only ever carries `openconnect_client`.
+///
+/// A `golfer_height` in `[body_tracking]` is read as `[player] height` when
+/// the player has no height of their own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(remote = "Self")]
 pub struct FlighthookConfig {
@@ -191,6 +194,10 @@ pub struct FlighthookConfig {
     /// and the API while it is at its defaults.
     #[serde(default, skip_serializing_if = "BodyTrackingSection::is_default")]
     pub body_tracking: BodyTrackingSection,
+    /// Facts about the player: sex and height. Omitted from the file and
+    /// the API while it is at its defaults.
+    #[serde(default, skip_serializing_if = "PlayerSection::is_default")]
+    pub player: PlayerSection,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub webserver: std::collections::HashMap<String, WebserverSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -248,6 +255,8 @@ impl<'de> Deserialize<'de> for FlighthookConfig {
         for (index, section) in gspro {
             config.openconnect_client.entry(index).or_insert(section);
         }
+        let legacy = config.body_tracking.legacy_golfer_height.take();
+        config.player.height = config.player.height.or(legacy);
         Ok(config)
     }
 }
@@ -664,8 +673,10 @@ impl BodyTrackingMode {
 /// its default is left out of the file and the API. A section with
 /// `enabled` and no `mode` reads `enabled = false` as
 /// [`BodyTrackingMode::Off`] and `enabled = true` as
-/// [`BodyTrackingMode::Historical`]; only `mode` is written.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// [`BodyTrackingMode::Historical`]; only `mode` is written. The golfer's
+/// height is [`PlayerSection::height`]; a `golfer_height` in the section is
+/// read and moved there when the config loads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "BodyTrackingRaw")]
 pub struct BodyTrackingSection {
     /// When body tracking runs. Defaults to [`BodyTrackingMode::Off`].
@@ -699,18 +710,27 @@ pub struct BodyTrackingSection {
         skip_serializing_if = "is_default_detect_every"
     )]
     pub detect_every: u32,
-    /// The golfer's height in centimetres,
-    /// [`MIN_GOLFER_HEIGHT_CM`](Self::MIN_GOLFER_HEIGHT_CM) to
-    /// [`MAX_GOLFER_HEIGHT_CM`](Self::MAX_GOLFER_HEIGHT_CM). With it, swing
-    /// metrics that are distances are also given in centimetres (inches in
-    /// imperial units); without it they stay fractions of the golfer's
-    /// torso length. Not set by default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub golfer_height: Option<f64>,
     /// The skeleton is drawn over the live views, the shots' clips and the
     /// replay. Defaults to true.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub show_skeleton: bool,
+    /// A `golfer_height` read from the section, in centimeters, until the
+    /// config moves it to [`PlayerSection::height`]. Never written, never
+    /// compared.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub legacy_golfer_height: Option<f64>,
+}
+
+impl PartialEq for BodyTrackingSection {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.model == other.model
+            && self.min_score == other.min_score
+            && self.smoothing == other.smoothing
+            && self.detect_every == other.detect_every
+            && self.show_skeleton == other.show_skeleton
+    }
 }
 
 /// `[body_tracking]` as written: `mode`, or the `enabled` switch of a
@@ -747,8 +767,8 @@ impl From<BodyTrackingRaw> for BodyTrackingSection {
             min_score: raw.min_score,
             smoothing: raw.smoothing,
             detect_every: raw.detect_every,
-            golfer_height: raw.golfer_height,
             show_skeleton: raw.show_skeleton,
+            legacy_golfer_height: raw.golfer_height,
         }
     }
 }
@@ -797,8 +817,8 @@ impl Default for BodyTrackingSection {
             min_score: Self::DEFAULT_MIN_SCORE,
             smoothing: Self::DEFAULT_SMOOTHING_HZ,
             detect_every: Self::DEFAULT_DETECT_EVERY,
-            golfer_height: None,
             show_skeleton: true,
+            legacy_golfer_height: None,
         }
     }
 }
@@ -816,10 +836,6 @@ impl BodyTrackingSection {
     pub const DEFAULT_DETECT_EVERY: u32 = 10;
     /// Most frames between two looks for the golfer.
     pub const MAX_DETECT_EVERY: u32 = 60;
-    /// Shortest golfer height accepted, cm.
-    pub const MIN_GOLFER_HEIGHT_CM: f64 = 100.0;
-    /// Tallest golfer height accepted, cm.
-    pub const MAX_GOLFER_HEIGHT_CM: f64 = 250.0;
 
     /// True when every setting is at its default.
     #[must_use]
@@ -831,9 +847,7 @@ impl BodyTrackingSection {
     /// `min_score` 0 to 1, `smoothing` 0 or
     /// [`MIN_SMOOTHING_HZ`](Self::MIN_SMOOTHING_HZ) to
     /// [`MAX_SMOOTHING_HZ`](Self::MAX_SMOOTHING_HZ), `detect_every` 1 to
-    /// [`MAX_DETECT_EVERY`](Self::MAX_DETECT_EVERY), `golfer_height` (when
-    /// set) [`MIN_GOLFER_HEIGHT_CM`](Self::MIN_GOLFER_HEIGHT_CM) to
-    /// [`MAX_GOLFER_HEIGHT_CM`](Self::MAX_GOLFER_HEIGHT_CM).
+    /// [`MAX_DETECT_EVERY`](Self::MAX_DETECT_EVERY).
     #[must_use]
     pub fn error(&self) -> Option<String> {
         if !self.min_score.is_finite() || !(0.0..=1.0).contains(&self.min_score) {
@@ -852,13 +866,6 @@ impl BodyTrackingSection {
                 "detect_every {} is outside 1 to {}",
                 self.detect_every,
                 Self::MAX_DETECT_EVERY
-            ));
-        }
-        if let Some(h) = self.golfer_height.filter(|h| !golfer_height_valid(*h)) {
-            return Some(format!(
-                "golfer_height {h} is outside {} to {} cm",
-                Self::MIN_GOLFER_HEIGHT_CM,
-                Self::MAX_GOLFER_HEIGHT_CM
             ));
         }
         None
@@ -887,19 +894,10 @@ impl BodyTrackingSection {
             } else {
                 defaults.detect_every
             },
-            golfer_height: self.golfer_height.filter(|h| golfer_height_valid(*h)),
             show_skeleton: self.show_skeleton,
+            legacy_golfer_height: None,
         }
     }
-}
-
-/// Whether `cm` is an acceptable golfer height: finite and from
-/// [`BodyTrackingSection::MIN_GOLFER_HEIGHT_CM`] to
-/// [`BodyTrackingSection::MAX_GOLFER_HEIGHT_CM`].
-fn golfer_height_valid(cm: f64) -> bool {
-    cm.is_finite()
-        && (BodyTrackingSection::MIN_GOLFER_HEIGHT_CM..=BodyTrackingSection::MAX_GOLFER_HEIGHT_CM)
-            .contains(&cm)
 }
 
 /// Whether `hz` is an acceptable live smoothing: 0 (off), or finite and
@@ -988,6 +986,25 @@ pub struct CameraSection {
     /// frame is dated that much earlier than its arrival. Absent is 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_s: Option<f64>,
+    /// Quarter turns applied to the camera's frames before body tracking
+    /// and display: 0, 90, 180 or 270 degrees clockwise. Clips are stored as
+    /// the camera sent them. Defaults to 0.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub rotation_deg: u16,
+    /// How far the camera points off square, degrees, -[`MAX_CAMERA_ANGLE_DEG`]
+    /// to [`MAX_CAMERA_ANGLE_DEG`]: positive when it points to the right of
+    /// the target line for a right-handed golfer. Absent is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yaw_deg: Option<f64>,
+    /// The camera's tilt down from level, degrees, -[`MAX_CAMERA_ANGLE_DEG`]
+    /// to [`MAX_CAMERA_ANGLE_DEG`]. Absent is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitch_deg: Option<f64>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
 }
 
 fn default_video_mode() -> String {
@@ -1010,6 +1027,9 @@ impl Default for CameraSection {
             position: CameraPosition::default(),
             mode: default_video_mode(),
             latency_s: None,
+            rotation_deg: 0,
+            yaw_deg: None,
+            pitch_deg: None,
         }
     }
 }
@@ -1041,6 +1061,192 @@ pub fn latency_error(id: &str, v: Option<f64>) -> Option<String> {
         return None;
     }
     v.map(|v| format!("{id}: latency_s {v} is outside 0 to {MAX_LATENCY_S} s"))
+}
+
+/// The camera rotations accepted, clockwise degrees.
+pub const CAMERA_ROTATIONS: [u16; 4] = [0, 90, 180, 270];
+
+/// Largest camera `yaw_deg` or `pitch_deg` either way, degrees.
+pub const MAX_CAMERA_ANGLE_DEG: f64 = 30.0;
+
+/// Whether `v`, a camera's `rotation_deg`, is acceptable: 0, 90, 180 or 270.
+#[must_use]
+pub fn rotation_valid(v: u16) -> bool {
+    CAMERA_ROTATIONS.contains(&v)
+}
+
+/// The rotation in effect for a camera, clockwise degrees: its `configured`
+/// value when it is valid, else 0.
+#[must_use]
+pub fn rotation_in_effect_deg(configured: u16) -> u16 {
+    if rotation_valid(configured) {
+        configured
+    } else {
+        0
+    }
+}
+
+/// Why `rotation_deg` of camera `id` (e.g. `camera.0`) is not acceptable, or
+/// `None` when it is ([`rotation_valid`]).
+#[must_use]
+pub fn rotation_error(id: &str, v: u16) -> Option<String> {
+    (!rotation_valid(v)).then(|| format!("{id}: rotation_deg {v} is not 0, 90, 180 or 270"))
+}
+
+/// Whether `v`, a camera's `yaw_deg` or `pitch_deg`, is acceptable: absent,
+/// or finite and from -[`MAX_CAMERA_ANGLE_DEG`] to [`MAX_CAMERA_ANGLE_DEG`].
+#[must_use]
+pub fn camera_angle_valid(v: Option<f64>) -> bool {
+    v.is_none_or(|v| v.is_finite() && (-MAX_CAMERA_ANGLE_DEG..=MAX_CAMERA_ANGLE_DEG).contains(&v))
+}
+
+/// The angle in effect for a camera's `yaw_deg` or `pitch_deg`, degrees: its
+/// `configured` value when it is valid, else 0.
+#[must_use]
+pub fn camera_angle_in_effect_deg(configured: Option<f64>) -> f64 {
+    configured
+        .filter(|v| camera_angle_valid(Some(*v)))
+        .unwrap_or(0.0)
+}
+
+/// Why `yaw_deg` of camera `id` is not acceptable, or `None` when it is
+/// ([`camera_angle_valid`]).
+#[must_use]
+pub fn yaw_error(id: &str, v: Option<f64>) -> Option<String> {
+    angle_error(id, "yaw_deg", v)
+}
+
+/// Why `pitch_deg` of camera `id` is not acceptable, or `None` when it is
+/// ([`camera_angle_valid`]).
+#[must_use]
+pub fn pitch_error(id: &str, v: Option<f64>) -> Option<String> {
+    angle_error(id, "pitch_deg", v)
+}
+
+fn angle_error(id: &str, field: &str, v: Option<f64>) -> Option<String> {
+    if camera_angle_valid(v) {
+        return None;
+    }
+    v.map(|v| {
+        format!("{id}: {field} {v} is outside -{MAX_CAMERA_ANGLE_DEG} to {MAX_CAMERA_ANGLE_DEG}")
+    })
+}
+
+impl CameraSection {
+    /// Why a setting of this section, camera `id` (e.g. `camera.0`), is out
+    /// of range, or `None` when all are valid: the first of `latency_s`
+    /// ([`latency_error`]), `rotation_deg` ([`rotation_error`]), `yaw_deg`
+    /// ([`yaw_error`]) and `pitch_deg` ([`pitch_error`]).
+    #[must_use]
+    pub fn error(&self, id: &str) -> Option<String> {
+        latency_error(id, self.latency_s)
+            .or_else(|| rotation_error(id, self.rotation_deg))
+            .or_else(|| yaw_error(id, self.yaw_deg))
+            .or_else(|| pitch_error(id, self.pitch_deg))
+    }
+}
+
+/// The player's sex: picks the men's or the women's tour averages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sex {
+    /// Men's tour averages. The default.
+    #[default]
+    Male,
+    /// Women's tour averages.
+    Female,
+}
+
+impl Sex {
+    /// True for the default ([`Sex::Male`]).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Stable key, as the config file holds it.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Male => "male",
+            Self::Female => "female",
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Male => "Men's",
+            Self::Female => "Women's",
+        }
+    }
+
+    /// Both, in display order.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::Male, Self::Female]
+    }
+}
+
+/// Facts about the player that the swing analysis uses. Every field is
+/// read live. A field at its default is left out of the file and the API.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlayerSection {
+    /// Whose tour averages the player is compared with. Defaults to
+    /// [`Sex::Male`].
+    #[serde(default, skip_serializing_if = "Sex::is_default")]
+    pub sex: Sex,
+    /// The player's height in centimeters,
+    /// [`MIN_HEIGHT_CM`](Self::MIN_HEIGHT_CM) to
+    /// [`MAX_HEIGHT_CM`](Self::MAX_HEIGHT_CM). With it, swing metrics that
+    /// are distances are also given in centimeters (inches in imperial
+    /// units); without it they stay fractions of the golfer's torso length.
+    /// Not set by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+}
+
+impl PlayerSection {
+    /// Shortest height accepted, cm.
+    pub const MIN_HEIGHT_CM: f64 = 100.0;
+    /// Tallest height accepted, cm.
+    pub const MAX_HEIGHT_CM: f64 = 250.0;
+
+    /// True when every setting is at its default.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Why a setting is out of range, or `None` when all are valid:
+    /// `height` (when set) [`MIN_HEIGHT_CM`](Self::MIN_HEIGHT_CM) to
+    /// [`MAX_HEIGHT_CM`](Self::MAX_HEIGHT_CM).
+    #[must_use]
+    pub fn error(&self) -> Option<String> {
+        self.height.filter(|h| !height_valid(*h)).map(|h| {
+            format!(
+                "height {h} is outside {} to {} cm",
+                Self::MIN_HEIGHT_CM,
+                Self::MAX_HEIGHT_CM
+            )
+        })
+    }
+
+    /// The settings in effect: a height out of range is no height.
+    #[must_use]
+    pub fn in_effect(&self) -> Self {
+        Self {
+            sex: self.sex,
+            height: self.height.filter(|h| height_valid(*h)),
+        }
+    }
+}
+
+/// Whether `cm` is an acceptable player height: finite and from
+/// [`PlayerSection::MIN_HEIGHT_CM`] to [`PlayerSection::MAX_HEIGHT_CM`].
+fn height_valid(cm: f64) -> bool {
+    cm.is_finite() && (PlayerSection::MIN_HEIGHT_CM..=PlayerSection::MAX_HEIGHT_CM).contains(&cm)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1337,14 +1543,18 @@ pub struct SquareSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discard_non_putting_zero_spin: Option<bool>,
     /// Per-club override for face impact calibration: distance from the bottom
-    /// edge of the club sticker's dot down to face centre, in millimetres.
+    /// edge of the club sticker's dot down to face center, in millimeters.
     /// Measure with the sticker in its normal spot.
     ///
     /// Keyed the same way `club` is (e.g. `"DR"`, `"7i"`, `"pw"`). Clubs not
     /// listed use allsquare's built-in defaults; the putter has no built-in
     /// default and reports no vertical impact unless given one here.
-    #[serde(default, skip_serializing_if = "is_none_or_empty_map")]
-    pub dot_bottom_to_face_centre_mm: Option<std::collections::BTreeMap<String, f64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "is_none_or_empty_map",
+        alias = "dot_bottom_to_face_centre_mm"
+    )]
+    pub dot_bottom_to_face_center_mm: Option<std::collections::BTreeMap<String, f64>>,
     /// Seconds before the shot's report that the swing's impact happened, for
     /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
     /// device's default ([`impact_lead_default_s`]).
@@ -1564,6 +1774,17 @@ impl FlighthookConfig {
             .and_then(|(_, _, lead)| lead)
     }
 
+    /// The first camera section, by index, with a setting out of range
+    /// ([`CameraSection::error`]), as a message.
+    #[must_use]
+    pub fn camera_error(&self) -> Option<String> {
+        let mut cameras: Vec<_> = self.camera.iter().collect();
+        cameras.sort_by(|a, b| a.0.cmp(b.0));
+        cameras
+            .into_iter()
+            .find_map(|(index, s)| s.error(&format!("camera.{index}")))
+    }
+
     /// The first camera section whose `latency_s` is out of range, as a
     /// message.
     #[must_use]
@@ -1634,6 +1855,7 @@ impl Default for FlighthookConfig {
             simulation: SimulationSection::default(),
             replay: ReplaySection::default(),
             body_tracking: BodyTrackingSection::default(),
+            player: PlayerSection::default(),
             webserver,
             mevo: std::collections::HashMap::new(),
             r10: std::collections::HashMap::new(),
@@ -1689,7 +1911,7 @@ impl Default for SquareSection {
             club: None,
             advanced_spin: None,
             discard_non_putting_zero_spin: Some(true),
-            dot_bottom_to_face_centre_mm: None,
+            dot_bottom_to_face_center_mm: None,
             impact_lead_s: None,
         }
     }
@@ -1921,17 +2143,17 @@ mod square_impact_calibration_tests {
     fn absent_map_is_not_written_back() {
         let s = SquareSection::default();
         let json = serde_json::to_string(&s).expect("serialize");
-        assert!(!json.contains("dot_bottom_to_face_centre_mm"), "{json}");
+        assert!(!json.contains("dot_bottom_to_face_center_mm"), "{json}");
     }
 
     #[test]
     fn empty_map_is_not_written_back() {
         let s = SquareSection {
-            dot_bottom_to_face_centre_mm: Some(std::collections::BTreeMap::new()),
+            dot_bottom_to_face_center_mm: Some(std::collections::BTreeMap::new()),
             ..SquareSection::default()
         };
         let json = serde_json::to_string(&s).expect("serialize");
-        assert!(!json.contains("dot_bottom_to_face_centre_mm"), "{json}");
+        assert!(!json.contains("dot_bottom_to_face_center_mm"), "{json}");
     }
 
     #[test]
@@ -1940,17 +2162,32 @@ mod square_impact_calibration_tests {
         let mut overrides = std::collections::BTreeMap::new();
         overrides.insert("driver".to_string(), 19.0);
         overrides.insert("7i".to_string(), 23.0);
-        s.dot_bottom_to_face_centre_mm = Some(overrides.clone());
+        s.dot_bottom_to_face_center_mm = Some(overrides.clone());
 
         let json = serde_json::to_string(&s).expect("serialize");
         let back: SquareSection = serde_json::from_str(&json).expect("parse");
-        assert_eq!(back.dot_bottom_to_face_centre_mm, Some(overrides));
+        assert_eq!(back.dot_bottom_to_face_center_mm, Some(overrides));
+    }
+
+    #[test]
+    fn the_british_key_is_read_and_the_american_one_written() {
+        let s: SquareSection =
+            serde_json::from_str(r#"{"name":"Square","dot_bottom_to_face_centre_mm":{"DR":15.0}}"#)
+                .expect("parse");
+        let overrides = s.dot_bottom_to_face_center_mm.clone().expect("overrides");
+        assert_eq!(overrides.get("DR"), Some(&15.0));
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            json.contains(r#""dot_bottom_to_face_center_mm":{"DR":15.0}"#),
+            "{json}"
+        );
+        assert!(!json.contains("centre"), "{json}");
     }
 
     #[test]
     fn absent_map_parses_as_none() {
         let s: SquareSection = serde_json::from_str(r#"{"name":"Square"}"#).expect("parse");
-        assert_eq!(s.dot_bottom_to_face_centre_mm, None);
+        assert_eq!(s.dot_bottom_to_face_center_mm, None);
     }
 }
 
@@ -2248,8 +2485,12 @@ mod openconnect_client_tests {
                 min_score: 0.45,
                 smoothing: 2.0,
                 detect_every: 5,
-                golfer_height: Some(180.0),
                 show_skeleton: false,
+                legacy_golfer_height: None,
+            },
+            player: PlayerSection {
+                sex: Sex::Female,
+                height: Some(180.0),
             },
             webserver: one(WebserverSection {
                 name: "Web".into(),
@@ -2294,6 +2535,9 @@ mod openconnect_client_tests {
                 position: CameraPosition::Overhead,
                 mode: "1920x1080@30".into(),
                 latency_s: Some(0.4),
+                rotation_deg: 270,
+                yaw_deg: Some(-7.5),
+                pitch_deg: Some(12.0),
             }),
         }
     }
@@ -2498,6 +2742,9 @@ mod camera_tests {
                 position,
                 mode: "1280x720@120".into(),
                 latency_s: Some(2.5),
+                rotation_deg: 90,
+                yaw_deg: Some(4.0),
+                pitch_deg: None,
             };
             let v = serde_json::to_value(&section).expect("ser");
             assert_eq!(v["position"], key);
@@ -2599,7 +2846,7 @@ mod impact_lead_tests {
     }
 
     #[test]
-    fn a_section_without_the_setting_serialises_as_before() {
+    fn a_section_without_the_setting_serializes_as_before() {
         let json = serde_json::to_string(&MevoSection::default()).expect("ser");
         assert!(!json.contains("impact_lead_s"), "{json}");
         for json in [
@@ -2695,7 +2942,7 @@ mod latency_tests {
     }
 
     #[test]
-    fn a_camera_without_a_latency_serialises_byte_identically() {
+    fn a_camera_without_a_latency_serializes_byte_identically() {
         let section = CameraSection {
             camera: CameraSection::TEST_PATTERN.into(),
             ..CameraSection::default()
@@ -2926,12 +3173,8 @@ mod body_tracking_tests {
                 detect_every: BodyTrackingSection::MAX_DETECT_EVERY,
                 mode: BodyTrackingMode::Off,
                 model: PoseModel::RtmposeS,
-                golfer_height: Some(BodyTrackingSection::MAX_GOLFER_HEIGHT_CM),
                 show_skeleton: false,
-            },
-            BodyTrackingSection {
-                golfer_height: Some(BodyTrackingSection::MIN_GOLFER_HEIGHT_CM),
-                ..ok.clone()
+                legacy_golfer_height: None,
             },
         ] {
             assert_eq!(good.error(), None);
@@ -2940,29 +3183,248 @@ mod body_tracking_tests {
     }
 
     #[test]
-    fn a_golfer_height_round_trips_in_centimetres_and_is_validated() {
-        let section = BodyTrackingSection {
-            golfer_height: Some(182.5),
-            ..BodyTrackingSection::default()
+    fn the_player_section_round_trips_and_is_omitted_at_its_defaults() {
+        let c = FlighthookConfig::default();
+        assert!(c.player.is_default());
+        assert!(!serde_json::to_string(&c).unwrap().contains("player"));
+        assert_eq!(c.player.sex, Sex::Male);
+        let player = PlayerSection {
+            sex: Sex::Female,
+            height: Some(182.5),
         };
-        assert!(!section.is_default());
-        let json = serde_json::to_string(&section).unwrap();
-        assert_eq!(json, r#"{"golfer_height":182.5}"#);
+        assert!(!player.is_default());
+        let json = serde_json::to_string(&player).unwrap();
+        assert_eq!(json, r#"{"sex":"female","height":182.5}"#);
         assert_eq!(
-            serde_json::from_str::<BodyTrackingSection>(&json).unwrap(),
-            section
+            serde_json::from_str::<PlayerSection>(&json).unwrap(),
+            player
         );
-        let c: FlighthookConfig =
-            serde_json::from_str(r#"{"body_tracking":{"golfer_height":182.5}}"#).unwrap();
-        assert_eq!(c.body_tracking.golfer_height, Some(182.5));
-        for bad in [99.9, 250.5, f64::NAN, f64::INFINITY, -180.0] {
-            let s = BodyTrackingSection {
-                golfer_height: Some(bad),
-                ..BodyTrackingSection::default()
+        let height_only = PlayerSection {
+            height: Some(175.0),
+            ..PlayerSection::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&height_only).unwrap(),
+            r#"{"height":175.0}"#
+        );
+        let v = serde_json::to_value(FlighthookConfig {
+            player: player.clone(),
+            ..FlighthookConfig::default()
+        })
+        .unwrap();
+        assert_eq!(
+            v["player"],
+            serde_json::json!({"sex": "female", "height": 182.5})
+        );
+        assert_eq!(Sex::all().map(Sex::key), ["male", "female"]);
+        assert_eq!(Sex::all().map(Sex::label), ["Men's", "Women's"]);
+        for sex in Sex::all() {
+            assert_eq!(
+                serde_json::to_value(sex).unwrap(),
+                serde_json::Value::from(sex.key())
+            );
+        }
+    }
+
+    #[test]
+    fn a_player_height_is_validated() {
+        for good in [
+            None,
+            Some(PlayerSection::MIN_HEIGHT_CM),
+            Some(180.0),
+            Some(PlayerSection::MAX_HEIGHT_CM),
+        ] {
+            let s = PlayerSection {
+                height: good,
+                sex: Sex::Female,
+            };
+            assert_eq!(s.error(), None, "{good:?}");
+            assert_eq!(s.in_effect(), s);
+        }
+        for bad in [99.0, 99.9, 250.5, f64::NAN, f64::INFINITY, -180.0] {
+            let s = PlayerSection {
+                height: Some(bad),
+                sex: Sex::Female,
             };
             let error = s.error().expect("out of range");
-            assert!(error.starts_with("golfer_height"), "{error}");
-            assert_eq!(s.in_effect().golfer_height, None, "{bad}");
+            assert!(error.starts_with("height"), "{error}");
+            assert_eq!(
+                s.in_effect(),
+                PlayerSection {
+                    height: None,
+                    sex: Sex::Female
+                },
+                "{bad}"
+            );
         }
+        assert_eq!(
+            PlayerSection {
+                height: Some(99.0),
+                ..PlayerSection::default()
+            }
+            .error()
+            .as_deref(),
+            Some("height 99 is outside 100 to 250 cm")
+        );
+    }
+
+    #[test]
+    fn a_golfer_height_in_body_tracking_moves_to_the_player() {
+        let c: FlighthookConfig =
+            serde_json::from_str(r#"{"body_tracking":{"golfer_height":182.5}}"#).unwrap();
+        assert_eq!(c.player.height, Some(182.5));
+        assert_eq!(c.body_tracking.legacy_golfer_height, None);
+        assert!(c.body_tracking.is_default());
+        // Never written back where it came from.
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("golfer_height"), "{json}");
+        assert!(!json.contains("body_tracking"), "{json}");
+        assert!(json.contains(r#""player":{"height":182.5}"#), "{json}");
+        // The player's own height wins.
+        let c: FlighthookConfig = serde_json::from_str(
+            r#"{"body_tracking":{"golfer_height":182.5},"player":{"height":170.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.player.height, Some(170.0));
+        // Beside the other body tracking settings.
+        let c: FlighthookConfig =
+            serde_json::from_str(r#"{"body_tracking":{"mode":"live","golfer_height":182.5}}"#)
+                .unwrap();
+        assert_eq!(c.player.height, Some(182.5));
+        assert_eq!(c.body_tracking.mode, BodyTrackingMode::Live);
+        // A section read alone carries it, and it never counts as a setting.
+        let section: BodyTrackingSection =
+            serde_json::from_str(r#"{"golfer_height":182.5}"#).unwrap();
+        assert_eq!(section.legacy_golfer_height, Some(182.5));
+        assert!(section.is_default());
+        assert_eq!(section, BodyTrackingSection::default());
+        assert_eq!(serde_json::to_string(&section).unwrap(), "{}");
+        assert_eq!(section.in_effect().legacy_golfer_height, None);
+    }
+
+    #[test]
+    fn camera_angles_and_rotation_are_omitted_at_their_defaults() {
+        let s = CameraSection {
+            camera: CameraSection::TEST_PATTERN.into(),
+            ..CameraSection::default()
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        for key in ["rotation_deg", "yaw_deg", "pitch_deg"] {
+            assert!(v.get(key).is_none(), "{key}: {v}");
+        }
+        let turned = CameraSection {
+            rotation_deg: 90,
+            yaw_deg: Some(0.0),
+            pitch_deg: Some(-3.5),
+            ..s.clone()
+        };
+        let v = serde_json::to_value(&turned).unwrap();
+        assert_eq!(v["rotation_deg"], 90);
+        assert_eq!(v["yaw_deg"], 0.0);
+        assert_eq!(v["pitch_deg"], -3.5);
+        let back: CameraSection = serde_json::from_value(v).unwrap();
+        assert_eq!(back, turned);
+        // An old section loads with no rotation and no angles.
+        let old: CameraSection = serde_json::from_str(
+            r#"{"name":"Face","camera":"test-pattern","position":"golfer_front","mode":"auto"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.rotation_deg, 0);
+        assert_eq!(old.yaw_deg, None);
+        assert_eq!(old.pitch_deg, None);
+    }
+
+    #[test]
+    fn camera_angles_and_rotation_are_validated() {
+        let ok = CameraSection {
+            camera: CameraSection::TEST_PATTERN.into(),
+            ..CameraSection::default()
+        };
+        for rotation in CAMERA_ROTATIONS {
+            let s = CameraSection {
+                rotation_deg: rotation,
+                ..ok.clone()
+            };
+            assert_eq!(s.error("camera.0"), None);
+            assert_eq!(rotation_in_effect_deg(rotation), rotation);
+        }
+        for angle in [None, Some(-30.0), Some(0.0), Some(12.5), Some(30.0)] {
+            let s = CameraSection {
+                yaw_deg: angle,
+                pitch_deg: angle,
+                ..ok.clone()
+            };
+            assert_eq!(s.error("camera.0"), None, "{angle:?}");
+            assert_eq!(camera_angle_in_effect_deg(angle), angle.unwrap_or(0.0));
+        }
+        let cases = [
+            (
+                CameraSection {
+                    rotation_deg: 45,
+                    ..ok.clone()
+                },
+                "camera.2: rotation_deg 45 is not 0, 90, 180 or 270",
+            ),
+            (
+                CameraSection {
+                    yaw_deg: Some(40.0),
+                    ..ok.clone()
+                },
+                "camera.2: yaw_deg 40 is outside -30 to 30",
+            ),
+            (
+                CameraSection {
+                    yaw_deg: Some(-30.5),
+                    ..ok.clone()
+                },
+                "camera.2: yaw_deg -30.5 is outside -30 to 30",
+            ),
+            (
+                CameraSection {
+                    pitch_deg: Some(f64::NAN),
+                    ..ok.clone()
+                },
+                "camera.2: pitch_deg NaN is outside -30 to 30",
+            ),
+            (
+                CameraSection {
+                    latency_s: Some(11.0),
+                    rotation_deg: 45,
+                    ..ok.clone()
+                },
+                "camera.2: latency_s 11 is outside 0 to 10 s",
+            ),
+        ];
+        for (section, message) in cases {
+            assert_eq!(section.error("camera.2").as_deref(), Some(message));
+        }
+        assert_eq!(rotation_in_effect_deg(45), 0);
+        assert_eq!(camera_angle_in_effect_deg(Some(40.0)), 0.0);
+        assert_eq!(camera_angle_in_effect_deg(Some(f64::INFINITY)), 0.0);
+        // The config reports the first camera by index.
+        let mut c = FlighthookConfig::default();
+        c.camera.insert(
+            "1".into(),
+            CameraSection {
+                pitch_deg: Some(31.0),
+                ..ok.clone()
+            },
+        );
+        c.camera.insert(
+            "0".into(),
+            CameraSection {
+                rotation_deg: 1,
+                ..ok.clone()
+            },
+        );
+        assert_eq!(
+            c.camera_error().as_deref(),
+            Some("camera.0: rotation_deg 1 is not 0, 90, 180 or 270")
+        );
+        c.camera.remove("0");
+        assert_eq!(
+            c.camera_error().as_deref(),
+            Some("camera.1: pitch_deg 31 is outside -30 to 30")
+        );
     }
 }

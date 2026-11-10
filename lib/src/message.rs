@@ -30,9 +30,14 @@ use crate::{ActorStatus, BallFlight, ClubData, DerivedFlight, FaceImpact, ShotRa
 use crate::{
     BodyTrackingSection, CameraPosition, CameraSection, ExPuttSection, FlighthookConfig,
     MevoSection, MockMonitorSection, OpenConnectClientSection, OpenConnectServerSection,
-    PureplaySection, R10Section, RandomClubSection, SquareSection, WebserverSection,
+    PlayerSection, PureplaySection, R10Section, RandomClubSection, SquareSection, WebserverSection,
 };
 use crate::{Club, ClubInfo, GroupedShot, HandInfo, PlayerInfo, ShotGroupInfo, ShotGrouping};
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
 
 // ---------------------------------------------------------------------------
 // Top-level message
@@ -292,8 +297,14 @@ pub enum FlighthookEvent {
     ShotVideoRemoved { keys: Vec<ShotKey> },
     /// Body tracking of a camera's clip is done (alpha): its keypoints are
     /// served beside the clip. The envelope's `actor` is the camera, as for
-    /// `shot_video`; `keys` are the clip's shots. Never per-frame data.
-    ShotPose { keys: Vec<ShotKey> },
+    /// `shot_video`; `keys` are the clip's shots; `rotation` is the camera's
+    /// rotation, clockwise degrees, the clip was tracked with (omitted at
+    /// 0). Never per-frame data.
+    ShotPose {
+        keys: Vec<ShotKey>,
+        #[serde(default, skip_serializing_if = "is_zero_u16")]
+        rotation: u16,
+    },
     /// The swing analysis of a camera's clip is done (alpha): events, tempo
     /// and metrics are served beside the clip. The envelope's `actor` is
     /// the camera; `keys` are the clip's shots. Never per-frame data.
@@ -408,6 +419,11 @@ pub enum ConfigAction {
     /// POST /api/settings?scope=body_tracking.
     SetBodyTracking {
         section: BodyTrackingSection,
+    },
+    /// Replace the `[player]` settings alone (persisted). Used by
+    /// POST /api/settings?scope=player.
+    SetPlayer {
+        section: PlayerSection,
     },
     /// Stop the launch monitor or output `id` ("mevo.0",
     /// "openconnect_client.1"), wait for its connection to close, and start
@@ -818,6 +834,55 @@ mod tests {
     }
 
     #[test]
+    fn shot_pose_carries_its_rotation_only_when_turned() {
+        let keys = vec![ShotKey {
+            shot_id: "a".into(),
+            shot_number: 1,
+        }];
+        let plain = serde_json::to_string(&FlighthookEvent::ShotPose {
+            keys: keys.clone(),
+            rotation: 0,
+        })
+        .unwrap();
+        assert!(!plain.contains("rotation"), "{plain}");
+        let turned = serde_json::to_string(&FlighthookEvent::ShotPose {
+            keys: keys.clone(),
+            rotation: 270,
+        })
+        .unwrap();
+        assert!(turned.contains(r#""rotation":270"#), "{turned}");
+        let back: FlighthookEvent = serde_json::from_str(&plain).unwrap();
+        assert!(matches!(
+            back,
+            FlighthookEvent::ShotPose { rotation: 0, .. }
+        ));
+        let back: FlighthookEvent = serde_json::from_str(&turned).unwrap();
+        assert!(matches!(
+            back,
+            FlighthookEvent::ShotPose { rotation: 270, .. }
+        ));
+    }
+
+    #[test]
+    fn set_player_round_trips() {
+        let action = ConfigAction::SetPlayer {
+            section: PlayerSection {
+                sex: crate::Sex::Female,
+                height: Some(170.0),
+            },
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"set_player","section":{"sex":"female","height":170.0}}"#
+        );
+        let back: ConfigAction = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(back, ConfigAction::SetPlayer { section } if section.height == Some(170.0))
+        );
+    }
+
+    #[test]
     fn upsert_camera_round_trips() {
         let action = ConfigAction::UpsertCamera {
             index: "1".into(),
@@ -828,6 +893,9 @@ mod tests {
                 position: CameraPosition::GolferFront,
                 mode: "auto".into(),
                 latency_s: None,
+                rotation_deg: 0,
+                yaw_deg: None,
+                pitch_deg: None,
             },
         };
         let json = serde_json::to_string(&action).expect("ser");

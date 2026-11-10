@@ -85,7 +85,7 @@ fn mb(bytes: u64) -> String {
 
 /// The dialog's lines: the opening sentence, one line per missing file
 /// (what, size, host), where they are kept, and that body tracking runs
-/// on this computer afterwards.
+/// on this computer afterward.
 pub(crate) fn ask_lines(models: &BodyTrackingModels) -> (String, Vec<String>, String) {
     let missing = models.missing();
     let total: u64 = missing.iter().map(|f| f.size).sum();
@@ -314,7 +314,7 @@ impl FlighthookApp {
                 if let Ok(models) = reply {
                     match models.state {
                         ModelFilesState::Ready => self.models_ready(),
-                        // Cancelled from elsewhere.
+                        // Canceled from elsewhere.
                         ModelFilesState::Missing => self.body_models.shown = None,
                         ModelFilesState::Downloading | ModelFilesState::Failed => {
                             self.body_models.shown = Some(Shown::Progress {
@@ -417,8 +417,8 @@ fn title(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Plain text in the modal, wrapped.
-fn text(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
-    ui.add(egui::Label::new(egui::RichText::new(text).size(14.0).color(colour)).wrap());
+fn text(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.add(egui::Label::new(egui::RichText::new(text).size(14.0).color(color)).wrap());
 }
 
 /// The dialog: what would be downloaded, from where, where it is kept.

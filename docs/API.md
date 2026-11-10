@@ -391,7 +391,7 @@ With `?units=imperial`:
 - `derived`: `DerivedFlight` or absent. Values simulated for fields the device
   didn't report, or for every result field under `mode = "force"` (beta); see [ball_flight](#ball_flight) for the fields.
   Converted by `?units=` like `ball` (distances to yards/meters, `max_height`
-  to feet/meters); `path`, when present, is always metres/seconds and is
+  to feet/meters); `path`, when present, is always meters/seconds and is
   never converted.
 - `club`: `ClubData` or `null`. Club head data. All fields are `Option`.
 - `impact`: `FaceImpact` or `null`. Face impact location.
@@ -415,7 +415,7 @@ With `?units=imperial`:
   "video": [
     { "camera": "camera.0", "position": "golfer_front", "duration_ms": 5500, "fps": 119.6,
       "trigger_offset_ms": 4000, "impact_offset_ms": 4000, "complete": true, "dropped": 0,
-      "pose": true, "swing": true }
+      "pose": true, "swing": true, "rotation": 90, "analyzed_with": "0.0.4" }
   ]
   ```
 
@@ -428,7 +428,12 @@ With `?units=imperial`:
   says the clip's swing analysis is ready at
   [`{camera}.swing.json`](#get-apishotsshot_idvideocameraswingjson); it turns
   true with [`shot_swing`](#shot_swing), and stays false for a camera at
-  `golfer_back` or `overhead`.
+  `golfer_back` or `overhead`. `rotation` (omitted at 0) is the camera's
+  rotation, clockwise degrees, the clip was tracked with: its keypoints are
+  in the picture turned by it. `analyzed_with` (omitted until tracked) is
+  the version of the body tracking library that tracked it. Both are kept
+  in the clip's `shot.json`; a clip tracked before they existed reads as
+  rotation 0 and no version.
 
   A clip that two launch monitors' triggers share (one swing) is on both
   shots' rows. It is added when the camera finishes the clip, which can be
@@ -608,10 +613,13 @@ the clip is deleted, HTTP `Range`, `Cache-Control: private, no-cache`.
   hit with (flighthook's hand at the shot, right-handed when unknown).
   `view_guess` and `handed_guess` are what the swing itself suggests.
   `mirrored` (`true`, else absent) says the picture was mirrored and
-  analysed as the golfer's true side; `smoothing` is the keypoint cleaning
+  analyzed as the golfer's true side; `smoothing` is the keypoint cleaning
   used.
 - `events`: times on the clip's time base (`t_ns` as in the sidecar), each
-  with a 0 to 1 confidence; an event the clip doesn't show is absent.
+  with a 0 to 1 confidence; an event the clip doesn't show is absent. Besides
+  `address`, `takeaway`, `top`, `impact` and `finish`: `arm_parallel_back`
+  and `arm_parallel_down`, the lead arm parallel to the ground in the
+  backswing and the downswing.
   flighthook gives the analysis the clip's estimated impact (the sidecar's
   `impact_ns`, when it falls inside the clip). `impact_source` says what
   became of it:
@@ -622,11 +630,13 @@ the clip is deleted, HTTP `Range`, `Cache-Control: private, no-cache`.
   - `estimated`: there was no estimate, so impact was found from the hands
     alone.
 - `tempo`: takeaway to top against top to impact.
-- `metrics`: the view's metrics at `address`, `top`, `impact` and `finish`
+- `metrics`: the view's metrics at `address`, `arm_parallel_back` (the
+  lead arm parallel to the ground in the backswing), `top`,
+  `arm_parallel_down` (the same in the downswing), `impact` and `finish`
   (each absent where not measured). `unit` is `degrees`, `torso` (a share of
-  the torso length, with `cm` when `body_tracking.golfer_height` is set) or
+  the torso length, with `cm` when `player.height` is set) or
   `ratio`. Every value is a 2D measure in this camera's picture. Sideways
-  shifts face-on (`hip_sway`, `head_lateral`) are positive towards the
+  shifts face-on (`hip_sway`, `head_lateral`) are positive toward the
   target and negative away from it, for either hand. The ids and their
   definitions are in
   [Cameras](devices/cameras.md#swing-analysis).
@@ -635,7 +645,7 @@ the clip is deleted, HTTP `Range`, `Cache-Control: private, no-cache`.
   sidecar) and per metric its `unit` and one value per frame (`null` where
   not measured), from the same formulas; shifts and turns are from address.
   At an event's frame a series holds the metric's value at that position.
-  Values have 4 decimals. `torso` values convert to centimetres as
+  Values have 4 decimals. `torso` values convert to centimeters as
   `value × scale.torso_px × scale.cm_per_px`. Absent when no metric was
   measured; a file without it is read as before. About 100 bytes per frame
   face-on: a 560-frame clip's file is about 55 KB.
@@ -644,14 +654,14 @@ the clip is deleted, HTTP `Range`, `Cache-Control: private, no-cache`.
 
 `0` nose, `1`/`2` left/right eye, `3`/`4` ears, `5`/`6` shoulders, `7`/`8`
 elbows, `9`/`10` wrists, `11`/`12` hips, `13`/`14` knees, `15`/`16`
-ankles, `17` head (top), `18` neck, `19` hip (centre), `20`/`21` left/right
+ankles, `17` head (top), `18` neck, `19` hip (center), `20`/`21` left/right
 big toe, `22`/`23` small toes, `24`/`25` heels. Left and right are the
 golfer's own sides.
 
 ### POST /api/shots/{shot_id}/video/{camera}/analyze
 
 Track one camera's clip now (body tracking, alpha): find the golfer's
-keypoints on it and, for a `golfer_front` or `target_line` camera, analyse
+keypoints on it and, for a `golfer_front` or `target_line` camera, analyze
 the swing. This is how a clip is tracked in Historical mode, where nothing
 runs until a clip is viewed; the UI sends it, once per clip,
 when it shows a clip whose `video` entry has no `pose`, in Historical and
@@ -669,6 +679,19 @@ any tracked clip, and [`shot_pose`](#shot_pose), then
 [`shot_swing`](#shot_swing), go out on the WebSocket. A clip already
 tracked, waiting or being tracked is not tracked again.
 
+The clip is tracked with its camera's `rotation_deg` at the time it runs.
+A clip keeps the tracking it was given; nothing tracks it again by itself.
+
+**Query parameters**:
+
+- `force=1` (optional, also `force=true`): delete the clip's
+  `{camera}.pose.json` and `{camera}.swing.json`, clear `pose`, `swing`,
+  `rotation` and `analyzed_with` on its `video` entry (in `shot.json` and on
+  the shot rows), and track it again: `202`. The UI sends it once per clip
+  and session when it shows a clip tracked with a `rotation` other than its
+  camera's `rotation_deg` now. While body tracking is off it is `409` and
+  nothing is deleted.
+
 **Response**: `{"state": "queued"}` or `{"state": "done"}`; errors carry
 `{"error": "<reason>"}`.
 
@@ -685,7 +708,88 @@ POST /api/shots/550e8400-e29b-41d4-a716-446655440000/video/camera.0/analyze
 … WS: shot_pose, then shot_swing
 POST /api/shots/550e8400-e29b-41d4-a716-446655440000/video/camera.0/analyze
 → 200 {"state":"done"}
+POST /api/shots/550e8400-e29b-41d4-a716-446655440000/video/camera.0/analyze?force=1
+→ 202 {"state":"queued"}
+… WS: shot_pose, then shot_swing
 ```
+
+### GET /api/shots/{shot_id}/grades/{camera}
+
+One camera's swing numbers graded against bands from published tour
+averages (alpha), for the tour and the amateur reference: what colors the
+Cameras pane's tiles and tables (see
+[Bands and colors](devices/cameras.md#bands-and-colors)). Computed on each
+request from the camera's
+[`{camera}.swing.json`](#get-apishotsshot_idvideocameraswingjson), the
+shot's `club_selected` and `handed`, and `player` in the settings as they
+are now; never stored, so a change to the Player card shows in the next
+request. `404` (`{"error": "<reason>"}`) until the camera's `video` entry has
+`swing: true`, and once the clip is deleted.
+
+```json
+{
+  "shot_id": "550e8400-e29b-41d4-a716-446655440000",
+  "camera": "camera.0",
+  "club_class": "driver",
+  "sex": "male",
+  "hand": "right",
+  "references": [
+    {
+      "reference": "tour",
+      "grades": [
+        { "id": "hip_turn", "position": "impact", "value": 44.0, "unit": "degrees",
+          "low": 33.0, "high": 43.0, "fade": [36.0, 46.0], "draw": [30.0, 40.0],
+          "z": 1.2, "z_fade": 0.6, "z_draw": 1.8, "fit": "fade", "side": "high",
+          "direction": "open", "word": "more open: fade side",
+          "proxy_sd": true, "confidence": 0.9 },
+        { "id": "hip_sway", "position": "impact", "value": 6.9, "unit": "inches",
+          "low": 2.0, "high": 6.0, "fade": [1.25, 5.25], "draw": [2.75, 6.75],
+          "z": 1.45, "z_fade": 1.83, "z_draw": 1.08, "fit": "near", "side": "high",
+          "direction": "toward", "word": "further toward the target than tour: slide, blocks",
+          "confidence": 0.8 }
+      ],
+      "tempo": [
+        { "id": "tempo_ratio", "position": "swing", "value": 2.8, "unit": "ratio",
+          "low": 2.5, "high": 3.5, "z": -0.4, "fit": "both", "side": "on",
+          "proxy_sd": true, "confidence": 1.0 }
+      ]
+    },
+    { "reference": "amateur", "grades": [], "tempo": [] }
+  ]
+}
+```
+
+- `club_class`: `driver` (driver, mini driver), `mid_iron` (every wood,
+  hybrid and iron) or `wedge` (PW, GW, SW, LW). A putter or a shot without a
+  club has none, and `references` is empty: nothing is graded.
+- `sex`: the Player card's, which picks the men's or women's bands. `hand`:
+  the shot's (right when unknown). The metrics are measured relative to the
+  target, so both hands grade alike.
+- `references`: `tour`, then `amateur`. `grades` holds every metric at every
+  key `position` (as in the swing file) that has a band; `tempo` the
+  `tempo_ratio` and the `downswing_time` (`position` `swing`). A value
+  without a band, or a band that is not graded, is absent.
+- `value`: in the band's `unit` (`degrees`, `inches`, `ratio`, `seconds`),
+  signed as the band: turns positive open (toward the target) and negative
+  closed, shifts positive toward the target, the ball or up. A distance is
+  put into inches with `player.height`, or an assumed height for the sex
+  without one (`assumed_scale: true`).
+- `low`, `high`: the band, center ± one SD. `fade`, `draw`: for hip turn,
+  shoulder turn, shoulder tilt and hip sway at impact, the fade band and the
+  draw band (the center shifted by a small offset each way, same width).
+  `z`, `z_fade`, `z_draw`: the value's distance from each center in SDs.
+- `fit`: `both` (inside the band, or inside both the fade and the draw band),
+  `fade` (inside the fade band only), `draw` (inside the draw band only),
+  `near` (outside, within 2 SD of the nearer band) or `far`. `side`: `low`,
+  `high` or `on` (inside). `direction`: the side's word (`open`, `closed`,
+  `toward`, `away`, `up`, `down`, `toward_ball`, `back`, `more`, `less`),
+  absent on the center. `word`: what the Cameras pane writes after the
+  metric's name for a value off its band; absent for `both`.
+- `proxy_sd` (the SD is borrowed from the nearest published spread),
+  `assumed_scale`, `club_fallback` (a wedge graded against the mid-iron
+  band), `sex_fallback` (a woman graded against the men's band): present
+  when `true`. `confidence`: the metric's keypoint confidence.
+- A turn from one camera is graded at impact only; elsewhere it is absent.
 
 ### GET /api/body_tracking/models
 
@@ -729,7 +833,7 @@ later calls only look at its size and modification time.
   `ready` (every file is there) or `failed` (the last download for this
   model failed: `error` says why, as stance words it: the URL and the
   network error, or a hash mismatch).
-  A failure stays until the next download or a cancel; a cancelled download
+  A failure stays until the next download or a cancel; a canceled download
   leaves `missing`, with no error.
 - `model`, `dir`: the configured pose model and the models folder.
 - `files`: `name` (in `dir`), `label`, `host` (where it is downloaded from;
@@ -869,7 +973,7 @@ no-store`) with:
   `view` `face_on` carries `spine_angle` (the spine's sideways tilt, positive
   with the shoulders away from the target), `shoulder_tilt` (positive with
   the lead shoulder higher) and `lead_arm_angle` (180 straight);
-  `down_the_line` carries `spine_angle` (the forward bend, positive towards
+  `down_the_line` carries `spine_angle` (the forward bend, positive toward
   the ball), `lead_knee_flex`, `trail_knee_flex` (0 straight) and
   `trail_elbow_angle` (180 straight).
 - `X-Pose-State` (body tracking): `off` (`body_tracking.mode` is not
@@ -1540,7 +1644,7 @@ Full persisted config (mirrors `config.toml`).
       "club": "7i",
       "advanced_spin": true,
       "discard_non_putting_zero_spin": true,
-      "dot_bottom_to_face_centre_mm": {
+      "dot_bottom_to_face_center_mm": {
         "DR": 15.0,
         "7I": 18.5
       }
@@ -1573,8 +1677,11 @@ Full persisted config (mirrors `config.toml`).
   },
   "body_tracking": {
     "model": "rtmpose-s",
-    "detect_every": 5,
-    "golfer_height": 180.0
+    "detect_every": 5
+  },
+  "player": {
+    "sex": "female",
+    "height": 168.0
   },
   "camera": {
     "0": {
@@ -1582,7 +1689,9 @@ Full persisted config (mirrors `config.toml`).
       "camera": "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_8A2B3C4D-video-index0",
       "camera_name": "HD Pro Webcam C920",
       "position": "golfer_front",
-      "mode": "auto"
+      "mode": "auto",
+      "rotation_deg": 90,
+      "yaw_deg": -4.0
     }
   }
 }
@@ -1664,13 +1773,27 @@ Full persisted config (mirrors `config.toml`).
   Omitted when unset (0). A save with a value below 0, above 10 or not finite
   is rejected with `400`; one outside that range in the config file is
   ignored. Changes apply at once without reopening the camera
+- `camera` sections take an optional `rotation_deg`: 0, 90, 180 or 270, the
+  clockwise quarter turns applied to the camera's frames before body
+  tracking and display (clips are stored as the camera sent them). Omitted
+  at 0. A save with any other value is rejected with `400`; one in the config
+  file is not used (0, with a warning in the log). Changes apply at once
+  without reopening the camera: the live view and the clips tracked from
+  then on use the new rotation
+- `camera` sections take optional `yaw_deg` and `pitch_deg`: degrees, -30 to
+  30. `yaw_deg` is how far the camera points off square, positive to the
+  right of the target line for a right-handed golfer; `pitch_deg` is its
+  tilt down from level. Omitted when unset (0). A save with a value outside
+  that range or not finite is rejected with `400`; one in the config file is
+  not used. Changes apply at once without reopening the camera
   The device must be in its mobile mode on the same network. Its shots are
   putts: club `PT` and Putting mode whatever club is in play, vertical
   launch 0, no spin
-- `dot_bottom_to_face_centre_mm` on Square sections overrides allsquare's built-in
+- `dot_bottom_to_face_center_mm` on Square sections overrides allsquare's built-in
   per-club face impact calibration (distance from the bottom edge of the
-  sticker's dot down to face centre, in mm). Keyed the same way `club` is. Omitted when no
-  overrides are set
+  sticker's dot down to face center, in mm). Keyed the same way `club` is. Omitted when no
+  overrides are set. The spelling `dot_bottom_to_face_centre_mm` is also read (in requests and
+  config files); responses and saved files use `dot_bottom_to_face_center_mm`
 - `openconnect_server` sections are **launch monitors**, not integrations: they
   listen (`bind`, default `0.0.0.0:921`) and accept inbound shots from any
   monitor that speaks GSPro Open Connect V1 as a client — Uneekor, Foresight,
@@ -1733,10 +1856,9 @@ Full persisted config (mirrors `config.toml`).
   `smoothing` (default `1.0`: the live One Euro filter's cutoff at rest in
   Hz, 0.1 to 10, lower is smoother; `0` is off) and `detect_every` (default
   `10`, 1 to 60: the live view looks for the golfer afresh at least every
-  that many frames), `golfer_height` (not set by default; the golfer's
-  height in centimetres, 100 to 250, for the swing analysis' distances in
-  centimetres) and `show_skeleton` (default `true`; `false`: the UI draws
-  no skeleton over the live views, the clips or the replay). Every value
+  that many frames) and `show_skeleton` (default `true`; `false`: the UI
+  draws no skeleton over the live views, the clips or the replay). Every
+  value
   applies at once, without restarting a
   camera. A save with a value out of range is `400`; a file holding one
   loads with a warning in the log, and the default is used. An unknown
@@ -1745,7 +1867,19 @@ Full persisted config (mirrors `config.toml`).
   `false` as `"off"` and `true` as `"historical"`, and one with neither as
   `"off"`; responses carry `mode` only. Saving a mode other than `"off"`
   downloads nothing: the models are downloaded only through
-  [`POST /api/body_tracking/models/download`](#post-apibody_trackingmodelsdownload)
+  [`POST /api/body_tracking/models/download`](#post-apibody_trackingmodelsdownload).
+  A `golfer_height` in the section is accepted and read as `player.height`
+  when the config has none; responses never carry it
+- `player` holds facts about the player, each omitted while at its default,
+  and the section with them: `sex` (`"male"`, the default, or `"female"`:
+  whose tour averages the swing is compared with) and `height` (not set by
+  default; the player's height in centimeters, 100 to 250, for the swing
+  analysis' distances in centimeters). Values apply from the next swing
+  analysis, without restarting anything. A save with a height out of range
+  is `400`; a file holding one loads with a warning in the log, and no
+  height is used. A config file with `body_tracking.golfer_height` loads it
+  as `player.height` and is rewritten without it (the original kept beside
+  it as a backup)
 - `camera` sections (beta) are swing cameras: `name`; `camera`, the stable id
   from [`GET /api/cameras`](#get-apicameras) (`test-pattern` for the test
   picture); `camera_name`, the camera's own name when it was picked, used
@@ -1771,8 +1905,8 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
 **Query parameters**:
 
 - `scope` (optional): a global actor ID (`mevo.0`, `openconnect_client.1`,
-  `pureplay.0`, `webserver.0`), `global` or `body_tracking`. `gspro.N` is accepted for
-  `openconnect_client.N`.
+  `pureplay.0`, `webserver.0`), `global`, `body_tracking` or `player`. `gspro.N`
+  is accepted for `openconnect_client.N`.
   - An actor ID narrows the save to that one actor — only its section is
     written to the config, and only that actor is reconciled. Every other
     section of the live config is left as-is, whatever the request body
@@ -1780,13 +1914,15 @@ on the bus, waits for `ConfigOutcome` from SystemActor, then returns the respons
     actor.
   - `global` writes only the global settings (`default_units`,
     `chipping_clubs`, `putting_clubs`, `shot_grouping`, `simulation`,
-    `replay`, `body_tracking`) from the body; every actor section of the live config is kept, whatever the body
+    `replay`, `body_tracking`, `player`) from the body; every actor section of the live config is kept, whatever the body
     carries for it. Every actor is reconciled.
   - `body_tracking` writes only the body's `body_tracking` section; every
     other setting of the live config is kept, whatever the body carries for
     it. No actor is reconciled (body tracking is read live). The UI saves
     this way from the model download prompt: when body tracking is turned on
     from `off`, and when the prompt's Cancel or Turn off sets it back to `off`.
+  - `player` writes only the body's `player` section the same way; no actor
+    is reconciled.
   - Any save that changes `body_tracking.mode` applies it at once: leaving
     `live` stops live tracking and the recorded clips still waiting to be
     tracked (a clip being tracked finishes); `off` also drops every clip
@@ -1819,14 +1955,16 @@ as applied.
 
 | Status | When |
 |---|---|
-| `400 Bad Request` | `scope` is not `global` and not a known actor ID |
+| `400 Bad Request` | `scope` is not `global`, `body_tracking`, `player` or a known actor ID |
 | `400 Bad Request` | the save removes the web server (`"the web server can't be removed"`) or adds a second one (`"flighthook runs one web server; edit the existing one"`) |
 | `400 Bad Request` | a Mevo section it writes has a `launch_only_spin` below 0, above 1000 or not finite (`"mevo.0: launch_only_spin must be 0 to 1000 rpm per mph, not -5"`) |
 | `400 Bad Request` | a launch monitor section it writes has an `impact_lead_s` below 0, above 5 or not finite (`"square.0: impact_lead_s 6 is outside 0 to 5 s"`) |
 | `400 Bad Request` | a camera section it writes has a `latency_s` below 0, above 10 or not finite (`"camera.0: latency_s 11 is outside 0 to 10 s"`) |
+| `400 Bad Request` | a camera section it writes has a `rotation_deg` other than 0, 90, 180 or 270 (`"camera.0: rotation_deg 45 is not 0, 90, 180 or 270"`), or a `yaw_deg` or `pitch_deg` outside -30 to 30 or not finite (`"camera.0: yaw_deg 40 is outside -30 to 30"`) |
 | `400 Bad Request` | a camera section it writes has no `camera` (`"camera.0: no camera picked"`) or a `mode` that is neither `auto` nor `WIDTHxHEIGHT@FPS` |
 | `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
 | `400 Bad Request` | a whole-config, `global` or `body_tracking` save has a `body_tracking` value out of range (`"body_tracking: min_score 2 is outside 0 to 1"`) |
+| `400 Bad Request` | a whole-config, `global` or `player` save has a `player.height` outside 100 to 250 or not finite (`"player: height 99 is outside 100 to 250 cm"`) |
 | `504 Gateway Timeout` | SystemActor did not answer within 22 s (see below) |
 
 A body that is not a valid `FlighthookConfig` is rejected by the JSON
@@ -1858,7 +1996,8 @@ answering, so the reply can be lost even though the config was saved: read
 
 - Emits `ConfigCommand` on the bus, processed by SystemActor. Without `scope`
   the action is `ReplaceAll`; with `scope=global`, `ReplaceGlobal`; with
-  `scope=body_tracking`, `SetBodyTracking`; with an
+  `scope=body_tracking`, `SetBodyTracking`; with `scope=player`,
+  `SetPlayer`; with an
   actor ID, the matching `Upsert*` variant for that section (or `Remove` when
   the body omits it)
 - SystemActor persists the new config to disk and reconciles actors:
@@ -2100,7 +2239,7 @@ face impact's `vertical`. Today: the Garmin R10's `backspin_rpm` and
 `backspin_rpm` and `sidespin_rpm` when **Spin source (Xi)** combines the E8
 total with an axis, the ExPutt's `launch_elevation` (always 0), the Square
 Golf Omni's `impact_vertical` (it includes the club's offset from the
-sticker to the face centre), and for the OpenConnect input the spin pair the
+sticker to the face center), and for the OpenConnect input the spin pair the
 monitor did not send. The Pureplay output leaves these out in strict mode.
 
 A ground ball is rolled, not flown: a shot whose measured apex is 0, or,
@@ -2169,8 +2308,8 @@ lands on it.
 **`path`** is the simulated ball's trajectory: an object with `flight` (tee to
 landing) and `ground` (landing to rest, empty when the ground phase doesn't
 reach rest), each a list of `[t, x, y, z]` points — seconds since launch,
-metres downrange, metres up, metres right of the target line, origin at the
-tee. Always metres and seconds, unaffected by `?units=`. Present only on
+meters downrange, meters up, meters right of the target line, origin at the
+tee. Always meters and seconds, unaffected by `?units=`. Present only on
 shots the server simulated, same conditions as the rest of `derived`. The
 path is fitted to the displayed values: the landing is at the carry (measured
 or simulated), the highest point at the apex, the landing time at the flight
@@ -2184,7 +2323,7 @@ fitted flight arrives. With `replaces_measured` every displayed
 value is simulated, so the path is the simulation unchanged. `ground[0]` equals the last `flight`
 point. A ground ball's `flight` is the tee alone (`[[0, 0, 0, 0]]`) and its
 `ground` the roll from the tee. The offline values are the `z` of the landing and rest points. A few
-dozen points per shot, rounded to centimetres and milliseconds.
+dozen points per shot, rounded to centimeters and milliseconds.
 
 ---
 
@@ -2226,12 +2365,12 @@ of the ball, − behind it.
 
 ##### face_impact
 
-Face impact location, in millimetres from the centre of the club face.
-Positive `lateral` is toward the toe, positive `vertical` is above centre.
+Face impact location, in millimeters from the center of the club face.
+Positive `lateral` is toward the toe, positive `vertical` is above center.
 Both axes are golfer-relative (toe/heel, high/low) and mean the same for
 either hand.
 
-Emitted only by devices whose reading is referenced to the face centre. The
+Emitted only by devices whose reading is referenced to the face center. The
 Square Golf Omni emits this event (beta): horizontal as the device measures
 it, vertical with a per-club calibration (built-in defaults, overridable per
 club in config or the Settings UI — see
@@ -2687,14 +2826,15 @@ Body tracking of a camera's clip is done (alpha): the golfer's keypoints on
 every frame are served at
 [`/api/shots/{shot_id}/video/{camera}.pose.json`](#get-apishotsshot_idvideocameraposejson).
 The envelope's `actor` is the camera, as for [`shot_video`](#shot_video);
-`keys` are the clip's shots. Sent once per clip when its tracking is done:
-in Live mode a few seconds after its `shot_video`, in Historical mode after
-the clip was asked for with
+`keys` are the clip's shots; `rotation` (omitted at 0) is the camera's
+rotation, clockwise degrees, the clip was tracked with. Sent once per clip
+when its tracking is done: in Live mode a few seconds after its
+`shot_video`, in Historical mode after the clip was asked for with
 [`POST .../analyze`](#post-apishotsshot_idvideocameraanalyze); no keypoints
 go on the bus. Flighthook extension event.
 
 ```json
-{ "actor": "camera.0", "event": { "kind": "shot_pose", "keys": [ { "shot_id": "550e8400-...", "shot_number": 42 } ] } }
+{ "actor": "camera.0", "event": { "kind": "shot_pose", "keys": [ { "shot_id": "550e8400-...", "shot_number": 42 } ], "rotation": 90 } }
 ```
 
 ---

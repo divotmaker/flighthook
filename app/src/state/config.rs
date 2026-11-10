@@ -142,6 +142,7 @@ impl LegacyFlighthookConfig {
             random_club: self.random_club,
             replay: flighthook::ReplaySection::default(),
             body_tracking: flighthook::BodyTrackingSection::default(),
+            player: flighthook::PlayerSection::default(),
             camera: HashMap::new(),
         }
     }
@@ -196,8 +197,14 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
             if let Some(error) = config.impact_lead_error() {
                 tracing::warn!("{}: {error}; the device default is used", path.display());
             }
-            if let Some(error) = config.latency_error() {
-                tracing::warn!("{}: {error}; a latency of 0 is used", path.display());
+            if let Some(error) = config.camera_error() {
+                tracing::warn!(
+                    "{}: {error}; that setting is not used (latency 0, no rotation, 0 degrees)",
+                    path.display()
+                );
+            }
+            if let Some(error) = config.player.error() {
+                tracing::warn!("{}: [player] {error}; no height is used", path.display());
             }
             if let Some(error) = config.body_tracking.error() {
                 tracing::warn!(
@@ -609,6 +616,32 @@ impl SystemConfig {
                 .and_then(|c| c.latency_s)
         });
         flighthook::latency_in_effect_s(configured)
+    }
+
+    /// The rotation in effect for camera `actor` (e.g. `camera.0`),
+    /// clockwise degrees: its section's `rotation_deg` when valid, else 0.
+    /// Read for every live frame and every clip pass, so a change applies at
+    /// once without reopening the camera.
+    pub fn camera_rotation(&self, actor: &str) -> u16 {
+        let configured = actor.strip_prefix("camera.").and_then(|index| {
+            self.inner
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .camera
+                .get(index)
+                .map(|c| c.rotation_deg)
+        });
+        configured.map_or(0, flighthook::rotation_in_effect_deg)
+    }
+
+    /// The `[player]` settings in effect: a height out of range is no
+    /// height. Read by the swing analysis of every clip.
+    pub fn player(&self) -> flighthook::PlayerSection {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .player
+            .in_effect()
     }
 
     /// The `[body_tracking]` settings in effect: a value out of range is its
@@ -1178,6 +1211,36 @@ full_monitor = "mevo.0"
     }
 
     #[test]
+    fn a_file_with_the_british_face_impact_key_loads_and_is_rewritten_with_a_backup() {
+        let src = format!(
+            "{GOLDEN_DEFAULT_TOML}\n[square.0]\nname = \"Omni\"\n\n\
+             [square.0.dot_bottom_to_face_centre_mm]\nDR = 15.0\n7i = 18.5\n"
+        );
+        let (dir, path) = config_dir(&src);
+        let loaded = load(&path).0;
+        let overrides = loaded.square["0"]
+            .dot_bottom_to_face_center_mm
+            .as_ref()
+            .expect("overrides");
+        assert_eq!(overrides.get("DR"), Some(&15.0));
+        assert_eq!(overrides.get("7i"), Some(&18.5));
+
+        assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(backup_name())).expect("backup"),
+            src
+        );
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            saved.contains("[square.0.dot_bottom_to_face_center_mm]"),
+            "{saved}"
+        );
+        assert!(!saved.contains("centre"), "{saved}");
+        let back: FlighthookConfig = toml::from_str(&saved).expect("parses");
+        assert_eq!(back, loaded);
+    }
+
+    #[test]
     fn a_body_tracking_section_loads_as_written_and_bad_values_default_in_effect() {
         // Only the values off their defaults: read and left byte-identical.
         let src = format!(
@@ -1358,9 +1421,9 @@ surface = "firm_green"
     }
 
     /// A value written out at its default, where the app leaves it out, is
-    /// normalised away once; the file is stable from then on.
+    /// normalized away once; the file is stable from then on.
     #[test]
-    fn explicit_defaults_are_normalised_once() {
+    fn explicit_defaults_are_normalized_once() {
         let src = format!("{GOLDEN_DEFAULT_TOML}\n[mevo.0]\nname = \"Xi\"\nspin_source = \"d4\"\n");
         let (dir, path) = config_dir(&src);
         let loaded = load(&path).0;
@@ -1390,6 +1453,58 @@ surface = "firm_green"
             assert_eq!(std::fs::read(&path).expect("read"), migrated);
             assert_eq!(files(&dir.0), after_first);
         }
+    }
+
+    #[test]
+    fn a_golfer_height_moves_to_the_player_once_with_a_backup() {
+        let src = "[body_tracking]\nmode = \"live\"\ngolfer_height = 182.5\n";
+        let (dir, path) = config_dir(src);
+        let first = load(&path).0;
+        assert_eq!(first.player.height, Some(182.5));
+        assert_eq!(first.body_tracking.mode, flighthook::BodyTrackingMode::Live);
+        assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
+        let backup = std::fs::read(dir.0.join(backup_name())).expect("backup");
+        assert_eq!(backup, src.as_bytes());
+        let migrated = std::fs::read_to_string(&path).expect("read");
+        assert!(!migrated.contains("golfer_height"), "{migrated}");
+        assert!(migrated.contains("[player]\nheight = 182.5"), "{migrated}");
+        assert!(
+            migrated.contains("[body_tracking]\nmode = \"live\""),
+            "{migrated}"
+        );
+
+        // The second load reads the same and leaves the file alone.
+        let second = load(&path).0;
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), migrated);
+        assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
+        let cfg = SystemConfig::new(path);
+        assert_eq!(cfg.player().height, Some(182.5));
+    }
+
+    #[test]
+    fn camera_rotation_and_player_are_read_in_effect() {
+        let (_dir, path) = config_dir(
+            "[camera.0]\nname = \"Face\"\ncamera = \"test-pattern\"\nrotation_deg = 90\n\n\
+             [camera.1]\nname = \"Side\"\ncamera = \"test-pattern\"\nrotation_deg = 45\n\n\
+             [player]\nsex = \"female\"\nheight = 99\n",
+        );
+        let cfg = SystemConfig::new(path);
+        assert!(cfg.snapshot().camera_error().is_some());
+        assert_eq!(cfg.camera_rotation("camera.0"), 90);
+        assert_eq!(cfg.camera_rotation("camera.1"), 0, "not one of the four");
+        assert_eq!(cfg.camera_rotation("camera.7"), 0, "no such camera");
+        assert_eq!(cfg.camera_rotation("mevo.0"), 0);
+        assert_eq!(
+            cfg.player(),
+            flighthook::PlayerSection {
+                sex: flighthook::Sex::Female,
+                height: None,
+            }
+        );
+        // The out-of-range values stay in the file for the user to fix.
+        assert_eq!(cfg.snapshot().camera["1"].rotation_deg, 45);
+        assert_eq!(cfg.snapshot().player.height, Some(99.0));
     }
 
     #[test]
@@ -1631,6 +1746,10 @@ altitude = "250m"
 temperature_c = 12
 surface = "green"
 
+[player]
+sex = "female"
+height = 170
+
 [webserver.0]
 name = "Web"
 bind = "0.0.0.0:5881"
@@ -1649,7 +1768,7 @@ name = "R10"
 [square.0]
 name = "Omni"
 
-[square.0.dot_bottom_to_face_centre_mm]
+[square.0.dot_bottom_to_face_center_mm]
 DR = 15
 7i = 18.5
 
@@ -1691,7 +1810,7 @@ name = "Clubs"
         assert_eq!(c.r10["0"].name, "R10");
         assert_eq!(
             c.square["0"]
-                .dot_bottom_to_face_centre_mm
+                .dot_bottom_to_face_center_mm
                 .as_ref()
                 .map(|m| m.len()),
             Some(2)
@@ -1706,6 +1825,8 @@ name = "Clubs"
         assert_eq!(c.random_club["0"].name, "Clubs");
         assert_eq!(c.pureplay["0"].address.as_deref(), Some("127.0.0.1:9760"));
         assert_eq!(c.pureplay["0"].full_monitor.as_deref(), Some("mevo.0"));
+        assert_eq!(c.player.sex, flighthook::Sex::Female);
+        assert_eq!(c.player.height, Some(170.0));
 
         let out = toml::to_string_pretty(&c).expect("ser");
         let back: FlighthookConfig = toml::from_str(&out).expect("parses");

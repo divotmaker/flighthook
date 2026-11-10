@@ -415,12 +415,40 @@ impl ClipStore {
     }
 
     /// Record that body tracking of `camera`'s clip in `slot` is done (its
-    /// `<camera>.pose.json` is written) and rewrite `shot.json`. False when
-    /// the clip is gone (pruned, or a Clear history since it was begun):
-    /// then the file is not served, and the caller deletes it if its folder
-    /// is still there.
-    pub fn set_pose(&self, slot: &ClipSlot, camera: &str) -> bool {
-        self.mark(slot, camera, |video| video.pose = true)
+    /// `<camera>.pose.json` is written) with the camera turned by
+    /// `rotation` clockwise degrees, and rewrite `shot.json` with the
+    /// rotation and [`stance::VERSION`]. False when the clip is gone
+    /// (pruned, or a Clear history since it was begun): then the file is
+    /// not served, and the caller deletes it if its folder is still there.
+    pub fn set_pose(&self, slot: &ClipSlot, camera: &str, rotation: u16) -> bool {
+        self.mark(slot, camera, |video| {
+            video.pose = true;
+            video.rotation = rotation;
+            video.analyzed_with = Some(stance::VERSION.to_owned());
+        })
+    }
+
+    /// Forget the body tracking and swing analysis of `camera`'s clip in
+    /// `slot`: delete its `<camera>.pose.json` and `<camera>.swing.json`,
+    /// clear what its listing says about them, and rewrite `shot.json`.
+    /// False when the clip is gone.
+    pub fn clear_analysis(&self, slot: &ClipSlot, camera: &str) -> bool {
+        let dir = slot.dir.clone();
+        let camera_files = camera.to_owned();
+        self.mark(slot, camera, move |video| {
+            for ext in ["pose.json", "swing.json"] {
+                let path = dir.join(format!("{camera_files}.{ext}"));
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!("clips: deleting {}: {e}", path.display()),
+                }
+            }
+            video.pose = false;
+            video.swing = false;
+            video.rotation = 0;
+            video.analyzed_with = None;
+        })
     }
 
     /// Record that the swing analysis of `camera`'s clip in `slot` is done
@@ -431,7 +459,7 @@ impl ClipStore {
 
     /// Apply `set` to `camera`'s clip in `slot` and rewrite `shot.json`.
     /// False when the clip is gone.
-    fn mark(&self, slot: &ClipSlot, camera: &str, set: fn(&mut ShotVideo)) -> bool {
+    fn mark(&self, slot: &ClipSlot, camera: &str, set: impl FnOnce(&mut ShotVideo)) -> bool {
         let mut inner = self.lock();
         if slot.generation != inner.generation {
             return false;
@@ -604,6 +632,8 @@ mod tests {
             dropped: 0,
             pose: false,
             swing: false,
+            rotation: 0,
+            analyzed_with: None,
         }
     }
 
@@ -617,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn clip_ids_sort_by_time_and_are_recognised() {
+    fn clip_ids_sort_by_time_and_are_recognized() {
         let a = new_clip_id();
         assert!(is_clip_id(&a), "{a}");
         assert!(!is_clip_id("photos"));
@@ -875,7 +905,7 @@ mod tests {
         assert!(store.finish(&slot, video("camera.0"), keep).kept);
         assert!(store.file(id, "camera.0", "pose.json").is_none(), "not yet");
         std::fs::write(slot.dir.join("camera.0.pose.json"), b"{}").expect("pose");
-        assert!(store.set_pose(&slot, "camera.0"));
+        assert!(store.set_pose(&slot, "camera.0", 0));
         slot
     }
 
@@ -887,7 +917,7 @@ mod tests {
         let pose = store.file("a", "camera.0", "pose.json").expect("served");
         assert_eq!(pose, slot.dir.join("camera.0.pose.json"));
         assert!(store.videos("a")[0].pose);
-        assert!(!store.set_pose(&slot, "camera.7"), "no such camera clip");
+        assert!(!store.set_pose(&slot, "camera.7", 0), "no such camera clip");
         // shot.json carries it into the next run.
         let again = ClipStore::default();
         assert!(again.load(&tmp.0, 20).is_empty());
@@ -937,10 +967,84 @@ mod tests {
         assert!(!pose.exists(), "pruned with its clip");
         assert!(store.file("a", "camera.0", "pose.json").is_none());
         // A pose finished after its clip was pruned is not kept.
-        assert!(!store.set_pose(&first, "camera.0"));
+        assert!(!store.set_pose(&first, "camera.0", 0));
         let pose = second.dir.join("camera.0.pose.json");
         assert!(store.clear().contains(&key("b")));
         assert!(!pose.exists(), "cleared with its clip");
-        assert!(!store.set_pose(&second, "camera.0"), "cleared since");
+        assert!(!store.set_pose(&second, "camera.0", 0), "cleared since");
+    }
+
+    #[test]
+    fn a_pose_records_its_rotation_and_the_stance_version() {
+        let tmp = temp();
+        let store = ClipStore::default();
+        let slot = record_with_pose(&store, &tmp.0, "a", 20);
+        let video = &store.videos("a")[0];
+        assert_eq!(video.rotation, 0);
+        assert_eq!(video.analyzed_with.as_deref(), Some(stance::VERSION));
+        assert!(store.set_pose(&slot, "camera.0", 270));
+        let video = &store.videos("a")[0];
+        assert_eq!(video.rotation, 270);
+        // shot.json carries both into the next run.
+        let again = ClipStore::default();
+        again.load(&tmp.0, 20);
+        let video = &again.videos("a")[0];
+        assert_eq!(video.rotation, 270);
+        assert_eq!(video.analyzed_with.as_deref(), Some(stance::VERSION));
+        let text = std::fs::read_to_string(slot.dir.join(SHOT_FILE)).expect("shot.json");
+        assert!(text.contains(r#""rotation": 270"#), "{text}");
+    }
+
+    #[test]
+    fn an_old_shot_file_reads_as_rotation_zero_and_no_version() {
+        let tmp = temp();
+        let store = ClipStore::default();
+        let slot = record_with_pose(&store, &tmp.0, "a", 20);
+        let path = slot.dir.join(SHOT_FILE);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        let camera = v["cameras"][0].as_object_mut().expect("camera");
+        camera.remove("rotation");
+        camera.remove("analyzed_with");
+        std::fs::write(&path, serde_json::to_vec(&v).expect("ser")).expect("write");
+        let again = ClipStore::default();
+        again.load(&tmp.0, 20);
+        let video = &again.videos("a")[0];
+        assert!(video.pose);
+        assert_eq!(video.rotation, 0);
+        assert_eq!(video.analyzed_with, None);
+    }
+
+    #[test]
+    fn clearing_the_analysis_deletes_its_files_and_flags() {
+        let tmp = temp();
+        let store = ClipStore::default();
+        let slot = record_with_pose(&store, &tmp.0, "a", 20);
+        assert!(store.set_pose(&slot, "camera.0", 90));
+        std::fs::write(slot.dir.join("camera.0.swing.json"), b"{}").expect("swing");
+        assert!(store.set_swing(&slot, "camera.0"));
+        // Another camera's files are left alone.
+        std::fs::write(slot.dir.join("camera.1.pose.json"), b"{}").expect("pose");
+        assert!(store.clear_analysis(&slot, "camera.0"));
+        assert!(!slot.dir.join("camera.0.pose.json").exists());
+        assert!(!slot.dir.join("camera.0.swing.json").exists());
+        assert!(slot.dir.join("camera.0.avi").exists(), "the clip stays");
+        assert!(slot.dir.join("camera.1.pose.json").exists());
+        let video = &store.videos("a")[0];
+        assert!(!video.pose && !video.swing);
+        assert_eq!(video.rotation, 0);
+        assert_eq!(video.analyzed_with, None);
+        assert!(store.file("a", "camera.0", "pose.json").is_none());
+        assert!(store.file("a", "camera.0", "swing.json").is_none());
+        // shot.json is rewritten.
+        let again = ClipStore::default();
+        again.load(&tmp.0, 20);
+        assert!(!again.videos("a")[0].pose);
+        // Clearing again finds nothing to delete and still succeeds; a
+        // camera with no clip, or a cleared history, does not.
+        assert!(store.clear_analysis(&slot, "camera.0"));
+        assert!(!store.clear_analysis(&slot, "camera.7"));
+        store.clear();
+        assert!(!store.clear_analysis(&slot, "camera.0"));
     }
 }

@@ -3,7 +3,7 @@
 //! its environment variable is set.
 //!
 //! - `FLIGHTHOOK_SCREENS_GRID_MS`: a time grid on the host clock. A `clip:`
-//!   camera puts its clip's labelled impact on a whole multiple of it, and
+//!   camera puts its clip's labeled impact on a whole multiple of it, and
 //!   every camera stamps a shot trigger at the next multiple at or after its
 //!   arrival, so a shot's clip holds the same frames, impact on the same
 //!   frame, whenever the shot arrives within one grid step.

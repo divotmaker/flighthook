@@ -279,11 +279,14 @@ fn start_live_worker(state: &Arc<SystemState>, actor: &str) -> Option<LiveWorker
         Box::new(move || live_settings(&settings_state, &settings_actor));
     let build_state = Arc::clone(state);
     let build_actor = actor.to_owned();
-    let build: live::Build = Box::new(move |s| {
+    let build: live::Build = Box::new(move |s, rotation| {
         let shared = build_state.pose.models.want(s.model).ready()?;
-        let made = shared
-            .fork()
-            .and_then(|m| m.tracker(models::pose_config(s.model, s.detect_every)));
+        let made = shared.fork().and_then(|m| {
+            m.tracker(stance::pose::PoseConfig {
+                rotation,
+                ..models::pose_config(s.model, s.detect_every)
+            })
+        });
         match made {
             Ok(tracker) => Some(Box::new(tracker) as Box<dyn live::Estimate>),
             Err(e) => {
@@ -309,7 +312,8 @@ fn start_live_worker(state: &Arc<SystemState>, actor: &str) -> Option<LiveWorker
 }
 
 /// What camera `actor`'s live view follows now: body tracking's settings,
-/// and the posture setup for the camera's position and the player's hand.
+/// the posture setup for the camera's position and the player's hand, and
+/// the camera's rotation.
 fn live_settings(state: &SystemState, actor: &str) -> live::LiveSettings {
     let index = actor.strip_prefix("camera.").unwrap_or("");
     let position = state
@@ -324,6 +328,8 @@ fn live_settings(state: &SystemState, actor: &str) -> live::LiveSettings {
             state.game.snapshot().handed,
             crate::pose::swing::mirrored(actor),
         ),
+        rotation: stance::pose::Rotation::from_degrees(state.system.camera_rotation(actor))
+            .unwrap_or_default(),
     }
 }
 
@@ -991,6 +997,8 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
         dropped: sidecar.dropped,
         pose: false,
         swing: false,
+        rotation: 0,
+        analyzed_with: None,
     };
     let done = state
         .clips
@@ -1638,6 +1646,15 @@ mod tests {
         ));
         assert!(matches!(
             outcome(&|s| s.latency_s = None),
+            ReconfigureOutcome::Applied
+        ));
+        // So are the rotation, yaw and pitch.
+        assert!(matches!(
+            outcome(&|s| {
+                s.rotation_deg = 90;
+                s.yaw_deg = Some(7.0);
+                s.pitch_deg = Some(-4.0);
+            }),
             ReconfigureOutcome::Applied
         ));
         assert!(matches!(
@@ -2330,7 +2347,7 @@ mod tests {
         let settings_actor = actor.to_owned();
         let settings: live::Settings =
             Box::new(move || live_settings(&settings_state, &settings_actor));
-        let build: live::Build = Box::new(|s| {
+        let build: live::Build = Box::new(|s, _| {
             BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             Some(live::tests::fake_tracker(
@@ -2422,7 +2439,7 @@ mod tests {
         let settings_actor = actor.to_owned();
         let settings: live::Settings =
             Box::new(move || live_settings(&settings_state, &settings_actor));
-        let build: live::Build = Box::new(|_| panic!("a broken model"));
+        let build: live::Build = Box::new(|_, _| panic!("a broken model"));
         let publish: live::Publish = Box::new(|_, _, _| {});
         LiveWorker::start(actor, settings, build, publish).ok()
     }
@@ -2537,6 +2554,7 @@ mod tests {
             detector: "fake".into(),
             width: sidecar.width,
             height: sidecar.height,
+            rotation: stance::pose::Rotation::None,
             frames: sidecar
                 .frames
                 .iter()
@@ -2557,7 +2575,7 @@ mod tests {
             })
             .expect("shot_pose");
         assert_eq!(done.actor, "camera.0");
-        let FlighthookEvent::ShotPose { keys } = done.event else {
+        let FlighthookEvent::ShotPose { keys, .. } = done.event else {
             unreachable!()
         };
         assert_eq!(keys, std::slice::from_ref(&a));
@@ -2652,6 +2670,15 @@ mod tests {
         let id = &a.shot_id;
         let analyze = format!("/api/shots/{id}/video/camera.0/analyze");
         assert_eq!(rig.row(&a, 1)["video"][0]["pose"], serde_json::Value::Null);
+        let grades = format!("/api/shots/{id}/grades/camera.0");
+        let (code, _, body) = rig.get(&grades, &[]);
+        assert_eq!(code, 404, "no grades before the swing analysis");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("camera.0"))
+        );
         // Viewed: queued, then tracked at once (no 3 s wait) with its events.
         let asked = Instant::now();
         let (code, body) = rig.post(&analyze);
@@ -2678,6 +2705,20 @@ mod tests {
             rig.get(&format!("/api/shots/{id}/video/camera.0.swing.json"), &[])
                 .0,
             200
+        );
+        // Graded once analyzed: the mock monitor names no club, so nothing
+        // is graded, and nothing is stored.
+        let (code, _, body) = rig.get(&grades, &[]);
+        assert_eq!(code, 200);
+        let body: flighthook::BodyGrades = serde_json::from_slice(&body).expect("grades");
+        assert_eq!(
+            (body.shot_id.as_str(), body.camera.as_str()),
+            (id.as_str(), "camera.0")
+        );
+        assert!(body.club_class.is_none() && body.references.is_empty());
+        assert_eq!(
+            rig.get(&format!("/api/shots/{id}/grades/camera.7"), &[]).0,
+            404
         );
         // Viewed again: done, nothing queued.
         let (code, body) = rig.post(&analyze);

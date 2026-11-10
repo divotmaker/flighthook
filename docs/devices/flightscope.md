@@ -232,7 +232,7 @@ the next shot without a restart.
 each shot with the device frames behind it: every frame from just before the
 BALL TRIGGER through the device re-armed, in both directions, as hex with its
 type and bus addresses — the shot texts, `E8`, `D4`, `ED`, `EF`, PRC and speed
-profile data, the Xi's other per-shot messages, and the acknowledgements and
+profile data, the Xi's other per-shot messages, and the acknowledgments and
 re-arm commands flighthook sends. Shots that produced no usable result
 (estimated-only, or a zero-speed full result) are included too.
 
@@ -255,7 +255,7 @@ Connects and reports shots. Feedback welcome on
 [issue #5](https://github.com/divotmaker/flighthook/issues/5).
 
 Add it as a normal `[mevo.N]` device; the Xi uses the same address and port
-(`192.168.2.1:5100`). flighthook recognises it during the handshake and shows
+(`192.168.2.1:5100`). flighthook recognizes it during the handshake and shows
 it as **FlightScope Xi**. The Xi does not report its SSID over its protocol, so
 its device identity is `FlightScope Xi (<address>)`.
 
@@ -290,7 +290,7 @@ What differs from the Mevo+:
   hex (`device refused a step, continuing: AVR 0x94 02303F`) and carries on
   with the rest, rather than waiting for a timeout and reconnecting.
 - **Flight results are acknowledged.** ironsight acknowledges each estimated
-  (E8) and full (D4) result from the Xi as it arrives. The acknowledgements
+  (E8) and full (D4) result from the Xi as it arrives. The acknowledgments
   appear in the shot export as sent frames. The Mevo+ and Mevo Gen2 need
   none.
 - **`range` and `surface_height` are sent** as the radar calibration (the
@@ -330,7 +330,7 @@ choosing `e8` there means choosing that value knowingly.
 | `auto` | E8 when flighthook is in Full mode, D4 otherwise | Same as whichever of the above applies |
 
 `d4` matches FS Golf. `e8` is steadier on full swings. `auto` gets `e8`'s
-behaviour on full swings and `d4`'s elsewhere, without having to switch the
+behavior on full swings and `d4`'s elsewhere, without having to switch the
 setting by hand.
 
 **Caveat for `auto`:** flighthook decides E8 vs. D4 from its own detection

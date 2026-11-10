@@ -1,6 +1,6 @@
 //! Body tracking of recorded swings (alpha): one background worker
 //! (`pose:clips`) finds the golfer's keypoints on every frame of a clip and
-//! stores them beside it as `<camera>.pose.json`, then analyses the swing
+//! stores them beside it as `<camera>.pose.json`, then analyzes the swing
 //! in them and stores `<camera>.swing.json` (a face-on or down-the-line
 //! camera only; see [`super::swing`]).
 //!
@@ -36,7 +36,7 @@ use flighthook::{
     BodyTrackingMode, CameraPosition, FlighthookEvent, FlighthookMessage, Handedness, PoseModel,
     ShotKey,
 };
-use stance::pose::{PoseConfig, PoseTrack};
+use stance::pose::{PoseConfig, PoseTrack, Rotation};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -153,13 +153,15 @@ pub fn clip_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| (n.get() / 4).max(1))
 }
 
-/// The clip pass's settings for `model`: [`clip_threads`] workers, each
-/// lowering its own priority first ([`super::priority::worker_hook`]),
-/// detecting every 10 frames.
-pub fn clip_config(model: PoseModel) -> PoseConfig {
+/// The clip pass's settings for `model` on a camera turned by `rotation`:
+/// [`clip_threads`] workers, each lowering its own priority first
+/// ([`super::priority::worker_hook`]), detecting every 10 frames, every
+/// frame turned upright before detection.
+pub fn clip_config(model: PoseModel, rotation: Rotation) -> PoseConfig {
     PoseConfig {
         threads: clip_threads(),
         on_worker_start: Some(super::priority::worker_hook()),
+        rotation,
         ..pose_config(model, PoseConfig::default().detect_every)
     }
 }
@@ -277,14 +279,19 @@ pub enum Requested {
 /// Track camera `camera`'s clip of shot `shot_id` now, for a viewer: queued
 /// first ([`ClipQueue::push`]), its pass starting at once, unless its
 /// keypoints are there already, it is already queued, or body tracking is
-/// off. The models load with the first such clip; while their files are
+/// off. With `force`, a clip tracked already has its body tracking and
+/// swing analysis deleted ([`ClipStore::clear_analysis`]) and is tracked
+/// again. The models load with the first such clip; while their files are
 /// not downloaded, the clip is left untracked. Its
 /// `shot_pose` and `shot_swing` go out on `bus` with the camera as their
 /// actor.
+///
+/// [`ClipStore::clear_analysis`]: crate::state::clips::ClipStore::clear_analysis
 pub fn request(
     state: &Arc<SystemState>,
     shot_id: &str,
     camera: &str,
+    force: bool,
     bus: &broadcast::Sender<FlighthookMessage>,
 ) -> Requested {
     let Some(clip) = state.clips.camera_clip(shot_id, camera) else {
@@ -293,7 +300,9 @@ pub fn request(
     if !state.system.body_tracking().mode.is_on() {
         return Requested::Off;
     }
-    if clip.video.pose {
+    if force {
+        state.clips.clear_analysis(&clip.slot, camera);
+    } else if clip.video.pose {
         return Requested::Done;
     }
     if state.pose.clips.has(&clip.slot.id, camera) {
@@ -475,7 +484,8 @@ fn process(state: &SystemState, job: &ClipJob, model: PoseModel, analyze: Analyz
     if !state.clips.is_current(&job.slot) {
         return false;
     }
-    let config = clip_config(model);
+    let rotation = state.system.camera_rotation(camera);
+    let config = clip_config(model, Rotation::from_degrees(rotation).unwrap_or_default());
     let threads = config.threads;
     let started = Instant::now();
     let track = match analyze(&job.avi, &config) {
@@ -499,31 +509,49 @@ fn process(state: &SystemState, job: &ClipJob, model: PoseModel, analyze: Analyz
             return false;
         }
     };
-    if !state.clips.set_pose(&job.slot, camera) {
+    if !state.clips.set_pose(&job.slot, camera, rotation) {
         let _ = std::fs::remove_file(&path);
         return false;
     }
-    let frames = track.frames.len();
     let found = track
         .frames
         .iter()
         .filter(|f| !f.keypoints.is_empty())
         .count();
-    // Frame counts are far below 2^52.
-    #[allow(clippy::cast_precision_loss)]
-    let per_frame = took.as_secs_f64() * 1000.0 / frames.max(1) as f64;
+    let shot_id = job.keys.first().map_or("-", |k| k.shot_id.as_str());
     info!(
-        "{camera}: body tracking of a {frames}-frame clip in {:.1} s ({per_frame:.1} ms a frame, {threads} threads, golfer on {found} frames)",
-        took.as_secs_f64(),
+        "{}",
+        timing_line(camera, shot_id, track.frames.len(), took, threads, found)
     );
     announce(
         job,
         FlighthookEvent::ShotPose {
             keys: job.keys.clone(),
+            rotation,
         },
     );
     swing(state, job, &track);
     true
+}
+
+/// The log line of one clip pass, to size a computer for body tracking:
+/// `body tracking: <camera> shot <id>: <frames> frames in <s> s (<threads>
+/// threads)`, then the time a frame and the frames the golfer was found on.
+fn timing_line(
+    camera: &str,
+    shot_id: &str,
+    frames: usize,
+    took: Duration,
+    threads: usize,
+    found: usize,
+) -> String {
+    // Frame counts are far below 2^52.
+    #[allow(clippy::cast_precision_loss)]
+    let per_frame = took.as_secs_f64() * 1000.0 / frames.max(1) as f64;
+    format!(
+        "body tracking: {camera} shot {shot_id}: {frames} frames in {:.1} s ({threads} threads) · {per_frame:.1} ms a frame, golfer on {found} frames",
+        took.as_secs_f64(),
+    )
 }
 
 /// Send `event` for `job`'s clip, with its camera as the actor.
@@ -533,7 +561,7 @@ fn announce(job: &ClipJob, event: FlighthookEvent) {
     let _ = job.bus.send(msg);
 }
 
-/// Analyse the swing in `track`, `job`'s keypoints, store it beside the
+/// Analyze the swing in `track`, `job`'s keypoints, store it beside the
 /// clip and announce it. Returns whether the swing file is kept.
 fn swing(state: &SystemState, job: &ClipJob, track: &PoseTrack) -> bool {
     let camera = &job.camera;
@@ -541,7 +569,7 @@ fn swing(state: &SystemState, job: &ClipJob, track: &PoseTrack) -> bool {
         position: job.position,
         hand: job.hand,
         impact_ns: job.impact_ns,
-        height_cm: state.system.body_tracking().golfer_height,
+        height_cm: state.system.player().height,
         mirrored: super::swing::mirrored(camera),
     };
     let written = match write_report(camera, track, &job.avi, &input) {
@@ -665,6 +693,8 @@ mod tests {
             dropped: 0,
             pose: false,
             swing: false,
+            rotation: 0,
+            analyzed_with: None,
         };
         assert!(state.clips.finish(&slot, video, 20).kept);
         ClipJob {
@@ -692,6 +722,7 @@ mod tests {
             detector: "fake".into(),
             width: 64,
             height: 48,
+            rotation: Rotation::None,
             frames: (0..frames as u64)
                 .map(|i| stance::pose::PoseFrame::empty(i * 33_333_333))
                 .collect(),
@@ -765,6 +796,114 @@ mod tests {
     }
 
     #[test]
+    fn the_cameras_rotation_reaches_the_pass_and_is_recorded() {
+        let (dir, state) = state();
+        state.system.update(|c| {
+            c.camera.insert(
+                "0".into(),
+                flighthook::CameraSection {
+                    camera: flighthook::CameraSection::TEST_PATTERN.into(),
+                    rotation_deg: 90,
+                    ..flighthook::CameraSection::default()
+                },
+            );
+        });
+        let mut job = clip(&state, &dir, 1);
+        let (tx, mut rx) = broadcast::channel(16);
+        job.bus = tx;
+        let seen = Mutex::new(None);
+        assert!(process(&state, &job, PoseModel::RtmposeM, &|_, config| {
+            *seen.lock().unwrap() = Some(config.rotation);
+            Ok(track(3))
+        }));
+        assert_eq!(*seen.lock().unwrap(), Some(Rotation::Cw90));
+        let video = &state.clips.videos("shot-1")[0];
+        assert_eq!(video.rotation, 90);
+        assert_eq!(video.analyzed_with.as_deref(), Some(stance::VERSION));
+        let msg = rx.try_recv().expect("shot_pose");
+        assert!(matches!(
+            msg.event,
+            FlighthookEvent::ShotPose { rotation: 90, .. }
+        ));
+        // A rotation that is not one of the four is no rotation.
+        state
+            .system
+            .update(|c| c.camera.get_mut("0").unwrap().rotation_deg = 45);
+        assert!(process(&state, &job, PoseModel::RtmposeM, &|_, config| {
+            *seen.lock().unwrap() = Some(config.rotation);
+            Ok(track(3))
+        }));
+        assert_eq!(*seen.lock().unwrap(), Some(Rotation::None));
+        assert_eq!(state.clips.videos("shot-1")[0].rotation, 0);
+    }
+
+    #[test]
+    fn clip_config_carries_the_rotation() {
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Half,
+            Rotation::Ccw90,
+        ] {
+            let config = clip_config(PoseModel::RtmposeS, rotation);
+            assert_eq!(config.rotation, rotation);
+            assert_eq!(config.threads, clip_threads());
+        }
+    }
+
+    #[test]
+    fn the_timing_line_names_the_camera_shot_frames_time_and_threads() {
+        let line = timing_line(
+            "camera.0",
+            "4f2c9e1a-77d0-4c43-9b54-2e1f0d6c8a11",
+            240,
+            Duration::from_millis(2304),
+            12,
+            238,
+        );
+        assert_eq!(
+            line,
+            "body tracking: camera.0 shot 4f2c9e1a-77d0-4c43-9b54-2e1f0d6c8a11: 240 frames in 2.3 s (12 threads) · 9.6 ms a frame, golfer on 238 frames"
+        );
+        // The prefix A5 asks for, whatever follows it.
+        let prefix = regex_lite_prefix(&line);
+        assert_eq!(
+            prefix,
+            Some((
+                "camera.0".to_owned(),
+                "4f2c9e1a-77d0-4c43-9b54-2e1f0d6c8a11".to_owned(),
+                240,
+                "2.3".to_owned(),
+                12
+            ))
+        );
+        // No frames: no division by zero.
+        let empty = timing_line("camera.1", "s", 0, Duration::from_millis(40), 1, 0);
+        assert!(
+            empty.starts_with("body tracking: camera.1 shot s: 0 frames in 0.0 s (1 threads)"),
+            "{empty}"
+        );
+    }
+
+    /// `body tracking: <camera> shot <id>: <frames> frames in <s> s
+    /// (<threads> threads)` read back from the start of `line`.
+    fn regex_lite_prefix(line: &str) -> Option<(String, String, usize, String, usize)> {
+        let rest = line.strip_prefix("body tracking: ")?;
+        let (camera, rest) = rest.split_once(" shot ")?;
+        let (id, rest) = rest.split_once(": ")?;
+        let (frames, rest) = rest.split_once(" frames in ")?;
+        let (secs, rest) = rest.split_once(" s (")?;
+        let (threads, _) = rest.split_once(" threads)")?;
+        Some((
+            camera.to_owned(),
+            id.to_owned(),
+            frames.parse().ok()?,
+            secs.to_owned(),
+            threads.parse().ok()?,
+        ))
+    }
+
+    #[test]
     fn a_tracked_clip_gets_its_pose_file_and_one_shot_pose_event() {
         let (dir, state) = state();
         let mut job = clip(&state, &dir, 1);
@@ -794,7 +933,9 @@ mod tests {
         );
         let msg = rx.try_recv().expect("shot_pose");
         assert_eq!(msg.actor, "camera.0");
-        assert!(matches!(msg.event, FlighthookEvent::ShotPose { ref keys } if keys == &[key(1)]));
+        assert!(
+            matches!(msg.event, FlighthookEvent::ShotPose { ref keys, .. } if keys == &[key(1)])
+        );
         assert!(rx.try_recv().is_err(), "one event");
     }
 
@@ -802,9 +943,7 @@ mod tests {
     fn the_swing_file_follows_the_pose_file_with_the_shots_hand_impact_and_height() {
         use stance::golf::{Handed, SwingReport, View};
         let (dir, state) = state();
-        state
-            .system
-            .update(|c| c.body_tracking.golfer_height = Some(175.0));
+        state.system.update(|c| c.player.height = Some(175.0));
         let mut job = clip(&state, &dir, 1);
         let (tx, mut rx) = broadcast::channel(16);
         job.bus = tx;
@@ -998,25 +1137,28 @@ mod tests {
         let job = clip(&state, &dir, 1);
         let (tx, mut rx) = broadcast::channel(16);
         assert_eq!(
-            request(&state, "shot-9", "camera.0", &tx),
+            request(&state, "shot-9", "camera.0", false, &tx),
             Requested::NoClip
         );
         assert_eq!(
-            request(&state, "shot-1", "camera.1", &tx),
+            request(&state, "shot-1", "camera.1", false, &tx),
             Requested::NoClip
         );
         set_mode(&state, BodyTrackingMode::Off);
-        assert_eq!(request(&state, "shot-1", "camera.0", &tx), Requested::Off);
+        assert_eq!(
+            request(&state, "shot-1", "camera.0", false, &tx),
+            Requested::Off
+        );
         assert!(!state.pose.clips.working());
         set_mode(&state, BodyTrackingMode::Historical);
         // Hold the worker off to see the queue.
         state.pose.clips.inner.lock().unwrap().working = true;
         assert_eq!(
-            request(&state, "shot-1", "camera.0", &tx),
+            request(&state, "shot-1", "camera.0", false, &tx),
             Requested::Queued
         );
         assert_eq!(
-            request(&state, "shot-1", "camera.0", &tx),
+            request(&state, "shot-1", "camera.0", false, &tx),
             Requested::Queued
         );
         assert_eq!(state.pose.clips.waiting(), std::slice::from_ref(&job.avi));
@@ -1034,10 +1176,58 @@ mod tests {
         assert!(queued.job.on_demand);
         state.pose.clips.push(&state, queued.job, 8);
         let first = rx.blocking_recv().expect("shot_pose");
-        assert!(matches!(first.event, FlighthookEvent::ShotPose { ref keys } if keys == &[key(1)]));
+        assert!(
+            matches!(first.event, FlighthookEvent::ShotPose { ref keys, .. } if keys == &[key(1)])
+        );
         assert_eq!(first.actor, "camera.0");
         assert!(job.slot.dir.join("camera.0.pose.json").exists());
-        assert_eq!(request(&state, "shot-1", "camera.0", &tx), Requested::Done);
+        assert_eq!(
+            request(&state, "shot-1", "camera.0", false, &tx),
+            Requested::Done
+        );
+    }
+
+    #[test]
+    fn a_forced_request_clears_a_done_clip_and_queues_it_again() {
+        let (dir, state) = state();
+        set_mode(&state, BodyTrackingMode::Historical);
+        let job = clip(&state, &dir, 1);
+        let (tx, _rx) = broadcast::channel(16);
+        assert!(process(&state, &job, PoseModel::RtmposeM, &|_, _| Ok(
+            crate::pose::swing::tests::swing_track()
+        )));
+        let pose = job.slot.dir.join("camera.0.pose.json");
+        assert!(pose.exists());
+        assert!(state.clips.videos("shot-1")[0].pose);
+        assert_eq!(
+            request(&state, "shot-1", "camera.0", false, &tx),
+            Requested::Done
+        );
+        // Off: nothing is cleared.
+        set_mode(&state, BodyTrackingMode::Off);
+        assert_eq!(
+            request(&state, "shot-1", "camera.0", true, &tx),
+            Requested::Off
+        );
+        assert!(pose.exists());
+        set_mode(&state, BodyTrackingMode::Historical);
+        // Hold the worker off to see the queue.
+        state.pose.clips.inner.lock().unwrap().working = true;
+        assert_eq!(
+            request(&state, "shot-1", "camera.0", true, &tx),
+            Requested::Queued
+        );
+        assert!(!pose.exists(), "the old keypoints are gone");
+        assert!(!job.slot.dir.join("camera.0.swing.json").exists());
+        let video = &state.clips.videos("shot-1")[0];
+        assert!(!video.pose && !video.swing);
+        assert_eq!(state.pose.clips.waiting(), std::slice::from_ref(&job.avi));
+        // Asked again while it waits: still queued once.
+        assert_eq!(
+            request(&state, "shot-1", "camera.0", true, &tx),
+            Requested::Queued
+        );
+        assert_eq!(state.pose.clips.waiting().len(), 1);
     }
 
     #[test]
@@ -1161,7 +1351,7 @@ mod tests {
             .collect();
         let config = PoseConfig {
             threads: 2,
-            ..clip_config(PoseModel::RtmposeM)
+            ..clip_config(PoseModel::RtmposeM, Rotation::None)
         };
         let caller = std::thread::spawn(move || {
             stance::pose::analyze_frames(&models, &frames, &config).expect("pass");
@@ -1205,7 +1395,7 @@ mod tests {
             }
         };
         let forked = shared.fork().expect("fork");
-        let config = clip_config(model);
+        let config = clip_config(model, Rotation::None);
         let (took, frames) = std::thread::spawn(move || {
             super::super::priority::lower_this_thread();
             let started = Instant::now();

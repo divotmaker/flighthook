@@ -78,8 +78,8 @@ flighthook's own simulated values (carry, apex, roll, ...) are never sent.
 | FaceAngle | face angle | degrees, + right of the target line (open for a right-hander) |
 | ClubPath | club path | degrees, + right of the target line |
 | AttackAngle | attack angle | degrees, + up |
-| ImpactPointX | face impact, horizontal | mm from the centre, + toward the toe |
-| ImpactPointY | face impact, vertical | mm from the centre, + above |
+| ImpactPointX | face impact, horizontal | mm from the center, + toward the toe |
+| ImpactPointY | face impact, vertical | mm from the center, + above |
 
 Pureplay Connect version 1 does not say which way SideSpin's sign points.
 flighthook sends it as above, + curving right, the same way as SpinAxis.
@@ -147,7 +147,7 @@ Every launch monitor flighthook supports falls into one of three classes:
   - the ExPutt's launch angle, which the device does not measure (flighthook
     uses 0);
   - the Square Golf Omni's vertical face impact, which includes the
-    per-club offset from the club sticker to the face centre (horizontal
+    per-club offset from the club sticker to the face center (horizontal
     impact is sent).
 
   Smash factor goes out only when the launch monitor measured it, and
@@ -187,7 +187,7 @@ Pureplay that offers only a protocol version flighthook does not speak.
 
 ## Limits
 
-- A launch monitor's state is learnt from its own updates. When the
+- A launch monitor's state is learned from its own updates. When the
   Pureplay output starts while a launch monitor is already connected (the
   card was just added or saved), Pureplay sees *Not ready* until that monitor
   next reports that it is ready, which also counts as connected.

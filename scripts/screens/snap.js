@@ -13,11 +13,11 @@
 //   { move: [x, y] }         move the pointer there
 //   { settle: true }         wait until the picture stops changing
 //   { waitPixel: { box: [x0, y0, x1, y1], rgb: [r, g, b], tol, stableMs } }
-//                            wait until the box shows that colour in the same
+//                            wait until the box shows that color in the same
 //                            place for stableMs (the page may be animating)
 //   { clickPixel: { box: [x0, y0, x1, y1], rgb: [r, g, b], tol } }
 //                            click the middle of the first run of pixels of
-//                            that colour, scanning the box row by row
+//                            that color, scanning the box row by row
 // Every image ends with a settle (quiet for the spec's quietMs, default
 // 1.2 s); `crop: { card: [x, y], margin }` keeps only the card around (x, y).
 

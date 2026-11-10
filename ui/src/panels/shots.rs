@@ -329,7 +329,7 @@ const TABLE_DISPERSION_HEIGHT: std::ops::RangeInclusive<f32> =
 /// a narrow Table.
 const SHARED_PLOT_MIN: f32 = 144.0;
 const TABLE_PLOT_MIN: f32 = 200.0;
-/// Gap between a chart and its neighbour.
+/// Gap between a chart and its neighbor.
 const CHART_GAP: f32 = 14.0;
 
 /// Height of a bottom row whose Dispersion plot is `plot` tall under a
@@ -360,9 +360,9 @@ struct ChartSlots {
 /// The charts' places for `view` in a window of `window` size.
 ///
 /// - Cards, wide: Dispersion in the right-hand column, Flight along the
-///   bottom of the centre.
+///   bottom of the center.
 /// - Cards, narrow: Flight and Dispersion side by side in the bottom row,
-///   so the cards keep the centre's width.
+///   so the cards keep the center's width.
 /// - Table, wide: Dispersion in the right-hand column.
 /// - Table, narrow: Dispersion along the bottom.
 fn chart_slots(view: ShotsView, window: egui::Vec2) -> ChartSlots {
@@ -413,7 +413,7 @@ fn bottom_height(height: f32, row: BottomRow, width: f32) -> f32 {
     height.max(CHART_GAP + header + dispersion::PLOT_PAD + plot)
 }
 
-/// Centred placeholder for a view with no shot to show.
+/// Centered placeholder for a view with no shot to show.
 pub(super) fn empty_state(ui: &mut egui::Ui, detail: &str) {
     let top = ui.available_height() * 0.36;
     ui.vertical_centered(|ui| {
@@ -859,7 +859,7 @@ fn card_metrics(
     (headline, groups)
 }
 
-/// Gap between neighbouring cards in a row.
+/// Gap between neighboring cards in a row.
 const CARD_GAP: f32 = 12.0;
 /// Gap between detail groups side by side.
 const GROUP_GAP: f32 = 28.0;
@@ -931,7 +931,7 @@ const ROOMY: Rhythm = Rhythm {
 };
 
 /// The smallest sizes. Short of room the view shrinks every size of
-/// [`ROOMY`] towards these by the same share; below them it scrolls.
+/// [`ROOMY`] toward these by the same share; below them it scrolls.
 const COMPACT: Rhythm = Rhythm {
     header: 28.0,
     header_gap: 6.0,
@@ -1227,7 +1227,7 @@ fn card_columns(w: f32, head_w: f32, square: f32, want: usize) -> Vec<egui::Rang
 /// Everything fits the height whenever it can. With room to spare, the
 /// sizes are [`ROOMY`], the cards grow with the height up to a limit, and
 /// what is still spare is split above and below. Short of room, every
-/// height (cards, bar rows, label lines and gaps) shrinks towards
+/// height (cards, bar rows, label lines and gaps) shrinks toward
 /// [`COMPACT`] by the same share, just enough to fit. Shorter still, the
 /// sizes stay [`COMPACT`] and `scrolls` is set.
 fn cards_layout(
@@ -1540,7 +1540,7 @@ pub(crate) const NUMERAL_FLOOR: f32 = 8.0;
 pub(crate) const WORD_MIN: f32 = 9.0;
 
 /// `m`'s reading at numeral size `size` within `room`: the sign word starts
-/// at the word unit's size and shrinks towards [`WORD_MIN`] to fit; only
+/// at the word unit's size and shrinks toward [`WORD_MIN`] to fit; only
 /// when it still doesn't fit does this card's numeral shrink. Returns the
 /// reading and its numeral size.
 fn fitted_reading(painter: &egui::Painter, m: &Metric, size: f32, room: f32) -> (Reading, f32) {
@@ -1571,7 +1571,7 @@ fn fitted_reading(painter: &egui::Painter, m: &Metric, size: f32, room: f32) -> 
 
 impl Reading {
     /// `distinguish_source` applies the simulated-value styling (a muted
-    /// colour); when false, every value but a missing one reads as plain
+    /// color); when false, every value but a missing one reads as plain
     /// text regardless of its source. Values are always upright: italics
     /// for simulated values is Table's own thing (`cell`), not drawn here.
     fn new(
@@ -1749,7 +1749,7 @@ fn card(ui: &egui::Ui, rect: egui::Rect, m: &Metric, look: CardLook, pulse: f32)
         });
     }
 
-    // Centre the numeral's digits in the space under the label.
+    // Center the numeral's digits in the space under the label.
     let (reading, size) = fitted_reading(painter, m, look.value, rect.width() - 2.0 * pad);
     let middle = (label_bottom + rect.bottom()) / 2.0;
     let digits_middle = reading.value.size().y - (DESCENT + DIGIT_HEIGHT / 2.0) * size;
@@ -1915,7 +1915,7 @@ const AVG_DOT_HALO: f32 = 1.0;
 const SHOT_LINE_HALO: f32 = 1.0;
 /// Padding around the distance domain, as a share of its range.
 const DISTANCE_PAD: f64 = 0.15;
-/// Least padding around the distance domain, in yards and in metres.
+/// Least padding around the distance domain, in yards and in meters.
 const DISTANCE_PAD_YD: f64 = 10.0;
 const DISTANCE_PAD_M: f64 = 9.0;
 /// Least half-width of the lateral domain before its margin, in display units.
@@ -2058,7 +2058,7 @@ fn bar_x(domain: (f64, f64), x: egui::Rangef, v: f64) -> f32 {
 }
 
 /// The horizontal extent of the band from `min` to `max` on the plot span
-/// `x`: at least `PIP_W` wide, centred on the values when narrower.
+/// `x`: at least `PIP_W` wide, centered on the values when narrower.
 fn band_x(domain: (f64, f64), x: egui::Rangef, min: f64, max: f64) -> egui::Rangef {
     let (a, b) = (bar_x(domain, x, min), bar_x(domain, x, max));
     if b - a >= PIP_W {
@@ -2088,10 +2088,10 @@ pub(super) fn bar_group<'a>(
         .or_else(|| groups.current_group(club))
 }
 
-/// One device's share of a range bar, drawn as a sub-band in its colour.
+/// One device's share of a range bar, drawn as a sub-band in its color.
 #[derive(Debug)]
 struct DeviceBand {
-    colour: egui::Color32,
+    color: egui::Color32,
     stats: Option<Stats>,
 }
 
@@ -2113,7 +2113,7 @@ struct Bar {
 /// The range bars over the rows `members` (indices into `shots`), with the
 /// shown shot `shots[shown]` marked when it is a member. With two or more
 /// `devices` (exact actor ids, sorted), each bar also splits into one
-/// sub-band per device, coloured by `chart::device_colour`.
+/// sub-band per device, colored by `chart::device_color`.
 fn bars_for(
     shots: &[ShotRow],
     members: &[usize],
@@ -2134,7 +2134,7 @@ fn bars_for(
             devices
                 .iter()
                 .map(|id| DeviceBand {
-                    colour: chart::device_colour(devices, id),
+                    color: chart::device_color(devices, id),
                     stats: Stats::of(
                         bar_values(rows().filter(|r| r.actor == *id), kind, imperial).values,
                     ),
@@ -2183,7 +2183,7 @@ fn shot_count(n: usize) -> String {
     }
 }
 
-/// Title and colour of the range bar section in `view`, around the set
+/// Title and color of the range bar section in `view`, around the set
 /// `set`, over `members` of `shots`; `session` is the current session.
 ///
 /// - By set: the set's header. Its count is the set's own without its
@@ -2327,7 +2327,7 @@ fn bar_tooltip(bar: &Bar) -> String {
 }
 
 /// Paint the legend of the range bars, right-aligned at `right` on the line
-/// through `mid`, with a colour chip per device in `chips` on its left.
+/// through `mid`, with a color chip per device in `chips` on its left.
 /// Returns its left edge.
 fn bars_legend(
     painter: &egui::Painter,
@@ -2397,7 +2397,7 @@ fn bars_legend(
         }
         x -= 16.0;
     }
-    for (name, colour) in chips.iter().rev() {
+    for (name, color) in chips.iter().rev() {
         let galley =
             painter.layout_no_wrap(name.clone(), FontId::proportional(11.0), theme::TEXT_MUTED);
         x -= galley.size().x;
@@ -2408,7 +2408,7 @@ fn bars_legend(
         );
         x -= 5.0;
         let swatch = egui::Rect::from_min_max(pos2(x - 8.0, mid - 4.0), pos2(x, mid + 4.0));
-        painter.rect_filled(swatch, egui::CornerRadius::same(2), *colour);
+        painter.rect_filled(swatch, egui::CornerRadius::same(2), *color);
         x -= 8.0 + 12.0;
     }
     x + if chips.is_empty() { 16.0 } else { 12.0 }
@@ -2500,12 +2500,12 @@ fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
     let plot = egui::Rangef::new(track.left() + GUTTER, track.right() - GUTTER);
     if let (Some(s), Some(domain)) = (&bar.stats, bar.domain) {
         let band = band_x(domain, plot, s.min, s.max);
-        let paint_band = |x: egui::Rangef, y: egui::Rangef, colour: egui::Color32| {
+        let paint_band = |x: egui::Rangef, y: egui::Rangef, color: egui::Color32| {
             painter.rect(
                 egui::Rect::from_x_y_ranges(x, y),
                 egui::CornerRadius::same((x.span().min(y.span()) / 2.0) as u8),
-                colour.gamma_multiply(0.28),
-                Stroke::new(1.0, colour.gamma_multiply(0.6)),
+                color.gamma_multiply(0.28),
+                Stroke::new(1.0, color.gamma_multiply(0.6)),
                 StrokeKind::Inside,
             );
         };
@@ -2520,7 +2520,7 @@ fn bar_row(ui: &egui::Ui, row: egui::Rect, bar: &Bar) {
                 .zip(sub_bands(track.y_range(), bar.devices.len()))
             {
                 if let Some(ds) = &d.stats {
-                    paint_band(band_x(domain, plot, ds.min, ds.max), y, d.colour);
+                    paint_band(band_x(domain, plot, ds.min, ds.max), y, d.color);
                 }
             }
         }
@@ -2789,7 +2789,7 @@ fn stats_card(
     // last row the card's foot; else spread down the card under the title.
     let aligned = rows.map(|r| r.center().y);
     let foot = rect.bottom() - impact::PAD / 2.0;
-    let centres = if aligned[0] - row_h / 2.0 - head_h - 2.0 >= title_bottom + 2.0
+    let centers = if aligned[0] - row_h / 2.0 - head_h - 2.0 >= title_bottom + 2.0
         && aligned[2] + row_h / 2.0 <= foot
     {
         aligned
@@ -2799,13 +2799,13 @@ fn stats_card(
         std::array::from_fn(|k| top + slot * (k as f32 + 0.5))
     };
 
-    let head_bottom = centres[0] - row_h / 2.0 - 2.0;
+    let head_bottom = centers[0] - row_h / 2.0 - 2.0;
     for (head, right) in heads.into_iter().zip(table.columns) {
         let pos = pos2(left + right - head.size().x, head_bottom - head_h);
         painter.galley(pos, head, theme::TEXT_MUTED);
     }
     let right = left + table.columns[2];
-    for ((bar, text), c) in bars.iter().zip(&texts).zip(centres) {
+    for ((bar, text), c) in bars.iter().zip(&texts).zip(centers) {
         let top = c - row_h / 2.0;
         let first_mid = top + first_h / 2.0;
         let second_mid = top + first_h + (row_h - first_h) / 2.0;
@@ -2829,7 +2829,7 @@ fn stats_card(
             egui::FontId::proportional(STATS_UNIT),
             theme::TEXT_DIM,
         );
-        let colour = if bar.stats.is_some() {
+        let color = if bar.stats.is_some() {
             theme::TEXT
         } else {
             theme::TEXT_DIM
@@ -2840,7 +2840,7 @@ fn stats_card(
                 Align2::RIGHT_CENTER,
                 value,
                 egui::FontId::proportional(table.value),
-                colour,
+                color,
             );
         }
         if let Some(count) = &text.count {
@@ -3654,7 +3654,7 @@ impl FlighthookApp {
     }
 
     fn render_shots_toolbar(&mut self, ui: &mut egui::Ui) {
-        // A fixed row height, taller than any item, so every item centres on
+        // A fixed row height, taller than any item, so every item centers on
         // the same line.
         let row = egui::vec2(ui.available_width(), 38.0);
         let layout = egui::Layout::left_to_right(egui::Align::Center);
@@ -3669,6 +3669,9 @@ impl FlighthookApp {
             // pane; the Cards | Table choice is kept while it is hidden.
             if self.render_live_toggle(ui) {
                 ui.add_space(12.0);
+                if self.render_reference_picker(ui) {
+                    ui.add_space(12.0);
+                }
             } else {
                 let current = ShotsView::ALL
                     .iter()
@@ -4263,7 +4266,7 @@ impl FlighthookApp {
                     i,
                     set.and_then(|g| g.club).or(self.selected_club),
                     self.handed,
-                    |s| chart::shot_colour(&devices, filter, &s.actor),
+                    |s| chart::shot_color(&devices, filter, &s.actor),
                     |s| {
                         several.then(|| {
                             let name = self.actors.get(&s.actor).map(|a| a.name.as_str());
@@ -4292,7 +4295,7 @@ impl FlighthookApp {
                     .into_iter()
                     .skip(1)
                     .zip(&devices)
-                    .map(|(label, id)| (label, chart::device_colour(&devices, id)))
+                    .map(|(label, id)| (label, chart::device_color(&devices, id)))
                     .collect(),
                 _ => Vec::new(),
             };
@@ -4602,7 +4605,7 @@ struct TableColumn {
 }
 
 /// The Table view's columns: Device (when `show_device`), `#`, Club, the
-/// ball columns, the club columns, then face impact (millimetres in both
+/// ball columns, the club columns, then face impact (millimeters in both
 /// unit systems).
 fn table_columns(show_device: bool, imperial: bool) -> Vec<TableColumn> {
     let (speed, dist, height) = table_header_units(imperial);
@@ -5922,7 +5925,7 @@ mod tests {
         let total = stats(&[230.0, 250.0]);
         let carry = stats(&[210.0, 225.0]);
         assert_eq!(distance_domain(&[total, carry], true), Some((200.0, 260.0)));
-        // Metres have a 9 m floor.
+        // Meters have a 9 m floor.
         assert_eq!(
             distance_domain(&[total, carry], false),
             Some((201.0, 259.0))
@@ -5974,7 +5977,7 @@ mod tests {
 
     #[test]
     fn coincident_markers_nest_with_expected_sizes() {
-        // The average dot fits inside the median ring's hollow centre, so a
+        // The average dot fits inside the median ring's hollow center, so a
         // value shared by every marker reads as a ring filled by the dot,
         // with the this-shot line drawn through both.
         let ring_inner_radius = MEDIAN_RING_RADIUS - MEDIAN_RING_STROKE / 2.0;
@@ -6199,7 +6202,7 @@ mod tests {
             .into_iter()
             .map(|(t, _)| t)
             .collect();
-        // The band ends are labelled ...
+        // The band ends are labeled ...
         for label in ["163", "181", "153", "171", "10.0 L", "4.9 R"] {
             assert!(texts.iter().any(|t| t == label), "{label} in {texts:?}");
         }
@@ -7155,7 +7158,7 @@ mod tests {
     }
 
     #[test]
-    fn apex_card_is_labelled_feet_in_imperial_and_metres_in_metric() {
+    fn apex_card_is_labeled_feet_in_imperial_and_meters_in_metric() {
         let mut shot = row(1, true);
         shot.ball.as_mut().unwrap().max_height = Some(Distance::Meters(31.2));
 
@@ -7275,26 +7278,26 @@ mod tests {
         // The whole bar is unchanged by the split.
         assert_eq!(total.stats.map(|s| (s.min, s.max)), Some((240.0, 252.0)));
         assert_eq!(total.this, Some(252.0));
-        // One band per device, in sorted id order and its device colour.
+        // One band per device, in sorted id order and its device color.
         let bands = |b: &Bar| {
             b.devices
                 .iter()
-                .map(|d| (d.colour, d.stats.map(|s| (s.min, s.max))))
+                .map(|d| (d.color, d.stats.map(|s| (s.min, s.max))))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
             bands(&total),
             vec![
-                (theme::DEVICE_COLOURS[0], Some((250.0, 252.0))),
-                (theme::DEVICE_COLOURS[1], Some((240.0, 244.0))),
+                (theme::DEVICE_COLORS[0], Some((250.0, 252.0))),
+                (theme::DEVICE_COLORS[1], Some((240.0, 244.0))),
             ]
         );
         assert_eq!(carry.devices.len(), 2);
         assert_eq!(
             bands(&lateral),
             vec![
-                (theme::DEVICE_COLOURS[0], Some((2.0, 4.0))),
-                (theme::DEVICE_COLOURS[1], Some((-3.0, -1.0))),
+                (theme::DEVICE_COLORS[0], Some((2.0, 4.0))),
+                (theme::DEVICE_COLORS[1], Some((-3.0, -1.0))),
             ]
         );
         // A device with no value in a bar keeps its slot, empty.
@@ -7346,7 +7349,7 @@ mod tests {
         .collect();
         assert_eq!(device_options(&[], &actors), None);
         assert_eq!(device_options(&["mevo.0".into()], &actors), None);
-        // An unnamed or unknown device is labelled by its id.
+        // An unnamed or unknown device is labeled by its id.
         let ids: Vec<String> = ["mevo.0", "openconnect_server", "square.0"]
             .map(String::from)
             .to_vec();
@@ -7642,7 +7645,7 @@ mod tests {
                     .show(ctx, |ui| app.render_shots_toolbar(ui));
             });
         };
-        // The icon is the toolbar's rightmost item, on its centre line.
+        // The icon is the toolbar's rightmost item, on its center line.
         let at = pos2(1600.0 - 6.0, 19.0);
         let button = |pressed| Event::PointerButton {
             pos: at,
@@ -8813,6 +8816,8 @@ mod tests {
             dropped: 0,
             pose: false,
             swing: false,
+            rotation: 0,
+            analyzed_with: None,
         }
     }
 

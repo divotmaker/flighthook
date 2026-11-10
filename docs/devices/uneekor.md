@@ -43,7 +43,7 @@ Third-party output is licensed separately by Uneekor and it varies by model:
 
 - **EYE MINI family** — needs the Pro subscription (~$199/yr).
 - **Legacy QED and EYE XO** — many units carry a *perpetual* third-party
-  licence tied to the device serial number.
+  license tied to the device serial number.
 
 Check what your unit has before buying anything.
 

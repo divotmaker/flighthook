@@ -4,7 +4,7 @@
 //!
 //! While any card has unsaved edits the tab is locked to it: the tab bar,
 //! the other cards' toggles and edit controls, and the (+) buttons are
-//! disabled until the edits are saved or cancelled. While a save is out,
+//! disabled until the edits are saved or canceled. While a save is out,
 //! every card's controls wait for its reply.
 
 use std::collections::HashMap;
@@ -229,6 +229,9 @@ struct CardView<'a> {
     monitors: &'a [(String, String)],
     /// The camera list, for a camera card's picker.
     cameras: &'a crate::app::CameraList,
+    /// A camera card's rotation, clockwise degrees, for its still frame:
+    /// the card's own setting, saved or not.
+    rotation: u16,
 }
 
 /// One device card. Its header holds the name on the left and, on the
@@ -240,7 +243,7 @@ struct CardView<'a> {
 /// on a launch monitor's or output's card (disabled while one is in flight
 /// and while the tab is locked), then Find mat on an ExPutt's, enabled while
 /// it is connected, and Still frame on a camera's (`still`), whose frame
-/// shows in the body. The left stripe is the actor's status colour, dim while
+/// shows in the body. The left stripe is the actor's status color, dim while
 /// it is not running.
 fn device_card(
     ui: &mut egui::Ui,
@@ -352,7 +355,7 @@ fn device_card(
                         }
                     }
                     if let Some(still) = still.as_deref_mut() {
-                        crate::panels::replay::still_picture(ui, id, still);
+                        crate::panels::replay::still_picture(ui, id, still, view.rotation);
                     }
                 });
                 if reconnect || find_mat || still.is_some() {
@@ -431,11 +434,11 @@ impl FlighthookApp {
                 let mut clicked: Option<(String, Option<usize>, CardAction)> = None;
                 let mut added = None;
                 for (group, members) in device_card_order(&self.actors, &self.settings.actors) {
-                    // General leads with the Global, Simulation, Replay and
-                    // Body tracking cards, once the settings have loaded, and
-                    // has no (+).
+                    // General leads with the Global, Simulation, Replay,
+                    // Body tracking and Player cards, once the settings have
+                    // loaded, and has no (+).
                     let general = if group == CardGroup::General {
-                        if loaded { 4 } else { 0 }
+                        if loaded { 5 } else { 0 }
                     } else {
                         0
                     };
@@ -458,7 +461,8 @@ impl FlighthookApp {
                                 0 => self.render_global_card(ctx, ui, general_editable),
                                 1 => self.render_simulation_card(ctx, ui, general_editable),
                                 2 => self.render_replay_card(ctx, ui, general_editable),
-                                _ => self.render_body_tracking_card(ctx, ui, general_editable),
+                                3 => self.render_body_tracking_card(ctx, ui, general_editable),
+                                _ => self.render_player_card(ctx, ui, general_editable),
                             }
                             return;
                         }
@@ -503,6 +507,7 @@ impl FlighthookApp {
             .as_ref()
             .filter(|e| e.target.scope() == Some(card.id.as_str()))
             .map(|e| e.message.clone());
+        let saved_rotation = self.camera_rotation(&card.id);
         let form = card.form.and_then(|idx| self.settings.actors.get_mut(idx));
         let dirty = form.as_ref().is_some_and(|f| f.dirty());
         let still = (entry_type(&card.id) == "camera")
@@ -518,7 +523,14 @@ impl FlighthookApp {
             shown.telemetry.insert("error".into(), e.clone());
             shown
         });
+        let rotation = match form.as_deref() {
+            Some(ActorFormEntry::Device(d)) if d.is_camera() => {
+                flighthook::rotation_in_effect_deg(d.cam.rotation)
+            }
+            _ => saved_rotation,
+        };
         let view = CardView {
+            rotation,
             telemetry: failed.as_ref().or_else(|| self.actors.get(&card.id)),
             now_ms: self.now_ms,
             mode: self.card_modes.get(&card.id),
@@ -678,7 +690,7 @@ mod tests {
     };
     use egui::{Color32, Event, Key, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 
-    /// The Outputs (+) menu entry labelled `label`.
+    /// The Outputs (+) menu entry labeled `label`.
     fn output_preset(label: &str) -> &'static cards::AddPreset {
         cards::add_options(CardGroup::Outputs)
             .iter()
@@ -782,6 +794,18 @@ mod tests {
                 flatten(clipped.shape, &mut shapes);
             }
             (marks, shapes)
+        }
+
+        /// One pass. Returns every text painted.
+        fn texts(&self, app: &mut FlighthookApp) -> Vec<String> {
+            self.painted(app, Vec::new())
+                .1
+                .into_iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect()
         }
 
         /// Click at `at`, then draw once more. Returns the marked controls.
@@ -953,7 +977,7 @@ mod tests {
         );
     }
 
-    /// The text and colour of card `id`'s badge, and the colour of the card
+    /// The text and color of card `id`'s badge, and the color of the card
     /// stripe left of it.
     fn badge_look(marks: &Marks, shapes: &[egui::Shape], id: &str) -> (String, Color32, Color32) {
         let (badge, _) = marks[&format!("badge:{id}")];
@@ -1132,7 +1156,7 @@ mod tests {
         assert!(enabled(&marks, "cancel:openconnect_client.0"));
         assert!(enabled(&marks, "remove:openconnect_client.0"));
 
-        // An invalid form can't be saved, only cancelled.
+        // An invalid form can't be saved, only canceled.
         let idx = form_index(&app, "openconnect_client.0");
         if let ActorFormEntry::Integration(i) = &mut app.settings.actors[idx] {
             i.address = "127.0.0.1:".into();
@@ -1416,6 +1440,46 @@ mod tests {
                 putting_monitor: Some("mevo.0".into()),
             }
         );
+    }
+
+    /// A Pureplay output and the Player card on one Devices tab: both
+    /// cards show, and saving either keeps the other's section.
+    #[test]
+    fn the_player_card_and_a_pureplay_output_share_the_devices_tab() {
+        let screen = Screen::new();
+        let mut app = app();
+        let mut config = app.settings.to_request();
+        config.pureplay.insert(
+            "0".into(),
+            crate::types::PureplaySection {
+                name: "Pureplay".into(),
+                address: Some("192.168.1.20:9760".into()),
+                ..Default::default()
+            },
+        );
+        config.player = flighthook::PlayerSection {
+            sex: flighthook::Sex::Female,
+            height: Some(170.0),
+        };
+        app.settings.load_from(&config);
+        app.actors.insert(
+            "pureplay.0".into(),
+            ActorStatusResponse::new("Pureplay", ActorStatus::Connected),
+        );
+        let marks = screen.frame(&mut app, Vec::new());
+        let (player, _) = marks["card:player"];
+        let (pureplay, _) = marks["card:pureplay.0"];
+        assert!(player.top() < pureplay.top(), "General above Outputs");
+        assert!(marks.contains_key("add:Outputs"));
+        assert_eq!(
+            app.settings.build_global_request().pureplay,
+            config.pureplay
+        );
+        assert_eq!(
+            app.settings.build_actor_request("pureplay.0").player,
+            config.player
+        );
+        assert_eq!(app.settings.to_request(), config);
     }
 
     fn device<'a>(app: &'a mut FlighthookApp, id: &str) -> &'a mut settings::DeviceFormEntry {
@@ -2020,29 +2084,34 @@ mod tests {
             let (simulation, _) = marks["title:simulation"];
             let (replay, _) = marks["title:replay"];
             let (body, _) = marks["title:body_tracking"];
+            let (player, _) = marks["title:player"];
             let (web, _) = marks["card:webserver.0"];
             let (mevo, _) = marks["card:mevo.0"];
             assert!(global.left() < simulation.left(), "{at}");
             assert!(web.top() < mevo.top(), "above the launch monitors at {at}");
             if w > 1200.0 {
-                // Three columns: Global, Simulation, Replay; Body tracking
-                // under Global, the web server under Simulation.
+                // Three columns: Global, Simulation, Replay; Body tracking,
+                // Player and the web server under them.
                 assert!(simulation.right() < replay.left(), "{at}");
                 assert!(replay.top() < global.bottom(), "the same row at {at}");
                 assert!(body.top() > global.bottom(), "{at}");
                 assert!(body.left() < simulation.left(), "{at}");
+                assert!(player.top() > global.bottom(), "{at}");
+                assert!(player.left() > body.right(), "{at}");
+                assert!(player.right() < replay.left(), "{at}");
                 assert!(web.top() > global.bottom(), "{at}");
-                assert!(web.left() > body.right(), "{at}");
-                assert!(web.right() < replay.left(), "{at}");
+                assert!(web.left() > player.right(), "{at}");
             } else {
                 // Two columns: Replay and Body tracking under Global and
-                // Simulation, the web server under Replay.
+                // Simulation, then Player and the web server.
                 assert!(replay.top() > global.bottom(), "{at}");
                 assert!(replay.left() < simulation.left(), "{at}");
                 assert!(body.top() > simulation.bottom(), "{at}");
                 assert!(body.left() > replay.right(), "{at}");
-                assert!(web.top() > replay.bottom(), "{at}");
-                assert!(web.left() < body.left(), "{at}");
+                assert!(player.top() > replay.bottom(), "{at}");
+                assert!(player.left() < body.left(), "{at}");
+                assert!(web.top() > body.bottom(), "{at}");
+                assert!(web.left() > player.right(), "{at}");
             }
             // General has no (+).
             assert!(!marks.contains_key("add:General"), "{at}");
@@ -2741,6 +2810,150 @@ mod tests {
     }
 
     #[test]
+    fn rotation_yaw_and_pitch_are_on_a_camera_card_save_and_are_validated() {
+        let screen = Screen::new();
+        let id = "camera.0";
+        let mut app = app_with_camera(CardMode::Telemetry);
+        let marks = screen.frame(&mut app, Vec::new());
+        for mark in ["camera_rotation", "camera_yaw", "camera_pitch"] {
+            assert!(
+                !marks.contains_key(&format!("{mark}:{id}")),
+                "telemetry side"
+            );
+        }
+        let mut app = app_with_camera(CardMode::Settings);
+        let (marks, shapes) = screen.painted(&mut app, Vec::new());
+        let (card, _) = marks["card:camera.0"];
+        for mark in ["camera_rotation", "camera_yaw", "camera_pitch"] {
+            assert!(marks.contains_key(&format!("{mark}:{id}")), "{mark}");
+        }
+        for r in [0, 90, 180, 270] {
+            let (pill, _) = marks[&format!("camera_rotation:{id}:{r}")];
+            assert!(card.left() <= pill.left() && pill.right() <= card.right());
+        }
+        // Rotation right under the camera, in sight without scrolling at
+        // the fixed card height; Yaw and Pitch under Latency.
+        let (camera, _) = marks[&format!("camera_pick:{id}")];
+        let (latency, _) = marks[&format!("camera_latency:{id}")];
+        let (rotation, _) = marks[&format!("camera_rotation:{id}")];
+        let (yaw, _) = marks[&format!("camera_yaw:{id}")];
+        let (pitch, _) = marks[&format!("camera_pitch:{id}")];
+        assert!(camera.bottom() <= rotation.top());
+        assert!(rotation.bottom() <= latency.top());
+        assert!(latency.bottom() <= yaw.top());
+        assert!(yaw.bottom() <= pitch.top());
+        let (body, _, offset) = screen.bodies()[id];
+        assert_eq!(offset, 0.0, "not scrolled");
+        assert!(
+            body.top() <= rotation.top() && rotation.bottom() <= body.bottom(),
+            "{rotation:?} in {body:?}"
+        );
+        drop(shapes);
+        // The card's body scrolls to the rows under Latency.
+        let wheel = |dy| Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, dy),
+            modifiers: Modifiers::NONE,
+        };
+        screen.frame(
+            &mut app,
+            vec![Event::PointerMoved(card.center()), wheel(-1000.0)],
+        );
+        // The yaw's sign, in words, under it.
+        let hint = "Positive: the camera points to the right of the target line for a right-hander";
+        assert!(screen.texts(&mut app).iter().any(|t| t == hint));
+        let section =
+            |app: &FlighthookApp| app.settings.build_actor_request(id).camera["0"].clone();
+        assert_eq!(section(&app).rotation_deg, 0);
+        assert_eq!(
+            (section(&app).yaw_deg, section(&app).pitch_deg),
+            (None, None)
+        );
+
+        // A rotation pill (back at the top of the body): the card turns
+        // dirty and saves it.
+        screen.frame(
+            &mut app,
+            vec![Event::PointerMoved(card.center()), wheel(1000.0)],
+        );
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, &format!("camera_rotation:{id}:90"));
+        assert_eq!(device(&mut app, id).cam.rotation, 90);
+        assert!(enabled(&marks, &format!("save:{id}")));
+        assert_eq!(section(&app).rotation_deg, 90);
+        let json = serde_json::to_value(section(&app)).unwrap();
+        assert_eq!(json["rotation_deg"], 90);
+        assert!(json.get("yaw_deg").is_none());
+
+        for (typed, saved) in [("-30", -30.0), (" 7.5 ", 7.5), ("30", 30.0)] {
+            device(&mut app, id).cam.yaw = typed.into();
+            device(&mut app, id).cam.pitch = typed.into();
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(enabled(&marks, &format!("save:{id}")), "{typed}");
+            assert_eq!(section(&app).yaw_deg, Some(saved), "{typed}");
+            assert_eq!(section(&app).pitch_deg, Some(saved), "{typed}");
+        }
+        let range = "Must be a number, -30 to 30";
+        for bad in ["-30.5", "31", "NaN", "level"] {
+            for field in ["yaw", "pitch"] {
+                device(&mut app, id).cam.yaw = String::new();
+                device(&mut app, id).cam.pitch = String::new();
+                match field {
+                    "yaw" => device(&mut app, id).cam.yaw = bad.into(),
+                    _ => device(&mut app, id).cam.pitch = bad.into(),
+                }
+                screen.frame(
+                    &mut app,
+                    vec![Event::PointerMoved(card.center()), wheel(-1000.0)],
+                );
+                let texts = screen.texts(&mut app);
+                let marks = screen.frame(&mut app, Vec::new());
+                assert!(!enabled(&marks, &format!("save:{id}")), "{field} {bad}");
+                assert_eq!(
+                    texts.iter().filter(|t| *t == range).count(),
+                    1,
+                    "{field} {bad}"
+                );
+            }
+        }
+        device(&mut app, id).cam.yaw = String::new();
+        device(&mut app, id).cam.pitch = String::new();
+        // A rotation from a hand-edited file that is not a quarter turn: the
+        // error under Rotation, at the top of the body.
+        device(&mut app, id).cam.rotation = 45;
+        screen.frame(
+            &mut app,
+            vec![Event::PointerMoved(card.center()), wheel(1000.0)],
+        );
+        let texts = screen.texts(&mut app);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, &format!("save:{id}")));
+        assert!(texts.iter().any(|t| t == "0°, 90°, 180° or 270°"));
+
+        // Saved values load back into the fields.
+        let mut config = FlighthookConfig::default();
+        config.camera.insert(
+            "0".into(),
+            flighthook::CameraSection {
+                camera: flighthook::CameraSection::TEST_PATTERN.into(),
+                rotation_deg: 270,
+                yaw_deg: Some(-6.0),
+                pitch_deg: Some(12.5),
+                ..Default::default()
+            },
+        );
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        app.settings.load_from(&config);
+        let cam = &device(&mut app, id).cam;
+        assert_eq!(
+            (cam.rotation, cam.yaw.as_str(), cam.pitch.as_str()),
+            (270, "-6", "12.5")
+        );
+        assert_eq!(app.settings.saved_rotation(id), Some(270));
+        assert_eq!(app.settings.saved_rotation("camera.9"), None);
+    }
+
+    #[test]
     fn an_added_camera_needs_a_camera_from_the_list() {
         let screen = Screen::new();
         let mut app = app();
@@ -2973,14 +3186,13 @@ mod tests {
     }
 
     /// The Body tracking card's fields, top to bottom.
-    const BODY_TRACKING_FIELDS: [&str; 7] = [
+    const BODY_TRACKING_FIELDS: [&str; 6] = [
         "body_tracking_mode",
         "body_tracking_model",
         "body_tracking_skeleton",
         "body_tracking_min_score",
         "body_tracking_smoothing",
         "body_tracking_detect_every",
-        "body_tracking_height",
     ];
 
     /// Click text field `name`, select its text and type `text` over it.
@@ -3183,58 +3395,88 @@ mod tests {
     }
 
     #[test]
-    fn the_golfer_height_is_typed_in_the_unit_setting_and_saved_in_centimetres() {
+    fn the_player_card_shows_sex_and_height_and_saves_with_the_global_settings() {
         let screen = Screen::new();
         let mut app = app();
         let marks = screen.frame(&mut app, Vec::new());
-        assert!(marks.contains_key("body_tracking_height"));
-        // Imperial by default: inches; empty is no height and saves none.
-        assert!(app.settings.body_tracking.inches);
-        assert_eq!(app.settings.body_tracking.golfer_height, "");
-        assert_eq!(
-            app.settings
-                .build_global_request()
-                .body_tracking
-                .golfer_height,
-            None
-        );
-        app.settings.body_tracking.golfer_height = "71".into();
-        app.settings.mark_general(GeneralCard::BodyTracking);
-        let marks = screen.frame(&mut app, Vec::new());
-        assert!(enabled(&marks, "save:body_tracking"));
+        assert!(marks.contains_key("card:player"));
+        assert!(marks.contains_key("player_sex"));
+        assert!(marks.contains_key("player_sex:male"));
+        assert!(marks.contains_key("player_sex:female"));
+        assert!(marks.contains_key("player_height"));
+        // The height is on the Player card, not the Body tracking card.
+        assert!(!marks.contains_key("body_tracking_height"));
+        assert!(!marks.contains_key("save:player"));
+        assert_eq!(app.settings.player.sex, flighthook::Sex::Male);
+        // Women's: Save shows, and saves the global settings with it.
+        let marks = screen.click_mark(&mut app, &marks, "player_sex:female");
+        assert_eq!(app.settings.player.sex, flighthook::Sex::Female);
+        assert!(enabled(&marks, "save:player"));
+        assert!(!marks.contains_key("save:body_tracking"));
         let request = app.settings.build_global_request();
-        assert_eq!(request.body_tracking.golfer_height, Some(180.3));
-        // Out of range or not a number: no save.
+        assert_eq!(request.player.sex, flighthook::Sex::Female);
+        assert_eq!(
+            app.settings.begin_save(SaveTarget::Global).player,
+            request.player
+        );
+        assert_eq!(SaveTarget::Global.scope(), Some("global"));
+        app.settings.finish_save(Ok(()));
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("save:player"));
+        // Cancel goes back to the saved settings.
+        let marks = screen.click_mark(&mut app, &marks, "player_sex:male");
+        assert!(enabled(&marks, "save:player"));
+        let marks = screen.click_mark(&mut app, &marks, "cancel:player");
+        assert!(!marks.contains_key("cancel:player"));
+        assert_eq!(app.settings.player.sex, flighthook::Sex::Female);
+    }
+
+    #[test]
+    fn the_player_height_is_typed_in_the_unit_setting_and_saved_in_centimeters() {
+        let screen = Screen::new();
+        let mut app = app();
+        screen.frame(&mut app, Vec::new());
+        // Imperial by default: inches; empty is no height and saves none.
+        assert!(app.settings.player.inches);
+        assert_eq!(app.settings.player.height, "");
+        assert_eq!(app.settings.player.height_unit(), "in");
+        assert_eq!(app.settings.build_global_request().player.height, None);
+        app.settings.player.height = "71".into();
+        app.settings.mark_general(GeneralCard::Player);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "save:player"));
+        assert!(!screen.texts(&mut app).iter().any(|t| t == "40 to 98 in"));
+        let request = app.settings.build_global_request();
+        assert_eq!(request.player.height, Some(180.3));
+        // Out of range or not a number: no save, and the range shows.
         for bad in ["30", "tall"] {
-            app.settings.body_tracking.golfer_height = bad.into();
+            app.settings.player.height = bad.into();
             let marks = screen.frame(&mut app, Vec::new());
-            assert!(!enabled(&marks, "save:body_tracking"), "{bad}");
+            assert!(!enabled(&marks, "save:player"), "{bad}");
             assert!(!app.settings.general_valid());
+            let texts = screen.texts(&mut app);
+            assert!(texts.iter().any(|t| t == "40 to 98 in"), "{bad}: {texts:?}");
         }
         // Metric default units convert what is typed.
-        app.settings.body_tracking.golfer_height = "71".into();
+        app.settings.player.height = "71".into();
         app.set_default_units(UnitSystem::Metric);
-        assert_eq!(app.settings.body_tracking.golfer_height, "180.3");
-        assert_eq!(app.settings.body_tracking.height_unit(), "cm");
+        assert_eq!(app.settings.player.height, "180.3");
+        assert_eq!(app.settings.player.height_unit(), "cm");
         assert_eq!(
-            app.settings
-                .build_global_request()
-                .body_tracking
-                .golfer_height,
+            app.settings.build_global_request().player.height,
             Some(180.3)
         );
+        app.settings.player.height = "99".into();
+        assert!(screen.texts(&mut app).iter().any(|t| t == "100 to 250 cm"));
         // Loaded, it reads back in the unit and saves exactly as loaded.
         let mut saved = app.settings.to_request();
         saved.default_units = UnitSystem::Imperial;
-        saved.body_tracking.golfer_height = Some(182.0);
+        saved.player.height = Some(182.0);
         app.settings.global_dirty = false;
         app.settings.load_from(&saved);
-        assert_eq!(app.settings.body_tracking.golfer_height, "71.7");
+        assert_eq!(app.settings.player.height, "71.7");
         assert_eq!(
-            app.settings
-                .build_global_request()
-                .body_tracking
-                .golfer_height,
+            app.settings.build_global_request().player.height,
             Some(182.0)
         );
     }
@@ -3965,7 +4207,7 @@ mod tests {
             assert!(
                 (spinner.center().x - body.center().x).abs() < 1.0
                     && (spinner.center().y - body.center().y).abs() < 2.0,
-                "{id}: centred in the body"
+                "{id}: centered in the body"
             );
             assert!(content <= body.height(), "{id}: nothing to scroll");
             assert!(!marks.contains_key(&format!("connected_icon:{id}")));

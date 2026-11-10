@@ -18,7 +18,7 @@ pub struct Stats {
 }
 
 impl Stats {
-    /// Summarise `values`, dropping NaN and infinities. `None` when no finite
+    /// Summarize `values`, dropping NaN and infinities. `None` when no finite
     /// value remains.
     #[must_use]
     #[allow(clippy::cast_precision_loss)] // sample sizes are far below 2^52

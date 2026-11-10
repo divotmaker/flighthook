@@ -2,7 +2,7 @@
 //!
 //! The inverse of `gspro::mapper`. Open Connect always reports speeds in mph
 //! and angles in degrees; distances follow the message's `Units` field, and
-//! face impact is millimetres. Open Connect lateral signs are absolute
+//! face impact is millimeters. Open Connect lateral signs are absolute
 //! (positive = right of the target line, for either hand), the same as FRP's,
 //! so HLA, SideSpin, SpinAxis, FaceToTarget and Path are taken as they are.
 
@@ -11,7 +11,7 @@ use flighthook::{BallFlight, ClubData, Distance, FaceImpact, ShotField, Velocity
 
 /// Distance unit selected by the message's `Units` field.
 ///
-/// GSPro Open Connect defines `"Yards"` and `"Meters"`. Anything unrecognised
+/// GSPro Open Connect defines `"Yards"` and `"Meters"`. Anything unrecognized
 /// (including the empty string, which some monitors send) falls back to yards,
 /// matching what flighthook itself emits as a client.
 fn distance(units: &str, value: f64) -> Distance {
@@ -121,10 +121,10 @@ pub fn map_club(msg: &api::GsProMessage) -> ClubData {
 /// Map face impact, if the message actually carries it.
 ///
 /// Open Connect's `ClubData` is a fixed schema with no optionality, so an
-/// unmeasured field arrives as `0.0` and is indistinguishable from a dead-centre
+/// unmeasured field arrives as `0.0` and is indistinguishable from a dead-center
 /// strike. Emit `FaceImpact` only when at least one axis is non-zero; a shot
-/// that really was struck dead centre simply loses a data point rather than
-/// every non-reporting monitor claiming perfect centre contact.
+/// that really was struck dead center simply loses a data point rather than
+/// every non-reporting monitor claiming perfect center contact.
 ///
 /// Toe/heel and high/low are golfer-relative and are taken as they are.
 pub fn map_face_impact(msg: &api::GsProMessage) -> Option<FaceImpact> {
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn face_impact_keeps_negative_millimetres() {
+    fn face_impact_keeps_negative_millimeters() {
         let mut m = msg();
         m.club_data.horizontal_face_impact = -6.5;
         m.club_data.vertical_face_impact = 0.0;

@@ -2,7 +2,7 @@
 //! picture, live and on a shot's clips in the Shots tab's Cameras pane,
 //! and in the replay. Pure geometry, and
 //! one function that paints it. The lead side (the left of a right-handed
-//! golfer) and the trail side get their own colours.
+//! golfer) and the trail side get their own colors.
 
 use egui::{Color32, Pos2, Rect, Stroke, vec2};
 
@@ -12,15 +12,15 @@ use flighthook::{
     BodySide, HALPE26_BONES, HALPE26_KEYPOINTS, Keypoint, halpe26_bone_side, halpe26_side,
 };
 
-/// The lead side's colour.
+/// The lead side's color.
 pub(crate) const LEAD: Color32 = theme::TEAL;
-/// The trail side's colour.
+/// The trail side's color.
 pub(crate) const TRAIL: Color32 = Color32::from_rgb(255, 146, 60);
-/// The midline's colour (head, neck, hips).
+/// The midline's color (head, neck, hips).
 pub(crate) const MIDLINE: Color32 = theme::TEXT;
 
 /// Where frame pixels land in a picture rect: the frame fitted inside it
-/// at its own aspect, centred.
+/// at its own aspect, centered.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Fit {
     origin: Pos2,
@@ -52,6 +52,57 @@ impl Fit {
     }
 }
 
+/// Whether a camera rotation of `rotation` clockwise degrees is a quarter
+/// turn (90 or 270), which swaps the picture's width and height.
+pub(crate) fn quarter_turn(rotation: u16) -> bool {
+    rotation % 180 == 90
+}
+
+/// The `[width, height]` of a `width × height` frame turned clockwise by
+/// `rotation` degrees (0, 90, 180 or 270).
+pub(crate) fn turned(width: u32, height: u32, rotation: u16) -> [u32; 2] {
+    if quarter_turn(rotation) {
+        [height, width]
+    } else {
+        [width, height]
+    }
+}
+
+/// The size of a picture of `size` turned clockwise by `rotation` degrees.
+pub(crate) fn turned_size(size: egui::Vec2, rotation: u16) -> egui::Vec2 {
+    if quarter_turn(rotation) {
+        vec2(size.y, size.x)
+    } else {
+        size
+    }
+}
+
+/// The rect the unturned picture is painted in so that, turned clockwise by
+/// `rotation` degrees about its center, it fills `rect`.
+pub(crate) fn unturned_rect(rect: Rect, rotation: u16) -> Rect {
+    Rect::from_center_size(rect.center(), turned_size(rect.size(), rotation))
+}
+
+/// Paint texture `texture` turned clockwise by `rotation` degrees so that
+/// it fills `rect`, whose aspect is the turned picture's. An unturned
+/// picture keeps `corners`; a turned one has square corners.
+pub(crate) fn paint_turned(
+    ui: &egui::Ui,
+    texture: egui::TextureId,
+    rect: Rect,
+    rotation: u16,
+    corners: egui::CornerRadius,
+) {
+    let at = unturned_rect(rect, rotation);
+    let image = egui::Image::new((texture, at.size()));
+    match rotation % 360 {
+        0 => image.corner_radius(corners).paint_at(ui, at),
+        degrees => image
+            .rotate(f32::from(degrees).to_radians(), vec2(0.5, 0.5))
+            .paint_at(ui, at),
+    }
+}
+
 /// Whether keypoint `k` is drawn: finite, and scoring at least `min_score`.
 pub(crate) fn shown(k: &Keypoint, min_score: f32) -> bool {
     k.iter().all(|v| v.is_finite()) && k[2] >= min_score
@@ -65,8 +116,8 @@ pub(crate) fn lead_side(hand: Handedness) -> BodySide {
     }
 }
 
-/// The colour of a part on `side` of a golfer who leads with `lead`.
-pub(crate) fn colour(side: BodySide, lead: BodySide) -> Color32 {
+/// The color of a part on `side` of a golfer who leads with `lead`.
+pub(crate) fn color(side: BodySide, lead: BodySide) -> Color32 {
     match side {
         BodySide::Center => MIDLINE,
         s if s == lead => LEAD,
@@ -74,7 +125,7 @@ pub(crate) fn colour(side: BodySide, lead: BodySide) -> Color32 {
     }
 }
 
-/// A skeleton laid out on screen: its bones and joints, with colours.
+/// A skeleton laid out on screen: its bones and joints, with colors.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Layout {
     pub(crate) bones: Vec<([Pos2; 2], Color32)>,
@@ -102,7 +153,7 @@ pub(crate) fn layout(
         .map(|&(a, b)| {
             (
                 [fit.map(&keypoints[a]), fit.map(&keypoints[b])],
-                colour(halpe26_bone_side((a, b)), lead),
+                color(halpe26_bone_side((a, b)), lead),
             )
         })
         .collect();
@@ -110,7 +161,7 @@ pub(crate) fn layout(
         .iter()
         .enumerate()
         .filter(|(_, k)| shown(k, min_score))
-        .map(|(i, k)| (fit.map(k), colour(halpe26_side(i), lead)))
+        .map(|(i, k)| (fit.map(k), color(halpe26_side(i), lead)))
         .collect();
     Layout {
         bones,
@@ -137,11 +188,11 @@ pub(crate) fn paint(
     for ([a, b], _) in &layout.bones {
         painter.line_segment([*a, *b], Stroke::new(layout.width + 2.0, shadow));
     }
-    for ([a, b], colour) in &layout.bones {
-        painter.line_segment([*a, *b], Stroke::new(layout.width, *colour));
+    for ([a, b], color) in &layout.bones {
+        painter.line_segment([*a, *b], Stroke::new(layout.width, *color));
     }
-    for (at, colour) in &layout.joints {
-        painter.circle(*at, layout.width * 1.4, *colour, Stroke::new(1.0, shadow));
+    for (at, color) in &layout.joints {
+        painter.circle(*at, layout.width * 1.4, *color, Stroke::new(1.0, shadow));
     }
 }
 
@@ -154,6 +205,22 @@ mod tests {
         (0..HALPE26_KEYPOINTS)
             .map(|i| [100.0 + i as f32 * 10.0, 50.0 + i as f32 * 5.0, score])
             .collect()
+    }
+
+    #[test]
+    fn a_quarter_turn_swaps_the_size_and_a_half_turn_keeps_it() {
+        assert_eq!(turned(1280, 720, 0), [1280, 720]);
+        assert_eq!(turned(1280, 720, 90), [720, 1280]);
+        assert_eq!(turned(1280, 720, 180), [1280, 720]);
+        assert_eq!(turned(1280, 720, 270), [720, 1280]);
+        assert_eq!(turned_size(vec2(16.0, 9.0), 90), vec2(9.0, 16.0));
+        assert_eq!(turned_size(vec2(16.0, 9.0), 180), vec2(16.0, 9.0));
+        // Turned about its center, the unturned rect covers the target.
+        let target = Rect::from_min_size(pos2(10.0, 20.0), vec2(90.0, 160.0));
+        let at = unturned_rect(target, 270);
+        assert_eq!(at.center(), target.center());
+        assert_eq!(at.size(), vec2(160.0, 90.0));
+        assert_eq!(unturned_rect(target, 180), target);
     }
 
     #[test]

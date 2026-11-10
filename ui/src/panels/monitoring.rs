@@ -3,7 +3,7 @@ use crate::panels::devices;
 use crate::theme;
 use crate::types::{ActorStatusResponse, ConnectionState};
 
-/// Stripe and badge colour for an actor at `now_ms`: green when Connected,
+/// Stripe and badge color for an actor at `now_ms`: green when Connected,
 /// yellow while Connecting, red while Reconnecting within
 /// [`RECONNECT_ALERT_MS`](crate::types::RECONNECT_ALERT_MS) of the lost
 /// connection and yellow after that.
@@ -89,9 +89,9 @@ pub(crate) fn has_telemetry(actor: &ActorStatusResponse) -> bool {
     actor.telemetry.values().any(|v| !v.is_empty())
 }
 
-/// The body of a card with no telemetry to show, centred in it: a check in
+/// The body of a card with no telemetry to show, centered in it: a check in
 /// a ring once the actor is Connected, otherwise
-/// a loading spinner in `color` (the card's status colour) going round,
+/// a loading spinner in `color` (the card's status color) going round,
 /// redrawn about 60 times a second while it is on screen.
 pub(crate) fn no_telemetry(
     ui: &mut egui::Ui,

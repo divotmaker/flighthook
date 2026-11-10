@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use flighthook::{BodyTrackingSection, LivePose, LivePosture, PoseModel};
 use stance::pose::{
-    Image, OneEuro, OneEuroParams, PersonDetector, Pose, PoseEngine, PoseTracker, decode_jpeg,
+    Image, OneEuro, OneEuroParams, PersonDetector, Pose, PoseEngine, PoseTracker, Rotation,
+    decode_jpeg,
 };
 use tracing::warn;
 
@@ -61,9 +62,10 @@ impl<P: PoseEngine, D: PersonDetector> Estimate for PoseTracker<P, D> {
     }
 }
 
-/// Makes an estimator for the settings, `None` while the models are not
-/// ready.
-pub type Build = Box<dyn FnMut(&BodyTrackingSection) -> Option<Box<dyn Estimate>> + Send>;
+/// Makes an estimator for the settings and the camera's rotation (the
+/// estimator turns each frame by it before looking for the golfer), `None`
+/// while the models are not ready.
+pub type Build = Box<dyn FnMut(&BodyTrackingSection, Rotation) -> Option<Box<dyn Estimate>> + Send>;
 
 /// Puts a frame (its time and JPEG) in the live slot with its pose, as the
 /// `X-Pose` JSON, or none.
@@ -77,6 +79,9 @@ pub struct LiveSettings {
     /// The camera's view and the player's hand for the posture; `None`
     /// for a camera without a view (behind or above the golfer).
     pub posture: Option<LiveSetup>,
+    /// The camera's rotation: frames are turned by it before body
+    /// tracking, so the keypoints and the posture are in the upright frame.
+    pub rotation: Rotation,
 }
 
 /// The settings in effect, read for every frame.
@@ -197,7 +202,13 @@ fn pace(handoff: &Handoff, until: Instant) -> bool {
 struct Current {
     model: PoseModel,
     detect_every: u32,
+    rotation: Rotation,
     estimator: Box<dyn Estimate>,
+}
+
+/// The width of a `width × height` frame once turned by `rotation`.
+fn upright_width(width: u32, height: u32, rotation: Rotation) -> u32 {
+    rotation.dimensions(width, height).0
 }
 
 fn run(
@@ -233,14 +244,18 @@ fn run(
         let LiveSettings {
             body: s,
             posture: setup,
+            rotation,
         } = settings();
-        let made_for = |c: &Current| c.model == s.model && c.detect_every == s.detect_every;
+        let made_for = |c: &Current| {
+            c.model == s.model && c.detect_every == s.detect_every && c.rotation == rotation
+        };
         if !current.as_ref().is_some_and(made_for) {
             current = None;
             if build_after.is_none_or(|at| Instant::now() >= at) {
-                current = build(&s).map(|estimator| Current {
+                current = build(&s, rotation).map(|estimator| Current {
                     model: s.model,
                     detect_every: s.detect_every,
+                    rotation,
                     estimator,
                 });
                 smoother.reset();
@@ -256,7 +271,7 @@ fn run(
             Some(c) => {
                 let started = Instant::now();
                 let found = decode_jpeg(&offer.jpeg).and_then(|image| {
-                    let width = image.width();
+                    let width = upright_width(image.width(), image.height(), c.rotation);
                     c.estimator
                         .estimate(&image, offer.time_ns)
                         .map(|pose| pose.map(|pose| (pose, width)))
@@ -317,7 +332,7 @@ pub fn wire(pose: Option<&Pose>, ms: f32, posture: Option<LivePosture>) -> Arc<s
         ms: (ms * 10.0).round() / 10.0,
         posture,
     };
-    // Rounded finite numbers always serialise; a non-finite one (a broken
+    // Rounded finite numbers always serialize; a non-finite one (a broken
     // model) leaves the frame without a pose.
     Arc::from(serde_json::to_string(&live).unwrap_or_default())
 }
@@ -508,6 +523,7 @@ pub(crate) mod tests {
         Box::new(move || LiveSettings {
             body: s.clone(),
             posture: None,
+            rotation: Rotation::None,
         })
     }
 
@@ -516,7 +532,7 @@ pub(crate) mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let built = Arc::clone(&calls);
         let build: Build =
-            Box::new(move |s| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
+            Box::new(move |s, _| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
         let (publish, published) = publisher();
         let section = BodyTrackingSection {
             smoothing: 0.0,
@@ -554,12 +570,14 @@ pub(crate) mod tests {
         ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let built = Arc::clone(&calls);
-            let build: Build =
-                Box::new(move |s| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
+            let build: Build = Box::new(move |s, _| {
+                Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every))
+            });
             let (publish, published) = publisher();
             let settings: Settings = Box::new(move || LiveSettings {
                 body: live_section(),
                 posture: super::super::swing::live_setup(position, None, false),
+                rotation: Rotation::None,
             });
             let worker = LiveWorker::start("camera.0", settings, build, publish).unwrap();
             worker.offer(1, numbered_jpeg(40));
@@ -577,7 +595,7 @@ pub(crate) mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let built = Arc::clone(&calls);
         // A slow model: 120 ms a frame.
-        let build: Build = Box::new(move |s| {
+        let build: Build = Box::new(move |s, _| {
             Some(fake_tracker(
                 Duration::from_millis(120),
                 &built,
@@ -610,7 +628,7 @@ pub(crate) mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let built = Arc::clone(&calls);
         let build: Build =
-            Box::new(move |s| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
+            Box::new(move |s, _| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
         let (publish, published) = publisher();
         let worker =
             LiveWorker::start("camera.0", settings(live_section()), build, publish).unwrap();
@@ -633,7 +651,7 @@ pub(crate) mod tests {
         let (publish, published) = publisher();
         let tries = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&tries);
-        let build: Build = Box::new(move |_| {
+        let build: Build = Box::new(move |_, _| {
             counted.fetch_add(1, Ordering::SeqCst);
             None
         });
@@ -651,7 +669,7 @@ pub(crate) mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let built = Arc::clone(&calls);
         let build: Build =
-            Box::new(move |s| Some(fake_tracker(Duration::ZERO, &built, false, s.detect_every)));
+            Box::new(move |s, _| Some(fake_tracker(Duration::ZERO, &built, false, s.detect_every)));
         let (publish, published) = publisher();
         let worker =
             LiveWorker::start("camera.0", settings(live_section()), build, publish).unwrap();
@@ -662,6 +680,141 @@ pub(crate) mod tests {
         assert!(pose.keypoints.is_empty() && pose.bbox.is_none());
     }
 
+    /// A pose engine that reports what it was given: the nose's x is the
+    /// first pixel's brightness, keypoint 1 sits at (width, height).
+    struct SizePose;
+
+    impl PoseEngine for SizePose {
+        fn skeleton(&self) -> Skeleton {
+            Skeleton::Halpe26
+        }
+        fn model_name(&self) -> &'static str {
+            "size-pose"
+        }
+        fn estimate(&mut self, image: &Image, bbox: &BBox) -> stance::Result<Pose> {
+            #[allow(clippy::cast_precision_loss)]
+            let (w, h) = (image.width() as f32, image.height() as f32);
+            let shade = f32::from(image.pixel(0, 0).map_or(0, |p| p[0]));
+            let kps = (0..26u8)
+                .map(|i| match i {
+                    0 => Keypoint {
+                        x: shade,
+                        y: 0.0,
+                        score: 0.9,
+                    },
+                    1 => Keypoint {
+                        x: w,
+                        y: h,
+                        score: 0.9,
+                    },
+                    _ => Keypoint {
+                        x: 1.0,
+                        y: 1.0,
+                        score: 0.9,
+                    },
+                })
+                .collect();
+            Ok(Pose::new(Skeleton::Halpe26, kps, *bbox))
+        }
+        fn fork(&self) -> stance::Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    /// A 32×24 JPEG, its top half bright and its bottom half dark.
+    fn top_bright_jpeg() -> Arc<[u8]> {
+        let (w, h) = (32u16, 24u16);
+        let mut pixels = Vec::new();
+        for y in 0..h {
+            let v = if y < h / 2 { 220 } else { 20 };
+            pixels.extend(std::iter::repeat_n(v, usize::from(w) * 3));
+        }
+        let mut out = Vec::new();
+        jpeg_encoder::Encoder::new(&mut out, 100)
+            .encode(&pixels, w, h, jpeg_encoder::ColorType::Rgb)
+            .expect("encode");
+        Arc::from(out)
+    }
+
+    #[test]
+    fn live_frames_are_turned_by_the_cameras_rotation_before_tracking() {
+        let rotation = Arc::new(Mutex::new(Rotation::None));
+        let read = Arc::clone(&rotation);
+        let settings: Settings = Box::new(move || LiveSettings {
+            body: BodyTrackingSection {
+                smoothing: 0.0,
+                ..live_section()
+            },
+            posture: None,
+            rotation: *read.lock().unwrap(),
+        });
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&builds);
+        let build: Build = Box::new(move |s, r| {
+            log.lock().unwrap().push(r);
+            Some(Box::new(PoseTracker::new(
+                SizePose,
+                FakeDetector { found: true },
+                stance::pose::PoseConfig {
+                    rotation: r,
+                    ..crate::pose::models::pose_config(s.model, s.detect_every)
+                },
+            )) as Box<dyn Estimate>)
+        });
+        let (publish, published) = publisher();
+        let worker = LiveWorker::start("camera.0", settings, build, publish).unwrap();
+        let frame = |n: u64| {
+            worker.offer(n, top_bright_jpeg());
+            wait_for(&published, usize::try_from(n).unwrap());
+        };
+        frame(1);
+        *rotation.lock().unwrap() = Rotation::Cw90;
+        frame(2);
+        *rotation.lock().unwrap() = Rotation::Half;
+        frame(3);
+        drop(worker);
+        assert_eq!(
+            *builds.lock().unwrap(),
+            [Rotation::None, Rotation::Cw90, Rotation::Half],
+            "a new rotation makes a new tracker"
+        );
+        let poses: Vec<LivePose> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, p)| p.clone().expect("a pose"))
+            .collect();
+        // Upright: 32×24 and the top-left pixel bright.
+        assert_eq!(poses[0].keypoints[1][..2], [32.0, 24.0]);
+        assert!(
+            poses[0].keypoints[0][0] > 150.0,
+            "{:?}",
+            poses[0].keypoints[0]
+        );
+        // A quarter turn clockwise: 24×32, the old bottom-left corner on top.
+        assert_eq!(poses[1].keypoints[1][..2], [24.0, 32.0]);
+        assert!(
+            poses[1].keypoints[0][0] < 100.0,
+            "{:?}",
+            poses[1].keypoints[0]
+        );
+        // A half turn: 32×24 again, the dark bottom now on top.
+        assert_eq!(poses[2].keypoints[1][..2], [32.0, 24.0]);
+        assert!(
+            poses[2].keypoints[0][0] < 100.0,
+            "{:?}",
+            poses[2].keypoints[0]
+        );
+    }
+
+    #[test]
+    fn the_posture_width_is_the_turned_frames() {
+        assert_eq!(upright_width(1280, 720, Rotation::None), 1280);
+        assert_eq!(upright_width(1280, 720, Rotation::Half), 1280);
+        assert_eq!(upright_width(1280, 720, Rotation::Cw90), 720);
+        assert_eq!(upright_width(1280, 720, Rotation::Ccw90), 720);
+    }
+
     #[test]
     fn a_new_model_or_detection_interval_makes_a_new_tracker() {
         let section = Arc::new(Mutex::new(live_section()));
@@ -669,11 +822,12 @@ pub(crate) mod tests {
         let settings: Settings = Box::new(move || LiveSettings {
             body: read.lock().unwrap().clone(),
             posture: None,
+            rotation: Rotation::None,
         });
         let builds = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&builds);
         let calls = Arc::new(AtomicUsize::new(0));
-        let build: Build = Box::new(move |s| {
+        let build: Build = Box::new(move |s, _| {
             log.lock().unwrap().push((s.model, s.detect_every));
             Some(fake_tracker(Duration::ZERO, &calls, true, s.detect_every))
         });
@@ -707,7 +861,7 @@ pub(crate) mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let built = Arc::clone(&calls);
         let build: Build =
-            Box::new(move |s| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
+            Box::new(move |s, _| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
         let (publish, published) = publisher();
         // Heavy smoothing: a jump would barely move the nose.
         let section = BodyTrackingSection {
@@ -729,7 +883,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_worker_whose_thread_ended_says_so_and_drop_does_not_wait() {
-        let build: Build = Box::new(|_| panic!("a broken model"));
+        let build: Build = Box::new(|_, _| panic!("a broken model"));
         let (publish, _published) = publisher();
         let worker =
             LiveWorker::start("camera.0", settings(live_section()), build, publish).unwrap();
@@ -744,7 +898,7 @@ pub(crate) mod tests {
         // A slow model: dropping the worker mid-pose returns at once.
         let calls = Arc::new(AtomicUsize::new(0));
         let built = Arc::clone(&calls);
-        let build: Build = Box::new(move |s| {
+        let build: Build = Box::new(move |s, _| {
             Some(fake_tracker(
                 Duration::from_millis(400),
                 &built,
@@ -858,7 +1012,7 @@ pub(crate) mod tests {
                 }
             }
         };
-        let build: Build = Box::new(move |s| {
+        let build: Build = Box::new(move |s, _| {
             let tracker = shared
                 .fork()
                 .and_then(|m| m.tracker(pose_config(s.model, s.detect_every)))

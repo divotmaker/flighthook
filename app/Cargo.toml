@@ -48,7 +48,7 @@ glam = "0.32"
 threeputt = "0.0.3"
 # Swing cameras: capture, pre-roll and trigger-cut MJPEG clips; `pose` is
 # body tracking (RTMPose on the CPU), `pose-download` fetches its models.
-stance = { version = "0.0.3", features = ["pose", "pose-download"] }
+stance = { path = "../../../stance/stance", features = ["pose", "pose-download"] }
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.

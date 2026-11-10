@@ -9,7 +9,7 @@ const STEP: Duration = Duration::from_secs(1);
 /// connect-time setup (GSPro's first heartbeat goes out ~1 s after connect,
 /// a Square Golf identity exchange and arm take a few seconds), so a link
 /// that is accepted and then drops during setup counts as a failed attempt
-/// and keeps growing towards the cap.
+/// and keeps growing toward the cap.
 pub(crate) const STABLE_SESSION: Duration = Duration::from_secs(10);
 
 /// Linear reconnect backoff: starts at `min`, grows by 1 s per failed

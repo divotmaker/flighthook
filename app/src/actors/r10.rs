@@ -378,7 +378,7 @@ fn connect_and_run(
 
                     Event::HandshakeComplete => {
                         info!("handshake complete");
-                        // The unit ID travelled in the handshake; capture
+                        // The unit ID traveled in the handshake; capture
                         // from here on.
                         client.transport_mut().capture.set_enabled(true);
                         emit_device_status(
@@ -675,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn channels_are_labelled() {
+    fn channels_are_labeled() {
         let rx = with_handle(HANDLE, &wire(RESPONSE, &[0x10, 0x20]));
         let tx = with_handle(HANDLE, &wire(REQUEST, &[0x30]));
         let mut tap = tap_with(vec![rx.clone()]);

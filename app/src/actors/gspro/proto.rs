@@ -133,7 +133,7 @@ mod tests {
     use super::*;
 
     /// GSPro sends club codes letter-first; every club in its index is
-    /// recognised and forwarded as a club change.
+    /// recognized and forwarded as a club change.
     #[test]
     fn letter_first_club_codes_become_club_info() {
         let cases = [

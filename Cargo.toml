@@ -2,7 +2,7 @@
 members = ["app", "ui", "lib"]
 resolver = "2"
 
-# `make screens`: an optimised build with debug assertions, which carries the
+# `make screens`: an optimized build with debug assertions, which carries the
 # test-only seams the README screenshot scenes use (see docs/SCREENSHOTS.md).
 [profile.screens]
 inherits = "release"

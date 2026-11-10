@@ -10,12 +10,12 @@ club-code scheme.
 ## Face impact (beta)
 
 flighthook forwards the Omni's face impact location to GSPro as
-`HorizontalFaceImpact` / `VerticalFaceImpact`, in millimetres from face centre.
+`HorizontalFaceImpact` / `VerticalFaceImpact`, in millimeters from face center.
 
 The calibration comes from [allsquare](https://crates.io/crates/allsquare) and
 is in beta. The Omni measures vertical impact from the bottom edge of the club
 sticker's dot, so allsquare adds the selected club's distance from the bottom of
-the dot down to face centre. The defaults assume the sticker is in its recommended spot, with the dot centre about 5 mm
+the dot down to face center. The defaults assume the sticker is in its recommended spot, with the dot center about 5 mm
 below the top of the club. A sticker placed higher or lower shifts vertical
 impact by the same amount. See allsquare's README for the default table and
 caveats, and [divotmaker/allsquare#1](https://github.com/divotmaker/allsquare/issues/1)
@@ -42,14 +42,14 @@ Dynamic loft and smash factor are reported normally.
 ### Per-club calibration
 
 The defaults assume a sticker in its recommended spot. Measuring your own clubs
-— from the bottom edge of the sticker's dot straight down to face centre, in
-millimetres — gives better results than the defaults, and is the only way to
+— from the bottom edge of the sticker's dot straight down to face center, in
+millimeters — gives better results than the defaults, and is the only way to
 get a vertical estimate for the putter, which has none built in.
 
 Set overrides in config, keyed the same way the `club` field is:
 
 ```toml
-[square.0.dot_bottom_to_face_centre_mm]
+[square.0.dot_bottom_to_face_center_mm]
 DR = 15.0
 7i = 18.5
 ```

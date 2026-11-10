@@ -81,7 +81,7 @@ pub(crate) fn batteries(
 }
 
 /// Red below [`LOW_PCT`] percent, else green.
-pub(crate) fn fill_colour(pct: u8) -> egui::Color32 {
+pub(crate) fn fill_color(pct: u8) -> egui::Color32 {
     if pct < LOW_PCT {
         theme::STATUS_DOWN
     } else {
@@ -117,7 +117,7 @@ pub(crate) fn show(ui: &mut egui::Ui, battery: &Battery) -> egui::Response {
         let (body, nub, fill) = parts(rect, battery.pct);
         let painter = ui.painter();
         painter.rect_filled(nub, 1.0, theme::TEXT_MUTED);
-        painter.rect_filled(fill, 1.0, fill_colour(battery.pct));
+        painter.rect_filled(fill, 1.0, fill_color(battery.pct));
         painter.rect_stroke(
             body,
             3.0,
@@ -253,10 +253,10 @@ mod tests {
 
     #[test]
     fn under_twenty_percent_is_red_otherwise_green() {
-        assert_eq!(fill_colour(0), theme::STATUS_DOWN);
-        assert_eq!(fill_colour(19), theme::STATUS_DOWN);
-        assert_eq!(fill_colour(20), theme::STATUS_OK);
-        assert_eq!(fill_colour(100), theme::STATUS_OK);
+        assert_eq!(fill_color(0), theme::STATUS_DOWN);
+        assert_eq!(fill_color(19), theme::STATUS_DOWN);
+        assert_eq!(fill_color(20), theme::STATUS_OK);
+        assert_eq!(fill_color(100), theme::STATUS_OK);
         assert_ne!(theme::STATUS_DOWN, theme::STATUS_OK);
     }
 
