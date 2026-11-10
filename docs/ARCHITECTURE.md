@@ -43,7 +43,9 @@ address = "127.0.0.1:921"
 - `[exputt.<idx>]` -- ExPutt RG putting device over WiFi (optional IP address;
   found on the local network when absent)
 - `[openconnect_server.<idx>]` -- Open Connect server: GSPro Open Connect ingest listener (Uneekor)
-- `[mock_monitor.<idx>]` -- mock launch monitor instance
+- `[mock_monitor.<idx>]` -- mock launch monitor instance (flightrelay's mock
+  driver; its settings `shot_interval_s`, `arm_delay_s`, `ball_ready_delay_s`,
+  `post_shot_delay_s` and `serial` sit in the same table)
 - `[openconnect_client.<idx>]` -- Open Connect client: dials a simulator that
   accepts GSPro Open Connect (GSPro and Pureplay on 921, Muni Golf on 9210). `[gspro.<idx>]`
   sections are read as `[openconnect_client.<idx>]`; when both name an index,
@@ -124,7 +126,8 @@ address = "127.0.0.1:921"
   its tee distance; BLE auto-discovery, no address field)
 - ExPutt sections show name and an optional IP Address (blank finds the
   device on the network); the putting hand follows the game's handedness
-- Mock sections show only name (no address or radar fields)
+- Mock sections show only name and Camera timing; the mock driver's settings
+  are set in the file or through the API
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `openconnect_client.0`)
 - WebSocket actor IDs = `"ws.{8-hex-chars}"`
 
@@ -231,7 +234,7 @@ pub enum SpinSource { D4, E8, Auto }
 pub struct R10Section { pub name: String, pub range: Option<Distance> }
 pub struct SquareSection { pub name: String, pub address: Option<String>, pub club: Option<Club>, pub advanced_spin: Option<bool>, pub discard_non_putting_zero_spin: Option<bool> }
 pub struct ExPuttSection { pub name: String, pub address: Option<String> }
-pub struct MockMonitorSection { pub name: String }
+pub struct MockMonitorSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: MockConfig }  // flightrelay's MockConfig
 pub struct OpenConnectServerSection { pub name: String, pub bind: Option<String> }
 pub struct OpenConnectClientSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
 pub struct RandomClubSection { pub name: String }
@@ -620,6 +623,14 @@ the ring and every cap.
 | Open Connect | the inbound JSON text and our reply | the one message | none | - | - | - |
 | Mock | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
 
+A device on a flightrelay device driver ([Device drivers](#device-drivers))
+records the driver's `raw_frame` events instead: each frame is one protocol
+message, cleared of identity by the driver, stored with the driver's `label`
+as it gave it (no `type`, `src`, `dst` or `channel`), `hex` (or `text` for a
+text protocol), and placed in time by the frame's own timestamp. Pre-roll,
+caps and the bulk budget come from the driver's raw profile. The mock has no
+wire protocol and records none.
+
 The web layer keeps each shot as a `StoredShot` (`app/src/actors/web/mod.rs`):
 when `shot_trigger` arrived, a `ShotContext` snapshot taken then (device kind,
 maker, model and firmware; the club the web layer last saw in a `club_info`
@@ -759,7 +770,9 @@ with **no overlapping telemetry keys**:
   FRP-only consumers ignore this per spec (unknown `kind` value).
 
   Standard telemetry keys: `detection_mode`, `radar_mode`, `device_info`.
-  Mock launch monitors add: `shot_count`, `tracking_mode`.
+  Launch monitors on a device driver add `shot_count` and, while a driver
+  reports one, `phase`; the mock's `tracking_mode` and `radar_mode` come
+  from its driver as device telemetry.
   Integration actors: `club`, `handed`, `name`, `error`.
   Open Connect clients add: `address`, `last_shot`, `shots_sent`,
   `monitor_ready`, `response` (see
@@ -1113,7 +1126,8 @@ What a stop does, by actor:
 | Square Golf | in a session or a backoff wait: it disarms the device, then disconnects it, with BlueZ and with btleplug | the scan and connect inside allsquare (up to 20s scan + 20s service resolution on Linux) |
 | Garmin R10 | in a session or a backoff wait | the scan and connect inside tenover |
 | ExPutt | measuring (100 ms event wait, the session closes at once) or waiting to reconnect | a session start (up to 17s: connect and greeting, two handshake replies, mat search) |
-| Mock monitor, Random club | always (100 ms loop) | -- |
+| Mock monitor | always (50 ms polls; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
+| Random club | always (100 ms loop) | -- |
 
 **Mevo actor mapping** (from internal phases):
 
@@ -1421,9 +1435,14 @@ today, and nothing in the policy is Pureplay's.
   `RoundPolicy::allows` before its solve, to answer at once. Refused, it
   returns `SolveError::RoundActive`, which `POST /api/auto-chip` answers
   with `409 {"error":"Auto-chip is off during a Pureplay strict-mode
-  round"}`; nothing is put on the bus and no number is taken. The mock
-  holds its shot, logs "mock: no shots during the tournament round" once
-  per round, and fires once the round ends.
+  round"}`; nothing is put on the bus and no number is taken. A device
+  driver of a virtual source (the mock) asks `Events::shots_allowed()`,
+  which its `DriverActor` sets from `RoundPolicy::allows` before every
+  poll, before it numbers a shot: a held shot takes no number and fires
+  once the round ends. The actor logs "<id>: no shots during the
+  tournament round" once per round, and sends each trigger through
+  `send_if_allowed` as the backstop: a shot that starts anyway is dropped
+  whole.
 - **State.** `RoundPolicy::state()` is a `flighthook::RoundState { active,
   holder }`. `main` attaches the bus, and every change goes out as a
   `round_state` event (actor `system`); `GET /api/status` carries it as
@@ -1450,6 +1469,73 @@ ends. The state of a launch monitor is learned only from its own bus events,
 so an output that starts while a monitor is already connected reports it
 NotReady/Disconnected until the monitor's next status or its next
 `ready=true`.
+
+## Device drivers
+
+A launch monitor card can run on a flightrelay device driver
+(`flightrelay::driver::DeviceDriver`): the mock does today
+(`flightrelay::mock::MockDriver`). The driver owns the device (connect,
+session, shots, telemetry, raw frames); `actors::driver::DriverActor<D, H>`
+is the host around it, one thread per card. What a card adds is its
+`Hooks<D>`: its config section (`H::Section`, a lib `DeviceSection`), its
+shot source (`H::SOURCE`) and optional processing (`on_frp`, `action`).
+The mock's are `actors::mock::MockHooks` (none of its own).
+
+**Config.** A `DeviceSection` is flighthook's own fields (`name`,
+`enabled`, `impact_lead_s`) with the driver's config `#[serde(flatten)]`ed
+next to them, so the file and the REST JSON hold one flat table per card;
+every driver field is left out while at its default, so a default section
+writes what it wrote before. `FlighthookConfig::device_error()` runs every
+card's `DriverConfig::validate` and names the card and the field
+(`mock_monitor.0: shot_interval_s: must be 0 to 86400`): a save that
+fails it is `400`; a file that fails it loads as written, logs the error
+and that card does not start (its card shows the error). A type error in a
+driver field, which serde reads through the flattened buffer, is located by
+re-reading each section into the driver's config, so the load error names
+the key's line. Tests keep host keys and driver keys apart and check that a
+card's source class is its driver's declared source.
+
+**Run loop.** `D::new(config)`; a refused config sends Disconnected with
+the error as the card's `error` and the actor waits for its stop. Then
+Starting (once), and per attempt `connect` with a `ConnectCtx` whose host
+is the actor: `tick()` drains the bus into the latched command (game
+state's mode, hand and club at start; `set_detection_mode` and `club_info`
+afterwards) and queues the card's actions. A session: Connected with
+`device_info` (the identity's label) and `shot_count`, then a
+`device_telemetry` with the identity (and `source`, stamped by the bus
+sender) before any shot; each pass drains the bus into `command` and
+`action`, hands a live config to `apply_config`, sets `wants_raw` (always)
+and `shots_allowed` (the round policy), and polls for 50 ms. A session
+error releases held launches, sends `ready=false` and then Reconnecting;
+the driver's `retry_delay` (its own alerts, an SDK `Backoff`) is slept with
+the bus drained; `None` gives up with Disconnected and the error. A stop
+closes the session (`close`) and ends Disconnected. `stop_wait()` is
+`D::STOP_WAIT`; a driver whose device takes one connection at a time
+(`exclusive`) is not replaceable while stopping.
+
+**Events.** Each driver event goes on the bus with the session's device id:
+
+| Driver event | Bus |
+|---|---|
+| `shot_trigger` | `ShotTrigger` (with the driver's timestamp) through `RoundPolicy::send_if_allowed`; opens the raw capture window at the trigger's time; refused, the whole shot is dropped |
+| `launch` | held until the shot's `flight_result` or `shot_finished`; then `on_frp` (with the flight result in view), the simulation once (the driver's fixed mode, else the live mode) and `Launch` with `derived`, then `FlightResult` |
+| `flight_result` | releases the held launch; one that comes first waits for its launch |
+| `club_path`, `face_impact`, `alert` | `ClubPath`, `FaceImpact`, `Alert` |
+| `shot_finished` | `ShotFinished` with the shot's raw frames (`"<kind> device has no wire protocol"` without a raw profile), then the card's `shot_count` |
+| `device_telemetry` | merged into the session's map and published in full |
+| `raw_frame` | numbered per device id across sessions, a hex line at the `audit` target, recorded for the export ([raw capture](#raw-capture-and-shot-export)); never on the bus |
+| `Phase` | the card's `phase` |
+| `Log` | tracing; trace lines at the `audit` target |
+| `ShotDiscarded` | the pre-roll is cleared |
+
+Held launches go out when a session ends, and one held past
+`flighthook::SHOT_TIMEOUT` (45 s, when every consumer has given up on its
+shot) is dropped.
+
+**Live config.** `reconfigure` reads the card's section: unchanged or a
+host field only is Applied; a driver change that `restart_needed` calls
+live (and that validates) is Applied and handed to the running driver;
+anything else, a refused config or a removed section is RestartRequired.
 
 ## Cameras and replay (beta)
 
@@ -2378,7 +2464,7 @@ main thread (eframe)       std::thread per actor              tokio runtime (bac
 | ctrl-c (headless|        | actors::mevo           |        | drain subscriber       |
 +-----------------+        | actors::r10            |        +------------------------+
                            | actors::camera (beta)  |
-                           | actors::mock::launch   |
+                           | actors::driver (mock)  |
   GUI --ehttp/ws---->      | polls bus via poll()    |            ^
   (to local web server)    +------------------------+            |
                                      ^                            |
@@ -2418,7 +2504,7 @@ start/stop/reconfigure.
 config-driven). Then each config section constructs an actor struct and calls
 `actor.start(state, sender, receiver)`. Each actor gets a per-actor
 `Arc<AtomicBool>` shutdown flag shared between the `BusReceiver` and the
-registry. Launch monitor actors (mevo, r10, mock::launch) run event loops polling
+registry. Launch monitor actors (mevo, r10, the mock's `DriverActor`) run event loops polling
 the bus. Integration actors (the Open Connect client in `actors::gspro`, the
 Pureplay output in `actors::pureplay`, mock::randomclub) subscribe to the bus
 and emit `ClubInfo` / `HandInfo` (for club and hand changes) and `ActorStatus`
@@ -2493,7 +2579,7 @@ card titles, the Shots tab's device filter and labels, and alert banners.
 
 `ReconfigureOutcome` enum:
 
-- `Applied` -- config unchanged or applied without restart (default for mock actors)
+- `Applied` -- config unchanged or applied without restart (the default)
 - `RestartRequired` -- address/routing/settings changed; must stop and recreate
 
 ## UI Zoom

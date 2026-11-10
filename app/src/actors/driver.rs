@@ -2088,6 +2088,7 @@ mod tests {
 
     #[test]
     fn every_cards_source_is_its_drivers() {
+        source_matches::<flightrelay::mock::MockDriver, crate::actors::mock::MockHooks>();
         source_matches::<FakeDriver, FakeHooks>();
     }
 
@@ -2177,6 +2178,37 @@ mod tests {
         assert_eq!(
             driver_keys::<FakeConfig>(),
             BTreeSet::from(["bad", "live", "restart", "script"].map(String::from))
+        );
+
+        let mock = flighthook::MockMonitorSection {
+            name: "Mock".into(),
+            enabled: false,
+            impact_lead_s: Some(1.5),
+            driver: flighthook::MockConfig::default(),
+        };
+        let full = flighthook::MockMonitorSection {
+            driver: flighthook::MockConfig {
+                shot_interval_s: 5.0,
+                arm_delay_s: 3.0,
+                ball_ready_delay_s: 2.0,
+                post_shot_delay_s: 4.0,
+                serial: Some("7".into()),
+            },
+            ..mock.clone()
+        };
+        keys_apart(&mock, &full);
+        assert_eq!(
+            driver_keys::<flighthook::MockConfig>(),
+            BTreeSet::from(
+                [
+                    "arm_delay_s",
+                    "ball_ready_delay_s",
+                    "post_shot_delay_s",
+                    "serial",
+                    "shot_interval_s"
+                ]
+                .map(String::from)
+            )
         );
     }
 }

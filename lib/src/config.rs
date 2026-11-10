@@ -1,6 +1,7 @@
 use std::fmt;
 
 use flightrelay::config::DriverConfig;
+use flightrelay::mock::MockConfig;
 use flightrelay::units::{Distance, Velocity};
 use serde::{Deserialize, Serialize};
 
@@ -1640,7 +1641,18 @@ pub trait DeviceSection:
     }
 }
 
-/// A mock launch monitor instance.
+/// The first section of type `S` in `config`, by index, whose driver
+/// settings are not usable ([`DeviceSection::driver_error`]).
+fn first_driver_error<S: DeviceSection>(config: &FlighthookConfig) -> Option<String> {
+    let mut sections: Vec<_> = S::sections(config).iter().collect();
+    sections.sort_by(|a, b| a.0.cmp(b.0));
+    sections
+        .into_iter()
+        .find_map(|(index, s)| s.driver_error(&format!("{}.{index}", S::KIND)))
+}
+
+/// A mock launch monitor instance: a virtual device that makes a shot at a
+/// fixed interval (flightrelay's mock driver).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MockMonitorSection {
     #[serde(default)]
@@ -1655,6 +1667,35 @@ pub struct MockMonitorSection {
     /// device's default ([`impact_lead_default_s`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact_lead_s: Option<f64>,
+    /// The mock driver's settings: `shot_interval_s`, `arm_delay_s`,
+    /// `ball_ready_delay_s`, `post_shot_delay_s`, `serial`. Each one is left
+    /// out of the file while at its default.
+    #[serde(flatten)]
+    pub driver: MockConfig,
+}
+
+impl Default for MockMonitorSection {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            impact_lead_s: None,
+            driver: MockConfig::default(),
+        }
+    }
+}
+
+impl DeviceSection for MockMonitorSection {
+    type Driver = MockConfig;
+    const KIND: &'static str = "mock_monitor";
+
+    fn driver(&self) -> &MockConfig {
+        &self.driver
+    }
+
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
+        &config.mock_monitor
+    }
 }
 
 /// An Open Connect server instance — a *launch monitor*, not an integration.
@@ -1934,6 +1975,14 @@ impl FlighthookConfig {
         self.launch_monitor_leads()
             .into_iter()
             .find_map(|(kind, index, lead)| impact_lead_error(&format!("{kind}.{index}"), lead))
+    }
+
+    /// The first card whose device driver refuses its settings
+    /// ([`DeviceSection::driver_error`]), as `"<id>: <field>: <reason>"`,
+    /// e.g. `mock_monitor.0: shot_interval_s: must be 0 to 86400`.
+    #[must_use]
+    pub fn device_error(&self) -> Option<String> {
+        first_driver_error::<MockMonitorSection>(self)
     }
 
     /// Look up the detection mode for a club based on the configured mapping.
@@ -2647,6 +2696,7 @@ mod openconnect_client_tests {
                 name: "Mock".into(),
                 enabled: true,
                 impact_lead_s: None,
+                driver: Default::default(),
             }),
             openconnect_server: one(OpenConnectServerSection {
                 name: "Uneekor".into(),
@@ -3612,5 +3662,69 @@ mod body_tracking_tests {
             c.camera_error().as_deref(),
             Some("camera.1: pitch_deg 31 is outside -30 to 30")
         );
+    }
+}
+
+#[cfg(test)]
+mod mock_section_tests {
+    use super::*;
+
+    /// A default mock section writes only its name; a section without
+    /// driver settings reads with the driver's defaults; a section with
+    /// them round-trips, writing only what differs from the defaults. TOML
+    /// files are tested in the app's config tests.
+    #[test]
+    fn the_mock_section_writes_only_what_differs() {
+        let section = MockMonitorSection {
+            name: "Mock".into(),
+            ..MockMonitorSection::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&section).unwrap(),
+            r#"{"name":"Mock"}"#
+        );
+        let old: MockMonitorSection = serde_json::from_str(r#"{"name":"Mock"}"#).unwrap();
+        assert_eq!(old, section);
+        let empty: MockMonitorSection = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, MockMonitorSection::default());
+
+        let set: MockMonitorSection = serde_json::from_str(
+            r#"{"name":"Mock","enabled":false,"shot_interval_s":5,"serial":"7"}"#,
+        )
+        .unwrap();
+        assert!(!set.enabled);
+        assert_eq!(set.driver.shot_interval_s, 5.0);
+        assert_eq!(set.driver.serial.as_deref(), Some("7"));
+        let json = serde_json::to_string(&set).unwrap();
+        assert_eq!(
+            json,
+            r#"{"name":"Mock","enabled":false,"shot_interval_s":5.0,"serial":"7"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<MockMonitorSection>(&json).unwrap(),
+            set
+        );
+    }
+
+    /// `device_error` names the first card, by index, whose driver refuses
+    /// its settings, and the field.
+    #[test]
+    fn device_error_names_the_card_and_the_field() {
+        let mut config = FlighthookConfig::default();
+        assert_eq!(config.device_error(), None);
+        config
+            .mock_monitor
+            .insert("0".into(), MockMonitorSection::default());
+        assert_eq!(config.device_error(), None);
+        for (index, interval) in [("2", -1.0), ("1", f64::NAN)] {
+            let mut bad = MockMonitorSection::default();
+            bad.driver.shot_interval_s = interval;
+            config.mock_monitor.insert(index.into(), bad);
+        }
+        assert_eq!(
+            config.device_error().as_deref(),
+            Some("mock_monitor.1: shot_interval_s: must be 0 to 86400")
+        );
+        assert_eq!(MockMonitorSection::sections(&config).len(), 3);
     }
 }

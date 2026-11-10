@@ -135,6 +135,7 @@ mod tests {
                 name: String::new(),
                 enabled: true,
                 impact_lead_s: None,
+                driver: Default::default(),
             },
         );
         config

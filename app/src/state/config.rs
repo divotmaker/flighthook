@@ -214,6 +214,12 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
             if let Some(error) = config.impact_lead_error() {
                 tracing::warn!("{}: {error}; the device default is used", path.display());
             }
+            if let Some(error) = config.device_error() {
+                tracing::warn!(
+                    "{}: {error}; that card does not start until it is fixed",
+                    path.display()
+                );
+            }
             if let Some(error) = config.camera_error() {
                 tracing::warn!(
                     "{}: {error}; that setting is not used (latency 0, no rotation, 0 degrees)",
@@ -253,8 +259,10 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
             }
             None => {
                 let e = located_error(contents, e);
-                tracing::warn!("failed to parse {}: {e}", path.display());
-                Err(fault(contents, &e))
+                let fault = driver_type_error::<flighthook::MockMonitorSection>(contents)
+                    .unwrap_or_else(|| fault(contents, &e));
+                tracing::warn!("failed to parse {}: {fault}", path.display());
+                Err(fault)
             }
         },
     }
@@ -409,6 +417,56 @@ fn located_error(contents: &str, error: toml::de::Error) -> toml::de::Error {
     FlighthookConfig::deserialize(toml::Deserializer::new(contents))
         .err()
         .unwrap_or(error)
+}
+
+/// The first type error, by index, in the driver settings of a card of
+/// type `S` in config text `contents`, as `"line L, column C: <id>:
+/// <field>: <message>"` with the line of the field's key (of the card's
+/// table when the key is not found as a plain `key = value` line). Driver
+/// settings are read through the section's flattened buffer, which loses
+/// the position, so each section is read again into the driver's config on
+/// its own. `None` when every card of the type reads.
+fn driver_type_error<S: flighthook::DeviceSection>(contents: &str) -> Option<String> {
+    use flighthook::DriverConfig;
+    let table: toml::Table = contents.parse().ok()?;
+    let sections = table.get(S::KIND)?.as_table()?;
+    let mut indices: Vec<&String> = sections.keys().collect();
+    indices.sort();
+    indices.into_iter().find_map(|index| {
+        let serde_json::Value::Object(map) = serde_json::to_value(&sections[index]).ok()? else {
+            return None;
+        };
+        if serde_json::from_value::<S::Driver>(serde_json::Value::Object(map.clone())).is_ok() {
+            return None;
+        }
+        let error = S::Driver::from_map(map).err()?;
+        let id = format!("{}.{index}", S::KIND);
+        let (line, column) = key_position(contents, &id, error.field.as_deref())?;
+        Some(format!("line {line}, column {column}: {id}: {error}"))
+    })
+}
+
+/// The line and column (1-based) of `key = ...` in table `[id]` of config
+/// text `contents`, else of the table's header; `None` without the header.
+fn key_position(contents: &str, id: &str, key: Option<&str>) -> Option<(usize, usize)> {
+    let header = format!("[{id}]");
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.iter().position(|l| l.trim() == header)?;
+    let found = key.and_then(|key| {
+        lines[start + 1..]
+            .iter()
+            .take_while(|l| !l.trim_start().starts_with('['))
+            .position(|l| {
+                l.trim_start()
+                    .strip_prefix(key)
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+            })
+            .map(|n| {
+                let line = lines[start + 1 + n];
+                (start + 2 + n, line.len() - line.trim_start().len() + 1)
+            })
+    });
+    Some(found.unwrap_or((start + 1, 1)))
 }
 
 /// Whether config text `contents` has the older singleton `[webserver]`
@@ -1100,6 +1158,87 @@ full_monitor = "mevo.0"
     fn load_error(contents: &str) -> String {
         let error = toml::from_str::<FlighthookConfig>(contents).expect_err("a bad config");
         located_error(contents, error).to_string()
+    }
+
+    /// A type error in a card's driver settings, which serde reads through
+    /// the section's flattened buffer, is located by its own key.
+    #[test]
+    fn a_driver_settings_type_error_names_its_key_and_line() {
+        let text = "[webserver.0]\n\
+                    name = \"Web Server\"\n\
+                    bind = \"127.0.0.1:5880\"\n\
+                    \n\
+                    [mock_monitor.0]\n\
+                    name = \"Mock\"\n\
+                    \n\
+                    [mock_monitor.1]\n\
+                    name = \"Mock 2\"\n\
+                    shot_interval_s = \"x\"\n";
+        let error = kept_error(text);
+        assert_eq!(
+            error.error,
+            "line 10, column 1: mock_monitor.1: shot_interval_s: invalid type: string \"x\", expected f64"
+        );
+    }
+
+    /// A mock card's section in a file reads and writes as before its
+    /// driver settings were flattened in: a file with only its name loads
+    /// with the driver's defaults and is not rewritten; driver settings
+    /// read from the file (an integer into a seconds field) and are written
+    /// back only when they differ from the defaults.
+    #[test]
+    fn a_mock_section_file_round_trips_unchanged() {
+        let mut written = FlighthookConfig::default();
+        written.mock_monitor.insert(
+            "0".into(),
+            flighthook::MockMonitorSection {
+                name: "Mock".into(),
+                ..flighthook::MockMonitorSection::default()
+            },
+        );
+        let text = toml::to_string_pretty(&written).expect("toml");
+        assert!(
+            text.ends_with("[mock_monitor.0]\nname = \"Mock\"\n"),
+            "{text}"
+        );
+        let (dir, path) = config_dir(&text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        assert_eq!(config, written);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            text,
+            "not rewritten"
+        );
+        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+
+        let text = "[mock_monitor.0]\nname = \"Mock\"\nshot_interval_s = 5\n";
+        let config: FlighthookConfig = toml::from_str(text).expect("parses");
+        assert_eq!(config.mock_monitor["0"].driver.shot_interval_s, 5.0);
+        let saved = toml::to_string_pretty(&config).expect("toml");
+        assert!(
+            saved.contains("[mock_monitor.0]\nname = \"Mock\"\nshot_interval_s = 5.0\n"),
+            "{saved}"
+        );
+        assert_eq!(
+            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            config
+        );
+    }
+
+    /// A value the mock driver refuses does not fail the load: the config
+    /// loads as written and names the card, which does not start.
+    #[test]
+    fn refused_driver_settings_load_and_are_reported() {
+        let text = "[mock_monitor.0]\nname = \"Mock\"\nshot_interval_s = -1\n";
+        let (_dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        assert_eq!(config.mock_monitor["0"].driver.shot_interval_s, -1.0);
+        assert_eq!(
+            config.device_error().as_deref(),
+            Some("mock_monitor.0: shot_interval_s: must be 0 to 86400")
+        );
     }
 
     #[test]

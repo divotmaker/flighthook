@@ -22,10 +22,11 @@ gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 ironsight = { version = "0.6.0", features = ["serde"] }
 tenover = "0.4.0"
 flighthook = { path = "../lib", features = ["clap"] }
-# FRP's forwarding rules for the `/frp` endpoint (`ForwardFilter`) and the
-# device driver contract launch monitor actors run on (`driver`); the same
-# crate the lib re-exports its types from. `driver` adds no dependency.
-flightrelay = { version = "0.5", features = ["device", "driver"] }
+# FRP's forwarding rules for the `/frp` endpoint (`ForwardFilter`), the
+# device driver contract the launch monitor actors run on (`driver`) and the
+# mock launch monitor (`mock`); the same crate the lib re-exports its types
+# from. Neither feature adds a dependency.
+flightrelay = { version = "0.5", features = ["device", "driver", "mock"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

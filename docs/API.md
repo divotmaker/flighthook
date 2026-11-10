@@ -1825,6 +1825,15 @@ Full persisted config (mirrors `config.toml`).
   the actor
 - ExPutt sections have `name` and an optional `address`: the device's IP
   address (no port). When absent the device is found on the local network.
+- `mock_monitor` sections have `name` and the mock launch monitor's
+  settings, each omitted while at its default: `shot_interval_s` (30, the
+  seconds from the ball being ready to the shot), `arm_delay_s` (2, from
+  connecting or a shot's end to armed), `ball_ready_delay_s` (1, from armed
+  to the ball being ready), `post_shot_delay_s` (1, from a shot to
+  re-arming), each 0 to 86400, and `serial` (the serial the mock reports,
+  `0001` when absent). A save with a delay out of range or not finite is
+  rejected with `400`; a config file holding one loads, and that card does
+  not start and shows the error. A change restarts the card
 - Every launch monitor, camera and output section (`mevo`, `r10`, `square`,
   `exputt`, `mock_monitor`, `openconnect_server`, `camera`,
   `openconnect_client`, `pureplay`, `random_club`) takes `enabled`: `true`
@@ -2064,6 +2073,7 @@ as applied.
 | `400 Bad Request` | a Mevo section it writes has a `launch_only_spin` below 0, above 1000 or not finite (`"mevo.0: launch_only_spin must be 0 to 1000 rpm per mph, not -5"`) |
 | `400 Bad Request` | a launch monitor section it writes has an `impact_lead_s` below 0, above 5 or not finite (`"square.0: impact_lead_s 6 is outside 0 to 5 s"`) |
 | `400 Bad Request` | a camera section it writes has a `latency_s` below 0, above 10 or not finite (`"camera.0: latency_s 11 is outside 0 to 10 s"`) |
+| `400 Bad Request` | a section it writes has a device driver setting the driver refuses, named by card and field (`"mock_monitor.0: shot_interval_s: must be 0 to 86400"`) |
 | `400 Bad Request` | a camera section it writes has a `rotation_deg` other than 0, 90, 180 or 270 (`"camera.0: rotation_deg 45 is not 0, 90, 180 or 270"`), or a `yaw_deg` or `pitch_deg` outside -30 to 30 or not finite (`"camera.0: yaw_deg 40 is outside -30 to 30"`) |
 | `400 Bad Request` | a camera section it writes has no `camera` (`"camera.0: no camera picked"`) or a `mode` that is neither `auto` nor `WIDTHxHEIGHT@FPS` |
 | `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
@@ -2275,8 +2285,8 @@ Ball strike detected. Emitted immediately by the launch monitor -- no data yet.
 - `key.shot_id`: UUID v4 string, globally unique across sessions
 - `key.shot_number`: session-level monotonic counter from the launch monitor
 - `timestamp` (optional): when the device detected the strike, milliseconds
-  since the Unix epoch (UTC), by the device's clock. No supported device
-  reports one yet, so it is absent.
+  since the Unix epoch (UTC), by the device's clock. The mock launch
+  monitor sends one; no other device reports one yet.
 
 A shot that has not finished within 45 s of its trigger (flighthook's
 accumulator timeout, longer than any device driver's own deadline for a
@@ -2659,6 +2669,9 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
       a BLE notification or command type; absent for R10 chunks and JSON
     - `src` / `dst`: FlightScope bus addresses (`APP`, `AVR`, `DSP`, `PI`)
     - `channel`: `notify`, `cmd`, `write`, `register` (BLE) or `tcp`
+    - `label`: the device driver's own name for the frame, stored as it gave
+      it; a frame from a device driver carries this instead of `type`,
+      `src`, `dst` and `channel`
     - `hex`: payload as lowercase hex (binary protocols; FlightScope: the
       unstuffed payload without header or checksum)
     - `text`: payload text (JSON protocols)
@@ -2872,7 +2885,9 @@ event types have no overlapping telemetry keys.
   same rule.
 
 Common keys for launch monitors: `detection_mode`, `radar_mode`, `device_info`.
-Mock launch monitors add: `shot_count`, `tracking_mode`.
+The mock launch monitor adds `shot_count`; its `tracking_mode`, `radar_mode`
+and `ready` come as `device_telemetry`, and it reports its model (`Mock Launch
+Monitor`) there.
 The ExPutt adds `shot_count` and `phase` (`discovering`, `connecting`,
 `measuring`).
 Integration actors: `club`, `handed`, `name`, `error`.

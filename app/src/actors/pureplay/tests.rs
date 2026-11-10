@@ -694,6 +694,7 @@ fn a_monitor_turned_off_does_not_refuse_a_round() {
                 name: "Mock".into(),
                 enabled: false,
                 impact_lead_s: None,
+                driver: Default::default(),
             },
         );
     });

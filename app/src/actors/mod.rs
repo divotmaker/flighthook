@@ -4,8 +4,6 @@ pub(crate) mod backoff;
 pub mod camera;
 #[cfg(debug_assertions)]
 pub mod clip_source;
-// No card runs on a device driver yet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod driver;
 pub mod exputt;
 pub mod gspro;
@@ -56,6 +54,10 @@ pub const MAX_STOP_WAIT: Duration = exputt::STOP_WAIT;
 
 const _: () = assert!(STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
 const _: () = assert!(square::STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
+const _: () = assert!(
+    <flightrelay::mock::MockDriver as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+        <= MAX_STOP_WAIT.as_millis()
+);
 
 /// Common trait for self-managed actors. Each actor struct holds its own config;
 /// `start()` clones what it needs and spawns a thread.
@@ -247,7 +249,7 @@ pub fn resolve_actors(
         actors.push(ResolvedActor {
             id,
             name: section.name.clone(),
-            actor: Box::new(mock::launch::MockLaunchActor { initial_mode: mode }),
+            actor: Box::new(mock::MockActor::new(section.clone())),
         });
     }
 

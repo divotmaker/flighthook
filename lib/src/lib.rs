@@ -34,6 +34,7 @@ pub use video::*;
 
 // Re-export flightrelay types used throughout flighthook.
 pub use flightrelay::config::{ConfigError, DriverConfig};
+pub use flightrelay::mock::MockConfig;
 pub use flightrelay::types::{AssumedLaunch, Basis, ClubData, FaceImpact, FlightResult, Launch};
 pub use flightrelay::units::{Distance, Velocity};
 pub use flightrelay::{DEFAULT_PATH as FRP_PATH, DEFAULT_PORT as FRP_PORT, DEFAULT_URL as FRP_URL};

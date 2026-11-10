@@ -1302,6 +1302,7 @@ mod tests {
                     name: "Mock".into(),
                     enabled: true,
                     impact_lead_s: None,
+                    driver: Default::default(),
                 },
             );
         });
@@ -1636,6 +1637,7 @@ mod tests {
                     name: "Mock".into(),
                     enabled: true,
                     impact_lead_s: None,
+                    driver: Default::default(),
                 },
             );
             c.openconnect_server.insert("0".into(), Default::default());
@@ -1698,6 +1700,7 @@ mod tests {
             name: name.into(),
             enabled: true,
             impact_lead_s: None,
+            driver: Default::default(),
         }
     }
 
@@ -1747,6 +1750,19 @@ mod tests {
     }
 
     /// Statuses `actor` sent, in order.
+    /// How many times the system started `actor` afresh in `seen`: its
+    /// Starting statuses that clear the card's `error` (an actor's own
+    /// Starting carries no such key).
+    fn fresh_starts(seen: &[FlighthookMessage], actor: &str) -> usize {
+        seen.iter()
+            .filter(|m| m.actor == actor)
+            .filter(|m| {
+                matches!(&m.event, FlighthookEvent::ActorStatus { status: ActorStatus::Starting, telemetry }
+                    if telemetry.contains_key("error"))
+            })
+            .count()
+    }
+
     fn statuses(seen: &[FlighthookMessage], actor: &str) -> Vec<ActorStatus> {
         seen.iter()
             .filter(|m| m.actor == actor)
@@ -2105,9 +2121,9 @@ mod tests {
                     holds: s.holds,
                     replaceable: s.replaceable,
                 }),
-                None => Box::new(crate::actors::mock::launch::MockLaunchActor {
-                    initial_mode: flighthook::ShotDetectionMode::Full,
-                }),
+                None => Box::new(crate::actors::mock::MockActor::new(
+                    flighthook::MockMonitorSection::default(),
+                )),
             };
             start_actor(format!("mock_monitor.{n}"), actor, &state, &bus_tx);
         }
@@ -2218,10 +2234,7 @@ mod tests {
         }));
         std::thread::sleep(Duration::from_millis(300));
         seen.extend(std::iter::from_fn(|| rx.try_recv().ok()));
-        let starts = statuses(&seen, id)
-            .into_iter()
-            .filter(|s| *s == ActorStatus::Starting)
-            .count();
+        let starts = fresh_starts(&seen, id);
         assert_eq!(starts, 1, "one restart, for two presses");
         assert_eq!(state.actor_thread(id), instance, "and no other after it");
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2724,8 +2737,7 @@ mod tests {
         seen.extend(std::iter::from_fn(|| rx.try_recv().ok()));
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         let card = statuses(&seen, id);
-        let starts = card.iter().filter(|s| **s == ActorStatus::Starting).count();
-        assert_eq!(starts, 1, "{card:?}");
+        assert_eq!(fresh_starts(&seen, id), 1, "{card:?}");
         assert!(!state.is_settling(id));
         assert_ne!(state.actor_thread(id), old, "one new instance runs");
         stop_all(&state);
@@ -2875,10 +2887,7 @@ mod tests {
         assert_eq!(outcome_of(&seen, "reconnect").0, [id]);
         std::thread::sleep(Duration::from_millis(200));
         seen.extend(std::iter::from_fn(|| rx.try_recv().ok()));
-        let starts = statuses(&seen, id)
-            .into_iter()
-            .filter(|s| *s == ActorStatus::Starting)
-            .count();
+        let starts = fresh_starts(&seen, id);
         assert_eq!(starts, 1, "one new instance");
         assert_ne!(state.actor_thread(id), old);
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2909,7 +2918,7 @@ mod tests {
         let (restarted, stopped, started) = outcome_of(&seen, "reconnect");
         assert!(restarted.is_empty() && stopped.is_empty() && started.is_empty());
         assert!(state.actor_ids().iter().all(|a| a != id));
-        assert!(!statuses(&seen, id).contains(&ActorStatus::Starting));
+        assert_eq!(fresh_starts(&seen, id), 0);
         assert_eq!(state.round.source(id), None, "not a shot source");
         shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         stop_all(&state);

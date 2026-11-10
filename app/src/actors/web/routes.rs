@@ -1097,7 +1097,24 @@ fn invalid_setting(action: &ConfigAction) -> Option<String> {
     if let Some(error) = invalid_camera_setting(action) {
         return Some(error);
     }
+    if let Some(error) = invalid_driver_setting(action) {
+        return Some(error);
+    }
     invalid_mevo_setting(action)
+}
+
+/// [`invalid_setting`] for the settings of a card's device driver: what its
+/// own validation refuses, with the field named
+/// ([`flighthook::DeviceSection::driver_error`]).
+fn invalid_driver_setting(action: &ConfigAction) -> Option<String> {
+    use flighthook::DeviceSection;
+    match action {
+        ConfigAction::ReplaceAll { config } => config.device_error(),
+        ConfigAction::UpsertMockMonitor { index, section } => {
+            section.driver_error(&format!("mock_monitor.{index}"))
+        }
+        _ => None,
+    }
 }
 
 /// [`invalid_setting`] for a camera's `latency_s`, `rotation_deg`, `yaw_deg`
@@ -2686,6 +2703,7 @@ mod group_tests {
                     name: "Mock".into(),
                     enabled: true,
                     impact_lead_s: None,
+                    driver: Default::default(),
                 },
             );
             c.openconnect_server.insert("0".into(), Default::default());
@@ -2737,6 +2755,55 @@ mod group_tests {
                 assert_eq!(invalid_setting(&action), None, "{id} {ok:?}");
             }
         }
+    }
+
+    /// A save with mock driver settings the driver refuses is 400 naming the
+    /// card and the field, and saves nothing, in a whole-config and a
+    /// scoped save; the driver's own limits are accepted.
+    #[tokio::test]
+    async fn settings_save_with_refused_driver_settings_is_400() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.mock_monitor
+                .insert("0".into(), flighthook::MockMonitorSection::default());
+        });
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        type Field = fn(&mut flighthook::MockConfig) -> &mut f64;
+        let fields: [(&str, Field); 4] = [
+            ("shot_interval_s", |c| &mut c.shot_interval_s),
+            ("arm_delay_s", |c| &mut c.arm_delay_s),
+            ("ball_ready_delay_s", |c| &mut c.ball_ready_delay_s),
+            ("post_shot_delay_s", |c| &mut c.post_shot_delay_s),
+        ];
+        for (field, value) in fields {
+            for bad in [-1.0, 86_400.5, f64::NAN] {
+                let mut body = live.clone();
+                *value(&mut body.mock_monitor.get_mut("0").unwrap().driver) = bad;
+                for scope in [None, Some("mock_monitor.0")] {
+                    let (status, Json(error)) =
+                        save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                            .await
+                            .expect_err("rejected");
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{field} {bad} {scope:?}");
+                    assert_eq!(
+                        error["error"],
+                        format!("mock_monitor.0: {field}: must be 0 to 86400"),
+                        "{scope:?}"
+                    );
+                }
+            }
+            for ok in [0.0, 86_400.0] {
+                let mut body = live.clone();
+                *value(&mut body.mock_monitor.get_mut("0").unwrap().driver) = ok;
+                let action = ConfigAction::ReplaceAll {
+                    config: Box::new(body),
+                };
+                assert_eq!(invalid_setting(&action), None, "{field} {ok}");
+            }
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
     }
 
     /// A save with a camera `latency_s` below 0, above 10 or non-finite is 400
@@ -3456,6 +3523,7 @@ mod reconnect_tests {
                     name: "Mock".into(),
                     enabled: true,
                     impact_lead_s: None,
+                    driver: Default::default(),
                 },
             );
             c.camera
@@ -3613,9 +3681,9 @@ mod reconnect_tests {
 
         crate::actors::start_actor(
             "mock_monitor.0".into(),
-            Box::new(crate::actors::mock::launch::MockLaunchActor {
-                initial_mode: flighthook::ShotDetectionMode::Full,
-            }),
+            Box::new(crate::actors::mock::MockActor::new(
+                flighthook::MockMonitorSection::default(),
+            )),
             &state.root,
             &state.bus_tx,
         );
@@ -3753,9 +3821,9 @@ mod reconnect_tests {
         );
         crate::actors::start_actor(
             "mock_monitor.0".into(),
-            Box::new(crate::actors::mock::launch::MockLaunchActor {
-                initial_mode: flighthook::ShotDetectionMode::Full,
-            }),
+            Box::new(crate::actors::mock::MockActor::new(
+                flighthook::MockMonitorSection::default(),
+            )),
             &root,
             &bus,
         );

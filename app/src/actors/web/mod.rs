@@ -2820,6 +2820,7 @@ pub(crate) mod tests {
                         name: "Mock".into(),
                         enabled,
                         impact_lead_s: None,
+                        driver: Default::default(),
                     },
                 );
             });

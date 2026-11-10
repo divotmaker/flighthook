@@ -3079,6 +3079,7 @@ mod tests {
                     name: "Mock".into(),
                     enabled: true,
                     impact_lead_s: None,
+                    driver: Default::default(),
                 },
             )),
             _ => drop(
@@ -4111,6 +4112,7 @@ mod tests {
                 name: "Mock".into(),
                 enabled: true,
                 impact_lead_s: None,
+                driver: Default::default(),
             },
         );
         config

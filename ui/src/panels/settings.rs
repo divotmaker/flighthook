@@ -11,7 +11,10 @@ use crate::types::{
     OpenConnectClientSection, PureplaySection, R10Section, RandomClubSection, ReplaySection,
     ShotGrouping, SimSurface, SimulationSection, SpinSource, UnitSystem, WebserverSection,
 };
-use flighthook::{BodyTrackingMode, BodyTrackingSection, PlayerSection, PoseModel, Sex, SimMode};
+use flighthook::{
+    BodyTrackingMode, BodyTrackingSection, DriverConfig, MockConfig, PlayerSection, PoseModel, Sex,
+    SimMode,
+};
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
     ("inches", "in"),
@@ -95,6 +98,10 @@ pub(crate) struct DeviceFormEntry {
     /// allsquare's default" for that club. The putter is excluded — it has
     /// no vertical impact estimate.
     pub(crate) square_impact_mm: std::collections::HashMap<Club, String>,
+    /// Mock launch monitor: the driver's settings, which the form does not
+    /// surface. Carried verbatim so that saving settings does not wipe them
+    /// from the config file, and checked with the driver's own validation.
+    pub(crate) mock: MockConfig,
     /// Camera: which camera, where it stands and its video mode.
     pub(crate) cam: Box<CameraFields>,
     pub(crate) dirty: bool,
@@ -330,6 +337,7 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            mock: MockConfig::default(),
             cam: Box::default(),
             dirty: false,
         }
@@ -364,6 +372,7 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            mock: MockConfig::default(),
             cam: Box::default(),
             dirty: false,
         }
@@ -380,6 +389,7 @@ impl DeviceFormEntry {
             square_club: s.club.clone(),
             square_advanced_spin: s.advanced_spin,
             square_impact_mm: impact_mm_form(s.dot_bottom_to_face_center_mm.as_ref()),
+            mock: MockConfig::default(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
             tee_height_unit: "inches".into(),
@@ -424,6 +434,7 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            mock: MockConfig::default(),
             cam: Box::default(),
             dirty: false,
         }
@@ -454,6 +465,7 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            mock: MockConfig::default(),
             cam: Box::default(),
             dirty: false,
         }
@@ -484,6 +496,7 @@ impl DeviceFormEntry {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            mock: s.driver.clone(),
             cam: Box::default(),
             dirty: false,
         }
@@ -510,8 +523,20 @@ impl DeviceFormEntry {
                     name: String::new(),
                     enabled: true,
                     impact_lead_s: None,
+                    driver: Default::default(),
                 },
             )
+        }
+    }
+
+    /// Why the device driver refuses the settings the form carries for it
+    /// (its own validation, the same the server applies on save), as
+    /// `"<field>: <reason>"`; `None` when it accepts them or the card runs
+    /// no device driver.
+    pub(crate) fn driver_error(&self) -> Option<String> {
+        match self.monitor_type.as_str() {
+            "mock_monitor" => self.mock.validate().err().map(|e| e.to_string()),
+            _ => None,
         }
     }
 
@@ -755,6 +780,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             square_club: None,
             square_advanced_spin: None,
             square_impact_mm: std::collections::HashMap::new(),
+            mock: MockConfig::default(),
             cam: Box::default(),
             dirty: true,
         })
@@ -2048,6 +2074,9 @@ pub(crate) fn actor_valid(actor: &ActorFormEntry) -> bool {
             if dev.is_launch_monitor() && impact_lead_value(&dev.impact_lead).is_none() {
                 return false;
             }
+            if dev.driver_error().is_some() {
+                return false;
+            }
             if dev.is_camera()
                 && (dev.cam.id.trim().is_empty()
                     || !video_mode_valid(&dev.cam.mode)
@@ -2190,6 +2219,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                             name: dev.name.clone(),
                             enabled: dev.enabled,
                             impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
+                            driver: dev.mock.clone(),
                         },
                     );
                 }
@@ -3036,6 +3066,14 @@ pub(crate) fn actor_fields(
 
             if dev.is_launch_monitor() {
                 camera_timing_field(ui, dev, field_width);
+            }
+            if let Some(error) = dev.driver_error() {
+                let line = ui.label(egui::RichText::new(error).color(theme::DANGER).size(11.0));
+                devices::mark(
+                    ui,
+                    || format!("driver_error:{}.{}", dev.monitor_type, dev.id),
+                    &line,
+                );
             }
         }
         ActorFormEntry::Integration(entry) => {
@@ -4122,7 +4160,7 @@ mod tests {
         MockMonitorSection, RandomClubSection, SimSurface, SimulationSection, SpinSource,
         UnitSystem,
     };
-    use flighthook::SimMode;
+    use flighthook::{MockConfig, SimMode};
 
     #[test]
     fn settings_are_requested_at_most_every_two_seconds_until_loaded() {
@@ -4167,6 +4205,7 @@ mod tests {
                 name: "Mock Monitor".into(),
                 enabled: true,
                 impact_lead_s: None,
+                driver: Default::default(),
             },
         );
         config.random_club.insert(
@@ -4613,6 +4652,44 @@ mod tests {
             super::apply_actor_to_config(&mut orig, &actor);
             assert_eq!(orig.mevo["0"].launch_only_spin, k);
         }
+    }
+
+    /// The mock card's driver settings, which the form does not show,
+    /// survive a save of the card; settings the driver refuses keep the
+    /// card from saving, with the field named.
+    #[test]
+    fn mock_driver_settings_survive_a_save_and_are_validated() {
+        let mut cfg = FlighthookConfig::default();
+        let driver = MockConfig {
+            shot_interval_s: 5.0,
+            serial: Some("7".into()),
+            ..MockConfig::default()
+        };
+        cfg.mock_monitor.insert(
+            "0".into(),
+            MockMonitorSection {
+                name: "Mock".into(),
+                driver: driver.clone(),
+                ..MockMonitorSection::default()
+            },
+        );
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        assert!(super::actor_valid(&form.actors[0]));
+        assert_eq!(
+            form.build_actor_request("mock_monitor.0").mock_monitor["0"].driver,
+            driver
+        );
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert_eq!(dev.driver_error(), None);
+        dev.mock.shot_interval_s = -1.0;
+        assert_eq!(
+            dev.driver_error().as_deref(),
+            Some("shot_interval_s: must be 0 to 86400")
+        );
+        assert!(!super::actor_valid(&form.actors[0]));
     }
 
     #[test]
