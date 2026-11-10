@@ -287,7 +287,8 @@ actor sends each key from one source only:
   (`true`), `input` (the name the device reports), `cpi`, `profile` (the
   club in play) and `handed` (`rh` | `lh`))
 - **Actor-framework** (from `actor_status`): `device_info`, `shot_count`,
-  `phase`
+  `phase`; `error` on a card on a device driver whose connects keep failing:
+  the latest connect error, removed when a session connects
 - **Integration actors**: `club`, `handed`, `name`, `error`
 - **Open Connect clients** (GSPro, Pureplay, Muni Golf, generic; from
   `actor_status`):

@@ -921,7 +921,8 @@ mod tests {
     }
 
     /// A trackball that cannot be opened is alerted with what to do and
-    /// retried; the card reads Starting, never Connected.
+    /// retried; the card reads Starting, never Connected, and shows the
+    /// driver's error as its `error` row.
     #[test]
     fn a_trackball_that_cannot_be_opened_is_retried() {
         let mut card = Card::new(section("missing"), opener(Vec::new()));
@@ -942,6 +943,18 @@ mod tests {
         assert!(
             !seen.iter().any(|m| is_status(m, ActorStatus::Connected)),
             "{seen:?}"
+        );
+        // What the web layer holds for the card, and so what any UI shows.
+        let mut held = flighthook::ActorStatusResponse::new("Trackball", ActorStatus::Starting);
+        for m in &seen {
+            if let FlighthookEvent::ActorStatus { status, telemetry } = &m.event {
+                held.apply_status(*status, telemetry, 0);
+            }
+        }
+        assert_eq!(held.status, ActorStatus::Starting);
+        assert_eq!(
+            held.telemetry.get("error").map(String::as_str),
+            Some("no input device found: no more test inputs")
         );
         card.stop();
     }

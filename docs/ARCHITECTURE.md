@@ -1379,7 +1379,8 @@ the driver reopens the device by itself (with no `device` named it chooses
 again, so a device back under another node is found) and `ready` turns true.
 A device that cannot be opened is a `warn` alert saying what to do (name
 one with the `device` setting when there are several, which is alerted
-once until the device opens; join the `input` group), never a device path, and a retry with the backoff. Off
+once until the device opens; join the `input` group), never a device path, and a retry with the backoff; the card shows the
+driver's error as its `error` row meanwhile. Off
 Linux the driver gives up with an `error` alert ("trackball input is not
 supported on this platform (Linux only)"), and the card ends Disconnected
 with that error; `GET /api/status` says `trackball_supported` only on
@@ -1697,6 +1698,16 @@ the R10's `actors::r10::R10Hooks`, the Square Golf's
 (its `action` is Find mat, its `on_frp` puts the driver's discovery hint in
 the card's words), the trackball's `actors::trackball::TrackballHooks` and
 the mock's `actors::mock::MockHooks` (no processing of their own).
+
+**A card that cannot connect says why.** While connects keep failing the
+card shows the latest connect error (the driver error's text) as its `error`
+row, through the retry delays too, and the log gets one `cannot connect`
+warning when the failures begin and another whenever the text changes, not
+one per retry. The row is part of the card's status, so a UI opened later
+reads it from `/api/status`; it goes when a session connects (the log then
+says it connected after failed connects) or the card stops. A driver's own
+alerts are logged as well (an alert that repeats the last one, as a
+driver may raise on every retry, once).
 
 **Config.** A `DeviceSection` is flighthook's own fields (`name`,
 `enabled`, `impact_lead_s`) with the driver's config `#[serde(flatten)]`ed

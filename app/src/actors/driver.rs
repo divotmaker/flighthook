@@ -11,7 +11,9 @@
 //!   asks for ([`DeviceDriver::retry_delay`], slept so that a stop cuts it
 //!   short). The card reads Starting before the first attempt, Connected
 //!   with each session, Reconnecting from the end of the first session on,
-//!   and Disconnected once stopped or given up.
+//!   and Disconnected once stopped or given up. A connect that fails puts
+//!   its error on the card as the `error` row until a session connects, and
+//!   in the log once per outage and again when the text changes.
 //! - **The bus in.** `set_detection_mode` and `club_info` become the
 //!   latched [`DeviceCommand`] (also during a connect, through
 //!   [`ConnectHost::tick`]) and the session's commands; the card's
@@ -58,7 +60,7 @@ use crate::sim;
 use crate::state::SystemState;
 use flighthook::{
     ActorStatus, Club, DeviceSection, DriverConfig, FlightResult, FlighthookEvent,
-    FlighthookMessage, Launch, RawDir, RawRecord, ShotDetectionMode, ShotKey, ShotRaw,
+    FlighthookMessage, Launch, RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw,
 };
 
 /// How long one session poll may take.
@@ -332,12 +334,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                         break;
                     }
                     // The failed connect's phase is not shown through the
-                    // retry delay.
-                    let mut telemetry = HashMap::new();
-                    sink.end_phase(&mut telemetry);
-                    if !telemetry.is_empty() {
-                        sink.status(sink.status, telemetry);
-                    }
+                    // retry delay; its error is.
+                    sink.connect_failed(&e.to_string());
                     attempts += 1;
                     (e, None)
                 }
@@ -390,9 +388,11 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                 }
             }
         }
-        // A stop that ended a connect leaves no phase on the card.
+        // A stop that ended a connect leaves no phase and no connect error
+        // on the card.
         let mut telemetry = HashMap::new();
         sink.end_phase(&mut telemetry);
+        sink.end_connect_error(&mut telemetry);
         sink.status(ActorStatus::Disconnected, telemetry);
     }
 
@@ -659,6 +659,13 @@ struct Sink<D: DeviceDriver, H: Hooks<D>> {
     /// The `phase` last set during this connect, if any (cleared when the
     /// session connects).
     phase_shown: Option<&'static str>,
+    /// The error of the last failed connect of the current outage: the card's
+    /// `error` row, on every status sent until a session connects.
+    connect_error: Option<String>,
+    /// The driver alert last logged, until a session connects: the same
+    /// alert again (a driver may raise it on every retry) is not logged
+    /// again.
+    last_alert: Option<(Severity, String)>,
     /// The session's raw capture, for a driver with a raw profile.
     capture: Option<RawCapture>,
     /// The next raw frame number per FRP device id, across sessions.
@@ -776,6 +783,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             telemetry: HashMap::new(),
             connecting: false,
             phase_shown: None,
+            connect_error: None,
+            last_alert: None,
             capture: None,
             seqs: HashMap::new(),
             held: HashMap::new(),
@@ -800,10 +809,51 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         self.sender.send(self.message(event));
     }
 
-    /// Send status `status` with actor telemetry `telemetry`.
-    fn status(&mut self, status: ActorStatus, telemetry: HashMap<String, String>) {
+    /// Send status `status` with actor telemetry `telemetry`, and the
+    /// connect error still held unless the status is Connected or carries
+    /// an `error` of its own (a Starting status drops what the card held).
+    fn status(&mut self, status: ActorStatus, mut telemetry: HashMap<String, String>) {
         self.status = status;
+        self.hold_connect_error(&mut telemetry);
         self.send(FlighthookEvent::ActorStatus { status, telemetry });
+    }
+
+    /// Put the connect error held into `telemetry`, unless the status shown
+    /// is Connected or `telemetry` has an `error`.
+    fn hold_connect_error(&self, telemetry: &mut HashMap<String, String>) {
+        if let Some(error) = &self.connect_error
+            && self.status != ActorStatus::Connected
+        {
+            telemetry
+                .entry("error".into())
+                .or_insert_with(|| error.clone());
+        }
+    }
+
+    /// A connect failed with `error`: the card shows it as its `error` row
+    /// through the retry delay, and the log gets one warning when it is the
+    /// first of the outage or the text changed. The connect's `phase` leaves
+    /// the card.
+    fn connect_failed(&mut self, error: &str) {
+        let changed = self.connect_error.as_deref() != Some(error);
+        if changed {
+            warn!("{}: cannot connect: {error}", self.actor);
+            self.connect_error = Some(error.to_owned());
+        }
+        let mut telemetry = HashMap::new();
+        self.end_phase(&mut telemetry);
+        if changed || !telemetry.is_empty() {
+            self.status(self.status, telemetry);
+        }
+    }
+
+    /// The outage is over (a session connected, or the actor stopped): takes
+    /// the held connect error back, removing the card's `error` row through
+    /// `telemetry` (an empty value removes the key).
+    fn end_connect_error(&mut self, telemetry: &mut HashMap<String, String>) {
+        if self.connect_error.take().is_some() {
+            telemetry.insert("error".into(), String::new());
+        }
     }
 
     /// A connect is about to start: a new session's telemetry and capture.
@@ -828,6 +878,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     /// any shot.
     fn connected(&mut self, identity: &DeviceIdentity) {
         self.connecting = false;
+        self.last_alert = None;
         // Frames sent while the first connect ran were numbered under the
         // actor's id; the device's numbers go on from there.
         if !self.seqs.contains_key(&identity.device)
@@ -836,11 +887,20 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             self.seqs.insert(identity.device.clone(), next);
         }
         self.device = Some(identity.device.clone());
-        info!("{}: connected to {}", self.actor, identity.label());
+        if self.connect_error.is_some() {
+            info!(
+                "{}: connected to {} after failed connects",
+                self.actor,
+                identity.label()
+            );
+        } else {
+            info!("{}: connected to {}", self.actor, identity.label());
+        }
         let mut telemetry = HashMap::from([
             ("device_info".into(), identity.label()),
             ("shot_count".into(), self.shot_count.to_string()),
         ]);
+        self.end_connect_error(&mut telemetry);
         // An empty value removes the key: the phases were the connect's.
         match self.phase_shown.take() {
             Some(SESSION_PHASE) => {
@@ -918,9 +978,11 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
                 if self.connecting {
                     self.phase_shown = Some(phase);
                 }
+                let mut telemetry = HashMap::from([("phase".into(), phase.to_owned())]);
+                self.hold_connect_error(&mut telemetry);
                 self.send(FlighthookEvent::ActorStatus {
                     status: self.status,
-                    telemetry: HashMap::from([("phase".into(), phase.to_owned())]),
+                    telemetry,
                 });
             }
             DeviceEvent::Log(level, line) => {
@@ -1044,6 +1106,15 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
                 });
             }
             FrpEvent::Alert { severity, message } => {
+                let alert = (severity, message);
+                if self.last_alert.as_ref() != Some(&alert) {
+                    match alert.0 {
+                        Severity::Warn => warn!("{}: {}", self.actor, alert.1),
+                        _ => error!("{}: {}", self.actor, alert.1),
+                    }
+                    self.last_alert = Some(alert.clone());
+                }
+                let (severity, message) = alert;
                 self.send(FlighthookEvent::Alert { severity, message });
             }
             FrpEvent::Launch { .. }
@@ -2128,6 +2199,70 @@ mod tests {
         assert!(raw.unavailable.is_none());
     }
 
+    /// What a [`log_capture`] subscriber wrote.
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Buf {
+        /// The log lines written so far.
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(lock(&self.0).clone())
+                .expect("text")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// A subscriber for `tracing::subscriber::with_default` that writes
+    /// events up to `level` as text lines into the returned buffer.
+    fn log_capture(level: tracing::Level) -> (Buf, impl tracing::Subscriber + Send + Sync) {
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        (buf, subscriber)
+    }
+
+    /// The lines of the one INFO-level log the whole test process writes
+    /// into, from every thread (the actor's too), installed on first use.
+    /// Tests that run at the same time write into it as well, so a test
+    /// looks only at the lines of its own actor ID. A scoped subscriber
+    /// would lose lines of callsites that other tests were the first to
+    /// hit.
+    fn process_log() -> &'static Buf {
+        static LOG: LazyLock<Buf> = LazyLock::new(|| {
+            let (buf, subscriber) = log_capture(tracing::Level::INFO);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other test installs a global subscriber");
+            buf
+        });
+        &LOG
+    }
+
+    /// The lines of [`process_log`] that mention `actor`, in order.
+    fn log_of(actor: &str) -> Vec<String> {
+        let tag = format!(" {actor}: ");
+        process_log()
+            .lines()
+            .into_iter()
+            .filter(|l| l.contains(&tag))
+            .collect()
+    }
+
     /// Trace lines go to the `audit` target, and a raw frame's audit line
     /// carries its direction, number, label and hex.
     #[test]
@@ -2136,30 +2271,13 @@ mod tests {
         beef.label = Some("D4 DSP>APP".into());
         assert_eq!(audit_line("fake.0", &beef), "fake.0 rx #7 D4 DSP>APP beef");
 
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                lock(&self.0).extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
+        let (buf, subscriber) = log_capture(tracing::Level::TRACE);
         let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
         drain(&mut rx);
         tracing::subscriber::with_default(subscriber, || {
             sink.handle(DeviceEvent::Log(Level::Trace, "rx handshake 01ab".into()));
         });
-        let log = String::from_utf8(lock(&buf.0).clone()).expect("text");
+        let log = buf.lines().join("\n");
         assert!(
             log.contains("TRACE audit: fake.0 rx handshake 01ab"),
             "{log}"
@@ -2287,11 +2405,11 @@ mod tests {
         }
     }
 
-    /// The card reads Starting before the first attempt only (failed
-    /// attempts don't repeat it), Connected for each session and
-    /// Reconnecting once a session has been established, with `ready=false`
-    /// just before it; each failure is the driver's alert. A stop closes
-    /// the session and ends Disconnected.
+    /// The card reads Starting before the first attempt (a failed attempt
+    /// repeats the status only to carry its error), Connected for each
+    /// session and Reconnecting once a session has been established, with
+    /// `ready=false` just before it; each failure is the driver's alert. A
+    /// stop closes the session and ends Disconnected.
     #[test]
     fn the_card_reads_starting_connected_then_reconnecting() {
         let ready = |v: &str| {
@@ -2320,7 +2438,15 @@ mod tests {
         use ActorStatus::{Connected, Disconnected, Reconnecting, Starting};
         assert_eq!(
             statuses(&seen),
-            [Starting, Connected, Reconnecting, Connected]
+            [
+                Starting,
+                Starting,
+                Starting,
+                Connected,
+                Reconnecting,
+                Reconnecting,
+                Connected
+            ]
         );
         let at = seen
             .iter()
@@ -2466,6 +2592,176 @@ mod tests {
             .expect("the driver's alert");
         assert!(cleared < alert, "{:?}", kinds(&seen));
         rig.state.stop_and_wait("fake.0");
+    }
+
+    /// The error row of the card after each of `seen`'s statuses, as the web
+    /// layer and the UI keep it.
+    fn error_rows(seen: &[FlighthookMessage]) -> Vec<Option<String>> {
+        let mut card = flighthook::ActorStatusResponse::new("Fake", ActorStatus::Starting);
+        seen.iter()
+            .filter_map(|m| match &m.event {
+                FlighthookEvent::ActorStatus { status, telemetry } => {
+                    card.apply_status(*status, telemetry, 0);
+                    Some(card.telemetry.get("error").cloned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A card whose connects keep failing carries the latest connect error as
+    /// its `error` row: set by the first failure, kept through the retry
+    /// delays and the next attempts' phases, updated when the text changes
+    /// and removed when a session connects. The status carries it only when
+    /// it is new, so a late UI reads it from the actor's held state.
+    #[test]
+    fn a_card_that_cannot_connect_shows_why() {
+        let (id, _script) = script(vec![
+            Connect::Fail("no device"),
+            Connect::Phase("probing", Box::new(Connect::Fail("no device"))),
+            Connect::Phase("probing", Box::new(Connect::Fail("no device"))),
+            Connect::Fail("busy"),
+            Connect::Fail("busy"),
+            Connect::Session(vec![]),
+        ]);
+        let mut rig = rig();
+        rig.start(section(id));
+        let seen = rig.until(|m| is_status(m, ActorStatus::Connected));
+        let rows = error_rows(&seen);
+        let found: Vec<Option<&str>> = rows.iter().map(Option::as_deref).collect();
+        // The first status is the plain Starting; from the first failure on
+        // the row is there, whatever else the statuses carry (a probing
+        // phase included), until the Connected status removes it.
+        assert_eq!(found.first(), Some(&None), "{found:?}");
+        assert_eq!(found.last(), Some(&None), "{found:?}");
+        assert!(
+            found[1..found.len() - 1].iter().all(Option::is_some),
+            "{found:?}"
+        );
+        let mut texts: Vec<&str> = found.iter().flatten().copied().collect();
+        texts.dedup();
+        assert_eq!(texts, ["no device", "busy"], "{found:?}");
+        // Sent as a value only when new: one status for each text, and the
+        // empty value that removes it.
+        let sent: Vec<&str> = seen
+            .iter()
+            .filter_map(|m| match &m.event {
+                FlighthookEvent::ActorStatus { telemetry, .. } => {
+                    telemetry.get("error").map(String::as_str)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sent.contains(&"busy") && sent.last() == Some(&""),
+            "{sent:?}"
+        );
+        rig.state.stop_and_wait("fake.0");
+    }
+
+    /// A stop in the middle of an outage leaves the card Disconnected without
+    /// the connect error.
+    #[test]
+    fn a_stop_ends_the_connect_error() {
+        let (id, script) = script(vec![Connect::Fail("no device")]);
+        lock(&script).retry = Some(Duration::from_secs(30));
+        let mut rig = rig();
+        rig.start(section(id));
+        let mut seen = rig.until(|m| matches!(&m.event, FlighthookEvent::Alert { .. }));
+        assert_eq!(
+            rig.state.stop_and_wait("fake.0"),
+            crate::state::Stopped::Exited
+        );
+        seen.extend(rig.until(|m| is_status(m, ActorStatus::Disconnected)));
+        let rows = error_rows(&seen);
+        assert!(
+            rows.contains(&Some("no device".to_owned())),
+            "set during the outage: {rows:?}"
+        );
+        assert_eq!(rows.last(), Some(&None), "{rows:?}");
+    }
+
+    /// The log says why a card cannot connect once when an outage begins and
+    /// again when the reason changes, not on every retry, and once when it
+    /// connects again.
+    #[test]
+    fn a_failed_connect_is_logged_once_per_outage_and_per_new_reason() {
+        let (id, _script) = script(vec![
+            Connect::Fail("no device"),
+            Connect::Fail("no device"),
+            Connect::Fail("no device"),
+            Connect::Fail("busy"),
+            Connect::Fail("busy"),
+            Connect::Session(vec![Step::Fail("lost")]),
+            Connect::Fail("no device"),
+            Connect::Session(vec![]),
+        ]);
+        process_log();
+        let rig = rig();
+        let actor = DriverActor::<FakeDriver, FakeHooks>::new(section(id));
+        let sender = BusSender::new("logged.0".into(), rig.tx.clone(), Arc::default())
+            .with_provenance(Provenance::Measured);
+        let mut rx = rig.tx.subscribe();
+        let thread = actor.start(Arc::clone(&rig.state), sender.clone(), sender.subscribe());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut connects = 0;
+        while connects < 2 {
+            assert!(Instant::now() < deadline, "timed out");
+            match rx.try_recv() {
+                Ok(m) if m.actor == "logged.0" && is_status(&m, ActorStatus::Connected) => {
+                    connects += 1;
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        actor.stop();
+        thread.join().expect("the thread ends");
+        let lines = log_of("logged.0");
+        let cannot: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.contains("WARN") && l.contains("cannot connect: "))
+            .map(|l| l.rsplit("cannot connect: ").next().unwrap_or(""))
+            .collect();
+        assert_eq!(cannot, ["no device", "busy", "no device"], "{lines:?}");
+        let again: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("after failed connects"))
+            .collect();
+        assert_eq!(again.len(), 2, "{lines:?}");
+        assert!(again.iter().all(|l| l.contains("INFO")), "{again:?}");
+    }
+
+    /// A driver's alert goes to the log too: a warning at warn, an error or a
+    /// critical one at error; the same alert again is logged once (it is on
+    /// the bus every time).
+    #[test]
+    fn a_drivers_alerts_are_logged() {
+        process_log();
+        let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
+        sink.actor = "alerting.0".into();
+        drain(&mut rx);
+        for (severity, message) in [
+            (Severity::Warn, "careful"),
+            (Severity::Warn, "careful"),
+            (Severity::Error, "broken"),
+            (Severity::Critical, "gone"),
+        ] {
+            sink.handle(frp(FrpEvent::Alert {
+                severity,
+                message: message.into(),
+            }));
+        }
+        let lines = log_of("alerting.0");
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("WARN") && lines[0].ends_with("alerting.0: careful"));
+        assert!(lines[1].contains("ERROR") && lines[1].ends_with("alerting.0: broken"));
+        assert!(lines[2].contains("ERROR") && lines[2].ends_with("alerting.0: gone"));
+        assert_eq!(
+            kinds(&drain(&mut rx)),
+            ["alert"; 4],
+            "every alert is on the bus"
+        );
     }
 
     /// A stop that ends a connect leaves the card Disconnected without the
