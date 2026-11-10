@@ -2932,7 +2932,7 @@ Groups and order (`ui/src/panels/cards.rs`):
 | General | Global card, Simulation card, Replay card, Body tracking card, Player card, `webserver` | -- (no (+)) |
 | Launch monitors | `mevo`, `r10`, `square`, `exputt`, `trackball`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, ExPutt, Trackball (only while `/api/status` says `trackball_supported`), Uneekor (Open Connect), Open Connect Server |
 | Cameras | `camera` | Camera (only while `/api/status` says `cameras_supported`; without it the group shows the cameras already configured and no (+)) |
-| Outputs | `openconnect_client`, `pureplay`, `random_club` (and any type the UI does not know) | GSPro (Open Connect), Pureplay (Open Connect), Muni Golf (Open Connect), Pureplay (Pureplay Connect) |
+| Outputs | `openconnect_client`, `pureplay`, `random_club` (and any type the UI does not know) | GSPro (Open Connect), Pureplay (Open Connect), Muni Golf (Open Connect) (no entry adds a `pureplay` card; one comes only from the config file) |
 
 Each (+) entry is a preset (`cards::AddPreset`): an actor type plus the new
 card's name and address. The Open Connect and Pureplay presets:
@@ -2944,7 +2944,6 @@ card's name and address. The Open Connect and Pureplay presets:
 | GSPro (Open Connect) | `openconnect_client` | Open Connect | `127.0.0.1:921` |
 | Pureplay (Open Connect) | `openconnect_client` | Open Connect | `127.0.0.1:921` |
 | Muni Golf (Open Connect) | `openconnect_client` | Muni Golf | `127.0.0.1:9210` |
-| Pureplay (Pureplay Connect) | `pureplay` | Pureplay Connect | `127.0.0.1:9760` |
 
 The generic Open Connect Server entry is for any other monitor that speaks
 Open Connect. GSPro and Pureplay both listen for Open Connect on 921, so
@@ -2960,7 +2959,7 @@ off, so it can be set up for another address.
 A card's type label names the actor type, "Open Connect Server" or
 "Open Connect Client", whichever preset created it, and "Pureplay Connect"
 for a `pureplay` card. The Open Connect card has no tournament mode; tournament (strict) mode needs
-the Pureplay Connect output.
+a Pureplay Connect output, which the (+) menu does not offer yet.
 
 flighthook runs one web server, the one serving this UI. Its card has no
 Remove and no menu adds another; the config API refuses both (`400`, see

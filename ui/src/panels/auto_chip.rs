@@ -36,9 +36,7 @@ fn auto_chip_blocked(
     } else if in_flight.is_some() {
         Some("Sending the chip\u{2026}")
     } else if !crate::app::set_by_simulator(actors) {
-        Some(
-            "Auto-chip: no simulator connected. Connect an Open Connect Client or Pureplay Connect output first.",
-        )
+        Some("Auto-chip: no simulator connected. Connect an Open Connect Client first.")
     } else {
         None
     }

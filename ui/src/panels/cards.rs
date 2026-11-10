@@ -258,12 +258,6 @@ const OUTPUT_PRESETS: &[AddPreset] = &[
         "Muni Golf",
         "127.0.0.1:9210",
     ),
-    preset(
-        "Pureplay (Pureplay Connect)",
-        "pureplay",
-        "Pureplay Connect",
-        "127.0.0.1:9760",
-    ),
 ];
 
 /// What a group's (+) menu can offer, in menu order.
@@ -574,7 +568,6 @@ mod tests {
                 "GSPro (Open Connect)",
                 "Pureplay (Open Connect)",
                 "Muni Golf (Open Connect)",
-                "Pureplay (Pureplay Connect)",
             ]
         );
         assert!(welcome_options(CardGroup::Cameras, true).is_empty());
@@ -658,12 +651,6 @@ mod tests {
                     "Muni Golf",
                     "127.0.0.1:9210"
                 ),
-                (
-                    "Pureplay (Pureplay Connect)",
-                    "pureplay",
-                    "Pureplay Connect",
-                    "127.0.0.1:9760"
-                ),
             ]
         );
         assert!(
@@ -685,7 +672,7 @@ mod tests {
             .collect();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 12);
+        assert_eq!(labels.len(), 11);
     }
 
     /// The Trackball is offered only where the server can read one; the

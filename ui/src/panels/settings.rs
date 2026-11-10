@@ -4519,6 +4519,16 @@ mod tests {
                 enabled: true,
             },
         );
+        // No menu entry adds a Pureplay Connect output; the file can.
+        for i in ["0", "1"] {
+            config.pureplay.insert(
+                i.into(),
+                crate::types::PureplaySection {
+                    name: "Pureplay Connect".into(),
+                    ..Default::default()
+                },
+            );
+        }
         let mut loaded = SettingsForm::default();
         loaded.load_from(&config);
         loaded

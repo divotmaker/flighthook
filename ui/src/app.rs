@@ -3416,10 +3416,10 @@ mod tests {
                 "GSPro (Open Connect)",
                 "Pureplay (Open Connect)",
                 "Muni Golf (Open Connect)",
-                "Pureplay (Pureplay Connect)",
             ] {
                 assert!(marks.contains_key(&format!("wizard:{label}")), "{label}");
             }
+            assert!(!marks.contains_key("wizard:Pureplay (Pureplay Connect)"));
             assert_eq!(marks.contains_key("wizard:Trackball"), trackball);
             assert!(!marks.contains_key("wizard:Open Connect Server"));
             assert!(!marks.contains_key("wizard:Camera"));
@@ -3477,11 +3477,7 @@ mod tests {
     fn get_started_adds_the_checked_presets_as_the_add_menu_does() {
         let welcome = Welcome::sized(1600.0, 900.0);
         let mut app = welcome_app(false);
-        for label in [
-            "ExPutt",
-            "Muni Golf (Open Connect)",
-            "Pureplay (Pureplay Connect)",
-        ] {
+        for label in ["ExPutt", "Muni Golf (Open Connect)"] {
             welcome.click(&mut app, &format!("wizard:{label}"));
         }
         let marks = welcome.frame(&mut app, Vec::new());
@@ -3498,13 +3494,9 @@ mod tests {
         assert_eq!(muni.name, "Muni Golf");
         assert_eq!(muni.address.as_deref(), Some("127.0.0.1:9210"));
         assert!(muni.enabled);
-        let pureplay = &posted.pureplay["0"];
-        assert_eq!(pureplay.name, "Pureplay Connect");
-        assert_eq!(pureplay.address.as_deref(), Some("127.0.0.1:9760"));
-        assert!(pureplay.enabled);
         assert_eq!(posted.exputt.len(), 1);
         assert_eq!(posted.openconnect_client.len(), 1);
-        assert_eq!(posted.pureplay.len(), 1);
+        assert!(posted.pureplay.is_empty());
         assert!(posted.mevo.is_empty() && posted.r10.is_empty() && posted.square.is_empty());
         assert!(posted.openconnect_server.is_empty() && posted.trackball.is_empty());
         assert!(posted.webserver.contains_key("0"), "the web server stays");
@@ -3520,7 +3512,7 @@ mod tests {
             }));
         app.apply_pending();
         assert!(app.wizard_dismissed);
-        for id in ["exputt.0", "openconnect_client.0", "pureplay.0"] {
+        for id in ["exputt.0", "openconnect_client.0"] {
             let i = app.settings.position(id).expect(id);
             assert!(!app.settings.actors[i].dirty(), "{id}");
         }
@@ -3574,12 +3566,12 @@ mod tests {
                 .values()
                 .map(|s| s.enabled)
                 .collect(),
-            posted.pureplay.values().map(|s| s.enabled).collect(),
         ];
         assert_eq!(
             on.iter().map(Vec::len).collect::<Vec<_>>(),
-            [1, 1, 1, 1, 1, 1, 2, 1]
+            [1, 1, 1, 1, 1, 1, 2]
         );
+        assert!(posted.pureplay.is_empty());
         assert!(on.iter().flatten().all(|e| *e), "every card on: {on:?}");
     }
 
@@ -3597,7 +3589,7 @@ mod tests {
             }
         };
         let marks = welcome.frame(&mut app, Vec::new());
-        assert_eq!(welcome_boxes(&marks).len(), 10);
+        assert_eq!(welcome_boxes(&marks).len(), 9);
         inside(&marks);
         assert!(marks.contains_key("wizard:skip"));
 

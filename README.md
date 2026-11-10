@@ -57,7 +57,6 @@ macOS yet.
 | GSPro                                | TCP (JSON, port 921)    | built-in (Open Connect client) | Supported        |
 | [Pureplay](docs/outputs/pureplay.md) | TCP (JSON, port 921)    | built-in (Open Connect client) | Beta             |
 | Muni Golf                            | TCP (JSON, port 9210)   | built-in (Open Connect client) | Alpha (untested) |
-| [Pureplay](docs/outputs/pureplay.md) | TCP (binary, port 9760) | built-in (Pureplay Connect)    | Alpha            |
 
 Simulators are reached through the **Open Connect client** output, which sends
 shots to any simulator that accepts GSPro Open Connect. The Open Connect client
@@ -70,13 +69,6 @@ card's address. Only one card per address can be on: a menu entry always
 adds its card, but a card added at an address another card of its type is
 using starts off (Disabled), and its switch stays locked until you change its
 address to a free one, so you can set it up for a different port.
-
-Pureplay also has an output of its own (alpha), **Pureplay (Pureplay
-Connect)** in the same menu, which speaks Pureplay's open Pureplay Connect
-protocol: shots go out with only the values the device measured, and
-Pureplay sets flighthook's club and hand. Tournament rounds need this output
-and take shots from measured launch monitors only; the Open Connect card has
-no tournament mode. See [Pureplay](docs/outputs/pureplay.md).
 
 ### Custom Integrations
 
@@ -473,10 +465,9 @@ with radar launch monitors that miss short chips.
   the configured surface, comes to rest at the chosen distance (carry plus
   roll). The simulator runs its own physics on that launch, so its green
   speed changes the actual roll.
-- It goes to every connected Open Connect Client and Pureplay Connect output,
-  whatever launch monitor each detection mode is routed to. The button is
-  disabled until one is connected, and while Pureplay has a strict-mode
-  (tournament) round in progress, when Auto-chip does not fire at all.
+- It goes to every connected Open Connect Client, whatever launch monitor
+  each detection mode is routed to. The button is disabled until one is
+  connected.
 - The shot list, the Cards and Table views and the export show it as its own
   device, **Auto-chip**. It stays out of your shot statistics: it is listed
   under the set it was hit in, but the set's shot count, the range bars, the
@@ -600,17 +591,13 @@ address = "127.0.0.1:921"
 [openconnect_client.1]
 name = "Muni Golf"
 address = "127.0.0.1:9210"
-
-[pureplay.0]
-name = "Pureplay Connect"
-address = "127.0.0.1:9760"
 ```
 
 `[simulation]` and `[replay]` (camera clips, see
 [Cameras](docs/devices/cameras.md)) are single global tables. Section
 prefixes encode component type: `webserver`, `mevo`, `r10`, `square`,
 `exputt`, `trackball`, `openconnect_server`, `mock_monitor`, `openconnect_client`,
-`pureplay`, `random_club`, `camera`. The
+`random_club`, `camera`. The
 index after the dot (`0`, `1`, ...) identifies the instance. Per-device
 options are covered in the [device docs](#launch-monitors). Settings can also
 be edited live on the Devices tab in the UI.

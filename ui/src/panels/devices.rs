@@ -1559,7 +1559,6 @@ mod tests {
                 "GSPro (Open Connect)",
                 "Muni Golf (Open Connect)",
                 "Pureplay (Open Connect)",
-                "Pureplay (Pureplay Connect)",
             ],
             "the menu offers exactly these"
         );
@@ -1698,7 +1697,7 @@ mod tests {
     }
 
     /// No (+) menu entry is ever disabled for a duplicate address: with an
-    /// Open Connect card at `127.0.0.1:921`, all four Outputs entries take
+    /// Open Connect card at `127.0.0.1:921`, all three Outputs entries take
     /// clicks, and GSPro (Open Connect) adds a second Open Connect card.
     #[test]
     fn no_menu_entry_is_disabled_for_a_duplicate_address() {
@@ -1710,7 +1709,6 @@ mod tests {
             "GSPro (Open Connect)",
             "Pureplay (Open Connect)",
             "Muni Golf (Open Connect)",
-            "Pureplay (Pureplay Connect)",
         ] {
             assert!(enabled(&marks, &format!("add:Outputs:{label}")), "{label}");
         }
@@ -1890,26 +1888,40 @@ mod tests {
         assert!(!posted.openconnect_client["1"].enabled);
     }
 
-    /// The Pureplay (Pureplay Connect) entry adds a `pureplay` card named
-    /// Pureplay Connect with Pureplay's address and the routing dropdowns;
-    /// it saves as a `pureplay` section.
+    /// The (+) menu offers no Pureplay Connect output; one in the config
+    /// file shows as a `pureplay` card with Pureplay's address and the
+    /// routing dropdowns, and saves as a `pureplay` section.
     #[test]
-    fn an_added_pureplay_connect_output_saves_its_address_and_routing() {
+    fn a_configured_pureplay_connect_output_saves_its_address_and_routing() {
         let screen = Screen::new();
         let mut app = app();
         let marks = screen.frame(&mut app, Vec::new());
-        let marks = screen.click_mark(&mut app, &marks, "add:Outputs");
-        let marks = screen.click_mark(&mut app, &marks, "add:Outputs:Pureplay (Pureplay Connect)");
+        let menu = screen.click_mark(&mut app, &marks, "add:Outputs");
+        assert!(
+            !menu
+                .keys()
+                .any(|k| k.starts_with("add:Outputs:") && k.contains("Pureplay Connect")),
+            "no Pureplay Connect entry"
+        );
+        let mut config = app.settings.to_request();
+        config.pureplay.insert(
+            "0".into(),
+            crate::types::PureplaySection {
+                name: "Pureplay Connect".into(),
+                address: Some("127.0.0.1:9760".into()),
+                ..Default::default()
+            },
+        );
+        app.settings.load_from(&config);
+        app.card_modes.set("pureplay.0", CardMode::Settings);
+        let marks = screen.frame(&mut app, Vec::new());
         let new = &app.settings.actors[form_index(&app, "pureplay.0")];
         assert_eq!(new.name(), "Pureplay Connect");
         assert_eq!(new.type_label(), "Pureplay Connect");
-        assert!(new.dirty());
         assert_eq!(
             integration(&mut app, "pureplay.0").address,
             "127.0.0.1:9760"
         );
-        assert_eq!(app.card_modes.get("pureplay.0"), CardMode::Settings);
-        assert!(enabled(&marks, "save:pureplay.0"));
         assert_header_fits(&marks, "pureplay.0", "default");
 
         let entry = integration(&mut app, "pureplay.0");
