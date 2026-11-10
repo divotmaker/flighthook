@@ -5000,14 +5000,13 @@ mod tests {
 
     /// The Trackball card saves its section as loaded unless a field
     /// changed: an unchanged card writes it byte for byte, an edited field
-    /// alone is written, a blank number is the driver's default, and a new
-    /// card writes its name and no grab.
+    /// alone is written, a blank number is the driver's default, a loaded
+    /// `grab` is left out, and a new card writes its name.
     #[test]
     fn trackball_settings_are_saved_as_loaded_unless_changed() {
         let json = |section: &flighthook::TrackballSection| serde_json::to_string(section).unwrap();
         for loaded in [
-            r#"{"name":"Arcade","device":"usb-Example_Trackball-event-mouse","club":"DR","hand":"lh","cpi":800.0,"report_limit":2047,"grab":false,"thresholds":{"v_start":0.0712,"coil_timeout_s":20.0},"tuning":{"full_power_speed":41.3,"curve_sense":"physical","mirror_for_left_hand":true}}"#,
-            r#"{"name":"Trackball","grab":false}"#,
+            r#"{"name":"Arcade","device":"usb-Example_Trackball-event-mouse","club":"DR","hand":"lh","cpi":800.0,"report_limit":2047,"thresholds":{"v_start":0.0712,"coil_timeout_s":20.0},"tuning":{"full_power_speed":41.3,"curve_sense":"physical","mirror_for_left_hand":true}}"#,
             r#"{"name":"Trackball"}"#,
         ] {
             let section: flighthook::TrackballSection = serde_json::from_str(loaded).unwrap();
@@ -5018,6 +5017,19 @@ mod tests {
             assert!(super::actor_valid(&form.actors[0]), "{loaded}");
             let saved = form.build_actor_request("trackball.0");
             assert_eq!(json(&saved.trackball["0"]), loaded);
+        }
+        for loaded in [
+            r#"{"name":"Trackball","grab":true}"#,
+            r#"{"name":"Trackball","grab":false}"#,
+        ] {
+            let section: flighthook::TrackballSection = serde_json::from_str(loaded).unwrap();
+            let mut cfg = FlighthookConfig::default();
+            cfg.trackball.insert("0".into(), section);
+            let mut form = SettingsForm::default();
+            form.load_from(&cfg);
+            let saved = form.build_actor_request("trackball.0");
+            assert_eq!(json(&saved.trackball["0"]), r#"{"name":"Trackball"}"#);
+            assert!(!saved.trackball["0"].driver.config.grab, "{loaded}");
         }
 
         let mut cfg = FlighthookConfig::default();
@@ -5057,10 +5069,7 @@ mod tests {
         let id = form.add_preset(preset).expect("added");
         assert_eq!(id, "trackball.0");
         let saved = form.build_actor_request(&id);
-        assert_eq!(
-            json(&saved.trackball["0"]),
-            r#"{"name":"Trackball","grab":false}"#
-        );
+        assert_eq!(json(&saved.trackball["0"]), r#"{"name":"Trackball"}"#);
 
         // Only a Trackball card carries the Trackball fields.
         let mut cfg = FlighthookConfig::default();

@@ -283,7 +283,9 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
 /// section names, unknown keys, and values written out at their defaults
 /// where the app leaves them out. An integer where a float goes counts as
 /// the same value. A file the app saved itself always matches, so a
-/// rewritten file is not rewritten again.
+/// rewritten file is not rewritten again. A Trackball section's `grab` key
+/// does not count ([`IGNORED_KEYS`]): it is read and ignored, and the next
+/// save leaves it out.
 ///
 /// The original bytes are first copied to a new backup file next to it
 /// (see [`write_backup`]); the new content then replaces the file atomically.
@@ -297,12 +299,13 @@ fn bring_up_to_date(path: &Path, contents: &str, config: &FlighthookConfig) {
             return;
         }
     };
-    let (Ok(file), Ok(current)) = (
+    let (Ok(mut file), Ok(current)) = (
         contents.parse::<toml::Value>(),
         saved.parse::<toml::Value>(),
     ) else {
         return;
     };
+    drop_ignored_keys(&mut file);
     if same_value(&file, &current) {
         return;
     }
@@ -326,6 +329,24 @@ fn bring_up_to_date(path: &Path, contents: &str, config: &FlighthookConfig) {
             "failed to rewrite {} in the current format: {e}",
             path.display()
         ),
+    }
+}
+
+/// Keys a section type reads and ignores, by section type: the Trackball
+/// never grabs the pointer, so its `grab` is no setting.
+const IGNORED_KEYS: &[(&str, &str)] = &[("trackball", "grab")];
+
+/// Remove the [`IGNORED_KEYS`] from every section of their type in `file`,
+/// a config file's TOML value.
+fn drop_ignored_keys(file: &mut toml::Value) {
+    for (kind, key) in IGNORED_KEYS {
+        if let Some(sections) = file.get_mut(*kind).and_then(toml::Value::as_table_mut) {
+            for (_, section) in sections.iter_mut() {
+                if let Some(section) = section.as_table_mut() {
+                    section.remove(*key);
+                }
+            }
+        }
     }
 }
 
@@ -766,7 +787,7 @@ impl SystemConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flighthook::SimMode;
+    use flighthook::{DeviceSection, SimMode};
 
     /// `FlighthookConfig::default()` as written to disk, with no
     /// `[simulation]` table. An untouched config must not gain one.
@@ -1542,8 +1563,8 @@ full_monitor = "mevo.0"
         );
     }
 
-    /// A Trackball section as the card writes it (device, club, no grab, a
-    /// tuning and a thresholds table) and one that is off load into the
+    /// A Trackball section as the card writes it (device, club, a tuning
+    /// and a thresholds table) and one that is off load into the
     /// driver's settings, and the file is not rewritten.
     #[test]
     fn a_trackball_section_file_loads_unchanged() {
@@ -1556,7 +1577,6 @@ full_monitor = "mevo.0"
                     device = \"usb-Example_Trackball-event-mouse\"\n\
                     club = \"DR\"\n\
                     cpi = 800\n\
-                    grab = false\n\
                     \n\
                     [trackball.0.thresholds]\n\
                     coil_timeout_s = 20.0\n\
@@ -1586,7 +1606,7 @@ full_monitor = "mevo.0"
         );
         let second = &config.trackball["1"];
         assert!(!second.enabled);
-        assert!(second.driver.config.grab, "the driver's default");
+        assert!(!second.driver_settings().config.grab);
         assert_eq!(config.device_error(), None);
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
@@ -1599,6 +1619,45 @@ full_monitor = "mevo.0"
             toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
             config
         );
+    }
+
+    /// A `grab` key in a Trackball section loads without an error or a
+    /// refused setting, never turns the grab on, and leaves the file as it
+    /// is; the next save leaves the key out.
+    #[test]
+    fn a_trackball_grab_key_loads_and_does_not_grab() {
+        let text = "default_units = \"imperial\"\n\
+                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
+                    putting_clubs = [\"PT\"]\n\
+                    \n\
+                    [trackball.0]\n\
+                    name = \"Arcade\"\n\
+                    device = \"usb-Example_Trackball-event-mouse\"\n\
+                    grab = true\n\
+                    \n\
+                    [trackball.1]\n\
+                    name = \"Thumb\"\n\
+                    enabled = false\n\
+                    grab = false\n";
+        let (dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        assert_eq!(config.device_error(), None);
+        for section in config.trackball.values() {
+            assert!(!section.driver.config.grab);
+            assert!(!section.driver_settings().config.grab);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            text,
+            "not rewritten"
+        );
+        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        save_to(&path, &config);
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert!(!saved.contains("grab"), "{saved}");
+        assert!(saved.contains("[trackball.0]"), "{saved}");
+        assert_eq!(load(&path).0, config);
     }
 
     /// A Trackball setting the driver refuses loads as written and names

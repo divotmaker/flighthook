@@ -41,10 +41,9 @@ cards naming the same device, or two leaving it blank, conflict, and the
 second one stays off ("A Trackball card already uses the only trackball or
 mouse").
 
-**Grab the device** (off on a new card) reads the trackball for this card
-alone, so the desktop pointer does not follow the ball. With the grab on and
-the trackball as your only pointer, the dashboard cannot be clicked with it
-while the card runs.
+The card reads the trackball beside the desktop: the pointer keeps following
+the ball while the card runs. Another program that grabs the trackball for
+itself keeps every swing from the card while it holds it.
 
 ## Connection
 
@@ -54,10 +53,10 @@ pull back, then push. When the device is unplugged the card stays Connected
 with `ready` false, opens it again by itself, and is ready again when it is
 back (with no device named, it finds the device again even under a new
 node). A device that cannot be opened is an alert saying what to do (name
-the device, fix the permissions, close the program holding the grab) and a
-retry, 1 s after the first failed attempt, growing by 1 s per attempt up to
-15 s. Alerts never show a device path. Turning the card off, a restart or
-Reconnect closes the device within a second, which releases the grab.
+the device, fix the permissions) and a retry, 1 s after the first failed
+attempt, growing by 1 s per attempt up to 15 s. Alerts never show a device
+path. Turning the card off, a restart or Reconnect closes the device within
+a second.
 
 Telemetry: `ready`, `synthetic` (`true`), `input` (the name the device
 reports), `cpi`, `profile` (the club in play) and `handed` (`rh` or `lh`).
@@ -117,8 +116,8 @@ number) and the `device` setting are not in the file.
 
 ## Settings
 
-Every setting is a field on the card; changes to Device, CPI, Report limit
-and Grab restart the card, the rest applies to the next swing. A blank number
+Every setting is a field on the card; changes to Device, CPI and Report
+limit restart the card, the rest applies to the next swing. A blank number
 is the default. A value out of range is refused: the card shows why and
 won't save it; a config file holding one loads, and that card does not start
 and shows the error until it is fixed.
@@ -130,7 +129,6 @@ device = "usb-Example_Trackball-event-mouse"   # blank or absent: the only one
 club = "DR"                    # until the game names a club (default 7I)
 hand = "rh"                    # until the game names a hand: rh | lh
 cpi = 800                      # counts per inch of ball travel (default 400)
-grab = false                   # a new card writes false; absent means true
 
 [trackball.0.tuning]
 full_power_speed = 40          # in/s for 100 % (default 30)
@@ -145,7 +143,6 @@ coil_timeout_s = 20            # how long the top of the swing waits (default 10
 | `device` | Device | unset | the input; unset: the only trackball or mouse |
 | `club` | Starting club | `7I` | the club until the game names one (an FRP club code) |
 | `hand` | Starting hand | `rh` | the hand until the game names one |
-| `grab` | Grab the device | `true` (new card: `false`) | exclusive grab |
 | `cpi` | CPI | 400 | counts per inch of ball travel |
 | `report_limit` | Report limit | 127 | largest movement one report carries (127, 2047 or 32767) |
 | `tuning.full_power_speed` | Full power speed | 30 in/s | push speed for 100 % power |

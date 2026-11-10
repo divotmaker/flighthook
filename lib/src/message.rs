@@ -528,7 +528,7 @@ mod tests {
         let json = serde_json::to_string(&action).expect("ser");
         assert_eq!(
             json,
-            r#"{"type":"upsert_trackball","index":"0","section":{"name":"Trackball","device":"usb-Example_Trackball-event-mouse","grab":false,"tuning":{"full_power_speed":40.0}}}"#
+            r#"{"type":"upsert_trackball","index":"0","section":{"name":"Trackball","device":"usb-Example_Trackball-event-mouse","tuning":{"full_power_speed":40.0}}}"#
         );
         let back: ConfigAction = serde_json::from_str(&json).expect("de");
         assert!(

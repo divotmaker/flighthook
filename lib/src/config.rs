@@ -1485,23 +1485,64 @@ impl DeviceSection for ExPuttSection {
 /// pushing it forward makes a full shot. Every value is synthesized from the
 /// swing, so it is a virtual launch monitor. It has no `impact_lead_s`: the
 /// cameras cut no clip for its shots.
+///
+/// flighthook never grabs the trackball, so the desktop pointer keeps
+/// following the ball: the driver always runs with its `grab` off
+/// ([`DeviceSection::driver_settings`]), a `grab` key read from a file or a
+/// request is ignored, and none is written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "TrackballTable", into = "TrackballTable")]
 pub struct TrackballSection {
-    #[serde(default)]
     pub name: String,
     /// Whether the card is on. A section that is off keeps its settings
     /// and runs no actor. Defaults to true, and is left out of the config
     /// file then.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
     /// The trackball driver's settings, each left out of the file at its
     /// default: `device` (a `/dev/input` path, a `/dev/input/by-id` name or
     /// the name the device reports; unset or blank uses the only trackball
     /// or mouse), `club` and `hand` (until the game names them, default
-    /// `7I` and `rh`), `cpi`, `report_limit`, `grab` (default true; a new
-    /// card writes false), a `thresholds` table and a `tuning` table.
-    #[serde(flatten)]
+    /// `7I` and `rh`), `cpi`, `report_limit`, a `thresholds` table and a
+    /// `tuning` table. Its `config.grab` is always false.
     pub driver: TrackballConfig,
+}
+
+/// A [`TrackballSection`] as the file and the REST JSON hold it.
+#[derive(Serialize, Deserialize)]
+struct TrackballTable {
+    #[serde(default)]
+    name: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    enabled: bool,
+    #[serde(flatten)]
+    driver: TrackballConfig,
+}
+
+impl From<TrackballTable> for TrackballSection {
+    /// A `grab` the table holds is dropped: the card never grabs.
+    fn from(table: TrackballTable) -> Self {
+        let mut driver = table.driver;
+        driver.config.grab = false;
+        Self {
+            name: table.name,
+            enabled: table.enabled,
+            driver,
+        }
+    }
+}
+
+impl From<TrackballSection> for TrackballTable {
+    /// The driver leaves a field at its default out of the table, so the
+    /// grab is set to the driver's default to leave the key out.
+    fn from(section: TrackballSection) -> Self {
+        let mut driver = section.driver;
+        driver.config.grab = thumbswing::Config::default().grab;
+        Self {
+            name: section.name,
+            enabled: section.enabled,
+            driver,
+        }
+    }
 }
 
 impl DeviceSection for TrackballSection {
@@ -1510,6 +1551,13 @@ impl DeviceSection for TrackballSection {
 
     fn driver(&self) -> &TrackballConfig {
         &self.driver
+    }
+
+    /// The driver's settings with the grab off.
+    fn driver_settings(&self) -> TrackballConfig {
+        let mut settings = self.driver.clone();
+        settings.config.grab = false;
+        settings
     }
 
     fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
@@ -1533,6 +1581,14 @@ pub trait DeviceSection:
 
     /// The driver's settings in this section.
     fn driver(&self) -> &Self::Driver;
+
+    /// The settings the driver runs with: [`driver`](Self::driver), with
+    /// the settings the host decides for itself put in. Default: the
+    /// driver's settings as they are.
+    #[must_use]
+    fn driver_settings(&self) -> Self::Driver {
+        self.driver().clone()
+    }
 
     /// The sections of this type in `config`, by index.
     fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self>;
@@ -2084,8 +2140,7 @@ impl Default for SquareSection {
 }
 
 impl Default for TrackballSection {
-    /// What a new Trackball card writes: no grab, so the desktop pointer
-    /// keeps working while the card runs.
+    /// What a new Trackball card writes: its name.
     fn default() -> Self {
         Self {
             name: "Trackball".into(),
@@ -2740,7 +2795,7 @@ mod openconnect_client_tests {
                     config: thumbswing::Config {
                         cpi: 800.0,
                         report_limit: 2047,
-                        grab: true,
+                        grab: false,
                         thresholds: thumbswing::Thresholds {
                             v_start: 0.08,
                             ..thumbswing::Thresholds::default()
@@ -3959,16 +4014,17 @@ mod exputt_section_tests {
 mod trackball_section_tests {
     use super::*;
 
-    /// A new Trackball card's section: its name and no grab, the driver's
-    /// other settings left out at their defaults.
+    /// A new Trackball card's section: its name, the driver's settings left
+    /// out at their defaults, and the grab off.
     #[test]
-    fn a_new_trackball_card_writes_its_name_and_no_grab() {
+    fn a_new_trackball_card_writes_its_name() {
         let section = TrackballSection::default();
         assert_eq!(
             serde_json::to_string(&section).unwrap(),
-            r#"{"name":"Trackball","grab":false}"#
+            r#"{"name":"Trackball"}"#
         );
         assert!(!section.driver.config.grab);
+        assert!(!section.driver_settings().config.grab);
         assert!(section.enabled);
         assert_eq!(
             section.driver,
@@ -3983,13 +4039,11 @@ mod trackball_section_tests {
     }
 
     /// Every key reads into the driver's settings and writes back the same
-    /// JSON; a section without `grab` grabs (the driver's default), and the
-    /// tables hold only what was set.
+    /// JSON, and the tables hold only what was set.
     #[test]
     fn a_trackball_section_reads_and_writes_its_keys() {
         for json in [
-            r#"{"name":"Arcade","enabled":false,"device":"usb-Example_Trackball-event-mouse","club":"DR","hand":"lh","cpi":800.0,"report_limit":2047,"grab":false,"thresholds":{"v_start":0.08,"coil_timeout_s":20.0},"tuning":{"full_power_speed":40.0,"curve_sense":"physical","mirror_for_left_hand":true}}"#,
-            r#"{"name":"Trackball","grab":false}"#,
+            r#"{"name":"Arcade","enabled":false,"device":"usb-Example_Trackball-event-mouse","club":"DR","hand":"lh","cpi":800.0,"report_limit":2047,"thresholds":{"v_start":0.08,"coil_timeout_s":20.0},"tuning":{"full_power_speed":40.0,"curve_sense":"physical","mirror_for_left_hand":true}}"#,
             r#"{"name":"Trackball"}"#,
         ] {
             let section: TrackballSection = serde_json::from_str(json).unwrap();
@@ -4010,11 +4064,34 @@ mod trackball_section_tests {
         assert_eq!(d.club, thumbswing::Club::Driver);
         assert_eq!(d.hand, thumbswing::Hand::Left);
         assert!((d.config.cpi - 800.0).abs() < f64::EPSILON, "an integer");
-        assert!(d.config.grab, "the driver's default");
+        assert!(!d.config.grab);
         assert!((d.config.thresholds.v_start - 0.08).abs() < f64::EPSILON);
         assert_eq!(d.tuning.curve_sense, thumbswing::CurveSense::Physical);
-        let plain: TrackballSection = serde_json::from_str(r#"{"name":"Trackball"}"#).unwrap();
-        assert!(plain.driver.config.grab);
+    }
+
+    /// A `grab` key, true or false, reads without an error, never turns the
+    /// grab on, and is not written back.
+    #[test]
+    fn a_grab_key_is_ignored_and_dropped() {
+        for grab in ["true", "false"] {
+            let json = format!(r#"{{"name":"Trackball","cpi":800.0,"grab":{grab}}}"#);
+            let section: TrackballSection = serde_json::from_str(&json).unwrap();
+            assert!(!section.driver.config.grab, "{json}");
+            assert!(!section.driver_settings().config.grab, "{json}");
+            assert_eq!(
+                serde_json::to_string(&section).unwrap(),
+                r#"{"name":"Trackball","cpi":800.0}"#
+            );
+        }
+        // A section built in code with the grab on still hands the driver
+        // the grab off, and writes no key.
+        let mut section = TrackballSection::default();
+        section.driver.config.grab = true;
+        assert!(!section.driver_settings().config.grab);
+        assert_eq!(
+            serde_json::to_string(&section).unwrap(),
+            r#"{"name":"Trackball"}"#
+        );
     }
 
     /// The trackball driver refuses settings out of range, naming the card

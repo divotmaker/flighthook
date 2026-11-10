@@ -348,7 +348,6 @@ pub(crate) struct TrackballForm {
     pub(crate) device: String,
     pub(crate) club: TrackballClub,
     pub(crate) hand: TrackballHand,
-    pub(crate) grab: bool,
     pub(crate) curve_sense: TrackballCurveSense,
     pub(crate) mirror: bool,
     /// The number fields as typed, by key.
@@ -370,7 +369,6 @@ impl TrackballForm {
             device: loaded.device.clone().unwrap_or_default(),
             club: loaded.club,
             hand: loaded.hand,
-            grab: loaded.config.grab,
             curve_sense: loaded.tuning.curve_sense,
             mirror: loaded.tuning.mirror_for_left_hand,
             numbers: numbers().map(|n| (n.key, text((n.get)(loaded)))).collect(),
@@ -392,7 +390,6 @@ impl TrackballForm {
         }
         out.club = self.club;
         out.hand = self.hand;
-        out.config.grab = self.grab;
         out.tuning.curve_sense = self.curve_sense;
         out.tuning.mirror_for_left_hand = self.mirror;
         for n in numbers() {
@@ -472,7 +469,7 @@ fn choice<T: Copy + PartialEq>(
 }
 
 /// The Trackball card's fields: the device, the club and hand it starts
-/// with, the grab and the numbers of the device, the tuning, then the swing
+/// with, the numbers of the device, the tuning, then the swing
 /// detection thresholds in a section of their own.
 pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: f32, wide: f32) {
     let id = dev.id.clone();
@@ -520,16 +517,6 @@ pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: 
                 (TrackballHand::Left, "Left"),
             ],
         );
-    });
-    ui.horizontal(|ui| {
-        field_indent(ui);
-        changed |= ui
-            .checkbox(&mut dev.trackball_form().grab, "Grab the device")
-            .on_hover_text(
-                "Read the trackball for this card alone, so the desktop pointer does not \
-                 follow the ball. While the card runs, the trackball moves no pointer.",
-            )
-            .changed();
     });
     for n in &DEVICE {
         number_field(ui, dev, n, field_width);

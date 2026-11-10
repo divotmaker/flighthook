@@ -1643,10 +1643,10 @@ dashboard cannot hit it: it disables Reconnect while a save is out.
 How long the old connection is given to close depends on the device: up to
 3 s, 6 s for a Garmin R10 or a Square Golf, 18 s for an ExPutt (a session start in progress
 cannot be cut short), 1 s for a Trackball. A Mevo/Xi, an Open Connect client,
-a mock or a Trackball without the grab still
+a mock or a Trackball still
 closing after that is replaced anyway (it holds nothing the new one needs and
 closes itself); so is an Open Connect server once its port is free. A Garmin
-R10, a Square Golf, an ExPutt or a Trackball holding the grab is not: the request answers `202`, the
+R10, a Square Golf or an ExPutt is not: the request answers `202`, the
 actor's `error` telemetry and an Error alert say the previous connection has
 not closed yet, and the actor starts again by itself once it has. Its `error` is
 cleared then, and a `config_outcome` without `request_id` lists it in
@@ -1743,7 +1743,6 @@ Full persisted config (mirrors `config.toml`).
     "0": {
       "name": "Trackball",
       "device": "usb-Example_Trackball-event-mouse",
-      "grab": false,
       "tuning": {
         "full_power_speed": 40.0
       }
@@ -1897,9 +1896,7 @@ Full persisted config (mirrors `config.toml`).
   `club` (the club in play until the game names one, an FRP club code,
   default `"7I"`), `hand` (`"rh"` | `"lh"` until the game names one,
   default `"rh"`), `cpi` (counts per inch of ball travel, default `400.0`),
-  `report_limit` (the largest movement one report carries, default `127`),
-  `grab` (an exclusive grab, so the desktop pointer does not follow the
-  ball; default `true`, and the card writes `false` for a new Trackball), a
+  `report_limit` (the largest movement one report carries, default `127`), a
   `thresholds` table (`speed_window_ms`, `gap_ms`, `v_start`, `v_stop`,
   `v_min_swing`, `dwell_min_ms`, `back_min`, `full_cock`, `fwd_min`,
   `back_max_s`, `coil_timeout_s`, `fwd_window_ms`, `idle_settle_ms`,
@@ -1914,8 +1911,10 @@ Full persisted config (mirrors `config.toml`).
   thresholds.v_stop: must be below thresholds.v_start (0.067)"`,
   `"trackball.0: tuning.backswing_power: must be 0 to 1"`); a config file
   holding one loads, and that card does not start and shows the error. A
-  change of `device`, `cpi`, `report_limit` or `grab` restarts the card; the
-  rest applies to the next swing. No `impact_lead_s` (a value written there
+  change of `device`, `cpi` or `report_limit` restarts the card; the rest
+  applies to the next swing. The card never grabs the trackball, so the
+  desktop pointer keeps following the ball: a `grab` key is read without an
+  error, ignored, and left out of the next save. No `impact_lead_s` (a value written there
   is ignored): the cameras cut no clip for a Trackball shot
 - `mock_monitor` sections have `name` and the mock launch monitor's
   settings, each omitted while at its default: `shot_interval_s` (30, the

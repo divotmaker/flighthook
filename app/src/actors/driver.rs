@@ -173,11 +173,11 @@ impl<D: DeviceDriver, H: Hooks<D>> DriverActor<D, H> {
         if *current == new {
             return ReconfigureOutcome::Applied;
         }
-        let (old, next) = (current.driver(), new.driver());
+        let (old, next) = (current.driver_settings(), new.driver_settings());
         let live = old == next
             || (old.validate().is_ok()
                 && next.validate().is_ok()
-                && !<D::Config as DriverConfig>::restart_needed(old, next));
+                && !<D::Config as DriverConfig>::restart_needed(&old, &next));
         if !live {
             return ReconfigureOutcome::RestartRequired;
         }
@@ -218,7 +218,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Actor for DriverActor<D, H> {
 
     /// A device that takes one connection at a time must be let go first.
     fn replaceable_while_stopping(&self) -> bool {
-        !D::info(lock(&self.section).driver()).exclusive
+        !D::info(&lock(&self.section).driver_settings()).exclusive
     }
 
     fn source(&self) -> Option<ShotSource> {
@@ -273,7 +273,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
     /// the thread ends (Reconnect starts a new one).
     fn run(self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let actor = sender.actor_id().to_owned();
-        let info = D::info(self.section.driver());
+        let info = D::info(&self.section.driver_settings());
         let flags = HostFlags::new();
         flags.set_wants_raw(true);
         flags.set_min_level(min_level());
@@ -295,7 +295,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
     /// retry delays until the actor is stopped or the driver gives up.
     fn run_with(&self, host: &mut Host<D, H>, sink: &mut Sink<D, H>, flags: &HostFlags) {
         let actor = sink.actor.clone();
-        let mut driver = match D::new(sink.section.driver().clone()) {
+        let mut driver = match D::new(sink.section.driver_settings()) {
             Ok(driver) => driver,
             Err(e) => {
                 warn!("{actor}: settings not usable, not started: {e}");
@@ -492,10 +492,11 @@ fn take_update<D: DeviceDriver, H: Hooks<D>>(
     let Some(new) = lock(updates).take() else {
         return;
     };
-    if let Some(driver) = driver
-        && new.driver() != sink.section.driver()
-    {
-        driver.apply_config(new.driver());
+    if let Some(driver) = driver {
+        let settings = new.driver_settings();
+        if settings != sink.section.driver_settings() {
+            driver.apply_config(&settings);
+        }
     }
     sink.section = new;
 }
@@ -2950,7 +2951,8 @@ mod tests {
 
         // The trackball's settings flatten their device config, so serde
         // reads them as a map: their keys are those of settings with every
-        // field set.
+        // field set (`grab` among them, which the section reads and
+        // ignores).
         let trackball = flighthook::TrackballSection {
             name: "Arcade".into(),
             enabled: false,

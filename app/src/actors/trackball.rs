@@ -13,9 +13,10 @@
 //! itself. Off Linux the driver reports that the trackball is not supported
 //! there and gives up, so a section copied to another computer shows that
 //! error on its card. The tuning, the thresholds, the club and the hand
-//! apply to the next swing; a change of `device`, `cpi`, `report_limit` or
-//! `grab` restarts the card. While the card holds the grab, a new instance
-//! waits for the old one to let the device go.
+//! apply to the next swing; a change of `device`, `cpi` or `report_limit`
+//! restarts the card. The card never grabs the device, so the desktop
+//! pointer keeps following the ball, and a new instance does not wait for
+//! the old one to let the device go.
 //!
 //! The card adds its section ([`TrackballSection`]) and its shot source.
 //! Its shots cut no camera clip (no impact lead).
@@ -691,18 +692,54 @@ mod tests {
         card.stop();
     }
 
-    /// The new card is virtual, waits for nothing while stopping (it holds
-    /// no grab) and stops within a second; with the grab it waits.
+    /// The card is virtual, waits for nothing while stopping (it holds no
+    /// grab) and stops within a second, also from a section that reads
+    /// `grab = true`.
     #[test]
-    fn the_card_is_virtual_and_waits_only_while_it_grabs() {
+    fn the_card_is_virtual_and_never_waits_for_a_grab() {
         let card = TrackballActor::new(TrackballSection::default());
         assert_eq!(card.source(), Some(ShotSource::Trackball));
         assert_eq!(ShotSource::Trackball.provenance(), Provenance::Virtual);
         assert!(card.replaceable_while_stopping());
         assert_eq!(card.stop_wait(), Duration::from_secs(1));
-        let mut grabbing = TrackballSection::default();
-        grabbing.driver.config.grab = true;
-        assert!(!TrackballActor::new(grabbing).replaceable_while_stopping());
+        let read: TrackballSection =
+            toml::from_str("name = \"Trackball\"\ngrab = true\n").expect("reads");
+        assert!(TrackballActor::new(read).replaceable_while_stopping());
+        let mut built = TrackballSection::default();
+        built.driver.config.grab = true;
+        assert!(TrackballActor::new(built).replaceable_while_stopping());
+    }
+
+    /// A section with `grab = true` opens the device without the grab.
+    #[test]
+    fn a_grab_key_opens_the_device_without_the_grab() {
+        let feed = Arc::new(Feed::default());
+        let grabs = Arc::new(Mutex::new(Vec::new()));
+        let mut section: TrackballSection =
+            toml::from_str("name = \"Trackball\"\ndevice = \"fed-no-grab\"\ngrab = true\n")
+                .expect("reads");
+        section.driver.config.grab = true;
+        let input: Box<dyn Input + Send> = Box::new(FedInput::new(&feed, trackball_info()));
+        let inputs = Mutex::new(Some(input));
+        let seen = Arc::clone(&grabs);
+        let open: Opener = Box::new(move |_device, grab| {
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(grab);
+            inputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| Error::NotFound("no more test inputs".into()))
+        });
+        let mut card = Card::new(section, open);
+        card.start();
+        card.until_telemetry("ready", "true");
+        assert_eq!(
+            *grabs.lock().unwrap_or_else(PoisonError::into_inner),
+            [false]
+        );
+        card.stop();
     }
 
     /// The club and the hand the game names reach the next swing, and the
@@ -817,7 +854,8 @@ mod tests {
     }
 
     /// The tuning, the thresholds, the club and the hand apply to the next
-    /// swing; `device`, `cpi`, `report_limit` and `grab` restart the card.
+    /// swing; `device`, `cpi` and `report_limit` restart the card, and a
+    /// changed `grab` changes nothing.
     #[test]
     fn tuning_applies_live_and_device_settings_restart() {
         let feed = Arc::new(Feed::default());
@@ -843,11 +881,10 @@ mod tests {
         let second = accumulate(&card.next_shot());
         assert!((speed(&second) - 120.0).abs() < 0.05, "{}", speed(&second));
 
-        let restarts: [fn(&mut TrackballConfig); 4] = [
+        let restarts: [fn(&mut TrackballConfig); 3] = [
             |d| d.device = Some("another".into()),
             |d| d.config.cpi = 800.0,
             |d| d.config.report_limit = 2047,
-            |d| d.config.grab = true,
         ];
         for change in restarts {
             let mut section = live.clone();
@@ -857,6 +894,12 @@ mod tests {
                 ReconfigureOutcome::RestartRequired
             ));
         }
+        let mut grab = live.clone();
+        grab.driver.config.grab = true;
+        assert!(matches!(
+            card.reconfigure(&grab),
+            ReconfigureOutcome::Applied
+        ));
         card.stop();
     }
 
@@ -991,10 +1034,7 @@ mod tests {
                 "firmware": "0.0.1"
             })
         );
-        assert_eq!(
-            line["settings"]["device"],
-            serde_json::json!({"grab": false})
-        );
+        assert_eq!(line["settings"]["device"], serde_json::json!({}));
         card.stop();
     }
 

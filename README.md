@@ -586,7 +586,6 @@ address = "192.168.1.50"
 name = "Trackball"
 # device is optional — omit it to use the only trackball or mouse (Linux).
 device = "usb-Example_Trackball-event-mouse"
-grab = false                   # true: the desktop pointer does not follow the ball
 
 [camera.0]
 name = "Golfer Back"

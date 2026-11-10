@@ -44,8 +44,9 @@ address = "127.0.0.1:921"
   found on the local network when absent)
 - `[trackball.<idx>]` -- Trackball (alpha): a trackball or mouse on Linux
   turned into a launch monitor (thumbswing's driver; its settings `device`,
-  `club`, `hand`, `cpi`, `report_limit`, `grab` and the `thresholds` and
-  `tuning` tables sit in the same table)
+  `club`, `hand`, `cpi`, `report_limit` and the `thresholds` and `tuning`
+  tables sit in the same table; a `grab` key is ignored, see "Trackball
+  card")
 - `[openconnect_server.<idx>]` -- Open Connect server: GSPro Open Connect ingest listener (Uneekor)
 - `[mock_monitor.<idx>]` -- mock launch monitor instance (flightrelay's mock
   driver; its settings `shot_interval_s`, `arm_delay_s`, `ball_ready_delay_s`,
@@ -133,8 +134,8 @@ address = "127.0.0.1:921"
   does not start)
 - Trackball sections show name and every setting of the trackball driver
   (thumbswing's `Settings`, flattened into the section): Device (`device`,
-  blank for the only trackball or mouse), Starting club and hand, Grab the
-  device, CPI, Report limit, the tuning (full power speed, max club and putt
+  blank for the only trackball or mouse), Starting club and hand, CPI,
+  Report limit, the tuning (full power speed, max club and putt
   speeds, the face, putt line and curve gains, backswing power, power curve,
   max face angle and face-to-path, the curve sense, mirror for left-handed
   players), and the swing detection thresholds in a collapsed section. A
@@ -252,7 +253,7 @@ pub enum SpinSource { D4, E8, Auto }                              // ironsight's
 pub struct R10Section { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: R10Config }  // tenover's Config: range: Option<Distance>
 pub struct SquareSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: SquareConfig }  // allsquare's Config: address: Option<String>, club: String ("7I"), advanced_spin: bool (true), discard_non_putting_zero_spin: bool (true), dot_bottom_to_face_center_mm: BTreeMap<String, f64>
 pub struct ExPuttSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: ExPuttConfig }  // threeputt's Config: address: Option<String>
-pub struct TrackballSection { pub name: String, pub enabled: bool, #[serde(flatten)] pub driver: TrackballConfig }  // thumbswing's Settings: device: Option<String>, club, hand, cpi, report_limit, grab, thresholds, tuning (each left out at its default; Default writes grab = false)
+pub struct TrackballSection { pub name: String, pub enabled: bool, pub driver: TrackballConfig }  // serde via a flat table (thumbswing's Settings flattened): device: Option<String>, club, hand, cpi, report_limit, thresholds, tuning, each left out at its default; driver.config.grab is always false, a `grab` key is read and ignored, none is written; DeviceSection::driver_settings() hands the driver grab = false
 pub struct MockMonitorSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: MockConfig }  // flightrelay's MockConfig
 pub struct OpenConnectServerSection { pub name: String, pub bind: Option<String> }
 pub struct OpenConnectClientSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
@@ -1082,12 +1083,12 @@ actor and the command waits for it on a helper thread (see
 2. If the thread is still running, the actor's `replaceable_while_stopping()`
    decides: a Mevo/Xi, an Open Connect client, the mock actors and the web
    server hold nothing a new instance needs (a TCP client, nothing, or a port
-   the new one retries), nor does a trackball without the grab (several
-   programs can read one input), and an Open Connect server is replaceable
+   the new one retries), nor does a trackball (it never grabs the input, and
+   several programs can read one input), and an Open Connect server is replaceable
    once its listen port binds again. A replaceable one is retired: taken out of the
    registry, its bus sender muted so nothing it still sends speaks for its
-   successor, its thread left to end. An R10, Square Golf, ExPutt, camera or
-   a trackball holding the grab is not: it is retired the same way and watched
+   successor, its thread left to end. An R10, Square Golf, ExPutt or camera
+   is not: it is retired the same way and watched
    (`SystemState::close_in_background`: a `closing:<id>` thread joins it),
    nothing is started, and the card's `error` telemetry and an Error alert
    say "The previous connection has not closed yet. It reconnects when it
@@ -1187,7 +1188,7 @@ What a stop does, by actor:
 | Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
 | Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
 | ExPutt | discovering (250 ms slices), measuring (100 ms event wait, the session closes at once) or waiting to reconnect | the driver's `STOP_WAIT` (18 s: a session start of up to 17 s, which cannot be cut short: connect and greeting, two handshake replies, mat search; then the close) |
-| Trackball | always: opening the device is a few system calls, checked for a stop before and after; a session polls every 50 ms; closing drops the device, which releases the grab | the driver's `STOP_WAIT` (1 s: closing joins the device's reader thread, which wakes every 100 ms); not exclusive without the grab, so an old instance still closing is replaced beside it |
+| Trackball | always: opening the device is a few system calls, checked for a stop before and after; a session polls every 50 ms; closing drops the device | the driver's `STOP_WAIT` (1 s: closing joins the device's reader thread, which wakes every 100 ms); not exclusive (the card never grabs the device), so an old instance still closing is replaced beside it |
 | Mock monitor | always (50 ms polls; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
 | Random club | always (100 ms loop) | -- |
 
@@ -1348,8 +1349,12 @@ and its Putting Monitor is unset (Any).
 `Trackball`, which is virtual; no hook, no action). The driver opens the
 input the section's `device` names (a `/dev/input/by-id` name, a
 `/dev/input` path or the name the device reports), or the only readable
-trackball or mouse when it names none (`phase: connecting`), with an
-exclusive grab when `grab` is set. The card is then `Connected`
+trackball or mouse when it names none (`phase: connecting`), never with a
+grab: the card runs the driver with its `grab` off
+(`DeviceSection::driver_settings`), so the desktop pointer keeps following
+the ball, and a `grab` key in the section is read without an error, ignored
+and left out of the next save (the config load does not count it as a
+difference, so it alone never rewrites the file). The card is then `Connected`
 (`device_info` "thumbswing (<the name the device reports>)"; the FRP
 device id is the input's `/dev/input/by-id` link name, else the reported
 name) with `device_telemetry` `manufacturer: "divotmaker"`, `model:
@@ -1373,16 +1378,15 @@ the driver reopens the device by itself (with no `device` named it chooses
 again, so a device back under another node is found) and `ready` turns true.
 A device that cannot be opened is a `warn` alert saying what to do (name
 one with the `device` setting when there are several, which is alerted
-once until the device opens; join the `input` group; close the program
-holding the grab), never a device path, and a retry with the backoff. Off
+once until the device opens; join the `input` group), never a device path, and a retry with the backoff. Off
 Linux the driver gives up with an `error` alert ("trackball input is not
 supported on this platform (Linux only)"), and the card ends Disconnected
 with that error; `GET /api/status` says `trackball_supported` only on
 Linux (`thumbswing::device::SUPPORTED`), and the UI offers the Trackball
 card only then. The club, the hand, the thresholds and the tuning apply to
-the next swing; `device`, `cpi`, `report_limit` and `grab` restart the card.
-With the grab the card is exclusive (a new instance waits for the old one
-to let the device go). Its shots cut no camera clip: the type has no
+the next swing; `device`, `cpi` and `report_limit` restart the card. The
+card is not exclusive: a new instance does not wait for the old one to let
+the device go. Its shots cut no camera clip: the type has no
 impact lead (`impact_lead_default_s("trackball")` is `None`).
 
 **Open Connect client actor** (GSPro, Pureplay, Muni Golf, ...): emits `Starting` before
@@ -1697,7 +1701,10 @@ the mock's `actors::mock::MockHooks` (no processing of their own).
 `enabled`, `impact_lead_s`) with the driver's config `#[serde(flatten)]`ed
 next to them, so the file and the REST JSON hold one flat table per card;
 every driver field is left out while at its default, so a default section
-writes what it wrote before. `FlighthookConfig::device_error()` runs every
+writes what it wrote before. The actor builds and updates the driver from
+`DeviceSection::driver_settings()`: the section's driver config as it is,
+except where the host decides a setting itself (the Trackball's grab is
+always off). `FlighthookConfig::device_error()` runs every
 card's `DriverConfig::validate` and names the card and the field
 (`mock_monitor.0: shot_interval_s: must be 0 to 86400`, cards in number
 order). A save that changes a card's driver settings into refused ones is
