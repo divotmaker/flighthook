@@ -47,6 +47,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Packaging builds the driver crates; tenover's build script needs protoc.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Verify tag matches Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
