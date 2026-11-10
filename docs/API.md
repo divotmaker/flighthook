@@ -171,7 +171,6 @@ Comprehensive system state (all actors -- launch monitors and integrations).
   "club": "7I",
   "handed": "rh",
   "cameras_supported": true,
-  "trackball_supported": true,
   "clip_dir": "C:\\Users\\me\\AppData\\Local\\flighthook\\clips",
   "config_error": {
     "path": "C:\\Users\\me\\AppData\\Roaming\\flighthook\\config.toml",
@@ -1916,8 +1915,8 @@ Full persisted config (mirrors `config.toml`).
   `"trackball.0: tuning.backswing_power: must be 0 to 1"`); a config file
   holding one loads, and that card does not start and shows the error. A
   change of `device`, `cpi`, `report_limit` or `grab` restarts the card; the
-  rest applies to the next swing. No `impact_lead_s`: the cameras cut no clip
-  for a Trackball shot
+  rest applies to the next swing. No `impact_lead_s` (a value written there
+  is ignored): the cameras cut no clip for a Trackball shot
 - `mock_monitor` sections have `name` and the mock launch monitor's
   settings, each omitted while at its default: `shot_interval_s` (30, the
   seconds from the ball being ready to the shot), `arm_delay_s` (2, from
@@ -2142,7 +2141,9 @@ a `scope` of that actor, with only its `enabled` changed.
 One card per address may be on. Two cards of a type conflict when their
 addresses collide: the same host and port (`localhost` is `127.0.0.1`, a blank
 address is the type's default), or, for an Open Connect server, the same port
-with overlapping bind addresses (`0.0.0.0` overlaps all). A section that is
+with overlapping bind addresses (`0.0.0.0` overlaps all). A Trackball's
+address is the `device` it names, compared as text; a blank one is the only
+trackball or mouse, so two blank sections conflict. A section that is
 off holds no address, so duplicates can exist while at most one is on. A save
 that turns a section on, or adds one that is on, while an enabled section of
 its type has its address is refused with `409` (see below) and saves

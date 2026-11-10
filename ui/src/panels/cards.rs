@@ -564,26 +564,26 @@ mod tests {
     /// other presets always.
     #[test]
     fn the_trackball_is_offered_only_where_it_works() {
-        for group in CardGroup::ALL {
-            let all: Vec<&AddPreset> = add_options(group).iter().collect();
-            assert_eq!(offered(group, true), all, "{group:?}");
-            let without: Vec<&AddPreset> = all
-                .iter()
-                .copied()
-                .filter(|p| p.type_key != "trackball")
-                .collect();
-            assert_eq!(offered(group, false), without, "{group:?}");
+        let labels = |group, trackball| -> Vec<&str> {
+            offered(group, trackball).iter().map(|p| p.label).collect()
+        };
+        let with = labels(CardGroup::LaunchMonitors, true);
+        let without = labels(CardGroup::LaunchMonitors, false);
+        assert_eq!(with.iter().filter(|l| **l == "Trackball").count(), 1);
+        assert!(!without.contains(&"Trackball"), "{without:?}");
+        assert_eq!(without.len(), with.len() - 1, "only the Trackball goes");
+        assert!(without.iter().all(|l| with.contains(l)), "{without:?}");
+        for group in CardGroup::ALL
+            .into_iter()
+            .filter(|g| *g != CardGroup::LaunchMonitors)
+        {
+            assert_eq!(labels(group, false), labels(group, true), "{group:?}");
+            assert_eq!(
+                labels(group, false).len(),
+                add_options(group).len(),
+                "{group:?}"
+            );
         }
-        assert!(
-            offered(CardGroup::LaunchMonitors, true)
-                .iter()
-                .any(|p| p.type_key == "trackball")
-        );
-        assert!(
-            !offered(CardGroup::LaunchMonitors, false)
-                .iter()
-                .any(|p| p.type_key == "trackball")
-        );
     }
 
     #[test]

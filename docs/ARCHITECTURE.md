@@ -1138,7 +1138,8 @@ that listens (Open Connect Server), the same port on overlapping bind
 addresses (`0.0.0.0` overlaps every address). Only cards that are on hold an
 address, and only the types with an address compare: Mevo, Square Golf
 Omni, ExPutt, Open Connect Server and Client, Pureplay Connect, and the
-Trackball by the device it names (compared as text; a blank one names none).
+Trackball by the device it names (compared as text; a blank one is the only
+trackball or mouse, so two blank cards conflict).
 
 Duplicates may exist; at most one of them is on.
 
@@ -1361,10 +1362,12 @@ setting); Putting mode selects the putter whatever the club. Each swing (a
 pull back, then a push) is a shot: trigger (timestamped with the end of the
 push), `launch` (speed, launch angle and direction, both spin pairs),
 `club_path` (club speed, path, face angle, attack angle, dynamic loft,
-smash factor, swing plane), `shot_finished`; no flight result (the
-simulation flies it) and no raw frames. Everything is synthesized, so the
-source is virtual: during a tournament round the driver is told to hold
-shots, and a swing then is dropped with an info log line and takes no shot
+smash factor, swing plane), `shot_finished`. The launch is held to the
+finish, as for every driver ([Device drivers](#device-drivers)), so the bus
+order is `ShotTrigger`, `ClubPath`, `BallFlight`, `ShotFinished`. There is
+no flight result (the simulation flies it) and no raw frames. Everything is
+synthesized, so the source is virtual: during a tournament round the driver
+is told to hold shots, and a swing then is dropped with an info log line and takes no shot
 number. When the input goes away the session stays up: `ready` turns false,
 the driver reopens the device by itself (with no `device` named it chooses
 again, so a device back under another node is found) and `ready` turns true.

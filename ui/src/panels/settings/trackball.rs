@@ -420,7 +420,7 @@ impl TrackballForm {
 /// A number field: label, text, unit; marked `trackball:<key>:<card>`.
 fn number_field(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, n: &Number, field_width: f32) {
     let card = format!("{}.{}", dev.monitor_type, dev.id);
-    let form = &mut dev.trackball;
+    let form = dev.trackball_form();
     let hint = text((n.get)(&TrackballConfig::default()));
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -483,7 +483,7 @@ pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: 
              name it here.",
         );
         let field = ui.add(
-            egui::TextEdit::singleline(&mut dev.trackball.device)
+            egui::TextEdit::singleline(&mut dev.trackball_form().device)
                 .desired_width(field_width - TEXT_EDIT_MARGIN)
                 .hint_text("the only trackball or mouse"),
         );
@@ -503,7 +503,7 @@ pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: 
             ui,
             format!("trackball_club_{id}"),
             field_width,
-            &mut dev.trackball.club,
+            &mut dev.trackball_form().club,
             &clubs,
         );
     });
@@ -514,7 +514,7 @@ pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: 
             ui,
             format!("trackball_hand_{id}"),
             field_width,
-            &mut dev.trackball.hand,
+            &mut dev.trackball_form().hand,
             &[
                 (TrackballHand::Right, "Right"),
                 (TrackballHand::Left, "Left"),
@@ -524,7 +524,7 @@ pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: 
     ui.horizontal(|ui| {
         field_indent(ui);
         changed |= ui
-            .checkbox(&mut dev.trackball.grab, "Grab the device")
+            .checkbox(&mut dev.trackball_form().grab, "Grab the device")
             .on_hover_text(
                 "Read the trackball for this card alone, so the desktop pointer does not \
                  follow the ball. While the card runs, the trackball moves no pointer.",
@@ -547,7 +547,7 @@ pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: 
             ui,
             format!("trackball_curve_{id}"),
             wide,
-            &mut dev.trackball.curve_sense,
+            &mut dev.trackball_form().curve_sense,
             &[
                 (TrackballCurveSense::Arcade, "Arcade"),
                 (TrackballCurveSense::Physical, "Physical"),
@@ -557,7 +557,10 @@ pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: 
     ui.horizontal(|ui| {
         field_indent(ui);
         changed |= ui
-            .checkbox(&mut dev.trackball.mirror, "Mirror for left-handed players")
+            .checkbox(
+                &mut dev.trackball_form().mirror,
+                "Mirror for left-handed players",
+            )
             .on_hover_text("Mirror the stroke directions while the player is left-handed.")
             .changed();
     });

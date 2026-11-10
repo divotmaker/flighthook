@@ -36,7 +36,10 @@ sudo udevadm control --reload && sudo udevadm trigger
 **Device** names the trackball: its `/dev/input/by-id` name (stable across
 replugs), a `/dev/input` path, or the name the device reports. Leave it blank
 to use the only trackball or mouse there is; with more than one, the card
-alerts once and asks you to name it.
+alerts once and asks you to name it. Only one card per device can be on: two
+cards naming the same device, or two leaving it blank, conflict, and the
+second one stays off ("A Trackball card already uses the only trackball or
+mouse").
 
 **Grab the device** (off on a new card) reads the trackball for this card
 alone, so the desktop pointer does not follow the ball. With the grab on and
@@ -97,7 +100,8 @@ result: flighthook simulates carry, roll and total from the launch, and GSPro
 flies it itself. A putt launches at 0.3° with no spin and rolls on the green
 in Putting mode. A swing that hits the device's per-report limit is logged as
 saturated: lower **Full power speed**, or set **Report limit** to the
-device's real limit.
+device's real limit. In the Shots tab its shots look like any other launch
+monitor's.
 
 The Trackball is a **virtual** launch monitor: during a tournament round it
 sends no shots (a swing then is dropped and takes no shot number), and a

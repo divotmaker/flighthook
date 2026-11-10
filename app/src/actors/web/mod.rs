@@ -620,7 +620,10 @@ fn device_section(
     if let Some(map) = section.as_object_mut() {
         map.retain(|_, v| !v.is_null());
         map.remove("name");
-        for key in ["address", "bind", "device"] {
+        // Only the trackball's `device` names a unit; no other section's is
+        // removed.
+        let device = (prefix == "trackball").then_some("device");
+        for key in ["address", "bind"].into_iter().chain(device) {
             if let Some(serde_json::Value::String(v)) = map.remove(key) {
                 removed.push(v);
             }

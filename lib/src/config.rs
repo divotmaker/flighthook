@@ -4076,15 +4076,29 @@ mod trackball_section_tests {
         config.trackball.get_mut("1").unwrap().enabled = false;
         let clash = config.address_clash("trackball.1").expect("clash");
         assert_eq!(clash.message(), "A Trackball card already uses event7");
+        let clash = config.address_clash("trackball.3").expect("blank clash");
         assert_eq!(
-            config.address_clash("trackball.2"),
-            None,
-            "unset names none"
+            clash.holder, "trackball.2",
+            "unset and blank are one device"
         );
+        assert_eq!(
+            clash.message(),
+            "A Trackball card already uses the only trackball or mouse"
+        );
+        config.trackball.get_mut("2").unwrap().enabled = false;
         assert_eq!(
             config.address_clash("trackball.3"),
             None,
-            "blank names none"
+            "a blank device and a named one are not compared"
+        );
+        let clashes = config.clone().demote_clashing(None);
+        assert!(clashes.is_empty(), "{clashes:?}");
+        config.trackball.get_mut("2").unwrap().enabled = true;
+        let clashes = config.demote_clashing(None);
+        assert_eq!(clashes.len(), 1, "{clashes:?}");
+        assert_eq!(
+            clashes[0].id, "trackball.3",
+            "the first blank card keeps running"
         );
     }
 }

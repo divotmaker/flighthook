@@ -2051,14 +2051,14 @@ mod tests {
         assert!(enabled(&marks, &format!("save:{id}")));
 
         device(&mut app, id)
-            .trackball
+            .trackball_form()
             .numbers
             .insert("tuning.full_power_speed", "0".into());
         let marks = screen.frame(&mut app, Vec::new());
         assert!(!enabled(&marks, &format!("save:{id}")), "refused");
         assert!(marks.contains_key(&format!("driver_error:{id}")));
         device(&mut app, id)
-            .trackball
+            .trackball_form()
             .numbers
             .insert("tuning.full_power_speed", "40".into());
         let marks = screen.frame(&mut app, Vec::new());

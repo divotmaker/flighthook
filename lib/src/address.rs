@@ -30,10 +30,12 @@ pub(crate) fn address_key(address: &str) -> String {
 }
 
 /// The address a card of `type_key` uses when its address is blank. Blank for
-/// a type that has no address to compare.
+/// a type that has no address to compare. A Trackball with no `device` reads
+/// the only trackball or mouse there is, so two of them use the same one.
 pub(crate) fn default_address(type_key: &str) -> &'static str {
     match type_key {
         "mevo" => "192.168.2.1:5100",
+        "trackball" => "the only trackball or mouse",
         "openconnect_client" => "127.0.0.1:921",
         "openconnect_server" => "0.0.0.0:921",
         "pureplay" => "127.0.0.1:9760",

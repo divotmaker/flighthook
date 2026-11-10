@@ -187,8 +187,9 @@ pub(crate) struct DeviceFormEntry {
     /// surface. Carried verbatim so that saving settings does not wipe them
     /// from the config file, and checked with the driver's own validation.
     pub(crate) mock: MockConfig,
-    /// Trackball: the driver's settings, every one a field.
-    pub(crate) trackball: Box<trackball::TrackballForm>,
+    /// Trackball: the driver's settings, every one a field; `None` on a card
+    /// of another type.
+    pub(crate) trackball: Option<Box<trackball::TrackballForm>>,
     /// The card's device driver settings as saved, as JSON; `None` for a
     /// card not saved yet or one that runs no device driver. A refused
     /// value blocks a save only when the card changes it
@@ -422,7 +423,7 @@ impl DeviceFormEntry {
             square_impact_mm: std::collections::HashMap::new(),
             mevo: d.clone(),
             mock: MockConfig::default(),
-            trackball: Box::default(),
+            trackball: None,
             saved_driver: serde_json::to_value(d).ok(),
             cam: Box::default(),
             dirty: false,
@@ -463,7 +464,7 @@ impl DeviceFormEntry {
             square_impact_mm: std::collections::HashMap::new(),
             mevo: MevoConfig::default(),
             mock: MockConfig::default(),
-            trackball: Box::default(),
+            trackball: None,
             saved_driver: serde_json::to_value(&s.driver).ok(),
             cam: Box::default(),
             dirty: false,
@@ -482,7 +483,7 @@ impl DeviceFormEntry {
             square_impact_mm: impact_mm_form(&s.driver.dot_bottom_to_face_center_mm),
             mevo: MevoConfig::default(),
             mock: MockConfig::default(),
-            trackball: Box::default(),
+            trackball: None,
             saved_driver: serde_json::to_value(&s.driver).ok(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
@@ -529,7 +530,7 @@ impl DeviceFormEntry {
             square_impact_mm: std::collections::HashMap::new(),
             mevo: MevoConfig::default(),
             mock: MockConfig::default(),
-            trackball: Box::default(),
+            trackball: None,
             saved_driver: serde_json::to_value(&s.driver).ok(),
             cam: Box::default(),
             dirty: false,
@@ -562,7 +563,7 @@ impl DeviceFormEntry {
             square_impact_mm: std::collections::HashMap::new(),
             mevo: MevoConfig::default(),
             mock: MockConfig::default(),
-            trackball: Box::default(),
+            trackball: None,
             saved_driver: None,
             cam: Box::default(),
             dirty: false,
@@ -571,10 +572,23 @@ impl DeviceFormEntry {
 
     pub(crate) fn from_mock(id: &str, s: &MockMonitorSection) -> Self {
         Self {
-            id: id.into(),
-            monitor_type: "mock_monitor".into(),
             name: s.name.clone(),
             enabled: s.enabled,
+            impact_lead: impact_lead_text(s.impact_lead_s),
+            mock: s.driver.clone(),
+            saved_driver: serde_json::to_value(&s.driver).ok(),
+            ..Self::blank(id, "mock_monitor")
+        }
+    }
+
+    /// A card of type `monitor_type` at index `id` with no name and every
+    /// field at its default, for the constructors to fill in.
+    fn blank(id: &str, monitor_type: &str) -> Self {
+        Self {
+            id: id.into(),
+            monitor_type: monitor_type.into(),
+            name: String::new(),
+            enabled: true,
             address: String::new(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
@@ -589,14 +603,14 @@ impl DeviceFormEntry {
             environment: FlightScopeEnvironment::default(),
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
-            impact_lead: impact_lead_text(s.impact_lead_s),
+            impact_lead: String::new(),
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
             mevo: MevoConfig::default(),
-            mock: s.driver.clone(),
-            trackball: Box::default(),
-            saved_driver: serde_json::to_value(&s.driver).ok(),
+            mock: MockConfig::default(),
+            trackball: None,
+            saved_driver: None,
             cam: Box::default(),
             dirty: false,
         }
@@ -604,26 +618,16 @@ impl DeviceFormEntry {
 
     pub(crate) fn from_trackball(id: &str, s: &flighthook::TrackballSection) -> Self {
         Self {
-            monitor_type: "trackball".into(),
             name: s.name.clone(),
             enabled: s.enabled,
-            trackball: Box::new(trackball::TrackballForm::new(&s.driver)),
+            trackball: Some(Box::new(trackball::TrackballForm::new(&s.driver))),
             saved_driver: serde_json::to_value(&s.driver).ok(),
-            ..Self::from_mock(
-                id,
-                &MockMonitorSection {
-                    name: String::new(),
-                    enabled: true,
-                    impact_lead_s: None,
-                    driver: Default::default(),
-                },
-            )
+            ..Self::blank(id, "trackball")
         }
     }
 
     pub(crate) fn from_camera(id: &str, s: &CameraSection) -> Self {
         Self {
-            monitor_type: "camera".into(),
             name: s.name.clone(),
             enabled: s.enabled,
             cam: Box::new(CameraFields {
@@ -636,16 +640,7 @@ impl DeviceFormEntry {
                 yaw: impact_lead_text(s.yaw_deg),
                 pitch: impact_lead_text(s.pitch_deg),
             }),
-            saved_driver: None,
-            ..Self::from_mock(
-                id,
-                &MockMonitorSection {
-                    name: String::new(),
-                    enabled: true,
-                    impact_lead_s: None,
-                    driver: Default::default(),
-                },
-            )
+            ..Self::blank(id, "camera")
         }
     }
 
@@ -664,8 +659,7 @@ impl DeviceFormEntry {
             "square" => self.square_config().validate().err().map(|e| e.to_string()),
             "exputt" => self.exputt_config().validate().err().map(|e| e.to_string()),
             "trackball" => self
-                .trackball
-                .config()
+                .trackball_config()
                 .validate()
                 .err()
                 .map(|e| e.to_string()),
@@ -682,7 +676,7 @@ impl DeviceFormEntry {
             "r10" => serde_json::to_value(self.r10_config()).ok(),
             "square" => serde_json::to_value(self.square_config()).ok(),
             "exputt" => serde_json::to_value(self.exputt_config()).ok(),
-            "trackball" => serde_json::to_value(self.trackball.config()).ok(),
+            "trackball" => serde_json::to_value(self.trackball_config()).ok(),
             _ => None,
         }
     }
@@ -692,7 +686,10 @@ impl DeviceFormEntry {
     /// range, surface height and track %, every Trackball number.
     fn unparsable(&self) -> Option<String> {
         if self.is_trackball() {
-            return self.trackball.unparsable();
+            return self
+                .trackball
+                .as_deref()
+                .and_then(trackball::TrackballForm::unparsable);
         }
         self.unparsable_field()
             .map(|field| format!("{field}: not a number"))
@@ -850,6 +847,20 @@ impl DeviceFormEntry {
 
     pub(crate) fn is_trackball(&self) -> bool {
         self.monitor_type == "trackball"
+    }
+
+    /// The Trackball fields; a new card's when the entry has none yet.
+    pub(crate) fn trackball_form(&mut self) -> &mut trackball::TrackballForm {
+        self.trackball.get_or_insert_with(Box::default)
+    }
+
+    /// The Trackball driver settings the fields give (a new card's when the
+    /// entry has none).
+    fn trackball_config(&self) -> flighthook::TrackballConfig {
+        self.trackball.as_deref().map_or_else(
+            || trackball::TrackballForm::default().config(),
+            trackball::TrackballForm::config,
+        )
     }
 
     /// Whether the card has a Camera timing field: a launch monitor whose
@@ -1102,7 +1113,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
                 ..MevoConfig::default()
             },
             mock: MockConfig::default(),
-            trackball: Box::default(),
+            trackball: (type_key == "trackball").then(Box::default),
             saved_driver: None,
             cam: Box::default(),
             dirty: true,
@@ -2477,7 +2488,7 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         flighthook::TrackballSection {
                             name: dev.name.clone(),
                             enabled: dev.enabled,
-                            driver: dev.trackball.config(),
+                            driver: dev.trackball_config(),
                         },
                     );
                 }
@@ -5022,12 +5033,12 @@ mod tests {
         let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
             panic!("not a device");
         };
-        dev.trackball
+        dev.trackball_form()
             .numbers
             .insert("tuning.max_club_speed", "110".into());
-        dev.trackball.numbers.insert("cpi", " ".into());
-        dev.trackball.device = " event7 ".into();
-        dev.trackball.club = flighthook::TrackballClub::Putter;
+        dev.trackball_form().numbers.insert("cpi", " ".into());
+        dev.trackball_form().device = " event7 ".into();
+        dev.trackball_form().club = flighthook::TrackballClub::Putter;
         dev.dirty = true;
         assert!(super::actor_valid(&form.actors[0]));
         let saved = form.build_actor_request("trackball.0");
@@ -5050,6 +5061,29 @@ mod tests {
             json(&saved.trackball["0"]),
             r#"{"name":"Trackball","grab":false}"#
         );
+
+        // Only a Trackball card carries the Trackball fields.
+        let mut cfg = FlighthookConfig::default();
+        cfg.trackball
+            .insert("0".into(), flighthook::TrackballSection::default());
+        cfg.mock_monitor
+            .insert("0".into(), MockMonitorSection::default());
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        form.add_preset(preset).expect("added");
+        let devices: Vec<&super::DeviceFormEntry> = form
+            .actors
+            .iter()
+            .filter_map(|a| match a {
+                ActorFormEntry::Device(dev) => Some(dev),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(devices.iter().filter(|d| d.is_trackball()).count(), 2);
+        assert!(devices.iter().any(|d| !d.is_trackball()));
+        for dev in devices {
+            assert_eq!(dev.trackball.is_some(), dev.is_trackball(), "{}", dev.id);
+        }
     }
 
     /// The Trackball card checks its settings with the driver's own
@@ -5095,15 +5129,15 @@ mod tests {
             let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
                 panic!("not a device");
             };
-            let before = dev.trackball.numbers[key].clone();
-            dev.trackball.numbers.insert(key, typed.into());
+            let before = dev.trackball_form().numbers[key].clone();
+            dev.trackball_form().numbers.insert(key, typed.into());
             dev.dirty = true;
             assert_eq!(dev.driver_error().as_deref(), Some(error), "{key} {typed}");
             assert!(!super::actor_valid(&form.actors[0]), "{key} {typed}");
             let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
                 panic!("not a device");
             };
-            dev.trackball.numbers.insert(key, before);
+            dev.trackball_form().numbers.insert(key, before);
             assert_eq!(dev.driver_error(), None);
         }
 
@@ -5127,7 +5161,7 @@ mod tests {
         let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
             panic!("not a device");
         };
-        dev.trackball
+        dev.trackball_form()
             .numbers
             .insert("tuning.power_gamma", "0".into());
         assert!(!super::actor_valid(&form.actors[0]), "another refusal");
