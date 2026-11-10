@@ -50,7 +50,7 @@ use tracing::{debug, error, info, warn};
 use crate::actors::provenance::{Provenance, ShotSource};
 use crate::actors::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError};
-use crate::raw_capture::{self, RawCapture, RawCaptureConfig};
+use crate::raw_capture::{RawCapture, RawCaptureConfig};
 use crate::sim;
 use crate::state::SystemState;
 use flighthook::{
@@ -102,9 +102,6 @@ pub trait Hooks<D: DeviceDriver>: Default + Send + 'static {
 }
 
 /// What [`Hooks::on_frp`] sees besides the event.
-// No card's hooks read it yet (the mock has none of its own); the tests'
-// hooks do.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub struct HookCtx<'a, S> {
     /// The card's section as it is in effect.
@@ -661,25 +658,63 @@ struct Sink<D: DeviceDriver, H: Hooks<D>> {
     holding: bool,
     /// Shots finished over the actor's life.
     shot_count: u32,
+    /// Puts the driver's timestamps on the host clock.
+    clock: UtcClock,
     _driver: PhantomData<fn() -> D>,
 }
 
-/// The instant of `ms`, milliseconds since the Unix epoch (UTC), on this
-/// host's monotonic clock.
-fn instant_of(ms: u64) -> Instant {
-    let now = Instant::now();
-    let Some(now_ms) = SystemTime::now()
+/// How far the host's wall clock may drift from the monotonic clock before
+/// [`UtcClock`] takes a new anchor.
+const MAX_CLOCK_DRIFT: Duration = Duration::from_millis(20);
+
+/// Puts a driver's UTC timestamps (milliseconds since the Unix epoch) on
+/// this host's monotonic clock, from one anchor pair, so every timestamp of
+/// the same millisecond maps to the same instant: raw frames stamped in one
+/// millisecond keep the order the driver handed them over (the capture sorts
+/// by time, stably). A new anchor is taken when the wall clock has drifted
+/// more than [`MAX_CLOCK_DRIFT`] from it.
+#[derive(Debug, Default)]
+struct UtcClock {
+    /// A monotonic instant and the UTC milliseconds read with it.
+    anchor: Option<(Instant, u64)>,
+}
+
+/// The current UTC time, milliseconds since the Unix epoch.
+fn utc_ms() -> Option<u64> {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok())
-    else {
-        return now;
-    };
-    if ms <= now_ms {
-        now.checked_sub(Duration::from_millis(now_ms - ms))
-            .unwrap_or(now)
+}
+
+/// `at` moved by `ms` milliseconds (back for a negative `ms`), or `at` when
+/// that is out of range.
+fn shifted(at: Instant, ms: i128) -> Instant {
+    let by = Duration::from_millis(u64::try_from(ms.unsigned_abs()).unwrap_or(u64::MAX));
+    if ms >= 0 {
+        at.checked_add(by)
     } else {
-        now + Duration::from_millis(ms - now_ms)
+        at.checked_sub(by)
+    }
+    .unwrap_or(at)
+}
+
+impl UtcClock {
+    /// The instant of `ms` on this host's monotonic clock.
+    fn instant_of(&mut self, ms: u64) -> Instant {
+        let now = Instant::now();
+        let Some(now_ms) = utc_ms() else {
+            return now;
+        };
+        let fresh = self.anchor.is_some_and(|(mono, utc)| {
+            let predicted = shifted(mono, i128::from(now_ms) - i128::from(utc));
+            predicted.max(now) - predicted.min(now) <= MAX_CLOCK_DRIFT
+        });
+        if !fresh {
+            self.anchor = Some((now, now_ms));
+        }
+        let (mono, utc) = self.anchor.unwrap_or((now, now_ms));
+        shifted(mono, i128::from(ms) - i128::from(utc))
     }
 }
 
@@ -730,6 +765,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             refused: HashMap::new(),
             holding: false,
             shot_count: 0,
+            clock: UtcClock::default(),
             _driver: PhantomData,
         }
     }
@@ -762,8 +798,6 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
                 pre_roll_frames: p.pre_roll_frames,
                 max_frames: p.max_frames,
                 max_bulk_bytes: p.max_bulk_bytes,
-                exclude: raw_capture::exclude_none,
-                is_bulk: raw_capture::no_bulk,
             })
         });
     }
@@ -1017,7 +1051,11 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         if sent.is_some() {
             self.holding = false;
             if let Some(capture) = &mut self.capture {
-                capture.mark_trigger_at(timestamp.map_or_else(Instant::now, instant_of));
+                let at = match timestamp {
+                    Some(ms) => self.clock.instant_of(ms),
+                    None => Instant::now(),
+                };
+                capture.mark_trigger_at(at);
             }
         } else {
             self.refused.insert(key.shot_id, Instant::now());
@@ -1184,7 +1222,10 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             flightrelay::RawDir::Rx => RawDir::Rx,
             flightrelay::RawDir::Tx => RawDir::Tx,
         };
-        let at = frame.timestamp.map_or_else(Instant::now, instant_of);
+        let at = match frame.timestamp {
+            Some(ms) => self.clock.instant_of(ms),
+            None => Instant::now(),
+        };
         let mut record = if profile.text {
             match String::from_utf8(frame.data) {
                 Ok(text) => RawRecord::text(dir, text),
@@ -1194,7 +1235,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             RawRecord::binary(dir, &frame.data)
         };
         record.label = frame.label;
-        capture.push_classified(record, at, bulk);
+        capture.push(record, at, bulk);
     }
 }
 
@@ -1929,6 +1970,62 @@ mod tests {
         assert_eq!(sink.seqs["FAKE-1"], 5, "counting on in the next session");
     }
 
+    /// Timestamps of one millisecond map to one instant however long after
+    /// each other they are converted; later milliseconds map later.
+    #[test]
+    fn one_millisecond_is_one_instant() {
+        let mut clock = UtcClock::default();
+        let ms = utc_ms().expect("clock");
+        let first = clock.instant_of(ms);
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_micros(700));
+            assert_eq!(clock.instant_of(ms), first);
+        }
+        assert_eq!(clock.instant_of(ms + 1) - first, Duration::from_millis(1));
+        assert_eq!(first - clock.instant_of(ms - 5), Duration::from_millis(5));
+    }
+
+    /// Raw frames the driver stamps in one millisecond keep the order it
+    /// handed them over, in the pre-roll and in the shot window.
+    #[test]
+    fn frames_of_one_millisecond_keep_their_order() {
+        use flightrelay::RawDir::Rx;
+        let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
+        drain(&mut rx);
+        let ms = utc_ms().expect("clock");
+        let stamped = |n: u8| {
+            let mut frame = RawFrame::new(Rx, 0, vec![n]);
+            frame.label = Some(n.to_string());
+            frame.timestamp = Some(ms);
+            frp(FrpEvent::RawFrame(frame))
+        };
+        for n in 0..3 {
+            sink.handle(stamped(n));
+        }
+        sink.handle(frp(FrpEvent::ShotTrigger {
+            key: key(1),
+            timestamp: Some(ms),
+        }));
+        // The fake's profile keeps 4 frames of pre-roll and 8 a shot.
+        for n in 3..8 {
+            sink.handle(stamped(n));
+            std::thread::sleep(Duration::from_micros(300));
+        }
+        sink.handle(frp(FrpEvent::shot_finished(key(1))));
+        let raw = raw_of(&drain(&mut rx));
+        let order: Vec<u8> = raw
+            .frames
+            .iter()
+            .map(|f| {
+                f.label
+                    .as_deref()
+                    .and_then(|l| l.parse().ok())
+                    .expect("label")
+            })
+            .collect();
+        assert_eq!(order, (0..8).collect::<Vec<u8>>());
+    }
+
     /// Frames sent during the first connect, before the device id is known,
     /// are numbered on into the session.
     #[test]
@@ -2535,6 +2632,7 @@ mod tests {
     #[test]
     fn every_cards_source_is_its_drivers() {
         source_matches::<flightrelay::mock::MockDriver, crate::actors::mock::MockHooks>();
+        source_matches::<ironsight::driver::Mevo, crate::actors::mevo::MevoHooks>();
         source_matches::<tenover::driver::R10, crate::actors::r10::R10Hooks>();
         source_matches::<allsquare::driver::Omni, crate::actors::square::SquareHooks>();
         source_matches::<threeputt::driver::ExPutt, crate::actors::exputt::ExPuttHooks>();
@@ -2659,6 +2757,41 @@ mod tests {
                     "post_shot_delay_s",
                     "serial",
                     "shot_interval_s"
+                ]
+                .map(String::from)
+            )
+        );
+
+        let mevo = flighthook::MevoSection {
+            name: "Mevo".into(),
+            enabled: false,
+            launch_only_spin: 50.0,
+            impact_lead_s: Some(0.5),
+            driver: flighthook::MevoConfig::default(),
+        };
+        let full = flighthook::MevoSection {
+            driver: flighthook::MevoConfig {
+                address: Some("10.0.0.5:5100".into()),
+                spin_source: flighthook::SpinSource::Auto,
+                ..flighthook::MevoConfig::example()
+            },
+            ..mevo.clone()
+        };
+        keys_apart(&mevo, &full);
+        assert_eq!(
+            driver_keys::<flighthook::MevoConfig>(),
+            BTreeSet::from(
+                [
+                    "address",
+                    "ball_type",
+                    "camera_mode",
+                    "environment",
+                    "range",
+                    "spin_source",
+                    "surface_height",
+                    "tee_height",
+                    "track_pct",
+                    "use_estimated",
                 ]
                 .map(String::from)
             )

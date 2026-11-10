@@ -11,7 +11,7 @@ use std::sync::{Mutex, RwLock};
 use serde::Deserialize;
 
 // Re-export config types from schemas for crate-internal use
-pub use flighthook::{FlighthookConfig, MevoSection};
+pub use flighthook::FlighthookConfig;
 
 /// Build a global ID from a type prefix and index: `"mevo.0"`,
 /// `"openconnect_client.0"`, etc.
@@ -259,7 +259,8 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
             }
             None => {
                 let e = located_error(contents, e);
-                let fault = driver_type_error::<flighthook::MockMonitorSection>(contents)
+                let fault = driver_type_error::<flighthook::MevoSection>(contents)
+                    .or_else(|| driver_type_error::<flighthook::MockMonitorSection>(contents))
                     .or_else(|| driver_type_error::<flighthook::R10Section>(contents))
                     .or_else(|| driver_type_error::<flighthook::SquareSection>(contents))
                     .or_else(|| driver_type_error::<flighthook::ExPuttSection>(contents))
@@ -631,31 +632,6 @@ impl SystemConfig {
             .clone()
     }
 
-    /// The spin source of the `[mevo.<index>]` section, or `None` when that
-    /// section is absent. Device threads read it once per shot, so a change
-    /// applies on the next shot without reconnecting.
-    pub fn mevo_spin_source(&self, index: &str) -> Option<flighthook::SpinSource> {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .mevo
-            .get(index)
-            .map(|m| m.spin_source)
-    }
-
-    /// The launch-only spin in effect for the `[mevo.<index>]` section, rpm
-    /// per mph (`0` = off), or `None` when that section is absent. Device
-    /// threads read it once per shot, so a change applies on the next shot
-    /// without reconnecting.
-    pub fn mevo_launch_only_spin(&self, index: &str) -> Option<f64> {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .mevo
-            .get(index)
-            .map(flighthook::MevoSection::launch_only_spin_rpm_per_mph)
-    }
-
     /// The impact lead in effect for launch monitor `actor` (e.g. `mevo.0`),
     /// seconds: its section's `impact_lead_s` when valid, else the monitor
     /// type's default. `None` for a source that is not a swing (Auto-chip).
@@ -938,14 +914,14 @@ bind = "0.0.0.0:5880"
     fn mevo_environment_is_optional_in_toml() {
         let without = "[mevo.0]\nname = \"Mevo\"\naddress = \"192.168.2.1:5100\"\n";
         let c: FlighthookConfig = toml::from_str(without).expect("parses");
-        assert_eq!(c.mevo["0"].environment, None);
+        assert_eq!(c.mevo["0"].driver.environment, None);
         let out = toml::to_string_pretty(&c).expect("ser");
         assert!(!out.contains("environment"), "{out}");
 
         let with = format!("{without}environment = \"outdoor\"\n");
         let c: FlighthookConfig = toml::from_str(&with).expect("parses");
         assert_eq!(
-            c.mevo["0"].environment,
+            c.mevo["0"].driver.environment,
             Some(flighthook::FlightScopeEnvironment::Outdoor)
         );
         let out = toml::to_string_pretty(&c).expect("ser");
@@ -956,13 +932,13 @@ bind = "0.0.0.0:5880"
     fn mevo_spin_source_is_omitted_at_default_in_toml() {
         let without = "[mevo.0]\nname = \"Xi\"\naddress = \"192.168.2.1:5100\"\n";
         let c: FlighthookConfig = toml::from_str(without).expect("parses");
-        assert_eq!(c.mevo["0"].spin_source, flighthook::SpinSource::D4);
+        assert_eq!(c.mevo["0"].driver.spin_source, flighthook::SpinSource::D4);
         let out = toml::to_string_pretty(&c).expect("ser");
         assert!(!out.contains("spin_source"), "{out}");
 
         let with = format!("{without}spin_source = \"e8\"\n");
         let c: FlighthookConfig = toml::from_str(&with).expect("parses");
-        assert_eq!(c.mevo["0"].spin_source, flighthook::SpinSource::E8);
+        assert_eq!(c.mevo["0"].driver.spin_source, flighthook::SpinSource::E8);
         let out = toml::to_string_pretty(&c).expect("ser");
         assert!(out.contains("spin_source = \"e8\"\n"), "{out}");
         let back: FlighthookConfig = toml::from_str(&out).expect("parses");
@@ -986,53 +962,6 @@ bind = "0.0.0.0:5880"
         assert_eq!(cfg.simulation().mode, SimMode::On);
         cfg.update(|c| c.simulation.mode = SimMode::Off);
         assert_eq!(cfg.simulation().mode, SimMode::Off);
-    }
-
-    #[test]
-    fn mevo_spin_source_reads_the_live_section() {
-        let dir =
-            TempDir(std::env::temp_dir().join(format!("flighthook-config-test-{}", generate_id())));
-        let cfg = SystemConfig::new(dir.0.join("config.toml"));
-        assert_eq!(cfg.mevo_spin_source("0"), None);
-        cfg.update(|c| {
-            c.mevo
-                .insert("0".into(), flighthook::MevoSection::default());
-        });
-        assert_eq!(cfg.mevo_spin_source("0"), Some(flighthook::SpinSource::D4));
-        cfg.update(|c| {
-            if let Some(m) = c.mevo.get_mut("0") {
-                m.spin_source = flighthook::SpinSource::E8;
-            }
-        });
-        assert_eq!(cfg.mevo_spin_source("0"), Some(flighthook::SpinSource::E8));
-    }
-
-    #[test]
-    fn mevo_launch_only_spin_reads_the_live_section() {
-        let dir =
-            TempDir(std::env::temp_dir().join(format!("flighthook-config-test-{}", generate_id())));
-        let cfg = SystemConfig::new(dir.0.join("config.toml"));
-        assert_eq!(cfg.mevo_launch_only_spin("0"), None);
-        cfg.update(|c| {
-            c.mevo
-                .insert("0".into(), flighthook::MevoSection::default());
-        });
-        assert_eq!(cfg.mevo_launch_only_spin("0"), Some(100.0));
-        for (set, read) in [
-            (0.0, 0.0),
-            (80.0, 80.0),
-            (1000.0, 1000.0),
-            (1500.0, 0.0),
-            (-5.0, 0.0),
-            (f64::NAN, 0.0),
-        ] {
-            cfg.update(|c| {
-                if let Some(m) = c.mevo.get_mut("0") {
-                    m.launch_only_spin = set;
-                }
-            });
-            assert_eq!(cfg.mevo_launch_only_spin("0"), Some(read), "{set}");
-        }
     }
 
     #[test]
@@ -1282,6 +1211,141 @@ full_monitor = "mevo.0"
         assert_eq!(
             toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
             config
+        );
+    }
+
+    /// FlightScope sections as flighthook 0.1.24 saved them (from the card:
+    /// every setting stated; a Xi with its spin source, launch-only spin and
+    /// camera timing; one that is off with its settings by hand) load into
+    /// the same values, the device settings now in the driver's, with no
+    /// device error; the file is not rewritten and gets no backup, and the
+    /// saved form round-trips.
+    #[test]
+    fn a_mevo_section_file_from_0_1_24_loads_unchanged() {
+        let text = "default_units = \"imperial\"\n\
+                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
+                    putting_clubs = [\"PT\"]\n\
+                    \n\
+                    [mevo.0]\n\
+                    name = \"Mevo WiFi\"\n\
+                    address = \"192.168.2.1:5100\"\n\
+                    ball_type = 1\n\
+                    tee_height = \"1.5in\"\n\
+                    range = \"8ft\"\n\
+                    surface_height = \"0in\"\n\
+                    track_pct = 80.0\n\
+                    use_estimated = false\n\
+                    camera_mode = \"standard\"\n\
+                    environment = \"limited_flight\"\n\
+                    \n\
+                    [mevo.1]\n\
+                    name = \"Xi\"\n\
+                    address = \"10.0.0.7:5100\"\n\
+                    ball_type = 1\n\
+                    tee_height = \"1.5in\"\n\
+                    range = \"9ft\"\n\
+                    surface_height = \"1in\"\n\
+                    track_pct = 80.0\n\
+                    use_estimated = true\n\
+                    camera_mode = \"standard\"\n\
+                    environment = \"outdoor\"\n\
+                    spin_source = \"auto\"\n\
+                    launch_only_spin = 120.0\n\
+                    impact_lead_s = 0.25\n\
+                    \n\
+                    [mevo.2]\n\
+                    name = \"Garage\"\n\
+                    enabled = false\n\
+                    address = \"192.168.2.1:5100\"\n\
+                    camera_mode = \"raw_fusion\"\n";
+        let (dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        let card = &config.mevo["0"];
+        assert_eq!(card.name, "Mevo WiFi");
+        assert_eq!(card.driver.address.as_deref(), Some("192.168.2.1:5100"));
+        assert_eq!(card.driver.ball_type, Some(1));
+        assert_eq!(
+            card.driver.tee_height,
+            Some(flighthook::Distance::Inches(1.5))
+        );
+        assert_eq!(card.driver.range, Some(flighthook::Distance::Feet(8.0)));
+        assert_eq!(
+            card.driver.surface_height,
+            Some(flighthook::Distance::Inches(0.0))
+        );
+        assert_eq!(card.driver.track_pct, Some(80.0));
+        assert_eq!(card.driver.use_estimated, Some(false));
+        assert_eq!(
+            card.driver.camera_mode,
+            Some(flighthook::CameraMode::Standard)
+        );
+        assert_eq!(
+            card.driver.environment,
+            Some(flighthook::FlightScopeEnvironment::LimitedFlight)
+        );
+        assert_eq!(card.driver.spin_source, flighthook::SpinSource::D4);
+        assert_eq!(
+            card.launch_only_spin,
+            flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN
+        );
+        let xi = &config.mevo["1"];
+        assert_eq!(xi.driver.spin_source, flighthook::SpinSource::Auto);
+        assert_eq!(
+            xi.driver.environment,
+            Some(flighthook::FlightScopeEnvironment::Outdoor)
+        );
+        assert_eq!(xi.launch_only_spin, 120.0);
+        assert_eq!(xi.impact_lead_s, Some(0.25));
+        let off = &config.mevo["2"];
+        assert!(!off.enabled);
+        assert_eq!(off.driver.ball_type, None);
+        assert_eq!(
+            off.driver.camera_mode,
+            Some(flighthook::CameraMode::RawFusion)
+        );
+        assert_eq!(config.device_error(), None);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            text,
+            "not rewritten"
+        );
+        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        let saved = toml::to_string_pretty(&config).expect("toml");
+        assert_eq!(
+            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            config
+        );
+    }
+
+    /// A FlightScope setting the driver refuses (a hand-edited file) loads
+    /// as written and is reported by card and field; a setting of the wrong
+    /// type names its card, key and line.
+    #[test]
+    fn a_refused_mevo_setting_loads_and_is_reported() {
+        let text = "[mevo.0]\nname = \"Mevo\"\ntrack_pct = 150.0\n";
+        let (_dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        assert_eq!(config.mevo["0"].driver.track_pct, Some(150.0));
+        assert_eq!(
+            config.device_error().as_deref(),
+            Some("mevo.0: track_pct: must be 0 to 100")
+        );
+
+        let text = "[mevo.0]\n\
+                    name = \"Mevo\"\n\
+                    \n\
+                    [mevo.3]\n\
+                    name = \"Xi\"\n\
+                    spin_source = \"e9\"\n";
+        let error = kept_error(text);
+        assert!(
+            error
+                .error
+                .starts_with("line 6, column 1: mevo.3: spin_source: "),
+            "{}",
+            error.error
         );
     }
 
@@ -1574,7 +1638,7 @@ full_monitor = "mevo.0"
         assert_eq!(c.mevo["0"].name, "Mevo+");
 
         // The same actor, under its new ID, as the old file started.
-        let ids: Vec<_> = crate::actors::resolve_actors(&c, None)
+        let ids: Vec<_> = crate::actors::resolve_actors(&c)
             .into_iter()
             .map(|a| a.id)
             .collect();
@@ -2309,8 +2373,8 @@ name = "Clubs"
         assert_eq!(c.simulation.mode, SimMode::Force);
         assert!((c.simulation.temperature_c - 12.0).abs() < f64::EPSILON);
         assert_eq!(c.webserver["0"].bind, "0.0.0.0:5881");
-        assert_eq!(c.mevo["0"].ball_type, Some(1));
-        assert_eq!(c.mevo["0"].track_pct, Some(80.0));
+        assert_eq!(c.mevo["0"].driver.ball_type, Some(1));
+        assert_eq!(c.mevo["0"].driver.track_pct, Some(80.0));
         assert_eq!(c.r10["0"].name, "R10");
         assert_eq!(c.square["0"].driver.dot_bottom_to_face_center_mm.len(), 2);
         assert_eq!(c.mock_monitor["0"].name, "Mock");

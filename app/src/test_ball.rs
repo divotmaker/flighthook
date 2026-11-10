@@ -57,30 +57,6 @@ impl Ball {
         (flight != FlightResult::new(Basis::Modeled)).then_some(flight)
     }
 
-    /// The block for a shot's `launch` and `flight`.
-    pub(crate) fn of(launch: Option<&Launch>, flight: Option<&FlightResult>) -> Self {
-        let l = launch.cloned().unwrap_or_default();
-        let f = flight.cloned();
-        let f = f.as_ref();
-        Self {
-            launch_speed: l.launch_speed,
-            launch_azimuth: l.launch_azimuth,
-            launch_elevation: l.launch_elevation,
-            backspin_rpm: l.backspin_rpm,
-            sidespin_rpm: l.sidespin_rpm,
-            total_spin_rpm: l.total_spin_rpm,
-            spin_axis: l.spin_axis,
-            carry_distance: f.and_then(|f| f.carry_distance),
-            carry_offline: f.and_then(|f| f.carry_offline),
-            total_distance: f.and_then(|f| f.total_distance),
-            total_offline: f.and_then(|f| f.total_offline),
-            roll_distance: f.and_then(|f| f.roll_distance),
-            max_height: f.and_then(|f| f.max_height),
-            flight_time: f.and_then(|f| f.flight_time),
-            descent_angle: f.and_then(|f| f.descent_angle),
-        }
-    }
-
     /// Put this block on `shot`: its launch and flight result.
     pub(crate) fn put_on(&self, shot: &mut ShotData) {
         shot.launch = Some(self.launch());

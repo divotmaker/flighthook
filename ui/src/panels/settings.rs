@@ -12,8 +12,8 @@ use crate::types::{
     ShotGrouping, SimSurface, SimulationSection, SpinSource, UnitSystem, WebserverSection,
 };
 use flighthook::{
-    BodyTrackingMode, BodyTrackingSection, DriverConfig, MockConfig, PlayerSection, PoseModel, Sex,
-    SimMode, SquareConfig,
+    BodyTrackingMode, BodyTrackingSection, DriverConfig, MevoConfig, MockConfig, PlayerSection,
+    PoseModel, Sex, SimMode, SquareConfig,
 };
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
@@ -30,6 +30,82 @@ fn format_distance_value(v: f64) -> String {
     let s = s.trim_end_matches('0');
     let s = s.trim_end_matches('.');
     s.to_string()
+}
+
+/// The FlightScope driver's values for settings left unset, as its card
+/// shows them.
+const MEVO_ADDRESS: &str = flighthook::MEVO_DEFAULT_ADDRESS;
+const MEVO_BALL_TYPE: u8 = flighthook::MEVO_DEFAULT_BALL_TYPE;
+const MEVO_TEE_HEIGHT: Distance = flighthook::MEVO_DEFAULT_TEE_HEIGHT;
+const MEVO_RANGE: Distance = flighthook::MEVO_DEFAULT_RANGE;
+const MEVO_SURFACE_HEIGHT: Distance = flighthook::MEVO_DEFAULT_SURFACE_HEIGHT;
+
+/// The FlightScope environments, in menu order.
+const ENVIRONMENTS: [FlightScopeEnvironment; 2] = [
+    FlightScopeEnvironment::LimitedFlight,
+    FlightScopeEnvironment::Outdoor,
+];
+
+/// The FlightScope Xi spin sources, in menu order.
+const SPIN_SOURCES: [SpinSource; 3] = [SpinSource::D4, SpinSource::E8, SpinSource::Auto];
+
+/// The FlightScope camera modes, in menu order.
+const CAMERA_MODES: [CameraMode; 3] = [
+    CameraMode::Standard,
+    CameraMode::Fusion,
+    CameraMode::RawFusion,
+];
+
+fn environment_label(env: FlightScopeEnvironment) -> &'static str {
+    match env {
+        FlightScopeEnvironment::LimitedFlight => "Limited flight (sim/indoor)",
+        FlightScopeEnvironment::Outdoor => "Outdoor (full flight)",
+    }
+}
+
+fn spin_source_label(src: SpinSource) -> &'static str {
+    match src {
+        SpinSource::D4 => "D4 (matches FS Golf)",
+        SpinSource::E8 => "E8",
+        SpinSource::Auto => "Auto (E8 on full swings)",
+    }
+}
+
+fn camera_mode_label(mode: CameraMode) -> &'static str {
+    match mode {
+        CameraMode::Standard => "Standard (radar only)",
+        CameraMode::Fusion => "Fusion — older firmware",
+        CameraMode::RawFusion => "Raw Fusion — BM17.04+",
+    }
+}
+
+/// The FlightScope track % as the card shows it: whole percent, the
+/// driver's default when unset.
+fn track_pct_text(track_pct: Option<f64>) -> String {
+    format!(
+        "{:.0}",
+        track_pct.unwrap_or(flighthook::MEVO_DEFAULT_TRACK_PCT)
+    )
+}
+
+/// A distance setting from the form: `loaded` while the field still shows
+/// it (or `default` for an unset one), else the value typed in `unit`;
+/// blank or not a number is unset.
+fn form_distance(
+    loaded: Option<Distance>,
+    default: Distance,
+    value: &str,
+    unit: &str,
+) -> Option<Distance> {
+    let shown = loaded.unwrap_or(default);
+    let value = value.trim();
+    if value == format_distance_value(shown.value()) && unit == shown.unit_key() {
+        return loaded;
+    }
+    value
+        .parse::<f64>()
+        .ok()
+        .map(|v| Distance::from_value_and_unit(v, unit))
 }
 
 fn unit_suffix(key: &str) -> &str {
@@ -100,6 +176,11 @@ pub(crate) struct DeviceFormEntry {
     /// allsquare's default" for that club. The putter is excluded — it has
     /// no vertical impact estimate.
     pub(crate) square_impact_mm: std::collections::HashMap<Club, String>,
+    /// FlightScope: the driver's settings as loaded (for a new card: the
+    /// values the card shows, stated). The form edits every one of them; a
+    /// field still showing its loaded value keeps it, set or unset, so a
+    /// save writes an unchanged section as it was.
+    pub(crate) mevo: MevoConfig,
     /// Mock launch monitor: the driver's settings, which the form does not
     /// surface. Carried verbatim so that saving settings does not wipe them
     /// from the config file, and checked with the driver's own validation.
@@ -308,34 +389,36 @@ fn impact_mm_to_config(
 
 impl DeviceFormEntry {
     pub(crate) fn from_mevo(id: &str, s: &MevoSection) -> Self {
-        let tee = s.tee_height.unwrap_or(Distance::Inches(1.5));
-        let rng = s.range.unwrap_or(Distance::Feet(8.0));
-        let surf = s.surface_height.unwrap_or(Distance::Inches(0.0));
+        let d = &s.driver;
+        let tee = d.tee_height.unwrap_or(MEVO_TEE_HEIGHT);
+        let rng = d.range.unwrap_or(MEVO_RANGE);
+        let surf = d.surface_height.unwrap_or(MEVO_SURFACE_HEIGHT);
         Self {
             id: id.into(),
             monitor_type: "mevo".into(),
             name: s.name.clone(),
             enabled: s.enabled,
-            address: s.address.clone().unwrap_or_default(),
-            ball_type: s.ball_type.unwrap_or(1),
+            address: d.address.clone().unwrap_or_default(),
+            ball_type: d.ball_type.unwrap_or(MEVO_BALL_TYPE),
             tee_height_val: format_distance_value(tee.value()),
             tee_height_unit: tee.unit_key().into(),
             range_val: format_distance_value(rng.value()),
             range_unit: rng.unit_key().into(),
             surface_height_val: format_distance_value(surf.value()),
             surface_height_unit: surf.unit_key().into(),
-            track_pct: format!("{:.0}", s.track_pct.unwrap_or(80.0)),
-            use_estimated: s.use_estimated.unwrap_or(false),
-            camera_mode: s.camera_mode.unwrap_or_default(),
-            environment: s.environment.unwrap_or_default(),
-            spin_source: s.spin_source,
+            track_pct: track_pct_text(d.track_pct),
+            use_estimated: d.use_estimated(),
+            camera_mode: d.camera_mode(),
+            environment: d.environment(),
+            spin_source: d.spin_source,
             launch_only_spin: format_distance_value(s.launch_only_spin),
             impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
+            mevo: d.clone(),
             mock: MockConfig::default(),
-            saved_driver: None,
+            saved_driver: serde_json::to_value(d).ok(),
             cam: Box::default(),
             dirty: false,
         }
@@ -373,6 +456,7 @@ impl DeviceFormEntry {
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
+            mevo: MevoConfig::default(),
             mock: MockConfig::default(),
             saved_driver: serde_json::to_value(&s.driver).ok(),
             cam: Box::default(),
@@ -390,6 +474,7 @@ impl DeviceFormEntry {
             discard_zero_spin: s.driver.discard_non_putting_zero_spin,
             square: s.driver.clone(),
             square_impact_mm: impact_mm_form(&s.driver.dot_bottom_to_face_center_mm),
+            mevo: MevoConfig::default(),
             mock: MockConfig::default(),
             saved_driver: serde_json::to_value(&s.driver).ok(),
             ball_type: 0,
@@ -435,6 +520,7 @@ impl DeviceFormEntry {
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
+            mevo: MevoConfig::default(),
             mock: MockConfig::default(),
             saved_driver: serde_json::to_value(&s.driver).ok(),
             cam: Box::default(),
@@ -466,6 +552,7 @@ impl DeviceFormEntry {
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
+            mevo: MevoConfig::default(),
             mock: MockConfig::default(),
             saved_driver: None,
             cam: Box::default(),
@@ -497,6 +584,7 @@ impl DeviceFormEntry {
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
+            mevo: MevoConfig::default(),
             mock: s.driver.clone(),
             saved_driver: serde_json::to_value(&s.driver).ok(),
             cam: Box::default(),
@@ -539,7 +627,10 @@ impl DeviceFormEntry {
     pub(crate) fn driver_error(&self) -> Option<String> {
         match self.monitor_type.as_str() {
             "mock_monitor" => self.mock.validate().err().map(|e| e.to_string()),
-            "r10" if self.range_unparsable() => Some("range: not a number".into()),
+            "r10" | "mevo" if self.unparsable_field().is_some() => self
+                .unparsable_field()
+                .map(|field| format!("{field}: not a number")),
+            "mevo" => self.mevo_config().validate().err().map(|e| e.to_string()),
             "r10" => self.r10_config().validate().err().map(|e| e.to_string()),
             "square" => self.square_config().validate().err().map(|e| e.to_string()),
             "exputt" => self.exputt_config().validate().err().map(|e| e.to_string()),
@@ -552,6 +643,7 @@ impl DeviceFormEntry {
     fn driver_json(&self) -> Option<serde_json::Value> {
         match self.monitor_type.as_str() {
             "mock_monitor" => serde_json::to_value(&self.mock).ok(),
+            "mevo" => serde_json::to_value(self.mevo_config()).ok(),
             "r10" => serde_json::to_value(self.r10_config()).ok(),
             "square" => serde_json::to_value(self.square_config()).ok(),
             "exputt" => serde_json::to_value(self.exputt_config()).ok(),
@@ -559,11 +651,86 @@ impl DeviceFormEntry {
         }
     }
 
-    /// Whether the range field holds text that is not a number (blank is
-    /// no range).
-    fn range_unparsable(&self) -> bool {
-        let text = self.range_val.trim();
-        !text.is_empty() && text.parse::<f64>().is_err()
+    /// The first number field of the card's driver settings that holds
+    /// text that is not a number (blank is unset): the R10's range, the
+    /// FlightScope's tee height, range, surface height and track %.
+    fn unparsable_field(&self) -> Option<&'static str> {
+        let fields: &[(&'static str, &str)] = match self.monitor_type.as_str() {
+            "r10" => &[("range", &self.range_val)],
+            "mevo" => &[
+                ("tee_height", &self.tee_height_val),
+                ("range", &self.range_val),
+                ("surface_height", &self.surface_height_val),
+                ("track_pct", &self.track_pct),
+            ],
+            _ => &[],
+        };
+        fields
+            .iter()
+            .find(|(_, text)| {
+                let text = text.trim();
+                !text.is_empty() && text.parse::<f64>().is_err()
+            })
+            .map(|(field, _)| *field)
+    }
+
+    /// The FlightScope driver's settings from the form, over the settings
+    /// as loaded ([`mevo`](Self::mevo)): a field that still shows its
+    /// loaded value keeps it (set or unset), any other is taken as typed
+    /// (a blank address or number is unset; a number that doesn't parse is
+    /// unset too, and [`driver_error`](Self::driver_error) refuses it).
+    pub(crate) fn mevo_config(&self) -> MevoConfig {
+        let m = &self.mevo;
+        let address = self.address.trim();
+        let pick = |loaded: Option<bool>, default: bool, shown: bool| {
+            if shown == loaded.unwrap_or(default) {
+                loaded
+            } else {
+                Some(shown)
+            }
+        };
+        MevoConfig {
+            address: if address == m.address.as_deref().unwrap_or_default().trim() {
+                m.address.clone()
+            } else {
+                (!address.is_empty()).then(|| address.to_owned())
+            },
+            ball_type: if self.ball_type == m.ball_type.unwrap_or(MEVO_BALL_TYPE) {
+                m.ball_type
+            } else {
+                Some(self.ball_type)
+            },
+            tee_height: form_distance(
+                m.tee_height,
+                MEVO_TEE_HEIGHT,
+                &self.tee_height_val,
+                &self.tee_height_unit,
+            ),
+            range: form_distance(m.range, MEVO_RANGE, &self.range_val, &self.range_unit),
+            surface_height: form_distance(
+                m.surface_height,
+                MEVO_SURFACE_HEIGHT,
+                &self.surface_height_val,
+                &self.surface_height_unit,
+            ),
+            track_pct: if self.track_pct.trim() == track_pct_text(m.track_pct) {
+                m.track_pct
+            } else {
+                self.track_pct.trim().parse().ok()
+            },
+            use_estimated: pick(m.use_estimated, false, self.use_estimated),
+            camera_mode: if self.camera_mode == m.camera_mode() {
+                m.camera_mode
+            } else {
+                Some(self.camera_mode)
+            },
+            environment: if self.environment == m.environment() {
+                m.environment
+            } else {
+                Some(self.environment)
+            },
+            spin_source: self.spin_source,
+        }
     }
 
     /// The R10 driver's settings from the form: the range as typed, blank
@@ -618,7 +785,7 @@ impl DeviceFormEntry {
     /// still saves its other fields and its on/off switch, as the server
     /// does.
     pub(crate) fn driver_blocks_save(&self) -> bool {
-        (self.is_r10() && self.range_unparsable())
+        self.unparsable_field().is_some()
             || (self.driver_error().is_some() && self.saved_driver != self.driver_json())
     }
 
@@ -861,6 +1028,18 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
+            // A new FlightScope card states the values it shows.
+            mevo: MevoConfig {
+                ball_type: Some(ball_type),
+                tee_height: Some(MEVO_TEE_HEIGHT),
+                range: Some(MEVO_RANGE),
+                surface_height: Some(MEVO_SURFACE_HEIGHT),
+                track_pct: Some(flighthook::MEVO_DEFAULT_TRACK_PCT),
+                use_estimated: Some(false),
+                camera_mode: Some(CameraMode::Standard),
+                environment: Some(FlightScopeEnvironment::LimitedFlight),
+                ..MevoConfig::default()
+            },
             mock: MockConfig::default(),
             saved_driver: None,
             cam: Box::default(),
@@ -2132,9 +2311,6 @@ pub(crate) fn actor_valid(actor: &ActorFormEntry) -> bool {
             if dev.name.is_empty() {
                 return false;
             }
-            if dev.has_network_address() && dev.address.parse::<std::net::SocketAddr>().is_err() {
-                return false;
-            }
             if dev.has_bind_address()
                 && !dev.address.is_empty()
                 && dev.address.parse::<std::net::SocketAddr>().is_err()
@@ -2194,33 +2370,10 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         MevoSection {
                             name: dev.name.clone(),
                             enabled: dev.enabled,
-                            address: if dev.address.is_empty() {
-                                None
-                            } else {
-                                Some(dev.address.clone())
-                            },
-                            ball_type: Some(dev.ball_type),
-                            tee_height: dev
-                                .tee_height_val
-                                .parse::<f64>()
-                                .ok()
-                                .map(|v| Distance::from_value_and_unit(v, &dev.tee_height_unit)),
-                            range: dev
-                                .range_val
-                                .parse::<f64>()
-                                .ok()
-                                .map(|v| Distance::from_value_and_unit(v, &dev.range_unit)),
-                            surface_height: dev.surface_height_val.parse::<f64>().ok().map(|v| {
-                                Distance::from_value_and_unit(v, &dev.surface_height_unit)
-                            }),
-                            track_pct: dev.track_pct.parse().ok(),
-                            use_estimated: Some(dev.use_estimated),
-                            camera_mode: Some(dev.camera_mode),
-                            environment: Some(dev.environment),
-                            spin_source: dev.spin_source,
                             launch_only_spin: launch_only_spin_value(&dev.launch_only_spin)
                                 .unwrap_or(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
                             impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
+                            driver: dev.mevo_config(),
                         },
                     );
                 }
@@ -2724,7 +2877,8 @@ pub(crate) fn actor_fields(
                     if ui
                         .add(
                             egui::TextEdit::singleline(&mut dev.address)
-                                .desired_width(field_width - TEXT_EDIT_MARGIN),
+                                .desired_width(field_width - TEXT_EDIT_MARGIN)
+                                .hint_text(MEVO_ADDRESS),
                         )
                         .on_hover_text("ip:port (e.g. 192.168.2.1:5100)")
                         .changed()
@@ -2732,9 +2886,6 @@ pub(crate) fn actor_fields(
                         dev.dirty = true;
                     }
                 });
-                if dev.address.parse::<std::net::SocketAddr>().is_err() {
-                    field_error(ui, "Invalid address");
-                }
             }
 
             if dev.has_bind_address() {
@@ -3025,14 +3176,14 @@ pub(crate) fn actor_fields(
                         "Limited flight is for nets and sim screens.\nOutdoor needs about 40 yd of unobstructed flight;\nshots into a screen won't read.",
                     );
                     egui::ComboBox::from_id_salt(format!("environment_{}", dev.id))
-                        .selected_text(dev.environment.label())
+                        .selected_text(environment_label(dev.environment))
                         .width(wide_width)
                         .show_ui(ui, |ui| {
-                            for env in FlightScopeEnvironment::all() {
+                            for env in ENVIRONMENTS {
                                 if ui
                                     .selectable_label(
                                         dev.environment == env,
-                                        env.label(),
+                                        environment_label(env),
                                     )
                                     .clicked()
                                 {
@@ -3049,14 +3200,14 @@ pub(crate) fn actor_fields(
                         "FlightScope Xi only. The Xi sends two backspin values per shot.\nD4 is its final spin, the value FS Golf shows.\nE8 is the second value, often higher on full swings; on chips and\npitches E8 isn't measured, so choose knowingly. Auto uses E8 only\nwhile flighthook is in Full mode, and D4 otherwise -- a chip hit\nwhile still in Full mode gets E8's speed-scaled value, so set\nchipping clubs or switch modes first. A Mevo+ or Gen2 reports the\nsame spin either way.",
                     );
                     egui::ComboBox::from_id_salt(format!("spin_source_{}", dev.id))
-                        .selected_text(dev.spin_source.label())
+                        .selected_text(spin_source_label(dev.spin_source))
                         .width(wide_width)
                         .show_ui(ui, |ui| {
-                            for src in SpinSource::all() {
+                            for src in SPIN_SOURCES {
                                 if ui
                                     .selectable_label(
                                         dev.spin_source == src,
-                                        src.label(),
+                                        spin_source_label(src),
                                     )
                                     .clicked()
                                 {
@@ -3102,14 +3253,14 @@ pub(crate) fn actor_fields(
                         "Standard reports ball flight and radar club data.\nFusion modes add the full club data set (path, face angle,\nattack angle, dynamic loft, smash factor, swing planes) and\nneed the Pro Package enabled on the device.\n\nWhich Fusion mode depends on firmware: Raw Fusion for\nBM17.04 and newer, Fusion for older. The wrong one yields\nno Fusion club data. Fusion is applied after a 15s camera warmup.",
                     );
                     egui::ComboBox::from_id_salt(format!("cam_mode_{}", dev.id))
-                        .selected_text(dev.camera_mode.label())
+                        .selected_text(camera_mode_label(dev.camera_mode))
                         .width(wide_width)
                         .show_ui(ui, |ui| {
-                            for mode in CameraMode::all() {
+                            for mode in CAMERA_MODES {
                                 if ui
                                     .selectable_label(
                                         dev.camera_mode == mode,
-                                        mode.label(),
+                                        camera_mode_label(mode),
                                     )
                                     .clicked()
                                 {
@@ -4214,8 +4365,7 @@ mod tests {
     use crate::panels::devices::device_card_order;
     use crate::types::{
         ActorStatus, ActorStatusResponse, Club, Distance, FlighthookConfig, MevoSection,
-        MockMonitorSection, RandomClubSection, SimSurface, SimulationSection, SpinSource,
-        UnitSystem,
+        MockMonitorSection, RandomClubSection, SimSurface, SimulationSection, UnitSystem,
     };
     use flighthook::{MockConfig, R10Section, SimMode};
 
@@ -5044,24 +5194,161 @@ mod tests {
 
     #[test]
     fn spin_source_survives_a_settings_save() {
-        for src in SpinSource::all() {
+        for src in super::SPIN_SOURCES {
             let mut cfg = FlighthookConfig::default();
-            cfg.mevo.insert(
-                "0".into(),
-                MevoSection {
-                    spin_source: src,
-                    ..MevoSection::default()
-                },
-            );
+            let mut section = MevoSection::default();
+            section.driver.spin_source = src;
+            cfg.mevo.insert("0".into(), section);
             let mut form = SettingsForm::default();
             form.load_from(&cfg);
-            assert_eq!(form.to_request().mevo["0"].spin_source, src);
+            assert_eq!(form.to_request().mevo["0"].driver.spin_source, src);
 
             let actor = form.actors[0].clone();
             let mut orig = FlighthookConfig::default();
             super::apply_actor_to_config(&mut orig, &actor);
-            assert_eq!(orig.mevo["0"].spin_source, src);
+            assert_eq!(orig.mevo["0"].driver.spin_source, src);
         }
+    }
+
+    /// Where the form holds its FlightScope card.
+    fn mevo_at(form: &SettingsForm) -> usize {
+        form.actors
+            .iter()
+            .position(|a| matches!(a, ActorFormEntry::Device(d) if d.monitor_type == "mevo"))
+            .expect("a FlightScope card")
+    }
+
+    /// The FlightScope card saves a section it didn't change exactly as it
+    /// was loaded (settings left unset stay unset), and a changed field as
+    /// typed; a new card states the values it shows, as before.
+    #[test]
+    fn mevo_settings_are_saved_as_loaded_unless_changed() {
+        for json in [
+            r#"{"name":"Mevo WiFi","address":"192.168.2.1:5100","ball_type":1,"tee_height":"1.5in","range":"8ft","surface_height":"0in","track_pct":80.0,"use_estimated":false,"camera_mode":"standard","environment":"limited_flight"}"#,
+            r#"{"name":"Xi","address":"10.0.0.7:5100","spin_source":"e8","range":"9ft"}"#,
+            r#"{"name":"Garage","enabled":false}"#,
+        ] {
+            let section: MevoSection = serde_json::from_str(json).unwrap();
+            let mut cfg = FlighthookConfig::default();
+            cfg.mevo.insert("0".into(), section.clone());
+            let mut form = SettingsForm::default();
+            form.load_from(&cfg);
+            let ActorFormEntry::Device(dev) = &form.actors[mevo_at(&form)] else {
+                panic!("not a device");
+            };
+            assert_eq!(dev.driver_error(), None, "{json}");
+            assert!(!dev.driver_blocks_save(), "{json}");
+            assert_eq!(
+                form.build_actor_request("mevo.0").mevo["0"],
+                section,
+                "{json}"
+            );
+        }
+
+        let mut cfg = FlighthookConfig::default();
+        let section: MevoSection =
+            serde_json::from_str(r#"{"name":"Xi","address":"10.0.0.7:5100"}"#).unwrap();
+        cfg.mevo.insert("0".into(), section);
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let at = mevo_at(&form);
+        let ActorFormEntry::Device(dev) = &mut form.actors[at] else {
+            panic!("not a device");
+        };
+        dev.range_val = "2.5".into();
+        dev.range_unit = "meters".into();
+        dev.track_pct = "70".into();
+        dev.environment = crate::types::FlightScopeEnvironment::Outdoor;
+        dev.address = String::new();
+        let saved = form.build_actor_request("mevo.0").mevo["0"].driver.clone();
+        assert_eq!(saved.range, Some(Distance::Meters(2.5)));
+        assert_eq!(saved.track_pct, Some(70.0));
+        assert_eq!(
+            saved.environment,
+            Some(crate::types::FlightScopeEnvironment::Outdoor)
+        );
+        assert_eq!(saved.address, None, "blank: the default address");
+        assert_eq!(saved.tee_height, None, "still unset");
+        assert_eq!(saved.camera_mode, None, "still unset");
+
+        let mut form = SettingsForm::default();
+        let id = form
+            .add_preset(
+                &super::super::cards::add_options(super::super::cards::CardGroup::LaunchMonitors)
+                    [0],
+            )
+            .expect("added");
+        assert!(id.starts_with("mevo."), "{id}");
+        let saved = form.build_actor_request(&id).mevo[id.trim_start_matches("mevo.")].clone();
+        assert_eq!(
+            serde_json::to_value(&saved.driver).unwrap(),
+            serde_json::json!({
+                "address": "192.168.2.1:5100", "ball_type": 1, "tee_height": "1.5in",
+                "range": "8ft", "surface_height": "0in", "track_pct": 80.0,
+                "use_estimated": false, "camera_mode": "standard",
+                "environment": "limited_flight"
+            })
+        );
+    }
+
+    /// Every FlightScope setting the driver can refuse is on the card and
+    /// checked by the driver's own validation (§7.3 #15): track % outside
+    /// 0 to 100, a negative distance, an address that is not an IP address
+    /// and port; a number field that is not a number never saves. A stored
+    /// refused value still lets the card save its other fields.
+    #[test]
+    fn the_mevo_settings_are_validated_by_its_driver() {
+        let mut cfg = FlighthookConfig::default();
+        cfg.mevo.insert("0".into(), MevoSection::default());
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        type Case = (fn(&mut super::DeviceFormEntry), &'static str);
+        let cases: [Case; 6] = [
+            (
+                |d| d.track_pct = "150".into(),
+                "track_pct: must be 0 to 100",
+            ),
+            (|d| d.track_pct = "lots".into(), "track_pct: not a number"),
+            (
+                |d| d.tee_height_val = "-1".into(),
+                "tee_height: must be a distance of 0 or more",
+            ),
+            (|d| d.range_val = "8x".into(), "range: not a number"),
+            (
+                |d| d.surface_height_val = "-0.5".into(),
+                "surface_height: must be a distance of 0 or more",
+            ),
+            (
+                |d| d.address = "mevo.local".into(),
+                "address: must be an IP address",
+            ),
+        ];
+        for (set, want) in cases {
+            let mut form = form.clone();
+            let at = mevo_at(&form);
+            let ActorFormEntry::Device(dev) = &mut form.actors[at] else {
+                panic!("not a device");
+            };
+            set(dev);
+            let error = dev.driver_error().expect("refused");
+            assert!(error.starts_with(want), "{error}");
+            assert!(!super::actor_valid(&form.actors[mevo_at(&form)]), "{want}");
+        }
+
+        let mut stored = cfg.clone();
+        stored.mevo.get_mut("0").unwrap().driver.track_pct = Some(150.0);
+        let mut form = SettingsForm::default();
+        form.load_from(&stored);
+        let at = mevo_at(&form);
+        let ActorFormEntry::Device(dev) = &mut form.actors[at] else {
+            panic!("not a device");
+        };
+        assert!(dev.driver_error().is_some(), "shown");
+        dev.name = "Bay 1".into();
+        assert!(
+            super::actor_valid(&form.actors[mevo_at(&form)]),
+            "a rename saves"
+        );
     }
 
     #[test]

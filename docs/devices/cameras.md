@@ -677,8 +677,9 @@ A clip runs from `pre_roll_s` before the **estimated impact** to
 reported the shot, or, for the ExPutt, the moment it saw the ball struck,
 which it sends along with the putt's result.
 
-A FlightScope (Mevo+, Gen2, Xi) reports the shot at impact, and the ExPutt
-dates each putt at its strike. The others report once the shot is measured,
+A FlightScope (Mevo+, Gen2, Xi) reports the shot at impact (its trigger is
+dated the moment it arrives), and the ExPutt dates each putt at its
+strike. The others report once the shot is measured,
 so flighthook estimates the impact a fixed time before their report: the
 monitor's **camera timing**. Every launch monitor has a default, and the
 default for a kind of monitor without a better-known value is 1.5 s. These

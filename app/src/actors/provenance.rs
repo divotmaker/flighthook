@@ -156,7 +156,7 @@ mod tests {
         );
         config.camera.insert("0".into(), CameraSection::default());
 
-        let resolved = super::super::resolve_actors(&config, None);
+        let resolved = super::super::resolve_actors(&config);
         assert_eq!(resolved.len(), 11, "one actor per section");
         let mut sources = Vec::new();
         for ra in &resolved {

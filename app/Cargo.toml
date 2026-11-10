@@ -19,7 +19,9 @@ headless = []
 gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
-ironsight = { version = "0.6.0", features = ["serde"] }
+# The FlightScope device driver (`driver`: `ironsight::driver::Mevo`).
+# LOCAL path until ironsight 0.7.0 is released
+ironsight = { path = "../../../ironsight/ironsight", features = ["driver"] }
 # The R10's device driver (`driver`: `tenover::driver::R10`).
 # LOCAL path until tenover 0.5.0 is released
 tenover = { path = "../../../10over/10over", features = ["driver"] }
@@ -89,7 +91,8 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 # ironsight's test support: a scripted device and recorded result frames.
-ironsight = { version = "0.6.0", features = ["serde", "testing"] }
+# LOCAL path until ironsight 0.7.0 is released
+ironsight = { path = "../../../ironsight/ironsight", features = ["driver", "testing"] }
 # tenover's test support: GFDI frame builders with synthetic identity.
 # LOCAL path until tenover 0.5.0 is released
 tenover = { path = "../../../10over/10over", features = ["driver", "testing"] }

@@ -12,10 +12,30 @@ Connect over the launch monitor's WiFi network. A Mevo+ or Mevo Gen2 reports
 its SSID during the handshake, and flighthook uses that as the FRP device
 identity.
 
-A Mevo+ reports its battery level (`battery_pct`). While it is connected,
-the dashboard header shows it as a battery icon, red under 20 %; hover it
-for the device's name and percentage. The Mevo Gen2 and the Xi report no
-battery level.
+A Mevo+ reports its battery level (`battery_pct`), temperature (`temp_c`)
+and whether it runs on external power (`external_power`). While it is
+connected, the dashboard header shows the battery as an icon, red under
+20 %; hover it for the device's name and percentage. The Mevo Gen2 and the
+Xi report none of the three. Every model reports `ready`, `tilt` and `roll`.
+
+## Connection
+
+The card connects over TCP to `address` (`phase` `connecting`, given up after
+5 s), runs the handshake (`handshaking`) and configures the model it found
+(`configuring`), then reads Connected with "FlightScope Mevo+", "FlightScope
+Mevo Gen2" or "Xi" and, once the device is armed, `measuring`. It starts in
+the detection mode in effect then, also after a reconnect, so a mode change
+made while the device was away is not lost. A mode change re-arms the device
+(`configuring`, not ready, then `measuring` and ready again), right away when
+it is armed or once the shot in progress is done.
+
+The session ends when the device closes the connection, an operation times
+out, or nothing at all arrives from the device for 10 s; a message the card
+cannot decode raises an alert and the session carries on. The card then
+reads Reconnecting and tries again 1 s after the first failed attempt,
+growing by 1 s per attempt up to 15 s, and back to 1 s once a session lasted
+10 s. Turning the card off, a restart or Reconnect ends a connect or a
+session at once; a new connection can open while the old one still closes.
 
 ### Upgrade notes
 
@@ -114,8 +134,8 @@ for a ball that did not fly (a carry, flight time or apex of 0). With the
 carry offline flighthook computes the shot's curve (see
 [Shot metrics](../API.md#shot-metrics)).
 
-The Mevo reports spin as backspin and sidespin. flighthook computes total
-spin and spin axis from them in the shot metrics.
+The device reports spin as backspin and sidespin; the shot's launch carries
+the total spin and spin axis worked out from them next to the pair.
 
 ## Simulated values (beta)
 
@@ -126,7 +146,8 @@ simulates what the device doesn't report — roll and total, their offlines,
 and the descent angle of an estimated shot — and marks them as simulated
 (italics, `derived` in the API); total is the measured carry plus the
 simulated roll, and the simulated path lands on the measured carry and
-offline. A
+offline. When the device reports a total distance itself, the total is the
+device's and the roll is total minus carry. A
 shot with an apex of 0 (a putt, or any bladed shot) is a ground ball: carry,
 apex and flight time are 0 and the roll is simulated from the tee, on a green
 when the shot was triggered in Putting mode (a mode change before its result
@@ -141,28 +162,27 @@ result with launch data only is flown with an estimated spin instead; see
 On very short chips (under about 25 mph of ball speed) the Xi can send a full
 result (`D4`) with launch data (ball speed, launch angle and direction) but
 no spin and no carry, apex or flight time (all three 0). When such a result
-was launched at 5° or more, flighthook estimates its backspin as
-`launch_only_spin` × ball speed in mph, with no sidespin, and leaves its
-carry, apex and flight time unset instead of reporting them as 0. The
+was launched at 5° or more, ironsight sends its launch without spin and no
+flight values, and flighthook estimates its backspin as `launch_only_spin` ×
+ball speed in mph, with no sidespin. The
 default is 100 rpm per mph: about 1500 rpm for a 15 mph chip. The simulation
 then computes carry, apex, flight time and descent (and roll and total) from
 the launch and that spin, and GSPro gets the estimated spin with a spin axis
-of 0. The shot's log line
-shows `spin=estimate`. The dashboard shows the spin as simulated (a `SIM`
+of 0. The log shows `shot #n: launch only, estimated backspin <rpm> rpm`. The dashboard shows the spin as simulated (a `SIM`
 tag on the Backspin and Sidespin cards, italics in the table), and the API
 and export flag it `spin_estimated`. On the FRP stream (`/frp`) the shot's
 `launch` carries no spin (it was not measured) and flighthook's own
 `flight_result` carries the simulated carry and total with the estimated
 spin in `assumed` (see [Forwarding](../API.md#forwarding)).
 
-- `launch_only_spin = 0` turns it off. Such a shot is then reported as the
-  device sent it: spin 0, carry, apex and flight time 0, rolled as a ground
-  ball.
-- Not used in Putting mode: there such a shot is reported as the device sent
-  it, as with the setting at 0.
+- `launch_only_spin = 0` turns it off. Such a shot then goes out with its
+  launch alone (no spin, no carry, apex or flight time), and is not
+  simulated.
+- Not used for a shot triggered in Putting mode (a mode change before its
+  result arrives doesn't count): it goes out as with the setting at 0.
 - Applies to any FlightScope model, and only to a result with no spin and
   none of carry, apex or flight time. A result with spin (including an Xi
-  spin taken from `spin_source`), with any of the three, or launched below
+  total taken from `spin_source`), with any of the three, or launched below
   5° (a putt, a bladed shot) keeps what the device sent; one with an apex of
   0 is rolled as a ground ball.
 
@@ -198,7 +218,8 @@ and radar club data alone with no error:
 
 A Fusion mode is not applied at connect. The device's camera boots in standard
 mode and only accepts a Fusion config once that has finished, so flighthook
-waits out a 15-second warmup, applies the config, and re-arms. Expect Fusion
+waits out a 15-second warmup (counted from the end of the handshake),
+applies the config between shots, and re-arms. Expect Fusion
 club data from roughly the second shot of a session rather than the first, and a
 `camera warmup complete` line in the log when it lands.
 
@@ -223,21 +244,27 @@ launch_only_spin = 100.0       # rpm per mph for launch-only chips; 0 = off
 ```
 
 Distances accept a unit suffix — `in`, `ft`, `m`, `cm`, `yd`, `mm` — and are
-converted to the wire format on demand. `track_pct` is 0–100.
+converted to the wire format on demand. `track_pct` is 0–100, distances are
+0 or more, `ball_type` is 0 or 1 and `address` is an IP address and port:
+the settings page shows any other value under the card's fields and won't
+save it, `POST /api/settings` answers `400`, and a config file holding one
+keeps the card from starting, with the error on the card. A setting left
+out takes the default shown above (the address `192.168.2.1:5100`).
 `launch_only_spin` is 0 to 1000. A value outside that range (or not a
 number) in the config file turns it off, with a warning in the log; the
 settings page and `POST /api/settings` refuse to save one.
 
-Changing the address, the environment, the camera mode, or any session
-setting restarts the actor. `spin_source` and `launch_only_spin` apply from
+Changing the address, the environment, the camera mode, or any other device
+setting restarts the card. `spin_source` and `launch_only_spin` apply from
 the next shot without a restart.
 
 ## Shot export
 
 `GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
-each shot with the device frames behind it: every frame from just before the
-BALL TRIGGER through the device re-armed, in both directions, as hex with its
-type and bus addresses — the shot texts, `E8`, `D4`, `ED`, `EF`, PRC and speed
+each shot with the device frames behind it: up to 8 frames before the shot's
+trigger, then every frame through the device re-armed, in both directions,
+as hex, each labeled with its message type and bus addresses (`D4 AVR>APP`,
+`B0 APP>AVR`) — the shot texts, `E8`, `D4`, `ED`, `EF`, PRC and speed
 profile data, the Xi's other per-shot messages, and the acknowledgments and
 re-arm commands flighthook sends. Shots that produced no usable result
 (estimated-only, or a zero-speed full result) are included too.
@@ -246,8 +273,11 @@ Never captured: status (the keepalive, which carries hardware and
 application IDs), device and product info (serial numbers), the DSP hardware
 query, network config and WiFi scans, factory calibration, the sensor
 activation exchange, time sync and the AVR config query: everything ironsight
-classifies as able to identify the unit, its network or the host. The device's
-network name and address are not in the file.
+classifies as able to identify the unit, its network or the host; the
+device's free text and debug output; and everything before the handshake
+finished. Those reach the log only, as hex lines at trace level (`audit`
+target); the frames in the file are logged as hex lines at debug level. The
+device's network name and address are not in the file.
 
 **Xi owners:** if shots go missing or read wrong, attach a JSONL export of a
 short session to the issue — it holds exactly what the device sent for each

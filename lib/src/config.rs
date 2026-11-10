@@ -4,6 +4,8 @@ use allsquare::config::Config as SquareConfig;
 use flightrelay::config::DriverConfig;
 use flightrelay::mock::MockConfig;
 use flightrelay::units::{Distance, Velocity};
+use ironsight::config::Config as MevoConfig;
+pub use ironsight::config::{CameraMode, FlightScopeEnvironment, SpinSource};
 use serde::{Deserialize, Serialize};
 use tenover::config::Config as R10Config;
 use threeputt::config::Config as ExPuttConfig;
@@ -1267,150 +1269,8 @@ pub struct WebserverSection {
     pub bind: String,
 }
 
-/// Camera mode requested from the device at session start.
-///
-/// Every mode reports ball flight and the device's radar club data (club
-/// speed, attack angle, path, and face and loft where the device provides
-/// them). Fusion processing adds the full club data set (path, face angle,
-/// attack angle, dynamic loft, smash factor, swing planes). It needs the Pro
-/// Package enabled on the device; without it the device reports ball flight
-/// and radar club data only, whatever this is set to. The two Fusion variants
-/// are firmware-dependent — picking the wrong one yields no Fusion club data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
-#[serde(rename_all = "snake_case")]
-pub enum CameraMode {
-    /// Ball flight and radar club data, no Fusion processing. The default.
-    #[default]
-    Standard,
-    /// High-resolution JPEG Fusion (1640x1232), older firmware.
-    Fusion,
-    /// Raw Fusion (640x480 @ 180fps), firmware BM17.04 and newer.
-    RawFusion,
-}
-
-impl CameraMode {
-    /// Whether this mode asks the device for Fusion processing.
-    #[must_use]
-    pub fn is_fusion(self) -> bool {
-        !matches!(self, Self::Standard)
-    }
-
-    /// Stable key used by the settings UI and config file.
-    #[must_use]
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Fusion => "fusion",
-            Self::RawFusion => "raw_fusion",
-        }
-    }
-
-    /// User-facing label.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Standard => "Standard (radar only)",
-            Self::Fusion => "Fusion — older firmware",
-            Self::RawFusion => "Raw Fusion — BM17.04+",
-        }
-    }
-
-    /// Every mode, in display order.
-    #[must_use]
-    pub fn all() -> [Self; 3] {
-        [Self::Standard, Self::Fusion, Self::RawFusion]
-    }
-}
-
-/// Where a FlightScope device is used, which picks its full-swing detection
-/// mode.
-///
-/// FlightScope's own app calls these "Limited flight" and "Outdoor".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FlightScopeEnvironment {
-    /// Nets and simulator screens, where the ball's flight is cut short. The
-    /// default.
-    #[default]
-    LimitedFlight,
-    /// Full ball flight outdoors. Needs about 40 yd of unobstructed flight;
-    /// shots into a net or screen do not read.
-    Outdoor,
-}
-
-impl FlightScopeEnvironment {
-    /// Stable key used by the settings UI and config file.
-    #[must_use]
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::LimitedFlight => "limited_flight",
-            Self::Outdoor => "outdoor",
-        }
-    }
-
-    /// User-facing label.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::LimitedFlight => "Limited flight (sim/indoor)",
-            Self::Outdoor => "Outdoor (full flight)",
-        }
-    }
-
-    /// Every environment, in display order.
-    #[must_use]
-    pub fn all() -> [Self; 2] {
-        [Self::LimitedFlight, Self::Outdoor]
-    }
-}
-
-/// Which backspin and sidespin a FlightScope Xi shot reports.
-///
-/// The Xi sends two backspin values per shot: `D4`, its final spin (the one
-/// FlightScope's own app displays), and `E8`, a second value. On a Mevo+ or
-/// Gen2 there is no `E8` value, so all three sources give the same result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpinSource {
-    /// Backspin and sidespin from the D4 result, exactly as reported. The
-    /// default.
-    #[default]
-    D4,
-    /// Total spin from the E8 result, with the spin axis from D4 when the
-    /// shot has club data and 0 otherwise.
-    E8,
-    /// The `E8` rule when flighthook's detection mode is Full at shot time,
-    /// otherwise `D4` exactly as reported.
-    Auto,
-}
-
-impl SpinSource {
-    /// Whether this is the default (`D4`). Used to keep the field out of
-    /// the config file when it is unset.
-    #[must_use]
-    pub fn is_d4(&self) -> bool {
-        matches!(self, Self::D4)
-    }
-
-    /// User-facing label.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::D4 => "D4 (matches FS Golf)",
-            Self::E8 => "E8",
-            Self::Auto => "Auto (E8 on full swings)",
-        }
-    }
-
-    /// Every source, in display order.
-    #[must_use]
-    pub fn all() -> [Self; 3] {
-        [Self::D4, Self::E8, Self::Auto]
-    }
-}
-
-/// A Mevo/Mevo+ device instance.
+/// A FlightScope device instance: Mevo+, Mevo Gen2 or Xi (ironsight's
+/// device driver).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MevoSection {
     #[serde(default)]
@@ -1420,41 +1280,15 @@ pub struct MevoSection {
     /// file then.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
-    pub address: Option<String>,
-    pub ball_type: Option<u8>,
-    pub tee_height: Option<Distance>,
-    pub range: Option<Distance>,
-    pub surface_height: Option<Distance>,
-    pub track_pct: Option<f64>,
-    /// Whether to use estimated (E8 fallback) shots when no full result
-    /// arrives. Defaults to false when absent: a shot with only an estimate
-    /// (e.g. a flight too short to read in Outdoor mode, or a very short
-    /// chip) is skipped. Estimated shots may lack sidespin and carry less
-    /// data.
-    #[serde(default)]
-    pub use_estimated: Option<bool>,
-    /// Camera mode. Defaults to `Standard` (no Fusion processing) when absent.
-    /// Fusion modes additionally require the Pro Package on the device.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub camera_mode: Option<CameraMode>,
-    /// Environment: limited flight (nets, sim screens) or full-flight
-    /// outdoor. Sets the full-swing detection mode. Defaults to
-    /// `LimitedFlight` when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment: Option<FlightScopeEnvironment>,
-    /// FlightScope Xi only: which spin the shot reports (`d4`, `e8`, or
-    /// `auto`). Defaults to `D4`, and is left out of the config file at the
-    /// default.
-    #[serde(default, skip_serializing_if = "SpinSource::is_d4")]
-    pub spin_source: SpinSource,
     /// Backspin to use, in rpm per mph of ball speed, for a shot whose result
     /// has launch data but no spin and no flight (very short chips on the
-    /// Xi). Sidespin is 0. `0` turns it off: such a shot keeps its 0 carry,
-    /// apex and flight time and is rolled as a ground ball. Not used in
-    /// Putting mode. Defaults to [`MevoSection::DEFAULT_LAUNCH_ONLY_SPIN`],
-    /// and is left out of the config file at the default. A value outside
-    /// 0 to [`MevoSection::MAX_LAUNCH_ONLY_SPIN`] (or non-finite) is treated
-    /// as `0`.
+    /// Xi). Sidespin is 0. `0` turns it off: such a shot flies on no spin
+    /// from the simulation, or rolls as a ground ball when its launch is
+    /// low. Not used for a shot whose detection mode at the trigger was
+    /// Putting. Defaults to [`MevoSection::DEFAULT_LAUNCH_ONLY_SPIN`], and is
+    /// left out of the config file at the default. A value outside 0 to
+    /// [`MevoSection::MAX_LAUNCH_ONLY_SPIN`] (or non-finite) is treated as
+    /// `0`.
     #[serde(
         default = "default_launch_only_spin",
         skip_serializing_if = "is_default_launch_only_spin"
@@ -1465,6 +1299,26 @@ pub struct MevoSection {
     /// device's default ([`impact_lead_default_s`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact_lead_s: Option<f64>,
+    /// The FlightScope driver's settings: `address`, `ball_type`,
+    /// `tee_height`, `range`, `surface_height`, `track_pct`,
+    /// `use_estimated`, `camera_mode`, `environment` and `spin_source`
+    /// (see [`MevoConfig`]). Each is left out of the file while unset;
+    /// `spin_source` while it is `d4`.
+    #[serde(flatten)]
+    pub driver: MevoConfig,
+}
+
+impl DeviceSection for MevoSection {
+    type Driver = MevoConfig;
+    const KIND: &'static str = "mevo";
+
+    fn driver(&self) -> &MevoConfig {
+        &self.driver
+    }
+
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
+        &config.mevo
+    }
 }
 
 fn default_launch_only_spin() -> f64 {
@@ -2036,7 +1890,8 @@ impl FlighthookConfig {
     /// e.g. `mock_monitor.0: shot_interval_s: must be 0 to 86400`.
     #[must_use]
     pub fn device_error(&self) -> Option<String> {
-        first_driver_error::<MockMonitorSection>(self, None)
+        first_driver_error::<MevoSection>(self, None)
+            .or_else(|| first_driver_error::<MockMonitorSection>(self, None))
             .or_else(|| first_driver_error::<R10Section>(self, None))
             .or_else(|| first_driver_error::<SquareSection>(self, None))
             .or_else(|| first_driver_error::<ExPuttSection>(self, None))
@@ -2048,7 +1903,8 @@ impl FlighthookConfig {
     /// ([`DeviceSection::changed_driver_error`]).
     #[must_use]
     pub fn changed_device_error(&self, saved: &FlighthookConfig) -> Option<String> {
-        first_driver_error::<MockMonitorSection>(self, Some(saved))
+        first_driver_error::<MevoSection>(self, Some(saved))
+            .or_else(|| first_driver_error::<MockMonitorSection>(self, Some(saved)))
             .or_else(|| first_driver_error::<R10Section>(self, Some(saved)))
             .or_else(|| first_driver_error::<SquareSection>(self, Some(saved)))
             .or_else(|| first_driver_error::<ExPuttSection>(self, Some(saved)))
@@ -2125,18 +1981,17 @@ impl Default for MevoSection {
         Self {
             name: "Mevo WiFi".into(),
             enabled: true,
-            address: Some("192.168.2.1:5100".into()),
-            ball_type: Some(1),
-            tee_height: Some(Distance::Inches(1.5)),
-            range: Some(Distance::Feet(8.0)),
-            surface_height: Some(Distance::Inches(0.0)),
-            track_pct: Some(80.0),
-            use_estimated: None,
-            camera_mode: None,
-            environment: None,
-            spin_source: SpinSource::D4,
             launch_only_spin: Self::DEFAULT_LAUNCH_ONLY_SPIN,
             impact_lead_s: None,
+            driver: MevoConfig {
+                address: Some("192.168.2.1:5100".into()),
+                ball_type: Some(1),
+                tee_height: Some(Distance::Inches(1.5)),
+                range: Some(Distance::Feet(8.0)),
+                surface_height: Some(Distance::Inches(0.0)),
+                track_pct: Some(80.0),
+                ..MevoConfig::default()
+            },
         }
     }
 }
@@ -2216,115 +2071,112 @@ impl Default for PureplaySection {
 }
 
 #[cfg(test)]
-mod camera_mode_tests {
+mod mevo_section_tests {
     use super::*;
 
+    /// Mevo sections as flighthook 0.1.24 wrote them (from the card: every
+    /// setting explicit; and by hand: a few) read into the same values, the
+    /// device settings now in the driver's, and write back the same JSON.
     #[test]
-    fn absent_camera_mode_defaults_to_standard() {
-        let s: MevoSection = serde_json::from_str(r#"{"name":"Mevo"}"#).expect("parse");
-        assert_eq!(s.camera_mode, None);
-        assert_eq!(s.camera_mode.unwrap_or_default(), CameraMode::Standard);
-    }
-
-    #[test]
-    fn camera_mode_round_trips_by_key() {
-        for mode in CameraMode::all() {
-            let json = format!(r#"{{"name":"Mevo","camera_mode":"{}"}}"#, mode.key());
-            let s: MevoSection = serde_json::from_str(&json).expect("parse");
-            assert_eq!(s.camera_mode, Some(mode), "{}", mode.key());
-        }
-    }
-
-    #[test]
-    fn standard_camera_mode_is_not_written_back() {
-        // `skip_serializing_if` keeps an untouched config file unchanged.
-        let s = MevoSection::default();
-        let json = serde_json::to_string(&s).expect("serialize");
-        assert!(!json.contains("camera_mode"), "{json}");
-    }
-
-    #[test]
-    fn only_standard_skips_fusion() {
-        assert!(!CameraMode::Standard.is_fusion());
-        assert!(CameraMode::Fusion.is_fusion());
-        assert!(CameraMode::RawFusion.is_fusion());
-    }
-}
-
-#[cfg(test)]
-mod environment_tests {
-    use super::*;
-
-    #[test]
-    fn absent_environment_defaults_to_limited_flight() {
-        let s: MevoSection = serde_json::from_str(r#"{"name":"Mevo"}"#).expect("parse");
-        assert_eq!(s.environment, None);
-        assert_eq!(
-            s.environment.unwrap_or_default(),
-            FlightScopeEnvironment::LimitedFlight
-        );
-    }
-
-    #[test]
-    fn environment_round_trips_by_key() {
-        for env in FlightScopeEnvironment::all() {
-            let json = format!(r#"{{"name":"Mevo","environment":"{}"}}"#, env.key());
-            let s: MevoSection = serde_json::from_str(&json).expect("parse");
-            assert_eq!(s.environment, Some(env), "{}", env.key());
-            let back = serde_json::to_string(&s).expect("serialize");
-            assert!(
-                back.contains(&format!(r#""environment":"{}""#, env.key())),
-                "{back}"
+    fn a_saved_mevo_section_reads_and_writes_as_before() {
+        let card = r#"{"name":"Mevo WiFi","address":"192.168.2.1:5100","ball_type":1,"tee_height":"1.5in","range":"8ft","surface_height":"0in","track_pct":80.0,"use_estimated":false,"camera_mode":"standard","environment":"outdoor","spin_source":"auto","launch_only_spin":120.0,"impact_lead_s":0.25}"#;
+        let section: MevoSection = serde_json::from_str(card).unwrap();
+        assert_eq!(section.name, "Mevo WiFi");
+        assert_eq!(section.launch_only_spin, 120.0);
+        assert_eq!(section.impact_lead_s, Some(0.25));
+        let d = &section.driver;
+        assert_eq!(d.address.as_deref(), Some("192.168.2.1:5100"));
+        assert_eq!(d.ball_type, Some(1));
+        assert_eq!(d.tee_height, Some(Distance::Inches(1.5)));
+        assert_eq!(d.range, Some(Distance::Feet(8.0)));
+        assert_eq!(d.surface_height, Some(Distance::Inches(0.0)));
+        assert_eq!(d.track_pct, Some(80.0));
+        assert_eq!(d.use_estimated, Some(false));
+        assert_eq!(d.camera_mode, Some(CameraMode::Standard));
+        assert_eq!(d.environment, Some(FlightScopeEnvironment::Outdoor));
+        assert_eq!(d.spin_source, SpinSource::Auto);
+        for json in [
+            card,
+            r#"{"name":"Xi","enabled":false,"address":"10.0.0.7:5100","spin_source":"e8"}"#,
+            r#"{"name":"Mevo"}"#,
+        ] {
+            let section: MevoSection = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                serde_json::to_value(&section).unwrap(),
+                serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                "{json}"
             );
         }
     }
 
+    /// Unset settings take the driver's defaults and are not written; a new
+    /// card's section states the defaults it shows, as before.
     #[test]
-    fn absent_environment_is_not_written_back() {
-        let s = MevoSection::default();
-        let json = serde_json::to_string(&s).expect("serialize");
-        assert!(!json.contains("environment"), "{json}");
-    }
-}
-
-#[cfg(test)]
-mod spin_source_tests {
-    use super::*;
-
-    #[test]
-    fn absent_spin_source_defaults_to_d4() {
-        let s: MevoSection = serde_json::from_str(r#"{"name":"Mevo"}"#).expect("parse");
-        assert_eq!(s.spin_source, SpinSource::D4);
-    }
-
-    #[test]
-    fn d4_spin_source_is_not_written_back() {
-        let mut s = MevoSection::default();
-        let json = serde_json::to_string(&s).expect("serialize");
-        assert!(!json.contains("spin_source"), "{json}");
+    fn unset_settings_are_left_out() {
+        let s: MevoSection = serde_json::from_str(r#"{"name":"Mevo"}"#).unwrap();
+        assert_eq!(s.driver, MevoConfig::default());
+        assert_eq!(s.driver.camera_mode(), CameraMode::Standard);
+        assert_eq!(
+            s.driver.environment(),
+            FlightScopeEnvironment::LimitedFlight
+        );
+        assert_eq!(s.driver.spin_source, SpinSource::D4);
+        assert!(s.enabled);
+        let json = serde_json::to_value(MevoSection::default()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "Mevo WiFi",
+                "address": "192.168.2.1:5100",
+                "ball_type": 1,
+                "tee_height": "1.5in",
+                "range": "8ft",
+                "surface_height": "0in",
+                "track_pct": 80.0
+            })
+        );
         // An explicit `d4` in the file is dropped on the next save.
-        s = serde_json::from_str(r#"{"name":"Mevo","spin_source":"d4"}"#).expect("parse");
-        assert_eq!(s.spin_source, SpinSource::D4);
-        let json = serde_json::to_string(&s).expect("serialize");
-        assert!(!json.contains("spin_source"), "{json}");
+        let s: MevoSection = serde_json::from_str(r#"{"name":"Mevo","spin_source":"d4"}"#).unwrap();
+        assert_eq!(s.driver.spin_source, SpinSource::D4);
+        assert!(!serde_json::to_string(&s).unwrap().contains("spin_source"));
     }
 
+    /// The driver refuses a track percentage outside 0 to 100, a negative
+    /// distance and an address that isn't an IP address and port, naming
+    /// the card and the field; a save that keeps such a stored value is not
+    /// refused.
     #[test]
-    fn spin_source_round_trips_by_key() {
-        let keys = [
-            (SpinSource::D4, "d4"),
-            (SpinSource::E8, "e8"),
-            (SpinSource::Auto, "auto"),
+    fn values_the_driver_refuses_name_the_card_and_field() {
+        let mut config = FlighthookConfig::default();
+        config.mevo.insert("0".into(), MevoSection::default());
+        assert_eq!(config.device_error(), None);
+        type Case = (fn(&mut MevoConfig), &'static str);
+        let cases: [Case; 4] = [
+            (
+                |d| d.track_pct = Some(101.0),
+                "mevo.0: track_pct: must be 0 to 100",
+            ),
+            (
+                |d| d.range = Some(Distance::Feet(-1.0)),
+                "mevo.0: range: must be a distance of 0 or more",
+            ),
+            (
+                |d| d.ball_type = Some(2),
+                "mevo.0: ball_type: must be 0 or 1",
+            ),
+            (
+                |d| d.address = Some("mevo.local".into()),
+                "mevo.0: address: ",
+            ),
         ];
-        assert_eq!(SpinSource::all().len(), keys.len());
-        for (src, key) in keys {
-            let json = format!(r#"{{"name":"Mevo","spin_source":"{key}"}}"#);
-            let s: MevoSection = serde_json::from_str(&json).expect("parse");
-            assert_eq!(s.spin_source, src, "{key}");
-            let back: MevoSection =
-                serde_json::from_str(&serde_json::to_string(&s).expect("serialize"))
-                    .expect("parse");
-            assert_eq!(back, s);
+        for (set, want) in cases {
+            let mut bad = config.clone();
+            set(&mut bad.mevo.get_mut("0").unwrap().driver);
+            let err = bad.device_error().expect("refused");
+            assert!(err.starts_with(want), "{err}");
+            let saved = bad.clone();
+            bad.mevo.get_mut("0").unwrap().name = "Renamed".into();
+            assert_eq!(bad.changed_device_error(&saved), None, "{want}");
         }
     }
 }

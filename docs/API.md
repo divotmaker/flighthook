@@ -37,7 +37,7 @@ Angles are degrees, spin is RPM.
 Other useful events on the same connection:
 
 - `device_telemetry` -- device-reported state (ready, battery, tilt, temp, identity)
-- `actor_status` -- actor/connection lifecycle (status enum, mode, radar_mode)
+- `actor_status` -- actor/connection lifecycle (status enum, card telemetry)
 - `hand_info` -- the player's hand, set by the simulator, the UI or the API
 - `round_state` -- a tournament round started or ended
 - `set_detection_mode` -- detection mode, handedness and/or club change (all optional, latched)
@@ -187,7 +187,9 @@ Comprehensive system state (all actors -- launch monitors and integrations).
         "roll": "-0.2",
         "temp_c": "28.5",
         "external_power": "false",
-        "device_info": "XXXXXXXX, H/W: XXXX v1.0, F/W: 1.00"
+        "phase": "measuring",
+        "shot_count": "12",
+        "device_info": "FlightScope Mevo+"
       },
       "state": "connected",
       "red_for_ms": 0
@@ -278,8 +280,8 @@ actor sends each key from one source only:
   `roll`, `temp_c`, `external_power`, and a device driver's own state keys
   (the mock's `radar_mode`, `tracking_mode`; the Square Golf's
   `device_state`, `zero_spin_discards`)
-- **Actor-framework** (from `actor_status`): `detection_mode`, `radar_mode`, `device_info`,
-  `shot_count`, `tracking_mode`, `phase`
+- **Actor-framework** (from `actor_status`): `device_info`, `shot_count`,
+  `phase`
 - **Integration actors**: `club`, `handed`, `name`, `error`
 - **Open Connect clients** (GSPro, Pureplay, Muni Golf, generic; from
   `actor_status`):
@@ -1380,29 +1382,31 @@ running flighthook.
     "club_selected": "8I",
     "group": "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
     "handed": "rh",
-    "launch": { "launch_speed": "37.9mps", "launch_azimuth": -3.1, "launch_elevation": 23.9, "backspin_rpm": 6897, "sidespin_rpm": 0 },
+    "launch": { "launch_speed": "37.9mps", "launch_azimuth": -3.1, "launch_elevation": 23.9, "backspin_rpm": 6897, "sidespin_rpm": 0, "total_spin_rpm": 6897, "spin_axis": 0.0 },
     "flight": { "basis": "modeled", "carry_distance": "95.2m" },
     "club": { "club_speed": "31.2mps", "path": 1.1, "attack_angle": -9.8, "face_angle": 0.4 }
   },
   "raw": {
     "transport": "flightscope-tcp",
     "frames": [
-      { "t_ms": 0, "dir": "rx", "type": "0xE5", "src": "AVR", "dst": "APP", "hex": "0c42414c4c2054524947474552000000" },
-      { "t_ms": 612, "dir": "rx", "type": "0xE8", "src": "AVR", "dst": "APP", "hex": "5d0000040000..." },
-      { "t_ms": 640, "dir": "rx", "type": "0xD4", "src": "AVR", "dst": "APP", "hex": "9c0000040000..." },
-      { "t_ms": 703, "dir": "tx", "type": "0x69", "src": "APP", "dst": "AVR", "hex": "" },
-      { "t_ms": 760, "dir": "tx", "type": "0xB0", "src": "APP", "dst": "AVR", "hex": "0101" }
+      { "t_ms": 0, "dir": "rx", "label": "E5 AVR>APP", "hex": "0c42414c4c2054524947474552000000" },
+      { "t_ms": 612, "dir": "rx", "label": "E8 AVR>APP", "hex": "5d0000040000..." },
+      { "t_ms": 640, "dir": "rx", "label": "D4 AVR>APP", "hex": "9c0000040000..." },
+      { "t_ms": 703, "dir": "tx", "label": "69 APP>AVR", "hex": "" },
+      { "t_ms": 760, "dir": "tx", "label": "B0 APP>AVR", "hex": "0101" }
     ]
   }
 }
 ```
 
 - `schema`: export format version (`3`). Bumped when a field changes meaning.
-  Schema 3: the raw records of a device on a device driver (the R10, the
-  Square Golf, the ExPutt) carry `label` instead of `type`, `src`, `dst` and
-  `channel`, one record per protocol message (the R10: one message per
-  record, not one BLE chunk; the ExPutt: each message of the session as its
-  JSON text, not the putt's values re-joined). Schema 2 has the launch and the device's flight values in
+  Schema 3: the raw records of a device on a device driver (the
+  FlightScope, the R10, the Square Golf, the ExPutt) carry `label` instead
+  of `type`, `src`, `dst` and `channel`, one record per protocol message
+  (the R10: one message per record, not one BLE chunk; the ExPutt: each
+  message of the session as its JSON text, not the putt's values re-joined;
+  the FlightScope: no device free text or debug output and nothing of the
+  handshake). Schema 2 has the launch and the device's flight values in
   `data.launch` and `data.flight`; a schema 1 line has both in one
   `data.ball` block. The `flighthook` crate's `ShotExport` reads schema 1
   into the schema 2 shape (`ball`'s flight values become a `flight` with
@@ -1815,6 +1819,19 @@ Full persisted config (mirrors `config.toml`).
   connects; a value of the wrong type is an invalid body (`4xx`), and in the
   config file a load error naming the key's line. Any change of these
   settings restarts the card
+- Mevo (FlightScope) sections: `name`, `enabled`, `impact_lead_s` and
+  `launch_only_spin` are the card's; `address` (`ip:port`, default
+  `192.168.2.1:5100`), `ball_type` (0 standard, 1 RCT, default 1),
+  `tee_height` (default `1.5in`), `range` (default `8ft`), `surface_height`
+  (default `0in`), `track_pct` (0 to 100, default 80) and the keys below are
+  the FlightScope driver's settings; each is omitted while unset (the
+  driver's default applies), never `null`. The driver refuses a `track_pct`
+  outside 0 to 100, a negative distance, a `ball_type` other than 0 or 1 and
+  an `address` that is not an IP address and port: a save that changes one
+  into such a value is `400` (`"mevo.0: track_pct: must be 0 to 100"`), and
+  a config file holding one loads, names it and keeps that card from
+  starting. `spin_source` and `launch_only_spin` apply live; any other change
+  of the driver's settings restarts the card
 - `use_estimated` on Mevo sections controls whether estimated (E8) ball flights
   are emitted when no full (D4) result arrives (defaults to `false`). With it
   off, a shot the device only estimated (e.g. a flight too short to read in
@@ -2105,7 +2122,7 @@ as applied.
 | `400 Bad Request` | a Mevo section it writes has a `launch_only_spin` below 0, above 1000 or not finite (`"mevo.0: launch_only_spin must be 0 to 1000 rpm per mph, not -5"`) |
 | `400 Bad Request` | a launch monitor section it writes has an `impact_lead_s` below 0, above 5 or not finite (`"square.0: impact_lead_s 6 is outside 0 to 5 s"`) |
 | `400 Bad Request` | a camera section it writes has a `latency_s` below 0, above 10 or not finite (`"camera.0: latency_s 11 is outside 0 to 10 s"`) |
-| `400 Bad Request` | a section it writes changes its device driver settings into ones the driver refuses, named by card and field (`"mock_monitor.0: shot_interval_s: must be 0 to 86400"`, `"r10.0: range: must be a distance greater than 0"`); a section whose saved driver settings are refused still saves when it keeps them as they are (its name, `enabled`, `impact_lead_s`, ...) |
+| `400 Bad Request` | a section it writes changes its device driver settings into ones the driver refuses, named by card and field (`"mock_monitor.0: shot_interval_s: must be 0 to 86400"`, `"r10.0: range: must be a distance greater than 0"`, `"mevo.0: track_pct: must be 0 to 100"`); a section whose saved driver settings are refused still saves when it keeps them as they are (its name, `enabled`, `impact_lead_s`, ...) |
 | `400 Bad Request` | a camera section it writes has a `rotation_deg` other than 0, 90, 180 or 270 (`"camera.0: rotation_deg 45 is not 0, 90, 180 or 270"`), or a `yaw_deg` or `pitch_deg` outside -30 to 30 or not finite (`"camera.0: yaw_deg 40 is outside -30 to 30"`) |
 | `400 Bad Request` | a camera section it writes has no `camera` (`"camera.0: no camera picked"`) or a `mode` that is neither `auto` nor `WIDTHxHEIGHT@FPS` |
 | `400 Bad Request` | a whole-config or `global` save has a `replay` value out of range (`"replay: keep_shots 0 is outside 1 to 1000"`) |
@@ -2317,8 +2334,10 @@ Ball strike detected. Emitted immediately by the launch monitor -- no data yet.
 - `key.shot_id`: UUID v4 string, globally unique across sessions
 - `key.shot_number`: session-level monotonic counter from the launch monitor
 - `timestamp` (optional): when the device detected the strike, milliseconds
-  since the Unix epoch (UTC). The mock launch monitor sends one; the Square
-  Golf sends the arrival of the ball notification; the ExPutt sends the
+  since the Unix epoch (UTC). The mock launch monitor sends one; the
+  FlightScope sends the moment its driver saw the device's trigger (the
+  same moment the trigger reaches the bus); the Square Golf sends the
+  arrival of the ball notification; the ExPutt sends the
   arrival of the device's strike message (when it reported one since it was
   last ready), and its trigger comes with the putt's result, seconds after
   that time. The cameras date a trigger by it.
@@ -2453,7 +2472,7 @@ Which launch and flight fields each device sends:
 
 | Device | `flight.carry_offline` | `flight.descent_angle` | `launch.total_spin_rpm` + `launch.spin_axis` |
 | --- | --- | --- | --- |
-| FlightScope full result (`D4`) | yes (landing position) | yes (landing velocity) | no (components only); the total alone, no components, when an Xi's **Spin source (Xi)** uses E8 and the shot has no club data |
+| FlightScope full result (`D4`) | yes (landing position) | yes (landing velocity) | yes, with the components; an Xi's **Spin source (Xi)** on E8 sends the early result's total with D4's axis, or the total alone, no components, when the shot has no club data |
 | FlightScope estimate (`E8`) | yes | no | no (backspin only) |
 | Garmin R10 | no | no | yes, with the components |
 | Square Golf Omni | no | no | yes, with the components |
@@ -2685,7 +2704,7 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
     "raw": {
       "transport": "flightscope-tcp",
       "frames": [
-        { "t_ms": 0, "dir": "rx", "type": "0xE5", "src": "AVR", "dst": "APP", "hex": "0c42414c4c..." }
+        { "t_ms": 0, "dir": "rx", "label": "E5 AVR>APP", "hex": "0c42414c4c..." }
       ]
     }
   }
@@ -2700,12 +2719,15 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
   - `frames`: `RawRecord[]`, in arrival order:
     - `t_ms`: milliseconds relative to the shot trigger (negative = before it)
     - `dir`: `rx` (device → flighthook) or `tx` (flighthook → device)
-    - `type`: message type, e.g. `"0xD4"` (FlightScope); absent for JSON
-    - `src` / `dst`: FlightScope bus addresses (`APP`, `AVR`, `DSP`, `PI`)
-    - `channel`: `tcp` (FlightScope)
+    - `type`, `src` / `dst`, `channel`: schema 2 exports only, a FlightScope
+      frame's message type (`"0xD4"`), bus addresses (`APP`, `AVR`, `DSP`,
+      `PI`) and `tcp`; a schema 3 record carries `label` instead
     - `label`: the device driver's own name for the frame, stored as it gave
-      it; a frame from a device driver carries this instead of `type`,
-      `src`, `dst` and `channel`. R10: `notify <message type>` /
+      it. FlightScope: `"<type> <src>><dst>"`, the message type in hex and
+      the bus addresses (`D4 AVR>APP`, `B0 APP>AVR`), one record per framed
+      message (`hex`: the unstuffed payload without header or checksum);
+      the device's free text and debug output and the handshake's messages
+      are never recorded. R10: `notify <message type>` /
       `write <message type>` (the type in hex), one record per protocol
       message (`hex`: the whole message as the driver framed it). Square
       Golf: `notify 11 02` (a notification's family and type byte in the
@@ -2714,8 +2736,7 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
       (`PuttResult`, `PuttShot`, `PuttReady`, `Test`, `N_OK`, `N_ALIVE`,
       `resyncToMat`, `PM_API_MatchBegin`, ...), both directions, as `text`;
       the putt's own result is the `PuttResult` among its shot's records
-    - `hex`: payload as lowercase hex (binary protocols; FlightScope: the
-      unstuffed payload without header or checksum)
+    - `hex`: payload as lowercase hex (binary protocols)
     - `text`: payload text (JSON protocols)
   - `dropped`: frames over the per-shot cap that were not kept (omitted when 0)
   - `unavailable`: why `frames` is empty or incomplete, e.g. `"mock device
@@ -2740,8 +2761,7 @@ telemetry updates (battery, tilt, temperature).
 itself. Actor/connection lifecycle (status enum, mode, shooting) is conveyed
 separately via `actor_status`. No key means two things in the two event
 types; a launch monitor on a device driver reports its own state keys here
-(the mock's `radar_mode` and `tracking_mode`), which other launch monitors
-send on `actor_status`.
+(the mock's `radar_mode` and `tracking_mode`).
 
 ```json
 {
@@ -2750,7 +2770,8 @@ send on `actor_status`.
   "event": {
     "kind": "device_telemetry",
     "manufacturer": "FlightScope",
-    "model": "XXXXXXXX, H/W: XXXX v1.0, F/W: 1.00",
+    "model": "Mevo+",
+    "firmware": "1.23 (Feb 3 2024)",
     "source": "measured",
     "telemetry": {
       "ready": "true"
@@ -2911,9 +2932,9 @@ of them only (see `device_telemetry`).
     "kind": "actor_status",
     "status": "connected",
     "telemetry": {
-      "detection_mode": "full",
-      "radar_mode": "armed",
-      "device_info": "XXXXXXXX (Gen2)"
+      "phase": "measuring",
+      "shot_count": "12",
+      "device_info": "FlightScope Mevo Gen2"
     }
   }
 }
@@ -2929,10 +2950,15 @@ of them only (see `device_telemetry`).
   remain. `/api/status` and the replay a new WebSocket client gets follow the
   same rule.
 
-Common keys for launch monitors: `detection_mode`, `radar_mode`, `device_info`.
+Common keys for launch monitors: `device_info`.
 The mock launch monitor adds `shot_count`; its `tracking_mode`, `radar_mode`
 and `ready` come as `device_telemetry`, and it reports its model (`Mock Launch
 Monitor`) there.
+The FlightScope adds `shot_count` (shots finished since the card started)
+and `phase` (`connecting`, `handshaking`, `configuring` while it connects,
+removed by the `connected` status; then `measuring` once the device is
+armed, and `configuring` while a mode change re-arms it); `device_info` is
+`FlightScope Mevo+`, `FlightScope Mevo Gen2` or `Xi`.
 The ExPutt adds `shot_count` (shots finished since the card started) and
 `phase` (`discovering`, `connecting`, then `measuring`, which the
 `connected` status keeps); `device_info` is `ExPutt RG (<ip>)`.

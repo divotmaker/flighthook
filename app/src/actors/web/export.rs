@@ -218,7 +218,7 @@ fn environment(shot: &StoredShot) -> Option<String> {
     match shot.context.device_section.get("environment") {
         Some(serde_json::Value::String(s)) => Some(s.clone()),
         _ if shot.context.device.kind == "flightscope" => {
-            Some(FlightScopeEnvironment::default().key().to_string())
+            label(Some(&FlightScopeEnvironment::default()))
         }
         _ => None,
     }
@@ -397,19 +397,12 @@ mod tests {
             "0".into(),
             MevoSection {
                 name: "My Mevo".into(),
-                enabled: true,
-                address: Some(ADDR.into()),
-                ball_type: Some(1),
-                tee_height: None,
-                range: None,
-                surface_height: None,
-                track_pct: None,
-                use_estimated: None,
-                camera_mode: None,
-                environment: None,
-                spin_source: flighthook::SpinSource::D4,
-                launch_only_spin: MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
-                impact_lead_s: None,
+                driver: flighthook::MevoConfig {
+                    address: Some(ADDR.into()),
+                    ball_type: Some(1),
+                    ..flighthook::MevoConfig::default()
+                },
+                ..MevoSection::default()
             },
         );
         config

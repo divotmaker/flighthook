@@ -2040,19 +2040,13 @@ pub(crate) mod tests {
                 "0".into(),
                 MevoSection {
                     name: "Range Mevo".into(),
-                    enabled: true,
-                    address: Some("10.0.0.7:5100".into()),
-                    ball_type: Some(1),
-                    tee_height: None,
-                    range: None,
-                    surface_height: None,
-                    track_pct: Some(80.0),
-                    use_estimated: None,
-                    camera_mode: None,
-                    environment: None,
-                    spin_source: flighthook::SpinSource::D4,
-                    launch_only_spin: MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
-                    impact_lead_s: None,
+                    driver: flighthook::MevoConfig {
+                        address: Some("10.0.0.7:5100".into()),
+                        ball_type: Some(1),
+                        track_pct: Some(80.0),
+                        ..flighthook::MevoConfig::default()
+                    },
+                    ..MevoSection::default()
                 },
             );
         });

@@ -78,50 +78,44 @@ address = "127.0.0.1:921"
   lists those sections and `actor_enabled(id)` asks for one;
   `resolve_actors` leaves them out, so no actor runs for them (see
   [Turning a card off](#turning-a-card-off))
-- Radar settings (ball_type, tee_height, etc.) are per-mevo only. A Mevo+ gets
-  them through ironsight (`SessionConfig::to_avr_settings` → `MevoSettings` →
-  `BinaryClient::configure_avr`); a mode change sends the detection mode alone
-  (`AvrSettings::mode_only`). An Xi is
-  configured through ironsight (`SessionConfig::to_xi_settings` →
-  `BinaryClient::configure_xi`): `range` and `surface_height` as its radar
-  calibration, Full → a full-swing session in the environment's mode,
-  Chipping and Putting → the pitching shot type (mode 9); `ball_type`,
-  `tee_height` and `track_pct` are not sent. A mode change reconfigures
-  after a disarm; Chipping ↔ Putting sends nothing. ironsight acknowledges
-  each Xi flight result and sets the DSP power mode at connect; both go
-  through the connection's send hook, so the audit log and the shot export
-  record them as tx. A refused configuration step arrives as
-  `BinaryEvent::StepRefused`, which the actor logs as a warning with the hex
-- `use_estimated` is per-mevo (defaults to `false`) -- controls whether estimated
-  (E8) ball flights are emitted when no full (D4) result arrives; with it off,
-  estimated-only shots (a flight too short to read in Outdoor mode, very short
-  chips) are skipped
-- `environment` is per-mevo (`limited_flight` default / `outdoor`) -- picks the
-  full-swing detection mode (9 / 8), on a Mevo+ and an Xi alike
-- `camera_mode` is per-mevo (`standard` default / `fusion` / `raw_fusion`) --
-  the Fusion modes request the full club data set (radar club data arrives in
-  every mode), applied after a camera warmup delay
-- `spin_source` is per-mevo (`d4` default / `e8` / `auto`), FlightScope Xi
-  only -- `d4` keeps D4's spin; `e8` takes total spin from E8 (split into
-  back/side by D4's axis with club data, else sent as the total alone) and
-  falls back to D4 when there is no E8 spin; `auto`
-  applies the `e8` rule when flighthook's detection mode is Full at shot time
-  (the mode captured at the shot's trigger), and `d4` otherwise -- a chip hit
-  while flighthook is still in Full mode gets `e8`'s speed-scaled value. Read
-  on every shot, so a change applies without a restart; omitted from the
-  config at the default
-- `launch_only_spin` is per-mevo (rpm per mph, default `100`, `0` = off,
+- FlightScope sections (`MevoSection`) are the card's own fields (`name`,
+  `enabled`, `impact_lead_s`, `launch_only_spin`) with ironsight's driver
+  settings flattened next to them (`MevoConfig`: `address`, `ball_type`,
+  `tee_height`, `range`, `surface_height`, `track_pct`, `use_estimated`,
+  `camera_mode`, `environment`, `spin_source`); each driver setting is left
+  out of the file while unset (`spin_source` while `d4`), and the driver uses
+  its own default then. The driver turns them into the device's
+  configuration: on a Mevo+ or Gen2 the radar settings, on an Xi `range` and
+  `surface_height` as its radar calibration (`ball_type`, `tee_height`,
+  `track_pct` and `camera_mode` do not apply to it). Full selects a
+  full-swing session in the environment's mode; on the Xi, Chipping and
+  Putting select the same pitching session, so a change between them sends
+  nothing. The driver's `validate()` refuses `track_pct` outside 0 to 100, a
+  negative distance, a `ball_type` other than 0 or 1 and an `address` that is
+  not an IP address and port
+- `use_estimated` (default off) -- whether a shot whose full result never
+  arrives is sent from the device's early result; with it off, such a shot
+  (a flight too short to read in Outdoor mode, a very short chip) is skipped
+- `environment` (`limited_flight` default / `outdoor`) -- picks the
+  full-swing detection mode, on a Mevo+ and an Xi alike
+- `camera_mode` (`standard` default / `fusion` / `raw_fusion`) -- the Fusion
+  modes request the full club data set (radar club data arrives in every
+  mode), applied after the camera's warmup
+- `spin_source` (`d4` default / `e8` / `auto`), FlightScope Xi only -- `d4`
+  keeps the full result's spin (D4, what FS Golf shows); `e8` takes the
+  total from the early result (split into back and side by D4's axis with
+  club data, else sent as the total alone) and keeps D4's when the early
+  result has no spin; `auto` applies the `e8` rule when the detection mode
+  at the shot's trigger is Full, and `d4` otherwise -- a chip hit while still
+  in Full mode gets `e8`'s value. Applied live (the driver's `Live` cell), so
+  a change takes effect without a restart; any other driver setting restarts
+  the card
+- `launch_only_spin` (the card's, rpm per mph, default `100`, `0` = off,
   valid `0..=MevoSection::MAX_LAUNCH_ONLY_SPIN` (1000); a value outside that
   in the file is treated as `0` with a warning at actor start, and
-  `POST /api/settings` rejects one with `400`) -- for a D4 with launch data
-  but no spin and no flight (carry, apex and flight time all absent),
-  launched at 5° or more (`launch_only`), `estimate_launch_only_spin` runs
-  after the Xi spin source: when the setting is above 0, the mode is not
-  Putting and the spin is still 0/0, it sets backspin to `launch_only_spin` ×
-  ball speed (mph), sidespin 0, and unsets carry, apex and flight time before
-  the simulation runs. Otherwise the D4 keeps its zeros and is a ground ball.
-  Read on every shot, so a change applies without a restart; omitted from
-  the config at the default
+  `POST /api/settings` rejects one with `400`) -- the card's estimate for a
+  launch-only chip (the **FlightScope card** paragraph under
+  [Reconnect](#reconnect)). Applied live (a host field)
 - R10 sections show name and Monitor-to-Ball (`range`, sent to the device as
   its tee distance; BLE auto-discovery, no address field). `range` is the R10
   driver's setting (tenover's `Config`, flattened into the section); a range
@@ -234,10 +228,10 @@ pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub te
 pub enum SimMode { Off, On, Force }                 // default On
 pub enum SimSurface { Fairway, Green, FirmGreen }
 pub struct WebserverSection { pub name: String, pub bind: String }
-pub struct MevoSection { pub name: String, pub address: Option<String>, pub ball_type: Option<u8>, pub tee_height: Option<Distance>, pub range: Option<Distance>, pub surface_height: Option<Distance>, pub track_pct: Option<f64>, pub use_estimated: Option<bool>, pub camera_mode: Option<CameraMode>, pub environment: Option<FlightScopeEnvironment>, pub spin_source: SpinSource, pub launch_only_spin: f64 }
-pub enum CameraMode { Standard, Fusion, RawFusion }
-pub enum FlightScopeEnvironment { LimitedFlight, Outdoor }
-pub enum SpinSource { D4, E8, Auto }
+pub struct MevoSection { pub name: String, pub enabled: bool, pub launch_only_spin: f64, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: MevoConfig }  // ironsight's Config: address, ball_type, tee_height, range, surface_height, track_pct, use_estimated, camera_mode: Option<CameraMode>, environment: Option<FlightScopeEnvironment> (each Option), spin_source: SpinSource
+pub enum CameraMode { Standard, Fusion, RawFusion }               // ironsight's, re-exported
+pub enum FlightScopeEnvironment { LimitedFlight, Outdoor }        // ironsight's, re-exported
+pub enum SpinSource { D4, E8, Auto }                              // ironsight's, re-exported
 pub struct R10Section { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: R10Config }  // tenover's Config: range: Option<Distance>
 pub struct SquareSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: SquareConfig }  // allsquare's Config: address: Option<String>, club: String ("7I"), advanced_spin: bool (true), discard_non_putting_zero_spin: bool (true), dot_bottom_to_face_center_mm: BTreeMap<String, f64>
 pub struct ExPuttSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: ExPuttConfig }  // threeputt's Config: address: Option<String>
@@ -454,7 +448,8 @@ shot, set from the settings in effect when the shot was simulated; a shot
 that can't be simulated gets no `derived` and shows the device's values.
 Launch values (speed, angles, spin, club data) are never replaced.
 `DerivedFlight::spin_estimated` marks the spin in `launch` as flighthook's
-estimate (the mevo actor's launch-only chips); the actor sets it after the
+estimate (the FlightScope card's launch-only chips); the card's hook asks
+for it (`HookCtx::spin_estimated`) and the sink sets it after the
 simulation, on a `derived` that holds only the flag when the shot was not
 simulated, so `derive` never sees it. `DerivedFlight::computed`
 (`Vec<ShotField>`, set with `DerivedFlight::mark_computed`) marks the values
@@ -485,10 +480,10 @@ The simulation runs in `app/src/sim.rs` with the
 [dimple](https://crates.io/crates/dimple) crate, an app-only dependency (the
 lib crate and the WASM UI never link it). Every device actor builds its
 `Launch` event (and the `FlightResult` event after it, when the device
-reported flight values) through `sim::launch_events` (the Mevo+/Xi through
-`sim::launch_events_in_mode`, passing the detection mode captured at the
-shot's trigger; a card on a device driver passes its driver's fixed mode,
-the ExPutt's Putting, else the live mode), on the device thread, so the launch already
+reported flight values) through `sim::launch_events_in_mode`, in the mode
+the card's sink picks: its driver's fixed mode (the ExPutt's Putting), else
+the mode the card's hook sets (the FlightScope card: the game's mode at the
+shot's trigger), else the live mode, on the device thread, so the launch already
 carries `derived` when it reaches the bus, before `ShotFinished`. It costs a few milliseconds per shot. A shot is simulated only
 when:
 
@@ -527,9 +522,8 @@ mode picks the surface (`sim::ground_surface`): in Putting mode it rolls on
 a green (`green`, 11.4 ft on the stimpmeter, unless the configured surface
 is already `green` or `firm_green`, which is kept); in any other mode on the
 configured surface. The mode is the one in effect for the shot: for the
-Mevo+/Xi the mode captured at its trigger (the same capture the Xi `Auto`
-spin source uses), for other devices the game mode when the shot is
-processed. A straight 3 m/s ground ball rolls about 2.6 m on the default
+FlightScope the game's mode at its trigger, for the ExPutt Putting, for
+other devices the game mode when the shot is processed. A straight 3 m/s ground ball rolls about 2.6 m on the default
 `fairway` (8 m/s: about 10.8 m) and about 5.0 m on `green` (8 m/s: about
 18.8 m). Roll and total are the simulated roll
 unless the device measured the total (shown as measured, the roll fitted
@@ -615,16 +609,16 @@ label, the `RawRecord`s (`t_ms` relative to the trigger, direction, type,
 bus addresses or channel, lowercase hex or JSON text), a `dropped` count and
 an `unavailable` reason.
 
-Each device actor captures on its own thread with `RawCapture`
-(`app/src/raw_capture.rs`). Frames are pushed as they cross the transport.
-Outside a shot they go to a pre-roll ring; `mark_trigger()` (right before the
-actor emits `ShotTrigger`) opens the shot window with the ring as its head,
-and `take()` closes it for `ShotFinished`. Excluded frames are dropped before
-the ring and every cap.
+Each device card captures on its own thread with `RawCapture`
+(`app/src/raw_capture.rs`). Frames are pushed as they arrive
+(`push`, with their time and whether they are bulk data). Outside a shot
+they go to a pre-roll ring; `mark_trigger_at` (at the shot's trigger) opens
+the shot window with the ring as its head, and `take()` closes it for
+`ShotFinished`, frames sorted by time (a stable sort, so frames of one time
+keep their order).
 
 | Device | Hook | Window | Excluded | Pre-roll | Max frames | Max bulk bytes |
 | --- | --- | --- | --- | --- | --- | --- |
-| FlightScope | ironsight `set_on_recv` / `set_on_send` (the same hooks log hex and keep the last D4) | BALL TRIGGER to the device re-armed, both directions | what ironsight classifies as identity-bearing (`protocol::carries_identity`): status/keepalive, device and product info, DSP query, network config, WiFi scan, calibration, sensor activation, time sync, AVR config query | 8 | 256 | 128 KiB (PRC, club PRC, speed profile) |
 | Open Connect | the inbound JSON text and our reply | the one message | none | - | - | - |
 | Mock | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
 
@@ -632,9 +626,17 @@ A device on a flightrelay device driver ([Device drivers](#device-drivers))
 records the driver's `raw_frame` events instead: each frame is one protocol
 message, cleared of identity by the driver, stored with the driver's `label`
 as it gave it (no `type`, `src`, `dst` or `channel`), `hex` (or `text` for a
-text protocol), and placed in time by the frame's own timestamp. Pre-roll,
-caps and the bulk budget come from the driver's raw profile. The mock has no
-wire protocol and records none. The R10 (tenover, `transport = "r10-ble"`)
+text protocol), and placed in time by the frame's own timestamp (a driver
+stamps in UTC milliseconds; the card maps them onto its clock from one
+anchor, so frames of one millisecond keep the order the driver gave them).
+Pre-roll, caps and the bulk budget come from the driver's raw profile. The
+mock has no wire protocol and records none. The FlightScope (ironsight,
+`transport = "flightscope-tcp"`) records every framed message once the
+handshake is done, both directions, labeled `"<type> <src>><dst>"` (e.g.
+`D4 AVR>APP`), pre-roll 8, at most 256 frames, 128 KiB of bulk per-shot data
+(the large tracking records); ironsight withholds every message that can
+identify the unit, its network or the host, the device's free text and debug
+output, and everything of the handshake (audit log only, at trace level). The R10 (tenover, `transport = "r10-ble"`)
 records one frame per GFDI message after the handshake, labeled
 `notify <type>` / `write <type>`, pre-roll 256, at most 256 frames, no bulk
 data; tenover withholds every message that carries the device's identity or
@@ -782,8 +784,7 @@ Device state and actor lifecycle are conveyed via two separate event variants.
 **No key means two things**, and an actor sends each key through one of the
 two only. The device's own state goes in `DeviceTelemetry`: a launch monitor
 on a device driver reports its state keys there, `radar_mode` and
-`tracking_mode` included (the mock does), where the older actors send them
-on `ActorStatus`. The web layer merges both into one map per actor, so a card
+`tracking_mode` included (the mock does). The web layer merges both into one map per actor, so a card
 reads the same either way; an FRP client on `/frp` sees such keys in
 `device_telemetry` for the driver-based devices only.
 
@@ -801,9 +802,8 @@ reads the same either way; an FRP client on `/frp` sees such keys in
   actor/connection. Carries a typed status enum and actor-framework telemetry.
   FRP-only consumers ignore this per spec (unknown `kind` value).
 
-  Standard telemetry keys: `detection_mode`, `radar_mode`, `device_info`.
-  Launch monitors on a device driver add `shot_count` and, while a driver
-  reports one, `phase`; the mock's `tracking_mode` and `radar_mode` come
+  Standard telemetry keys: `device_info`. Launch monitors on a device
+  driver add `shot_count` and, while a driver reports one, `phase`; the mock's `tracking_mode` and `radar_mode` come
   from its driver as device telemetry.
   Integration actors: `club`, `handed`, `name`, `error`.
   Open Connect clients add: `address`, `last_shot`, `shots_sent`,
@@ -1016,14 +1016,16 @@ TCP connect). The Open Connect client actor restarts at 1s after a connection
 that lasted at least 10s; one that drops sooner counts as a failed attempt, so
 a link that keeps connecting and dropping still backs off to the cap. The
 Open Connect server restarts at 1s after a successful bind. A card on a
-device driver (the R10, the Square Golf, the ExPutt, the mock) waits the
-delay its driver asks for: the R10 and the Square Golf use the SDK's
-`Backoff`, 1 s per failed attempt up to 15 s, back to 1 s after a session of
-at least 10 s; the ExPutt adjusts the same backoff (below). The Mevo actor keeps the grown delay. Every actor polls its shutdown flag during the
-backoff wait (the Open Connect server during its bind retry delay too), so
-stopping one never waits out the delay. The Mevo and Open Connect client TCP
-connects (up to 5s) run on a thread of their own: a stop ends the actor at
-once, and a connect that completes afterward closes again. The ExPutt's
+device driver (the FlightScope, the R10, the Square Golf, the ExPutt, the
+mock) waits the delay its driver asks for: the FlightScope, the R10 and the
+Square Golf use the SDK's `Backoff`, 1 s per failed attempt up to 15 s,
+back to 1 s after a session of at least 10 s; the ExPutt adjusts the same
+backoff (below). Every actor polls its shutdown flag during the backoff wait
+(the Open Connect server during its bind retry delay too), so stopping one
+never waits out the delay. The Open Connect client's TCP connect (up to 5s)
+runs on a thread of its own: a stop ends the actor at once, and a connect
+that completes afterward closes again; the FlightScope driver's (up to 5 s,
+the SDK's `connect_tcp`) gives up at once on a stop. The ExPutt's
 session start cannot be cut short: the TCP connect and the device's greeting
 (up to 3s each), its two handshake replies (up to 3s each) and its mat search
 (up to 5s).
@@ -1155,7 +1157,7 @@ What a stop does, by actor:
 
 | Actor | Stops at once when | Bounded by |
 |---|---|---|
-| Mevo/Xi | always: the client is non-blocking and polls every 50 ms; the connect runs on its own thread | -- (an old instance still inside the driver is replaced beside it: a second socket to the device can overlap the old one until it closes) |
+| FlightScope (Mevo+, Gen2, Xi) | always: the TCP connect gives up at once on a stop, the handshake checks for one between polls, a session polls every 50 ms; closing sends nothing | the driver's `STOP_WAIT` (3 s); the driver is not exclusive, so an old instance still closing is replaced beside it (a second socket to the device can overlap the old one until it closes) |
 | Open Connect client | always: 50 ms reads, 2s write timeout, the connect on its own thread; its local-client registration ends with the connection | a write in progress (2s) |
 | Pureplay | always: 50 ms reads, 2s write timeout, the connect on its own thread | a write in progress (2s) |
 | Open Connect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
@@ -1165,15 +1167,53 @@ What a stop does, by actor:
 | Mock monitor | always (50 ms polls; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
 | Random club | always (100 ms loop) | -- |
 
-**Mevo actor mapping** (from internal phases):
+**FlightScope card**: ironsight's device driver (`ironsight::driver::Mevo`)
+on `DriverActor` (`actors::mevo::MevoHooks`: section `MevoSection`, source
+`Mevo`). The driver connects over TCP to `address` (`phase: connecting`, at
+most 5 s), runs the handshake (`phase: handshaking`) and configures the
+model it detected in the latched detection mode (`phase: configuring`); the
+card is then `Connected` (`device_info` "FlightScope Mevo+" or "FlightScope
+Mevo Gen2", "Xi" on an Xi) with `device_telemetry` `manufacturer:
+"FlightScope"`, model `Mevo+`, `Mevo Gen2` or `Xi` and the device's firmware
+(version and build date), and once armed `phase: measuring`, `ready=true`.
+The FRP device id is the camera Pi's WiFi name, or "FlightScope Xi
+(<address>)" on an Xi (and on a Mevo whose Pi reports none). Every session
+starts in the latched mode, so a mode change during a reconnect is kept. A
+mode change that reaches the device reconfigures and re-arms it (`phase:
+configuring` and `ready=false`, then `measuring` and `ready=true`): at once
+when the device is armed, else once the shot in progress is done; on the Xi,
+Chipping ↔ Putting sends nothing. Hand and club don't apply. A Fusion camera
+mode goes out after the camera's 15 s warmup (timed from the handshake),
+between shots. Telemetry keys: `ready`, `tilt`, `roll`, and on a Mevo+
+`battery_pct`, `temp_c` and `external_power` (a Gen2's or Xi's status has
+none), each sent when it changes. A shot is trigger (timestamped with the
+host time the driver saw it, which is when it reaches the bus), `launch`
+and `flight_result` as soon as the full result (D4) arrives (the launch
+with total spin and axis next to back and side spin; the flight result
+`basis: modeled`, with the device's total and roll distance when it reports
+them), `club_path` once the shot has a ball result, and `shot_finished`
+when the device is done. A launch-only full result (launch angle of 5° or
+more, no spin and no flight values: very short chips on the Xi) is a launch
+without spin and no flight result. With `use_estimated` on, a shot without
+a full result is sent from the early result (E8). A shot the device did not
+read is an alert ("Shot #n: Xi didn't track the ball (no read)") and no
+shot; a message the session cannot decode is an alert naming the error,
+never its bytes, and the session carries on; the device closing the
+connection, an operation timing out, or 10 s without a message from the
+device ends the session (the alert is the error, e.g. "connection closed by
+device"). The card's hook adds two things on a launch:
 
-- `Connecting | Handshaking | Configuring | Arming` -> `Starting`
-- `Armed` -> `Connected` with `telemetry["radar_mode"] = "armed"`
-- `Shooting` -> `Connected` with `telemetry["radar_mode"] = "idle"`
-- Connection lost (never connected) -> `Starting` (retrying)
-- Connection lost (previously connected) -> `Reconnecting`
+- the shot is simulated in the detection mode the game had at the shot's
+  trigger (`HookCtx::mode`), so a mode change between the trigger and the
+  full result, seconds later, does not change how it rolls;
+- a launch with no flight result, no spin, a launch angle of 5° or more
+  and a mode at the trigger other than Putting gets an estimated backspin
+  of `launch_only_spin` × ball speed (mph) and sidespin 0, marked
+  `derived.spin_estimated` (beta); a launch the Xi sends with its early
+  result's total spin (`spin_source` `e8` or `auto`) keeps that.
 
-Post-shot cycle: `Connected(radar_mode=idle)` -> `Starting` (re-arm) -> `Connected(radar_mode=armed)`.
+The driver is not exclusive: a new instance connects while an old one still
+closes.
 
 **R10 card**: tenover's device driver (`tenover::driver::R10`) on
 `DriverActor` (`actors::r10::R10Hooks`: section `R10Section`, source `R10`, no
@@ -1561,15 +1601,18 @@ NotReady/Disconnected until the monitor's next status or its next
 ## Device drivers
 
 A launch monitor card can run on a flightrelay device driver
-(`flightrelay::driver::DeviceDriver`): the R10 (`tenover::driver::R10`), the
-Square Golf Omni (`allsquare::driver::Omni`), the ExPutt
+(`flightrelay::driver::DeviceDriver`): the FlightScope Mevo+, Gen2 and Xi
+(`ironsight::driver::Mevo`), the R10 (`tenover::driver::R10`), the Square
+Golf Omni (`allsquare::driver::Omni`), the ExPutt
 (`threeputt::driver::ExPutt`) and the mock (`flightrelay::mock::MockDriver`)
-do today. The driver owns the device (connect,
+do. The driver owns the device (connect,
 session, shots, telemetry, raw frames); `actors::driver::DriverActor<D, H>`
 is the host around it, one thread per card. What a card adds is its
 `Hooks<D>`: its config section (`H::Section`, a lib `DeviceSection`), its
 shot source (`H::SOURCE`) and optional processing (`on_frp`, `action`).
-The R10's are `actors::r10::R10Hooks`, the Square Golf's
+The FlightScope's are `actors::mevo::MevoHooks` (its `on_frp` simulates a
+shot in the mode at its trigger and estimates a launch-only chip's spin),
+the R10's `actors::r10::R10Hooks`, the Square Golf's
 `actors::square::SquareHooks`, the ExPutt's `actors::exputt::ExPuttHooks`
 (its `action` is Find mat, its `on_frp` puts the driver's discovery hint in
 the card's words) and the mock's `actors::mock::MockHooks` (no processing of
@@ -3004,13 +3047,17 @@ displayed).
 - Name is **required** and serves as the rename mechanism. Changing a device name
   updates the name cache in WebState, so subsequent status responses and shot
   data use the new name.
-- `Use Estimated` is per-mevo (checkbox, off by default) -- controls whether
-  estimated (E8) ball flights are emitted when no full (D4) result arrives
-- `Environment` is per-mevo (dropdown: Limited flight (sim/indoor) / Outdoor
-  (full flight)) -- the full-swing detection mode; a change restarts the actor
-- `Camera Mode` is per-mevo (dropdown: Standard / Fusion / Raw Fusion) --
-  the Fusion modes request the full club data set from the device (radar club
-  data arrives in every mode)
+- FlightScope cards show name, Address (`ip:port`; blank is the driver's
+  default, `192.168.2.1:5100`, shown as the hint), Ball Type, Tee Height,
+  Monitor-to-Ball, Surface Height, Track %, Use Estimated Shots, Environment
+  (Limited flight (sim/indoor) / Outdoor (full flight)), Spin source (Xi),
+  Launch-only spin, Camera Mode (Standard / Fusion / Raw Fusion) and Camera
+  timing. Every driver setting is on the card (`DeviceFormEntry::mevo_config`
+  builds the driver's config over the one loaded, so a field still showing
+  its loaded value keeps it, set or unset); the driver's refusal (track %
+  outside 0 to 100, a negative distance, an address that is not `ip:port`)
+  and a number field that is not a number show under the fields. Spin source
+  and Launch-only spin apply live; any other change restarts the card
 - R10 cards show name and Monitor-to-Ball, the tee distance sent to the device
   (BLE auto-discovery; no address or radar fields)
 - Open Connect Server cards show name and Bind Address, the `ip:port` the

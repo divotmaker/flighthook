@@ -60,6 +60,10 @@ const _: () = assert!(
         <= MAX_STOP_WAIT.as_millis()
 );
 const _: () = assert!(
+    <ironsight::driver::Mevo as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+        <= MAX_STOP_WAIT.as_millis()
+);
+const _: () = assert!(
     <tenover::driver::R10 as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
@@ -129,16 +133,7 @@ pub struct ResolvedActor {
 /// concrete actor for each, webservers first.
 /// Invalid addresses are logged and skipped, and so is every section that is
 /// off (`enabled = false`): it keeps its card and runs no actor.
-///
-/// `current_mode` is the active detection mode from game state. Falls back
-/// to `Full` when no mode has been set yet (e.g. first startup).
-pub fn resolve_actors(
-    config: &FlighthookConfig,
-    current_mode: Option<flighthook::ShotDetectionMode>,
-) -> Vec<ResolvedActor> {
-    use flighthook::ShotDetectionMode;
-
-    let mode = current_mode.unwrap_or(ShotDetectionMode::Full);
+pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor> {
     let mut actors = Vec::new();
 
     // Webservers first: each subscribes to the bus in `start`, so the
@@ -159,40 +154,21 @@ pub fn resolve_actors(
         }
     }
 
-    // Mevo devices
+    // FlightScope devices
     for (index, section) in &config.mevo {
         let id = global_id("mevo", index);
-        let addr_str = section.address.as_deref().unwrap_or("192.168.2.1:5100");
-        match addr_str.parse::<SocketAddr>() {
-            Ok(addr) => {
-                let session_config = mevo::SessionConfig::from_mevo_section(section);
-                let use_estimated = section.use_estimated.unwrap_or(false);
-                let camera_mode = section.camera_mode.unwrap_or_default();
-                if !flighthook::MevoSection::launch_only_spin_valid(section.launch_only_spin) {
-                    tracing::warn!(
-                        "device '{id}': invalid launch_only_spin {} (must be 0 to {}), using 0 (off)",
-                        section.launch_only_spin,
-                        flighthook::MevoSection::MAX_LAUNCH_ONLY_SPIN,
-                    );
-                }
-                actors.push(ResolvedActor {
-                    id,
-                    name: section.name.clone(),
-                    actor: Box::new(mevo::MevoActor {
-                        addr,
-                        initial_mode: mode,
-                        session_config,
-                        use_estimated,
-                        camera_mode,
-                        spin_source: section.spin_source,
-                        launch_only_spin: section.launch_only_spin_rpm_per_mph(),
-                    }),
-                });
-            }
-            Err(e) => {
-                tracing::warn!("device '{id}': invalid address '{addr_str}': {e}");
-            }
+        if !flighthook::MevoSection::launch_only_spin_valid(section.launch_only_spin) {
+            tracing::warn!(
+                "device '{id}': invalid launch_only_spin {} (must be 0 to {}), using 0 (off)",
+                section.launch_only_spin,
+                flighthook::MevoSection::MAX_LAUNCH_ONLY_SPIN,
+            );
         }
+        actors.push(ResolvedActor {
+            id,
+            name: section.name.clone(),
+            actor: Box::new(mevo::MevoActor::new(section.clone())),
+        });
     }
 
     // R10 devices
@@ -639,7 +615,7 @@ mod tests {
                 ..flighthook::PureplaySection::default()
             },
         );
-        let ids: Vec<String> = resolve_actors(&config, None)
+        let ids: Vec<String> = resolve_actors(&config)
             .into_iter()
             .map(|a| a.id)
             .filter(|id| id.starts_with("pureplay."))

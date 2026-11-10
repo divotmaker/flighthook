@@ -152,7 +152,7 @@ impl FlighthookConfig {
         }
         let mut out = Vec::new();
         push(&mut out, "mevo", &self.mevo, |s| {
-            (s.enabled, s.address.as_deref())
+            (s.enabled, s.driver.address.as_deref())
         });
         push(&mut out, "square", &self.square, |s| {
             (s.enabled, s.driver.address.as_deref())
@@ -289,6 +289,7 @@ impl FlighthookConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MevoConfig;
     use crate::config::{
         FlighthookConfig, MevoSection, OpenConnectClientSection, OpenConnectServerSection,
     };
@@ -368,7 +369,10 @@ mod tests {
         c.mevo.insert(
             "0".into(),
             MevoSection {
-                address: Some("127.0.0.1:921".into()),
+                driver: MevoConfig {
+                    address: Some("127.0.0.1:921".into()),
+                    ..MevoConfig::default()
+                },
                 ..MevoSection::default()
             },
         );
@@ -417,7 +421,6 @@ mod tests {
             "1".into(),
             MevoSection {
                 enabled: false,
-                address: Some("192.168.2.1:5100".into()),
                 ..MevoSection::default()
             },
         );

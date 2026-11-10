@@ -1110,6 +1110,9 @@ fn invalid_driver_setting(saved: &FlighthookConfig, action: &ConfigAction) -> Op
     use flighthook::DeviceSection;
     match action {
         ConfigAction::ReplaceAll { config } => config.changed_device_error(saved),
+        ConfigAction::UpsertMevo { index, section } => {
+            section.changed_driver_error(saved.mevo.get(index), &format!("mevo.{index}"))
+        }
         ConfigAction::UpsertMockMonitor { index, section } => section.changed_driver_error(
             saved.mock_monitor.get(index),
             &format!("mock_monitor.{index}"),
@@ -2877,6 +2880,66 @@ mod group_tests {
             };
             assert_eq!(invalid_driver_setting(&live, &action), None, "{ok:?}");
         }
+    }
+
+    /// A save that changes a FlightScope setting into one its driver refuses
+    /// (track % outside 0 to 100, a negative distance, a ball type other
+    /// than 0 or 1, an address that is not an IP address and port) is
+    /// refused, whole or scoped, before anything is emitted; a stored
+    /// refused value still lets a rename through.
+    #[tokio::test]
+    async fn settings_save_with_a_refused_mevo_setting_is_400() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.mevo
+                .insert("0".into(), flighthook::MevoSection::default());
+        });
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        type Case = (fn(&mut flighthook::MevoConfig), &'static str);
+        let cases: [Case; 4] = [
+            (
+                |d| d.track_pct = Some(101.0),
+                "mevo.0: track_pct: must be 0 to 100",
+            ),
+            (
+                |d| d.tee_height = Some(flighthook::Distance::Inches(-1.0)),
+                "mevo.0: tee_height: must be a distance of 0 or more",
+            ),
+            (
+                |d| d.ball_type = Some(3),
+                "mevo.0: ball_type: must be 0 or 1",
+            ),
+            (
+                |d| d.address = Some("mevo.local".into()),
+                "mevo.0: address: ",
+            ),
+        ];
+        for (set, want) in cases {
+            let mut body = live.clone();
+            set(&mut body.mevo.get_mut("0").unwrap().driver);
+            for scope in [None, Some("mevo.0")] {
+                let (status, Json(error)) =
+                    save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                        .await
+                        .expect_err("rejected");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{want} {scope:?}");
+                let error = error["error"].as_str().expect("text");
+                assert!(error.starts_with(want), "{error}");
+            }
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+
+        let mut stored = live.clone();
+        stored.mevo.get_mut("0").unwrap().driver.track_pct = Some(150.0);
+        let mut renamed = stored.mevo["0"].clone();
+        renamed.name = "Bay 1".into();
+        let action = ConfigAction::UpsertMevo {
+            index: "0".into(),
+            section: renamed,
+        };
+        assert_eq!(invalid_driver_setting(&stored, &action), None);
     }
 
     /// A save that changes an ExPutt's address into one that is not an IP

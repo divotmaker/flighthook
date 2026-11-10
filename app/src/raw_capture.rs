@@ -1,14 +1,12 @@
-//! Per-shot raw frame capture, shared by every device actor.
+//! Per-shot raw frame capture, shared by every device card.
 //!
-//! An actor records each wire frame with [`RawCapture::push`] as it crosses
-//! the transport. Outside a shot the frames go to a small pre-roll ring;
-//! [`RawCapture::mark_trigger`] opens the shot window with the ring as its
-//! head, and [`RawCapture::take`] closes it and returns the [`ShotRaw`] that
-//! rides on `ShotFinished`. Everything runs on the actor's own thread.
-//!
-//! Frames an actor marks as excluded (identity, handshake, keepalive) are
-//! dropped before they reach the ring or any budget, so they never appear in
-//! an export.
+//! A card records each raw frame its device driver hands over with
+//! [`RawCapture::push`]. Outside a shot the frames go to a small pre-roll
+//! ring; [`RawCapture::mark_trigger_at`] opens the shot window with the ring
+//! as its head, and [`RawCapture::take`] closes it and returns the
+//! [`ShotRaw`] that rides on `ShotFinished`. Everything runs on the card's
+//! own thread. Which frames may be recorded at all (never identity) is the
+//! driver's call: it hands over only those.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -19,28 +17,13 @@ use flighthook::{RawRecord, ShotRaw};
 pub struct RawCaptureConfig {
     /// `ShotRaw.transport` label, e.g. `"flightscope-tcp"`.
     pub transport: &'static str,
-    /// Frames kept from before `mark_trigger()`. BLE devices deliver a
-    /// shot's notifications before the client reports the shot; FlightScope
-    /// decodes the BALL TRIGGER frame just before its trigger event.
+    /// Frames kept from before the trigger: a device may deliver some of a
+    /// shot's frames before its trigger.
     pub pre_roll_frames: usize,
     /// Cap on non-bulk frames per shot.
     pub max_frames: usize,
     /// Cap on payload bytes of bulk frames per shot.
     pub max_bulk_bytes: usize,
-    /// Frames never recorded (identity, handshake, keepalive).
-    pub exclude: fn(&RawRecord) -> bool,
-    /// Frames charged to the bulk byte budget instead of the frame cap.
-    pub is_bulk: fn(&RawRecord) -> bool,
-}
-
-/// No frame is excluded.
-pub fn exclude_none(_: &RawRecord) -> bool {
-    false
-}
-
-/// No frame is bulk.
-pub fn no_bulk(_: &RawRecord) -> bool {
-    false
 }
 
 /// An open shot window.
@@ -70,30 +53,11 @@ impl RawCapture {
         }
     }
 
-    /// Record one frame now. `rec.t_ms` is filled in by [`take`](Self::take).
-    pub fn push(&mut self, rec: RawRecord) {
-        self.push_at(rec, Instant::now());
-    }
-
-    /// Record one frame that crossed the transport at `at`. A frame pushed
-    /// after a later one still lands in time order in [`take`](Self::take).
-    pub fn push_at(&mut self, rec: RawRecord, at: Instant) {
-        if (self.cfg.exclude)(&rec) {
-            return;
-        }
-        let bulk = (self.cfg.is_bulk)(&rec);
-        self.record(rec, at, bulk);
-    }
-
-    /// Record one frame that crossed the transport at `at`, already cleared
-    /// for capture and classified by its source: `bulk` charges it to the
-    /// bulk byte budget instead of the frame cap. The config's `exclude` and
-    /// `is_bulk` are not asked.
-    pub fn push_classified(&mut self, rec: RawRecord, at: Instant, bulk: bool) {
-        self.record(rec, at, bulk);
-    }
-
-    fn record(&mut self, rec: RawRecord, at: Instant, bulk: bool) {
+    /// Record one frame that crossed the transport at `at`; `bulk` charges
+    /// it to the bulk byte budget instead of the frame cap. `rec.t_ms` is
+    /// filled in by [`take`](Self::take), and a frame pushed after a later
+    /// one still lands in time order there.
+    pub fn push(&mut self, rec: RawRecord, at: Instant, bulk: bool) {
         if self.window.is_some() {
             self.admit(rec, at, bulk);
         } else if self.cfg.pre_roll_frames > 0 {
@@ -128,13 +92,9 @@ impl RawCapture {
         w.frames.push((at, rec));
     }
 
-    /// Open the shot window now; the pre-roll ring becomes its head. A window
-    /// still open from a shot that never completed is discarded.
-    pub fn mark_trigger(&mut self) {
-        self.mark_trigger_at(Instant::now());
-    }
-
-    /// Open the shot window as of `at`, the moment of the trigger.
+    /// Open the shot window as of `at`, the moment of the trigger; the
+    /// pre-roll ring becomes its head. A window still open from a shot that
+    /// never completed is discarded.
     pub fn mark_trigger_at(&mut self, at: Instant) {
         if let Some(stale) = self.window.take() {
             tracing::debug!(
@@ -199,17 +159,6 @@ fn ms_between(mark: Instant, t: Instant) -> i64 {
     }
 }
 
-/// The record's `type` as a byte (`"0xD4"` → `0xD4`).
-pub fn type_byte(rec: &RawRecord) -> Option<u8> {
-    let t = rec.r#type.as_deref()?;
-    u8::from_str_radix(t.strip_prefix("0x")?, 16).ok()
-}
-
-/// `0x`-prefixed uppercase type label, e.g. `"0xD4"`.
-pub fn type_label(type_id: u8) -> String {
-    format!("0x{type_id:02X}")
-}
-
 /// Replace every occurrence of each identity string in `text` with
 /// `<redacted>`, longest first so an address goes before its host part.
 /// Strings shorter than four characters are ignored, so a short value cannot
@@ -234,19 +183,12 @@ mod tests {
 
     use super::*;
 
-    fn rec(type_id: u8, len: usize) -> RawRecord {
+    /// A frame named `n`, `len` bytes long.
+    fn rec(n: u8, len: usize) -> RawRecord {
         RawRecord {
-            r#type: Some(type_label(type_id)),
-            ..RawRecord::binary(RawDir::Rx, &vec![type_id; len])
+            label: Some(n.to_string()),
+            ..RawRecord::binary(RawDir::Rx, &vec![n; len])
         }
-    }
-
-    fn excluded(r: &RawRecord) -> bool {
-        type_byte(r) == Some(0xAA)
-    }
-
-    fn bulk(r: &RawRecord) -> bool {
-        type_byte(r) == Some(0xEC)
     }
 
     fn capture(pre_roll: usize, max_frames: usize, max_bulk: usize) -> RawCapture {
@@ -255,25 +197,27 @@ mod tests {
             pre_roll_frames: pre_roll,
             max_frames,
             max_bulk_bytes: max_bulk,
-            exclude: excluded,
-            is_bulk: bulk,
         })
     }
 
-    fn types(raw: &ShotRaw) -> Vec<u8> {
-        raw.frames.iter().filter_map(type_byte).collect()
+    fn names(raw: &ShotRaw) -> Vec<u8> {
+        raw.frames
+            .iter()
+            .filter_map(|r| r.label.as_deref()?.parse().ok())
+            .collect()
     }
 
     #[test]
     fn pre_roll_ring_is_bounded_and_becomes_the_head() {
         let mut c = capture(3, 16, 0);
+        let now = Instant::now();
         for t in 1..=5 {
-            c.push(rec(t, 1));
+            c.push(rec(t, 1), now, false);
         }
-        c.mark_trigger();
-        c.push(rec(0x10, 1));
+        c.mark_trigger_at(now);
+        c.push(rec(10, 1), now, false);
         let raw = c.take();
-        assert_eq!(types(&raw), [3, 4, 5, 0x10]);
+        assert_eq!(names(&raw), [3, 4, 5, 10]);
         assert_eq!(raw.transport, "test");
         assert_eq!(raw.dropped, 0);
         assert!(raw.unavailable.is_none());
@@ -283,11 +227,11 @@ mod tests {
     fn t_ms_is_negative_before_the_mark_and_zero_based_after() {
         let mut c = capture(4, 16, 0);
         let base = Instant::now();
-        c.push_at(rec(1, 1), base);
-        c.push_at(rec(2, 1), base + Duration::from_millis(40));
+        c.push(rec(1, 1), base, false);
+        c.push(rec(2, 1), base + Duration::from_millis(40), false);
         c.mark_trigger_at(base + Duration::from_millis(100));
-        c.push_at(rec(3, 1), base + Duration::from_millis(100));
-        c.push_at(rec(4, 1), base + Duration::from_millis(350));
+        c.push(rec(3, 1), base + Duration::from_millis(100), false);
+        c.push(rec(4, 1), base + Duration::from_millis(350), false);
         let t: Vec<i64> = c.take().frames.iter().map(|r| r.t_ms).collect();
         assert_eq!(t, [-100, -60, 0, 250]);
     }
@@ -296,70 +240,54 @@ mod tests {
     fn frames_pushed_late_are_returned_in_time_order() {
         let mut c = capture(4, 16, 0);
         let base = Instant::now();
-        c.push_at(rec(2, 1), base + Duration::from_millis(20));
-        c.push_at(rec(1, 1), base + Duration::from_millis(10));
+        c.push(rec(2, 1), base + Duration::from_millis(20), false);
+        c.push(rec(1, 1), base + Duration::from_millis(10), false);
         c.mark_trigger_at(base + Duration::from_millis(30));
-        c.push_at(rec(4, 1), base + Duration::from_millis(50));
-        c.push_at(rec(3, 1), base + Duration::from_millis(40));
-        assert_eq!(types(&c.take()), [1, 2, 3, 4]);
+        c.push(rec(4, 1), base + Duration::from_millis(50), false);
+        c.push(rec(3, 1), base + Duration::from_millis(40), false);
+        assert_eq!(names(&c.take()), [1, 2, 3, 4]);
     }
 
     #[test]
     fn frame_cap_and_bulk_cap_count_dropped() {
         let mut c = capture(0, 2, 10);
-        c.mark_trigger();
+        let now = Instant::now();
+        c.mark_trigger_at(now);
         for _ in 0..3 {
-            c.push(rec(1, 1));
+            c.push(rec(1, 1), now, false);
         }
-        c.push(rec(0xEC, 6));
-        c.push(rec(0xEC, 4));
-        c.push(rec(0xEC, 1));
+        c.push(rec(9, 6), now, true);
+        c.push(rec(9, 4), now, true);
+        c.push(rec(9, 1), now, true);
         let raw = c.take();
-        assert_eq!(types(&raw), [1, 1, 0xEC, 0xEC]);
+        assert_eq!(names(&raw), [1, 1, 9, 9]);
         assert_eq!(raw.dropped, 2);
-    }
-
-    #[test]
-    fn excluded_frames_are_never_counted() {
-        let mut c = capture(2, 1, 0);
-        c.push(rec(0xAA, 1));
-        c.push(rec(0xAA, 1));
-        c.push(rec(1, 1));
-        c.mark_trigger();
-        c.push(rec(0xAA, 1));
-        let raw = c.take();
-        assert_eq!(types(&raw), [1]);
-        assert_eq!(raw.dropped, 0);
     }
 
     #[test]
     fn take_resets() {
         let mut c = capture(2, 16, 0);
-        c.mark_trigger();
-        c.push(rec(1, 1));
+        let now = Instant::now();
+        c.mark_trigger_at(now);
+        c.push(rec(1, 1), now, false);
         assert_eq!(c.take().frames.len(), 1);
         let again = c.take();
         assert!(again.frames.is_empty());
         assert!(again.unavailable.is_some());
-        c.push(rec(2, 1));
-        c.mark_trigger();
-        assert_eq!(types(&c.take()), [2]);
+        c.push(rec(2, 1), now, false);
+        c.mark_trigger_at(now);
+        assert_eq!(names(&c.take()), [2]);
     }
 
     #[test]
     fn a_second_mark_discards_the_open_window() {
         let mut c = capture(2, 16, 0);
-        c.mark_trigger();
-        c.push(rec(1, 1));
-        c.mark_trigger();
-        c.push(rec(2, 1));
-        assert_eq!(types(&c.take()), [2]);
-    }
-
-    #[test]
-    fn type_helper() {
-        let r = rec(0xD4, 3);
-        assert_eq!(type_byte(&r), Some(0xD4));
+        let now = Instant::now();
+        c.mark_trigger_at(now);
+        c.push(rec(1, 1), now, false);
+        c.mark_trigger_at(now);
+        c.push(rec(2, 1), now, false);
+        assert_eq!(names(&c.take()), [2]);
     }
 
     #[test]

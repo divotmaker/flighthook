@@ -17,6 +17,10 @@ client = ["dep:tungstenite"]
 # `mock`: the mock launch monitor's settings (`MockConfig`), with the
 # driver settings contract (`DriverConfig`); adds no dependencies.
 flightrelay = { version = "0.5", features = ["mock"] }
+# The FlightScope driver's settings (`ironsight::config::Config`, the
+# `config` feature: no device stack, so the WASM UI builds it too).
+# LOCAL path until ironsight 0.7.0 is released
+ironsight = { path = "../../../ironsight/ironsight", default-features = false, features = ["config"] }
 # The R10 driver's settings (`tenover::config::Config`, the `config`
 # feature: no BLE stack, so the WASM UI builds it too).
 # LOCAL path until tenover 0.5.0 is released

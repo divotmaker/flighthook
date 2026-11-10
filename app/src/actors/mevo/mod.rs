@@ -1,1362 +1,126 @@
-pub mod settings;
+//! The FlightScope card (Mevo+, Mevo Gen2, Xi): ironsight's device driver
+//! ([`Mevo`]) on [`DriverActor`].
+//!
+//! The driver owns the device: it connects over TCP, runs the handshake,
+//! configures and arms the device for the detected model in the detection
+//! mode in effect, follows mode changes (a reconfigure and re-arm when the
+//! change reaches the device), applies the Fusion camera config after the
+//! camera's warmup, and reports readiness, tilt, roll, battery, shots and
+//! the frames of each shot. The ball goes out as soon as the device's full
+//! result arrives. The Xi's spin source is applied live, without a new
+//! session; any other setting change takes a new session (a restart).
+//!
+//! The card adds its section ([`MevoSection`]), its shot source and two
+//! things of its own on each shot's launch:
+//!
+//! - **The mode at the trigger.** A shot is simulated in the detection mode
+//!   that was in effect at its trigger, not when its result arrives
+//!   (seconds later), so a mode change during a shot doesn't change how it
+//!   rolls.
+//! - **The launch-only spin estimate** (beta). When the device reports a
+//!   launch with speed and launch angle but no spin and no flight values
+//!   (very short chips on the Xi), the card fills in a backspin of
+//!   `launch_only_spin` rpm per mph of ball speed and no sidespin, so the
+//!   simulation can fly it, and marks the shot's spin as estimated. Not for
+//!   a shot whose mode at the trigger was Putting, a launch under
+//!   [`LAUNCH_ONLY_MIN_LAUNCH_DEG`] (it rolls as a ground ball), or a
+//!   `launch_only_spin` of 0.
 
-pub use settings::SessionConfig;
+use std::collections::VecDeque;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::f64::consts::FRAC_PI_2;
-use std::io::{Read, Write};
-use std::net::SocketAddr;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use flighthook::{Launch, MevoSection, ShotDetectionMode};
+use flightrelay::FrpEvent;
+use ironsight::driver::Mevo;
+use ironsight::driver::convert::LAUNCH_ONLY_MIN_LAUNCH_DEG;
+use tracing::info;
 
-use ironsight::protocol::camera::{self, CamConfig};
-use ironsight::protocol::handshake::{DevInfoResp, DeviceGen, DeviceModel};
-use ironsight::protocol::shot::{FlightResult, FlightResultV1};
-use ironsight::protocol::status::DspStatus;
-use ironsight::protocol::{
-    TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1, carries_identity, is_bulk_shot_data,
-};
-use ironsight::seq::ShotDatum;
-use ironsight::{BinaryClient, BinaryConnection, BinaryEvent, ConnError, Message};
-use tracing::{debug, info, warn};
+use crate::actors::driver::{DriverActor, HookCtx, Hooks};
+use crate::actors::provenance::ShotSource;
 
-use super::{Actor, ReconfigureOutcome};
-use crate::bus::{BusReceiver, BusSender, PollError};
-use crate::raw_capture::{self, RawCapture, RawCaptureConfig};
-use crate::sim;
-use crate::state::SystemState;
-use settings::fusion_cam_config;
+/// How many shots' trigger modes the card remembers: more than can be open
+/// at once (a shot's launch comes before the next shot's trigger).
+const TRIGGER_MODES: usize = 8;
 
-use flighthook::{
-    ActorStatus, Basis, CameraMode, ClubData, Distance, FlighthookEvent, FlighthookMessage, Launch,
-    RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw, SpinSource, Velocity,
-    hex_lower,
-};
-
-/// The device's flight values for one shot, as flighthook's bus carries them
-/// (ironsight's own `FlightResult` is the D4 frame).
-type Flight = flighthook::FlightResult;
-
-/// No events for this long → treat as disconnected.
-const STALE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Keepalive cadence for BinaryClient.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Reconnect backoff bounds (linear: +1s per attempt, capped at 15s).
-const MIN_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(15);
-
-/// TCP connect timeout.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// FlightScope session actor. Connects to a Mevo/Mevo+ or Xi, runs the
-/// handshake, arms, and processes shots in a reconnecting event loop.
-///
-/// The model is detected by ironsight during the handshake. The Xi has no
-/// camera, so camera modes do not apply to it. ironsight configures it from
-/// `SessionConfig::to_xi_settings` and acknowledges each of its flight
-/// results; both go through the same send hook as every other frame, so the
-/// audit log and the shot export record them.
-///
-/// `spin_source` picks the Xi's spin, and `launch_only_spin` (rpm per mph,
-/// `0` = off) the backspin of a result with launch data but no spin and no
-/// flight. The run loop reads both from the live config on every shot; the
-/// fields are the values at start, used if the section cannot be read.
-pub struct MevoActor {
-    pub addr: SocketAddr,
-    pub initial_mode: ShotDetectionMode,
-    pub session_config: SessionConfig,
-    pub use_estimated: bool,
-    pub camera_mode: CameraMode,
-    pub spin_source: SpinSource,
-    pub launch_only_spin: f64,
+/// The FlightScope card: the mode at each shot's trigger and the launch-only
+/// spin estimate.
+#[derive(Debug, Default)]
+pub struct MevoHooks {
+    /// The detection mode at each recent shot's trigger, by shot id, newest
+    /// last.
+    trigger_modes: VecDeque<(String, Option<ShotDetectionMode>)>,
 }
 
-impl Actor for MevoActor {
-    /// A launch monitor flighthook reads directly.
-    fn source(&self) -> Option<crate::actors::provenance::ShotSource> {
-        Some(crate::actors::provenance::ShotSource::Mevo)
-    }
+impl Hooks<Mevo> for MevoHooks {
+    type Section = MevoSection;
+    const SOURCE: ShotSource = ShotSource::Mevo;
 
-    fn start(
-        &self,
-        state: Arc<SystemState>,
-        sender: BusSender,
-        receiver: BusReceiver,
-    ) -> std::thread::JoinHandle<()> {
-        let addr = self.addr;
-        let initial_mode = self.initial_mode;
-        let session_config = self.session_config.clone();
-        let use_estimated = self.use_estimated;
-        let camera_mode = self.camera_mode;
-        let spin_source = self.spin_source;
-        let launch_only_spin = self.launch_only_spin;
-        let thread_name = format!("device:{}", sender.actor_id());
-
-        std::thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
-                run(
-                    &state,
-                    addr,
-                    initial_mode,
-                    session_config,
-                    use_estimated,
-                    camera_mode,
-                    spin_source,
-                    launch_only_spin,
-                    sender,
-                    receiver,
-                );
-            })
-            .expect("failed to spawn mevo thread")
-    }
-
-    /// The device is reached over TCP as a client: a connect still running
-    /// in the old instance keeps nothing from the new one, and closes itself
-    /// once it completes.
-    fn replaceable_while_stopping(&self) -> bool {
-        true
-    }
-
-    fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
-        // Parse actor_id "mevo.0" -> ("mevo", "0")
-        let actor_id = sender.actor_id();
-        let (_, index) = match actor_id.split_once('.') {
-            Some(pair) => pair,
-            None => return ReconfigureOutcome::Applied,
-        };
-
-        let snap = state.system.snapshot();
-        let section = match snap.mevo.get(index) {
-            Some(s) => s,
-            None => return ReconfigureOutcome::RestartRequired, // section removed
-        };
-
-        // Check if address changed -> restart required
-        let new_addr_str = section.address.as_deref().unwrap_or("192.168.2.1:5100");
-        if let Ok(new_addr) = new_addr_str.parse::<SocketAddr>() {
-            if new_addr != self.addr {
-                return ReconfigureOutcome::RestartRequired;
+    fn on_frp(&mut self, event: &mut FrpEvent, ctx: &mut HookCtx<'_, MevoSection>) {
+        match event {
+            FrpEvent::ShotTrigger { key, .. } => {
+                if self.trigger_modes.len() == TRIGGER_MODES {
+                    self.trigger_modes.pop_front();
+                }
+                self.trigger_modes
+                    .push_back((key.shot_id.clone(), ctx.mode));
             }
-        } else {
-            return ReconfigureOutcome::RestartRequired;
-        }
-
-        // Check if session config changed -> restart to apply
-        let new_session = SessionConfig::from_mevo_section(section);
-        if new_session != self.session_config {
-            return ReconfigureOutcome::RestartRequired;
-        }
-
-        // Check if use_estimated changed -> restart to apply
-        let new_use_estimated = section.use_estimated.unwrap_or(false);
-        if new_use_estimated != self.use_estimated {
-            return ReconfigureOutcome::RestartRequired;
-        }
-
-        // Camera mode is sent once per session -> restart to apply
-        if section.camera_mode.unwrap_or_default() != self.camera_mode {
-            return ReconfigureOutcome::RestartRequired;
-        }
-
-        // Spin source and launch-only spin are read from the live config on
-        // every shot, so a change applies on the next shot without a restart.
-        ReconfigureOutcome::Applied
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn same_mode(a: ShotDetectionMode, b: ShotDetectionMode) -> bool {
-    std::mem::discriminant(&a) == std::mem::discriminant(&b)
-}
-
-/// Detection mode label as sent to the device.
-fn wire_label(
-    model: DeviceModel,
-    session_config: &SessionConfig,
-    mode: &ShotDetectionMode,
-) -> &'static str {
-    if model == DeviceModel::Xi {
-        session_config.xi_label(mode)
-    } else {
-        session_config.mode_label(mode)
-    }
-}
-
-/// Whether switching between two detection modes changes what is sent to
-/// the device. On the Xi, Chipping and Putting select the same session.
-fn changes_wire(
-    model: DeviceModel,
-    session_config: &SessionConfig,
-    from: &ShotDetectionMode,
-    to: &ShotDetectionMode,
-) -> bool {
-    if model == DeviceModel::Xi {
-        session_config.to_xi_settings(from) != session_config.to_xi_settings(to)
-    } else {
-        !same_mode(*from, *to)
-    }
-}
-
-/// Apply a mode change that waited for the device to be idle. Returns
-/// whether a configuration was queued (the device is then re-armed).
-fn apply_deferred<S: Read + Write>(
-    client: &mut BinaryClient<S>,
-    model: DeviceModel,
-    session_config: &SessionConfig,
-    current_mode: &mut ShotDetectionMode,
-    target: ShotDetectionMode,
-) -> bool {
-    let target_wire = wire_label(model, session_config, &target);
-    let is_mode_change = !same_mode(*current_mode, target);
-    if model == DeviceModel::Xi && !changes_wire(model, session_config, current_mode, &target) {
-        info!("deferred mode change to {target:?} -- device stays in {target_wire}");
-        *current_mode = target;
-        return false;
-    }
-    if is_mode_change {
-        info!("applying deferred mode change to {target:?} wire={target_wire}");
-    } else {
-        info!("applying deferred settings reconfig");
-    }
-    *current_mode = target;
-    queue_configure(client, model, session_config, &target, is_mode_change);
-    true
-}
-
-/// Queue the configuration for `mode`, then an arm. A Mevo+ gets the mode
-/// alone on a mode change and its full settings otherwise. The Xi gets
-/// ironsight's Xi configuration (`configure_xi`): the full set on the
-/// connection's first configuration, the mode set after that (`BinaryClient`
-/// disarms first when armed).
-fn queue_configure<S: Read + Write>(
-    client: &mut BinaryClient<S>,
-    model: DeviceModel,
-    session_config: &SessionConfig,
-    mode: &ShotDetectionMode,
-    mode_change: bool,
-) {
-    if model == DeviceModel::Xi {
-        client.configure_xi(session_config.to_xi_settings(mode));
-    } else if mode_change {
-        client.configure_avr(session_config.to_avr_settings_mode_only(mode));
-    } else {
-        client.configure_avr(session_config.to_avr_settings(mode));
-    }
-    client.arm();
-}
-
-/// Flight and club results of the shot in progress.
-///
-/// Club data waits here until the shot has a ball result: it is sent right
-/// after an accepted D4, or when the shot completes, so a shot the device
-/// did not read sends no club data.
-#[derive(Default)]
-struct ShotResults {
-    /// A D4 with a launch speed arrived and its ball flight was sent.
-    had_d4: bool,
-    /// Latest E8, for the spin source and the E8 fallback.
-    e8: Option<FlightResultV1>,
-    /// Club data not sent yet.
-    club: Option<ClubData>,
-}
-
-/// What a completed shot still sends, from [`ShotResults::finish`].
-#[derive(Debug)]
-enum ShotOutcome {
-    /// The D4 ball flight was sent.
-    Measured,
-    /// No D4: the ball flight comes from the E8.
-    Estimated(FlightResultV1),
-    /// No D4, and estimated shots are off.
-    Skipped,
-    /// No D4 and no E8.
-    NoFlight,
-    /// The device triggered but did not read the ball: its E8 is empty and
-    /// there is no D4. Nothing is sent for the shot but the alert.
-    NoRead(FlightResultV1),
-}
-
-impl ShotResults {
-    /// Record an accepted D4. Returns the club data to send after its ball
-    /// flight.
-    fn accept_d4(&mut self) -> Option<ClubData> {
-        self.had_d4 = true;
-        self.club.take()
-    }
-
-    /// Record club data. Returns it when it can be sent now (the ball
-    /// flight is already out); otherwise it waits for the ball result.
-    fn club(&mut self, club: ClubData) -> Option<ClubData> {
-        if self.had_d4 {
-            Some(club)
-        } else {
-            self.club = Some(club);
-            None
-        }
-    }
-
-    /// The shot's outcome and the club data it still sends.
-    fn finish(self, use_estimated: bool) -> (ShotOutcome, Option<ClubData>) {
-        if self.had_d4 {
-            return (ShotOutcome::Measured, self.club);
-        }
-        match self.e8 {
-            Some(e8) if e8.is_no_read() => (ShotOutcome::NoRead(e8), None),
-            _ if !use_estimated => (ShotOutcome::Skipped, self.club),
-            Some(e8) => (ShotOutcome::Estimated(e8), self.club),
-            None => (ShotOutcome::NoFlight, self.club),
-        }
-    }
-}
-
-/// Latest raw payload of each shot result type, for the log lines that
-/// report a dropped result.
-#[derive(Default)]
-struct ResultRaw {
-    d4: Vec<u8>,
-    e8: Vec<u8>,
-}
-
-fn hex_string(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02X}");
-            s
-        })
-}
-
-/// Product name and firmware for display and the shot export.
-///
-/// The name comes from the detected model and, for a Mevo, the DSP hardware
-/// generation: `"Mevo+"`, `"Mevo Gen2"`, `"Mevo"` when the generation is
-/// unknown, or `"Xi"`. Firmware is the AVR device info's version and build
-/// date (ironsight's `DevInfoResp::version` and `build_date`),
-/// `"1.23 (Feb 3 2024)"`; either part is left out when it is not found.
-/// Nothing else from the device info is used.
-fn product_and_firmware(
-    model: DeviceModel,
-    device_gen: Option<DeviceGen>,
-    avr_info: &DevInfoResp,
-) -> (String, Option<String>) {
-    let product = match (model, device_gen) {
-        (DeviceModel::Xi, _) => "Xi",
-        (DeviceModel::Mevo, Some(g @ (DeviceGen::MevoPlus | DeviceGen::Gen2))) => g.label(),
-        _ => model.label(),
-    };
-
-    let firmware = match (avr_info.version(), avr_info.build_date()) {
-        (Some(v), Some(d)) => Some(format!("{v} ({d})")),
-        (Some(v), None) => Some(v.to_string()),
-        (None, Some(d)) => Some(format!("built {d}")),
-        (None, None) => None,
-    };
-    (product.to_string(), firmware)
-}
-
-/// Whether a record stays out of the shot export: frames that ironsight
-/// classifies as able to identify the unit, its network or the host
-/// (`protocol::carries_identity`), and records without a type.
-fn export_excluded(rec: &RawRecord) -> bool {
-    raw_capture::type_byte(rec).is_none_or(carries_identity)
-}
-
-/// Whether a record is bulk per-shot data (`protocol::is_bulk_shot_data`),
-/// charged to the per-shot byte budget instead of the frame cap.
-fn export_bulk(rec: &RawRecord) -> bool {
-    raw_capture::type_byte(rec).is_some_and(is_bulk_shot_data)
-}
-
-/// Raw capture for one FlightScope connection: the shot window runs from
-/// BALL TRIGGER to the device re-armed, both directions.
-fn raw_capture_config() -> RawCaptureConfig {
-    RawCaptureConfig {
-        transport: "flightscope-tcp",
-        pre_roll_frames: 8,
-        max_frames: 256,
-        max_bulk_bytes: 128 * 1024,
-        exclude: export_excluded,
-        is_bulk: export_bulk,
-    }
-}
-
-/// Install the send/receive hooks: hex audit logging, raw capture for the
-/// shot export, and the latest D4, E8 and ED payloads (for logging a result
-/// that is dropped).
-fn attach_raw_capture<S: Read + Write>(
-    conn: &mut BinaryConnection<S>,
-    actor_id: &str,
-    capture: &Rc<RefCell<RawCapture>>,
-) -> Rc<RefCell<ResultRaw>> {
-    let send_id = actor_id.to_string();
-    let send_capture = Rc::clone(capture);
-    conn.set_on_send(move |cmd, dest| {
-        tracing::debug!(
-            "{send_id} send >> {dest:?} {:?} [{}]",
-            cmd,
-            cmd.debug_hex(dest)
-        );
-        let frame = cmd.encode(dest);
-        if carries_identity(frame.type_id) {
-            return;
-        }
-        send_capture.borrow_mut().push(RawRecord {
-            r#type: Some(raw_capture::type_label(frame.type_id)),
-            src: Some(frame.src.to_string()),
-            dst: Some(dest.to_string()),
-            ..RawRecord::binary(RawDir::Tx, &frame.payload)
-        });
-    });
-
-    let audit_id = actor_id.to_string();
-    let result_raw: Rc<RefCell<ResultRaw>> = Rc::default();
-    let raw_sink = Rc::clone(&result_raw);
-    let recv_capture = Rc::clone(capture);
-    conn.set_on_recv(move |env| {
-        let mut sink = raw_sink.borrow_mut();
-        match env.type_id {
-            TYPE_FLIGHT_RESULT => sink.d4.clone_from(&env.raw),
-            TYPE_FLIGHT_RESULT_V1 => sink.e8.clone_from(&env.raw),
+            FrpEvent::Launch { key, launch } => {
+                if let Some(at) = self
+                    .trigger_modes
+                    .iter()
+                    .position(|(id, _)| *id == key.shot_id)
+                    && let Some((_, mode)) = self.trigger_modes.remove(at)
+                {
+                    ctx.mode = mode;
+                }
+                if ctx.flight.is_none()
+                    && let Some(back) = launch_only_spin(
+                        launch,
+                        ctx.section.launch_only_spin_rpm_per_mph(),
+                        ctx.mode,
+                    )
+                {
+                    launch.backspin_rpm = Some(back);
+                    launch.sidespin_rpm = Some(0);
+                    ctx.spin_estimated = true;
+                    info!(
+                        "shot #{}: launch only, estimated backspin {back} rpm ({} rpm per mph)",
+                        key.shot_number,
+                        ctx.section.launch_only_spin_rpm_per_mph()
+                    );
+                }
+            }
             _ => {}
         }
-        drop(sink);
-        tracing::debug!(
-            "{audit_id} recv << 0x{:02X} {} | {:?}",
-            env.type_id,
-            hex_string(&env.raw),
-            env.message,
-        );
-        if carries_identity(env.type_id) {
-            return;
-        }
-        recv_capture.borrow_mut().push(RawRecord {
-            t_ms: 0,
-            dir: RawDir::Rx,
-            r#type: Some(raw_capture::type_label(env.type_id)),
-            src: Some(env.src.to_string()),
-            dst: Some("APP".into()),
-            channel: None,
-            label: None,
-            hex: Some(hex_lower(&env.raw)),
-            text: None,
-        });
-    });
-    result_raw
-}
-
-fn emit_device_status(sender: &BusSender, status: ActorStatus, telemetry: HashMap<String, String>) {
-    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-        status,
-        telemetry,
-    }));
-}
-
-fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>) {
-    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-        severity,
-        message: message.into(),
-    }));
-}
-
-fn stamp_device(msg: FlighthookMessage, device_id: &Option<String>) -> FlighthookMessage {
-    match device_id {
-        Some(dev) => msg.device(dev),
-        None => msg,
     }
 }
 
-/// What the shot handlers need from the connection.
-#[derive(Clone, Copy)]
-struct ShotContext<'a> {
-    state: &'a SystemState,
-    sender: &'a BusSender,
-    device_id: &'a Option<String>,
-    model: DeviceModel,
-    /// Xi spin source when the live config has none for this actor.
-    spin_source: SpinSource,
-    /// Launch-only spin (rpm per mph) when the live config has none for
-    /// this actor.
-    launch_only_spin: f64,
-    result_raw: &'a RefCell<ResultRaw>,
-}
-
-/// Handle one result of the shot in progress: send a D4 ball flight, keep
-/// the E8 for the fallback, and send or hold club data.
-fn on_shot_datum(
-    ctx: &ShotContext<'_>,
-    results: &mut ShotResults,
-    key: &ShotKey,
-    mode: ShotDetectionMode,
-    datum: ShotDatum,
-) {
-    let ShotContext {
-        state,
-        sender,
-        device_id,
-        model,
-        result_raw,
-        ..
-    } = *ctx;
-    match datum {
-        ShotDatum::Flight(d4) if d4.is_model_failure() => {
-            // The device's distance model failed (e.g. full-flight outdoor
-            // mode into a screen). Treat the shot as having no D4 so the E8
-            // fallback applies.
-            warn!(
-                "shot #{} D4 dropped: launch speed {} (distance model failed) -- 0x{:02X} {}",
-                key.shot_number,
-                d4.launch_speed,
-                TYPE_FLIGHT_RESULT,
-                hex_string(&result_raw.borrow().d4),
-            );
-        }
-        ShotDatum::Flight(d4) => {
-            let held_club = results.accept_d4();
-            let (mut ball, flight) = shot_from_d4(&d4);
-            let mut flight = Some(flight);
-            let mut spin_source = "D4";
-            if model == DeviceModel::Xi {
-                let source = live_spin_source(state, sender.actor_id()).unwrap_or(ctx.spin_source);
-                let (spin, label) = xi_spin(source, mode, &d4, results.e8.as_ref());
-                if let Some(spin) = spin {
-                    spin.apply(&mut ball);
-                }
-                spin_source = label;
-            }
-            let rpm_per_mph =
-                live_launch_only_spin(state, sender.actor_id()).unwrap_or(ctx.launch_only_spin);
-            let estimated =
-                estimate_launch_only_spin(&mut ball, &mut flight, &d4, rpm_per_mph, mode);
-            if estimated {
-                spin_source = "estimate";
-            }
-            info!(
-                "shot #{} (D4): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd back={:.0}rpm side={:.0}rpm total={:.0}rpm spin={spin_source}",
-                key.shot_number,
-                ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
-                ball.launch_elevation.unwrap_or(0.0),
-                ball.launch_azimuth.unwrap_or(0.0),
-                carry_yards(flight.as_ref()),
-                ball.backspin_rpm.unwrap_or(0),
-                ball.sidespin_rpm.unwrap_or(0),
-                ball.total_spin_rpm.unwrap_or(0),
-            );
-            let mut events =
-                sim::launch_events_in_mode(state, key.clone(), ball, flight, Some(mode));
-            if estimated {
-                mark_spin_estimated(&mut events);
-            }
-            for event in events {
-                sender.send(stamp_device(FlighthookMessage::new(event), device_id));
-            }
-            if let Some(club) = held_club {
-                send_club(sender, device_id, key, club);
-            }
-        }
-        ShotDatum::FlightV1(e8) => {
-            debug!("stashed E8 for fallback");
-            results.e8 = Some(e8);
-        }
-        ShotDatum::Club(ed) => {
-            if let Some(club) = results.club(club_from_ed(&ed)) {
-                send_club(sender, device_id, key, club);
-            }
-        }
-        ShotDatum::Spin(_) => {
-            // Spin axis / total spin are derived from backspin + sidespin in
-            // the launch; EF is redundant.
-        }
+/// The estimated backspin (rpm) for `launch`, a launch the device sent no
+/// flight result for: `rpm_per_mph` times its ball speed in mph, rounded.
+/// `None` (no estimate) when `rpm_per_mph` is not above 0, `mode` (the mode
+/// at the trigger) is Putting, the launch has any spin, its launch angle is
+/// under [`LAUNCH_ONLY_MIN_LAUNCH_DEG`] or unknown, or its speed is not
+/// positive or the product is out of range for an rpm.
+fn launch_only_spin(
+    launch: &Launch,
+    rpm_per_mph: f64,
+    mode: Option<ShotDetectionMode>,
+) -> Option<i32> {
+    if rpm_per_mph <= 0.0 || mode == Some(ShotDetectionMode::Putting) {
+        return None;
     }
-}
-
-fn send_club(sender: &BusSender, device_id: &Option<String>, key: &ShotKey, club: ClubData) {
-    let msg = FlighthookMessage::new(FlighthookEvent::ClubPath {
-        key: key.clone(),
-        club: Box::new(club),
-    });
-    sender.send(stamp_device(msg, device_id));
-}
-
-/// A shot the device has finished: its key, the detection mode captured at
-/// its trigger, and its raw frames.
-struct CompletedShot {
-    key: ShotKey,
-    mode: ShotDetectionMode,
-    raw: ShotRaw,
-}
-
-/// Send what a completed shot still sends (the E8 ball flight, the club
-/// data held back, or an alert), then its `ShotFinished` with the raw
-/// frames.
-fn finish_shot(
-    ctx: &ShotContext<'_>,
-    shot: CompletedShot,
-    (outcome, club): (ShotOutcome, Option<ClubData>),
-) {
-    let ShotContext {
-        state,
-        sender,
-        device_id,
-        model,
-        result_raw,
-        ..
-    } = *ctx;
-    let CompletedShot { key, mode, raw } = shot;
-    match outcome {
-        ShotOutcome::Measured => {}
-        ShotOutcome::Estimated(e8) => {
-            let (ball, flight) = shot_from_e8(&e8);
-            info!(
-                "shot #{} (E8): ball={:.1}mph VLA={:.1} HLA={:.1} carry={:.1}yd",
-                key.shot_number,
-                ball.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
-                ball.launch_elevation.unwrap_or(0.0),
-                ball.launch_azimuth.unwrap_or(0.0),
-                carry_yards(Some(&flight)),
-            );
-            for event in
-                sim::launch_events_in_mode(state, key.clone(), ball, Some(flight), Some(mode))
-            {
-                sender.send(stamp_device(FlighthookMessage::new(event), device_id));
-            }
-        }
-        ShotOutcome::Skipped => {
-            info!(
-                "shot #{} had only E8 (estimated) — skipped (use_estimated=false)",
-                key.shot_number,
-            );
-        }
-        ShotOutcome::NoFlight => {
-            warn!(
-                "shot #{} processed but no flight result (D4 or E8)",
-                key.shot_number,
-            );
-            emit_alert(
-                sender,
-                Severity::Warn,
-                format!(
-                    "Shot #{} triggered but no flight result produced",
-                    key.shot_number,
-                ),
-            );
-        }
-        ShotOutcome::NoRead(e8) => {
-            warn!(
-                "shot #{} not read: E8 ball speed {} and no D4 -- 0x{:02X} {}",
-                key.shot_number,
-                e8.ball_velocity,
-                TYPE_FLIGHT_RESULT_V1,
-                hex_string(&result_raw.borrow().e8),
-            );
-            emit_alert(
-                sender,
-                Severity::Warn,
-                format!(
-                    "Shot #{}: {} didn't track the ball (no read)",
-                    key.shot_number,
-                    model.label(),
-                ),
-            );
-        }
-    }
-    if let Some(club) = club {
-        send_club(sender, device_id, &key, club);
-    }
-    sender.send(stamp_device(
-        FlighthookMessage::new(FlighthookEvent::ShotFinished {
-            key,
-            raw: Some(Box::new(raw)),
-        }),
-        device_id,
-    ));
-}
-
-/// Battery level from a DSP status, or `None` when the status layout has no
-/// decoded battery field (the raw variant used by the Mevo Gen2 and the Xi).
-fn dsp_battery_pct(dsp: &DspStatus) -> Option<u8> {
-    match dsp {
-        DspStatus::V80(_) => Some(dsp.battery_percent()),
-        DspStatus::V46(_) => None,
-    }
-}
-
-/// Set `battery_pct` from a DSP status, removing the key when the battery
-/// level is unknown so it is never reported as 0 %.
-fn set_battery_telemetry(telemetry: &mut HashMap<String, String>, dsp: &DspStatus) {
-    match dsp_battery_pct(dsp) {
-        Some(pct) => {
-            telemetry.insert("battery_pct".into(), pct.to_string());
-        }
-        None => {
-            telemetry.remove("battery_pct");
-        }
-    }
-}
-
-fn try_emit_device_telemetry(
-    sender: &BusSender,
-    device_id: &Option<String>,
-    telemetry: &HashMap<String, String>,
-) {
-    let Some(dev) = device_id else { return };
-    sender.send(
-        FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-            manufacturer: None,
-            model: None,
-            firmware: None,
-            source: None,
-            telemetry: Some(telemetry.clone()),
-        })
-        .device(dev),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Run loop
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-fn run(
-    state: &SystemState,
-    addr: SocketAddr,
-    initial_mode: ShotDetectionMode,
-    initial_session_config: SessionConfig,
-    use_estimated: bool,
-    camera_mode: CameraMode,
-    spin_source: SpinSource,
-    launch_only_spin: f64,
-    sender: BusSender,
-    mut receiver: BusReceiver,
-) {
-    let mut backoff = MIN_BACKOFF;
-    let mut session_config = initial_session_config;
-    let mut ever_connected = false;
-    // FRP device identity — set on first successful handshake (from SSID),
-    // persists across reconnects. None until handshake completes; no
-    // DeviceTelemetry is emitted before we have a device identity.
-    let mut device_id: Option<String> = None;
-
-    loop {
-        if receiver.poll().is_err() {
-            break;
-        }
-
-        emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
-
-        match connect_and_run(
-            state,
-            &addr,
-            initial_mode,
-            use_estimated,
-            camera_mode,
-            spin_source,
-            launch_only_spin,
-            &sender,
-            &mut receiver,
-            &mut session_config,
-            &mut ever_connected,
-            &mut device_id,
-        ) {
-            Ok(()) => break,
-            Err(e) => {
-                warn!("session error: {e}");
-                emit_alert(
-                    &sender,
-                    Severity::Warn,
-                    format!("Device connection error: {e}"),
-                );
-                let backoff_status = if ever_connected {
-                    ActorStatus::Reconnecting
-                } else {
-                    ActorStatus::Starting
-                };
-                // Not ready before the status changes: the status drops what
-                // the card held, so nothing of the lost device is left to
-                // report after it.
-                if device_id.is_some() {
-                    try_emit_device_telemetry(
-                        &sender,
-                        &device_id,
-                        &HashMap::from([("ready".into(), "false".into())]),
-                    );
-                }
-                emit_device_status(&sender, backoff_status, HashMap::new());
-
-                let verb = if ever_connected {
-                    "Reconnecting"
-                } else {
-                    "Retrying"
-                };
-                info!("{} in {}s", verb.to_lowercase(), backoff.as_secs());
-
-                let deadline = Instant::now() + backoff;
-                while Instant::now() < deadline {
-                    if receiver.poll().is_err() {
-                        emit_device_status(&sender, ActorStatus::Disconnected, HashMap::new());
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-                backoff = (backoff + Duration::from_secs(1)).min(MAX_BACKOFF);
-            }
-        }
-    }
-
-    emit_device_status(&sender, ActorStatus::Disconnected, HashMap::new());
-}
-
-// ---------------------------------------------------------------------------
-// Session lifecycle
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-fn connect_and_run(
-    state: &SystemState,
-    addr: &SocketAddr,
-    initial_mode: ShotDetectionMode,
-    use_estimated: bool,
-    camera_mode: CameraMode,
-    initial_spin_source: SpinSource,
-    initial_launch_only_spin: f64,
-    sender: &BusSender,
-    receiver: &mut BusReceiver,
-    session_config: &mut SessionConfig,
-    ever_connected: &mut bool,
-    device_id: &mut Option<String>,
-) -> Result<(), ConnError> {
-    // 1. Connect
-    info!("connecting to {addr}...");
-    // A stop during the connect ends the session at once.
-    let Some(stream) = super::connect_tcp(sender.actor_id(), *addr, CONNECT_TIMEOUT, receiver)?
-    else {
-        return Ok(());
-    };
-    let _ = stream.set_nodelay(true);
-    let mut conn = BinaryConnection::new(stream);
-    *ever_connected = true;
-
-    // Audit logging, raw capture for the shot export, and the latest
-    // D4/E8/ED payloads.
-    let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
-    let result_raw = attach_raw_capture(&mut conn, sender.actor_id(), &capture);
-
-    // 2. Create non-blocking client
-    let mut client = BinaryClient::from_tcp(conn)?;
-    client.set_keepalive_interval(KEEPALIVE_INTERVAL);
-
-    // 3. Enqueue the handshake. Configuration depends on the model it
-    //    detects, so it is enqueued when the handshake completes.
-    client.handshake();
-
-    // 4. Event loop state
-    let mut model = DeviceModel::Mevo;
-    let mut current_mode = initial_mode;
-    let mut pending_reconfig: Option<ShotDetectionMode> = None;
-
-    // Shot lifecycle state
-    let mut shot_counter: u32 = 0;
-    let mut current_shot_key: Option<ShotKey> = None;
-    let mut shot_results = ShotResults::default();
-    // Detection mode in effect when the current shot's trigger fired, for
-    // the `Auto` spin source and the ground-ball surface. `current_mode` can
-    // change mid-shot; this doesn't.
-    let mut shot_detection_mode: Option<ShotDetectionMode> = None;
-
-    // Fusion camera config, applied once warmup has elapsed. None for
-    // Standard, which keeps the warmup config for the whole session.
-    let mut pending_fusion_cam = fusion_cam_config(camera_mode);
-    let session_start = Instant::now();
-
-    // Staleness + poll backoff
-    let mut last_event_time = Instant::now();
-    let mut idle_count: u32 = 0;
-
-    // Device-reported telemetry cache (battery, tilt, roll, temp, ready, etc.).
-    // Updated incrementally, always emitted in full so downstream consumers
-    // never lose fields. Sent via DeviceTelemetry events.
-    let mut device_telemetry: HashMap<String, String> = HashMap::new();
-
-    loop {
-        // ==============================================================
-        // Phase 1: Drain bus commands
-        // ==============================================================
-        loop {
-            match receiver.poll() {
-                Err(PollError::Shutdown) => {
-                    drop(client); // close TCP connection
-                    return Ok(());
-                }
-                Ok(None) => break,
-                Ok(Some(msg)) => {
-                    if let FlighthookEvent::SetDetectionMode {
-                        mode: Some(new_mode),
-                        ..
-                    } = msg.event
-                        && !same_mode(current_mode, new_mode)
-                    {
-                        if !changes_wire(model, session_config, &current_mode, &new_mode) {
-                            info!(
-                                "mode change: {:?} -> {:?} -- device stays in {}",
-                                current_mode,
-                                new_mode,
-                                wire_label(model, session_config, &new_mode)
-                            );
-                            current_mode = new_mode;
-                        } else if client.is_armed() {
-                            let new_wire = wire_label(model, session_config, &new_mode);
-                            info!(
-                                "mode change: {:?} -> {:?} wire={new_wire}",
-                                current_mode, new_mode
-                            );
-                            queue_configure(&mut client, model, session_config, &new_mode, true);
-                            current_mode = new_mode;
-                            emit_device_status(sender, ActorStatus::Connected, HashMap::new());
-                            device_telemetry.insert("ready".into(), "false".into());
-                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
-                        } else {
-                            pending_reconfig = Some(new_mode);
-                            info!(
-                                "deferred mode change to {:?} (operation in progress)",
-                                new_mode
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // ==============================================================
-        // Phase 1b: Apply the Fusion camera config after warmup
-        // ==============================================================
-        // The camera accepts a Fusion config only after running in standard
-        // mode for ironsight's `camera::WARMUP`. Held back until the shot in
-        // progress (if any) has finished so the reconfigure cannot interrupt
-        // it.
-        if pending_fusion_cam.is_some()
-            && current_shot_key.is_none()
-            && session_start.elapsed() >= camera::WARMUP
-            && let Some(cam) = pending_fusion_cam.take()
-        {
-            info!(
-                "camera warmup complete -- applying {} config",
-                camera_mode.key()
-            );
-            client.configure_cam(cam);
-            client.arm();
-            emit_device_status(sender, ActorStatus::Connected, HashMap::new());
-            device_telemetry.insert("ready".into(), "false".into());
-            try_emit_device_telemetry(sender, device_id, &device_telemetry);
-        }
-
-        // ==============================================================
-        // Phase 2: Drive BinaryClient
-        // ==============================================================
-        match client.poll() {
-            Ok(Some(event)) => {
-                last_event_time = Instant::now();
-                idle_count = 0;
-                debug!("poll -> {event:?}");
-
-                match event {
-                    BinaryEvent::Handshake(h) => {
-                        model = h.model;
-                        let gen_label = match h.model {
-                            DeviceModel::Xi => h.model.to_string(),
-                            _ => h
-                                .dsp
-                                .hw_info
-                                .as_ref()
-                                .map_or("Unknown", |hw| hw.device_gen().label())
-                                .to_string(),
-                        };
-                        let info_text = format!("{} ({})", h.avr.dev_info.text, gen_label);
-                        let battery = dsp_battery_pct(&h.dsp.status)
-                            .map_or_else(|| "unknown".to_string(), |pct| format!("{pct}%"));
-                        let external_power = h.dsp.status.external_power();
-                        let tilt = h.avr.status.tilt;
-                        let roll = -h.avr.status.roll;
-
-                        // FRP device identity: the WiFi SSID reported by the
-                        // camera Pi. The Xi has no Pi, so it is identified by
-                        // model and address.
-                        let identity = match h.pi {
-                            Some(ref pi) => pi.ssid.clone(),
-                            None => format!("{} ({addr})", h.model),
-                        };
-                        if !identity.is_empty() {
-                            *device_id = Some(identity.clone());
-                            info!("device identity: {identity}");
-                        }
-
-                        info!(
-                            "handshake complete: {info_text} | battery {battery}{} | tilt {tilt:.1} roll {roll:.1}",
-                            if external_power { " (charging)" } else { "" },
-                        );
-
-                        // Emit identity DeviceTelemetry + initial device state
-                        set_battery_telemetry(&mut device_telemetry, &h.dsp.status);
-                        device_telemetry.insert("tilt".into(), format!("{tilt:.1}"));
-                        device_telemetry.insert("roll".into(), format!("{roll:.1}"));
-                        device_telemetry.insert("temp_c".into(), "0.0".into());
-                        device_telemetry
-                            .insert("external_power".into(), external_power.to_string());
-                        device_telemetry.insert("ready".into(), "false".into());
-
-                        // Product name and AVR firmware. Never the DSP
-                        // device info: it carries the serial, and these
-                        // values are published in shot exports.
-                        let (device_model, firmware) = product_and_firmware(
-                            h.model,
-                            h.dsp.hw_info.as_ref().map(|hw| hw.device_gen()),
-                            &h.avr.dev_info,
-                        );
-                        if let Some(dev) = device_id.as_deref() {
-                            sender.send(
-                                FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                    manufacturer: Some("FlightScope".into()),
-                                    model: Some(device_model),
-                                    firmware,
-                                    source: None,
-                                    telemetry: Some(device_telemetry.clone()),
-                                })
-                                .device(dev),
-                            );
-                        }
-
-                        let status_telemetry = match h.model {
-                            DeviceModel::Xi => {
-                                HashMap::from([("device_info".into(), h.model.to_string())])
-                            }
-                            _ => HashMap::new(),
-                        };
-                        emit_device_status(sender, ActorStatus::Connected, status_telemetry);
-
-                        // Configure and arm for the detected model.
-                        if h.model == DeviceModel::Xi {
-                            info!(
-                                "FlightScope Xi: configured for {}; \
-                                 ball type, tee height, track % and camera mode do not apply",
-                                session_config.xi_label(&current_mode)
-                            );
-                            pending_fusion_cam = None;
-                            queue_configure(
-                                &mut client,
-                                h.model,
-                                session_config,
-                                &current_mode,
-                                false,
-                            );
-                        } else {
-                            client.configure_avr(session_config.to_avr_settings(&current_mode));
-                            client.configure_cam(CamConfig::warmup_preset());
-                            client.arm();
-                        }
-                    }
-
-                    BinaryEvent::Disarmed => {
-                        info!("device disarmed (preparing for reconfigure)");
-                    }
-
-                    BinaryEvent::Configured => {
-                        let wire = wire_label(model, session_config, &current_mode);
-                        info!("device configured (mode={wire})");
-                    }
-
-                    BinaryEvent::Armed => {
-                        let wire = wire_label(model, session_config, &current_mode);
-                        info!("armed -- mode={wire} -- waiting for shots");
-
-                        emit_device_status(sender, ActorStatus::Connected, HashMap::new());
-                        device_telemetry.insert("ready".into(), "true".into());
-                        try_emit_device_telemetry(sender, device_id, &device_telemetry);
-
-                        // Apply pending reconfig now that we're idle
-                        if let Some(target) = pending_reconfig.take()
-                            && apply_deferred(
-                                &mut client,
-                                model,
-                                session_config,
-                                &mut current_mode,
-                                target,
-                            )
-                        {
-                            emit_device_status(sender, ActorStatus::Connected, HashMap::new());
-                            device_telemetry.insert("ready".into(), "false".into());
-                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
-                        }
-                    }
-
-                    BinaryEvent::Trigger => {
-                        shot_counter += 1;
-                        let key = ShotKey {
-                            shot_id: uuid::Uuid::new_v4().to_string(),
-                            shot_number: shot_counter,
-                        };
-                        debug!("ball trigger detected — shot_id={}", key.shot_id);
-                        capture.borrow_mut().mark_trigger();
-                        let msg =
-                            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()));
-                        sender.send(stamp_device(msg, device_id));
-                        current_shot_key = Some(key);
-                        shot_results = ShotResults::default();
-                        shot_detection_mode = Some(current_mode);
-                        emit_device_status(sender, ActorStatus::Connected, HashMap::new());
-                        device_telemetry.insert("ready".into(), "false".into());
-                        try_emit_device_telemetry(sender, device_id, &device_telemetry);
-                    }
-
-                    BinaryEvent::ShotDatum(datum) => {
-                        if let Some(ref key) = current_shot_key {
-                            let ctx = ShotContext {
-                                state,
-                                sender,
-                                device_id,
-                                model,
-                                spin_source: initial_spin_source,
-                                launch_only_spin: initial_launch_only_spin,
-                                result_raw: &result_raw,
-                            };
-                            let mode = shot_mode(shot_detection_mode, current_mode);
-                            on_shot_datum(&ctx, &mut shot_results, key, mode, datum);
-                        }
-                    }
-
-                    BinaryEvent::ShotComplete(_shot_data) => {
-                        let raw = capture.borrow_mut().take();
-                        let results = std::mem::take(&mut shot_results);
-                        if let Some(key) = current_shot_key.take() {
-                            let ctx = ShotContext {
-                                state,
-                                sender,
-                                device_id,
-                                model,
-                                spin_source: initial_spin_source,
-                                launch_only_spin: initial_launch_only_spin,
-                                result_raw: &result_raw,
-                            };
-                            let shot = CompletedShot {
-                                key,
-                                mode: shot_mode(shot_detection_mode, current_mode),
-                                raw,
-                            };
-                            finish_shot(&ctx, shot, results.finish(use_estimated));
-                        }
-
-                        // Device is auto-re-armed by BinaryClient's ShotSequencer,
-                        // which reports the completed shot rather than an Armed
-                        // event, so readiness is restored here. Without this the
-                        // device reads not-ready for the rest of the session, from
-                        // the first trigger onwards.
-                        device_telemetry.insert("ready".into(), "true".into());
-                        try_emit_device_telemetry(sender, device_id, &device_telemetry);
-
-                        // Apply pending reconfig if any.
-                        if let Some(target) = pending_reconfig.take()
-                            && apply_deferred(
-                                &mut client,
-                                model,
-                                session_config,
-                                &mut current_mode,
-                                target,
-                            )
-                        {
-                            emit_device_status(sender, ActorStatus::Connected, HashMap::new());
-                            device_telemetry.insert("ready".into(), "false".into());
-                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
-                        }
-                    }
-
-                    BinaryEvent::Keepalive(status) => {
-                        let mut changed = false;
-                        if let Some(avr) = &status.avr {
-                            device_telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
-                            device_telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
-                            changed = true;
-                        }
-                        if let Some(dsp) = &status.dsp {
-                            set_battery_telemetry(&mut device_telemetry, dsp);
-                            device_telemetry
-                                .insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
-                            device_telemetry
-                                .insert("external_power".into(), dsp.external_power().to_string());
-                            changed = true;
-                        }
-                        if changed {
-                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
-                        }
-                    }
-
-                    BinaryEvent::StepRefused(env) => {
-                        warn!(
-                            "device refused a step, continuing: {} 0x{:02X} {}",
-                            env.src,
-                            env.type_id,
-                            hex_string(&env.raw),
-                        );
-                    }
-
-                    BinaryEvent::Message(env) => match &env.message {
-                        Message::DspStatus(dsp) => {
-                            set_battery_telemetry(&mut device_telemetry, dsp);
-                            device_telemetry
-                                .insert("temp_c".into(), format!("{:.1}", dsp.temperature_c()));
-                            device_telemetry
-                                .insert("external_power".into(), dsp.external_power().to_string());
-                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
-                        }
-                        Message::AvrStatus(avr) => {
-                            device_telemetry.insert("tilt".into(), format!("{:.1}", avr.tilt));
-                            device_telemetry.insert("roll".into(), format!("{:.1}", -avr.roll));
-                            try_emit_device_telemetry(sender, device_id, &device_telemetry);
-                        }
-                        _ => {}
-                    },
-                }
-            }
-
-            Ok(None) => {
-                idle_count += 1;
-                if idle_count >= 3 {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                if idle_count == 1 || idle_count.is_multiple_of(200) {
-                    debug!(
-                        "poll -> None (idle={idle_count}, stale_in={:.1}s, armed={})",
-                        STALE_TIMEOUT
-                            .saturating_sub(last_event_time.elapsed())
-                            .as_secs_f64(),
-                        client.is_armed(),
-                    );
-                }
-            }
-
-            Err(ref e @ ConnError::Timeout) => {
-                warn!("operation timeout: {e}");
-                return Err(ConnError::Timeout);
-            }
-            Err(ConnError::Disconnected) => {
-                info!("device disconnected");
-                return Err(ConnError::Disconnected);
-            }
-            Err(ref e @ ConnError::Wire(_)) | Err(ref e @ ConnError::Protocol(_)) => {
-                warn!(message = "Could not process message", error = ?e);
-                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    severity: Severity::Warn,
-                    message: format!("Could not process message: {e:?}"),
-                }));
-            }
-            Err(e) => return Err(e),
-        }
-
-        // ==============================================================
-        // Staleness check
-        // ==============================================================
-        if last_event_time.elapsed() >= STALE_TIMEOUT {
-            warn!(
-                "no events for {}s, assuming disconnected",
-                STALE_TIMEOUT.as_secs()
-            );
-            return Err(ConnError::Disconnected);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Protocol type → bus type conversion helpers
-// ---------------------------------------------------------------------------
-
-/// The shot log's carry in yards: the device's, else 0.
-fn carry_yards(flight: Option<&Flight>) -> f64 {
-    flight
-        .and_then(|f| f.carry_distance)
-        .map_or(0.0, |d| d.as_yards())
-}
-
-/// A D4's measured launch and its flight values. The flight values come from
-/// the device's own flight model, so their basis is [`Basis::Modeled`].
-fn shot_from_d4(d4: &FlightResult) -> (Launch, Flight) {
-    // ironsight reports azimuth and sidespin positive = left; FRP positive =
-    // right, so both are negated.
-    let flew = flew(d4.carry_distance, d4.flight_time, d4.max_height);
-    let launch = Launch {
-        launch_speed: Some(Velocity::MetersPerSecond(d4.launch_speed)),
-        launch_elevation: Some(d4.launch_elevation),
-        launch_azimuth: Some(-d4.launch_azimuth),
-        backspin_rpm: Some(d4.backspin_rpm),
-        sidespin_rpm: Some(-d4.sidespin_rpm),
-        ..Launch::default()
-    };
-    let flight = Flight {
-        carry_distance: Some(Distance::Meters(d4.carry_distance)),
-        carry_offline: flew
-            .then(|| finite(-d4.landing_position[2]))
-            .flatten()
-            .map(Distance::Meters),
-        max_height: Some(Distance::Meters(d4.max_height)),
-        flight_time: Some(d4.flight_time),
-        descent_angle: flew.then(|| descent_angle(d4.landing_velocity)).flatten(),
-        ..Flight::new(Basis::Modeled)
-    };
-    (launch, flight)
-}
-
-/// Whether a flight result describes a ball in flight: positive, finite
-/// carry, flight time and apex. A ball that stayed on the ground has no
-/// landing, so no landing offline or descent angle.
-fn flew(carry: f64, flight_time: f64, apex: f64) -> bool {
-    [carry, flight_time, apex]
-        .iter()
-        .all(|v| v.is_finite() && *v > 0.0)
-}
-
-/// Lowest launch angle (deg) of a launch-only D4. Below it (putts, bladed
-/// shots) a D4 with no spin and no flight keeps its apex of 0 and is a
-/// ground ball.
-const LAUNCH_ONLY_MIN_LAUNCH_DEG: f64 = 5.0;
-
-/// Whether a D4 is launch-only: it has launch data but no spin (backspin and
-/// sidespin 0) and no flight at all (carry, flight time and apex each 0,
-/// negative or non-finite), and was launched at
-/// [`LAUNCH_ONLY_MIN_LAUNCH_DEG`] or more. The Xi sends these on very short
-/// chips. A D4 with any one of carry, flight time or apex is not.
-fn launch_only(d4: &FlightResult) -> bool {
-    let absent = |v: f64| !(v.is_finite() && v > 0.0);
-    absent(d4.carry_distance)
-        && absent(d4.flight_time)
-        && absent(d4.max_height)
-        && d4.backspin_rpm == 0
-        && d4.sidespin_rpm == 0
-        && d4.launch_elevation >= LAUNCH_ONLY_MIN_LAUNCH_DEG
-}
-
-/// Backspin (rpm) for a ball with launch data but no spin: `rpm_per_mph`
-/// times the ball speed in mph, rounded. `None` (keep the ball's spin) when
-/// `rpm_per_mph` is not above 0 or not a valid `launch_only_spin`
-/// ([`MevoSection::launch_only_spin_valid`](flighthook::MevoSection::launch_only_spin_valid)),
-/// in Putting mode, when the ball has any spin, or when its speed
-/// is not positive or the product is out of range for an rpm.
-fn launch_only_spin(ball: &Launch, rpm_per_mph: f64, mode: ShotDetectionMode) -> Option<i32> {
-    if !(flighthook::MevoSection::launch_only_spin_valid(rpm_per_mph) && rpm_per_mph > 0.0)
-        || mode == ShotDetectionMode::Putting
+    if launch.backspin_rpm.unwrap_or(0) != 0
+        || launch.sidespin_rpm.unwrap_or(0) != 0
+        || launch.total_spin_rpm.unwrap_or(0) != 0
     {
         return None;
     }
-    if ball.backspin_rpm.unwrap_or(0) != 0
-        || ball.sidespin_rpm.unwrap_or(0) != 0
-        || ball.total_spin_rpm.unwrap_or(0) != 0
+    if !launch
+        .launch_elevation
+        .is_some_and(|vla| vla >= LAUNCH_ONLY_MIN_LAUNCH_DEG)
     {
         return None;
     }
-    let mph = ball.launch_speed?.as_mph();
+    let mph = launch.launch_speed?.as_mph();
     if !(mph.is_finite() && mph > 0.0) {
         return None;
     }
@@ -1368,1417 +132,711 @@ fn launch_only_spin(ball: &Launch, rpm_per_mph: f64, mode: ShotDetectionMode) ->
     Some(rpm as i32)
 }
 
-/// Give `ball`, from the launch-only `d4` ([`launch_only`]), the estimated
-/// backspin [`launch_only_spin`] and no sidespin, and unset the carry, apex
-/// and flight time of its `flight` (leaving no flight result, since a
-/// launch-only D4 has no other flight value): the device computed none, so
-/// the simulation flies the shot from its launch and that spin. Returns
-/// whether the estimate was applied. When it is not (`d4` is not
-/// launch-only, the estimate is off or declines, or the spin, after the Xi's
-/// spin source, is not 0/0), `ball` and `flight` are left as they are: a D4
-/// with no flight keeps its 0 carry, apex and flight time and is rolled as a
-/// ground ball.
-fn estimate_launch_only_spin(
-    ball: &mut Launch,
-    flight: &mut Option<Flight>,
-    d4: &FlightResult,
-    rpm_per_mph: f64,
-    mode: ShotDetectionMode,
-) -> bool {
-    if !launch_only(d4) {
-        return false;
-    }
-    let Some(back) = launch_only_spin(ball, rpm_per_mph, mode) else {
-        return false;
-    };
-    ball.backspin_rpm = Some(back);
-    ball.sidespin_rpm = Some(0);
-    if let Some(f) = flight.as_mut() {
-        f.carry_distance = None;
-        f.max_height = None;
-        f.flight_time = None;
-    }
-    if flight.as_ref() == Some(&Flight::new(Basis::Modeled)) {
-        *flight = None;
-    }
-    true
-}
+/// The FlightScope actor (`mevo.N`).
+pub type MevoActor = DriverActor<Mevo, MevoHooks>;
 
-/// Mark the spin of a shot's `Launch` event as flighthook's estimate
-/// ([`DerivedFlight::spin_estimated`](flighthook::DerivedFlight::spin_estimated)),
-/// adding a derived block that holds only the flag when the shot was not
-/// simulated.
-fn mark_spin_estimated(events: &mut [FlighthookEvent]) {
-    for event in events {
-        if let FlighthookEvent::Launch { derived, .. } = event {
-            derived.get_or_insert_with(Box::default).spin_estimated = true;
-        }
-    }
-}
-
-fn finite(v: f64) -> Option<f64> {
-    v.is_finite().then_some(v)
-}
-
-/// Angle below horizontal (deg) of the D4 landing velocity
-/// `[forward, vertical, lateral]`, or `None` when the ball is not descending.
-fn descent_angle(v: [f64; 3]) -> Option<f64> {
-    let [forward, vertical, lateral] = v;
-    let horizontal = forward.hypot(lateral);
-    let angle = (-vertical).atan2(horizontal).to_degrees();
-    (vertical < 0.0 && angle.is_finite()).then_some(angle)
-}
-
-/// The `[mevo.N]` spin source for the actor `actor_id` (`"mevo.N"`), from
-/// the live config.
-fn live_spin_source(state: &SystemState, actor_id: &str) -> Option<SpinSource> {
-    let (_, index) = actor_id.split_once('.')?;
-    state.system.mevo_spin_source(index)
-}
-
-/// The `[mevo.N]` launch-only spin (rpm per mph, `0` = off) for the actor
-/// `actor_id` (`"mevo.N"`), from the live config.
-fn live_launch_only_spin(state: &SystemState, actor_id: &str) -> Option<f64> {
-    let (_, index) = actor_id.split_once('.')?;
-    state.system.mevo_launch_only_spin(index)
-}
-
-/// The spin an Xi shot sends instead of D4's ([`xi_spin`]). Both are the
-/// device's readings: splitting the E8 total by D4's axis only expresses it
-/// in the other spin pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum XiSpin {
-    /// Back and FRP side spin: the E8 total split by D4's axis.
-    Components(i32, i32),
-    /// The E8 total alone: the shot has no axis to split it by, so no axis
-    /// and no components are sent.
-    Total(i32),
-}
-
-impl XiSpin {
-    /// Put this spin on `ball` in place of D4's.
-    fn apply(self, ball: &mut Launch) {
-        let (back, side, total) = match self {
-            Self::Components(back, side) => (Some(back), Some(side), None),
-            Self::Total(total) => (None, None, Some(total)),
-        };
-        ball.backspin_rpm = back;
-        ball.sidespin_rpm = side;
-        ball.total_spin_rpm = total;
-        ball.spin_axis = None;
-    }
-}
-
-/// Xi spin for `source`: the spin to use instead of D4's, or `None` to keep
-/// D4's, plus a label naming the source for the shot log.
-///
-/// `D4` keeps D4. `E8` takes the total spin from the E8 backspin. When the
-/// shot carries club data (club speed plus attack angle or path) and D4's
-/// backspin is positive, the total is split by D4's spin axis, which then
-/// follows face-to-path; the axis is clamped to ±90° so backspin never turns
-/// negative. Otherwise the shot has no axis, and only the total is sent.
-/// `E8` keeps D4 when there is no E8 backspin, since that is a missing value,
-/// not a measurement. Sidespin keeps the sign flip of [`shot_from_d4`].
-///
-/// `Auto` applies the `E8` rule when `mode` (flighthook's detection mode at
-/// shot time) is `Full`, and otherwise keeps D4 exactly like `D4`. Either
-/// way, the label is the one the underlying rule would have used, with
-/// " (auto)" appended.
-fn xi_spin(
-    source: SpinSource,
-    mode: ShotDetectionMode,
-    d4: &FlightResult,
-    e8: Option<&FlightResultV1>,
-) -> (Option<XiSpin>, &'static str) {
-    match source {
-        SpinSource::D4 => (None, "D4"),
-        SpinSource::E8 => xi_spin_e8(d4, e8),
-        SpinSource::Auto if mode == ShotDetectionMode::Full => {
-            let (spin, label) = xi_spin_e8(d4, e8);
-            (spin, auto_label(label))
-        }
-        SpinSource::Auto => (None, "D4 (auto)"),
-    }
-}
-
-/// Detection mode in effect for a shot: the mode captured at its trigger,
-/// else the current one. It picks the Xi `Auto` spin source and the
-/// surface a ground ball rolls on.
-fn shot_mode(
-    at_trigger: Option<ShotDetectionMode>,
-    current: ShotDetectionMode,
-) -> ShotDetectionMode {
-    at_trigger.unwrap_or(current)
-}
-
-/// The `E8` rule: total spin from the E8 backspin, split by D4's spin axis
-/// when the shot has club data, falling back to D4 when there is no E8
-/// backspin.
-fn xi_spin_e8(d4: &FlightResult, e8: Option<&FlightResultV1>) -> (Option<XiSpin>, &'static str) {
-    let Some(e8) = e8.filter(|e8| e8.backspin_rpm > 0) else {
-        return (None, "D4 (no E8 spin)");
-    };
-    let has_club_data =
-        d4.clubhead_speed > 0.0 && (d4.club_attack_angle != 0.0 || d4.club_strike_direction != 0.0);
-    if !(has_club_data && d4.backspin_rpm > 0) {
-        return (Some(XiSpin::Total(e8.backspin_rpm)), "E8 total, no axis");
-    }
-    let total = f64::from(e8.backspin_rpm);
-    let axis = f64::from(d4.sidespin_rpm)
-        .atan2(f64::from(d4.backspin_rpm))
-        .clamp(-FRAC_PI_2, FRAC_PI_2);
-    let back = (total * axis.cos()).round() as i32;
-    let side = -(total * axis.sin()).round() as i32;
-    (Some(XiSpin::Components(back, side)), "E8 total, D4 axis")
-}
-
-/// Appends " (auto)" to one of [`xi_spin_e8`]'s labels, for the `Auto` source
-/// in `Full` mode.
-fn auto_label(label: &'static str) -> &'static str {
-    match label {
-        "D4 (no E8 spin)" => "D4 (no E8 spin) (auto)",
-        "E8 total, no axis" => "E8 total, no axis (auto)",
-        "E8 total, D4 axis" => "E8 total, D4 axis (auto)",
-        _ => "D4 (auto)",
-    }
-}
-
-/// An E8's measured launch and its flight values, [`Basis::Modeled`] as for
-/// a D4 ([`shot_from_d4`]).
-fn shot_from_e8(e8: &FlightResultV1) -> (Launch, Flight) {
-    // ironsight reports azimuth positive = left; FRP positive = right, so it
-    // is negated.
-    let flew = flew(e8.distance, e8.flight_time, e8.height);
-    let launch = Launch {
-        launch_speed: Some(Velocity::MetersPerSecond(e8.ball_velocity)),
-        launch_elevation: Some(e8.elevation),
-        launch_azimuth: Some(-e8.azimuth),
-        backspin_rpm: Some(e8.backspin_rpm),
-        sidespin_rpm: None, // always zero in E8 — None, not Some(0)
-        ..Launch::default()
-    };
-    let flight = Flight {
-        carry_distance: Some(Distance::Meters(e8.distance)),
-        carry_offline: flew
-            .then(|| finite(-e8.lateral))
-            .flatten()
-            .map(Distance::Meters),
-        max_height: Some(Distance::Meters(e8.height)),
-        flight_time: Some(e8.flight_time),
-        ..Flight::new(Basis::Modeled)
-    };
-    (launch, flight)
-}
-
-fn club_from_ed(ed: &ironsight::protocol::shot::ClubResult) -> ClubData {
-    // ironsight reports path, face angle and swing plane positive = left;
-    // FRP positive = right, so they are negated.
-    ClubData {
-        club_speed: Some(Velocity::MetersPerSecond(ed.pre_club_speed)),
-        path: Some(-ed.strike_direction),
-        attack_angle: Some(ed.attack_angle),
-        face_angle: Some(-ed.face_angle),
-        dynamic_loft: Some(ed.dynamic_loft),
-        smash_factor: Some(ed.smash_factor),
-        club_speed_post: Some(Velocity::MetersPerSecond(ed.post_club_speed)),
-        swing_plane_horizontal: Some(-ed.swing_plane_horizontal),
-        swing_plane_vertical: Some(ed.swing_plane_vertical),
-        club_offset: Some(Distance::Meters(ed.club_offset)),
-        club_height: Some(Distance::Meters(ed.club_height)),
-        ..ClubData::default()
-    }
-}
+#[cfg(test)]
+use ironsight as iron;
+#[cfg(test)]
+mod scenario;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use flighthook::{
+        ActorStatus, Distance, FlighthookEvent, FlighthookMessage, Launch, MevoConfig, ShotKey,
+        SpinSource, Velocity,
+    };
+    use flightrelay::config::{ConfigError, DriverConfig};
+    use flightrelay::driver::{
+        ConnectCtx, DeviceCommand, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
+        NoAction,
+    };
+    use ironsight::protocol::shot::{FlightResult as D4, FlightResultV1};
+    use ironsight::testing::{Shot, fixtures};
+    use serde_json::{Value, json};
+    use tokio::sync::broadcast;
+
+    use super::scenario::{Bench, Model, play, section};
     use super::*;
-    use crate::test_ball::Ball;
-    use ironsight::protocol::TYPE_CLUB_RESULT;
-    use ironsight::protocol::shot::ClubResult;
-    use ironsight::testing::{FakeDevice, Shot, fixtures};
+    use crate::actors::scripted::Handoff;
+    use crate::actors::{Actor, ReconfigureOutcome};
+    use crate::bus::BusSender;
+    use crate::state::{GameStateWriter, SystemState};
 
-    // The conversions and spin rules under test, on a test shot block: the
-    // launch and the device's flight values side by side.
+    // -- The equivalence harness ---------------------------------------------
 
-    fn ball_from_d4(d4: &FlightResult) -> Ball {
-        let (launch, flight) = shot_from_d4(d4);
-        Ball::of(Some(&launch), Some(&flight))
+    /// The bus messages and export lines of flighthook ec53ba6's Mevo actor
+    /// (its own session code on ironsight 0.6.0) for each model's script
+    /// ([`play`]), recorded with this module's scripted device.
+    fn recorded(model: Model) -> (&'static str, &'static str) {
+        match model {
+            Model::MevoPlus => (
+                include_str!("../../testdata/mevo_old_mevo_plus_session.jsonl"),
+                include_str!("../../testdata/mevo_old_mevo_plus_export.jsonl"),
+            ),
+            Model::Gen2 => (
+                include_str!("../../testdata/mevo_old_gen2_session.jsonl"),
+                include_str!("../../testdata/mevo_old_gen2_export.jsonl"),
+            ),
+            Model::Xi => (
+                include_str!("../../testdata/mevo_old_xi_session.jsonl"),
+                include_str!("../../testdata/mevo_old_xi_export.jsonl"),
+            ),
+        }
     }
 
-    fn ball_from_e8(e8: &FlightResultV1) -> Ball {
-        let (launch, flight) = shot_from_e8(e8);
-        Ball::of(Some(&launch), Some(&flight))
+    fn lines(text: &str) -> Vec<Value> {
+        text.lines()
+            .map(|l| serde_json::from_str(l).expect("a recorded line"))
+            .collect()
     }
 
-    fn launch_only_spin(b: &Ball, rpm_per_mph: f64, mode: ShotDetectionMode) -> Option<i32> {
-        super::launch_only_spin(&b.launch(), rpm_per_mph, mode)
-    }
-
-    fn estimate_launch_only_spin(
-        b: &mut Ball,
-        d4: &FlightResult,
-        rpm_per_mph: f64,
-        mode: ShotDetectionMode,
-    ) -> bool {
-        let (mut launch, mut flight) = (b.launch(), b.flight());
-        let estimated =
-            super::estimate_launch_only_spin(&mut launch, &mut flight, d4, rpm_per_mph, mode);
-        *b = Ball::of(Some(&launch), flight.as_ref());
-        estimated
-    }
-
-    /// Apply `spin` to the launch of `b`.
-    fn apply_spin(spin: XiSpin, b: &mut Ball) {
-        let mut launch = b.launch();
-        spin.apply(&mut launch);
-        *b = Ball::of(Some(&launch), b.flight().as_ref());
-    }
-
-    /// The shot block the `Launch` and `FlightResult` events in `events`
-    /// carry, with the launch's simulated values.
-    fn ball_of(
-        events: impl IntoIterator<Item = FlighthookEvent>,
-    ) -> Option<(Ball, Option<flighthook::DerivedFlight>)> {
-        let mut launch = None;
-        let mut flight = None;
-        let mut sim = None;
-        for event in events {
-            match event {
-                FlighthookEvent::Launch {
-                    launch: l, derived, ..
-                } => {
-                    launch = Some(*l);
-                    sim = derived.map(|d| *d);
-                }
-                FlighthookEvent::FlightResult { flight: f, .. } => flight = Some(*f),
-                _ => {}
+    /// `messages` with their shot and group ids numbered in order of
+    /// appearance (the ids are random), the scripted device's local port
+    /// taken out of the Xi's device id, and each shot's raw frames taken
+    /// out (compared on their own).
+    fn normalized(mut messages: Vec<Value>) -> (Vec<Value>, Vec<Vec<Value>>) {
+        let mut ids: HashMap<String, String> = HashMap::new();
+        let mut raws = Vec::new();
+        for m in &mut messages {
+            scrub(m, &mut ids);
+            let at = if m.pointer("/event/raw").is_some() {
+                "/event/raw"
+            } else {
+                "/raw"
+            };
+            if let Some(raw) = m.pointer_mut(at)
+                && raw.is_object()
+            {
+                raws.push(raw["frames"].as_array().cloned().unwrap_or_default());
+                *raw = json!({ "transport": raw["transport"] });
             }
         }
-        let launch = launch?;
-        Some((Ball::of(Some(&launch), flight.as_ref()), sim))
+        (messages, raws)
     }
 
-    #[test]
-    fn xi_chipping_and_putting_share_a_session() {
-        use ShotDetectionMode::{Chipping, Full, Putting};
-        let s = SessionConfig::default();
-        let xi = DeviceModel::Xi;
-        assert!(!changes_wire(xi, &s, &Chipping, &Putting));
-        assert!(!changes_wire(xi, &s, &Putting, &Chipping));
-        assert!(changes_wire(xi, &s, &Full, &Chipping));
-        assert!(changes_wire(xi, &s, &Putting, &Full));
-        assert!(changes_wire(DeviceModel::Mevo, &s, &Chipping, &Putting));
-        assert_eq!(wire_label(xi, &s, &Putting), "pitching limited-flight(9)");
-        assert_eq!(wire_label(DeviceModel::Mevo, &s, &Putting), "putting(3)");
-    }
-
-    /// Xi shot with club data: D4 back/side 7127/-652 rpm, E8 backspin 7157 rpm.
-    fn shot_with_club_data() -> (FlightResult, FlightResultV1) {
-        (
-            FlightResult::decode(fixtures::XI_SHOT_D4).unwrap(),
-            FlightResultV1::decode(fixtures::XI_SHOT_E8).unwrap(),
-        )
-    }
-
-    /// Xi shot without club data: D4 back/side 2756/1464 rpm, E8 backspin 6897 rpm.
-    fn shot_without_club_data() -> (FlightResult, FlightResultV1) {
-        (
-            FlightResult::decode(fixtures::XI_DRAW_D4).unwrap(),
-            FlightResultV1::decode(fixtures::XI_DRAW_E8).unwrap(),
-        )
-    }
-
-    #[test]
-    fn xi_spin_uses_d4_axis_with_club_data() {
-        let (d4, e8) = shot_with_club_data();
-        assert_eq!((d4.backspin_rpm, d4.sidespin_rpm), (7127, -652));
-        assert_eq!(e8.backspin_rpm, 7157);
-        let (spin, label) = xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8));
-        let Some(XiSpin::Components(back, side)) = spin else {
-            panic!("not split: {spin:?}");
-        };
-        assert_eq!(label, "E8 total, D4 axis");
-        // Same axis as D4 (sidespin negated for FRP), total from E8.
-        assert_eq!((back, side), (7127, 652));
-        let total = f64::from(back).hypot(f64::from(side));
-        assert!((total - 7157.0).abs() < 1.0);
-        let axis = f64::from(side).atan2(f64::from(back)).to_degrees();
-        assert!((axis - 5.2).abs() < 0.05, "axis {axis}");
-    }
-
-    /// Without club data the shot has no axis: the E8 total goes out alone.
-    #[test]
-    fn xi_spin_is_the_total_alone_without_club_data() {
-        let (d4, e8) = shot_without_club_data();
-        assert_eq!((d4.backspin_rpm, d4.sidespin_rpm), (2756, 1464));
-        assert_eq!(
-            xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)),
-            (Some(XiSpin::Total(6897)), "E8 total, no axis")
-        );
-        let mut ball = ball_from_d4(&d4);
-        apply_spin(XiSpin::Total(6897), &mut ball);
-        assert_eq!(
-            (
-                ball.backspin_rpm,
-                ball.sidespin_rpm,
-                ball.total_spin_rpm,
-                ball.spin_axis
-            ),
-            (None, None, Some(6897), None)
-        );
-    }
-
-    #[test]
-    fn xi_spin_d4_keeps_d4() {
-        for (d4, e8) in [shot_with_club_data(), shot_without_club_data()] {
-            assert_eq!(
-                xi_spin(SpinSource::D4, ShotDetectionMode::Full, &d4, Some(&e8)),
-                (None, "D4")
-            );
-            assert_eq!(
-                xi_spin(SpinSource::D4, ShotDetectionMode::Full, &d4, None),
-                (None, "D4")
-            );
-            // The shot then carries D4's spin exactly (sidespin negated for FRP).
-            let ball = ball_from_d4(&d4);
-            assert_eq!(ball.backspin_rpm, Some(d4.backspin_rpm));
-            assert_eq!(ball.sidespin_rpm, Some(-d4.sidespin_rpm));
-        }
-    }
-
-    #[test]
-    fn xi_spin_e8_has_no_placeholder_guard() {
-        // A short pitch: the E8 value is used as reported, even below D4's;
-        // `e8` has no placeholder guard.
-        let (mut d4, mut e8) = shot_without_club_data();
-        d4.backspin_rpm = 4000;
-        e8.backspin_rpm = 2500;
-        assert_eq!(
-            xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)).0,
-            Some(XiSpin::Total(2500))
-        );
-    }
-
-    #[test]
-    fn xi_spin_auto_uses_the_mode_at_trigger() {
-        let (d4, e8) = shot_with_club_data();
-        // Triggered in Full, switched to Chipping before the D4 arrived.
-        let mode = shot_mode(Some(ShotDetectionMode::Full), ShotDetectionMode::Chipping);
-        assert_eq!(mode, ShotDetectionMode::Full);
-        assert_eq!(
-            xi_spin(SpinSource::Auto, mode, &d4, Some(&e8)),
-            (
-                Some(XiSpin::Components(7127, 652)),
-                "E8 total, D4 axis (auto)"
-            )
-        );
-        // Triggered in Chipping, switched to Full mid-shot: D4 stays.
-        let mode = shot_mode(Some(ShotDetectionMode::Chipping), ShotDetectionMode::Full);
-        assert_eq!(
-            xi_spin(SpinSource::Auto, mode, &d4, Some(&e8)),
-            (None, "D4 (auto)")
-        );
-        // No trigger seen: the current mode applies.
-        assert_eq!(
-            shot_mode(None, ShotDetectionMode::Putting),
-            ShotDetectionMode::Putting
-        );
-    }
-
-    #[test]
-    fn xi_spin_auto_full_applies_e8_rule() {
-        let (d4, e8) = shot_with_club_data();
-        assert_eq!(
-            xi_spin(SpinSource::Auto, ShotDetectionMode::Full, &d4, Some(&e8)),
-            (
-                Some(XiSpin::Components(7127, 652)),
-                "E8 total, D4 axis (auto)"
-            )
-        );
-    }
-
-    #[test]
-    fn xi_spin_auto_chipping_keeps_d4() {
-        let (d4, e8) = shot_with_club_data();
-        assert_eq!(
-            xi_spin(
-                SpinSource::Auto,
-                ShotDetectionMode::Chipping,
-                &d4,
-                Some(&e8)
-            ),
-            (None, "D4 (auto)")
-        );
-        // Also with no E8 at all -- still a plain D4 passthrough.
-        assert_eq!(
-            xi_spin(SpinSource::Auto, ShotDetectionMode::Chipping, &d4, None),
-            (None, "D4 (auto)")
-        );
-    }
-
-    /// An AVR device info carrying `text`.
-    fn avr_info(text: &str) -> DevInfoResp {
-        DevInfoResp {
-            text: text.to_string(),
-            payload: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn product_and_firmware_from_device_info() {
-        assert_eq!(
-            product_and_firmware(
-                DeviceModel::Mevo,
-                Some(DeviceGen::MevoPlus),
-                &avr_info("0.37   M2 TR 03 Jan 21 2026 11:29:54")
-            ),
-            ("Mevo+".into(), Some("0.37 (Jan 21 2026)".into()))
-        );
-        assert_eq!(
-            product_and_firmware(
-                DeviceModel::Mevo,
-                Some(DeviceGen::Gen2),
-                &avr_info("0.37   M2 TR 03")
-            ),
-            ("Mevo Gen2".into(), Some("0.37".into()))
-        );
-        assert_eq!(
-            product_and_firmware(
-                DeviceModel::Mevo,
-                Some(DeviceGen::Unknown(0x01)),
-                &avr_info("1.02 XY 7 Dec  9 2025 08:00:00")
-            ),
-            ("Mevo".into(), Some("1.02 (Dec 9 2025)".into()))
-        );
-        assert_eq!(
-            product_and_firmware(
-                DeviceModel::Xi,
-                None,
-                &avr_info("2.07    FSCOPE  Apr  2 2018 12:00:00")
-            ),
-            ("Xi".into(), Some("2.07 (Apr 2 2018)".into()))
-        );
-        assert_eq!(
-            product_and_firmware(DeviceModel::Mevo, None, &avr_info("FSCOPE Mar 1 2021")),
-            ("Mevo".into(), Some("built Mar 1 2021".into()))
-        );
-        assert_eq!(
-            product_and_firmware(DeviceModel::Mevo, None, &avr_info("")),
-            ("Mevo".into(), None)
-        );
-        // Nothing but the version and the date reaches the firmware.
-        let (model, firmware) = product_and_firmware(
-            DeviceModel::Mevo,
-            None,
-            &avr_info("0.37   M2 TR 03 Jan 21 2026 11:29:54"),
-        );
-        assert!(!format!("{model} {firmware:?}").contains("M2"));
-    }
-
-    /// The type label of a raw record (`"0xD4"`), as a byte.
-    fn type_of(r: &RawRecord) -> u8 {
-        raw_capture::type_byte(r).expect("typed record")
-    }
-
-    /// A Mevo+ shot, results from the AVR, with identity frames before it
-    /// and one inside it: the export keeps every other frame of the shot
-    /// window, in order, each with its direction, type, source and
-    /// destination, and the identity frames never appear.
-    #[test]
-    fn raw_capture_holds_the_shot_window_without_identity_frames() {
-        use ironsight::BusAddr;
-        use ironsight::protocol::{TYPE_DEV_INFO_RESP, TYPE_SPIN_RESULT, TYPE_STATUS};
-        use ironsight::testing::{avr_status, dev_info};
-
-        let status = avr_status([0x12, 0x34]);
-        let info = dev_info(["0.37   M2 TR 03", "Jan 21 2026", "SERIAL9"]);
-        let mut shot = Shot::new(
-            63,
-            BusAddr::Avr,
-            [
-                (TYPE_FLIGHT_RESULT_V1, fixtures::XI_SHOT_E8.to_vec()),
-                (TYPE_FLIGHT_RESULT, fixtures::XI_SHOT_D4.to_vec()),
-                (TYPE_CLUB_RESULT, fixtures::XI_SHOT_ED.to_vec()),
-                (TYPE_SPIN_RESULT, fixtures::XI_SHOT_EF.to_vec()),
-            ],
-            fixtures::XI_SHOT_ED.to_vec(),
-        );
-        shot.frames.insert(
-            2,
-            ironsight::RawFrame {
-                dest: BusAddr::App,
-                src: BusAddr::Avr,
-                type_id: TYPE_STATUS,
-                payload: status.clone(),
-            },
-        );
-        let device = FakeDevice::new();
-        device.push(BusAddr::Avr, TYPE_STATUS, status.clone());
-        device.push(BusAddr::Avr, TYPE_DEV_INFO_RESP, info.clone());
-        device.push_shot(&shot);
-
-        let mut conn = device.connection();
-        let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
-        let result_raw = attach_raw_capture(&mut conn, "mevo.0", &capture);
-        let mut client = BinaryClient::new(conn);
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let raw = loop {
-            assert!(Instant::now() < deadline, "shot never completed");
-            match client.poll().expect("poll") {
-                Some(BinaryEvent::Trigger) => capture.borrow_mut().mark_trigger(),
-                Some(BinaryEvent::ShotComplete(_)) => break capture.borrow_mut().take(),
-                Some(_) => {}
-                None => std::thread::sleep(Duration::from_millis(1)),
+    /// Number every UUID string under `v`, and write the local address of
+    /// a device id as `<addr>`.
+    fn scrub(v: &mut Value, ids: &mut HashMap<String, String>) {
+        match v {
+            Value::String(s) if s.len() == 36 && s.matches('-').count() == 4 => {
+                let n = ids.len();
+                *s = ids
+                    .entry(s.clone())
+                    .or_insert_with(|| format!("id-{n}"))
+                    .clone();
             }
-        };
+            Value::String(s) if s.contains("(127.0.0.1:") => {
+                let start = s.find("(127.0.0.1:").expect("address");
+                let end = start + s[start..].find(')').expect("closing");
+                s.replace_range(start..=end, "(<addr>)");
+            }
+            Value::Array(a) => a.iter_mut().for_each(|v| scrub(v, ids)),
+            Value::Object(o) => o.values_mut().for_each(|v| scrub(v, ids)),
+            _ => {}
+        }
+    }
 
-        assert_eq!(raw.transport, "flightscope-tcp");
-        assert_eq!(raw.dropped, 0);
-        // Every frame either side sent, less the identity frames, in order.
-        let shown: Vec<(RawDir, u8)> = raw.frames.iter().map(|r| (r.dir, type_of(r))).collect();
-        assert!(shown.iter().all(|(_, t)| !carries_identity(*t)));
-        let rx: Vec<u8> = shown
-            .iter()
-            .filter(|(d, _)| *d == RawDir::Rx)
-            .map(|(_, t)| *t)
-            .collect();
-        let tx: Vec<u8> = shown
-            .iter()
-            .filter(|(d, _)| *d == RawDir::Tx)
-            .map(|(_, t)| *t)
-            .collect();
-        let pushed: Vec<u8> = device
-            .pushed()
-            .iter()
-            .map(|f| f.type_id)
-            .filter(|t| !carries_identity(*t))
-            .collect();
-        let sent: Vec<u8> = device
-            .sent()
-            .iter()
-            .map(|f| f.type_id)
-            .filter(|t| !carries_identity(*t))
-            .collect();
-        assert_eq!(rx, pushed);
-        assert_eq!(tx, sent);
-        assert!(!tx.is_empty());
-        // The trigger text is pre-roll; every later frame came after it.
-        assert!(raw.frames[0].t_ms <= 0);
-        assert!(raw.frames[1..].iter().all(|r| r.t_ms >= 0));
-        // Received frames come from the device's node that sent them to the
-        // app, sent frames from the app, each with the hex the device saw.
-        let mut sent_hex = device
-            .sent()
+    fn kind(m: &Value) -> &str {
+        m["event"]["kind"].as_str().unwrap_or("")
+    }
+
+    fn status_message(status: &str, telemetry: Value) -> Value {
+        json!({ "actor": "mevo.0", "event": { "kind": "actor_status", "status": status, "telemetry": telemetry } })
+    }
+
+    /// `messages` without a `device_telemetry` that repeats the telemetry
+    /// already published (the old actor sent its whole map at every
+    /// keepalive; the driver sends what changed, and the card publishes the
+    /// merged map).
+    fn without_repeats(messages: Vec<Value>) -> Vec<Value> {
+        let mut last: Option<Value> = None;
+        messages
             .into_iter()
-            .filter(|f| !carries_identity(f.type_id))
-            .map(|f| hex_lower(&f.payload));
-        let mut pushed_src = device
-            .pushed()
-            .into_iter()
-            .filter(|f| !carries_identity(f.type_id))
-            .map(|f| f.src.to_string());
-        for r in &raw.frames {
-            match r.dir {
-                RawDir::Rx => {
-                    assert_eq!(r.src, pushed_src.next());
-                    assert_eq!(r.dst.as_deref(), Some("APP"));
+            .filter(|m| {
+                if kind(m) != "device_telemetry" || m["event"].get("model").is_some() {
+                    return true;
                 }
-                RawDir::Tx => {
-                    assert_eq!(r.src.as_deref(), Some("APP"));
-                    assert_eq!(r.dst.as_deref(), Some("AVR"));
-                    assert_eq!(r.hex, sent_hex.next());
-                }
-            }
-        }
-        assert!(!result_raw.borrow().d4.is_empty());
-        assert!(!result_raw.borrow().e8.is_empty());
-        let results: Vec<_> = raw
-            .frames
-            .iter()
-            .filter(|r| matches!(raw_capture::type_byte(r), Some(0xD4 | 0xE8)))
-            .collect();
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.src.as_deref() == Some("AVR")));
-
-        // No identity: neither the status nor the device info payload, nor
-        // the serial text, is anywhere in the export.
-        let json = serde_json::to_string(&raw).expect("ser");
-        assert!(!json.contains(&hex_lower(&status)));
-        assert!(!json.contains(&hex_lower(&info)));
-        assert!(!json.contains(&hex_lower(b"SERIAL9")));
-    }
-
-    /// The export keeps exactly what ironsight does not classify as
-    /// identity-bearing, and charges exactly its bulk shot data to the byte
-    /// budget. A record without a type is excluded.
-    #[test]
-    fn export_follows_ironsight_classification() {
-        let rec = |t: u8| RawRecord {
-            r#type: Some(raw_capture::type_label(t)),
-            ..RawRecord::binary(RawDir::Rx, &[])
-        };
-        for t in 0..=255u8 {
-            assert_eq!(export_excluded(&rec(t)), carries_identity(t), "0x{t:02X}");
-            assert_eq!(export_bulk(&rec(t)), is_bulk_shot_data(t), "0x{t:02X}");
-        }
-        assert!(export_excluded(&RawRecord::binary(RawDir::Rx, &[])));
-        assert!(!export_excluded(&rec(TYPE_FLIGHT_RESULT)));
-        assert!(!export_bulk(&rec(TYPE_FLIGHT_RESULT)));
-    }
-
-    /// The sensor activation exchange (0x90 out, 0x89 back) carries a
-    /// per-device certificate and never reaches a shot export.
-    #[test]
-    fn export_skips_sensor_activation() {
-        use ironsight::protocol::{TYPE_SENSOR_ACT, TYPE_SENSOR_ACT_RESP};
-        let rec = |dir: RawDir, t: u8| RawRecord {
-            r#type: Some(raw_capture::type_label(t)),
-            ..RawRecord::binary(dir, &[t; 8])
-        };
-        let mut capture = RawCapture::new(raw_capture_config());
-        capture.push(rec(RawDir::Tx, TYPE_SENSOR_ACT));
-        capture.push(rec(RawDir::Rx, TYPE_SENSOR_ACT_RESP));
-        capture.mark_trigger();
-        capture.push(rec(RawDir::Tx, TYPE_SENSOR_ACT));
-        capture.push(rec(RawDir::Rx, TYPE_SENSOR_ACT_RESP));
-        capture.push(rec(RawDir::Rx, TYPE_FLIGHT_RESULT));
-        let raw = capture.take();
-        let types: Vec<u8> = raw
-            .frames
-            .iter()
-            .filter_map(raw_capture::type_byte)
-            .collect();
-        assert_eq!(types, [TYPE_FLIGHT_RESULT]);
-        assert_eq!(raw.dropped, 0);
-    }
-
-    #[test]
-    fn xi_spin_is_the_total_alone_without_d4_backspin() {
-        let (mut d4, e8) = shot_with_club_data();
-        assert!(d4.clubhead_speed > 0.0);
-        for back in [0, -1200] {
-            d4.backspin_rpm = back;
-            assert_eq!(
-                xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)),
-                (Some(XiSpin::Total(7157)), "E8 total, no axis"),
-                "D4 backspin {back}"
-            );
-        }
-    }
-
-    #[test]
-    fn xi_spin_keeps_d4_without_e8_spin() {
-        let (d4, mut e8) = shot_with_club_data();
-        assert_eq!(
-            xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, None),
-            (None, "D4 (no E8 spin)")
-        );
-        e8.backspin_rpm = 0;
-        assert_eq!(
-            xi_spin(SpinSource::E8, ShotDetectionMode::Full, &d4, Some(&e8)),
-            (None, "D4 (no E8 spin)")
-        );
-    }
-
-    /// D4 landing lateral and E8 lateral carry the azimuth's sign
-    /// (positive = left), so FRP's carry offline is their negation. This Xi
-    /// shot launched left (FRP azimuth -8.14) and landed left.
-    #[test]
-    fn carry_offline_is_the_negated_wire_lateral() {
-        let (d4, e8) = shot_with_club_data();
-        let ball = ball_from_d4(&d4);
-        assert_eq!(ball.launch_azimuth, Some(-d4.launch_azimuth));
-        assert!(ball.launch_azimuth.unwrap() < 0.0);
-        let offline = ball.carry_offline.expect("offline").as_meters();
-        assert!((offline - -d4.landing_position[2]).abs() < 1e-12);
-        assert!(offline < 0.0, "{offline}");
-
-        let ball = ball_from_e8(&e8);
-        let offline = ball.carry_offline.expect("offline").as_meters();
-        assert!((offline - -e8.lateral).abs() < 1e-12);
-        assert!(offline < 0.0, "{offline}");
-    }
-
-    #[test]
-    fn d4_carry_offline_follows_the_wire_sign() {
-        let (mut d4, mut e8) = shot_with_club_data();
-        d4.landing_position[2] = -4.25;
-        e8.lateral = -3.5;
-        let d4_offline = ball_from_d4(&d4).carry_offline;
-        let e8_offline = ball_from_e8(&e8).carry_offline;
-        assert_eq!(d4_offline, Some(Distance::Meters(4.25)));
-        assert_eq!(e8_offline, Some(Distance::Meters(3.5)));
-    }
-
-    /// Descent angle from the D4 landing velocity: angle below horizontal of
-    /// `[forward, vertical, lateral]`.
-    #[test]
-    fn d4_descent_angle_from_landing_velocity() {
-        let (d4, _) = shot_with_club_data();
-        let [fwd, up, side] = d4.landing_velocity;
-        assert!(up < 0.0);
-        let want = (-up).atan2(fwd.hypot(side)).to_degrees();
-        let got = ball_from_d4(&d4).descent_angle.expect("descent");
-        assert!((got - want).abs() < 1e-12);
-        assert!((got - 39.25).abs() < 0.01, "{got}");
-
-        let steep = descent_angle([20.0, -20.0, 0.0]).expect("descending");
-        assert!((steep - 45.0).abs() < 1e-12, "{steep}");
-        let sideways = descent_angle([0.0, -10.0, 10.0]).expect("descending");
-        assert!((sideways - 45.0).abs() < 1e-12, "{sideways}");
-        // Still rising, level, or not a number: no descent.
-        assert_eq!(descent_angle([20.0, 1.0, 0.0]), None);
-        assert_eq!(descent_angle([20.0, 0.0, 0.0]), None);
-        assert_eq!(descent_angle([f64::NAN, -1.0, 0.0]), None);
-    }
-
-    /// A ball that did not fly has no landing: no offline or descent.
-    #[test]
-    fn no_landing_fields_without_a_flight() {
-        let (d4, e8) = shot_with_club_data();
-        for (carry, time, apex) in [(0.0, 4.0, 13.0), (85.0, 0.0, 13.0), (85.0, 4.0, 0.0)] {
-            let mut d = d4.clone();
-            (d.carry_distance, d.flight_time, d.max_height) = (carry, time, apex);
-            let ball = ball_from_d4(&d);
-            assert_eq!(ball.carry_offline, None, "{carry} {time} {apex}");
-            assert_eq!(ball.descent_angle, None, "{carry} {time} {apex}");
-
-            let mut e = e8.clone();
-            (e.distance, e.flight_time, e.height) = (carry, time, apex);
-            assert_eq!(
-                ball_from_e8(&e).carry_offline,
-                None,
-                "{carry} {time} {apex}"
-            );
-        }
-        // E8 has no landing velocity, so never a descent angle.
-        assert_eq!(ball_from_e8(&e8).descent_angle, None);
-    }
-
-    /// The Mevo reports spin components only; total and axis are left to the
-    /// shot metrics.
-    #[test]
-    fn mevo_sends_spin_components_only() {
-        let (d4, e8) = shot_with_club_data();
-        for ball in [ball_from_d4(&d4), ball_from_e8(&e8)] {
-            assert_eq!(ball.total_spin_rpm, None);
-            assert_eq!(ball.spin_axis, None);
-        }
-    }
-
-    /// The Xi's result acks are tx frames like any other: sent through the
-    /// connection, they reach the export with the hex ironsight sent,
-    /// directed APP to AVR, after the result they ack.
-    #[test]
-    fn raw_capture_records_xi_result_acks() {
-        use ironsight::{BusAddr, seq};
-
-        let device = FakeDevice::new();
-        device.push(BusAddr::Avr, TYPE_FLIGHT_RESULT_V1, fixtures::XI_CHIP_E8);
-        device.push(BusAddr::Avr, TYPE_FLIGHT_RESULT, fixtures::XI_SHOT_D4);
-        let mut conn = device.connection();
-        let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
-        let _ = attach_raw_capture(&mut conn, "mevo.0", &capture);
-        capture.borrow_mut().mark_trigger();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut acks = Vec::new();
-        while acks.len() < 2 {
-            assert!(Instant::now() < deadline, "results never arrived");
-            if let Some(env) = conn.recv().expect("recv") {
-                let ack = seq::result_ack(DeviceModel::Xi, &env).expect("result ack");
-                let seq::Action::Send(cmd, dest) = &ack;
-                let frame = cmd.encode(*dest);
-                acks.push((frame.type_id, hex_lower(&frame.payload)));
-                seq::send_action(&mut conn, ack).expect("send");
-            }
-        }
-
-        let raw = capture.borrow_mut().take();
-        let got: Vec<(RawDir, u8, &str, &str, &str)> = raw
-            .frames
-            .iter()
-            .map(|r| {
-                (
-                    r.dir,
-                    type_of(r),
-                    r.src.as_deref().unwrap_or(""),
-                    r.dst.as_deref().unwrap_or(""),
-                    r.hex.as_deref().unwrap_or(""),
-                )
+                let t = m["event"]["telemetry"].clone();
+                let repeat = last.as_ref() == Some(&t);
+                last = Some(t);
+                !repeat
             })
-            .collect();
-        use RawDir::{Rx, Tx};
-        let (e8, d4) = (
-            hex_lower(fixtures::XI_CHIP_E8),
-            hex_lower(fixtures::XI_SHOT_D4),
-        );
-        assert_eq!(
-            got,
-            [
-                (Rx, TYPE_FLIGHT_RESULT_V1, "AVR", "APP", e8.as_str()),
-                (Tx, acks[0].0, "APP", "AVR", acks[0].1.as_str()),
-                (Rx, TYPE_FLIGHT_RESULT, "AVR", "APP", d4.as_str()),
-                (Tx, acks[1].0, "APP", "AVR", acks[1].1.as_str()),
-            ]
-        );
+            .collect()
     }
 
-    /// The Xi connection through the client: what ironsight sends during the
-    /// handshake, among it the DSP power-mode write, and the device's
-    /// replies are recorded for the export, each with its direction, source,
-    /// destination and hex, except the frames that carry identity.
-    #[test]
-    fn raw_capture_records_the_xi_handshake_without_identity() {
-        let device = FakeDevice::xi();
-        let mut conn = device.connection();
-        let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
-        let _ = attach_raw_capture(&mut conn, "mevo.0", &capture);
-        capture.borrow_mut().mark_trigger();
-        let mut client = BinaryClient::new(conn);
-        client.handshake();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            assert!(Instant::now() < deadline, "no handshake");
-            match client.poll().expect("poll") {
-                Some(BinaryEvent::Handshake(h)) => {
-                    assert_eq!(h.model, DeviceModel::Xi);
-                    break;
+    /// The card text of `model` on ironsight's driver: the identity's
+    /// label (manufacturer and model; the Xi's own label is "Xi").
+    fn device_info(model: Model) -> &'static str {
+        match model {
+            Model::MevoPlus => "FlightScope Mevo+",
+            Model::Gen2 => "FlightScope Mevo Gen2",
+            Model::Xi => "Xi",
+        }
+    }
+
+    /// The telemetry map `t` as the driver reports it for `model`: the
+    /// Mevo+'s temperature as its status says (31.0 °C on the scripted
+    /// device; the old actor sent `0.0` until a keepalive), and no
+    /// temperature or power on a Gen2 or Xi, whose status has none.
+    fn telemetry_on_driver(model: Model, t: &mut Value) {
+        let Some(map) = t.as_object_mut() else {
+            return;
+        };
+        match model {
+            Model::MevoPlus => {
+                if map.contains_key("temp_c") {
+                    map.insert("temp_c".into(), json!("31.0"));
                 }
-                Some(_) => {}
-                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+            Model::Gen2 | Model::Xi => {
+                map.remove("temp_c");
+                map.remove("external_power");
             }
         }
+    }
 
-        let raw = capture.borrow_mut().take();
-        assert_eq!(raw.dropped, 0);
-        type Row = (u8, String, String, String);
-        let recorded = |dir: RawDir| -> Vec<Row> {
-            raw.frames
+    /// What the recorded actor's `old` messages for `model` become on
+    /// `DriverActor` with ironsight's driver. Each change is one of design
+    /// §7.3's rows for the Mevo, a rule of `DriverActor` accepted in steps 1
+    /// to 3E, or one of ironsight's flighthook-visible differences accepted
+    /// at its review; the report lists each one.
+    fn expected_from_old(model: Model, old: &[Value]) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        let mut device: Option<Value> = None;
+        let mut session_telemetry = json!({});
+        let mut i = 0;
+        while i < old.len() {
+            let mut m = old[i].clone();
+            if kind(&m) == "device_telemetry" {
+                telemetry_on_driver(model, &mut m["event"]["telemetry"]);
+            }
+            let status = m["event"]["status"].as_str().unwrap_or("").to_owned();
+            let next = old.get(i + 1);
+            match kind(&m) {
+                // §7.3 #8: the driver's connect phases show on the card
+                // while it starts.
+                "actor_status" if status == "starting" => {
+                    out.push(m);
+                    for phase in ["connecting", "handshaking", "configuring"] {
+                        out.push(status_message("starting", json!({ "phase": phase })));
+                    }
+                }
+                // DriverActor: the identity telemetry follows the Connected
+                // status, which carries the identity's card text (ironsight
+                // report #10, see the report), the shot count (steps 1/2)
+                // and removes the connect's phase (§7.3 #8).
+                "device_telemetry" if m["event"].get("model").is_some() => {
+                    device = m.get("device").cloned();
+                    let connected = next.expect("Connected after the identity");
+                    assert_eq!(connected["event"]["status"], "connected");
+                    let mut status = status_message(
+                        "connected",
+                        json!({ "device_info": device_info(model), "shot_count": "0", "phase": "" }),
+                    );
+                    status["device"] = device.clone().expect("device id");
+                    out.push(status);
+                    session_telemetry = m["event"]["telemetry"].clone();
+                    out.push(m);
+                    i += 2;
+                    continue;
+                }
+                // The old actor's empty Connected statuses changed nothing
+                // on the card; the driver's phases take their place: a
+                // reconfigure shows `configuring`, the arm `measuring`, a
+                // trigger nothing (§7.3 #8).
+                "actor_status" if status == "connected" => {
+                    let ready = next.and_then(|n| n["event"]["telemetry"]["ready"].as_str());
+                    let after_trigger = out.last().is_some_and(|l| kind(l) == "shot_trigger");
+                    match ready {
+                        Some(_) if after_trigger => {}
+                        Some("false") => out.push(status_message(
+                            "connected",
+                            json!({ "phase": "configuring" }),
+                        )),
+                        Some("true") => {
+                            out.push(status_message("connected", json!({ "phase": "measuring" })));
+                        }
+                        _ => panic!("unexpected empty Connected at {i}"),
+                    }
+                }
+                // Steps 1/2: the card's shot count follows each finished
+                // shot.
+                "shot_finished" => {
+                    out.push(m);
+                    let shots = out.iter().filter(|m| kind(m) == "shot_finished").count();
+                    out.push(status_message(
+                        "connected",
+                        json!({ "shot_count": shots.to_string() }),
+                    ));
+                }
+                // ironsight report #4 (review: correct, FRP's "send the
+                // other pair when known") and §7.3 #14 for the Xi's E8
+                // split: a launch with backspin and sidespin also carries
+                // the total and the axis.
+                "launch" => {
+                    let launch = &mut m["event"]["launch"];
+                    if launch.get("backspin_rpm").is_some() && launch.get("sidespin_rpm").is_some()
+                    {
+                        let mut l: Launch =
+                            serde_json::from_value(launch.clone()).expect("a launch");
+                        l.complete_spin();
+                        *launch = serde_json::to_value(l).expect("json");
+                    }
+                    out.push(m);
+                }
+                // A message the session cannot decode: ironsight's alert
+                // names the error without the message's bytes (ironsight
+                // review M1).
+                "alert"
+                    if m["event"]["message"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("Could not process message: Wire(")) =>
+                {
+                    m["event"]["message"] = json!(
+                        "Could not process message: wire error: payload too short for AvrStatus: need 25 bytes, got 20"
+                    );
+                    out.push(m);
+                }
+                // Step 2 (accepted): a lost session sends `ready=false` with
+                // the rest of the session's telemetry, then Reconnecting,
+                // then the driver's alert, whose text is the error itself
+                // (ironsight report #9, the SDK's default retry delay).
+                "alert"
+                    if m["event"]["message"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("Device connection error: ")) =>
+                {
+                    let text = m["event"]["message"].as_str().expect("text");
+                    let error = text
+                        .trim_start_matches("Device connection error: ")
+                        .to_owned();
+                    let ready = next.expect("ready=false");
+                    assert_eq!(ready["event"]["telemetry"], json!({ "ready": "false" }));
+                    let lost = old.get(i + 2).expect("Reconnecting");
+                    assert_eq!(lost["event"]["status"], "reconnecting");
+                    let mut telemetry = session_telemetry.clone();
+                    telemetry["ready"] = json!("false");
+                    let mut ready = ready.clone();
+                    ready["event"]["telemetry"] = telemetry;
+                    out.push(ready);
+                    out.push(lost.clone());
+                    m["event"]["message"] = json!(error);
+                    out.push(m);
+                    i += 3;
+                    continue;
+                }
+                "device_telemetry" => {
+                    if let Some(t) = m["event"]["telemetry"].as_object() {
+                        for (k, v) in t {
+                            session_telemetry[k] = v.clone();
+                        }
+                    }
+                    out.push(m);
+                }
+                _ => out.push(m),
+            }
+            i += 1;
+        }
+        // DriverActor: every message from the session's Connected on
+        // carries its device id, statuses and alerts included.
+        if let Some(from) = out.iter().position(|m| m.get("device").is_some()) {
+            for m in &mut out[from..] {
+                m["device"] = device.clone().expect("device id");
+            }
+        }
+        without_repeats(out)
+    }
+
+    /// FRP 0.2.0 (design §3.1): a trigger carries the host time the driver
+    /// saw it at. Taken out of `messages` after checking it lies between
+    /// the moment the script handed the shot to the device and the moment
+    /// the trigger reached the bus (`shot_times`): the time the old actor's
+    /// trigger reached the cameras.
+    fn without_trigger_times(messages: &mut [Value], shot_times: &[(u64, u64)]) {
+        let mut times = shot_times.iter();
+        for m in messages.iter_mut().filter(|m| kind(m) == "shot_trigger") {
+            let at = m["event"]
+                .as_object_mut()
+                .expect("event")
+                .remove("timestamp")
+                .and_then(|t| t.as_u64())
+                .expect("a trigger time");
+            if let Some(&(pushed, arrived)) = times.next() {
+                assert!(
+                    pushed <= at && at <= arrived,
+                    "trigger at {at}, pushed {pushed}, on the bus {arrived}"
+                );
+            }
+        }
+    }
+
+    /// §7.3 #1 and #19: each shot's raw records are the recorded actor's
+    /// minus the device's free text and DSP debug messages, in the same
+    /// order, each labeled `"<type> <src>><dst>"` instead of carrying
+    /// `type`, `src` and `dst`. The pre-roll ring (8 frames) reaches further
+    /// back by as many frames as it no longer holds of those, so the
+    /// recorded frames are the end of the new ones.
+    fn assert_raw_matches(old: &[Vec<Value>], new: &[Vec<Value>]) {
+        assert_eq!(old.len(), new.len(), "shots with raw frames");
+        for (n, (old, new)) in old.iter().zip(new).enumerate() {
+            let audit_only = |f: &&Value| matches!(f["type"].as_str(), Some("0xE3" | "0xF0"));
+            let want: Vec<(String, String, String)> = old
                 .iter()
-                .filter(|r| r.dir == dir)
-                .map(|r| {
-                    (
-                        type_of(r),
-                        r.src.clone().unwrap_or_default(),
-                        r.dst.clone().unwrap_or_default(),
-                        r.hex.clone().unwrap_or_default(),
-                    )
-                })
-                .collect()
-        };
-        let expected = |frames: Vec<ironsight::RawFrame>| -> Vec<Row> {
-            frames
-                .into_iter()
-                .filter(|f| !carries_identity(f.type_id))
+                .filter(|f| !audit_only(f))
                 .map(|f| {
+                    assert!(f.get("label").is_none());
                     (
-                        f.type_id,
-                        f.src.to_string(),
-                        f.dest.to_string(),
-                        hex_lower(&f.payload),
+                        f["dir"].as_str().expect("dir").to_owned(),
+                        format!(
+                            "{} {}>{}",
+                            f["type"].as_str().expect("type").trim_start_matches("0x"),
+                            f["src"].as_str().expect("src"),
+                            f["dst"].as_str().expect("dst")
+                        ),
+                        f["hex"].as_str().unwrap_or("").to_owned(),
                     )
                 })
-                .collect()
-        };
-        let tx = recorded(RawDir::Tx);
-        assert_eq!(tx, expected(device.sent()));
-        assert_eq!(recorded(RawDir::Rx), expected(device.pushed()));
-        // The DSP's power-mode write is among the frames sent to the DSP.
-        assert!(tx.iter().any(|(t, src, dst, _)| {
-            *t == ironsight::protocol::TYPE_PARAM_VALUE && src == "APP" && dst == "DSP"
-        }));
-        // Identity frames were exchanged but are not recorded.
-        assert!(device.sent().iter().any(|f| carries_identity(f.type_id)));
-        assert!(raw.frames.iter().all(|r| !carries_identity(type_of(r))));
+                .collect();
+            let got: Vec<(String, String, String)> = new
+                .iter()
+                .map(|f| {
+                    assert!(
+                        f.get("type").is_none()
+                            && f.get("src").is_none()
+                            && f.get("channel").is_none(),
+                        "shot {n}: {f}"
+                    );
+                    (
+                        f["dir"].as_str().expect("dir").to_owned(),
+                        f["label"].as_str().expect("label").to_owned(),
+                        f["hex"].as_str().unwrap_or("").to_owned(),
+                    )
+                })
+                .collect();
+            let left_out = old
+                .iter()
+                .filter(|f| audit_only(f) && f["t_ms"].as_i64().is_some_and(|t| t < 0))
+                .count();
+            assert!(
+                got.len() >= want.len() && got.len() - want.len() <= left_out,
+                "shot {n}: {} frames for {} recorded",
+                got.len(),
+                want.len()
+            );
+            assert_eq!(got[got.len() - want.len()..], want[..], "shot {n}");
+        }
     }
 
-    /// Three Xi chips: a non-read, a read, then a non-read.
-    fn xi_chips() -> Vec<Shot> {
-        vec![Shot::xi_no_read(), Shot::xi_chip(), Shot::xi_no_read()]
+    /// Design §7.2's equivalence harness, per model: the recorded Mevo
+    /// actor and the card on ironsight's driver, fed the same scripted
+    /// device and the same game events, put the same messages on the bus
+    /// and export the same shots, except for the differences
+    /// `expected_from_old` and `without_trigger_times` list and the raw
+    /// records' labels and left-out messages (§7.3 #1, #19).
+    async fn matches_the_recorded_actor(model: Model) {
+        let mut bench = Bench::start(model, section(model), |s| {
+            Box::new(MevoActor::new(s.clone()))
+        });
+        play(&mut bench, model);
+        let (old_bus, old_export) = recorded(model);
+
+        let (old, old_raws) = normalized(lines(old_bus));
+        let (mut new, new_raws) = normalized(
+            bench
+                .seen
+                .iter()
+                .map(|m| serde_json::to_value(m).expect("json"))
+                .collect(),
+        );
+        without_trigger_times(&mut new, &bench.shot_times);
+        let new = without_repeats(new);
+        let expected = expected_from_old(model, &old);
+        for (n, (want, got)) in expected.iter().zip(&new).enumerate() {
+            assert_eq!(got, want, "{model:?} message {n}");
+        }
+        assert_eq!(
+            new.len(),
+            expected.len(),
+            "{model:?}: {:?}",
+            new.iter().map(kind).collect::<Vec<_>>()
+        );
+        assert_raw_matches(&old_raws, &new_raws);
+
+        // The export: the same lines but for the time, the launch's total
+        // and axis (as on the bus; the metrics derived them before) and the
+        // raw records (compared above).
+        let config = bench.state.system.snapshot();
+        let export = crate::actors::web::tests::export_lines(&config, &bench.seen).await;
+        let (old_export, old_export_raws) = normalized(lines(old_export));
+        let (new_export, new_export_raws) = normalized(
+            export
+                .iter()
+                .map(|l| serde_json::from_str(l).expect("json"))
+                .collect(),
+        );
+        assert_eq!(new_export.len(), old_export.len());
+        for (mut want, got) in old_export.into_iter().zip(new_export) {
+            want["time"] = got["time"].clone();
+            if let Some(metrics) = want
+                .pointer_mut("/data/metrics")
+                .and_then(Value::as_object_mut)
+                && let (Some(total), Some(axis)) = (
+                    metrics.remove("total_spin_rpm"),
+                    metrics.remove("spin_axis"),
+                )
+            {
+                want["data"]["launch"]["total_spin_rpm"] = total;
+                want["data"]["launch"]["spin_axis"] = axis;
+            }
+            assert_eq!(got, want, "{model:?}");
+        }
+        assert_raw_matches(&old_export_raws, &new_export_raws);
     }
 
-    /// Replay `shots` from a fake `model` through the client and the actor's
-    /// shot handlers, as the run loop drives them, and return every bus
-    /// message.
-    ///
-    /// Shot `i` of `shots` is shot number `i + 1`.
-    fn replay(
-        state: &SystemState,
-        model: DeviceModel,
-        shots: &[Shot],
-        use_estimated: bool,
-    ) -> Vec<FlighthookMessage> {
-        let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel(1024);
-        let sender = BusSender::new("mevo.0".into(), bus_tx, Arc::default());
-        let device = FakeDevice::new();
-        let mut conn = device.connection();
-        let capture = Rc::new(RefCell::new(RawCapture::new(raw_capture_config())));
-        let result_raw = attach_raw_capture(&mut conn, "mevo.0", &capture);
-        let mut client = BinaryClient::new(conn);
-        let device_id = Some(format!("{} (test)", model.label()));
-        let ctx = ShotContext {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mevo_plus_card_matches_the_recorded_actor() {
+        matches_the_recorded_actor(Model::MevoPlus).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gen2_card_matches_the_recorded_actor() {
+        matches_the_recorded_actor(Model::Gen2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_xi_card_matches_the_recorded_actor() {
+        matches_the_recorded_actor(Model::Xi).await;
+    }
+
+    // -- A replayed device ----------------------------------------------------
+
+    /// What a replayed device does next.
+    enum Step {
+        /// These events, in one poll.
+        Emit(Vec<FrpEvent>),
+        /// Nothing, until the flag is set.
+        Hold(Arc<AtomicBool>),
+    }
+
+    /// Replays waiting for a driver, by the card's `address`: each test
+    /// runs with its own (see [`Handoff`]).
+    static REPLAYS: Handoff<String, Vec<Step>> = Handoff::new();
+
+    /// A FlightScope driver that replays a list of events as ironsight's
+    /// session emits them: for the card's own processing of events the
+    /// scripted device cannot produce (a launch-only chip, a device total).
+    struct ReplayMevo {
+        config: MevoConfig,
+        steps: VecDeque<Step>,
+    }
+
+    struct ReplaySession {
+        identity: DeviceIdentity,
+        steps: VecDeque<Step>,
+    }
+
+    impl DeviceDriver for ReplayMevo {
+        type Config = MevoConfig;
+        type Error = ironsight::driver::Error;
+        type Action = NoAction;
+        type Session = ReplaySession;
+        const STOP_WAIT: Duration = Mevo::STOP_WAIT;
+
+        fn info(config: &MevoConfig) -> DriverInfo {
+            Mevo::info(config)
+        }
+
+        fn new(config: MevoConfig) -> Result<Self, ConfigError> {
+            config.validate()?;
+            let steps = REPLAYS
+                .take(&config.address.clone().unwrap_or_default())
+                .unwrap_or_default();
+            Ok(Self {
+                config,
+                steps: steps.into(),
+            })
+        }
+
+        fn config(&self) -> &MevoConfig {
+            &self.config
+        }
+
+        fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ReplaySession, Self::Error> {
+            ctx.tick()?;
+            Ok(ReplaySession {
+                identity: DeviceIdentity::new("FS M2-REPLAY")
+                    .with_manufacturer("FlightScope")
+                    .with_model("Mevo+"),
+                steps: std::mem::take(&mut self.steps),
+            })
+        }
+
+        fn apply_config(&mut self, new: &MevoConfig) {
+            self.config = new.clone();
+        }
+    }
+
+    impl DeviceSession for ReplaySession {
+        type Driver = ReplayMevo;
+
+        fn poll(
+            &mut self,
+            timeout: Duration,
+            out: &mut Events<'_>,
+        ) -> Result<(), ironsight::driver::Error> {
+            match self.steps.front() {
+                Some(Step::Emit(_)) => {
+                    if let Some(Step::Emit(events)) = self.steps.pop_front() {
+                        for event in events {
+                            out.frp(event);
+                        }
+                    }
+                }
+                Some(Step::Hold(flag)) if flag.load(Ordering::SeqCst) => {
+                    self.steps.pop_front();
+                }
+                _ => std::thread::sleep(timeout.min(Duration::from_millis(5))),
+            }
+            Ok(())
+        }
+
+        fn command(&mut self, _: &DeviceCommand) -> Result<(), ironsight::driver::Error> {
+            Ok(())
+        }
+
+        fn identity(&self) -> &DeviceIdentity {
+            &self.identity
+        }
+
+        fn close(self, out: &mut Events<'_>) -> Result<(), ironsight::driver::Error> {
+            out.ready(false);
+            Ok(())
+        }
+    }
+
+    impl Hooks<ReplayMevo> for MevoHooks {
+        type Section = MevoSection;
+        const SOURCE: ShotSource = ShotSource::Mevo;
+
+        fn on_frp(&mut self, event: &mut FrpEvent, ctx: &mut HookCtx<'_, MevoSection>) {
+            <Self as Hooks<Mevo>>::on_frp(self, event, ctx);
+        }
+    }
+
+    /// A running replay card (`mevo.0`), the game state it reads and the
+    /// bus.
+    struct Replay {
+        state: Arc<SystemState>,
+        writer: GameStateWriter,
+        actor: Arc<DriverActor<ReplayMevo, MevoHooks>>,
+        sender: BusSender,
+        rx: broadcast::Receiver<FlighthookMessage>,
+        _dir: crate::actors::web::tests::TempDir,
+    }
+
+    /// A card with `section` (its address the replay's key) replaying
+    /// `steps`, the game in `mode`.
+    fn replay(section: MevoSection, mode: ShotDetectionMode, steps: Vec<Step>) -> Replay {
+        REPLAYS.put(section.driver.address.clone().unwrap_or_default(), steps);
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-mevo-replay-{}",
+            crate::state::config::generate_id()
+        ));
+        let (state, writer) = SystemState::new(dir.join("config.toml"));
+        writer.set_mode(mode);
+        state.system.update(|c| {
+            c.mevo.insert("0".into(), section.clone());
+        });
+        let state = Arc::new(state);
+        let (tx, rx) = broadcast::channel(1024);
+        let sender = BusSender::new("mevo.0".into(), tx, Arc::default())
+            .with_provenance(ShotSource::Mevo.provenance());
+        let actor = Arc::new(DriverActor::<ReplayMevo, MevoHooks>::new(section));
+        actor.start(Arc::clone(&state), sender.clone(), sender.subscribe());
+        Replay {
             state,
-            sender: &sender,
-            device_id: &device_id,
-            model,
-            spin_source: SpinSource::E8,
-            launch_only_spin: flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
-            result_raw: &result_raw,
-        };
-        let mode = ShotDetectionMode::Chipping;
+            writer,
+            actor,
+            sender,
+            rx,
+            _dir: crate::actors::web::tests::TempDir(dir),
+        }
+    }
 
-        for (i, shot) in shots.iter().enumerate() {
-            device.push_shot(shot);
-            let mut current: Option<(ShotKey, ShotResults)> = None;
-            let deadline = Instant::now() + Duration::from_secs(10);
+    impl Replay {
+        /// Messages until one matches `want`, within 5 s.
+        fn until(
+            &mut self,
+            mut want: impl FnMut(&FlighthookMessage) -> bool,
+        ) -> Vec<FlighthookMessage> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut seen = Vec::new();
             loop {
-                assert!(Instant::now() < deadline, "shot {i} never completed");
-                match client.poll().expect("poll") {
-                    Some(BinaryEvent::Trigger) => {
-                        capture.borrow_mut().mark_trigger();
-                        let key = ShotKey {
-                            shot_id: format!("chip-{i}"),
-                            shot_number: u32::try_from(i + 1).expect("shot number"),
-                        };
-                        sender.send(stamp_device(
-                            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone())),
-                            &device_id,
-                        ));
-                        current = Some((key, ShotResults::default()));
+                assert!(Instant::now() < deadline, "timed out: {} seen", seen.len());
+                match self.rx.try_recv() {
+                    Ok(m) => {
+                        let done = want(&m);
+                        seen.push(m);
+                        if done {
+                            return seen;
+                        }
                     }
-                    Some(BinaryEvent::ShotDatum(datum)) => {
-                        let (key, results) = current.as_mut().expect("datum before trigger");
-                        on_shot_datum(&ctx, results, key, mode, datum);
-                    }
-                    Some(BinaryEvent::ShotComplete(_)) => {
-                        let raw = capture.borrow_mut().take();
-                        let (key, results) = current.take().expect("complete before trigger");
-                        let shot = CompletedShot { key, mode, raw };
-                        finish_shot(&ctx, shot, results.finish(use_estimated));
-                        break;
-                    }
-                    Some(_) => {}
-                    None => std::thread::sleep(Duration::from_millis(1)),
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
                 }
             }
         }
 
-        let mut out = Vec::new();
-        while let Ok(msg) = bus_rx.try_recv() {
-            out.push(msg);
-        }
-        out
-    }
-
-    /// Event kinds of `messages`, one string per shot (`|`-separated).
-    fn kinds_by_shot(messages: &[FlighthookMessage]) -> Vec<String> {
-        let mut shots: Vec<Vec<&str>> = Vec::new();
-        for msg in messages {
-            let kind = match &msg.event {
-                FlighthookEvent::ShotTrigger { .. } => {
-                    shots.push(Vec::new());
-                    "trigger"
-                }
-                FlighthookEvent::Launch { .. } => "ball",
-                // Counted with its launch, which it follows.
-                FlighthookEvent::FlightResult { .. } => continue,
-                FlighthookEvent::ClubPath { .. } => "club",
-                FlighthookEvent::Alert { .. } => "alert",
-                FlighthookEvent::ShotFinished { .. } => "finished",
-                other => panic!("unexpected {other:?}"),
-            };
-            shots.last_mut().expect("trigger first").push(kind);
-        }
-        shots.into_iter().map(|k| k.join("|")).collect()
-    }
-
-    /// The alert texts in `messages`, all warnings.
-    fn warnings(messages: &[FlighthookMessage]) -> Vec<&str> {
-        messages
-            .iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::Alert { severity, message } => {
-                    assert_eq!(*severity, Severity::Warn);
-                    Some(message.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The club data sent in `messages`.
-    fn club_paths(messages: &[FlighthookMessage]) -> Vec<ClubData> {
-        messages
-            .iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::ClubPath { club, .. } => Some(club.as_ref().clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// [`replay`] on a fresh system state.
-    fn replay_fresh(
-        model: DeviceModel,
-        shots: &[Shot],
-        use_estimated: bool,
-    ) -> Vec<FlighthookMessage> {
-        let dir = std::env::temp_dir().join(format!(
-            "flighthook-mevo-test-{}",
-            crate::state::config::generate_id()
-        ));
-        let (state, _writer) = SystemState::new(dir.join("config.toml"));
-        let messages = replay(&state, model, shots, use_estimated);
-        let _ = std::fs::remove_dir_all(&dir);
-        messages
-    }
-
-    /// The shots `messages` complete, as GSPro's accumulator builds them.
-    fn completed_shots(messages: &[FlighthookMessage]) -> Vec<flighthook::ShotData> {
-        use flighthook::ShotAccumulator;
-
-        let mut sent = Vec::new();
-        let mut acc: Option<ShotAccumulator> = None;
-        for msg in messages {
-            match &msg.event {
-                FlighthookEvent::ShotTrigger { key, .. } => {
-                    acc = Some(ShotAccumulator::new(msg.actor.clone(), key.clone()));
-                }
-                FlighthookEvent::Launch { launch, .. } => {
-                    acc.as_mut().expect("acc").set_launch(*launch.clone(), None);
-                }
-                FlighthookEvent::FlightResult { flight, .. } => {
-                    acc.as_mut().expect("acc").set_flight(*flight.clone());
-                }
-                FlighthookEvent::ClubPath { club, .. } => {
-                    acc.as_mut().expect("acc").set_club(*club.clone());
-                }
-                FlighthookEvent::ShotFinished { .. } => {
-                    if let Some(shot) = acc.take().expect("acc").finish() {
-                        sent.push(shot);
-                    }
-                }
-                _ => {}
-            }
-        }
-        sent
-    }
-
-    #[test]
-    fn shot_results_hold_club_data_until_the_ball_result() {
-        let (d4, e8) = shot_with_club_data();
-        let club = club_from_ed(&ClubResult::decode(fixtures::XI_SHOT_ED).unwrap());
-        let empty_e8 = FlightResultV1::decode(fixtures::XI_NO_READ_E8).unwrap();
-
-        // ED before D4: held, then sent after the D4's ball flight.
-        let mut r = ShotResults {
-            e8: Some(e8.clone()),
-            ..ShotResults::default()
-        };
-        assert!(r.club(club.clone()).is_none());
-        assert!(!d4.is_model_failure());
-        assert!(r.accept_d4().is_some());
-        let (outcome, held) = r.finish(false);
-        assert!(matches!(outcome, ShotOutcome::Measured));
-        assert!(held.is_none());
-
-        // ED after D4: sent at once.
-        let mut r = ShotResults::default();
-        assert!(r.accept_d4().is_none());
-        assert!(r.club(club.clone()).is_some());
-
-        // No D4: club data goes out with the E8 fallback, or alone when
-        // estimated shots are off.
-        let mut r = ShotResults {
-            e8: Some(e8.clone()),
-            ..ShotResults::default()
-        };
-        assert!(r.club(club.clone()).is_none());
-        let (outcome, held) = r.finish(true);
-        assert!(matches!(outcome, ShotOutcome::Estimated(_)));
-        assert!(held.is_some());
-        let mut r = ShotResults {
-            e8: Some(e8),
-            ..ShotResults::default()
-        };
-        r.club(club.clone());
-        let (outcome, held) = r.finish(false);
-        assert!(matches!(outcome, ShotOutcome::Skipped));
-        assert!(held.is_some());
-        let mut r = ShotResults::default();
-        r.club(club.clone());
-        let (outcome, held) = r.finish(true);
-        assert!(matches!(outcome, ShotOutcome::NoFlight));
-        assert!(held.is_some());
-
-        // Empty E8 and no D4: no read, and the club data is dropped,
-        // whether estimated shots are on or off.
-        for use_estimated in [true, false] {
-            let mut r = ShotResults {
-                e8: Some(empty_e8.clone()),
-                ..ShotResults::default()
-            };
-            r.club(club.clone());
-            let (outcome, held) = r.finish(use_estimated);
-            assert!(matches!(outcome, ShotOutcome::NoRead(_)));
-            assert!(held.is_none());
-        }
-
-        // Empty E8 but a D4 with a launch speed: the D4 stands.
-        let mut r = ShotResults {
-            e8: Some(empty_e8),
-            ..ShotResults::default()
-        };
-        r.accept_d4();
-        assert!(matches!(r.finish(true).0, ShotOutcome::Measured));
-    }
-
-    /// Xi chips replayed end to end: the non-reads send no ball flight or
-    /// club data, only an alert, and stay out of `/api/shots` and GSPro but
-    /// in the export; the read (shot 2) decodes to the device's values.
-    #[tokio::test]
-    async fn xi_non_reads_replayed_end_to_end() {
-        use crate::actors::gspro::mapper::map_shot;
-        use crate::actors::web::export::build_export_line;
-        use crate::actors::web::{routes, tests as web};
-
-        let (web_state, _writer, _dir) = web::test_state();
-        let shots = xi_chips();
-        let messages = replay(&web_state.root, DeviceModel::Xi, &shots, true);
-
-        assert_eq!(
-            kinds_by_shot(&messages),
-            [
-                "trigger|alert|finished",
-                "trigger|ball|club|finished",
-                "trigger|alert|finished",
-            ]
-        );
-        assert_eq!(
-            warnings(&messages),
-            [
-                "Shot #1: Xi didn't track the ball (no read)",
-                "Shot #3: Xi didn't track the ball (no read)",
-            ]
-        );
-        // Every shot keeps its raw frames, E8 and ED included.
-        for msg in &messages {
-            if let FlighthookEvent::ShotFinished { raw, .. } = &msg.event {
-                let raw = raw.as_deref().expect("raw");
-                for ty in ["0xE8", "0xED"] {
-                    assert!(raw.frames.iter().any(|r| r.r#type.as_deref() == Some(ty)));
-                }
-            }
-        }
-
-        // GSPro: only shot 2 completes a shot.
-        let sent = completed_shots(&messages);
-        assert_eq!(sent.len(), 1);
-        let shot = &sent[0];
-        assert_eq!(shot.shot_number, 2);
-        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
-        let ball = &Ball::of(shot.launch.as_ref(), shot.flight.as_ref());
-        assert!(shot.launch.is_some() && shot.flight.is_some());
-        assert!(close(ball.launch_speed.unwrap().as_mph(), 40.141_888_3));
-        assert!(close(ball.launch_elevation.unwrap(), 30.948));
-        assert!(close(ball.launch_azimuth.unwrap(), -3.958));
-        assert!(close(
-            ball.carry_distance.unwrap().as_yards(),
-            30.800_524_934
-        ));
-        assert!(close(
-            ball.carry_offline.unwrap().as_yards(),
-            -2.345_800_525
-        ));
-        assert!(close(ball.max_height.unwrap().as_feet(), 15.912_073_491));
-        assert!(close(ball.flight_time.unwrap(), 2.169));
-        assert_eq!(ball.backspin_rpm, Some(4037));
-        assert_eq!(ball.sidespin_rpm, None);
-        let club = shot.club.as_ref().expect("club");
-        assert!(close(club.club_speed.unwrap().as_mph(), 31.093_466));
-        assert!(close(club.face_angle.unwrap(), -5.92));
-        assert!(close(club.dynamic_loft.unwrap(), 46.31));
-        assert!(close(club.smash_factor.unwrap(), 1.29));
-        let gspro = map_shot(shot);
-        assert!(gspro.shot_data_options.contains_ball_data);
-        assert!(close(gspro.ball_data.speed, 40.141_888_3));
-        assert!(close(gspro.club_data.speed, 31.093_466));
-
-        // Web: all three stored for the export, only shot 2 in /api/shots.
-        let events = messages.into_iter().map(|m| m.event).collect();
-        web::feed(&web_state, "mevo.0", events).await;
-        {
-            let stored = web_state.shots.read().await;
-            assert_eq!(stored.len(), 3);
-            for s in stored.iter() {
-                assert_eq!(s.data.has_data(), s.key.shot_number == 2);
-                let line = build_export_line(s, "", None, true);
-                assert!(line.raw.is_some_and(|r| !r.frames.is_empty()));
-                let data = serde_json::to_value(&line.data).expect("json");
-                if s.key.shot_number != 2 {
-                    assert!(data.get("ball").is_none() && data.get("club").is_none());
-                }
-            }
-        }
-        let api = routes::get_shots(
-            axum::extract::State(Arc::new(web_state)),
-            axum::extract::Query(routes::ShotsQuery {
-                limit: 50,
-                units: None,
-            }),
-        )
-        .await;
-        let numbers: Vec<u32> = api.0.iter().map(|s| s.shot_number).collect();
-        assert_eq!(numbers, [2]);
-    }
-
-    /// With estimated shots off the non-reads still alert, and the read
-    /// (E8 only) sends its club data alone.
-    #[test]
-    fn xi_non_reads_alert_with_estimated_shots_off() {
-        let messages = replay_fresh(DeviceModel::Xi, &xi_chips(), false);
-        assert_eq!(
-            kinds_by_shot(&messages),
-            [
-                "trigger|alert|finished",
-                "trigger|club|finished",
-                "trigger|alert|finished",
-            ]
-        );
-    }
-
-    /// Hand `datums` to the shot handlers of a `model` actor as one shot,
-    /// between its trigger and its completion, as the run loop does, and
-    /// return every bus message.
-    fn replay_datums(
-        model: DeviceModel,
-        datums: Vec<ShotDatum>,
-        use_estimated: bool,
-    ) -> Vec<FlighthookMessage> {
-        let dir = std::env::temp_dir().join(format!(
-            "flighthook-mevo-test-{}",
-            crate::state::config::generate_id()
-        ));
-        let (state, _writer) = SystemState::new(dir.join("config.toml"));
-        let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel(1024);
-        let sender = BusSender::new("mevo.0".into(), bus_tx, Arc::default());
-        let device_id = Some(format!("{} (test)", model.label()));
-        let result_raw = RefCell::new(ResultRaw::default());
-        let ctx = ShotContext {
-            state: &state,
-            sender: &sender,
-            device_id: &device_id,
-            model,
-            spin_source: SpinSource::E8,
-            launch_only_spin: flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
-            result_raw: &result_raw,
-        };
-        let mode = ShotDetectionMode::Full;
-        let key = ShotKey {
-            shot_id: "shot".into(),
-            shot_number: 1,
-        };
-        sender.send(stamp_device(
-            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone())),
-            &device_id,
-        ));
-        let mut results = ShotResults::default();
-        for datum in datums {
-            on_shot_datum(&ctx, &mut results, &key, mode, datum);
-        }
-        let raw = RawCapture::new(raw_capture_config()).take();
-        let shot = CompletedShot { key, mode, raw };
-        finish_shot(&ctx, shot, results.finish(use_estimated));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut out = Vec::new();
-        while let Ok(msg) = bus_rx.try_recv() {
-            out.push(msg);
-        }
-        out
-    }
-
-    /// A Mevo shot with a full result and club data with zero club speed
-    /// but a face angle, attack angle, loft and path: the club data is sent
-    /// as decoded, after the ball flight, and reaches GSPro.
-    #[test]
-    fn zero_club_speed_beside_a_d4_sends_the_club_data() {
-        use crate::actors::gspro::mapper::map_shot;
-
-        let mut club = ClubResult::decode(fixtures::XI_SHOT_ED).unwrap();
-        club.pre_club_speed = 0.0;
-        for v in [
-            club.face_angle,
-            club.attack_angle,
-            club.dynamic_loft,
-            club.strike_direction,
-        ] {
-            assert_ne!(v, 0.0);
-        }
-        let d4 = FlightResult::decode(fixtures::XI_SHOT_D4).unwrap();
-        for use_estimated in [false, true] {
-            let messages = replay_datums(
-                DeviceModel::Mevo,
-                vec![ShotDatum::Flight(d4.clone()), ShotDatum::Club(club.clone())],
-                use_estimated,
-            );
-            assert_eq!(kinds_by_shot(&messages), ["trigger|ball|club|finished"]);
-            assert_eq!(club_paths(&messages), [club_from_ed(&club)]);
-
-            let sent = completed_shots(&messages);
-            assert_eq!(sent.len(), 1);
-            let gspro = map_shot(&sent[0]);
-            assert!(gspro.shot_data_options.contains_club_data);
-            assert_eq!(gspro.club_data.speed, 0.0);
-            assert_eq!(gspro.club_data.face_to_target, -club.face_angle);
-            assert_eq!(gspro.club_data.angle_of_attack, club.attack_angle);
-            assert_eq!(gspro.club_data.loft, club.dynamic_loft);
-            assert_eq!(gspro.club_data.path, -club.strike_direction);
+        /// The messages of the next finished shot, up to its end.
+        fn shot(&mut self) -> Vec<FlighthookMessage> {
+            self.until(|m| matches!(m.event, FlighthookEvent::ShotFinished { .. }))
         }
     }
 
-    /// Club data the device sends before the full result goes out right
-    /// after the ball flight, as when it follows it, and GSPro gets both.
-    #[test]
-    fn club_data_before_the_d4_follows_the_ball_flight() {
-        let ed = fixtures::XI_SHOT_ED.to_vec();
-        let club = club_from_ed(&ClubResult::decode(&ed).unwrap());
-        let d4 = (TYPE_FLIGHT_RESULT, fixtures::XI_SHOT_D4.to_vec());
-        let ed_frame = (TYPE_CLUB_RESULT, ed.clone());
-        for results in [
-            vec![ed_frame.clone(), d4.clone()],
-            vec![d4.clone(), ed_frame.clone()],
-        ] {
-            let shot = Shot::new(123, ironsight::BusAddr::Avr, results, ed.clone());
-            let messages = replay_fresh(DeviceModel::Xi, &[shot], false);
-            assert_eq!(kinds_by_shot(&messages), ["trigger|ball|club|finished"]);
-            assert_eq!(club_paths(&messages), std::slice::from_ref(&club));
-            let sent = completed_shots(&messages);
-            assert_eq!(sent.len(), 1);
-            assert!(sent[0].launch.is_some());
-            assert_eq!(sent[0].club.as_ref(), Some(&club));
+    impl Drop for Replay {
+        fn drop(&mut self) {
+            self.actor.stop();
         }
     }
 
-    /// On a Mevo+ or Mevo Gen2 the no-read alert names the Mevo.
-    #[test]
-    fn no_read_alert_names_the_mevo() {
-        for use_estimated in [false, true] {
-            let messages = replay_fresh(DeviceModel::Mevo, &[Shot::xi_no_read()], use_estimated);
-            assert_eq!(kinds_by_shot(&messages), ["trigger|alert|finished"]);
-            assert_eq!(
-                warnings(&messages),
-                ["Shot #1: Mevo didn't track the ball (no read)"]
-            );
+    /// A card section replaying under `key` (an address no other test uses).
+    fn replay_section(key: &str) -> MevoSection {
+        MevoSection {
+            driver: MevoConfig {
+                address: Some(key.into()),
+                ..MevoConfig::default()
+            },
+            ..MevoSection::default()
         }
     }
 
-    /// A synthetic launch-only D4, as the Xi sends on a very short chip:
-    /// 7.019 m/s (15.7 mph) at 22.8 deg, 0.856 deg left, no spin, no carry,
-    /// apex or flight time.
-    fn launch_only_d4() -> FlightResult {
-        FlightResult {
+    fn shot_key(n: u32) -> ShotKey {
+        ShotKey::new(format!("replay-{n}"), n)
+    }
+
+    /// Shot `n` as ironsight's session emits it: the trigger, a hold until
+    /// `go` when given, then `rest`.
+    fn replayed_shot(n: u32, go: Option<Arc<AtomicBool>>, rest: Vec<FrpEvent>) -> Vec<Step> {
+        let mut steps = vec![Step::Emit(vec![FrpEvent::ShotTrigger {
+            key: shot_key(n),
+            timestamp: Some(super::scenario::now_ms()),
+        }])];
+        if let Some(go) = go {
+            steps.push(Step::Hold(go));
+        }
+        steps.push(Step::Emit(rest));
+        steps
+    }
+
+    /// The launch-only Xi chip the old card's pins used: 7.019 m/s (15.7
+    /// mph) at 22.8°, 0.856° left, no spin, no carry, apex or flight time.
+    fn launch_only_d4() -> D4 {
+        D4 {
             total: 1,
             track_time: 0.0,
             start_position: [0.0; 3],
@@ -2813,529 +871,449 @@ mod tests {
         }
     }
 
-    /// A ball with launch data only: `mph` at 22.8 deg, spin `back`/`side`.
-    fn launch_only_ball(mph: f64, back: i32, side: i32) -> Ball {
-        Ball {
-            launch_speed: Some(Velocity::MilesPerHour(mph)),
-            launch_elevation: Some(22.8),
-            launch_azimuth: Some(-0.856),
-            backspin_rpm: Some(back),
-            sidespin_rpm: Some(side),
-            ..Ball::default()
-        }
-    }
-
-    #[test]
-    fn launch_only_spin_scales_with_ball_speed() {
-        let b = launch_only_ball(15.7, 0, 0);
-        assert_eq!(
-            launch_only_spin(&b, 100.0, ShotDetectionMode::Chipping),
-            Some(1570)
-        );
-        assert_eq!(
-            launch_only_spin(&b, 100.0, ShotDetectionMode::Full),
-            Some(1570)
-        );
-        assert_eq!(
-            launch_only_spin(&b, 80.0, ShotDetectionMode::Chipping),
-            Some(1256)
-        );
-        // Rounded to the nearest rpm.
-        let b = launch_only_ball(12.345, 0, 0);
-        assert_eq!(
-            launch_only_spin(&b, 100.0, ShotDetectionMode::Full),
-            Some(1235)
-        );
-        let b = launch_only_ball(12.344, 0, 0);
-        assert_eq!(
-            launch_only_spin(&b, 100.0, ShotDetectionMode::Full),
-            Some(1234)
-        );
-        // The D4 speed in m/s: 7.019 m/s is 15.70 mph.
-        let ball = ball_from_d4(&launch_only_d4());
-        assert_eq!(
-            launch_only_spin(&ball, 100.0, ShotDetectionMode::Chipping),
-            Some(1570)
-        );
-        // Absent spin is no spin reading too.
-        let b = Ball {
+    /// The launch ironsight's session sends for a launch-only full result
+    /// `d4`: its launch with no spin fields, and no flight result.
+    fn launch_only_launch(d4: &D4) -> Launch {
+        assert!(ironsight::driver::convert::launch_only(d4));
+        Launch {
             backspin_rpm: None,
             sidespin_rpm: None,
-            ..launch_only_ball(15.7, 0, 0)
-        };
-        assert_eq!(
-            launch_only_spin(&b, 100.0, ShotDetectionMode::Full),
-            Some(1570)
-        );
+            total_spin_rpm: None,
+            spin_axis: None,
+            ..ironsight::driver::convert::launch(d4)
+        }
     }
 
+    fn launch_of(seen: &[FlighthookMessage]) -> (Launch, Option<flighthook::DerivedFlight>) {
+        seen.iter()
+            .find_map(|m| match &m.event {
+                FlighthookEvent::Launch {
+                    launch, derived, ..
+                } => Some((launch.as_ref().clone(), derived.as_deref().cloned())),
+                _ => None,
+            })
+            .expect("a launch")
+    }
+
+    // -- The card's own processing ------------------------------------------
+
+    /// A shot is simulated in the detection mode at its trigger: a mode
+    /// change between the trigger and the launch (the full result comes
+    /// seconds later) doesn't change where a ground ball rolls (the green in
+    /// Putting, the fairway otherwise).
     #[test]
-    fn launch_only_spin_is_skipped_when_off_putting_or_spinning() {
-        let b = launch_only_ball(15.7, 0, 0);
-        for k in [0.0, -100.0, 1000.5, 1e12, f64::NAN, f64::INFINITY] {
-            assert_eq!(
-                launch_only_spin(&b, k, ShotDetectionMode::Chipping),
-                None,
-                "{k}"
+    fn a_launch_is_simulated_in_the_mode_at_its_trigger() {
+        let ground_ball = || Launch {
+            launch_speed: Some(Velocity::MetersPerSecond(3.0)),
+            launch_elevation: Some(0.0),
+            launch_azimuth: Some(0.0),
+            ..Launch::default()
+        };
+        let total = |key: &str, at_trigger, at_launch| {
+            let go = Arc::new(AtomicBool::new(false));
+            let steps = replayed_shot(
+                1,
+                Some(Arc::clone(&go)),
+                vec![
+                    FrpEvent::launch(shot_key(1), ground_ball()),
+                    FrpEvent::shot_finished(shot_key(1)),
+                ],
             );
-        }
-        assert_eq!(
-            launch_only_spin(&b, 100.0, ShotDetectionMode::Putting),
-            None
-        );
-        for (back, side) in [(900, 0), (0, -150), (900, -150)] {
-            let b = launch_only_ball(15.7, back, side);
-            assert_eq!(
-                launch_only_spin(&b, 100.0, ShotDetectionMode::Chipping),
-                None,
-                "{back} {side}"
-            );
-        }
-        for speed in [0.0, -1.0, f64::NAN] {
-            let b = launch_only_ball(speed, 0, 0);
-            assert_eq!(
-                launch_only_spin(&b, 100.0, ShotDetectionMode::Chipping),
-                None,
-                "{speed}"
-            );
-        }
-        let b = Ball {
-            launch_speed: None,
-            ..launch_only_ball(15.7, 0, 0)
+            let mut card = replay(replay_section(key), at_trigger, steps);
+            card.until(|m| matches!(m.event, FlighthookEvent::ShotTrigger { .. }));
+            card.writer.set_mode(at_launch);
+            go.store(true, Ordering::SeqCst);
+            let (_, derived) = launch_of(&card.shot());
+            derived
+                .and_then(|d| d.total_distance)
+                .expect("a rolled total")
+                .as_meters()
         };
-        assert_eq!(
-            launch_only_spin(&b, 100.0, ShotDetectionMode::Chipping),
-            None
-        );
+        use ShotDetectionMode::{Full, Putting};
+        let green = total("10.1.0.1:5100", Putting, Putting);
+        let fairway = total("10.1.0.2:5100", Full, Full);
+        assert!(green > fairway, "{green} vs {fairway}");
+        assert_eq!(total("10.1.0.3:5100", Putting, Full), green);
+        assert_eq!(total("10.1.0.4:5100", Full, Putting), fairway);
     }
 
-    /// The highest setting gives a large but in-range spin; a product past
-    /// `i32::MAX` is declined, never saturated.
+    /// Design §5.3: a launch-only chip (speed and launch angle, no spin, no
+    /// flight result) gets a backspin of `launch_only_spin` rpm per mph and
+    /// no sidespin, marked as estimated, and the simulation flies it.
     #[test]
-    fn launch_only_spin_never_saturates() {
-        let b = launch_only_ball(15.7, 0, 0);
-        assert_eq!(
-            launch_only_spin(&b, 1000.0, ShotDetectionMode::Chipping),
-            Some(15_700)
-        );
-        let b = launch_only_ball(1e7, 0, 0);
-        assert_eq!(
-            launch_only_spin(&b, 1000.0, ShotDetectionMode::Chipping),
-            None
-        );
-    }
-
-    /// A D4 with any one of carry, flight time or apex is not launch-only,
-    /// even when the others are 0.
-    #[test]
-    fn launch_only_needs_carry_apex_and_flight_time_all_absent() {
-        assert!(launch_only(&launch_only_d4()));
-        let mut absent = launch_only_d4();
-        absent.carry_distance = -1.0;
-        absent.flight_time = f64::NAN;
-        absent.max_height = f64::NEG_INFINITY;
-        assert!(launch_only(&absent));
-        for (carry, time, apex) in [(12.0, 0.0, 0.0), (0.0, 0.9, 0.0), (0.0, 0.0, 0.4)] {
-            let mut d4 = launch_only_d4();
-            d4.carry_distance = carry;
-            d4.flight_time = time;
-            d4.max_height = apex;
-            assert!(!launch_only(&d4), "{carry} {time} {apex}");
-        }
-    }
-
-    /// The estimate unsets the launch-only D4's 0 carry, apex and flight
-    /// time; when it is not applied, the ball keeps them and its spin.
-    #[test]
-    fn estimate_unsets_the_zeros_only_when_applied() {
-        let d4 = launch_only_d4();
-        let mut ball = ball_from_d4(&d4);
-        assert_eq!(ball.carry_distance, Some(Distance::Meters(0.0)));
-        assert!(estimate_launch_only_spin(
-            &mut ball,
-            &d4,
-            100.0,
-            ShotDetectionMode::Chipping
-        ));
-        assert_eq!(ball.carry_distance, None);
-        assert_eq!(ball.max_height, None);
-        assert_eq!(ball.flight_time, None);
-        assert_eq!(ball.carry_offline, None);
-        assert_eq!(ball.descent_angle, None);
-        assert_eq!(ball.backspin_rpm, Some(1570));
-        assert_eq!(ball.sidespin_rpm, Some(0));
-        assert_eq!(ball.launch_elevation, Some(22.8));
-        assert_eq!(ball.launch_azimuth, Some(-0.856));
-
-        // Off, Putting, or a spin the Xi's spin source supplied.
-        let mut spun = ball_from_d4(&d4);
-        spun.backspin_rpm = Some(900);
-        for (mut ball, k, mode) in [
-            (ball_from_d4(&d4), 0.0, ShotDetectionMode::Chipping),
-            (ball_from_d4(&d4), 100.0, ShotDetectionMode::Putting),
-            (spun, 100.0, ShotDetectionMode::Chipping),
-        ] {
-            let before = ball.clone();
-            assert!(
-                !estimate_launch_only_spin(&mut ball, &d4, k, mode),
-                "{k} {mode:?}"
-            );
-            assert_eq!(ball, before, "{k} {mode:?}");
-            assert_eq!(ball.max_height, Some(Distance::Meters(0.0)));
-        }
-    }
-
-    /// A low launch with no spin and no flight (a putt, a bladed shot), or
-    /// any D4 with spin, keeps the reported 0 carry, apex and flight time,
-    /// so the simulation rolls it as a ground ball.
-    #[test]
-    fn d4_without_flight_keeps_its_zeros_below_the_launch_only_angle_or_with_spin() {
-        let mut low = launch_only_d4();
-        low.launch_elevation = 2.0;
-        let mut spinning = launch_only_d4();
-        spinning.backspin_rpm = 900;
-        let mut sidespin = launch_only_d4();
-        sidespin.sidespin_rpm = 120;
-        for d4 in [low, spinning, sidespin] {
-            assert!(!launch_only(&d4));
-            let ball = ball_from_d4(&d4);
-            assert_eq!(ball.carry_distance, Some(Distance::Meters(0.0)));
-            assert_eq!(ball.max_height, Some(Distance::Meters(0.0)));
-            assert_eq!(ball.flight_time, Some(0.0));
-        }
-        let mut edge = launch_only_d4();
-        edge.launch_elevation = LAUNCH_ONLY_MIN_LAUNCH_DEG;
-        assert!(launch_only(&edge));
-        edge.launch_elevation = f64::NAN;
-        assert!(!launch_only(&edge));
-    }
-
-    #[test]
-    fn flown_d4_keeps_its_flight() {
-        let (d4, _) = shot_with_club_data();
-        assert!(!launch_only(&d4));
-        let ball = ball_from_d4(&d4);
-        assert_eq!(
-            ball.carry_distance,
-            Some(Distance::Meters(d4.carry_distance))
-        );
-        assert_eq!(ball.max_height, Some(Distance::Meters(d4.max_height)));
-        assert_eq!(ball.flight_time, Some(d4.flight_time));
-        assert!(ball.carry_offline.is_some());
-        assert!(ball.descent_angle.is_some());
-        assert_eq!(ball.backspin_rpm, Some(d4.backspin_rpm));
-        assert_eq!(ball.sidespin_rpm, Some(-d4.sidespin_rpm));
-    }
-
-    /// Hand `d4` to the D4 handler of a `model` actor whose shot was taken
-    /// in `mode`, and return the ball flight it sends with its simulated
-    /// values. `section` is the live `[mevo.0]`, if any.
-    fn handle_d4(
-        model: DeviceModel,
-        mode: ShotDetectionMode,
-        section: Option<flighthook::MevoSection>,
-        d4: FlightResult,
-    ) -> (Ball, Option<flighthook::DerivedFlight>) {
-        handle_d4_with(model, mode, section, flighthook::SimMode::On, d4)
-    }
-
-    /// [`handle_d4`] with `[simulation] mode = sim`.
-    fn handle_d4_with(
-        model: DeviceModel,
-        mode: ShotDetectionMode,
-        section: Option<flighthook::MevoSection>,
-        sim: flighthook::SimMode,
-        d4: FlightResult,
-    ) -> (Ball, Option<flighthook::DerivedFlight>) {
-        let dir = std::env::temp_dir().join(format!(
-            "flighthook-mevo-test-{}",
-            crate::state::config::generate_id()
-        ));
-        let (state, _writer) = SystemState::new(dir.join("config.toml"));
-        state.system.update(|c| {
-            c.simulation.mode = sim;
-            if let Some(section) = section {
-                c.mevo.insert("0".into(), section);
-            }
-        });
-        let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel(16);
-        let sender = BusSender::new("mevo.0".into(), bus_tx, Arc::default());
-        let device_id = None;
-        let result_raw = RefCell::new(ResultRaw::default());
-        let ctx = ShotContext {
-            state: &state,
-            sender: &sender,
-            device_id: &device_id,
-            model,
-            spin_source: SpinSource::D4,
-            launch_only_spin: flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
-            result_raw: &result_raw,
-        };
-        let key = ShotKey {
-            shot_id: "chip".into(),
-            shot_number: 1,
-        };
-        let mut results = ShotResults::default();
-        on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::Flight(d4));
-        let _ = std::fs::remove_dir_all(&dir);
-        ball_of(std::iter::from_fn(|| bus_rx.try_recv().ok()).map(|m| m.event))
-            .expect("no launch sent")
-    }
-
-    /// What an Xi shot puts on the bus for its spin, and the computed marks
-    /// it carries, for `source` and the D4/E8 pair.
-    fn xi_ball(
-        source: SpinSource,
-        (d4, e8): (FlightResult, FlightResultV1),
-    ) -> (Ball, Vec<flighthook::ShotField>) {
-        let dir = std::env::temp_dir().join(format!(
-            "flighthook-mevo-test-{}",
-            crate::state::config::generate_id()
-        ));
-        let (state, _writer) = SystemState::new(dir.join("config.toml"));
-        let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel(16);
-        let sender = BusSender::new("mevo.0".into(), bus_tx, Arc::default());
-        let device_id = None;
-        let result_raw = RefCell::new(ResultRaw::default());
-        let ctx = ShotContext {
-            state: &state,
-            sender: &sender,
-            device_id: &device_id,
-            model: DeviceModel::Xi,
-            spin_source: source,
-            launch_only_spin: flighthook::MevoSection::DEFAULT_LAUNCH_ONLY_SPIN,
-            result_raw: &result_raw,
-        };
-        let key = ShotKey {
-            shot_id: "e8".into(),
-            shot_number: 1,
-        };
-        let mut results = ShotResults::default();
-        let mode = ShotDetectionMode::Full;
-        on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::FlightV1(e8));
-        on_shot_datum(&ctx, &mut results, &key, mode, ShotDatum::Flight(d4));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (ball, derived) =
-            ball_of(std::iter::from_fn(|| bus_rx.try_recv().ok()).map(|m| m.event))
-                .expect("a launch");
-        (ball, derived.map(|d| d.computed).unwrap_or_default())
-    }
-
-    /// With the Xi's Spin source E8 the spin is the device's reading either
-    /// way, so nothing is marked computed: with club data the E8 total goes
-    /// out split by D4's axis; without it, the total alone, with no axis
-    /// and no components. With D4, D4's spin goes out.
-    #[test]
-    fn an_xi_e8_spin_is_measured_and_has_no_placeholder_axis() {
-        let spin = |b: &Ball| {
-            (
-                b.backspin_rpm,
-                b.sidespin_rpm,
-                b.total_spin_rpm,
-                b.spin_axis,
-            )
-        };
-        let (ball, computed) = xi_ball(SpinSource::E8, shot_with_club_data());
-        assert_eq!(spin(&ball), (Some(7127), Some(652), None, None));
-        assert!(computed.is_empty(), "{computed:?}");
-
-        let (ball, computed) = xi_ball(SpinSource::E8, shot_without_club_data());
-        assert_eq!(spin(&ball), (None, None, Some(6897), None));
-        assert!(computed.is_empty(), "{computed:?}");
-
-        let (ball, computed) = xi_ball(SpinSource::D4, shot_without_club_data());
-        assert_eq!(spin(&ball), (Some(2756), Some(-1464), None, None));
-        assert!(computed.is_empty(), "{computed:?}");
-    }
-
-    /// The Xi's launch-only chip gets the default 100 rpm per mph of
-    /// backspin, no carry, and with the simulation on (the default) flies:
-    /// not a ground ball, with carry, apex, flight time and descent derived.
-    #[test]
-    fn xi_launch_only_chip_flies_with_the_estimated_spin() {
-        for mode in [ShotDetectionMode::Chipping, ShotDetectionMode::Full] {
-            let (ball, derived) = handle_d4(DeviceModel::Xi, mode, None, launch_only_d4());
-            assert_eq!(ball.backspin_rpm, Some(1570));
-            assert_eq!(ball.sidespin_rpm, Some(0));
-            assert_eq!(ball.carry_distance, None);
-            assert_eq!(ball.max_height, None);
-            assert_eq!(ball.flight_time, None);
-            let d = derived.expect("simulated");
-            assert!(d.spin_estimated, "{mode:?}");
-            // 15.7 mph at 22.8 deg with 1570 rpm: about 3.9 yd carry
-            // (3.57 m), 0.38 m apex, 0.56 s, 23 deg descent, 10 yd total.
-            let carry_yd = d.carry_distance.expect("carry").as_yards();
-            assert!((3.5..4.5).contains(&carry_yd), "{carry_yd}");
-            let apex_m = d.max_height.expect("apex").as_meters();
-            assert!((0.3..0.5).contains(&apex_m), "{apex_m}");
-            let time = d.flight_time.expect("flight time");
-            assert!((0.45..0.7).contains(&time), "{time}");
-            let descent = d.descent_angle.expect("descent");
-            assert!((18.0..30.0).contains(&descent), "{descent}");
-            assert!(d.total_distance.expect("total").as_meters() > 3.57);
-            // A flight, not a ground ball's lone tee point.
-            let path = d.path.expect("path");
-            assert!(path.flight.len() >= 2, "{:?}", path.flight);
-            assert!(path.flight.iter().any(|p| p[2] > 0.3), "{:?}", path.flight);
-        }
-    }
-
-    /// Any FlightScope model gets the estimate, and the live section's
-    /// value is used.
-    #[test]
-    fn launch_only_spin_follows_the_live_section() {
-        let section = |k| flighthook::MevoSection {
-            launch_only_spin: k,
-            ..flighthook::MevoSection::default()
-        };
-        let (ball, _) = handle_d4(
-            DeviceModel::Mevo,
-            ShotDetectionMode::Chipping,
-            Some(section(80.0)),
-            launch_only_d4(),
-        );
-        assert_eq!(ball.backspin_rpm, Some(1256));
-        assert_eq!(ball.sidespin_rpm, Some(0));
-    }
-
-    /// With the estimate off, or in Putting mode, a launch-only chip goes out
-    /// as the device sent it: spin 0, carry, apex and flight time 0, rolled
-    /// by the simulation as a ground ball, and not flagged.
-    #[test]
-    fn launch_only_chip_without_the_estimate_is_a_ground_ball() {
-        let off = flighthook::MevoSection {
-            launch_only_spin: 0.0,
-            ..flighthook::MevoSection::default()
-        };
-        for (mode, section) in [
-            (ShotDetectionMode::Chipping, Some(off)),
-            (ShotDetectionMode::Putting, None),
-        ] {
-            let (ball, derived) = handle_d4(DeviceModel::Xi, mode, section, launch_only_d4());
-            assert_eq!(ball.backspin_rpm, Some(0), "{mode:?}");
-            assert_eq!(ball.sidespin_rpm, Some(0), "{mode:?}");
-            assert_eq!(ball.carry_distance, Some(Distance::Meters(0.0)), "{mode:?}");
-            assert_eq!(ball.max_height, Some(Distance::Meters(0.0)), "{mode:?}");
-            assert_eq!(ball.flight_time, Some(0.0), "{mode:?}");
-            let d = derived.expect("rolled");
-            assert!(!d.spin_estimated, "{mode:?}");
-            let path = d.path.expect("path");
-            assert_eq!(path.flight, vec![[0.0; 4]], "{mode:?}");
-            assert!(d.total_distance.expect("total").as_meters() > 0.0);
-        }
-    }
-
-    /// A D4 with a measured carry but apex 0 keeps its carry and gets no
-    /// estimate.
-    #[test]
-    fn d4_with_carry_but_no_apex_keeps_its_carry() {
-        let mut d4 = launch_only_d4();
-        d4.carry_distance = 12.0;
-        d4.flight_time = 0.9;
-        let (ball, derived) = handle_d4(DeviceModel::Xi, ShotDetectionMode::Chipping, None, d4);
-        assert_eq!(ball.carry_distance, Some(Distance::Meters(12.0)));
-        assert_eq!(ball.flight_time, Some(0.9));
-        assert_eq!(ball.max_height, Some(Distance::Meters(0.0)));
-        assert_eq!(ball.backspin_rpm, Some(0));
-        assert!(derived.is_none_or(|d| !d.spin_estimated));
-    }
-
-    /// A low launch with no spin and no flight (a putt) is still rolled as a
-    /// ground ball, in any mode, with no spin added.
-    #[test]
-    fn low_launch_without_flight_is_still_a_ground_ball() {
-        let mut putt = launch_only_d4();
-        putt.launch_speed = 3.0;
-        putt.launch_elevation = 2.0;
-        for mode in [ShotDetectionMode::Putting, ShotDetectionMode::Chipping] {
-            let (ball, derived) = handle_d4(DeviceModel::Xi, mode, None, putt.clone());
-            assert_eq!(ball.backspin_rpm, Some(0), "{mode:?}");
-            assert_eq!(ball.max_height, Some(Distance::Meters(0.0)), "{mode:?}");
-            let d = derived.expect("rolled");
-            assert!(!d.spin_estimated, "{mode:?}");
-            let path = d.path.expect("path");
-            assert_eq!(path.flight, vec![[0.0; 4]], "{mode:?}");
-            assert!(d.total_distance.expect("total").as_meters() > 0.0);
-        }
-    }
-
-    /// With the simulation off, the estimated spin still goes out flagged:
-    /// a derived block that holds only `spin_estimated`.
-    #[test]
-    fn launch_only_chip_flags_its_spin_with_the_simulation_off() {
-        let (ball, derived) = handle_d4_with(
-            DeviceModel::Xi,
-            ShotDetectionMode::Chipping,
+    fn a_launch_only_chip_gets_the_estimated_spin() {
+        let launch = launch_only_launch(&launch_only_d4());
+        let steps = replayed_shot(
+            1,
             None,
-            flighthook::SimMode::Off,
-            launch_only_d4(),
+            vec![
+                FrpEvent::launch(shot_key(1), launch),
+                FrpEvent::shot_finished(shot_key(1)),
+            ],
         );
-        assert_eq!(ball.backspin_rpm, Some(1570));
-        let mut only_the_flag = flighthook::DerivedFlight::default();
-        only_the_flag.spin_estimated = true;
-        assert_eq!(derived, Some(only_the_flag));
+        let mut card = replay(
+            replay_section("10.1.1.1:5100"),
+            ShotDetectionMode::Chipping,
+            steps,
+        );
+        let (launch, derived) = launch_of(&card.shot());
+        // 100 rpm per mph × 15.7 mph.
+        assert_eq!(launch.backspin_rpm, Some(1570));
+        assert_eq!(launch.sidespin_rpm, Some(0));
+        let derived = derived.expect("simulated");
+        assert!(derived.spin_estimated);
+        assert!(derived.carry_distance.is_some_and(|c| c.as_meters() > 0.0));
     }
 
-    /// A shot with the device's own spin is not flagged, simulated or not.
+    /// No estimate when the mode at the trigger was Putting (whatever it is
+    /// when the launch arrives), when the launch is under 5° (it rolls as a
+    /// ground ball), when `launch_only_spin` is 0, or when the launch has a
+    /// spin of the device's (§7.3 #11: an Xi E8 total).
     #[test]
-    fn measured_spin_is_not_flagged_as_estimated() {
-        let (d4, _) = shot_with_club_data();
-        for model in [DeviceModel::Xi, DeviceModel::Mevo] {
-            let (ball, derived) = handle_d4(model, ShotDetectionMode::Full, None, d4.clone());
-            assert_eq!(ball.backspin_rpm, Some(d4.backspin_rpm), "{model:?}");
-            let d = derived.expect("simulated");
-            assert!(!d.spin_estimated, "{model:?}");
-            let (_, derived) = handle_d4_with(
-                model,
+    fn a_launch_only_estimate_needs_a_chip_without_spin() {
+        let base = launch_only_launch(&launch_only_d4());
+        // The card, the launch, `launch_only_spin`, the mode at the trigger
+        // and at the launch, and the backspin the launch goes out with.
+        type Case = (
+            &'static str,
+            Launch,
+            f64,
+            ShotDetectionMode,
+            ShotDetectionMode,
+            Option<i32>,
+        );
+        let cases: [Case; 6] = [
+            (
+                "10.1.2.1:5100",
+                base.clone(),
+                100.0,
+                ShotDetectionMode::Putting,
                 ShotDetectionMode::Full,
                 None,
-                flighthook::SimMode::Off,
-                d4.clone(),
+            ),
+            (
+                "10.1.2.2:5100",
+                base.clone(),
+                100.0,
+                ShotDetectionMode::Full,
+                ShotDetectionMode::Putting,
+                Some(1570),
+            ),
+            (
+                "10.1.2.3:5100",
+                Launch {
+                    launch_elevation: Some(4.9),
+                    ..base.clone()
+                },
+                100.0,
+                ShotDetectionMode::Full,
+                ShotDetectionMode::Full,
+                None,
+            ),
+            (
+                "10.1.2.4:5100",
+                base.clone(),
+                0.0,
+                ShotDetectionMode::Full,
+                ShotDetectionMode::Full,
+                None,
+            ),
+            (
+                "10.1.2.5:5100",
+                Launch {
+                    total_spin_rpm: Some(1800),
+                    ..base.clone()
+                },
+                100.0,
+                ShotDetectionMode::Full,
+                ShotDetectionMode::Full,
+                None,
+            ),
+            (
+                "10.1.2.6:5100",
+                base.clone(),
+                80.0,
+                ShotDetectionMode::Chipping,
+                ShotDetectionMode::Chipping,
+                // 80 rpm per mph × 15.7 mph.
+                Some(1256),
+            ),
+        ];
+        for (key, launch, k, at_trigger, at_launch, want) in cases {
+            let go = Arc::new(AtomicBool::new(false));
+            let steps = replayed_shot(
+                1,
+                Some(Arc::clone(&go)),
+                vec![
+                    FrpEvent::launch(shot_key(1), launch),
+                    FrpEvent::shot_finished(shot_key(1)),
+                ],
             );
-            assert_eq!(derived, None, "{model:?}");
+            let mut section = replay_section(key);
+            section.launch_only_spin = k;
+            let mut card = replay(section, at_trigger, steps);
+            card.until(|m| matches!(m.event, FlighthookEvent::ShotTrigger { .. }));
+            card.writer.set_mode(at_launch);
+            go.store(true, Ordering::SeqCst);
+            let (got, derived) = launch_of(&card.shot());
+            assert_eq!(got.backspin_rpm, want, "{key}");
+            assert_eq!(
+                derived.is_some_and(|d| d.spin_estimated),
+                want.is_some(),
+                "{key}"
+            );
         }
     }
 
-    /// Every output's numbers for a Mevo and an Xi shot: a full swing from
-    /// each, a launch-only Xi chip with flighthook's spin estimate, and a
-    /// Mevo shot sent from its early result.
+    /// `launch_only_spin` is a card setting applied live: a change reaches
+    /// the next shot without a restart.
     #[test]
-    fn outputs_keep_their_numbers() {
-        let d4 = || FlightResult::decode(fixtures::XI_SHOT_D4).unwrap();
-        let e8 = || FlightResultV1::decode(fixtures::XI_SHOT_E8).unwrap();
-        let ed = || ClubResult::decode(fixtures::XI_SHOT_ED).unwrap();
-        for (case, model, datums, use_estimated) in [
-            (
-                "xi_full_swing",
-                DeviceModel::Xi,
-                vec![
-                    ShotDatum::FlightV1(e8()),
-                    ShotDatum::Flight(d4()),
-                    ShotDatum::Club(ed()),
+    fn a_launch_only_spin_change_applies_to_the_next_shot() {
+        let go = Arc::new(AtomicBool::new(false));
+        let chip = |n| {
+            vec![
+                FrpEvent::launch(shot_key(n), launch_only_launch(&launch_only_d4())),
+                FrpEvent::shot_finished(shot_key(n)),
+            ]
+        };
+        let mut steps = replayed_shot(1, None, chip(1));
+        steps.extend(replayed_shot(2, Some(Arc::clone(&go)), chip(2)));
+        let section = replay_section("10.1.3.1:5100");
+        let mut card = replay(section.clone(), ShotDetectionMode::Chipping, steps);
+        assert_eq!(launch_of(&card.shot()).0.backspin_rpm, Some(1570));
+        let changed = MevoSection {
+            launch_only_spin: 50.0,
+            ..section
+        };
+        card.state.system.update(|c| {
+            c.mevo.insert("0".into(), changed.clone());
+        });
+        assert!(matches!(
+            card.actor.reconfigure(&card.state, &card.sender),
+            ReconfigureOutcome::Applied
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        go.store(true, Ordering::SeqCst);
+        assert_eq!(launch_of(&card.shot()).0.backspin_rpm, Some(785));
+    }
+
+    /// §7.3 #10: a full result's total distance reaches flighthook in the
+    /// flight result, and the shot's total is the device's; the simulated
+    /// roll is total − carry.
+    #[test]
+    fn the_device_total_is_the_shots_total() {
+        let d4 = D4::decode(fixtures::XI_SHOT_D4).expect("d4");
+        let mut flight = ironsight::driver::convert::flight_result(&d4);
+        flight.total_distance = Some(Distance::Meters(95.0));
+        let steps = replayed_shot(
+            1,
+            None,
+            vec![
+                FrpEvent::launch(shot_key(1), ironsight::driver::convert::launch(&d4)),
+                FrpEvent::FlightResult {
+                    key: shot_key(1),
+                    flight,
+                },
+                FrpEvent::shot_finished(shot_key(1)),
+            ],
+        );
+        let mut card = replay(
+            replay_section("10.1.4.1:5100"),
+            ShotDetectionMode::Full,
+            steps,
+        );
+        let seen = card.shot();
+        let (_, derived) = launch_of(&seen);
+        let derived = derived.expect("simulated");
+        let roll = derived.roll_distance.expect("a roll").as_meters();
+        assert!((roll - (95.0 - 85.154)).abs() < 1e-9, "{roll}");
+        let mut agg = flighthook::ShotAggregator::new();
+        let shot = seen.iter().find_map(|m| agg.feed(m)).expect("a shot");
+        assert_eq!(
+            shot.flight.and_then(|f| f.total_distance),
+            Some(Distance::Meters(95.0))
+        );
+        assert_eq!(derived.total_distance, None, "measured, not simulated");
+    }
+
+    // -- Output pins -----------------------------------------------------------
+
+    /// The messages of the first shot `shot` makes on a scripted `model`
+    /// card with `section`, up to its end.
+    fn first_wire_shot(model: Model, section: MevoSection, shot: Shot) -> Vec<FlighthookMessage> {
+        let mut bench = Bench::start(model, section, |s| Box::new(MevoActor::new(s.clone())));
+        bench.ready("true");
+        let from = bench.seen.len();
+        bench.device.send(super::scenario::Do::Shot(shot));
+        bench.until(|m| matches!(m.event, FlighthookEvent::ShotFinished { .. }));
+        let seen = bench.seen[from..].to_vec();
+        bench.state.stop_and_wait("mevo.0");
+        seen
+    }
+
+    /// Every output's numbers for a Mevo+ and an Xi full swing (through the
+    /// card on ironsight's driver, over the scripted device), a launch-only
+    /// Xi chip with the card's spin estimate and a Mevo shot sent from its
+    /// early result (both replayed as ironsight's session emits them).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn outputs_keep_their_numbers() {
+        use ironsight::protocol::{TYPE_CLUB_RESULT, TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1};
+        let d4 = || fixtures::XI_SHOT_D4.to_vec();
+        let e8 = || fixtures::XI_SHOT_E8.to_vec();
+        let ed = || fixtures::XI_SHOT_ED.to_vec();
+        let avr = ironsight::BusAddr::Avr;
+
+        let mevo = first_wire_shot(
+            Model::MevoPlus,
+            section(Model::MevoPlus),
+            Shot::new(
+                63,
+                avr,
+                [(TYPE_FLIGHT_RESULT, d4()), (TYPE_CLUB_RESULT, ed())],
+                ed(),
+            ),
+        );
+        crate::test_ball::assert_outputs_pinned("mevo_full_swing", &mevo);
+
+        let mut xi_section = section(Model::Xi);
+        xi_section.driver.spin_source = SpinSource::E8;
+        let xi = first_wire_shot(
+            Model::Xi,
+            xi_section,
+            Shot::new(
+                63,
+                avr,
+                [
+                    (TYPE_FLIGHT_RESULT_V1, e8()),
+                    (TYPE_FLIGHT_RESULT, d4()),
+                    (TYPE_CLUB_RESULT, ed()),
                 ],
-                false,
+                ed(),
             ),
-            (
-                "mevo_full_swing",
-                DeviceModel::Mevo,
-                vec![ShotDatum::Flight(d4()), ShotDatum::Club(ed())],
-                false,
+        );
+        crate::test_ball::assert_outputs_pinned("xi_full_swing", &xi);
+
+        let mut chip = replay(
+            replay_section("10.1.5.1:5100"),
+            ShotDetectionMode::Full,
+            replayed_shot(
+                1,
+                None,
+                vec![
+                    FrpEvent::launch(shot_key(1), launch_only_launch(&launch_only_d4())),
+                    FrpEvent::shot_finished(shot_key(1)),
+                ],
             ),
-            (
-                "xi_launch_only_chip",
-                DeviceModel::Xi,
-                vec![ShotDatum::Flight(launch_only_d4())],
-                false,
+        );
+        crate::test_ball::assert_outputs_pinned("xi_launch_only_chip", &chip.shot());
+
+        let early = FlightResultV1::decode(fixtures::XI_SHOT_E8).expect("e8");
+        let mut fallback = replay(
+            replay_section("10.1.5.2:5100"),
+            ShotDetectionMode::Full,
+            replayed_shot(
+                1,
+                None,
+                vec![
+                    FrpEvent::launch(
+                        shot_key(1),
+                        ironsight::driver::convert::early_launch(&early),
+                    ),
+                    FrpEvent::FlightResult {
+                        key: shot_key(1),
+                        flight: ironsight::driver::convert::early_flight_result(&early),
+                    },
+                    FrpEvent::shot_finished(shot_key(1)),
+                ],
             ),
-            (
-                "mevo_e8_fallback",
-                DeviceModel::Mevo,
-                vec![ShotDatum::FlightV1(e8())],
-                true,
-            ),
-        ] {
-            let messages = replay_datums(model, datums, use_estimated);
-            crate::test_ball::assert_outputs_pinned(case, &messages);
+        );
+        crate::test_ball::assert_outputs_pinned("mevo_e8_fallback", &fallback.shot());
+    }
+
+    // -- The card ----------------------------------------------------------------
+
+    /// The device takes a new connection while the old one closes (the
+    /// driver is not exclusive), the card waits the driver's 3 s for a
+    /// stop, and its shots are measured.
+    #[test]
+    fn the_card_is_replaceable_while_stopping() {
+        let actor = MevoActor::new(MevoSection::default());
+        assert!(actor.replaceable_while_stopping());
+        assert_eq!(actor.stop_wait(), Duration::from_secs(3));
+        assert_eq!(actor.source(), Some(ShotSource::Mevo));
+    }
+
+    /// The Xi spin source, the launch-only spin, the camera timing and the
+    /// name apply live; every other FlightScope setting starts a new session
+    /// (a restart).
+    #[test]
+    fn only_the_spin_source_and_card_settings_apply_live() {
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-mevo-reconfigure-{}",
+            crate::state::config::generate_id()
+        ));
+        let _dir = crate::actors::web::tests::TempDir(dir.clone());
+        let (state, _writer) = SystemState::new(dir.join("config.toml"));
+        let state = Arc::new(state);
+        let (tx, _rx) = broadcast::channel(16);
+        let sender = BusSender::new("mevo.0".into(), tx, Arc::default());
+        let saved = MevoSection::default();
+        let actor = MevoActor::new(saved.clone());
+        let outcome = |section: &MevoSection| {
+            state.system.update(|c| {
+                c.mevo.insert("0".into(), section.clone());
+            });
+            actor.reconfigure(&state, &sender)
+        };
+        let restarts: [fn(&mut MevoConfig); 9] = [
+            |d| d.address = Some("10.0.0.9:5100".into()),
+            |d| d.ball_type = Some(0),
+            |d| d.tee_height = Some(Distance::Inches(2.0)),
+            |d| d.range = Some(Distance::Feet(9.0)),
+            |d| d.surface_height = Some(Distance::Inches(1.0)),
+            |d| d.track_pct = Some(70.0),
+            |d| d.use_estimated = Some(true),
+            |d| d.camera_mode = Some(flighthook::CameraMode::RawFusion),
+            |d| d.environment = Some(flighthook::FlightScopeEnvironment::Outdoor),
+        ];
+        for change in restarts {
+            let mut section = saved.clone();
+            change(&mut section.driver);
+            assert!(matches!(
+                outcome(&section),
+                ReconfigureOutcome::RestartRequired
+            ));
         }
+        let mut live = MevoSection {
+            name: "Bay 2".into(),
+            launch_only_spin: 60.0,
+            impact_lead_s: Some(0.2),
+            ..saved.clone()
+        };
+        live.driver.spin_source = SpinSource::Auto;
+        assert!(matches!(outcome(&live), ReconfigureOutcome::Applied));
+    }
+
+    /// A setting the driver refuses (from a hand-edited file) keeps the card
+    /// from starting and shows on it (§7.3 #6 and #15).
+    #[test]
+    fn a_refused_setting_shows_on_the_card() {
+        let mut section = replay_section("10.1.6.1:5100");
+        section.driver.track_pct = Some(150.0);
+        let mut card = replay(section, ShotDetectionMode::Full, Vec::new());
+        let seen = card.until(|m| {
+            matches!(
+                &m.event,
+                FlighthookEvent::ActorStatus {
+                    status: ActorStatus::Disconnected,
+                    ..
+                }
+            )
+        });
+        assert_eq!(seen.len(), 1, "no Starting, no connect");
+        assert!(
+            matches!(&seen[0].event, FlighthookEvent::ActorStatus { telemetry, .. }
+            if telemetry["error"] == "track_pct: must be 0 to 100")
+        );
     }
 }

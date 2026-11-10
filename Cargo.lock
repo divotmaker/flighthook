@@ -1527,6 +1527,7 @@ dependencies = [
  "allsquare",
  "clap",
  "flightrelay",
+ "ironsight",
  "serde",
  "serde_json",
  "tenover",
@@ -2217,10 +2218,9 @@ dependencies = [
 
 [[package]]
 name = "ironsight"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64f4bfe5fc747f23aca3749cab559dc217eba02fb7ddc256a6362de23ba4235b"
+version = "0.6.1"
 dependencies = [
+ "flightrelay",
  "serde",
  "thiserror 2.0.20",
 ]

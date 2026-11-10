@@ -136,8 +136,7 @@ fn main() -> anyhow::Result<()> {
 
     // Start all actors from config (launch monitors, integrations, webserver)
     let snap = state.system.snapshot();
-    let current_mode = state.game.snapshot().mode;
-    for ra in actors::resolve_actors(&snap, current_mode) {
+    for ra in actors::resolve_actors(&snap) {
         tracing::info!("starting actor '{}' ({})", ra.id, ra.name);
         actors::start_actor(ra.id, ra.actor, &state, &bus_tx);
     }

@@ -91,8 +91,7 @@ fn apply_config_reload(
     scope: Option<&str>,
 ) -> Plan {
     let snap = state.system.snapshot();
-    let current_mode = state.game.snapshot().mode;
-    let resolved = resolve_actors(&snap, current_mode);
+    let resolved = resolve_actors(&snap);
     let in_scope = |id: &str| scope.is_none_or(|target| target == id);
 
     let mut current_ids = state.actor_ids();
@@ -271,7 +270,7 @@ fn finish(
     sender: &BusSender,
     plan: Plan,
 ) {
-    let mut resolved = resolve_actors(&state.system.snapshot(), state.game.snapshot().mode);
+    let mut resolved = resolve_actors(&state.system.snapshot());
     let configured: Vec<String> = resolved.iter().map(|ra| ra.id.clone()).collect();
     let mut restarted = Vec::new();
     let mut stopped = plan.stopped;
@@ -449,7 +448,7 @@ pub(crate) fn restart_closed(
     if closed.is_empty() {
         return;
     }
-    let mut resolved = resolve_actors(&state.system.snapshot(), state.game.snapshot().mode);
+    let mut resolved = resolve_actors(&state.system.snapshot());
     let mut restarted = Vec::new();
     for id in closed {
         match resolved.iter().position(|ra| ra.id == id) {
@@ -529,7 +528,7 @@ fn reconnect_check(state: &SystemState, id: &str) -> Result<ResolvedActor, Strin
     if !config.actor_enabled(&id) {
         return Err(format!("'{id}' is off"));
     }
-    resolve_actors(&config, state.game.snapshot().mode)
+    resolve_actors(&config)
         .into_iter()
         .find(|ra| ra.id == id)
         .ok_or_else(|| format!("'{id}' cannot start from its saved settings"))
@@ -1642,7 +1641,7 @@ mod tests {
             );
             c.openconnect_server.insert("0".into(), Default::default());
         });
-        let actors = resolve_actors(&state.system.snapshot(), None);
+        let actors = resolve_actors(&state.system.snapshot());
         assert_eq!(actors.len(), ids.len());
         state.system.update(|c| {
             c.mevo.get_mut("0").unwrap().impact_lead_s = Some(0.5);
@@ -1689,7 +1688,7 @@ mod tests {
             edit(c);
         });
         let (bus_tx, rx) = broadcast::channel(4096);
-        for ra in resolve_actors(&state.system.snapshot(), None) {
+        for ra in resolve_actors(&state.system.snapshot()) {
             start_actor(ra.id, ra.actor, &state, &bus_tx);
         }
         (dir, state, bus_tx, rx)
@@ -2969,7 +2968,7 @@ mod tests {
         let (_dir, state, _bus_tx, _rx) = running(|c| {
             let mut section: flighthook::MevoSection =
                 serde_json::from_str("{}").expect("empty section");
-            section.address = Some(device.addr.to_string());
+            section.driver.address = Some(device.addr.to_string());
             c.mevo.insert("0".into(), section);
         });
         // Connected, its handshake unanswered.
