@@ -4351,9 +4351,7 @@ dependencies = [
 
 [[package]]
 name = "thumbswing"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84fbb020a7b718bd8fcbb14bf7157fb12b698bb558b2f07af71aaf01718407d8"
+version = "0.0.2"
 dependencies = [
  "flightrelay",
  "libc",

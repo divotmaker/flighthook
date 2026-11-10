@@ -68,7 +68,7 @@ reports), `cpi`, `profile` (the club in play) and `handed` (`rh` or `lh`).
   speed the club speed. A forward roll with no backswing does nothing.
 - **The club caps the speed.** Full power is **Max club speed** (100 mph for
   the driver) times the club's speed ratio, so no swing hits a 7-iron faster
-  than 80 mph; **Full power speed** (30 in/s) is how fast a push must be for
+  than 80 mph; **Full power speed** (15 in/s) is how fast a push must be for
   100 %.
 - **Curve.** Arcade (the default): push toward where the ball should start
   and pull back from where it should finish; the ball curves toward the
@@ -131,7 +131,7 @@ hand = "rh"                    # until the game names a hand: rh | lh
 cpi = 800                      # counts per inch of ball travel (default 400)
 
 [trackball.0.tuning]
-full_power_speed = 40          # in/s for 100 % (default 30)
+full_power_speed = 40          # in/s for 100 % (default 15)
 curve_sense = "physical"       # arcade (default) | physical
 
 [trackball.0.thresholds]
@@ -145,7 +145,7 @@ coil_timeout_s = 20            # how long the top of the swing waits (default 10
 | `hand` | Starting hand | `rh` | the hand until the game names one |
 | `cpi` | CPI | 400 | counts per inch of ball travel |
 | `report_limit` | Report limit | 127 | largest movement one report carries (127, 2047 or 32767) |
-| `tuning.full_power_speed` | Full power speed | 30 in/s | push speed for 100 % power |
+| `tuning.full_power_speed` | Full power speed | 15 in/s | push speed for 100 % power |
 | `tuning.max_club_speed` | Max club speed | 100 mph | driver club speed at full power |
 | `tuning.max_putt_speed` | Max putt speed | 11 mph | putter speed at full power |
 | `tuning.angle_gain` | Face gain | 0.25 | face angle per degree of push direction |

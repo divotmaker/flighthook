@@ -1044,7 +1044,7 @@ mod tests {
                 "kind": "trackball",
                 "manufacturer": "divotmaker",
                 "model": "thumbswing trackball",
-                "firmware": "0.0.1"
+                "firmware": "0.0.2"
             })
         );
         assert_eq!(line["settings"]["device"], serde_json::json!({}));
@@ -1078,6 +1078,8 @@ mod tests {
             let feed = Arc::new(Feed::default());
             let mut section = section(device);
             section.driver.club = club;
+            // The pinned numbers are for a full power speed of 30 in/s.
+            section.driver.tuning.full_power_speed = 30.0;
             let mut card = Card::new(
                 section,
                 opener(vec![Box::new(FedInput::new(&feed, trackball_info()))]),
