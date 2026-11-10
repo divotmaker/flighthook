@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "allsquare",
  "clap",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-app"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "allsquare",
  "anyhow",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-ui"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
