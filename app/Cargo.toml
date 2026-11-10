@@ -20,11 +20,9 @@ gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
 # The FlightScope device driver (`driver`: `ironsight::driver::Mevo`).
-# LOCAL path until ironsight 0.7.0 is released
-ironsight = { path = "../../../ironsight/ironsight", features = ["driver"] }
+ironsight = { version = "0.7.0", features = ["driver"] }
 # The R10's device driver (`driver`: `tenover::driver::R10`).
-# LOCAL path until tenover 0.5.0 is released
-tenover = { path = "../../../10over/10over", features = ["driver"] }
+tenover = { version = "0.5.0", features = ["driver"] }
 flighthook = { path = "../lib", features = ["clap"] }
 # FRP's forwarding rules for the `/frp` endpoint (`ForwardFilter`), the
 # device driver contract the launch monitor actors run on (`driver`) and the
@@ -54,16 +52,14 @@ dimple = "0.0.7"
 # glam version dimple uses (already in the tree through it).
 glam = "0.32"
 # The ExPutt RG's device driver (`driver`: `threeputt::driver::ExPutt`).
-# LOCAL path until threeputt 0.1.0 is released
-threeputt = { path = "../../../3putt/3putt", features = ["driver"] }
+threeputt = { version = "0.1.0", features = ["driver"] }
 # Swing cameras: capture, pre-roll and trigger-cut MJPEG clips; `pose` is
 # body tracking (RTMPose on the CPU), `pose-download` fetches its models.
-stance = { path = "../../../stance/stance", features = ["pose", "pose-download"] }
+stance = { version = "0.0.4", features = ["pose", "pose-download"] }
 # The Trackball's device driver (`driver`: `thumbswing::driver::Thumbswing`).
 # It reads Linux evdev; on other platforms it builds and its connect reports
 # that the trackball is not supported there.
-# LOCAL path until thumbswing 0.0.2 is released
-thumbswing = { path = "../../../thumbswing/thumbswing", features = ["driver"] }
+thumbswing = { version = "0.0.2", features = ["driver"] }
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.
@@ -74,15 +70,13 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # The Square Golf device driver (`driver`: `allsquare::driver::Omni`). Its
 # BLE backend is platform-specific: BlueZ on Linux, btleplug elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
-# LOCAL path until allsquare 0.4.0 is released
-allsquare = { path = "../../../allsquare/allsquare", features = ["driver", "bluez"] }
+allsquare = { version = "0.4.0", features = ["driver", "bluez"] }
 # The body tracking clip pass runs at a higher nice value (setpriority);
 # already in the tree (tokio, ...).
 libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-# LOCAL path until allsquare 0.4.0 is released
-allsquare = { path = "../../../allsquare/allsquare", features = ["driver", "btleplug"] }
+allsquare = { version = "0.4.0", features = ["driver", "btleplug"] }
 
 # eframe backend is platform-specific: x11+wayland on Linux, Win32 on Windows.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
@@ -96,22 +90,17 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 # ironsight's test support: a scripted device and recorded result frames.
-# LOCAL path until ironsight 0.7.0 is released
-ironsight = { path = "../../../ironsight/ironsight", features = ["driver", "testing"] }
+ironsight = { version = "0.7.0", features = ["driver", "testing"] }
 # tenover's test support: GFDI frame builders with synthetic identity.
-# LOCAL path until tenover 0.5.0 is released
-tenover = { path = "../../../10over/10over", features = ["driver", "testing"] }
+tenover = { version = "0.5.0", features = ["driver", "testing"] }
 # allsquare's test support: notification fixtures and encoders, and the
 # driver's connect over a scripted link.
-# LOCAL path until allsquare 0.4.0 is released
-allsquare = { path = "../../../allsquare/allsquare", features = ["driver", "testing"] }
+allsquare = { version = "0.4.0", features = ["driver", "testing"] }
 # threeputt's test support: an in-process mock device, sample putts and the
 # driver's test timings.
-# LOCAL path until threeputt 0.1.0 is released
-threeputt = { path = "../../../3putt/3putt", features = ["driver", "testing"] }
+threeputt = { version = "0.1.0", features = ["driver", "testing"] }
 # thumbswing's test support: synthetic swing streams and recordings.
-# LOCAL path until thumbswing 0.0.2 is released
-thumbswing = { path = "../../../thumbswing/thumbswing", features = ["driver", "testing"] }
+thumbswing = { version = "0.0.2", features = ["driver", "testing"] }
 # Encodes the numbered test frames of the body tracking tests (already in the
 # tree through stance).
 jpeg-encoder = "0.7"

@@ -25,7 +25,7 @@ egui_extras = { version = "0.33", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 # The replay view: clip sidecars, and webcam frames made decodable
 # (`jpeg::ensure_huffman`).
-stance = "0.0.3"
+stance = "0.0.4"
 # Decodes the replay's MJPEG frames; pure Rust, builds for wasm.
 zune-jpeg = "0.5"
 

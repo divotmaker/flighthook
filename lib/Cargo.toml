@@ -19,24 +19,19 @@ client = ["dep:tungstenite"]
 flightrelay = { version = "0.5", features = ["mock"] }
 # The FlightScope driver's settings (`ironsight::config::Config`, the
 # `config` feature: no device stack, so the WASM UI builds it too).
-# LOCAL path until ironsight 0.7.0 is released
-ironsight = { path = "../../../ironsight/ironsight", default-features = false, features = ["config"] }
+ironsight = { version = "0.7.0", default-features = false, features = ["config"] }
 # The R10 driver's settings (`tenover::config::Config`, the `config`
 # feature: no BLE stack, so the WASM UI builds it too).
-# LOCAL path until tenover 0.5.0 is released
-tenover = { path = "../../../10over/10over", default-features = false, features = ["config"] }
+tenover = { version = "0.5.0", default-features = false, features = ["config"] }
 # The Square Golf driver's settings (`allsquare::config::Config`, the
 # `config` feature: no BLE stack, so the WASM UI builds it too).
-# LOCAL path until allsquare 0.4.0 is released
-allsquare = { path = "../../../allsquare/allsquare", default-features = false, features = ["config"] }
+allsquare = { version = "0.4.0", default-features = false, features = ["config"] }
 # The ExPutt driver's settings (`threeputt::config::Config`, the `config`
 # feature: no network code, so the WASM UI builds it too).
-# LOCAL path until threeputt 0.1.0 is released
-threeputt = { path = "../../../3putt/3putt", default-features = false, features = ["config"] }
+threeputt = { version = "0.1.0", default-features = false, features = ["config"] }
 # The Trackball driver's settings (`thumbswing::Settings`, the `config`
 # feature: no device stack, so the WASM UI builds it too).
-# LOCAL path until thumbswing 0.0.2 is released
-thumbswing = { path = "../../../thumbswing/thumbswing", default-features = false, features = ["config"] }
+thumbswing = { version = "0.0.2", default-features = false, features = ["config"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"], optional = true }
