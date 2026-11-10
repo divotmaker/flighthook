@@ -163,11 +163,12 @@ mod tests {
         )));
         std::fs::create_dir_all(&dir.0).unwrap();
         let avi = clip(&dir.0);
+        // Before the open: the clip's first frame is stamped when it opens.
+        let start = stance::clock::now_ns();
         let mut source = LoopingClip::open(&avi).expect("open");
         let n = AviFile::open(&avi, false).unwrap().len();
         assert!(n >= 5, "{n} frames");
         assert!(source.info().id.starts_with(PREFIX));
-        let start = stance::clock::now_ns();
         let mut stamps = Vec::new();
         while stamps.len() < n * 2 + 2 {
             if let Some(f) = source.next_frame(Duration::from_secs(1)).unwrap() {
