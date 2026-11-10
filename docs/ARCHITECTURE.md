@@ -42,6 +42,10 @@ address = "127.0.0.1:921"
 - `[square.<idx>]` -- Square Golf Omni BLE device instance
 - `[exputt.<idx>]` -- ExPutt RG putting device over WiFi (optional IP address;
   found on the local network when absent)
+- `[trackball.<idx>]` -- Trackball (alpha): a trackball or mouse on Linux
+  turned into a launch monitor (thumbswing's driver; its settings `device`,
+  `club`, `hand`, `cpi`, `report_limit`, `grab` and the `thresholds` and
+  `tuning` tables sit in the same table)
 - `[openconnect_server.<idx>]` -- Open Connect server: GSPro Open Connect ingest listener (Uneekor)
 - `[mock_monitor.<idx>]` -- mock launch monitor instance (flightrelay's mock
   driver; its settings `shot_interval_s`, `arm_delay_s`, `ball_ready_delay_s`,
@@ -127,6 +131,18 @@ address = "127.0.0.1:921"
   into the section); one that is not an IP address is refused (the card
   shows why and Save stays off; a save is `400`; from the file, the card
   does not start)
+- Trackball sections show name and every setting of the trackball driver
+  (thumbswing's `Settings`, flattened into the section): Device (`device`,
+  blank for the only trackball or mouse), Starting club and hand, Grab the
+  device, CPI, Report limit, the tuning (full power speed, max club and putt
+  speeds, the face, putt line and curve gains, backswing power, power curve,
+  max face angle and face-to-path, the curve sense, mirror for left-handed
+  players), and the swing detection thresholds in a collapsed section. A
+  blank number is the driver's default. A value the driver refuses (a CPI
+  or speed of 0, a stop speed not below the start speed, a backswing power
+  over 1, ...) or a number that isn't one is refused (the card shows why
+  and Save stays off; a save is `400`; from the file, the card does not
+  start). No Camera timing: the cameras cut no clip for its shots
 - Mock sections show only name and Camera timing; the mock driver's settings
   are set in the file or through the API
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `openconnect_client.0`)
@@ -213,6 +229,7 @@ pub struct FlighthookConfig {
     pub r10: HashMap<String, R10Section>,
     pub square: HashMap<String, SquareSection>,
     pub exputt: HashMap<String, ExPuttSection>,
+    pub trackball: HashMap<String, TrackballSection>,
     pub mock_monitor: HashMap<String, MockMonitorSection>,
     pub openconnect_server: HashMap<String, OpenConnectServerSection>,
     pub openconnect_client: HashMap<String, OpenConnectClientSection>,  // `gspro` also read
@@ -235,6 +252,7 @@ pub enum SpinSource { D4, E8, Auto }                              // ironsight's
 pub struct R10Section { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: R10Config }  // tenover's Config: range: Option<Distance>
 pub struct SquareSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: SquareConfig }  // allsquare's Config: address: Option<String>, club: String ("7I"), advanced_spin: bool (true), discard_non_putting_zero_spin: bool (true), dot_bottom_to_face_center_mm: BTreeMap<String, f64>
 pub struct ExPuttSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: ExPuttConfig }  // threeputt's Config: address: Option<String>
+pub struct TrackballSection { pub name: String, pub enabled: bool, #[serde(flatten)] pub driver: TrackballConfig }  // thumbswing's Settings: device: Option<String>, club, hand, cpi, report_limit, grab, thresholds, tuning (each left out at its default; Default writes grab = false)
 pub struct MockMonitorSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: MockConfig }  // flightrelay's MockConfig
 pub struct OpenConnectServerSection { pub name: String, pub bind: Option<String> }
 pub struct OpenConnectClientSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
@@ -620,7 +638,7 @@ keep their order).
 | Device | Hook | Window | Excluded | Pre-roll | Max frames | Max bulk bytes |
 | --- | --- | --- | --- | --- | --- | --- |
 | Open Connect | the inbound JSON text and our reply | the one message | none | - | - | - |
-| Mock | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
+| Mock, Trackball | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
 
 A device on a flightrelay device driver ([Device drivers](#device-drivers))
 records the driver's `raw_frame` events instead: each frame is one protocol
@@ -630,7 +648,7 @@ text protocol), and placed in time by the frame's own timestamp (a driver
 stamps in UTC milliseconds; the card maps them onto its clock from one
 anchor, so frames of one millisecond keep the order the driver gave them).
 Pre-roll, caps and the bulk budget come from the driver's raw profile. The
-mock has no wire protocol and records none. The FlightScope (ironsight,
+mock and the trackball have no wire protocol and record none. The FlightScope (ironsight,
 `transport = "flightscope-tcp"`) records every framed message once the
 handshake is done, both directions, labeled `"<type> <src>><dst>"` (e.g.
 `D4 AVR>APP`), pre-roll 8, at most 256 frames, 128 KiB of bulk per-shot data
@@ -859,6 +877,7 @@ pub enum ConfigAction {
     UpsertR10 { index: String, section: R10Section },
     UpsertSquare { index: String, section: SquareSection },
     UpsertExPutt { index: String, section: ExPuttSection },          // "upsert_exputt"
+    UpsertTrackball { index: String, section: TrackballSection },
     UpsertOpenConnectServer { index: String, section: OpenConnectServerSection },
     UpsertOpenConnectClient { index: String, section: OpenConnectClientSection },  // `upsert_gs_pro` also read
     UpsertWebserver { index: String, section: WebserverSection },
@@ -1017,10 +1036,11 @@ that lasted at least 10s; one that drops sooner counts as a failed attempt, so
 a link that keeps connecting and dropping still backs off to the cap. The
 Open Connect server restarts at 1s after a successful bind. A card on a
 device driver (the FlightScope, the R10, the Square Golf, the ExPutt, the
-mock) waits the delay its driver asks for: the FlightScope, the R10 and the
-Square Golf use the SDK's `Backoff`, 1 s per failed attempt up to 15 s,
-back to 1 s after a session of at least 10 s; the ExPutt adjusts the same
-backoff (below). Every actor polls its shutdown flag during the backoff wait
+trackball, the mock) waits the delay its driver asks for: the FlightScope,
+the R10, the Square Golf and the trackball use the SDK's `Backoff`, 1 s per
+failed attempt up to 15 s, back to 1 s after a session of at least 10 s; the
+ExPutt adjusts the same backoff (below). The trackball's driver gives up off
+Linux (the card ends Disconnected with the error). Every actor polls its shutdown flag during the backoff wait
 (the Open Connect server during its bind retry delay too), so stopping one
 never waits out the delay. The Open Connect client's TCP connect (up to 5s)
 runs on a thread of its own: a stop ends the actor at once, and a connect
@@ -1056,17 +1076,18 @@ actor and the command waits for it on a helper thread (see
    then wait up to `Actor::stop_wait()` for the actor's thread to end
    (`SystemState::wait_for_exit`): 3s by default; a card on a device driver
    waits its driver's `STOP_WAIT` (6s for an R10, and for a Square Golf,
-   which disarms and disconnects); 18s for an ExPutt, whose session start
+   which disarms and disconnects; 1s for a trackball); 18s for an ExPutt, whose session start
    cannot be cut short; none for the web server (the save that moves it is
    answered by the server being stopped, and its successor retries the bind).
 2. If the thread is still running, the actor's `replaceable_while_stopping()`
    decides: a Mevo/Xi, an Open Connect client, the mock actors and the web
    server hold nothing a new instance needs (a TCP client, nothing, or a port
-   the new one retries), and an Open Connect server is replaceable once its
-   listen port binds again. A replaceable one is retired: taken out of the
+   the new one retries), nor does a trackball without the grab (several
+   programs can read one input), and an Open Connect server is replaceable
+   once its listen port binds again. A replaceable one is retired: taken out of the
    registry, its bus sender muted so nothing it still sends speaks for its
-   successor, its thread left to end. An R10, Square Golf, ExPutt or camera
-   is not: it is retired the same way and watched
+   successor, its thread left to end. An R10, Square Golf, ExPutt, camera or
+   a trackball holding the grab is not: it is retired the same way and watched
    (`SystemState::close_in_background`: a `closing:<id>` thread joins it),
    nothing is started, and the card's `error` telemetry and an Error alert
    say "The previous connection has not closed yet. It reconnects when it
@@ -1116,7 +1137,8 @@ address as IPv4, and a blank address as the type's default), or, for a card
 that listens (Open Connect Server), the same port on overlapping bind
 addresses (`0.0.0.0` overlaps every address). Only cards that are on hold an
 address, and only the types with an address compare: Mevo, Square Golf
-Omni, ExPutt, Open Connect Server and Client, Pureplay Connect.
+Omni, ExPutt, Open Connect Server and Client, Pureplay Connect, and the
+Trackball by the device it names (compared as text; a blank one names none).
 
 Duplicates may exist; at most one of them is on.
 
@@ -1164,6 +1186,7 @@ What a stop does, by actor:
 | Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
 | Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
 | ExPutt | discovering (250 ms slices), measuring (100 ms event wait, the session closes at once) or waiting to reconnect | the driver's `STOP_WAIT` (18 s: a session start of up to 17 s, which cannot be cut short: connect and greeting, two handshake replies, mat search; then the close) |
+| Trackball | always: opening the device is a few system calls, checked for a stop before and after; a session polls every 50 ms; closing drops the device, which releases the grab | the driver's `STOP_WAIT` (1 s: closing joins the device's reader thread, which wakes every 100 ms); not exclusive without the grab, so an old instance still closing is replaced beside it |
 | Mock monitor | always (50 ms polls; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
 | Random club | always (100 ms loop) | -- |
 
@@ -1313,6 +1336,47 @@ clock). The reconnect delays are in [Connection state](#connection-state) above.
 An Open Connect client logs a warning at start when an ExPutt is configured
 and its Putting Monitor is unset (Any).
 
+**Trackball card** (alpha): thumbswing's device driver
+(`thumbswing::driver::Thumbswing`) on `DriverActor`
+(`actors::trackball::TrackballHooks`: section `TrackballSection`, source
+`Trackball`, which is virtual; no hook, no action). The driver opens the
+input the section's `device` names (a `/dev/input/by-id` name, a
+`/dev/input` path or the name the device reports), or the only readable
+trackball or mouse when it names none (`phase: connecting`), with an
+exclusive grab when `grab` is set. The card is then `Connected`
+(`device_info` "thumbswing (<the name the device reports>)"; the FRP
+device id is the input's `/dev/input/by-id` link name, else the reported
+name) with `device_telemetry` `manufacturer: "divotmaker"`, `model:
+"thumbswing trackball"`, the crate version as `firmware` and `source:
+virtual`. Telemetry keys: `ready`, `synthetic` (`true`), `input` (the
+reported name), `cpi`, `profile` (the club in play) and `handed` (`rh` |
+`lh`). The club and the hand start as the section's `club` and `hand` and
+follow the game's `SetDetectionMode` (a club the game names replaces the
+setting); Putting mode selects the putter whatever the club. Each swing (a
+pull back, then a push) is a shot: trigger (timestamped with the end of the
+push), `launch` (speed, launch angle and direction, both spin pairs),
+`club_path` (club speed, path, face angle, attack angle, dynamic loft,
+smash factor, swing plane), `shot_finished`; no flight result (the
+simulation flies it) and no raw frames. Everything is synthesized, so the
+source is virtual: during a tournament round the driver is told to hold
+shots, and a swing then is dropped with an info log line and takes no shot
+number. When the input goes away the session stays up: `ready` turns false,
+the driver reopens the device by itself (with no `device` named it chooses
+again, so a device back under another node is found) and `ready` turns true.
+A device that cannot be opened is a `warn` alert saying what to do (name
+one with the `device` setting when there are several, which is alerted
+once until the device opens; join the `input` group; close the program
+holding the grab), never a device path, and a retry with the backoff. Off
+Linux the driver gives up with an `error` alert ("trackball input is not
+supported on this platform (Linux only)"), and the card ends Disconnected
+with that error; `GET /api/status` says `trackball_supported` only on
+Linux (`thumbswing::device::SUPPORTED`), and the UI offers the Trackball
+card only then. The club, the hand, the thresholds and the tuning apply to
+the next swing; `device`, `cpi`, `report_limit` and `grab` restart the card.
+With the grab the card is exclusive (a new instance waits for the old one
+to let the device go). Its shots cut no camera clip: the type has no
+impact lead (`impact_lead_default_s("trackball")` is `None`).
+
 **Open Connect client actor** (GSPro, Pureplay, Muni Golf, ...): emits `Starting` before
 first TCP connect attempt, `Connected` on success. Connection loss after a
 successful session emits `Reconnecting`; failure before ever connecting stays
@@ -1461,8 +1525,8 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   counting from 1 on every link.
 - The device's state comes from the launch monitor actors (the actors the
   round policy has registered as an `actors::provenance::ShotSource` that
-  is a launch monitor: `mevo`, `r10`, `square`, `exputt`, `mock_monitor`,
-  `openconnect_server`) on the bus:
+  is a launch monitor: `mevo`, `r10`, `square`, `exputt`, `trackball`,
+  `mock_monitor`, `openconnect_server`) on the bus:
   `ActorStatus` (and its `error` key), `DeviceTelemetry` `ready` and
   `battery_pct`, and `ShotTrigger`/`ShotFinished`. `ready=true` from a
   monitor with no status seen yet (the output started while it was
@@ -1518,11 +1582,12 @@ today, and nothing in the policy is Pureplay's.
 - **Provenance.** `flighthook::Provenance` is a wire type and says where a
   shot comes from, nothing more: `Measured` (a launch monitor measured it: a
   driver reads the hardware, or a monitor's own app sends it to the Open
-  Connect input) or `Virtual` (the mock monitor and Auto-chip, and the
-  trackball launch monitor when it is added). How each value was obtained is
+  Connect input) or `Virtual` (the trackball, the mock monitor and
+  Auto-chip). How each value was obtained is
   a separate question (`ShotData::unmeasured_fields`). Every shot source is an `actors::provenance::ShotSource`
-  (`Mevo`, `R10`, `Square`, `ExPutt`, `MockMonitor`, `OpenConnectServer`,
-  `AutoChip`); `ShotSource::provenance()` is the single exhaustive match.
+  (`Mevo`, `R10`, `Square`, `ExPutt`, `Trackball`, `MockMonitor`,
+  `OpenConnectServer`, `AutoChip`); `ShotSource::provenance()` is the single
+  exhaustive match.
   An actor type declares its source (`Actor::source()`; `None` for actors
   that put no shots on the bus). `start_actor` registers it in the policy by
   actor ID and gives the actor's `BusSender` that provenance, which it
@@ -1564,10 +1629,11 @@ today, and nothing in the policy is Pureplay's.
   returns `SolveError::RoundActive`, which `POST /api/auto-chip` answers
   with `409 {"error":"Auto-chip is off during a Pureplay strict-mode
   round"}`; nothing is put on the bus and no number is taken. A device
-  driver of a virtual source (the mock) asks `Events::shots_allowed()`,
-  which its `DriverActor` sets from `RoundPolicy::allows` before every
-  poll, before it numbers a shot: a held shot takes no number and fires
-  once the round ends. The actor logs "<id>: no shots during the
+  driver of a virtual source (the mock, the trackball) asks
+  `Events::shots_allowed()`, which its `DriverActor` sets from
+  `RoundPolicy::allows` before every poll, before it numbers a shot: a held
+  shot takes no number; the mock's fires once the round ends, a swing on
+  the trackball during the round is dropped. The actor logs "<id>: no shots during the
   tournament round" once per round, and sends each trigger through
   `send_if_allowed` as the backstop: a shot that starts anyway is dropped
   whole.
@@ -1604,8 +1670,9 @@ A launch monitor card can run on a flightrelay device driver
 (`flightrelay::driver::DeviceDriver`): the FlightScope Mevo+, Gen2 and Xi
 (`ironsight::driver::Mevo`), the R10 (`tenover::driver::R10`), the Square
 Golf Omni (`allsquare::driver::Omni`), the ExPutt
-(`threeputt::driver::ExPutt`) and the mock (`flightrelay::mock::MockDriver`)
-do. The driver owns the device (connect,
+(`threeputt::driver::ExPutt`), the trackball
+(`thumbswing::driver::Thumbswing`) and the mock
+(`flightrelay::mock::MockDriver`) do. The driver owns the device (connect,
 session, shots, telemetry, raw frames); `actors::driver::DriverActor<D, H>`
 is the host around it, one thread per card. What a card adds is its
 `Hooks<D>`: its config section (`H::Section`, a lib `DeviceSection`), its
@@ -1615,8 +1682,8 @@ shot in the mode at its trigger and estimates a launch-only chip's spin),
 the R10's `actors::r10::R10Hooks`, the Square Golf's
 `actors::square::SquareHooks`, the ExPutt's `actors::exputt::ExPuttHooks`
 (its `action` is Find mat, its `on_frp` puts the driver's discovery hint in
-the card's words) and the mock's `actors::mock::MockHooks` (no processing of
-their own).
+the card's words), the trackball's `actors::trackball::TrackballHooks` and
+the mock's `actors::mock::MockHooks` (no processing of their own).
 
 **Config.** A `DeviceSection` is flighthook's own fields (`name`,
 `enabled`, `impact_lead_s`) with the driver's config `#[serde(flatten)]`ed
@@ -1636,8 +1703,9 @@ disables Save.
 
 **Rule: every field a driver's `validate()` can refuse is editable on that
 card**, so a refused value can always be fixed from the UI. Each card on a
-device driver is checked against it when it moves onto `DriverActor`. (The
-mock's driver fields are file and API only.) A type error in a
+device driver is checked against it when it moves onto `DriverActor` or is
+added (the trackball: every number its `validate()` checks is a field on its
+card). (The mock's driver fields are file and API only.) A type error in a
 driver field, which serde reads through the flattened buffer, is located by
 re-reading each section into the driver's config, so the load error names
 the key's line. Tests keep host keys and driver keys apart and check that a
@@ -2047,7 +2115,7 @@ applies to the next shot; neither the camera nor the monitor restarts
 | `r10` | 2000 ms |
 | `openconnect_server` | 2500 ms |
 | any other launch monitor (`DEFAULT_IMPACT_LEAD_S`) | 1500 ms |
-| `autochip` | not recorded |
+| `autochip`, `trackball` | not recorded (no swing a camera films) |
 
 Pre- and post-roll come from the live `[replay]` section at every trigger;
 the recorder's history is the pre-roll plus the longest reach in effect over
@@ -2831,7 +2899,7 @@ Groups and order (`ui/src/panels/cards.rs`):
 | Group | Cards, in order | (+) offers |
 |---|---|---|
 | General | Global card, Simulation card, Replay card, Body tracking card, Player card, `webserver` | -- (no (+)) |
-| Launch monitors | `mevo`, `r10`, `square`, `exputt`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, ExPutt, Uneekor (Open Connect), Open Connect Server |
+| Launch monitors | `mevo`, `r10`, `square`, `exputt`, `trackball`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, ExPutt, Trackball (only while `/api/status` says `trackball_supported`), Uneekor (Open Connect), Open Connect Server |
 | Cameras | `camera` | Camera (only while `/api/status` says `cameras_supported`; without it the group shows the cameras already configured and no (+)) |
 | Outputs | `openconnect_client`, `pureplay`, `random_club` (and any type the UI does not know) | GSPro (Open Connect), Pureplay (Open Connect), Muni Golf (Open Connect), Pureplay (Pureplay Connect) |
 
@@ -2939,7 +3007,7 @@ left out once it would be cut to a stub. The toggle flips the card body:
   (`monitoring::no_telemetry`, `theme::loading_ring` / `connected_ring`). It
   goes as soon as a row arrives; a camera's still frame takes its place too.
   Only a spinner on screen asks for repaints (about 30 a second). Every launch
-  monitor and output card (Mevo/Xi, R10, Square Golf, ExPutt, the
+  monitor and output card (Mevo/Xi, R10, Square Golf, ExPutt, Trackball, the
   Open Connect server, the mock monitor, the Open Connect clients, Random club
   and any other output) has **Reconnect** in its action row: it stops the
   actor, waits for its connection to close and starts it again from the saved

@@ -17,6 +17,7 @@ pub mod r10;
 pub(crate) mod scripted;
 pub mod square;
 pub mod system;
+pub mod trackball;
 pub mod web;
 
 use std::collections::HashMap;
@@ -69,6 +70,10 @@ const _: () = assert!(
 );
 const _: () = assert!(
     <flightrelay::mock::MockDriver as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+        <= MAX_STOP_WAIT.as_millis()
+);
+const _: () = assert!(
+    <thumbswing::driver::Thumbswing as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
 
@@ -198,6 +203,16 @@ pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor> {
             id,
             name: section.name.clone(),
             actor: Box::new(exputt::ExPuttActor::new(section.clone())),
+        });
+    }
+
+    // Trackballs
+    for (index, section) in &config.trackball {
+        let id = global_id("trackball", index);
+        actors.push(ResolvedActor {
+            id,
+            name: section.name.clone(),
+            actor: Box::new(trackball::TrackballActor::new(section.clone())),
         });
     }
 
@@ -390,6 +405,9 @@ pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String> {
     }
     for (index, section) in &config.exputt {
         names.insert(global_id("exputt", index), section.name.clone());
+    }
+    for (index, section) in &config.trackball {
+        names.insert(global_id("trackball", index), section.name.clone());
     }
     for (index, section) in &config.mock_monitor {
         names.insert(global_id("mock_monitor", index), section.name.clone());
@@ -588,6 +606,7 @@ mod tests {
             "r10",
             "square",
             "exputt",
+            "trackball",
             "mock_monitor",
             "openconnect_server",
             "openconnect_client",

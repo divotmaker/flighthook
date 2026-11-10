@@ -850,6 +850,13 @@ fn apply_config_command(
             });
             scope = Some(format!("exputt.{index}"));
         }
+        ConfigAction::UpsertTrackball { index, section } => {
+            let idx = index.clone();
+            state.system.update(|p| {
+                p.trackball.insert(idx, section.clone());
+            });
+            scope = Some(format!("trackball.{index}"));
+        }
         ConfigAction::UpsertOpenConnectServer { index, section } => {
             let idx = index.clone();
             state.system.update(|p| {
@@ -908,6 +915,9 @@ fn apply_config_command(
                     }
                     "exputt" => {
                         p.exputt.remove(&idx);
+                    }
+                    "trackball" => {
+                        p.trackball.remove(&idx);
                     }
                     "openconnect_server" => {
                         p.openconnect_server.remove(&idx);

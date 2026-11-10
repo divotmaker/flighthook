@@ -175,6 +175,9 @@ pub struct FlighthookApp {
     // Cameras and replay
     /// The server can record from cameras (`/api/status`).
     pub(crate) cameras_supported: bool,
+    /// The server can read a trackball, so the Launch monitors menu offers
+    /// the Trackball card.
+    pub(crate) trackball_supported: bool,
     /// The folder the server writes clips to (`/api/status`).
     pub(crate) clip_dir: Option<String>,
     /// Why the server's config file was not used (`/api/status`): the
@@ -319,6 +322,7 @@ impl FlighthookApp {
             wizard_error: None,
             ui_scale: UiScale::default(),
             cameras_supported: false,
+            trackball_supported: false,
             clip_dir: None,
             config_error: None,
             camera_list: CameraList::default(),
@@ -363,6 +367,7 @@ impl FlighthookApp {
                 self.round = status.round;
             }
             self.cameras_supported = status.cameras_supported;
+            self.trackball_supported = status.trackball_supported;
             self.clip_dir = status.clip_dir;
             self.config_error = status.config_error;
             // The reply lists every running actor: one it leaves out has
@@ -1764,6 +1769,7 @@ mod tests {
             club: None,
             handed: None,
             cameras_supported: false,
+            trackball_supported: false,
             clip_dir: None,
             config_error,
             round: Default::default(),
@@ -1876,6 +1882,7 @@ mod tests {
             club: None,
             handed,
             cameras_supported: false,
+            trackball_supported: false,
             clip_dir: None,
             config_error: None,
             round: Default::default(),
@@ -2007,6 +2014,7 @@ mod tests {
             club: None,
             handed: None,
             cameras_supported: false,
+            trackball_supported: false,
             clip_dir: None,
             config_error: None,
             round: Default::default(),
@@ -3038,6 +3046,7 @@ mod tests {
                 club: None,
                 handed: None,
                 cameras_supported: true,
+                trackball_supported: false,
                 clip_dir: Some("/clips".into()),
                 config_error: None,
                 round: Default::default(),
@@ -3225,6 +3234,7 @@ mod tests {
             club: None,
             handed: None,
             cameras_supported: false,
+            trackball_supported: false,
             clip_dir: None,
             config_error: None,
             round: round("Pureplay 2"),

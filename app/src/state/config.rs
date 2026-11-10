@@ -135,6 +135,7 @@ impl LegacyFlighthookConfig {
             r10: HashMap::new(),
             square: HashMap::new(),
             exputt: HashMap::new(),
+            trackball: HashMap::new(),
             mock_monitor: self.mock_monitor,
             openconnect_server: HashMap::new(),
             openconnect_client: self.gspro,
@@ -264,6 +265,7 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
                     .or_else(|| driver_type_error::<flighthook::R10Section>(contents))
                     .or_else(|| driver_type_error::<flighthook::SquareSection>(contents))
                     .or_else(|| driver_type_error::<flighthook::ExPuttSection>(contents))
+                    .or_else(|| driver_type_error::<flighthook::TrackballSection>(contents))
                     .unwrap_or_else(|| fault(contents, &e));
                 tracing::warn!("failed to parse {}: {fault}", path.display());
                 Err(fault)
@@ -1537,6 +1539,95 @@ full_monitor = "mevo.0"
         assert_eq!(
             toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
             config
+        );
+    }
+
+    /// A Trackball section as the card writes it (device, club, no grab, a
+    /// tuning and a thresholds table) and one that is off load into the
+    /// driver's settings, and the file is not rewritten.
+    #[test]
+    fn a_trackball_section_file_loads_unchanged() {
+        let text = "default_units = \"imperial\"\n\
+                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
+                    putting_clubs = [\"PT\"]\n\
+                    \n\
+                    [trackball.0]\n\
+                    name = \"Arcade\"\n\
+                    device = \"usb-Example_Trackball-event-mouse\"\n\
+                    club = \"DR\"\n\
+                    cpi = 800\n\
+                    grab = false\n\
+                    \n\
+                    [trackball.0.thresholds]\n\
+                    coil_timeout_s = 20.0\n\
+                    \n\
+                    [trackball.0.tuning]\n\
+                    full_power_speed = 40.0\n\
+                    curve_sense = \"physical\"\n\
+                    \n\
+                    [trackball.1]\n\
+                    name = \"Thumb\"\n\
+                    enabled = false\n";
+        let (dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        let first = &config.trackball["0"];
+        assert_eq!(first.name, "Arcade");
+        let d = &first.driver;
+        assert_eq!(d.device(), Some("usb-Example_Trackball-event-mouse"));
+        assert_eq!(d.club, flighthook::TrackballClub::Driver);
+        assert!((d.config.cpi - 800.0).abs() < f64::EPSILON);
+        assert!(!d.config.grab);
+        assert!((d.config.thresholds.coil_timeout_s - 20.0).abs() < f64::EPSILON);
+        assert!((d.tuning.full_power_speed - 40.0).abs() < f64::EPSILON);
+        assert_eq!(
+            d.tuning.curve_sense,
+            flighthook::TrackballCurveSense::Physical
+        );
+        let second = &config.trackball["1"];
+        assert!(!second.enabled);
+        assert!(second.driver.config.grab, "the driver's default");
+        assert_eq!(config.device_error(), None);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            text,
+            "not rewritten"
+        );
+        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        let saved = toml::to_string_pretty(&config).expect("toml");
+        assert_eq!(
+            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            config
+        );
+    }
+
+    /// A Trackball setting the driver refuses loads as written and names
+    /// the card, which does not start; a club it does not know names its
+    /// key's line.
+    #[test]
+    fn a_refused_trackball_setting_loads_and_is_reported() {
+        let text = "[trackball.0]\nname = \"Trackball\"\ncpi = 0\n";
+        let (_dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        assert_eq!(
+            config.device_error().as_deref(),
+            Some("trackball.0: cpi: must be greater than 0")
+        );
+
+        let text = "[trackball.0]\n\
+                    name = \"Trackball\"\n\
+                    \n\
+                    [trackball.3]\n\
+                    name = \"Thumb\"\n\
+                    club = \"ZZ\"\n";
+        let error = kept_error(text);
+        assert!(
+            error
+                .error
+                .starts_with("line 6, column 1: trackball.3: club: "),
+            "{}",
+            error.error
         );
     }
 

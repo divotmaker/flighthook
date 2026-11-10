@@ -54,6 +54,7 @@ const ACTOR_TYPES: &[(&str, CardGroup)] = &[
     ("r10", CardGroup::LaunchMonitors),
     ("square", CardGroup::LaunchMonitors),
     ("exputt", CardGroup::LaunchMonitors),
+    ("trackball", CardGroup::LaunchMonitors),
     ("mock_monitor", CardGroup::LaunchMonitors),
     ("openconnect_server", CardGroup::LaunchMonitors),
     ("camera", CardGroup::Cameras),
@@ -159,6 +160,7 @@ const LAUNCH_MONITOR_PRESETS: &[AddPreset] = &[
     preset("R10", "r10", "Garmin R10", ""),
     preset("Square Golf Omni", "square", "Square Golf Omni", ""),
     preset("ExPutt", "exputt", "ExPutt", ""),
+    preset("Trackball", "trackball", "Trackball", ""),
     preset(
         "Uneekor (Open Connect)",
         "openconnect_server",
@@ -202,7 +204,7 @@ const OUTPUT_PRESETS: &[AddPreset] = &[
     ),
 ];
 
-/// What a group's (+) menu offers, in menu order.
+/// What a group's (+) menu can offer, in menu order.
 pub(crate) fn add_options(group: CardGroup) -> &'static [AddPreset] {
     match group {
         CardGroup::General => &[],
@@ -210,6 +212,15 @@ pub(crate) fn add_options(group: CardGroup) -> &'static [AddPreset] {
         CardGroup::Cameras => CAMERA_PRESETS,
         CardGroup::Outputs => OUTPUT_PRESETS,
     }
+}
+
+/// What a group's (+) menu offers on a server that can read a trackball
+/// (`trackball`) or not: [`add_options`], the Trackball only where it works.
+pub(crate) fn offered(group: CardGroup, trackball: bool) -> Vec<&'static AddPreset> {
+    add_options(group)
+        .iter()
+        .filter(|p| trackball || p.type_key != "trackball")
+        .collect()
 }
 
 /// Narrowest a card gets before the grid drops a column.
@@ -240,12 +251,14 @@ pub(crate) fn group_heading(ui: &mut egui::Ui, group: CardGroup) {
 }
 
 /// A group heading with a (+) after it, muted at rest and accent on hover,
-/// that opens a menu of the group's presets ([`add_options`]). Disabled
-/// unless `enabled`. Returns the preset picked.
+/// that opens a menu of the group's presets ([`offered`], with the
+/// Trackball where the server can read one: `trackball`). Disabled unless
+/// `enabled`. Returns the preset picked.
 pub(crate) fn add_heading(
     ui: &mut egui::Ui,
     group: CardGroup,
     enabled: bool,
+    trackball: bool,
 ) -> Option<&'static AddPreset> {
     ui.add_space(4.0);
     let picked = ui
@@ -260,7 +273,7 @@ pub(crate) fn add_heading(
             devices::mark(ui, || format!("add:{}", group.title()), &add);
             let mut picked = None;
             egui::Popup::menu(&add).show(|ui| {
-                for preset in add_options(group) {
+                for preset in offered(group, trackball) {
                     let item = ui.add(egui::Button::new(preset.label));
                     devices::mark(
                         ui,
@@ -348,6 +361,7 @@ mod tests {
             "r10",
             "square",
             "exputt",
+            "trackball",
             "mock_monitor",
             "openconnect_server",
         ] {
@@ -376,6 +390,7 @@ mod tests {
             r10: _,
             square: _,
             exputt: _,
+            trackball: _,
             mock_monitor: _,
             openconnect_server: _,
             openconnect_client: _,
@@ -392,6 +407,7 @@ mod tests {
             "r10",
             "square",
             "exputt",
+            "trackball",
             "mock_monitor",
             "openconnect_server",
             "openconnect_client",
@@ -474,6 +490,7 @@ mod tests {
                 ("R10", "r10", "Garmin R10", ""),
                 ("Square Golf Omni", "square", "Square Golf Omni", ""),
                 ("ExPutt", "exputt", "ExPutt", ""),
+                ("Trackball", "trackball", "Trackball", ""),
                 (
                     "Uneekor (Open Connect)",
                     "openconnect_server",
@@ -540,7 +557,33 @@ mod tests {
             .collect();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 11);
+        assert_eq!(labels.len(), 12);
+    }
+
+    /// The Trackball is offered only where the server can read one; the
+    /// other presets always.
+    #[test]
+    fn the_trackball_is_offered_only_where_it_works() {
+        for group in CardGroup::ALL {
+            let all: Vec<&AddPreset> = add_options(group).iter().collect();
+            assert_eq!(offered(group, true), all, "{group:?}");
+            let without: Vec<&AddPreset> = all
+                .iter()
+                .copied()
+                .filter(|p| p.type_key != "trackball")
+                .collect();
+            assert_eq!(offered(group, false), without, "{group:?}");
+        }
+        assert!(
+            offered(CardGroup::LaunchMonitors, true)
+                .iter()
+                .any(|p| p.type_key == "trackball")
+        );
+        assert!(
+            !offered(CardGroup::LaunchMonitors, false)
+                .iter()
+                .any(|p| p.type_key == "trackball")
+        );
     }
 
     #[test]

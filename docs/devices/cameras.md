@@ -752,7 +752,7 @@ in the config file.
   impact estimates are within 0.5 s) make **one clip**, shown on both shots.
 - The same monitor reporting again ends the clip at that moment and starts a
   new one, so quick putts each get their own clip.
-- **Auto-chip** shots are never recorded.
+- **Auto-chip** and **Trackball** shots are never recorded.
 - If a camera stops during a clip, the clip is kept when it reached the
   impact (marked incomplete), and dropped when it didn't. The card shows
   RECONNECTING and the camera is reopened with the usual backoff.

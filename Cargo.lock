@@ -1532,6 +1532,7 @@ dependencies = [
  "serde_json",
  "tenover",
  "threeputt",
+ "thumbswing",
  "tungstenite 0.26.2",
 ]
 
@@ -1562,6 +1563,7 @@ dependencies = [
  "stance 0.0.4",
  "tenover",
  "threeputt",
+ "thumbswing",
  "tokio",
  "toml 0.8.23",
  "tower",
@@ -4344,6 +4346,18 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "thumbswing"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84fbb020a7b718bd8fcbb14bf7157fb12b698bb558b2f07af71aaf01718407d8"
+dependencies = [
+ "flightrelay",
+ "libc",
+ "serde",
  "thiserror 2.0.20",
 ]
 

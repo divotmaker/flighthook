@@ -49,3 +49,8 @@ pub use ironsight::config::{
 };
 pub use tenover::config::Config as R10Config;
 pub use threeputt::config::Config as ExPuttConfig;
+/// The Trackball driver's settings and the types of their fields.
+pub use thumbswing::{
+    Club as TrackballClub, CurveSense as TrackballCurveSense, Hand as TrackballHand,
+    Settings as TrackballConfig,
+};

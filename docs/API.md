@@ -171,6 +171,7 @@ Comprehensive system state (all actors -- launch monitors and integrations).
   "club": "7I",
   "handed": "rh",
   "cameras_supported": true,
+  "trackball_supported": true,
   "clip_dir": "C:\\Users\\me\\AppData\\Local\\flighthook\\clips",
   "config_error": {
     "path": "C:\\Users\\me\\AppData\\Roaming\\flighthook\\config.toml",
@@ -223,6 +224,10 @@ numbered in index order (`Open Connect 1`, `Open Connect 2`).
 - `cameras_supported`: `true` when this server can record from cameras
   (Windows and Linux); omitted where it can't (macOS). The
   [test picture](#get-apicameras) works everywhere
+- `trackball_supported`: `true` when this server can read a trackball (Linux),
+  so the dashboard offers the Trackball card (alpha); omitted where it
+  can't. A `trackball` section on another platform shows the error on its
+  card
 - `clip_dir`: the folder [camera clips](#get-apishotsshot_idvideo) are
   written to: `[replay] clip_dir`, or `flighthook/clips` in the user's local
   data folder (`%LOCALAPPDATA%` on Windows, `~/.local/share` on Linux)
@@ -279,7 +284,9 @@ actor sends each key from one source only:
 - **Device-reported** (from `device_telemetry`): `ready`, `battery_pct`, `tilt`,
   `roll`, `temp_c`, `external_power`, and a device driver's own state keys
   (the mock's `radar_mode`, `tracking_mode`; the Square Golf's
-  `device_state`, `zero_spin_discards`)
+  `device_state`, `zero_spin_discards`; the Trackball's `synthetic`
+  (`true`), `input` (the name the device reports), `cpi`, `profile` (the
+  club in play) and `handed` (`rh` | `lh`))
 - **Actor-framework** (from `actor_status`): `device_info`, `shot_count`,
   `phase`
 - **Integration actors**: `club`, `handed`, `name`, `error`
@@ -459,8 +466,8 @@ for example in `POST /api/shots/convert`.
 - `provenance`: where the shot comes from, by the type of the actor that
   emitted it (see [Provenance](#provenance)): `"measured"` (a launch monitor
   measured it: one flighthook reads, or one whose app sends its shots to
-  the Open Connect input) or `"virtual"` (the mock launch monitor,
-  Auto-chip). Absent on a shot stored without it; a tournament round counts
+  the Open Connect input) or `"virtual"` (the Trackball, the mock launch
+  monitor, Auto-chip). Absent on a shot stored without it; a tournament round counts
   such a shot as not measured.
 - `video` (beta): the cameras' clips of the shot, one per camera, omitted
   when there are none. Each is a `ShotVideo`, the fields of
@@ -1413,7 +1420,7 @@ running flighthook.
   `basis` `"modeled"`) and schema 2 and 3 lines as they are.
 - `time`: when `shot_trigger` reached the web layer (host clock, RFC 3339 UTC).
 - `device`: `kind` (`flightscope`, `square_golf`, `garmin_r10`, `exputt`,
-  `openconnect`, `mock`) plus manufacturer, model and firmware as the device reported them.
+  `trackball`, `openconnect`, `mock`) plus manufacturer, model and firmware as the device reported them.
   FlightScope: `model` is the product (`Mevo+`, `Mevo Gen2`, `Mevo` when the
   generation is unknown, or `Xi`) and `firmware` the device's version and
   build date, e.g. `"1.23 (Feb 3 2024)"`.
@@ -1636,10 +1643,11 @@ dashboard cannot hit it: it disables Reconnect while a save is out.
 
 How long the old connection is given to close depends on the device: up to
 3 s, 6 s for a Garmin R10 or a Square Golf, 18 s for an ExPutt (a session start in progress
-cannot be cut short). A Mevo/Xi, an Open Connect client or a mock still
+cannot be cut short), 1 s for a Trackball. A Mevo/Xi, an Open Connect client,
+a mock or a Trackball without the grab still
 closing after that is replaced anyway (it holds nothing the new one needs and
 closes itself); so is an Open Connect server once its port is free. A Garmin
-R10, a Square Golf or an ExPutt is not: the request answers `202`, the
+R10, a Square Golf, an ExPutt or a Trackball holding the grab is not: the request answers `202`, the
 actor's `error` telemetry and an Error alert say the previous connection has
 not closed yet, and the actor starts again by itself once it has. Its `error` is
 cleared then, and a `config_outcome` without `request_id` lists it in
@@ -1732,6 +1740,16 @@ Full persisted config (mirrors `config.toml`).
       "name": "ExPutt"
     }
   },
+  "trackball": {
+    "0": {
+      "name": "Trackball",
+      "device": "usb-Example_Trackball-event-mouse",
+      "grab": false,
+      "tuning": {
+        "full_power_speed": 40.0
+      }
+    }
+  },
   "mock_monitor": {},
   "openconnect_server": {
     "0": {
@@ -1774,7 +1792,7 @@ Full persisted config (mirrors `config.toml`).
 }
 ```
 
-- Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `square.0`, `exputt.0`, `mock_monitor.0`,
+- Keys are type-prefixed global IDs: `mevo.0`, `r10.0`, `square.0`, `exputt.0`, `trackball.0`, `mock_monitor.0`,
   `openconnect_server.0`, `openconnect_client.0`, `random_club.0`, `webserver.0`,
   `camera.0`
 - `shot_grouping`: the Shots tab's default view, [`ShotGrouping`](#shotgrouping),
@@ -1873,6 +1891,33 @@ Full persisted config (mirrors `config.toml`).
   address; leave it blank to find the device on the network"`); a config
   file holding one loads, and that card does not start and shows the error.
   A change restarts the card
+- `trackball` sections (alpha) have `name` and the trackball driver's
+  settings, each omitted while at its default: `device` (the input to read:
+  a `/dev/input/by-id` name, a `/dev/input` path or the name the device
+  reports; absent or blank uses the only readable trackball or mouse),
+  `club` (the club in play until the game names one, an FRP club code,
+  default `"7I"`), `hand` (`"rh"` | `"lh"` until the game names one,
+  default `"rh"`), `cpi` (counts per inch of ball travel, default `400.0`),
+  `report_limit` (the largest movement one report carries, default `127`),
+  `grab` (an exclusive grab, so the desktop pointer does not follow the
+  ball; default `true`, and the card writes `false` for a new Trackball), a
+  `thresholds` table (`speed_window_ms`, `gap_ms`, `v_start`, `v_stop`,
+  `v_min_swing`, `dwell_min_ms`, `back_min`, `full_cock`, `fwd_min`,
+  `back_max_s`, `coil_timeout_s`, `fwd_window_ms`, `idle_settle_ms`,
+  `cooldown_max_s`, `pull_cone_deg`: how swings are found) and a `tuning`
+  table (`full_power_speed`, `max_club_speed`, `max_putt_speed`,
+  `angle_gain`, `putt_angle_gain`, `curve_gain`, `curve_sense` (`"arcade"` |
+  `"physical"`), `backswing_power`, `power_gamma`, `mirror_for_left_hand`,
+  `face_max`, `face_to_path_max`: how a swing becomes a shot); see
+  [Trackball](devices/trackball.md). A save that changes one into a value
+  the driver refuses is rejected with `400` naming the key
+  (`"trackball.0: cpi: must be greater than 0"`, `"trackball.0:
+  thresholds.v_stop: must be below thresholds.v_start (0.067)"`,
+  `"trackball.0: tuning.backswing_power: must be 0 to 1"`); a config file
+  holding one loads, and that card does not start and shows the error. A
+  change of `device`, `cpi`, `report_limit` or `grab` restarts the card; the
+  rest applies to the next swing. No `impact_lead_s`: the cameras cut no clip
+  for a Trackball shot
 - `mock_monitor` sections have `name` and the mock launch monitor's
   settings, each omitted while at its default: `shot_interval_s` (30, the
   seconds from the ball being ready to the shot), `arm_delay_s` (2, from
@@ -1883,7 +1928,7 @@ Full persisted config (mirrors `config.toml`).
   rejected with `400`; a config file holding one loads, and that card does
   not start and shows the error. A change restarts the card
 - Every launch monitor, camera and output section (`mevo`, `r10`, `square`,
-  `exputt`, `mock_monitor`, `openconnect_server`, `camera`,
+  `exputt`, `trackball`, `mock_monitor`, `openconnect_server`, `camera`,
   `openconnect_client`, `pureplay`, `random_club`) takes `enabled`: `true`
   (the default) runs its actor, `false` turns the card off, keeping its
   section and settings. Omitted while `true`, so a config written before the
@@ -2139,7 +2184,7 @@ extractor with a `4xx` and a plain-text reason.
 A save that restarts or removes actors stops them together and waits for
 each to let go of its device or connection, as a
 [reconnect](#post-apiactorsidreconnect) does: up to 3 s, 6 s for a Garmin
-R10 or a Square Golf, 18 s for an ExPutt. One still closing after that is handled the same way
+R10 or a Square Golf, 18 s for an ExPutt, 1 s for a Trackball. One still closing after that is handled the same way
 as for a reconnect: replaced beside it when it holds nothing the new one
 needs, otherwise its card says the previous connection has not closed yet,
 it is listed in neither `restarted` nor `started`, and it starts by itself
@@ -2962,6 +3007,9 @@ armed, and `configuring` while a mode change re-arms it); `device_info` is
 The ExPutt adds `shot_count` (shots finished since the card started) and
 `phase` (`discovering`, `connecting`, then `measuring`, which the
 `connected` status keeps); `device_info` is `ExPutt RG (<ip>)`.
+The Trackball adds `shot_count` (shots finished since the card started)
+and, while it connects, `phase` (`connecting`; removed by the `connected`
+status); `device_info` is `thumbswing (<the name the device reports>)`.
 The R10 adds `shot_count` (shots finished since the card started) and, while
 it connects, `phase` (`discovering`, `handshaking`; the `connected` status
 removes it with `"phase": ""`); `device_info` is `Garmin R10 (<address>)`.
@@ -3005,7 +3053,7 @@ External consumers can observe these to track config changes in flight.
 
 `action.type` is one of `replace_all`, `replace_global`, `upsert_webserver`,
 `upsert_mevo`, `upsert_r10`, `upsert_square`, `upsert_exputt`,
-`upsert_open_connect_server`, `upsert_open_connect_client`, `upsert_pureplay`,
+`upsert_trackball`, `upsert_open_connect_server`, `upsert_open_connect_client`, `upsert_pureplay`,
 `upsert_mock_monitor`, `upsert_random_club`, `upsert_camera`, `remove`,
 `set_shot_grouping` (`{ "type": "set_shot_grouping", "mode": "by_club" }`, from
 `POST /api/shots/grouping` or the WS `grouping` command) and `reconnect`
@@ -3350,7 +3398,8 @@ unknown club code or mode is ignored.
 `"measured"` | `"virtual"`: a launch monitor measured the shot, either one
 flighthook reads directly (FlightScope, Garmin R10, Square Golf, ExPutt) or
 one whose own app sends its shots to the Open Connect input; no launch
-monitor measured the shot (the mock launch monitor, Auto-chip).
+monitor measured the shot (the Trackball, the mock launch monitor,
+Auto-chip).
 
 ### CameraPosition
 

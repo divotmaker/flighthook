@@ -33,7 +33,8 @@ use crate::{
 use crate::{
     BodyTrackingSection, CameraPosition, CameraSection, ExPuttSection, FlighthookConfig,
     MevoSection, MockMonitorSection, OpenConnectClientSection, OpenConnectServerSection,
-    PlayerSection, PureplaySection, R10Section, RandomClubSection, SquareSection, WebserverSection,
+    PlayerSection, PureplaySection, R10Section, RandomClubSection, SquareSection, TrackballSection,
+    WebserverSection,
 };
 use crate::{Club, ClubInfo, GroupedShot, HandInfo, PlayerInfo, ShotGroupInfo, ShotGrouping};
 
@@ -427,6 +428,10 @@ pub enum ConfigAction {
         index: String,
         section: ExPuttSection,
     },
+    UpsertTrackball {
+        index: String,
+        section: TrackballSection,
+    },
     UpsertOpenConnectServer {
         index: String,
         section: OpenConnectServerSection,
@@ -508,6 +513,26 @@ mod tests {
         let back: ConfigAction = serde_json::from_str(&json).expect("de");
         assert!(
             matches!(back, ConfigAction::UpsertExPutt { section, .. } if section.driver.address.is_some())
+        );
+    }
+
+    #[test]
+    fn trackball_upsert_round_trips_as_upsert_trackball() {
+        let mut section = TrackballSection::default();
+        section.driver.device = Some("usb-Example_Trackball-event-mouse".into());
+        section.driver.tuning.full_power_speed = 40.0;
+        let action = ConfigAction::UpsertTrackball {
+            index: "0".into(),
+            section: section.clone(),
+        };
+        let json = serde_json::to_string(&action).expect("ser");
+        assert_eq!(
+            json,
+            r#"{"type":"upsert_trackball","index":"0","section":{"name":"Trackball","device":"usb-Example_Trackball-event-mouse","grab":false,"tuning":{"full_power_speed":40.0}}}"#
+        );
+        let back: ConfigAction = serde_json::from_str(&json).expect("de");
+        assert!(
+            matches!(back, ConfigAction::UpsertTrackball { section: back, .. } if back == section)
         );
     }
 

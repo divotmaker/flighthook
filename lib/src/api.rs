@@ -26,6 +26,10 @@ pub struct StatusResponse {
     /// when it can't.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cameras_supported: bool,
+    /// The server can read a trackball on its platform (alpha), so it offers
+    /// the Trackball card. Omitted when it can't.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trackball_supported: bool,
     /// The folder replay clips are written to (`[replay] clip_dir`, or the
     /// default). Omitted when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]

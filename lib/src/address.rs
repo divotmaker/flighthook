@@ -48,6 +48,7 @@ pub(crate) fn type_name(type_key: &str) -> &str {
         "r10" => "R10",
         "square" => "Square Golf Omni",
         "exputt" => "ExPutt",
+        "trackball" => "Trackball",
         "openconnect_server" => "Open Connect Server",
         "openconnect_client" => "Open Connect",
         "pureplay" => "Pureplay Connect",
@@ -159,6 +160,9 @@ impl FlighthookConfig {
         });
         push(&mut out, "exputt", &self.exputt, |s| {
             (s.enabled, s.driver.address.as_deref())
+        });
+        push(&mut out, "trackball", &self.trackball, |s| {
+            (s.enabled, s.driver.device())
         });
         push(
             &mut out,
@@ -275,6 +279,7 @@ impl FlighthookConfig {
             "r10" => set(&mut self.r10, i, on, |s| &mut s.enabled),
             "square" => set(&mut self.square, i, on, |s| &mut s.enabled),
             "exputt" => set(&mut self.exputt, i, on, |s| &mut s.enabled),
+            "trackball" => set(&mut self.trackball, i, on, |s| &mut s.enabled),
             "mock_monitor" => set(&mut self.mock_monitor, i, on, |s| &mut s.enabled),
             "openconnect_server" => set(&mut self.openconnect_server, i, on, |s| &mut s.enabled),
             "openconnect_client" => set(&mut self.openconnect_client, i, on, |s| &mut s.enabled),

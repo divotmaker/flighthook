@@ -141,7 +141,7 @@ Every launch monitor flighthook supports falls into one of two classes:
 | Class | Launch monitors | In strict mode |
 |---|---|---|
 | Measured | FlightScope Mevo, Mevo+ and Xi; Square Golf Omni; Garmin R10; ExPutt RG; the Open Connect input (shots a launch monitor's own app sends to flighthook) | allowed |
-| Virtual | the mock launch monitor; Auto-chip | not allowed |
+| Virtual | the Trackball; the mock launch monitor; Auto-chip | not allowed |
 
 - **Accepting a round**: flighthook accepts strict mode only when every
   launch monitor this output takes shots from is a measured one: the
@@ -175,7 +175,8 @@ Every launch monitor flighthook supports falls into one of two classes:
   of strict mode.
 - **Auto-chip is off** while Pureplay has a round in progress: it does not
   fire, and the header's Auto-chip control is shown disabled. The mock
-  launch monitor makes no shots either. Both return when the round ends or
+  launch monitor makes no shots either, and a swing on the Trackball is
+  dropped. Both return when the round ends or
   the connection to Pureplay drops.
 - **The Tournament banner**: while a round is in progress, a slim
   **Tournament** banner shows under the header, so it is clear why some

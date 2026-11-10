@@ -24,7 +24,14 @@ Each device links to its setup notes, quirks, and config reference.
 | [Square Golf Omni](docs/devices/square-golf.md)      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Supported        |
 | [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
 | ExPutt RG                                            | WiFi                    | [threeputt](https://crates.io/crates/threeputt) | Alpha            |
+| [Trackball](docs/devices/trackball.md)               | Linux evdev (any mouse) | [thumbswing](https://crates.io/crates/thumbswing) | Alpha (Linux)  |
 | [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (Open Connect server)                  | Alpha (untested) |
+
+The Trackball turns a trackball or mouse into a launch monitor for testing and
+practice: pull the ball back, push it forward, and the swing becomes a full
+shot. Every value is synthesized from the swing, so it is a virtual launch
+monitor (no tournament rounds). Add it from the Launch monitors (+) menu
+(Linux only).
 
 Uneekor connects through the **Open Connect server** actor, which accepts shots
 from any launch monitor that speaks GSPro Open Connect as a client — Foresight,
@@ -575,6 +582,12 @@ name = "ExPutt"
 # address is optional — omit it to find the device on the network.
 address = "192.168.1.50"
 
+[trackball.0]
+name = "Trackball"
+# device is optional — omit it to use the only trackball or mouse (Linux).
+device = "usb-Example_Trackball-event-mouse"
+grab = false                   # true: the desktop pointer does not follow the ball
+
 [camera.0]
 name = "Golfer Back"
 camera = "test-pattern"        # the camera's id, picked on the camera card
@@ -597,7 +610,7 @@ address = "127.0.0.1:9760"
 `[simulation]` and `[replay]` (camera clips, see
 [Cameras](docs/devices/cameras.md)) are single global tables. Section
 prefixes encode component type: `webserver`, `mevo`, `r10`, `square`,
-`exputt`, `openconnect_server`, `mock_monitor`, `openconnect_client`,
+`exputt`, `trackball`, `openconnect_server`, `mock_monitor`, `openconnect_client`,
 `pureplay`, `random_club`, `camera`. The
 index after the dot (`0`, `1`, ...) identifies the instance. Per-device
 options are covered in the [device docs](#launch-monitors). Settings can also

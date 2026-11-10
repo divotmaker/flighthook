@@ -22,6 +22,9 @@ pub enum ShotSource {
     Square,
     /// ExPutt RG (threeputt).
     ExPutt,
+    /// A trackball turned into a launch monitor (thumbswing): a swing on the
+    /// ball becomes a synthesized shot.
+    Trackball,
     /// The mock launch monitor's random shots.
     MockMonitor,
     /// The Open Connect input: shots a monitor's own app sends to
@@ -34,11 +37,12 @@ pub enum ShotSource {
 impl ShotSource {
     /// Every source type.
     #[cfg(test)]
-    pub const ALL: [ShotSource; 7] = [
+    pub const ALL: [ShotSource; 8] = [
         Self::Mevo,
         Self::R10,
         Self::Square,
         Self::ExPutt,
+        Self::Trackball,
         Self::MockMonitor,
         Self::OpenConnectServer,
         Self::AutoChip,
@@ -46,15 +50,15 @@ impl ShotSource {
 
     /// Where this source's shots come from. The Open Connect input is
     /// measured: a launch monitor's own app sends it the shots that monitor
-    /// measured. The trackball launch monitor (a stroke turned into a shot)
-    /// is virtual, and goes with the mock and Auto-chip when it is added.
+    /// measured. The trackball (a stroke turned into a shot) is virtual,
+    /// like the mock and Auto-chip.
     #[must_use]
     pub fn provenance(self) -> Provenance {
         match self {
             Self::Mevo | Self::R10 | Self::Square | Self::ExPutt | Self::OpenConnectServer => {
                 Provenance::Measured
             }
-            Self::MockMonitor | Self::AutoChip => Provenance::Virtual,
+            Self::Trackball | Self::MockMonitor | Self::AutoChip => Provenance::Virtual,
         }
     }
 
@@ -67,6 +71,7 @@ impl ShotSource {
             | Self::R10
             | Self::Square
             | Self::ExPutt
+            | Self::Trackball
             | Self::MockMonitor
             | Self::OpenConnectServer => true,
             Self::AutoChip => false,
@@ -92,6 +97,7 @@ mod tests {
                 (ShotSource::R10, Measured, true),
                 (ShotSource::Square, Measured, true),
                 (ShotSource::ExPutt, Measured, true),
+                (ShotSource::Trackball, Virtual, true),
                 (ShotSource::MockMonitor, Virtual, true),
                 (ShotSource::OpenConnectServer, Measured, true),
                 (ShotSource::AutoChip, Virtual, false),
@@ -108,7 +114,7 @@ mod tests {
         use flighthook::{
             CameraSection, ExPuttSection, FlighthookConfig, MevoSection, MockMonitorSection,
             OpenConnectClientSection, OpenConnectServerSection, PureplaySection, R10Section,
-            RandomClubSection, SquareSection, WebserverSection,
+            RandomClubSection, SquareSection, TrackballSection, WebserverSection,
         };
         const NOT_SOURCES: [&str; 5] = [
             "webserver",
@@ -129,6 +135,9 @@ mod tests {
         config.r10.insert("0".into(), R10Section::default());
         config.square.insert("0".into(), SquareSection::default());
         config.exputt.insert("0".into(), ExPuttSection::default());
+        config
+            .trackball
+            .insert("0".into(), TrackballSection::default());
         config.mock_monitor.insert(
             "0".into(),
             MockMonitorSection {
@@ -157,7 +166,7 @@ mod tests {
         config.camera.insert("0".into(), CameraSection::default());
 
         let resolved = super::super::resolve_actors(&config);
-        assert_eq!(resolved.len(), 11, "one actor per section");
+        assert_eq!(resolved.len(), 12, "one actor per section");
         let mut sources = Vec::new();
         for ra in &resolved {
             let (section, _) = ra.id.split_once('.').expect("type.index");
@@ -176,6 +185,7 @@ mod tests {
                 ("r10", ShotSource::R10),
                 ("square", ShotSource::Square),
                 ("exputt", ShotSource::ExPutt),
+                ("trackball", ShotSource::Trackball),
                 ("mock_monitor", ShotSource::MockMonitor),
                 ("openconnect_server", ShotSource::OpenConnectServer),
             ]

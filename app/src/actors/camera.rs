@@ -1153,6 +1153,7 @@ mod tests {
         // A launch monitor kind without a better-known value.
         assert_eq!(ms(&state, "newmonitor.0"), Some(1500));
         assert_eq!(ms(&state, flighthook::AUTO_CHIP_ACTOR), None);
+        assert_eq!(ms(&state, "trackball.0"), None, "no swing a camera films");
         for actor in ["mevo.0", "square.0", "r10.0", "openconnect_server.0"] {
             assert!(
                 impact_lead(&state, actor).unwrap() <= lead(MAX_IMPACT_LEAD_S),

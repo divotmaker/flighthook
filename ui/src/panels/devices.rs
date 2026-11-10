@@ -470,7 +470,9 @@ impl FlighthookApp {
                             continue;
                         }
                         cards::group_heading(ui, group);
-                    } else if let Some(preset) = cards::add_heading(ui, group, loaded && !locked) {
+                    } else if let Some(preset) =
+                        cards::add_heading(ui, group, loaded && !locked, self.trackball_supported)
+                    {
                         added = Some(preset);
                     }
                     let general_editable = (!locked || self.settings.global_dirty) && !saving;
@@ -2017,6 +2019,55 @@ mod tests {
         assert_eq!(bind(&app).as_deref(), Some("127.0.0.1:9921"));
     }
 
+    /// The Launch monitors menu offers the Trackball only when the server
+    /// can read one; the added card shows the driver's fields, refuses what
+    /// the driver refuses, and has no Camera timing.
+    #[test]
+    fn the_trackball_is_added_where_the_server_can_read_one() {
+        let screen = Screen::new();
+        let mut app = app();
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, "add:Launch monitors");
+        assert!(!marks.contains_key("add:Launch monitors:Trackball"));
+        assert!(marks.contains_key("add:Launch monitors:ExPutt"));
+
+        let screen = Screen::new();
+        let mut app = self::app();
+        app.trackball_supported = true;
+        let marks = screen.frame(&mut app, Vec::new());
+        let marks = screen.click_mark(&mut app, &marks, "add:Launch monitors");
+        let marks = screen.click_mark(&mut app, &marks, "add:Launch monitors:Trackball");
+        let id = "trackball.0";
+        let entry = &app.settings.actors[form_index(&app, id)];
+        assert_eq!(entry.name(), "Trackball");
+        assert_eq!(entry.type_label(), "Trackball");
+        assert!(entry.type_tooltip().starts_with("Trackball (alpha)"));
+        assert!(enabled(&marks, &format!("trackball:device:{id}")));
+        assert!(enabled(
+            &marks,
+            &format!("trackball:tuning.full_power_speed:{id}")
+        ));
+        assert!(!marks.contains_key(&format!("camera_timing:{id}")));
+        assert!(enabled(&marks, &format!("save:{id}")));
+
+        device(&mut app, id)
+            .trackball
+            .numbers
+            .insert("tuning.full_power_speed", "0".into());
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!enabled(&marks, &format!("save:{id}")), "refused");
+        assert!(marks.contains_key(&format!("driver_error:{id}")));
+        device(&mut app, id)
+            .trackball
+            .numbers
+            .insert("tuning.full_power_speed", "40".into());
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, &format!("save:{id}")));
+        let section = app.settings.build_actor_request(id).trackball["0"].clone();
+        assert!((section.driver.tuning.full_power_speed - 40.0).abs() < f64::EPSILON);
+        assert!(!section.driver.config.grab);
+    }
+
     #[test]
     fn an_added_exputt_takes_an_optional_ip_address() {
         let screen = Screen::new();
@@ -2840,6 +2891,7 @@ mod tests {
                 club: None,
                 handed: None,
                 cameras_supported: false,
+                trackball_supported: false,
                 clip_dir: None,
                 config_error: None,
                 round: Default::default(),

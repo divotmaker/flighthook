@@ -9,6 +9,7 @@ pub use ironsight::config::{CameraMode, FlightScopeEnvironment, SpinSource};
 use serde::{Deserialize, Serialize};
 use tenover::config::Config as R10Config;
 use threeputt::config::Config as ExPuttConfig;
+use thumbswing::Settings as TrackballConfig;
 
 use crate::game_state::Club;
 use crate::group::ShotGrouping;
@@ -215,6 +216,10 @@ pub struct FlighthookConfig {
     pub square: std::collections::HashMap<String, SquareSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub exputt: std::collections::HashMap<String, ExPuttSection>,
+    /// Trackball launch monitors (alpha): a trackball or mouse turned into
+    /// a full shot (Linux).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub trackball: std::collections::HashMap<String, TrackballSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub mock_monitor: std::collections::HashMap<String, MockMonitorSection>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -1475,6 +1480,43 @@ impl DeviceSection for ExPuttSection {
     }
 }
 
+/// A trackball launch monitor instance (alpha; thumbswing's device driver):
+/// a trackball or mouse read on Linux, where pulling the ball back and
+/// pushing it forward makes a full shot. Every value is synthesized from the
+/// swing, so it is a virtual launch monitor. It has no `impact_lead_s`: the
+/// cameras cut no clip for its shots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackballSection {
+    #[serde(default)]
+    pub name: String,
+    /// Whether the card is on. A section that is off keeps its settings
+    /// and runs no actor. Defaults to true, and is left out of the config
+    /// file then.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// The trackball driver's settings, each left out of the file at its
+    /// default: `device` (a `/dev/input` path, a `/dev/input/by-id` name or
+    /// the name the device reports; unset or blank uses the only trackball
+    /// or mouse), `club` and `hand` (until the game names them, default
+    /// `7I` and `rh`), `cpi`, `report_limit`, `grab` (default true; a new
+    /// card writes false), a `thresholds` table and a `tuning` table.
+    #[serde(flatten)]
+    pub driver: TrackballConfig,
+}
+
+impl DeviceSection for TrackballSection {
+    type Driver = TrackballConfig;
+    const KIND: &'static str = "trackball";
+
+    fn driver(&self) -> &TrackballConfig {
+        &self.driver
+    }
+
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
+        &config.trackball
+    }
+}
+
 /// The config section of a card whose device runs on a flightrelay device
 /// driver: flighthook's own fields (`name`, `enabled`, `impact_lead_s`, ...)
 /// with the driver's settings flattened next to them, so the file and the
@@ -1697,13 +1739,15 @@ pub const MAX_IMPACT_LEAD_S: f64 = 5.0;
 /// an actor ID before the dot, e.g. `mevo`), seconds: how long before the
 /// time of the monitor's `shot_trigger` the ball was struck. A trigger's
 /// time is its `timestamp` when it carries one, else its arrival. `None`
-/// for Auto-chip, which is not a swing. Any other source is a launch
+/// for Auto-chip and the trackball, whose shots are no swing a camera
+/// films. Any other source is a launch
 /// monitor and gets [`DEFAULT_IMPACT_LEAD_S`] unless a value is better
 /// known.
 #[must_use]
 pub fn impact_lead_default_s(prefix: &str) -> Option<f64> {
     match prefix {
-        crate::api::AUTO_CHIP_ACTOR => None,
+        // Not a swing a camera films: Auto-chip, and the trackball.
+        crate::api::AUTO_CHIP_ACTOR | "trackball" => None,
         // Reports at impact, or dates its trigger at the strike.
         "mevo" | "mock_monitor" | "exputt" => Some(0.0),
         "square" => Some(1.0),
@@ -1816,6 +1860,7 @@ impl FlighthookConfig {
         off(&mut out, "r10", &self.r10, |s| s.enabled);
         off(&mut out, "square", &self.square, |s| s.enabled);
         off(&mut out, "exputt", &self.exputt, |s| s.enabled);
+        off(&mut out, "trackball", &self.trackball, |s| s.enabled);
         off(&mut out, "mock_monitor", &self.mock_monitor, |s| s.enabled);
         off(
             &mut out,
@@ -1895,6 +1940,7 @@ impl FlighthookConfig {
             .or_else(|| first_driver_error::<R10Section>(self, None))
             .or_else(|| first_driver_error::<SquareSection>(self, None))
             .or_else(|| first_driver_error::<ExPuttSection>(self, None))
+            .or_else(|| first_driver_error::<TrackballSection>(self, None))
     }
 
     /// [`device_error`](Self::device_error) for saving this config over
@@ -1908,6 +1954,7 @@ impl FlighthookConfig {
             .or_else(|| first_driver_error::<R10Section>(self, Some(saved)))
             .or_else(|| first_driver_error::<SquareSection>(self, Some(saved)))
             .or_else(|| first_driver_error::<ExPuttSection>(self, Some(saved)))
+            .or_else(|| first_driver_error::<TrackballSection>(self, Some(saved)))
     }
 
     /// Look up the detection mode for a club based on the configured mapping.
@@ -1931,6 +1978,7 @@ impl FlighthookConfig {
             || !self.r10.is_empty()
             || !self.square.is_empty()
             || !self.exputt.is_empty()
+            || !self.trackball.is_empty()
             || !self.mock_monitor.is_empty()
             || !self.openconnect_server.is_empty()
             || !self.openconnect_client.is_empty()
@@ -1966,6 +2014,7 @@ impl Default for FlighthookConfig {
             r10: std::collections::HashMap::new(),
             square: std::collections::HashMap::new(),
             exputt: std::collections::HashMap::new(),
+            trackball: std::collections::HashMap::new(),
             mock_monitor: std::collections::HashMap::new(),
             openconnect_server: std::collections::HashMap::new(),
             openconnect_client: std::collections::HashMap::new(),
@@ -2017,6 +2066,24 @@ impl Default for SquareSection {
             // Auto-discover, arm the 7-iron, advanced spin, discard
             // zero-spin misreads, built-in calibration.
             driver: SquareConfig::default(),
+        }
+    }
+}
+
+impl Default for TrackballSection {
+    /// What a new Trackball card writes: no grab, so the desktop pointer
+    /// keeps working while the card runs.
+    fn default() -> Self {
+        Self {
+            name: "Trackball".into(),
+            enabled: true,
+            driver: TrackballConfig {
+                config: thumbswing::Config {
+                    grab: false,
+                    ..thumbswing::Config::default()
+                },
+                ..TrackballConfig::default()
+            },
         }
     }
 }
@@ -2650,6 +2717,29 @@ mod openconnect_client_tests {
                     address: Some("192.168.1.50".into()),
                 },
             }),
+            trackball: one(TrackballSection {
+                name: "Arcade".into(),
+                enabled: false,
+                driver: TrackballConfig {
+                    device: Some("usb-Example_Trackball-event-mouse".into()),
+                    club: thumbswing::Club::Driver,
+                    hand: thumbswing::Hand::Left,
+                    config: thumbswing::Config {
+                        cpi: 800.0,
+                        report_limit: 2047,
+                        grab: true,
+                        thresholds: thumbswing::Thresholds {
+                            v_start: 0.08,
+                            ..thumbswing::Thresholds::default()
+                        },
+                    },
+                    tuning: thumbswing::Tuning {
+                        curve_sense: thumbswing::CurveSense::Physical,
+                        full_power_speed: 40.0,
+                        ..thumbswing::Tuning::default()
+                    },
+                },
+            }),
             mock_monitor: one(MockMonitorSection {
                 name: "Mock".into(),
                 enabled: true,
@@ -2957,6 +3047,8 @@ mod impact_lead_tests {
         }
         assert_eq!(DEFAULT_IMPACT_LEAD_S, 1.5);
         assert_eq!(impact_lead_default_s(AUTO_CHIP_ACTOR), None);
+        assert_eq!(impact_lead_default_s("trackball"), None);
+        assert_eq!(impact_lead_in_effect_s("trackball", Some(1.0)), None);
     }
 
     #[test]
@@ -3115,6 +3207,7 @@ mod latency_tests {
             "r10": {"0": {"name": "R10"}},
             "square": {"0": {"name": "Omni"}},
             "exputt": {"0": {"name": "ExPutt"}},
+            "trackball": {"0": {"name": "Trackball"}},
             "mock_monitor": {"0": {"name": "Mock"}},
             "openconnect_server": {"0": {"name": "Uneekor"}},
             "openconnect_client": {"0": {"name": "Open Connect"}},
@@ -3842,5 +3935,139 @@ mod exputt_section_tests {
             config.exputt.get_mut("0").unwrap().driver.address = Some("putter".into());
             assert!(config.changed_device_error(&saved).is_some());
         }
+    }
+}
+
+#[cfg(test)]
+mod trackball_section_tests {
+    use super::*;
+
+    /// A new Trackball card's section: its name and no grab, the driver's
+    /// other settings left out at their defaults.
+    #[test]
+    fn a_new_trackball_card_writes_its_name_and_no_grab() {
+        let section = TrackballSection::default();
+        assert_eq!(
+            serde_json::to_string(&section).unwrap(),
+            r#"{"name":"Trackball","grab":false}"#
+        );
+        assert!(!section.driver.config.grab);
+        assert!(section.enabled);
+        assert_eq!(
+            section.driver,
+            TrackballConfig {
+                config: thumbswing::Config {
+                    grab: false,
+                    ..thumbswing::Config::default()
+                },
+                ..TrackballConfig::default()
+            }
+        );
+    }
+
+    /// Every key reads into the driver's settings and writes back the same
+    /// JSON; a section without `grab` grabs (the driver's default), and the
+    /// tables hold only what was set.
+    #[test]
+    fn a_trackball_section_reads_and_writes_its_keys() {
+        for json in [
+            r#"{"name":"Arcade","enabled":false,"device":"usb-Example_Trackball-event-mouse","club":"DR","hand":"lh","cpi":800.0,"report_limit":2047,"grab":false,"thresholds":{"v_start":0.08,"coil_timeout_s":20.0},"tuning":{"full_power_speed":40.0,"curve_sense":"physical","mirror_for_left_hand":true}}"#,
+            r#"{"name":"Trackball","grab":false}"#,
+            r#"{"name":"Trackball"}"#,
+        ] {
+            let section: TrackballSection = serde_json::from_str(json).unwrap();
+            let back = serde_json::to_value(&section).unwrap();
+            assert_eq!(
+                back,
+                serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                "{json}"
+            );
+        }
+        let section: TrackballSection = serde_json::from_str(
+            r#"{"name":"Arcade","enabled":false,"device":"usb-Example_Trackball-event-mouse","club":"DR","hand":"lh","cpi":800,"thresholds":{"v_start":0.08},"tuning":{"curve_sense":"physical"}}"#,
+        )
+        .unwrap();
+        assert!(!section.enabled);
+        let d = &section.driver;
+        assert_eq!(d.device(), Some("usb-Example_Trackball-event-mouse"));
+        assert_eq!(d.club, thumbswing::Club::Driver);
+        assert_eq!(d.hand, thumbswing::Hand::Left);
+        assert!((d.config.cpi - 800.0).abs() < f64::EPSILON, "an integer");
+        assert!(d.config.grab, "the driver's default");
+        assert!((d.config.thresholds.v_start - 0.08).abs() < f64::EPSILON);
+        assert_eq!(d.tuning.curve_sense, thumbswing::CurveSense::Physical);
+        let plain: TrackballSection = serde_json::from_str(r#"{"name":"Trackball"}"#).unwrap();
+        assert!(plain.driver.config.grab);
+    }
+
+    /// The trackball driver refuses settings out of range, naming the card
+    /// and the key; a save that keeps a stored refused value is not
+    /// refused, one that changes it into another refused one is.
+    #[test]
+    fn values_the_driver_refuses_name_the_card_and_field() {
+        let mut config = FlighthookConfig::default();
+        config
+            .trackball
+            .insert("0".into(), TrackballSection::default());
+        assert_eq!(config.device_error(), None);
+        type Refuse = fn(&mut TrackballConfig);
+        let cases: [(Refuse, &str); 5] = [
+            (|d| d.config.cpi = 0.0, "trackball.0: cpi: "),
+            (|d| d.config.report_limit = 0, "trackball.0: report_limit: "),
+            (
+                |d| d.config.thresholds.v_stop = 0.5,
+                "trackball.0: thresholds.v_stop: ",
+            ),
+            (
+                |d| d.tuning.power_gamma = 0.0,
+                "trackball.0: tuning.power_gamma: ",
+            ),
+            (
+                |d| d.tuning.backswing_power = 2.0,
+                "trackball.0: tuning.backswing_power: ",
+            ),
+        ];
+        for (refuse, prefix) in cases {
+            config
+                .trackball
+                .insert("0".into(), TrackballSection::default());
+            refuse(&mut config.trackball.get_mut("0").unwrap().driver);
+            let error = config.device_error().expect("refused");
+            assert!(error.starts_with(prefix), "{error}");
+            let saved = config.clone();
+            config.trackball.get_mut("0").unwrap().name = "Renamed".into();
+            config.trackball.get_mut("0").unwrap().enabled = false;
+            assert_eq!(config.changed_device_error(&saved), None, "{prefix}");
+            config.trackball.get_mut("0").unwrap().driver.config.cpi = -1.0;
+            assert!(config.changed_device_error(&saved).is_some(), "{prefix}");
+        }
+    }
+
+    /// Two cards that name the same device cannot both be on.
+    #[test]
+    fn two_cards_naming_one_device_clash() {
+        let mut config = FlighthookConfig::default();
+        let named = |device: Option<&str>| {
+            let mut section = TrackballSection::default();
+            section.driver.device = device.map(Into::into);
+            section
+        };
+        config.trackball.insert("0".into(), named(Some("event7")));
+        config.trackball.insert("1".into(), named(Some(" event7 ")));
+        config.trackball.insert("2".into(), named(None));
+        config.trackball.insert("3".into(), named(Some("")));
+        config.trackball.get_mut("1").unwrap().enabled = false;
+        let clash = config.address_clash("trackball.1").expect("clash");
+        assert_eq!(clash.message(), "A Trackball card already uses event7");
+        assert_eq!(
+            config.address_clash("trackball.2"),
+            None,
+            "unset names none"
+        );
+        assert_eq!(
+            config.address_clash("trackball.3"),
+            None,
+            "blank names none"
+        );
     }
 }

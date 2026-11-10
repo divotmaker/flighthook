@@ -585,6 +585,7 @@ pub(crate) fn device_kind(prefix: &str) -> &str {
         "mevo" => "flightscope",
         "square" => "square_golf",
         "exputt" => "exputt",
+        "trackball" => "trackball",
         "r10" => "garmin_r10",
         "openconnect_server" => "openconnect",
         "mock_monitor" => "mock",
@@ -592,8 +593,9 @@ pub(crate) fn device_kind(prefix: &str) -> &str {
     }
 }
 
-/// The actor's config section with `name`, `address`, `bind` and unset
-/// fields removed, plus the removed address values (to scrub on export).
+/// The actor's config section with `name`, `address`, `bind`, a trackball's
+/// `device` (a device name, which can carry a serial number) and unset
+/// fields removed, plus the removed values (to scrub on export).
 fn device_section(
     config: &FlighthookConfig,
     prefix: &str,
@@ -608,6 +610,7 @@ fn device_section(
         "mevo" => value(config.mevo.get(index)),
         "square" => value(config.square.get(index)),
         "exputt" => value(config.exputt.get(index)),
+        "trackball" => value(config.trackball.get(index)),
         "r10" => value(config.r10.get(index)),
         "openconnect_server" => value(config.openconnect_server.get(index)),
         "mock_monitor" => value(config.mock_monitor.get(index)),
@@ -617,7 +620,7 @@ fn device_section(
     if let Some(map) = section.as_object_mut() {
         map.retain(|_, v| !v.is_null());
         map.remove("name");
-        for key in ["address", "bind"] {
+        for key in ["address", "bind", "device"] {
             if let Some(serde_json::Value::String(v)) = map.remove(key) {
                 removed.push(v);
             }

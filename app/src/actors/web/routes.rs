@@ -120,6 +120,7 @@ pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusRespon
         club: game.club_info.map(|c| c.club),
         handed: game.handed,
         cameras_supported: crate::state::cameras::supported(),
+        trackball_supported: thumbswing::device::SUPPORTED,
         clip_dir: Some(clip_dir.display().to_string()),
         config_error: state.root.system.load_error(),
         round: state.root.round.state(),
@@ -956,6 +957,7 @@ fn scoped_action(scope: &str, config: &FlighthookConfig) -> Option<ConfigAction>
         "r10" => upsert!(r10, UpsertR10),
         "square" => upsert!(square, UpsertSquare),
         "exputt" => upsert!(exputt, UpsertExPutt),
+        "trackball" => upsert!(trackball, UpsertTrackball),
         "openconnect_server" => upsert!(openconnect_server, UpsertOpenConnectServer),
         "openconnect_client" => upsert!(openconnect_client, UpsertOpenConnectClient),
         "pureplay" => upsert!(pureplay, UpsertPureplay),
@@ -997,6 +999,7 @@ fn enable_refusal(
                 "mevo" => copy!(mevo),
                 "square" => copy!(square),
                 "exputt" => copy!(exputt),
+                "trackball" => copy!(trackball),
                 "openconnect_server" => copy!(openconnect_server),
                 "openconnect_client" => copy!(openconnect_client),
                 "pureplay" => copy!(pureplay),
@@ -1125,6 +1128,9 @@ fn invalid_driver_setting(saved: &FlighthookConfig, action: &ConfigAction) -> Op
         }
         ConfigAction::UpsertExPutt { index, section } => {
             section.changed_driver_error(saved.exputt.get(index), &format!("exputt.{index}"))
+        }
+        ConfigAction::UpsertTrackball { index, section } => {
+            section.changed_driver_error(saved.trackball.get(index), &format!("trackball.{index}"))
         }
         _ => None,
     }
@@ -2981,6 +2987,56 @@ mod group_tests {
         }
     }
 
+    /// A save that changes a Trackball setting into one the driver refuses
+    /// is 400, whole or scoped, naming the card and the key; a stored
+    /// refused value with a rename passes.
+    #[tokio::test]
+    async fn settings_save_with_a_refused_trackball_setting_is_400() {
+        let (state, _writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.trackball
+                .insert("0".into(), flighthook::TrackballSection::default());
+        });
+        let mut rx = state.bus_tx.subscribe();
+        let live = state.root.system.snapshot();
+        type Refuse = fn(&mut flighthook::TrackballConfig);
+        let refusals: [(Refuse, &str); 3] = [
+            (|d| d.config.cpi = 0.0, "trackball.0: cpi: "),
+            (
+                |d| d.config.thresholds.v_stop = 1.0,
+                "trackball.0: thresholds.v_stop: ",
+            ),
+            (
+                |d| d.tuning.backswing_power = 1.5,
+                "trackball.0: tuning.backswing_power: ",
+            ),
+        ];
+        for (refuse, prefix) in refusals {
+            let mut body = live.clone();
+            refuse(&mut body.trackball.get_mut("0").unwrap().driver);
+            for scope in [None, Some("trackball.0")] {
+                let (status, Json(error)) =
+                    save_settings(&state, scope, body.clone(), Duration::from_millis(50))
+                        .await
+                        .expect_err("rejected");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{prefix} {scope:?}");
+                let error = error["error"].as_str().expect("text");
+                assert!(error.starts_with(prefix), "{error}");
+            }
+            let mut saved = live.clone();
+            refuse(&mut saved.trackball.get_mut("0").unwrap().driver);
+            let mut renamed = saved.trackball["0"].clone();
+            renamed.name = "Arcade".into();
+            let action = ConfigAction::UpsertTrackball {
+                index: "0".into(),
+                section: renamed,
+            };
+            assert_eq!(invalid_driver_setting(&saved, &action), None, "{prefix}");
+        }
+        assert!(rx.try_recv().is_err(), "nothing emitted");
+        assert_eq!(state.root.system.snapshot(), live, "nothing saved");
+    }
+
     /// The Square driver reads its settings leniently (an unknown club or a
     /// negative calibration is ignored with a warning when the device
     /// connects), so a save never refuses them, whole or scoped.
@@ -3620,6 +3676,7 @@ mod group_tests {
             )
         );
         assert_eq!(status.cameras_supported, crate::state::cameras::supported());
+        assert_eq!(status.trackball_supported, cfg!(target_os = "linux"));
         state
             .root
             .system

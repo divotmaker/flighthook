@@ -2636,6 +2636,8 @@ mod tests {
         source_matches::<tenover::driver::R10, crate::actors::r10::R10Hooks>();
         source_matches::<allsquare::driver::Omni, crate::actors::square::SquareHooks>();
         source_matches::<threeputt::driver::ExPutt, crate::actors::exputt::ExPuttHooks>();
+        source_matches::<thumbswing::driver::Thumbswing, crate::actors::trackball::TrackballHooks>(
+        );
         source_matches::<FakeDriver, FakeHooks>();
     }
 
@@ -2867,6 +2869,65 @@ mod tests {
         assert_eq!(
             driver_keys::<flighthook::ExPuttConfig>(),
             BTreeSet::from(["address".to_owned()])
+        );
+
+        // The trackball's settings flatten their device config, so serde
+        // reads them as a map: their keys are those of settings with every
+        // field set.
+        let trackball = flighthook::TrackballSection {
+            name: "Arcade".into(),
+            enabled: false,
+            driver: flighthook::TrackballConfig::default(),
+        };
+        let mut full = trackball.clone();
+        let d = &mut full.driver;
+        d.device = Some("usb-Example_Trackball-event-mouse".into());
+        d.club = flighthook::TrackballClub::Driver;
+        d.hand = flighthook::TrackballHand::Left;
+        d.config.cpi = 800.0;
+        d.config.report_limit = 2047;
+        d.config.grab = false;
+        d.config.thresholds.v_start = 0.08;
+        d.tuning.curve_sense = flighthook::TrackballCurveSense::Physical;
+        let serde_json::Value::Object(driver) = serde_json::to_value(&full.driver).expect("json")
+        else {
+            panic!("a table");
+        };
+        let driver: BTreeSet<String> = driver.keys().cloned().collect();
+        assert_eq!(
+            driver,
+            BTreeSet::from(
+                [
+                    "club",
+                    "cpi",
+                    "device",
+                    "grab",
+                    "hand",
+                    "report_limit",
+                    "thresholds",
+                    "tuning",
+                ]
+                .map(String::from)
+            )
+        );
+        let serde_json::Value::Object(host) = serde_json::to_value(&trackball).expect("json")
+        else {
+            panic!("a table");
+        };
+        assert_eq!(
+            host.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["enabled".to_owned(), "name".to_owned()])
+        );
+        let json = serde_json::to_string(&full).expect("json");
+        assert_eq!(
+            serde_json::from_str::<flighthook::TrackballSection>(&json).expect("reads"),
+            full
+        );
+        let toml = toml::to_string(&full).expect("toml");
+        assert_eq!(
+            toml::from_str::<flighthook::TrackballSection>(&toml).expect("reads"),
+            full,
+            "{toml}"
         );
     }
 }

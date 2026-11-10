@@ -316,6 +316,7 @@ mod tests {
             ("r10.0", ShotSource::R10),
             ("square.0", ShotSource::Square),
             ("exputt.0", ShotSource::ExPutt),
+            ("trackball.0", ShotSource::Trackball),
             ("mock_monitor.0", ShotSource::MockMonitor),
             ("openconnect_server.0", ShotSource::OpenConnectServer),
             (flighthook::AUTO_CHIP_ACTOR, ShotSource::AutoChip),
@@ -388,6 +389,13 @@ mod tests {
         assert_eq!(
             reason(ask(&policy, &[(flighthook::AUTO_CHIP_ACTOR, "Auto-chip")])),
             "Auto-chip is a virtual launch monitor"
+        );
+        assert_eq!(
+            reason(ask(
+                &policy,
+                &[("square.0", "Omni"), ("trackball.0", "Trackball")]
+            )),
+            "Trackball is a virtual launch monitor"
         );
         assert!(!policy.active(), "no refusal holds a round");
     }

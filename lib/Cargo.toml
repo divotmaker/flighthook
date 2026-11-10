@@ -33,6 +33,9 @@ allsquare = { path = "../../../allsquare/allsquare", default-features = false, f
 # feature: no network code, so the WASM UI builds it too).
 # LOCAL path until threeputt 0.1.0 is released
 threeputt = { path = "../../../3putt/3putt", default-features = false, features = ["config"] }
+# The Trackball driver's settings (`thumbswing::Settings`, the `config`
+# feature: no device stack, so the WASM UI builds it too).
+thumbswing = { version = "0.0.1", default-features = false, features = ["config"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"], optional = true }
