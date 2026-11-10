@@ -29,7 +29,6 @@ use tokio::sync::broadcast;
 use crate::bus::{BusReceiver, BusSender};
 use crate::state::config::{FlighthookConfig, global_id};
 use crate::state::{ActorHandle, SystemState};
-use flighthook::Club;
 
 // ---------------------------------------------------------------------------
 // Actor trait
@@ -53,7 +52,10 @@ pub const STOP_WAIT: Duration = Duration::from_secs(3);
 pub const MAX_STOP_WAIT: Duration = exputt::STOP_WAIT;
 
 const _: () = assert!(STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
-const _: () = assert!(square::STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
+const _: () = assert!(
+    <allsquare::driver::Omni as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+        <= MAX_STOP_WAIT.as_millis()
+);
 const _: () = assert!(
     <tenover::driver::R10 as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
@@ -203,25 +205,10 @@ pub fn resolve_actors(
     // Square Golf devices
     for (index, section) in &config.square {
         let id = global_id("square", index);
-        let club = section
-            .club
-            .as_deref()
-            .and_then(Club::from_code)
-            .unwrap_or(Club::Iron7);
-        let impact_calibration =
-            square::build_impact_calibration(section.dot_bottom_to_face_center_mm.as_ref());
         actors.push(ResolvedActor {
             id,
             name: section.name.clone(),
-            actor: Box::new(square::SquareActor {
-                address: section.address.clone(),
-                club,
-                advanced_spin: section.advanced_spin.unwrap_or(true),
-                discard_non_putting_zero_spin: section
-                    .discard_non_putting_zero_spin
-                    .unwrap_or(true),
-                impact_calibration,
-            }),
+            actor: Box::new(square::SquareActor::new(section.clone())),
         });
     }
 

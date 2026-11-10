@@ -48,11 +48,10 @@ dependencies = [
 
 [[package]]
 name = "allsquare"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1991a86d31d582045ddab32808fa6354fa3f4294ee70d1add8a32a1e9cb91cf"
+version = "0.3.1"
 dependencies = [
  "btleplug",
+ "flightrelay",
  "futures",
  "serde",
  "thiserror 2.0.20",
@@ -1525,6 +1524,7 @@ dependencies = [
 name = "flighthook"
 version = "0.1.24"
 dependencies = [
+ "allsquare",
  "clap",
  "flightrelay",
  "serde",

@@ -261,6 +261,7 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
                 let e = located_error(contents, e);
                 let fault = driver_type_error::<flighthook::MockMonitorSection>(contents)
                     .or_else(|| driver_type_error::<flighthook::R10Section>(contents))
+                    .or_else(|| driver_type_error::<flighthook::SquareSection>(contents))
                     .unwrap_or_else(|| fault(contents, &e));
                 tracing::warn!("failed to parse {}: {fault}", path.display());
                 Err(fault)
@@ -1278,6 +1279,116 @@ full_monitor = "mevo.0"
         );
     }
 
+    /// Square sections as flighthook 0.1.24 saved them load into the same
+    /// values, now in the driver's settings, with no device error; a file
+    /// whose values are not at their defaults is not rewritten and gets no
+    /// backup, and the saved form round-trips.
+    #[test]
+    fn a_square_section_file_from_0_1_24_loads_unchanged() {
+        let text = "default_units = \"imperial\"\n\
+                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
+                    putting_clubs = [\"PT\"]\n\
+                    \n\
+                    [square.0]\n\
+                    name = \"Square Golf Omni\"\n\
+                    address = \"SquareGolf(CD01)\"\n\
+                    club = \"PW\"\n\
+                    advanced_spin = false\n\
+                    discard_non_putting_zero_spin = false\n\
+                    impact_lead_s = 1.5\n\
+                    \n\
+                    [square.0.dot_bottom_to_face_center_mm]\n\
+                    7I = 21.5\n\
+                    DR = 19.0\n\
+                    \n\
+                    [square.1]\n\
+                    name = \"Bay 2\"\n\
+                    enabled = false\n\
+                    address = \"02:00:00:AB:CD:01\"\n";
+        let (dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        let first = &config.square["0"];
+        assert_eq!(first.name, "Square Golf Omni");
+        assert!(first.enabled);
+        assert_eq!(first.impact_lead_s, Some(1.5));
+        assert_eq!(first.driver.address.as_deref(), Some("SquareGolf(CD01)"));
+        assert_eq!(first.driver.club, "PW");
+        assert!(!first.driver.advanced_spin);
+        assert!(!first.driver.discard_non_putting_zero_spin);
+        assert_eq!(
+            first.driver.dot_bottom_to_face_center_mm,
+            std::collections::BTreeMap::from([("7I".into(), 21.5), ("DR".into(), 19.0)])
+        );
+        let second = &config.square["1"];
+        assert!(!second.enabled);
+        assert_eq!(second.driver.address.as_deref(), Some("02:00:00:AB:CD:01"));
+        assert_eq!(
+            second.driver,
+            flighthook::SquareConfig {
+                address: Some("02:00:00:AB:CD:01".into()),
+                ..flighthook::SquareConfig::default()
+            }
+        );
+        assert_eq!(config.device_error(), None);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            text,
+            "not rewritten"
+        );
+        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        let saved = toml::to_string_pretty(&config).expect("toml");
+        assert_eq!(
+            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            config
+        );
+    }
+
+    /// What the 0.1.24 card saved for a new Omni writes the zero-spin switch
+    /// out at its default: it loads into the same values, and the file is
+    /// rewritten once without the default, with a backup of the original.
+    #[test]
+    fn a_square_section_with_explicit_defaults_is_rewritten_once_with_a_backup() {
+        let text = "[square.0]\n\
+                    name = \"Square Golf Omni\"\n\
+                    discard_non_putting_zero_spin = true\n";
+        let (dir, path) = config_dir(text);
+        let (config, error) = load(&path);
+        assert_eq!(error, None);
+        assert_eq!(config.square["0"], flighthook::SquareSection::default());
+        assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(backup_name())).expect("backup"),
+            text
+        );
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert!(saved.contains("[square.0]"), "{saved}");
+        assert!(!saved.contains("discard_non_putting_zero_spin"), "{saved}");
+        // Loading the rewritten file changes nothing more.
+        let (again, _) = load(&path);
+        assert_eq!(again, config);
+        assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
+    }
+
+    /// A Square setting of the wrong type names its key's line.
+    #[test]
+    fn a_square_setting_type_error_names_its_key_and_line() {
+        let text = "[square.0]\n\
+                    name = \"Omni\"\n\
+                    \n\
+                    [square.3]\n\
+                    name = \"Bay 2\"\n\
+                    advanced_spin = \"maybe\"\n";
+        let error = kept_error(text);
+        assert!(
+            error
+                .error
+                .starts_with("line 6, column 1: square.3: advanced_spin: "),
+            "{}",
+            error.error
+        );
+    }
+
     /// A range the R10 driver refuses (0 or less) loads as written and names
     /// the card, which does not start; a range of the wrong type names its
     /// key's line.
@@ -1458,10 +1569,7 @@ full_monitor = "mevo.0"
         );
         let (dir, path) = config_dir(&src);
         let loaded = load(&path).0;
-        let overrides = loaded.square["0"]
-            .dot_bottom_to_face_center_mm
-            .as_ref()
-            .expect("overrides");
+        let overrides = &loaded.square["0"].driver.dot_bottom_to_face_center_mm;
         assert_eq!(overrides.get("DR"), Some(&15.0));
         assert_eq!(overrides.get("7i"), Some(&18.5));
 
@@ -2114,13 +2222,7 @@ name = "Clubs"
         assert_eq!(c.mevo["0"].ball_type, Some(1));
         assert_eq!(c.mevo["0"].track_pct, Some(80.0));
         assert_eq!(c.r10["0"].name, "R10");
-        assert_eq!(
-            c.square["0"]
-                .dot_bottom_to_face_center_mm
-                .as_ref()
-                .map(|m| m.len()),
-            Some(2)
-        );
+        assert_eq!(c.square["0"].driver.dot_bottom_to_face_center_mm.len(), 2);
         assert_eq!(c.mock_monitor["0"].name, "Mock");
         assert_eq!(
             c.openconnect_server["0"].bind.as_deref(),

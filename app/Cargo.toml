@@ -63,16 +63,18 @@ flighthook-ui = { path = "../ui", optional = true }
 egui = { version = "0.33", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
-# allsquare's BLE backend is platform-specific: BlueZ on Linux, btleplug
-# elsewhere.
+# The Square Golf device driver (`driver`: `allsquare::driver::Omni`). Its
+# BLE backend is platform-specific: BlueZ on Linux, btleplug elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
-allsquare = { version = "0.3.0", features = ["serde", "bluez"] }
+# LOCAL path until allsquare 0.4.0 is released
+allsquare = { path = "../../../allsquare/allsquare", features = ["driver", "bluez"] }
 # The body tracking clip pass runs at a higher nice value (setpriority);
 # already in the tree (tokio, ...).
 libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-allsquare = { version = "0.3.0", features = ["serde", "btleplug"] }
+# LOCAL path until allsquare 0.4.0 is released
+allsquare = { path = "../../../allsquare/allsquare", features = ["driver", "btleplug"] }
 
 # eframe backend is platform-specific: x11+wayland on Linux, Win32 on Windows.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
@@ -90,8 +92,10 @@ ironsight = { version = "0.6.0", features = ["serde", "testing"] }
 # tenover's test support: GFDI frame builders with synthetic identity.
 # LOCAL path until tenover 0.5.0 is released
 tenover = { path = "../../../10over/10over", features = ["driver", "testing"] }
-# allsquare's test support: notification fixtures and encoders.
-allsquare = { version = "0.3.0", features = ["serde", "testing"] }
+# allsquare's test support: notification fixtures and encoders, and the
+# driver's connect over a scripted link.
+# LOCAL path until allsquare 0.4.0 is released
+allsquare = { path = "../../../allsquare/allsquare", features = ["driver", "testing"] }
 # threeputt's test support: an in-process mock device and sample putts.
 threeputt = { version = "0.0.3", features = ["testing"] }
 # Encodes the numbered test frames of the body tracking tests (already in the

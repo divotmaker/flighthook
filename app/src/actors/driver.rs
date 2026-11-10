@@ -428,8 +428,15 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
             if host.stopped() {
                 return Ok(());
             }
+            // One command per pass: what the pass's messages set, field by
+            // field, so a hand and a club changed together reach the device
+            // together.
+            let mut pass = DeviceCommand::default();
             for command in host.commands.drain(..) {
-                session.command(&command)?;
+                pass.merge(&command);
+            }
+            if !pass.is_empty() {
+                session.command(&pass)?;
             }
             while let Some(action) = host.actions.pop_front() {
                 session.action(&action)?;
@@ -2403,6 +2410,7 @@ mod tests {
     fn every_cards_source_is_its_drivers() {
         source_matches::<flightrelay::mock::MockDriver, crate::actors::mock::MockHooks>();
         source_matches::<tenover::driver::R10, crate::actors::r10::R10Hooks>();
+        source_matches::<allsquare::driver::Omni, crate::actors::square::SquareHooks>();
         source_matches::<FakeDriver, FakeHooks>();
     }
 
@@ -2545,6 +2553,42 @@ mod tests {
         assert_eq!(
             driver_keys::<flighthook::R10Config>(),
             BTreeSet::from(["range".to_owned()])
+        );
+
+        let square = flighthook::SquareSection {
+            name: "Omni".into(),
+            enabled: false,
+            impact_lead_s: Some(1.0),
+            driver: flighthook::SquareConfig::default(),
+        };
+        let full = flighthook::SquareSection {
+            driver: flighthook::SquareConfig {
+                address: Some("SquareGolf(CD01)".into()),
+                club: "PW".into(),
+                advanced_spin: false,
+                discard_non_putting_zero_spin: false,
+                dot_bottom_to_face_center_mm: std::collections::BTreeMap::from([(
+                    "7I".into(),
+                    21.5,
+                )]),
+            },
+            ..square.clone()
+        };
+        keys_apart(&square, &full);
+        assert_eq!(
+            driver_keys::<flighthook::SquareConfig>(),
+            BTreeSet::from(
+                [
+                    "address",
+                    "advanced_spin",
+                    "club",
+                    "discard_non_putting_zero_spin",
+                    "dot_bottom_to_face_center_mm",
+                    // Read too (the British spelling), never written.
+                    "dot_bottom_to_face_centre_mm",
+                ]
+                .map(String::from)
+            )
         );
     }
 }

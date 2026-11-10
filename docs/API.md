@@ -276,7 +276,8 @@ Telemetry keys are merged from two sources; no key means two things, and an
 actor sends each key from one source only:
 - **Device-reported** (from `device_telemetry`): `ready`, `battery_pct`, `tilt`,
   `roll`, `temp_c`, `external_power`, and a device driver's own state keys
-  (the mock's `radar_mode`, `tracking_mode`)
+  (the mock's `radar_mode`, `tracking_mode`; the Square Golf's
+  `device_state`, `zero_spin_discards`)
 - **Actor-framework** (from `actor_status`): `detection_mode`, `radar_mode`, `device_info`,
   `shot_count`, `tracking_mode`, `phase`
 - **Integration actors**: `club`, `handed`, `name`, `error`
@@ -1419,7 +1420,7 @@ running flighthook.
 - `group`: id of the [set](#get-apishotsgroups) the shot joined (a UUID,
   unique across restarts); absent when the shot has no data.
 - `settings.device`: the device's config section with `name`, `address`,
-  `bind` and unset fields removed. `settings.simulation`: the `[simulation]`
+  `bind`, unset fields and device driver settings at their default removed. `settings.simulation`: the `[simulation]`
   section, with the same shape as in [GET /api/settings](#get-apisettings)
   (`mode` present unless `"on"`). `data.derived.replaces_measured` marks a
   shot whose simulated results replace the device's, and
@@ -1629,7 +1630,7 @@ restarted. A `409` of that kind is settled by the actor's status. The
 dashboard cannot hit it: it disables Reconnect while a save is out.
 
 How long the old connection is given to close depends on the device: up to
-3 s, 5 s for a Square Golf, 18 s for an ExPutt (a session start in progress
+3 s, 6 s for a Garmin R10 or a Square Golf, 18 s for an ExPutt (a session start in progress
 cannot be cut short). A Mevo/Xi, an Open Connect client or a mock still
 closing after that is replaced anyway (it holds nothing the new one needs and
 closes itself); so is an Open Connect server once its port is free. A Garmin
@@ -1713,9 +1714,8 @@ Full persisted config (mirrors `config.toml`).
   "square": {
     "0": {
       "name": "Square Golf Omni",
-      "club": "7i",
-      "advanced_spin": true,
-      "discard_non_putting_zero_spin": true,
+      "address": "SquareGolf(CD01)",
+      "club": "PW",
       "dot_bottom_to_face_center_mm": {
         "DR": 15.0,
         "7I": 18.5
@@ -1800,6 +1800,20 @@ Full persisted config (mirrors `config.toml`).
   `400` `"r10.0: range: must be a distance greater than 0"`; a file holding
   one loads, and that card does not start and shows the error). A changed
   range restarts the card
+- Square sections have `name` and the Square Golf driver's settings, each
+  left out of responses and saved files while at its default: `address`
+  (the device's advertised name, e.g. `"SquareGolf(CD01)"`, its BLE address
+  or on macOS its peripheral UUID; absent or blank finds the first Square
+  Golf device), `club` (the club armed on connect until the game names one,
+  default `"7I"`), `advanced_spin` (default `true`),
+  `discard_non_putting_zero_spin` (drop a shot that reads no spin at all
+  unless the putter is in play, default `true`) and
+  `dot_bottom_to_face_center_mm` (below). The driver refuses no value it can
+  read: an unknown club, an unknown calibration key or a negative
+  calibration is skipped with a warning in the log when the device
+  connects; a value of the wrong type is an invalid body (`4xx`), and in the
+  config file a load error naming the key's line. Any change of these
+  settings restarts the card
 - `use_estimated` on Mevo sections controls whether estimated (E8) ball flights
   are emitted when no full (D4) result arrives (defaults to `false`). With it
   off, a shot the device only estimated (e.g. a flight too short to read in
@@ -2099,8 +2113,8 @@ extractor with a `4xx` and a plain-text reason.
 
 A save that restarts or removes actors stops them together and waits for
 each to let go of its device or connection, as a
-[reconnect](#post-apiactorsidreconnect) does: up to 3 s, 5 s for a Square
-Golf, 18 s for an ExPutt. One still closing after that is handled the same way
+[reconnect](#post-apiactorsidreconnect) does: up to 3 s, 6 s for a Garmin
+R10 or a Square Golf, 18 s for an ExPutt. One still closing after that is handled the same way
 as for a reconnect: replaced beside it when it holds nothing the new one
 needs, otherwise its card says the previous connection has not closed yet,
 it is listed in neither `restarted` nor `started`, and it starts by itself
@@ -2683,7 +2697,10 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
       it; a frame from a device driver carries this instead of `type`,
       `src`, `dst` and `channel`. R10: `notify <message type>` /
       `write <message type>` (the type in hex), one record per protocol
-      message (`hex`: the whole message as the driver framed it)
+      message (`hex`: the whole message as the driver framed it). Square
+      Golf: `notify 11 02` (a notification's family and type byte in the
+      `0x11` family; `notify 91` for the other families, family byte only)
+      and `cmd 87` (a command's type byte)
     - `hex`: payload as lowercase hex (binary protocols; FlightScope: the
       unstuffed payload without header or checksum)
     - `text`: payload text (JSON protocols)
@@ -2908,6 +2925,9 @@ The ExPutt adds `shot_count` and `phase` (`discovering`, `connecting`,
 The R10 adds `shot_count` (shots finished since the card started) and, while
 it connects, `phase` (`discovering`, `handshaking`; the `connected` status
 removes it with `"phase": ""`); `device_info` is `Garmin R10 (<address>)`.
+The Square Golf adds `shot_count` (shots finished since the card started)
+and, while it connects, `phase` (`discovering`; removed by the `connected`
+status); `device_info` is `Square Golf <model> <name> (<address>)`.
 Integration actors: `club`, `handed`, `name`, `error`.
 
 An `openconnect_client` sets `error` when this flighthook's own

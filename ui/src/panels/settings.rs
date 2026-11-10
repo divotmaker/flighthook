@@ -13,7 +13,7 @@ use crate::types::{
 };
 use flighthook::{
     BodyTrackingMode, BodyTrackingSection, DriverConfig, MockConfig, PlayerSection, PoseModel, Sex,
-    SimMode,
+    SimMode, SquareConfig,
 };
 
 const DISTANCE_UNITS: &[(&str, &str)] = &[
@@ -89,10 +89,12 @@ pub(crate) struct DeviceFormEntry {
     pub(crate) impact_lead: String,
     /// Square Golf: discard zero-spin reads, except when putting.
     pub(crate) discard_zero_spin: bool,
-    /// Square Golf fields the form does not surface. Carried verbatim so that
-    /// saving settings does not wipe them from the config file.
-    pub(crate) square_club: Option<String>,
-    pub(crate) square_advanced_spin: Option<bool>,
+    /// Square Golf: the driver's settings as loaded. The form edits
+    /// `address`, `discard_non_putting_zero_spin` and the calibration of
+    /// the clubs it lists; the rest (`club`, `advanced_spin`, calibration
+    /// keys the form does not list) is carried verbatim so that saving
+    /// settings does not wipe it from the config file.
+    pub(crate) square: SquareConfig,
     /// Square Golf: per-club face impact calibration override, in mm from
     /// the bottom of the sticker dot down to face center. Keyed by club; blank means "use
     /// allsquare's default" for that club. The putter is excluded — it has
@@ -215,16 +217,14 @@ const SQUARE_CALIBRATED_CLUBS: &[Club] = &[
 /// Build the face-impact-calibration form map from config overrides. A club
 /// with no entry renders blank, meaning "use allsquare's default".
 fn impact_mm_form(
-    overrides: Option<&std::collections::BTreeMap<String, f64>>,
+    overrides: &std::collections::BTreeMap<String, f64>,
 ) -> std::collections::HashMap<Club, String> {
     let mut map = std::collections::HashMap::new();
-    if let Some(overrides) = overrides {
-        for (key, &mm) in overrides {
-            if let Some(club) = Club::from_code(key)
-                && SQUARE_CALIBRATED_CLUBS.contains(&club)
-            {
-                map.insert(club, format_distance_value(mm));
-            }
+    for (key, &mm) in overrides {
+        if let Some(club) = Club::from_code(key)
+            && SQUARE_CALIBRATED_CLUBS.contains(&club)
+        {
+            map.insert(club, format_distance_value(mm));
         }
     }
     map
@@ -299,7 +299,7 @@ fn impact_lead_text(v: Option<f64>) -> String {
 /// entries only, keyed by club code. Returns `None` when no overrides are set.
 fn impact_mm_to_config(
     form: &std::collections::HashMap<Club, String>,
-) -> Option<std::collections::BTreeMap<String, f64>> {
+) -> std::collections::BTreeMap<String, f64> {
     let mut map = std::collections::BTreeMap::new();
     for (club, s) in form {
         let s = s.trim();
@@ -310,7 +310,7 @@ fn impact_mm_to_config(
             map.insert(club.to_string(), v);
         }
     }
-    if map.is_empty() { None } else { Some(map) }
+    map
 }
 
 impl DeviceFormEntry {
@@ -339,8 +339,7 @@ impl DeviceFormEntry {
             launch_only_spin: format_distance_value(s.launch_only_spin),
             impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
-            square_club: None,
-            square_advanced_spin: None,
+            square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
             saved_driver: None,
@@ -379,8 +378,7 @@ impl DeviceFormEntry {
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
-            square_club: None,
-            square_advanced_spin: None,
+            square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
             saved_driver: serde_json::to_value(&s.driver).ok(),
@@ -395,13 +393,12 @@ impl DeviceFormEntry {
             monitor_type: "square".into(),
             name: s.name.clone(),
             enabled: s.enabled,
-            address: s.address.clone().unwrap_or_default(),
-            discard_zero_spin: s.discard_non_putting_zero_spin.unwrap_or(true),
-            square_club: s.club.clone(),
-            square_advanced_spin: s.advanced_spin,
-            square_impact_mm: impact_mm_form(s.dot_bottom_to_face_center_mm.as_ref()),
+            address: s.driver.address.clone().unwrap_or_default(),
+            discard_zero_spin: s.driver.discard_non_putting_zero_spin,
+            square: s.driver.clone(),
+            square_impact_mm: impact_mm_form(&s.driver.dot_bottom_to_face_center_mm),
             mock: MockConfig::default(),
-            saved_driver: None,
+            saved_driver: serde_json::to_value(&s.driver).ok(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
             tee_height_unit: "inches".into(),
@@ -443,8 +440,7 @@ impl DeviceFormEntry {
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
-            square_club: None,
-            square_advanced_spin: None,
+            square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
             saved_driver: None,
@@ -475,8 +471,7 @@ impl DeviceFormEntry {
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
-            square_club: None,
-            square_advanced_spin: None,
+            square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
             saved_driver: None,
@@ -507,8 +502,7 @@ impl DeviceFormEntry {
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: impact_lead_text(s.impact_lead_s),
             discard_zero_spin: true,
-            square_club: None,
-            square_advanced_spin: None,
+            square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
             mock: s.driver.clone(),
             saved_driver: serde_json::to_value(&s.driver).ok(),
@@ -553,6 +547,7 @@ impl DeviceFormEntry {
         match self.monitor_type.as_str() {
             "mock_monitor" => self.mock.validate().err().map(|e| e.to_string()),
             "r10" => self.r10_config().validate().err().map(|e| e.to_string()),
+            "square" => self.square_config().validate().err().map(|e| e.to_string()),
             _ => None,
         }
     }
@@ -563,6 +558,7 @@ impl DeviceFormEntry {
         match self.monitor_type.as_str() {
             "mock_monitor" => serde_json::to_value(&self.mock).ok(),
             "r10" => serde_json::to_value(self.r10_config()).ok(),
+            "square" => serde_json::to_value(self.square_config()).ok(),
             _ => None,
         }
     }
@@ -576,6 +572,29 @@ impl DeviceFormEntry {
                 .parse::<f64>()
                 .ok()
                 .map(|v| Distance::from_value_and_unit(v, &self.range_unit)),
+        }
+    }
+
+    /// The Square Golf driver's settings from the form: the address
+    /// (blank for none), the zero-spin switch and the listed clubs'
+    /// calibration as typed, over the settings carried from the file.
+    pub(crate) fn square_config(&self) -> SquareConfig {
+        let address = self.address.trim();
+        let mut calibration: std::collections::BTreeMap<String, f64> = self
+            .square
+            .dot_bottom_to_face_center_mm
+            .iter()
+            .filter(|(key, _)| {
+                !Club::from_code(key).is_some_and(|c| SQUARE_CALIBRATED_CLUBS.contains(&c))
+            })
+            .map(|(key, &mm)| (key.clone(), mm))
+            .collect();
+        calibration.extend(impact_mm_to_config(&self.square_impact_mm));
+        SquareConfig {
+            address: (!address.is_empty()).then(|| address.to_owned()),
+            discard_non_putting_zero_spin: self.discard_zero_spin,
+            dot_bottom_to_face_center_mm: calibration,
+            ..self.square.clone()
         }
     }
 
@@ -825,8 +844,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: String::new(),
             discard_zero_spin: true,
-            square_club: None,
-            square_advanced_spin: None,
+            square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
             mock: MockConfig::default(),
             saved_driver: None,
@@ -2201,18 +2219,8 @@ fn apply_actor_to_config(config: &mut FlighthookConfig, actor: &ActorFormEntry) 
                         flighthook::SquareSection {
                             name: dev.name.clone(),
                             enabled: dev.enabled,
-                            address: if dev.address.trim().is_empty() {
-                                None
-                            } else {
-                                Some(dev.address.trim().to_string())
-                            },
-                            club: dev.square_club.clone(),
-                            advanced_spin: dev.square_advanced_spin,
-                            discard_non_putting_zero_spin: Some(dev.discard_zero_spin),
-                            dot_bottom_to_face_center_mm: impact_mm_to_config(
-                                &dev.square_impact_mm,
-                            ),
                             impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
+                            driver: dev.square_config(),
                         },
                     );
                 }
@@ -4791,6 +4799,78 @@ mod tests {
     /// the driver refuses (0 or less) shows under the card's fields and
     /// keeps a changed card from saving, blank means none, and a saved
     /// refused range still lets the card save its name.
+    /// The Square card edits the address, the zero-spin switch and the
+    /// listed clubs' calibration; the driver's other settings (`club`,
+    /// `advanced_spin`, calibration keys the card does not list) survive a
+    /// save as they were. The driver refuses nothing, so the card never
+    /// shows a driver error.
+    #[test]
+    fn square_driver_settings_survive_a_save() {
+        let mut cfg = FlighthookConfig::default();
+        cfg.square.insert(
+            "0".into(),
+            flighthook::SquareSection {
+                driver: flighthook::SquareConfig {
+                    address: Some("SquareGolf(CD01)".into()),
+                    club: "PW".into(),
+                    advanced_spin: false,
+                    discard_non_putting_zero_spin: true,
+                    dot_bottom_to_face_center_mm: std::collections::BTreeMap::from([
+                        ("7i".into(), 21.5),
+                        ("PT".into(), 8.0),
+                    ]),
+                },
+                ..flighthook::SquareSection::default()
+            },
+        );
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert_eq!(dev.address, "SquareGolf(CD01)");
+        assert!(dev.discard_zero_spin);
+        assert_eq!(
+            dev.square_impact_mm.get(&Club::Iron7).map(String::as_str),
+            Some("21.5")
+        );
+        assert_eq!(dev.driver_error(), None);
+        assert!(!dev.driver_blocks_save());
+
+        // Saved as loaded: the same settings, the 7-iron's key in its code.
+        let saved = form.build_actor_request("square.0").square["0"].clone();
+        assert_eq!(saved.driver.club, "PW");
+        assert!(!saved.driver.advanced_spin);
+        assert_eq!(
+            saved.driver.dot_bottom_to_face_center_mm,
+            std::collections::BTreeMap::from([("7I".into(), 21.5), ("PT".into(), 8.0)])
+        );
+
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        dev.address = "  ".into();
+        dev.discard_zero_spin = false;
+        dev.square_impact_mm.insert(Club::Iron7, String::new());
+        dev.square_impact_mm.insert(Club::Driver, "19".into());
+        assert_eq!(dev.driver_error(), None);
+        assert!(super::actor_valid(&form.actors[0]));
+        let saved = form.build_actor_request("square.0").square["0"].clone();
+        assert_eq!(
+            saved.driver,
+            flighthook::SquareConfig {
+                address: None,
+                club: "PW".into(),
+                advanced_spin: false,
+                discard_non_putting_zero_spin: false,
+                dot_bottom_to_face_center_mm: std::collections::BTreeMap::from([
+                    ("DR".into(), 19.0),
+                    ("PT".into(), 8.0),
+                ]),
+            }
+        );
+    }
+
     #[test]
     fn the_r10_range_is_validated_by_its_driver() {
         let mut cfg = FlighthookConfig::default();

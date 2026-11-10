@@ -58,17 +58,15 @@ pub struct RawCapture {
     /// Frames before the trigger, each with whether it is bulk.
     ring: VecDeque<(Instant, RawRecord, bool)>,
     window: Option<Window>,
-    enabled: bool,
 }
 
 impl RawCapture {
-    /// A recorder that starts enabled with an empty ring.
+    /// A recorder with an empty ring.
     pub fn new(cfg: RawCaptureConfig) -> Self {
         Self {
             ring: VecDeque::with_capacity(cfg.pre_roll_frames),
             cfg,
             window: None,
-            enabled: true,
         }
     }
 
@@ -80,7 +78,7 @@ impl RawCapture {
     /// Record one frame that crossed the transport at `at`. A frame pushed
     /// after a later one still lands in time order in [`take`](Self::take).
     pub fn push_at(&mut self, rec: RawRecord, at: Instant) {
-        if !self.enabled || (self.cfg.exclude)(&rec) {
+        if (self.cfg.exclude)(&rec) {
             return;
         }
         let bulk = (self.cfg.is_bulk)(&rec);
@@ -92,9 +90,7 @@ impl RawCapture {
     /// bulk byte budget instead of the frame cap. The config's `exclude` and
     /// `is_bulk` are not asked.
     pub fn push_classified(&mut self, rec: RawRecord, at: Instant, bulk: bool) {
-        if self.enabled {
-            self.record(rec, at, bulk);
-        }
+        self.record(rec, at, bulk);
     }
 
     fn record(&mut self, rec: RawRecord, at: Instant, bulk: bool) {
@@ -190,14 +186,6 @@ impl RawCapture {
     pub fn discard(&mut self) {
         self.ring.clear();
         self.window = None;
-    }
-
-    /// Turn recording on or off. Turning it off also clears what is held.
-    pub fn set_enabled(&mut self, on: bool) {
-        self.enabled = on;
-        if !on {
-            self.discard();
-        }
     }
 }
 
@@ -366,23 +354,6 @@ mod tests {
         c.mark_trigger();
         c.push(rec(2, 1));
         assert_eq!(types(&c.take()), [2]);
-    }
-
-    #[test]
-    fn disabled_capture_records_nothing() {
-        let mut c = capture(4, 16, 0);
-        c.set_enabled(false);
-        c.push(rec(1, 1));
-        c.mark_trigger();
-        c.push(rec(2, 1));
-        assert!(c.take().frames.is_empty());
-
-        c.set_enabled(true);
-        c.push(rec(3, 1));
-        c.set_enabled(false);
-        c.set_enabled(true);
-        c.mark_trigger();
-        assert!(c.take().frames.is_empty());
     }
 
     #[test]

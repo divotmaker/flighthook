@@ -7,6 +7,29 @@ required.
 The original **Square / Square Home is not supported** — it uses a different
 club-code scheme.
 
+## Connection
+
+While it looks for the Omni the card shows `phase` `discovering`. Once
+connected the card's `device_info` reads `Square Golf <model> <name>
+(<address>)`; the name (e.g. `SquareGolf(CD01)`) or the address pins the
+device in the config. The log has the same line on every connect:
+
+```
+connected to SquareGolf(CD01) at 02:00:00:AB:CD:01
+```
+
+When the link drops the card reads Reconnecting and flighthook looks for the
+Omni again, 1 s after the first failed attempt, growing by 1 s per attempt
+up to 15 s, and back to 1 s once a session lasted 10 s. Turning the card
+off, a restart or Reconnect stops a search or a connect within about a
+second. Stopping disarms the Omni and disconnects it, on Linux and on
+Windows/macOS, within 5 s: the Omni takes one connection at a time, so the
+phone app (or a new session) can connect right after. A new session waits
+until the old one has let go.
+
+Changing any of the Omni's settings (address, club, spin mode, zero-spin
+rejection, calibration) restarts the card.
+
 ## Face impact (beta)
 
 flighthook forwards the Omni's face impact location to GSPro as
@@ -57,7 +80,11 @@ DR = 15.0
 Or on the Devices tab: flip a Square Golf card to Settings; it has a
 collapsible "Face impact calibration (beta)" section with one field per club. Leave a field
 blank to use the default for that club; a value overrides it. Changing a
-calibration restarts the device actor.
+calibration restarts the card.
+
+A key that names no club, a club the Omni has no code for, or a value below
+0 is ignored with a warning in the log when the device connects; that club
+keeps its default.
 
 ## Spin
 
@@ -111,11 +138,14 @@ measure spin over, so it reads zero every time; discarding those would make
 putting impossible. Every other club is a struck shot that should show spin,
 whatever the distance.
 
+Each discarded shot raises a warning alert and counts up the card's
+`zero_spin_discards` telemetry; it takes no shot number.
+
 ```toml
-discard_non_putting_zero_spin = true    # default; written when a device is added
+discard_non_putting_zero_spin = false   # forward every shot, spin or not
 ```
 
-Set it to `false` to forward every shot, spin or not.
+The default (`true`) is left out of the config file.
 
 ## Putting mode
 
@@ -131,16 +161,21 @@ the device's name and percentage.
 ## Shot export
 
 `GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
-each shot with the BLE traffic behind it: the notifications the Omni sent for
-the shot (ball, club, and anything else in between, including the duplicate
-copies the device sends), and the commands flighthook wrote, such as the club
-metrics request. Each frame is hex with its first byte as `type`.
+each shot with the BLE traffic behind it: up to 64 messages before the shot
+event, the notifications the Omni sent for the shot (ball, club, and anything
+else in between, including the duplicate copies the device sends) and the
+commands flighthook wrote, such as the club metrics request and club selects.
+Each is hex, labeled by the driver: `notify 11 02` (a notification's family
+and type byte; `notify 91` for the battery and clock families, family byte
+only) or `cmd 87` (a command's type byte). The same messages are written to
+the log as hex lines at debug level (`audit` target).
 
 Never captured: the identity characteristics (serial, firmware, hardware and
 model are read once at connect, not through the capture), anything before the
-connection is set up, heartbeats and their acks, and the reply to the status
-query. Zero-spin shots that are discarded are not exported. The device's BLE
-name and address are not in the file.
+identity has been read, heartbeats and their acks, the status query and its
+reply, and any notification the driver does not recognize; those reach the
+log only, as hex lines at trace level. A discarded zero-spin shot clears what
+was captured for it. The device's BLE name and address are not in the file.
 
 ## Configuration
 
@@ -152,7 +187,11 @@ name = "Square Golf Omni"
 # every OS. A MAC address also works, or on macOS (which hides MACs) the
 # peripheral UUID.
 address = "SquareGolf(CD01)"
-club = "7i"                          # club selected on connect
-advanced_spin = true                 # device's advanced spin measurement
-discard_non_putting_zero_spin = true # drop 0-spin misreads (putts exempt)
+club = "PW"                           # armed on connect until the game names a club (default 7I)
+advanced_spin = false                 # device's advanced spin measurement (default true)
+discard_non_putting_zero_spin = false # drop 0-spin misreads, putts exempt (default true)
 ```
+
+Every setting is optional, and one at its default is left out of the file.
+`club` takes the club codes of the API (`7I`, `PW`, `DR`, also `i7`, `52`,
+...); a code that names no club arms the 7-iron, with a warning in the log.

@@ -1117,6 +1117,9 @@ fn invalid_driver_setting(saved: &FlighthookConfig, action: &ConfigAction) -> Op
         ConfigAction::UpsertR10 { index, section } => {
             section.changed_driver_error(saved.r10.get(index), &format!("r10.{index}"))
         }
+        ConfigAction::UpsertSquare { index, section } => {
+            section.changed_driver_error(saved.square.get(index), &format!("square.{index}"))
+        }
         _ => None,
     }
 }
@@ -2873,6 +2876,40 @@ mod group_tests {
         }
     }
 
+    /// The Square driver reads its settings leniently (an unknown club or a
+    /// negative calibration is ignored with a warning when the device
+    /// connects), so a save never refuses them, whole or scoped.
+    #[test]
+    fn square_settings_are_never_refused_by_the_driver() {
+        let saved = FlighthookConfig::default();
+        let section: flighthook::SquareSection = serde_json::from_value(serde_json::json!({
+            "name": "Omni",
+            "address": "SquareGolf(CD01)",
+            "club": "no such club",
+            "advanced_spin": false,
+            "discard_non_putting_zero_spin": false,
+            "dot_bottom_to_face_centre_mm": { "7I": -3.0, "ZZ": 4.0 },
+        }))
+        .expect("a Square section");
+        assert_eq!(
+            section.driver.dot_bottom_to_face_center_mm.get("7I"),
+            Some(&-3.0)
+        );
+        let mut whole = saved.clone();
+        whole.square.insert("0".into(), section.clone());
+        for action in [
+            ConfigAction::ReplaceAll {
+                config: Box::new(whole),
+            },
+            ConfigAction::UpsertSquare {
+                index: "0".into(),
+                section,
+            },
+        ] {
+            assert_eq!(invalid_driver_setting(&saved, &action), None);
+        }
+    }
+
     /// A card whose saved driver settings are refused still saves its host
     /// fields and its on/off switch, whole and scoped, as long as the save
     /// keeps the refused driver settings as they are (a NaN read from the
@@ -3828,7 +3865,8 @@ mod reconnect_tests {
         use crate::actors::{MAX_STOP_WAIT, STOP_WAIT};
         let exputt = crate::actors::exputt::ExPuttActor { address: None };
         assert_eq!(exputt.stop_wait(), MAX_STOP_WAIT);
-        for wait in [STOP_WAIT, crate::actors::square::STOP_WAIT] {
+        let square = crate::actors::square::SquareActor::new(flighthook::SquareSection::default());
+        for wait in [STOP_WAIT, square.stop_wait()] {
             assert!(wait <= MAX_STOP_WAIT, "{wait:?}");
         }
         assert!(CONFIG_TIMEOUT >= MAX_STOP_WAIT + START_ROOM);

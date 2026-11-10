@@ -235,7 +235,7 @@ pub enum CameraMode { Standard, Fusion, RawFusion }
 pub enum FlightScopeEnvironment { LimitedFlight, Outdoor }
 pub enum SpinSource { D4, E8, Auto }
 pub struct R10Section { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: R10Config }  // tenover's Config: range: Option<Distance>
-pub struct SquareSection { pub name: String, pub address: Option<String>, pub club: Option<Club>, pub advanced_spin: Option<bool>, pub discard_non_putting_zero_spin: Option<bool> }
+pub struct SquareSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: SquareConfig }  // allsquare's Config: address: Option<String>, club: String ("7I"), advanced_spin: bool (true), discard_non_putting_zero_spin: bool (true), dot_bottom_to_face_center_mm: BTreeMap<String, f64>
 pub struct ExPuttSection { pub name: String, pub address: Option<String> }
 pub struct MockMonitorSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: MockConfig }  // flightrelay's MockConfig
 pub struct OpenConnectServerSection { pub name: String, pub bind: Option<String> }
@@ -620,7 +620,6 @@ the ring and every cap.
 | Device | Hook | Window | Excluded | Pre-roll | Max frames | Max bulk bytes |
 | --- | --- | --- | --- | --- | --- | --- |
 | FlightScope | ironsight `set_on_recv` / `set_on_send` (the same hooks log hex and keep the last D4) | BALL TRIGGER to the device re-armed, both directions | what ironsight classifies as identity-bearing (`protocol::carries_identity`): status/keepalive, device and product info, DSP query, network config, WiFi scan, calibration, sensor activation, time sync, AVR config query | 8 | 256 | 128 KiB (PRC, club PRC, speed profile) |
-| Square Golf | `Tap<T>` around the allsquare transport; characteristic reads are never recorded | pre-roll through the shot event; enabled after the identity exchange | heartbeats and acks, query reply | 64 | 64 | 0 |
 | ExPutt | none: the putt's 16 values, comma-separated, as one text record (`transport = "exputt-wifi"`) | the putt | none | - | 1 | 0 |
 | Open Connect | the inbound JSON text and our reply | the one message | none | - | - | - |
 | Mock | none: `transport = "none"`, `unavailable` says why | - | - | - | - | - |
@@ -636,7 +635,15 @@ records one frame per GFDI message after the handshake, labeled
 `notify <type>` / `write <type>`, pre-roll 256, at most 256 frames, no bulk
 data; tenover withholds every message that carries the device's identity or
 keys, every one it cannot classify and everything before the handshake
-finished (those reach the audit log only, at trace level).
+finished (those reach the audit log only, at trace level). The Square Golf
+(allsquare, `transport = "square-ble"`) records each notification and each
+command once the device's identity has been read, labeled `notify 11 02`
+(family and type byte in the `0x11` family), `notify 91` (the family byte
+for the others) or `cmd 87` (the command's type byte), pre-roll 64, at most
+64 frames, no bulk data; characteristic reads, where the identity lives, are
+never frames, and allsquare withholds heartbeats and their acks, the status
+query and its reply, and every notification it does not recognize (audit
+log only, at trace level).
 
 The web layer keeps each shot as a `StoredShot` (`app/src/actors/web/mod.rs`):
 when `shot_trigger` arrived, a `ShotContext` snapshot taken then (device kind,
@@ -754,8 +761,9 @@ devices. Sources only emit `ClubInfo` / `HandInfo`; no source emits
 `SetDetectionMode` events to reconfigure the device — they latch the mode and
 only re-arm when the mode actually changes. Handed-only updates (mode
 omitted) do not re-arm a launch monitor. The ExPutt starts a new round, which
-re-locates the mat; the Square Golf actor re-sends the active club with the
-new hand. Both also take the hand from game state when their session starts.
+re-locates the mat; the Square Golf driver re-sends the active club with the
+new hand (one club select for a hand and a club that change together). Both
+also take the hand from game state when their session starts.
 Mode and hand are global state, not per-device.
 
 ### DeviceTelemetry / ActorStatus split
@@ -994,13 +1002,13 @@ receipt on its own clock), then applies live `actor_status` events and
 
 All actors use linear backoff on connection failure: starts at 1s, adds 1s per
 failed attempt, capped at 15s (3s for the Open Connect client, a loopback/LAN
-TCP connect). The Open Connect client, Square Golf and ExPutt actors restart at 1s after a connection
+TCP connect). The Open Connect client and ExPutt actors restart at 1s after a connection
 that lasted at least 10s; one that drops sooner counts as a failed attempt, so
 a link that keeps connecting and dropping still backs off to the cap. The
 Open Connect server restarts at 1s after a successful bind. A card on a
-device driver (the R10, the mock) waits the delay its driver asks for: the R10
-uses the SDK's `Backoff`, 1 s per failed attempt up to 15 s, back to 1 s after a
-session of at least 10 s. The Mevo actor keeps the grown delay. Every actor polls its shutdown flag during the
+device driver (the R10, the Square Golf, the mock) waits the delay its driver
+asks for: the R10 and the Square Golf use the SDK's `Backoff`, 1 s per failed
+attempt up to 15 s, back to 1 s after a session of at least 10 s. The Mevo actor keeps the grown delay. Every actor polls its shutdown flag during the
 backoff wait (the Open Connect server during its bind retry delay too), so
 stopping one never waits out the delay. The Mevo and Open Connect client TCP
 connects (up to 5s) run on a thread of their own: a stop ends the actor at
@@ -1033,8 +1041,9 @@ actor and the command waits for it on a helper thread (see
 
 1. Stop: set the shutdown flag and call `stop()` (`SystemState::stop_actor`),
    then wait up to `Actor::stop_wait()` for the actor's thread to end
-   (`SystemState::wait_for_exit`): 3s by default; 5s for a Square Golf,
-   which disarms and disconnects; 18s for an ExPutt, whose session start
+   (`SystemState::wait_for_exit`): 3s by default; a card on a device driver
+   waits its driver's `STOP_WAIT` (6s for an R10, and for a Square Golf,
+   which disarms and disconnects); 18s for an ExPutt, whose session start
    cannot be cut short; none for the web server (the save that moves it is
    answered by the server being stopped, and its successor retries the bind).
 2. If the thread is still running, the actor's `replaceable_while_stopping()`
@@ -1139,7 +1148,7 @@ What a stop does, by actor:
 | Open Connect client | always: 50 ms reads, 2s write timeout, the connect on its own thread; its local-client registration ends with the connection | a write in progress (2s) |
 | Pureplay | always: 50 ms reads, 2s write timeout, the connect on its own thread | a write in progress (2s) |
 | Open Connect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
-| Square Golf | in a session or a backoff wait: it disarms the device, then disconnects it, with BlueZ and with btleplug | the scan and connect inside allsquare (up to 20s scan + 20s service resolution on Linux) |
+| Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
 | Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
 | ExPutt | measuring (100 ms event wait, the session closes at once) or waiting to reconnect | a session start (up to 17s: connect and greeting, two handshake replies, mat search) |
 | Mock monitor | always (50 ms polls; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
@@ -1171,6 +1180,36 @@ clock, so the trigger carries no timestamp. Commands are ignored (no mode,
 hand or club on the R10). The BLE address is the FRP device id. On Windows
 and macOS closing the session disconnects the R10 (at most 4 s); on Linux the
 BlueZ link is left up.
+
+**Square Golf card**: allsquare's device driver (`allsquare::driver::Omni`)
+on `DriverActor` (`actors::square::SquareHooks`: section `SquareSection`,
+source `Square`, no processing of its own). The driver scans for the Omni (or
+the one `address` pins: advertised name, BLE address, or the macOS peripheral
+UUID; blank or the all-zero placeholder discovers), `phase: discovering`,
+connects without pairing and reads its identity, then the card is
+`Connected` (`device_info` "Square Golf <model> <name> (<address>)", so the
+address can be copied into the config) with `device_telemetry`
+`manufacturer: "Invant"`, the model the device reports and its `lm`
+firmware. It arms on its first poll (`ready=false`) with the club and hand
+in play: the latched game state, else the section's `club` (default `7I`)
+and a right-handed player. A club or hand change re-sends one club select
+carrying both, only when either differs; a club the Omni has no code for is
+armed as the nearest club of the same kind, the stronger loft on a tie;
+before the arm a change is only recorded; the detection mode is ignored.
+Telemetry keys: `ready`, `device_state` (`waiting` | `ready` | `recording`
+| `processing`), `battery_pct`, `zero_spin_discards`. A shot is trigger
+(timestamped with the ball notification's arrival), `launch` (all four spin
+values; a total of 0 is sent as 0 with no axis), `club_path` and
+`face_impact` (per-club calibration applied) when the club was tracked,
+`shot_finished`. A zero-spin read with any club but the putter is dropped
+when `discard_non_putting_zero_spin` is on (default): a `warn` alert, the
+`zero_spin_discards` count, `ShotDiscarded` (no shot number taken). Settings
+are read leniently: an unknown club or calibration key and a negative
+calibration are skipped with a warning at the first connect; the driver
+refuses nothing it can read, and any change of its settings restarts the
+card. The advertised name is the FRP device id. Closing disarms the Omni
+and disconnects it on both backends (it takes one central at a time), so
+the card is exclusive: a new instance waits for the old one to close.
 
 **ExPutt actor**: runs a `threeputt::Session` on its own thread. With no
 address it waits for the device to announce itself on the network
@@ -1500,14 +1539,16 @@ NotReady/Disconnected until the monitor's next status or its next
 ## Device drivers
 
 A launch monitor card can run on a flightrelay device driver
-(`flightrelay::driver::DeviceDriver`): the R10 (`tenover::driver::R10`) and
-the mock (`flightrelay::mock::MockDriver`) do today. The driver owns the device (connect,
+(`flightrelay::driver::DeviceDriver`): the R10 (`tenover::driver::R10`), the
+Square Golf Omni (`allsquare::driver::Omni`) and the mock
+(`flightrelay::mock::MockDriver`) do today. The driver owns the device (connect,
 session, shots, telemetry, raw frames); `actors::driver::DriverActor<D, H>`
 is the host around it, one thread per card. What a card adds is its
 `Hooks<D>`: its config section (`H::Section`, a lib `DeviceSection`), its
 shot source (`H::SOURCE`) and optional processing (`on_frp`, `action`).
-The R10's are `actors::r10::R10Hooks` and the mock's
-`actors::mock::MockHooks` (neither has processing of its own).
+The R10's are `actors::r10::R10Hooks`, the Square Golf's
+`actors::square::SquareHooks` and the mock's `actors::mock::MockHooks` (none
+has processing of its own).
 
 **Config.** A `DeviceSection` is flighthook's own fields (`name`,
 `enabled`, `impact_lead_s`) with the driver's config `#[serde(flatten)]`ed
@@ -1542,8 +1583,9 @@ state's mode, hand and club at start; `set_detection_mode` and `club_info`
 afterwards) and queues the card's actions. A session: Connected with
 `device_info` (the identity's label) and `shot_count`, then a
 `device_telemetry` with the identity (and `source`, stamped by the bus
-sender) before any shot; each pass drains the bus into `command` and
-`action`, hands a live config to `apply_config`, sets `wants_raw` (always)
+sender) before any shot; each pass drains the bus into one `command` (the
+pass's messages merged field by field, so a hand and a club that change
+together reach the driver together) and its `action`s, hands a live config to `apply_config`, sets `wants_raw` (always)
 and `shots_allowed` (the round policy), and polls for 50 ms. A session
 error releases held launches, sends `ready=false` and then Reconnecting;
 the driver's `retry_delay` (its own alerts, an SDK `Backoff`) is slept with

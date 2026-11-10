@@ -33,6 +33,7 @@ pub use stats::*;
 pub use video::*;
 
 // Re-export flightrelay types used throughout flighthook.
+pub use allsquare::config::Config as SquareConfig;
 pub use flightrelay::config::{ConfigError, DriverConfig};
 pub use flightrelay::mock::MockConfig;
 pub use flightrelay::types::{AssumedLaunch, Basis, ClubData, FaceImpact, FlightResult, Launch};

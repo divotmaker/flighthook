@@ -1,1792 +1,264 @@
-use std::collections::{BTreeMap, HashMap};
-use std::io;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+//! The Square Golf Omni card: allsquare's device driver ([`Omni`]) on
+//! [`DriverActor`].
+//!
+//! The driver owns the device: it finds the Omni over BLE (or the one the
+//! card's `address` pins), connects without pairing, arms it with the club
+//! and hand in play (the card's `club` until the game names one), follows
+//! club and hand changes with one club select each, drops zero-spin
+//! misreads unless the putter is in play, and reports readiness, device
+//! state, battery and shots with the per-club face impact calibration
+//! applied. The Omni takes one central at a time, so stopping disarms and
+//! disconnects it, and a new instance waits for that (the driver is
+//! exclusive). The card adds its section ([`SquareSection`]) and its shot
+//! source; it has no processing of its own. Any change of the driver's
+//! settings takes a new session (a restart).
+//!
+//! The original Square / Square Home is not supported: it uses a different
+//! club-code scheme.
 
-use allsquare::{Client, Event, SpinMode, ble};
-use tracing::{debug, info, warn};
+use allsquare::driver::Omni;
+use flighthook::SquareSection;
 
-use super::backoff::Backoff;
-use super::{Actor, ReconfigureOutcome};
-use crate::bus::{BusReceiver, BusSender, PollError};
-use crate::raw_capture::{self, RawCapture, RawCaptureConfig};
-use crate::sim;
-use crate::state::SystemState;
+use crate::actors::driver::{DriverActor, Hooks};
+use crate::actors::provenance::ShotSource;
 
-use flighthook::{
-    ActorStatus, Club, ClubData, Distance, FaceImpact, FlighthookEvent, FlighthookMessage,
-    Handedness, Launch, RawDir, RawRecord, Severity, ShotKey, Velocity,
-};
+/// The Square Golf card: no processing of its own.
+#[derive(Debug, Default)]
+pub struct SquareHooks;
 
-/// Reconnect backoff bounds (linear: +1s per failed attempt, capped at 15s,
-/// back to the minimum after a session that lasted 10s).
-const MIN_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(15);
-
-/// Square Golf Omni BLE actor. Connects over BLE — the device is never paired
-/// or bonded — selects a club, arms ball detection and processes shots.
-///
-/// The original Square / Square Home is **not** supported: it uses a different
-/// club-code scheme, so club selection would be wrong on all but the putter.
-pub struct SquareActor {
-    pub address: Option<String>,
-    pub club: Club,
-    pub advanced_spin: bool,
-    /// Discard shots that read zero spin, unless the putter is selected.
-    pub discard_non_putting_zero_spin: bool,
-    /// Per-club face impact calibration, built from allsquare's defaults plus
-    /// any configured overrides.
-    pub impact_calibration: allsquare::ImpactCalibration,
+impl Hooks<Omni> for SquareHooks {
+    type Section = SquareSection;
+    const SOURCE: ShotSource = ShotSource::Square;
 }
 
-impl Actor for SquareActor {
-    /// A launch monitor flighthook reads directly.
-    fn source(&self) -> Option<crate::actors::provenance::ShotSource> {
-        Some(crate::actors::provenance::ShotSource::Square)
-    }
-
-    fn start(
-        &self,
-        state: Arc<SystemState>,
-        sender: BusSender,
-        receiver: BusReceiver,
-    ) -> std::thread::JoinHandle<()> {
-        let address = self.address.clone();
-        let club = self.club;
-        let advanced_spin = self.advanced_spin;
-        let discard_zero_spin = self.discard_non_putting_zero_spin;
-        let impact_calibration = self.impact_calibration.clone();
-        let thread_name = format!("device:{}", sender.actor_id());
-
-        std::thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
-                run(
-                    &state,
-                    address,
-                    club,
-                    advanced_spin,
-                    discard_zero_spin,
-                    impact_calibration,
-                    sender,
-                    receiver,
-                );
-            })
-            .expect("failed to spawn square thread")
-    }
-
-    /// Stopping disarms the device and ends the BLE link ([`STOP_WAIT`]).
-    fn stop_wait(&self) -> Duration {
-        STOP_WAIT
-    }
-
-    fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
-        let actor_id = sender.actor_id();
-        let Some((_, index)) = actor_id.split_once('.') else {
-            return ReconfigureOutcome::Applied;
-        };
-
-        let snap = state.system.snapshot();
-        match snap.square.get(index) {
-            // Address, club and spin mode are applied at connect time.
-            Some(section) => {
-                let impact_calibration =
-                    build_impact_calibration(section.dot_bottom_to_face_center_mm.as_ref());
-                if section.address == self.address && impact_calibration == self.impact_calibration
-                {
-                    ReconfigureOutcome::Applied
-                } else {
-                    ReconfigureOutcome::RestartRequired
-                }
-            }
-            None => ReconfigureOutcome::RestartRequired, // section removed
-        }
-    }
-}
-
-/// Build the per-club face impact calibration from config overrides.
-///
-/// Starts from allsquare's built-in defaults and applies each override.
-/// Unknown club keys, clubs Square Golf has no code for, and non-finite or
-/// negative values are warned about and skipped, leaving that club at its
-/// built-in default.
-pub(crate) fn build_impact_calibration(
-    overrides: Option<&BTreeMap<String, f64>>,
-) -> allsquare::ImpactCalibration {
-    let mut cal = allsquare::ImpactCalibration::default();
-    let Some(overrides) = overrides else {
-        return cal;
-    };
-    for (key, &mm) in overrides {
-        let Some(club) = Club::from_code(key) else {
-            warn!("square: unknown club '{key}' in dot_bottom_to_face_center_mm, ignoring");
-            continue;
-        };
-        let Some(club) = allsquare_club(club) else {
-            warn!(
-                "square: Square Golf has no code for '{key}'; it is armed as {}, whose \
-                 calibration applies; ignoring its dot_bottom_to_face_center_mm",
-                to_allsquare_club(club).to_string().to_uppercase()
-            );
-            continue;
-        };
-        if !mm.is_finite() || mm < 0.0 {
-            warn!("square: invalid dot_bottom_to_face_center_mm for '{key}': {mm}, ignoring");
-            continue;
-        }
-        cal.set_dot_bottom_to_face_centre_mm(club, Some(mm));
-    }
-    cal
-}
-
-// ---------------------------------------------------------------------------
-// Raw capture
-// ---------------------------------------------------------------------------
-
-/// Frames never captured: heartbeat acks, query replies and our heartbeats.
-/// Neither a heartbeat ack nor a query reply is shot data.
-fn export_excluded(rec: &RawRecord) -> bool {
-    match rec.dir {
-        RawDir::Rx => rec
-            .hex
-            .as_deref()
-            .and_then(decode_hex)
-            .and_then(|bytes| allsquare::protocol::parse(&bytes).ok())
-            .is_some_and(|n| {
-                matches!(
-                    n,
-                    allsquare::protocol::Notification::HeartbeatAck(_)
-                        | allsquare::protocol::Notification::QueryResponse(_)
-                )
-            }),
-        RawDir::Tx => {
-            rec.hex
-                .as_deref()
-                .and_then(decode_hex)
-                .and_then(|bytes| allsquare::Command::type_byte_of(&bytes))
-                == Some(allsquare::Command::Heartbeat.type_byte())
-        }
-    }
-}
-
-/// The bytes of a lowercase hex string, or `None` when it is not valid hex.
-fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect()
-}
-
-/// Raw capture for one Square Golf connection. The pre-roll holds the ball
-/// notification, our club metrics request and the club notification, which
-/// all precede allsquare's shot event.
-fn raw_capture_config() -> RawCaptureConfig {
-    RawCaptureConfig {
-        transport: "square-ble",
-        pre_roll_frames: 64,
-        max_frames: 64,
-        max_bulk_bytes: 0,
-        exclude: export_excluded,
-        is_bulk: raw_capture::no_bulk,
-    }
-}
-
-/// Transport wrapper that records notifications and commands for the shot
-/// export. Characteristic reads, where identity lives, are never recorded,
-/// and the capture starts disabled until the identity exchange is done.
-struct Tap<T> {
-    inner: T,
-    capture: RawCapture,
-}
-
-impl<T> Tap<T> {
-    fn new(inner: T) -> Self {
-        let mut capture = RawCapture::new(raw_capture_config());
-        capture.set_enabled(false);
-        Self { inner, capture }
-    }
-}
-
-/// How long a stop waits for the actor: disarming the device and ending the
-/// BLE link take a few BLE operations.
-pub(crate) const STOP_WAIT: Duration = Duration::from_secs(5);
-
-/// Ends the link to the device when the actor stops.
-trait Release {
-    /// Disconnect from the device. Default: nothing beyond dropping the
-    /// transport.
-    fn release(&mut self) {}
-}
-
-/// The Omni takes one central at a time, so the actor disconnects it when it
-/// stops, on either BLE backend: BlueZ keeps a device connected after its
-/// transport is dropped.
-impl Release for ble::BleTransport {
-    fn release(&mut self) {
-        if let Err(e) = self.disconnect() {
-            debug!("disconnect: {e}");
-        }
-    }
-}
-
-impl<T: Release> Release for Tap<T> {
-    fn release(&mut self) {
-        self.inner.release();
-    }
-}
-
-impl<T: allsquare::Transport> allsquare::Transport for Tap<T> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.capture.push(RawRecord {
-                r#type: Some(raw_capture::type_label(buf[0])),
-                channel: Some("notify".into()),
-                ..RawRecord::binary(RawDir::Rx, &buf[..n])
-            });
-        }
-        Ok(n)
-    }
-
-    fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.inner.write(data)?;
-        self.capture.push(RawRecord {
-            r#type: allsquare::Command::type_byte_of(data).map(raw_capture::type_label),
-            channel: Some("cmd".into()),
-            ..RawRecord::binary(RawDir::Tx, data)
-        });
-        Ok(())
-    }
-
-    fn read_characteristic(&mut self, uuid: u128) -> io::Result<Vec<u8>> {
-        self.inner.read_characteristic(uuid)
-    }
-
-    fn model_hint(&self) -> Option<String> {
-        self.inner.model_hint()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Whether `address` is the all-zero placeholder macOS reports in place of a
-/// hidden BLE address. It identifies no device.
-fn is_zero_address(address: &str) -> bool {
-    address.trim().eq_ignore_ascii_case("00:00:00:00:00:00")
-}
-
-fn emit_device_status(sender: &BusSender, status: ActorStatus, telemetry: HashMap<String, String>) {
-    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-        status,
-        telemetry,
-    }));
-}
-
-fn emit_alert(sender: &BusSender, severity: Severity, message: impl Into<String>) {
-    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-        severity,
-        message: message.into(),
-    }));
-}
-
-/// The device hand for the player's handedness; right when unknown.
-fn handed_of(handed: Option<Handedness>) -> allsquare::Handed {
-    if handed == Some(Handedness::Left) {
-        allsquare::Handed::Left
-    } else {
-        allsquare::Handed::Right
-    }
-}
-
-/// Map a flighthook club to the allsquare club the device is set to.
-///
-/// A club change coming from GSPro is pushed straight to the device. This
-/// matters more here than on other monitors: Square Golf uses the selected
-/// club to classify the shot, and putting mode is nothing more than "the putter
-/// is selected". A club the device has no code for (see [`allsquare_club`]) is
-/// sent as the nearest club of the same kind it does have, taking the stronger
-/// loft on a tie.
-fn to_allsquare_club(club: Club) -> allsquare::Club {
-    match club {
-        Club::Driver | Club::MiniDriver => allsquare::Club::Driver,
-        Club::Wood2 | Club::Wood3 | Club::Wood4 => allsquare::Club::Wood3,
-        Club::Wood5 | Club::Wood6 => allsquare::Club::Wood5,
-        Club::Wood7 | Club::Wood8 | Club::Wood9 => allsquare::Club::Wood7,
-        Club::Hybrid1 | Club::Hybrid2 | Club::Hybrid3 => allsquare::Club::Hybrid3,
-        Club::Hybrid4 => allsquare::Club::Hybrid4,
-        Club::Hybrid5 | Club::Hybrid6 | Club::Hybrid7 | Club::Hybrid8 | Club::Hybrid9 => {
-            allsquare::Club::Hybrid5
-        }
-        Club::Iron1 | Club::Iron2 | Club::Iron3 => allsquare::Club::Iron3,
-        Club::Iron4 => allsquare::Club::Iron4,
-        Club::Iron5 => allsquare::Club::Iron5,
-        Club::Iron6 => allsquare::Club::Iron6,
-        Club::Iron7 => allsquare::Club::Iron7,
-        Club::Iron8 => allsquare::Club::Iron8,
-        Club::Iron9 => allsquare::Club::Iron9,
-        Club::PitchingWedge => allsquare::Club::PitchingWedge,
-        Club::GapWedge => allsquare::Club::GapWedge,
-        Club::SandWedge => allsquare::Club::SandWedge,
-        Club::LobWedge => allsquare::Club::LobWedge,
-        Club::Putter => allsquare::Club::Putter,
-    }
-}
-
-/// The allsquare club with the same code, or `None` for a club Square Golf has
-/// no code for (MD, 2W, 4W, 6W, 8W, 9W, 1H, 2H, 6H, 7H, 8H, 9H, 1I, 2I).
-fn allsquare_club(club: Club) -> Option<allsquare::Club> {
-    match club {
-        Club::MiniDriver
-        | Club::Wood2
-        | Club::Wood4
-        | Club::Wood6
-        | Club::Wood8
-        | Club::Wood9
-        | Club::Hybrid1
-        | Club::Hybrid2
-        | Club::Hybrid6
-        | Club::Hybrid7
-        | Club::Hybrid8
-        | Club::Hybrid9
-        | Club::Iron1
-        | Club::Iron2 => None,
-        _ => Some(to_allsquare_club(club)),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Protocol type -> bus type conversion helpers
-// ---------------------------------------------------------------------------
-
-/// Whether a shot is a spin misread and should be dropped rather than forwarded.
-///
-/// The device occasionally returns a shot with no spin at all, typically a ball
-/// struck at the very front of the detection zone. A real strike always imparts
-/// spin, and a spinless shot handed to a sim carries much further than it should
-/// — a zero-spin 8 iron flies roughly 30 yards long — so it is better to lose the
-/// shot than to record a wrong one.
-///
-/// The putter is exempt, and it is the only exemption that makes sense. A putt
-/// has no airborne flight for the device to measure spin over, so it reads zero
-/// every time; discarding those would make putting impossible. Every other club
-/// is a struck shot that should show spin, whatever the distance.
-fn is_zero_spin_misread(b: &allsquare::BallMetrics, club: Club, enabled: bool) -> bool {
-    if !enabled || club == Club::Putter {
-        return false;
-    }
-    b.total_spin == 0 && b.back_spin == 0 && b.side_spin == 0
-}
-
-fn ball_from_square(b: &allsquare::BallMetrics) -> Launch {
-    Launch {
-        launch_speed: Some(Velocity::MetersPerSecond(b.speed)),
-        launch_elevation: Some(b.launch_angle),
-        launch_azimuth: Some(b.direction),
-        // The device measures launch only; flighthook simulates the flight.
-        backspin_rpm: Some(i32::from(b.back_spin)),
-        // Negated: the device reports negative sidespin for rightward curve,
-        // FRP defines positive as rightward. Without this, fades draw and
-        // draws fade in GSPro (which derives spin axis from these components).
-        sidespin_rpm: Some(-i32::from(b.side_spin)),
-        // The device reports total spin and axis alongside the components.
-        // The axis has the device's sidespin polarity (negative = right), so
-        // it is negated too. A total of 0 has no axis.
-        total_spin_rpm: Some(i32::from(b.total_spin)),
-        spin_axis: (b.total_spin != 0).then_some(-b.spin_axis),
-    }
-}
-
-fn club_from_square(c: &allsquare::ClubMetrics) -> ClubData {
-    ClubData {
-        club_speed: c.club_speed.map(Velocity::MetersPerSecond),
-        club_speed_post: None,
-        path: c.path,
-        attack_angle: c.attack_angle,
-        face_angle: c.face_angle,
-        // Unlike the R10, the Omni reports these two.
-        dynamic_loft: c.dynamic_loft,
-        smash_factor: c.smash_factor,
-        swing_plane_horizontal: None,
-        swing_plane_vertical: None,
-        // Impact location belongs in FaceImpact, not here.
-        club_offset: None,
-        club_height: None,
-        ..ClubData::default()
-    }
-}
-
-/// Impact location as millimeters from face center, if the device measured it.
-///
-/// allsquare reports both axes from face center (beta calibration, with the
-/// vertical offset taken from the armed club). Lateral is negated: the device
-/// reports negative toward the toe, FRP defines positive toward the toe.
-fn face_impact_from_square(c: &allsquare::ClubMetrics) -> Option<FaceImpact> {
-    if c.impact_horizontal.is_none() && c.impact_vertical.is_none() {
-        return None;
-    }
-    Some(FaceImpact {
-        lateral: c.impact_horizontal.map(|v| Distance::Millimeters(-v)),
-        vertical: c.impact_vertical.map(Distance::Millimeters),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Run loop
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-fn run(
-    state: &SystemState,
-    address: Option<String>,
-    club: Club,
-    advanced_spin: bool,
-    discard_zero_spin: bool,
-    impact_calibration: allsquare::ImpactCalibration,
-    sender: BusSender,
-    mut receiver: BusReceiver,
-) {
-    let address = address.filter(|a| {
-        let zero = is_zero_address(a);
-        if zero {
-            warn!(
-                "ignoring configured address {a}: it is the placeholder macOS reports \
-                 for a hidden BLE address, not a device address; auto-discovering instead"
-            );
-        }
-        !zero
-    });
-    let mut backoff = Backoff::new(MIN_BACKOFF, MAX_BACKOFF);
-    let mut ever_connected = false;
-    let mut device_id: Option<String> = None;
-    // Latched across reconnects so the device comes back with the right club.
-    let mut current_club = club;
-
-    loop {
-        if receiver.poll().is_err() {
-            break;
-        }
-
-        emit_device_status(&sender, ActorStatus::Starting, HashMap::new());
-
-        let mut connected_at = None;
-        match connect_and_run(
-            state,
-            address.as_deref(),
-            &mut current_club,
-            advanced_spin,
-            discard_zero_spin,
-            &impact_calibration,
-            &sender,
-            &mut receiver,
-            &mut connected_at,
-            &mut device_id,
-        ) {
-            Ok(()) => break,
-            Err(e) => {
-                let session = connected_at.map(|at| at.elapsed());
-                ever_connected |= session.is_some();
-                warn!("session error: {e}");
-                emit_alert(&sender, Severity::Warn, format!("Square Golf error: {e}"));
-
-                let backoff_status = if ever_connected {
-                    ActorStatus::Reconnecting
-                } else {
-                    ActorStatus::Starting
-                };
-                // Not ready before the status changes: the status drops what
-                // the card held, so nothing of the lost device is left to
-                // report after it.
-                if let Some(dev) = device_id.as_deref() {
-                    sender.send(
-                        FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                            manufacturer: None,
-                            model: None,
-                            firmware: None,
-                            source: None,
-                            telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
-                        })
-                        .device(dev),
-                    );
-                }
-                emit_device_status(&sender, backoff_status, HashMap::new());
-
-                let verb = if ever_connected {
-                    "reconnecting"
-                } else {
-                    "retrying"
-                };
-                let delay = backoff.delay(session);
-                info!("{verb} in {}s", delay.as_secs());
-
-                let deadline = Instant::now() + delay;
-                while Instant::now() < deadline {
-                    if receiver.poll().is_err() {
-                        emit_device_status(&sender, ActorStatus::Disconnected, HashMap::new());
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            }
-        }
-    }
-
-    emit_device_status(&sender, ActorStatus::Disconnected, HashMap::new());
-}
-
-// ---------------------------------------------------------------------------
-// Session lifecycle
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-fn connect_and_run(
-    state: &SystemState,
-    address: Option<&str>,
-    current_club: &mut Club,
-    advanced_spin: bool,
-    discard_zero_spin: bool,
-    impact_calibration: &allsquare::ImpactCalibration,
-    sender: &BusSender,
-    receiver: &mut BusReceiver,
-    connected_at: &mut Option<Instant>,
-    device_id: &mut Option<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("searching for Square Golf device...");
-    let transport = ble::connect(address)?;
-    *connected_at = Some(Instant::now());
-
-    let name = transport.name().to_string();
-    let ble_address = transport.address().to_string();
-    // Log the address explicitly: after a first auto-discovered connect the
-    // user needs it to pin this device in config, and auto-discovery would
-    // otherwise never show it anywhere.
-    info!("connected to {name} at {ble_address}");
-    *device_id = Some(name.clone());
-
-    run_session(
-        transport,
-        name,
-        ble_address,
-        state,
-        current_club,
-        advanced_spin,
-        discard_zero_spin,
-        impact_calibration,
-        sender,
-        receiver,
-    )
-}
-
-/// Drive a connected device until shutdown or a link error: follow the bus
-/// (club, handedness), arm the device, and publish its shots.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn run_session<T: allsquare::Transport + Release>(
-    transport: T,
-    name: String,
-    ble_address: String,
-    state: &SystemState,
-    current_club: &mut Club,
-    advanced_spin: bool,
-    discard_zero_spin: bool,
-    impact_calibration: &allsquare::ImpactCalibration,
-    sender: &BusSender,
-    receiver: &mut BusReceiver,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut client = Client::new(Tap::new(transport));
-    client.set_impact_calibration(impact_calibration.clone());
-    // Every club select carries the player's hand.
-    let mut hand = handed_of(state.game.snapshot().handed);
-    client.set_handed(hand);
-    let spin = if advanced_spin {
-        SpinMode::Advanced
-    } else {
-        SpinMode::Standard
-    };
-    // Whether the device has been armed; a hand change before that only
-    // records the hand, which the arm then carries.
-    let mut armed = false;
-
-    let mut shot_counter: u32 = 0;
-    let mut discarded_counter: u32 = 0;
-    let mut idle_count: u32 = 0;
-    let mut device_telemetry: HashMap<String, String> = HashMap::new();
-
-    loop {
-        // ==============================================================
-        // Phase 1: Drain bus commands
-        // ==============================================================
-        // A club or hand change seen in this drain; one select after it
-        // carries both.
-        let mut reselect = false;
-        loop {
-            match receiver.poll() {
-                Err(PollError::Shutdown) => {
-                    let _ = client.disarm();
-                    client.transport_mut().release();
-                    return Ok(());
-                }
-                Ok(None) => break,
-                Ok(Some(msg)) => match msg.event {
-                    // Follow the simulator's club selection. Square Golf uses
-                    // it to classify the shot, so keeping it in sync matters.
-                    FlighthookEvent::ClubInfo { club_info } => {
-                        if club_info.club != *current_club {
-                            *current_club = club_info.club;
-                            reselect = true;
-                        }
-                    }
-                    // Follow the player's hand: the system actor's command, whatever set it.
-                    // The same event can carry a mode, which does not apply
-                    // (see below).
-                    FlighthookEvent::SetDetectionMode { mode, handed, .. } => {
-                        if let Some(handed) = handed {
-                            let new_hand = handed_of(Some(handed));
-                            if new_hand != hand {
-                                hand = new_hand;
-                                client.set_handed(hand);
-                                // Before the arm the hand is only recorded.
-                                reselect |= armed;
-                            }
-                        }
-                        // There is no device-side shot mode: putting and
-                        // chipping differ only by which club is selected.
-                        if let Some(new_mode) = mode {
-                            debug!(
-                                "mode change to {new_mode:?} ignored \
-                                 — Square Golf has no mode control, select a club"
-                            );
-                        }
-                    }
-                    _ => {}
-                },
-            }
-        }
-        if reselect {
-            let mapped = to_allsquare_club(*current_club);
-            info!("club -> {mapped}, hand {hand:?}");
-            if let Err(e) = client.select_club(mapped) {
-                warn!("club select failed: {e}");
-            }
-        }
-
-        // ==============================================================
-        // Phase 2: Drive the Square Golf client
-        // ==============================================================
-        match client.poll() {
-            Ok(Some(event)) => {
-                idle_count = 0;
-
-                match event {
-                    Event::Connected {
-                        firmware,
-                        hardware,
-                        device_id: serial,
-                        model,
-                    } => {
-                        info!(
-                            "model {model}, firmware lm {} (mmi {}), hw {hardware}, id {serial}",
-                            firmware.lm, firmware.mmi
-                        );
-                        // Identity has been read; capture from here on.
-                        client.transport_mut().capture.set_enabled(true);
-                        emit_device_status(
-                            sender,
-                            ActorStatus::Connected,
-                            HashMap::from([
-                                (
-                                    "device_info".into(),
-                                    if model.is_empty() {
-                                        format!("Square Golf {name} ({ble_address})")
-                                    } else {
-                                        format!("Square Golf {model} {name} ({ble_address})")
-                                    },
-                                ),
-                                // Surfaced on the bus (so it reaches the UI log
-                                // and telemetry) specifically so a user who
-                                // auto-discovered can copy it into config.
-                                ("ble_address".into(), ble_address.clone()),
-                                ("shot_count".into(), shot_counter.to_string()),
-                            ]),
-                        );
-
-                        device_telemetry.insert("ready".into(), "false".into());
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                manufacturer: Some("Invant".into()),
-                                // What the device calls itself, e.g. SGO300A.
-                                model: if model.is_empty() {
-                                    None
-                                } else {
-                                    Some(model.clone())
-                                },
-                                firmware: Some(firmware.lm.clone()),
-                                source: None,
-                                telemetry: Some(device_telemetry.clone()),
-                            })
-                            .device(&name),
-                        );
-
-                        // Arm once — the device stays armed across shots.
-                        client.arm(to_allsquare_club(*current_club), spin)?;
-                        armed = true;
-                        info!("armed with {}", to_allsquare_club(*current_club));
-                    }
-
-                    Event::StateChanged(state) => {
-                        use allsquare::DeviceState;
-                        debug!("device state: {state:?}");
-                        let ready = state == DeviceState::Ready;
-                        let label = match state {
-                            DeviceState::Detect => Some("waiting"),
-                            DeviceState::Ready => Some("ready"),
-                            DeviceState::Shot => Some("recording"),
-                            DeviceState::Done => Some("processing"),
-                            _ => None,
-                        };
-                        device_telemetry.insert("ready".into(), ready.to_string());
-                        if let Some(label) = label {
-                            device_telemetry.insert("device_state".into(), label.into());
-                        }
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                manufacturer: None,
-                                model: None,
-                                firmware: None,
-                                source: None,
-                                telemetry: Some(device_telemetry.clone()),
-                            })
-                            .device(&name),
-                        );
-                    }
-
-                    Event::Battery { percent, state } => {
-                        debug!("battery {percent}% {state:?}");
-                        device_telemetry.insert("battery_pct".into(), percent.to_string());
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                manufacturer: None,
-                                model: None,
-                                firmware: None,
-                                source: None,
-                                telemetry: Some(device_telemetry.clone()),
-                            })
-                            .device(&name),
-                        );
-                    }
-
-                    Event::Shot { ball, club } => {
-                        // Drop before the counter advances, so a discarded shot
-                        // leaves no gap in the numbering and no half-shot on the
-                        // bus — nothing downstream ever learns it happened.
-                        if is_zero_spin_misread(&ball, *current_club, discard_zero_spin) {
-                            let mph = Velocity::MetersPerSecond(ball.speed).as_mph();
-                            discarded_counter += 1;
-                            warn!("discarded shot: {mph:.1}mph with zero spin (misread)");
-                            emit_alert(
-                                sender,
-                                Severity::Warn,
-                                format!(
-                                    "Square Golf: discarded a {mph:.0} mph shot that read zero \
-                                     spin — the ball was likely too far forward in the hitting \
-                                     zone. Re-hit it."
-                                ),
-                            );
-                            // Also surface a running count as telemetry. The log
-                            // line says one shot was lost; this says whether it
-                            // is a one-off or a ball-position problem worth
-                            // fixing on the mat.
-                            device_telemetry
-                                .insert("zero_spin_discards".into(), discarded_counter.to_string());
-                            sender.send(
-                                FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                                    manufacturer: None,
-                                    model: None,
-                                    firmware: None,
-                                    source: None,
-                                    telemetry: Some(device_telemetry.clone()),
-                                })
-                                .device(&name),
-                            );
-                            client.transport_mut().capture.discard();
-                            continue;
-                        }
-
-                        shot_counter += 1;
-                        let key = ShotKey {
-                            shot_id: uuid::Uuid::new_v4().to_string(),
-                            shot_number: shot_counter,
-                        };
-                        info!("shot #{}", key.shot_number);
-                        client.transport_mut().capture.mark_trigger();
-
-                        emit_device_status(
-                            sender,
-                            ActorStatus::Connected,
-                            HashMap::from([("shot_count".into(), shot_counter.to_string())]),
-                        );
-
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()))
-                                .device(&name),
-                        );
-
-                        let bf = ball_from_square(&ball);
-                        info!(
-                            "  ball: {:.1}mph VLA={:.1} HLA={:.1} back={}rpm side={}rpm",
-                            bf.launch_speed.map_or(0.0, Velocity::as_mph),
-                            bf.launch_elevation.unwrap_or(0.0),
-                            bf.launch_azimuth.unwrap_or(0.0),
-                            bf.backspin_rpm.unwrap_or(0),
-                            bf.sidespin_rpm.unwrap_or(0),
-                        );
-                        for event in sim::launch_events(state, key.clone(), bf, None) {
-                            sender.send(FlighthookMessage::new(event).device(&name));
-                        }
-
-                        // Club data is absent when the device could not track
-                        // the sticker — a putt, or a mishit it declined.
-                        if let Some(ref c) = club {
-                            let cd = club_from_square(c);
-                            info!(
-                                "  club: {:.1}mph face={:.1} path={:.1} AoA={:.1} smash={:.2}",
-                                cd.club_speed.map_or(0.0, Velocity::as_mph),
-                                cd.face_angle.unwrap_or(0.0),
-                                cd.path.unwrap_or(0.0),
-                                cd.attack_angle.unwrap_or(0.0),
-                                cd.smash_factor.unwrap_or(0.0),
-                            );
-                            sender.send(
-                                FlighthookMessage::new(FlighthookEvent::ClubPath {
-                                    key: key.clone(),
-                                    club: Box::new(cd),
-                                })
-                                .device(&name),
-                            );
-
-                            if let Some(impact) = face_impact_from_square(c) {
-                                info!(
-                                    "  impact (beta): toe={:.1}mm up={:.1}mm",
-                                    impact.lateral.map_or(f64::NAN, |d| d.as_millimeters()),
-                                    impact.vertical.map_or(f64::NAN, |d| d.as_millimeters()),
-                                );
-                                sender.send(
-                                    FlighthookMessage::new(FlighthookEvent::FaceImpact {
-                                        key: key.clone(),
-                                        impact: Box::new(impact),
-                                    })
-                                    .device(&name),
-                                );
-                            }
-                        } else {
-                            debug!("  no club data (sticker not tracked)");
-                        }
-
-                        let raw = client.transport_mut().capture.take();
-                        sender.send(
-                            FlighthookMessage::new(FlighthookEvent::ShotFinished {
-                                key,
-                                raw: Some(Box::new(raw)),
-                            })
-                            .device(&name),
-                        );
-                    }
-
-                    Event::Sensor(_) | Event::Clock(_) | Event::Alignment(_) => {}
-
-                    _ => {}
-                }
-            }
-
-            Ok(None) => {
-                idle_count += 1;
-                if idle_count >= 3 {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-
-            Err(allsquare::Error::Disconnected) => {
-                info!("device closed the link");
-                return Err(Box::new(allsquare::Error::Disconnected));
-            }
-            Err(allsquare::Error::Transport(e)) => {
-                info!("BLE transport error: {e}");
-                return Err(Box::new(allsquare::Error::Transport(e)));
-            }
-            Err(e) => {
-                warn!("protocol error: {e}");
-                emit_alert(sender, Severity::Warn, format!("Square Golf: {e}"));
-            }
-        }
-    }
-}
+/// The Square Golf actor (`square.N`).
+pub type SquareActor = DriverActor<Omni, SquareHooks>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use allsquare::testing::{self, BALL_NOTIFICATION};
-    use allsquare::{ClubMetrics, DeviceState};
-    use flighthook::ShotDetectionMode;
-    use std::sync::Mutex;
+    use std::collections::{HashMap, VecDeque};
+    use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::{Duration, Instant};
 
-    /// The device reports negative toward the toe; FRP's lateral is positive
-    /// toward the toe. Vertical passes through.
-    #[test]
-    fn face_impact_flips_lateral_to_frp() {
-        let c = allsquare::ClubMetrics {
-            impact_horizontal: Some(-12.5),
-            impact_vertical: Some(3.0),
-            ..Default::default()
-        };
-        let impact = face_impact_from_square(&c).expect("impact");
-        assert_eq!(impact.lateral, Some(Distance::Millimeters(12.5)));
-        assert_eq!(impact.vertical, Some(Distance::Millimeters(3.0)));
+    use allsquare::driver::{BleLink, OmniSession};
+    use allsquare::testing;
+    use allsquare::{BallMetrics, ClubMetrics, DeviceState};
+    use flighthook::{
+        ActorStatus, Club, FlighthookEvent, FlighthookMessage, Handedness, ShotDetectionMode,
+        SquareConfig,
+    };
+    use flightrelay::config::ConfigError;
+    use flightrelay::driver::{
+        Backoff, ConnectCtx, DeviceCommand, DeviceDriver, DeviceIdentity, DeviceSession,
+        DriverInfo, Events, NoAction, SessionEnd,
+    };
+    use serde_json::{Value, json};
+    use tokio::sync::broadcast;
+
+    use super::*;
+    use crate::actors::web::tests::TempDir;
+    use crate::actors::{Actor, ReconfigureOutcome};
+    use crate::bus::BusSender;
+    use crate::state::SystemState;
+
+    // -- The scripted Omni ----------------------------------------------------
+
+    /// The scripted device's advertised name and BLE address (synthetic).
+    const EQ_NAME: &str = "SquareGolf(EQ01)";
+    const EQ_ADDRESS: &str = "02:00:00:00:00:01";
+    /// How long the device stays quiet after it put a bus event out, so the
+    /// card sees the event before the next notification.
+    const EQ_BUS_GAP: Duration = Duration::from_millis(300);
+
+    /// One step of what the scripted device does.
+    #[derive(Clone)]
+    enum Step {
+        /// A notification; the device sends every notification twice.
+        Note(Vec<u8>),
+        /// Something happens elsewhere that the game reports on the bus (a
+        /// club or hand change); the device is quiet for [`EQ_BUS_GAP`].
+        Bus(FlighthookEvent),
+        /// The link is gone.
+        Lost,
     }
 
-    /// The impact height with allsquare's per-club offset to the face
-    /// center is a calibrated reading, not a model's value: a tournament
-    /// round keeps it.
-    #[test]
-    fn a_round_keeps_the_calibrated_impact_height() {
-        let round = crate::state::round::RoundPolicy::default();
-        let guard = round
-            .begin_round(&crate::state::round::RoundRequest {
-                holder: "Pureplay",
-                feeds: &[],
-            })
-            .expect("accepted");
-        let c = allsquare::ClubMetrics {
-            impact_horizontal: Some(-12.5),
-            impact_vertical: Some(3.0),
-            ..Default::default()
-        };
-        let impact = face_impact_from_square(&c).expect("impact");
-        let shot = flighthook::ShotData {
-            impact: Some(impact.clone()),
-            provenance: Some(crate::actors::provenance::ShotSource::Square.provenance()),
-            ..flighthook::ShotData::default()
-        };
-        let certified = guard.certify(&shot).expect("measured");
-        assert_eq!(certified.shot().impact.as_ref(), Some(&impact));
-        assert_eq!(impact.vertical, Some(Distance::Millimeters(3.0)));
+    /// What the scripted device has left to do and what it was told.
+    #[derive(Default)]
+    struct EqWire {
+        steps: VecDeque<Step>,
+        /// The second copy of the last notification.
+        repeat: Option<Vec<u8>>,
+        quiet_until: Option<Instant>,
+        lost: bool,
+        written: Vec<Vec<u8>>,
+        released: u32,
     }
 
-    /// No vertical estimate (e.g. the putter) still reports lateral.
-    #[test]
-    fn face_impact_without_vertical_keeps_lateral() {
-        let c = allsquare::ClubMetrics {
-            impact_horizontal: Some(4.0),
-            ..Default::default()
-        };
-        let impact = face_impact_from_square(&c).expect("impact");
-        assert_eq!(impact.lateral, Some(Distance::Millimeters(-4.0)));
-        assert_eq!(impact.vertical, None);
-        assert!(face_impact_from_square(&allsquare::ClubMetrics::default()).is_none());
-    }
-
-    /// The device reports negative sidespin for a rightward curve; FRP defines
-    /// positive as rightward. Getting this backwards makes fades draw and draws
-    /// fade in GSPro, which derives spin axis from the spin components.
-    #[test]
-    fn sidespin_polarity_is_inverted() {
-        let fade = allsquare::BallMetrics {
-            speed: 3.30,
-            launch_angle: 32.51,
-            direction: 7.39,
-            total_spin: 627,
-            spin_axis: -8.00,
-            back_spin: 621,
-            side_spin: -87,
-            ..testing::ball_metrics()
-        };
-        let bf = ball_from_square(&fade);
-        assert_eq!(bf.sidespin_rpm, Some(87), "device -87 (right) -> FRP +87");
-        assert_eq!(bf.backspin_rpm, Some(621), "backspin is not flipped");
-        assert_eq!(bf.launch_azimuth, Some(7.39), "azimuth is not flipped");
-    }
-
-    /// Device sidespin polarity carries through FRP into the simulation: the
-    /// device's negative (rightward) sidespin must land the ball right.
-    #[test]
-    fn device_fade_lands_right_in_the_simulation() {
-        let fade = allsquare::BallMetrics {
-            speed: 3.30,
-            launch_angle: 32.51,
-            direction: 7.39,
-            total_spin: 627,
-            spin_axis: -8.00,
-            back_spin: 621,
-            side_spin: -87,
-            ..testing::ball_metrics()
-        };
-        let cfg = flighthook::SimulationSection::default();
-        let d = sim::derive(&ball_from_square(&fade), None, &cfg).expect("simulated");
-        let off = d.carry_offline.expect("offline").as_meters();
-        assert!(off > 0.0, "{off}");
-
-        // The same fade at full speed and launched straight, so only the
-        // sidespin can move it right.
-        let straight = allsquare::BallMetrics {
-            speed: 60.0,
-            launch_angle: 14.0,
-            direction: 0.0,
-            back_spin: 3000,
-            side_spin: -600,
-            ..fade
-        };
-        let d = sim::derive(&ball_from_square(&straight), None, &cfg).expect("simulated");
-        let off = d.carry_offline.expect("offline").as_meters();
-        assert!(off > 0.0, "{off}");
-    }
-
-    fn ball(speed_ms: f64, total: i16, back: i16, side: i16) -> allsquare::BallMetrics {
-        allsquare::BallMetrics {
-            speed: speed_ms,
-            launch_angle: 18.0,
-            total_spin: total,
-            back_spin: back,
-            side_spin: side,
-            ..testing::ball_metrics()
-        }
-    }
-
-    /// A full-swing club reading zero spin is a misread, whatever the ball
-    /// speed: a struck ball always spins, and a spinless shot flies far too
-    /// long in the sim.
-    #[test]
-    fn rejects_zero_spin_shot() {
-        assert!(is_zero_spin_misread(
-            &ball(49.0, 0, 0, 0),
-            Club::Iron8,
-            true
-        ));
-    }
-
-    /// Distance is irrelevant: a chip is a struck shot and should show spin, so
-    /// a zero-spin chip is a misread like any other.
-    #[test]
-    fn rejects_zero_spin_chip() {
-        // 8 m/s ~= 18 mph, a 10-yard chip.
-        assert!(is_zero_spin_misread(
-            &ball(8.0, 0, 0, 0),
-            Club::LobWedge,
-            true
-        ));
-    }
-
-    /// The putter is the one real exemption: there is no airborne flight to
-    /// measure spin over, so a putt reads zero every time and discarding those
-    /// would make putting impossible.
-    #[test]
-    fn never_discards_a_putt() {
-        // 3.3 m/s ~= 7 mph, a normal putt.
-        assert!(!is_zero_spin_misread(
-            &ball(3.3, 0, 0, 0),
-            Club::Putter,
-            true
-        ));
-        // Even a rammed one.
-        assert!(!is_zero_spin_misread(
-            &ball(9.0, 0, 0, 0),
-            Club::Putter,
-            true
-        ));
-    }
-
-    /// Any measured spin means the read succeeded, however fast the ball.
-    #[test]
-    fn allows_shot_with_spin() {
-        assert!(!is_zero_spin_misread(
-            &ball(70.0, 2400, 2400, 0),
-            Club::Driver,
-            true
-        ));
-        // Sidespin alone still counts as a successful read.
-        assert!(!is_zero_spin_misread(
-            &ball(70.0, 0, 0, -87),
-            Club::Driver,
-            true
-        ));
-    }
-
-    /// Disabled means disabled — nothing is examined, whatever the club.
-    #[test]
-    fn disabled_forwards_everything() {
-        assert!(!is_zero_spin_misread(
-            &ball(80.0, 0, 0, 0),
-            Club::Driver,
-            false
-        ));
-        assert!(!is_zero_spin_misread(
-            &ball(3.3, 0, 0, 0),
-            Club::Putter,
-            false
-        ));
-    }
-
-    #[test]
-    fn zero_address_is_detected() {
-        assert!(is_zero_address("00:00:00:00:00:00"));
-        assert!(is_zero_address(" 00:00:00:00:00:00\n"));
-        assert!(!is_zero_address("02:00:00:AB:CD:01"));
-        assert!(!is_zero_address("SquareGolf(CD01)"));
-    }
-
-    #[test]
-    fn no_overrides_matches_allsquare_default() {
-        assert_eq!(
-            build_impact_calibration(None),
-            allsquare::ImpactCalibration::default()
-        );
-    }
-
-    #[test]
-    fn valid_override_is_applied() {
-        let mut overrides = BTreeMap::new();
-        overrides.insert("DR".to_string(), 30.0);
-        let cal = build_impact_calibration(Some(&overrides));
-        assert_eq!(
-            cal.dot_bottom_to_face_centre_mm(allsquare::Club::Driver),
-            Some(30.0)
-        );
-    }
-
-    /// An unknown club key is warned about and skipped — every other club
-    /// still gets allsquare's built-in default.
-    #[test]
-    fn unknown_club_key_is_skipped() {
-        let mut overrides = BTreeMap::new();
-        overrides.insert("bogus".to_string(), 30.0);
-        let cal = build_impact_calibration(Some(&overrides));
-        assert_eq!(cal, allsquare::ImpactCalibration::default());
-    }
-
-    /// A club the device has no code for has no calibration of its own; its
-    /// key is skipped rather than overriding the club it is armed as.
-    #[test]
-    fn club_without_device_code_is_skipped() {
-        let mut overrides = BTreeMap::new();
-        overrides.insert("6H".to_string(), 30.0);
-        let cal = build_impact_calibration(Some(&overrides));
-        assert_eq!(cal, allsquare::ImpactCalibration::default());
-    }
-
-    /// Every club the device has no code for is armed as its nearest club.
-    #[test]
-    fn clubs_without_device_code_map_to_nearest() {
-        let cases = [
-            (Club::MiniDriver, allsquare::Club::Driver),
-            (Club::Wood2, allsquare::Club::Wood3),
-            (Club::Wood4, allsquare::Club::Wood3),
-            (Club::Wood6, allsquare::Club::Wood5),
-            (Club::Wood8, allsquare::Club::Wood7),
-            (Club::Wood9, allsquare::Club::Wood7),
-            (Club::Hybrid1, allsquare::Club::Hybrid3),
-            (Club::Hybrid2, allsquare::Club::Hybrid3),
-            (Club::Hybrid6, allsquare::Club::Hybrid5),
-            (Club::Hybrid7, allsquare::Club::Hybrid5),
-            (Club::Hybrid8, allsquare::Club::Hybrid5),
-            (Club::Hybrid9, allsquare::Club::Hybrid5),
-            (Club::Iron1, allsquare::Club::Iron3),
-            (Club::Iron2, allsquare::Club::Iron3),
-        ];
-        for (club, expected) in cases {
-            assert_eq!(allsquare_club(club), None, "{club}");
-            assert_eq!(to_allsquare_club(club), expected, "{club}");
-        }
-        let exact = Club::ALL
-            .iter()
-            .filter(|&&c| allsquare_club(c).is_some())
-            .count();
-        assert_eq!(exact, 19);
-    }
-
-    /// A negative value is nonsensical (it is a distance) and is skipped —
-    /// the club keeps its built-in default rather than taking a bad value.
-    #[test]
-    fn negative_value_is_skipped() {
-        let mut overrides = BTreeMap::new();
-        overrides.insert("DR".to_string(), -5.0);
-        let cal = build_impact_calibration(Some(&overrides));
-        assert_eq!(
-            cal.dot_bottom_to_face_centre_mm(allsquare::Club::Driver),
-            allsquare::ImpactCalibration::default()
-                .dot_bottom_to_face_centre_mm(allsquare::Club::Driver)
-        );
-    }
-
-    /// `reconfigure()` restarts the actor exactly when the built calibration
-    /// changes — this is the equality check it relies on.
-    #[test]
-    fn calibration_changes_are_detected() {
-        let mut overrides_a = BTreeMap::new();
-        overrides_a.insert("DR".to_string(), 19.0);
-        let mut overrides_b = overrides_a.clone();
-        overrides_b.insert("DR".to_string(), 25.0);
-
-        let cal_a = build_impact_calibration(Some(&overrides_a));
-        let cal_a_again = build_impact_calibration(Some(&overrides_a));
-        let cal_b = build_impact_calibration(Some(&overrides_b));
-
-        assert_eq!(cal_a, cal_a_again, "same overrides must compare equal");
-        assert_ne!(cal_a, cal_b, "changed overrides must compare unequal");
-    }
-
-    /// Holds a session inside its device read, between two bus drains.
+    /// Holds a session inside its device read, so a test can put several
+    /// bus events out for one pass of the card.
     #[derive(Default)]
     struct Gate {
-        closed: Mutex<()>,
+        held: Mutex<()>,
         waiting: AtomicBool,
     }
 
-    /// Scripted Omni: queued notifications, identity characteristics, and a
-    /// log of every command written.
-    #[derive(Default)]
-    struct FakeTransport {
-        notifications: std::collections::VecDeque<Vec<u8>>,
-        written: Arc<Mutex<Vec<Vec<u8>>>>,
-        gate: Option<Arc<Gate>>,
-        /// Set once the session ends the link.
-        released: Arc<AtomicBool>,
-    }
-
-    impl Release for FakeTransport {
-        fn release(&mut self) {
-            self.released.store(true, Ordering::SeqCst);
-        }
-    }
-
-    impl allsquare::Transport for FakeTransport {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if let Some(gate) = &self.gate {
-                gate.waiting.store(true, Ordering::SeqCst);
-                drop(gate.closed.lock().unwrap_or_else(|e| e.into_inner()));
-            }
-            let Some(n) = self.notifications.pop_front() else {
-                return Err(io::ErrorKind::WouldBlock.into());
-            };
-            buf[..n.len()].copy_from_slice(&n);
-            Ok(n.len())
-        }
-
-        fn write(&mut self, data: &[u8]) -> io::Result<()> {
-            self.written
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(data.to_vec());
-            Ok(())
-        }
-
-        fn read_characteristic(&mut self, uuid: u128) -> io::Result<Vec<u8>> {
-            use allsquare::protocol::uuid;
-            match uuid {
-                uuid::DEVICE_ID => Ok(b"SQ-123456".to_vec()),
-                uuid::FW_VERSION => Ok(br#"{"lm":"1.0","mmi":"1.0","launcher":"1.0"}"#.to_vec()),
-                uuid::HW_VERSION => Ok(b"1".to_vec()),
-                _ => Err(io::ErrorKind::NotFound.into()),
-            }
-        }
-    }
-
-    #[test]
-    fn tap_captures_the_shot_without_identity_or_housekeeping() {
-        let club = testing::club_notification(&ClubMetrics::default());
-        let notifications = [
-            testing::query_response(&[0xaa, 0xbb]),
-            testing::heartbeat_ack(DeviceState::Idle).to_vec(),
-            testing::heartbeat_ack(DeviceState::Init).to_vec(),
-            BALL_NOTIFICATION.to_vec(),
-            BALL_NOTIFICATION.to_vec(),
-            club.to_vec(),
-        ];
-        let fake = FakeTransport {
-            notifications: notifications.into_iter().collect(),
-            ..FakeTransport::default()
-        };
-        let mut client = Client::new(Tap::new(fake));
-
-        let mut shot = false;
-        for _ in 0..32 {
-            match client.poll().expect("poll") {
-                Some(Event::Connected { device_id, .. }) => {
-                    assert_eq!(device_id, "SQ-123456");
-                    client.transport_mut().capture.set_enabled(true);
-                }
-                Some(Event::Shot { .. }) => {
-                    shot = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        assert!(shot, "no shot event");
-        client.transport_mut().capture.mark_trigger();
-        let raw = client.transport_mut().capture.take();
-
-        let seq: Vec<(RawDir, Option<&str>, Option<String>)> = raw
-            .frames
-            .iter()
-            .map(|r| (r.dir, r.channel.as_deref(), r.r#type.clone()))
-            .collect();
-        let notify = Some(raw_capture::type_label(BALL_NOTIFICATION[0]));
-        let request = Some(raw_capture::type_label(
-            allsquare::Command::RequestClubMetrics.type_byte(),
-        ));
-        assert_eq!(
-            seq,
-            [
-                (RawDir::Rx, Some("notify"), notify.clone()),
-                (RawDir::Tx, Some("cmd"), request),
-                (RawDir::Rx, Some("notify"), notify.clone()),
-                (RawDir::Rx, Some("notify"), notify),
-            ]
-        );
-        assert_eq!(raw.transport, "square-ble");
-        assert_eq!(
-            raw.frames[0].hex.as_deref(),
-            Some(flighthook::hex_lower(&BALL_NOTIFICATION).as_str())
-        );
-        assert_eq!(
-            raw.frames[3].hex.as_deref(),
-            Some(flighthook::hex_lower(&club).as_str())
-        );
-        // The replies to the identity exchange's query and heartbeat arrive
-        // after the capture is enabled and are dropped by `export_excluded`;
-        // the identity itself is never read through the tap.
-        let json = serde_json::to_string(&raw).expect("ser");
-        assert!(!json.contains(&flighthook::hex_lower(b"SQ-123456")));
-        assert!(
-            !json.contains(&flighthook::hex_lower(&testing::query_response(&[
-                0xaa, 0xbb
-            ])))
-        );
-        assert!(
-            !json.contains(&flighthook::hex_lower(&testing::heartbeat_ack(
-                DeviceState::Idle
-            )))
-        );
-    }
-
-    #[test]
-    fn tap_records_nothing_until_enabled() {
-        let fake = FakeTransport {
-            notifications: [BALL_NOTIFICATION.to_vec()].into_iter().collect(),
-            ..FakeTransport::default()
-        };
-        let mut tap = Tap::new(fake);
-        let mut buf = [0u8; 64];
-        assert_eq!(
-            allsquare::Transport::read(&mut tap, &mut buf).expect("read"),
-            17
-        );
-        allsquare::Transport::write(&mut tap, &allsquare::Command::RequestClubMetrics.encode(1))
-            .expect("write");
-        tap.capture.mark_trigger();
-        assert!(tap.capture.take().frames.is_empty());
-    }
-
-    #[test]
-    fn heartbeat_command_is_excluded() {
-        let hb = RawRecord::binary(RawDir::Tx, &allsquare::Command::Heartbeat.encode(7));
-        assert!(export_excluded(&hb));
-        let req = RawRecord::binary(
-            RawDir::Tx,
-            &allsquare::Command::RequestClubMetrics.encode(7),
-        );
-        assert!(!export_excluded(&req));
-        assert!(!export_excluded(&RawRecord::binary(
-            RawDir::Rx,
-            &BALL_NOTIFICATION
-        )));
-    }
-
-    #[test]
-    fn heartbeat_ack_and_query_reply_are_excluded() {
-        let ack = RawRecord::binary(RawDir::Rx, &testing::heartbeat_ack(DeviceState::Ready));
-        let query = RawRecord::binary(RawDir::Rx, &testing::QUERY_RESPONSE);
-        assert!(export_excluded(&ack));
-        assert!(export_excluded(&query));
-        assert!(!export_excluded(&RawRecord::binary(
-            RawDir::Rx,
-            &BALL_NOTIFICATION
-        )));
-        // A frame that does not parse is kept, never dropped silently.
-        let truncated = &testing::heartbeat_ack(DeviceState::Ready)[..3];
-        assert!(!export_excluded(&RawRecord::binary(RawDir::Rx, truncated)));
-        assert_eq!(decode_hex("0a1b"), Some(vec![0x0a, 0x1b]));
-        assert_eq!(decode_hex("0a1"), None);
-        assert_eq!(decode_hex("zz"), None);
-        assert_eq!(decode_hex("é1"), None);
-    }
-
-    /// The device's total spin passes through; its axis is negated like its
-    /// sidespin (device negative = right, FRP positive = right), so the two
-    /// FRP spin pairs agree.
-    #[test]
-    fn total_spin_and_axis_follow_frp_signs() {
-        let fade = allsquare::BallMetrics {
-            speed: 3.30,
-            launch_angle: 32.51,
-            direction: 7.39,
-            total_spin: 627,
-            spin_axis: -8.00,
-            back_spin: 621,
-            side_spin: -87,
-            ..testing::ball_metrics()
-        };
-        let bf = ball_from_square(&fade);
-        assert_eq!(bf.total_spin_rpm, Some(627));
-        assert_eq!(bf.spin_axis, Some(8.0), "device -8 (right) -> FRP +8");
-        let mut components = Launch {
-            backspin_rpm: bf.backspin_rpm,
-            sidespin_rpm: bf.sidespin_rpm,
-            ..Launch::default()
-        };
-        components.complete_spin();
-        assert_eq!(components.total_spin_rpm, Some(627));
-        assert!((components.spin_axis.unwrap() - 8.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn zero_total_spin_has_no_axis() {
-        let bf = ball_from_square(&ball(1.5, 0, 0, 0));
-        assert_eq!(bf.total_spin_rpm, Some(0));
-        assert_eq!(bf.spin_axis, None);
-    }
-
-    #[test]
-    fn handedness_maps_to_the_device_hand() {
-        assert_eq!(handed_of(Some(Handedness::Left)), allsquare::Handed::Left);
-        assert_eq!(handed_of(Some(Handedness::Right)), allsquare::Handed::Right);
-        assert_eq!(handed_of(None), allsquare::Handed::Right);
-    }
-
-    /// A session against a scripted device on its own thread.
-    struct Session {
-        written: Arc<Mutex<Vec<Vec<u8>>>>,
-        released: Arc<AtomicBool>,
-        sender: BusSender,
-        shutdown: Arc<AtomicBool>,
+    /// A scripted Omni link: identity characteristics, the script's
+    /// notifications, and a log of every command written. Bus steps go out
+    /// through `bus`.
+    #[derive(Clone)]
+    struct EqLink {
+        wire: Arc<Mutex<EqWire>>,
+        bus: Option<BusSender>,
         gate: Arc<Gate>,
-        thread: Option<std::thread::JoinHandle<Result<(), String>>>,
-        dir: std::path::PathBuf,
+        /// While set, a connect to this device waits (and keeps ticking).
+        hold: Arc<AtomicBool>,
     }
 
-    impl Session {
-        /// The player's hand is `hand` when the session starts; `queued` is
-        /// on the bus before the session first looks at it.
-        fn start(hand: Option<Handedness>, queued: Vec<FlighthookEvent>) -> Self {
-            Self::launch(hand, queued, false)
-        }
-
-        /// A session with the system actor on its bus, so the hand is set
-        /// with `hand_info` as every source sets it.
-        fn with_system_actor() -> Self {
-            Self::launch(None, vec![], true)
-        }
-
-        fn launch(
-            hand: Option<Handedness>,
-            queued: Vec<FlighthookEvent>,
-            system_actor: bool,
-        ) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "flighthook-square-{}",
-                crate::state::config::generate_id()
-            ));
-            let (state, writer) = SystemState::new(dir.join("config.toml"));
-            let state = Arc::new(state);
-            if let Some(hand) = hand {
-                writer.set_handed(hand);
-            }
-            let (tx, _rx) = tokio::sync::broadcast::channel(1024);
-            let shutdown = Arc::new(AtomicBool::new(false));
-            if system_actor {
-                crate::actors::system::start_for_test(writer, &state, &tx, shutdown.clone());
-            }
-            let sender = BusSender::new("square.0".into(), tx, shutdown.clone());
-            let mut receiver = sender.subscribe();
-            for event in queued {
-                sender.send(FlighthookMessage::new(event));
-            }
-            let gate = Arc::new(Gate::default());
-            let fake = FakeTransport {
-                gate: Some(gate.clone()),
-                ..FakeTransport::default()
-            };
-            let written = fake.written.clone();
-            let released = fake.released.clone();
-            let session_sender = sender.clone();
-            let thread = std::thread::spawn(move || {
-                let mut club = Club::Iron7;
-                run_session(
-                    fake,
-                    "SquareGolf(TEST)".into(),
-                    "00:11:22:33:44:55".into(),
-                    &state,
-                    &mut club,
-                    true,
-                    true,
-                    &allsquare::ImpactCalibration::default(),
-                    &session_sender,
-                    &mut receiver,
-                )
-                .map_err(|e| e.to_string())
-            });
+    impl EqLink {
+        fn new(steps: Vec<Step>, bus: Option<BusSender>) -> Self {
             Self {
-                written,
-                released,
-                sender,
-                shutdown,
-                gate,
-                thread: Some(thread),
-                dir,
+                wire: Arc::new(Mutex::new(EqWire {
+                    steps: steps.into(),
+                    ..EqWire::default()
+                })),
+                bus,
+                gate: Arc::default(),
+                hold: Arc::default(),
             }
         }
 
-        fn send(&self, event: FlighthookEvent) {
-            self.sender.send(FlighthookMessage::new(event));
+        fn wire(&self) -> std::sync::MutexGuard<'_, EqWire> {
+            self.wire
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
-        /// Put `events` on the bus so the session drains them in one pass.
-        fn send_together(&self, events: Vec<FlighthookEvent>) {
-            let held = self.gate.closed.lock().unwrap_or_else(|e| e.into_inner());
-            self.gate.waiting.store(false, Ordering::SeqCst);
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !self.gate.waiting.load(Ordering::SeqCst) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            for event in events {
-                self.send(event);
-            }
-            drop(held);
-        }
-
-        /// The club selects written so far, as the `(club, hand)` each one
-        /// carries.
-        fn selects(&self) -> Vec<(allsquare::Club, allsquare::Handed)> {
-            use allsquare::Handed::{Left, Right};
-            let probe = allsquare::Command::SelectClub {
+        /// The club selects written so far.
+        fn selects(&self) -> Vec<Vec<u8>> {
+            let select = allsquare::Command::SelectClub {
                 club: allsquare::Club::Driver,
-                handed: Right,
-            };
-            let log = self.written.lock().unwrap_or_else(|e| e.into_inner());
-            log.iter()
-                .filter(|frame| allsquare::Command::type_byte_of(frame) == Some(probe.type_byte()))
-                .map(|frame| {
-                    let matches = |club, handed| {
-                        let cmd = allsquare::Command::SelectClub { club, handed };
-                        (0..=u8::MAX).any(|seq| cmd.encode(seq).as_slice() == frame.as_slice())
-                    };
-                    Club::ALL
-                        .iter()
-                        .map(|&club| to_allsquare_club(club))
-                        .flat_map(|club| [(club, Right), (club, Left)])
-                        .find(|&(club, handed)| matches(club, handed))
-                        .unwrap_or_else(|| {
-                            panic!("a club select for no club and hand: {frame:02x?}")
-                        })
-                })
+                handed: allsquare::Handed::Right,
+            }
+            .type_byte();
+            self.wire()
+                .written
+                .iter()
+                .filter(|w| allsquare::Command::type_byte_of(w) == Some(select))
+                .cloned()
                 .collect()
         }
 
         /// Wait until `count` club selects have been written.
-        fn wait_for(&self, count: usize) {
+        fn wait_for_selects(&self, count: usize) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while self.selects().len() < count && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
 
-        /// Wait for `count` club selects, then stop the session and return
-        /// every select it wrote.
-        fn finish(mut self, count: usize) -> Vec<(allsquare::Club, allsquare::Handed)> {
-            self.wait_for(count);
-            self.shutdown.store(true, Ordering::SeqCst);
-            if let Some(thread) = self.thread.take() {
-                thread.join().expect("session thread").expect("session ran");
+        /// Put `events` on the bus while the session waits in a read, so the
+        /// card takes them in one pass.
+        fn send_together(&self, bus: &BusSender, events: Vec<FlighthookEvent>) {
+            let held = self.gate.held.lock().unwrap_or_else(|e| e.into_inner());
+            self.gate.waiting.store(false, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.gate.waiting.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
             }
-            self.selects()
-        }
-    }
-
-    impl Drop for Session {
-        /// Stops a session that `finish` did not (a failed assertion) and
-        /// removes its config directory.
-        fn drop(&mut self) {
-            self.shutdown.store(true, Ordering::SeqCst);
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+            for event in events {
+                bus.send(FlighthookMessage::new(event));
             }
-            let _ = std::fs::remove_dir_all(&self.dir);
+            drop(held);
         }
     }
 
-    fn hand_event(mode: Option<ShotDetectionMode>, handed: Handedness) -> FlighthookEvent {
-        FlighthookEvent::SetDetectionMode {
-            mode,
-            handed: Some(handed),
-            club: None,
+    impl allsquare::Transport for EqLink {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.gate.waiting.store(true, Ordering::SeqCst);
+            drop(self.gate.held.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut w = self.wire();
+            if w.lost {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "link lost"));
+            }
+            if let Some(note) = w.repeat.take() {
+                buf[..note.len()].copy_from_slice(&note);
+                return Ok(note.len());
+            }
+            if let Some(until) = w.quiet_until {
+                if Instant::now() < until {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                w.quiet_until = None;
+            }
+            match w.steps.pop_front() {
+                Some(Step::Note(note)) => {
+                    buf[..note.len()].copy_from_slice(&note);
+                    w.repeat = Some(note.clone());
+                    Ok(note.len())
+                }
+                Some(Step::Bus(event)) => {
+                    w.quiet_until = Some(Instant::now() + EQ_BUS_GAP);
+                    drop(w);
+                    if let Some(bus) = &self.bus {
+                        bus.send(FlighthookMessage::new(event));
+                    }
+                    Err(io::ErrorKind::WouldBlock.into())
+                }
+                Some(Step::Lost) => {
+                    w.lost = true;
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "link lost"))
+                }
+                None => Err(io::ErrorKind::WouldBlock.into()),
+            }
+        }
+
+        fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            self.wire().written.push(data.to_vec());
+            Ok(())
+        }
+
+        fn read_characteristic(&mut self, id: u128) -> io::Result<Vec<u8>> {
+            use allsquare::protocol::uuid;
+            let s = match id {
+                uuid::FW_VERSION => r#"{"launcher": "1.0.1", "mmi": "1.4.0", "lm": "1.5.8"}"#,
+                uuid::HW_VERSION => "3.1",
+                uuid::GAP_NAME => "SGO300A",
+                uuid::DEVICE_ID => "SQ-TEST-0001",
+                _ => return Err(io::ErrorKind::NotFound.into()),
+            };
+            Ok(s.as_bytes().to_vec())
         }
     }
 
-    fn club_event(club: Club) -> FlighthookEvent {
-        FlighthookEvent::ClubInfo {
-            club_info: flighthook::ClubInfo { club },
+    impl BleLink for EqLink {
+        fn name(&self) -> &str {
+            EQ_NAME
+        }
+        fn address(&self) -> &str {
+            EQ_ADDRESS
+        }
+        fn release(&mut self) -> allsquare::Result<()> {
+            self.wire().released += 1;
+            Ok(())
         }
     }
 
-    /// A left-handed player's first club select, the arm, carries the left
-    /// hand.
-    #[test]
-    fn arm_carries_the_game_states_left_hand() {
-        let session = Session::start(Some(Handedness::Left), vec![]);
-        let seven = to_allsquare_club(Club::Iron7);
-        assert_eq!(session.finish(1), [(seven, allsquare::Handed::Left)]);
+    // -- The script the harness plays ----------------------------------------
+
+    fn note(bytes: &[u8]) -> Step {
+        Step::Note(bytes.to_vec())
     }
 
-    /// Without a hand in the game state the arm is right-handed.
-    #[test]
-    fn arm_is_right_handed_when_the_hand_is_unknown() {
-        let session = Session::start(None, vec![]);
-        let seven = to_allsquare_club(Club::Iron7);
-        assert_eq!(session.finish(1), [(seven, allsquare::Handed::Right)]);
+    fn ack(state: DeviceState) -> Step {
+        note(&testing::heartbeat_ack(state))
     }
 
-    /// A hand that arrives before the device is armed is recorded, not sent
-    /// as a club select of its own.
-    #[test]
-    fn hand_before_the_arm_rides_the_arm() {
-        let session = Session::start(None, vec![hand_event(None, Handedness::Left)]);
-        let seven = to_allsquare_club(Club::Iron7);
-        assert_eq!(session.finish(1), [(seven, allsquare::Handed::Left)]);
-    }
-
-    /// A hand change while connected re-sends the active club once with the
-    /// new hand; the same hand again writes nothing. The club change after it
-    /// pins the order: its select is the next frame, and carries the hand. A
-    /// mode in the same event does not matter.
-    #[test]
-    fn hand_change_resends_the_active_club_once() {
-        use allsquare::Handed::{Left, Right};
-        let session = Session::start(None, vec![]);
-        let seven = to_allsquare_club(Club::Iron7);
-        let eight = to_allsquare_club(Club::Iron8);
-        session.wait_for(1);
-        session.send(hand_event(
-            Some(ShotDetectionMode::Putting),
-            Handedness::Left,
-        ));
-        session.wait_for(2);
-        session.send(hand_event(None, Handedness::Left));
-        session.send(club_event(Club::Iron8));
-        assert_eq!(
-            session.finish(3),
-            [(seven, Right), (seven, Left), (eight, Left)]
-        );
-    }
-
-    /// A hand set in the UI (`hand_info` from `web`) reaches the Omni through
-    /// the system actor's command: the active club is re-sent once with it,
-    /// and the next club carries it.
-    #[test]
-    fn a_hand_set_in_the_ui_reaches_the_device() {
-        use allsquare::Handed::{Left, Right};
-        let session = Session::with_system_actor();
-        let seven = to_allsquare_club(Club::Iron7);
-        let eight = to_allsquare_club(Club::Iron8);
-        session.wait_for(1);
-        let web = BusSender::new(
-            "web".into(),
-            session.sender.raw_sender().clone(),
-            Arc::default(),
-        );
-        let left = || {
-            FlighthookMessage::new(FlighthookEvent::HandInfo {
-                hand_info: flighthook::HandInfo {
-                    handed: Handedness::Left,
-                },
-            })
-        };
-        web.send(left());
-        session.wait_for(2);
-        web.send(left());
-        web.send(FlighthookMessage::new(club_event(Club::Iron8)));
-        assert_eq!(
-            session.finish(3),
-            [(seven, Right), (seven, Left), (eight, Left)]
-        );
-    }
-
-    /// A hand and a club that change in the same pass write one select: the
-    /// new club with the new hand.
-    #[test]
-    fn hand_and_club_in_one_pass_write_one_select() {
-        use allsquare::Handed::{Left, Right};
-        let session = Session::start(None, vec![]);
-        let seven = to_allsquare_club(Club::Iron7);
-        let eight = to_allsquare_club(Club::Iron8);
-        session.wait_for(1);
-        session.send_together(vec![
-            hand_event(Some(ShotDetectionMode::Full), Handedness::Left),
-            club_event(Club::Iron8),
-        ]);
-        session.wait_for(2);
-        // The next select is the next frame: nothing else was written.
-        session.send(club_event(Club::Iron7));
-        assert_eq!(
-            session.finish(3),
-            [(seven, Right), (eight, Left), (seven, Left)]
-        );
-    }
-
-    #[test]
-    fn a_stop_disarms_the_device_and_ends_the_link_at_once() {
-        let session = Session::start(None, vec![]);
-        session.wait_for(1);
-        let released = Arc::clone(&session.released);
-        assert!(!released.load(Ordering::SeqCst));
-        let stopped = Instant::now();
-        session.finish(1);
-        let took = stopped.elapsed();
-        assert!(took < Duration::from_secs(1), "{took:?}");
-        assert!(released.load(Ordering::SeqCst), "the link is ended");
-    }
-
-    /// Every output's numbers for an Omni shot with club data and face
-    /// impact, through the Omni's sign flips: the fade chip of the tests
-    /// above, and a full swing.
-    #[test]
-    fn outputs_keep_their_numbers() {
-        let chip = (
-            allsquare::BallMetrics {
-                speed: 3.30,
-                launch_angle: 32.51,
-                direction: 7.39,
-                total_spin: 627,
-                spin_axis: -8.00,
-                back_spin: 621,
-                side_spin: -87,
-                ..testing::ball_metrics()
-            },
-            ClubMetrics {
-                mask: 0xff,
-                path: Some(2.15),
-                face_angle: Some(4.62),
-                attack_angle: Some(-3.18),
-                dynamic_loft: Some(38.4),
-                impact_horizontal: Some(-6.5),
-                impact_vertical: Some(2.25),
-                club_speed: Some(3.02),
-                smash_factor: Some(1.09),
-            },
-        );
-        let full_swing = (
-            allsquare::BallMetrics {
+    /// A full 7-iron swing with every club value (the full-swing pin's).
+    fn full_swing() -> (BallMetrics, ClubMetrics) {
+        (
+            BallMetrics {
                 speed: 60.0,
                 launch_angle: 14.0,
                 direction: -1.2,
@@ -1807,17 +279,1031 @@ mod tests {
                 club_speed: Some(41.4),
                 smash_factor: Some(1.45),
             },
-        );
-        for (case, (ball, club)) in [("square", chip), ("square_full_swing", full_swing)] {
-            let messages = crate::test_ball::device_shot(
-                "square.0",
-                ball_from_square(&ball),
-                None,
-                Some(club_from_square(&club)),
-                face_impact_from_square(&club),
-                None,
+        )
+    }
+
+    /// A tracked fade chip (the chip pin's).
+    fn chip() -> (BallMetrics, ClubMetrics) {
+        (
+            BallMetrics {
+                speed: 3.30,
+                launch_angle: 32.51,
+                direction: 7.39,
+                total_spin: 627,
+                spin_axis: -8.00,
+                back_spin: 621,
+                side_spin: -87,
+                ..testing::ball_metrics()
+            },
+            ClubMetrics {
+                mask: 0xff,
+                path: Some(2.15),
+                face_angle: Some(4.62),
+                attack_angle: Some(-3.18),
+                dynamic_loft: Some(38.4),
+                impact_horizontal: Some(-6.5),
+                impact_vertical: Some(2.25),
+                club_speed: Some(3.02),
+                smash_factor: Some(1.09),
+            },
+        )
+    }
+
+    fn shot(ball: &BallMetrics, club: &ClubMetrics) -> [Step; 2] {
+        [
+            note(&testing::ball_notification(ball)),
+            note(&testing::club_notification(club)),
+        ]
+    }
+
+    /// The session the harness plays: waiting, battery, ready, a full
+    /// swing, the device's state through the shot, a zero-spin 7-iron (a
+    /// misread), a notification no one recognizes and a sensor report, the
+    /// game's putter, a putt without club data, a left-handed player, the
+    /// sand wedge, a tracked chip; then the link is gone.
+    fn eq_script(bus: bool) -> Vec<Step> {
+        let mut sensor = vec![0x11, 0x01, 0x00, 0x01, 0x01];
+        sensor.resize(17, 0);
+        let zero_spin = BallMetrics {
+            speed: 30.0,
+            launch_angle: 18.0,
+            total_spin: 0,
+            spin_axis: 0.0,
+            back_spin: 0,
+            side_spin: 0,
+            ..testing::ball_metrics()
+        };
+        let putt = BallMetrics {
+            speed: 2.5,
+            launch_angle: 1.2,
+            direction: -0.8,
+            total_spin: 0,
+            spin_axis: 0.0,
+            back_spin: 0,
+            side_spin: 0,
+            ..testing::ball_metrics()
+        };
+        let untracked = ClubMetrics::default();
+        let (swing_ball, swing_club) = full_swing();
+        let (chip_ball, chip_club) = chip();
+        let club = |club| {
+            Step::Bus(FlighthookEvent::ClubInfo {
+                club_info: flighthook::ClubInfo { club },
+            })
+        };
+        let mut steps = vec![
+            ack(DeviceState::Detect),
+            note(&[0x91, 0x4b, 0x01]),
+            ack(DeviceState::Ready),
+        ];
+        steps.extend(shot(&swing_ball, &swing_club));
+        steps.extend([
+            ack(DeviceState::Shot),
+            ack(DeviceState::Done),
+            ack(DeviceState::Ready),
+        ]);
+        steps.extend(shot(&zero_spin, &untracked));
+        steps.extend([note(&[0x11, 0x55, 0x01, 0x02, 0x03]), note(&sensor)]);
+        if bus {
+            steps.push(club(Club::Putter));
+        }
+        steps.extend(shot(&putt, &untracked));
+        if bus {
+            steps.push(Step::Bus(FlighthookEvent::SetDetectionMode {
+                mode: None,
+                handed: Some(Handedness::Left),
+                club: None,
+            }));
+            steps.push(club(Club::SandWedge));
+        }
+        steps.extend(shot(&chip_ball, &chip_club));
+        steps.push(Step::Lost);
+        steps
+    }
+
+    /// The Square section the harness runs with: a pinned device, the sand
+    /// wedge's calibration, and the zero-spin switch written out as the
+    /// 0.1.24 card wrote it.
+    const EQ_SECTION: &str = r#"{"name":"Square Golf Omni","address":"eq-harness","discard_non_putting_zero_spin":true,"dot_bottom_to_face_center_mm":{"SW":12.5}}"#;
+
+    // -- allsquare's driver over the scripted device -------------------------
+
+    /// Scripted links waiting for a driver, by the card's `address`: each
+    /// test runs with its own.
+    static DEVICES: LazyLock<Mutex<HashMap<String, VecDeque<EqLink>>>> =
+        LazyLock::new(Mutex::default);
+
+    /// allsquare's [`Omni`] with its BLE scan replaced by the scripted links
+    /// queued for its address: a connect runs the real identity read and
+    /// session over the next one, and waits for its stop when none is left.
+    struct ScriptedOmni {
+        inner: Omni,
+        devices: VecDeque<EqLink>,
+    }
+
+    impl DeviceDriver for ScriptedOmni {
+        type Config = SquareConfig;
+        type Error = allsquare::driver::Error;
+        type Action = NoAction;
+        type Session = ScriptedSession;
+        const STOP_WAIT: Duration = Omni::STOP_WAIT;
+
+        fn info(config: &SquareConfig) -> DriverInfo {
+            Omni::info(config)
+        }
+
+        fn new(config: SquareConfig) -> Result<Self, ConfigError> {
+            let devices = DEVICES
+                .lock()
+                .unwrap()
+                .remove(config.address.as_deref().unwrap_or_default())
+                .unwrap_or_default();
+            Ok(Self {
+                inner: Omni::new(config)?,
+                devices,
+            })
+        }
+
+        fn config(&self) -> &SquareConfig {
+            self.inner.config()
+        }
+
+        fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ScriptedSession, Self::Error> {
+            ctx.tick()?;
+            ctx.out.phase("discovering");
+            match self.devices.pop_front() {
+                Some(link) => {
+                    while link.hold.load(Ordering::SeqCst) {
+                        ctx.tick()?;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(ScriptedSession(self.inner.connect_with(ctx, link)?))
+                }
+                None => loop {
+                    ctx.tick()?;
+                    std::thread::sleep(Duration::from_millis(20));
+                },
+            }
+        }
+
+        fn retry_delay(
+            &mut self,
+            ended: &SessionEnd<'_, Self::Error>,
+            backoff: &mut Backoff,
+            out: &mut Events<'_>,
+        ) -> Option<Duration> {
+            self.inner.retry_delay(ended, backoff, out)
+        }
+
+        fn apply_config(&mut self, new: &SquareConfig) {
+            self.inner.apply_config(new);
+        }
+    }
+
+    struct ScriptedSession(OmniSession);
+
+    impl DeviceSession for ScriptedSession {
+        type Driver = ScriptedOmni;
+
+        fn poll(
+            &mut self,
+            timeout: Duration,
+            out: &mut Events<'_>,
+        ) -> Result<(), allsquare::driver::Error> {
+            self.0.poll(timeout, out)
+        }
+
+        fn command(&mut self, cmd: &DeviceCommand) -> Result<(), allsquare::driver::Error> {
+            self.0.command(cmd)
+        }
+
+        fn identity(&self) -> &DeviceIdentity {
+            self.0.identity()
+        }
+
+        fn close(self, out: &mut Events<'_>) -> Result<(), allsquare::driver::Error> {
+            self.0.close(out)
+        }
+    }
+
+    impl Hooks<ScriptedOmni> for SquareHooks {
+        type Section = SquareSection;
+        const SOURCE: ShotSource = ShotSource::Square;
+    }
+
+    /// A running Square card (`square.0`) on a scripted device, and the bus.
+    struct Card {
+        _dir: TempDir,
+        state: Arc<SystemState>,
+        tx: broadcast::Sender<FlighthookMessage>,
+        rx: broadcast::Receiver<FlighthookMessage>,
+        link: EqLink,
+    }
+
+    impl Card {
+        /// Start `section`'s card on a device playing `steps`. With
+        /// `hand`, the game state holds that hand first; with
+        /// `system_actor`, the system actor runs on the bus.
+        fn start(
+            section: &SquareSection,
+            steps: Vec<Step>,
+            hand: Option<Handedness>,
+            queued: Vec<FlighthookEvent>,
+            system_actor: bool,
+        ) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "flighthook-square-test-{}",
+                crate::state::config::generate_id()
+            ));
+            let (state, writer) = SystemState::new(dir.join("config.toml"));
+            if let Some(hand) = hand {
+                writer.set_handed(hand);
+            }
+            state.system.update(|c| {
+                c.square.insert("0".into(), section.clone());
+            });
+            let state = Arc::new(state);
+            let (tx, rx) = broadcast::channel(1024);
+            if system_actor {
+                crate::actors::system::start_for_test(writer, &state, &tx, Arc::default());
+            }
+            let game = BusSender::new("web".into(), tx.clone(), Arc::default());
+            let link = EqLink::new(steps, Some(game.clone()));
+            link.hold.store(!queued.is_empty(), Ordering::SeqCst);
+            DEVICES.lock().unwrap().insert(
+                section.driver.address.clone().unwrap_or_default(),
+                VecDeque::from([link.clone()]),
             );
+            crate::actors::start_actor(
+                "square.0".into(),
+                Box::new(DriverActor::<ScriptedOmni, SquareHooks>::new(
+                    section.clone(),
+                )),
+                &state,
+                &tx,
+            );
+            // On the bus before the device is connected.
+            for event in queued {
+                game.send(FlighthookMessage::new(event));
+            }
+            link.hold.store(false, Ordering::SeqCst);
+            Self {
+                _dir: TempDir(dir),
+                state,
+                tx,
+                rx,
+                link,
+            }
+        }
+
+        /// The game's side of the bus (`web`).
+        fn game(&self) -> BusSender {
+            BusSender::new("web".into(), self.tx.clone(), Arc::default())
+        }
+
+        /// Messages of `square.0` until one matches `want`, within 10 s.
+        fn until(
+            &mut self,
+            mut want: impl FnMut(&FlighthookMessage) -> bool,
+        ) -> Vec<FlighthookMessage> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut seen = Vec::new();
+            loop {
+                assert!(Instant::now() < deadline, "timed out: {} seen", seen.len());
+                match self.rx.try_recv() {
+                    Ok(m) if m.actor == "square.0" => {
+                        let done = want(&m);
+                        seen.push(m);
+                        if done {
+                            return seen;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        }
+
+        /// The whole scripted session: every message up to the
+        /// Disconnected after the stop that follows the lost connection.
+        fn session(&mut self) -> Vec<FlighthookMessage> {
+            let mut seen = self.until(|m| is_status(m, ActorStatus::Reconnecting));
+            assert_eq!(
+                self.state.stop_and_wait("square.0"),
+                crate::state::Stopped::Exited
+            );
+            seen.extend(self.until(|m| is_status(m, ActorStatus::Disconnected)));
+            seen
+        }
+
+        /// Stop the card and wait for it.
+        fn stop(&self) {
+            assert_eq!(
+                self.state.stop_and_wait("square.0"),
+                crate::state::Stopped::Exited
+            );
+        }
+    }
+
+    fn is_status(m: &FlighthookMessage, want: ActorStatus) -> bool {
+        matches!(&m.event, FlighthookEvent::ActorStatus { status, .. } if *status == want)
+    }
+
+    /// A section pinned to its own scripted device by `address`.
+    fn section(address: &str) -> SquareSection {
+        SquareSection {
+            driver: SquareConfig {
+                address: Some(address.into()),
+                ..SquareConfig::default()
+            },
+            ..SquareSection::default()
+        }
+    }
+
+    // -- The equivalence harness ---------------------------------------------
+
+    /// The bus messages and export lines of flighthook 897419c's Square
+    /// actor (its own session code on allsquare 0.3.0's client) for
+    /// [`eq_script`] and [`EQ_SECTION`], recorded with this file's scripted
+    /// device.
+    const OLD_BUS: &str = include_str!("../testdata/square_old_session.jsonl");
+    const OLD_EXPORT: &str = include_str!("../testdata/square_old_export.jsonl");
+
+    fn lines(text: &str) -> Vec<Value> {
+        text.lines()
+            .map(|l| serde_json::from_str(l).expect("a recorded line"))
+            .collect()
+    }
+
+    /// `messages` with their shot and group ids numbered in order of
+    /// appearance (the ids are random), and each shot's raw frames taken
+    /// out (compared on their own): the shot's frames in order.
+    fn normalized(mut messages: Vec<Value>) -> (Vec<Value>, Vec<Vec<Value>>) {
+        let mut ids: HashMap<String, String> = HashMap::new();
+        let mut raws = Vec::new();
+        for m in &mut messages {
+            renumber(m, &mut ids);
+            let at = if m.pointer("/event/raw").is_some() {
+                "/event/raw"
+            } else {
+                "/raw"
+            };
+            if let Some(raw) = m.pointer_mut(at)
+                && raw.is_object()
+            {
+                raws.push(raw["frames"].as_array().cloned().unwrap_or_default());
+                *raw = json!({ "transport": raw["transport"] });
+            }
+        }
+        (messages, raws)
+    }
+
+    /// Replace every UUID string under `v` by its number of appearance.
+    fn renumber(v: &mut Value, ids: &mut HashMap<String, String>) {
+        match v {
+            Value::String(s) if s.len() == 36 && s.matches('-').count() == 4 => {
+                let n = ids.len();
+                *s = ids
+                    .entry(s.clone())
+                    .or_insert_with(|| format!("id-{n}"))
+                    .clone();
+            }
+            Value::Array(a) => a.iter_mut().for_each(|v| renumber(v, ids)),
+            Value::Object(o) => o.values_mut().for_each(|v| renumber(v, ids)),
+            _ => {}
+        }
+    }
+
+    fn kind(m: &Value) -> &str {
+        m["event"]["kind"].as_str().unwrap_or("")
+    }
+
+    fn status_message(status: &str, telemetry: Value) -> Value {
+        json!({ "actor": "square.0", "event": { "kind": "actor_status", "status": status, "telemetry": telemetry } })
+    }
+
+    /// What the recorded actor's `messages` become on `DriverActor` with
+    /// allsquare's driver: each change is one of design §7.3's rows for the
+    /// Square, a rule of `DriverActor` accepted in steps 1 to 3R, or design
+    /// §6.3's identity rule.
+    fn expected_from_old(old: &[Value]) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        let mut i = 0;
+        let mut device: Option<Value> = None;
+        while i < old.len() {
+            let mut m = old[i].clone();
+            let status = m["event"]["status"].as_str().unwrap_or("").to_owned();
+            match kind(&m) {
+                // §7.3 #8: the driver's connect phase shows on the card while
+                // it connects.
+                "actor_status" if status == "starting" => {
+                    out.push(m);
+                    out.push(status_message(
+                        "starting",
+                        json!({ "phase": "discovering" }),
+                    ));
+                    i += 1;
+                    continue;
+                }
+                // §7.3 #8 (step 3R): Connected removes the connect's phase.
+                // Design §6.3: the BLE address is on the card label only, so
+                // the `ble_address` key is gone. From here on every message
+                // carries the session's device id (the sink's rule, step 2).
+                "actor_status" if status == "connected" && device.is_none() => {
+                    let telemetry = m["event"]["telemetry"].as_object_mut().expect("telemetry");
+                    telemetry.remove("ble_address");
+                    telemetry.insert("phase".into(), json!(""));
+                    device = Some(old[i + 1]["device"].clone());
+                    // The driver arms on its first poll and says `ready =
+                    // false` then; the identity goes out on its own first
+                    // (driver order).
+                    let mut identity = old[i + 1].clone();
+                    let ready = identity["event"]
+                        .as_object_mut()
+                        .expect("event")
+                        .remove("telemetry")
+                        .expect("the recorded identity carries ready");
+                    out.push(m);
+                    out.push(identity);
+                    out.push(json!({
+                        "actor": "square.0",
+                        "device": old[i + 1]["device"],
+                        "event": {
+                            "kind": "device_telemetry",
+                            "source": old[i + 1]["event"]["source"],
+                            "telemetry": ready,
+                        },
+                    }));
+                    i += 2;
+                    continue;
+                }
+                // Steps 1/2: a shot's `shot_count` goes out after its
+                // `shot_finished`, and its launch is held until the shot
+                // ends (no flight result from the Omni), so it follows the
+                // club data.
+                "actor_status" if m["event"]["telemetry"].get("shot_count").is_some() => {
+                    let end = (i..old.len())
+                        .find(|&j| kind(&old[j]) == "shot_finished")
+                        .expect("the shot's end");
+                    let launch = old[i + 1..end]
+                        .iter()
+                        .find(|x| kind(x) == "launch")
+                        .cloned();
+                    for x in &old[i + 1..end] {
+                        if kind(x) != "launch" {
+                            out.push(x.clone());
+                        }
+                    }
+                    out.extend(launch);
+                    out.push(old[end].clone());
+                    out.push(m);
+                    i = end + 1;
+                    continue;
+                }
+                // Step 2: a lost session sends `ready=false` with the rest
+                // of the session's telemetry, then Reconnecting, then the
+                // driver's per-attempt alert.
+                "alert"
+                    if m["event"]["message"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("Square Golf error")) =>
+                {
+                    let mut lost = old[i + 1].clone();
+                    let mut merged = out
+                        .iter()
+                        .rev()
+                        .find(|x| {
+                            kind(x) == "device_telemetry" && x["event"].get("telemetry").is_some()
+                        })
+                        .map_or_else(|| json!({}), |x| x["event"]["telemetry"].clone());
+                    merged["ready"] = json!("false");
+                    lost["event"]["telemetry"] = merged;
+                    out.push(lost);
+                    out.push(old[i + 2].clone());
+                    out.push(m);
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+            out.push(m);
+            i += 1;
+        }
+        if let Some(device) = device {
+            let from = out
+                .iter()
+                .position(|m| kind(m) == "actor_status" && m["event"]["status"] == "connected")
+                .expect("connected");
+            for m in &mut out[from..] {
+                m["device"] = device.clone();
+            }
+        }
+        out
+    }
+
+    /// FRP 0.2.0 (design §3.1): a shot trigger carries the time its ball
+    /// notification arrived. Taken out of `messages` (it is the host's
+    /// clock), after checking every trigger has one.
+    fn without_trigger_times(messages: &mut [Value]) {
+        for m in messages.iter_mut().filter(|m| kind(m) == "shot_trigger") {
+            let at = m["event"]
+                .as_object_mut()
+                .expect("event")
+                .remove("timestamp");
+            assert!(
+                at.as_ref().is_some_and(Value::is_u64),
+                "a trigger time: {at:?}"
+            );
+        }
+    }
+
+    /// The bytes of a lowercase hex string.
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// §7.3 #1: each shot's raw records are the recorded actor's, minus the
+    /// notifications allsquare does not recognize (its driver keeps them
+    /// out of the export, `drivers-050-decisions.md`), each labeled by the
+    /// driver (`notify 11 02`, `notify 91`, `cmd 87`) instead of a
+    /// `type` and `channel`.
+    fn assert_raw_matches(old: &[Vec<Value>], new: &[Vec<Value>]) {
+        assert_eq!(old.len(), new.len(), "shots with raw frames");
+        for (n, (old, new)) in old.iter().zip(new).enumerate() {
+            let want: Vec<(String, String)> = old
+                .iter()
+                .filter(|f| {
+                    f["dir"] == "tx"
+                        || allsquare::protocol::parse(&hex(f["hex"].as_str().expect("hex"))).is_ok()
+                })
+                .map(|f| {
+                    assert!(f.get("label").is_none());
+                    (
+                        f["dir"].as_str().expect("dir").to_owned(),
+                        f["hex"].as_str().expect("hex").to_owned(),
+                    )
+                })
+                .collect();
+            let got: Vec<(String, String)> = new
+                .iter()
+                .map(|f| {
+                    (
+                        f["dir"].as_str().expect("dir").to_owned(),
+                        f["hex"].as_str().expect("hex").to_owned(),
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "shot {n}");
+            for f in new {
+                let bytes = hex(f["hex"].as_str().expect("hex"));
+                let label = match (f["dir"].as_str(), bytes.as_slice()) {
+                    (Some("rx"), [0x11, ty, ..]) => format!("notify 11 {ty:02x}"),
+                    (Some("rx"), [family, ..]) => format!("notify {family:02x}"),
+                    (Some("tx"), [_, ty, ..]) => format!("cmd {ty:02x}"),
+                    other => panic!("shot {n}: {other:?}"),
+                };
+                assert_eq!(f["label"], label.as_str(), "shot {n}");
+                assert!(f.get("channel").is_none() && f.get("type").is_none());
+            }
+        }
+    }
+
+    /// Design §7.2's equivalence harness: the recorded Square actor and the
+    /// Square card on allsquare's driver, fed the same scripted device and
+    /// the same game events, put the same messages on the bus and export
+    /// the same shots, except for the differences `expected_from_old` and
+    /// `without_trigger_times` list (design §7.3 rows 1 and 8, design §6.3
+    /// and `DriverActor`'s accepted rules) and the raw records' labels and
+    /// unrecognized notifications (§7.3 #1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_square_card_matches_the_recorded_actor() {
+        let section: SquareSection = serde_json::from_str(EQ_SECTION).expect("section");
+        let mut card = Card::start(&section, eq_script(true), None, vec![], false);
+        let seen = card.session();
+
+        let (old, old_raws) = normalized(lines(OLD_BUS));
+        let (mut new, new_raws) = normalized(
+            seen.iter()
+                .map(|m| serde_json::to_value(m).expect("json"))
+                .collect(),
+        );
+        without_trigger_times(&mut new);
+        let expected = expected_from_old(&old);
+        for (n, (want, got)) in expected.iter().zip(&new).enumerate() {
+            assert_eq!(got, want, "message {n}");
+        }
+        assert_eq!(
+            new.len(),
+            expected.len(),
+            "{:?}",
+            new.iter().map(kind).collect::<Vec<_>>()
+        );
+        assert_raw_matches(&old_raws, &new_raws);
+
+        // The game's club and hand changes: one select each, as recorded.
+        let selects = card.link.selects();
+        let select = |club, handed| allsquare::Command::SelectClub { club, handed };
+        let is = |frame: &[u8], club, handed| {
+            (0..=u8::MAX).any(|seq| select(club, handed).encode(seq).as_slice() == frame)
+        };
+        use allsquare::Club as S;
+        use allsquare::Handed::{Left, Right};
+        assert_eq!(selects.len(), 4, "the arm and three changes");
+        assert!(is(&selects[0], S::Iron7, Right));
+        assert!(is(&selects[1], S::Putter, Right));
+        assert!(is(&selects[2], S::Putter, Left));
+        assert!(is(&selects[3], S::SandWedge, Left));
+
+        // The export: the same lines but for the schema (§7.3 #1), the
+        // device settings (§7.3 #16: values at their default are left out)
+        // and the raw records (compared above).
+        let config = card.state.system.snapshot();
+        let export = crate::actors::web::tests::export_lines(&config, &seen).await;
+        let (old_export, old_export_raws) = normalized(lines(OLD_EXPORT));
+        let (new_export, new_export_raws) = normalized(
+            export
+                .iter()
+                .map(|l| serde_json::from_str(l).expect("json"))
+                .collect(),
+        );
+        assert_eq!(new_export.len(), old_export.len());
+        for (mut want, got) in old_export.into_iter().zip(new_export) {
+            assert_eq!(want["schema"], 3);
+            want["time"] = got["time"].clone();
+            let settings = want["settings"]["device"]
+                .as_object_mut()
+                .expect("device settings");
+            assert_eq!(
+                settings.remove("discard_non_putting_zero_spin"),
+                Some(json!(true))
+            );
+            assert_eq!(got, want);
+        }
+        assert_raw_matches(&old_export_raws, &new_export_raws);
+    }
+
+    // -- Club, hand and stop ---------------------------------------------------
+
+    fn select_is(frame: &[u8], club: allsquare::Club, handed: allsquare::Handed) -> bool {
+        let cmd = allsquare::Command::SelectClub { club, handed };
+        (0..=u8::MAX).any(|seq| cmd.encode(seq).as_slice() == frame)
+    }
+
+    fn hand_event(mode: Option<ShotDetectionMode>, handed: Handedness) -> FlighthookEvent {
+        FlighthookEvent::SetDetectionMode {
+            mode,
+            handed: Some(handed),
+            club: None,
+        }
+    }
+
+    fn club_event(club: Club) -> FlighthookEvent {
+        FlighthookEvent::ClubInfo {
+            club_info: flighthook::ClubInfo { club },
+        }
+    }
+
+    /// A left-handed player's first club select, the arm, carries the left
+    /// hand; without a hand in the game state it is right-handed.
+    #[test]
+    fn the_arm_carries_the_game_states_hand() {
+        use allsquare::Handed::{Left, Right};
+        for (address, hand, want) in [
+            ("arm-left", Some(Handedness::Left), Left),
+            ("arm-unknown", None, Right),
+        ] {
+            let card = Card::start(&section(address), vec![], hand, vec![], false);
+            card.link.wait_for_selects(1);
+            card.stop();
+            let selects = card.link.selects();
+            assert_eq!(selects.len(), 1, "{address}");
+            assert!(
+                select_is(&selects[0], allsquare::Club::Iron7, want),
+                "{address}"
+            );
+        }
+    }
+
+    /// The card's club is armed until the game names one; a hand that is on
+    /// the bus before the device is connected rides the arm.
+    #[test]
+    fn a_hand_before_the_arm_rides_the_arm() {
+        let mut section = section("hand-before-arm");
+        section.driver.club = "pw".into();
+        let card = Card::start(
+            &section,
+            vec![],
+            None,
+            vec![hand_event(None, Handedness::Left)],
+            false,
+        );
+        card.link.wait_for_selects(1);
+        std::thread::sleep(Duration::from_millis(200));
+        card.stop();
+        let selects = card.link.selects();
+        assert_eq!(selects.len(), 1);
+        assert!(select_is(
+            &selects[0],
+            allsquare::Club::PitchingWedge,
+            allsquare::Handed::Left
+        ));
+    }
+
+    /// A hand change while connected re-sends the active club once with the
+    /// new hand; the same hand again writes nothing; the next club carries
+    /// the hand. A mode in the same event does not matter.
+    #[test]
+    fn a_hand_change_resends_the_active_club_once() {
+        use allsquare::Club::{Iron7, Iron8};
+        use allsquare::Handed::{Left, Right};
+        let card = Card::start(&section("hand-change"), vec![], None, vec![], false);
+        let game = card.game();
+        card.link.wait_for_selects(1);
+        game.send(FlighthookMessage::new(hand_event(
+            Some(ShotDetectionMode::Putting),
+            Handedness::Left,
+        )));
+        card.link.wait_for_selects(2);
+        game.send(FlighthookMessage::new(hand_event(None, Handedness::Left)));
+        game.send(FlighthookMessage::new(club_event(Club::Iron8)));
+        card.link.wait_for_selects(3);
+        std::thread::sleep(Duration::from_millis(200));
+        card.stop();
+        let selects = card.link.selects();
+        assert_eq!(selects.len(), 3);
+        assert!(select_is(&selects[0], Iron7, Right));
+        assert!(select_is(&selects[1], Iron7, Left));
+        assert!(select_is(&selects[2], Iron8, Left));
+    }
+
+    /// A hand and a club that change in the same pass write one select: the
+    /// new club with the new hand.
+    #[test]
+    fn a_hand_and_a_club_in_one_pass_write_one_select() {
+        use allsquare::Club::{Iron7, Iron8};
+        use allsquare::Handed::{Left, Right};
+        let card = Card::start(&section("one-pass"), vec![], None, vec![], false);
+        let game = card.game();
+        card.link.wait_for_selects(1);
+        card.link.send_together(
+            &game,
+            vec![
+                hand_event(Some(ShotDetectionMode::Full), Handedness::Left),
+                club_event(Club::Iron8),
+            ],
+        );
+        card.link.wait_for_selects(2);
+        // The next select is the next frame: nothing else was written.
+        game.send(FlighthookMessage::new(club_event(Club::Iron7)));
+        card.link.wait_for_selects(3);
+        std::thread::sleep(Duration::from_millis(200));
+        card.stop();
+        let selects = card.link.selects();
+        assert_eq!(selects.len(), 3);
+        assert!(select_is(&selects[0], Iron7, Right));
+        assert!(select_is(&selects[1], Iron8, Left));
+        assert!(select_is(&selects[2], Iron7, Left));
+    }
+
+    /// A hand set in the UI (`hand_info` from `web`) reaches the Omni through
+    /// the system actor's command: the active club is re-sent once with it,
+    /// and the next club carries it.
+    #[test]
+    fn a_hand_set_in_the_ui_reaches_the_device() {
+        use allsquare::Club::{Iron7, Iron8};
+        use allsquare::Handed::{Left, Right};
+        let card = Card::start(&section("ui-hand"), vec![], None, vec![], true);
+        let game = card.game();
+        card.link.wait_for_selects(1);
+        let left = || {
+            FlighthookMessage::new(FlighthookEvent::HandInfo {
+                hand_info: flighthook::HandInfo {
+                    handed: Handedness::Left,
+                },
+            })
+        };
+        game.send(left());
+        card.link.wait_for_selects(2);
+        game.send(left());
+        game.send(FlighthookMessage::new(club_event(Club::Iron8)));
+        card.link.wait_for_selects(3);
+        std::thread::sleep(Duration::from_millis(200));
+        card.stop();
+        let selects = card.link.selects();
+        assert_eq!(selects.len(), 3);
+        assert!(select_is(&selects[0], Iron7, Right));
+        assert!(select_is(&selects[1], Iron7, Left));
+        assert!(select_is(&selects[2], Iron8, Left));
+    }
+
+    /// Stopping disarms the device and ends the link at once.
+    #[test]
+    fn a_stop_disarms_the_device_and_ends_the_link_at_once() {
+        let card = Card::start(&section("stop"), vec![], None, vec![], false);
+        card.link.wait_for_selects(1);
+        assert_eq!(card.link.wire().released, 0);
+        let stopped = Instant::now();
+        card.stop();
+        let took = stopped.elapsed();
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        let wire = card.link.wire();
+        assert_eq!(wire.released, 1, "the link is ended");
+        let disarm = allsquare::Command::DetectBall {
+            on: false,
+            spin: allsquare::SpinMode::Advanced,
+        };
+        assert!(
+            wire.written
+                .iter()
+                .any(|w| (0..=u8::MAX).any(|seq| disarm.encode(seq).as_slice() == w.as_slice())),
+            "disarmed"
+        );
+    }
+
+    /// The Omni takes one central: the card is not replaced while it stops.
+    #[test]
+    fn the_card_is_exclusive() {
+        let actor = SquareActor::new(SquareSection::default());
+        assert!(!actor.replaceable_while_stopping());
+        assert_eq!(actor.stop_wait(), Duration::from_secs(6));
+        assert_eq!(actor.source(), Some(ShotSource::Square));
+    }
+
+    /// Design §7.3 #5: a change of the driver's settings (`club`,
+    /// `advanced_spin`, `discard_non_putting_zero_spin`, the calibration,
+    /// the address) takes a new session; the card's own fields apply live.
+    #[test]
+    fn a_driver_setting_change_restarts_the_card() {
+        let dir = std::env::temp_dir().join(format!(
+            "flighthook-square-reconfigure-{}",
+            crate::state::config::generate_id()
+        ));
+        let _dir = TempDir(dir.clone());
+        let (state, _writer) = SystemState::new(dir.join("config.toml"));
+        let state = Arc::new(state);
+        let (tx, _rx) = broadcast::channel(16);
+        let sender = BusSender::new("square.0".into(), tx, Arc::default());
+        let saved = SquareSection::default();
+        let actor = SquareActor::new(saved.clone());
+        let outcome = |section: &SquareSection| {
+            state.system.update(|c| {
+                c.square.insert("0".into(), section.clone());
+            });
+            actor.reconfigure(&state, &sender)
+        };
+        let changed: [fn(&mut SquareSection); 5] = [
+            |s| s.driver.club = "PW".into(),
+            |s| s.driver.advanced_spin = false,
+            |s| s.driver.discard_non_putting_zero_spin = false,
+            |s| {
+                s.driver
+                    .dot_bottom_to_face_center_mm
+                    .insert("7I".into(), 20.0);
+            },
+            |s| s.driver.address = Some("SquareGolf(CD01)".into()),
+        ];
+        for change in changed {
+            let mut section = saved.clone();
+            change(&mut section);
+            assert!(matches!(
+                outcome(&section),
+                ReconfigureOutcome::RestartRequired
+            ));
+        }
+        let live = SquareSection {
+            name: "Bay 2".into(),
+            impact_lead_s: Some(0.5),
+            ..saved.clone()
+        };
+        assert!(matches!(outcome(&live), ReconfigureOutcome::Applied));
+    }
+
+    // -- Shot values and outputs ---------------------------------------------
+
+    /// The bus messages of a card on a device that makes the one shot
+    /// `(ball, club)` with the 7-iron, up to the shot's end. The 7-iron's
+    /// calibration is 0, so the vertical impact is the device's value.
+    fn first_shot(
+        address: &str,
+        (ball, club): (BallMetrics, ClubMetrics),
+    ) -> Vec<FlighthookMessage> {
+        let mut section = section(address);
+        section
+            .driver
+            .dot_bottom_to_face_center_mm
+            .insert("7I".into(), 0.0);
+        let mut steps = vec![ack(DeviceState::Ready)];
+        steps.extend(shot(&ball, &club));
+        let mut card = Card::start(&section, steps, None, vec![], false);
+        let messages = card.until(|m| matches!(m.event, FlighthookEvent::ShotFinished { .. }));
+        card.stop();
+        messages
+    }
+
+    /// Every output's numbers for an Omni shot with club data and face
+    /// impact, through the card on allsquare's driver: the fade chip and a
+    /// full swing.
+    #[test]
+    fn outputs_keep_their_numbers() {
+        for (case, address, shot) in [
+            ("square", "pins-chip", chip()),
+            ("square_full_swing", "pins-full", full_swing()),
+        ] {
+            let messages = first_shot(address, shot);
             crate::test_ball::assert_outputs_pinned(case, &messages);
         }
+    }
+
+    /// The impact height with the per-club offset to the face center is a
+    /// calibrated reading, not a model's value: a tournament round keeps
+    /// it, and the launch's four spin values.
+    #[test]
+    fn a_round_keeps_the_calibrated_impact_height() {
+        let messages = first_shot("round", chip());
+        let impact = messages
+            .iter()
+            .find_map(|m| match &m.event {
+                FlighthookEvent::FaceImpact { impact, .. } => Some((**impact).clone()),
+                _ => None,
+            })
+            .expect("an impact");
+        let launch = messages
+            .iter()
+            .find_map(|m| match &m.event {
+                FlighthookEvent::Launch { launch, .. } => Some((**launch).clone()),
+                _ => None,
+            })
+            .expect("a launch");
+        assert_eq!(impact.lateral, Some(flighthook::Distance::Millimeters(6.5)));
+        assert_eq!(
+            impact.vertical,
+            Some(flighthook::Distance::Millimeters(2.25))
+        );
+        let round = crate::state::round::RoundPolicy::default();
+        let guard = round
+            .begin_round(&crate::state::round::RoundRequest {
+                holder: "Pureplay",
+                feeds: &[],
+            })
+            .expect("accepted");
+        let shot = flighthook::ShotData {
+            launch: Some(launch.clone()),
+            impact: Some(impact.clone()),
+            provenance: Some(ShotSource::Square.provenance()),
+            ..flighthook::ShotData::default()
+        };
+        assert_eq!(shot.unmeasured_fields().count(), 0);
+        let certified = guard.certify(&shot).expect("measured");
+        assert_eq!(certified.shot().impact.as_ref(), Some(&impact));
+        assert_eq!(certified.shot().launch.as_ref(), Some(&launch));
+    }
+
+    /// The device's negative (rightward) sidespin lands the ball right in
+    /// the simulation.
+    #[test]
+    fn a_device_fade_lands_right_in_the_simulation() {
+        let (fade, _) = chip();
+        let cfg = flighthook::SimulationSection::default();
+        let d =
+            crate::sim::derive(&allsquare::driver::launch(&fade), None, &cfg).expect("simulated");
+        let off = d.carry_offline.expect("offline").as_meters();
+        assert!(off > 0.0, "{off}");
+        // The same fade at full speed and launched straight, so only the
+        // sidespin can move it right.
+        let straight = BallMetrics {
+            speed: 60.0,
+            launch_angle: 14.0,
+            direction: 0.0,
+            back_spin: 3000,
+            side_spin: -600,
+            ..fade
+        };
+        let d = crate::sim::derive(&allsquare::driver::launch(&straight), None, &cfg)
+            .expect("simulated");
+        let off = d.carry_offline.expect("offline").as_meters();
+        assert!(off > 0.0, "{off}");
+    }
+
+    /// The scripted device answers nothing until it is told to stop: the
+    /// session tests above rely on it, and a lost link ends a session.
+    #[test]
+    fn a_lost_link_ends_the_session_and_reconnects() {
+        let mut card = Card::start(
+            &section("lost"),
+            vec![ack(DeviceState::Ready), Step::Lost],
+            None,
+            vec![],
+            false,
+        );
+        let seen = card.until(|m| is_status(m, ActorStatus::Reconnecting));
+        card.stop();
+        assert!(seen.iter().any(|m| matches!(&m.event,
+            FlighthookEvent::DeviceTelemetry { telemetry: Some(t), .. }
+                if t.get("ready").map(String::as_str) == Some("false")
+                    && t.get("device_state").map(String::as_str) == Some("ready"))));
+        assert_eq!(card.link.wire().released, 1, "the lost link is let go");
     }
 }

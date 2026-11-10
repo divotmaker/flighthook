@@ -556,9 +556,9 @@ use_estimated = false          # true keeps estimated-only shots (e.g. very shor
 name = "Square Golf Omni"
 # address is optional — omit it to auto-discover by name. No pairing required.
 address = "02:00:00:AB:CD:01"
-club = "7i"                    # club selected on connect
-advanced_spin = true           # device's advanced spin measurement
-discard_non_putting_zero_spin = true   # drop 0-spin misreads (putts exempt)
+club = "7I"                    # armed on connect until the game names a club (default 7I)
+advanced_spin = true           # device's advanced spin measurement (default true)
+discard_non_putting_zero_spin = true   # drop 0-spin misreads, putts exempt (default true)
 
 # optional per-club face impact calibration, in mm (bottom of sticker dot to face center)
 [square.0.dot_bottom_to_face_center_mm]
