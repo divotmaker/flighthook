@@ -396,7 +396,11 @@ fn longest_reach(state: &SystemState) -> Duration {
 
 /// When a trigger read at `now_ns` (host monotonic clock) happened: its
 /// `timestamp` (UTC ms) on the same clock, else `now_ns`. A timestamp
-/// ahead of the host's UTC clock counts as now.
+/// ahead of the host's UTC clock counts as now. The UTC clock is read
+/// afresh for each trigger: a step of the host's wall clock (an NTP
+/// correction) between the driver's stamp and this read moves the clip by
+/// the step. Steps are rare and a stamp is at most seconds old (the
+/// ExPutt's), so no anchor is kept.
 fn trigger_time(now_ns: u64, timestamp: Option<u64>) -> u64 {
     let Some(timestamp) = timestamp else {
         return now_ns;
@@ -857,16 +861,29 @@ fn drain_bus(
                             at
                         }
                     };
-                    trigger(state, recorder, seen, &msg.actor, key, at);
+                    trigger(
+                        state,
+                        recorder,
+                        seen,
+                        &msg.actor,
+                        key,
+                        at,
+                        timestamp.is_some(),
+                    );
                 }
             }
         }
     }
 }
 
-/// Apply `source`'s trigger for shot `key`, dated `at_ns`. Auto-chip,
-/// and repeats are ignored. The lead and the rolls come from the live config
-/// (the source's `impact_lead_s`, the `[replay]` section).
+/// Apply `source`'s trigger for shot `key`, dated `at_ns`: its
+/// `timestamp` when `dated`, else its arrival. Auto-chip, and repeats are
+/// ignored. The lead and the rolls come from the live config (the source's
+/// `impact_lead_s`, the `[replay]` section). A trigger without a timestamp
+/// from a type that dates its triggers at the strike and sends them late
+/// (an ExPutt putt reported without its strike message) takes the generic
+/// lead instead ([`flighthook::undated_impact_lead_s`]): it is dated at the
+/// result's arrival.
 fn trigger(
     state: &SystemState,
     recorder: &mut ClipRecorder<Tag>,
@@ -874,8 +891,9 @@ fn trigger(
     source: &str,
     key: &ShotKey,
     at_ns: u64,
+    dated: bool,
 ) {
-    let Some(lead) = impact_lead(state, source) else {
+    let Some(mut lead) = impact_lead(state, source) else {
         return;
     };
     if !seen.first(source, key) {
@@ -883,11 +901,21 @@ fn trigger(
         return;
     }
     let replay = state.system.replay();
-    // The history covers this monitor's reach even if its section is gone.
     let prefix = source.split_once('.').map_or(source, |(p, _)| p);
+    let mut delay = reach(flighthook::trigger_delay_s(prefix));
+    if !dated && let Some(undated) = flighthook::undated_impact_lead_s(prefix) {
+        debug!(
+            "camera: {source} shot {} has no strike time; dated at its arrival, {undated} s lead",
+            key.shot_number
+        );
+        lead = self::lead(undated);
+        // It arrived when it is dated: nothing late to reach back over.
+        delay = Duration::ZERO;
+    }
+    // The history covers this monitor's reach even if its section is gone.
     let mut config = recorder_config(
         &replay,
-        longest_reach(state).max(lead + reach(flighthook::trigger_delay_s(prefix))),
+        longest_reach(state).max(lead + delay),
         recorder.config().fps,
     );
     config.merge_window = recorder.config().merge_window;
@@ -948,6 +976,19 @@ fn ms(ns: i64) -> i64 {
     ms
 }
 
+/// How much of the pre-roll `pre_roll` a clip whose first frame is at
+/// `first_ns` and whose impact is at `impact_ns` misses, when more than
+/// [`PRE_ROLL_SLACK`]: its trigger came later than the history reaches.
+fn pre_roll_shortfall(first_ns: u64, impact_ns: u64, pre_roll: Duration) -> Option<Duration> {
+    let wanted = impact_ns.saturating_sub(u64::try_from(pre_roll.as_nanos()).unwrap_or(u64::MAX));
+    Some(Duration::from_nanos(first_ns.saturating_sub(wanted)))
+        .filter(|short| *short > PRE_ROLL_SLACK)
+}
+
+/// How far a clip's first frame may lie after its wanted start (a frame
+/// interval and the clock's jitter) without counting as short.
+const PRE_ROLL_SLACK: Duration = Duration::from_millis(100);
+
 /// A clip's estimated impact for its swing analysis, ns after its first
 /// frame: `None` when it falls outside the clip's frames (before the first,
 /// or after the last of a clip cut short).
@@ -975,6 +1016,18 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
     if shots.is_empty() {
         info!("{actor}: history cleared since the swing, clip not saved");
         return;
+    }
+    if let Some(short) = clip
+        .frames
+        .first()
+        .and_then(|f| pre_roll_shortfall(f.host_ns, clip.impact_ns, roll(replay.pre_roll_s)))
+    {
+        info!(
+            "{actor}: shot #{}'s clip has {} ms less pre-roll than set: its trigger came \
+             later than the camera's history reaches",
+            shots[0].key.shot_number,
+            short.as_millis()
+        );
     }
     let slot = match state
         .clips
@@ -1211,12 +1264,28 @@ mod tests {
             shot_number: n,
         };
         assert_eq!(ms(&state, "mevo.0"), Some(0));
-        trigger(&state, &mut recorder, &mut seen, "mevo.0", &key(1), 1);
+        trigger(
+            &state,
+            &mut recorder,
+            &mut seen,
+            "mevo.0",
+            &key(1),
+            1,
+            false,
+        );
         state.system.update(|c| {
             c.mevo.get_mut("0").unwrap().impact_lead_s = Some(0.4);
         });
         assert_eq!(ms(&state, "mevo.0"), Some(400));
-        trigger(&state, &mut recorder, &mut seen, "mevo.0", &key(2), 2);
+        trigger(
+            &state,
+            &mut recorder,
+            &mut seen,
+            "mevo.0",
+            &key(2),
+            2,
+            false,
+        );
         state.system.update(|c| {
             c.mevo.get_mut("0").unwrap().impact_lead_s = None;
         });
@@ -1281,7 +1350,7 @@ mod tests {
             shot_id: "a".into(),
             shot_number: 1,
         };
-        trigger(&state, &mut recorder, &mut seen, "square.0", &key, 1);
+        trigger(&state, &mut recorder, &mut seen, "square.0", &key, 1, true);
         assert!(recorder.config().buffer > before);
         assert!(recorder.config().buffer_covers(Duration::from_secs(5)));
         assert_eq!(
@@ -1362,6 +1431,7 @@ mod tests {
             "exputt.0",
             &key,
             8600 * MS,
+            true,
         );
         let mut i = 1201;
         while events.is_empty() {
@@ -1375,6 +1445,92 @@ mod tests {
         assert!(!clip.short_buffer);
         let pre_roll = u64::try_from(roll(replay.pre_roll_s).as_nanos()).expect("ns");
         assert_eq!(clip.frames[0].host_ns, 8600 * MS - pre_roll);
+    }
+
+    #[test]
+    fn a_clip_short_of_its_pre_roll_is_told() {
+        let pre = Duration::from_secs(4);
+        assert_eq!(pre_roll_shortfall(6000 * MS, 10_000 * MS, pre), None);
+        assert_eq!(pre_roll_shortfall(6090 * MS, 10_000 * MS, pre), None);
+        assert_eq!(
+            pre_roll_shortfall(7500 * MS, 10_000 * MS, pre),
+            Some(millis(1500))
+        );
+        // An impact earlier than the pre-roll reaches.
+        assert_eq!(pre_roll_shortfall(0, 3000 * MS, pre), None);
+    }
+
+    /// An ExPutt putt reported without its strike message carries no
+    /// timestamp: it is dated at its arrival, with the result, so it takes
+    /// the generic 1.5 s lead, not the ExPutt's strike-based lead or its
+    /// Camera timing (which count from the strike), and the history needs
+    /// no trigger delay for it.
+    #[test]
+    fn an_exputt_putt_without_a_strike_takes_the_generic_lead() {
+        let (_dir, state) = state_with("[exputt.0]\nname = \"Putt\"\nimpact_lead_s = 0.2\n");
+        assert_eq!(ms(&state, "exputt.0"), Some(200));
+        let replay = state.system.replay();
+        let mut recorder: ClipRecorder<Tag> =
+            ClipRecorder::new(recorder_config(&replay, longest_reach(&state), Some(100.0)));
+        let buffer = recorder.config().buffer;
+        // 12 s of frames at 100 fps; the result arrives at 12 s.
+        let mut events = Vec::new();
+        for i in 0..=1200 {
+            events.extend(recorder.push(at(i * 10 * MS, None)));
+        }
+        let mut seen = SeenTriggers::default();
+        let key = ShotKey {
+            shot_id: "putt".into(),
+            shot_number: 1,
+        };
+        trigger(
+            &state,
+            &mut recorder,
+            &mut seen,
+            "exputt.0",
+            &key,
+            12_000 * MS,
+            false,
+        );
+        assert_eq!(recorder.config().buffer, buffer, "the history is enough");
+        let mut i = 1201;
+        while events.is_empty() {
+            events.extend(recorder.push(at(i * 10 * MS, None)));
+            i += 1;
+        }
+        let [RecorderEvent::Finished(clip)] = events.as_slice() else {
+            panic!("one clip: {events:?}");
+        };
+        assert_eq!(clip.impact_ns, 10_500 * MS);
+        assert_eq!(clip.tags[0].shot.impact_lead_ms, 1500);
+
+        // The same putt with its strike time keeps the configured lead.
+        let mut seen = SeenTriggers::default();
+        let mut recorder: ClipRecorder<Tag> =
+            ClipRecorder::new(recorder_config(&replay, longest_reach(&state), Some(100.0)));
+        let mut events = Vec::new();
+        for i in 0..=1200 {
+            events.extend(recorder.push(at(i * 10 * MS, None)));
+        }
+        trigger(
+            &state,
+            &mut recorder,
+            &mut seen,
+            "exputt.0",
+            &key,
+            8600 * MS,
+            true,
+        );
+        let mut i = 1201;
+        while events.is_empty() {
+            events.extend(recorder.push(at(i * 10 * MS, None)));
+            i += 1;
+        }
+        let [RecorderEvent::Finished(clip)] = events.as_slice() else {
+            panic!("one clip: {events:?}");
+        };
+        assert_eq!(clip.impact_ns, 8400 * MS);
+        assert_eq!(clip.tags[0].shot.impact_lead_ms, 200);
     }
 
     #[test]

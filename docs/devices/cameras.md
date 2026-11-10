@@ -697,6 +697,11 @@ are **beta estimates**, to be measured with a camera:
 With the default 4 s pre-roll the backswing is in the clip even when an
 estimate is off by a second.
 
+An ExPutt putt reported without the ball-struck message has no strike time:
+it is dated when its result arrives, with the 1.5 s of a monitor without a
+better-known value, whatever the ExPutt's camera timing (which counts from
+the strike).
+
 ### Setting the camera timing
 
 If a monitor's impact sits early or late in its clips, set its camera

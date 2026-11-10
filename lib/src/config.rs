@@ -1287,10 +1287,10 @@ pub struct MevoSection {
     pub enabled: bool,
     /// Backspin to use, in rpm per mph of ball speed, for a shot whose result
     /// has launch data but no spin and no flight (very short chips on the
-    /// Xi). Sidespin is 0. `0` turns it off: such a shot flies on no spin
-    /// from the simulation, or rolls as a ground ball when its launch is
-    /// low. Not used for a shot whose detection mode at the trigger was
-    /// Putting. Defaults to [`MevoSection::DEFAULT_LAUNCH_ONLY_SPIN`], and is
+    /// Xi, launched at 5° or more). Sidespin is 0. `0` turns it off: such a
+    /// shot then goes out with its launch alone and is not simulated. Not
+    /// used for a shot whose detection mode at the trigger was Putting (it
+    /// goes out as with the setting at 0). Defaults to [`MevoSection::DEFAULT_LAUNCH_ONLY_SPIN`], and is
     /// left out of the config file at the default. A value outside 0 to
     /// [`MevoSection::MAX_LAUNCH_ONLY_SPIN`] (or non-finite) is treated as
     /// `0`.
@@ -1772,6 +1772,19 @@ pub fn trigger_delay_s(prefix: &str) -> f64 {
 
 /// Longest [`trigger_delay_s`], seconds.
 pub const MAX_TRIGGER_DELAY_S: f64 = 5.0;
+
+/// The impact lead of a `shot_trigger` without a `timestamp` from launch
+/// monitor type `prefix`, seconds, when the type dates its triggers at the
+/// strike and delivers them late (a [`trigger_delay_s`] above 0): such a
+/// trigger (an ExPutt putt reported without its strike message) is dated at
+/// its arrival, with the result, so [`DEFAULT_IMPACT_LEAD_S`] applies in
+/// place of the type's lead and its `impact_lead_s`, which count from the
+/// strike. `None` for every other type: its lead in effect applies to every
+/// trigger.
+#[must_use]
+pub fn undated_impact_lead_s(prefix: &str) -> Option<f64> {
+    (trigger_delay_s(prefix) > 0.0).then_some(DEFAULT_IMPACT_LEAD_S)
+}
 
 /// Whether `v`, a section's `impact_lead_s`, is acceptable: absent, or finite
 /// and from 0 to [`MAX_IMPACT_LEAD_S`].
@@ -3054,14 +3067,18 @@ mod impact_lead_tests {
     #[test]
     fn only_the_exputt_delivers_its_trigger_late() {
         assert_eq!(trigger_delay_s("exputt"), MAX_TRIGGER_DELAY_S);
+        assert_eq!(undated_impact_lead_s("exputt"), Some(DEFAULT_IMPACT_LEAD_S));
         for prefix in [
             "mevo",
             "mock_monitor",
             "square",
             "r10",
             "openconnect_server",
+            "trackball",
+            AUTO_CHIP_ACTOR,
         ] {
             assert_eq!(trigger_delay_s(prefix), 0.0, "{prefix}");
+            assert_eq!(undated_impact_lead_s(prefix), None, "{prefix}");
         }
     }
 

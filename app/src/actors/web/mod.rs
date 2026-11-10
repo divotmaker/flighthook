@@ -1279,7 +1279,7 @@ pub(crate) mod tests {
             "mevo.0",
             FlighthookEvent::ActorStatus {
                 status: ActorStatus::Connected,
-                telemetry: kv(&[("device_info", "Xi")]),
+                telemetry: kv(&[("device_info", "FlightScope Xi")]),
             },
         )
         .await;

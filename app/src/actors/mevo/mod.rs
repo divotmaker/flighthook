@@ -14,9 +14,11 @@
 //! things of its own on each shot's launch:
 //!
 //! - **The mode at the trigger.** A shot is simulated in the detection mode
-//!   that was in effect at its trigger, not when its result arrives
-//!   (seconds later), so a mode change during a shot doesn't change how it
-//!   rolls.
+//!   the session ran in at its trigger ([`HookCtx::session_mode`]), not
+//!   when its result arrives (seconds later), so a mode change during a
+//!   shot doesn't change how it rolls. It is the mode the driver itself
+//!   took for the shot (the Xi's `auto` spin source reads it), so the two
+//!   agree even for a mode change landing in the trigger's `poll` pass.
 //! - **The launch-only spin estimate** (beta). When the device reports a
 //!   launch with speed and launch angle but no spin and no flight values
 //!   (very short chips on the Xi), the card fills in a backspin of
@@ -61,7 +63,7 @@ impl Hooks<Mevo> for MevoHooks {
                     self.trigger_modes.pop_front();
                 }
                 self.trigger_modes
-                    .push_back((key.shot_id.clone(), ctx.mode));
+                    .push_back((key.shot_id.clone(), ctx.session_mode.or(ctx.mode)));
             }
             FrpEvent::Launch { key, launch } => {
                 if let Some(at) = self
@@ -271,12 +273,12 @@ mod tests {
     }
 
     /// The card text of `model` on ironsight's driver: the identity's
-    /// label (manufacturer and model; the Xi's own label is "Xi").
+    /// label, manufacturer and model.
     fn device_info(model: Model) -> &'static str {
         match model {
             Model::MevoPlus => "FlightScope Mevo+",
             Model::Gen2 => "FlightScope Mevo Gen2",
-            Model::Xi => "Xi",
+            Model::Xi => "FlightScope Xi",
         }
     }
 
@@ -796,6 +798,22 @@ mod tests {
         fn shot(&mut self) -> Vec<FlighthookMessage> {
             self.until(|m| matches!(m.event, FlighthookEvent::ShotFinished { .. }))
         }
+
+        /// The messages of the next [`launch_only_shot`]: up to its launch,
+        /// which is on the bus before the device finishes the shot, then,
+        /// once `finish` is set, up to its end.
+        fn launch_only(&mut self, finish: &AtomicBool) -> Vec<FlighthookMessage> {
+            let mut seen = self.until(|m| matches!(m.event, FlighthookEvent::Launch { .. }));
+            assert!(
+                !seen
+                    .iter()
+                    .any(|m| matches!(m.event, FlighthookEvent::ShotFinished { .. })),
+                "the ball goes out before the device finishes the shot"
+            );
+            finish.store(true, Ordering::SeqCst);
+            seen.extend(self.shot());
+            seen
+        }
     }
 
     impl Drop for Replay {
@@ -830,6 +848,17 @@ mod tests {
             steps.push(Step::Hold(go));
         }
         steps.push(Step::Emit(rest));
+        steps
+    }
+
+    /// Shot `n` as ironsight's session emits a launch-only full result: the
+    /// trigger, then `launch` with no flight result, then `shot_finished`
+    /// only once `finish` is set (the device finishes the shot after its
+    /// re-arm, up to seconds later).
+    fn launch_only_shot(n: u32, launch: Launch, finish: &Arc<AtomicBool>) -> Vec<Step> {
+        let mut steps = replayed_shot(n, None, vec![FrpEvent::launch(shot_key(n), launch)]);
+        steps.push(Step::Hold(Arc::clone(finish)));
+        steps.push(Step::Emit(vec![FrpEvent::shot_finished(shot_key(n))]));
         steps
     }
 
@@ -937,26 +966,85 @@ mod tests {
         assert_eq!(total("10.1.0.4:5100", Full, Putting), fairway);
     }
 
+    /// The mode at the trigger is the mode the session (the driver) was
+    /// handed, not the game state's: the system actor can change the game
+    /// state before the card drains the bus's `set_detection_mode` (or the
+    /// card can take one the game state shows later), so in the trigger's
+    /// `poll` pass the two can differ. The simulation goes with the driver,
+    /// whose own mode decides the Xi's `auto` spin source.
+    #[test]
+    fn a_mode_change_in_the_triggers_pass_is_the_drivers() {
+        let ground_ball = || Launch {
+            launch_speed: Some(Velocity::MetersPerSecond(3.0)),
+            launch_elevation: Some(0.0),
+            launch_azimuth: Some(0.0),
+            ..Launch::default()
+        };
+        // The game state's mode and the bus's at the trigger.
+        let total = |key: &str, game: ShotDetectionMode, bus: Option<ShotDetectionMode>| {
+            let go = Arc::new(AtomicBool::new(false));
+            let mut steps = vec![Step::Hold(Arc::clone(&go))];
+            steps.extend(replayed_shot(
+                1,
+                None,
+                vec![
+                    FrpEvent::launch(shot_key(1), ground_ball()),
+                    FrpEvent::shot_finished(shot_key(1)),
+                ],
+            ));
+            let mut card = replay(replay_section(key), ShotDetectionMode::Full, steps);
+            card.until(|m| {
+                matches!(
+                    m.event,
+                    FlighthookEvent::ActorStatus {
+                        status: ActorStatus::Connected,
+                        ..
+                    }
+                )
+            });
+            card.writer.set_mode(game);
+            if let Some(mode) = bus {
+                card.sender
+                    .send(FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
+                        mode: Some(mode),
+                        handed: None,
+                        club: None,
+                    }));
+            }
+            // The next pass drains what was sent before the hold ends, then
+            // the trigger comes.
+            go.store(true, Ordering::SeqCst);
+            let (_, derived) = launch_of(&card.shot());
+            derived
+                .and_then(|d| d.total_distance)
+                .expect("a rolled total")
+                .as_meters()
+        };
+        use ShotDetectionMode::{Full, Putting};
+        let fairway = total("10.1.7.1:5100", Full, None);
+        let green = total("10.1.7.2:5100", Putting, Some(Putting));
+        assert!(green > fairway, "{green} vs {fairway}");
+        // The game state shows Putting, the card has not taken it yet.
+        assert_eq!(total("10.1.7.3:5100", Putting, None), fairway);
+        // The card took Putting, the game state does not show it yet.
+        assert_eq!(total("10.1.7.4:5100", Full, Some(Putting)), green);
+    }
+
     /// Design §5.3: a launch-only chip (speed and launch angle, no spin, no
     /// flight result) gets a backspin of `launch_only_spin` rpm per mph and
-    /// no sidespin, marked as estimated, and the simulation flies it.
+    /// no sidespin, marked as estimated, and the simulation flies it. Design
+    /// §6.1: it goes out at its full result, not when the device finishes
+    /// the shot.
     #[test]
     fn a_launch_only_chip_gets_the_estimated_spin() {
-        let launch = launch_only_launch(&launch_only_d4());
-        let steps = replayed_shot(
-            1,
-            None,
-            vec![
-                FrpEvent::launch(shot_key(1), launch),
-                FrpEvent::shot_finished(shot_key(1)),
-            ],
-        );
+        let finish = Arc::new(AtomicBool::new(false));
+        let steps = launch_only_shot(1, launch_only_launch(&launch_only_d4()), &finish);
         let mut card = replay(
             replay_section("10.1.1.1:5100"),
             ShotDetectionMode::Chipping,
             steps,
         );
-        let (launch, derived) = launch_of(&card.shot());
+        let (launch, derived) = launch_of(&card.launch_only(&finish));
         // 100 rpm per mph × 15.7 mph.
         assert_eq!(launch.backspin_rpm, Some(1570));
         assert_eq!(launch.sidespin_rpm, Some(0));
@@ -1193,19 +1281,13 @@ mod tests {
         );
         crate::test_ball::assert_outputs_pinned("xi_full_swing", &xi);
 
+        let finish = Arc::new(AtomicBool::new(false));
         let mut chip = replay(
             replay_section("10.1.5.1:5100"),
             ShotDetectionMode::Full,
-            replayed_shot(
-                1,
-                None,
-                vec![
-                    FrpEvent::launch(shot_key(1), launch_only_launch(&launch_only_d4())),
-                    FrpEvent::shot_finished(shot_key(1)),
-                ],
-            ),
+            launch_only_shot(1, launch_only_launch(&launch_only_d4()), &finish),
         );
-        crate::test_ball::assert_outputs_pinned("xi_launch_only_chip", &chip.shot());
+        crate::test_ball::assert_outputs_pinned("xi_launch_only_chip", &chip.launch_only(&finish));
 
         let early = FlightResultV1::decode(fixtures::XI_SHOT_E8).expect("e8");
         let mut fallback = replay(

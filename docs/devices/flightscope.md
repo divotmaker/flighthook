@@ -23,7 +23,7 @@ Xi report none of the three. Every model reports `ready`, `tilt` and `roll`.
 The card connects over TCP to `address` (`phase` `connecting`, given up after
 5 s), runs the handshake (`handshaking`) and configures the model it found
 (`configuring`), then reads Connected with "FlightScope Mevo+", "FlightScope
-Mevo Gen2" or "Xi" and, once the device is armed, `measuring`. It starts in
+Mevo Gen2" or "FlightScope Xi" and, once the device is armed, `measuring`. It starts in
 the detection mode in effect then, also after a reconnect, so a mode change
 made while the device was away is not lost. A mode change re-arms the device
 (`configuring`, not ready, then `measuring` and ready again), right away when
@@ -263,7 +263,7 @@ the next shot without a restart.
 `GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
 each shot with the device frames behind it: up to 8 frames before the shot's
 trigger, then every frame through the device re-armed, in both directions,
-as hex, each labeled with its message type and bus addresses (`D4 AVR>APP`,
+as hex, each labeled with its message type and direction (`D4 AVR>APP`,
 `B0 APP>AVR`) — the shot texts, `E8`, `D4`, `ED`, `EF`, PRC and speed
 profile data, the Xi's other per-shot messages, and the acknowledgments and
 re-arm commands flighthook sends. Shots that produced no usable result

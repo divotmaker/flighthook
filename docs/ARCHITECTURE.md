@@ -500,8 +500,8 @@ lib crate and the WASM UI never link it). Every device actor builds its
 `Launch` event (and the `FlightResult` event after it, when the device
 reported flight values) through `sim::launch_events_in_mode`, in the mode
 the card's sink picks: its driver's fixed mode (the ExPutt's Putting), else
-the mode the card's hook sets (the FlightScope card: the game's mode at the
-shot's trigger), else the live mode, on the device thread, so the launch already
+the mode the card's hook sets (the FlightScope card: the session's mode at
+the shot's trigger), else the live mode, on the device thread, so the launch already
 carries `derived` when it reaches the bus, before `ShotFinished`. It costs a few milliseconds per shot. A shot is simulated only
 when:
 
@@ -540,7 +540,7 @@ mode picks the surface (`sim::ground_surface`): in Putting mode it rolls on
 a green (`green`, 11.4 ft on the stimpmeter, unless the configured surface
 is already `green` or `firm_green`, which is kept); in any other mode on the
 configured surface. The mode is the one in effect for the shot: for the
-FlightScope the game's mode at its trigger, for the ExPutt Putting, for
+FlightScope the session's mode at its trigger, for the ExPutt Putting, for
 other devices the game mode when the shot is processed. A straight 3 m/s ground ball rolls about 2.6 m on the default
 `fairway` (8 m/s: about 10.8 m) and about 5.0 m on `green` (8 m/s: about
 18.8 m). Roll and total are the simulated roll
@@ -1195,8 +1195,8 @@ on `DriverActor` (`actors::mevo::MevoHooks`: section `MevoSection`, source
 `Mevo`). The driver connects over TCP to `address` (`phase: connecting`, at
 most 5 s), runs the handshake (`phase: handshaking`) and configures the
 model it detected in the latched detection mode (`phase: configuring`); the
-card is then `Connected` (`device_info` "FlightScope Mevo+" or "FlightScope
-Mevo Gen2", "Xi" on an Xi) with `device_telemetry` `manufacturer:
+card is then `Connected` (`device_info` "FlightScope Mevo+", "FlightScope
+Mevo Gen2" or "FlightScope Xi") with `device_telemetry` `manufacturer:
 "FlightScope"`, model `Mevo+`, `Mevo Gen2` or `Xi` and the device's firmware
 (version and build date), and once armed `phase: measuring`, `ready=true`.
 The FRP device id is the camera Pi's WiFi name, or "FlightScope Xi
@@ -1226,9 +1226,14 @@ connection, an operation timing out, or 10 s without a message from the
 device ends the session (the alert is the error, e.g. "connection closed by
 device"). The card's hook adds two things on a launch:
 
-- the shot is simulated in the detection mode the game had at the shot's
-  trigger (`HookCtx::mode`), so a mode change between the trigger and the
-  full result, seconds later, does not change how it rolls;
+- the shot is simulated in the detection mode the session ran in at the
+  shot's trigger (`HookCtx::session_mode`: the latched mode the host handed
+  the driver before that `poll` pass), so a mode change between the trigger
+  and the full result, seconds later, does not change how it rolls. It is
+  the mode the driver itself takes for the shot (the Xi's `auto` spin
+  source reads it), so the simulation and the spin choice agree even when a
+  mode change lands in the trigger's pass; the game state's mode, which the
+  system actor updates on its own thread, can be a pass ahead or behind;
 - a launch with no flight result, no spin, a launch angle of 5° or more
   and a mode at the trigger other than Putting gets an estimated backspin
   of `launch_only_spin` × ball speed (mph) and sidespin 0, marked
@@ -1724,7 +1729,8 @@ session: Connected with
 sender) before any shot; each pass drains the bus into one `command` (the
 pass's messages merged field by field, so a hand and a club that change
 together reach the driver together) and its `action`s, hands a live config to `apply_config`, sets `wants_raw` (always)
-and `shots_allowed` (the round policy), and polls for 50 ms. A session
+and `shots_allowed` (the round policy), and polls for 50 ms; launches
+still held go out at the end of the pass (below). A session
 error releases held launches, sends `ready=false` and then Reconnecting;
 the driver's `retry_delay` (its own alerts, an SDK `Backoff`) is slept with
 the bus drained; `None` gives up with Disconnected and the error. A stop
@@ -1740,7 +1746,7 @@ and the thread ends, so a card never stays Connected over a dead driver. `stop_w
 | Driver event | Bus |
 |---|---|
 | `shot_trigger` | `ShotTrigger` (with the driver's timestamp) through `RoundPolicy::send_if_allowed`; opens the raw capture window at the trigger's time; refused, the whole shot is dropped |
-| `launch` | held until the shot's `flight_result` or `shot_finished`; then `on_frp` (with the flight result in view), the simulation once (the driver's fixed mode, else the live mode, or the mode the hook set in `HookCtx::mode`) and `Launch` with `derived`, then `FlightResult` |
+| `launch` | held until the shot's `flight_result`, its `shot_finished` or the end of the `poll` pass it came in; then `on_frp` (with the flight result in view), the simulation once (the driver's fixed mode, else the live mode, or the mode the hook set in `HookCtx::mode`) and `Launch` with `derived`, then `FlightResult` |
 | `flight_result` | releases the held launch; one that comes first waits for its launch |
 | `club_path`, `face_impact`, `alert` | `ClubPath`, `FaceImpact`, `Alert` |
 | `shot_finished` | `ShotFinished` with the shot's raw frames (`"<kind> device has no wire protocol"` without a raw profile), then the card's `shot_count` |
@@ -1750,9 +1756,12 @@ and the thread ends, so a card never stays Connected over a dead driver. `stop_w
 | `Log` | tracing; trace lines at the `audit` target |
 | `ShotDiscarded` | the pre-roll is cleared |
 
-Held launches go out when a session ends, and one held past
-`flighthook::SHOT_TIMEOUT` (45 s, when every consumer has given up on its
-shot) is dropped.
+Contract: a driver sends a shot's `flight_result` in the `poll` pass of its
+`launch`. Every launch still held goes out at the end of the pass (a
+launch-only result reaches the bus at once, not when the device finishes the
+shot), and when a session ends; a flight result that comes in a later pass
+goes out alone. One held past `flighthook::SHOT_TIMEOUT` (45 s, when every
+consumer has given up on its shot) is dropped, a backstop.
 
 **Live config.** `reconfigure` reads the card's section: unchanged or a
 host field only is Applied; a driver change that `restart_needed` calls

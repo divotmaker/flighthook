@@ -20,8 +20,11 @@
 //!   a connect reaches the session it opens).
 //! - **The bus out** ([`Sink`]): every [`DeviceEvent`] goes on the bus as
 //!   flighthook's event with the session's device id. A shot's `launch` is
-//!   held until its `flight_result` or its `shot_finished`, so the
-//!   simulation runs once, anchored on the device's own flight values.
+//!   held until its `flight_result`, its `shot_finished` or the end of the
+//!   `poll` pass it arrived in, whichever comes first, so the simulation
+//!   runs once, anchored on the device's own flight values (a driver sends
+//!   a shot's flight result in the pass of its launch), and the ball goes
+//!   out without waiting for the device to finish the shot.
 //!   Telemetry is merged per actor and published in full; raw frames go to
 //!   the shot's capture for the export, never onto the bus.
 //! - **Live config** ([`DriverActor::reconfigure`]): host fields and the
@@ -108,9 +111,15 @@ pub struct HookCtx<'a, S> {
     pub section: &'a S,
     /// The detection mode the shot is simulated in: the driver's fixed mode,
     /// else the live game mode. On a `launch` a hook may change it: the
-    /// shot is simulated in the mode it leaves here (e.g. the mode the hook
-    /// saw at the shot's trigger).
+    /// shot is simulated in the mode it leaves here (e.g. the mode the
+    /// session ran in at the shot's trigger).
     pub mode: Option<ShotDetectionMode>,
+    /// The detection mode the session runs in: the mode of the latched
+    /// command the host handed it before this `poll` pass (the bus's
+    /// `set_detection_mode`s drained at the pass's start), so the same mode
+    /// the driver itself sees for an event of this pass. `None` outside a
+    /// session or with no mode latched.
+    pub session_mode: Option<ShotDetectionMode>,
     /// For a `launch`: the device's flight result of the same shot, if it
     /// sent one.
     pub flight: Option<&'a FlightResult>,
@@ -338,6 +347,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                     sink.connected(session.identity());
                     let ended = self.drive(&mut session, &mut driver, host, sink, flags);
                     sink.release_all();
+                    sink.session_mode = None;
                     match ended {
                         Err(e) if !host.stopped() => {
                             drop(session);
@@ -458,10 +468,14 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
             }
             take_update(&self.updates, sink, Some(driver));
             flags.set_shots_allowed(sink.shots_allowed());
+            sink.session_mode = host.latched.mode.map(Into::into);
             {
                 let mut emit = |e| sink.handle(e);
                 session.poll(POLL_TIMEOUT, &mut Events::new(&mut emit, flags))?;
             }
+            // A shot's flight result comes in the pass of its launch: what
+            // is still held goes out now, not when the device finishes.
+            sink.release_all();
             sink.prune_held();
         }
     }
@@ -660,6 +674,8 @@ struct Sink<D: DeviceDriver, H: Hooks<D>> {
     shot_count: u32,
     /// Puts the driver's timestamps on the host clock.
     clock: UtcClock,
+    /// The detection mode the session runs in ([`HookCtx::session_mode`]).
+    session_mode: Option<ShotDetectionMode>,
     _driver: PhantomData<fn() -> D>,
 }
 
@@ -766,6 +782,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             holding: false,
             shot_count: 0,
             clock: UtcClock::default(),
+            session_mode: None,
             _driver: PhantomData,
         }
     }
@@ -928,6 +945,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         let mut ctx = HookCtx {
             section: &self.section,
             mode: self.mode(),
+            session_mode: self.session_mode,
             flight: None,
             spin_estimated: false,
         };
@@ -1132,6 +1150,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             let mut ctx = HookCtx {
                 section: &self.section,
                 mode,
+                session_mode: self.session_mode,
                 flight,
                 spin_estimated: false,
             };
@@ -1144,6 +1163,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             let mut ctx = HookCtx {
                 section: &self.section,
                 mode,
+                session_mode: self.session_mode,
                 flight: None,
                 spin_estimated: false,
             };
@@ -1170,7 +1190,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         }
     }
 
-    /// Release every held shot, oldest first: the session ended.
+    /// Release every held shot, oldest first: at the end of each `poll`
+    /// pass, and when the session ends.
     fn release_all(&mut self) {
         let mut ids: Vec<(Instant, String)> = self
             .held
@@ -1184,8 +1205,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     }
 
     /// Drop shots held longer than flighthook's shot timeout: by then every
-    /// consumer has given up on the shot. Refused shots are forgotten after
-    /// the same time.
+    /// consumer has given up on the shot (a backstop: the end of each pass
+    /// releases them). Refused shots are forgotten after the same time.
     fn prune_held(&mut self) {
         self.refused
             .retain(|_, at| at.elapsed() < flighthook::SHOT_TIMEOUT);
@@ -1330,6 +1351,8 @@ mod tests {
     /// What one session poll does; an empty list idles.
     enum Step {
         Emit(Vec<DeviceEvent>),
+        /// Blocks until the test sends (within 5 s).
+        Wait(std::sync::mpsc::Receiver<()>),
         Fail(&'static str),
         Panic,
     }
@@ -1477,6 +1500,11 @@ mod tests {
                     for event in events {
                         out.emit(event);
                     }
+                    Ok(())
+                }
+                Some(Step::Wait(go)) => {
+                    // A test that fails before it sends drops the sender.
+                    let _ = go.recv_timeout(Duration::from_secs(5));
                     Ok(())
                 }
                 Some(Step::Fail(why)) => Err(FakeError(why.into())),
@@ -2322,6 +2350,55 @@ mod tests {
             kinds(&end)
         );
         assert_eq!(lock(&script).closes, 1);
+    }
+
+    /// A launch without a flight result goes out at the end of the `poll`
+    /// pass it came in, not when the device finishes the shot passes later
+    /// (a launch-only Xi chip, which the device finishes after its re-arm):
+    /// the ball is on the bus, simulated from the launch alone, while the
+    /// session is still in its next poll. It is simulated once, and an
+    /// output that sends at `shot_finished` (GSPro) gets the shot when the
+    /// device finishes it.
+    #[test]
+    fn a_launch_goes_out_at_the_end_of_its_pass() {
+        let (go, wait) = std::sync::mpsc::channel();
+        let (id, _script) = script(vec![Connect::Session(vec![
+            Step::Emit(vec![
+                frp(FrpEvent::shot_trigger(key(1))),
+                frp(FrpEvent::launch(key(1), launch())),
+            ]),
+            Step::Wait(wait),
+            Step::Emit(vec![frp(FrpEvent::shot_finished(key(1)))]),
+        ])]);
+        let mut rig = rig();
+        rig.start(section(id));
+        let early = rig.until(|m| matches!(m.event, FlighthookEvent::Launch { .. }));
+        // The session is still blocked in its second poll.
+        let mut gspro = flighthook::ShotAggregator::new();
+        assert!(
+            early.iter().all(|m| gspro.feed(m).is_none()),
+            "not sent yet"
+        );
+        let FlighthookEvent::Launch { derived, .. } = &early[early.len() - 1].event else {
+            unreachable!()
+        };
+        assert!(derived.as_ref().is_some_and(|d| d.carry_distance.is_some()));
+        go.send(()).expect("the session waits");
+        let rest = rig.until(|m| matches!(m.event, FlighthookEvent::ShotFinished { .. }));
+        assert!(
+            !kinds(&rest).contains(&"launch"),
+            "simulated once: {:?}",
+            kinds(&rest)
+        );
+        let shot = rest
+            .iter()
+            .find_map(|m| gspro.feed(m))
+            .expect("the shot, at shot_finished");
+        assert!(shot.launch.is_some() && shot.derived.is_some());
+        assert_eq!(
+            rig.state.stop_and_wait("fake.0"),
+            crate::state::Stopped::Exited
+        );
     }
 
     /// A stop ends a connect that is still waiting within the driver's

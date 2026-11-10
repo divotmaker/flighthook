@@ -3003,7 +3003,7 @@ The FlightScope adds `shot_count` (shots finished since the card started)
 and `phase` (`connecting`, `handshaking`, `configuring` while it connects,
 removed by the `connected` status; then `measuring` once the device is
 armed, and `configuring` while a mode change re-arms it); `device_info` is
-`FlightScope Mevo+`, `FlightScope Mevo Gen2` or `Xi`.
+`FlightScope Mevo+`, `FlightScope Mevo Gen2` or `FlightScope Xi`.
 The ExPutt adds `shot_count` (shots finished since the card started) and
 `phase` (`discovering`, `connecting`, then `measuring`, which the
 `connected` status keeps); `device_info` is `ExPutt RG (<ip>)`.
