@@ -2458,8 +2458,13 @@ four spin values (Pureplay's strict mode).
 A value a device does not measure is left out, never sent as a placeholder:
 the ExPutt sends no `launch_elevation`, and an Xi shot whose E8 total has no
 axis to go with it sends `total_spin_rpm` alone. An output that needs the
-field fills its own default (GSPro gets a VLA of 0, and such a total as
-backspin with axis 0).
+field fills its own default, and a lone total goes out as backspin, with no
+sidespin or axis made up: GSPro and the Open Connect clients get a VLA of 0
+and such a total as backspin with sidespin and axis 0; Pureplay sends it as
+TotalSpin and BackSpin with SideSpin and SpinAxis clear; the CSV puts it in
+`backspin_rpm` (and `total_spin_rpm`) with `sidespin_rpm` and
+`spin_axis_deg` empty; the dashboard shows it as backspin with no sidespin;
+the simulation flies it as backspin.
 
 A ground ball is rolled, not flown: a shot whose measured apex is 0, or,
 from a device that reports no apex, whose launch angle is at most 0.5° or

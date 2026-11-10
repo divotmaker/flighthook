@@ -280,7 +280,7 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
         speed(b.launch_speed),
         f(b.launch_elevation),
         f(b.launch_azimuth),
-        i(b.backspin_rpm),
+        i(flighthook::output_backspin(&b)),
         i(b.sidespin_rpm),
         i(b.total_spin_rpm),
         f(b.spin_axis),
@@ -650,6 +650,34 @@ mod tests {
         assert_eq!(cells.len(), 58);
         assert_eq!(cells[20], "100");
         assert_eq!(cells[28], num(sim_carry.as_meters()));
+    }
+
+    /// A total spin with no axis and no components fills `backspin_rpm`
+    /// with the total, as the dashboard shows it, and leaves sidespin and
+    /// spin axis empty.
+    #[test]
+    fn csv_shows_a_total_spin_alone_as_backspin() {
+        let mut shot = private_shot();
+        Ball {
+            backspin_rpm: None,
+            sidespin_rpm: None,
+            total_spin_rpm: Some(6897),
+            spin_axis: None,
+            ..ball()
+        }
+        .put_on(&mut shot.data);
+        let header: Vec<String> = csv_header(UnitSystem::Metric)
+            .trim_end()
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let row = to_csv_row(&shot, UnitSystem::Metric);
+        let cells: Vec<&str> = row.trim_end().split(',').collect();
+        let col = |name: &str| cells[header.iter().position(|h| h == name).expect(name)];
+        assert_eq!(col("backspin_rpm"), "6897");
+        assert_eq!(col("total_spin_rpm"), "6897");
+        assert_eq!(col("sidespin_rpm"), "");
+        assert_eq!(col("spin_axis_deg"), "");
     }
 
     #[test]

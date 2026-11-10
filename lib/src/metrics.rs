@@ -142,6 +142,24 @@ pub fn spin_components(launch: &Launch) -> (Option<i32>, Option<i32>) {
     (spin.backspin_rpm, spin.sidespin_rpm)
 }
 
+/// The backspin for an output with a backspin field of its own: the
+/// device's, or, for a total spin reported with no axis and no components
+/// (the Xi's E8 total on a shot without club data), the total, all of it
+/// backspin. No sidespin or axis is made up for such a total; an output
+/// that must send a number for them sends 0.
+#[must_use]
+pub fn output_backspin(launch: &Launch) -> Option<i32> {
+    match (
+        launch.backspin_rpm,
+        launch.sidespin_rpm,
+        launch.total_spin_rpm,
+        launch.spin_axis,
+    ) {
+        (None, None, Some(total), None) => Some(total),
+        (back, ..) => back,
+    }
+}
+
 /// `face_angle − path`.
 fn face_to_path(club: &ClubData) -> Option<f64> {
     Some(finite(club.face_angle)? - finite(club.path)?)
@@ -235,6 +253,27 @@ mod tests {
         );
         assert_eq!(spin_components(&total(None, Some(3.0))), (None, None));
         assert_eq!(spin_components(&Launch::default()), (None, None));
+    }
+
+    /// A total with no axis and no components is all backspin; any other
+    /// launch keeps its own backspin, none made up.
+    #[test]
+    fn output_backspin_takes_a_lone_total() {
+        let total = |total, axis| Launch {
+            total_spin_rpm: total,
+            spin_axis: axis,
+            ..Launch::default()
+        };
+        assert_eq!(output_backspin(&total(Some(6897), None)), Some(6897));
+        assert_eq!(output_backspin(&total(Some(3231), Some(-8.0))), None);
+        assert_eq!(output_backspin(&total(None, None)), None);
+        assert_eq!(
+            output_backspin(&components(Some(3200), Some(-450))),
+            Some(3200)
+        );
+        let mut both = components(None, Some(-450));
+        both.total_spin_rpm = Some(3231);
+        assert_eq!(output_backspin(&both), None, "a partial pair is kept");
     }
 
     #[test]

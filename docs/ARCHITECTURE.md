@@ -457,10 +457,15 @@ model outputs, as `spin_estimated` does for the launch-only spin estimate.
 A value a device does not measure is left out rather than sent as a
 placeholder: the ExPutt sends no launch elevation, and an Xi shot under the
 E8 spin source without club data sends the E8 total alone (no axis, no
-components). Outputs that need such a field fill their own default: the
-GSPro mapper sends VLA 0 and a lone total as backspin with axis 0
-(`flighthook::spin_components`), and the simulation flies a lone total as
-backspin. The values stay where outputs read them. `ShotData::unmeasured_fields()` is the one question for "is this
+components). Outputs that need such a field fill their own default, and a
+lone total goes out as backspin with no sidespin or axis made up: the GSPro
+mapper (every Open Connect client) sends VLA 0 and the total as backspin
+with sidespin and axis 0 (`flighthook::spin_components`), Pureplay sends it
+as TotalSpin and BackSpin with the SideSpin and SpinAxis bits clear and the
+CSV in `backspin_rpm` with sidespin and axis empty (both
+`flighthook::output_backspin`), the dashboard's cards and table show it as
+backspin with no sidespin (`spin_components`), and the simulation flies it
+as backspin. The values stay where outputs read them. `ShotData::unmeasured_fields()` is the one question for "is this
 value measured": it joins both marks (`spin_estimated` names all four spin
 fields), and the round policy is the only reader
 ([Tournament rounds](#tournament-rounds)).
@@ -1283,7 +1288,9 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   never read. A
   certified shot has its unmeasured values removed, so they go out with the
   bit clear (0.0).
-  Nothing is computed (no total/axis from the components, no smash factor):
+  A total spin with no axis and no components also goes out as BackSpin
+  (`flighthook::output_backspin`). Nothing is computed (no total/axis from
+  the components, no smash factor):
   Pureplay fills those gaps. Speeds in m/s, impact in mm via
   `Distance::as_millimeters()`. Signs pass through unchanged for both hands:
   HLA, SpinAxis, FaceAngle and ClubPath are target-absolute on the bus and in

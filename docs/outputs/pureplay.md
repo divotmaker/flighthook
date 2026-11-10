@@ -76,8 +76,11 @@ address = "127.0.0.1:9760"
 
 Only values the device measured are marked valid; the rest are sent as 0
 with their valid bit clear, and Pureplay fills in what it can (total spin
-and spin axis from back and side spin, smash factor from the speeds).
-flighthook's own simulated values (carry, apex, roll, ...) are never sent.
+and spin axis from back and side spin, smash factor from the speeds). A
+total spin the device sent with no axis and no back or side spin goes out
+as TotalSpin and as BackSpin; SideSpin and SpinAxis stay clear (no axis is
+made up). flighthook's own simulated values (carry, apex, roll, ...) are
+never sent.
 
 | Pureplay field | flighthook value | Unit |
 |---|---|---|
@@ -162,7 +165,8 @@ Every launch monitor flighthook supports falls into one of two classes:
   A value a launch monitor does not measure is never sent, in or out of
   strict mode: the ExPutt's launch angle, and the spin axis and back and
   side spin of an Xi shot whose **Spin source (Xi)** uses E8 on a shot with
-  no club data (the E8 total spin is sent alone). Kept, because they are
+  no club data (the E8 total spin is sent alone, as TotalSpin and
+  BackSpin). Kept, because they are
   the device's readings: all four of the Garmin R10's spin values, the
   Square Golf Omni's vertical face impact with its per-club offset, the
   Xi's E8 total split by D4's axis, and both spin pairs from the

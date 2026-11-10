@@ -81,10 +81,12 @@ pub fn map_shot(shot: &ShotData, shot_id: u32) -> Option<ShotFrames> {
             BallData::TOTAL_SPIN,
             b.total_spin_rpm.map(f64::from),
         ),
+        // A total spin with no axis goes out as backspin too, with no
+        // sidespin or axis made up.
         back_spin_rpm: field(
             &mut valid,
             BallData::BACK_SPIN,
-            b.backspin_rpm.map(f64::from),
+            flighthook::output_backspin(b).map(f64::from),
         ),
         side_spin_rpm: field(
             &mut valid,
@@ -384,6 +386,27 @@ pub(super) mod tests {
         shot.derived = Some(derived);
         let f = map_shot(&shot, 1).expect("frames");
         assert_eq!(f.ball.valid, BallData::BALL_SPEED);
+    }
+
+    /// A total spin with no axis and no components (an Xi E8 total without
+    /// club data) goes out as the total and as backspin; no sidespin or
+    /// spin axis is made up (their bits stay clear).
+    #[test]
+    fn a_total_spin_alone_goes_out_as_backspin() {
+        let mut shot = ball_only_shot();
+        let ball = shot.launch.as_mut().expect("launch");
+        (ball.backspin_rpm, ball.sidespin_rpm) = (None, None);
+        (ball.total_spin_rpm, ball.spin_axis) = (Some(6897), None);
+        let f = map_shot(&shot, 1).expect("frames");
+        assert_eq!(f.ball.total_spin_rpm, 6897.0);
+        assert_eq!(f.ball.back_spin_rpm, 6897.0);
+        assert_eq!(f.ball.valid & BallData::TOTAL_SPIN, BallData::TOTAL_SPIN);
+        assert_eq!(f.ball.valid & BallData::BACK_SPIN, BallData::BACK_SPIN);
+        assert_eq!(
+            f.ball.valid & (BallData::SIDE_SPIN | BallData::SPIN_AXIS),
+            0
+        );
+        assert_eq!((f.ball.side_spin_rpm, f.ball.spin_axis_deg), (0.0, 0.0));
     }
 
     #[test]
