@@ -139,6 +139,12 @@ pub(crate) struct AddPreset {
     /// The new card's address: the bind address of a server, blank for a
     /// device that is auto-discovered.
     pub(crate) address: &'static str,
+    /// Offered on the first-run welcome screen ([`welcome_options`]).
+    pub(crate) welcome: bool,
+    /// The welcome screen's label, when it differs from [`Self::label`].
+    pub(crate) welcome_label: Option<&'static str>,
+    /// The welcome screen's hover text.
+    pub(crate) welcome_hover: Option<&'static str>,
 }
 
 const fn preset(
@@ -152,11 +158,56 @@ const fn preset(
         type_key,
         name,
         address,
+        welcome: true,
+        welcome_label: None,
+        welcome_hover: None,
+    }
+}
+
+impl AddPreset {
+    /// This preset labeled `label` on the welcome screen.
+    const fn welcome_as(self, label: &'static str) -> Self {
+        Self {
+            welcome_label: Some(label),
+            ..self
+        }
+    }
+
+    /// This preset with hover text `hover` on the welcome screen.
+    const fn welcome_hover(self, hover: &'static str) -> Self {
+        Self {
+            welcome_hover: Some(hover),
+            ..self
+        }
+    }
+
+    /// This preset left off the welcome screen.
+    const fn not_on_welcome(self) -> Self {
+        Self {
+            welcome: false,
+            ..self
+        }
+    }
+
+    /// The label on the welcome screen.
+    pub(crate) fn welcome_text(&self) -> &'static str {
+        self.welcome_label.unwrap_or(self.label)
+    }
+
+    /// Whether this preset and `other` add the same connection: the same
+    /// section at the same address, so a card from the second would start
+    /// off. The welcome screen lets only one of them be checked.
+    pub(crate) fn same_connection(&self, other: &AddPreset) -> bool {
+        self.label != other.label
+            && self.type_key == other.type_key
+            && !self.address.is_empty()
+            && self.address == other.address
     }
 }
 
 const LAUNCH_MONITOR_PRESETS: &[AddPreset] = &[
-    preset("Mevo", "mevo", "Mevo WiFi", "192.168.2.1:5100"),
+    preset("Mevo", "mevo", "Mevo WiFi", "192.168.2.1:5100")
+        .welcome_as("FlightScope Mevo / Mevo+ / Xi"),
     preset("R10", "r10", "Garmin R10", ""),
     preset("Square Golf Omni", "square", "Square Golf Omni", ""),
     preset("ExPutt", "exputt", "ExPutt", ""),
@@ -166,13 +217,20 @@ const LAUNCH_MONITOR_PRESETS: &[AddPreset] = &[
         "openconnect_server",
         "Uneekor",
         "0.0.0.0:921",
+    )
+    .welcome_hover(
+        "Uneekor's own software pushes shots to flighthook over GSPro \
+         Open Connect. Needs a Uneekor third-party license, and \
+         flighthook binds port 921 — to run GSPro on the same host, \
+         move it to 922 with OpenAPIUseAltPort.",
     ),
     preset(
         "Open Connect Server",
         "openconnect_server",
         "Open Connect Server",
         "0.0.0.0:921",
-    ),
+    )
+    .not_on_welcome(),
 ];
 
 const CAMERA_PRESETS: &[AddPreset] = &[preset("Camera", "camera", "Camera", "")];
@@ -189,6 +247,10 @@ const OUTPUT_PRESETS: &[AddPreset] = &[
         "openconnect_client",
         "Open Connect",
         "127.0.0.1:921",
+    )
+    .welcome_hover(
+        "Uses the same Open Connect connection as GSPro, so only one of \
+         the two can be checked.",
     ),
     preset(
         "Muni Golf (Open Connect)",
@@ -221,6 +283,18 @@ pub(crate) fn offered(group: CardGroup, trackball: bool) -> Vec<&'static AddPres
         .iter()
         .filter(|p| trackball || p.type_key != "trackball")
         .collect()
+}
+
+/// What the first-run welcome screen offers in `group`: the (+) menu's
+/// presets ([`offered`]) marked for it, none for General and Cameras.
+pub(crate) fn welcome_options(group: CardGroup, trackball: bool) -> Vec<&'static AddPreset> {
+    match group {
+        CardGroup::LaunchMonitors | CardGroup::Outputs => offered(group, trackball)
+            .into_iter()
+            .filter(|p| p.welcome)
+            .collect(),
+        CardGroup::General | CardGroup::Cameras => Vec::new(),
+    }
 }
 
 /// Narrowest a card gets before the grid drops a column.
@@ -470,6 +544,60 @@ mod tests {
                         "custom.0",
                     ]
                 ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_welcome_screen_takes_its_entries_from_the_add_menus() {
+        let labels = |g, trackball| {
+            welcome_options(g, trackball)
+                .iter()
+                .map(|p| p.welcome_text())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(CardGroup::LaunchMonitors, true),
+            [
+                "FlightScope Mevo / Mevo+ / Xi",
+                "R10",
+                "Square Golf Omni",
+                "ExPutt",
+                "Trackball",
+                "Uneekor (Open Connect)",
+            ]
+        );
+        assert!(!labels(CardGroup::LaunchMonitors, false).contains(&"Trackball"));
+        assert_eq!(
+            labels(CardGroup::Outputs, false),
+            [
+                "GSPro (Open Connect)",
+                "Pureplay (Open Connect)",
+                "Muni Golf (Open Connect)",
+                "Pureplay (Pureplay Connect)",
+            ]
+        );
+        assert!(welcome_options(CardGroup::Cameras, true).is_empty());
+        assert!(welcome_options(CardGroup::General, true).is_empty());
+
+        // Only GSPro and Pureplay over Open Connect share a connection.
+        let all: Vec<_> = [CardGroup::LaunchMonitors, CardGroup::Outputs]
+            .into_iter()
+            .flat_map(|g| welcome_options(g, true))
+            .collect();
+        let mut pairs = Vec::new();
+        for a in &all {
+            for b in &all {
+                if a.same_connection(b) {
+                    pairs.push((a.label, b.label));
+                }
+            }
+        }
+        assert_eq!(
+            pairs,
+            [
+                ("GSPro (Open Connect)", "Pureplay (Open Connect)"),
+                ("Pureplay (Open Connect)", "GSPro (Open Connect)"),
             ]
         );
     }

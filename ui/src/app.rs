@@ -6,6 +6,7 @@ use crate::battery;
 use crate::chart::{Cached, ChartKey, MembersKey};
 use crate::groups::{self, GroupEvent, ShotGroups};
 use crate::net::{self, PendingHandle, WsPollEvent};
+use crate::panels::cards::{self, AddPreset, CardGroup};
 use crate::panels::devices::{CardModes, mark};
 use crate::panels::dispersion::{self, DispersionKey, EllipseSize, Points};
 use crate::panels::settings::{PendingRemoval, SettingsForm};
@@ -15,9 +16,8 @@ use crate::scale::{self, UiScale};
 use crate::theme;
 use crate::types::{
     ActorStatus, ActorStatusResponse, CameraListResponse, Club, FlighthookEvent, FlighthookMessage,
-    GameStateSnapshot, Handedness, LogEntry, MevoSection, OpenConnectClientSection,
-    OpenConnectServerSection, R10Section, RoundState, ShotDetectionMode, ShotRow, ShotVideo,
-    SquareSection, UnitSystem,
+    GameStateSnapshot, Handedness, LogEntry, RoundState, ShotDetectionMode, ShotRow, ShotVideo,
+    UnitSystem,
 };
 use chrono::{SecondsFormat, Utc};
 
@@ -159,11 +159,8 @@ pub struct FlighthookApp {
     // Setup wizard
     pub(crate) wizard_checked: bool,
     pub(crate) wizard_dismissed: bool,
-    pub(crate) wizard_mevo: bool,
-    pub(crate) wizard_r10: bool,
-    pub(crate) wizard_square: bool,
-    pub(crate) wizard_uneekor: bool,
-    pub(crate) wizard_gspro: bool,
+    /// The welcome screen's checked presets, by (+) menu label.
+    pub(crate) wizard_picked: HashSet<&'static str>,
     pub(crate) wizard_saving: bool,
     /// Why the last Get Started failed.
     pub(crate) wizard_error: Option<String>,
@@ -178,6 +175,9 @@ pub struct FlighthookApp {
     /// The server can read a trackball, so the Launch monitors menu offers
     /// the Trackball card.
     pub(crate) trackball_supported: bool,
+    /// A status reply has been applied, so `cameras_supported` and
+    /// `trackball_supported` are the server's.
+    pub(crate) status_loaded: bool,
     /// The folder the server writes clips to (`/api/status`).
     pub(crate) clip_dir: Option<String>,
     /// Why the server's config file was not used (`/api/status`): the
@@ -313,16 +313,13 @@ impl FlighthookApp {
             log_filter_open: false,
             wizard_checked: false,
             wizard_dismissed: false,
-            wizard_mevo: false,
-            wizard_r10: false,
-            wizard_square: false,
-            wizard_uneekor: false,
-            wizard_gspro: false,
+            wizard_picked: HashSet::new(),
             wizard_saving: false,
             wizard_error: None,
             ui_scale: UiScale::default(),
             cameras_supported: false,
             trackball_supported: false,
+            status_loaded: false,
             clip_dir: None,
             config_error: None,
             camera_list: CameraList::default(),
@@ -368,6 +365,7 @@ impl FlighthookApp {
             }
             self.cameras_supported = status.cameras_supported;
             self.trackball_supported = status.trackball_supported;
+            self.status_loaded = true;
             self.clip_dir = status.clip_dir;
             self.config_error = status.config_error;
             // The reply lists every running actor: one it leaves out has
@@ -958,11 +956,42 @@ impl FlighthookApp {
         }
     }
 
+    /// Whether the welcome screen is up: the settings hold no user actors
+    /// and the status has said what the server offers (the Trackball).
     fn show_wizard(&self) -> bool {
+        self.wizard_waiting() && self.status_loaded
+    }
+
+    /// Whether the welcome screen is due: the settings have loaded with no
+    /// user actors and it has not been dismissed.
+    fn wizard_waiting(&self) -> bool {
         self.settings.loaded && !self.wizard_dismissed && self.wizard_checked
     }
 
-    fn render_wizard(&mut self, ctx: &egui::Context) {
+    /// What the welcome screen offers, under its group titles.
+    fn wizard_groups(&self) -> [(&'static str, Vec<&'static AddPreset>); 2] {
+        [
+            (
+                "Launch Monitors",
+                cards::welcome_options(CardGroup::LaunchMonitors, self.trackball_supported),
+            ),
+            (
+                "Simulators",
+                cards::welcome_options(CardGroup::Outputs, self.trackball_supported),
+            ),
+        ]
+    }
+
+    /// The checked presets that are offered, in welcome screen order.
+    fn wizard_selection(&self) -> Vec<&'static AddPreset> {
+        self.wizard_groups()
+            .into_iter()
+            .flat_map(|(_, presets)| presets)
+            .filter(|p| self.wizard_picked.contains(p.label))
+            .collect()
+    }
+
+    pub(crate) fn render_wizard(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ctx, |ui| {
@@ -990,65 +1019,32 @@ impl FlighthookApp {
                         egui::vec2(checkbox_width, 0.0),
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
-                            ui.label(
-                                egui::RichText::new("Launch Monitors")
-                                    .size(12.0)
-                                    .color(theme::TEXT_DIM),
-                            );
-                            ui.add_space(4.0);
-                            ui.checkbox(
-                                &mut self.wizard_mevo,
-                                egui::RichText::new("FlightScope Mevo / Mevo+ / Xi").size(15.0),
-                            );
-                            ui.add_space(4.0);
-                            ui.checkbox(
-                                &mut self.wizard_r10,
-                                egui::RichText::new("Garmin R10").size(15.0),
-                            );
-                            ui.add_space(4.0);
-                            ui.checkbox(
-                                &mut self.wizard_square,
-                                egui::RichText::new("Square Golf Omni").size(15.0),
-                            );
-                            ui.add_space(4.0);
-                            ui.checkbox(
-                                &mut self.wizard_uneekor,
-                                egui::RichText::new("Uneekor (Open Connect)").size(15.0),
-                            )
-                            .on_hover_text(
-                                "Uneekor's own software pushes shots to flighthook over GSPro \
-                                 Open Connect. Needs a Uneekor third-party license, and \
-                                 flighthook binds port 921 — to run GSPro on the same host, \
-                                 move it to 922 with OpenAPIUseAltPort.",
-                            );
-                            ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new("Simulators")
-                                    .size(12.0)
-                                    .color(theme::TEXT_DIM),
-                            );
-                            ui.add_space(4.0);
-                            ui.checkbox(
-                                &mut self.wizard_gspro,
-                                egui::RichText::new("GSPro").size(15.0),
-                            );
+                            for (i, (title, presets)) in
+                                self.wizard_groups().into_iter().enumerate()
+                            {
+                                if i > 0 {
+                                    ui.add_space(12.0);
+                                }
+                                ui.label(
+                                    egui::RichText::new(title).size(12.0).color(theme::TEXT_DIM),
+                                );
+                                for preset in presets {
+                                    ui.add_space(4.0);
+                                    self.wizard_checkbox(ui, preset);
+                                }
+                            }
                         },
                     );
 
                     ui.add_space(24.0);
 
-                    let any_selected = self.wizard_mevo
-                        || self.wizard_r10
-                        || self.wizard_square
-                        || self.wizard_uneekor
-                        || self.wizard_gspro;
+                    let any_selected = !self.wizard_selection().is_empty();
                     let btn = theme::primary_button("Get Started", 16.0)
                         .min_size(egui::vec2(160.0, 40.0));
 
-                    if ui
-                        .add_enabled(any_selected && !self.wizard_saving, btn)
-                        .clicked()
-                    {
+                    let start = ui.add_enabled(any_selected && !self.wizard_saving, btn);
+                    mark(ui, || "wizard:get_started".into(), &start);
+                    if start.clicked() {
                         self.apply_wizard(ctx);
                     }
                     if let Some(error) = &self.wizard_error {
@@ -1058,10 +1054,10 @@ impl FlighthookApp {
 
                     if !any_selected {
                         ui.add_space(8.0);
-                        if ui
-                            .link(egui::RichText::new("Skip — configure manually").size(12.0))
-                            .clicked()
-                        {
+                        let skip =
+                            ui.link(egui::RichText::new("Skip — configure manually").size(12.0));
+                        mark(ui, || "wizard:skip".into(), &skip);
+                        if skip.clicked() {
                             self.wizard_dismissed = true;
                             self.active_tab = Tab::Devices;
                         }
@@ -1070,28 +1066,46 @@ impl FlighthookApp {
             });
     }
 
-    pub(crate) fn apply_wizard(&mut self, ctx: &egui::Context) {
-        let mut config = self.settings.to_request();
+    /// The welcome screen's checkbox for `preset`. Checking it unchecks a
+    /// preset that adds the same connection.
+    fn wizard_checkbox(&mut self, ui: &mut egui::Ui, preset: &'static AddPreset) {
+        let mut checked = self.wizard_picked.contains(preset.label);
+        let mut response = ui.checkbox(
+            &mut checked,
+            egui::RichText::new(preset.welcome_text()).size(15.0),
+        );
+        if let Some(hover) = preset.welcome_hover {
+            response = response.on_hover_text(hover);
+        }
+        mark(ui, || format!("wizard:{}", preset.label), &response);
+        if response.changed() {
+            if checked {
+                let clashing: Vec<&'static str> = self
+                    .wizard_groups()
+                    .into_iter()
+                    .flat_map(|(_, presets)| presets)
+                    .filter(|p| p.same_connection(preset))
+                    .map(|p| p.label)
+                    .collect();
+                for label in clashing {
+                    self.wizard_picked.remove(label);
+                }
+                self.wizard_picked.insert(preset.label);
+            } else {
+                self.wizard_picked.remove(preset.label);
+            }
+        }
+    }
 
-        if self.wizard_mevo {
-            config.mevo.insert("0".into(), MevoSection::default());
+    /// Get Started: add each checked preset as its (+) menu entry does
+    /// ([`SettingsForm::add_preset`]) and save the whole config. The form
+    /// takes the new cards once the save has been applied.
+    pub(crate) fn apply_wizard(&mut self, ctx: &egui::Context) {
+        let mut form = self.settings.clone();
+        for preset in self.wizard_selection() {
+            let _ = form.add_preset(preset);
         }
-        if self.wizard_r10 {
-            config.r10.insert("0".into(), R10Section::default());
-        }
-        if self.wizard_square {
-            config.square.insert("0".into(), SquareSection::default());
-        }
-        if self.wizard_uneekor {
-            config
-                .openconnect_server
-                .insert("0".into(), OpenConnectServerSection::default());
-        }
-        if self.wizard_gspro {
-            config
-                .openconnect_client
-                .insert("0".into(), OpenConnectClientSection::default());
-        }
+        let config = form.to_request();
 
         self.wizard_saving = true;
         self.wizard_error = None;
@@ -1592,9 +1606,17 @@ impl eframe::App for FlighthookApp {
                 });
         }
 
-        // Setup wizard — shown when config has no user actors
+        // Setup wizard — shown when config has no user actors, once the
+        // status has said what the server offers. Until then a blank page
+        // stands in for it.
         if self.show_wizard() {
             self.render_wizard(ctx);
+            return;
+        }
+        if self.wizard_waiting() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::BG))
+                .show(ctx, |_| {});
             return;
         }
 
@@ -3272,5 +3294,320 @@ mod tests {
             assert!(!marks.contains_key("tournament"));
             assert!(!texts.iter().any(|t| t == "TOURNAMENT"));
         }
+    }
+
+    /// A status reply that says whether the server reads a trackball.
+    fn welcome_status(trackball: bool) -> crate::types::StatusResponse {
+        crate::types::StatusResponse {
+            actors: HashMap::new(),
+            mode: None,
+            club: None,
+            handed: None,
+            cameras_supported: false,
+            trackball_supported: trackball,
+            clip_dir: None,
+            config_error: None,
+            round: RoundState::default(),
+        }
+    }
+
+    /// An app on a first run: the default config, with no user actors, and
+    /// a status that says whether the server reads a trackball.
+    fn welcome_app(trackball: bool) -> FlighthookApp {
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        {
+            let mut p = app.pending.lock().expect("pending");
+            p.settings = Some(crate::types::FlighthookConfig::default());
+            p.status = Some(welcome_status(trackball));
+        }
+        app.apply_pending();
+        app
+    }
+
+    /// Draws the app's welcome screen (or what stands in for it) in a
+    /// window of the given size, at zoom 1.
+    struct Welcome(egui::Context, egui::Vec2);
+
+    impl Welcome {
+        fn sized(width: f32, height: f32) -> Self {
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            Self(ctx, egui::vec2(width, height))
+        }
+
+        /// One pass with `events`. Returns the marked controls.
+        fn frame(
+            &self,
+            app: &mut FlighthookApp,
+            events: Vec<egui::Event>,
+        ) -> crate::panels::devices::Marks {
+            self.0
+                .data_mut(|d| d.remove_temp::<crate::panels::devices::Marks>(egui::Id::NULL));
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.1)),
+                events,
+                ..Default::default()
+            };
+            let _ = self.0.run(input, |ctx| {
+                if app.show_wizard() {
+                    app.render_wizard(ctx);
+                }
+            });
+            self.0
+                .data(|d| d.get_temp::<crate::panels::devices::Marks>(egui::Id::NULL))
+                .unwrap_or_default()
+        }
+
+        /// Click the middle of control `name`, then draw once more.
+        fn click(&self, app: &mut FlighthookApp, name: &str) -> crate::panels::devices::Marks {
+            let marks = self.frame(app, Vec::new());
+            let at = marks
+                .get(name)
+                .unwrap_or_else(|| panic!("no {name}: {:?}", marks.keys()))
+                .0
+                .center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(app, vec![egui::Event::PointerMoved(at)]);
+            self.frame(app, vec![button(true)]);
+            self.frame(app, vec![button(false)]);
+            self.frame(app, Vec::new())
+        }
+    }
+
+    /// The welcome screen's checkboxes, by (+) menu label.
+    fn welcome_boxes(marks: &crate::panels::devices::Marks) -> Vec<&str> {
+        let mut boxes: Vec<&str> = marks
+            .keys()
+            .filter_map(|k| k.strip_prefix("wizard:"))
+            .filter(|k| !matches!(*k, "get_started" | "skip"))
+            .collect();
+        boxes.sort_unstable();
+        boxes
+    }
+
+    /// The welcome screen lists what the Devices tab's (+) menus offer for
+    /// launch monitors and outputs, without the generic Open Connect Server
+    /// and the cameras, and the Trackball only where the server reads one.
+    #[test]
+    fn the_welcome_screen_offers_every_preset_of_the_add_menus() {
+        for trackball in [false, true] {
+            let welcome = Welcome::sized(1600.0, 900.0);
+            let mut app = welcome_app(trackball);
+            let marks = welcome.frame(&mut app, Vec::new());
+            let mut want: Vec<&str> = [CardGroup::LaunchMonitors, CardGroup::Outputs]
+                .into_iter()
+                .flat_map(|g| cards::offered(g, trackball))
+                .map(|p| p.label)
+                .filter(|l| *l != "Open Connect Server")
+                .collect();
+            want.sort_unstable();
+            assert_eq!(welcome_boxes(&marks), want, "trackball {trackball}");
+            for label in [
+                "Mevo",
+                "R10",
+                "Square Golf Omni",
+                "ExPutt",
+                "Uneekor (Open Connect)",
+                "GSPro (Open Connect)",
+                "Pureplay (Open Connect)",
+                "Muni Golf (Open Connect)",
+                "Pureplay (Pureplay Connect)",
+            ] {
+                assert!(marks.contains_key(&format!("wizard:{label}")), "{label}");
+            }
+            assert_eq!(marks.contains_key("wizard:Trackball"), trackball);
+            assert!(!marks.contains_key("wizard:Open Connect Server"));
+            assert!(!marks.contains_key("wizard:Camera"));
+            assert!(!enabled_mark(&marks, "wizard:get_started"));
+            assert!(marks.contains_key("wizard:skip"));
+        }
+    }
+
+    fn enabled_mark(marks: &crate::panels::devices::Marks, name: &str) -> bool {
+        marks.get(name).is_some_and(|(_, enabled)| *enabled)
+    }
+
+    /// The welcome screen waits for the status, so the Trackball is listed
+    /// from its first frame; a later status keeps a checked Trackball.
+    #[test]
+    fn the_welcome_screen_waits_for_the_status() {
+        let welcome = Welcome::sized(1600.0, 900.0);
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        app.pending.lock().expect("pending").settings =
+            Some(crate::types::FlighthookConfig::default());
+        app.apply_pending();
+        assert!(app.wizard_waiting());
+        assert!(!app.show_wizard(), "not before the status");
+        assert!(welcome.frame(&mut app, Vec::new()).is_empty());
+
+        app.pending.lock().expect("pending").status = Some(welcome_status(true));
+        app.apply_pending();
+        assert!(app.show_wizard());
+        let marks = welcome.click(&mut app, "wizard:Trackball");
+        assert!(app.wizard_picked.contains("Trackball"));
+        assert!(enabled_mark(&marks, "wizard:get_started"));
+
+        app.pending.lock().expect("pending").status = Some(welcome_status(true));
+        app.apply_pending();
+        let marks = welcome.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("wizard:Trackball"));
+        assert!(app.wizard_picked.contains("Trackball"));
+
+        // Status first, settings second: the same screen.
+        let mut app = FlighthookApp::with_pending(net::new_pending());
+        app.pending.lock().expect("pending").status = Some(welcome_status(false));
+        app.apply_pending();
+        assert!(!app.show_wizard());
+        app.pending.lock().expect("pending").settings =
+            Some(crate::types::FlighthookConfig::default());
+        app.apply_pending();
+        let marks = welcome.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("wizard:ExPutt"));
+        assert!(!marks.contains_key("wizard:Trackball"));
+    }
+
+    /// Get Started adds each checked preset as its (+) menu entry does and
+    /// posts the whole config; the form takes the cards once it is saved.
+    #[test]
+    fn get_started_adds_the_checked_presets_as_the_add_menu_does() {
+        let welcome = Welcome::sized(1600.0, 900.0);
+        let mut app = welcome_app(false);
+        for label in [
+            "ExPutt",
+            "Muni Golf (Open Connect)",
+            "Pureplay (Pureplay Connect)",
+        ] {
+            welcome.click(&mut app, &format!("wizard:{label}"));
+        }
+        let marks = welcome.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("wizard:skip"));
+        welcome.click(&mut app, "wizard:get_started");
+        assert!(app.wizard_saving);
+
+        let (target, posted) = app.settings.posted().expect("posted");
+        assert!(matches!(target, crate::panels::settings::SaveTarget::Full));
+        let exputt = &posted.exputt["0"];
+        assert_eq!(exputt.name, "ExPutt");
+        assert!(exputt.enabled);
+        let muni = &posted.openconnect_client["0"];
+        assert_eq!(muni.name, "Muni Golf");
+        assert_eq!(muni.address.as_deref(), Some("127.0.0.1:9210"));
+        assert!(muni.enabled);
+        let pureplay = &posted.pureplay["0"];
+        assert_eq!(pureplay.name, "Pureplay Connect");
+        assert_eq!(pureplay.address.as_deref(), Some("127.0.0.1:9760"));
+        assert!(pureplay.enabled);
+        assert_eq!(posted.exputt.len(), 1);
+        assert_eq!(posted.openconnect_client.len(), 1);
+        assert_eq!(posted.pureplay.len(), 1);
+        assert!(posted.mevo.is_empty() && posted.r10.is_empty() && posted.square.is_empty());
+        assert!(posted.openconnect_server.is_empty() && posted.trackball.is_empty());
+        assert!(posted.webserver.contains_key("0"), "the web server stays");
+        assert!(
+            app.settings.position("exputt.0").is_none(),
+            "the form waits for the save"
+        );
+
+        app.pending.lock().expect("pending").settings_save =
+            Some(Ok(crate::types::PostSettingsResponse {
+                restarted: Vec::new(),
+                stopped: Vec::new(),
+            }));
+        app.apply_pending();
+        assert!(app.wizard_dismissed);
+        for id in ["exputt.0", "openconnect_client.0", "pureplay.0"] {
+            let i = app.settings.position(id).expect(id);
+            assert!(!app.settings.actors[i].dirty(), "{id}");
+        }
+        assert!(!app.settings.locked());
+    }
+
+    /// GSPro and Pureplay over Open Connect add the same connection: only
+    /// one can be checked. Any other pair of welcome presets saves both
+    /// cards switched on.
+    #[test]
+    fn gspro_and_pureplay_over_open_connect_exclude_each_other() {
+        let welcome = Welcome::sized(1600.0, 900.0);
+        let mut app = welcome_app(true);
+        welcome.click(&mut app, "wizard:GSPro (Open Connect)");
+        welcome.click(&mut app, "wizard:Muni Golf (Open Connect)");
+        welcome.click(&mut app, "wizard:Pureplay (Open Connect)");
+        assert!(app.wizard_picked.contains("Pureplay (Open Connect)"));
+        assert!(!app.wizard_picked.contains("GSPro (Open Connect)"));
+        assert!(app.wizard_picked.contains("Muni Golf (Open Connect)"));
+        welcome.click(&mut app, "wizard:GSPro (Open Connect)");
+        assert!(app.wizard_picked.contains("GSPro (Open Connect)"));
+        assert!(!app.wizard_picked.contains("Pureplay (Open Connect)"));
+        welcome.click(&mut app, "wizard:GSPro (Open Connect)");
+        assert!(app.wizard_picked.contains("Muni Golf (Open Connect)"));
+        assert!(!app.wizard_picked.contains("GSPro (Open Connect)"));
+
+        // Everything that can be checked together, checked: every card on.
+        let mut app = welcome_app(true);
+        let marks = welcome.frame(&mut app, Vec::new());
+        for label in welcome_boxes(&marks) {
+            if label != "Pureplay (Open Connect)" {
+                welcome.click(&mut app, &format!("wizard:{label}"));
+            }
+        }
+        assert_eq!(app.wizard_picked.len(), welcome_boxes(&marks).len() - 1);
+        welcome.click(&mut app, "wizard:get_started");
+        let (_, posted) = app.settings.posted().expect("posted");
+        let on = [
+            posted.mevo.values().map(|s| s.enabled).collect::<Vec<_>>(),
+            posted.r10.values().map(|s| s.enabled).collect(),
+            posted.square.values().map(|s| s.enabled).collect(),
+            posted.exputt.values().map(|s| s.enabled).collect(),
+            posted.trackball.values().map(|s| s.enabled).collect(),
+            posted
+                .openconnect_server
+                .values()
+                .map(|s| s.enabled)
+                .collect(),
+            posted
+                .openconnect_client
+                .values()
+                .map(|s| s.enabled)
+                .collect(),
+            posted.pureplay.values().map(|s| s.enabled).collect(),
+        ];
+        assert_eq!(
+            on.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1, 1, 1, 1, 1, 1, 2, 1]
+        );
+        assert!(on.iter().flatten().all(|e| *e), "every card on: {on:?}");
+    }
+
+    /// The welcome screen fits a 1024×768 window without scrolling, with
+    /// every launch monitor and simulator listed, both before anything is
+    /// checked (Skip shown) and after a failed Get Started (error shown).
+    #[test]
+    fn the_welcome_screen_fits_1024_by_768() {
+        let welcome = Welcome::sized(1024.0, 768.0);
+        let mut app = welcome_app(true);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0));
+        let inside = |marks: &crate::panels::devices::Marks| {
+            for (name, (rect, _)) in marks {
+                assert!(screen.contains_rect(*rect), "{name} at {rect:?}");
+            }
+        };
+        let marks = welcome.frame(&mut app, Vec::new());
+        assert_eq!(welcome_boxes(&marks).len(), 10);
+        inside(&marks);
+        assert!(marks.contains_key("wizard:skip"));
+
+        welcome.click(&mut app, "wizard:Trackball");
+        welcome.click(&mut app, "wizard:get_started");
+        app.pending.lock().expect("pending").settings_save =
+            Some(Err("Failed to fetch".to_owned()));
+        app.apply_pending();
+        let marks = welcome.frame(&mut app, Vec::new());
+        assert!(marks.contains_key("error:wizard"));
+        inside(&marks);
     }
 }

@@ -2764,7 +2764,7 @@ mod tests {
     fn a_failed_get_started_unlocks_the_wizard() {
         let mut app = FlighthookApp::with_pending(net::new_pending());
         app.settings.load_from(&FlighthookConfig::default());
-        app.wizard_gspro = true;
+        app.wizard_picked.insert("GSPro (Open Connect)");
         app.apply_wizard(&egui::Context::default());
         assert!(app.wizard_saving);
 

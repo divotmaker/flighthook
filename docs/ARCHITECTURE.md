@@ -202,16 +202,17 @@ the copy, so there is no frame left to show it in.
 
 On first startup the default config contains only a webserver — no devices or
 integrations. The UI detects this (`FlighthookConfig::has_user_actors()`) and
-shows a setup wizard instead of the normal dashboard. The wizard presents
-checkboxes for available devices (Mevo, Square Golf Omni, R10, Uneekor
-(Open Connect)) and simulators (GSPro, as an Open Connect client). On
-confirmation it builds a config with defaults for each selection, posts it via
+shows a setup wizard instead of the normal dashboard, once `/api/status` has
+said whether the server reads a trackball. The wizard lists the same presets as
+the Devices tab's (+) menus (`cards::welcome_options`): every launch monitor
+except the generic Open Connect Server, the Trackball only where the server
+reads one, and every output (GSPro, Pureplay and Muni Golf over Open Connect,
+Pureplay over Pureplay Connect). No cameras. GSPro and Pureplay over Open
+Connect add the same connection (an Open Connect client at `127.0.0.1:921`), so
+checking one unchecks the other. On confirmation it adds each checked preset as
+its (+) menu entry does (`SettingsForm::add_preset`), posts the whole config via
 the existing settings save path, and dismisses. Users can also skip the wizard
 and configure manually on the Devices tab.
-
-`MevoSection`, `R10Section`, and `OpenConnectClientSection` each implement
-`Default` with sensible values (e.g. Mevo at `192.168.2.1:5100`, the
-Open Connect client named GSPro at `127.0.0.1:921`).
 
 ### Rust types
 
