@@ -1633,9 +1633,9 @@ and the thread ends, so a card never stays Connected over a dead driver. `stop_w
 | `flight_result` | releases the held launch; one that comes first waits for its launch |
 | `club_path`, `face_impact`, `alert` | `ClubPath`, `FaceImpact`, `Alert` |
 | `shot_finished` | `ShotFinished` with the shot's raw frames (`"<kind> device has no wire protocol"` without a raw profile), then the card's `shot_count` |
-| `device_telemetry` | merged into the session's map and published in full; during a connect only merged, and published with the identity when the session connects |
+| `device_telemetry` | merged into the session's map and published in full; during a connect only merged, and published with the identity when the session connects (its own identity fields are not used then: a driver puts manufacturer, model and firmware in its `DeviceIdentity`) |
 | `raw_frame` | numbered per device id across sessions (frames of the first connect, before the id is known, number on into it), a hex line at the `audit` target, recorded for the export ([raw capture](#raw-capture-and-shot-export)); never on the bus |
-| `Phase` | the card's `phase`; the Connected status removes a phase set during the connect (`phase: ""`), unless the connect's last phase was `measuring` (the session's own phase in the driver contract's list), which it keeps |
+| `Phase` | the card's `phase`; the Connected status removes a phase set during the connect (`phase: ""`), unless the connect's last phase was `measuring` (the session's own phase in the driver contract's list), which it keeps. A connect that fails removes its phase before the retry delay, and a stop during a connect leaves the card Disconnected without it |
 | `Log` | tracing; trace lines at the `audit` target |
 | `ShotDiscarded` | the pre-roll is cleared |
 

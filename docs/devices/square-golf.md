@@ -23,7 +23,7 @@ Omni again, 1 s after the first failed attempt, growing by 1 s per attempt
 up to 15 s, and back to 1 s once a session lasted 10 s. Turning the card
 off, a restart or Reconnect stops a search or a connect within about a
 second. Stopping disarms the Omni and disconnects it, on Linux and on
-Windows/macOS, within 5 s: the Omni takes one connection at a time, so the
+Windows/macOS, within about 5 s (the card allows 6): the Omni takes one connection at a time, so the
 phone app (or a new session) can connect right after. A new session waits
 until the old one has let go.
 
@@ -161,14 +161,16 @@ the device's name and percentage.
 ## Shot export
 
 `GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
-each shot with the BLE traffic behind it: up to 64 messages before the shot
-event, the notifications the Omni sent for the shot (ball, club, and anything
+each shot with the BLE traffic behind it: up to 64 messages before the ball
+notification, the notifications the Omni sent for the shot (ball, club, and anything
 else in between, including the duplicate copies the device sends) and the
 commands flighthook wrote, such as the club metrics request and club selects.
 Each is hex, labeled by the driver: `notify 11 02` (a notification's family
 and type byte; `notify 91` for the battery and clock families, family byte
 only) or `cmd 87` (a command's type byte). The same messages are written to
-the log as hex lines at debug level (`audit` target).
+the log as hex lines at debug level (`audit` target). Each message's `t_ms`
+counts from the arrival of the shot's ball notification, which is when the
+shot starts.
 
 Never captured: the identity characteristics (serial, firmware, hardware and
 model are read once at connect, not through the capture), anything before the

@@ -39,7 +39,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, LazyLock, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use allsquare::driver::{BleLink, OmniSession};
@@ -58,6 +58,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::actors::scripted::Handoff;
     use crate::actors::web::tests::TempDir;
     use crate::actors::{Actor, ReconfigureOutcome};
     use crate::bus::BusSender;
@@ -68,9 +69,6 @@ mod tests {
     /// The scripted device's advertised name and BLE address (synthetic).
     const EQ_NAME: &str = "SquareGolf(EQ01)";
     const EQ_ADDRESS: &str = "02:00:00:00:00:01";
-    /// How long the device stays quiet after it put a bus event out, so the
-    /// card sees the event before the next notification.
-    const EQ_BUS_GAP: Duration = Duration::from_millis(300);
 
     /// One step of what the scripted device does.
     #[derive(Clone)]
@@ -78,7 +76,8 @@ mod tests {
         /// A notification; the device sends every notification twice.
         Note(Vec<u8>),
         /// Something happens elsewhere that the game reports on the bus (a
-        /// club or hand change); the device is quiet for [`EQ_BUS_GAP`].
+        /// club or hand change); the device is quiet until the card's next
+        /// pass, which takes the event off the bus first.
         Bus(FlighthookEvent),
         /// The link is gone.
         Lost,
@@ -90,7 +89,10 @@ mod tests {
         steps: VecDeque<Step>,
         /// The second copy of the last notification.
         repeat: Option<Vec<u8>>,
-        quiet_until: Option<Instant>,
+        /// The card's session passes so far (polls).
+        passes: u64,
+        /// Quiet until this pass.
+        quiet_until: Option<u64>,
         lost: bool,
         written: Vec<Vec<u8>>,
         released: u32,
@@ -187,7 +189,7 @@ mod tests {
                 return Ok(note.len());
             }
             if let Some(until) = w.quiet_until {
-                if Instant::now() < until {
+                if w.passes < until {
                     return Err(io::ErrorKind::WouldBlock.into());
                 }
                 w.quiet_until = None;
@@ -199,7 +201,7 @@ mod tests {
                     Ok(note.len())
                 }
                 Some(Step::Bus(event)) => {
-                    w.quiet_until = Some(Instant::now() + EQ_BUS_GAP);
+                    w.quiet_until = Some(w.passes + 1);
                     drop(w);
                     if let Some(bus) = &self.bus {
                         bus.send(FlighthookMessage::new(event));
@@ -389,9 +391,8 @@ mod tests {
     // -- allsquare's driver over the scripted device -------------------------
 
     /// Scripted links waiting for a driver, by the card's `address`: each
-    /// test runs with its own.
-    static DEVICES: LazyLock<Mutex<HashMap<String, VecDeque<EqLink>>>> =
-        LazyLock::new(Mutex::default);
+    /// test runs with its own (see [`Handoff`]).
+    static DEVICES: Handoff<String, VecDeque<EqLink>> = Handoff::new();
 
     /// allsquare's [`Omni`] with its BLE scan replaced by the scripted links
     /// queued for its address: a connect runs the real identity read and
@@ -414,9 +415,7 @@ mod tests {
 
         fn new(config: SquareConfig) -> Result<Self, ConfigError> {
             let devices = DEVICES
-                .lock()
-                .unwrap()
-                .remove(config.address.as_deref().unwrap_or_default())
+                .take(&config.address.clone().unwrap_or_default())
                 .unwrap_or_default();
             Ok(Self {
                 inner: Omni::new(config)?,
@@ -437,7 +436,8 @@ mod tests {
                         ctx.tick()?;
                         std::thread::sleep(Duration::from_millis(5));
                     }
-                    Ok(ScriptedSession(self.inner.connect_with(ctx, link)?))
+                    let session = self.inner.connect_with(ctx, link.clone())?;
+                    Ok(ScriptedSession(session, link))
                 }
                 None => loop {
                     ctx.tick()?;
@@ -460,7 +460,9 @@ mod tests {
         }
     }
 
-    struct ScriptedSession(OmniSession);
+    /// allsquare's session, counting the card's passes for the scripted
+    /// link.
+    struct ScriptedSession(OmniSession, EqLink);
 
     impl DeviceSession for ScriptedSession {
         type Driver = ScriptedOmni;
@@ -470,6 +472,7 @@ mod tests {
             timeout: Duration,
             out: &mut Events<'_>,
         ) -> Result<(), allsquare::driver::Error> {
+            self.1.wire().passes += 1;
             self.0.poll(timeout, out)
         }
 
@@ -530,7 +533,7 @@ mod tests {
             let game = BusSender::new("web".into(), tx.clone(), Arc::default());
             let link = EqLink::new(steps, Some(game.clone()));
             link.hold.store(!queued.is_empty(), Ordering::SeqCst);
-            DEVICES.lock().unwrap().insert(
+            DEVICES.put(
                 section.driver.address.clone().unwrap_or_default(),
                 VecDeque::from([link.clone()]),
             );

@@ -1400,7 +1400,7 @@ running flighthook.
 - `schema`: export format version (`3`). Bumped when a field changes meaning.
   Schema 3: the raw records of a device on a device driver (the R10, the
   Square Golf, the ExPutt) carry `label` instead of `type`, `src`, `dst` and
-  `channel`, one record per protocol message (the R10: one GFDI message per
+  `channel`, one record per protocol message (the R10: one message per
   record, not one BLE chunk; the ExPutt: each message of the session as its
   JSON text, not the putt's values re-joined). Schema 2 has the launch and the device's flight values in
   `data.launch` and `data.flight`; a schema 1 line has both in one
@@ -2700,10 +2700,9 @@ Shot sequence complete. Accumulators should finalize and emit the composed shot.
   - `frames`: `RawRecord[]`, in arrival order:
     - `t_ms`: milliseconds relative to the shot trigger (negative = before it)
     - `dir`: `rx` (device → flighthook) or `tx` (flighthook → device)
-    - `type`: message type, e.g. `"0xD4"` (FlightScope) or the first byte of
-      a BLE notification or command type; absent for JSON
+    - `type`: message type, e.g. `"0xD4"` (FlightScope); absent for JSON
     - `src` / `dst`: FlightScope bus addresses (`APP`, `AVR`, `DSP`, `PI`)
-    - `channel`: `notify`, `cmd` (BLE) or `tcp`
+    - `channel`: `tcp` (FlightScope)
     - `label`: the device driver's own name for the frame, stored as it gave
       it; a frame from a device driver carries this instead of `type`,
       `src`, `dst` and `channel`. R10: `notify <message type>` /

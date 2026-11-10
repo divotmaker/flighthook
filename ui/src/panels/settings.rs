@@ -539,6 +539,7 @@ impl DeviceFormEntry {
     pub(crate) fn driver_error(&self) -> Option<String> {
         match self.monitor_type.as_str() {
             "mock_monitor" => self.mock.validate().err().map(|e| e.to_string()),
+            "r10" if self.range_unparsable() => Some("range: not a number".into()),
             "r10" => self.r10_config().validate().err().map(|e| e.to_string()),
             "square" => self.square_config().validate().err().map(|e| e.to_string()),
             "exputt" => self.exputt_config().validate().err().map(|e| e.to_string()),
@@ -558,12 +559,21 @@ impl DeviceFormEntry {
         }
     }
 
+    /// Whether the range field holds text that is not a number (blank is
+    /// no range).
+    fn range_unparsable(&self) -> bool {
+        let text = self.range_val.trim();
+        !text.is_empty() && text.parse::<f64>().is_err()
+    }
+
     /// The R10 driver's settings from the form: the range as typed, blank
-    /// (or not a number) for none.
+    /// (or not a number, which [`driver_error`](Self::driver_error)
+    /// refuses) for none.
     pub(crate) fn r10_config(&self) -> flighthook::R10Config {
         flighthook::R10Config {
             range: self
                 .range_val
+                .trim()
                 .parse::<f64>()
                 .ok()
                 .map(|v| Distance::from_value_and_unit(v, &self.range_unit)),
@@ -608,7 +618,8 @@ impl DeviceFormEntry {
     /// still saves its other fields and its on/off switch, as the server
     /// does.
     pub(crate) fn driver_blocks_save(&self) -> bool {
-        self.driver_error().is_some() && self.saved_driver != self.driver_json()
+        (self.is_r10() && self.range_unparsable())
+            || (self.driver_error().is_some() && self.saved_driver != self.driver_json())
     }
 
     pub(crate) fn is_mevo(&self) -> bool {
@@ -4962,6 +4973,15 @@ mod tests {
         let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
             panic!("not a device");
         };
+        dev.range_val = "7f".into();
+        assert_eq!(dev.driver_error().as_deref(), Some("range: not a number"));
+        assert!(
+            !super::actor_valid(&form.actors[0]),
+            "never saved as no range"
+        );
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
         dev.range_val = String::new();
         assert_eq!(dev.driver_error(), None);
         assert!(super::actor_valid(&form.actors[0]));
@@ -4988,6 +5008,17 @@ mod tests {
         assert!(dev.driver_error().is_some(), "shown");
         dev.name = "Bay 1".into();
         assert!(super::actor_valid(&form.actors[0]), "a rename saves");
+
+        // Text that is not a number never saves, also on a card with no
+        // range saved.
+        cfg.r10.get_mut("0").unwrap().driver.range = None;
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        dev.range_val = "seven".into();
+        assert!(!super::actor_valid(&form.actors[0]));
     }
 
     #[test]

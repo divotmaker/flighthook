@@ -29,7 +29,7 @@ pub type R10Actor = DriverActor<R10, R10Hooks>;
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
-    use std::sync::{Arc, LazyLock, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use flighthook::{ActorStatus, FlighthookEvent, FlighthookMessage, R10Config};
@@ -43,6 +43,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::actors::scripted::Handoff;
     use crate::actors::web::tests::TempDir;
     use crate::state::SystemState;
 
@@ -169,12 +170,13 @@ mod tests {
 
     // -- tenover's driver over the scripted device --------------------------
 
-    /// Scripted devices waiting for a driver, by the card's range (its
-    /// value's bits, 0 for none): each test runs with its own range.
-    static DEVICES: LazyLock<Mutex<HashMap<u64, VecDeque<EqFake>>>> = LazyLock::new(Mutex::default);
+    /// Scripted devices waiting for a driver, by the card's range (with
+    /// its unit; empty for none): each test runs with its own range (see
+    /// [`Handoff`]).
+    static DEVICES: Handoff<String, VecDeque<EqFake>> = Handoff::new();
 
-    fn range_key(config: &R10Config) -> u64 {
-        config.range.map_or(0, |d| d.value().to_bits())
+    fn range_key(config: &R10Config) -> String {
+        config.range.map(|d| format!("{d:?}")).unwrap_or_default()
     }
 
     /// tenover's [`R10`] with its BLE scan replaced by the scripted devices
@@ -199,11 +201,7 @@ mod tests {
         }
 
         fn new(config: R10Config) -> Result<Self, ConfigError> {
-            let devices = DEVICES
-                .lock()
-                .unwrap()
-                .remove(&range_key(&config))
-                .unwrap_or_default();
+            let devices = DEVICES.take(&range_key(&config)).unwrap_or_default();
             Ok(Self {
                 inner: R10::new(config)?,
                 devices,
@@ -285,10 +283,7 @@ mod tests {
                 c.r10.insert("0".into(), section.clone());
             });
             let state = Arc::new(state);
-            DEVICES
-                .lock()
-                .unwrap()
-                .insert(range_key(&section.driver), VecDeque::from([device]));
+            DEVICES.put(range_key(&section.driver), VecDeque::from([device]));
             let (tx, rx) = broadcast::channel(1024);
             crate::actors::start_actor(
                 "r10.0".into(),

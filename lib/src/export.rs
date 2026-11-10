@@ -13,9 +13,9 @@ use crate::{Club, Handedness, ShotData, ShotDetectionMode, SimulationSection};
 /// Export format version. Bumped when a field changes meaning.
 ///
 /// Schema 3: the raw records of a device on a flightrelay device driver
-/// (the R10, the mock) carry the driver's `label` instead of `type`, `src`,
-/// `dst` and `channel`, one record per protocol message (the R10's: one
-/// GFDI message each, not a BLE chunk). Schema 2: `data` carries the
+/// carry the driver's `label` instead of `type`, `src`, `dst` and
+/// `channel`, one record per protocol message (the R10's: one message each,
+/// not a BLE chunk). Schema 2: `data` carries the
 /// measured launch in `launch` and the device's flight values in `flight`
 /// (FRP 0.2.0's `launch` and `flight_result`). Schema 1 lines held both in
 /// one `ball` block; [`ShotExport`] reads them into the schema 2 shape, and

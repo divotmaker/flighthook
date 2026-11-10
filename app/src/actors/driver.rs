@@ -279,10 +279,9 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
         if let Err(panic) = ran {
             error!("{actor}: the device driver failed: {}", panic_text(&*panic));
             sink.session_ended();
-            sink.status(
-                ActorStatus::Disconnected,
-                HashMap::from([("error".into(), DRIVER_FAILED.into())]),
-            );
+            let mut telemetry = HashMap::from([("error".into(), DRIVER_FAILED.into())]);
+            sink.end_phase(&mut telemetry);
+            sink.status(ActorStatus::Disconnected, telemetry);
         }
     }
 
@@ -325,6 +324,13 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                 Err(e) => {
                     if host.stopped() {
                         break;
+                    }
+                    // The failed connect's phase is not shown through the
+                    // retry delay.
+                    let mut telemetry = HashMap::new();
+                    sink.end_phase(&mut telemetry);
+                    if !telemetry.is_empty() {
+                        sink.status(sink.status, telemetry);
                     }
                     attempts += 1;
                     (e, None)
@@ -377,7 +383,10 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                 }
             }
         }
-        sink.status(ActorStatus::Disconnected, HashMap::new());
+        // A stop that ended a connect leaves no phase on the card.
+        let mut telemetry = HashMap::new();
+        sink.end_phase(&mut telemetry);
+        sink.status(ActorStatus::Disconnected, telemetry);
     }
 
     /// Wait `duration` (a retry delay), draining the bus and taking live
@@ -800,6 +809,14 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         });
     }
 
+    /// A connect ended without a session: removes the `phase` it set, if
+    /// any, through `telemetry` (an empty value removes the key).
+    fn end_phase(&mut self, telemetry: &mut HashMap<String, String>) {
+        if self.phase_shown.take().is_some() {
+            telemetry.insert("phase".into(), String::new());
+        }
+    }
+
     /// The session failed: `ready=false`, then Reconnecting, so a card
     /// never shows a lost connection's values.
     fn session_lost(&mut self) {
@@ -959,7 +976,9 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
                 ..
             } => {
                 self.telemetry.extend(telemetry.unwrap_or_default());
-                // While connecting, it goes out with the identity.
+                // While connecting, it goes out with the identity (the
+                // session's `DeviceIdentity`; these identity fields are not
+                // used then).
                 if self.connecting {
                     return;
                 }
@@ -1263,6 +1282,8 @@ mod tests {
         Session(Vec<Step>),
         /// Ticks until stopped.
         Block,
+        /// Shows a phase, then does the inner connect.
+        Phase(&'static str, Box<Connect>),
     }
 
     /// What one session poll does; an empty list idles.
@@ -1359,11 +1380,15 @@ mod tests {
 
         fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<FakeSession, FakeError> {
             ctx.tick()?;
-            let next = {
+            let mut next = {
                 let mut script = lock(&self.script);
                 script.latched.push(*ctx.latched());
                 script.connects.pop_front()
             };
+            while let Some(Connect::Phase(phase, inner)) = next {
+                ctx.out.phase(phase);
+                next = Some(*inner);
+            }
             match next {
                 Some(Connect::Fail(why)) => Err(FakeError(why.into())),
                 Some(Connect::Session(steps)) => Ok(FakeSession {
@@ -1373,7 +1398,7 @@ mod tests {
                     steps: steps.into(),
                     script: Arc::clone(&self.script),
                 }),
-                Some(Connect::Block) | None => loop {
+                Some(Connect::Block | Connect::Phase(..)) | None => loop {
                     ctx.tick()?;
                     std::thread::sleep(Duration::from_millis(20));
                 },
@@ -2218,6 +2243,88 @@ mod tests {
         );
         assert!(at.elapsed() < FakeDriver::STOP_WAIT, "{:?}", at.elapsed());
         rig.until(|m| is_status(m, ActorStatus::Disconnected));
+    }
+
+    /// The `phase` of a connect that fails leaves the card before the retry
+    /// delay (and before the driver's alert); the next attempt shows its
+    /// own again.
+    #[test]
+    fn a_failed_connects_phase_leaves_the_card() {
+        let (id, _script) = script(vec![
+            Connect::Phase("handshaking", Box::new(Connect::Fail("no answer"))),
+            Connect::Phase("discovering", Box::new(Connect::Block)),
+        ]);
+        let mut rig = rig();
+        rig.start(section(id));
+        let seen = rig.until(|m| {
+            matches!(&m.event, FlighthookEvent::ActorStatus { telemetry, .. }
+            if telemetry.get("phase").is_some_and(|p| p == "discovering"))
+        });
+        let phases: Vec<(ActorStatus, &str)> = seen
+            .iter()
+            .filter_map(|m| match &m.event {
+                FlighthookEvent::ActorStatus { status, telemetry } => {
+                    telemetry.get("phase").map(|p| (*status, p.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        use ActorStatus::Starting;
+        assert_eq!(
+            phases,
+            [
+                (Starting, "handshaking"),
+                (Starting, ""),
+                (Starting, "discovering")
+            ]
+        );
+        let cleared = seen
+            .iter()
+            .position(|m| {
+                matches!(&m.event, FlighthookEvent::ActorStatus { telemetry, .. }
+                if telemetry.get("phase").is_some_and(String::is_empty))
+            })
+            .expect("cleared");
+        let alert = seen
+            .iter()
+            .position(|m| matches!(&m.event, FlighthookEvent::Alert { .. }))
+            .expect("the driver's alert");
+        assert!(cleared < alert, "{:?}", kinds(&seen));
+        rig.state.stop_and_wait("fake.0");
+    }
+
+    /// A stop that ends a connect leaves the card Disconnected without the
+    /// connect's `phase`.
+    #[test]
+    fn a_stop_during_a_connect_leaves_no_phase() {
+        let (id, _script) = script(vec![Connect::Phase(
+            "handshaking",
+            Box::new(Connect::Block),
+        )]);
+        let mut rig = rig();
+        rig.start(section(id));
+        let seen = rig.until(|m| {
+            matches!(&m.event, FlighthookEvent::ActorStatus { telemetry, .. }
+            if telemetry.contains_key("phase"))
+        });
+        assert_eq!(
+            rig.state.stop_and_wait("fake.0"),
+            crate::state::Stopped::Exited
+        );
+        let end = rig.until(|m| is_status(m, ActorStatus::Disconnected));
+        // The card's view of every status: no phase once Disconnected.
+        let mut card = flighthook::ActorStatusResponse::new("Fake", ActorStatus::Starting);
+        for m in seen.iter().chain(&end) {
+            if let FlighthookEvent::ActorStatus { status, telemetry } = &m.event {
+                card.apply_status(*status, telemetry, 0);
+            }
+        }
+        assert_eq!(card.status, ActorStatus::Disconnected);
+        assert!(
+            !card.telemetry.contains_key("phase"),
+            "{:?}",
+            card.telemetry
+        );
     }
 
     /// Settings the driver refuses keep the card from starting and show on

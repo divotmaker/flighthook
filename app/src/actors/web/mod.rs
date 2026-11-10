@@ -657,12 +657,10 @@ async fn shot_context(
     {
         scrub.push(id.clone());
     }
-    if let Some(actor) = state.actors.read().await.get(&msg.actor) {
-        for key in ["ble_address", "peer"] {
-            if let Some(v) = actor.telemetry.get(key) {
-                scrub.push(v.clone());
-            }
-        }
+    if let Some(actor) = state.actors.read().await.get(&msg.actor)
+        && let Some(v) = actor.telemetry.get("peer")
+    {
+        scrub.push(v.clone());
     }
     // An address may also appear without its port.
     let hosts: Vec<String> = scrub

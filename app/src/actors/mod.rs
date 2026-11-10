@@ -13,6 +13,8 @@ pub mod openconnect;
 pub mod provenance;
 pub mod pureplay;
 pub mod r10;
+#[cfg(test)]
+pub(crate) mod scripted;
 pub mod square;
 pub mod system;
 pub mod web;

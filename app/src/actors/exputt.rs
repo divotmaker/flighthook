@@ -72,8 +72,8 @@ pub type ExPuttActor = DriverActor<ExPutt, ExPuttHooks>;
 mod tests {
     use std::collections::HashMap;
     use std::net::TcpListener;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-    use std::sync::{Arc, LazyLock, Mutex};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -98,6 +98,7 @@ mod tests {
     use super::*;
     use crate::actors::gspro::mapper::map_shot;
     use crate::actors::gspro::{GsProRouting, readiness_after};
+    use crate::actors::scripted::Handoff;
     use crate::actors::{Actor, ReconfigureOutcome};
     use crate::bus::BusSender;
     use crate::state::{GameStateWriter, SystemState};
@@ -107,8 +108,9 @@ mod tests {
 
     // -- The ExPutt on a mock device -----------------------------------------
 
-    /// Test timings by the card's `address`: each test runs with its own.
-    static TUNINGS: LazyLock<Mutex<HashMap<String, Tuning>>> = LazyLock::new(Mutex::default);
+    /// Test timings by the card's `address`: each test runs with its own
+    /// (see [`Handoff`]).
+    static TUNINGS: Handoff<String, Tuning> = Handoff::new();
 
     /// A UDP port nothing sends beacons to.
     fn quiet_udp_port() -> u16 {
@@ -162,9 +164,7 @@ mod tests {
         fn new(config: ExPuttConfig) -> Result<Self, ConfigError> {
             config.validate()?;
             let tuning = TUNINGS
-                .lock()
-                .unwrap()
-                .remove(config.address.as_deref().unwrap_or_default())
+                .take(&config.address.clone().unwrap_or_default())
                 .unwrap_or_default();
             let local = ExPuttConfig {
                 address: config.ip()?.map(|_| "127.0.0.1".into()),
@@ -275,10 +275,7 @@ mod tests {
             state.system.update(|c| {
                 c.exputt.insert("0".into(), section.clone());
             });
-            TUNINGS
-                .lock()
-                .unwrap()
-                .insert(section.driver.address.clone().unwrap_or_default(), tuning);
+            TUNINGS.put(section.driver.address.clone().unwrap_or_default(), tuning);
             let (tx, rx) = broadcast::channel(4096);
             Self {
                 dir,
