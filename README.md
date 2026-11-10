@@ -22,7 +22,7 @@ Each device links to its setup notes, quirks, and config reference.
 | [FlightScope Mevo Gen2](docs/devices/flightscope.md) | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
 | [FlightScope Xi](docs/devices/flightscope.md)        | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
 | [Square Golf Omni](docs/devices/square-golf.md)      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Supported        |
-| [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Alpha            |
+| [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Supported        |
 | ExPutt RG                                            | WiFi                    | [threeputt](https://crates.io/crates/threeputt) | Alpha            |
 | [Trackball](docs/devices/trackball.md)               | Linux evdev (any mouse) | [thumbswing](https://crates.io/crates/thumbswing) | Alpha (Linux)  |
 | [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (Open Connect server)                  | Alpha (untested) |

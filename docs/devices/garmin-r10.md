@@ -1,6 +1,6 @@
 # Garmin Approach R10
 
-**Status: Alpha** — decoded by [tenover](https://crates.io/crates/tenover) over
+**Status: Supported** — decoded by [tenover](https://crates.io/crates/tenover) over
 BLE, using Garmin's GFDI framing and protobuf payloads.
 
 ## Pairing
