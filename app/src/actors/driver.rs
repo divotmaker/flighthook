@@ -3182,13 +3182,14 @@ mod tests {
         let full = flighthook::R10Section {
             driver: flighthook::R10Config {
                 range: Some(flighthook::Distance::Feet(7.0)),
+                aim_offset_deg: Some(1.5),
             },
             ..r10.clone()
         };
         keys_apart(&r10, &full);
         assert_eq!(
             driver_keys::<flighthook::R10Config>(),
-            BTreeSet::from(["range".to_owned()])
+            BTreeSet::from(["aim_offset_deg".to_owned(), "range".to_owned()])
         );
 
         let square = flighthook::SquareSection {

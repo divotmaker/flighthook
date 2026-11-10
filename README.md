@@ -567,6 +567,7 @@ DR = 15.0
 [r10.0]
 name = "Garmin R10"
 range = "7ft"                  # device-to-ball distance, sent as tee distance
+aim_offset_deg = -1.5          # optional (beta): degrees added to the horizontal angles, + = right
 
 [exputt.0]
 name = "ExPutt"

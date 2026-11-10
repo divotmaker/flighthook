@@ -57,6 +57,7 @@ hex lines at trace level. The device's BLE address is not in the file.
 [r10.0]
 name = "Garmin R10"
 range = "7ft"                  # distance from the device to the ball
+aim_offset_deg = -1.5          # optional (beta): degrees added to the horizontal angles
 ```
 
 ### `range`
@@ -74,3 +75,29 @@ not start and shows the error until the value is fixed.
 
 Omit it to leave the device on whatever tee distance was last set on it. The
 value is pushed once per connection, so changing it restarts the card.
+
+### `aim_offset_deg` (beta)
+
+The R10 measures horizontal angles from its own centerline, and it is hard
+to line a unit up with the target by turning it. The aim offset corrects a unit
+that is not aimed exactly at the target in software: it is **added**, in
+degrees, to
+
+- the launch direction of every shot, and
+- the club's face angle and path, when the R10 tracked the club.
+
+The R10 reports a face angle, path and attack angle of exactly 0 together
+when it did not track the club (a slow swing). Those zeros are not
+measurements, so they are left as they are. Spin, the spin axis and the attack
+angle never change. A positive offset turns shots to the right.
+
+To dial it in, hit a short straight chip at the target and read the launch
+direction it shows (+ = right). Enter the negative of that number: a chip that
+reads 2.0° right takes `-2.0` (the card's **Aim offset** field, or
+`aim_offset_deg = -2.0` in the file). Hit another chip to check it, and nudge
+the number until a straight chip reads close to 0.
+
+It must be a number from -10 to 10. Blank (or omitted) means 0. The card's
+Settings side shows why a value is refused and won't save it. The offset
+applies from the next shot, with no restart. Shots already recorded keep the
+values they had.

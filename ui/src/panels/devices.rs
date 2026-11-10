@@ -3264,6 +3264,75 @@ mod tests {
         assert_eq!(device(&mut app, "square.0").impact_lead, "0.5");
     }
 
+    #[test]
+    fn the_r10_aim_offset_is_on_its_settings_side_only() {
+        let screen = Screen::new();
+        let mut app = app_with_monitor("r10", CardMode::Telemetry);
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(!marks.contains_key("aim_offset:0"), "telemetry side");
+
+        let mut app = app_with_monitor("r10", CardMode::Settings);
+        let (marks, shapes) = screen.painted(&mut app, Vec::new());
+        let (field, _) = marks["aim_offset:0"];
+        let (card, _) = marks["card:r10.0"];
+        assert!(card.contains_rect(field), "{field:?} in {card:?}");
+        // Empty: the hint `0` is shown in the field, and the unit beside it.
+        let texts: Vec<String> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) if field.contains(t.visual_bounding_rect().center()) => {
+                    Some(t.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["0"]);
+        assert!(
+            shapes.iter().any(|s| matches!(s, egui::Shape::Text(t)
+                if t.galley.text() == "°" && t.visual_bounding_rect().left() >= field.right())),
+            "the degree sign sits right of the field"
+        );
+
+        // Not on other launch monitors.
+        for kind in ["square", "exputt", "mock_monitor"] {
+            let mut app = app_with_monitor(kind, CardMode::Settings);
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(!marks.contains_key("aim_offset:0"), "{kind}");
+        }
+    }
+
+    #[test]
+    fn the_r10_aim_offset_saves_and_shows_the_drivers_refusal() {
+        let screen = Screen::new();
+        let mut app = app_with_monitor("r10", CardMode::Settings);
+        let aim = |app: &FlighthookApp| {
+            app.settings.build_actor_request("r10.0").r10["0"]
+                .driver
+                .aim_offset_deg
+        };
+        assert_eq!(aim(&app), None, "blank: unset");
+        for (typed, saved) in [("0", 0.0), (" -1.25 ", -1.25), ("10", 10.0)] {
+            device(&mut app, "r10.0").aim_offset = typed.into();
+            device(&mut app, "r10.0").dirty = true;
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(enabled(&marks, "save:r10.0"), "{typed}");
+            assert_eq!(aim(&app), Some(saved), "{typed}");
+        }
+        for bad in ["10.1", "-11", "NaN", "inf", "left"] {
+            device(&mut app, "r10.0").aim_offset = bad.into();
+            let marks = screen.frame(&mut app, Vec::new());
+            assert!(!enabled(&marks, "save:r10.0"), "{bad}");
+            assert!(
+                marks.contains_key("driver_error:r10.0"),
+                "{bad}: the refusal shows"
+            );
+        }
+        device(&mut app, "r10.0").aim_offset = String::new();
+        let marks = screen.frame(&mut app, Vec::new());
+        assert!(enabled(&marks, "save:r10.0"), "blank");
+        assert_eq!(aim(&app), None);
+    }
+
     /// An app with one saved test-pattern `camera.0`, its card showing `mode`.
     fn app_with_camera(mode: CardMode) -> FlighthookApp {
         let mut config = FlighthookConfig::default();

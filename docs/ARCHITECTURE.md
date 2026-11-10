@@ -121,10 +121,13 @@ address = "127.0.0.1:921"
   `POST /api/settings` rejects one with `400`) -- the card's estimate for a
   launch-only chip (the **FlightScope card** paragraph under
   [Reconnect](#reconnect)). Applied live (a host field)
-- R10 sections show name and Monitor-to-Ball (`range`, sent to the device as
-  its tee distance; BLE auto-discovery, no address field). `range` is the R10
-  driver's setting (tenover's `Config`, flattened into the section); a range
-  that isn't greater than 0 is refused (the card shows why and Save stays
+- R10 sections show name, Monitor-to-Ball (`range`, sent to the device as
+  its tee distance; BLE auto-discovery, no address field) and Aim offset
+  (`aim_offset_deg`, beta: degrees added to the launch direction and to a
+  tracked club's face angle and path; blank is 0; applied from the next shot
+  without a restart). Both are the R10 driver's settings (tenover's `Config`,
+  flattened into the section); a range that isn't greater than 0, or an aim
+  offset outside -10 to 10, is refused (the card shows why and Save stays
   off; a save is `400`; from the file, the card does not start)
 - ExPutt sections show name and an optional IP Address (blank finds the
   device on the network); the putting hand follows the game's handedness.
@@ -251,7 +254,7 @@ pub struct MevoSection { pub name: String, pub enabled: bool, pub launch_only_sp
 pub enum CameraMode { Standard, Fusion, RawFusion }               // ironsight's, re-exported
 pub enum FlightScopeEnvironment { LimitedFlight, Outdoor }        // ironsight's, re-exported
 pub enum SpinSource { D4, E8, Auto }                              // ironsight's, re-exported
-pub struct R10Section { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: R10Config }  // tenover's Config: range: Option<Distance>
+pub struct R10Section { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: R10Config }  // tenover's Config: range: Option<Distance>, aim_offset_deg: Option<f64>
 pub struct SquareSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: SquareConfig }  // allsquare's Config: address: Option<String>, club: String ("7I"), advanced_spin: bool (true), discard_non_putting_zero_spin: bool (true), dot_bottom_to_face_center_mm: BTreeMap<String, f64>
 pub struct ExPuttSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: ExPuttConfig }  // threeputt's Config: address: Option<String>
 pub struct TrackballSection { pub name: String, pub enabled: bool, pub driver: TrackballConfig }  // serde via a flat table (thumbswing's Settings flattened): device: Option<String>, club, hand, cpi, report_limit, thresholds, tuning, each left out at its default; driver.config.grab is always false, a `grab` key is read and ignored, none is written; DeviceSection::driver_settings() hands the driver grab = false
@@ -3156,8 +3159,9 @@ displayed).
   outside 0 to 100, a negative distance, an address that is not `ip:port`)
   and a number field that is not a number show under the fields. Spin source
   and Launch-only spin apply live; any other change restarts the card
-- R10 cards show name and Monitor-to-Ball, the tee distance sent to the device
-  (BLE auto-discovery; no address or radar fields)
+- R10 cards show name, Monitor-to-Ball (the tee distance sent to the device)
+  and Aim offset (degrees, `°`, blank is 0; BLE auto-discovery; no address or
+  radar fields)
 - Open Connect Server cards show name and Bind Address, the `ip:port` the
   server listens on; blank means `0.0.0.0:921`, anything else must parse as
   `ip:port`. A bind change restarts the actor

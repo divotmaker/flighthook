@@ -1814,14 +1814,18 @@ Full persisted config (mirrors `config.toml`).
   turns simulation off until it is fixed. Changes apply from the next shot
   without restarting any actor
 - All launch monitor config fields are optional (omitted = use defaults)
-- R10 sections have `name` and an optional `range`: the distance from the
+- R10 sections have `name`, an optional `aim_offset_deg` (beta; degrees, -10
+  to 10, added to the launch direction of every shot and to the face angle
+  and path of a tracked club; + = right; omitted = 0; `400`
+  `"r10.0: aim_offset_deg: must be -10 to 10 degrees"` outside the range;
+  applied from the next shot, no restart) and an optional `range`: the distance from the
   device to the ball (unit-tagged, e.g. `"7ft"`), sent to the R10 as its tee
   distance once it wakes up; when absent the device keeps the distance it
   has. No address (BLE auto-discovery). `range` is the R10 driver's setting:
   it must be greater than 0 (a save with `"0ft"` or a negative distance is
   `400` `"r10.0: range: must be a distance greater than 0"`; a file holding
   one loads, and that card does not start and shows the error). A changed
-  range restarts the card
+  range restarts the card, a changed aim offset does not
 - Square sections have `name` and the Square Golf driver's settings, each
   left out of responses and saved files while at its default: `address`
   (the device's advertised name, e.g. `"SquareGolf(CD01)"`, its BLE address

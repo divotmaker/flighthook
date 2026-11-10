@@ -165,6 +165,9 @@ pub(crate) struct DeviceFormEntry {
     /// Launch monitors: seconds from impact to the monitor's report, for the
     /// cameras' clips, as typed. Blank means the device's default.
     pub(crate) impact_lead: String,
+    /// R10: the aim offset in degrees (`aim_offset_deg`), as typed. Blank
+    /// means unset.
+    pub(crate) aim_offset: String,
     /// Square Golf: discard zero-spin reads, except when putting.
     pub(crate) discard_zero_spin: bool,
     /// Square Golf: the driver's settings as loaded. The form edits
@@ -418,6 +421,7 @@ impl DeviceFormEntry {
             spin_source: d.spin_source,
             launch_only_spin: format_distance_value(s.launch_only_spin),
             impact_lead: impact_lead_text(s.impact_lead_s),
+            aim_offset: String::new(),
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
@@ -459,6 +463,12 @@ impl DeviceFormEntry {
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: impact_lead_text(s.impact_lead_s),
+            // Blank means "unset": no correction.
+            aim_offset: s
+                .driver
+                .aim_offset_deg
+                .map(format_distance_value)
+                .unwrap_or_default(),
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
@@ -499,6 +509,7 @@ impl DeviceFormEntry {
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: impact_lead_text(s.impact_lead_s),
+            aim_offset: String::new(),
             cam: Box::default(),
             dirty: false,
         }
@@ -525,6 +536,7 @@ impl DeviceFormEntry {
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: impact_lead_text(s.impact_lead_s),
+            aim_offset: String::new(),
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
@@ -558,6 +570,7 @@ impl DeviceFormEntry {
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: impact_lead_text(s.impact_lead_s),
+            aim_offset: String::new(),
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
@@ -575,6 +588,7 @@ impl DeviceFormEntry {
             name: s.name.clone(),
             enabled: s.enabled,
             impact_lead: impact_lead_text(s.impact_lead_s),
+            aim_offset: String::new(),
             mock: s.driver.clone(),
             saved_driver: serde_json::to_value(&s.driver).ok(),
             ..Self::blank(id, "mock_monitor")
@@ -604,6 +618,7 @@ impl DeviceFormEntry {
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: String::new(),
+            aim_offset: String::new(),
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
@@ -682,8 +697,8 @@ impl DeviceFormEntry {
     }
 
     /// Why a number field of the card's driver settings holds no number, as
-    /// `"<field>: <why>"`: the R10's range, the FlightScope's tee height,
-    /// range, surface height and track %, every Trackball number.
+    /// `"<field>: <why>"`: the R10's range and aim offset, the FlightScope's tee
+    /// height, range, surface height and track %, every Trackball number.
     fn unparsable(&self) -> Option<String> {
         if self.is_trackball() {
             return self
@@ -696,11 +711,15 @@ impl DeviceFormEntry {
     }
 
     /// The first number field of the card's driver settings that holds
-    /// text that is not a number (blank is unset): the R10's range, the
-    /// FlightScope's tee height, range, surface height and track %.
+    /// text that is not a number (blank is unset): the R10's range and aim
+    /// offset, the FlightScope's tee height, range, surface height and
+    /// track %.
     fn unparsable_field(&self) -> Option<&'static str> {
         let fields: &[(&'static str, &str)] = match self.monitor_type.as_str() {
-            "r10" => &[("range", &self.range_val)],
+            "r10" => &[
+                ("range", &self.range_val),
+                ("aim_offset_deg", &self.aim_offset),
+            ],
             "mevo" => &[
                 ("tee_height", &self.tee_height_val),
                 ("range", &self.range_val),
@@ -777,9 +796,9 @@ impl DeviceFormEntry {
         }
     }
 
-    /// The R10 driver's settings from the form: the range as typed, blank
-    /// (or not a number, which [`driver_error`](Self::driver_error)
-    /// refuses) for none.
+    /// The R10 driver's settings from the form: the range and the aim offset
+    /// as typed, blank (or not a number, which
+    /// [`driver_error`](Self::driver_error) refuses) for none.
     pub(crate) fn r10_config(&self) -> flighthook::R10Config {
         flighthook::R10Config {
             range: self
@@ -788,6 +807,7 @@ impl DeviceFormEntry {
                 .parse::<f64>()
                 .ok()
                 .map(|v| Distance::from_value_and_unit(v, &self.range_unit)),
+            aim_offset_deg: self.aim_offset.trim().parse::<f64>().ok(),
         }
     }
 
@@ -1097,6 +1117,7 @@ fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFormEntry> {
             spin_source: SpinSource::default(),
             launch_only_spin: format_distance_value(MevoSection::DEFAULT_LAUNCH_ONLY_SPIN),
             impact_lead: String::new(),
+            aim_offset: String::new(),
             discard_zero_spin: true,
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
@@ -3135,6 +3156,20 @@ pub(crate) fn actor_fields(
                                 }
                             }
                         });
+                });
+                // Correction for a unit that is not aimed at the target.
+                ui.horizontal(|ui| {
+                    field_label(ui, "Aim offset:").on_hover_text("Added to the launch direction (and to the face angle and path of a tracked club), in degrees; + is right.\n\nTo set it, hit a short straight chip and enter the negative of the launch direction it shows.\n\nBlank is 0.");
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut dev.aim_offset)
+                            .desired_width(field_width - TEXT_EDIT_MARGIN)
+                            .hint_text("0"),
+                    );
+                    devices::mark(ui, || format!("aim_offset:{}", dev.id), &field);
+                    if field.changed() {
+                        dev.dirty = true;
+                    }
+                    ui.label("°");
                 });
             }
 
@@ -5381,6 +5416,7 @@ mod tests {
             R10Section {
                 driver: flighthook::R10Config {
                     range: Some(Distance::Feet(7.0)),
+                    ..flighthook::R10Config::default()
                 },
                 ..R10Section::default()
             },
@@ -5456,6 +5492,109 @@ mod tests {
         };
         dev.range_val = "seven".into();
         assert!(!super::actor_valid(&form.actors[0]));
+    }
+
+    /// The R10 card's Aim offset is the R10 driver's `aim_offset_deg`:
+    /// blank is unset, a value outside -10 to 10 is refused by the driver
+    /// and keeps a changed card from saving, text that is not a number never
+    /// saves, and a saved value survives a round trip through the form.
+    #[test]
+    fn the_r10_aim_offset_is_validated_by_its_driver() {
+        let mut cfg = FlighthookConfig::default();
+        cfg.r10.insert(
+            "0".into(),
+            R10Section {
+                driver: flighthook::R10Config {
+                    range: Some(Distance::Feet(7.0)),
+                    aim_offset_deg: Some(-1.5),
+                },
+                ..R10Section::default()
+            },
+        );
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert_eq!(dev.aim_offset, "-1.5");
+        assert_eq!(dev.driver_error(), None);
+        // Saved as loaded, range and all.
+        let saved = form.build_actor_request("r10.0").r10["0"].driver.clone();
+        assert_eq!(saved.aim_offset_deg, Some(-1.5));
+        assert_eq!(saved.range, Some(Distance::Feet(7.0)));
+
+        for (typed, want) in [("2.25", 2.25), (" 10 ", 10.0), ("-10", -10.0), ("0", 0.0)] {
+            let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+                panic!("not a device");
+            };
+            dev.aim_offset = typed.into();
+            assert_eq!(dev.driver_error(), None, "{typed}");
+            assert!(super::actor_valid(&form.actors[0]), "{typed}");
+            assert_eq!(
+                form.build_actor_request("r10.0").r10["0"]
+                    .driver
+                    .aim_offset_deg,
+                Some(want),
+                "{typed}"
+            );
+        }
+        for bad in ["10.5", "-11", "45", "inf", "NaN"] {
+            let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+                panic!("not a device");
+            };
+            dev.aim_offset = bad.into();
+            assert_eq!(
+                dev.driver_error().as_deref(),
+                Some("aim_offset_deg: must be -10 to 10 degrees"),
+                "{bad}"
+            );
+            assert!(!super::actor_valid(&form.actors[0]), "{bad}");
+        }
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        dev.aim_offset = "left".into();
+        assert_eq!(
+            dev.driver_error().as_deref(),
+            Some("aim_offset_deg: not a number")
+        );
+        assert!(!super::actor_valid(&form.actors[0]), "never saved as none");
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        dev.aim_offset = String::new();
+        assert_eq!(dev.driver_error(), None);
+        assert!(super::actor_valid(&form.actors[0]));
+        assert_eq!(
+            form.build_actor_request("r10.0").r10["0"]
+                .driver
+                .aim_offset_deg,
+            None
+        );
+
+        // A refused saved value shows, and the card still saves its name.
+        cfg.r10.get_mut("0").unwrap().driver.aim_offset_deg = Some(30.0);
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert_eq!(
+            dev.driver_error().as_deref(),
+            Some("aim_offset_deg: must be -10 to 10 degrees")
+        );
+        dev.name = "Bay 1".into();
+        assert!(super::actor_valid(&form.actors[0]), "a rename saves");
+
+        // A card with none saved shows a blank field.
+        cfg.r10.get_mut("0").unwrap().driver.aim_offset_deg = None;
+        let mut form = SettingsForm::default();
+        form.load_from(&cfg);
+        let ActorFormEntry::Device(dev) = &mut form.actors[0] else {
+            panic!("not a device");
+        };
+        assert_eq!(dev.aim_offset, "");
+        assert_eq!(dev.driver_error(), None);
     }
 
     #[test]
