@@ -223,6 +223,11 @@ applies the config between shots, and re-arms. Expect Fusion
 club data from roughly the second shot of a session rather than the first, and a
 `camera warmup complete` line in the log when it lands.
 
+If the Mevo+ doesn't finish a Fusion camera setup (the Pro Package is off, or the
+other Fusion mode fits its firmware), flighthook shows an alert, keeps the camera
+in standard mode and arms the device anyway, so ball flight keeps working without
+Fusion club data.
+
 Face impact is not reported in any mode.
 
 ## Configuration
