@@ -48,9 +48,9 @@ dependencies = [
 
 [[package]]
 name = "allsquare"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd19823689b2d08aad06878ea9f3a744b4fe8652a37236c0061ca8f6145cbab4"
+checksum = "82dd36e49e6882c777c820f141247f39592e856822c0d1c9e74d2117ae0bcbe3"
 dependencies = [
  "btleplug",
  "flightrelay",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook"
-version = "0.1.26"
+version = "0.2.1"
 dependencies = [
  "allsquare",
  "clap",
@@ -1535,12 +1535,11 @@ dependencies = [
  "tenover",
  "threeputt",
  "thumbswing",
- "tungstenite 0.26.2",
 ]
 
 [[package]]
 name = "flighthook-app"
-version = "0.1.26"
+version = "0.2.1"
 dependencies = [
  "allsquare",
  "anyhow",
@@ -1572,6 +1571,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tungstenite 0.29.0",
  "uuid",
  "windows-sys 0.61.2",
  "winresource",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-ui"
-version = "0.1.26"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
@@ -1592,6 +1592,7 @@ dependencies = [
  "ewebsock",
  "flighthook",
  "log",
+ "png",
  "serde",
  "serde_json",
  "stance",
@@ -1603,9 +1604,9 @@ dependencies = [
 
 [[package]]
 name = "flightrelay"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bb4f82cfb6e82e0de958c04571d8921e0a380d07f92fbac42c0519b1842cc05"
+checksum = "cbeeb75798cb2179e65162de8be0249bf615165a2162341a8588845f62369ed2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2222,9 +2223,9 @@ dependencies = [
 
 [[package]]
 name = "ironsight"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e197192cb17ad2d5043c60dcbd28b957a7b0e9076b2d949488570d2c047d0977"
+checksum = "02c15cfd25ae2bc697ced8fb6ed92e6de1cde6047323c2ebe9cd1c86d13644be"
 dependencies = [
  "flightrelay",
  "serde",
@@ -4147,9 +4148,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stance"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68eba851f873b9178ed942d1951b0a5f692239846bfaabc46f91d1e869751d43"
+checksum = "a5b41dfce4c211705e0d95fe726207ee800610b253fadf30b0b78d432fc21157"
 dependencies = [
  "jpeg-encoder",
  "libc",
@@ -4265,9 +4266,9 @@ dependencies = [
 
 [[package]]
 name = "tenover"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "799c26e173dcd1fd9d9f6d14fe2857c2b16631b8aec3b4c735ffc720732dd3e8"
+checksum = "9c6ce6a0ca9e641189a4b426daa1cfead99733394eb505cfb3517db231864340"
 dependencies = [
  "btleplug",
  "flightrelay",
@@ -4333,9 +4334,9 @@ dependencies = [
 
 [[package]]
 name = "threeputt"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98b07e56b5ceeeb97f3aac212c45f77a89e28a4de730c95868596c51d380e5db"
+checksum = "ae5ef11fa37654b5c460c0531df8e435f4cffbe95ffbe060adcde0276eb37c16"
 dependencies = [
  "base64 0.22.1",
  "flightrelay",
@@ -4347,9 +4348,9 @@ dependencies = [
 
 [[package]]
 name = "thumbswing"
-version = "0.0.2"
+version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "536e00e0e9246fcf3eeba5758ef587848d5c5f8d0d2e88226fa8b99d1dbf556a"
+checksum = "d3ad7990e5727d0719eef9a402214320654d0cc3f9d59c8d88f2afbea6399a32"
 dependencies = [
  "flightrelay",
  "libc",
@@ -4842,23 +4843,6 @@ dependencies = [
  "rand 0.8.7",
  "sha1",
  "thiserror 1.0.69",
- "utf-8",
-]
-
-[[package]]
-name = "tungstenite"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.5",
- "sha1",
- "thiserror 2.0.20",
  "utf-8",
 ]
 

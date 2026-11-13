@@ -14,8 +14,9 @@ pub(crate) enum CardGroup {
     LaunchMonitors,
     /// Swing cameras, which record a clip of every shot.
     Cameras,
-    /// Everything that consumes shots.
-    Outputs,
+    /// Every card that talks to another program: the outputs to
+    /// simulators and the Pureplay Accessory card.
+    Software,
 }
 
 impl CardGroup {
@@ -23,7 +24,7 @@ impl CardGroup {
         CardGroup::General,
         CardGroup::LaunchMonitors,
         CardGroup::Cameras,
-        CardGroup::Outputs,
+        CardGroup::Software,
     ];
 
     pub(crate) fn title(self) -> &'static str {
@@ -31,7 +32,7 @@ impl CardGroup {
             CardGroup::General => "General",
             CardGroup::LaunchMonitors => "Launch monitors",
             CardGroup::Cameras => "Cameras",
-            CardGroup::Outputs => "Outputs",
+            CardGroup::Software => "Software",
         }
     }
 
@@ -41,7 +42,7 @@ impl CardGroup {
             CardGroup::General => "",
             CardGroup::LaunchMonitors => "Add a launch monitor",
             CardGroup::Cameras => "Add a camera",
-            CardGroup::Outputs => "Add an output",
+            CardGroup::Software => "Add software",
         }
     }
 }
@@ -58,26 +59,27 @@ const ACTOR_TYPES: &[(&str, CardGroup)] = &[
     ("mock_monitor", CardGroup::LaunchMonitors),
     ("openconnect_server", CardGroup::LaunchMonitors),
     ("camera", CardGroup::Cameras),
-    ("openconnect_client", CardGroup::Outputs),
-    ("pureplay", CardGroup::Outputs),
-    ("random_club", CardGroup::Outputs),
+    ("openconnect_client", CardGroup::Software),
+    ("pureplay", CardGroup::Software),
+    ("pureplay_accessory", CardGroup::Software),
+    ("random_club", CardGroup::Software),
 ];
 
 /// The group an actor type belongs to. A type this list does not know goes
-/// under Outputs.
+/// under Software.
 pub(crate) fn group_of(type_key: &str) -> CardGroup {
     ACTOR_TYPES
         .iter()
         .find(|(t, _)| *t == type_key)
-        .map_or(CardGroup::Outputs, |(_, g)| *g)
+        .map_or(CardGroup::Software, |(_, g)| *g)
 }
 
 /// Whether a card of this type offers Reconnect: every launch monitor and
-/// output, not a camera or a General card.
+/// Software card, not a camera or a General card.
 pub(crate) fn reconnectable(type_key: &str) -> bool {
     matches!(
         group_of(type_key),
-        CardGroup::LaunchMonitors | CardGroup::Outputs
+        CardGroup::LaunchMonitors | CardGroup::Software
     )
 }
 
@@ -145,6 +147,9 @@ pub(crate) struct AddPreset {
     pub(crate) welcome_label: Option<&'static str>,
     /// The welcome screen's hover text.
     pub(crate) welcome_hover: Option<&'static str>,
+    /// On the welcome screen among the launch monitors (a way to get
+    /// shots), whatever the group of its (+) menu.
+    pub(crate) welcome_with_launch_monitors: bool,
 }
 
 const fn preset(
@@ -161,6 +166,7 @@ const fn preset(
         welcome: true,
         welcome_label: None,
         welcome_hover: None,
+        welcome_with_launch_monitors: false,
     }
 }
 
@@ -181,10 +187,10 @@ impl AddPreset {
         }
     }
 
-    /// This preset left off the welcome screen.
-    const fn not_on_welcome(self) -> Self {
+    /// This preset on the welcome screen among the launch monitors.
+    const fn welcome_with_launch_monitors(self) -> Self {
         Self {
-            welcome: false,
+            welcome_with_launch_monitors: true,
             ..self
         }
     }
@@ -213,29 +219,22 @@ const LAUNCH_MONITOR_PRESETS: &[AddPreset] = &[
     preset("ExPutt", "exputt", "ExPutt", ""),
     preset("Trackball", "trackball", "Trackball", ""),
     preset(
-        "Uneekor (Open Connect)",
+        "Open Connect Server",
         "openconnect_server",
-        "Uneekor",
+        "Open Connect Server",
         "0.0.0.0:921",
     )
     .welcome_hover(
-        "Uneekor's own software pushes shots to flighthook over GSPro \
-         Open Connect. Needs a Uneekor third-party license, and \
-         flighthook binds port 921 — to run GSPro on the same host, \
-         move it to 922 with OpenAPIUseAltPort.",
+        "For other launch monitor software that sends its shots over GSPro \
+         Open Connect: point it at flighthook. flighthook binds port 921, so \
+         to run GSPro on the same host, move it to 922 with \
+         OpenAPIUseAltPort.",
     ),
-    preset(
-        "Open Connect Server",
-        "openconnect_server",
-        "Open Connect Server",
-        "0.0.0.0:921",
-    )
-    .not_on_welcome(),
 ];
 
 const CAMERA_PRESETS: &[AddPreset] = &[preset("Camera", "camera", "Camera", "")];
 
-const OUTPUT_PRESETS: &[AddPreset] = &[
+const SOFTWARE_PRESETS: &[AddPreset] = &[
     preset(
         "GSPro (Open Connect)",
         "openconnect_client",
@@ -258,6 +257,13 @@ const OUTPUT_PRESETS: &[AddPreset] = &[
         "Muni Golf",
         "127.0.0.1:9210",
     ),
+    preset(
+        "Pureplay Accessory",
+        "pureplay_accessory",
+        "Pureplay Accessory",
+        "127.0.0.1:9770",
+    )
+    .welcome_with_launch_monitors(),
 ];
 
 /// What a group's (+) menu can offer, in menu order.
@@ -266,7 +272,7 @@ pub(crate) fn add_options(group: CardGroup) -> &'static [AddPreset] {
         CardGroup::General => &[],
         CardGroup::LaunchMonitors => LAUNCH_MONITOR_PRESETS,
         CardGroup::Cameras => CAMERA_PRESETS,
-        CardGroup::Outputs => OUTPUT_PRESETS,
+        CardGroup::Software => SOFTWARE_PRESETS,
     }
 }
 
@@ -280,28 +286,42 @@ pub(crate) fn offered(group: CardGroup, trackball: bool) -> Vec<&'static AddPres
 }
 
 /// What the first-run welcome screen offers in `group`: the (+) menu's
-/// presets ([`offered`]) marked for it, none for General and Cameras.
+/// presets ([`offered`]) marked for it, none for General and Cameras. The
+/// launch monitors also take the Software presets that are a way to get
+/// shots (the Pureplay Accessory card), which Software then leaves out.
 pub(crate) fn welcome_options(group: CardGroup, trackball: bool) -> Vec<&'static AddPreset> {
-    match group {
-        CardGroup::LaunchMonitors | CardGroup::Outputs => offered(group, trackball)
+    let marked = |g| {
+        offered(g, trackball)
             .into_iter()
-            .filter(|p| p.welcome)
+            .filter(|p: &&AddPreset| p.welcome)
+    };
+    match group {
+        CardGroup::LaunchMonitors => marked(CardGroup::LaunchMonitors)
+            .chain(marked(CardGroup::Software).filter(|p| p.welcome_with_launch_monitors))
+            .collect(),
+        CardGroup::Software => marked(CardGroup::Software)
+            .filter(|p| !p.welcome_with_launch_monitors)
             .collect(),
         CardGroup::General | CardGroup::Cameras => Vec::new(),
     }
 }
 
-/// Narrowest a card gets before the grid drops a column.
-pub(crate) const CARD_MIN_WIDTH: f32 = 420.0;
+/// Narrowest a card gets before the grid drops a column: wide enough for
+/// "Open Connect Server" and its status chip in full.
+#[cfg(test)]
+pub(crate) const CARD_MIN_WIDTH: f32 = 500.0;
 /// Widest a card gets; a window too narrow for another column leaves the
 /// rest of the row empty.
+#[cfg(test)]
 pub(crate) const CARD_MAX_WIDTH: f32 = 620.0;
 /// Space between cards, both ways.
+#[cfg(test)]
 pub(crate) const CARD_GAP: f32 = 10.0;
 
 /// Columns and card width for a grid `available` wide: as many columns as
 /// fit at [`CARD_MIN_WIDTH`], each card at most [`CARD_MAX_WIDTH`]. One
 /// column on a window narrower than a card, the card as wide as the window.
+#[cfg(test)]
 pub(crate) fn grid_layout(available: f32) -> (usize, f32) {
     let available = available.max(1.0);
     let cols = ((available + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP))
@@ -313,10 +333,24 @@ pub(crate) fn grid_layout(available: f32) -> (usize, f32) {
 
 /// A group heading: small caps, muted.
 pub(crate) fn group_heading(ui: &mut egui::Ui, group: CardGroup) {
+    heading(ui, group.title());
+}
+
+/// A heading over cards: `title` in small caps, muted, in a row as tall as
+/// [`add_heading`]'s, so the cards under every heading start at the same
+/// height.
+pub(crate) fn heading(ui: &mut egui::Ui, title: &str) {
     ui.add_space(4.0);
-    ui.label(theme::caps(group.title(), 13.0, theme::TEXT_MUTED));
+    ui.horizontal(|ui| {
+        ui.label(theme::caps(title, 13.0, theme::TEXT_MUTED));
+        // The room of the (+) icon, left empty.
+        ui.allocate_exact_size(egui::vec2(ADD_ICON, ADD_ICON), egui::Sense::hover());
+    });
     ui.add_space(2.0);
 }
+
+/// Size of a heading's (+) icon.
+const ADD_ICON: f32 = 20.0;
 
 /// A group heading with a (+) after it, muted at rest and accent on hover,
 /// that opens a menu of the group's presets ([`offered`], with the
@@ -334,13 +368,16 @@ pub(crate) fn add_heading(
             ui.label(theme::caps(group.title(), 13.0, theme::TEXT_MUTED));
             let add = ui
                 .add_enabled_ui(enabled, |ui| {
-                    theme::icon(ui, theme::Icon::Add, 20.0, theme::ACCENT, enabled)
+                    theme::icon(ui, theme::Icon::Add, ADD_ICON, theme::ACCENT, enabled)
                 })
                 .inner
                 .on_hover_text(group.add_hover());
             devices::mark(ui, || format!("add:{}", group.title()), &add);
             let mut picked = None;
             egui::Popup::menu(&add).show(|ui| {
+                if crate::panels::settings::narrow(ui) {
+                    crate::topbar::touch_menu(ui);
+                }
                 for preset in offered(group, trackball) {
                     let item = ui.add(egui::Button::new(preset.label));
                     devices::mark(
@@ -360,6 +397,27 @@ pub(crate) fn add_heading(
     picked
 }
 
+/// The Golfers heading with a (+) after it that adds a golfer, disabled
+/// unless `enabled`. Returns whether it was clicked.
+pub(crate) fn add_golfer_heading(ui: &mut egui::Ui, enabled: bool) -> bool {
+    ui.add_space(4.0);
+    let clicked = ui
+        .horizontal(|ui| {
+            ui.label(theme::caps("Golfers", 13.0, theme::TEXT_MUTED));
+            let add = ui
+                .add_enabled_ui(enabled, |ui| {
+                    theme::icon(ui, theme::Icon::Add, ADD_ICON, theme::ACCENT, enabled)
+                })
+                .inner
+                .on_hover_text("Add a golfer");
+            devices::mark(ui, || "add:Golfers".to_owned(), &add);
+            add.clicked()
+        })
+        .inner;
+    ui.add_space(2.0);
+    clicked
+}
+
 /// Lay `n` cards out in a wrapping grid ([`grid_layout`]): card `i` goes in
 /// column `i % cols`, each column stacking its cards top-down. `card` draws
 /// card `i` and fills the width it is given. Each column, and each card in
@@ -367,6 +425,7 @@ pub(crate) fn add_heading(
 /// grid or the cards under it. The grid leaves
 /// the width of a scroll bar free on its right, so the bar of the scroll
 /// area around it never covers a card.
+#[cfg(test)]
 pub(crate) fn card_grid(ui: &mut egui::Ui, n: usize, mut card: impl FnMut(&mut egui::Ui, usize)) {
     if n == 0 {
         return;
@@ -374,6 +433,8 @@ pub(crate) fn card_grid(ui: &mut egui::Ui, n: usize, mut card: impl FnMut(&mut e
     let scroll = ui.spacing().scroll;
     let bar = scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin;
     let (cols, width) = grid_layout(ui.available_width() - bar);
+    // Whole points, so no card's pixel rounding reaches past its column.
+    let width = width.floor();
     let used = cols.min(n);
     let top_left = ui.cursor().min;
     let mut height: f32 = 0.0;
@@ -437,10 +498,15 @@ mod tests {
         }
         assert_eq!(group_of("webserver"), CardGroup::General);
         assert_eq!(group_of("camera"), CardGroup::Cameras);
-        for t in ["openconnect_client", "pureplay", "random_club"] {
-            assert_eq!(group_of(t), CardGroup::Outputs, "{t}");
+        for t in [
+            "openconnect_client",
+            "pureplay",
+            "pureplay_accessory",
+            "random_club",
+        ] {
+            assert_eq!(group_of(t), CardGroup::Software, "{t}");
         }
-        assert_eq!(group_of("something_new"), CardGroup::Outputs);
+        assert_eq!(group_of("something_new"), CardGroup::Software);
     }
 
     #[test]
@@ -449,8 +515,8 @@ mod tests {
         // to compile here until it is listed below and given a group.
         let flighthook::FlighthookConfig {
             default_units: _,
-            chipping_clubs: _,
-            putting_clubs: _,
+            frp: _,
+            selected_golfer: _,
             shot_grouping: _,
             simulation: _,
             webserver: _,
@@ -463,10 +529,11 @@ mod tests {
             openconnect_server: _,
             openconnect_client: _,
             pureplay: _,
+            pureplay_accessory: _,
             random_club: _,
             replay: _,
             body_tracking: _,
-            player: _,
+            golfers: _,
             camera: _,
         } = flighthook::FlighthookConfig::default();
         for key in [
@@ -480,6 +547,7 @@ mod tests {
             "openconnect_server",
             "openconnect_client",
             "pureplay",
+            "pureplay_accessory",
             "random_club",
             "camera",
         ] {
@@ -499,6 +567,7 @@ mod tests {
             "openconnect_client.2",
             "mevo.1",
             "random_club.0",
+            "pureplay_accessory.0",
             "r10.0",
             "mevo.0",
             "mock_monitor.0",
@@ -530,10 +599,11 @@ mod tests {
                 ),
                 (CardGroup::Cameras, vec!["camera.0", "camera.1"]),
                 (
-                    CardGroup::Outputs,
+                    CardGroup::Software,
                     vec![
                         "openconnect_client.2",
                         "openconnect_client.10",
+                        "pureplay_accessory.0",
                         "random_club.0",
                         "custom.0",
                     ]
@@ -558,12 +628,13 @@ mod tests {
                 "Square Golf Omni",
                 "ExPutt",
                 "Trackball",
-                "Uneekor (Open Connect)",
+                "Open Connect Server",
+                "Pureplay Accessory",
             ]
         );
         assert!(!labels(CardGroup::LaunchMonitors, false).contains(&"Trackball"));
         assert_eq!(
-            labels(CardGroup::Outputs, false),
+            labels(CardGroup::Software, false),
             [
                 "GSPro (Open Connect)",
                 "Pureplay (Open Connect)",
@@ -573,8 +644,22 @@ mod tests {
         assert!(welcome_options(CardGroup::Cameras, true).is_empty());
         assert!(welcome_options(CardGroup::General, true).is_empty());
 
+        // The Pureplay Accessory card is offered once, among the ways to
+        // get shots, though its (+) menu is Software's.
+        assert_eq!(group_of("pureplay_accessory"), CardGroup::Software);
+        assert!(
+            !labels(CardGroup::Software, true).contains(&"Pureplay Accessory"),
+            "not among the simulators"
+        );
+        let hover = welcome_options(CardGroup::LaunchMonitors, true)
+            .into_iter()
+            .find(|p| p.label == "Open Connect Server")
+            .and_then(|p| p.welcome_hover)
+            .expect("the Open Connect Server's hover");
+        assert!(hover.contains("922"), "{hover}");
+
         // Only GSPro and Pureplay over Open Connect share a connection.
-        let all: Vec<_> = [CardGroup::LaunchMonitors, CardGroup::Outputs]
+        let all: Vec<_> = [CardGroup::LaunchMonitors, CardGroup::Software]
             .into_iter()
             .flat_map(|g| welcome_options(g, true))
             .collect();
@@ -613,12 +698,6 @@ mod tests {
                 ("ExPutt", "exputt", "ExPutt", ""),
                 ("Trackball", "trackball", "Trackball", ""),
                 (
-                    "Uneekor (Open Connect)",
-                    "openconnect_server",
-                    "Uneekor",
-                    "0.0.0.0:921"
-                ),
-                (
                     "Open Connect Server",
                     "openconnect_server",
                     "Open Connect Server",
@@ -631,7 +710,7 @@ mod tests {
             [("Camera", "camera", "Camera", "")]
         );
         assert_eq!(
-            entries(CardGroup::Outputs),
+            entries(CardGroup::Software),
             [
                 (
                     "GSPro (Open Connect)",
@@ -650,6 +729,12 @@ mod tests {
                     "openconnect_client",
                     "Muni Golf",
                     "127.0.0.1:9210"
+                ),
+                (
+                    "Pureplay Accessory",
+                    "pureplay_accessory",
+                    "Pureplay Accessory",
+                    "127.0.0.1:9770"
                 ),
             ]
         );
@@ -715,7 +800,7 @@ mod tests {
         assert_eq!(grid_layout(360.0), (1, 360.0));
         // Too narrow for two: one column, capped at the max width.
         assert_eq!(grid_layout(800.0), (1, CARD_MAX_WIDTH));
-        let (cols, width) = grid_layout(996.0);
+        let (cols, width) = grid_layout(1100.0);
         assert_eq!(cols, 2);
         assert!((CARD_MIN_WIDTH..=CARD_MAX_WIDTH).contains(&width));
         let (cols, width) = grid_layout(1572.0);

@@ -21,7 +21,7 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2, pos2, vec2};
 
 use super::shots::pick;
 use crate::app::FlighthookApp;
-use crate::chart::{self, Candidate, ChartKey, Curve, Projection};
+use crate::chart::{self, Candidate, ChartKey, Curve, Projection, ShotFilter};
 use crate::groups::ShotGroups;
 use crate::theme;
 use crate::types::{Distance, FlightPath, ShotGrouping, ShotRow, UnitSystem};
@@ -180,7 +180,7 @@ pub(super) fn drawn_sets(
     view: ShotGrouping,
     members: &[usize],
     shown: usize,
-    device: Option<&str>,
+    filter: ShotFilter<'_>,
     drawable: impl Fn(&ShotRow) -> bool,
 ) -> Drawn {
     let member = |i: usize| members.binary_search(&i).is_ok();
@@ -208,7 +208,7 @@ pub(super) fn drawn_sets(
             .filter(|&(i, r)| {
                 i != shown
                     && !member(i)
-                    && chart::in_filter(&r.actor, device)
+                    && filter.passes(r)
                     && !chart::is_auto_chip(&r.actor)
                     && in_session(r)
                     && drawable(r)
@@ -367,8 +367,8 @@ struct SceneInput<'a> {
     shown: usize,
     /// Every device in the history, exact and sorted.
     devices: &'a [String],
-    /// The device filter.
-    device: Option<&'a str>,
+    /// The Shots tab's filter.
+    filter: ShotFilter<'a>,
     units: UnitSystem,
     /// Panel size.
     size: Vec2,
@@ -410,11 +410,11 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         members,
         shown,
         devices,
-        device,
+        filter,
         units,
         size,
     } = *input;
-    let drawn = drawn_sets(shots, groups, view, members, shown, device, drawable);
+    let drawn = drawn_sets(shots, groups, view, members, shown, filter, drawable);
     let k = per_meter(units);
 
     // Scales over the bright shots, else the faint ones.
@@ -469,7 +469,7 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
     let x_ticks = tick_labels(&proj.x, distance_axis.step, X_TICK_MIN_PX, domain.0);
     let y_ticks = tick_labels(&proj.y, height_axis.step, Y_TICK_MIN_PX, domain.1);
 
-    let color_of = |s: &ShotRow| chart::shot_color(devices, device, &s.actor);
+    let color_of = |s: &ShotRow| chart::shot_color(devices, filter.device, &s.actor);
     let ground_y = proj.y.map(0.0);
     let mut traces = Vec::new();
     let mut ticks = Vec::new();
@@ -998,7 +998,7 @@ impl FlighthookApp {
             members: &members,
             shown,
             devices: &devices,
-            device: self.device_filter.as_deref(),
+            filter: self.filter(),
             units: self.units(),
             size: vec2(key.size[0] as f32, key.size[1] as f32),
         });
@@ -1062,10 +1062,8 @@ impl FlighthookApp {
                 let devices = self.devices();
                 let id = self.shots[i].actor.as_str();
                 // An Auto-chip is always named: it is never one of the devices.
-                let device = (devices.len() >= 2 || chart::is_auto_chip(id)).then(|| {
-                    let name = self.actors.get(id).map(|a| a.name.as_str());
-                    chart::device_label(id, name)
-                });
+                let device = (devices.len() >= 2 || chart::is_auto_chip(id))
+                    .then(|| chart::device_label(id, self.actor_name(id)));
                 let text = tooltip(&self.shots[i], device, units);
                 let response = response
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1084,33 +1082,24 @@ impl FlighthookApp {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::types::{Basis, Club, DerivedFlight, FlightResult, Launch, ShotGroupInfo};
+    use crate::groups::SetInfo;
+    use crate::types::{Basis, Club, DerivedFlight, FlightResult, Launch};
 
-    fn set(id: &str, number: u32, club: Club, session: u32) -> ShotGroupInfo {
-        ShotGroupInfo {
+    fn set(id: &str, number: u32, club: Club, session: u32) -> SetInfo {
+        SetInfo {
+            golfer: None,
             id: id.into(),
             number,
             session,
-            golfer: None,
             club: Some(club),
-            started_at: "2026-10-26T15:41:28.300Z".into(),
-            manual: false,
+            started_at: 0,
             open: false,
             shots: 2,
         }
     }
 
-    fn groups(list: Vec<ShotGroupInfo>) -> ShotGroups {
-        let session = list.iter().map(|g| g.session).max().unwrap_or(0);
-        let mut g = ShotGroups::default();
-        g.replace(crate::types::ShotGroupsResponse {
-            server: "webserver.0".into(),
-            mode: ShotGrouping::BySet,
-            session,
-            current: None,
-            groups: list,
-        });
-        g
+    fn groups(list: Vec<SetInfo>) -> ShotGroups {
+        ShotGroups::with_sets(ShotGrouping::BySet, list)
     }
 
     /// A path landing `carry` meters out with an apex of `apex` meters,
@@ -1143,6 +1132,7 @@ pub(super) mod tests {
     /// A shot from `actor` in set `group` with a simulated path.
     fn shot(n: u32, actor: &str, group: &str) -> ShotRow {
         ShotRow {
+            golfer: None,
             actor: actor.into(),
             shot_id: format!("id{n}"),
             shot_number: n,
@@ -1196,7 +1186,6 @@ pub(super) mod tests {
         d.flight_time = Some(0.0);
         ShotRow {
             derived: Some(d),
-            club_selected: Some(Club::Putter),
             ..shot(n, actor, group)
         }
     }
@@ -1229,7 +1218,7 @@ pub(super) mod tests {
         device: Option<&str>,
     ) -> Vec<usize> {
         let set = shots[shown].group.as_deref().and_then(|id| g.get(id));
-        chart::members_for(shots, g, view, set, Some(shown), device)
+        chart::members_for(shots, g, view, set, Some(shown), ShotFilter::device(device))
     }
 
     fn input<'a>(
@@ -1247,7 +1236,7 @@ pub(super) mod tests {
             members,
             shown,
             devices,
-            device: None,
+            filter: ShotFilter::device(None),
             units,
             size: vec2(800.0, 240.0),
         }
@@ -1283,7 +1272,15 @@ pub(super) mod tests {
         // Shown #8 of set b: the same bright and faint shots as without them.
         let m = members(&shots, &g, ShotGrouping::BySet, 9, None);
         assert_eq!(m, vec![6, 8, 9]);
-        let d = drawn_sets(&shots, &g, ShotGrouping::BySet, &m, 9, None, drawable);
+        let d = drawn_sets(
+            &shots,
+            &g,
+            ShotGrouping::BySet,
+            &m,
+            9,
+            ShotFilter::ALL,
+            drawable,
+        );
         assert_eq!(d.gold, Some(9));
         assert_eq!(d.bright, vec![6, 8]);
         assert_eq!(d.faint, vec![2, 3, 5]);
@@ -1291,7 +1288,15 @@ pub(super) mod tests {
         // stays out.
         let m = members(&shots, &g, ShotGrouping::BySet, 7, None);
         assert_eq!(m, vec![6, 8, 9]);
-        let d = drawn_sets(&shots, &g, ShotGrouping::BySet, &m, 7, None, drawable);
+        let d = drawn_sets(
+            &shots,
+            &g,
+            ShotGrouping::BySet,
+            &m,
+            7,
+            ShotFilter::ALL,
+            drawable,
+        );
         assert_eq!(d.gold, Some(7));
         assert_eq!(d.bright, vec![6, 8, 9]);
         assert_eq!(d.faint, vec![2, 3, 5]);
@@ -1305,7 +1310,15 @@ pub(super) mod tests {
         // By set, shown #8 in set b: the set bright, set a faint, the
         // earlier session's set left out.
         let m = members(&shots, &g, ShotGrouping::BySet, 7, None);
-        let d = drawn_sets(&shots, &g, ShotGrouping::BySet, &m, 7, None, drawable);
+        let d = drawn_sets(
+            &shots,
+            &g,
+            ShotGrouping::BySet,
+            &m,
+            7,
+            ShotFilter::ALL,
+            drawable,
+        );
         assert_eq!(d.gold, Some(7));
         assert_eq!(d.bright, vec![5, 6]);
         assert_eq!(d.faint, vec![2, 3, 4]);
@@ -1317,7 +1330,7 @@ pub(super) mod tests {
             ShotGrouping::BySet,
             &m,
             7,
-            Some("mevo.0"),
+            ShotFilter::device(Some("mevo.0")),
             drawable,
         );
         assert_eq!(d.bright, vec![5]);
@@ -1329,17 +1342,33 @@ pub(super) mod tests {
             ShotGrouping::BySet,
             &m,
             6,
-            Some("mevo.0"),
+            ShotFilter::device(Some("mevo.0")),
             drawable,
         );
         assert_eq!(d.gold, None);
         // By club: the club's sets in the session.
         let m = members(&shots, &g, ShotGrouping::ByClub, 7, None);
-        let d = drawn_sets(&shots, &g, ShotGrouping::ByClub, &m, 7, None, drawable);
+        let d = drawn_sets(
+            &shots,
+            &g,
+            ShotGrouping::ByClub,
+            &m,
+            7,
+            ShotFilter::ALL,
+            drawable,
+        );
         assert_eq!((d.gold, d.bright.len(), d.faint.len()), (Some(7), 2, 3));
         // None: the shown shot alone, nothing faint.
         let m = members(&shots, &g, ShotGrouping::None, 7, None);
-        let d = drawn_sets(&shots, &g, ShotGrouping::None, &m, 7, None, drawable);
+        let d = drawn_sets(
+            &shots,
+            &g,
+            ShotGrouping::None,
+            &m,
+            7,
+            ShotFilter::ALL,
+            drawable,
+        );
         assert_eq!(
             d,
             Drawn {
@@ -1359,7 +1388,15 @@ pub(super) mod tests {
         let mut shots: Vec<ShotRow> = (0..250).map(|n| shot(n, "mevo.0", "a")).collect();
         shots.push(shot(250, "mevo.0", "b"));
         let m = members(&shots, &g, ShotGrouping::BySet, 250, None);
-        let d = drawn_sets(&shots, &g, ShotGrouping::BySet, &m, 250, None, drawable);
+        let d = drawn_sets(
+            &shots,
+            &g,
+            ShotGrouping::BySet,
+            &m,
+            250,
+            ShotFilter::ALL,
+            drawable,
+        );
         assert_eq!(d.faint.len(), FAINT_CAP);
         assert_eq!(d.faint.first(), Some(&50));
         assert_eq!(d.faint.last(), Some(&249));
@@ -1375,7 +1412,7 @@ pub(super) mod tests {
         // The device filter hides the shown shot: no gold, no header values.
         let m = members(&shots, &g, ShotGrouping::BySet, 6, Some("mevo.0"));
         let scene = build_scene(&SceneInput {
-            device: Some("mevo.0"),
+            filter: ShotFilter::device(Some("mevo.0")),
             ..input(&shots, &g, &m, 6, &[], UnitSystem::Metric)
         });
         assert_eq!(gold(&scene), None);
@@ -1763,7 +1800,7 @@ pub(super) mod tests {
         // note blaming the shot.
         let m = members(&shots, &g, ShotGrouping::BySet, 7, Some("r10.0"));
         let scene = build_scene(&SceneInput {
-            device: Some("r10.0"),
+            filter: ShotFilter::device(Some("r10.0")),
             ..input(&shots, &g, &m, 7, &[], UnitSystem::Metric)
         });
         assert_eq!(scene.members, 0);
@@ -1929,7 +1966,7 @@ pub(super) mod tests {
     #[ignore = "timing, not a check"]
     fn frame_time_with_1000_shots() {
         use std::time::Instant;
-        let list: Vec<ShotGroupInfo> = (0..20)
+        let list: Vec<SetInfo> = (0..20)
             .map(|n| set(&format!("s{n}"), n + 1, Club::Iron7, 0))
             .collect();
         let g = groups(list);

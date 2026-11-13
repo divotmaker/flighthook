@@ -1,6 +1,6 @@
 [package]
 name = "flighthook-app"
-version = "0.1.26"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.94"
 description = "Golf simulator central event bus - bridges launch monitors and simulation software"
@@ -20,15 +20,15 @@ gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
 # The FlightScope device driver (`driver`: `ironsight::driver::Mevo`).
-ironsight = { version = "0.7.0", features = ["driver"] }
+ironsight = { version = "0.8.0", features = ["driver"] }
 # The R10's device driver (`driver`: `tenover::driver::R10`).
-tenover = { version = "0.5.0", features = ["driver"] }
+tenover = { version = "0.6.0", features = ["driver"] }
 flighthook = { path = "../lib", features = ["clap"] }
 # FRP's forwarding rules for the `/frp` endpoint (`ForwardFilter`), the
 # device driver contract the launch monitor actors run on (`driver`) and the
 # mock launch monitor (`mock`); the same crate the lib re-exports its types
 # from. Neither feature adds a dependency.
-flightrelay = { version = "0.5", features = ["device", "driver", "mock"] }
+flightrelay = { version = "0.6.0", features = ["controller", "driver", "mock"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -37,6 +37,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
+# The Pureplay card's WebSocket client (Pureplay's Accessory API), blocking
+# on the actor's thread. The version axum's `ws` feature already builds
+# through tokio-tungstenite, with its default `handshake` feature: no new
+# crate in the build.
+tungstenite = "0.29"
 # `fs`: clips and their sidecars are served with HTTP Range support.
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 # Runs tower-http's file service inside a handler (`ServiceExt::oneshot`).
@@ -52,14 +57,14 @@ dimple = "0.0.7"
 # glam version dimple uses (already in the tree through it).
 glam = "0.32"
 # The ExPutt RG's device driver (`driver`: `threeputt::driver::ExPutt`).
-threeputt = { version = "0.1.0", features = ["driver"] }
+threeputt = { version = "0.2.0", features = ["driver"] }
 # Swing cameras: capture, pre-roll and trigger-cut MJPEG clips; `pose` is
 # body tracking (RTMPose on the CPU), `pose-download` fetches its models.
-stance = { version = "0.0.4", features = ["pose", "pose-download"] }
+stance = { version = "0.0.5", features = ["pose", "pose-download"] }
 # The Trackball's device driver (`driver`: `thumbswing::driver::Thumbswing`).
 # It reads Linux evdev; on other platforms it builds and its connect reports
 # that the trackball is not supported there.
-thumbswing = { version = "0.0.2", features = ["driver"] }
+thumbswing = { version = "0.0.3", features = ["driver"] }
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.
@@ -70,13 +75,13 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # The Square Golf device driver (`driver`: `allsquare::driver::Omni`). Its
 # BLE backend is platform-specific: BlueZ on Linux, btleplug elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
-allsquare = { version = "0.4.0", features = ["driver", "bluez"] }
+allsquare = { version = "0.5.0", features = ["driver", "bluez"] }
 # The body tracking clip pass runs at a higher nice value (setpriority);
 # already in the tree (tokio, ...).
 libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-allsquare = { version = "0.4.0", features = ["driver", "btleplug"] }
+allsquare = { version = "0.5.0", features = ["driver", "btleplug"] }
 
 # eframe backend is platform-specific: x11+wayland on Linux, Win32 on Windows.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
@@ -90,17 +95,17 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 # ironsight's test support: a scripted device and recorded result frames.
-ironsight = { version = "0.7.0", features = ["driver", "testing"] }
+ironsight = { version = "0.8.0", features = ["driver", "testing"] }
 # tenover's test support: GFDI frame builders with synthetic identity.
-tenover = { version = "0.5.0", features = ["driver", "testing"] }
+tenover = { version = "0.6.0", features = ["driver", "testing"] }
 # allsquare's test support: notification fixtures and encoders, and the
 # driver's connect over a scripted link.
-allsquare = { version = "0.4.0", features = ["driver", "testing"] }
+allsquare = { version = "0.5.0", features = ["driver", "testing"] }
 # threeputt's test support: an in-process mock device, sample putts and the
 # driver's test timings.
-threeputt = { version = "0.1.0", features = ["driver", "testing"] }
+threeputt = { version = "0.2.0", features = ["driver", "testing"] }
 # thumbswing's test support: synthetic swing streams and recordings.
-thumbswing = { version = "0.0.2", features = ["driver", "testing"] }
+thumbswing = { version = "0.0.3", features = ["driver", "testing"] }
 # Encodes the numbered test frames of the body tracking tests (already in the
 # tree through stance).
 jpeg-encoder = "0.7"

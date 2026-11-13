@@ -14,6 +14,8 @@ use tracing_subscriber::EnvFilter;
 mod actors;
 mod autochip;
 mod bus;
+#[cfg(test)]
+mod golden;
 mod pose;
 mod raw_capture;
 #[cfg(debug_assertions)]
@@ -25,7 +27,6 @@ mod test_ball;
 
 use actors::Actor;
 use bus::BusSender;
-use flighthook::FlighthookMessage;
 use state::SystemState;
 
 #[derive(Parser, Debug, Clone)]
@@ -50,6 +51,9 @@ fn main() -> anyhow::Result<()> {
     } else {
         EnvFilter::new("flighthook=info")
     };
+    // tungstenite traces whole frames, a Pureplay pairing token included;
+    // the Pureplay Accessory card logs every frame itself, the token redacted.
+    let filter = filter.add_directive("tungstenite=warn".parse()?);
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     tracing::debug!("debug logging enabled");
@@ -67,10 +71,10 @@ fn main() -> anyhow::Result<()> {
     let _guard = rt.enter();
 
     // Single unified bus
-    let (bus_tx, _) = broadcast::channel::<FlighthookMessage>(1024);
+    let (bus_tx, _) = broadcast::channel::<bus::BusMsg>(1024);
 
     // Build shared state root
-    let (system_state, game_writer) = SystemState::new(config_path);
+    let (system_state, session_writer) = SystemState::new(config_path);
     let state = Arc::new(system_state);
     state.round.attach(bus_tx.clone());
 
@@ -95,11 +99,13 @@ fn main() -> anyhow::Result<()> {
     // Must be fully up before other actors start so no bus events are missed.
     {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::clone(&shutdown));
+        let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::clone(&shutdown))
+            .with_frp_id(Some(state.flighthook_id()))
+            .with_beats(state.beats.clone());
         let muted = sender.muted();
         let receiver = sender.subscribe();
         let (actor, ready_rx) =
-            actors::system::SystemActor::new(game_writer, Arc::clone(&state), bus_tx.clone());
+            actors::system::SystemActor::new(session_writer, Arc::clone(&state), bus_tx.clone());
         let thread = actor.start(Arc::clone(&state), sender, receiver);
         ready_rx.recv().expect("system actor failed to start");
         state.register_actor(
@@ -125,12 +131,10 @@ fn main() -> anyhow::Result<()> {
                 removed.len(),
                 dir.display()
             );
-            let _ = bus_tx.send(
-                FlighthookMessage::new(flighthook::FlighthookEvent::ShotVideoRemoved {
-                    keys: removed,
-                })
-                .actor("system"),
-            );
+            let _ = bus_tx.send(bus::BusMsg::local(
+                "system",
+                bus::LocalEvent::ShotVideoRemoved { keys: removed },
+            ));
         }
     }
 

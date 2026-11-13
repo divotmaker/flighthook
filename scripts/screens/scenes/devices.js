@@ -1,14 +1,16 @@
 'use strict';
-// screens/devices.png and screens/devices-settings.png: the Devices tab with
-// a Mock and an Open Connect launch monitor (a Uneekor), a test-pattern
-// camera and GSPro; then the same with the camera card on its Settings side,
-// its Rotation in sight under the camera.
+// screens/devices.png and screens/devices-settings.png: Settings, the Mock
+// launch monitor's page (an Open Connect launch monitor beside it in the
+// list); then the test-pattern camera's page, its telemetry beside its
+// settings, its Rotation in sight under the camera. GSPro is configured too
+// (Settings, Software).
 //
-// The cards show ports, so this scene uses fixed ones. The Uneekor sends six
-// 7-iron shots; the Mock's first shot comes 33 s after it starts, so the
-// scene is done before then (shot_count 0). The Web Server card counts HTTP
-// requests, so the scene makes exactly one before the browser's (a status
-// check) and settles across a telemetry update (every 5 s).
+// The cards show ports, so this scene uses fixed ones. The Open Connect
+// monitor sends six 7-iron shots; the Mock's first shot comes 33 s after it
+// starts, so the scene is done before then (shot_count 0). The Web Server
+// card counts HTTP requests, so the scene makes exactly one before the
+// browser's (a status check) and settles across a telemetry update (every
+// 5 s).
 
 const { sleep } = require('../lib/util');
 const { Monitor, Simulator } = require('../lib/openconnect');
@@ -59,7 +61,7 @@ bind = "127.0.0.1:${ports.web}"
 name = "Mock"
 
 [openconnect_server.0]
-name = "Uneekor"
+name = "Open Connect Server"
 bind = "127.0.0.1:${ports.monitor}"
 
 [camera.0]
@@ -95,7 +97,7 @@ address = "127.0.0.1:${ports.gspro}"
     await gspro.received(6);
     // The card's telemetry follows within one pass of GSPro's loop (100 ms).
     await sleep(500);
-    const { actors } = await ctx.fh.get('/api/status');
+    const { cards: actors } = await ctx.fh.get('/api/status');
     const card = actors['openconnect_client.0'];
     if (card.status !== 'connected' || card.telemetry.shots_sent !== '6' || card.telemetry.club !== '7I') {
       throw new Error(`GSPro's card is not ready: ${JSON.stringify(card)}`);
@@ -104,15 +106,21 @@ address = "127.0.0.1:${ports.gspro}"
 
   quietMs: 5500,
   snap: () => ({
+    // The app opens on Shots, whose camera cards keep playing.
+    openSettle: false,
     viewport: { width: 1600, height: 1700 },
     images: [
-      { name: 'devices', steps: [{ click: [55, 27] }, { move: [1590, 1690] }] },
-      { name: 'devices-settings', steps: [{ click: [478, 1096] }, { move: [1590, 1690] }] },
+      { name: 'devices', steps: [{ click: [124, 26] }, { move: [1590, 1690] }] },
+      {
+        name: 'devices-settings',
+        // The camera's row in the list.
+        steps: [{ click: [134, 569] }, { move: [1590, 1690] }],
+      },
     ],
   }),
 
   async verify(ctx) {
-    const { actors } = await ctx.fh.get('/api/status');
+    const { cards: actors } = await ctx.fh.get('/api/status');
     const mock = actors['mock_monitor.0'];
     if (!mock || mock.telemetry.shot_count !== '0') {
       throw new Error(`the Mock shot before the screenshots were done (over ${MOCK_FIRST_SHOT_MS / 1000} s)`);

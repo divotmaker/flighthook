@@ -11,7 +11,8 @@ use crate::config::FlighthookConfig;
 /// Address `address` in a form that compares equal for the same host and
 /// port: trimmed, `localhost` as `127.0.0.1`, an IPv4-mapped IPv6 address as
 /// IPv4, anything that is no socket address lowercased.
-pub(crate) fn address_key(address: &str) -> String {
+#[must_use]
+pub fn address_key(address: &str) -> String {
     let address = address.trim();
     let address = match address.rsplit_once(':') {
         Some((host, port)) if host.eq_ignore_ascii_case("localhost") => {
@@ -39,6 +40,7 @@ pub(crate) fn default_address(type_key: &str) -> &'static str {
         "openconnect_client" => "127.0.0.1:921",
         "openconnect_server" => "0.0.0.0:921",
         "pureplay" => "127.0.0.1:9760",
+        "pureplay_accessory" => "127.0.0.1:9770",
         _ => "",
     }
 }
@@ -54,6 +56,7 @@ pub(crate) fn type_name(type_key: &str) -> &str {
         "openconnect_server" => "Open Connect Server",
         "openconnect_client" => "Open Connect",
         "pureplay" => "Pureplay Connect",
+        "pureplay_accessory" => "Pureplay Accessory",
         "mock_monitor" => "Mock",
         "camera" => "Camera",
         "random_club" => "Random Club",
@@ -181,6 +184,12 @@ impl FlighthookConfig {
         push(&mut out, "pureplay", &self.pureplay, |s| {
             (s.enabled, s.address.as_deref())
         });
+        push(
+            &mut out,
+            "pureplay_accessory",
+            &self.pureplay_accessory,
+            |s| (s.enabled, s.address.as_deref()),
+        );
         out
     }
 
@@ -286,6 +295,7 @@ impl FlighthookConfig {
             "openconnect_server" => set(&mut self.openconnect_server, i, on, |s| &mut s.enabled),
             "openconnect_client" => set(&mut self.openconnect_client, i, on, |s| &mut s.enabled),
             "pureplay" => set(&mut self.pureplay, i, on, |s| &mut s.enabled),
+            "pureplay_accessory" => set(&mut self.pureplay_accessory, i, on, |s| &mut s.enabled),
             "random_club" => set(&mut self.random_club, i, on, |s| &mut s.enabled),
             "camera" => set(&mut self.camera, i, on, |s| &mut s.enabled),
             _ => false,
@@ -303,6 +313,9 @@ mod tests {
 
     fn client(address: Option<&str>, enabled: bool) -> OpenConnectClientSection {
         OpenConnectClientSection {
+            actor_id: None,
+            chipping_clubs: crate::default_chipping_clubs(),
+            putting_clubs: crate::default_putting_clubs(),
             name: "Open Connect".into(),
             enabled,
             address: address.map(str::to_owned),
@@ -314,6 +327,7 @@ mod tests {
 
     fn server(bind: &str, enabled: bool) -> OpenConnectServerSection {
         OpenConnectServerSection {
+            actor_id: None,
             name: "Server".into(),
             enabled,
             bind: Some(bind.into()),

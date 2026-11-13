@@ -6,22 +6,26 @@
 //! FRP device ID, actor names, telemetry or configured addresses; identity
 //! strings that could appear in text payloads or device labels are scrubbed.
 
+use std::collections::HashMap;
+
 use chrono::SecondsFormat;
 
 use super::StoredShot;
 use crate::raw_capture::scrub_text;
 use flighthook::{
     Basis, Distance, EXPORT_SCHEMA, ExportDevice, ExportSettings, FlightResult,
-    FlightScopeEnvironment, ShotExport, UnitSystem, Velocity,
+    FlightScopeEnvironment, FlighthookConfig, ShotExport, UnitSystem, Velocity,
 };
 
 /// Build the JSONL record for one shot. `units` converts `data` (native
-/// units when `None`); `include_raw = false` leaves the raw frames out.
+/// units when `None`); `include_raw = false` leaves the raw frames out;
+/// `golfers` names the shot's golfer by the lookup rule.
 pub fn build_export_line(
     shot: &StoredShot,
     exported_at: &str,
     units: Option<UnitSystem>,
     include_raw: bool,
+    golfers: &FlighthookConfig,
 ) -> ShotExport {
     let ctx = &shot.context;
     let scrub = |v: &Option<String>| v.as_deref().map(|s| scrub_text(s, &ctx.scrub));
@@ -50,37 +54,69 @@ pub fn build_export_line(
         time: shot
             .received_at
             .to_rfc3339_opts(SecondsFormat::Millis, true),
-        actor: shot.data.actor.clone(),
+        actor: shot.data.card_key().to_owned(),
         shot_id: shot.key.shot_id.clone(),
         shot_number: shot.key.shot_number,
         device,
-        club_selected: ctx.club_selected,
-        group: shot.data.group.clone(),
+        golfer_id: golfer_id(&shot.data, golfers),
+        club_selected: shot.data.club_selected(),
+        block: shot.data.block.clone(),
         settings: ExportSettings {
             device: ctx.device_section.clone(),
             // The conditions the shot was simulated under; whether the
-            // dashboard offers Auto-chip is no part of them.
+            // dashboard offers Auto-chip, tournament mode and the flight
+            // model's actor id are no part of them.
             simulation: flighthook::SimulationSection {
                 auto_chip: false,
+                tournament: false,
+                actor_id: None,
                 ..ctx.simulation.clone()
             },
             detection_mode: ctx.detection_mode,
-            handed: ctx.handed,
+            handed: shot.data.handed(),
         },
-        data: export_data(&shot.data, units),
+        data: export_data(&shot.data, units, &ctx.card_keys),
         raw,
     }
 }
 
-/// `data` as the export carries it: in `units` (native when `None`), and
+/// The golfer of the turn the shot was hit in, as the export names it:
+/// the `flighthook.*` id of the golfer of `golfers` whose identifiers
+/// contain it, else the turn's golfer id as it is.
+fn golfer_id(data: &flighthook::ShotData, golfers: &FlighthookConfig) -> Option<String> {
+    golfers.golfer_key(
+        data.turn
+            .as_ref()
+            .and_then(|t| t.golfer.as_ref())
+            .map(flightrelay::GolferId::as_str),
+    )
+}
+
+/// `data` as the export carries it: in `units` (native when `None`),
 /// without the shot's camera clips, which never leave this computer through
-/// the export.
-fn export_data(data: &flighthook::ShotData, units: Option<UnitSystem>) -> flighthook::ShotData {
+/// the export, and with every local actor (a key of `card_keys`) named by
+/// its card key, since an actor id is stable per install.
+fn export_data(
+    data: &flighthook::ShotData,
+    units: Option<UnitSystem>,
+    card_keys: &HashMap<String, String>,
+) -> flighthook::ShotData {
     let mut data = match units {
         Some(u) => data.to_unit_system(u),
         None => data.clone(),
     };
     data.video = Vec::new();
+    data.from_name = None;
+    data.golfer_name = None;
+    let local = |from: &mut String| {
+        if let Some(card) = card_keys.get(from.as_str()) {
+            from.clone_from(card);
+        }
+    };
+    local(&mut data.from);
+    for flight in &mut data.flights {
+        local(&mut flight.from);
+    }
     data
 }
 
@@ -90,8 +126,9 @@ pub fn jsonl_line(
     exported_at: &str,
     units: Option<UnitSystem>,
     include_raw: bool,
+    golfers: &FlighthookConfig,
 ) -> String {
-    let line = build_export_line(shot, exported_at, units, include_raw);
+    let line = build_export_line(shot, exported_at, units, include_raw, golfers);
     match serde_json::to_string(&line) {
         Ok(mut s) => {
             s.push('\n');
@@ -132,8 +169,9 @@ fn units(system: UnitSystem) -> Units {
     }
 }
 
-/// CSV header row, newline-terminated.
-pub fn csv_header(system: UnitSystem) -> String {
+/// CSV header row, newline-terminated. `golfer` adds the trailing
+/// `golfer_id` column, for an export where a shot has a golfer.
+pub fn csv_header(system: UnitSystem, golfer: bool) -> String {
     let u = units(system);
     let cols = [
         "time".to_string(),
@@ -145,7 +183,7 @@ pub fn csv_header(system: UnitSystem) -> String {
         "shot_number".into(),
         "shot_id".into(),
         "club_selected".into(),
-        "group".into(),
+        "block".into(),
         "handed".into(),
         "detection_mode".into(),
         "environment".into(),
@@ -195,8 +233,19 @@ pub fn csv_header(system: UnitSystem) -> String {
         format!("metrics_curve_{}", u.dist),
         "spin_estimated".into(),
     ];
-    let cells: Vec<Option<String>> = cols.into_iter().map(Some).collect();
+    let mut cells: Vec<Option<String>> = cols.into_iter().map(Some).collect();
+    if golfer {
+        cells.push(Some("golfer_id".into()));
+    }
     csv_row(&cells)
+}
+
+/// Whether any of `shots` has a golfer: the CSV then has a `golfer_id`
+/// column.
+pub fn any_golfer<'a>(shots: impl IntoIterator<Item = &'a StoredShot>) -> bool {
+    shots
+        .into_iter()
+        .any(|s| s.data.turn.as_ref().is_some_and(|t| t.golfer.is_some()))
 }
 
 /// A number rounded to 4 decimal places.
@@ -224,9 +273,16 @@ fn environment(shot: &StoredShot) -> Option<String> {
     }
 }
 
-/// One CSV row for a shot, in `system` units, newline-terminated.
-pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
-    let line = build_export_line(shot, "", Some(system), false);
+/// One CSV row for a shot, in `system` units, newline-terminated; with
+/// `golfer`, the trailing `golfer_id` cell (by the lookup rule on
+/// `golfers`).
+pub fn to_csv_row(
+    shot: &StoredShot,
+    system: UnitSystem,
+    golfer: bool,
+    golfers: &FlighthookConfig,
+) -> String {
+    let line = build_export_line(shot, "", Some(system), false, golfers);
     let imperial = system == UnitSystem::Imperial;
     let dist = |d: Option<Distance>| {
         d.map(|d| {
@@ -254,12 +310,12 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
     let i = |v: Option<i32>| v.map(|v| v.to_string());
 
     let data = &line.data;
-    let b = data.launch.clone().unwrap_or_default();
-    let fl = data
+    let shown = data.shown();
+    let b = shown.launch.unwrap_or_default();
+    let fl = shown
         .flight
-        .clone()
         .unwrap_or_else(|| FlightResult::new(Basis::Modeled));
-    let d = data.derived.clone().unwrap_or_default();
+    let d = shown.derived.unwrap_or_default();
     let c = data.club.clone().unwrap_or_default();
     let m = data.impact.clone().unwrap_or_default();
     let x = data.metrics.clone().unwrap_or_default();
@@ -273,7 +329,7 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
         Some(line.shot_number.to_string()),
         Some(line.shot_id.clone()),
         line.club_selected.map(|c| c.to_string()),
-        line.group.clone(),
+        line.block.clone(),
         label(line.settings.handed.as_ref()),
         line.settings.detection_mode.map(|m| m.to_string()),
         environment(shot),
@@ -323,6 +379,10 @@ pub fn to_csv_row(shot: &StoredShot, system: UnitSystem) -> String {
         dist(x.curve),
         d.spin_estimated.then(|| "true".to_owned()),
     ];
+    let mut cells = cells.to_vec();
+    if golfer {
+        cells.push(line.golfer_id.clone());
+    }
     csv_row(&cells)
 }
 
@@ -351,13 +411,13 @@ fn csv_row(cells: &[Option<String>]) -> String {
 mod tests {
     use chrono::Utc;
 
-    use super::super::tests::{feed, test_state};
-    use super::super::{ShotContext, StoredShot, device_section};
+    use super::super::tests::{Ev, feed, test_state};
+    use super::super::{ExportContext, StoredShot, device_section};
     use super::*;
     use crate::test_ball::Ball;
     use flighthook::{
-        ClubData, DerivedFlight, FaceImpact, FlighthookConfig, FlighthookEvent, MevoSection,
-        RawDir, RawRecord, ShotData, ShotKey, ShotMetrics, ShotRaw,
+        ClubData, FaceImpact, FlighthookConfig, MevoSection, RawDir, RawRecord, ShotData, ShotKey,
+        ShotMetrics, ShotRaw,
     };
 
     const SSID: &str = "FS M2-123456";
@@ -376,18 +436,17 @@ mod tests {
         }
     }
 
-    /// The `Launch` and `FlightResult` events of [`ball`].
-    fn ball_events(key: &ShotKey) -> [FlighthookEvent; 2] {
+    /// The `shot.launch` and `shot.flight` of [`ball`].
+    fn ball_events(key: &ShotKey) -> [Ev; 2] {
         [
-            FlighthookEvent::Launch {
+            Ev::frp(flightrelay::ShotLaunch {
                 key: key.clone(),
-                launch: Box::new(ball().launch()),
-                derived: None,
-            },
-            FlighthookEvent::FlightResult {
+                launch: ball().launch(),
+            }),
+            Ev::frp(flightrelay::ShotFlight {
                 key: key.clone(),
-                flight: Box::new(ball().flight().expect("carry")),
-            },
+                flight: ball().flight().expect("carry"),
+            }),
         ]
     }
 
@@ -418,7 +477,7 @@ mod tests {
                 shot_id: "id-1".into(),
                 shot_number: 1,
             },
-            context: ShotContext {
+            context: ExportContext {
                 device: ExportDevice {
                     kind: "flightscope".into(),
                     manufacturer: Some("FlightScope".into()),
@@ -427,16 +486,22 @@ mod tests {
                 },
                 device_section: section,
                 scrub,
-                ..ShotContext::default()
+                ..ExportContext::default()
             },
             data: ShotData {
-                actor: "mevo.0".into(),
+                card: Some("mevo.0".into()),
                 shot_number: 1,
                 launch: Some(ball().launch()),
-                flight: ball().flight(),
+                flights: ball()
+                    .flight()
+                    .into_iter()
+                    .map(|flight| flighthook::Flight {
+                        from: String::new(),
+                        flight,
+                    })
+                    .collect(),
                 club: None,
                 impact: None,
-                derived: None,
                 ..ShotData::default()
             },
             raw: Some(ShotRaw {
@@ -447,13 +512,21 @@ mod tests {
                 ],
                 ..ShotRaw::default()
             }),
+            frp: None,
+            path: None,
         }
     }
 
     #[test]
     fn export_line_contains_no_identity() {
         let shot = private_shot();
-        let line = jsonl_line(&shot, "2026-01-01T00:00:00.000Z", None, true);
+        let line = jsonl_line(
+            &shot,
+            "2026-01-01T00:00:00.000Z",
+            None,
+            true,
+            &FlighthookConfig::default(),
+        );
         assert!(line.ends_with('\n'));
         for secret in [SSID, ADDR, BLE, "192.168.2.1", "My Mevo"] {
             assert!(!line.contains(secret), "line leaks {secret}: {line}");
@@ -478,6 +551,85 @@ mod tests {
         assert_eq!(parsed.settings.device["ball_type"], 1);
     }
 
+    /// Local actor ids never leave through the export: the shot's and each
+    /// flight's sender are written as the card key; a remote actor keeps
+    /// its actor id.
+    #[test]
+    fn the_export_names_local_actors_by_card_key() {
+        let mut shot = private_shot();
+        shot.data.from = "lm-actor-7f3a".into();
+        shot.data.flights = vec![
+            flighthook::Flight {
+                from: "lm-actor-7f3a".into(),
+                flight: flightrelay::FlightResult::new(flightrelay::Basis::Tracked),
+            },
+            flighthook::Flight {
+                from: "fm-actor-91bc".into(),
+                flight: flightrelay::FlightResult::new(flightrelay::Basis::Modeled),
+            },
+            flighthook::Flight {
+                from: "remote-model".into(),
+                flight: flightrelay::FlightResult::new(flightrelay::Basis::Modeled),
+            },
+        ];
+        shot.context.card_keys = HashMap::from([
+            ("lm-actor-7f3a".into(), "mevo.0".into()),
+            ("fm-actor-91bc".into(), "simulation".into()),
+        ]);
+        let line = jsonl_line(
+            &shot,
+            "2026-01-01T00:00:00.000Z",
+            None,
+            false,
+            &FlighthookConfig::default(),
+        );
+        for id in ["lm-actor-7f3a", "fm-actor-91bc"] {
+            assert!(!line.contains(id), "line has {id}: {line}");
+        }
+        let parsed: ShotExport = serde_json::from_str(&line).expect("parses");
+        assert_eq!(parsed.data.from, "mevo.0");
+        let senders: Vec<&str> = parsed
+            .data
+            .flights
+            .iter()
+            .map(|f| f.from.as_str())
+            .collect();
+        assert_eq!(senders, ["mevo.0", "simulation", "remote-model"]);
+    }
+
+    /// A game golfer's name and a remote sender's name stay on this
+    /// computer: neither reaches the JSONL line nor the CSV row.
+    #[test]
+    fn the_export_never_carries_golfer_or_sender_names() {
+        let mut shot = private_shot();
+        shot.data.golfer_name = Some("Joe Private".into());
+        shot.data.from_name = Some("Bay Two Sender".into());
+        let line = jsonl_line(
+            &shot,
+            "2026-01-01T00:00:00.000Z",
+            None,
+            false,
+            &FlighthookConfig::default(),
+        );
+        for leak in ["Joe Private", "Bay Two Sender", "golfer_name", "from_name"] {
+            assert!(!line.contains(leak), "line has {leak}: {line}");
+        }
+        let parsed: ShotExport = serde_json::from_str(&line).expect("parses");
+        assert_eq!(parsed.data.golfer_name, None);
+        assert_eq!(parsed.data.from_name, None);
+        for golfer in [false, true] {
+            let row = to_csv_row(
+                &shot,
+                UnitSystem::Metric,
+                golfer,
+                &FlighthookConfig::default(),
+            );
+            for leak in ["Joe Private", "Bay Two Sender"] {
+                assert!(!row.contains(leak), "row has {leak}: {row}");
+            }
+        }
+    }
+
     #[test]
     fn the_export_never_carries_camera_clips() {
         let mut shot = private_shot();
@@ -496,7 +648,7 @@ mod tests {
             analyzed_with: None,
         }];
         for units in [None, Some(UnitSystem::Imperial), Some(UnitSystem::Metric)] {
-            let line = jsonl_line(&shot, "t", units, true);
+            let line = jsonl_line(&shot, "t", units, true, &FlighthookConfig::default());
             assert!(!line.contains("video"), "{line}");
             assert!(!line.contains("camera.0"), "{line}");
         }
@@ -505,21 +657,32 @@ mod tests {
     #[test]
     fn jsonl_line_parses_back_and_converts_units() {
         let shot = private_shot();
-        let native: ShotExport =
-            serde_json::from_str(&jsonl_line(&shot, "t", None, true)).expect("parses");
+        let native: ShotExport = serde_json::from_str(&jsonl_line(
+            &shot,
+            "t",
+            None,
+            true,
+            &FlighthookConfig::default(),
+        ))
+        .expect("parses");
         assert_eq!(native.schema, flighthook::EXPORT_SCHEMA);
         assert_eq!(native.data, shot.data);
         assert_eq!(native.exported_at, "t");
 
-        let imperial: ShotExport =
-            serde_json::from_str(&jsonl_line(&shot, "t", Some(UnitSystem::Imperial), false))
-                .expect("parses");
+        let imperial: ShotExport = serde_json::from_str(&jsonl_line(
+            &shot,
+            "t",
+            Some(UnitSystem::Imperial),
+            false,
+            &FlighthookConfig::default(),
+        ))
+        .expect("parses");
         assert_eq!(
             imperial.data,
             shot.data.to_unit_system(UnitSystem::Imperial)
         );
+        let flight = imperial.data.shown().flight.expect("flight");
         let launch = imperial.data.launch.expect("launch");
-        let flight = imperial.data.flight.expect("flight");
         assert!(matches!(
             launch.launch_speed,
             Some(Velocity::MilesPerHour(_))
@@ -530,8 +693,8 @@ mod tests {
 
     #[test]
     fn csv_header_names_units() {
-        let imp = csv_header(UnitSystem::Imperial);
-        let met = csv_header(UnitSystem::Metric);
+        let imp = csv_header(UnitSystem::Imperial, false);
+        let met = csv_header(UnitSystem::Metric, false);
         assert!(imp.starts_with("time,actor,device_kind,manufacturer,model,firmware,"));
         assert!(imp.contains(",impact_lateral_mm,impact_vertical_mm,"));
         assert!(imp.ends_with(",metrics_curve_yd,spin_estimated\r\n"));
@@ -554,7 +717,12 @@ mod tests {
     #[test]
     fn csv_row_has_empty_cells_for_none_and_matches_header() {
         let shot = private_shot();
-        let row = to_csv_row(&shot, UnitSystem::Metric);
+        let row = to_csv_row(
+            &shot,
+            UnitSystem::Metric,
+            false,
+            &FlighthookConfig::default(),
+        );
         let cells: Vec<&str> = row.trim_end().split(',').collect();
         assert_eq!(cells.len(), 58);
         assert_eq!(cells[1], "mevo.0");
@@ -568,7 +736,12 @@ mod tests {
         assert_eq!(cells[20], "100");
         assert!(!row.contains(SSID) && !row.contains(ADDR));
 
-        let imp = to_csv_row(&shot, UnitSystem::Imperial);
+        let imp = to_csv_row(
+            &shot,
+            UnitSystem::Imperial,
+            false,
+            &FlighthookConfig::default(),
+        );
         let cells: Vec<&str> = imp.trim_end().split(',').collect();
         assert_eq!(cells[13], num(Velocity::MetersPerSecond(40.0).as_mph()));
         assert_eq!(cells[20], num(Distance::Meters(100.0).as_yards()));
@@ -580,21 +753,34 @@ mod tests {
         let mut b = ball();
         b.sidespin_rpm = Some(-200);
         b.put_on(&mut shot.data);
-        shot.data.derived = crate::sim::derive(
-            &b.launch(),
-            b.flight().as_ref(),
-            &flighthook::SimulationSection::default(),
+        crate::test_ball::put_derived(
+            &mut shot.data,
+            crate::sim::derive(
+                &b.launch(),
+                b.flight().as_ref(),
+                &flighthook::SimulationSection::default(),
+            ),
         );
-        assert!(shot.data.derived.as_ref().is_some_and(|d| d.path.is_some()));
+        assert!(shot.data.path.is_some());
 
-        let line: serde_json::Value =
-            serde_json::from_str(&jsonl_line(&shot, "t", Some(UnitSystem::Imperial), false))
-                .expect("parses");
-        let flight = &line["data"]["derived"]["path"]["flight"];
+        let line: serde_json::Value = serde_json::from_str(&jsonl_line(
+            &shot,
+            "t",
+            Some(UnitSystem::Imperial),
+            false,
+            &FlighthookConfig::default(),
+        ))
+        .expect("parses");
+        let flight = &line["data"]["path"]["flight"];
         assert_eq!(flight[0], serde_json::json!([0.0, 0.0, 0.0, 0.0]));
         assert!(flight.as_array().is_some_and(|f| f.len() > 2), "{line}");
 
-        let row = to_csv_row(&shot, UnitSystem::Metric);
+        let row = to_csv_row(
+            &shot,
+            UnitSystem::Metric,
+            false,
+            &FlighthookConfig::default(),
+        );
         assert_eq!(row.trim_end().split(',').count(), 58);
     }
 
@@ -602,11 +788,22 @@ mod tests {
     fn the_auto_chip_setting_is_not_exported_with_a_shots_simulation() {
         let mut shot = private_shot();
         shot.context.simulation.auto_chip = true;
-        let line: serde_json::Value =
-            serde_json::from_str(&jsonl_line(&shot, "t", None, false)).expect("parses");
+        shot.context.simulation.tournament = true;
+        let line: serde_json::Value = serde_json::from_str(&jsonl_line(
+            &shot,
+            "t",
+            None,
+            false,
+            &FlighthookConfig::default(),
+        ))
+        .expect("parses");
         assert!(
             line["settings"]["simulation"].get("auto_chip").is_none(),
             "{line}"
+        );
+        assert!(
+            line["settings"]["simulation"].get("tournament").is_none(),
+            "tournament mode is no shot condition: {line}"
         );
     }
 
@@ -620,25 +817,39 @@ mod tests {
         let mut b = ball();
         b.sidespin_rpm = Some(-200);
         b.put_on(&mut shot.data);
-        shot.data.derived = crate::sim::derive(&b.launch(), b.flight().as_ref(), &replacing);
+        crate::test_ball::put_derived(
+            &mut shot.data,
+            crate::sim::derive(&b.launch(), b.flight().as_ref(), &replacing),
+        );
         shot.context.simulation = replacing;
         let sim_carry = shot
             .data
+            .shown()
             .derived
-            .as_ref()
             .and_then(|d| d.carry_distance)
             .expect("simulated carry");
 
-        let line: serde_json::Value =
-            serde_json::from_str(&jsonl_line(&shot, "t", None, false)).expect("parses");
-        assert_eq!(line["data"]["derived"]["replaces_measured"], true, "{line}");
+        let line: serde_json::Value = serde_json::from_str(&jsonl_line(
+            &shot,
+            "t",
+            None,
+            false,
+            &FlighthookConfig::default(),
+        ))
+        .expect("parses");
         assert_eq!(line["settings"]["simulation"]["mode"], "force", "{line}");
         assert!(line["settings"]["simulation"].get("enabled").is_none());
-        assert_eq!(line["data"]["flight"]["carry_distance"], "100m", "{line}");
-        assert_eq!(line["data"]["flight"]["basis"], "modeled", "{line}");
+        let own = &line["data"]["flights"][0]["flight"];
+        assert_eq!(own["carry_distance"], "100m", "{line}");
+        assert_eq!(own["basis"], "modeled", "{line}");
 
         // CSV keeps its columns: the device's carry and the simulated carry.
-        let row = to_csv_row(&shot, UnitSystem::Metric);
+        let row = to_csv_row(
+            &shot,
+            UnitSystem::Metric,
+            false,
+            &FlighthookConfig::default(),
+        );
         let cells: Vec<&str> = row.trim_end().split(',').collect();
         assert_eq!(cells.len(), 58);
         assert_eq!(cells[20], "100");
@@ -659,12 +870,17 @@ mod tests {
             ..ball()
         }
         .put_on(&mut shot.data);
-        let header: Vec<String> = csv_header(UnitSystem::Metric)
+        let header: Vec<String> = csv_header(UnitSystem::Metric, false)
             .trim_end()
             .split(',')
             .map(str::to_string)
             .collect();
-        let row = to_csv_row(&shot, UnitSystem::Metric);
+        let row = to_csv_row(
+            &shot,
+            UnitSystem::Metric,
+            false,
+            &FlighthookConfig::default(),
+        );
         let cells: Vec<&str> = row.trim_end().split(',').collect();
         let col = |name: &str| cells[header.iter().position(|h| h == name).expect(name)];
         assert_eq!(col("backspin_rpm"), "6897");
@@ -696,12 +912,17 @@ mod tests {
             lateral: Some(Distance::Millimeters(-4.0)),
             vertical: Some(Distance::Millimeters(2.5)),
         });
-        let header: Vec<String> = csv_header(UnitSystem::Metric)
+        let header: Vec<String> = csv_header(UnitSystem::Metric, false)
             .trim_end()
             .split(',')
             .map(str::to_string)
             .collect();
-        let row = to_csv_row(&shot, UnitSystem::Metric);
+        let row = to_csv_row(
+            &shot,
+            UnitSystem::Metric,
+            false,
+            &FlighthookConfig::default(),
+        );
         let cells: Vec<&str> = row.trim_end().split(',').collect();
         let col = |name: &str| cells[header.iter().position(|h| h == name).expect(name)];
         assert_eq!(col("club_speed_mps"), "30");
@@ -738,12 +959,12 @@ mod tests {
             (UnitSystem::Metric, "-2.5", "-3", "9.144", "0.0254"),
             (UnitSystem::Imperial, "-2.734", "-3.2808", "10", "1"),
         ] {
-            let header: Vec<String> = csv_header(system)
+            let header: Vec<String> = csv_header(system, false)
                 .trim_end()
                 .split(',')
                 .map(str::to_string)
                 .collect();
-            let row = to_csv_row(&shot, system);
+            let row = to_csv_row(&shot, system, false, &FlighthookConfig::default());
             let cells: Vec<&str> = row.trim_end().split(',').collect();
             assert_eq!(cells.len(), header.len());
             let (d, s) = if system == UnitSystem::Imperial {
@@ -780,24 +1001,29 @@ mod tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::shot_trigger(key.clone()),
-                FlighthookEvent::ClubPath {
+                Ev::trigger(key.clone()),
+                Ev::frp(flightrelay::ShotClub {
                     key: key.clone(),
-                    club: Box::new(ClubData {
+                    club: ClubData {
                         face_angle: Some(1.0),
                         path: Some(-2.0),
                         ..ClubData::default()
-                    }),
-                },
-                FlighthookEvent::ShotFinished { key, raw: None },
+                    },
+                }),
+                Ev::Finished(key, None),
             ],
         )
         .await;
         let stored = state.shots.read().await[0].clone();
-        let line = build_export_line(&stored, "t", None, false);
+        let line = build_export_line(&stored, "t", None, false, &FlighthookConfig::default());
         assert_eq!(line.data.metrics.and_then(|m| m.face_to_path), Some(3.0));
-        let row = to_csv_row(&stored, UnitSystem::Metric);
-        let header = csv_header(UnitSystem::Metric);
+        let row = to_csv_row(
+            &stored,
+            UnitSystem::Metric,
+            false,
+            &FlighthookConfig::default(),
+        );
+        let header = csv_header(UnitSystem::Metric, false);
         let at = header
             .trim_end()
             .split(',')
@@ -825,23 +1051,26 @@ mod tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::shot_trigger(key.clone()),
+                Ev::trigger(key.clone()),
                 ball_events(&key)[0].clone(),
                 ball_events(&key)[1].clone(),
-                FlighthookEvent::ClubPath {
+                Ev::frp(flightrelay::ShotClub {
                     key: key.clone(),
-                    club: Box::new(ClubData::default()),
-                },
-                FlighthookEvent::ShotFinished {
-                    key: key.clone(),
-                    raw: Some(Box::new(raw)),
-                },
+                    club: ClubData::default(),
+                }),
+                Ev::Finished(key.clone(), Some(Box::new(raw))),
             ],
         )
         .await;
         let stored = state.shots.read().await[0].clone();
-        let line: ShotExport =
-            serde_json::from_str(&jsonl_line(&stored, "t", None, true)).expect("parses");
+        let line: ShotExport = serde_json::from_str(&jsonl_line(
+            &stored,
+            "t",
+            None,
+            true,
+            &FlighthookConfig::default(),
+        ))
+        .expect("parses");
         assert_eq!(line.data, stored.data);
         assert_eq!(line.shot_id, "rt");
         assert_eq!(line.shot_number, 9);
@@ -853,49 +1082,81 @@ mod tests {
     #[tokio::test]
     async fn estimated_spin_is_flagged_in_both_exports() {
         let (state, _writer, _dir) = test_state();
-        let mut only_the_flag = DerivedFlight::default();
-        only_the_flag.spin_estimated = true;
-        for (n, derived) in [(1, Some(only_the_flag)), (2, None)] {
+        let model = state.root.flight_model_id();
+        for (n, estimated) in [(1, true), (2, false)] {
             let key = ShotKey {
                 shot_id: format!("chip-{n}"),
                 shot_number: n,
             };
+            // Shot 1 is a launch-only chip: a launch without spin and the
+            // card's own flight result holding only the assumed backspin.
+            // Shot 2 is measured: spin on the launch, a measured carry.
+            let device = if estimated {
+                let launch = flighthook::Launch {
+                    backspin_rpm: None,
+                    ..ball().launch()
+                };
+                vec![
+                    Ev::frp(flightrelay::ShotLaunch {
+                        key: key.clone(),
+                        launch,
+                    }),
+                    Ev::frp(flightrelay::ShotFlight {
+                        key: key.clone(),
+                        flight: FlightResult {
+                            model: Some(crate::actors::mevo::LAUNCH_ONLY_MODEL.into()),
+                            assumed: Some(flighthook::AssumedLaunch {
+                                backspin_rpm: Some(6000),
+                                sidespin_rpm: Some(0),
+                                ..flighthook::AssumedLaunch::default()
+                            }),
+                            ..FlightResult::new(Basis::Modeled)
+                        },
+                    }),
+                ]
+            } else {
+                ball_events(&key).to_vec()
+            };
+            let mut events = vec![Ev::trigger(key.clone())];
+            events.extend(device);
+            events.push(Ev::Finished(key.clone(), None));
+            feed(&state, "mevo.0", events).await;
+            // The flight model flies the finished shot from its own actor.
             feed(
                 &state,
-                "mevo.0",
-                vec![
-                    FlighthookEvent::shot_trigger(key.clone()),
-                    FlighthookEvent::Launch {
-                        key: key.clone(),
-                        launch: Box::new(ball().launch()),
-                        derived: derived.map(Box::new),
+                &model,
+                vec![Ev::frp(flightrelay::ShotFlight {
+                    key,
+                    flight: FlightResult {
+                        carry_distance: Some(Distance::Meters(100.0)),
+                        ..FlightResult::new(Basis::Modeled)
                     },
-                    ball_events(&key)[1].clone(),
-                    FlighthookEvent::ShotFinished { key, raw: None },
-                ],
+                })],
             )
             .await;
         }
         let shots = state.shots.read().await.clone();
         assert_eq!(shots.len(), 2);
         for system in [UnitSystem::Imperial, UnitSystem::Metric] {
-            let header = csv_header(system);
+            let header = csv_header(system, false);
             let at = header
                 .trim_end()
                 .split(',')
                 .position(|h| h == "spin_estimated")
                 .expect("column");
             for (shot, flagged) in shots.iter().zip([true, false]) {
-                let line: serde_json::Value =
-                    serde_json::from_str(&jsonl_line(shot, "t", Some(system), false))
-                        .expect("parses");
-                let flag = line["data"]["derived"].get("spin_estimated");
-                assert_eq!(
-                    flag,
-                    flagged.then_some(&serde_json::Value::Bool(true)),
-                    "{line}"
-                );
-                let row = to_csv_row(shot, system);
+                let line: serde_json::Value = serde_json::from_str(&jsonl_line(
+                    shot,
+                    "t",
+                    Some(system),
+                    false,
+                    &FlighthookConfig::default(),
+                ))
+                .expect("parses");
+                // The JSONL line carries the assumed spin it came from.
+                let assumed = line["data"]["flights"][0]["flight"].get("assumed");
+                assert_eq!(assumed.is_some(), flagged, "{line}");
+                let row = to_csv_row(shot, system, false, &FlighthookConfig::default());
                 let cell = row.trim_end().split(',').nth(at);
                 assert_eq!(cell, Some(if flagged { "true" } else { "" }), "{row}");
             }
@@ -907,7 +1168,10 @@ mod tests {
     #[tokio::test]
     async fn auto_chip_exports_chipping_as_its_detection_mode() {
         let (state, writer, _dir) = test_state();
-        writer.set_mode(flighthook::ShotDetectionMode::Full);
+        writer.apply(&flightrelay::GolferSelect {
+            mode: Some(flighthook::Mode::Full),
+            ..flightrelay::GolferSelect::new("test")
+        });
         for (n, actor) in [(1, "mevo.0"), (2, flighthook::AUTO_CHIP_ACTOR)] {
             let key = ShotKey {
                 shot_id: format!("shot-{n}"),
@@ -917,10 +1181,10 @@ mod tests {
                 &state,
                 actor,
                 vec![
-                    FlighthookEvent::shot_trigger(key.clone()),
+                    Ev::trigger(key.clone()),
                     ball_events(&key)[0].clone(),
                     ball_events(&key)[1].clone(),
-                    FlighthookEvent::ShotFinished { key, raw: None },
+                    Ev::Finished(key, None),
                 ],
             )
             .await;
@@ -929,13 +1193,19 @@ mod tests {
         let modes: Vec<serde_json::Value> = shots
             .iter()
             .map(|shot| {
-                let line: serde_json::Value =
-                    serde_json::from_str(&jsonl_line(shot, "t", None, false)).expect("parses");
+                let line: serde_json::Value = serde_json::from_str(&jsonl_line(
+                    shot,
+                    "t",
+                    None,
+                    false,
+                    &FlighthookConfig::default(),
+                ))
+                .expect("parses");
                 line["settings"]["detection_mode"].clone()
             })
             .collect();
         assert_eq!(modes, ["full", "chipping"]);
-        let at = csv_header(UnitSystem::Imperial)
+        let at = csv_header(UnitSystem::Imperial, false)
             .trim_end()
             .split(',')
             .position(|h| h == "detection_mode")
@@ -943,64 +1213,174 @@ mod tests {
         let cells: Vec<String> = shots
             .iter()
             .map(|shot| {
-                to_csv_row(shot, UnitSystem::Imperial)
-                    .trim_end()
-                    .split(',')
-                    .nth(at)
-                    .unwrap_or_default()
-                    .to_owned()
+                to_csv_row(
+                    shot,
+                    UnitSystem::Imperial,
+                    false,
+                    &FlighthookConfig::default(),
+                )
+                .trim_end()
+                .split(',')
+                .nth(at)
+                .unwrap_or_default()
+                .to_owned()
             })
             .collect();
         assert_eq!(cells, ["full", "chipping"]);
     }
 
-    const GROUP: &str = "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7";
+    const BLOCK: &str = "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7";
 
-    fn grouped_shot() -> StoredShot {
+    fn blocked_shot() -> StoredShot {
         let mut shot = private_shot();
-        shot.context.club_selected = Some(flighthook::Club::Iron7);
         shot.data.shot_id = Some(shot.key.shot_id.clone());
-        shot.data.club_selected = Some(flighthook::Club::Iron7);
-        shot.data.group = Some(GROUP.into());
+        shot.data.turn = Some(flighthook::GolferTurn {
+            golfer: None,
+            club: Some(flighthook::Club::Iron7),
+            handedness: None,
+            mode: None,
+        });
+        shot.data.block = Some(BLOCK.into());
         shot
     }
 
-    #[test]
-    fn csv_group_column_follows_club_selected() {
-        let header: Vec<String> = csv_header(UnitSystem::Imperial)
+    fn header(golfer: bool) -> Vec<String> {
+        csv_header(UnitSystem::Imperial, golfer)
             .trim_end()
             .split(',')
             .map(str::to_string)
-            .collect();
-        let at = |name: &str| header.iter().position(|h| h == name).expect(name);
-        assert_eq!(at("group"), at("club_selected") + 1);
-        assert_eq!(at("handed"), at("group") + 1);
-
-        let row = to_csv_row(&grouped_shot(), UnitSystem::Imperial);
-        let cells: Vec<&str> = row.trim_end().split(',').collect();
-        assert_eq!(cells.len(), header.len());
-        assert_eq!(cells[at("club_selected")], "7I");
-        assert_eq!(cells[at("group")], GROUP);
+            .collect()
     }
 
     #[test]
-    fn jsonl_line_carries_the_group() {
-        let shot = grouped_shot();
-        let line = jsonl_line(&shot, "t", None, false);
+    fn csv_block_column_follows_club_selected() {
+        let header = header(false);
+        let at = |name: &str| header.iter().position(|h| h == name).expect(name);
+        assert_eq!(at("block"), at("club_selected") + 1);
+        assert_eq!(at("handed"), at("block") + 1);
+        assert!(!header.iter().any(|h| h == "golfer_id" || h == "group"));
+
+        let row = to_csv_row(
+            &blocked_shot(),
+            UnitSystem::Imperial,
+            false,
+            &FlighthookConfig::default(),
+        );
+        let cells: Vec<&str> = row.trim_end().split(',').collect();
+        assert_eq!(cells.len(), header.len());
+        assert_eq!(cells[at("club_selected")], "7I");
+        assert_eq!(cells[at("block")], BLOCK);
+    }
+
+    #[test]
+    fn jsonl_line_carries_the_block() {
+        let shot = blocked_shot();
+        let line = jsonl_line(&shot, "t", None, false, &FlighthookConfig::default());
         let v: serde_json::Value = serde_json::from_str(&line).expect("json");
-        assert_eq!(v["group"], GROUP);
-        assert_eq!(v["data"]["group"], GROUP);
+        assert_eq!(v["schema"], 4);
+        assert_eq!(v["block"], BLOCK);
+        assert_eq!(v["data"]["block"], BLOCK);
         assert_eq!(v["data"]["shot_id"], v["shot_id"]);
-        assert_eq!(v["data"]["club_selected"], v["club_selected"]);
-        for absent in ["number", "mode", "session"] {
+        assert_eq!(v["data"]["turn"]["club"], v["club_selected"]);
+        for absent in ["number", "mode", "session", "group", "golfer_id"] {
             assert!(v.get(absent).is_none(), "{absent}");
         }
-        // Top level: `group` right after `club_selected`, before `settings`.
-        let pair = format!(r#""club_selected":"7I","group":"{GROUP}","settings""#);
+        // Top level: `block` right after `club_selected`, before `settings`.
+        let pair = format!(r#""club_selected":"7I","block":"{BLOCK}","settings""#);
         assert!(line.contains(&pair), "{line}");
 
-        let ungrouped = jsonl_line(&private_shot(), "t", None, false);
-        let v: serde_json::Value = serde_json::from_str(&ungrouped).expect("json");
-        assert!(v.get("group").is_none());
+        let unblocked = jsonl_line(
+            &private_shot(),
+            "t",
+            None,
+            false,
+            &FlighthookConfig::default(),
+        );
+        let v: serde_json::Value = serde_json::from_str(&unblocked).expect("json");
+        assert!(v.get("block").is_none());
+    }
+
+    /// A shot hit in a golfer's turn names the golfer: `golfer_id` in the
+    /// JSONL line, and a trailing CSV column when a shot has one. The hand
+    /// comes from the turn.
+    #[test]
+    fn a_golfers_shot_carries_golfer_id_and_the_turns_hand() {
+        let mut shot = blocked_shot();
+        let golfer: flightrelay::GolferId = "pureplay.local-3".parse().expect("id");
+        shot.data.turn = Some(flightrelay::GolferTurn::new(
+            Some(golfer),
+            Some(flighthook::Club::Iron7),
+            flighthook::Handedness::Left,
+            flighthook::Mode::Full,
+        ));
+        let v: serde_json::Value = serde_json::from_str(&jsonl_line(
+            &shot,
+            "t",
+            None,
+            false,
+            &FlighthookConfig::default(),
+        ))
+        .expect("json");
+        assert_eq!(v["golfer_id"], "pureplay.local-3");
+        assert_eq!(v["data"]["turn"]["golfer"], "pureplay.local-3");
+        assert_eq!(v["settings"]["handed"], "lh");
+
+        assert!(any_golfer([&shot]));
+        assert!(!any_golfer([&blocked_shot()]));
+        let header = header(true);
+        assert_eq!(header.last().map(String::as_str), Some("golfer_id"));
+        let row = to_csv_row(
+            &shot,
+            UnitSystem::Imperial,
+            true,
+            &FlighthookConfig::default(),
+        );
+        let cells: Vec<&str> = row.trim_end().split(',').collect();
+        assert_eq!(cells.len(), header.len());
+        assert_eq!(cells.last(), Some(&"pureplay.local-3"));
+        let none = to_csv_row(
+            &blocked_shot(),
+            UnitSystem::Imperial,
+            true,
+            &FlighthookConfig::default(),
+        );
+        assert_eq!(none.trim_end().split(',').next_back(), Some(""));
+    }
+
+    /// `golfer_id` is the `flighthook.*` id of the golfer whose
+    /// identifiers contain the turn's golfer, in JSONL and CSV; the turn in
+    /// `data` keeps the raw id.
+    #[test]
+    fn golfer_id_names_the_golfer_by_the_lookup_rule() {
+        let mut eric = flighthook::GolferRecord::new("flighthook.e", "Eric");
+        eric.identifiers.push("pureplay.local-3".into());
+        let golfers = FlighthookConfig {
+            golfers: vec![eric],
+            ..FlighthookConfig::default()
+        };
+        let mut shot = blocked_shot();
+        shot.data.turn = Some(flightrelay::GolferTurn::new(
+            Some("pureplay.local-3".parse().expect("id")),
+            Some(flighthook::Club::Iron7),
+            flighthook::Handedness::Right,
+            flighthook::Mode::Full,
+        ));
+        let v: serde_json::Value =
+            serde_json::from_str(&jsonl_line(&shot, "t", None, false, &golfers)).expect("json");
+        assert_eq!(v["golfer_id"], "flighthook.e");
+        assert_eq!(v["data"]["turn"]["golfer"], "pureplay.local-3");
+        let row = to_csv_row(&shot, UnitSystem::Imperial, true, &golfers);
+        assert_eq!(row.trim_end().split(',').next_back(), Some("flighthook.e"));
+        // Its own id is itself; an id no golfer lists stays as it is.
+        for (raw, out) in [
+            ("flighthook.e", "flighthook.e"),
+            ("backnine.p7", "backnine.p7"),
+        ] {
+            if let Some(turn) = shot.data.turn.as_mut() {
+                turn.golfer = Some(raw.parse().expect("id"));
+            }
+            let line = build_export_line(&shot, "t", None, false, &golfers);
+            assert_eq!(line.golfer_id.as_deref(), Some(out));
+        }
     }
 }

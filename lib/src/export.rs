@@ -8,11 +8,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Club, Handedness, ShotData, ShotDetectionMode, SimulationSection};
+use crate::{Club, Handedness, Mode, ShotData, SimulationSection};
 
 /// Export format version. Bumped when a field changes meaning.
 ///
-/// Schema 3: the raw records of a device on a flightrelay device driver
+/// Schema 4: `data` is the stored shot in the FRP 0.3.0 shape: the measured
+/// `launch`, every `shot.flight` with its sender in `flights` (local actors
+/// named by card key), the turn at the trigger in `turn`, the block in
+/// `block`, and `club_selected` as the store stamped it. Schema 3: the raw records of a device on a flightrelay device driver
 /// carry the driver's `label` instead of `type`, `src`, `dst` and
 /// `channel`, one record per protocol message (the R10's: one message each,
 /// not a BLE chunk). Schema 2: `data` carries the
@@ -20,7 +23,7 @@ use crate::{Club, Handedness, ShotData, ShotDetectionMode, SimulationSection};
 /// (FRP 0.2.0's `launch` and `flight_result`). Schema 1 lines held both in
 /// one `ball` block; [`ShotExport`] reads them into the schema 2 shape, and
 /// schema 2 lines read as they are.
-pub const EXPORT_SCHEMA: u32 = 3;
+pub const EXPORT_SCHEMA: u32 = 4;
 
 /// Direction of a raw frame relative to flighthook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,11 +163,12 @@ pub struct ExportDevice {
 /// Settings in effect when the shot was hit.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExportSettings {
-    /// The actor's config section with `name`, `address` and `bind` removed.
+    /// The actor's config section with `name`, `address`, `bind` and the
+    /// card's `actor_id` removed.
     pub device: serde_json::Value,
     pub simulation: SimulationSection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detection_mode: Option<ShotDetectionMode>,
+    pub detection_mode: Option<Mode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handed: Option<Handedness>,
 }
@@ -179,23 +183,27 @@ pub struct ShotExport {
     pub exported_at: String,
     /// RFC 3339 UTC, host clock, when `shot_trigger` reached the web layer.
     pub time: String,
-    /// Actor ID (`"mevo.0"`). Not a device identity.
+    /// The card key of a local card (`"mevo.0"`), else the FRP actor id.
+    /// Not a device identity.
     pub actor: String,
     pub shot_id: String,
     pub shot_number: u32,
     pub device: ExportDevice,
-    /// Club in play when the shot was triggered (the last `club_info` on the
-    /// bus, e.g. the simulator's selection), if known.
+    /// The golfer of the turn the shot was hit in, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golfer_id: Option<String>,
+    /// Club in the turn when the shot was triggered, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club_selected: Option<Club>,
-    /// Shot group id (UUID v4), when the shot was grouped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    /// Practice block id (UUID v4), when the shot is in one. Read from
+    /// `group` in a schema 3 line or older.
+    #[serde(default, alias = "group", skip_serializing_if = "Option::is_none")]
+    pub block: Option<String>,
     pub settings: ExportSettings,
     /// Exactly the `/api/shots` element for this shot (same serde shape), so
-    /// `data.shot_id`, `data.club_selected` and `data.group`, when set, equal
-    /// the top-level fields. Shots the device produced no data for carry no
-    /// ball, club, impact or derived block.
+    /// `data.shot_id` and `data.block`, when set, equal the top-level fields,
+    /// and `data.turn` holds the club and hand. Shots the device produced no
+    /// data for carry no launch, flights, club or impact.
     pub data: ShotData,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<ShotRaw>,
@@ -235,16 +243,18 @@ mod tests {
                 model: None,
                 firmware: None,
             },
+            golfer_id: None,
             club_selected: Some(Club::Iron7),
-            group: None,
+            block: None,
             settings: ExportSettings {
                 device: serde_json::json!({"ball_type": 1}),
                 simulation: SimulationSection::default(),
-                detection_mode: Some(ShotDetectionMode::Full),
+                detection_mode: Some(Mode::Full),
                 handed: None,
             },
             data: ShotData {
-                actor: "mevo.0".into(),
+                from: "mevo-id".into(),
+                card: Some("mevo.0".into()),
                 shot_number: 3,
                 launch: Some(Launch {
                     launch_speed: Some(Velocity::MetersPerSecond(40.0)),
@@ -257,9 +267,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_three() {
-        assert_eq!(EXPORT_SCHEMA, 3);
-        assert_eq!(export(None).schema, 3);
+    fn schema_is_four() {
+        assert_eq!(EXPORT_SCHEMA, 4);
+        assert_eq!(export(None).schema, 4);
     }
 
     /// A schema 1 line, with launch and flight values in one `ball` block,
@@ -284,8 +294,9 @@ mod tests {
                 spin_axis: Some(-2.9),
             })
         );
+        let shown = data.shown();
         assert_eq!(
-            data.flight,
+            shown.flight,
             Some(FlightResult {
                 carry_distance: Some(Distance::Meters(150.2)),
                 carry_offline: Some(Distance::Meters(-3.1)),
@@ -297,17 +308,18 @@ mod tests {
         );
         assert!(data.club.is_some());
         assert_eq!(
-            data.derived.as_ref().and_then(|d| d.roll_distance),
+            shown.derived.as_ref().and_then(|d| d.roll_distance),
             Some(Distance::Meters(9.5))
         );
-        assert_eq!(data.club_selected, Some(Club::Iron7));
+        assert_eq!(data.club_selected(), Some(Club::Iron7));
         assert_eq!(old.raw.expect("raw").frames.len(), 1);
-        // Written back, it has the schema 2 shape.
+        // Written back, it has the stored shot's shape.
         let json = serde_json::to_value(&old.data).expect("ser");
         assert!(json.get("ball").is_none(), "{json}");
         assert_eq!(json["launch"]["launch_speed"], "40mps");
-        assert_eq!(json["flight"]["basis"], "modeled");
-        assert_eq!(json["flight"]["carry_distance"], "150.2m");
+        assert_eq!(json["flights"][0]["from"], "mevo.0");
+        assert_eq!(json["flights"][0]["flight"]["basis"], "modeled");
+        assert_eq!(json["flights"][0]["flight"]["carry_distance"], "150.2m");
         assert!(json["launch"].get("carry_distance").is_none(), "{json}");
     }
 
@@ -378,33 +390,32 @@ mod tests {
             assert_eq!(v["club_selected"], "7I");
             assert!(v["device"].get("model").is_none());
             assert!(v["settings"].get("handed").is_none());
-            assert!(v.get("group").is_none());
+            assert!(v.get("block").is_none());
+            assert!(v.get("golfer_id").is_none());
         }
     }
 
     #[test]
-    fn shot_export_group_round_trips() {
+    fn shot_export_block_round_trips() {
         let id = "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7";
         let mut line = export(None);
-        line.group = Some(id.into());
+        line.block = Some(id.into());
         line.data.shot_id = Some(line.shot_id.clone());
-        line.data.club_selected = line.club_selected;
-        line.data.group = line.group.clone();
+        line.data.block = line.block.clone();
         let json = serde_json::to_string(&line).expect("ser");
-        // `group` sits right after `club_selected`.
+        // `block` sits right after `club_selected`.
         assert!(
             json.contains(&format!(
-                r#""club_selected":"7I","group":"{id}","settings""#
+                r#""club_selected":"7I","block":"{id}","settings""#
             )),
             "{json}"
         );
         let back: ShotExport = serde_json::from_str(&json).expect("de");
         assert_eq!(back, line);
         let v: serde_json::Value = serde_json::from_str(&json).expect("value");
-        assert_eq!(v["group"], id);
-        assert_eq!(v["data"]["group"], id);
+        assert_eq!(v["block"], id);
+        assert_eq!(v["data"]["block"], id);
         assert_eq!(v["data"]["shot_id"], v["shot_id"]);
-        assert_eq!(v["data"]["club_selected"], v["club_selected"]);
         assert!(v.get("number").is_none());
         assert!(v.get("mode").is_none());
         assert!(v.get("session").is_none());

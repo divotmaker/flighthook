@@ -14,6 +14,8 @@ pub use flighthook::{
     ActorStatusResponse,
     AutoChipRequest,
     Basis,
+    BlockInfo,
+    BlocksResponse,
     BodyTrackingMode,
     BodyTrackingSection,
     CameraListEntry,
@@ -24,7 +26,7 @@ pub use flighthook::{
     // Global state types
     Club,
     ClubData,
-    ClubInfo,
+    ClubExt,
     ConfigLoadError,
     ConnectionState,
     DerivedFlight,
@@ -37,22 +39,18 @@ pub use flighthook::{
     FlightResult,
     FlightScopeEnvironment,
     FlighthookConfig,
-    FlighthookEvent,
-    FlighthookMessage,
-    GameStateSnapshot,
-    HandInfo,
-    HandRequest,
     Handedness,
     Launch,
     LivePose,
     LivePosture,
     MevoSection,
     MockMonitorSection,
+    Mode,
     OpenConnectClientSection,
     OpenConnectServerSection,
-    PlayerInfo,
     PoseTrackFile,
     PostSettingsResponse,
+    PureplayAccessorySection,
     PureplaySection,
     R10Section,
     RECONNECT_ALERT_MS,
@@ -61,10 +59,7 @@ pub use flighthook::{
     RoundState,
     Severity,
     ShotData,
-    ShotDetectionMode,
-    ShotGroupInfo,
     ShotGrouping,
-    ShotGroupsResponse,
     ShotKey,
     ShotVideo,
     SimSurface,
@@ -108,33 +103,19 @@ pub struct ShotRow {
     pub club_selected: Option<Club>,
     /// Player handedness when the shot was triggered.
     pub handed: Option<Handedness>,
-    /// Id of the shot group the shot joined (`ShotGroupInfo::id`).
+    /// Id of the practice block (set) the shot belongs to.
     pub group: Option<String>,
     /// The shot's `shot_finished` arrived. Always true for a row loaded
     /// from `/api/shots`.
     pub finished: bool,
     /// The cameras' clips of the shot, one per camera.
     pub video: Vec<ShotVideo>,
+    /// The turn's golfer id when the shot was triggered, as the turn named
+    /// it (resolve it with the lookup rule).
+    pub golfer: Option<String>,
 }
 
 impl ShotRow {
-    /// Take in a `flight_result` of this shot. A device's goes in
-    /// [`flight`](Self::flight), the first one kept. flighthook's own
-    /// ([`flighthook::is_flighthook_flight`], added on its FRP output when the
-    /// device sent none) repeats the simulated values the row already holds
-    /// in `derived`; only its `assumed` launch is taken, for the estimated
-    /// spin that the measured launch leaves out, so the row matches the shot
-    /// `/api/shots` serves.
-    pub fn apply_flight(&mut self, flight: FlightResult) {
-        if flighthook::is_flighthook_flight(&flight) {
-            if let Some(launch) = self.launch.as_mut() {
-                launch.fill_assumed(&flight);
-            }
-        } else {
-            self.flight.get_or_insert(flight);
-        }
-    }
-
     /// Whether the device reported launch, flight or club data for the shot.
     pub fn has_data(&self) -> bool {
         self.launch.is_some() || self.flight.is_some() || self.club.is_some()
@@ -146,21 +127,32 @@ impl ShotRow {
         // impact is millimeters in every unit system and is kept as it is.
         let tmp = ShotData {
             launch: self.launch.clone(),
-            flight: self.flight.clone(),
+            flights: self
+                .flight
+                .iter()
+                .map(|flight| flighthook::Flight {
+                    from: String::new(),
+                    flight: flight.clone(),
+                })
+                .collect(),
             club: self.club.clone(),
-            derived: self.derived.clone(),
             ..ShotData::default()
         };
         let converted = tmp.to_unit_system(system);
+        let derived = self.derived.as_ref().map(|d| match system {
+            UnitSystem::Imperial => d.to_imperial(),
+            UnitSystem::Metric => d.to_metric(),
+        });
         ShotRow {
+            golfer: self.golfer.clone(),
             actor: self.actor.clone(),
             shot_id: self.shot_id.clone(),
             shot_number: self.shot_number,
             launch: converted.launch,
-            flight: converted.flight,
+            flight: converted.flights.into_iter().next().map(|f| f.flight),
             club: converted.club,
             impact: self.impact.clone(),
-            derived: converted.derived,
+            derived,
             club_selected: self.club_selected,
             handed: self.handed,
             group: self.group.clone(),
@@ -185,20 +177,31 @@ impl ShotRow {
     }
 }
 
+/// A stored shot as a row: what [`ShotData::shown`] composes, under the
+/// card key (else the launch monitor's actor id).
 impl From<ShotData> for ShotRow {
     fn from(shot: ShotData) -> Self {
+        let shown = shot.shown();
+        let club_selected = shot.club_selected();
+        let handed = shot.handed();
+        let golfer = shot
+            .turn
+            .as_ref()
+            .and_then(|t| t.golfer.as_ref())
+            .map(|g| g.as_str().to_owned());
         Self {
-            actor: shot.actor,
+            golfer,
+            actor: shot.card_key().to_owned(),
             shot_id: shot.shot_id.unwrap_or_default(),
             shot_number: shot.shot_number,
-            launch: shot.launch,
-            flight: shot.flight,
+            launch: shown.launch,
+            flight: shown.flight,
             club: shot.club,
             impact: shot.impact,
-            derived: shot.derived,
-            club_selected: shot.club_selected,
-            handed: shot.handed,
-            group: shot.group,
+            derived: shown.derived,
+            club_selected,
+            handed,
+            group: shot.block,
             finished: true,
             video: shot.video,
         }
@@ -303,7 +306,7 @@ pub fn remove_video(rows: &mut [ShotRow], keys: &[ShotKey]) -> bool {
 // Log entry (UI-local)
 // ---------------------------------------------------------------------------
 
-/// Log entry — constructed from FlighthookMessage bus events.
+/// Log entry — constructed from the UI socket's messages.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub timestamp: String,
@@ -315,11 +318,3 @@ pub struct LogEntry {
     /// Alert severity (only set for alert events).
     pub alert_severity: Option<Severity>,
 }
-
-/// Parse a WS JSON message into a FlighthookMessage.
-pub fn parse_ws_message(text: &str) -> Option<FlighthookMessage> {
-    serde_json::from_str(text).ok()
-}
-
-/// Synthetic WS event for connection loss.
-pub const WS_DISCONNECTED: &str = "__ws_disconnected__";

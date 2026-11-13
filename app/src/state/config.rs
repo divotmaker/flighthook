@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Deserialize;
 
@@ -124,10 +124,15 @@ impl LegacyFlighthookConfig {
             }
             webserver.insert("0".into(), ws);
         }
+        let mut openconnect_client = self.gspro;
+        for section in openconnect_client.values_mut() {
+            section.chipping_clubs.clone_from(&self.chipping_clubs);
+            section.putting_clubs.clone_from(&self.putting_clubs);
+        }
         FlighthookConfig {
             default_units: self.default_units,
-            chipping_clubs: self.chipping_clubs,
-            putting_clubs: self.putting_clubs,
+            frp: flighthook::FrpSection::default(),
+            selected_golfer: None,
             shot_grouping: flighthook::ShotGrouping::default(),
             simulation: self.simulation,
             webserver,
@@ -138,12 +143,13 @@ impl LegacyFlighthookConfig {
             trackball: HashMap::new(),
             mock_monitor: self.mock_monitor,
             openconnect_server: HashMap::new(),
-            openconnect_client: self.gspro,
+            openconnect_client,
             pureplay: HashMap::new(),
+            pureplay_accessory: HashMap::new(),
             random_club: self.random_club,
             replay: flighthook::ReplaySection::default(),
             body_tracking: flighthook::BodyTrackingSection::default(),
-            player: flighthook::PlayerSection::default(),
+            golfers: Vec::new(),
             camera: HashMap::new(),
         }
     }
@@ -167,23 +173,69 @@ pub fn load(path: &Path) -> (FlighthookConfig, Option<flighthook::ConfigLoadErro
     match std::fs::read_to_string(path) {
         Ok(contents) => match parse(path, &contents) {
             Ok(mut config) => {
+                give_actor_ids(&mut config);
+                // Output routing that names a card by its key (`mevo.0`)
+                // names it by its actor id from here on. A key no card
+                // holds stays as it is and routes nothing.
+                config.route_by_actor_id();
                 bring_up_to_date(path, &contents, &config);
                 turn_off_clashing(path, &mut config);
                 (config, None)
             }
-            Err(error) => (FlighthookConfig::default(), Some(failed(error))),
+            Err(error) => (
+                with_actor_ids(FlighthookConfig::default()),
+                Some(failed(error)),
+            ),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let defaults = FlighthookConfig::default();
+            // Written at once, so flighthook's actors keep their ids across
+            // restarts from the first start on.
+            let defaults = with_actor_ids(FlighthookConfig::default());
             tracing::info!("no config file found, creating {}", path.display());
             save_to(path, &defaults);
             (defaults, None)
         }
         Err(e) => {
             tracing::warn!("failed to read {}: {e}", path.display());
-            (FlighthookConfig::default(), Some(failed(e.to_string())))
+            (
+                with_actor_ids(FlighthookConfig::default()),
+                Some(failed(e.to_string())),
+            )
         }
     }
+}
+
+/// Give every actor in `config` that has none, or whose id an earlier actor
+/// holds, its FRP actor id, generated once ([`flightrelay::new_actor_id`]).
+/// Run at load (the file is rewritten once, with a backup, by
+/// [`bring_up_to_date`]) and on every change (a new card gets its id when
+/// it is first saved).
+pub fn give_actor_ids(config: &mut FlighthookConfig) {
+    for key in config.renew_duplicate_actor_ids(flightrelay::new_actor_id) {
+        tracing::warn!("'{key}' held an actor id an earlier actor holds; it has a new id");
+    }
+    config.fill_actor_ids(flightrelay::new_actor_id);
+    give_golfer_ids(config);
+}
+
+/// Keep each golfer id in the first golfer that lists it (a warning names
+/// the golfer that loses it), and give every golfer without a
+/// `flighthook.*` identifier one, generated once ([`new_golfer_id`]).
+pub fn give_golfer_ids(config: &mut FlighthookConfig) {
+    for dup in config.dedupe_golfer_ids() {
+        tracing::warn!("{dup}; {} keeps it", dup.first);
+    }
+    config.fill_golfer_ids(new_golfer_id);
+}
+
+/// A new golfer's own id, without its namespace: a random UUID.
+pub fn new_golfer_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn with_actor_ids(mut config: FlighthookConfig) -> FlighthookConfig {
+    give_actor_ids(&mut config);
+    config
 }
 
 /// Turn off, in `config` loaded from `path`, every enabled card whose
@@ -215,6 +267,13 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
             if let Some(error) = config.impact_lead_error() {
                 tracing::warn!("{}: {error}; the device default is used", path.display());
             }
+            for output in config.simulator_routes() {
+                tracing::warn!(
+                    "{}: {output} is routed to a Pureplay Accessory card, whose shots no output \
+                     takes; that route passes nothing",
+                    path.display()
+                );
+            }
             if let Some(error) = config.device_error() {
                 tracing::warn!(
                     "{}: {error}; that card does not start until it is fixed",
@@ -227,8 +286,8 @@ fn parse(path: &Path, contents: &str) -> Result<FlighthookConfig, String> {
                     path.display()
                 );
             }
-            if let Some(error) = config.player.error() {
-                tracing::warn!("{}: [player] {error}; no height is used", path.display());
+            if let Some(error) = config.golfer_error() {
+                tracing::warn!("{}: {error}; no height is used", path.display());
             }
             if let Some(error) = config.body_tracking.error() {
                 tracing::warn!(
@@ -562,21 +621,128 @@ pub fn save_to(path: &Path, config: &FlighthookConfig) {
 /// one at a time on its thread), so no external reload lock is needed.
 pub struct SystemConfig {
     path: PathBuf,
-    inner: RwLock<FlighthookConfig>,
+    inner: Arc<RwLock<FlighthookConfig>>,
     /// Why the file was not used at startup, until a save has backed it up
     /// and replaced it.
     load_error: Mutex<Option<flighthook::ConfigLoadError>>,
+    /// Every card's key (`mevo.0`) and actor id, rebuilt on each change.
+    cards: RwLock<CardActors>,
+}
+
+/// The cards of a config by key and by actor id, and flighthook's own
+/// actor ids.
+#[derive(Default)]
+struct CardActors {
+    by_key: std::collections::HashMap<String, String>,
+    by_id: std::collections::HashMap<String, String>,
+    own: OwnActorIds,
+}
+
+/// The actor ids of flighthook's own actors, `None` while one has none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnActorIds {
+    /// `[frp] actor_id`.
+    pub flighthook: Option<String>,
+    /// `[frp] auto_chip_actor_id`.
+    pub auto_chip: Option<String>,
+    /// `[simulation] actor_id`.
+    pub flight_model: Option<String>,
+}
+
+impl CardActors {
+    fn of(config: &FlighthookConfig) -> Self {
+        let mut out = Self {
+            own: OwnActorIds {
+                flighthook: config.frp.actor_id.clone(),
+                auto_chip: config.frp.auto_chip_actor_id.clone(),
+                flight_model: config.simulation.actor_id.clone(),
+            },
+            ..Self::default()
+        };
+        for (key, id) in config.card_actors() {
+            if let Some(id) = id {
+                out.by_key.insert(key.clone(), id.to_owned());
+                out.by_id.entry(id.to_owned()).or_insert(key);
+            }
+        }
+        out
+    }
+}
+
+/// A read-only handle on the live config, for code that reads it where it
+/// is used (the session's golfer rules).
+#[derive(Clone)]
+pub struct ConfigView(Arc<RwLock<FlighthookConfig>>);
+
+impl std::fmt::Debug for ConfigView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConfigView")
+    }
+}
+
+impl ConfigView {
+    /// A view of `config` alone, not tied to any [`SystemConfig`].
+    #[cfg(test)]
+    pub fn detached(config: FlighthookConfig) -> Self {
+        Self(Arc::new(RwLock::new(config)))
+    }
+
+    /// The config, to change it in a test.
+    #[cfg(test)]
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, FlighthookConfig> {
+        self.0.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The config as it is now.
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, FlighthookConfig> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl SystemConfig {
+    /// A read-only handle that follows every change.
+    pub fn view(&self) -> ConfigView {
+        ConfigView(Arc::clone(&self.inner))
+    }
+
     /// Load config from disk (or create defaults) and cache it.
     pub fn new(path: PathBuf) -> Self {
         let (config, load_error) = load(&path);
         Self {
             path,
-            inner: RwLock::new(config),
+            cards: RwLock::new(CardActors::of(&config)),
+            inner: Arc::new(RwLock::new(config)),
             load_error: Mutex::new(load_error),
         }
+    }
+
+    /// The actor id of the card `key` (`mevo.0`), if it has one.
+    pub fn actor_of_card(&self, key: &str) -> Option<String> {
+        self.cards
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .by_key
+            .get(key)
+            .cloned()
+    }
+
+    /// The actor ids of flighthook's own actors.
+    pub fn own_actor_ids(&self) -> OwnActorIds {
+        self.cards
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .own
+            .clone()
+    }
+
+    /// The key of the card whose actor id is `actor_id`, if one is.
+    pub fn card_of_actor(&self, actor_id: &str) -> Option<String> {
+        self.cards
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .by_id
+            .get(actor_id)
+            .cloned()
     }
 
     /// Why the config file was not used at startup, while it still sits
@@ -630,9 +796,11 @@ impl SystemConfig {
         Ok(backup)
     }
 
-    /// Write `config` to the config file, after backing up a file that
-    /// failed to load. A file that cannot be backed up is left alone.
+    /// Rebuild the card map from `config` and write `config` to the config
+    /// file, after backing up a file that failed to load. A file that cannot
+    /// be backed up is left alone.
     fn persist(&self, config: &FlighthookConfig) {
+        *self.cards.write().unwrap_or_else(|e| e.into_inner()) = CardActors::of(config);
         if let Err(e) = self.back_up_unusable_file() {
             tracing::warn!("not saving the config: {e}");
             return;
@@ -719,14 +887,15 @@ impl SystemConfig {
         configured.map_or(0, flighthook::rotation_in_effect_deg)
     }
 
-    /// The `[player]` settings in effect: a height out of range is no
-    /// height. Read by the swing analysis of every clip.
-    pub fn player(&self) -> flighthook::PlayerSection {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .player
-            .in_effect()
+    /// The facts (sex, height) of the golfer golfer id `golfer` means, by
+    /// the lookup rule; a height out of range is no height. The defaults
+    /// when no golfer has the id. Read by the swing analysis of every clip.
+    pub fn golfer_facts(&self, golfer: Option<&str>) -> flighthook::PlayerSection {
+        let config = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        golfer
+            .and_then(|id| config.golfer_of(id))
+            .map(flighthook::GolferRecord::facts)
+            .unwrap_or_default()
     }
 
     /// The `[body_tracking]` settings in effect: a value out of range is its
@@ -738,6 +907,24 @@ impl SystemConfig {
             .unwrap_or_else(|e| e.into_inner())
             .body_tracking
             .in_effect()
+    }
+
+    /// The Shots setting of Pureplay Accessory card `actor` (e.g.
+    /// `pureplay_accessory.0`), the default when it has no section. Read
+    /// for every shot and on every pass of the card's loop, so a change
+    /// applies at once.
+    pub fn pureplay_shots(&self, actor: &str) -> flighthook::PureplayShots {
+        actor
+            .strip_prefix("pureplay_accessory.")
+            .and_then(|index| {
+                self.inner
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pureplay_accessory
+                    .get(index)
+                    .map(|s| s.shots)
+            })
+            .unwrap_or_default()
     }
 
     /// Number of configured cameras.
@@ -772,14 +959,33 @@ impl SystemConfig {
     /// Mutate the cached config in place, then persist to disk.
     pub fn update(&self, f: impl FnOnce(&mut FlighthookConfig)) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let before = guard.clone();
         f(&mut guard);
+        guard.keep_actor_ids_from(&before);
+        give_actor_ids(&mut guard);
         self.persist(&guard);
     }
 
-    /// Replace the entire cached config and persist to disk.
+    /// Replace the entire cached config and persist to disk. The running
+    /// process keeps its own actor ids (flighthook, Auto-chip, the flight
+    /// model) whatever `new` holds; a card keeps its id when `new` gives it
+    /// none.
     pub fn replace(&self, new: FlighthookConfig) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        *guard = new;
+        let before = std::mem::replace(&mut *guard, new);
+        let own = |slot: &mut Option<String>, old: &Option<String>| {
+            if old.is_some() {
+                slot.clone_from(old);
+            }
+        };
+        own(&mut guard.frp.actor_id, &before.frp.actor_id);
+        own(
+            &mut guard.frp.auto_chip_actor_id,
+            &before.frp.auto_chip_actor_id,
+        );
+        own(&mut guard.simulation.actor_id, &before.simulation.actor_id);
+        guard.keep_actor_ids_from(&before);
+        give_actor_ids(&mut guard);
         self.persist(&guard);
     }
 }
@@ -790,24 +996,213 @@ mod tests {
     use flighthook::{DeviceSection, SimMode};
 
     /// `FlighthookConfig::default()` as written to disk, with no
-    /// `[simulation]` table. An untouched config must not gain one.
+    /// `[simulation]` table. An untouched config gains one only to hold the
+    /// flight model's actor id.
     const GOLDEN_DEFAULT_TOML: &str = r#"default_units = "imperial"
-chipping_clubs = [
-    "GW",
-    "SW",
-    "LW",
-]
-putting_clubs = ["PT"]
 
 [webserver.0]
 name = "Web Server"
 bind = "0.0.0.0:5880"
 "#;
 
+    /// The default config is written as it is, and the first start writes
+    /// it with nothing else but the actor ids.
     #[test]
     fn default_config_file_is_unchanged() {
         let toml = toml::to_string_pretty(&FlighthookConfig::default()).expect("ser");
         assert_eq!(toml, GOLDEN_DEFAULT_TOML);
+
+        let (dir, _) = config_dir("");
+        let path = dir.0.join("new.toml");
+        let (created, error) = load(&path);
+        assert_eq!(error, None);
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(without_ids(&written), GOLDEN_DEFAULT_TOML, "{written}");
+        assert!(created.frp.actor_id.is_some() && created.frp.auto_chip_actor_id.is_some());
+        let (again, _) = load(&path);
+        assert_same_config(&again, &created);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), written);
+    }
+
+    /// Two cards with the same actor id at load: the later one gets a new
+    /// id, the earlier keeps its own.
+    #[test]
+    fn a_duplicate_actor_id_at_load_is_renewed_on_the_later_card() {
+        let src = "[mock_monitor.0]\nname = \"A\"\nactor_id = \"aaaa000000000001\"\n\n\
+                   [mock_monitor.1]\nname = \"B\"\nactor_id = \"aaaa000000000001\"\n\n\
+                   [mevo.0]\nname = \"C\"\nactor_id = \"aaaa000000000001\"\n";
+        let (_dir, path) = config_dir(src);
+        let (c, error) = load(&path);
+        assert_eq!(error, None);
+        assert_eq!(c.mevo["0"].actor_id.as_deref(), Some("aaaa000000000001"));
+        let b0 = c.mock_monitor["0"].actor_id.clone().expect("id");
+        let b1 = c.mock_monitor["1"].actor_id.clone().expect("id");
+        assert_ne!(b0, "aaaa000000000001");
+        assert_ne!(b1, "aaaa000000000001");
+        assert_ne!(b0, b1);
+        let (again, _) = load(&path);
+        assert_same_config(&again, &c);
+    }
+
+    /// A replace with other ids for flighthook, Auto-chip and the flight
+    /// model keeps the running process's own; card ids come from `new`.
+    #[test]
+    fn replace_keeps_the_process_own_actor_ids() {
+        let (_dir, path) = config_dir("[mock_monitor.0]\nname = \"A\"\n");
+        let store = SystemConfig::new(path);
+        let before = store.snapshot();
+        let mut restored = before.clone();
+        restored.frp.actor_id = Some("1111111111111111".into());
+        restored.frp.auto_chip_actor_id = Some("2222222222222222".into());
+        restored.simulation.actor_id = Some("3333333333333333".into());
+        restored.mock_monitor.get_mut("0").expect("card").actor_id =
+            Some("4444444444444444".into());
+        store.replace(restored);
+        let after = store.snapshot();
+        assert_eq!(after.frp, before.frp);
+        assert_eq!(after.simulation.actor_id, before.simulation.actor_id);
+        assert_eq!(
+            after.mock_monitor["0"].actor_id.as_deref(),
+            Some("4444444444444444")
+        );
+    }
+
+    /// An old config whose trackball card holds `hand = "lh"` loads; the
+    /// key is ignored and dropped on the next save.
+    #[test]
+    fn an_old_trackball_hand_setting_loads_and_is_ignored() {
+        let (_dir, path) =
+            config_dir("[trackball.0]\nname = \"Arcade\"\nclub = \"DR\"\nhand = \"lh\"\n");
+        let (c, error) = load(&path);
+        assert_eq!(error, None);
+        let card = &c.trackball["0"];
+        assert_eq!(card.name, "Arcade");
+        assert_eq!(card.driver.hand, thumbswing::Hand::default());
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert!(!written.contains("hand"), "{written}");
+        assert!(written.contains("club = \"DR\""), "{written}");
+    }
+
+    /// A routing key no card holds at load stays as it is, and a card
+    /// added later at that index does not take the route.
+    #[test]
+    fn a_stale_routing_key_does_not_route_to_a_later_card() {
+        let src = "[openconnect_client.0]\nname = \"GSPro\"\nfull_monitor = \"mevo.0\"\n";
+        let (_dir, path) = config_dir(src);
+        let store = SystemConfig::new(path);
+        let c = store.snapshot();
+        assert_eq!(
+            c.openconnect_client["0"].full_monitor.as_deref(),
+            Some("mevo.0")
+        );
+        store.update(|c| {
+            c.mevo.insert(
+                "0".into(),
+                flighthook::MevoSection {
+                    name: "Mevo".into(),
+                    ..flighthook::MevoSection::default()
+                },
+            );
+        });
+        let c = store.snapshot();
+        assert!(c.mevo["0"].actor_id.is_some());
+        assert_eq!(
+            c.openconnect_client["0"].full_monitor.as_deref(),
+            Some("mevo.0"),
+            "the stale key stays a missing monitor"
+        );
+    }
+
+    /// The card map follows every change: a card added is found by key and
+    /// by id, a card removed is not.
+    #[test]
+    fn the_card_map_follows_changes() {
+        let (_dir, path) = config_dir("");
+        let store = SystemConfig::new(path);
+        assert_eq!(store.actor_of_card("mock_monitor.0"), None);
+        store.update(|c| {
+            drop(
+                c.mock_monitor
+                    .insert("0".into(), flighthook::MockMonitorSection::default()),
+            )
+        });
+        let id = store.actor_of_card("mock_monitor.0").expect("id");
+        assert_eq!(store.card_of_actor(&id).as_deref(), Some("mock_monitor.0"));
+        assert_eq!(
+            store.own_actor_ids().flighthook,
+            store.snapshot().frp.actor_id
+        );
+        store.update(|c| drop(c.mock_monitor.remove("0")));
+        assert_eq!(store.actor_of_card("mock_monitor.0"), None);
+        assert_eq!(store.card_of_actor(&id), None);
+    }
+
+    /// A fresh config's `[simulation]` table holds the flight model's actor
+    /// id and nothing else.
+    #[test]
+    fn fresh_config_simulation_holds_only_actor_id() {
+        let (dir, _) = config_dir("");
+        let path = dir.0.join("new.toml");
+        let (created, _) = load(&path);
+        let written = std::fs::read_to_string(&path).expect("read");
+        let id = created.simulation.actor_id.expect("flight model id");
+        let table = format!("[simulation]\nactor_id = \"{id}\"\n");
+        let at = written.find("[simulation]").expect("simulation table");
+        let end = written[at + 1..]
+            .find("\n[")
+            .map_or(written.len(), |i| at + 1 + i);
+        assert_eq!(&written[at..end], table, "{written}");
+    }
+
+    /// A `[simulation]` table that spells out the default values loads as
+    /// the defaults.
+    #[test]
+    fn simulation_with_explicit_defaults_loads() {
+        let file = format!(
+            "[simulation]\nmode = \"on\"\naltitude = \"0ft\"\ntemperature_c = 25.0\nsurface = \"fairway\"\nauto_chip = false\n{GOLDEN_DEFAULT_TOML}"
+        );
+        let c: FlighthookConfig = toml::from_str(&file).expect("parses");
+        assert_eq!(c.simulation, flighthook::SimulationSection::default());
+        let out = toml::to_string_pretty(&c).expect("ser");
+        assert_eq!(out, GOLDEN_DEFAULT_TOML);
+    }
+
+    /// Ids survive load, save, load, and the second save writes the same
+    /// text as the first.
+    #[test]
+    fn ids_are_stable_across_load_and_save() {
+        // A default `[simulation]`: the flight model's id is all its table
+        // holds once written.
+        let (dir, path) = config_dir("[mock_monitor.0]\nname = \"Mock\"\n");
+        let store = SystemConfig::new(path.clone());
+        assert_eq!(store.load_error(), None);
+        let first = store.snapshot();
+        let first_text = std::fs::read_to_string(&path).expect("read");
+        let model_id = first
+            .simulation
+            .actor_id
+            .clone()
+            .expect("a flight model id");
+        let table: toml::Table = toml::from_str(&first_text).expect("toml");
+        let written = table["simulation"]
+            .as_table()
+            .expect("the [simulation] table");
+        assert_eq!(written.len(), 1, "{first_text}");
+        assert_eq!(written["actor_id"].as_str(), Some(model_id.as_str()));
+        // Reloaded as written, the default table keeps its id.
+        let reloaded = SystemConfig::new(path.clone());
+        assert_eq!(
+            reloaded.snapshot().simulation.actor_id.as_deref(),
+            Some(model_id.as_str())
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), first_text);
+        store.update(|_| {});
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(saved, first_text);
+        let (second, _) = load(&path);
+        assert_same_config(&second, &first);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), first_text);
+        drop(dir);
     }
 
     #[test]
@@ -1145,8 +1540,8 @@ full_monitor = "mevo.0"
     }
 
     /// A mock card's section in a file reads and writes as before its
-    /// driver settings were flattened in: a file with only its name loads
-    /// with the driver's defaults and is not rewritten; driver settings
+    /// driver settings were flattened in: a current file with only its name
+    /// loads with the driver's defaults and is not rewritten; driver settings
     /// read from the file (an integer into a seconds field) and are written
     /// back only when they differ from the defaults.
     #[test]
@@ -1164,10 +1559,11 @@ full_monitor = "mevo.0"
             text.ends_with("[mock_monitor.0]\nname = \"Mock\"\n"),
             "{text}"
         );
+        let text = with_ids(&text);
         let (dir, path) = config_dir(&text);
         let (config, error) = load(&path);
         assert_eq!(error, None);
-        assert_eq!(config, written);
+        assert_eq!(plain(&config), written);
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
             text,
@@ -1191,13 +1587,12 @@ full_monitor = "mevo.0"
 
     /// An R10 section as flighthook 0.1.24 saved it (range, camera timing,
     /// a second card that is off) loads into the same values, the range now
-    /// in the driver's settings, and the file is not rewritten.
+    /// in the driver's settings, and the file is rewritten once, only to give
+    /// its actors ids (the global club lists go: no Open Connect card takes
+    /// them), with a backup.
     #[test]
     fn an_r10_section_file_from_0_1_24_loads_unchanged() {
-        let text = "default_units = \"imperial\"\n\
-                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
-                    putting_clubs = [\"PT\"]\n\
-                    \n\
+        let body = "\n\
                     [r10.0]\n\
                     name = \"Garmin R10\"\n\
                     range = \"7ft\"\n\
@@ -1207,7 +1602,9 @@ full_monitor = "mevo.0"
                     name = \"Bay 2\"\n\
                     enabled = false\n\
                     range = \"2.1m\"\n";
-        let (dir, path) = config_dir(text);
+        let expected = format!("default_units = \"imperial\"\n{body}");
+        let text = format!("default_units = \"imperial\"\n{GLOBAL_CLUB_LISTS}{body}");
+        let (dir, path) = config_dir(&text);
         let (config, error) = load(&path);
         assert_eq!(error, None);
         let first = &config.r10["0"];
@@ -1219,21 +1616,16 @@ full_monitor = "mevo.0"
         assert!(!second.enabled);
         assert_eq!(second.driver.range, Some(flighthook::Distance::Meters(2.1)));
         assert_eq!(config.device_error(), None);
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read"),
-            text,
-            "not rewritten"
-        );
-        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        assert_only_ids_added(&dir, &path, &config, &text, &expected);
         let saved = toml::to_string_pretty(&config).expect("toml");
         assert!(
-            saved
+            without_ids(&saved)
                 .contains("[r10.0]\nname = \"Garmin R10\"\nimpact_lead_s = 2.5\nrange = \"7ft\"\n"),
             "{saved}"
         );
-        assert_eq!(
-            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
-            config
+        assert_same_config(
+            &toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            &config,
         );
     }
 
@@ -1241,14 +1633,12 @@ full_monitor = "mevo.0"
     /// every setting stated; a Xi with its spin source, launch-only spin and
     /// camera timing; one that is off with its settings by hand) load into
     /// the same values, the device settings now in the driver's, with no
-    /// device error; the file is not rewritten and gets no backup, and the
-    /// saved form round-trips.
+    /// device error; the file is rewritten once, only to give its actors ids
+    /// (the global club lists go: no Open Connect card takes them), with a
+    /// backup, and the saved form round-trips.
     #[test]
     fn a_mevo_section_file_from_0_1_24_loads_unchanged() {
-        let text = "default_units = \"imperial\"\n\
-                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
-                    putting_clubs = [\"PT\"]\n\
-                    \n\
+        let body = "\n\
                     [mevo.0]\n\
                     name = \"Mevo WiFi\"\n\
                     address = \"192.168.2.1:5100\"\n\
@@ -1281,7 +1671,9 @@ full_monitor = "mevo.0"
                     enabled = false\n\
                     address = \"192.168.2.1:5100\"\n\
                     camera_mode = \"raw_fusion\"\n";
-        let (dir, path) = config_dir(text);
+        let expected = format!("default_units = \"imperial\"\n{body}");
+        let text = format!("default_units = \"imperial\"\n{GLOBAL_CLUB_LISTS}{body}");
+        let (dir, path) = config_dir(&text);
         let (config, error) = load(&path);
         assert_eq!(error, None);
         let card = &config.mevo["0"];
@@ -1328,16 +1720,11 @@ full_monitor = "mevo.0"
             Some(flighthook::CameraMode::RawFusion)
         );
         assert_eq!(config.device_error(), None);
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read"),
-            text,
-            "not rewritten"
-        );
-        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        assert_only_ids_added(&dir, &path, &config, &text, &expected);
         let saved = toml::to_string_pretty(&config).expect("toml");
-        assert_eq!(
-            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
-            config
+        assert_same_config(
+            &toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            &config,
         );
     }
 
@@ -1374,14 +1761,12 @@ full_monitor = "mevo.0"
 
     /// Square sections as flighthook 0.1.24 saved them load into the same
     /// values, now in the driver's settings, with no device error; a file
-    /// whose values are not at their defaults is not rewritten and gets no
-    /// backup, and the saved form round-trips.
+    /// whose values are not at their defaults is rewritten once, only to give
+    /// its actors ids (the global club lists go: no Open Connect card takes
+    /// them), with a backup, and the saved form round-trips.
     #[test]
     fn a_square_section_file_from_0_1_24_loads_unchanged() {
-        let text = "default_units = \"imperial\"\n\
-                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
-                    putting_clubs = [\"PT\"]\n\
-                    \n\
+        let body = "\n\
                     [square.0]\n\
                     name = \"Square Golf Omni\"\n\
                     address = \"SquareGolf(CD01)\"\n\
@@ -1398,7 +1783,9 @@ full_monitor = "mevo.0"
                     name = \"Bay 2\"\n\
                     enabled = false\n\
                     address = \"02:00:00:AB:CD:01\"\n";
-        let (dir, path) = config_dir(text);
+        let expected = format!("default_units = \"imperial\"\n{body}");
+        let text = format!("default_units = \"imperial\"\n{GLOBAL_CLUB_LISTS}{body}");
+        let (dir, path) = config_dir(&text);
         let (config, error) = load(&path);
         assert_eq!(error, None);
         let first = &config.square["0"];
@@ -1424,16 +1811,11 @@ full_monitor = "mevo.0"
             }
         );
         assert_eq!(config.device_error(), None);
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read"),
-            text,
-            "not rewritten"
-        );
-        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        assert_only_ids_added(&dir, &path, &config, &text, &expected);
         let saved = toml::to_string_pretty(&config).expect("toml");
-        assert_eq!(
-            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
-            config
+        assert_same_config(
+            &toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            &config,
         );
     }
 
@@ -1448,7 +1830,10 @@ full_monitor = "mevo.0"
         let (dir, path) = config_dir(text);
         let (config, error) = load(&path);
         assert_eq!(error, None);
-        assert_eq!(config.square["0"], flighthook::SquareSection::default());
+        assert_eq!(
+            plain(&config).square["0"],
+            flighthook::SquareSection::default()
+        );
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
         assert_eq!(
             std::fs::read_to_string(dir.0.join(backup_name())).expect("backup"),
@@ -1459,7 +1844,7 @@ full_monitor = "mevo.0"
         assert!(!saved.contains("discard_non_putting_zero_spin"), "{saved}");
         // Loading the rewritten file changes nothing more.
         let (again, _) = load(&path);
-        assert_eq!(again, config);
+        assert_same_config(&again, &config);
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
     }
 
@@ -1517,13 +1902,11 @@ full_monitor = "mevo.0"
     /// ExPutt sections as flighthook 0.1.24 saved them (an address and a
     /// camera timing, a second card that is off and finds its device) load
     /// into the same values, the address now in the driver's settings, and
-    /// the file is not rewritten.
+    /// the file is rewritten once, only to give its actors ids (the global
+    /// club lists go: no Open Connect card takes them), with a backup.
     #[test]
     fn an_exputt_section_file_from_0_1_24_loads_unchanged() {
-        let text = "default_units = \"imperial\"\n\
-                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
-                    putting_clubs = [\"PT\"]\n\
-                    \n\
+        let body = "\n\
                     [exputt.0]\n\
                     name = \"ExPutt\"\n\
                     address = \"192.168.1.50\"\n\
@@ -1532,7 +1915,9 @@ full_monitor = "mevo.0"
                     [exputt.1]\n\
                     name = \"Practice\"\n\
                     enabled = false\n";
-        let (dir, path) = config_dir(text);
+        let expected = format!("default_units = \"imperial\"\n{body}");
+        let text = format!("default_units = \"imperial\"\n{GLOBAL_CLUB_LISTS}{body}");
+        let (dir, path) = config_dir(&text);
         let (config, error) = load(&path);
         assert_eq!(error, None);
         let first = &config.exputt["0"];
@@ -1544,33 +1929,26 @@ full_monitor = "mevo.0"
         assert!(!second.enabled);
         assert_eq!(second.driver.address, None);
         assert_eq!(config.device_error(), None);
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read"),
-            text,
-            "not rewritten"
-        );
-        assert_eq!(files(&dir.0), ["config.toml"], "no backup");
+        assert_only_ids_added(&dir, &path, &config, &text, &expected);
         let saved = toml::to_string_pretty(&config).expect("toml");
         assert!(
-            saved.contains(
+            without_ids(&saved).contains(
                 "[exputt.0]\nname = \"ExPutt\"\nimpact_lead_s = 0.75\naddress = \"192.168.1.50\"\n"
             ),
             "{saved}"
         );
-        assert_eq!(
-            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
-            config
+        assert_same_config(
+            &toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            &config,
         );
     }
 
     /// A Trackball section as the card writes it (device, club, a tuning
     /// and a thresholds table) and one that is off load into the
-    /// driver's settings, and the file is not rewritten.
+    /// driver's settings, and the current file is not rewritten.
     #[test]
     fn a_trackball_section_file_loads_unchanged() {
         let text = "default_units = \"imperial\"\n\
-                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
-                    putting_clubs = [\"PT\"]\n\
                     \n\
                     [trackball.0]\n\
                     name = \"Arcade\"\n\
@@ -1588,7 +1966,8 @@ full_monitor = "mevo.0"
                     [trackball.1]\n\
                     name = \"Thumb\"\n\
                     enabled = false\n";
-        let (dir, path) = config_dir(text);
+        let text = with_ids(text);
+        let (dir, path) = config_dir(&text);
         let (config, error) = load(&path);
         assert_eq!(error, None);
         let first = &config.trackball["0"];
@@ -1615,20 +1994,18 @@ full_monitor = "mevo.0"
         );
         assert_eq!(files(&dir.0), ["config.toml"], "no backup");
         let saved = toml::to_string_pretty(&config).expect("toml");
-        assert_eq!(
-            toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
-            config
+        assert_same_config(
+            &toml::from_str::<FlighthookConfig>(&saved).expect("parses"),
+            &config,
         );
     }
 
     /// A `grab` key in a Trackball section loads without an error or a
-    /// refused setting, never turns the grab on, and leaves the file as it
-    /// is; the next save leaves the key out.
+    /// refused setting, never turns the grab on, and leaves a current file as
+    /// it is; the next save leaves the key out.
     #[test]
     fn a_trackball_grab_key_loads_and_does_not_grab() {
         let text = "default_units = \"imperial\"\n\
-                    chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
-                    putting_clubs = [\"PT\"]\n\
                     \n\
                     [trackball.0]\n\
                     name = \"Arcade\"\n\
@@ -1639,7 +2016,8 @@ full_monitor = "mevo.0"
                     name = \"Thumb\"\n\
                     enabled = false\n\
                     grab = false\n";
-        let (dir, path) = config_dir(text);
+        let text = with_ids(text);
+        let (dir, path) = config_dir(&text);
         let (config, error) = load(&path);
         assert_eq!(error, None);
         assert_eq!(config.device_error(), None);
@@ -1657,7 +2035,7 @@ full_monitor = "mevo.0"
         let saved = std::fs::read_to_string(&path).expect("read");
         assert!(!saved.contains("grab"), "{saved}");
         assert!(saved.contains("[trackball.0]"), "{saved}");
-        assert_eq!(load(&path).0, config);
+        assert_same_config(&load(&path).0, &config);
     }
 
     /// A Trackball setting the driver refuses loads as written and names
@@ -1784,7 +2162,8 @@ full_monitor = "mevo.0"
         let client = &c.openconnect_client["0"];
         assert_eq!(client.name, "Bay GSPro");
         assert_eq!(client.address.as_deref(), Some("192.168.1.20:921"));
-        assert_eq!(client.full_monitor.as_deref(), Some("mevo.0"));
+        let routed = client.full_monitor.as_deref().expect("routed");
+        assert_eq!(c.card_of_actor(routed).as_deref(), Some("mevo.0"));
         assert_eq!(c.mevo["0"].name, "Mevo+");
 
         // The same actor, under its new ID, as the old file started.
@@ -1832,6 +2211,253 @@ full_monitor = "mevo.0"
         format!("config.pre-{}.toml", env!("CARGO_PKG_VERSION"))
     }
 
+    /// The keys that hold a generated actor id in a config file.
+    const ID_KEYS: [&str; 2] = ["actor_id", "auto_chip_actor_id"];
+
+    /// The keys that route an output to a card.
+    const ROUTE_KEYS: [&str; 3] = ["full_monitor", "chipping_monitor", "putting_monitor"];
+
+    /// The value of config line `line` when it sets one of `keys` to a
+    /// string: `(key, value)`.
+    fn string_setting<'a>(line: &'a str, keys: &[&'a str]) -> Option<(&'a str, &'a str)> {
+        let line = line.trim();
+        keys.iter().find_map(|&key| {
+            let value = line.strip_prefix(key)?.trim_start().strip_prefix('=')?;
+            let value = value.trim().strip_prefix('"')?;
+            Some((key, &value[..value.find('"')?]))
+        })
+    }
+
+    /// The table a config line `line` opens (`mevo.0` for `[mevo.0]`), if it
+    /// is a table header.
+    fn table_header(line: &str) -> Option<&str> {
+        let line = line.trim();
+        line.strip_prefix('[')
+            .filter(|rest| !rest.starts_with('['))?
+            .strip_suffix(']')
+    }
+
+    /// What the app writes for top-level table `name` at its defaults with
+    /// no id: the table an id alone makes the app write. `None` for a table
+    /// that is never written for an id alone.
+    fn table_at_defaults(name: &str) -> Option<toml::Value> {
+        match name {
+            "frp" => toml::Value::try_from(flighthook::FrpSection::default()).ok(),
+            "simulation" => toml::Value::try_from(flighthook::SimulationSection::default()).ok(),
+            _ => None,
+        }
+    }
+
+    /// Config text `text` with its generated actor ids taken out: every
+    /// line setting one ([`ID_KEYS`]) is removed, a table left empty by that
+    /// or holding only its defaults ([`table_at_defaults`]: written only for
+    /// the id) is removed with its blank lines, and every other value that
+    /// is one of those ids (output routing) names the table the id was set
+    /// in (the card's key) instead. Everything else is kept byte for byte.
+    fn without_ids(text: &str) -> String {
+        let mut owners: Vec<(String, String)> = Vec::new();
+        let mut emptied: Vec<(usize, &str)> = Vec::new();
+        let mut lines: Vec<&str> = Vec::new();
+        let mut table = None;
+        for line in text.split_inclusive('\n') {
+            if let Some(name) = table_header(line) {
+                table = Some((name, lines.len()));
+            } else if let Some((_, id)) = string_setting(line, &ID_KEYS) {
+                let (name, at) = table.expect("an id outside a table");
+                owners.push((id.to_owned(), name.to_owned()));
+                emptied.push((at, name));
+                continue;
+            }
+            lines.push(line);
+        }
+        let blank = |line: &str| line.trim().is_empty();
+        let mut keep = vec![true; lines.len()];
+        for (at, name) in emptied {
+            let end = (at + 1..lines.len())
+                .find(|&i| table_header(lines[i]).is_some())
+                .unwrap_or(lines.len());
+            let rest: String = lines[at + 1..end].concat();
+            let only_defaults = || {
+                let rest = rest.parse::<toml::Value>().ok();
+                rest.zip(table_at_defaults(name))
+                    .is_some_and(|(rest, defaults)| same_value(&rest, &defaults))
+            };
+            if !blank(&rest) && !only_defaults() {
+                continue;
+            }
+            keep[at..end].fill(false);
+            if end == lines.len() {
+                for i in (0..at).rev().take_while(|&i| blank(lines[i])) {
+                    keep[i] = false;
+                }
+            }
+        }
+        lines
+            .into_iter()
+            .zip(keep)
+            .filter(|&(_, kept)| kept)
+            .map(|(line, _)| {
+                owners.iter().fold(line.to_owned(), |line, (id, owner)| {
+                    line.replace(&format!("\"{id}\""), &format!("\"{owner}\""))
+                })
+            })
+            .collect()
+    }
+
+    /// Config text `text`, from before actor ids, as a current file: the
+    /// ids its first load gives, those the app saves, are written in under
+    /// their tables' headers (a table the text lacks, such as `[frp]` or a
+    /// `[simulation]` at its defaults, is added at the end as the app writes
+    /// it), and output routing that names a card by its key names the
+    /// card's id. Comments, order and whitespace are kept, so
+    /// [`without_ids`] gives `text` back.
+    fn with_ids(text: &str) -> String {
+        let mut config: FlighthookConfig = toml::from_str(text).expect("parses");
+        give_actor_ids(&mut config);
+        let saved: toml::Table = toml::to_string_pretty(&config)
+            .expect("ser")
+            .parse()
+            .expect("toml");
+        let table_of = |name: &str| {
+            name.split('.')
+                .try_fold(&saved, |t, part| t.get(part)?.as_table())
+        };
+        let id_lines = |name: &str| -> String {
+            let Some(table) = table_of(name) else {
+                return String::new();
+            };
+            ID_KEYS
+                .iter()
+                .filter_map(|key| Some(format!("{key} = {}\n", table.get(*key)?)))
+                .collect()
+        };
+        let cards = config.card_actors();
+        let mut placed = Vec::new();
+        let mut out = String::new();
+        for line in text.split_inclusive('\n') {
+            if let Some((_, value)) = string_setting(line, &ROUTE_KEYS)
+                && let Some((_, Some(id))) = cards.iter().find(|(card, _)| card == value)
+            {
+                out.push_str(&line.replacen(&format!("\"{value}\""), &format!("\"{id}\""), 1));
+                continue;
+            }
+            out.push_str(line);
+            if let Some(name) = table_header(line) {
+                out.push_str(&id_lines(name));
+                placed.push(name.to_owned());
+            }
+        }
+        for name in ["frp", "simulation"] {
+            if placed.iter().any(|p| p == name) || id_lines(name).is_empty() {
+                continue;
+            }
+            out.push_str(&format!("\n[{name}]\n"));
+            for (key, value) in table_of(name).expect("the table") {
+                assert!(!value.is_table(), "[{name}] has a sub-table");
+                out.push_str(&format!("{key} = {value}\n"));
+            }
+        }
+        for (card, _) in &cards {
+            assert!(placed.contains(card), "no [{card}] header in {text}");
+        }
+        out
+    }
+
+    /// `config` as it was before its first load gave it actor ids: no ids,
+    /// and output routing naming cards by their keys.
+    fn plain(config: &FlighthookConfig) -> FlighthookConfig {
+        let keys: HashMap<String, String> = config
+            .card_actors()
+            .into_iter()
+            .filter_map(|(key, id)| Some((id?.to_owned(), key)))
+            .collect();
+        let mut c = config.clone();
+        c.frp = flighthook::FrpSection::default();
+        c.simulation.actor_id = None;
+        macro_rules! clear_ids {
+            ($($field:ident),*) => {$(
+                for section in c.$field.values_mut() {
+                    section.actor_id = None;
+                }
+            )*};
+        }
+        clear_ids!(
+            mevo,
+            r10,
+            square,
+            exputt,
+            trackball,
+            mock_monitor,
+            openconnect_server,
+            openconnect_client,
+            pureplay,
+            pureplay_accessory,
+            random_club
+        );
+        let by_key = |slot: &mut Option<String>| {
+            if let Some(key) = slot.as_deref().and_then(|id| keys.get(id)) {
+                *slot = Some(key.clone());
+            }
+        };
+        for s in c.openconnect_client.values_mut() {
+            by_key(&mut s.full_monitor);
+            by_key(&mut s.chipping_monitor);
+            by_key(&mut s.putting_monitor);
+        }
+        for s in c.pureplay.values_mut() {
+            by_key(&mut s.full_monitor);
+            by_key(&mut s.chipping_monitor);
+            by_key(&mut s.putting_monitor);
+        }
+        c
+    }
+
+    /// Asserts that `a` and `b` are the same config with the same actors:
+    /// equal besides their ids, and flighthook's own actors and every card
+    /// with the same id in both.
+    fn assert_same_config(a: &FlighthookConfig, b: &FlighthookConfig) {
+        assert_eq!(plain(a), plain(b));
+        assert_eq!(a.frp, b.frp);
+        assert_eq!(a.simulation.actor_id, b.simulation.actor_id);
+        assert_eq!(a.card_actors(), b.card_actors());
+    }
+
+    /// Asserts that the first load of `original`, which gave `first` from
+    /// `path` in `dir`, rewrote the file once only to give its actors ids:
+    /// the original is backed up, the file holds the values of `expected`
+    /// (`original` less what moved elsewhere) besides the ids, and a second
+    /// load reads the same and leaves the file as it is.
+    fn assert_only_ids_added(
+        dir: &TempDir,
+        path: &Path,
+        first: &FlighthookConfig,
+        original: &str,
+        expected: &str,
+    ) {
+        let after_first = [backup_name(), "config.toml".to_string()];
+        assert_eq!(files(&dir.0), after_first);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(backup_name())).expect("backup"),
+            original
+        );
+        let rewritten = std::fs::read_to_string(path).expect("read");
+        let value = |s: &str| s.parse::<toml::Value>().expect("toml");
+        assert!(
+            same_value(&value(&without_ids(&rewritten)), &value(expected)),
+            "{rewritten}"
+        );
+        let (second, error) = load(path);
+        assert_eq!(error, None);
+        assert_same_config(&second, first);
+        assert_eq!(std::fs::read_to_string(path).expect("read"), rewritten);
+        assert_eq!(files(&dir.0), after_first);
+    }
+
+    /// The global club lists of a file from before they moved onto the Open
+    /// Connect client cards, as flighthook saved them.
+    const GLOBAL_CLUB_LISTS: &str = "chipping_clubs = [\n    \"GW\",\n    \"SW\",\n    \"LW\",\n]\n\
+                                     putting_clubs = [\"PT\"]\n";
+
     #[test]
     fn a_gspro_file_is_rewritten_with_a_backup_of_the_original() {
         let (dir, path) = config_dir(GSPRO_TOML);
@@ -1846,8 +2472,15 @@ full_monitor = "mevo.0"
         assert!(saved.contains("[openconnect_client.0]"), "{saved}");
         assert!(!saved.contains("gspro"), "{saved}");
         let back: FlighthookConfig = toml::from_str(&saved).expect("parses");
-        assert_eq!(back, loaded);
+        assert_same_config(&back, &loaded);
         assert_eq!(loaded.openconnect_client["0"].name, "Bay GSPro");
+        // The global club lists moved onto the client card.
+        let client = &loaded.openconnect_client["0"];
+        assert_eq!(client.chipping_clubs, flighthook::default_chipping_clubs());
+        assert_eq!(client.putting_clubs, flighthook::default_putting_clubs());
+        let top: toml::Table = saved.parse().expect("toml");
+        assert!(!top.contains_key("chipping_clubs"), "{saved}");
+        assert!(!top.contains_key("putting_clubs"), "{saved}");
     }
 
     #[test]
@@ -1889,15 +2522,15 @@ full_monitor = "mevo.0"
         );
         assert!(!saved.contains("centre"), "{saved}");
         let back: FlighthookConfig = toml::from_str(&saved).expect("parses");
-        assert_eq!(back, loaded);
+        assert_same_config(&back, &loaded);
     }
 
     #[test]
     fn a_body_tracking_section_loads_as_written_and_bad_values_default_in_effect() {
         // Only the values off their defaults: read and left byte-identical.
-        let src = format!(
+        let src = with_ids(&format!(
             "{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmodel = \"rtmpose-s\"\ndetect_every = 5\n"
-        );
+        ));
         let src = src.as_str();
         let (dir, path) = config_dir(src);
         let loaded = load(&path).0;
@@ -1908,8 +2541,9 @@ full_monitor = "mevo.0"
         assert_eq!(loaded.body_tracking.mode, flighthook::BodyTrackingMode::Off);
         // Out of range: loaded as written (the file is not rewritten), the
         // default in effect.
-        let src =
-            format!("{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmin_score = 3.0\nsmoothing = 0.5\n");
+        let src = with_ids(&format!(
+            "{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmin_score = 3.0\nsmoothing = 0.5\n"
+        ));
         let src = src.as_str();
         let (dir, path) = config_dir(src);
         let cfg = SystemConfig::new(path.clone());
@@ -1934,6 +2568,7 @@ full_monitor = "mevo.0"
             GOLDEN_DEFAULT_TOML.to_owned(),
             format!("{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmode = \"live\"\nmin_score = 0.45\n"),
         ] {
+            let src = with_ids(&src);
             let (dir, path) = config_dir(&src);
             let loaded = load(&path).0;
             assert!(loaded.body_tracking.show_skeleton, "{src}");
@@ -1941,9 +2576,9 @@ full_monitor = "mevo.0"
             assert_eq!(files(&dir.0), ["config.toml"]);
         }
         // Off: loaded and left as written; a change is read live.
-        let src = format!(
+        let src = with_ids(&format!(
             "{GOLDEN_DEFAULT_TOML}\n[body_tracking]\nmode = \"live\"\nshow_skeleton = false\n"
-        );
+        ));
         let (dir, path) = config_dir(&src);
         let cfg = SystemConfig::new(path.clone());
         assert!(!cfg.body_tracking().show_skeleton);
@@ -1962,6 +2597,7 @@ full_monitor = "mevo.0"
             GOLDEN_DEFAULT_TOML.to_owned(),
             format!("{GOLDEN_DEFAULT_TOML}\n{replay}"),
         ] {
+            let src = with_ids(&src);
             let (dir, path) = config_dir(&src);
             let loaded = load(&path).0;
             assert!(loaded.replay.shot_cards, "{src}");
@@ -1969,7 +2605,9 @@ full_monitor = "mevo.0"
             assert_eq!(files(&dir.0), ["config.toml"]);
         }
         // Off: loaded and left as written; a change is read live.
-        let src = format!("{GOLDEN_DEFAULT_TOML}\n{replay}shot_cards = false\n");
+        let src = with_ids(&format!(
+            "{GOLDEN_DEFAULT_TOML}\n{replay}shot_cards = false\n"
+        ));
         let (dir, path) = config_dir(&src);
         let cfg = SystemConfig::new(path.clone());
         assert!(!cfg.replay().shot_cards);
@@ -1995,6 +2633,7 @@ full_monitor = "mevo.0"
                 BodyTrackingMode::Historical,
             ),
         ] {
+            let src = with_ids(&src);
             let (dir, path) = config_dir(&src);
             let loaded = load(&path).0;
             assert_eq!(loaded.body_tracking.mode, mode);
@@ -2018,7 +2657,7 @@ full_monitor = "mevo.0"
         let (_dir, path) = config_dir(&src);
         assert_eq!(load(&path).0.body_tracking.mode, BodyTrackingMode::Off);
         assert_eq!(
-            std::fs::read_to_string(&path).expect("read"),
+            without_ids(&std::fs::read_to_string(&path).expect("read")),
             GOLDEN_DEFAULT_TOML
         );
     }
@@ -2028,7 +2667,9 @@ full_monitor = "mevo.0"
     /// untouched.
     #[test]
     fn enabled_is_written_only_when_off_and_such_a_file_is_left_alone() {
-        let c: FlighthookConfig = toml::from_str(EVERY_SECTION_TOML).expect("parses");
+        let mut c: FlighthookConfig = toml::from_str(EVERY_SECTION_TOML).expect("parses");
+        // Its `[player]` became a golfer; a current file holds its id.
+        c.fill_golfer_ids(|| "0f1e".into());
         assert!(c.disabled_actors().is_empty(), "absent is on");
         assert!(!toml::to_string_pretty(&c).expect("ser").contains("enabled"));
 
@@ -2045,11 +2686,12 @@ full_monitor = "mevo.0"
             .map_or(rest.len(), |e| e + table.len());
         assert!(rest[..end].contains("enabled = false\n"), "{out}");
 
+        let out = with_ids(&out);
         let (dir, path) = config_dir(&out);
         let loaded = load(&path).0;
         assert_eq!(std::fs::read_to_string(&path).expect("read"), out);
         assert_eq!(files(&dir.0), ["config.toml"]);
-        assert_eq!(loaded, off);
+        assert_eq!(plain(&loaded), off);
     }
 
     /// A file with two enabled cards on one address: the first in index
@@ -2062,15 +2704,22 @@ full_monitor = "mevo.0"
 [openconnect_client.2]
 name = "Open Connect"
 address = "localhost:921"
+chipping_clubs = ["GW", "SW", "LW"]
+putting_clubs = ["PT"]
 
 [openconnect_client.1]
 name = "GSPro"
+chipping_clubs = ["GW", "SW", "LW"]
+putting_clubs = ["PT"]
 
 [openconnect_client.3]
 name = "Muni Golf"
 address = "127.0.0.1:9210"
+chipping_clubs = ["GW", "SW", "LW"]
+putting_clubs = ["PT"]
 "#
         );
+        let contents = with_ids(&contents);
         let (dir, path) = config_dir(&contents);
         let system = SystemConfig::new(path.clone());
         let config = system.snapshot();
@@ -2086,29 +2735,29 @@ address = "127.0.0.1:9210"
         let written = std::fs::read_to_string(&path).expect("read");
         assert_eq!(written.matches("enabled = false").count(), 1, "{written}");
         let again = SystemConfig::new(path).snapshot();
-        assert_eq!(again, config);
+        assert_same_config(&again, &config);
     }
 
     #[test]
     fn a_current_file_is_left_byte_identical_with_no_backup() {
-        let c: FlighthookConfig = toml::from_str(EVERY_SECTION_TOML).expect("parses");
+        let mut c: FlighthookConfig = toml::from_str(EVERY_SECTION_TOML).expect("parses");
+        // Its `[player]` became a golfer; a current file holds its id.
+        c.fill_golfer_ids(|| "0f1e".into());
         let current = toml::to_string_pretty(&c).expect("ser");
         for contents in [GOLDEN_DEFAULT_TOML, current.as_str()] {
-            let (dir, path) = config_dir(contents);
+            let contents = with_ids(contents);
+            let (dir, path) = config_dir(&contents);
             let loaded = load(&path).0;
             assert_eq!(std::fs::read_to_string(&path).expect("read"), contents);
             assert_eq!(files(&dir.0), ["config.toml"]);
-            let want: FlighthookConfig = toml::from_str(contents).expect("parses");
-            assert_eq!(loaded, want);
+            let want: FlighthookConfig = toml::from_str(&contents).expect("parses");
+            assert_same_config(&loaded, &want);
         }
     }
 
     #[test]
     fn comments_order_and_whitespace_alone_do_not_rewrite() {
         let src = r#"# My bay.
-putting_clubs = [ "PT" ]
-chipping_clubs = ["GW",
-  "SW", "LW"]
 default_units = "imperial"
 
 [mevo.0]
@@ -2116,7 +2765,10 @@ address = "192.168.2.1:5100"   # the Mevo's own WiFi
 name = "Mevo+"
 
 [openconnect_client.0]
+putting_clubs = [ "PT" ]
 full_monitor = "mevo.0"
+chipping_clubs = ["GW",
+  "SW", "LW"]
 address = "192.168.1.20:921"
 name = "Bay GSPro"
 
@@ -2127,10 +2779,10 @@ name = "Web Server"
 
 [simulation]
 temperature_c = 12
-altitude = "0ft"
 surface = "firm_green"
 "#;
-        let (dir, path) = config_dir(src);
+        let src = with_ids(src);
+        let (dir, path) = config_dir(&src);
         let loaded = load(&path).0;
         assert!((loaded.simulation.temperature_c - 12.0).abs() < f64::EPSILON);
         assert_eq!(loaded.openconnect_client["0"].name, "Bay GSPro");
@@ -2148,7 +2800,7 @@ surface = "firm_green"
         let saved = std::fs::read_to_string(&path).expect("read");
         assert!(!saved.contains("spin_source"), "{saved}");
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
-        assert_eq!(load(&path).0, loaded);
+        assert_same_config(&load(&path).0, &loaded);
         assert_eq!(std::fs::read_to_string(&path).expect("read"), saved);
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
     }
@@ -2167,25 +2819,33 @@ surface = "firm_green"
             assert_eq!(after_first, [backup_name(), "config.toml".to_string()]);
 
             let second = load(&path).0;
-            assert_eq!(second, first);
+            assert_same_config(&second, &first);
             assert_eq!(std::fs::read(&path).expect("read"), migrated);
             assert_eq!(files(&dir.0), after_first);
         }
     }
 
     #[test]
-    fn a_golfer_height_moves_to_the_player_once_with_a_backup() {
+    fn a_golfer_height_moves_to_a_golfer_once_with_a_backup() {
         let src = "[body_tracking]\nmode = \"live\"\ngolfer_height = 182.5\n";
         let (dir, path) = config_dir(src);
         let first = load(&path).0;
-        assert_eq!(first.player.height, Some(182.5));
+        assert_eq!(first.golfers[0].height, Some(182.5));
+        let id = first.golfers[0].own_id().expect("generated id").to_owned();
+        assert!(id.starts_with("flighthook."), "{id}");
         assert_eq!(first.body_tracking.mode, flighthook::BodyTrackingMode::Live);
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
         let backup = std::fs::read(dir.0.join(backup_name())).expect("backup");
         assert_eq!(backup, src.as_bytes());
         let migrated = std::fs::read_to_string(&path).expect("read");
         assert!(!migrated.contains("golfer_height"), "{migrated}");
-        assert!(migrated.contains("[player]\nheight = 182.5"), "{migrated}");
+        assert!(!migrated.contains("[player]"), "{migrated}");
+        assert!(
+            migrated.contains(&format!(
+                "[[golfers]]\nidentifiers = [\"{id}\"]\nname = \"Golfer\"\nheight = 182.5"
+            )),
+            "{migrated}"
+        );
         assert!(
             migrated.contains("[body_tracking]\nmode = \"live\""),
             "{migrated}"
@@ -2193,15 +2853,69 @@ surface = "firm_green"
 
         // The second load reads the same and leaves the file alone.
         let second = load(&path).0;
-        assert_eq!(second, first);
+        assert_same_config(&second, &first);
         assert_eq!(std::fs::read_to_string(&path).expect("read"), migrated);
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
         let cfg = SystemConfig::new(path);
-        assert_eq!(cfg.player().height, Some(182.5));
+        assert_eq!(cfg.golfer_facts(Some(&id)).height, Some(182.5));
+        assert_eq!(cfg.golfer_facts(None).height, None);
+    }
+
+    /// `[player]` moves into the golfers in one rewrite with a backup: into
+    /// a new golfer "Golfer" with a generated id when there is none, into
+    /// the first golfer's missing facts when there are golfers. The id and
+    /// the height reappear on the next load.
+    #[test]
+    fn the_player_section_moves_into_the_golfers_once() {
+        let src = "[player]\nsex = \"female\"\nheight = 170\n";
+        let (dir, path) = config_dir(src);
+        let first = load(&path).0;
+        assert_eq!(first.golfers.len(), 1);
+        let golfer = &first.golfers[0];
+        assert_eq!(golfer.name, "Golfer");
+        assert_eq!(golfer.sex, Some(flighthook::Sex::Female));
+        let id = golfer.own_id().expect("id").to_owned();
+        assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
+        let migrated = std::fs::read_to_string(&path).expect("read");
+        assert!(!migrated.contains("[player]"), "{migrated}");
+        let second = load(&path).0;
+        assert_eq!(second.golfers, first.golfers, "same id and height again");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), migrated);
+        assert_eq!(
+            SystemConfig::new(path).golfer_facts(Some(&id)).height,
+            Some(170.0)
+        );
+
+        let src = "[player]\nheight = 170\n\n[[golfers]]\nidentifiers = [\"flighthook.a\"]\n\
+                   name = \"A\"\n\n[[golfers]]\nname = \"B\"\n";
+        let (_dir, path) = config_dir(src);
+        let c = load(&path).0;
+        assert_eq!(c.golfers[0].identifiers, ["flighthook.a"]);
+        assert_eq!(c.golfers[0].height, Some(170.0));
+        assert_eq!(c.golfers[1].height, None);
+        assert!(
+            c.golfers[1].own_id().is_some(),
+            "a golfer without one gets an id"
+        );
+    }
+
+    /// A file that lists one id in two golfers loads with the first keeping
+    /// it.
+    #[test]
+    fn a_duplicate_golfer_id_in_a_file_stays_with_the_first_golfer() {
+        let src = "[[golfers]]\nidentifiers = [\"flighthook.a\", \"pureplay.local-3\"]\nname = \"A\"\n\n\
+                   [[golfers]]\nidentifiers = [\"flighthook.b\", \"pureplay.local-3\"]\nname = \"B\"\n";
+        let (_dir, path) = config_dir(src);
+        let c = load(&path).0;
+        assert_eq!(
+            c.golfers[0].identifiers,
+            ["flighthook.a", "pureplay.local-3"]
+        );
+        assert_eq!(c.golfers[1].identifiers, ["flighthook.b"]);
     }
 
     #[test]
-    fn camera_rotation_and_player_are_read_in_effect() {
+    fn camera_rotation_and_golfer_facts_are_read_in_effect() {
         let (_dir, path) = config_dir(
             "[camera.0]\nname = \"Face\"\ncamera = \"test-pattern\"\nrotation_deg = 90\n\n\
              [camera.1]\nname = \"Side\"\ncamera = \"test-pattern\"\nrotation_deg = 45\n\n\
@@ -2213,8 +2927,9 @@ surface = "firm_green"
         assert_eq!(cfg.camera_rotation("camera.1"), 0, "not one of the four");
         assert_eq!(cfg.camera_rotation("camera.7"), 0, "no such camera");
         assert_eq!(cfg.camera_rotation("mevo.0"), 0);
+        let id = cfg.snapshot().golfers[0].own_id().expect("id").to_owned();
         assert_eq!(
-            cfg.player(),
+            cfg.golfer_facts(Some(&id)),
             flighthook::PlayerSection {
                 sex: flighthook::Sex::Female,
                 height: None,
@@ -2222,7 +2937,7 @@ surface = "firm_green"
         );
         // The out-of-range values stay in the file for the user to fix.
         assert_eq!(cfg.snapshot().camera["1"].rotation_deg, 45);
-        assert_eq!(cfg.snapshot().player.height, Some(99.0));
+        assert_eq!(cfg.snapshot().golfers[0].height, Some(99.0));
     }
 
     #[test]
@@ -2255,7 +2970,7 @@ surface = "firm_green"
         ] {
             let (dir, path) = config_dir(contents);
             let cfg = SystemConfig::new(path.clone());
-            assert_eq!(cfg.snapshot(), FlighthookConfig::default());
+            assert_eq!(plain(&cfg.snapshot()), FlighthookConfig::default());
             assert_eq!(std::fs::read_to_string(&path).expect("read"), contents);
             assert_eq!(files(&dir.0), ["config.toml"]);
         }
@@ -2265,7 +2980,7 @@ surface = "firm_green"
     fn kept_error(contents: &str) -> flighthook::ConfigLoadError {
         let (dir, path) = config_dir(contents);
         let (config, error) = load(&path);
-        assert_eq!(config, FlighthookConfig::default());
+        assert_eq!(plain(&config), FlighthookConfig::default());
         assert_eq!(std::fs::read_to_string(&path).expect("read"), contents);
         drop(dir);
         error.expect("an error")
@@ -2494,7 +3209,7 @@ DR = 15
 name = "Mock"
 
 [openconnect_server.0]
-name = "Uneekor"
+name = "Range Bridge"
 bind = "0.0.0.0:921"
 
 [openconnect_client.0]
@@ -2537,8 +3252,8 @@ name = "Clubs"
         assert_eq!(c.random_club["0"].name, "Clubs");
         assert_eq!(c.pureplay["0"].address.as_deref(), Some("127.0.0.1:9760"));
         assert_eq!(c.pureplay["0"].full_monitor.as_deref(), Some("mevo.0"));
-        assert_eq!(c.player.sex, flighthook::Sex::Female);
-        assert_eq!(c.player.height, Some(170.0));
+        assert_eq!(c.golfers[0].sex, Some(flighthook::Sex::Female));
+        assert_eq!(c.golfers[0].height, Some(170.0));
 
         let out = toml::to_string_pretty(&c).expect("ser");
         let back: FlighthookConfig = toml::from_str(&out).expect("parses");

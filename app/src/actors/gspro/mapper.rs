@@ -1,7 +1,7 @@
 //! Shot data -> GSPro message conversion.
 
 use super::api::{BallData, ClubData, GsProMessage, ShotDataOptions};
-use flighthook::ShotData;
+use crate::actors::simout::OutputShot;
 
 /// Convert a decoded shot into a GSPro Open Connect V1 message.
 ///
@@ -9,7 +9,7 @@ use flighthook::ShotData;
 /// left- and right-handed players alike. GSPro takes HLA, SideSpin,
 /// FaceToTarget and Path with the same signs, so they are sent as they are,
 /// whatever the player's handedness.
-pub fn map_shot(shot: &ShotData) -> GsProMessage {
+pub fn map_shot(shot: &OutputShot) -> GsProMessage {
     let contains_ball = shot.launch.is_some();
 
     // Ball data: the launch, zero-filling missing fields, and the device's
@@ -106,13 +106,10 @@ pub fn map_shot(shot: &ShotData) -> GsProMessage {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use flighthook::{
-        ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, FlightPath, Launch, ShotData,
-        Velocity,
-    };
+    use flighthook::{ClubData as FhClubData, Distance, FaceImpact, Launch, Velocity};
 
-    fn shot_with_impact(lateral_mm: f64, vertical_mm: f64) -> ShotData {
-        ShotData {
+    fn shot_with_impact(lateral_mm: f64, vertical_mm: f64) -> OutputShot {
+        OutputShot {
             launch: Some(Launch {
                 launch_speed: Some(Velocity::MetersPerSecond(3.30)),
                 launch_elevation: Some(32.51),
@@ -141,14 +138,13 @@ pub(super) mod tests {
             }),
             actor: "square.0".into(),
             shot_number: 1,
-            derived: None,
-            ..ShotData::default()
+            ..OutputShot::default()
         }
     }
 
     /// A Square-like full swing: launch data only, no carry, no club data.
-    pub(in crate::actors::gspro) fn square_like_shot(derived: Option<DerivedFlight>) -> ShotData {
-        ShotData {
+    pub(in crate::actors::gspro) fn square_like_shot() -> OutputShot {
+        OutputShot {
             actor: "square.0".into(),
             shot_number: 12,
             launch: Some(Launch {
@@ -161,52 +157,27 @@ pub(super) mod tests {
             }),
             club: None,
             impact: None,
-            derived,
-            ..ShotData::default()
+            ..OutputShot::default()
         }
     }
 
-    /// GSPro output for a launch-only shot; `derived` must not change it: no
-    /// `CarryDistance` appears.
+    /// GSPro output for a launch-only shot: no `CarryDistance` appears.
     pub(in crate::actors::gspro) const GOLDEN_RH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89998400000002,"SpinAxis":-2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":-300.0,"HLA":-1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Lie":0.0,"Loft":0.0,"Path":0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
 
     #[test]
-    fn gspro_output_ignores_derived_values() {
-        let mut derived = DerivedFlight::default();
-        derived.carry_distance = Some(Distance::Meters(150.9));
-        derived.carry_offline = Some(Distance::Meters(-5.5));
-        derived.total_distance = Some(Distance::Meters(154.6));
-        derived.path = Some(FlightPath {
-            flight: vec![[0.0, 0.0, 0.0, 0.0], [2.4, 150.9, 28.0, -5.5]],
-            ground: vec![[2.4, 150.9, 0.0, -5.5], [3.1, 154.6, 0.0, -5.9]],
-        });
-        let without =
-            serde_json::to_string(&map_shot(&square_like_shot(None))).expect("serializes");
-        let with =
-            serde_json::to_string(&map_shot(&square_like_shot(Some(derived)))).expect("serializes");
-        assert_eq!(without, GOLDEN_RH);
-        assert_eq!(with, GOLDEN_RH);
+    fn a_launch_only_shot_sends_no_carry() {
+        let json = serde_json::to_string(&map_shot(&square_like_shot())).expect("serializes");
+        assert_eq!(json, GOLDEN_RH);
     }
 
     #[test]
-    fn gspro_output_ignores_replacing_derived_values() {
-        let mut derived = DerivedFlight::default();
-        derived.carry_distance = Some(Distance::Meters(150.9));
-        derived.total_distance = Some(Distance::Meters(154.6));
-        derived.replaces_measured = true;
-        let mut measured = square_like_shot(None);
+    fn the_devices_carry_is_sent() {
+        let mut measured = square_like_shot();
         measured.flight = Some(flighthook::FlightResult {
             carry_distance: Some(Distance::Yards(171.0)),
             ..flighthook::FlightResult::new(flighthook::Basis::Modeled)
         });
-        let replacing = ShotData {
-            derived: Some(derived),
-            ..measured.clone()
-        };
-        let without = serde_json::to_string(&map_shot(&measured)).expect("ser");
-        let with = serde_json::to_string(&map_shot(&replacing)).expect("ser");
-        assert_eq!(with, without);
-        assert_eq!(map_shot(&replacing).ball_data.carry_distance, Some(171.0));
+        assert_eq!(map_shot(&measured).ball_data.carry_distance, Some(171.0));
     }
 
     #[test]
@@ -275,7 +246,7 @@ pub(super) mod tests {
     /// shot without club data) goes out as backspin with axis 0.
     #[test]
     fn a_total_spin_alone_goes_out_as_backspin() {
-        let shot = ShotData {
+        let shot = OutputShot {
             actor: "mevo.0".into(),
             shot_number: 3,
             launch: Some(Launch {
@@ -285,7 +256,7 @@ pub(super) mod tests {
                 total_spin_rpm: Some(6897),
                 ..Launch::default()
             }),
-            ..ShotData::default()
+            ..OutputShot::default()
         };
         let b = map_shot(&shot).ball_data;
         assert_eq!(
@@ -299,7 +270,7 @@ pub(super) mod tests {
     /// absent goes out with 0.
     #[test]
     fn launch_only_chip_sends_its_backspin_with_axis_zero() {
-        let chip = |back: Option<i32>, side: Option<i32>| ShotData {
+        let chip = |back: Option<i32>, side: Option<i32>| OutputShot {
             actor: "mevo.0".into(),
             shot_number: 3,
             launch: Some(Launch {
@@ -310,7 +281,7 @@ pub(super) mod tests {
                 sidespin_rpm: side,
                 ..Launch::default()
             }),
-            ..ShotData::default()
+            ..OutputShot::default()
         };
         let b = map_shot(&chip(Some(1570), Some(0))).ball_data;
         assert_eq!(

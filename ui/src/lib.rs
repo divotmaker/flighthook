@@ -2,13 +2,16 @@ pub mod app;
 pub(crate) mod battery;
 pub(crate) mod chart;
 pub(crate) mod groups;
+pub(crate) mod icons;
 pub(crate) mod local;
 pub mod net;
 pub(crate) mod panels;
 pub(crate) mod pose;
 pub(crate) mod replay;
 pub(crate) mod scale;
+pub(crate) mod socket;
 pub(crate) mod theme;
+pub(crate) mod topbar;
 pub mod types;
 
 #[cfg(target_arch = "wasm32")]

@@ -1,8 +1,8 @@
 # Cameras
 
 **Status: Beta** — swing replay: USB cameras record a clip of every shot,
-and the Shots tab plays it back beside the shot's numbers. The Shots tab's
-**Cameras** pane plays each shot's clips and shows each camera live.
+and the Shots tab plays it back beside the shot's numbers. The **Cameras**
+tab plays each shot's clips and shows each camera live.
 **Body tracking** (alpha) draws the golfer's skeleton over the live pictures
 and the replays, and measures each swing: tempo, the swing's key moments and
 body angles.
@@ -26,21 +26,21 @@ with a replay button. Capture uses the
 
 ## Setup
 
-1. Devices tab → **Cameras (+)** → **Camera**.
-2. On the new card's Settings side, pick the **Camera** from the list
+1. Settings → Cameras → **Cameras (+)** → **Camera**.
+2. On the new camera's page, pick the **Camera** from the list
    (**Test pattern** is a generated picture for trying it out), its
    **Position**, and the **Video mode**: **Auto** takes the highest frame
    rate, then the largest size; or pick one of the camera's modes.
 3. **Save**. The card turns green once frames arrive; its telemetry shows
    the resolution, the frame rate achieved and dropped frames.
-4. **Still frame** on the Telemetry side shows the camera's current picture,
+4. **Still frame** (the camera icon) in the camera page's header shows the camera's current picture,
    for aiming it.
 5. For a camera on its side, set its **Rotation**; for one that doesn't face
    the golfer square on, its **Yaw** and **Pitch** (see
    [Rotation, yaw and pitch](#rotation-yaw-and-pitch)).
 
 Add one card per camera. Clip settings are on the **Replay** card under
-General.
+Settings, Cameras.
 
 ```toml
 [camera.0]
@@ -93,7 +93,7 @@ is saved; the camera keeps recording.
   picture clockwise. A swing is taller than it is wide, so a face-on camera
   on its side fits the whole swing at about 2 m (6 ft) from the golfer, where
   an upright one needs about 3 m (10 ft). The picture is turned everywhere it
-  is shown: the live view, the replay, the Cameras pane, the shot cards and
+  is shown: the live view, the replay, the Cameras tab, the shot cards and
   the still frame. Body tracking works on the turned picture. Clips are
   stored as the camera sends them; the rotation is applied when they are
   played and tracked.
@@ -131,8 +131,8 @@ the clip goes on from the start point. With Loop off it stops at the end, and
 play restarts from the start point; drag the scrubber to reach the start of
 the clip. Each camera has a download icon next to its name for its clip.
 
-The Shots tab's **Cameras** pane plays the shot's clips too, in the page
-rather than over it (see [Cameras pane](#cameras-pane)).
+The **Cameras** tab plays the shot's clips too, in the page rather than over
+it (see [Cameras tab](#cameras-tab)).
 
 In the Cards view, each connected camera can also have a card beside the
 range bars, when the window has room (click a card to cycle what it shows).
@@ -146,36 +146,34 @@ replay a long 120 fps clip. At 1× a phone may not decode every frame of a
 120 fps clip in time: it skips frames and keeps the clip's pace. ½ and
 slower show every frame.
 
-## Cameras pane
+## Cameras tab
 
-**Beta.** With at least one camera added (on Windows or Linux), the Shots
-tab gets a **Data | Cameras** switch at the start of the toolbar, in both
-the Cards and the Table view. **Data** is the shots' numbers and charts, in
-the Cards or Table view. **Cameras** shows the shot list on the left and
-gives the whole page right of it to the cameras, the same from either view.
-The choice is kept on this computer or browser. Next to it, **Data** has the
-Cards | Table switch and **Cameras** a **Live** switch in its place; your
-Cards | Table choice is kept for when you switch back, so picking **Data**
-from Table returns to Table. In Table, each row's Replay button still opens
-the replay over the page.
+**Beta.** The Cameras tab is the second icon of the header; it is available
+with at least one camera added (on Windows or Linux). The Shots and Cameras
+tabs share one shots navigation on the left (the shot list with its views,
+device filter, **New set** and **New session**), so a shot picked in one is the
+shot shown in the other, and the Cameras tab gives the whole page right of the
+navigation to the cameras. Its toolbar has a **Live** switch and
+**Tour | Amateur**. The tab you are on is kept on this computer or
+browser.
 
-Each time the Cameras pane comes up (you pick **Cameras**, or come back to
-the Shots tab with Cameras picked), it shows the latest
-shot, or Live when there is no shot yet (under the device filter, when one
-is set). Clearing the shot history while it shows turns Live on.
+Coming from the Shots tab, the Cameras tab shows the shot selected there; opened from Settings or Log it shows the
+latest shot. With no shot to show (under the device filter, when one is set) it shows Live. Clearing the
+shot history while it shows turns Live on.
 
 **A shot, in Cameras.** Pick a shot in the list (a new shot is picked as it
-lands, as in Data). Its clips play side by side, each with the golfer's
-skeleton while body tracking is on, looping from the replay's start point,
-with the replay's controls: play and pause, frame steps, speed, Loop and the
-scrubber. Under the clips are the tempo and the body at the frame on screen,
-then under each clip that camera's swing numbers (see
-[Swing analysis](#swing-analysis)), and the scrubber marks the swing events. The shot's **Replay** button still opens
-the replay over the page. A shot without clips shows each camera's status
-where its picture would be: **Waiting for the clip** for the newest shot
-(clips are saved a moment after the shot), **No clip of this shot** for an
-older one, and a camera that is not connected shows its status as on its
-Devices card. The page scrolls when the numbers don't fit under the clips.
+lands, as in the Shots tab). Its clips play side by side, each with the
+golfer's skeleton while body tracking is on, looping from the replay's start
+point, with the replay's controls: play and pause, frame steps, speed, Loop and
+the scrubber. Under the clips are the tempo and the body at the frame on
+screen, then under each clip that camera's swing numbers (see
+[Swing analysis](#swing-analysis)), and the scrubber marks the swing events.
+The shot's **Replay** button still opens the replay over the page. A shot
+without clips shows each camera's status where its picture would be:
+**Waiting for the clip** for the newest shot (clips are saved a moment after
+the shot), **No clip of this shot** for an older one, and a camera that is not
+connected shows its status as on its card in Settings. The page scrolls when
+the numbers don't fit under the clips.
 
 **Live.** Turn on **Live** to see every camera live, side by side, labeled
 with its name and position, at up to 15 frames a second. With body tracking
@@ -189,11 +187,11 @@ camera's impact, colored, and the line naming the ones off their band (see
 [Bands and colors](#bands-and-colors)). It stays until the next shot's
 swing is in. A new shot doesn't take you
 off Live; turn **Live** off (back to the shot the list shows), pick a shot,
-or switch to **Data** to leave it. A camera that is not connected shows its
-status as on its Devices card.
+or go to another tab to leave it. A camera that is not connected shows its
+status as on its card in Settings.
 
 The live pictures are fetched only while Live is on and on screen:
-another tab, the Table view, a minimized window or a hidden browser tab
+another tab, a minimized window or a hidden browser tab
 stops them, and the cameras stop preparing live frames a few seconds later.
 Recording clips is not affected either way.
 
@@ -206,7 +204,7 @@ Body tracking finds the golfer's body in each camera's picture: 26 points
 (head, neck, shoulders, elbows, wrists, hips, knees, ankles, heels and toes),
 joined into a skeleton. The golfer's lead side (the left of a right-hander)
 is drawn in teal, the trail side in orange, the head, neck and hips in
-white. The **Body tracking** card under General holds its settings (see
+white. The **Body tracking** card under Settings, Cameras holds its settings (see
 [Settings](#settings)).
 
 The mode decides when body tracking runs, and so what it costs:
@@ -217,7 +215,7 @@ The mode decides when body tracking runs, and so what it costs:
 | **Historical** | a shot's clip is tracked the first time you view it | only when you view a clip not tracked yet |
 | **Live** | the live views while you watch them, and every clip right after it is recorded | every clip of every shot, and each watched live view |
 
-- **Historical:** when you view a shot in the Cameras pane or open its
+- **Historical:** when you view a shot in the Cameras tab or open its
   replay, each of its clips that has not been tracked yet is tracked then,
   and the result is kept beside the clip, so every later view is instant.
   The first view of a clip waits for it: the clip plays at once, and the
@@ -227,16 +225,16 @@ The mode decides when body tracking runs, and so what it costs:
 - **Live:** on **Live**, the skeleton is drawn over each camera's picture.
   Each picture comes with the skeleton found on it, so they always match;
   the live view runs as fast as body tracking keeps up, at most 15 frames a
-  second. The hand is the one in the header (**RH | LH**). 3 seconds after
+  second. The hand is the golfer's: the connected simulator's, else the hand set on the golfer's page in Settings, else right-handed. 3 seconds after
   each clip is saved, flighthook tracks the golfer on every frame of it,
   then measures the swing. A clip recorded before Live was on is tracked
   when you view it, as in Historical.
 - **Off:** no skeleton and no swing numbers anywhere, also for clips
   tracked earlier. The clips play as usual.
 
-A tracked clip (in the Cameras pane and in the replay) shows the skeleton on
+A tracked clip (in the Cameras tab and in the replay) shows the skeleton on
 every frame, in slow motion and frame by frame too, with the hand the shot
-was hit with, and the Cameras pane shows its swing numbers.
+was hit with, and the Cameras tab shows its swing numbers.
 
 ![Cameras](../../screens/cameras.png "Cameras")
 
@@ -271,7 +269,7 @@ flighthook never downloads a model on its own. If body tracking is on but
 its models are missing (the config file was edited by hand, the models were
 deleted, or the other model was picked), the same dialog appears the first
 time you open something that needs them: a shot's clips in the Cameras
-pane, **Live** in Live mode, or a replay. Until they are downloaded there is
+tab, **Live** in Live mode, or a replay. Until they are downloaded there is
 no skeleton.
 
 Turning body tracking on from Off saves the mode at once; every other change
@@ -296,7 +294,7 @@ camera and says so the same way, until you leave Live for a few seconds.
 
 For each clip from a camera at **Golfer Front** (face-on) or **Target Line**
 (down the line), flighthook measures the swing from the golfer's points and
-shows it under the clip in the Cameras pane. A camera at **Golfer Back** or
+shows it under the clip in the Cameras tab. A camera at **Golfer Back** or
 **Overhead** gets the skeleton only.
 
 - **Tempo:** backswing (takeaway to top) against downswing (top to impact),
@@ -356,12 +354,17 @@ much.
 | Face-on metric | What it is |
 | --- | --- |
 | Hip sway | how far the hips (their midpoint) moved sideways since address, toward or away from the target, at the top and impact |
+| Chest sway | how far the shoulders (their midpoint) moved sideways since address, toward or away from the target, at the top and impact |
+| Sway gap | how far the shoulders are ahead of the hips toward the target (negative with the chest behind the hips, as at the top and impact of most full swings) |
 | Head sway | how far the head moved sideways since address, toward or away from the target, at the top and impact |
 | Head height | how far the head moved up or down since address, at the top and impact (also down the line) |
+| Pelvis lift | how far the hips rose since address, or dropped when negative, at the top and impact (also down the line) |
 | Side bend | the spine (hips to shoulders) from vertical, sideways: positive with the shoulders away from the target |
 | Shoulder tilt | the shoulder line from horizontal, positive with the lead shoulder higher, at address and impact |
+| Hip tilt | the hip line from horizontal, positive with the lead hip higher, at address, the top and impact |
 | Lead elbow | the lead arm's angle at the elbow, 180° straight |
 | Stance width | the feet's width over the shoulders' width, at address |
+| Hip width proxy | how wide the hips look compared with address, at the top, impact and finish: a rough sign of the hip turn |
 | Hip turn | how far the hips have turned since address, estimated from how much narrower they look, at the top and impact |
 | Shoulder turn | the same for the shoulders |
 
@@ -369,9 +372,11 @@ much.
 | --- | --- |
 | Forward bend | the spine (hips to shoulders) from vertical, leaning toward the ball |
 | Hip depth | how far the hips (their midpoint) moved toward the ball or back from it since address, at the top and impact |
+| Loss of posture | how much more upright the spine is than at address, in degrees, during the swing |
 | Lead knee flex, Trail knee flex | how far the knee is bent, 0° straight |
 | Trail elbow | the trail arm's angle at the elbow, 180° straight |
 | Hand height | how high the hands are above the trail shoulder, at the top |
+| Hand depth | how far the hands are behind the trail shoulder, away from the ball (negative: nearer the ball), at the top |
 
 Every number is a **2D estimate from one camera**: an angle or a distance
 in that camera's picture, not in 3D. A move toward or away from the camera
@@ -397,7 +402,7 @@ limits:
 - A width wider than at address has no turn: no value.
 
 Distances are a share of the golfer's torso length (`5% torso`). With the
-**Height** set on the Player card (see [Player](#player)), they are in
+**Height** set on the golfer's card (see [Golfer](#golfer)), they are in
 inches or centimeters, following the Units switch.
 
 Over a Golfer Front camera's numbers, a line says when the camera points 5°
@@ -417,11 +422,11 @@ and published swing studies, collected in stance's
 Each band is an average ± one spread (SD) for a metric at a key position,
 for the club the shot was hit with (driver; woods, hybrids and irons;
 wedges, which use the iron bands where there is no wedge band) and the
-player's sex on the Player card (see [Player](#player)). A putter or a shot
+golfer's sex on the Golfers card (see [Golfer](#golfer)). A putter or a shot
 without a club is not colored.
 
-**Tour | Amateur**, next to the **Live** switch in the toolbar while the
-Cameras pane shows, picks the bands: tour players, or mid-handicap amateur
+**Tour | Amateur**, next to the **Live** switch in the Cameras tab's
+toolbar, picks the bands: tour players, or mid-handicap amateur
 golfers (fewer metrics have amateur bands). The choice is kept on this
 computer or browser.
 
@@ -470,7 +475,7 @@ they differ; the tempo takes the face-on camera's.
 only: at the top one camera reads it well short of its 3D value (see
 [Swing analysis](#swing-analysis)), so it would be red for everyone. The side
 bend at the finish has a band but is not colored yet. Distances are put into
-inches with the Player card's height, or a typical height for the sex (177 cm
+inches with the golfer's height, or a typical height for the sex (177 cm
 men, 164 cm women) without one, so set it. Each number is still a one-camera
 estimate, compared with averages mostly measured in 3D: read the colors as
 a guide, not a verdict.
@@ -485,13 +490,13 @@ the skeleton:
 - **Down the line:** forward bend, lead knee flex, trail knee flex and
   trail elbow.
 
-They are measured as in the swing analysis, for the hand in the header. A
+They are measured as in the swing analysis, for the golfer's hand. A
 dash is a point not found.
 
 ### Settings
 
-The **Body tracking** card under General holds every body tracking setting,
-in this order, saved with its **Save** like the other General cards:
+The **Body tracking** card under Settings, Cameras holds every body tracking setting,
+in this order, saved with its **Save** like the other cards:
 
 | Field | Does |
 | --- | --- |
@@ -537,26 +542,30 @@ before the modes may hold `enabled` instead of `mode`: `enabled = false`
 reads as `off` and `enabled = true` as `historical`, and the file is
 rewritten with `mode` (the original kept beside it as a backup).
 
-### Player
+### Golfer
 
-The **Player** card under General holds facts about the player, saved with
-its **Save** like the other General cards:
+The swing analysis uses two facts about the golfer whose shot it is: their sex
+and their height. Both are set on that golfer's card under Settings, Golfers
+(beta); a shot of a golfer with no record uses the defaults.
 
 | Field | Does |
 | --- | --- |
-| **Sex** | Men's (default) or Women's: whose tour averages the swing is compared with |
-| **Height** | the player's height, in inches with Imperial default units and centimeters with Metric, 100 to 250 cm; with it, swing distances are in inches or centimeters (see [Swing analysis](#swing-analysis)). Empty is no height |
+| **Gender** | Male (default) or Female: men's or women's tour averages the swing is compared with |
+| **Height** | the golfer's height, in inches with Imperial default units and centimeters with Metric, 100 to 250 cm; with it, swing distances are in inches or centimeters (see [Swing analysis](#swing-analysis)). Empty is no height |
 
 ```toml
-[player]          # left out while at its defaults
+[[golfers]]
+identifiers = ["flighthook.5b0e3c1e-7d2a-4f4b-9a63-0c1f2e8d7a10"]
+name = "Alex"
 sex = "female"    # "male" (default) or "female"
-height = 180      # cm, 100 to 250; not set by default
+height = 168      # cm, 100 to 250; not set by default
 ```
 
 A height out of range is refused when saved, and not used (a warning in the
-log) when it is in the config file. A config file with `golfer_height` in
-`[body_tracking]` loads it as the player's height, and the file is rewritten
-with `[player] height` (the original kept beside it as a backup).
+log) when it is in the config file. A config file with `[player]` (sex and
+height) or `golfer_height` in `[body_tracking]` loads it onto the first
+golfer, and the file is rewritten with the golfer (the original kept beside it
+as a backup).
 
 ### Models
 
@@ -572,7 +581,7 @@ downswing. The RTMPose weights are OpenMMLab's own release, labeled
 Apache-2.0; they were trained on public pose datasets whose terms are mixed,
 some of them research-only.
 
-The **Body tracking** card under General picks the model.
+The **Body tracking** card under Settings, Cameras picks the model.
 
 The models are not part of flighthook, and nothing is downloaded until you
 confirm it in the dialog (see [Turning it on](#turning-it-on)). flighthook
@@ -587,7 +596,7 @@ clip folder: `%LOCALAPPDATA%\flighthook\models` on Windows,
 body tracking needs them: in Historical mode the first time you view a clip
 that is not tracked yet, in Live mode as soon as a camera starts. Switching
 to the other model needs its file too: the dialog asks for it the first time
-something needs it. The model no longer in use is released from memory. A
+something needs it. The model not in use is released from memory. A
 failed download is not tried again on its own; **Retry** in the window
 does. A download cut short (flighthook closed mid-download) is deleted
 before the next one. To use body tracking without an internet connection,
@@ -657,8 +666,8 @@ and by **Clear history**, and neither is in the export.
 A clip keeps the tracking it was given: a newer flighthook does not track it
 again by itself. Each clip's `shot.json` entry records the camera's
 rotation and the body tracking version it was tracked with. When the
-Cameras pane shows a clip tracked with another rotation than its camera's
-now, it has the clip tracked again (once per clip until the app is
+Cameras tab shows a clip tracked with another rotation than its camera's
+currently set, it has the clip tracked again (once per clip until the app is
 reloaded); the old skeleton and numbers go, and the clip shows the tracking
 state until the new ones are in.
 [`POST .../analyze?force=1`](../API.md#post-apishotsshot_idvideocameraanalyze)
@@ -691,7 +700,8 @@ are **beta estimates**, to be measured with a camera:
 | ExPutt | 0 s |
 | Square Golf Omni | 1 s |
 | Garmin R10 | 2 s |
-| Open Connect (Uneekor, ...) | 2.5 s |
+| Pureplay Accessory card | 0.9 s |
+| Open Connect Server | 2.5 s |
 | Any other launch monitor | 1.5 s |
 
 With the default 4 s pre-roll the backswing is in the clip even when an
@@ -757,7 +767,7 @@ in the config file.
   impact estimates are within 0.5 s) make **one clip**, shown on both shots.
 - The same monitor reporting again ends the clip at that moment and starts a
   new one, so quick putts each get their own clip.
-- **Auto-chip** and **Trackball** shots are never recorded.
+- **Auto-Chip** and **Trackball** shots are never recorded.
 - If a camera stops during a clip, the clip is kept when it reached the
   impact (marked incomplete), and dropped when it didn't. The card shows
   RECONNECTING and the camera is reopened with the usual backoff.
@@ -788,7 +798,7 @@ camera timing, because the ExPutt sends a putt seconds after the strike it
 is dated at: a putt reported up to 5.5 s after its strike still gets the
 whole pre-roll, a later one less of it.
 
-Each clip is a folder in the clip folder (shown on the Replay card): one
+Each clip is a folder in the clip folder (shown on the Replay card under Settings, Cameras): one
 `<camera>.avi` (plays in VLC, Kinovea, Windows Media Player) and
 `<camera>.json` (frame times) per camera, and `shot.json` (the shots, launch
 monitor kinds and cameras). Only folders flighthook named are ever deleted.

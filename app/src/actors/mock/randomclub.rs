@@ -1,8 +1,9 @@
-//! Random club integration — logs shots, always connected.
+//! Random club integration — always connected.
 //!
-//! Subscribes to bus for shots, emits club/player updates for connection status.
-//! Randomly cycles club and handedness after each shot to exercise the UI.
-//! Useful for testing without a real simulator (GSPro, etc.).
+//! Picks a random club and hand at start and after each finished shot, and
+//! sends them as a `golfer.select` under its own actor id. It holds nothing,
+//! so it never re-asserts. Useful for testing without a real simulator
+//! (GSPro, etc.).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,11 +11,10 @@ use std::time::Duration;
 use std::collections::HashMap;
 
 use super::super::Actor;
-use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::bus::{BusReceiver, BusSender, LocalEvent, PollError};
 use crate::state::SystemState;
-use flighthook::{
-    ActorStatus, Club, ClubInfo, FlighthookEvent, FlighthookMessage, HandInfo, Handedness,
-};
+use flighthook::{ActorStatus, Club, Handedness};
+use flightrelay::{FrpBody, GolferSelect};
 
 const HANDEDNESS: &[Handedness] = &[Handedness::Right, Handedness::Left];
 
@@ -60,10 +60,20 @@ fn emit_status(sender: &BusSender, club: Club, handed: Handedness) {
     let mut telemetry = HashMap::new();
     telemetry.insert("club".into(), club.to_string());
     telemetry.insert("handed".into(), handed.to_string());
-    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+    sender.local(LocalEvent::CardStatus {
         status: ActorStatus::Connected,
         telemetry,
-    }));
+    });
+}
+
+/// Select `club` and `handed` as this card's actor.
+fn select(sender: &BusSender, n: &mut u64, club: Club, handed: Handedness) {
+    *n += 1;
+    sender.frp(GolferSelect {
+        club: Some(Some(club)),
+        handedness: Some(handed),
+        ..GolferSelect::new(format!("random-club-{n}"))
+    });
 }
 
 fn run(sender: BusSender, mut receiver: BusReceiver) {
@@ -77,13 +87,9 @@ fn run(sender: BusSender, mut receiver: BusReceiver) {
     let mut club = Club::ALL[next_rand(&mut seed) % Club::ALL.len()];
 
     // Report connected with telemetry + emit game state
+    let mut n = 0;
     emit_status(&sender, club, handed);
-    sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
-        club_info: ClubInfo { club },
-    }));
-    sender.send(FlighthookMessage::new(FlighthookEvent::HandInfo {
-        hand_info: HandInfo { handed },
-    }));
+    select(&sender, &mut n, club, handed);
 
     loop {
         match receiver.poll() {
@@ -96,16 +102,14 @@ fn run(sender: BusSender, mut receiver: BusReceiver) {
             }
             Ok(Some(msg)) => {
                 // Cycle club/handedness on each completed shot
-                if let FlighthookEvent::ShotFinished { .. } = &msg.event {
+                if matches!(
+                    msg.as_frp().map(|m| &m.body),
+                    Some(FrpBody::ShotFinished(_))
+                ) {
                     club = Club::ALL[next_rand(&mut seed) % Club::ALL.len()];
                     handed = HANDEDNESS[next_rand(&mut seed) % HANDEDNESS.len()];
                     emit_status(&sender, club, handed);
-                    sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
-                        club_info: ClubInfo { club },
-                    }));
-                    sender.send(FlighthookMessage::new(FlighthookEvent::HandInfo {
-                        hand_info: HandInfo { handed },
-                    }));
+                    select(&sender, &mut n, club, handed);
                 }
             }
         }

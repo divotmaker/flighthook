@@ -1,5 +1,5 @@
 //! Body tracking drawing (alpha): the golfer's skeleton over a camera
-//! picture, live and on a shot's clips in the Shots tab's Cameras pane,
+//! picture, live and on a shot's clips in the Cameras tab,
 //! and in the replay. Pure geometry, and
 //! one function that paints it. The lead side (the left of a right-handed
 //! golfer) and the trail side get their own colors.

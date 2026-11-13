@@ -1,8 +1,8 @@
 //! [`DriverActor`]: a launch monitor card that runs on a flightrelay device
-//! driver ([`DeviceDriver`]).
+//! driver ([`DeviceDriver`]) as an FRP launch monitor actor.
 //!
-//! The driver owns the device: connect, session, shots, telemetry, raw
-//! frames. The actor is the host around it, one thread per card:
+//! The driver owns the device: connect, session, shots, status, raw frames.
+//! The actor is the host around it, one thread per card:
 //!
 //! - **The run loop.** It builds the driver from the card's section
 //!   ([`DeviceDriver::new`]; a refused config shows on the card and the
@@ -14,30 +14,29 @@
 //!   and Disconnected once stopped or given up. A connect that fails puts
 //!   its error on the card as the `error` row until a session connects, and
 //!   in the log once per outage and again when the text changes.
-//! - **The bus in.** `set_detection_mode` and `club_info` become the
-//!   latched [`DeviceCommand`] (also during a connect, through
-//!   [`ConnectHost::tick`]) and the session's commands; the card's
-//!   [`Hooks::action`] matches become session actions (one asked while no
-//!   session runs is dropped when the next connect starts; one asked during
-//!   a connect reaches the session it opens).
-//! - **The bus out** ([`Sink`]): every [`DeviceEvent`] goes on the bus as
-//!   flighthook's event with the session's device id. A shot's `launch` is
-//!   held until its `flight_result`, its `shot_finished` or the end of the
-//!   `poll` pass it arrived in, whichever comes first, so the simulation
-//!   runs once, anchored on the device's own flight values (a driver sends
-//!   a shot's flight result in the pass of its launch), and the ball goes
-//!   out without waiting for the device to finish the shot.
-//!   Telemetry is merged per actor and published in full; raw frames go to
-//!   the shot's capture for the export, never onto the bus.
+//! - **The bus in.** flighthook's own `golfer.turn` becomes the driver's
+//!   [`TurnHints`]: handed to the session whenever they change, and to a
+//!   connect through [`ConnectHost::hints`]. The card's [`Hooks::action`]
+//!   matches become session actions (one asked while no session runs is
+//!   dropped when the next connect starts; one asked during a connect
+//!   reaches the session it opens).
+//! - **The bus out** ([`Sink`]): every shot message and alert goes on the
+//!   bus under the card's actor id as soon as the driver gives it. The
+//!   device's status and identity make the card's `bus.actor` (role
+//!   `launch_monitor`, `device.source` from the card's shot source),
+//!   published when it changes; while no session is up it is blocked by
+//!   `not_armed` and carries no battery, attitude or telemetry. Raw frames
+//!   go to the shot's capture, which goes out as the local `ShotCapture`
+//!   just before the shot's `shot.finished`, never as FRP.
 //! - **Live config** ([`DriverActor::reconfigure`]): host fields and the
 //!   driver fields the driver applies live take effect without a restart,
 //!   at the loop's next pass whatever it is doing (in a session, before a
 //!   connect, during a retry delay); any other change restarts the card.
 //! - **A driver panic** ends the card Disconnected with an error (and
-//!   `ready=false`), never stuck Connected; Reconnect starts it again.
+//!   `not_armed`), never stuck Connected; Reconnect starts it again.
 //!
 //! What a card adds to its driver is its [`Hooks`]: its config section, its
-//! shot source and any host-side processing of the device's events.
+//! shot source and any host-side processing of the device's messages.
 
 use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
@@ -46,21 +45,24 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flightrelay::driver::{
-    Backoff, ConnectCtx, ConnectHost, DeviceCommand, DeviceDriver, DeviceEvent, DeviceIdentity,
-    DeviceSession, DriverInfo, Events, HostFlags, Level, SessionEnd, Stop,
+    Backoff, ConnectCtx, ConnectHost, DeviceDriver, DeviceEvent, DeviceIdentity, DeviceSession,
+    DeviceStatus, DriverInfo, Events, HostFlags, Level, SessionEnd, Stop, TurnHints,
 };
-use flightrelay::{FrpEvent, RawFrame};
+use flightrelay::types::roles;
+use flightrelay::{
+    BusActor, DEFAULT_HEARTBEAT, DeviceInfo, FrpBody, RawFrame, Removal, ShotFinished, ShotTrigger,
+    StateKind,
+};
 use tracing::{debug, error, info, warn};
 
-use crate::actors::provenance::{Provenance, ShotSource};
+use crate::actors::provenance::{ShotSource, Source};
 use crate::actors::{Actor, ReconfigureOutcome};
-use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::bus::{BusMsg, BusReceiver, BusSender, LocalEvent, PollError};
 use crate::raw_capture::{RawCapture, RawCaptureConfig};
-use crate::sim;
 use crate::state::SystemState;
 use flighthook::{
-    ActorStatus, Club, DeviceSection, DriverConfig, FlightResult, FlighthookEvent,
-    FlighthookMessage, Launch, RawDir, RawRecord, Severity, ShotDetectionMode, ShotKey, ShotRaw,
+    ActorStatus, DeviceSection, DriverConfig, FlightResult, Launch, Mode, RawDir, RawRecord,
+    Severity, ShotKey, ShotRaw,
 };
 
 /// How long one session poll may take.
@@ -92,42 +94,47 @@ pub trait Hooks<D: DeviceDriver>: Default + Send + 'static {
     /// declares ([`DriverInfo::source`]).
     const SOURCE: ShotSource;
 
-    /// Host-side processing of one of the device's FRP events before it goes
-    /// on the bus. A shot's `launch` reaches it when the shot is released
-    /// (with its flight result in [`HookCtx::flight`]), then the flight
-    /// result. A hook keeps the event's kind. Raw frames do not reach it.
-    /// Default: none.
-    fn on_frp(&mut self, _event: &mut FrpEvent, _ctx: &mut HookCtx<'_, Self::Section>) {}
+    /// Host-side processing of one of the device's messages (a `shot.*`
+    /// message or a `bus.alert`) before it goes on the bus. A hook keeps the
+    /// message's kind. Raw frames do not reach it. Default: none.
+    fn on_frp(&mut self, _body: &mut FrpBody, _ctx: &mut HookCtx<'_, Self::Section>) {}
 
-    /// The device action a bus event asks of the card with actor ID
-    /// `actor`, if any. Default: none.
-    fn action(_event: &FlighthookEvent, _actor: &str) -> Option<D::Action> {
+    /// Messages the card adds to `shot`, its own, just before the shot's
+    /// `shot.finished` goes on the bus (e.g. the Mevo card's launch-only
+    /// spin estimate, as its own flight result). Default: none.
+    fn before_finished(
+        &mut self,
+        _shot: &ShotSoFar,
+        _ctx: &mut HookCtx<'_, Self::Section>,
+    ) -> Vec<FrpBody> {
+        Vec::new()
+    }
+
+    /// The device action a bus message asks of the card with card key
+    /// `card`, if any. Default: none.
+    fn action(_msg: &BusMsg, _card: &str) -> Option<D::Action> {
         None
     }
 }
 
-/// What [`Hooks::on_frp`] sees besides the event.
+/// What [`Hooks::on_frp`] and [`Hooks::before_finished`] see besides the
+/// message.
 #[derive(Debug)]
 pub struct HookCtx<'a, S> {
     /// The card's section as it is in effect.
     pub section: &'a S,
-    /// The detection mode the shot is simulated in: the driver's fixed mode,
-    /// else the live game mode. On a `launch` a hook may change it: the
-    /// shot is simulated in the mode it leaves here (e.g. the mode the
-    /// session ran in at the shot's trigger).
-    pub mode: Option<ShotDetectionMode>,
-    /// The detection mode the session runs in: the mode of the latched
-    /// command the host handed it before this `poll` pass (the bus's
-    /// `set_detection_mode`s drained at the pass's start), so the same mode
-    /// the driver itself sees for an event of this pass. `None` outside a
-    /// session or with no mode latched.
-    pub session_mode: Option<ShotDetectionMode>,
-    /// For a `launch`: the device's flight result of the same shot, if it
-    /// sent one.
-    pub flight: Option<&'a FlightResult>,
-    /// Set by a hook that put an estimated spin into the launch: the shot's
-    /// `derived.spin_estimated` is set.
-    pub spin_estimated: bool,
+}
+
+/// What the card sent of one of its shots so far.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShotSoFar {
+    pub key: ShotKey,
+    /// The measured launch, if one went out.
+    pub launch: Option<Launch>,
+    /// The device's own flight result, if one went out.
+    pub flight: Option<FlightResult>,
+    /// The mode the session ran in at the shot's trigger.
+    pub mode: Option<Mode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,16 +278,28 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
 
 impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
     /// The actor's thread: [`run_with`](Self::run_with), and if the driver
-    /// panics, `ready=false` and Disconnected with [`DRIVER_FAILED`], then
+    /// panics, `not_armed` and Disconnected with [`DRIVER_FAILED`], then
     /// the thread ends (Reconnect starts a new one).
     fn run(self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let actor = sender.actor_id().to_owned();
         let info = D::info(&self.section.driver_settings());
+        // The fixed mode is forgotten when this thread ends.
+        let _fixed_mode = match (info.fixed_mode, sender.frp_id()) {
+            (Some(mode), Some(id)) => Some(state.set_fixed_mode(id, mode)),
+            _ => None,
+        };
         let flags = HostFlags::new();
         flags.set_wants_raw(true);
         flags.set_min_level(min_level());
-        let mut host = Host::<D, H>::new(receiver, self.stop.clone(), actor.clone(), &state);
         let mut sink = Sink::<D, H>::new(state, sender, info, self.section.clone());
+        let mut host = Host::<D, H>::new(
+            receiver,
+            self.stop.clone(),
+            actor.clone(),
+            &sink.state,
+            Synced::new(&sink),
+        );
+        sink.publish_actor();
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run_with(&mut host, &mut sink, &flags);
         }));
@@ -290,6 +309,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
             let mut telemetry = HashMap::from([("error".into(), DRIVER_FAILED.into())]);
             sink.end_phase(&mut telemetry);
             sink.status(ActorStatus::Disconnected, telemetry);
+        } else if host.stopped() {
+            sink.remove_actor();
         }
     }
 
@@ -321,6 +342,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
             // Device actions asked while no session ran were for no device.
             host.actions.clear();
             sink.begin_session();
+            host.begin_connect();
             flags.set_shots_allowed(sink.shots_allowed());
             let connected = {
                 let mut emit = |e| sink.handle(e);
@@ -344,8 +366,6 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
                     let since = Instant::now();
                     sink.connected(session.identity());
                     let ended = self.drive(&mut session, &mut driver, host, sink, flags);
-                    sink.release_all();
-                    sink.session_mode = None;
                     match ended {
                         Err(e) if !host.stopped() => {
                             drop(session);
@@ -390,6 +410,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
         }
         // A stop that ended a connect leaves no phase and no connect error
         // on the card.
+        sink.session_ended();
         let mut telemetry = HashMap::new();
         sink.end_phase(&mut telemetry);
         sink.end_connect_error(&mut telemetry);
@@ -432,8 +453,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
     }
 
     /// Poll `session` until it fails (`Err`) or the actor is stopped
-    /// (`Ok`), handing it the bus's commands and actions, live config and
-    /// the round policy between polls.
+    /// (`Ok`), handing it new turn hints and the bus's actions, live config
+    /// and the round policy between polls.
     fn drive(
         &self,
         session: &mut D::Session,
@@ -442,41 +463,29 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
         sink: &mut Sink<D, H>,
         flags: &HostFlags,
     ) -> Result<(), D::Error> {
-        // Commands that arrived while connecting: the driver read the
-        // latched command at some point; this hands it the latest.
-        if !host.commands.is_empty() {
-            host.commands.clear();
-            session.command(&host.latched)?;
-        }
+        // The connect read the hints at some point; a turn that changed
+        // since reaches the session now.
+        let mut given = host.connect_hints.take().unwrap_or_default();
         loop {
             host.drain();
             if host.stopped() {
                 return Ok(());
             }
-            // One command per pass: what the pass's messages set, field by
-            // field, so a hand and a club changed together reach the device
-            // together.
-            let mut pass = DeviceCommand::default();
-            for command in host.commands.drain(..) {
-                pass.merge(&command);
-            }
-            if !pass.is_empty() {
-                session.command(&pass)?;
+            if host.hints != given {
+                given = host.hints;
+                session.hints(&given)?;
             }
             while let Some(action) = host.actions.pop_front() {
                 session.action(&action)?;
             }
             take_update(&self.updates, sink, Some(driver));
             flags.set_shots_allowed(sink.shots_allowed());
-            sink.session_mode = host.latched.mode.map(Into::into);
+            sink.session_mode = given.mode;
             {
                 let mut emit = |e| sink.handle(e);
                 session.poll(POLL_TIMEOUT, &mut Events::new(&mut emit, flags))?;
             }
-            // A shot's flight result comes in the pass of its launch: what
-            // is still held goes out now, not when the device finishes.
-            sink.release_all();
-            sink.prune_held();
+            sink.prune_shots();
         }
     }
 }
@@ -499,58 +508,83 @@ fn take_update<D: DeviceDriver, H: Hooks<D>>(
         }
     }
     sink.section = new;
+    // A renamed card is a renamed actor.
+    sink.publish_actor();
 }
 
 // ---------------------------------------------------------------------------
 // The bus in
 // ---------------------------------------------------------------------------
 
-/// The actor's inputs: the bus, the latched command, queued commands and
-/// actions, and the stop token. It is the driver's [`ConnectHost`].
+/// The actor's inputs: the bus, the turn hints, queued actions and the stop
+/// token. It is the driver's [`ConnectHost`].
 struct Host<D: DeviceDriver, H> {
     receiver: BusReceiver,
-    latched: DeviceCommand,
-    /// Commands received since the session last took them.
-    commands: Vec<DeviceCommand>,
+    /// The hints of flighthook's latest turn.
+    hints: TurnHints,
+    /// The hints a connect read last ([`ConnectHost::hints`]).
+    connect_hints: Option<TurnHints>,
     actions: VecDeque<D::Action>,
     stop: Stop,
     actor: String,
+    /// flighthook's actor id: only its turn counts.
+    session: String,
+    /// Answers `bus.sync`.
+    synced: Synced,
     _hooks: PhantomData<fn() -> H>,
 }
 
-/// flightrelay's club of the same code.
-fn frp_club(club: Club) -> Option<flightrelay::Club> {
-    club.to_string().parse().ok()
+/// What the card republishes when another actor sends `bus.sync`: the
+/// `bus.actor` it last published. The host answers while it drains the bus,
+/// so a card added later learns the device's state at once, also while a
+/// connect runs.
+struct Synced {
+    sender: BusSender,
+    published: Arc<Mutex<Option<BusActor>>>,
+}
+
+impl Synced {
+    fn new<D: DeviceDriver, H: Hooks<D>>(sink: &Sink<D, H>) -> Self {
+        Self {
+            sender: sink.sender.clone(),
+            published: Arc::clone(&sink.published),
+        }
+    }
+
+    /// Republish the card's `bus.actor`, if it has published one.
+    fn answer(&self) {
+        let published = lock(&self.published).clone();
+        if let Some(actor) = published {
+            self.sender.frp(actor);
+        }
+    }
 }
 
 impl<D: DeviceDriver, H: Hooks<D>> Host<D, H> {
-    /// Inputs over `receiver`, latching the game's mode, hand and club.
-    fn new(receiver: BusReceiver, stop: Stop, actor: String, state: &SystemState) -> Self {
-        let game = state.game.snapshot();
-        let mut latched = DeviceCommand::default();
-        if let Some(mode) = game.mode {
-            latched = latched.with_mode(mode.into());
-        }
-        if let Some(handed) = game.handed {
-            latched = latched.with_handed(handed);
-        }
-        if let Some(club) = game.club_info.and_then(|c| frp_club(c.club)) {
-            latched = latched.with_club(club);
-        }
+    /// Inputs over `receiver`, with the hints of the session's turn now.
+    fn new(
+        receiver: BusReceiver,
+        stop: Stop,
+        actor: String,
+        state: &SystemState,
+        synced: Synced,
+    ) -> Self {
         Self {
             receiver,
-            latched,
-            commands: Vec::new(),
+            hints: TurnHints::from_turn(&state.session.turn()),
+            connect_hints: None,
             actions: VecDeque::new(),
             stop,
             actor,
+            session: state.flighthook_id(),
+            synced,
             _hooks: PhantomData,
         }
     }
 
-    /// Take what is on the bus: detection mode, hand and club into the
-    /// latched command and the queue, the card's actions into theirs. A
-    /// closed bus or a shutdown flag stops the actor.
+    /// Take what is on the bus: flighthook's turn into the hints, the card's
+    /// actions into their queue. A closed bus or a shutdown flag stops the
+    /// actor.
     fn drain(&mut self) {
         loop {
             let msg = match self.receiver.poll() {
@@ -561,30 +595,16 @@ impl<D: DeviceDriver, H: Hooks<D>> Host<D, H> {
                     return;
                 }
             };
-            let command = match &msg.event {
-                FlighthookEvent::SetDetectionMode { mode, handed, club } => {
-                    let mut command = DeviceCommand::default();
-                    if let Some(mode) = mode {
-                        command = command.with_mode((*mode).into());
-                    }
-                    if let Some(handed) = handed {
-                        command = command.with_handed(*handed);
-                    }
-                    if let Some(club) = club.and_then(frp_club) {
-                        command = command.with_club(club);
-                    }
-                    Some(command)
-                }
-                FlighthookEvent::ClubInfo { club_info } => {
-                    frp_club(club_info.club).map(|c| DeviceCommand::default().with_club(c))
-                }
-                _ => None,
-            };
-            if let Some(command) = command.filter(|c| !c.is_empty()) {
-                self.latched.merge(&command);
-                self.commands.push(command);
+            if let Some((turn, _)) = msg.turn_of(&self.session) {
+                self.hints = TurnHints::from_turn(turn);
             }
-            if let Some(action) = H::action(&msg.event, &self.actor) {
+            if msg
+                .as_frp()
+                .is_some_and(|m| matches!(m.body, FrpBody::BusSync(_)))
+            {
+                self.synced.answer();
+            }
+            if let Some(action) = H::action(&msg, &self.actor) {
                 self.actions.push_back(action);
             }
         }
@@ -620,22 +640,22 @@ impl<D: DeviceDriver, H: Hooks<D>> ConnectHost for Host<D, H> {
         self.drain();
     }
 
-    fn latched(&self) -> &DeviceCommand {
-        &self.latched
+    fn hints(&self) -> &TurnHints {
+        &self.hints
+    }
+}
+
+impl<D: DeviceDriver, H: Hooks<D>> Host<D, H> {
+    /// Note the hints a connect starts with, so the session gets only a
+    /// later change.
+    fn begin_connect(&mut self) {
+        self.connect_hints = Some(self.hints);
     }
 }
 
 // ---------------------------------------------------------------------------
 // The bus out
 // ---------------------------------------------------------------------------
-
-/// A shot's launch and flight result, held until the shot is released.
-struct Held {
-    key: ShotKey,
-    launch: Option<Launch>,
-    flight: Option<FlightResult>,
-    since: Instant,
-}
 
 /// Where the driver's events go: the bus, the shot's raw capture and the
 /// log. See the [module docs](self).
@@ -644,17 +664,22 @@ struct Sink<D: DeviceDriver, H: Hooks<D>> {
     sender: BusSender,
     actor: String,
     info: DriverInfo,
-    provenance: Provenance,
+    source: Source,
     section: H::Section,
     hooks: H,
-    /// The session's FRP device id, once connected.
+    /// The session's device id (for raw frame numbers), once connected.
     device: Option<String>,
-    /// The status last sent.
+    /// The device's identity, while a session is up.
+    identity: Option<DeviceIdentity>,
+    /// The card's status last sent.
     status: ActorStatus,
-    /// The session's device telemetry, merged.
-    telemetry: HashMap<String, String>,
-    /// A connect is running: device telemetry is merged and goes out with
-    /// the session's identity once it connects.
+    /// The device's status, as the card's `bus.actor` carries it.
+    device_status: DeviceStatus,
+    /// The `bus.actor` last published, shared with [`Host`], which
+    /// republishes it in answer to `bus.sync`.
+    published: Arc<Mutex<Option<BusActor>>>,
+    /// A connect is running: the device's status goes out with the
+    /// session's identity once it connects.
     connecting: bool,
     /// The `phase` last set during this connect, if any (cleared when the
     /// session connects).
@@ -668,10 +693,11 @@ struct Sink<D: DeviceDriver, H: Hooks<D>> {
     last_alert: Option<(Severity, String)>,
     /// The session's raw capture, for a driver with a raw profile.
     capture: Option<RawCapture>,
-    /// The next raw frame number per FRP device id, across sessions.
+    /// The next raw frame number per device id, across sessions.
     seqs: HashMap<String, u64>,
-    /// Launches and flight results held, by shot id.
-    held: HashMap<String, Held>,
+    /// What went out of each shot not finished yet, by shot id, with when
+    /// it started.
+    shots: HashMap<String, (ShotSoFar, Instant)>,
     /// Shots the round policy refused at their trigger, by shot id, with
     /// when.
     refused: HashMap<String, Instant>,
@@ -682,8 +708,8 @@ struct Sink<D: DeviceDriver, H: Hooks<D>> {
     shot_count: u32,
     /// Puts the driver's timestamps on the host clock.
     clock: UtcClock,
-    /// The detection mode the session runs in ([`HookCtx::session_mode`]).
-    session_mode: Option<ShotDetectionMode>,
+    /// The mode the session runs in ([`HookCtx::session_mode`]).
+    session_mode: Option<Mode>,
     _driver: PhantomData<fn() -> D>,
 }
 
@@ -754,15 +780,6 @@ fn audit_line(actor: &str, frame: &RawFrame) -> String {
     )
 }
 
-/// Mark the `Launch` among `events` as carrying an estimated spin.
-fn mark_spin_estimated(events: &mut [FlighthookEvent]) {
-    for event in events {
-        if let FlighthookEvent::Launch { derived, .. } = event {
-            derived.get_or_insert_with(Box::default).spin_estimated = true;
-        }
-    }
-}
-
 impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     fn new(
         state: Arc<SystemState>,
@@ -775,19 +792,21 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             state,
             sender,
             info,
-            provenance: H::SOURCE.provenance(),
+            source: H::SOURCE.provenance(),
             section,
             hooks: H::default(),
             device: None,
+            identity: None,
             status: ActorStatus::Starting,
-            telemetry: HashMap::new(),
+            device_status: DeviceStatus::not_armed(),
+            published: Arc::new(Mutex::new(None)),
             connecting: false,
             phase_shown: None,
             connect_error: None,
             last_alert: None,
             capture: None,
             seqs: HashMap::new(),
-            held: HashMap::new(),
+            shots: HashMap::new(),
             refused: HashMap::new(),
             holding: false,
             shot_count: 0,
@@ -797,25 +816,60 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         }
     }
 
-    fn message(&self, event: FlighthookEvent) -> FlighthookMessage {
-        let msg = FlighthookMessage::new(event);
-        match &self.device {
-            Some(device) => msg.device(device.as_str()),
-            None => msg,
+    /// The card's `bus.actor` as it is now: the card's name, role
+    /// `launch_monitor`, the device's identity and status, and the card's
+    /// shot source.
+    fn bus_actor(&self) -> BusActor {
+        let name = crate::actors::actor_names(&self.state.system.snapshot())
+            .remove(&self.actor)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| self.info.name.to_owned());
+        let identity = self.identity.as_ref();
+        let status = &self.device_status;
+        let mut actor = BusActor::new(name, DEFAULT_HEARTBEAT.as_secs_f64())
+            .with_role(roles::LAUNCH_MONITOR)
+            .with_device(DeviceInfo {
+                manufacturer: identity
+                    .and_then(|i| i.manufacturer.clone())
+                    .or_else(|| self.info.manufacturer.map(str::to_owned)),
+                model: identity.and_then(|i| i.model.clone()),
+                firmware: identity.and_then(|i| i.firmware.clone()),
+                source: Some(self.source),
+                battery_pct: status.battery_pct,
+                tilt: status.tilt,
+                roll: status.roll,
+            });
+        actor.blockers.clone_from(&status.blockers);
+        actor.telemetry = (!status.telemetry.is_empty()).then(|| status.telemetry.clone());
+        actor
+    }
+
+    /// Send the card's `bus.actor` removal: the actor stopped cleanly.
+    /// Every consumer forgets it; a `bus.sync` gets no answer from it.
+    fn remove_actor(&mut self) {
+        *lock(&self.published) = None;
+        self.sender.frp(Removal::of(StateKind::BusActor));
+    }
+
+    /// Publish the card's `bus.actor` when it differs from the one last
+    /// published.
+    fn publish_actor(&mut self) {
+        let actor = self.bus_actor();
+        let mut published = lock(&self.published);
+        if published.as_ref() != Some(&actor) {
+            *published = Some(actor.clone());
+            self.sender.frp(actor);
         }
     }
 
-    fn send(&self, event: FlighthookEvent) {
-        self.sender.send(self.message(event));
-    }
-
-    /// Send status `status` with actor telemetry `telemetry`, and the
+    /// Send status `status` with card telemetry `telemetry`, and the
     /// connect error still held unless the status is Connected or carries
     /// an `error` of its own (a Starting status drops what the card held).
     fn status(&mut self, status: ActorStatus, mut telemetry: HashMap<String, String>) {
         self.status = status;
         self.hold_connect_error(&mut telemetry);
-        self.send(FlighthookEvent::ActorStatus { status, telemetry });
+        self.sender
+            .local(LocalEvent::CardStatus { status, telemetry });
     }
 
     /// Put the connect error held into `telemetry`, unless the status shown
@@ -856,9 +910,9 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         }
     }
 
-    /// A connect is about to start: a new session's telemetry and capture.
+    /// A connect is about to start: a new session's status and capture.
     fn begin_session(&mut self) {
-        self.telemetry.clear();
+        self.device_status = DeviceStatus::not_armed();
         self.connecting = true;
         self.capture = self.info.raw.as_ref().map(|p| {
             RawCapture::new(RawCaptureConfig {
@@ -873,9 +927,8 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     /// A session connected as `identity`: Connected, with the card text and
     /// the shot count (and the connect's `phase` removed, unless the driver
     /// ended its connect on [`SESSION_PHASE`], which describes the session),
-    /// then the device's identity (and `source`, which the bus sender
-    /// stamps) with the telemetry the driver sent while connecting, before
-    /// any shot.
+    /// then the card's `bus.actor` with the device's identity and the status
+    /// the driver sent while connecting, before any shot.
     fn connected(&mut self, identity: &DeviceIdentity) {
         self.connecting = false;
         self.last_alert = None;
@@ -887,6 +940,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             self.seqs.insert(identity.device.clone(), next);
         }
         self.device = Some(identity.device.clone());
+        self.identity = Some(identity.clone());
         if self.connect_error.is_some() {
             info!(
                 "{}: connected to {} after failed connects",
@@ -912,13 +966,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
             None => {}
         }
         self.status(ActorStatus::Connected, telemetry);
-        self.send(FlighthookEvent::DeviceTelemetry {
-            manufacturer: identity.manufacturer.clone(),
-            model: identity.model.clone(),
-            firmware: identity.firmware.clone(),
-            source: None,
-            telemetry: (!self.telemetry.is_empty()).then(|| self.telemetry.clone()),
-        });
+        self.publish_actor();
     }
 
     /// A connect ended without a session: removes the `phase` it set, if
@@ -929,29 +977,26 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         }
     }
 
-    /// The session failed: `ready=false`, then Reconnecting, so a card
-    /// never shows a lost connection's values.
+    /// The session failed: `not_armed`, then Reconnecting, so a card never
+    /// shows a lost connection's values.
     fn session_lost(&mut self) {
         self.session_ended();
         self.status(ActorStatus::Reconnecting, HashMap::new());
     }
 
-    /// `ready=false` with the rest of the session's telemetry.
+    /// No session: the card's `bus.actor` is `not_armed`, with no battery,
+    /// attitude or telemetry, and its shots in progress are forgotten.
     fn session_ended(&mut self) {
-        self.telemetry.insert("ready".into(), "false".into());
-        self.send(FlighthookEvent::DeviceTelemetry {
-            manufacturer: None,
-            model: None,
-            firmware: None,
-            source: None,
-            telemetry: Some(self.telemetry.clone()),
-        });
+        self.device_status = DeviceStatus::not_armed();
+        self.identity = None;
+        self.shots.clear();
+        self.publish_actor();
     }
 
     /// Whether the driver may start a shot now, by the round policy; logs
     /// once per round when a virtual source's shots are held back.
     fn shots_allowed(&mut self) -> bool {
-        let allowed = self.state.round.allows(self.provenance);
+        let allowed = self.state.round.allows(self.source);
         if allowed {
             self.holding = false;
         } else if !self.holding {
@@ -961,26 +1006,35 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         allowed
     }
 
-    /// The detection mode a shot is simulated in: the driver's fixed mode,
-    /// else the live game mode.
-    fn mode(&self) -> Option<ShotDetectionMode> {
-        self.info
-            .fixed_mode
-            .map(Into::into)
-            .or_else(|| self.state.game.snapshot().mode)
+    /// The mode the session runs in: the driver's fixed mode, else the turn
+    /// hints' mode.
+    fn mode(&self) -> Option<Mode> {
+        self.info.fixed_mode.or(self.session_mode)
     }
 
     /// Put one driver event where it goes.
     fn handle(&mut self, event: DeviceEvent) {
         match event {
-            DeviceEvent::Frp(event) => self.frp(event),
+            DeviceEvent::Frp(body) => self.frp(body),
+            DeviceEvent::Status(status) => {
+                self.device_status = status;
+                if !self.connecting {
+                    self.publish_actor();
+                }
+            }
+            DeviceEvent::StatusChange(change) => {
+                self.device_status.apply(change);
+                if !self.connecting {
+                    self.publish_actor();
+                }
+            }
             DeviceEvent::Phase(phase) => {
                 if self.connecting {
                     self.phase_shown = Some(phase);
                 }
                 let mut telemetry = HashMap::from([("phase".into(), phase.to_owned())]);
                 self.hold_connect_error(&mut telemetry);
-                self.send(FlighthookEvent::ActorStatus {
+                self.sender.local(LocalEvent::CardStatus {
                     status: self.status,
                     telemetry,
                 });
@@ -1003,124 +1057,53 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         }
     }
 
-    /// Run the card's hook on `event` (not a launch or flight result).
-    fn hook(&mut self, event: &mut FrpEvent) {
-        let mut ctx = HookCtx {
-            section: &self.section,
-            mode: self.mode(),
-            session_mode: self.session_mode,
-            flight: None,
-            spin_estimated: false,
-        };
-        self.hooks.on_frp(event, &mut ctx);
-    }
-
-    fn frp(&mut self, mut event: FrpEvent) {
-        let shot = match &event {
-            FrpEvent::ShotTrigger { key, .. }
-            | FrpEvent::Launch { key, .. }
-            | FrpEvent::FlightResult { key, .. }
-            | FrpEvent::ClubPath { key, .. }
-            | FrpEvent::FaceImpact { key, .. }
-            | FrpEvent::ShotFinished { key } => Some(key.shot_id.clone()),
-            _ => None,
-        };
-        if let Some(id) = &shot
-            && self.refused.contains_key(id)
-        {
-            if matches!(event, FrpEvent::ShotFinished { .. }) {
-                self.refused.remove(id);
-            }
+    fn frp(&mut self, mut body: FrpBody) {
+        if let FrpBody::ShotRaw(frame) = body {
+            self.raw(frame);
             return;
         }
-        match event {
-            FrpEvent::Launch { key, launch } => {
-                let held = self.hold(key);
-                held.launch = Some(launch);
-                if held.flight.is_some() {
-                    self.release(&shot.unwrap_or_default());
+        if let Some(key) = body.shot_key() {
+            let id = key.shot_id.clone();
+            if self.refused.contains_key(&id) {
+                if matches!(body, FrpBody::ShotFinished(_)) {
+                    self.refused.remove(&id);
                 }
-            }
-            FrpEvent::FlightResult { key, flight } => {
-                let held = self.hold(key);
-                held.flight = Some(flight);
-                if held.launch.is_some() {
-                    self.release(&shot.unwrap_or_default());
-                }
-            }
-            FrpEvent::RawFrame(frame) => self.raw(frame),
-            FrpEvent::Unknown => {}
-            _ => {
-                self.hook(&mut event);
-                self.publish(event);
+                return;
             }
         }
-    }
-
-    /// The held entry of shot `key`.
-    fn hold(&mut self, key: ShotKey) -> &mut Held {
-        self.held
-            .entry(key.shot_id.clone())
-            .or_insert_with(|| Held {
-                key,
-                launch: None,
-                flight: None,
-                since: Instant::now(),
-            })
-    }
-
-    /// Put a hooked event (not a launch, flight result or raw frame) on the
-    /// bus.
-    fn publish(&mut self, event: FrpEvent) {
-        match event {
-            FrpEvent::ShotTrigger { key, timestamp } => self.trigger(key, timestamp),
-            FrpEvent::ClubPath { key, club } => self.send(FlighthookEvent::ClubPath {
-                key,
-                club: Box::new(club),
-            }),
-            FrpEvent::FaceImpact { key, impact } => self.send(FlighthookEvent::FaceImpact {
-                key,
-                impact: Box::new(impact),
-            }),
-            FrpEvent::ShotFinished { key } => self.finished(key),
-            FrpEvent::DeviceTelemetry {
-                manufacturer,
-                model,
-                firmware,
-                telemetry,
-                ..
-            } => {
-                self.telemetry.extend(telemetry.unwrap_or_default());
-                // While connecting, it goes out with the identity (the
-                // session's `DeviceIdentity`; these identity fields are not
-                // used then).
-                if self.connecting {
-                    return;
+        let mut ctx = HookCtx {
+            section: &self.section,
+        };
+        self.hooks.on_frp(&mut body, &mut ctx);
+        match body {
+            FrpBody::ShotTrigger(trigger) => self.trigger(trigger),
+            FrpBody::ShotFinished(finished) => self.finished(finished.key),
+            FrpBody::ShotLaunch(ref m) => {
+                if let Some((shot, _)) = self.shots.get_mut(&m.key.shot_id) {
+                    shot.launch.get_or_insert_with(|| m.launch.clone());
                 }
-                self.send(FlighthookEvent::DeviceTelemetry {
-                    manufacturer,
-                    model,
-                    firmware,
-                    source: None,
-                    telemetry: Some(self.telemetry.clone()),
-                });
+                self.sender.frp(body);
             }
-            FrpEvent::Alert { severity, message } => {
-                let alert = (severity, message);
-                if self.last_alert.as_ref() != Some(&alert) {
-                    match alert.0 {
-                        Severity::Warn => warn!("{}: {}", self.actor, alert.1),
-                        _ => error!("{}: {}", self.actor, alert.1),
+            FrpBody::ShotFlight(ref m) => {
+                if let Some((shot, _)) = self.shots.get_mut(&m.key.shot_id) {
+                    shot.flight.get_or_insert_with(|| m.flight.clone());
+                }
+                self.sender.frp(body);
+            }
+            FrpBody::ShotClub(_) | FrpBody::ShotImpact(_) => self.sender.frp(body),
+            FrpBody::BusAlert(alert) => {
+                let pair = (alert.severity, alert.message.clone());
+                if self.last_alert.as_ref() != Some(&pair) {
+                    match alert.severity {
+                        Severity::Warn => warn!("{}: {}", self.actor, alert.message),
+                        _ => error!("{}: {}", self.actor, alert.message),
                     }
-                    self.last_alert = Some(alert.clone());
+                    self.last_alert = Some(pair);
                 }
-                let (severity, message) = alert;
-                self.send(FlighthookEvent::Alert { severity, message });
+                self.sender.frp(alert);
             }
-            FrpEvent::Launch { .. }
-            | FrpEvent::FlightResult { .. }
-            | FrpEvent::RawFrame(_)
-            | FrpEvent::Unknown => {}
+            // Not the driver's to send.
+            _ => {}
         }
     }
 
@@ -1128,18 +1111,29 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
     /// (the atomic check, a backstop to the driver's own `shots_allowed`),
     /// which opens its raw capture window; else the rest of the shot is
     /// dropped.
-    fn trigger(&mut self, key: ShotKey, timestamp: Option<u64>) {
-        let msg = self.message(FlighthookEvent::ShotTrigger {
-            key: key.clone(),
-            timestamp,
-        });
+    fn trigger(&mut self, trigger: ShotTrigger) {
+        let key = trigger.key.clone();
+        let timestamp = trigger.timestamp;
         let sender = &self.sender;
         let sent = self
             .state
             .round
-            .send_if_allowed(self.provenance, || sender.send(msg));
+            .send_if_allowed(self.source, || sender.frp(trigger));
         if sent.is_some() {
             self.holding = false;
+            let mode = self.mode();
+            self.shots.insert(
+                key.shot_id.clone(),
+                (
+                    ShotSoFar {
+                        key,
+                        launch: None,
+                        flight: None,
+                        mode,
+                    },
+                    Instant::now(),
+                ),
+            );
             if let Some(capture) = &mut self.capture {
                 let at = match timestamp {
                     Some(ms) => self.clock.instant_of(ms),
@@ -1155,10 +1149,25 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
         }
     }
 
-    /// A shot's end: its held launch first, then `shot_finished` with the
-    /// shot's raw frames, and the shot count.
+    /// A shot's end: what the hooks add to it, the shot's raw frames
+    /// (local), then `shot.finished`, and the shot count.
     fn finished(&mut self, key: ShotKey) {
-        self.release(&key.shot_id);
+        let shot = self.shots.remove(&key.shot_id).map_or_else(
+            || ShotSoFar {
+                key: key.clone(),
+                launch: None,
+                flight: None,
+                mode: self.mode(),
+            },
+            |(shot, _)| shot,
+        );
+        let mut ctx = HookCtx {
+            section: &self.section,
+        };
+        let extra = self.hooks.before_finished(&shot, &mut ctx);
+        for body in extra {
+            self.sender.frp(body);
+        }
         let raw = match &mut self.capture {
             Some(capture) => capture.take(),
             None => ShotRaw {
@@ -1167,129 +1176,29 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
                 ..ShotRaw::default()
             },
         };
-        self.send(FlighthookEvent::ShotFinished {
-            key,
-            raw: Some(Box::new(raw)),
+        self.sender.local(LocalEvent::ShotCapture {
+            key: key.clone(),
+            raw: Box::new(raw),
+            scrub: self.device.iter().cloned().collect(),
         });
+        self.sender.frp(ShotFinished { key });
         self.shot_count += 1;
-        self.send(FlighthookEvent::ActorStatus {
+        self.sender.local(LocalEvent::CardStatus {
             status: self.status,
             telemetry: HashMap::from([("shot_count".into(), self.shot_count.to_string())]),
         });
     }
 
-    /// Release shot `id`'s held launch and flight result: the hooks, then
-    /// the simulation once (with the device's flight result), then both on
-    /// the bus. A flight result without a launch goes alone.
-    fn release(&mut self, id: &str) {
-        let Some(Held {
-            key,
-            launch,
-            flight,
-            ..
-        }) = self.held.remove(id)
-        else {
-            return;
-        };
-        let mode = self.mode();
-        let mut flight_event = flight.map(|flight| FrpEvent::FlightResult {
-            key: key.clone(),
-            flight,
-        });
-        let Some(launch) = launch else {
-            if let Some(mut event) = flight_event {
-                self.hook(&mut event);
-                if let FrpEvent::FlightResult { key, flight } = event {
-                    self.send(FlighthookEvent::FlightResult {
-                        key,
-                        flight: Box::new(flight),
-                    });
-                }
-            }
-            return;
-        };
-        let mut launch_event = FrpEvent::Launch {
-            key: key.clone(),
-            launch,
-        };
-        let mut spin_estimated = false;
-        let mut mode = mode;
-        {
-            let flight = match &flight_event {
-                Some(FrpEvent::FlightResult { flight, .. }) => Some(flight),
-                _ => None,
-            };
-            let mut ctx = HookCtx {
-                section: &self.section,
-                mode,
-                session_mode: self.session_mode,
-                flight,
-                spin_estimated: false,
-            };
-            self.hooks.on_frp(&mut launch_event, &mut ctx);
-            spin_estimated |= ctx.spin_estimated;
-            // The hook may have set the mode to simulate in.
-            mode = ctx.mode;
-        }
-        if let Some(event) = &mut flight_event {
-            let mut ctx = HookCtx {
-                section: &self.section,
-                mode,
-                session_mode: self.session_mode,
-                flight: None,
-                spin_estimated: false,
-            };
-            self.hooks.on_frp(event, &mut ctx);
-            spin_estimated |= ctx.spin_estimated;
-        }
-        let FrpEvent::Launch { launch, .. } = launch_event else {
-            warn!(
-                "{}: a hook changed a launch's kind; shot #{} dropped",
-                self.actor, key.shot_number
-            );
-            return;
-        };
-        let flight = match flight_event {
-            Some(FrpEvent::FlightResult { flight, .. }) => Some(flight),
-            _ => None,
-        };
-        let mut events = sim::launch_events_in_mode(&self.state, key, launch, flight, mode);
-        if spin_estimated {
-            mark_spin_estimated(&mut events);
-        }
-        for event in events {
-            self.send(event);
-        }
-    }
-
-    /// Release every held shot, oldest first: at the end of each `poll`
-    /// pass, and when the session ends.
-    fn release_all(&mut self) {
-        let mut ids: Vec<(Instant, String)> = self
-            .held
-            .iter()
-            .map(|(id, h)| (h.since, id.clone()))
-            .collect();
-        ids.sort();
-        for (_, id) in ids {
-            self.release(&id);
-        }
-    }
-
-    /// Drop shots held longer than flighthook's shot timeout: by then every
-    /// consumer has given up on the shot (a backstop: the end of each pass
-    /// releases them). Refused shots are forgotten after the same time.
-    fn prune_held(&mut self) {
+    /// Forget shots that never finished within flighthook's shot timeout,
+    /// and refused shots after the same time.
+    fn prune_shots(&mut self) {
         self.refused
             .retain(|_, at| at.elapsed() < flighthook::SHOT_TIMEOUT);
         let actor = &self.actor;
-        self.held.retain(|_, h| {
-            let keep = h.since.elapsed() < flighthook::SHOT_TIMEOUT;
+        self.shots.retain(|_, (shot, since)| {
+            let keep = since.elapsed() < flighthook::SHOT_TIMEOUT;
             if !keep {
-                debug!(
-                    "{actor}: shot #{} never finished; its launch is dropped",
-                    h.key.shot_number
-                );
+                debug!("{actor}: shot #{} never finished", shot.key.shot_number);
             }
             keep
         });
@@ -1333,7 +1242,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::sync::LazyLock;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1346,8 +1255,8 @@ mod tests {
 
     use super::*;
     use crate::actors::web::tests::TempDir;
-    use crate::state::GameStateWriter;
     use crate::state::round::RoundRequest;
+    use crate::state::session::SessionWriter as GameStateWriter;
 
     // -- A scripted fake driver ---------------------------------------------
 
@@ -1423,8 +1332,6 @@ mod tests {
     /// What one session poll does; an empty list idles.
     enum Step {
         Emit(Vec<DeviceEvent>),
-        /// Blocks until the test sends (within 5 s).
-        Wait(std::sync::mpsc::Receiver<()>),
         Fail(&'static str),
         Panic,
     }
@@ -1434,10 +1341,10 @@ mod tests {
         connects: VecDeque<Connect>,
         /// `live` of every config applied.
         applied: Vec<u32>,
-        /// Commands the sessions took.
-        commands: Vec<DeviceCommand>,
-        /// The latched command at each connect.
-        latched: Vec<DeviceCommand>,
+        /// Turn hints the sessions took.
+        commands: Vec<TurnHints>,
+        /// The turn hints at each connect.
+        latched: Vec<TurnHints>,
         closes: u32,
         /// The retry delay the driver asks for; 10 ms when `None`.
         retry: Option<Duration>,
@@ -1518,7 +1425,7 @@ mod tests {
             ctx.tick()?;
             let mut next = {
                 let mut script = lock(&self.script);
-                script.latched.push(*ctx.latched());
+                script.latched.push(*ctx.hints());
                 script.connects.pop_front()
             };
             while let Some(Connect::Phase(phase, inner)) = next {
@@ -1574,11 +1481,6 @@ mod tests {
                     }
                     Ok(())
                 }
-                Some(Step::Wait(go)) => {
-                    // A test that fails before it sends drops the sender.
-                    let _ = go.recv_timeout(Duration::from_secs(5));
-                    Ok(())
-                }
                 Some(Step::Fail(why)) => Err(FakeError(why.into())),
                 Some(Step::Panic) => panic!("a decoder bug"),
                 None => {
@@ -1588,8 +1490,8 @@ mod tests {
             }
         }
 
-        fn command(&mut self, cmd: &DeviceCommand) -> Result<(), FakeError> {
-            lock(&self.script).commands.push(*cmd);
+        fn hints(&mut self, hints: &TurnHints) -> Result<(), FakeError> {
+            lock(&self.script).commands.push(*hints);
             Ok(())
         }
 
@@ -1605,9 +1507,7 @@ mod tests {
     }
 
     /// A measured card. Its hook fills an estimated backspin into a launch
-    /// without spin on a card named "estimate", has a card named "putt"
-    /// simulate its launches in Putting, and marks a launch whose flight
-    /// result it saw with spin axis 0.5.
+    /// without spin on a card named "estimate".
     #[derive(Default)]
     struct FakeHooks;
 
@@ -1615,21 +1515,12 @@ mod tests {
         type Section = FakeSection;
         const SOURCE: ShotSource = ShotSource::Mevo;
 
-        fn on_frp(&mut self, event: &mut FrpEvent, ctx: &mut HookCtx<'_, FakeSection>) {
-            if let FrpEvent::Launch { launch, .. } = event {
-                if ctx.flight.is_some() {
-                    launch.spin_axis = Some(0.5);
-                }
-                if ctx.section.name == "estimate"
-                    && launch.backspin_rpm.is_none()
-                    && ctx.mode != Some(ShotDetectionMode::Putting)
-                {
-                    launch.backspin_rpm = Some(1234);
-                    ctx.spin_estimated = true;
-                }
-                if ctx.section.name == "putt" {
-                    ctx.mode = Some(ShotDetectionMode::Putting);
-                }
+        fn on_frp(&mut self, body: &mut FrpBody, ctx: &mut HookCtx<'_, FakeSection>) {
+            if let FrpBody::ShotLaunch(m) = body
+                && ctx.section.name == "estimate"
+                && m.launch.backspin_rpm.is_none()
+            {
+                m.launch.backspin_rpm = Some(1234);
             }
         }
     }
@@ -1676,14 +1567,38 @@ mod tests {
         }
     }
 
-    fn frp(event: FrpEvent) -> DeviceEvent {
-        DeviceEvent::Frp(event)
+    fn frp(body: impl Into<FrpBody>) -> DeviceEvent {
+        DeviceEvent::Frp(body.into())
+    }
+
+    fn trigger(key: ShotKey) -> FrpBody {
+        ShotTrigger::new(key).into()
+    }
+
+    fn trigger_at(key: ShotKey, ms: u64) -> FrpBody {
+        ShotTrigger::at(key, ms).into()
+    }
+
+    fn launch_of(key: ShotKey, launch: Launch) -> FrpBody {
+        flightrelay::ShotLaunch { key, launch }.into()
+    }
+
+    fn flight_of(key: ShotKey, flight: FlightResult) -> FrpBody {
+        flightrelay::ShotFlight { key, flight }.into()
+    }
+
+    fn club_of(key: ShotKey, club: ClubData) -> FrpBody {
+        flightrelay::ShotClub { key, club }.into()
+    }
+
+    fn finished(key: ShotKey) -> FrpBody {
+        ShotFinished { key }.into()
     }
 
     fn frame(dir: flightrelay::RawDir, label: &str, data: &[u8]) -> DeviceEvent {
         let mut frame = RawFrame::new(dir, 0, data.to_vec());
         frame.label = Some(label.into());
-        frp(FrpEvent::RawFrame(frame))
+        frp(FrpBody::ShotRaw(frame))
     }
 
     /// A connected sink of card `H` named `name`, and the bus behind it.
@@ -1692,7 +1607,7 @@ mod tests {
     ) -> (
         TempDir,
         Sink<FakeDriver, H>,
-        broadcast::Receiver<FlighthookMessage>,
+        broadcast::Receiver<BusMsg>,
         GameStateWriter,
     ) {
         let (dir, mut sink, rx, writer) = connecting_sink(name);
@@ -1706,13 +1621,13 @@ mod tests {
     ) -> (
         TempDir,
         Sink<FakeDriver, H>,
-        broadcast::Receiver<FlighthookMessage>,
+        broadcast::Receiver<BusMsg>,
         GameStateWriter,
     ) {
         let (dir, state, writer) = temp_state();
         let (tx, rx) = broadcast::channel(256);
-        let sender = BusSender::new("fake.0".into(), tx, Arc::default())
-            .with_provenance(H::SOURCE.provenance());
+        let sender =
+            BusSender::new("fake.0".into(), tx, Arc::default()).with_frp_id(Some("fake.0".into()));
         let section = FakeSection {
             name: name.into(),
             driver: FakeConfig::default(),
@@ -1722,34 +1637,53 @@ mod tests {
         (dir, sink, rx, writer)
     }
 
-    fn drain(rx: &mut broadcast::Receiver<FlighthookMessage>) -> Vec<FlighthookMessage> {
+    fn drain(rx: &mut broadcast::Receiver<BusMsg>) -> Vec<BusMsg> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
-    fn kind(event: &FlighthookEvent) -> &'static str {
-        match event {
-            FlighthookEvent::ShotTrigger { .. } => "trigger",
-            FlighthookEvent::Launch { .. } => "launch",
-            FlighthookEvent::FlightResult { .. } => "flight",
-            FlighthookEvent::ClubPath { .. } => "club",
-            FlighthookEvent::FaceImpact { .. } => "impact",
-            FlighthookEvent::ShotFinished { .. } => "finished",
-            FlighthookEvent::DeviceTelemetry { .. } => "telemetry",
-            FlighthookEvent::Alert { .. } => "alert",
-            FlighthookEvent::ActorStatus { .. } => "status",
-            _ => "other",
+    fn kind(msg: &BusMsg) -> &'static str {
+        match msg {
+            BusMsg::Frp { msg, .. } => match &msg.body {
+                FrpBody::ShotTrigger(_) => "trigger",
+                FrpBody::ShotLaunch(_) => "launch",
+                FrpBody::ShotFlight(_) => "flight",
+                FrpBody::ShotClub(_) => "club",
+                FrpBody::ShotImpact(_) => "impact",
+                FrpBody::ShotFinished(_) => "finished",
+                FrpBody::BusActor(_) => "actor",
+                FrpBody::BusAlert(_) => "alert",
+                _ => "other",
+            },
+            BusMsg::Local { event, .. } => match event {
+                LocalEvent::CardStatus { .. } => "status",
+                LocalEvent::ShotCapture { .. } => "capture",
+                _ => "other",
+            },
         }
     }
 
-    fn kinds(messages: &[FlighthookMessage]) -> Vec<&'static str> {
-        messages.iter().map(|m| kind(&m.event)).collect()
+    fn kinds(messages: &[BusMsg]) -> Vec<&'static str> {
+        messages.iter().map(kind).collect()
     }
 
-    fn raw_of(messages: &[FlighthookMessage]) -> ShotRaw {
+    /// The body of an FRP message.
+    fn body(msg: &BusMsg) -> &FrpBody {
+        &msg.as_frp().expect("an FRP message").body
+    }
+
+    /// The status and telemetry of a card status.
+    fn card_status(msg: &BusMsg) -> Option<(ActorStatus, &HashMap<String, String>)> {
+        match msg.as_local() {
+            Some((_, LocalEvent::CardStatus { status, telemetry })) => Some((*status, telemetry)),
+            _ => None,
+        }
+    }
+
+    fn raw_of(messages: &[BusMsg]) -> ShotRaw {
         messages
             .iter()
-            .find_map(|m| match &m.event {
-                FlighthookEvent::ShotFinished { raw: Some(raw), .. } => Some((**raw).clone()),
+            .find_map(|m| match m.as_local() {
+                Some((_, LocalEvent::ShotCapture { raw, .. })) => Some((**raw).clone()),
                 _ => None,
             })
             .expect("a finished shot")
@@ -1758,32 +1692,36 @@ mod tests {
     // -- The sink ------------------------------------------------------------
 
     /// A session's start: Connected with the card text and the shot count,
-    /// then the identity (with `source`) before anything else.
+    /// then the card's `bus.actor` (with the device and its `source`)
+    /// before anything else.
     #[test]
     fn a_session_starts_with_connected_and_the_identity() {
         let (_dir, _sink, mut rx, _w) = sink::<FakeHooks>("");
         let seen = drain(&mut rx);
-        assert_eq!(kinds(&seen), ["status", "telemetry"]);
-        let FlighthookEvent::ActorStatus { status, telemetry } = &seen[0].event else {
-            unreachable!()
-        };
-        assert_eq!(*status, ActorStatus::Connected);
+        assert_eq!(kinds(&seen), ["status", "actor"]);
+        let (status, telemetry) = card_status(&seen[0]).expect("a card status");
+        assert_eq!(status, ActorStatus::Connected);
         assert_eq!(telemetry["device_info"], "Eagle");
         assert_eq!(telemetry["shot_count"], "0");
-        assert!(matches!(
-            &seen[1].event,
-            FlighthookEvent::DeviceTelemetry { model: Some(m), source: Some(Provenance::Measured), telemetry: None, .. }
-                if m == "Eagle"
-        ));
-        assert!(seen.iter().all(|m| m.device.as_deref() == Some("FAKE-1")));
+        let FrpBody::BusActor(actor) = body(&seen[1]) else {
+            unreachable!()
+        };
+        let device = actor.device.as_ref().expect("the device");
+        assert_eq!(device.model.as_deref(), Some("Eagle"));
+        assert_eq!(device.source, Some(Source::Measured));
+        assert_eq!(actor.telemetry, None);
+        assert!(
+            seen.iter()
+                .filter_map(BusMsg::as_frp)
+                .all(|m| m.from == "fake.0")
+        );
     }
 
-    /// Every kind of driver event reaches the bus as flighthook's event,
-    /// with the session's device id: phase as the card's `phase`, telemetry
-    /// merged and published in full, alerts, the shot lifecycle (trigger
-    /// with its timestamp and provenance, launch with its simulation and
-    /// the flight result, club, impact, finished with the raw frames), the
-    /// shot count, and nothing for a log line.
+    /// Every kind of driver event reaches the bus: phase as the card's
+    /// `phase`, the device's status in the card's `bus.actor`, alerts, the
+    /// shot lifecycle (trigger with its timestamp, launch, flight result,
+    /// club, impact, the raw frames, finished), the shot count, and nothing
+    /// for a log line.
     #[test]
     fn every_event_kind_goes_on_the_bus_with_the_device() {
         let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
@@ -1792,42 +1730,31 @@ mod tests {
         for event in [
             DeviceEvent::Phase("arming"),
             DeviceEvent::Log(Level::Info, "armed".into()),
-            frp(FrpEvent::DeviceTelemetry {
-                manufacturer: None,
-                model: None,
-                firmware: None,
-                source: None,
-                telemetry: Some(HashMap::from([("ready".into(), "true".into())])),
-            }),
-            frp(FrpEvent::DeviceTelemetry {
-                manufacturer: None,
-                model: None,
-                firmware: None,
-                source: None,
-                telemetry: Some(HashMap::from([("battery_pct".into(), "80".into())])),
-            }),
-            frp(FrpEvent::Alert {
-                severity: Severity::Warn,
-                message: "low battery".into(),
-            }),
-            frp(FrpEvent::shot_trigger_at(k.clone(), 1_700_000_000_000)),
-            frp(FrpEvent::launch(k.clone(), launch())),
-            frp(FrpEvent::flight_result(k.clone(), flight())),
-            frp(FrpEvent::club_path(
-                k.clone(),
-                ClubData {
+            DeviceEvent::Status(DeviceStatus::new().with_telemetry("ready", "true")),
+            DeviceEvent::Status(
+                DeviceStatus::new()
+                    .with_telemetry("ready", "true")
+                    .with_battery(80),
+            ),
+            frp(flightrelay::BusAlert::new(Severity::Warn, "low battery")),
+            frp(trigger_at(k.clone(), 1_700_000_000_000)),
+            frp(launch_of(k.clone(), launch())),
+            frp(flight_of(k.clone(), flight())),
+            frp(flightrelay::ShotClub {
+                key: k.clone(),
+                club: ClubData {
                     club_speed: Some(Velocity::MetersPerSecond(41.0)),
                     ..ClubData::default()
                 },
-            )),
-            frp(FrpEvent::face_impact(
-                k.clone(),
-                FaceImpact {
+            }),
+            frp(flightrelay::ShotImpact {
+                key: k.clone(),
+                impact: FaceImpact {
                     lateral: Some(Distance::Millimeters(3.0)),
                     ..FaceImpact::default()
                 },
-            )),
-            frp(FrpEvent::shot_finished(k.clone())),
+            }),
+            frp(finished(k.clone())),
         ] {
             sink.handle(event);
         }
@@ -1835,117 +1762,41 @@ mod tests {
         assert_eq!(
             kinds(&seen),
             [
-                "status",
-                "telemetry",
-                "telemetry",
-                "alert",
-                "trigger",
-                "launch",
-                "flight",
-                "club",
-                "impact",
-                "finished",
-                "status"
+                "status", "actor", "actor", "alert", "trigger", "launch", "flight", "club",
+                "impact", "capture", "finished", "status"
             ]
         );
-        assert!(seen.iter().all(|m| m.device.as_deref() == Some("FAKE-1")));
-        assert!(
-            matches!(&seen[0].event, FlighthookEvent::ActorStatus { status: ActorStatus::Connected, telemetry }
-            if telemetry["phase"] == "arming" && telemetry.len() == 1)
-        );
-        let FlighthookEvent::DeviceTelemetry {
-            telemetry: Some(merged),
-            source,
-            ..
-        } = &seen[2].event
-        else {
+        let (status, telemetry) = card_status(&seen[0]).expect("a card status");
+        assert_eq!(status, ActorStatus::Connected);
+        assert!(telemetry["phase"] == "arming" && telemetry.len() == 1);
+        let FrpBody::BusActor(actor) = body(&seen[2]) else {
             unreachable!()
         };
+        let merged = actor.telemetry.as_ref().expect("telemetry");
         assert_eq!(merged["ready"], "true");
-        assert_eq!(merged["battery_pct"], "80");
-        assert_eq!(*source, Some(Provenance::Measured));
-        assert!(
-            matches!(&seen[3].event, FlighthookEvent::Alert { message, .. } if message == "low battery")
-        );
-        assert!(matches!(
-            &seen[4].event,
-            FlighthookEvent::ShotTrigger {
-                timestamp: Some(1_700_000_000_000),
-                ..
-            }
-        ));
-        assert_eq!(seen[4].provenance, Some(Provenance::Measured));
-        let FlighthookEvent::Launch {
-            launch: l, derived, ..
-        } = &seen[5].event
-        else {
-            unreachable!()
-        };
-        assert_eq!(l.backspin_rpm, Some(3000));
-        assert!(derived.is_some(), "simulated, with the device's carry");
-        assert!(
-            matches!(&seen[6].event, FlighthookEvent::FlightResult { flight, .. } if **flight == self::flight())
-        );
-        assert_eq!(raw_of(&seen).transport, "fake-tcp");
-        assert!(
-            matches!(&seen[10].event, FlighthookEvent::ActorStatus { status: ActorStatus::Connected, telemetry }
-            if telemetry["shot_count"] == "1")
-        );
-    }
-
-    /// A launch waits for its flight result; the hook sees the flight result
-    /// when the launch is released, and both go out together, launch first.
-    /// A flight result that comes first waits for its launch.
-    #[test]
-    fn a_launch_waits_for_its_flight_result() {
-        let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
-        drain(&mut rx);
-        sink.handle(frp(FrpEvent::shot_trigger(key(1))));
-        sink.handle(frp(FrpEvent::launch(key(1), launch())));
-        assert_eq!(kinds(&drain(&mut rx)), ["trigger"], "held");
-        sink.handle(frp(FrpEvent::flight_result(key(1), flight())));
-        let seen = drain(&mut rx);
-        assert_eq!(kinds(&seen), ["launch", "flight"]);
-        let FlighthookEvent::Launch { launch, .. } = &seen[0].event else {
-            unreachable!()
-        };
+        assert_eq!(actor.device.as_ref().and_then(|d| d.battery_pct), Some(80));
         assert_eq!(
-            launch.spin_axis,
-            Some(0.5),
-            "the hook saw the flight result"
+            actor.device.as_ref().and_then(|d| d.source),
+            Some(Source::Measured)
         );
-
-        sink.handle(frp(FrpEvent::flight_result(key(2), flight())));
-        assert!(drain(&mut rx).is_empty(), "held");
-        sink.handle(frp(FrpEvent::launch(key(2), self::launch())));
-        assert_eq!(kinds(&drain(&mut rx)), ["launch", "flight"]);
-        assert!(sink.held.is_empty());
-    }
-
-    /// A launch with no flight result goes out at its shot's end, just
-    /// before `shot_finished`, simulated from the launch alone.
-    #[test]
-    fn a_launch_without_a_flight_result_goes_at_shot_finished() {
-        let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
-        drain(&mut rx);
-        sink.handle(frp(FrpEvent::shot_trigger(key(1))));
-        sink.handle(frp(FrpEvent::launch(key(1), launch())));
-        sink.handle(frp(FrpEvent::club_path(key(1), ClubData::default())));
-        assert_eq!(kinds(&drain(&mut rx)), ["trigger", "club"]);
-        sink.handle(frp(FrpEvent::shot_finished(key(1))));
-        let seen = drain(&mut rx);
-        assert_eq!(kinds(&seen), ["launch", "finished", "status"]);
-        let FlighthookEvent::Launch {
-            launch, derived, ..
-        } = &seen[0].event
-        else {
+        assert!(matches!(body(&seen[3]), FrpBody::BusAlert(a) if a.message == "low battery"));
+        assert!(matches!(
+            body(&seen[4]),
+            FrpBody::ShotTrigger(t) if t.timestamp == Some(1_700_000_000_000)
+        ));
+        let FrpBody::ShotLaunch(l) = body(&seen[5]) else {
             unreachable!()
         };
-        assert_eq!(launch.spin_axis, None, "no flight result to see");
-        assert!(derived.as_ref().is_some_and(|d| d.carry_distance.is_some()));
+        assert_eq!(l.launch.backspin_rpm, Some(3000));
+        assert!(matches!(body(&seen[6]), FrpBody::ShotFlight(f) if f.flight == self::flight()));
+        assert_eq!(raw_of(&seen).transport, "fake-tcp");
+        let (status, telemetry) = card_status(&seen[11]).expect("a card status");
+        assert_eq!(status, ActorStatus::Connected);
+        assert_eq!(telemetry["shot_count"], "1");
     }
 
-    /// A hook that fills in a spin marks the shot's `derived.spin_estimated`.
+    /// A hook may change a message before it goes on the bus: the
+    /// "estimate" card's hook fills in a launch's missing spin.
     #[test]
     fn a_hook_marks_an_estimated_spin() {
         let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("estimate");
@@ -1955,78 +1806,14 @@ mod tests {
             sidespin_rpm: None,
             ..launch()
         };
-        sink.handle(frp(FrpEvent::shot_trigger(key(1))));
-        sink.handle(frp(FrpEvent::launch(key(1), no_spin)));
-        sink.handle(frp(FrpEvent::shot_finished(key(1))));
+        sink.handle(frp(trigger(key(1))));
+        sink.handle(frp(launch_of(key(1), no_spin)));
+        sink.handle(frp(finished(key(1))));
         let seen = drain(&mut rx);
-        let FlighthookEvent::Launch {
-            launch, derived, ..
-        } = &seen[1].event
-        else {
+        let FrpBody::ShotLaunch(l) = body(&seen[1]) else {
             panic!("{:?}", kinds(&seen))
         };
-        assert_eq!(launch.backspin_rpm, Some(1234));
-        assert!(derived.as_ref().is_some_and(|d| d.spin_estimated));
-    }
-
-    /// A hook may set the mode a launch is simulated in: a ground ball the
-    /// "putt" card's hook sends to Putting rolls as on a green, like one
-    /// struck with the game in Putting.
-    #[test]
-    fn a_hook_sets_the_mode_a_launch_is_simulated_in() {
-        let ground_ball = Launch {
-            launch_speed: Some(Velocity::MetersPerSecond(3.0)),
-            launch_elevation: Some(0.0),
-            launch_azimuth: Some(0.0),
-            backspin_rpm: None,
-            sidespin_rpm: None,
-            ..Launch::default()
-        };
-        let total = |name: &str, game: Option<ShotDetectionMode>| {
-            let (_dir, mut sink, mut rx, writer) = sink::<FakeHooks>(name);
-            if let Some(mode) = game {
-                writer.set_mode(mode);
-            }
-            drain(&mut rx);
-            sink.handle(frp(FrpEvent::launch(key(1), ground_ball.clone())));
-            sink.handle(frp(FrpEvent::shot_finished(key(1))));
-            drain(&mut rx)
-                .iter()
-                .find_map(|m| match &m.event {
-                    FlighthookEvent::Launch {
-                        derived: Some(d), ..
-                    } => d.total_distance.map(|t| t.as_meters()),
-                    _ => None,
-                })
-                .expect("a rolled total")
-        };
-        let fairway = total("", Some(ShotDetectionMode::Full));
-        let green = total("", Some(ShotDetectionMode::Putting));
-        assert!(green > fairway, "{green} vs {fairway}");
-        assert_eq!(total("putt", Some(ShotDetectionMode::Full)), green);
-    }
-
-    /// Held launches go out when the session ends; one held past
-    /// flighthook's shot timeout is dropped, since every consumer has given
-    /// up on its shot by then.
-    #[test]
-    fn held_launches_go_out_at_the_session_end_and_expire() {
-        let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
-        drain(&mut rx);
-        sink.handle(frp(FrpEvent::launch(key(1), launch())));
-        sink.handle(frp(FrpEvent::launch(key(2), launch())));
-        let old = Instant::now()
-            .checked_sub(flighthook::SHOT_TIMEOUT + Duration::from_secs(1))
-            .expect("an old instant");
-        sink.held.get_mut("shot-2").expect("held").since = old;
-        sink.prune_held();
-        assert_eq!(sink.held.len(), 1);
-        sink.release_all();
-        let seen = drain(&mut rx);
-        assert_eq!(kinds(&seen), ["launch"]);
-        assert!(
-            matches!(&seen[0].event, FlighthookEvent::Launch { key, .. } if key.shot_number == 1)
-        );
+        assert_eq!(l.launch.backspin_rpm, Some(1234));
     }
 
     /// Raw frames go to the shot's capture (pre-roll included) with their
@@ -2039,15 +1826,15 @@ mod tests {
         let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
         drain(&mut rx);
         sink.handle(frame(Tx, "pre roll", &[0x01]));
-        sink.handle(frp(FrpEvent::shot_trigger(key(1))));
+        sink.handle(frp(trigger(key(1))));
         sink.handle(frame(Rx, "D4 DSP>APP", &[0xde, 0xad]));
         sink.handle(frame(Rx, "bulk", &[0xaa; 10]));
         sink.handle(frame(Rx, "bulk", &[0xbb; 10]));
-        sink.handle(frp(FrpEvent::shot_finished(key(1))));
+        sink.handle(frp(finished(key(1))));
         let seen = drain(&mut rx);
         assert_eq!(
             kinds(&seen),
-            ["trigger", "finished", "status"],
+            ["trigger", "capture", "finished", "status"],
             "no frame on the bus"
         );
         let raw = raw_of(&seen);
@@ -2068,6 +1855,25 @@ mod tests {
         sink.connected(&DeviceIdentity::new("FAKE-1"));
         sink.handle(frame(Rx, "again", &[0x02]));
         assert_eq!(sink.seqs["FAKE-1"], 5, "counting on in the next session");
+    }
+
+    /// A shot's capture carries the device's own id locally, for the
+    /// export scrub; no FRP message names it beyond its `device` field.
+    #[test]
+    fn the_capture_carries_the_device_id_for_the_scrub() {
+        let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
+        drain(&mut rx);
+        sink.handle(frp(trigger(key(1))));
+        sink.handle(frp(finished(key(1))));
+        let seen = drain(&mut rx);
+        let scrub = seen
+            .iter()
+            .find_map(|m| match m.as_local() {
+                Some((_, LocalEvent::ShotCapture { scrub, .. })) => Some(scrub.clone()),
+                _ => None,
+            })
+            .expect("a capture");
+        assert_eq!(scrub, ["FAKE-1"]);
     }
 
     /// Timestamps of one millisecond map to one instant however long after
@@ -2097,21 +1903,18 @@ mod tests {
             let mut frame = RawFrame::new(Rx, 0, vec![n]);
             frame.label = Some(n.to_string());
             frame.timestamp = Some(ms);
-            frp(FrpEvent::RawFrame(frame))
+            frp(FrpBody::ShotRaw(frame))
         };
         for n in 0..3 {
             sink.handle(stamped(n));
         }
-        sink.handle(frp(FrpEvent::ShotTrigger {
-            key: key(1),
-            timestamp: Some(ms),
-        }));
+        sink.handle(frp(trigger_at(key(1), ms)));
         // The fake's profile keeps 4 frames of pre-roll and 8 a shot.
         for n in 3..8 {
             sink.handle(stamped(n));
             std::thread::sleep(Duration::from_micros(300));
         }
-        sink.handle(frp(FrpEvent::shot_finished(key(1))));
+        sink.handle(frp(finished(key(1))));
         let raw = raw_of(&drain(&mut rx));
         let order: Vec<u8> = raw
             .frames
@@ -2140,48 +1943,49 @@ mod tests {
         assert_eq!(sink.seqs["FAKE-1"], 3);
     }
 
-    /// Telemetry a driver sends while it connects goes out with the
-    /// identity once the session connects (so with its device id), and the
+    /// The status a driver sends while it connects goes out in the card's
+    /// `bus.actor` with the identity once the session connects, and the
     /// connect's `phase` leaves the card then; a connect without a phase
     /// sends no `phase` key.
     #[test]
     fn a_connects_telemetry_goes_out_with_the_identity() {
-        let ready = || {
-            frp(FrpEvent::DeviceTelemetry {
-                manufacturer: None,
-                model: None,
-                firmware: None,
-                source: None,
-                telemetry: Some(HashMap::from([("ready".into(), "false".into())])),
-            })
+        let ready = |pct: u8| {
+            DeviceEvent::Status(
+                DeviceStatus::new()
+                    .with_telemetry("ready", "false")
+                    .with_battery(pct),
+            )
         };
         let (_dir, mut sink, mut rx, _w) = connecting_sink::<FakeHooks>("");
         sink.handle(DeviceEvent::Phase("handshaking"));
-        sink.handle(ready());
+        sink.handle(ready(50));
         let seen = drain(&mut rx);
         assert_eq!(kinds(&seen), ["status"], "the phase only");
         sink.connected(&DeviceIdentity::new("FAKE-1").with_model("Eagle"));
         let seen = drain(&mut rx);
-        assert_eq!(kinds(&seen), ["status", "telemetry"]);
-        assert!(
-            matches!(&seen[0].event, FlighthookEvent::ActorStatus { status: ActorStatus::Connected, telemetry }
-            if telemetry["phase"].is_empty())
+        assert_eq!(kinds(&seen), ["status", "actor"]);
+        let (status, telemetry) = card_status(&seen[0]).expect("a card status");
+        assert_eq!(status, ActorStatus::Connected);
+        assert!(telemetry["phase"].is_empty());
+        let FrpBody::BusActor(actor) = body(&seen[1]) else {
+            unreachable!()
+        };
+        assert_eq!(
+            actor.device.as_ref().and_then(|d| d.model.as_deref()),
+            Some("Eagle")
         );
-        assert!(
-            matches!(&seen[1].event, FlighthookEvent::DeviceTelemetry { model: Some(m), telemetry: Some(t), .. }
-            if m == "Eagle" && t["ready"] == "false")
+        assert_eq!(
+            actor.telemetry.as_ref().expect("telemetry")["ready"],
+            "false"
         );
-        assert!(seen.iter().all(|m| m.device.as_deref() == Some("FAKE-1")));
-        sink.handle(ready());
-        assert_eq!(kinds(&drain(&mut rx)), ["telemetry"], "connected: at once");
+        sink.handle(ready(49));
+        assert_eq!(kinds(&drain(&mut rx)), ["actor"], "connected: at once");
 
         sink.begin_session();
         sink.connected(&DeviceIdentity::new("FAKE-1"));
         let seen = drain(&mut rx);
-        assert!(
-            matches!(&seen[0].event, FlighthookEvent::ActorStatus { telemetry, .. }
-            if !telemetry.contains_key("phase"))
-        );
+        let (_, telemetry) = card_status(&seen[0]).expect("a card status");
+        assert!(!telemetry.contains_key("phase"));
     }
 
     /// A discarded shot's frames leave the pre-roll.
@@ -2192,8 +1996,8 @@ mod tests {
         drain(&mut rx);
         sink.handle(frame(Rx, "misread", &[0x11]));
         sink.handle(DeviceEvent::ShotDiscarded);
-        sink.handle(frp(FrpEvent::shot_trigger(key(1))));
-        sink.handle(frp(FrpEvent::shot_finished(key(1))));
+        sink.handle(frp(trigger(key(1))));
+        sink.handle(frp(finished(key(1))));
         let raw = raw_of(&drain(&mut rx));
         assert!(raw.frames.is_empty(), "{raw:?}");
         assert!(raw.unavailable.is_none());
@@ -2201,7 +2005,7 @@ mod tests {
 
     /// What a [`log_capture`] subscriber wrote.
     #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct Buf(Arc<Mutex<Vec<u8>>>);
 
     impl std::io::Write for Buf {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -2215,7 +2019,7 @@ mod tests {
 
     impl Buf {
         /// The log lines written so far.
-        fn lines(&self) -> Vec<String> {
+        pub(crate) fn lines(&self) -> Vec<String> {
             String::from_utf8(lock(&self.0).clone())
                 .expect("text")
                 .lines()
@@ -2243,7 +2047,7 @@ mod tests {
     /// looks only at the lines of its own actor ID. A scoped subscriber
     /// would lose lines of callsites that other tests were the first to
     /// hit.
-    fn process_log() -> &'static Buf {
+    pub(crate) fn process_log() -> &'static Buf {
         static LOG: LazyLock<Buf> = LazyLock::new(|| {
             let (buf, subscriber) = log_capture(tracing::Level::INFO);
             tracing::subscriber::set_global_default(subscriber)
@@ -2284,6 +2088,27 @@ mod tests {
         );
     }
 
+    /// Tournament mode holds a virtual card's shots (the trackball and the
+    /// mock run on this driver), and they are taken again once it is off.
+    #[test]
+    fn tournament_mode_holds_a_virtual_cards_shots() {
+        let (_dir, mut sink, mut rx, _w) = sink::<VirtualHooks>("");
+        drain(&mut rx);
+        sink.state.round.set_manual(true);
+        assert!(!sink.shots_allowed());
+        for event in [
+            trigger(key(1)),
+            launch_of(key(1), launch()),
+            finished(key(1)),
+        ] {
+            sink.handle(frp(event));
+        }
+        assert!(drain(&mut rx).is_empty(), "nothing of the shot");
+        assert!(sink.shots.is_empty());
+        sink.state.round.set_manual(false);
+        assert!(sink.shots_allowed());
+    }
+
     /// During a round a virtual card's driver is told to hold its shots;
     /// a shot that starts anyway is dropped whole by the round policy.
     #[test]
@@ -2301,29 +2126,32 @@ mod tests {
             .expect("a round");
         assert!(!sink.shots_allowed());
         for event in [
-            FrpEvent::shot_trigger(key(1)),
-            FrpEvent::launch(key(1), launch()),
-            FrpEvent::club_path(key(1), ClubData::default()),
-            FrpEvent::shot_finished(key(1)),
+            trigger(key(1)),
+            launch_of(key(1), launch()),
+            club_of(key(1), ClubData::default()),
+            finished(key(1)),
         ] {
             sink.handle(frp(event));
         }
         assert!(drain(&mut rx).is_empty(), "nothing of the shot");
-        assert!(sink.refused.is_empty() && sink.held.is_empty());
-        sink.handle(frp(FrpEvent::shot_trigger(key(9))));
+        assert!(sink.refused.is_empty() && sink.shots.is_empty());
+        sink.handle(frp(trigger(key(9))));
         assert_eq!(sink.refused.len(), 1, "a shot that never finishes");
         let old = Instant::now()
             .checked_sub(flighthook::SHOT_TIMEOUT + Duration::from_secs(1))
             .expect("an old instant");
         *sink.refused.get_mut("shot-9").expect("refused") = old;
-        sink.prune_held();
+        sink.prune_shots();
         assert!(sink.refused.is_empty(), "forgotten after the shot timeout");
         drop(guard);
         assert!(sink.shots_allowed());
-        sink.handle(frp(FrpEvent::shot_trigger(key(2))));
+        sink.handle(frp(trigger(key(2))));
         let seen = drain(&mut rx);
         assert_eq!(kinds(&seen), ["trigger"]);
-        assert_eq!(seen[0].provenance, Some(Provenance::Virtual));
+        assert_eq!(
+            sink.bus_actor().device.and_then(|d| d.source),
+            Some(Source::Virtual)
+        );
     }
 
     // -- The actor -----------------------------------------------------------
@@ -2332,8 +2160,8 @@ mod tests {
         _dir: TempDir,
         state: Arc<SystemState>,
         writer: GameStateWriter,
-        tx: broadcast::Sender<FlighthookMessage>,
-        rx: broadcast::Receiver<FlighthookMessage>,
+        tx: broadcast::Sender<BusMsg>,
+        rx: broadcast::Receiver<BusMsg>,
     }
 
     fn rig() -> Rig {
@@ -2349,9 +2177,12 @@ mod tests {
     }
 
     impl Rig {
+        /// Start `fake.0` with FRP actor id `fake.0` (it has no config
+        /// section to take one from).
         fn start(&self, section: FakeSection) {
-            crate::actors::start_actor(
+            crate::actors::start_actor_as(
                 "fake.0".into(),
+                Some("fake.0".into()),
                 Box::new(DriverActor::<FakeDriver, FakeHooks>::new(section)),
                 &self.state,
                 &self.tx,
@@ -2359,16 +2190,13 @@ mod tests {
         }
 
         /// Messages of `fake.0` until one matches `want`, within 5 s.
-        fn until(
-            &mut self,
-            mut want: impl FnMut(&FlighthookMessage) -> bool,
-        ) -> Vec<FlighthookMessage> {
+        fn until(&mut self, mut want: impl FnMut(&BusMsg) -> bool) -> Vec<BusMsg> {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut seen = Vec::new();
             loop {
                 assert!(Instant::now() < deadline, "timed out: {:?}", kinds(&seen));
                 match self.rx.try_recv() {
-                    Ok(m) if m.actor == "fake.0" => {
+                    Ok(m) if of_fake(&m) => {
                         let done = want(&m);
                         seen.push(m);
                         if done {
@@ -2382,17 +2210,43 @@ mod tests {
         }
     }
 
-    fn statuses(seen: &[FlighthookMessage]) -> Vec<ActorStatus> {
+    /// Whether `m` is of the card `fake.0`.
+    fn of_fake(m: &BusMsg) -> bool {
+        match m {
+            BusMsg::Frp { msg, .. } => msg.from == "fake.0",
+            BusMsg::Local { card, .. } => card == "fake.0",
+        }
+    }
+
+    fn statuses(seen: &[BusMsg]) -> Vec<ActorStatus> {
         seen.iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::ActorStatus { status, .. } => Some(*status),
+            .filter_map(|m| card_status(m).map(|(s, _)| s))
+            .collect()
+    }
+
+    fn is_status(m: &BusMsg, want: ActorStatus) -> bool {
+        card_status(m).is_some_and(|(s, _)| s == want)
+    }
+
+    fn is_alert(m: &BusMsg) -> bool {
+        matches!(m.as_frp().map(|f| &f.body), Some(FrpBody::BusAlert(_)))
+    }
+
+    fn alert_texts(seen: &[BusMsg]) -> Vec<&str> {
+        seen.iter()
+            .filter_map(|m| match m.as_frp().map(|f| &f.body) {
+                Some(FrpBody::BusAlert(a)) => Some(a.message.as_str()),
                 _ => None,
             })
             .collect()
     }
 
-    fn is_status(m: &FlighthookMessage, want: ActorStatus) -> bool {
-        matches!(&m.event, FlighthookEvent::ActorStatus { status, .. } if *status == want)
+    /// Whether `m` is the card's `bus.actor` blocked by `not_armed`.
+    fn is_not_armed(m: &BusMsg) -> bool {
+        matches!(
+            m.as_frp().map(|f| &f.body),
+            Some(FrpBody::BusActor(a)) if a.blockers.iter().any(|b| b == "not_armed")
+        )
     }
 
     fn section(script: u64) -> FakeSection {
@@ -2412,15 +2266,7 @@ mod tests {
     /// stop closes the session and ends Disconnected.
     #[test]
     fn the_card_reads_starting_connected_then_reconnecting() {
-        let ready = |v: &str| {
-            frp(FrpEvent::DeviceTelemetry {
-                manufacturer: None,
-                model: None,
-                firmware: None,
-                source: None,
-                telemetry: Some(HashMap::from([("ready".into(), v.into())])),
-            })
-        };
+        let ready = |_: &str| DeviceEvent::Status(DeviceStatus::new());
         let (id, script) = script(vec![
             Connect::Fail("no device"),
             Connect::Fail("no device yet"),
@@ -2452,18 +2298,8 @@ mod tests {
             .iter()
             .position(|m| is_status(m, Reconnecting))
             .expect("reconnecting");
-        assert!(
-            matches!(&seen[at - 1].event, FlighthookEvent::DeviceTelemetry { telemetry: Some(t), .. }
-            if t["ready"] == "false"),
-            "ready=false first"
-        );
-        let alerts: Vec<&str> = seen
-            .iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::Alert { message, .. } => Some(message.as_str()),
-                _ => None,
-            })
-            .collect();
+        assert!(is_not_armed(&seen[at - 1]), "not_armed first");
+        let alerts = alert_texts(&seen);
         assert_eq!(alerts, ["no device", "no device yet", "lost", "still gone"]);
         assert_eq!(
             rig.state.stop_and_wait("fake.0"),
@@ -2471,61 +2307,11 @@ mod tests {
         );
         let end = rig.until(|m| is_status(m, Disconnected));
         assert!(
-            matches!(&end[end.len() - 2].event, FlighthookEvent::DeviceTelemetry { telemetry: Some(t), .. }
-            if t["ready"] == "false"),
+            is_not_armed(&end[end.len() - 2]),
             "close says not ready: {:?}",
             kinds(&end)
         );
         assert_eq!(lock(&script).closes, 1);
-    }
-
-    /// A launch without a flight result goes out at the end of the `poll`
-    /// pass it came in, not when the device finishes the shot passes later
-    /// (a launch-only Xi chip, which the device finishes after its re-arm):
-    /// the ball is on the bus, simulated from the launch alone, while the
-    /// session is still in its next poll. It is simulated once, and an
-    /// output that sends at `shot_finished` (GSPro) gets the shot when the
-    /// device finishes it.
-    #[test]
-    fn a_launch_goes_out_at_the_end_of_its_pass() {
-        let (go, wait) = std::sync::mpsc::channel();
-        let (id, _script) = script(vec![Connect::Session(vec![
-            Step::Emit(vec![
-                frp(FrpEvent::shot_trigger(key(1))),
-                frp(FrpEvent::launch(key(1), launch())),
-            ]),
-            Step::Wait(wait),
-            Step::Emit(vec![frp(FrpEvent::shot_finished(key(1)))]),
-        ])]);
-        let mut rig = rig();
-        rig.start(section(id));
-        let early = rig.until(|m| matches!(m.event, FlighthookEvent::Launch { .. }));
-        // The session is still blocked in its second poll.
-        let mut gspro = flighthook::ShotAggregator::new();
-        assert!(
-            early.iter().all(|m| gspro.feed(m).is_none()),
-            "not sent yet"
-        );
-        let FlighthookEvent::Launch { derived, .. } = &early[early.len() - 1].event else {
-            unreachable!()
-        };
-        assert!(derived.as_ref().is_some_and(|d| d.carry_distance.is_some()));
-        go.send(()).expect("the session waits");
-        let rest = rig.until(|m| matches!(m.event, FlighthookEvent::ShotFinished { .. }));
-        assert!(
-            !kinds(&rest).contains(&"launch"),
-            "simulated once: {:?}",
-            kinds(&rest)
-        );
-        let shot = rest
-            .iter()
-            .find_map(|m| gspro.feed(m))
-            .expect("the shot, at shot_finished");
-        assert!(shot.launch.is_some() && shot.derived.is_some());
-        assert_eq!(
-            rig.state.stop_and_wait("fake.0"),
-            crate::state::Stopped::Exited
-        );
     }
 
     /// A stop ends a connect that is still waiting within the driver's
@@ -2558,16 +2344,16 @@ mod tests {
         let mut rig = rig();
         rig.start(section(id));
         let seen = rig.until(|m| {
-            matches!(&m.event, FlighthookEvent::ActorStatus { telemetry, .. }
-            if telemetry.get("phase").is_some_and(|p| p == "discovering"))
+            card_status(m).is_some_and(|(_, telemetry)| {
+                telemetry.get("phase").is_some_and(|p| p == "discovering")
+            })
         });
         let phases: Vec<(ActorStatus, &str)> = seen
             .iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::ActorStatus { status, telemetry } => {
-                    telemetry.get("phase").map(|p| (*status, p.as_str()))
-                }
-                _ => None,
+            .filter_map(|m| {
+                card_status(m).and_then(|(status, telemetry)| {
+                    telemetry.get("phase").map(|p| (status, p.as_str()))
+                })
             })
             .collect();
         use ActorStatus::Starting;
@@ -2582,29 +2368,23 @@ mod tests {
         let cleared = seen
             .iter()
             .position(|m| {
-                matches!(&m.event, FlighthookEvent::ActorStatus { telemetry, .. }
-                if telemetry.get("phase").is_some_and(String::is_empty))
+                card_status(m).is_some_and(|(_, t)| t.get("phase").is_some_and(String::is_empty))
             })
             .expect("cleared");
-        let alert = seen
-            .iter()
-            .position(|m| matches!(&m.event, FlighthookEvent::Alert { .. }))
-            .expect("the driver's alert");
+        let alert = seen.iter().position(is_alert).expect("the driver's alert");
         assert!(cleared < alert, "{:?}", kinds(&seen));
         rig.state.stop_and_wait("fake.0");
     }
 
     /// The error row of the card after each of `seen`'s statuses, as the web
     /// layer and the UI keep it.
-    fn error_rows(seen: &[FlighthookMessage]) -> Vec<Option<String>> {
+    fn error_rows(seen: &[BusMsg]) -> Vec<Option<String>> {
         let mut card = flighthook::ActorStatusResponse::new("Fake", ActorStatus::Starting);
         seen.iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::ActorStatus { status, telemetry } => {
-                    card.apply_status(*status, telemetry, 0);
-                    Some(card.telemetry.get("error").cloned())
-                }
-                _ => None,
+            .filter_map(|m| {
+                let (status, telemetry) = card_status(m)?;
+                card.apply_status(status, telemetry, 0);
+                Some(card.telemetry.get("error").cloned())
             })
             .collect()
     }
@@ -2645,12 +2425,7 @@ mod tests {
         // empty value that removes it.
         let sent: Vec<&str> = seen
             .iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::ActorStatus { telemetry, .. } => {
-                    telemetry.get("error").map(String::as_str)
-                }
-                _ => None,
-            })
+            .filter_map(|m| card_status(m).and_then(|(_, t)| t.get("error").map(String::as_str)))
             .collect();
         assert!(
             sent.contains(&"busy") && sent.last() == Some(&""),
@@ -2667,7 +2442,7 @@ mod tests {
         lock(&script).retry = Some(Duration::from_secs(30));
         let mut rig = rig();
         rig.start(section(id));
-        let mut seen = rig.until(|m| matches!(&m.event, FlighthookEvent::Alert { .. }));
+        let mut seen = rig.until(is_alert);
         assert_eq!(
             rig.state.stop_and_wait("fake.0"),
             crate::state::Stopped::Exited
@@ -2700,7 +2475,7 @@ mod tests {
         let rig = rig();
         let actor = DriverActor::<FakeDriver, FakeHooks>::new(section(id));
         let sender = BusSender::new("logged.0".into(), rig.tx.clone(), Arc::default())
-            .with_provenance(Provenance::Measured);
+            .with_frp_id(Some("logged.0".into()));
         let mut rx = rig.tx.subscribe();
         let thread = actor.start(Arc::clone(&rig.state), sender.clone(), sender.subscribe());
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2708,7 +2483,10 @@ mod tests {
         while connects < 2 {
             assert!(Instant::now() < deadline, "timed out");
             match rx.try_recv() {
-                Ok(m) if m.actor == "logged.0" && is_status(&m, ActorStatus::Connected) => {
+                Ok(m)
+                    if m.as_local().is_some_and(|(card, _)| card == "logged.0")
+                        && is_status(&m, ActorStatus::Connected) =>
+                {
                     connects += 1;
                 }
                 Ok(_) => {}
@@ -2747,10 +2525,7 @@ mod tests {
             (Severity::Error, "broken"),
             (Severity::Critical, "gone"),
         ] {
-            sink.handle(frp(FrpEvent::Alert {
-                severity,
-                message: message.into(),
-            }));
+            sink.handle(frp(flightrelay::BusAlert::new(severity, message)));
         }
         let lines = log_of("alerting.0");
         assert_eq!(lines.len(), 3, "{lines:?}");
@@ -2774,10 +2549,7 @@ mod tests {
         )]);
         let mut rig = rig();
         rig.start(section(id));
-        let seen = rig.until(|m| {
-            matches!(&m.event, FlighthookEvent::ActorStatus { telemetry, .. }
-            if telemetry.contains_key("phase"))
-        });
+        let seen = rig.until(|m| card_status(m).is_some_and(|(_, t)| t.contains_key("phase")));
         assert_eq!(
             rig.state.stop_and_wait("fake.0"),
             crate::state::Stopped::Exited
@@ -2786,8 +2558,8 @@ mod tests {
         // The card's view of every status: no phase once Disconnected.
         let mut card = flighthook::ActorStatusResponse::new("Fake", ActorStatus::Starting);
         for m in seen.iter().chain(&end) {
-            if let FlighthookEvent::ActorStatus { status, telemetry } = &m.event {
-                card.apply_status(*status, telemetry, 0);
+            if let Some((status, telemetry)) = card_status(m) {
+                card.apply_status(status, telemetry, 0);
             }
         }
         assert_eq!(card.status, ActorStatus::Disconnected);
@@ -2795,6 +2567,30 @@ mod tests {
             !card.telemetry.contains_key("phase"),
             "{:?}",
             card.telemetry
+        );
+    }
+
+    /// Another actor's `bus.sync` gets the card's current `bus.actor` again,
+    /// so a card added later learns the device's state at once.
+    #[test]
+    fn a_bus_sync_republishes_the_cards_actor() {
+        let (id, _script) = script(vec![Connect::Session(vec![Step::Emit(vec![
+            DeviceEvent::Status(DeviceStatus::new()),
+        ])])]);
+        let mut rig = rig();
+        rig.start(section(id));
+        let clear = |m: &BusMsg| matches!(m.as_frp().map(|f| &f.body), Some(FrpBody::BusActor(a)) if a.is_clear());
+        rig.until(clear);
+        let _ = rig.tx.send(BusMsg::frp(flightrelay::FrpMessage::new(
+            "late-card",
+            flightrelay::BusSync::new(),
+        )));
+        let again =
+            rig.until(|m| matches!(m.as_frp().map(|f| &f.body), Some(FrpBody::BusActor(_))));
+        assert!(clear(&again[again.len() - 1]), "{:?}", kinds(&again));
+        assert_eq!(
+            rig.state.stop_and_wait("fake.0"),
+            crate::state::Stopped::Exited
         );
     }
 
@@ -2807,11 +2603,9 @@ mod tests {
         bad.driver.bad = true;
         rig.start(bad);
         let seen = rig.until(|m| is_status(m, ActorStatus::Disconnected));
-        assert_eq!(kinds(&seen), ["status"], "no Starting, no connect");
-        assert!(
-            matches!(&seen[0].event, FlighthookEvent::ActorStatus { telemetry, .. }
-            if telemetry["error"] == "bad: must be false")
-        );
+        // The card's `bus.actor` goes out as the actor starts.
+        assert_eq!(kinds(&seen), ["actor", "status"], "no Starting, no connect");
+        assert!(card_status(&seen[1]).is_some_and(|(_, t)| t["error"] == "bad: must be false"));
         let at = Instant::now();
         assert_eq!(
             rig.state.stop_and_wait("fake.0"),
@@ -2824,13 +2618,7 @@ mod tests {
     /// `ready=false`, never stuck Connected; the thread has ended.
     #[test]
     fn a_driver_panic_ends_disconnected_with_the_error() {
-        let ready = frp(FrpEvent::DeviceTelemetry {
-            manufacturer: None,
-            model: None,
-            firmware: None,
-            source: None,
-            telemetry: Some(HashMap::from([("ready".into(), "true".into())])),
-        });
+        let ready = DeviceEvent::Status(DeviceStatus::new());
         let (id, _script) = script(vec![Connect::Session(vec![
             Step::Emit(vec![ready]),
             Step::Panic,
@@ -2841,16 +2629,8 @@ mod tests {
         use ActorStatus::{Connected, Disconnected, Starting};
         assert_eq!(statuses(&seen), [Starting, Connected, Disconnected]);
         let last = seen.len() - 1;
-        assert!(
-            matches!(&seen[last].event, FlighthookEvent::ActorStatus { telemetry, .. }
-            if telemetry["error"] == DRIVER_FAILED)
-        );
-        assert!(
-            matches!(&seen[last - 1].event, FlighthookEvent::DeviceTelemetry { telemetry: Some(t), .. }
-            if t["ready"] == "false"),
-            "{:?}",
-            kinds(&seen)
-        );
+        assert!(card_status(&seen[last]).is_some_and(|(_, t)| t["error"] == DRIVER_FAILED));
+        assert!(is_not_armed(&seen[last - 1]), "{:?}", kinds(&seen));
         assert_eq!(
             rig.state.stop_and_wait("fake.0"),
             crate::state::Stopped::Exited
@@ -2867,9 +2647,9 @@ mod tests {
         let start = section(id);
         let actor = DriverActor::<FakeDriver, FakeHooks>::new(start.clone());
         let sender = BusSender::new("fake.0".into(), rig.tx.clone(), Arc::default())
-            .with_provenance(Provenance::Measured);
+            .with_frp_id(Some("fake.0".into()));
         let thread = actor.start(Arc::clone(&rig.state), sender.clone(), sender.subscribe());
-        rig.until(|m| matches!(&m.event, FlighthookEvent::Alert { .. }));
+        rig.until(is_alert);
         let mut live = start.clone();
         live.driver.live = 7;
         assert!(matches!(
@@ -2897,7 +2677,7 @@ mod tests {
         let start = section(id);
         let actor = DriverActor::<FakeDriver, FakeHooks>::new(start.clone());
         let sender = BusSender::new("fake.0".into(), rig.tx.clone(), Arc::default())
-            .with_provenance(Provenance::Measured);
+            .with_frp_id(Some("fake.0".into()));
         let thread = actor.start(Arc::clone(&rig.state), sender.clone(), sender.subscribe());
 
         let renamed = FakeSection {
@@ -2946,47 +2726,49 @@ mod tests {
         thread.join().expect("the thread ends");
     }
 
-    /// The latched command starts from the game state and follows the bus,
-    /// during a connect too; the session gets every command.
+    /// The connect's turn hints start from the session's turn and follow
+    /// flighthook's `golfer.turn` on the bus; the session gets the new
+    /// hints.
     #[test]
     fn commands_reach_the_latched_command_and_the_session() {
         let (id, script) = script(vec![Connect::Session(vec![])]);
         let mut rig = rig();
-        rig.writer.set_mode(ShotDetectionMode::Putting);
+        let _ = rig.writer.apply(&flightrelay::GolferSelect {
+            mode: Some(Mode::Putting),
+            ..flightrelay::GolferSelect::new("r")
+        });
         rig.start(section(id));
         rig.until(|m| is_status(m, ActorStatus::Connected));
-        assert_eq!(
-            lock(&script).latched[0].mode,
-            Some(flightrelay::DetectionMode::Putting)
-        );
+        assert_eq!(lock(&script).latched[0].mode, Some(Mode::Putting));
         rig.tx
-            .send(
-                FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
-                    mode: Some(ShotDetectionMode::Chipping),
-                    handed: Some(flighthook::Handedness::Left),
-                    club: Some(Club::SandWedge),
-                })
-                .actor("system"),
-            )
+            .send(BusMsg::frp(flightrelay::FrpMessage::new(
+                rig.state.flighthook_id(),
+                flightrelay::GolferTurn::new(
+                    None,
+                    Some(flightrelay::Club::SandWedge),
+                    flightrelay::Handedness::Left,
+                    Mode::Chipping,
+                ),
+            )))
             .expect("sent");
         let deadline = Instant::now() + Duration::from_secs(5);
         while lock(&script).commands.is_empty() {
-            assert!(Instant::now() < deadline, "no command");
+            assert!(Instant::now() < deadline, "no hints");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let command = lock(&script).commands[0];
-        assert_eq!(command.mode, Some(flightrelay::DetectionMode::Chipping));
-        assert_eq!(command.handed, Some(flighthook::Handedness::Left));
-        assert_eq!(command.club, Some(flightrelay::Club::SandWedge));
+        let hints = lock(&script).commands[0];
+        assert_eq!(hints.mode, Some(Mode::Chipping));
+        assert_eq!(hints.handedness, Some(flightrelay::Handedness::Left));
+        assert_eq!(hints.club, Some(flightrelay::Club::SandWedge));
         rig.state.stop_and_wait("fake.0");
     }
 
     // -- Every hooked driver -------------------------------------------------
 
-    fn provenance_of(source: Source) -> Option<Provenance> {
+    fn provenance_of(source: Source) -> Option<Source> {
         match source {
-            Source::Measured => Some(Provenance::Measured),
-            Source::Virtual => Some(Provenance::Virtual),
+            Source::Measured => Some(Source::Measured),
+            Source::Virtual => Some(Source::Virtual),
             _ => None,
         }
     }
@@ -3109,6 +2891,7 @@ mod tests {
 
         let mock = flighthook::MockMonitorSection {
             name: "Mock".into(),
+            actor_id: Some("lm-1".into()),
             enabled: false,
             impact_lead_s: Some(1.5),
             driver: flighthook::MockConfig::default(),
@@ -3140,6 +2923,7 @@ mod tests {
 
         let mevo = flighthook::MevoSection {
             name: "Mevo".into(),
+            actor_id: Some("lm-1".into()),
             enabled: false,
             launch_only_spin: 50.0,
             impact_lead_s: Some(0.5),
@@ -3175,6 +2959,7 @@ mod tests {
 
         let r10 = flighthook::R10Section {
             name: "R10".into(),
+            actor_id: Some("lm-1".into()),
             enabled: false,
             impact_lead_s: Some(2.5),
             driver: flighthook::R10Config::default(),
@@ -3194,6 +2979,7 @@ mod tests {
 
         let square = flighthook::SquareSection {
             name: "Omni".into(),
+            actor_id: Some("lm-1".into()),
             enabled: false,
             impact_lead_s: Some(1.0),
             driver: flighthook::SquareConfig::default(),
@@ -3230,6 +3016,7 @@ mod tests {
 
         let exputt = flighthook::ExPuttSection {
             name: "ExPutt".into(),
+            actor_id: Some("lm-1".into()),
             enabled: false,
             impact_lead_s: Some(0.5),
             driver: flighthook::ExPuttConfig::default(),
@@ -3252,6 +3039,7 @@ mod tests {
         // ignores).
         let trackball = flighthook::TrackballSection {
             name: "Arcade".into(),
+            actor_id: Some("lm-1".into()),
             enabled: false,
             driver: flighthook::TrackballConfig::default(),
         };
@@ -3292,8 +3080,14 @@ mod tests {
         };
         assert_eq!(
             host.keys().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from(["enabled".to_owned(), "name".to_owned()])
+            BTreeSet::from([
+                "actor_id".to_owned(),
+                "enabled".to_owned(),
+                "name".to_owned()
+            ])
         );
+        // The card drops the driver's hand: it comes from the turn.
+        full.driver.hand = flighthook::TrackballHand::default();
         let json = serde_json::to_string(&full).expect("json");
         assert_eq!(
             serde_json::from_str::<flighthook::TrackballSection>(&json).expect("reads"),

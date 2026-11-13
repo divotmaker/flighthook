@@ -12,8 +12,9 @@
 use egui::{Color32, Pos2, Rect};
 
 use crate::groups::ShotGroups;
+use crate::groups::{GolferKeys, SetInfo};
 use crate::theme;
-use crate::types::{Club, FlightPath, ShotGroupInfo, ShotGrouping, ShotRow, UnitSystem};
+use crate::types::{Club, FlightPath, ShotGrouping, ShotRow, UnitSystem};
 
 // ---------------------------------------------------------------------------
 // Domains and ticks
@@ -798,14 +799,77 @@ pub(crate) fn is_auto_chip(actor: &str) -> bool {
     actor == flighthook::AUTO_CHIP_ACTOR
 }
 
-/// Whether the device filter `filter` (an exact actor id; every shot when
-/// `None`) passes a shot from `actor`. The one filter of the Shots tab: the
-/// shot list, the shot on show, the Table rows, the view's members and the
-/// charts' faint shots all go through it. An Auto-chip is no device, so a
-/// filter hides it like any other device's shot.
-#[must_use]
-pub(crate) fn in_filter(actor: &str, filter: Option<&str>) -> bool {
-    filter.is_none_or(|d| actor == d)
+/// What a [`ShotFilter`] picks: the device and the golfer key.
+pub(crate) type FilterKey = (Option<String>, Option<Option<String>>);
+
+/// The Shots tab's one filter: a device (an exact actor id) and the viewed
+/// golfer (a golfer key by the lookup rule, `None` = shots with no golfer),
+/// each unset for every shot. The shot list, the shot on show, the Table rows,
+/// the view's members and the charts' faint shots all go through
+/// [`ShotFilter::passes`]. An Auto-chip is no device, so a device filter
+/// hides it like any other device's shot.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ShotFilter<'a> {
+    /// The device filter: an exact actor id, or every device.
+    pub(crate) device: Option<&'a str>,
+    /// The viewed golfer: its key and the keys that resolve a shot's golfer
+    /// id; every golfer when `None`.
+    golfer: Option<(Option<&'a str>, &'a GolferKeys)>,
+}
+
+impl<'a> ShotFilter<'a> {
+    /// Every shot.
+    pub(crate) const ALL: Self = Self {
+        device: None,
+        golfer: None,
+    };
+
+    /// The device filter `device` alone.
+    #[must_use]
+    pub(crate) fn device(device: Option<&'a str>) -> Self {
+        Self {
+            device,
+            golfer: None,
+        }
+    }
+
+    /// This filter, narrowed to the golfer `key` (by `keys`) when `key` is
+    /// `Some`.
+    #[must_use]
+    pub(crate) fn golfer(self, key: Option<Option<&'a str>>, keys: &'a GolferKeys) -> Self {
+        Self {
+            golfer: key.map(|k| (k, keys)),
+            ..self
+        }
+    }
+
+    /// What the filter picks, owned: the device and the golfer key.
+    #[must_use]
+    pub(crate) fn key(&self) -> FilterKey {
+        (
+            self.device.map(str::to_owned),
+            self.golfer.map(|(k, _)| k.map(str::to_owned)),
+        )
+    }
+
+    /// Whether the device filter narrows the shots. The viewed golfer is
+    /// the view itself, not a narrowing.
+    #[must_use]
+    pub(crate) fn narrows(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Whether golfer id `golfer` resolves to the viewed golfer.
+    #[must_use]
+    pub(crate) fn passes_golfer(&self, golfer: Option<&str>) -> bool {
+        self.golfer.is_none_or(|(k, keys)| keys.key(golfer) == k)
+    }
+
+    /// Whether the filter passes the shot `row`.
+    #[must_use]
+    pub(crate) fn passes(&self, row: &ShotRow) -> bool {
+        self.device.is_none_or(|d| row.actor == d) && self.passes_golfer(row.golfer.as_deref())
+    }
 }
 
 /// Label of a device: its name, else [`flighthook::AUTO_CHIP_NAME`] for the
@@ -839,9 +903,9 @@ pub(crate) fn members_for(
     shots: &[ShotRow],
     groups: &ShotGroups,
     view: ShotGrouping,
-    set: Option<&ShotGroupInfo>,
+    set: Option<&SetInfo>,
     shown: Option<usize>,
-    device: Option<&str>,
+    filter: ShotFilter<'_>,
 ) -> Vec<usize> {
     if view == ShotGrouping::None {
         return shown.filter(|&i| i < shots.len()).into_iter().collect();
@@ -849,41 +913,78 @@ pub(crate) fn members_for(
     let Some(set) = set else {
         return Vec::new();
     };
+    // A putting device's putt in another club's set is a putter shot: the
+    // view around one is the putts'.
+    let club = match shown.and_then(|i| shots.get(i)) {
+        Some(r) if r.group.as_deref() == Some(set.id.as_str()) => row_club(r, set.club),
+        _ => set.club,
+    };
     let in_view = |r: &ShotRow| {
         let Some(id) = r.group.as_deref() else {
             return false;
         };
         if view == ShotGrouping::BySet {
-            return id == set.id;
+            return id == set.id && row_club(r, set.club) == club;
         }
-        groups
-            .get(id)
-            .is_some_and(|g| g.club == set.club && g.session == set.session)
+        let golfer = groups.golfers().key(set.golfer.as_deref());
+        groups.get(id).is_some_and(|g| {
+            g.session == set.session
+                && row_club(r, g.club) == club
+                && groups.golfers().key(g.golfer.as_deref()) == golfer
+        })
     };
     shots
         .iter()
         .enumerate()
-        .filter(|&(_, r)| in_filter(&r.actor, device) && !is_auto_chip(&r.actor) && in_view(r))
+        .filter(|&(_, r)| filter.passes(r) && !is_auto_chip(&r.actor) && in_view(r))
         .map(|(i, _)| i)
         .collect()
 }
 
-/// The shots of `set` its headers count: its shot count less its Auto-chip
-/// shots in `shots` ([`is_auto_chip`]); with a device filter `filter`, its
-/// rows in `shots` from that device. A shot joins a set's count when it has
-/// data, which is when it carries the set's id.
+/// The club a row of a set with club `club` counts under: the putter for a
+/// putting device's putt (the store stamps it, whatever club is in play),
+/// else the set's club.
 #[must_use]
-pub(crate) fn set_shot_count(set: &ShotGroupInfo, shots: &[ShotRow], filter: Option<&str>) -> u32 {
-    if let Some(device) = filter {
+pub(crate) fn row_club(row: &ShotRow, club: Option<Club>) -> Option<Club> {
+    if row.club_selected == Some(Club::Putter) {
+        Some(Club::Putter)
+    } else {
+        club
+    }
+}
+
+/// The shots of `set` its headers count: its shot count less its Auto-chip
+/// shots ([`is_auto_chip`]) and putting-device putts of another club's set
+/// ([`row_club`]) in `shots`; with a device filter `filter`, its rows in
+/// `shots` from that device. A shot joins a set's count when it has data,
+/// which is when it carries the set's id.
+#[must_use]
+pub(crate) fn set_shot_count(set: &SetInfo, shots: &[ShotRow], filter: ShotFilter<'_>) -> u32 {
+    if filter.device.is_some() {
         let n = shots
             .iter()
-            .filter(|r| r.actor == device && r.group.as_deref() == Some(set.id.as_str()))
+            .filter(|r| filter.passes(r) && r.group.as_deref() == Some(set.id.as_str()))
+            .count();
+        return u32::try_from(n).unwrap_or(u32::MAX);
+    }
+    if !filter.passes_golfer(set.golfer.as_deref()) {
+        let n = shots
+            .iter()
+            .filter(|r| {
+                filter.passes(r)
+                    && r.group.as_deref() == Some(set.id.as_str())
+                    && !is_auto_chip(&r.actor)
+                    && row_club(r, set.club) == set.club
+            })
             .count();
         return u32::try_from(n).unwrap_or(u32::MAX);
     }
     let chips = shots
         .iter()
-        .filter(|r| is_auto_chip(&r.actor) && r.group.as_deref() == Some(set.id.as_str()))
+        .filter(|r| {
+            r.group.as_deref() == Some(set.id.as_str())
+                && (is_auto_chip(&r.actor) || row_club(r, set.club) != set.club)
+        })
         .count();
     set.shots
         .saturating_sub(u32::try_from(chips).unwrap_or(u32::MAX))
@@ -943,6 +1044,8 @@ pub(crate) struct MembersKey {
     pub(crate) view: ShotGrouping,
     /// Device filter: an exact actor id, or every device.
     pub(crate) device: Option<String>,
+    /// The viewed golfer's key (`None` = no golfer).
+    pub(crate) golfer: Option<String>,
     /// Index of the shown shot.
     pub(crate) shown: Option<usize>,
     /// Club in play, which picks the set when the shown shot has none.
@@ -1747,6 +1850,7 @@ mod tests {
 
     fn shot(actor: &str) -> ShotRow {
         ShotRow {
+            golfer: None,
             actor: actor.into(),
             shot_id: String::new(),
             shot_number: 1,
@@ -1815,8 +1919,8 @@ mod tests {
             "openconnect_server"
         );
         assert_eq!(device_label("square.0", None), "square.0");
-        assert_eq!(device_label("autochip", None), "Auto-chip");
-        assert_eq!(device_label("autochip", Some("")), "Auto-chip");
+        assert_eq!(device_label("autochip", None), "Auto-Chip");
+        assert_eq!(device_label("autochip", Some("")), "Auto-Chip");
     }
 
     #[test]
@@ -1854,34 +1958,25 @@ mod tests {
 
     // -- members of the view --
 
-    fn set(id: &str, number: u32, club: Option<Club>, open: bool) -> ShotGroupInfo {
-        ShotGroupInfo {
+    fn set(id: &str, number: u32, club: Option<Club>, open: bool) -> SetInfo {
+        SetInfo {
+            golfer: None,
             id: id.into(),
             number,
             session: 0,
-            golfer: None,
             club,
-            started_at: "2026-10-26T15:41:28.300Z".into(),
-            manual: false,
+            started_at: 0,
             open,
             shots: 2,
         }
     }
 
-    fn in_session(session: u32, s: ShotGroupInfo) -> ShotGroupInfo {
-        ShotGroupInfo { session, ..s }
+    fn in_session(session: u32, s: SetInfo) -> SetInfo {
+        SetInfo { session, ..s }
     }
 
-    fn sets(list: Vec<ShotGroupInfo>) -> ShotGroups {
-        let mut g = ShotGroups::default();
-        g.replace(crate::types::ShotGroupsResponse {
-            server: "webserver.0".into(),
-            mode: ShotGrouping::BySet,
-            session: 0,
-            current: None,
-            groups: list,
-        });
-        g
+    fn sets(list: Vec<SetInfo>) -> ShotGroups {
+        ShotGroups::with_sets(ShotGrouping::BySet, list)
     }
 
     /// Rows oldest first, each `(actor, set id, club)`.
@@ -1900,7 +1995,7 @@ mod tests {
 
     /// Session 0: a 7-iron set. Session 1: 7I, DR, 7I sets, from two
     /// devices. Plus a row in no set.
-    fn history() -> (Vec<ShotRow>, Vec<ShotGroupInfo>) {
+    fn history() -> (Vec<ShotRow>, Vec<SetInfo>) {
         let shots = rows(&[
             ("mevo.0", Some("old"), I7),
             ("mevo.0", None, I7),
@@ -1927,14 +2022,24 @@ mod tests {
         let m = |set: &str, device| {
             members_for(&shots, &g, ShotGrouping::BySet, g.get(set), Some(6), device)
         };
-        assert_eq!(m("c", None), vec![6, 7]);
-        assert_eq!(m("a", None), vec![2, 3]);
-        assert_eq!(m("old", None), vec![0]);
+        assert_eq!(m("c", ShotFilter::ALL), vec![6, 7]);
+        assert_eq!(m("a", ShotFilter::ALL), vec![2, 3]);
+        assert_eq!(m("old", ShotFilter::ALL), vec![0]);
         // The device filter applies first.
-        assert_eq!(m("c", Some("square.0")), vec![7]);
-        assert!(m("c", Some("r10.0")).is_empty());
+        assert_eq!(m("c", ShotFilter::device(Some("square.0"))), vec![7]);
+        assert!(m("c", ShotFilter::device(Some("r10.0"))).is_empty());
         // No set: nothing.
-        assert!(members_for(&shots, &g, ShotGrouping::BySet, None, Some(1), None).is_empty());
+        assert!(
+            members_for(
+                &shots,
+                &g,
+                ShotGrouping::BySet,
+                None,
+                Some(1),
+                ShotFilter::ALL
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1953,15 +2058,57 @@ mod tests {
         };
         // Both 7-iron sets since the last New session, not the driver set,
         // the earlier session's 7-iron set or the row in no set.
-        assert_eq!(m("c", None), vec![2, 3, 6, 7]);
-        assert_eq!(m("a", None), vec![2, 3, 6, 7], "either set of the club");
-        assert_eq!(m("b", None), vec![4, 5]);
+        assert_eq!(m("c", ShotFilter::ALL), vec![2, 3, 6, 7]);
+        assert_eq!(
+            m("a", ShotFilter::ALL),
+            vec![2, 3, 6, 7],
+            "either set of the club"
+        );
+        assert_eq!(m("b", ShotFilter::ALL), vec![4, 5]);
         // A shot from the earlier session shows that session's club.
-        assert_eq!(m("old", None), vec![0]);
+        assert_eq!(m("old", ShotFilter::ALL), vec![0]);
         // The device filter applies first.
-        assert_eq!(m("c", Some("mevo.0")), vec![2, 6]);
-        assert_eq!(m("b", Some("square.0")), vec![5]);
-        assert!(members_for(&shots, &g, ShotGrouping::ByClub, None, Some(1), None).is_empty());
+        assert_eq!(m("c", ShotFilter::device(Some("mevo.0"))), vec![2, 6]);
+        assert_eq!(m("b", ShotFilter::device(Some("square.0"))), vec![5]);
+        assert!(
+            members_for(
+                &shots,
+                &g,
+                ShotGrouping::ByClub,
+                None,
+                Some(1),
+                ShotFilter::ALL
+            )
+            .is_empty()
+        );
+    }
+
+    /// A putting device's putt filed in a 7-iron set stays out of that
+    /// set's members and count; shown, its view is the putts' (By club:
+    /// every putt of the session).
+    #[test]
+    fn putts_stay_out_of_another_clubs_set() {
+        const PT: Option<Club> = Some(Club::Putter);
+        let shots = rows(&[
+            ("mevo.0", Some("a"), I7),
+            ("exputt.0", Some("a"), PT),
+            ("mevo.0", Some("b"), DR),
+            ("exputt.0", Some("b"), PT),
+        ]);
+        let g = sets(vec![set("a", 1, I7, false), set("b", 2, DR, true)]);
+        let m = |view, set: &str, shown| {
+            members_for(&shots, &g, view, g.get(set), Some(shown), ShotFilter::ALL)
+        };
+        assert_eq!(m(ShotGrouping::BySet, "a", 0), vec![0]);
+        assert_eq!(
+            m(ShotGrouping::BySet, "a", 1),
+            vec![1],
+            "the putt's own view"
+        );
+        assert_eq!(m(ShotGrouping::ByClub, "b", 3), vec![1, 3], "every putt");
+        assert_eq!(m(ShotGrouping::ByClub, "b", 2), vec![2]);
+        let a = g.get("a").expect("a");
+        assert_eq!(set_shot_count(a, &shots, ShotFilter::ALL), 1);
     }
 
     #[test]
@@ -1978,11 +2125,18 @@ mod tests {
         ]);
         let y = g.get("y");
         assert_eq!(
-            members_for(&shots, &g, ShotGrouping::ByClub, y, Some(2), None),
+            members_for(
+                &shots,
+                &g,
+                ShotGrouping::ByClub,
+                y,
+                Some(2),
+                ShotFilter::ALL
+            ),
             vec![0, 2]
         );
         assert_eq!(
-            members_for(&shots, &g, ShotGrouping::BySet, y, Some(2), None),
+            members_for(&shots, &g, ShotGrouping::BySet, y, Some(2), ShotFilter::ALL),
             vec![2]
         );
     }
@@ -2000,7 +2154,7 @@ mod tests {
             ("mevo.0", Some("a"), I7),
             (chip, Some("b"), I7),
         ]);
-        let a = ShotGroupInfo {
+        let a = SetInfo {
             shots: 3,
             ..set("a", 1, Some(Club::Iron7), true)
         };
@@ -2008,26 +2162,37 @@ mod tests {
         for view in [ShotGrouping::BySet, ShotGrouping::ByClub] {
             for shown in [1, 2] {
                 assert_eq!(
-                    members_for(&shots, &g, view, g.get("a"), Some(shown), None),
+                    members_for(&shots, &g, view, g.get("a"), Some(shown), ShotFilter::ALL),
                     vec![0, 2],
                     "{view:?} {shown}"
                 );
             }
         }
         assert_eq!(
-            members_for(&shots, &g, ShotGrouping::None, g.get("a"), Some(1), None),
+            members_for(
+                &shots,
+                &g,
+                ShotGrouping::None,
+                g.get("a"),
+                Some(1),
+                ShotFilter::ALL
+            ),
             vec![1]
         );
         assert_eq!(device_ids(&shots), vec!["mevo.0"]);
         assert!(device_ids(&shots[1..2]).is_empty());
         // The set counts 3 shots, one an Auto-chip: its headers say 2.
-        assert_eq!(set_shot_count(&a, &shots, None), 2);
-        assert_eq!(set_shot_count(&a, &shots[..1], None), 3);
+        assert_eq!(set_shot_count(&a, &shots, ShotFilter::ALL), 2);
+        assert_eq!(set_shot_count(&a, &shots[..1], ShotFilter::ALL), 3);
         // Under a device filter, the set's rows from that device.
-        assert_eq!(set_shot_count(&a, &shots, Some("mevo.0")), 2);
-        assert_eq!(set_shot_count(&a, &shots, Some("square.0")), 0);
-        assert!(in_filter("mevo.0", None) && in_filter("mevo.0", Some("mevo.0")));
-        assert!(!in_filter(flighthook::AUTO_CHIP_ACTOR, Some("mevo.0")));
+        assert_eq!(
+            set_shot_count(&a, &shots, ShotFilter::device(Some("mevo.0"))),
+            2
+        );
+        assert_eq!(
+            set_shot_count(&a, &shots, ShotFilter::device(Some("square.0"))),
+            0
+        );
     }
 
     #[test]
@@ -2037,12 +2202,15 @@ mod tests {
         let m =
             |set, shown, device| members_for(&shots, &g, ShotGrouping::None, set, shown, device);
         for set in [None, g.get("c")] {
-            assert_eq!(m(set, Some(6), None), vec![6]);
-            assert_eq!(m(set, Some(1), None), vec![1], "a row in no set");
+            assert_eq!(m(set, Some(6), ShotFilter::ALL), vec![6]);
+            assert_eq!(m(set, Some(1), ShotFilter::ALL), vec![1], "a row in no set");
             // The device filter does not apply: the shown shot stays.
-            assert_eq!(m(set, Some(4), Some("square.0")), vec![4]);
-            assert!(m(set, None, None).is_empty());
-            assert!(m(set, Some(shots.len()), None).is_empty());
+            assert_eq!(
+                m(set, Some(4), ShotFilter::device(Some("square.0"))),
+                vec![4]
+            );
+            assert!(m(set, None, ShotFilter::ALL).is_empty());
+            assert!(m(set, Some(shots.len()), ShotFilter::ALL).is_empty());
         }
     }
 
@@ -2076,6 +2244,7 @@ mod tests {
             groups_rev: 3,
             view: ShotGrouping::BySet,
             device: None,
+            golfer: None,
             shown: Some(4),
             club: I7,
         };

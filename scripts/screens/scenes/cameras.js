@@ -1,5 +1,5 @@
 'use strict';
-// screens/cameras.png: Shots tab, Cameras pane. Two cameras play the CC0
+// screens/cameras.png: the Cameras tab. Two cameras play the CC0
 // swing clips (face-on and down-the-line, see lib/footage.js) through
 // flighthook's `clip:` camera, body tracking is Live, and two driver shots
 // come from an Open Connect launch monitor. Shot #2 is shown with both clips
@@ -99,11 +99,11 @@ latency_s = 0.0
       }
     });
     await until('both cameras', async () => {
-      const { actors } = await fh.get('/api/status');
+      const { cards: actors } = await fh.get('/api/status');
       return CAMERAS.every((c) => actors[c] && actors[c].status === 'connected');
     });
     // The club picks the bands the swing numbers are graded against.
-    await fh.post('/api/club', { club: 'DR' });
+    await fh.post('/api/select', { club: 'DR' });
     const monitor = new Monitor(ctx.ports.monitor, { deviceId: 'Harness' });
     ctx.cleanup.push(() => monitor.close());
     await monitor.connect();
@@ -117,12 +117,13 @@ latency_s = 0.0
   },
 
   snap: () => ({
+    // The app opens on Shots, whose camera cards keep playing.
+    openSettle: false,
     viewport: { width: 1280, height: 944 },
     images: [{
       name: 'cameras',
       steps: [
-        { click: [125, 27] }, // Shots tab
-        { click: [117, 91] }, // Cameras pane
+        { click: [78, 26] }, // Cameras
         { move: [640, 120] },
         // The scrubber's gold impact line: seek there (pauses both clips),
         // again once the layout has settled, then park the pointer.

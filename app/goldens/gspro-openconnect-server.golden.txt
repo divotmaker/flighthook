@@ -1,0 +1,54 @@
+== 1 connected: every device ready, the output connected
+wrote {"Code":200,"Message":"Heartbeat received"}
+== 2 header picks 7I (no hand set yet)
+wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"RH","Club":"I7"}}
+== 3 simulator: RH, DR (Full)
+wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"RH","Club":"DR"}}
+== 4 Mevo+ full swing (Full, Any)
+== 5 R10 full shot (Full, Any)
+== 6 Omni full swing (Full, Any)
+== 7 Xi full swing (Full, Any; spin source auto = E8 rule)
+== 8 Open Connect monitor full shot (Full, Any)
+wrote {"Code":200,"Message":"Shot received"}
+== 9 Mevo+ launch-only chip, sim on (Full, Any)
+# [simulation] mode = Off
+== 10 Mevo+ launch-only chip, sim off (Full, Any)
+# [simulation] mode = Force
+== 11 Mevo+ full swing, sim force (Full, Any)
+== 12 R10 full shot, sim force (Full, Any)
+# [simulation] mode = On
+== 13 Auto-chip 3 yd (Full)
+== 14 simulator: RH, SW (Chipping)
+wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"RH","Club":"SW"}}
+== 15 Xi launch-only chip, sim on (Chipping, routed Xi)
+# [simulation] mode = Off
+== 16 Xi launch-only chip, sim off (Chipping, routed Xi)
+# [simulation] mode = Force
+== 17 Xi launch-only chip, sim force (Chipping, routed Xi)
+# [simulation] mode = On
+== 18 Xi early-only chip, estimate on (Chipping, routed Xi)
+== 19 Xi full swing (Chipping, routed Xi; spin source auto = D4)
+== 20 Mevo+ full swing (Chipping: not routed)
+== 21 R10 full shot (Chipping: not routed)
+== 22 Auto-chip 1 yd (Chipping)
+== 23 header picks Full (club stays SW)
+== 24 Mevo+ full swing (hand-picked Full, Any)
+== 25 simulator repeats RH, SW (back to Chipping)
+== 26 Mevo+ full swing (Chipping again: not routed)
+== 27 Xi full swing (Chipping again, routed Xi)
+== 28 simulator: LH, PT (Putting)
+wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"LH","Club":"PT"}}
+== 29 Open Connect monitor putt (Putting, routed server)
+wrote {"Code":200,"Message":"Shot received"}
+== 30 Omni putt (Putting: not routed)
+== 31 Auto-chip 5 yd (Putting)
+== 32 simulator: LH, 7I (Full)
+wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"LH","Club":"I7"}}
+== 33 Omni full swing, left-handed (Full, Any)
+== 34 R10 full shot, left-handed (Full, Any)
+== 35 Xi full swing, left-handed (Full, Any)
+== 36 Open Connect monitor full shot, left-handed (Full, Any)
+wrote {"Code":200,"Message":"Shot received"}
+== 37 Mevo+ launch-only chip, left-handed (Full, Any)
+== 38 simulator: RH, DR (Full)
+wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"RH","Club":"DR"}}

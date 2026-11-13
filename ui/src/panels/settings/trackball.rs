@@ -3,9 +3,7 @@
 
 use std::collections::HashMap;
 
-use flighthook::{
-    TrackballClub, TrackballConfig, TrackballCurveSense, TrackballHand, TrackballSection,
-};
+use flighthook::{TrackballClub, TrackballConfig, TrackballCurveSense, TrackballSection};
 
 use super::{DeviceFormEntry, TEXT_EDIT_MARGIN, field_indent, field_label};
 use crate::panels::devices;
@@ -347,7 +345,6 @@ pub(crate) struct TrackballForm {
     pub(crate) loaded: TrackballConfig,
     pub(crate) device: String,
     pub(crate) club: TrackballClub,
-    pub(crate) hand: TrackballHand,
     pub(crate) curve_sense: TrackballCurveSense,
     pub(crate) mirror: bool,
     /// The number fields as typed, by key.
@@ -368,7 +365,6 @@ impl TrackballForm {
             loaded: loaded.clone(),
             device: loaded.device.clone().unwrap_or_default(),
             club: loaded.club,
-            hand: loaded.hand,
             curve_sense: loaded.tuning.curve_sense,
             mirror: loaded.tuning.mirror_for_left_hand,
             numbers: numbers().map(|n| (n.key, text((n.get)(loaded)))).collect(),
@@ -389,7 +385,6 @@ impl TrackballForm {
             out.device = (!device.is_empty()).then(|| device.to_owned());
         }
         out.club = self.club;
-        out.hand = self.hand;
         out.tuning.curve_sense = self.curve_sense;
         out.tuning.mirror_for_left_hand = self.mirror;
         for n in numbers() {
@@ -468,8 +463,8 @@ fn choice<T: Copy + PartialEq>(
     changed
 }
 
-/// The Trackball card's fields: the device, the club and hand it starts
-/// with, the numbers of the device, the tuning, then the swing
+/// The Trackball card's fields: the device, the club it starts with, the
+/// numbers of the device, the tuning, then the swing
 /// detection thresholds in a section of their own.
 pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: f32, wide: f32) {
     let id = dev.id.clone();
@@ -502,20 +497,6 @@ pub(super) fn fields(ui: &mut egui::Ui, dev: &mut DeviceFormEntry, field_width: 
             field_width,
             &mut dev.trackball_form().club,
             &clubs,
-        );
-    });
-    ui.horizontal(|ui| {
-        field_label(ui, "Starting hand:")
-            .on_hover_text("The player's hand until the game names one.");
-        changed |= choice(
-            ui,
-            format!("trackball_hand_{id}"),
-            field_width,
-            &mut dev.trackball_form().hand,
-            &[
-                (TrackballHand::Right, "Right"),
-                (TrackballHand::Left, "Left"),
-            ],
         );
     });
     for n in &DEVICE {

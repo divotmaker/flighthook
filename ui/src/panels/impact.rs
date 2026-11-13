@@ -283,6 +283,8 @@ impl FaceFamily {
             | None => Self::Iron,
             Some(GapWedge | SandWedge | LobWedge) => Self::Wedge,
             Some(Putter) => Self::Putter,
+            // A club code newer than this table: an iron's outline.
+            Some(_) => Self::Iron,
         }
     }
 
@@ -1358,6 +1360,7 @@ mod tests {
 
     fn row(n: u32, impact: (Option<f64>, Option<f64>)) -> ShotRow {
         ShotRow {
+            golfer: None,
             actor: "square.0".into(),
             shot_id: format!("s{n}"),
             shot_number: n,

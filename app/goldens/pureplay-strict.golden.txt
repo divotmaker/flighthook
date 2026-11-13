@@ -1,0 +1,129 @@
+== 1 connected: every device ready, the output connected
+Hello 50 4C 01 00 01 16 00 01 00 00 0A 66 6C 69 67 68 74 68 6F 6F 6B 07 56 45 52 53 49 4F 4E A6 02 15 9F
+StrictModeAck 50 4C 01 00 04 02 00 01 00 FA A6 89 42
+last ReadyState 50 4C 01 00 12 01 00 01 2C A7 3D 6D
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 2 header picks 7I (no hand set yet)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 3 simulator: RH, DR (Full)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 4 Mevo+ full swing (Full, Any)
+BallData 50 4C 01 00 10 22 00 01 00 00 00 7F 00 D5 78 0D 42 0C 02 A8 41 89 41 02 C1 00 A8 DF 45 00 B8 DE 45 00 00 23 44 F5 43 A7 40 A2 E5 C2 32
+ClubData 50 4C 01 00 11 26 00 01 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 61 94 47 6B
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 5 R10 full shot (Full, Any)
+BallData 50 4C 01 00 10 22 00 02 00 00 00 7F 00 00 00 86 42 00 00 48 41 9A 99 99 BF 00 00 2F 45 00 50 2E 45 00 00 74 C3 00 00 A0 C0 1A EF FF B2
+ClubData 50 4C 01 00 11 26 00 02 00 00 00 39 00 00 00 30 42 00 00 00 00 00 00 00 00 00 00 C0 3F 00 00 00 C0 00 00 60 C0 00 00 00 00 00 00 00 00 27 41 F9 41
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 6 Omni full swing (Full, Any)
+BallData 50 4C 01 00 10 22 00 03 00 00 00 7F 00 00 00 70 42 00 00 60 41 9A 99 99 BF 00 30 3F 45 00 80 3B 45 00 00 16 44 C3 F5 34 41 DE 61 3E 82
+ClubData 50 4C 01 00 11 26 00 03 00 00 00 FF 00 9A 99 25 42 9A 99 B9 3F 33 33 8F 41 CD CC 4C BF 9A 99 19 C0 CD CC CC BF 00 00 60 C0 00 00 30 41 72 7E D9 43
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 7 Xi full swing (Full, Any; spin source auto = E8 rule)
+BallData 50 4C 01 00 10 22 00 04 00 00 00 7F 00 D5 78 0D 42 0C 02 A8 41 89 41 02 C1 00 A8 DF 45 00 B8 DE 45 00 00 23 44 F5 43 A7 40 C6 37 08 B2
+ClubData 50 4C 01 00 11 26 00 04 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 30 C2 1A 23
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 8 Open Connect monitor full shot (Full, Any)
+BallData 50 4C 01 00 10 22 00 05 00 00 00 7F 00 D7 F6 6A 42 9A 99 81 41 66 66 E6 BF 00 00 A0 45 00 B0 9F 45 00 80 9C C3 00 00 60 C0 A8 E8 B8 C2
+ClubData 50 4C 01 00 11 26 00 05 00 00 00 FD 00 87 14 23 42 00 00 00 00 33 33 A3 41 9A 99 19 3F 33 33 F3 3F 66 66 46 C0 00 00 90 C0 00 00 00 40 44 F0 2A 85
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 9 Mevo+ launch-only chip, sim on (Full, Any)
+BallData 50 4C 01 00 10 22 00 06 00 00 00 07 00 A6 9B E0 40 66 66 B6 41 D1 22 5B BF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 34 7E 8D EA
+ClubData 50 4C 01 00 11 26 00 06 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 70 82 05 A4
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+# [simulation] mode = Off
+== 10 Mevo+ launch-only chip, sim off (Full, Any)
+BallData 50 4C 01 00 10 22 00 07 00 00 00 07 00 A6 9B E0 40 66 66 B6 41 D1 22 5B BF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 E5 F5 79 94
+ClubData 50 4C 01 00 11 26 00 07 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 50 22 8A E7
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+# [simulation] mode = Force
+== 11 Mevo+ full swing, sim force (Full, Any)
+BallData 50 4C 01 00 10 22 00 08 00 00 00 7F 00 D5 78 0D 42 0C 02 A8 41 89 41 02 C1 00 A8 DF 45 00 B8 DE 45 00 00 23 44 F5 43 A7 40 E8 AB A6 B5
+ClubData 50 4C 01 00 11 26 00 08 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 A3 D8 6D 3F
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 12 R10 full shot, sim force (Full, Any)
+BallData 50 4C 01 00 10 22 00 09 00 00 00 7F 00 00 00 86 42 00 00 48 41 9A 99 99 BF 00 40 83 45 00 10 83 45 00 00 5C 43 00 00 40 40 DD 01 76 54
+ClubData 50 4C 01 00 11 26 00 09 00 00 00 39 00 00 00 30 42 00 00 00 00 00 00 00 00 00 00 C0 3F 00 00 00 C0 00 00 60 C0 00 00 00 00 00 00 00 00 A5 4D CC 92
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+# [simulation] mode = On
+# auto-chip not sent: Auto-Chip is off during a tournament round
+== 13 Auto-chip 3 yd (Full)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 14 simulator: RH, SW (Chipping)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 15 Xi launch-only chip, sim on (Chipping, routed Xi)
+BallData 50 4C 01 00 10 22 00 0A 00 00 00 07 00 A6 9B E0 40 66 66 B6 41 D1 22 5B BF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1A E2 23 ED
+ClubData 50 4C 01 00 11 26 00 0A 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 E3 98 72 B8
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+# [simulation] mode = Off
+== 16 Xi launch-only chip, sim off (Chipping, routed Xi)
+BallData 50 4C 01 00 10 22 00 0B 00 00 00 07 00 A6 9B E0 40 66 66 B6 41 D1 22 5B BF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 CB 69 D7 93
+ClubData 50 4C 01 00 11 26 00 0B 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 C3 38 FD FB
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+# [simulation] mode = Force
+== 17 Xi launch-only chip, sim force (Chipping, routed Xi)
+BallData 50 4C 01 00 10 22 00 0C 00 00 00 07 00 A6 9B E0 40 66 66 B6 41 D1 22 5B BF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0D AC F4 EE
+ClubData 50 4C 01 00 11 26 00 0C 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 D2 2E BF 34
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+# [simulation] mode = On
+== 18 Xi early-only chip, estimate on (Chipping, routed Xi)
+BallData 50 4C 01 00 10 22 00 0D 00 00 00 17 00 5C 8F 8F 41 81 95 F7 41 DF 4F 7D C0 00 00 00 00 00 50 7C 45 00 00 00 00 00 00 00 00 97 C4 35 3D
+ClubData 50 4C 01 00 11 26 00 0D 00 00 00 3F 00 66 66 5E 41 B8 1E A5 3F 71 3D 39 42 A4 70 BD C0 00 00 00 80 00 00 00 00 00 00 00 00 00 00 00 00 81 5E 21 8B
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 19 Xi full swing (Chipping, routed Xi; spin source auto = D4)
+BallData 50 4C 01 00 10 22 00 0E 00 00 00 7F 00 D5 78 0D 42 0C 02 A8 41 89 41 02 C1 00 A8 DF 45 00 B8 DE 45 00 00 23 44 F5 43 A7 40 FF E5 71 B6
+ClubData 50 4C 01 00 11 26 00 0E 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 92 6E A0 B3
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 20 Mevo+ full swing (Chipping: not routed)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 21 R10 full shot (Chipping: not routed)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+# auto-chip not sent: Auto-Chip is off during a tournament round
+== 22 Auto-chip 1 yd (Chipping)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 23 header picks Full (club stays SW)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 24 Mevo+ full swing (hand-picked Full, Any)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 25 simulator repeats RH, SW (back to Chipping)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 26 Mevo+ full swing (Chipping again: not routed)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 27 Xi full swing (Chipping again, routed Xi)
+BallData 50 4C 01 00 10 22 00 0F 00 00 00 7F 00 D5 78 0D 42 0C 02 A8 41 89 41 02 C1 00 A8 DF 45 00 B8 DE 45 00 00 23 44 F5 43 A7 40 2E 6E 85 C8
+ClubData 50 4C 01 00 11 26 00 0F 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 B2 CE 2F F0
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 28 simulator: LH, PT (Putting)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 29 Open Connect monitor putt (Putting, routed server)
+BallData 50 4C 01 00 10 22 00 10 00 00 00 3F 00 19 38 20 40 CD CC 8C 3F 33 33 33 3F 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 DB B3 92 4E
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 30 Omni putt (Putting: not routed)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+# auto-chip not sent: Auto-Chip is off during a tournament round
+== 31 Auto-chip 5 yd (Putting)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 32 simulator: LH, 7I (Full)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 33 Omni full swing, left-handed (Full, Any)
+BallData 50 4C 01 00 10 22 00 11 00 00 00 7F 00 00 00 70 42 00 00 60 41 9A 99 99 BF 00 30 3F 45 00 80 3B 45 00 00 16 44 C3 F5 34 41 BB 8B 1A 89
+ClubData 50 4C 01 00 11 26 00 11 00 00 00 FF 00 9A 99 25 42 9A 99 B9 3F 33 33 8F 41 CD CC 4C BF 9A 99 19 C0 CD CC CC BF 00 00 60 C0 00 00 70 41 F2 21 9A 14
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 34 R10 full shot, left-handed (Full, Any)
+BallData 50 4C 01 00 10 22 00 12 00 00 00 7F 00 00 00 86 42 00 00 48 41 9A 99 99 BF 00 40 83 45 00 10 83 45 00 00 5C 43 00 00 40 40 F2 A5 36 D8
+ClubData 50 4C 01 00 11 26 00 12 00 00 00 39 00 00 00 30 42 00 00 00 00 00 00 00 00 00 00 C0 3F 00 00 00 C0 00 00 60 C0 00 00 00 00 00 00 00 00 E3 98 B2 6E
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 35 Xi full swing, left-handed (Full, Any)
+BallData 50 4C 01 00 10 22 00 13 00 00 00 7F 00 D5 78 0D 42 0C 02 A8 41 89 41 02 C1 00 A8 DF 45 00 B8 DE 45 00 00 23 44 F5 43 A7 40 C7 0F E6 39
+ClubData 50 4C 01 00 11 26 00 13 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 E5 0D 13 C3
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 36 Open Connect monitor full shot, left-handed (Full, Any)
+BallData 50 4C 01 00 10 22 00 14 00 00 00 7F 00 D7 F6 6A 42 9A 99 81 41 66 66 E6 BF 00 00 A0 45 00 B0 9F 45 00 80 9C C3 00 00 60 C0 BE 9E 81 4A
+ClubData 50 4C 01 00 11 26 00 14 00 00 00 FD 00 87 14 23 42 00 00 00 00 33 33 A3 41 9A 99 19 3F 33 33 F3 3F 66 66 46 C0 00 00 90 C0 00 00 00 40 A0 89 EE E9
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 37 Mevo+ launch-only chip, left-handed (Full, Any)
+BallData 50 4C 01 00 10 22 00 15 00 00 00 07 00 A6 9B E0 40 66 66 B6 41 D1 22 5B BF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80 1F 5D 9F
+ClubData 50 4C 01 00 11 26 00 15 00 00 00 3F 00 EC 51 DE 41 E5 D0 A2 3F C3 F5 1A 42 EC 51 D0 C0 66 66 36 C1 14 AE 6B C1 00 00 00 00 00 00 00 00 D4 BB DE 4F
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
+== 38 simulator: RH, DR (Full)
+ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF

@@ -10,6 +10,7 @@
 //! schema unevenly, so the optional sub-objects default rather than failing
 //! the parse. Only `DeviceID` and `ShotNumber` are treated as required.
 
+use flighthook::ClubExt;
 use flighthook::{Club, Handedness};
 use serde::{Deserialize, Serialize};
 

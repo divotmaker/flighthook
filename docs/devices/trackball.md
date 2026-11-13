@@ -83,19 +83,19 @@ The formulas, the club table and the defaults are in thumbswing's
 
 ## Club and hand
 
-The card starts with its **Starting club** (7-iron) and **Starting hand**
-(right). A club or hand the game names (GSPro, the header's club picker, the
-hand control) replaces them from then on, and Putting mode selects the
-putter whatever the club. The trackball sits where it sits whichever hand
+The card starts with its **Starting club** (7-iron). The hand is the golfer
+up's (right-handed until one is chosen); a club that a simulator or the
+header's Club picker chooses replaces the starting club from then on, and
+Putting mode selects the putter whatever the club. The trackball sits where it sits whichever hand
 plays, so the strokes are not mirrored for a left-handed player unless
 **Mirror for left-handed players** is on.
 
 ## Shots
 
-Each swing is a shot: `launch` (speed, launch angle and direction, backspin
-and sidespin, with total spin and axis), then `club_path` (club speed, path,
-face angle, attack angle, dynamic loft, smash factor). There is no flight
-result: flighthook simulates carry, roll and total from the launch, and GSPro
+Each swing is a shot: `shot.launch` (speed, launch angle and direction,
+backspin and sidespin, with total spin and axis), then `shot.club` (club speed,
+path, face angle, attack angle, dynamic loft, smash factor). There is no
+`shot.flight`: flighthook simulates carry, roll and total from the launch, and GSPro
 flies it itself. A putt launches at 0.3° with no spin and rolls on the green
 in Putting mode. A swing that hits the device's per-report limit is logged as
 saturated: lower **Full power speed**, or set **Report limit** to the
@@ -127,7 +127,6 @@ and shows the error until it is fixed.
 name = "Trackball"
 device = "usb-Example_Trackball-event-mouse"   # blank or absent: the only one
 club = "DR"                    # until the game names a club (default 7I)
-hand = "rh"                    # until the game names a hand: rh | lh
 cpi = 800                      # counts per inch of ball travel (default 400)
 
 [trackball.0.tuning]
@@ -142,7 +141,6 @@ coil_timeout_s = 20            # how long the top of the swing waits (default 10
 |---|---|---|---|
 | `device` | Device | unset | the input; unset: the only trackball or mouse |
 | `club` | Starting club | `7I` | the club until the game names one (an FRP club code) |
-| `hand` | Starting hand | `rh` | the hand until the game names one |
 | `cpi` | CPI | 400 | counts per inch of ball travel |
 | `report_limit` | Report limit | 127 | largest movement one report carries (127, 2047 or 32767) |
 | `tuning.full_power_speed` | Full power speed | 15 in/s | push speed for 100 % power |

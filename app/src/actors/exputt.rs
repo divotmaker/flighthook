@@ -19,12 +19,13 @@
 //! one connection at a time, so a new instance waits for the old one to
 //! close (the driver is exclusive).
 
-use flighthook::{ExPuttSection, FlighthookEvent};
-use flightrelay::FrpEvent;
+use flighthook::ExPuttSection;
+use flightrelay::FrpBody;
 use threeputt::driver::{Action, ExPutt};
 
 use crate::actors::driver::{DriverActor, HookCtx, Hooks};
 use crate::actors::provenance::ShotSource;
+use crate::bus::{BusMsg, LocalEvent};
 
 /// The alert after 30 s of discovery without the device, in the card's
 /// words: the address is the card's IP Address field.
@@ -39,28 +40,28 @@ impl Hooks<ExPutt> for ExPuttHooks {
     type Section = ExPuttSection;
     const SOURCE: ShotSource = ShotSource::ExPutt;
 
-    fn on_frp(&mut self, event: &mut FrpEvent, _ctx: &mut HookCtx<'_, ExPuttSection>) {
-        card_words(event);
+    fn on_frp(&mut self, body: &mut FrpBody, _ctx: &mut HookCtx<'_, ExPuttSection>) {
+        card_words(body);
     }
 
-    fn action(event: &FlighthookEvent, actor: &str) -> Option<Action> {
-        find_mat(event, actor)
+    fn action(msg: &BusMsg, card: &str) -> Option<Action> {
+        find_mat(msg, card)
     }
 }
 
 /// The driver's discovery hint in the card's words ([`DISCOVERY_HINT`]).
-fn card_words(event: &mut FrpEvent) {
-    if let FrpEvent::Alert { message, .. } = event
-        && message == threeputt::driver::DISCOVERY_HINT
+fn card_words(body: &mut FrpBody) {
+    if let FrpBody::BusAlert(alert) = body
+        && alert.message == threeputt::driver::DISCOVERY_HINT
     {
-        DISCOVERY_HINT.clone_into(message);
+        DISCOVERY_HINT.clone_into(&mut alert.message);
     }
 }
 
-/// [`Action::FindMat`] when `event` is a Find mat for the card `actor`.
-fn find_mat(event: &FlighthookEvent, actor: &str) -> Option<Action> {
-    match event {
-        FlighthookEvent::FindMat { target } if target == actor => Some(Action::FindMat),
+/// [`Action::FindMat`] when `msg` is a Find mat for the card `card`.
+fn find_mat(msg: &BusMsg, card: &str) -> Option<Action> {
+    match msg.as_local() {
+        Some((_, LocalEvent::FindMat { target })) if target == card => Some(Action::FindMat),
         _ => None,
     }
 }
@@ -77,16 +78,16 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use crate::actors::simout::OutputShot;
     use flighthook::{
-        ActorStatus, ExPuttConfig, FlighthookMessage, Handedness, Severity, ShotAccumulator,
-        ShotData, ShotDetectionMode, Velocity,
+        ActorStatus, ClubData, ExPuttConfig, Handedness, Launch, Mode, Severity, ShotRaw, Velocity,
     };
     use flightrelay::config::{ConfigError, DriverConfig};
     use flightrelay::driver::{
-        Backoff, ConnectCtx, DeviceCommand, DeviceDriver, DeviceIdentity, DeviceSession,
-        DriverInfo, Events, SessionEnd,
+        Backoff, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
+        SessionEnd, TurnHints,
     };
-    use serde_json::{Value, json};
+    use flightrelay::{BusActor, FrpMessage, GolferSelect, GolferTurn};
     use threeputt::driver::{ExPuttSession, NOT_ANSWERING, Tuning};
     use threeputt::testing::{
         BALL_STRUCK, MockConfig, MockDevice, PUTT_READY, PUTT_RESULT_BALL_ONLY, PUTT_RESULT_FULL,
@@ -97,11 +98,10 @@ mod tests {
 
     use super::*;
     use crate::actors::gspro::mapper::map_shot;
-    use crate::actors::gspro::{GsProRouting, readiness_after};
     use crate::actors::scripted::Handoff;
     use crate::actors::{Actor, ReconfigureOutcome};
     use crate::bus::BusSender;
-    use crate::state::{GameStateWriter, SystemState};
+    use crate::state::{SessionWriter, SystemState};
 
     /// Longest any test waits for one thing.
     const WAIT: Duration = Duration::from_secs(8);
@@ -210,8 +210,8 @@ mod tests {
             self.0.poll(timeout, out)
         }
 
-        fn command(&mut self, cmd: &DeviceCommand) -> Result<(), threeputt::driver::Error> {
-            self.0.command(cmd)
+        fn hints(&mut self, hints: &TurnHints) -> Result<(), threeputt::driver::Error> {
+            self.0.hints(hints)
         }
 
         fn action(&mut self, action: &Action) -> Result<(), threeputt::driver::Error> {
@@ -231,12 +231,12 @@ mod tests {
         type Section = ExPuttSection;
         const SOURCE: ShotSource = ShotSource::ExPutt;
 
-        fn on_frp(&mut self, event: &mut FrpEvent, _ctx: &mut HookCtx<'_, ExPuttSection>) {
-            card_words(event);
+        fn on_frp(&mut self, body: &mut FrpBody, _ctx: &mut HookCtx<'_, ExPuttSection>) {
+            card_words(body);
         }
 
-        fn action(event: &FlighthookEvent, actor: &str) -> Option<Action> {
-            find_mat(event, actor)
+        fn action(msg: &BusMsg, card: &str) -> Option<Action> {
+            find_mat(msg, card)
         }
     }
 
@@ -255,12 +255,14 @@ mod tests {
     struct Card {
         dir: std::path::PathBuf,
         state: Arc<SystemState>,
-        /// Game state's writer, until a system actor takes it.
-        writer: Option<GameStateWriter>,
-        tx: broadcast::Sender<FlighthookMessage>,
-        rx: broadcast::Receiver<FlighthookMessage>,
+        /// The session's writer, until a system actor takes it.
+        writer: Option<SessionWriter>,
+        tx: broadcast::Sender<BusMsg>,
+        rx: broadcast::Receiver<BusMsg>,
         shutdown: Arc<AtomicBool>,
         section: ExPuttSection,
+        /// The card's FRP actor id.
+        frp: String,
     }
 
     impl Card {
@@ -275,6 +277,7 @@ mod tests {
             state.system.update(|c| {
                 c.exputt.insert("0".into(), section.clone());
             });
+            let frp = state.actor_of_card("exputt.0").expect("frp id");
             TUNINGS.put(section.driver.address.clone().unwrap_or_default(), tuning);
             let (tx, rx) = broadcast::channel(4096);
             Self {
@@ -285,6 +288,7 @@ mod tests {
                 rx,
                 shutdown: Arc::default(),
                 section,
+                frp,
             }
         }
 
@@ -300,8 +304,16 @@ mod tests {
             card
         }
 
-        /// Start a system actor on the bus, holding game state's writer:
-        /// the hand is then set with `hand_info`, as every source sets it.
+        /// Set the session's turn before the card starts.
+        fn select(&self, f: impl FnOnce(&mut GolferSelect)) {
+            let mut select = GolferSelect::new("test");
+            f(&mut select);
+            self.writer.as_ref().expect("writer").apply(&select);
+        }
+
+        /// Start a system actor on the bus, holding the session's writer:
+        /// the hand is then set with a `golfer.select`, as every source
+        /// sets it.
         fn start_system_actor(&mut self) {
             let writer = self.writer.take().expect("writer");
             crate::actors::system::start_for_test(
@@ -323,23 +335,43 @@ mod tests {
             );
         }
 
-        /// Put `event` on the bus as the game (`web`).
-        fn game(&self, event: FlighthookEvent) {
-            let _ = self.tx.send(FlighthookMessage::new(event).actor("web"));
+        /// Put a local `event` on the bus as the web layer.
+        fn web(&self, event: LocalEvent) {
+            let _ = self.tx.send(BusMsg::local("web", event));
+        }
+
+        /// Put the session's turn with `hand` on the bus, as the system
+        /// actor publishes it.
+        fn turn(&self, hand: Handedness) {
+            let turn = GolferTurn::new(None, None, hand, Mode::Full);
+            let _ = self.tx.send(BusMsg::frp(FrpMessage::new(
+                self.state.flighthook_id(),
+                turn,
+            )));
+        }
+
+        /// A `golfer.select` of `hand` from the web layer.
+        fn select_hand(&self, hand: Handedness) {
+            let mut select = GolferSelect::new("web");
+            select.handedness = Some(hand);
+            let _ = self.tx.send(BusMsg::frp(FrpMessage::new("web", select)));
+        }
+
+        fn mine(&self, m: &BusMsg) -> bool {
+            match m {
+                BusMsg::Frp { msg, .. } => msg.from == self.frp,
+                BusMsg::Local { card, .. } => card == "exputt.0",
+            }
         }
 
         /// Messages of `exputt.0` until `want` matches one, returning them
         /// all (the match last).
-        fn until(
-            &mut self,
-            what: &str,
-            want: impl Fn(&FlighthookMessage) -> bool,
-        ) -> Vec<FlighthookMessage> {
+        fn until(&mut self, what: &str, want: impl Fn(&BusMsg) -> bool) -> Vec<BusMsg> {
             let deadline = Instant::now() + WAIT;
             let mut seen = Vec::new();
             while Instant::now() < deadline {
                 match self.rx.try_recv() {
-                    Ok(m) if m.actor == "exputt.0" => {
+                    Ok(m) if self.mine(&m) => {
                         let done = want(&m);
                         seen.push(m);
                         if done {
@@ -350,46 +382,40 @@ mod tests {
                     Err(_) => std::thread::sleep(Duration::from_millis(2)),
                 }
             }
-            panic!(
-                "{what} not seen; got {:?}",
-                seen.iter().map(|m| &m.event).collect::<Vec<_>>()
-            );
+            panic!("{what} not seen; got {seen:?}");
         }
 
-        fn until_status(&mut self, status: ActorStatus) -> Vec<FlighthookMessage> {
+        fn until_status(&mut self, status: ActorStatus) -> Vec<BusMsg> {
             self.until(&format!("{status:?}"), |m| is_status(m, status))
         }
 
-        /// Messages until a device telemetry with `ready` = `ready` and,
-        /// when given, `device_state` = `state`.
-        fn until_ready(&mut self, ready: bool, state: Option<&str>) -> Vec<FlighthookMessage> {
-            let ready = ready.to_string();
+        /// Messages until a `bus.actor` ready (no blockers) as `ready` and,
+        /// when given, with `device_state` = `state`.
+        fn until_ready(&mut self, ready: bool, state: Option<&str>) -> Vec<BusMsg> {
             self.until(&format!("ready={ready} {state:?}"), |m| {
-                matches!(&m.event, FlighthookEvent::DeviceTelemetry { telemetry: Some(t), .. }
-                    if t.get("ready") == Some(&ready)
-                        && state.is_none_or(|s| t.get("device_state").map(String::as_str) == Some(s)))
+                is_ready(m) == Some(ready) && state.is_none_or(|s| device_state(m) == Some(s))
             })
         }
 
         /// The messages of the next shot, trigger to finish.
-        fn next_shot(&mut self) -> Vec<FlighthookMessage> {
-            let mut seen = self.until("shot_finished", |m| {
-                matches!(m.event, FlighthookEvent::ShotFinished { .. })
+        fn next_shot(&mut self) -> Vec<BusMsg> {
+            let mut seen = self.until("shot.finished", |m| {
+                matches!(body(m), Some(FrpBody::ShotFinished(_)))
             });
             let start = seen
                 .iter()
-                .rposition(|m| matches!(m.event, FlighthookEvent::ShotTrigger { .. }))
-                .expect("shot_trigger");
+                .rposition(|m| matches!(body(m), Some(FrpBody::ShotTrigger(_))))
+                .expect("shot.trigger");
             seen.drain(..start);
             seen
         }
 
         /// Every message from the card waiting on the bus, without waiting.
-        fn drain(&mut self) -> Vec<FlighthookMessage> {
+        fn drain(&mut self) -> Vec<BusMsg> {
             let mut seen = Vec::new();
             loop {
                 match self.rx.try_recv() {
-                    Ok(m) if m.actor == "exputt.0" => seen.push(m),
+                    Ok(m) if self.mine(&m) => seen.push(m),
                     Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                     Err(_) => return seen,
                 }
@@ -416,41 +442,74 @@ mod tests {
         }
     }
 
-    fn is_status(m: &FlighthookMessage, status: ActorStatus) -> bool {
-        matches!(&m.event, FlighthookEvent::ActorStatus { status: s, .. } if *s == status)
+    fn body(m: &BusMsg) -> Option<&FrpBody> {
+        m.as_frp().map(|f| &f.body)
     }
 
-    fn alerts(seen: &[FlighthookMessage]) -> Vec<String> {
-        seen.iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::Alert { message, .. } => Some(message.clone()),
+    fn card_status(m: &BusMsg) -> Option<(ActorStatus, &HashMap<String, String>)> {
+        match m.as_local() {
+            Some((_, LocalEvent::CardStatus { status, telemetry })) => Some((*status, telemetry)),
+            _ => None,
+        }
+    }
+
+    fn is_status(m: &BusMsg, status: ActorStatus) -> bool {
+        card_status(m).is_some_and(|(s, _)| s == status)
+    }
+
+    fn bus_actor(m: &BusMsg) -> Option<&BusActor> {
+        match body(m) {
+            Some(FrpBody::BusActor(a)) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Whether the card's `bus.actor` says ready (no blockers).
+    fn is_ready(m: &BusMsg) -> Option<bool> {
+        bus_actor(m).map(|a| a.blockers.is_empty())
+    }
+
+    fn device_state(m: &BusMsg) -> Option<&str> {
+        bus_actor(m)
+            .and_then(|a| a.telemetry.as_ref())
+            .and_then(|t| t.get("device_state"))
+            .map(String::as_str)
+    }
+
+    fn alert(m: &BusMsg) -> Option<(Severity, &str)> {
+        match body(m) {
+            Some(FrpBody::BusAlert(a)) => Some((a.severity, a.message.as_str())),
+            _ => match m.as_local() {
+                Some((_, LocalEvent::Alert { severity, message })) => {
+                    Some((*severity, message.as_str()))
+                }
                 _ => None,
-            })
+            },
+        }
+    }
+
+    fn alerts(seen: &[BusMsg]) -> Vec<String> {
+        seen.iter()
+            .filter_map(|m| alert(m).map(|(_, a)| a.to_owned()))
             .collect()
     }
 
     /// The `phase` values the card's statuses carry in `seen`, in order.
-    fn phases(seen: &[FlighthookMessage]) -> Vec<&str> {
+    fn phases(seen: &[BusMsg]) -> Vec<&str> {
         seen.iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::ActorStatus { telemetry, .. } => {
-                    telemetry.get("phase").map(String::as_str)
-                }
-                _ => None,
-            })
+            .filter_map(|m| card_status(m).and_then(|(_, t)| t.get("phase")))
+            .map(String::as_str)
             .collect()
     }
 
     /// The `device_state` values in `seen`, in order.
-    fn device_states(seen: &[FlighthookMessage]) -> Vec<&str> {
-        seen.iter()
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::DeviceTelemetry {
-                    telemetry: Some(t), ..
-                } => t.get("device_state").map(String::as_str),
-                _ => None,
-            })
-            .collect()
+    fn device_states(seen: &[BusMsg]) -> Vec<&str> {
+        seen.iter().filter_map(device_state).collect()
+    }
+
+    /// Readiness as the card last published it in `seen`.
+    fn last_ready(seen: &[BusMsg]) -> bool {
+        seen.iter().rev().find_map(is_ready).unwrap_or(false)
     }
 
     /// The putt the device reports for `comment`, read by the driver.
@@ -461,32 +520,40 @@ mod tests {
         }
     }
 
-    /// The shot the messages add up to, as the bridges accumulate it.
-    fn accumulate(messages: &[FlighthookMessage]) -> ShotData {
-        let FlighthookEvent::ShotTrigger { key, .. } = &messages[0].event else {
+    /// The launch and club of a shot's messages (trigger first).
+    fn accumulate(messages: &[BusMsg]) -> (Launch, Option<ClubData>) {
+        let Some(FrpBody::ShotTrigger(trigger)) = body(&messages[0]) else {
             panic!("starts with a trigger: {messages:?}");
         };
-        let mut acc = ShotAccumulator::new("exputt.0".into(), key.clone());
+        let mut launch = None;
+        let mut club = None;
         for m in messages {
-            match &m.event {
-                FlighthookEvent::Launch {
-                    key: k,
-                    launch,
-                    derived,
-                } => {
-                    assert_eq!(k, key);
-                    acc.set_launch(*launch.clone(), derived.as_deref().cloned());
+            match body(m) {
+                Some(FrpBody::ShotLaunch(l)) => {
+                    assert_eq!(l.key, trigger.key);
+                    launch = Some(l.launch.clone());
                 }
-                FlighthookEvent::FlightResult { .. } => panic!("a putt has no flight result"),
-                FlighthookEvent::ClubPath { key: k, club } => {
-                    assert_eq!(k, key);
-                    acc.set_club(*club.clone());
+                Some(FrpBody::ShotFlight(f)) if f.key == trigger.key => {
+                    panic!("a putt has no flight result of its own")
                 }
-                FlighthookEvent::ShotFinished { key: k, .. } => assert_eq!(k, key),
+                Some(FrpBody::ShotClub(c)) => {
+                    assert_eq!(c.key, trigger.key);
+                    club = Some(c.club.clone());
+                }
+                Some(FrpBody::ShotFinished(f)) => assert_eq!(f.key, trigger.key),
                 _ => {}
             }
         }
-        acc.finish().expect("shot data")
+        (launch.expect("shot.launch"), club)
+    }
+
+    /// The stored shape the outputs map.
+    fn shot_data(launch: &Launch, club: Option<&ClubData>) -> OutputShot {
+        OutputShot {
+            launch: Some(launch.clone()),
+            club: club.cloned(),
+            ..OutputShot::default()
+        }
     }
 
     fn sent(mock: &MockDevice, request: Request) -> bool {
@@ -517,16 +584,6 @@ mod tests {
         sent == want.iter().collect::<Vec<_>>()
     }
 
-    /// Readiness an Open Connect client routing putts to the ExPutt
-    /// reports in Putting mode after `seen`.
-    fn gspro_ready(seen: &[FlighthookMessage]) -> bool {
-        let routing = GsProRouting {
-            putting_monitor: Some("exputt.0".into()),
-            ..GsProRouting::default()
-        };
-        readiness_after(routing, ShotDetectionMode::Putting, seen.iter().cloned())
-    }
-
     fn quiet_mock() -> MockDevice {
         MockDevice::spawn(MockConfig {
             heartbeat: None,
@@ -553,388 +610,6 @@ mod tests {
         .expect("ms")
     }
 
-    // -- The equivalence harness ---------------------------------------------
-
-    /// The bus messages and export lines of flighthook c7dd6fd's ExPutt
-    /// actor (its own session loop on threeputt 0.0.3) for the script in
-    /// [`the_exputt_card_matches_the_recorded_actor`], recorded against
-    /// threeputt's mock device with the same timings.
-    const OLD_BUS: &str = include_str!("../testdata/exputt_old_session.jsonl");
-    const OLD_EXPORT: &str = include_str!("../testdata/exputt_old_export.jsonl");
-
-    fn lines(text: &str) -> Vec<Value> {
-        text.lines()
-            .map(|l| serde_json::from_str(l).expect("a recorded line"))
-            .collect()
-    }
-
-    /// `messages` with their shot and group ids numbered in order of
-    /// appearance (the ids are random), and each shot's raw frames taken
-    /// out (compared on their own): the shot's frames in order.
-    fn normalized(mut messages: Vec<Value>) -> (Vec<Value>, Vec<Vec<Value>>) {
-        let mut ids: HashMap<String, String> = HashMap::new();
-        let mut raws = Vec::new();
-        for m in &mut messages {
-            renumber(m, &mut ids);
-            let at = if m.pointer("/event/raw").is_some() {
-                "/event/raw"
-            } else {
-                "/raw"
-            };
-            if let Some(raw) = m.pointer_mut(at)
-                && raw.is_object()
-            {
-                raws.push(raw["frames"].as_array().cloned().unwrap_or_default());
-                *raw = json!({ "transport": raw["transport"] });
-            }
-        }
-        (messages, raws)
-    }
-
-    /// Replace every UUID string under `v` by its number of appearance.
-    fn renumber(v: &mut Value, ids: &mut HashMap<String, String>) {
-        match v {
-            Value::String(s) if s.len() == 36 && s.matches('-').count() == 4 => {
-                let n = ids.len();
-                *s = ids
-                    .entry(s.clone())
-                    .or_insert_with(|| format!("id-{n}"))
-                    .clone();
-            }
-            Value::Array(a) => a.iter_mut().for_each(|v| renumber(v, ids)),
-            Value::Object(o) => o.values_mut().for_each(|v| renumber(v, ids)),
-            _ => {}
-        }
-    }
-
-    fn kind(m: &Value) -> &str {
-        m["event"]["kind"].as_str().unwrap_or("")
-    }
-
-    fn status_message(status: &str, telemetry: Value) -> Value {
-        json!({ "actor": "exputt.0", "event": { "kind": "actor_status", "status": status, "telemetry": telemetry } })
-    }
-
-    /// What the recorded actor's `messages` become on `DriverActor` with
-    /// threeputt's driver: each change is one of design §7.3's rows for the
-    /// ExPutt or a rule of `DriverActor` accepted in steps 1 to 3S.
-    fn expected_from_old(old: &[Value]) -> Vec<Value> {
-        let mut out: Vec<Value> = Vec::new();
-        let mut i = 0;
-        let mut device: Option<Value> = None;
-        while i < old.len() {
-            let m = old[i].clone();
-            let status = m["event"]["status"].as_str().unwrap_or("").to_owned();
-            let phase = m["event"]["telemetry"]["phase"].as_str().map(str::to_owned);
-            match kind(&m) {
-                // §7.3 #8: Starting before the first attempt, from the host;
-                // then the driver's phases, `measuring` as its connect's
-                // last step.
-                "actor_status"
-                    if status == "starting" && phase.as_deref() == Some("connecting") =>
-                {
-                    out.push(status_message("starting", json!({})));
-                    out.push(m);
-                    out.push(status_message("starting", json!({ "phase": "measuring" })));
-                    i += 1;
-                    continue;
-                }
-                // The identity goes out at Connected without telemetry: the
-                // driver reports `ready=false` on its first poll (driver
-                // order). From here on every message carries the session's
-                // device id (the sink's rule, step 2).
-                "actor_status" if status == "connected" && device.is_none() => {
-                    device = Some(old[i + 1]["device"].clone());
-                    let mut identity = old[i + 1].clone();
-                    let ready = identity["event"]
-                        .as_object_mut()
-                        .expect("event")
-                        .remove("telemetry")
-                        .expect("the recorded identity carries ready");
-                    out.push(m);
-                    out.push(identity);
-                    out.push(json!({
-                        "actor": "exputt.0",
-                        "device": old[i + 1]["device"],
-                        "event": {
-                            "kind": "device_telemetry",
-                            "source": old[i + 1]["event"]["source"],
-                            "telemetry": ready,
-                        },
-                    }));
-                    i += 2;
-                    continue;
-                }
-                // Steps 1/2: a shot's `shot_count` goes out after its
-                // `shot_finished`, and its launch is held until the shot
-                // ends (no flight result from the ExPutt), so it follows the
-                // putter data.
-                "actor_status" if m["event"]["telemetry"].get("shot_count").is_some() => {
-                    let end = (i..old.len())
-                        .find(|&j| kind(&old[j]) == "shot_finished")
-                        .expect("the shot's end");
-                    let launch = old[i + 1..end]
-                        .iter()
-                        .find(|x| kind(x) == "launch")
-                        .cloned();
-                    for x in &old[i + 1..end] {
-                        if kind(x) != "launch" {
-                            out.push(x.clone());
-                        }
-                    }
-                    out.extend(launch);
-                    out.push(old[end].clone());
-                    out.push(m);
-                    i = end + 1;
-                    continue;
-                }
-                // Step 2: a lost session sends `ready=false` with the rest
-                // of the session's telemetry, then Reconnecting (no `phase`
-                // key: Reconnecting clears the card), then the driver's
-                // per-attempt alert.
-                "device_telemetry"
-                    if old.get(i + 1).is_some_and(|x| {
-                        x["event"]["message"]
-                            .as_str()
-                            .is_some_and(|s| s.starts_with("ExPutt error"))
-                    }) =>
-                {
-                    let mut lost = m;
-                    let mut merged = out
-                        .iter()
-                        .rev()
-                        .find(|x| {
-                            kind(x) == "device_telemetry" && x["event"].get("telemetry").is_some()
-                        })
-                        .map_or_else(|| json!({}), |x| x["event"]["telemetry"].clone());
-                    merged["ready"] = json!("false");
-                    lost["event"]["telemetry"] = merged;
-                    out.push(lost);
-                    out.push(status_message("reconnecting", json!({})));
-                    out.push(old[i + 1].clone());
-                    i += 3;
-                    continue;
-                }
-                _ => {}
-            }
-            out.push(m);
-            i += 1;
-        }
-        if let Some(device) = device {
-            let from = out
-                .iter()
-                .position(|m| kind(m) == "actor_status" && m["event"]["status"] == "connected")
-                .expect("connected");
-            for m in &mut out[from..] {
-                m["device"] = device.clone();
-            }
-        }
-        out
-    }
-
-    /// §7.3 #18 (FRP 0.2.0): a putt's trigger carries the time its strike
-    /// arrived, when the device reported a strike since it was last ready.
-    /// Taken out of `messages` (it is the host's clock) after checking each
-    /// trigger against `strikes`: per shot, the window its strike was
-    /// reported in, or `None` for a putt with no strike reported.
-    fn without_trigger_times(messages: &mut [Value], strikes: &[Option<(u64, u64)>]) {
-        let triggers: Vec<&mut Value> = messages
-            .iter_mut()
-            .filter(|m| kind(m) == "shot_trigger")
-            .collect();
-        assert_eq!(triggers.len(), strikes.len());
-        for (m, strike) in triggers.into_iter().zip(strikes) {
-            let at = m["event"]
-                .as_object_mut()
-                .expect("event")
-                .remove("timestamp");
-            match strike {
-                Some((from, to)) => {
-                    let at = at.as_ref().and_then(Value::as_u64).expect("a strike time");
-                    assert!((*from..=*to).contains(&at), "{from} <= {at} <= {to}");
-                }
-                None => assert_eq!(at, None),
-            }
-        }
-    }
-
-    /// §7.3 #1: the recorded actor's raw record of a putt was its 16 values
-    /// re-joined as text; the driver's are the wire messages around it, each
-    /// labeled, with the putt's own result among them carrying the same
-    /// values. Camera images and unknown messages are never among them.
-    fn assert_raw_matches(old: &[Vec<Value>], new: &[Vec<Value>]) {
-        const SHARED: [&str; 20] = [
-            "N_OK",
-            "Test",
-            "FindMat",
-            "MatOK",
-            "PuttReady",
-            "PuttShot",
-            "IndiCator",
-            "IndiCatorOut",
-            "PuttResult",
-            "N_VERIFY_ID",
-            "N_REQ_CONNECT",
-            "sendImage",
-            "resyncToMat",
-            "stopSendImage",
-            "setDexterityRight",
-            "setDexterityLeft",
-            "PM_API_MatchBegin",
-            "PM_API_MatchEnded",
-            "N_ALIVE",
-            "AppPause",
-        ];
-        assert_eq!(old.len(), new.len(), "shots with raw frames");
-        for (n, (old, new)) in old.iter().zip(new).enumerate() {
-            assert_eq!(old.len(), 1, "shot {n}");
-            assert_eq!(old[0]["channel"], "tcp");
-            let values = old[0]["text"].as_str().expect("text");
-            let results: Vec<&Value> = new.iter().filter(|f| f["label"] == "PuttResult").collect();
-            assert_eq!(results.len(), 1, "shot {n}: {new:?}");
-            let body: Value =
-                serde_json::from_str(results[0]["text"].as_str().expect("text")).expect("json");
-            let comment = body["Comment"].as_str().expect("comment");
-            let wire: Vec<String> = comment
-                .strip_prefix("PuttResult,")
-                .expect("a putt result")
-                .split(',')
-                .map(|v| v.parse::<f64>().expect("number").to_string())
-                .collect();
-            assert_eq!(wire.join(","), values, "shot {n}");
-            assert_eq!(results[0]["dir"], "rx");
-            for f in new {
-                let label = f["label"].as_str().expect("a label");
-                assert!(SHARED.contains(&label), "shot {n}: {label}");
-                assert!(f.get("text").is_some() && f.get("hex").is_none());
-                assert!(f.get("channel").is_none() && f.get("type").is_none());
-            }
-        }
-    }
-
-    /// Design §7.2's equivalence harness: the recorded ExPutt actor and the
-    /// ExPutt card on threeputt's driver, fed the same mock device script and
-    /// the same game events, put the same messages on the bus and export the
-    /// same shots, except for the differences `expected_from_old` and
-    /// `without_trigger_times` list (design §7.3 rows 8 and 18 and
-    /// `DriverActor`'s accepted rules) and the raw records (§7.3 #1).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_exputt_card_matches_the_recorded_actor() {
-        let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
-        let section: ExPuttSection =
-            serde_json::from_str(r#"{"name":"ExPutt RG","address":"127.0.0.1"}"#).expect("section");
-        let mut card = Card::new(section, tuning(&Arc::new(AtomicU16::new(mock.port()))));
-        card.start();
-
-        let mut seen: Vec<FlighthookMessage> = Vec::new();
-        let telemetry = |ready: &'static str, state: &'static str| {
-            move |m: &FlighthookMessage| {
-                matches!(&m.event, FlighthookEvent::DeviceTelemetry { telemetry: Some(t), .. }
-                    if t.get("ready").map(String::as_str) == Some(ready)
-                        && t.get("device_state").map(String::as_str) == Some(state))
-            }
-        };
-        let finished =
-            |m: &FlighthookMessage| matches!(m.event, FlighthookEvent::ShotFinished { .. });
-        let mut strikes = Vec::new();
-
-        seen.extend(card.until_status(ActorStatus::Connected));
-        seen.extend(card.until("identity", |m| {
-            matches!(
-                &m.event,
-                FlighthookEvent::DeviceTelemetry { model: Some(_), .. }
-            )
-        }));
-        // A full putt, then a pulled one, each after a strike.
-        for result in [PUTT_RESULT_FULL, PUTT_RESULT_PULLED] {
-            mock.push_event(PUTT_READY);
-            seen.extend(card.until("ready", telemetry("true", "ready")));
-            let from = now_ms();
-            mock.push_event(BALL_STRUCK);
-            seen.extend(card.until("struck", telemetry("false", "ball struck")));
-            strikes.push(Some((from, now_ms())));
-            mock.push_event(result);
-            seen.extend(card.until("putt", finished));
-        }
-        // A ball-only putt with no strike reported first.
-        mock.push_event(PUTT_READY);
-        seen.extend(card.until("ready", telemetry("true", "ready")));
-        mock.push_event(PUTT_RESULT_BALL_ONLY);
-        seen.extend(card.until("putt", finished));
-        strikes.push(None);
-        // The player turns left-handed: a new round, which finds the mat.
-        card.game(FlighthookEvent::SetDetectionMode {
-            mode: None,
-            handed: Some(Handedness::Left),
-            club: None,
-        });
-        seen.extend(card.until("mat found", telemetry("false", "mat found")));
-        mock.push_event(PUTT_READY);
-        seen.extend(card.until("ready", telemetry("true", "ready")));
-        // Find mat from the card.
-        card.game(FlighthookEvent::FindMat {
-            target: "exputt.0".into(),
-        });
-        seen.extend(card.until("mat found", telemetry("false", "mat found")));
-        mock.push_event(PUTT_READY);
-        seen.extend(card.until("ready", telemetry("true", "ready")));
-        // The device goes away.
-        mock.disconnect();
-        seen.extend(card.until_status(ActorStatus::Reconnecting));
-        let _ = card.state.stop_actor("exputt.0");
-        seen.extend(card.until_status(ActorStatus::Disconnected));
-
-        let (old, old_raws) = normalized(lines(OLD_BUS));
-        let (mut new, new_raws) = normalized(
-            seen.iter()
-                .map(|m| serde_json::to_value(m).expect("json"))
-                .collect(),
-        );
-        without_trigger_times(&mut new, &strikes);
-        let expected = expected_from_old(&old);
-        for (n, (want, got)) in expected.iter().zip(&new).enumerate() {
-            assert_eq!(got, want, "message {n}");
-        }
-        assert_eq!(
-            new.len(),
-            expected.len(),
-            "{:?}",
-            new.iter().map(kind).collect::<Vec<_>>()
-        );
-        assert_raw_matches(&old_raws, &new_raws);
-
-        // The same rounds on the wire: the session's own, the left hand's,
-        // then Find mat (with the hand in effect).
-        let rounds = mock
-            .received()
-            .iter()
-            .filter(|p| p.json == Request::MatchBegin.to_json())
-            .count();
-        assert_eq!(rounds, 3);
-        assert!(sent(&mock, Request::SetHand(Hand::Left)));
-
-        // The export: the same lines but for the raw records (compared
-        // above); the device settings are the same (the address is never
-        // exported).
-        let config = card.state.system.snapshot();
-        let export = crate::actors::web::tests::export_lines(&config, &seen).await;
-        let (old_export, old_export_raws) = normalized(lines(OLD_EXPORT));
-        let (new_export, new_export_raws) = normalized(
-            export
-                .iter()
-                .map(|l| serde_json::from_str(l).expect("json"))
-                .collect(),
-        );
-        assert_eq!(new_export.len(), old_export.len());
-        for (mut want, got) in old_export.into_iter().zip(new_export) {
-            assert_eq!(want["schema"], 3);
-            want["time"] = got["time"].clone();
-            want["flighthook_version"] = got["flighthook_version"].clone();
-            assert_eq!(got, want);
-        }
-        assert_raw_matches(&old_export_raws, &new_export_raws);
-    }
-
     // -- Session ---------------------------------------------------------------
 
     #[test]
@@ -946,22 +621,15 @@ mod tests {
         // A configured address skips discovery; the card shows `measuring`
         // while Connected.
         assert_eq!(phases(&seen), ["connecting", "measuring", "measuring"]);
-        let FlighthookEvent::ActorStatus { telemetry, .. } = &seen.last().unwrap().event else {
-            unreachable!()
-        };
+        let (_, telemetry) = card_status(seen.last().unwrap()).unwrap();
         assert_eq!(telemetry["device_info"], "ExPutt RG (127.0.0.1)");
 
-        // Ready once the device says so; the identity goes first.
+        // Ready once the device says so; the identity goes with it.
         let seen = card.until_ready(true, None);
-        let first = seen
-            .iter()
-            .find_map(|m| match &m.event {
-                FlighthookEvent::DeviceTelemetry { model, .. } => Some((model, &m.device)),
-                _ => None,
-            })
-            .expect("device telemetry");
-        assert_eq!(first.0.as_deref(), Some("ExPutt RG"));
-        assert_eq!(first.1.as_deref(), Some("ExPutt RG (127.0.0.1)"));
+        let device = bus_actor(seen.last().unwrap())
+            .and_then(|a| a.device.as_ref())
+            .expect("device info");
+        assert_eq!(device.model.as_deref(), Some("ExPutt RG"));
         assert!(
             sent(&mock, Request::SetHand(Hand::Right)),
             "right by default"
@@ -972,9 +640,7 @@ mod tests {
         assert!(sent(&mock, Request::MatchEnded), "measuring ended");
         assert!(mock.wait_closed(WAIT), "connection closed");
         let seen = card.until_status(ActorStatus::Disconnected);
-        assert!(seen.iter().any(|m| matches!(&m.event,
-            FlighthookEvent::DeviceTelemetry { telemetry: Some(t), .. }
-                if t.get("ready").map(String::as_str) == Some("false"))));
+        assert!(seen.iter().any(|m| is_ready(m) == Some(false)));
     }
 
     #[test]
@@ -995,9 +661,8 @@ mod tests {
         mock.push_event(PUTT_RESULT_FULL);
         let messages = card.next_shot();
         let expected = putt(PUTT_RESULT_FULL);
-        let shot = accumulate(&messages);
+        let (ball, club) = accumulate(&messages);
 
-        let ball = shot.launch.as_ref().expect("launch");
         assert_eq!(
             ball.launch_speed,
             Some(Velocity::MetersPerSecond(expected.ball_speed_mps))
@@ -1005,27 +670,21 @@ mod tests {
         assert!((ball.launch_speed.unwrap().as_mps() - 2.50).abs() < 0.01);
         assert_eq!(ball.launch_azimuth, Some(expected.launch_direction_deg));
         assert!(ball.launch_azimuth.unwrap() > 1.4, "R1.4 is positive");
-        // Neither a launch angle nor spin is measured, so neither is sent,
-        // and nothing is marked computed.
+        // Neither a launch angle nor spin is measured, so neither is sent.
         assert_eq!(ball.launch_elevation, None);
         assert_eq!(ball.backspin_rpm, None);
         assert_eq!(ball.sidespin_rpm, None);
         assert_eq!(ball.total_spin_rpm, None);
-        let derived = shot.derived.as_ref().expect("derived");
-        assert!(derived.computed.is_empty(), "{:?}", derived.computed);
 
-        let club = shot.club.as_ref().expect("club data");
+        let club = club.expect("club data");
         assert_eq!(club.path, expected.path_deg);
         assert_eq!(club.face_angle, expected.face_deg);
         assert!(club.path.unwrap() > 0.0 && club.face_angle.unwrap() > 0.0);
         assert_eq!(club.club_speed, None, "the putter speed is not used");
 
-        // Rolled along the ground by the simulation.
-        assert!(derived.total_distance.is_some_and(|d| d.as_meters() > 0.0));
-
         // What GSPro receives: a putt with ball speed and HLA, no launch
         // angle or spin.
-        let gspro = map_shot(&shot);
+        let gspro = map_shot(&shot_data(&ball, Some(&club)));
         let b = &gspro.ball_data;
         assert!(
             (b.speed - Velocity::MetersPerSecond(expected.ball_speed_mps).as_mph()).abs() < 1e-9
@@ -1041,27 +700,17 @@ mod tests {
         assert!(gspro.shot_data_options.contains_ball_data);
     }
 
+    /// The card runs in putting mode whatever the session's mode: its fixed
+    /// mode, which the flight model simulates its shots in.
     #[test]
     fn a_putt_is_simulated_in_putting_mode_whatever_the_game_mode() {
         let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
         let mut card = Card::on("10.77.0.3", &Arc::new(AtomicU16::new(mock.port())));
-        card.writer
-            .as_ref()
-            .expect("writer")
-            .set_mode(ShotDetectionMode::Full);
+        card.select(|s| s.mode = Some(Mode::Full));
         card.start();
         card.until_status(ActorStatus::Connected);
-        mock.push_event(PUTT_RESULT_FULL);
-        let shot = accumulate(&card.next_shot());
-        let total = shot
-            .derived
-            .as_ref()
-            .and_then(|d| d.total_distance)
-            .expect("total")
-            .as_meters();
-        // On the green (Putting) the putt rolls 3.74 m (the output pins); on
-        // the fairway it would roll less.
-        assert!((total - 3.7427).abs() < 1e-3, "{total}");
+        assert_eq!(card.state.fixed_mode(&card.frp), Some(Mode::Putting));
+        assert_eq!(card.state.session.mode(), Mode::Full);
     }
 
     #[test]
@@ -1071,18 +720,10 @@ mod tests {
         card.until_status(ActorStatus::Connected);
 
         mock.push_event(PUTT_RESULT_PULLED);
-        let shot = accumulate(&card.next_shot());
-        let ball = shot.launch.as_ref().expect("launch");
+        let (ball, club) = accumulate(&card.next_shot());
         assert!(ball.launch_azimuth.unwrap() < -10.0, "L10.3 is negative");
-        let club = shot.club.as_ref().expect("club");
+        let club = club.expect("club");
         assert!(club.path.unwrap() < -5.0 && club.face_angle.unwrap() < -10.0);
-        // Left of the target lands left.
-        let rest = shot
-            .derived
-            .as_ref()
-            .and_then(|d| d.total_offline)
-            .expect("offline");
-        assert!(rest.as_meters() < 0.0, "{rest:?}");
     }
 
     #[test]
@@ -1096,30 +737,29 @@ mod tests {
         assert!(
             !messages
                 .iter()
-                .any(|m| matches!(m.event, FlighthookEvent::ClubPath { .. })),
+                .any(|m| matches!(body(m), Some(FrpBody::ShotClub(_)))),
             "{messages:?}"
         );
         let expected = putt(PUTT_RESULT_BALL_ONLY);
-        let shot = accumulate(&messages);
-        assert!(shot.club.is_none());
-        let ball = shot.launch.as_ref().expect("launch");
+        let (ball, club) = accumulate(&messages);
+        assert!(club.is_none());
         assert_eq!(
             ball.launch_speed,
             Some(Velocity::MetersPerSecond(expected.ball_speed_mps))
         );
         assert_eq!(ball.launch_azimuth, Some(expected.launch_direction_deg));
-        let gspro = map_shot(&shot);
+        let gspro = map_shot(&shot_data(&ball, None));
         assert!(gspro.ball_data.speed > 0.0);
         assert_eq!(gspro.ball_data.hla, expected.launch_direction_deg);
     }
 
-    /// §7.3 #18: a putt's trigger carries the time the strike arrived, so
+    /// A putt's trigger carries the time the strike arrived, so
     /// the cameras cut the clip at the stroke, not at the result.
     #[test]
     fn a_putt_is_dated_at_its_strike() {
         let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
         let mut card = Card::started("10.77.0.6", &mock);
-        card.until_ready(false, None);
+        card.until_ready(true, None);
         let from = now_ms();
         mock.push_event(BALL_STRUCK);
         card.until_ready(false, Some("ball struck"));
@@ -1127,17 +767,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         mock.push_event(PUTT_RESULT_FULL);
         let messages = card.next_shot();
-        let FlighthookEvent::ShotTrigger {
-            timestamp: Some(at),
-            ..
-        } = messages[0].event
-        else {
-            panic!("a dated trigger: {:?}", messages[0].event);
+        let Some(FrpBody::ShotTrigger(trigger)) = body(&messages[0]) else {
+            unreachable!()
         };
+        let at = trigger.timestamp.expect("a dated trigger");
         assert!((from..=to).contains(&at), "{from} <= {at} <= {to}");
     }
 
-    /// §7.3 #1: a putt's export holds the wire messages around it, labeled,
+    /// A putt's export holds the wire messages around it, labeled,
     /// the putt's own result among them.
     #[test]
     fn a_putt_carries_its_wire_messages_as_raw_records() {
@@ -1146,11 +783,13 @@ mod tests {
         card.until_status(ActorStatus::Connected);
         mock.push_event(PUTT_RESULT_FULL);
         let messages = card.next_shot();
-        let Some(FlighthookEvent::ShotFinished { raw: Some(raw), .. }) =
-            messages.last().map(|m| &m.event)
-        else {
-            panic!("finished with raw records: {messages:?}");
-        };
+        let raw: &ShotRaw = messages
+            .iter()
+            .find_map(|m| match m.as_local() {
+                Some((_, LocalEvent::ShotCapture { raw, .. })) => Some(&**raw),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a capture with raw records: {messages:?}"));
         assert_eq!(raw.transport, "exputt-wifi");
         let result = raw
             .frames
@@ -1179,10 +818,7 @@ mod tests {
     fn the_hand_follows_the_player() {
         let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
         let mut card = Card::on("10.77.0.8", &Arc::new(AtomicU16::new(mock.port())));
-        card.writer
-            .as_ref()
-            .expect("writer")
-            .set_handed(Handedness::Left);
+        card.select(|s| s.handedness = Some(Handedness::Left));
         card.start();
         card.until_status(ActorStatus::Connected);
         mock.push_event(PUTT_READY);
@@ -1190,25 +826,15 @@ mod tests {
         assert!(sent(&mock, Request::SetHand(Hand::Left)), "starts left");
         let before = mock.received().len();
 
-        // The devices are told the player is right-handed.
-        let _ = card.tx.send(
-            FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
-                mode: None,
-                handed: Some(Handedness::Right),
-                club: None,
-            })
-            .actor("system"),
-        );
+        // The session's turn: the player is right-handed.
+        card.turn(Handedness::Right);
         let mut seen = card.until_ready(false, Some("ready"));
-        seen.extend(card.until("mat found", |m| {
-            device_states(std::slice::from_ref(m)) == ["mat found"]
-        }));
+        seen.extend(card.until("mat found", |m| device_state(m) == Some("mat found")));
         mock.push_event(PUTT_READY);
         seen.extend(card.until_ready(true, Some("ready")));
-        assert_eq!(
-            device_states(&seen),
-            ["ready", "finding mat", "mat found", "ready"]
-        );
+        let mut states = device_states(&seen);
+        states.dedup();
+        assert_eq!(states, ["ready", "finding mat", "mat found", "ready"]);
         assert!(
             !seen.iter().any(|m| is_status(m, ActorStatus::Reconnecting)),
             "no reconnect"
@@ -1220,8 +846,8 @@ mod tests {
         );
     }
 
-    /// A hand set in the UI (`hand_info` from `web`) reaches the ExPutt
-    /// through the system actor's command: a new round with the new hand,
+    /// A hand set in the UI (a `golfer.select` from `web`) reaches the
+    /// ExPutt through the session's turn: a new round with the new hand,
     /// and a repeat of the same hand starts no other.
     #[test]
     fn a_hand_set_in_the_ui_reaches_the_device() {
@@ -1234,10 +860,7 @@ mod tests {
         assert!(sent(&mock, Request::SetHand(Hand::Right)), "starts right");
         let before = mock.received().len();
 
-        let hand = |handed| FlighthookEvent::HandInfo {
-            hand_info: flighthook::HandInfo { handed },
-        };
-        card.game(hand(Handedness::Left));
+        card.select_hand(Handedness::Left);
         assert!(
             mock.wait_until(WAIT, |p| round_sent(&p[before..], Hand::Left)),
             "{:?}",
@@ -1247,8 +870,8 @@ mod tests {
         // A repeat of the same hand, then the other hand as a sentinel: the
         // bus is in order, so the round for the sentinel is the only one
         // since `after` unless the repeat started one of its own.
-        card.game(hand(Handedness::Left));
-        card.game(hand(Handedness::Right));
+        card.select_hand(Handedness::Left);
+        card.select_hand(Handedness::Right);
         assert!(
             mock.wait_until(WAIT, |p| round_sent(&p[after..], Hand::Right)),
             "{:?}",
@@ -1266,22 +889,19 @@ mod tests {
         let before = mock.received().len();
 
         // A Find mat for another ExPutt is not for this one.
-        card.game(FlighthookEvent::FindMat {
+        card.web(LocalEvent::FindMat {
             target: "exputt.1".into(),
         });
-        card.game(FlighthookEvent::FindMat {
+        card.web(LocalEvent::FindMat {
             target: "exputt.0".into(),
         });
         let mut seen = card.until_ready(false, Some("ready"));
-        seen.extend(card.until("mat found", |m| {
-            device_states(std::slice::from_ref(m)) == ["mat found"]
-        }));
+        seen.extend(card.until("mat found", |m| device_state(m) == Some("mat found")));
         mock.push_event(PUTT_READY);
         seen.extend(card.until_ready(true, Some("ready")));
-        assert_eq!(
-            device_states(&seen),
-            ["ready", "finding mat", "mat found", "ready"]
-        );
+        let mut states = device_states(&seen);
+        states.dedup();
+        assert_eq!(states, ["ready", "finding mat", "mat found", "ready"]);
         assert!(
             !seen.iter().any(|m| is_status(m, ActorStatus::Reconnecting)),
             "no reconnect"
@@ -1314,14 +934,7 @@ mod tests {
             Handedness::Left,
             Handedness::Left,
         ] {
-            let _ = card.tx.send(
-                FlighthookMessage::new(FlighthookEvent::SetDetectionMode {
-                    mode: None,
-                    handed: Some(handed),
-                    club: None,
-                })
-                .actor("system"),
-            );
+            card.turn(handed);
         }
         // Held: nothing sent yet.
         std::thread::sleep(gap / 3);
@@ -1351,35 +964,33 @@ mod tests {
     // -- Readiness ---------------------------------------------------------------
 
     #[test]
-    fn readiness_follows_the_putt_cycle_into_gspro() {
+    fn readiness_follows_the_putt_cycle() {
         let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
         let mut card = Card::started("10.77.0.12", &mock);
         mock.push_event(PUTT_READY);
         let mut seen = card.until_ready(true, Some("ready"));
-        assert!(gspro_ready(&seen), "ready for a putt");
+        assert!(last_ready(&seen), "ready for a putt");
 
         // Struck: not ready until the device says so again.
         mock.push_event(BALL_STRUCK);
         seen.extend(card.until_ready(false, Some("ball struck")));
-        assert!(!gspro_ready(&seen), "ball struck");
+        assert!(!last_ready(&seen), "ball struck");
 
         // The result changes neither value.
         mock.push_event(PUTT_RESULT_FULL);
-        let shot = card.until("shot_finished", |m| {
-            matches!(m.event, FlighthookEvent::ShotFinished { .. })
+        let shot = card.until("shot.finished", |m| {
+            matches!(body(m), Some(FrpBody::ShotFinished(_)))
         });
         assert!(
-            !shot
-                .iter()
-                .any(|m| matches!(m.event, FlighthookEvent::DeviceTelemetry { .. })),
-            "no telemetry for the result"
+            !shot.iter().any(|m| bus_actor(m).is_some()),
+            "no bus.actor for the result"
         );
         seen.extend(shot);
-        assert!(!gspro_ready(&seen), "still not ready after the result");
+        assert!(!last_ready(&seen), "still not ready after the result");
 
         mock.push_event(PUTT_READY);
         seen.extend(card.until_ready(true, Some("ready")));
-        assert!(gspro_ready(&seen), "ready again");
+        assert!(last_ready(&seen), "ready again");
     }
 
     #[test]
@@ -1390,18 +1001,14 @@ mod tests {
         let mut seen = card.until_ready(true, Some("ready"));
         mock.disconnect();
         let dropped = card.until_status(ActorStatus::Reconnecting);
-        let not_ready = dropped.iter().position(|m| {
-            matches!(&m.event, FlighthookEvent::DeviceTelemetry { telemetry: Some(t), .. }
-                if t.get("ready").map(String::as_str) == Some("false"))
-        });
+        let not_ready = dropped.iter().position(|m| is_ready(m) == Some(false));
         assert!(
             not_ready.is_some_and(|i| i < dropped.len() - 1),
-            "ready=false before reconnecting: {:?}",
-            dropped.iter().map(|m| &m.event).collect::<Vec<_>>()
+            "ready=false before reconnecting: {dropped:?}"
         );
-        // GSPro sees the device not ready from the telemetry alone.
+        // Not ready from the bus.actor alone.
         seen.extend(dropped[..dropped.len() - 1].iter().cloned());
-        assert!(!gspro_ready(&seen));
+        assert!(!last_ready(&seen));
     }
 
     #[test]
@@ -1413,13 +1020,13 @@ mod tests {
         mock.push_event(PUTT_READY);
         let mut seen = card.until_ready(true, Some("ready"));
         seen.extend(card.until_ready(false, None));
-        assert!(!gspro_ready(&seen), "not ready during silence");
+        assert!(!last_ready(&seen), "not ready during silence");
 
         // It sends again before the limit: ready as the device last said,
         // and the session stands.
         mock.push_event("Test,yy");
         seen.extend(card.until_ready(true, None));
-        assert!(gspro_ready(&seen), "ready again");
+        assert!(last_ready(&seen), "ready again");
         std::thread::sleep(Duration::from_millis(100));
         seen.extend(card.drain());
         assert!(
@@ -1459,11 +1066,11 @@ mod tests {
         assert_eq!(shot_number(&card.next_shot()), 2);
     }
 
-    fn shot_number(messages: &[FlighthookMessage]) -> u32 {
-        let FlighthookEvent::ShotTrigger { key, .. } = &messages[0].event else {
+    fn shot_number(messages: &[BusMsg]) -> u32 {
+        let Some(FrpBody::ShotTrigger(trigger)) = body(&messages[0]) else {
             unreachable!()
         };
-        key.shot_number
+        trigger.key.shot_number
     }
 
     /// The driver's quick retries: refused attempts grow the host's backoff
@@ -1475,9 +1082,7 @@ mod tests {
         let mut card = Card::on("10.77.0.16", &port);
         card.start();
         for _ in 0..2 {
-            card.until("alert", |m| {
-                matches!(m.event, FlighthookEvent::Alert { .. })
-            });
+            card.until("alert", |m| alert(m).is_some());
         }
         let first = MockDevice::spawn(MockConfig::default()).expect("mock");
         port.store(first.port(), Ordering::SeqCst);
@@ -1509,8 +1114,7 @@ mod tests {
         port.store(second.port(), Ordering::SeqCst);
 
         let seen = card.until("silence", |m| {
-            matches!(&m.event, FlighthookEvent::Alert { message, .. }
-                if message.contains("no data from the device"))
+            alert(m).is_some_and(|(_, message)| message.contains("no data from the device"))
         });
         let lost = Instant::now();
         assert!(seen.iter().any(|m| is_status(m, ActorStatus::Reconnecting)));
@@ -1585,7 +1189,7 @@ mod tests {
         card.start();
 
         let seen = card.until("not answering", |m| {
-            matches!(&m.event, FlighthookEvent::Alert { message, .. } if message == NOT_ANSWERING)
+            alert(m).is_some_and(|(_, message)| message == NOT_ANSWERING)
         });
         let got = alerts(&seen);
         let (told, errors) = got.split_last().expect("alerts");
@@ -1595,10 +1199,8 @@ mod tests {
             errors.iter().all(|a| a.starts_with("ExPutt error")),
             "{got:?}"
         );
-        let FlighthookEvent::Alert { severity, .. } = &seen.last().unwrap().event else {
-            unreachable!()
-        };
-        assert_eq!(*severity, Severity::Warn);
+        let (severity, _) = alert(seen.last().unwrap()).unwrap();
+        assert_eq!(severity, Severity::Warn);
 
         // Attempts go on (the next after the host's 2 s), silently.
         std::thread::sleep(Duration::from_millis(2600));
@@ -1610,9 +1212,7 @@ mod tests {
         let port = Arc::new(AtomicU16::new(closed_port()));
         let mut card = Card::on("10.77.0.19", &port);
         card.start();
-        let seen = card.until("alert", |m| {
-            matches!(m.event, FlighthookEvent::Alert { .. })
-        });
+        let seen = card.until("alert", |m| alert(m).is_some());
         assert!(alerts(&seen)[0].starts_with("ExPutt error"));
         assert!(!seen.iter().any(|m| is_status(m, ActorStatus::Connected)));
         // Comes up once the device does.
@@ -1670,9 +1270,7 @@ mod tests {
             t,
         );
         card.start();
-        let mut seen = card.until("alert", |m| {
-            matches!(m.event, FlighthookEvent::Alert { .. })
-        });
+        let mut seen = card.until("alert", |m| alert(m).is_some());
         assert_eq!(phases(&seen), ["discovering"]);
         // Many more slices, no second hint.
         std::thread::sleep(Duration::from_millis(800));
@@ -1694,10 +1292,8 @@ mod tests {
         let port = Arc::new(AtomicU16::new(closed_port()));
         let mut card = Card::on("10.77.0.22", &port);
         card.start();
-        card.until("alert", |m| {
-            matches!(m.event, FlighthookEvent::Alert { .. })
-        });
-        card.game(FlighthookEvent::FindMat {
+        card.until("alert", |m| alert(m).is_some());
+        card.web(LocalEvent::FindMat {
             target: "exputt.0".into(),
         });
         std::thread::sleep(Duration::from_millis(200));
@@ -1715,7 +1311,7 @@ mod tests {
 
     // -- Config ----------------------------------------------------------------
 
-    /// §7.3 #6: an address that is not an IP keeps the card from starting
+    /// An address that is not an IP keeps the card from starting
     /// and shows on it.
     #[test]
     fn a_refused_address_shows_on_the_card() {
@@ -1723,9 +1319,7 @@ mod tests {
         let mut card = Card::new(section("exputt.local"), tuning(&port));
         card.start();
         let seen = card.until_status(ActorStatus::Disconnected);
-        let FlighthookEvent::ActorStatus { telemetry, .. } = &seen.last().unwrap().event else {
-            unreachable!()
-        };
+        let (_, telemetry) = card_status(seen.last().unwrap()).unwrap();
         assert!(
             telemetry["error"].contains("address") && telemetry["error"].contains("exputt.local"),
             "{telemetry:?}"
@@ -1776,12 +1370,27 @@ mod tests {
 
     #[test]
     fn find_mat_is_the_cards_own() {
-        let mine = FlighthookEvent::FindMat {
-            target: "exputt.0".into(),
-        };
+        let mine = BusMsg::local(
+            "web",
+            LocalEvent::FindMat {
+                target: "exputt.0".into(),
+            },
+        );
         assert_eq!(find_mat(&mine, "exputt.0"), Some(Action::FindMat));
         assert_eq!(find_mat(&mine, "exputt.1"), None);
-        assert_eq!(find_mat(&FlighthookEvent::NewShotGroup, "exputt.0"), None);
+        let other = BusMsg::local("web", LocalEvent::ClearShotHistory);
+        assert_eq!(find_mat(&other, "exputt.0"), None);
+    }
+
+    #[test]
+    fn the_discovery_hint_is_in_the_cards_words() {
+        let mut hint: FrpBody =
+            flightrelay::BusAlert::new(Severity::Warn, threeputt::driver::DISCOVERY_HINT).into();
+        card_words(&mut hint);
+        let FrpBody::BusAlert(alert) = &hint else {
+            unreachable!()
+        };
+        assert_eq!(alert.message, DISCOVERY_HINT);
     }
 
     // -- Output pins -------------------------------------------------------------
@@ -1798,10 +1407,15 @@ mod tests {
             let mut card = Card::started(address, &mock);
             card.until_status(ActorStatus::Connected);
             mock.push_event(line);
-            let messages = card.until("shot_finished", |m| {
-                matches!(m.event, FlighthookEvent::ShotFinished { .. })
+            let messages = card.until("shot.finished", |m| {
+                matches!(body(m), Some(FrpBody::ShotFinished(_)))
             });
-            crate::test_ball::assert_outputs_pinned(case, &messages);
+            crate::test_ball::assert_outputs_pinned(
+                case,
+                "exputt.0",
+                Some(Mode::Putting),
+                &messages,
+            );
         }
     }
 }

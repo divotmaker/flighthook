@@ -6,15 +6,18 @@ pub mod camera;
 pub mod clip_source;
 pub mod driver;
 pub mod exputt;
+pub mod flight_model;
 pub mod gspro;
 pub mod mevo;
 pub mod mock;
 pub mod openconnect;
 pub mod provenance;
 pub mod pureplay;
+pub mod pureplay_accessory;
 pub mod r10;
 #[cfg(test)]
 pub(crate) mod scripted;
+pub(crate) mod simout;
 pub mod square;
 pub mod system;
 pub mod trackball;
@@ -113,8 +116,8 @@ pub trait Actor: Send + Sync {
     }
 
     /// The shot source this actor is, `None` for an actor that puts no shots
-    /// on the bus. [`start_actor`] records it in the round policy and has
-    /// the actor's bus sender stamp its provenance on every shot trigger.
+    /// on the bus. [`start_actor`] records it in the round policy, by the
+    /// card's actor id.
     fn source(&self) -> Option<provenance::ShotSource> {
         None
     }
@@ -226,7 +229,7 @@ pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor> {
         });
     }
 
-    // Open Connect servers (inbound launch monitors: Uneekor, Foresight, ...)
+    // Open Connect servers (launch monitor software that sends Open Connect)
     for (index, section) in &config.openconnect_server {
         let id = global_id("openconnect_server", index);
         let bind_str = section.bind.as_deref().unwrap_or("0.0.0.0:921");
@@ -293,6 +296,25 @@ pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor> {
         }
     }
 
+    // Pureplay Accessory cards (Pureplay's Accessory API)
+    for (index, section) in &config.pureplay_accessory {
+        let id = global_id("pureplay_accessory", index);
+        let addr_str = section
+            .address
+            .as_deref()
+            .unwrap_or(pureplay_accessory::DEFAULT_ADDRESS);
+        match addr_str.parse::<SocketAddr>() {
+            Ok(addr) => actors.push(ResolvedActor {
+                id,
+                name: section.name.clone(),
+                actor: Box::new(pureplay_accessory::PureplayAccessoryActor { addr }),
+            }),
+            Err(e) => {
+                tracing::warn!("device '{id}': invalid address '{addr_str}': {e}");
+            }
+        }
+    }
+
     // Random club integrations
     for (index, section) in &config.random_club {
         let id = global_id("random_club", index);
@@ -328,16 +350,35 @@ pub fn start_actor(
     id: String,
     actor: Box<dyn Actor>,
     state: &Arc<SystemState>,
-    bus_tx: &broadcast::Sender<flighthook::FlighthookMessage>,
+    bus_tx: &broadcast::Sender<crate::bus::BusMsg>,
+) {
+    let frp_id = state.actor_of_card(&id);
+    start_actor_as(id, frp_id, actor, state, bus_tx);
+}
+
+/// [`start_actor`] with the FRP actor id `frp_id` (`None`: not an FRP
+/// actor) instead of the one the config gives card `id`.
+pub(crate) fn start_actor_as(
+    id: String,
+    frp_id: Option<String>,
+    actor: Box<dyn Actor>,
+    state: &Arc<SystemState>,
+    bus_tx: &broadcast::Sender<crate::bus::BusMsg>,
 ) {
     let shutdown = Arc::new(AtomicBool::new(false));
-    let mut sender = BusSender::new(id.clone(), bus_tx.clone(), Arc::clone(&shutdown));
     if let Some(source) = actor.source() {
-        state.round.register_source(&id, source);
-        sender = sender.with_provenance(source.provenance());
+        state
+            .round
+            .register_card_source(&id, frp_id.as_deref().unwrap_or(&id), source);
     }
+    let sender = BusSender::new(id.clone(), bus_tx.clone(), Arc::clone(&shutdown))
+        .with_frp_id(frp_id)
+        .with_beats(state.beats.clone());
     let muted = sender.muted();
     let receiver = sender.subscribe();
+    if is_output_card(&id) {
+        sender.frp(output_bus_actor(state, &id));
+    }
     let thread = actor.start(Arc::clone(state), sender, receiver);
     state.register_actor(
         id,
@@ -348,6 +389,29 @@ pub fn start_actor(
             thread: Some(thread),
         },
     );
+}
+
+/// Whether card `card` is an output card (an Open Connect client, a
+/// Pureplay Connect output, random club): an actor with a name and no role.
+/// Its `bus.actor` goes out as it starts and is heartbeat
+/// like every local actor's; the system actor sends it again on `bus.sync`
+/// and its removal when the card is removed or turned off.
+pub(crate) fn is_output_card(card: &str) -> bool {
+    matches!(
+        card.split_once('.').map(|(kind, _)| kind),
+        Some("openconnect_client" | "pureplay" | "random_club")
+    )
+}
+
+/// The `bus.actor` of output card `card`: the card's name (its key when it
+/// has none), no role.
+pub(crate) fn output_bus_actor(state: &SystemState, card: &str) -> flightrelay::BusActor {
+    let name = actor_names(&state.system.snapshot())
+        .get(card)
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| card.to_owned());
+    flightrelay::BusActor::new(name, flightrelay::DEFAULT_HEARTBEAT.as_secs_f64())
 }
 
 /// Whether actors of this type can be reconnected: every launch monitor and
@@ -418,6 +482,9 @@ pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String> {
     for (index, section) in &config.pureplay {
         names.insert(global_id("pureplay", index), section.name.clone());
     }
+    for (index, section) in &config.pureplay_accessory {
+        names.insert(global_id("pureplay_accessory", index), section.name.clone());
+    }
     for (index, section) in &config.random_club {
         names.insert(global_id("random_club", index), section.name.clone());
     }
@@ -476,38 +543,17 @@ fn openconnect_names(
 mod tests {
     use super::*;
 
-    /// An actor of source type `source` that sends its device telemetry and
-    /// triggers one shot on start.
+    /// An actor of source type `source` that does nothing.
     struct Shooter(Option<provenance::ShotSource>);
 
     impl Actor for Shooter {
         fn start(
             &self,
             _state: Arc<SystemState>,
-            sender: BusSender,
+            _sender: BusSender,
             _receiver: BusReceiver,
         ) -> JoinHandle<()> {
-            std::thread::spawn(move || {
-                let key = flighthook::ShotKey {
-                    shot_id: "s".into(),
-                    shot_number: 1,
-                };
-                sender.send(flighthook::FlighthookMessage::new(
-                    flighthook::FlighthookEvent::DeviceTelemetry {
-                        manufacturer: Some("Birdie Labs".into()),
-                        model: None,
-                        firmware: None,
-                        source: None,
-                        telemetry: None,
-                    },
-                ));
-                sender.send(flighthook::FlighthookMessage::new(
-                    flighthook::FlighthookEvent::shot_trigger(key.clone()),
-                ));
-                sender.send(flighthook::FlighthookMessage::new(
-                    flighthook::FlighthookEvent::ShotFinished { key, raw: None },
-                ));
-            })
+            std::thread::spawn(|| {})
         }
 
         fn source(&self) -> Option<provenance::ShotSource> {
@@ -515,10 +561,8 @@ mod tests {
         }
     }
 
-    /// `start_actor` records the source type an actor declares and stamps
-    /// its class on the actor's shot triggers and as its device telemetry's
-    /// `source`, and nothing else: whatever its ID says. An actor that is
-    /// not a shot source stamps nothing.
+    /// `start_actor` records the source type an actor declares, whatever
+    /// its ID says. An actor that is not a shot source records nothing.
     #[test]
     fn a_shot_takes_its_provenance_from_the_type_the_actor_started_as() {
         use provenance::ShotSource;
@@ -528,7 +572,7 @@ mod tests {
         ));
         let (state, _writer) = SystemState::new(dir.join("config.toml"));
         let state = Arc::new(state);
-        let (tx, mut rx) = broadcast::channel(64);
+        let (tx, _rx) = broadcast::channel(64);
         let started = ShotSource::ALL
             .into_iter()
             .map(Some)
@@ -542,30 +586,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for (id, source) in &started {
-            assert_eq!(state.round.source(id), *source, "{id}");
-        }
-        let mut triggers = HashMap::new();
-        let mut sources = HashMap::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while triggers.len() < started.len() || sources.len() < started.len() {
-            assert!(std::time::Instant::now() < deadline, "{triggers:?}");
-            match rx.try_recv() {
-                Ok(msg) => match msg.event {
-                    flighthook::FlighthookEvent::ShotTrigger { .. } => {
-                        triggers.insert(msg.actor, msg.provenance);
-                    }
-                    flighthook::FlighthookEvent::DeviceTelemetry { source, .. } => {
-                        assert_eq!(msg.provenance, None, "only the trigger");
-                        sources.insert(msg.actor, source);
-                    }
-                    _ => assert_eq!(msg.provenance, None, "only the trigger"),
-                },
-                Err(_) => std::thread::sleep(Duration::from_millis(5)),
-            }
-        }
-        for (id, source) in started {
-            assert_eq!(triggers[&id], source.map(ShotSource::provenance), "{id}");
-            assert_eq!(sources[&id], source.map(ShotSource::provenance), "{id}");
+            let key = state.actor_of_card(id).unwrap_or_else(|| id.clone());
+            assert_eq!(state.round.source(&key), *source, "{id}");
         }
         assert_eq!(
             state.stop_all_and_wait(Duration::from_secs(2)),
@@ -611,6 +633,7 @@ mod tests {
             "openconnect_server",
             "openconnect_client",
             "pureplay",
+            "pureplay_accessory",
             "random_club",
         ] {
             assert!(reconnectable(t), "{t}");
@@ -653,6 +676,7 @@ mod tests {
                     enabled: true,
                     bind: None,
                     impact_lead_s: None,
+                    actor_id: None,
                 },
             );
         }
@@ -661,8 +685,11 @@ mod tests {
 
     #[test]
     fn openconnect_servers_are_named_from_config() {
-        let names = actor_names(&with_openconnect(&[("0", "Uneekor"), ("1", "Omni Bridge")]));
-        assert_eq!(names["openconnect_server.0"], "Uneekor");
+        let names = actor_names(&with_openconnect(&[
+            ("0", "Range Bridge"),
+            ("1", "Omni Bridge"),
+        ]));
+        assert_eq!(names["openconnect_server.0"], "Range Bridge");
         assert_eq!(names["openconnect_server.1"], "Omni Bridge");
     }
 

@@ -25,9 +25,9 @@
 use egui::{Color32, Pos2, Rect, Stroke, Vec2, pos2, vec2};
 
 use super::flight;
-use super::shots::{latest_index, pick};
+use super::shots::pick;
 use crate::app::FlighthookApp;
-use crate::chart::{self, Candidate, ChartKey, Curve, Ellipse, Projection};
+use crate::chart::{self, Candidate, ChartKey, Curve, Ellipse, Projection, ShotFilter};
 use crate::groups::ShotGroups;
 use crate::theme;
 use crate::types::{Distance, ShotGrouping, ShotRow, UnitSystem};
@@ -331,8 +331,8 @@ struct SceneInput<'a> {
     shown: usize,
     /// Every device in the history, exact and sorted.
     devices: &'a [String],
-    /// The device filter.
-    device: Option<&'a str>,
+    /// The Shots tab's filter.
+    filter: ShotFilter<'a>,
     units: UnitSystem,
     points: Points,
     size: EllipseSize,
@@ -396,13 +396,13 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         members,
         shown,
         devices,
-        device,
+        filter,
         units,
         points,
         size,
         area,
     } = *input;
-    let drawn = flight::drawn_sets(shots, groups, view, members, shown, device, |s| {
+    let drawn = flight::drawn_sets(shots, groups, view, members, shown, filter, |s| {
         plottable(s, points)
     });
     let ends_of = |i: usize| shots.get(i).map(|s| ends(s, units)).unwrap_or_default();
@@ -458,10 +458,10 @@ fn build_scene(input: &SceneInput<'_>) -> Scene {
         .map(|v| (proj.x.map(v), format!("{:.0}", v.abs())))
         .collect();
 
-    let by_device = chart::by_device(devices, device);
+    let by_device = chart::by_device(devices, filter.device);
     let color_of = |i: usize| {
         shots.get(i).map_or(theme::ACCENT, |s| {
-            chart::shot_color(devices, device, &s.actor)
+            chart::shot_color(devices, filter.device, &s.actor)
         })
     };
     let to_screen = |s: Spot| proj.to_screen(s.lateral, s.down);
@@ -829,15 +829,10 @@ fn oval_tooltip(
 }
 
 impl FlighthookApp {
-    /// The shot the panel is built around: the shown shot in Cards, the
-    /// latest one in Table (`table`), whose rows cannot be picked; both
-    /// from the filtered device.
-    pub(super) fn dispersion_shown(&self, table: bool) -> Option<usize> {
-        if table {
-            latest_index(&self.shots, self.filter())
-        } else {
-            self.shown_index()
-        }
+    /// The shot the panel is built around: the shown shot, from the
+    /// filtered device.
+    pub(super) fn dispersion_shown(&self) -> Option<usize> {
+        self.shown_index()
     }
 
     /// Key of the Dispersion scene for a plot area of `size` around the
@@ -872,7 +867,7 @@ impl FlighthookApp {
             members: &members,
             shown,
             devices: &devices,
-            device: self.device_filter.as_deref(),
+            filter: self.filter(),
             units: self.units(),
             points: key.points,
             size: key.size,
@@ -933,7 +928,7 @@ impl FlighthookApp {
     }
 
     /// The Dispersion panel, filling `ui`; `table` when it sits beside the
-    /// Table view.
+    /// Table view, where its dots cannot be picked.
     pub(super) fn render_dispersion_panel(&mut self, ui: &mut egui::Ui, table: bool) {
         let full = ui.available_rect_before_wrap();
         let header = header_height(full.width());
@@ -942,7 +937,7 @@ impl FlighthookApp {
         let response = ui.allocate_rect(rect, egui::Sense::click());
         let painter = ui.painter_at(rect);
         let units = self.units();
-        let Some(shown) = self.dispersion_shown(table) else {
+        let Some(shown) = self.dispersion_shown() else {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -961,7 +956,7 @@ impl FlighthookApp {
 
         // The latest shot flies out from the tee while its pulse runs.
         let now = ui.ctx().input(|i| i.time);
-        let following = table || self.following();
+        let following = self.following();
         let progress = following.then(|| self.shot_focus.progress(now)).flatten();
         let draw_on = progress.and_then(|p| DrawOn::new(scene, p));
         if draw_on.is_some() {
@@ -985,10 +980,7 @@ impl FlighthookApp {
             );
         }
 
-        let device_name = |id: &str| {
-            let name = self.actors.get(id).map(|a| a.name.as_str());
-            chart::device_label(id, name).to_owned()
-        };
+        let device_name = |id: &str| chart::device_label(id, self.actor_name(id)).to_owned();
         let mut clicked = None;
         match hover {
             Some(Hover::Shot(i)) => {
@@ -1035,35 +1027,24 @@ impl FlighthookApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
-        Basis, Club, DerivedFlight, FlightPath, FlightResult, Launch, ShotGroupInfo,
-    };
+    use crate::groups::SetInfo;
+    use crate::types::{Basis, Club, DerivedFlight, FlightPath, FlightResult, Launch};
 
-    fn set(id: &str, number: u32, club: Club, session: u32) -> ShotGroupInfo {
-        ShotGroupInfo {
+    fn set(id: &str, number: u32, club: Club, session: u32) -> SetInfo {
+        SetInfo {
+            golfer: None,
             id: id.into(),
             number,
             session,
-            golfer: None,
             club: Some(club),
-            started_at: "2026-10-26T15:41:28.300Z".into(),
-            manual: false,
+            started_at: 0,
             open: false,
             shots: 2,
         }
     }
 
-    fn groups(list: Vec<ShotGroupInfo>) -> ShotGroups {
-        let session = list.iter().map(|g| g.session).max().unwrap_or(0);
-        let mut g = ShotGroups::default();
-        g.replace(crate::types::ShotGroupsResponse {
-            server: "webserver.0".into(),
-            mode: ShotGrouping::BySet,
-            session,
-            current: None,
-            groups: list,
-        });
-        g
+    fn groups(list: Vec<SetInfo>) -> ShotGroups {
+        ShotGroups::with_sets(ShotGrouping::BySet, list)
     }
 
     /// A path landing `carry` meters downrange and `lateral` meters right,
@@ -1097,6 +1078,7 @@ mod tests {
         d.total_offline = Some(Distance::Meters(lateral * 1.2));
         d.path = Some(flight_path(carry, lateral, carry + 10.0));
         ShotRow {
+            golfer: None,
             actor: actor.into(),
             shot_id: format!("id{n}"),
             shot_number: n,
@@ -1155,7 +1137,7 @@ mod tests {
         device: Option<&str>,
     ) -> Vec<usize> {
         let set = shots[shown].group.as_deref().and_then(|id| g.get(id));
-        chart::members_for(shots, g, view, set, Some(shown), device)
+        chart::members_for(shots, g, view, set, Some(shown), ShotFilter::device(device))
     }
 
     fn input<'a>(
@@ -1172,7 +1154,7 @@ mod tests {
             members,
             shown,
             devices,
-            device: None,
+            filter: ShotFilter::device(None),
             units: UnitSystem::Metric,
             points: Points::Total,
             size: EllipseSize::TwoSigma,
@@ -1248,7 +1230,7 @@ mod tests {
             let m = members(&shots, &g, view, shown, device);
             build_scene(&SceneInput {
                 view,
-                device,
+                filter: ShotFilter::device(device),
                 ..input(&shots, &g, &m, shown, &[])
             })
         };
@@ -1483,7 +1465,7 @@ mod tests {
         // One device's points only: one ellipse in the accent color.
         let mevo = members(&shots, &g, ShotGrouping::BySet, 6, Some("mevo.0"));
         let s = build_scene(&SceneInput {
-            device: Some("mevo.0"),
+            filter: ShotFilter::device(Some("mevo.0")),
             ..input(&shots, &g, &mevo, 6, &devices)
         });
         assert_eq!(s.ovals.len(), 1);
@@ -1679,18 +1661,21 @@ mod tests {
     }
 
     #[test]
-    fn table_view_builds_around_the_latest_shot() {
+    fn the_panel_builds_around_the_shown_shot() {
         let (shots, g) = history();
         let mut app = FlighthookApp::with_pending(crate::net::new_pending());
         app.shots = shots;
         app.shots_rev = 1;
         app.groups = g;
         app.refresh_shot_caches();
-        app.shot_focus.observe(&app.shots, None, 0.0);
+        app.shot_focus.observe(&app.shots, ShotFilter::ALL, 0.0);
         app.select_shot(3);
-        assert_eq!(app.dispersion_shown(false), Some(3));
-        assert_eq!(app.dispersion_shown(true), Some(7));
-        // Table: the latest shot's set is bright, whatever the Cards pin.
+        assert_eq!(
+            app.dispersion_shown(),
+            Some(3),
+            "the pick, in Cards and Table"
+        );
+        // The latest shot's scene: its set is bright.
         let key = app.dispersion_key(7, vec2(306.0, 700.0));
         app.refresh_dispersion_scene(&key, 7);
         let s = app.dispersion_scene.peek(&key).unwrap();
@@ -1792,7 +1777,7 @@ mod tests {
     #[ignore = "timing, not a check"]
     fn dispersion_frame_time_with_1000_shots() {
         use std::time::Instant;
-        let list: Vec<ShotGroupInfo> = (0..20)
+        let list: Vec<SetInfo> = (0..20)
             .map(|n| set(&format!("s{n}"), n + 1, Club::Iron7, 0))
             .collect();
         let g = groups(list);

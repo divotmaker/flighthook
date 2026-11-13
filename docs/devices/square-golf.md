@@ -77,7 +77,7 @@ DR = 15.0
 7i = 18.5
 ```
 
-Or on the Devices tab: flip a Square Golf card to Settings; it has a
+Or in Settings > Devices: flip a Square Golf card to Settings; it has a
 collapsible "Face impact calibration (beta)" section with one field per club. Leave a field
 blank to use the default for that club; a value overrides it. Changing a
 calibration restarts the card.
@@ -94,12 +94,12 @@ flighthook sends all four, as FRP `backspin_rpm`, `sidespin_rpm`,
 positive for a ball curving left; both are negated, so in FRP a positive
 sidespin and axis curve the ball right. A total of 0 has no axis.
 
-## Carry and total (beta, simulated)
+## Carry and total (simulated)
 
 The Omni measures launch only: ball speed, launch angle, launch direction,
 backspin and sidespin. flighthook simulates the rest — carry, apex, flight
 time, descent angle, offline, roll and total — from that launch (see the
-README's [Simulated values](../../README.md#simulated-values-beta) section).
+README's [Simulated values](../../README.md#simulated-values) section).
 They show in *italics* in the Shots tab, appear as `derived` in the API, and
 are logged under the ball line:
 
@@ -118,9 +118,10 @@ launched higher is flown and needs a spin reading like every other flight.
 
 ## Handedness
 
-The Omni follows the player's hand from the simulator, or from the hand
-control in the UI: every club select carries it, and a change of hand re-sends
-the active club. The device is right-handed until a hand is set.
+The Omni follows the player's hand from the simulator, else the hand set on
+the golfer's page in Settings: every club select carries it, and a change
+of hand re-sends the active club. The device is right-handed until a hand is
+set.
 
 Left-handed mode is **beta**: the lateral signs (launch direction, sidespin,
 spin axis, face impact) are not yet verified on a left-handed session.
@@ -155,12 +156,11 @@ device into putting mode via the normal club-forwarding path.
 ## Battery
 
 The Omni reports its charge (`battery_pct`). While it is connected, the
-dashboard header shows it as a battery icon, red under 20 %; hover it for
-the device's name and percentage.
+header's Energy icon turns yellow under 20 % and red under 10 %; click it for each device's charge.
 
 ## Shot export
 
-`GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
+`GET /api/shots/export` (the export icon's **JSONL** item on the Shots tab) saves
 each shot with the BLE traffic behind it: up to 64 messages before the ball
 notification, the notifications the Omni sent for the shot (ball, club, and anything
 else in between, including the duplicate copies the device sends) and the

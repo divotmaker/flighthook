@@ -1,0 +1,128 @@
+== 1 connected: every device ready, the output connected
+Hello Hello { protocol_version: 1, device_caps: 0, device_name: "flighthook", firmware: "VERSION" }
+last ReadyState ReadyState(1)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 2 header picks 7I (no hand set yet)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 3 simulator: RH, DR (Full)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 4 Mevo+ full swing (Full, Any)
+BallData BallData(BallData { shot_id: 1, valid: 127, ball_speed_ms: 35.368, vla: 21.001, hla: -8.141, total_spin_rpm: 7157.0, back_spin_rpm: 7127.0, side_spin_rpm: 652.0, spin_axis_deg: 5.2270455 })
+ClubData ClubData(ClubData { shot_id: 1, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 5 R10 full shot (Full, Any)
+BallData BallData(BallData { shot_id: 2, valid: 127, ball_speed_ms: 67.0, vla: 12.5, hla: -1.2, total_spin_rpm: 2800.0, back_spin_rpm: 2789.0, side_spin_rpm: -244.0, spin_axis_deg: -5.0 })
+ClubData ClubData(ClubData { shot_id: 2, valid: 57, club_head_speed_ms: 44.0, smash_factor: 0.0, dynamic_loft_deg: 0.0, face_angle_deg: 1.5, club_path_deg: -2.0, attack_angle_deg: -3.5, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 6 Omni full swing (Full, Any)
+BallData BallData(BallData { shot_id: 3, valid: 127, ball_speed_ms: 60.0, vla: 14.0, hla: -1.2, total_spin_rpm: 3059.0, back_spin_rpm: 3000.0, side_spin_rpm: 600.0, spin_axis_deg: 11.31 })
+ClubData ClubData(ClubData { shot_id: 3, valid: 255, club_head_speed_ms: 41.4, smash_factor: 1.45, dynamic_loft_deg: 17.9, face_angle_deg: -0.8, club_path_deg: -2.4, attack_angle_deg: -1.6, impact_point_x_mm: -3.5, impact_point_y_mm: 11.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 7 Xi full swing (Full, Any; spin source auto = E8 rule)
+BallData BallData(BallData { shot_id: 4, valid: 127, ball_speed_ms: 35.368, vla: 21.001, hla: -8.141, total_spin_rpm: 7157.0, back_spin_rpm: 7127.0, side_spin_rpm: 652.0, spin_axis_deg: 5.2270455 })
+ClubData ClubData(ClubData { shot_id: 4, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 8 Open Connect monitor full shot (Full, Any)
+BallData BallData(BallData { shot_id: 5, valid: 127, ball_speed_ms: 58.741055, vla: 16.2, hla: -1.8, total_spin_rpm: 5120.0, back_spin_rpm: 5110.0, side_spin_rpm: -313.0, spin_axis_deg: -3.5 })
+ClubData ClubData(ClubData { shot_id: 5, valid: 253, club_head_speed_ms: 40.770046, smash_factor: 0.0, dynamic_loft_deg: 20.4, face_angle_deg: 0.6, club_path_deg: 1.9, attack_angle_deg: -3.1, impact_point_x_mm: -4.5, impact_point_y_mm: 2.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 9 Mevo+ launch-only chip, sim on (Full, Any)
+BallData BallData(BallData { shot_id: 6, valid: 55, ball_speed_ms: 7.019, vla: 22.8, hla: -0.856, total_spin_rpm: 0.0, back_spin_rpm: 1570.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ClubData ClubData(ClubData { shot_id: 6, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+# [simulation] mode = Off
+== 10 Mevo+ launch-only chip, sim off (Full, Any)
+BallData BallData(BallData { shot_id: 7, valid: 55, ball_speed_ms: 7.019, vla: 22.8, hla: -0.856, total_spin_rpm: 0.0, back_spin_rpm: 1570.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ClubData ClubData(ClubData { shot_id: 7, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+# [simulation] mode = Force
+== 11 Mevo+ full swing, sim force (Full, Any)
+BallData BallData(BallData { shot_id: 8, valid: 127, ball_speed_ms: 35.368, vla: 21.001, hla: -8.141, total_spin_rpm: 7157.0, back_spin_rpm: 7127.0, side_spin_rpm: 652.0, spin_axis_deg: 5.2270455 })
+ClubData ClubData(ClubData { shot_id: 8, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 12 R10 full shot, sim force (Full, Any)
+BallData BallData(BallData { shot_id: 9, valid: 127, ball_speed_ms: 67.0, vla: 12.5, hla: -1.2, total_spin_rpm: 4200.0, back_spin_rpm: 4194.0, side_spin_rpm: 220.0, spin_axis_deg: 3.0 })
+ClubData ClubData(ClubData { shot_id: 9, valid: 57, club_head_speed_ms: 44.0, smash_factor: 0.0, dynamic_loft_deg: 0.0, face_angle_deg: 1.5, club_path_deg: -2.0, attack_angle_deg: -3.5, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+# [simulation] mode = On
+== 13 Auto-chip 3 yd (Full)
+BallData BallData(BallData { shot_id: 10, valid: 55, ball_speed_ms: 4.8993897, vla: 45.0, hla: 0.0, total_spin_rpm: 0.0, back_spin_rpm: 3288.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 14 simulator: RH, SW (Chipping)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 15 Xi launch-only chip, sim on (Chipping, routed Xi)
+BallData BallData(BallData { shot_id: 11, valid: 55, ball_speed_ms: 7.019, vla: 22.8, hla: -0.856, total_spin_rpm: 0.0, back_spin_rpm: 1570.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ClubData ClubData(ClubData { shot_id: 11, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+# [simulation] mode = Off
+== 16 Xi launch-only chip, sim off (Chipping, routed Xi)
+BallData BallData(BallData { shot_id: 12, valid: 55, ball_speed_ms: 7.019, vla: 22.8, hla: -0.856, total_spin_rpm: 0.0, back_spin_rpm: 1570.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ClubData ClubData(ClubData { shot_id: 12, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+# [simulation] mode = Force
+== 17 Xi launch-only chip, sim force (Chipping, routed Xi)
+BallData BallData(BallData { shot_id: 13, valid: 55, ball_speed_ms: 7.019, vla: 22.8, hla: -0.856, total_spin_rpm: 0.0, back_spin_rpm: 1570.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ClubData ClubData(ClubData { shot_id: 13, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+# [simulation] mode = On
+== 18 Xi early-only chip, estimate on (Chipping, routed Xi)
+BallData BallData(BallData { shot_id: 14, valid: 23, ball_speed_ms: 17.945, vla: 30.948, hla: -3.958, total_spin_rpm: 0.0, back_spin_rpm: 4037.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ClubData ClubData(ClubData { shot_id: 14, valid: 63, club_head_speed_ms: 13.9, smash_factor: 1.29, dynamic_loft_deg: 46.31, face_angle_deg: -5.92, club_path_deg: -0.0, attack_angle_deg: 0.0, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 19 Xi full swing (Chipping, routed Xi; spin source auto = D4)
+BallData BallData(BallData { shot_id: 15, valid: 127, ball_speed_ms: 35.368, vla: 21.001, hla: -8.141, total_spin_rpm: 7157.0, back_spin_rpm: 7127.0, side_spin_rpm: 652.0, spin_axis_deg: 5.2270455 })
+ClubData ClubData(ClubData { shot_id: 15, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 20 Mevo+ full swing (Chipping: not routed)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 21 R10 full shot (Chipping: not routed)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 22 Auto-chip 1 yd (Chipping)
+BallData BallData(BallData { shot_id: 16, valid: 55, ball_speed_ms: 2.7534988, vla: 45.0, hla: 0.0, total_spin_rpm: 0.0, back_spin_rpm: 1848.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 23 header picks Full (club stays SW)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 24 Mevo+ full swing (hand-picked Full, Any)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 25 simulator repeats RH, SW (back to Chipping)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 26 Mevo+ full swing (Chipping again: not routed)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 27 Xi full swing (Chipping again, routed Xi)
+BallData BallData(BallData { shot_id: 17, valid: 127, ball_speed_ms: 35.368, vla: 21.001, hla: -8.141, total_spin_rpm: 7157.0, back_spin_rpm: 7127.0, side_spin_rpm: 652.0, spin_axis_deg: 5.2270455 })
+ClubData ClubData(ClubData { shot_id: 17, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 28 simulator: LH, PT (Putting)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 29 Open Connect monitor putt (Putting, routed server)
+BallData BallData(BallData { shot_id: 18, valid: 63, ball_speed_ms: 2.503424, vla: 1.1, hla: 0.7, total_spin_rpm: 0.0, back_spin_rpm: 0.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 30 Omni putt (Putting: not routed)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 31 Auto-chip 5 yd (Putting)
+BallData BallData(BallData { shot_id: 19, valid: 55, ball_speed_ms: 6.4438543, vla: 45.0, hla: 0.0, total_spin_rpm: 0.0, back_spin_rpm: 4324.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 32 simulator: LH, 7I (Full)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 33 Omni full swing, left-handed (Full, Any)
+BallData BallData(BallData { shot_id: 20, valid: 127, ball_speed_ms: 60.0, vla: 14.0, hla: -1.2, total_spin_rpm: 3059.0, back_spin_rpm: 3000.0, side_spin_rpm: 600.0, spin_axis_deg: 11.31 })
+ClubData ClubData(ClubData { shot_id: 20, valid: 255, club_head_speed_ms: 41.4, smash_factor: 1.45, dynamic_loft_deg: 17.9, face_angle_deg: -0.8, club_path_deg: -2.4, attack_angle_deg: -1.6, impact_point_x_mm: -3.5, impact_point_y_mm: 15.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 34 R10 full shot, left-handed (Full, Any)
+BallData BallData(BallData { shot_id: 21, valid: 127, ball_speed_ms: 67.0, vla: 12.5, hla: -1.2, total_spin_rpm: 4200.0, back_spin_rpm: 4194.0, side_spin_rpm: 220.0, spin_axis_deg: 3.0 })
+ClubData ClubData(ClubData { shot_id: 21, valid: 57, club_head_speed_ms: 44.0, smash_factor: 0.0, dynamic_loft_deg: 0.0, face_angle_deg: 1.5, club_path_deg: -2.0, attack_angle_deg: -3.5, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 35 Xi full swing, left-handed (Full, Any)
+BallData BallData(BallData { shot_id: 22, valid: 127, ball_speed_ms: 35.368, vla: 21.001, hla: -8.141, total_spin_rpm: 7157.0, back_spin_rpm: 7127.0, side_spin_rpm: 652.0, spin_axis_deg: 5.2270455 })
+ClubData ClubData(ClubData { shot_id: 22, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 36 Open Connect monitor full shot, left-handed (Full, Any)
+BallData BallData(BallData { shot_id: 23, valid: 127, ball_speed_ms: 58.741055, vla: 16.2, hla: -1.8, total_spin_rpm: 5120.0, back_spin_rpm: 5110.0, side_spin_rpm: -313.0, spin_axis_deg: -3.5 })
+ClubData ClubData(ClubData { shot_id: 23, valid: 253, club_head_speed_ms: 40.770046, smash_factor: 0.0, dynamic_loft_deg: 20.4, face_angle_deg: 0.6, club_path_deg: 1.9, attack_angle_deg: -3.1, impact_point_x_mm: -4.5, impact_point_y_mm: 2.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 37 Mevo+ launch-only chip, left-handed (Full, Any)
+BallData BallData(BallData { shot_id: 24, valid: 55, ball_speed_ms: 7.019, vla: 22.8, hla: -0.856, total_spin_rpm: 0.0, back_spin_rpm: 1570.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+ClubData ClubData(ClubData { shot_id: 24, valid: 63, club_head_speed_ms: 27.79, smash_factor: 1.272, dynamic_loft_deg: 38.74, face_angle_deg: -6.51, club_path_deg: -11.4, attack_angle_deg: -14.73, impact_point_x_mm: 0.0, impact_point_y_mm: 0.0 })
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
+== 38 simulator: RH, DR (Full)
+ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }

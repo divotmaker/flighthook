@@ -2,15 +2,15 @@
 //!
 //! This is the inverse of the `openconnect_client` actor, an Open Connect
 //! *client* that dials a simulator and pushes shots to it. This actor *listens* and
-//! accepts shots pushed to it by a launch monitor that speaks Open Connect —
-//! Uneekor, Foresight, SkyTrak, MLM2PRO, and others all emit it.
+//! accepts shots pushed to it by launch monitor software that sends Open
+//! Connect.
 //!
 //! It is therefore a launch monitor actor, not an integration: it publishes
 //! the standard shot lifecycle onto the bus, and anything downstream
 //! (including an `openconnect_client`) consumes it unchanged.
 //!
 //! ```text
-//!   Uneekor / Foresight / SkyTrak  --TCP 921-->  openconnect_server.0
+//!   launch monitor software        --TCP 921-->  openconnect_server.0
 //!                                                        |
 //!                                                        v  bus
 //!                                       openconnect_client.0  --TCP 922-->  GSPro
@@ -41,13 +41,14 @@ use std::time::{Duration, Instant};
 
 use super::gspro::api;
 use super::{Actor, ReconfigureOutcome, actor_names};
-use crate::bus::{BusReceiver, BusSender};
-use crate::sim;
+use crate::bus::{BusReceiver, BusSender, LocalEvent};
 use crate::state::SystemState;
 use crate::state::local_clients::LocalClients;
-use flighthook::{
-    ActorStatus, Club, FlighthookEvent, FlighthookMessage, Handedness, RawDir, RawPayload,
-    RawRecord, Severity, ShotKey, ShotRaw,
+use flighthook::{ActorStatus, Club, Handedness, RawDir, RawRecord, Severity, ShotKey, ShotRaw};
+use flightrelay::types::{blockers, roles};
+use flightrelay::{
+    BusActor, DEFAULT_HEARTBEAT, DeviceInfo, ShotClub, ShotFinished, ShotFlight, ShotImpact,
+    ShotLaunch, ShotTrigger,
 };
 
 /// Cap on buffered bytes from a single peer before the connection is dropped.
@@ -118,10 +119,7 @@ fn refuse_own_client(
     clients.refuse(peer, &refusal_error(&server_name));
     tracing::warn!("openconnect server: refused {peer}, from {client} ({client_name})");
     if refusals.record(&client, Instant::now()) {
-        sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-            severity: Severity::Error,
-            message: refusal_alert(&client_name, peer),
-        }));
+        sender.alert(Severity::Error, refusal_alert(&client_name, peer));
     }
     true
 }
@@ -196,11 +194,21 @@ impl Actor for OpenConnectServerActor {
 /// Listener loop. Rebinds with linear backoff if the bind fails (typically
 /// because GSPro or another instance already holds the port — see the module
 /// docs for moving GSPConnect to 922).
-fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: BusReceiver) {
+fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, receiver: BusReceiver) {
+    listen(state, bind, &sender, receiver);
+    // Stopped: the server's input is gone.
+    sender.frp(flightrelay::Removal::of(flightrelay::StateKind::BusActor));
+}
+
+/// [`run`] until the actor is stopped.
+fn listen(state: &SystemState, bind: SocketAddr, sender: &BusSender, mut receiver: BusReceiver) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(15);
     let clients = Arc::clone(&state.local_clients);
     let mut refusals = Refusals::default();
+    // The monitor the server's `bus.actor` last described, for `bus.sync`.
+    let mut last: Option<MonitorState> = None;
+    sender.frp(server_actor(state, sender.actor_id(), None));
 
     loop {
         if receiver.is_shutdown() {
@@ -208,10 +216,10 @@ fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: B
             return;
         }
 
-        sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+        sender.local(LocalEvent::CardStatus {
             status: ActorStatus::Starting,
             telemetry: HashMap::from([("bind".into(), bind.to_string())]),
-        }));
+        });
 
         let listener = match TcpListener::bind(bind) {
             Ok(l) => l,
@@ -219,10 +227,10 @@ fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: B
                 tracing::warn!(
                     "openconnect server: bind {bind} failed: {e}, retrying in {backoff:?}"
                 );
-                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    severity: Severity::Error,
-                    message: format!("Open Connect server could not bind {bind}: {e}"),
-                }));
+                sender.alert(
+                    Severity::Error,
+                    format!("Open Connect server could not bind {bind}: {e}"),
+                );
                 let deadline = Instant::now() + backoff;
                 while let Some(left) = deadline.checked_duration_since(Instant::now()) {
                     if receiver.is_shutdown() {
@@ -243,7 +251,7 @@ fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: B
         // The address actually bound (port 0 picks one).
         let bound = listener.local_addr().unwrap_or(bind);
         tracing::info!("openconnect server: listening on {bound}");
-        sender.send(listening_status(bound));
+        sender.local(listening_status(bound));
 
         // Accept one monitor at a time. Open Connect is a single-peer protocol;
         // a second monitor should be a second actor on its own port.
@@ -252,18 +260,32 @@ fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: B
                 tracing::info!("openconnect server: shutting down");
                 return;
             }
+            drain_answering_sync(&mut receiver, sender, || {
+                server_actor(state, sender.actor_id(), last.as_ref())
+            });
             match listener.accept() {
                 Ok((stream, peer)) => {
-                    if refuse_own_client(state, &clients, peer, &mut refusals, &sender) {
+                    if refuse_own_client(state, &clients, peer, &mut refusals, sender) {
                         close(&stream);
                         continue;
                     }
                     tracing::info!("openconnect server: {peer} connected");
-                    serve(state, stream, peer, &mut refusals, &sender, &mut receiver);
+                    serve(
+                        state,
+                        stream,
+                        peer,
+                        &mut refusals,
+                        sender,
+                        &mut receiver,
+                        &mut last,
+                    );
                     if receiver.is_shutdown() {
                         return;
                     }
-                    sender.send(listening_status(bound));
+                    // No monitor: the input is not ready.
+                    last = None;
+                    sender.frp(server_actor(state, sender.actor_id(), None));
+                    sender.local(listening_status(bound));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(IDLE_POLL);
@@ -277,24 +299,77 @@ fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, mut receiver: B
     }
 }
 
+/// Take what is on the bus, answering each `bus.sync` with the server's
+/// `bus.actor` as it was last published (`current`).
+fn drain_answering_sync(
+    receiver: &mut BusReceiver,
+    sender: &BusSender,
+    current: impl Fn() -> BusActor,
+) {
+    while let Ok(Some(msg)) = receiver.poll() {
+        if msg
+            .as_frp()
+            .is_some_and(|m| matches!(m.body, flightrelay::FrpBody::BusSync(_)))
+        {
+            sender.frp(current());
+        }
+    }
+}
+
 /// The status of a server listening on `bound` with no monitor connected.
 /// The empty `peer` removes the last monitor's address from the telemetry.
-fn listening_status(bound: SocketAddr) -> FlighthookMessage {
-    FlighthookMessage::new(FlighthookEvent::ActorStatus {
+fn listening_status(bound: SocketAddr) -> LocalEvent {
+    LocalEvent::CardStatus {
         status: ActorStatus::Disconnected,
         telemetry: HashMap::from([
             ("bind".into(), bound.to_string()),
             ("peer".into(), String::new()),
         ]),
-    })
+    }
+}
+
+/// What the server's `bus.actor` says of the connected monitor: its device
+/// id (as the model) and the readiness and ball detection its last message
+/// carried.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MonitorState {
+    model: Option<String>,
+    ready: Option<bool>,
+    ball_detected: Option<bool>,
+}
+
+/// The server's `bus.actor`: a measured launch monitor named as its card,
+/// `not_armed` until a connected monitor says it is ready.
+fn server_actor(state: &SystemState, card: &str, monitor: Option<&MonitorState>) -> BusActor {
+    let name = actor_names(&state.system.snapshot())
+        .remove(card)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "Open Connect".into());
+    let mut actor = BusActor::new(name, DEFAULT_HEARTBEAT.as_secs_f64())
+        .with_role(roles::LAUNCH_MONITOR)
+        .with_device(DeviceInfo {
+            model: monitor.and_then(|m| m.model.clone()),
+            source: Some(crate::actors::provenance::ShotSource::OpenConnectServer.provenance()),
+            ..DeviceInfo::default()
+        });
+    if monitor.and_then(|m| m.ready) != Some(true) {
+        actor.blockers = vec![blockers::NOT_ARMED.into()];
+    }
+    if let Some(ball) = monitor.and_then(|m| m.ball_detected) {
+        actor.telemetry = Some(std::collections::BTreeMap::from([(
+            "ball_detected".into(),
+            ball.to_string(),
+        )]));
+    }
+    actor
 }
 
 /// Per-connection state that persists across messages from one monitor.
 struct Peer {
     /// Device identity announced via `DeviceID`, emitted once.
     announced: bool,
-    /// Last readiness we published, so telemetry is emitted only on change.
-    ready: Option<bool>,
+    /// What the server's `bus.actor` last said of the monitor.
+    monitor: MonitorState,
     /// The hand and club of the last player information (201) sent to this
     /// monitor; `None` for a field not sent yet.
     player_sent: (Option<Handedness>, Option<Club>),
@@ -323,6 +398,7 @@ fn serve(
     refusals: &mut Refusals,
     sender: &BusSender,
     receiver: &mut BusReceiver,
+    last: &mut Option<MonitorState>,
 ) {
     let name = sender.actor_id();
     let clients = &state.local_clients;
@@ -344,7 +420,7 @@ fn serve(
     let mut announced = false;
     let mut peer = Peer {
         announced: false,
-        ready: None,
+        monitor: MonitorState::default(),
         player_sent: (None, None),
         replied_at: None,
     };
@@ -356,8 +432,13 @@ fn serve(
             return;
         }
         // Drain the bus so this actor's queue cannot grow unbounded. An
-        // Open Connect monitor is push-only: there is nothing to act on.
-        while let Ok(Some(_)) = receiver.poll() {}
+        // Open Connect monitor is push-only: only `bus.sync` is answered.
+        if peer.announced {
+            *last = Some(peer.monitor.clone());
+        }
+        drain_answering_sync(receiver, sender, || {
+            server_actor(state, name, last.as_ref())
+        });
 
         let read = stream.read(&mut chunk);
         if refuse_own_client(state, clients, peer_addr, refusals, sender) {
@@ -366,10 +447,10 @@ fn serve(
         }
         if !announced {
             announced = true;
-            sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+            sender.local(LocalEvent::CardStatus {
                 status: ActorStatus::Connected,
                 telemetry: HashMap::from([("peer".into(), peer_addr.to_string())]),
-            }));
+            });
         }
         match read {
             Ok(0) => {
@@ -382,11 +463,10 @@ fn serve(
                     tracing::warn!(
                         "openconnect server: {peer_addr} exceeded {MAX_BUFFER} buffered bytes, dropping"
                     );
-                    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                        severity: Severity::Warn,
-                        message: "Open Connect peer sent unparsable data, dropping connection"
-                            .into(),
-                    }));
+                    sender.alert(
+                        Severity::Warn,
+                        "Open Connect peer sent unparsable data, dropping connection",
+                    );
                     return;
                 }
                 if !drain(state, &mut buf, &mut stream, &mut peer, sender, name) {
@@ -398,10 +478,7 @@ fn serve(
                     || e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
                 tracing::warn!("openconnect server: {peer_addr} read error: {e}");
-                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    severity: Severity::Warn,
-                    message: format!("Open Connect read error: {e}"),
-                }));
+                sender.alert(Severity::Warn, format!("Open Connect read error: {e}"));
                 return;
             }
         }
@@ -437,8 +514,8 @@ fn send_player_info(
     {
         return true;
     }
-    let game = state.game.snapshot();
-    let now = (game.handed, game.club_info.map(|c| c.club));
+    let turn = state.session.turn();
+    let now = (turn.handedness, turn.club);
     if now == peer.player_sent || now.1.is_none() {
         return true;
     }
@@ -495,10 +572,7 @@ fn drain(
             Err(e) if e.is_eof() => return true, // partial object, wait for more
             Err(e) => {
                 tracing::warn!("openconnect server: malformed message: {e}");
-                sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                    severity: Severity::Warn,
-                    message: format!("Open Connect parse error: {e}"),
-                }));
+                sender.alert(Severity::Warn, format!("Open Connect parse error: {e}"));
                 buf.clear();
                 return true;
             }
@@ -518,49 +592,19 @@ fn handle(
     sender: &BusSender,
     name: &str,
 ) -> bool {
-    // Hex-first policy: for a JSON protocol the raw text *is* the canonical
-    // wire form, so it rides along on every event derived from it.
-    let payload = RawPayload::Text(raw.clone());
-    let device = msg.device_id.clone();
-
     tracing::info!(target: "audit", "{name} received {raw} | {msg:?}");
 
-    if !peer.announced {
-        peer.announced = true;
-        sender.send(
-            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                manufacturer: None,
-                model: Some(msg.device_id.clone()),
-                firmware: None,
-                source: None,
-                telemetry: None,
-            })
-            .device(device.as_str()),
-        );
-    }
-
-    // Readiness rides on every message, heartbeat or not.
-    let ready = msg.shot_data_options.launch_monitor_is_ready;
-    if peer.ready != Some(ready) {
-        peer.ready = Some(ready);
-        sender.send(
-            FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                manufacturer: None,
-                model: None,
-                firmware: None,
-                source: None,
-                telemetry: Some(HashMap::from([
-                    ("ready".into(), ready.to_string()),
-                    (
-                        "ball_detected".into(),
-                        msg.shot_data_options
-                            .launch_monitor_ball_detected
-                            .to_string(),
-                    ),
-                ])),
-            })
-            .device(device.as_str()),
-        );
+    // The monitor's device id, readiness and ball detection ride on every
+    // message, heartbeat or not; the server's `bus.actor` follows them.
+    peer.announced = true;
+    let monitor = MonitorState {
+        model: Some(msg.device_id.clone()),
+        ready: Some(msg.shot_data_options.launch_monitor_is_ready),
+        ball_detected: Some(msg.shot_data_options.launch_monitor_ball_detected),
+    };
+    if peer.monitor != monitor {
+        peer.monitor = monitor;
+        sender.frp(server_actor(state, sender.actor_id(), Some(&peer.monitor)));
     }
 
     let is_shot = is_shot(&msg.shot_data_options);
@@ -579,13 +623,7 @@ fn handle(
     };
 
     if is_shot {
-        emit_shot(
-            state,
-            &msg,
-            &payload,
-            shot_raw(&raw, reply_text.as_deref()),
-            sender,
-        );
+        emit_shot(&msg, shot_raw(&raw, reply_text.as_deref()), sender);
     }
 
     if let Some(text) = reply_text {
@@ -630,17 +668,14 @@ fn is_shot(options: &api::ShotDataOptions) -> bool {
     !options.is_heart_beat && options.contains_ball_data
 }
 
-/// Publish the standard shot lifecycle for one Open Connect shot message
-/// ([`is_shot`]): the ball data, and the club data and face impact when the
-/// message says it carries club data, each value as the monitor sent it.
-fn emit_shot(
-    state: &SystemState,
-    msg: &api::GsProMessage,
-    payload: &RawPayload,
-    raw: ShotRaw,
-    sender: &BusSender,
-) {
-    let device = msg.device_id.as_str();
+/// Publish the shot messages for one Open Connect shot message
+/// ([`is_shot`]): the ball data as the launch (its spin pair completed from
+/// the other one) and the monitor's carry as its own flight result
+/// (`basis: modeled`, since whether it was tracked is not known), and the
+/// club data and face impact when the message says it carries club data,
+/// each value as the monitor sent it; then the shot's request and reply as
+/// its raw frames (local) and `shot.finished`.
+fn emit_shot(msg: &api::GsProMessage, raw: ShotRaw, sender: &BusSender) {
     let key = ShotKey {
         shot_id: uuid::Uuid::new_v4().to_string(),
         shot_number: msg.shot_number,
@@ -657,57 +692,66 @@ fn emit_shot(
         ball.sidespin_rpm.unwrap_or(0),
     );
 
-    sender.send(
-        FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone()))
-            .raw(payload.clone())
-            .device(device),
-    );
-    for event in sim::launch_events(state, key.clone(), ball, mapper::map_flight(msg)) {
-        sender.send(
-            FlighthookMessage::new(event)
-                .raw(payload.clone())
-                .device(device),
-        );
+    sender.frp(ShotTrigger::new(key.clone()));
+    sender.frp(ShotLaunch {
+        key: key.clone(),
+        launch: ball,
+    });
+    if let Some(flight) = mapper::map_flight(msg) {
+        sender.frp(ShotFlight {
+            key: key.clone(),
+            flight,
+        });
     }
-
     if msg.shot_data_options.contains_club_data {
-        sender.send(
-            FlighthookMessage::new(FlighthookEvent::ClubPath {
-                key: key.clone(),
-                club: Box::new(mapper::map_club(msg)),
-            })
-            .raw(payload.clone())
-            .device(device),
-        );
+        sender.frp(ShotClub {
+            key: key.clone(),
+            club: mapper::map_club(msg),
+        });
         if let Some(impact) = mapper::map_face_impact(msg) {
-            sender.send(
-                FlighthookMessage::new(FlighthookEvent::FaceImpact {
-                    key: key.clone(),
-                    impact: Box::new(impact),
-                })
-                .raw(payload.clone())
-                .device(device),
-            );
+            sender.frp(ShotImpact {
+                key: key.clone(),
+                impact,
+            });
         }
     }
-
-    sender.send(
-        FlighthookMessage::new(FlighthookEvent::ShotFinished {
-            key,
-            raw: Some(Box::new(raw)),
-        })
-        .raw(payload.clone())
-        .device(device),
-    );
+    sender.local(LocalEvent::ShotCapture {
+        key: key.clone(),
+        raw: Box::new(raw),
+        // Open Connect's device id is the monitor's product label.
+        scrub: Vec::new(),
+    });
+    sender.frp(ShotFinished { key });
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
 
+    use flightrelay::{FrpBody, FrpMessage, GolferSelect, ShotAggregator, ShotEvent};
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::bus::BusMsg;
+
+    /// The server's sender in the unit tests: its FRP actor id is its card
+    /// key.
+    fn server_sender(tx: broadcast::Sender<BusMsg>) -> BusSender {
+        BusSender::new(
+            "openconnect_server.0".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_frp_id(Some("openconnect_server.0".into()))
+    }
+
+    /// The raw frames of the shot's `shot_capture` among `seen`.
+    fn captured(seen: &[BusMsg]) -> Option<ShotRaw> {
+        seen.iter().rev().find_map(|m| match m.as_local() {
+            Some((_, LocalEvent::ShotCapture { raw, .. })) => Some((**raw).clone()),
+            _ => None,
+        })
+    }
 
     #[test]
     fn shot_finished_carries_request_and_reply() {
@@ -715,32 +759,21 @@ mod tests {
             "flighthook-oc-test-{}",
             crate::state::config::generate_id()
         ));
-        let (state, _writer) = SystemState::new(dir.join("config.toml"));
         let (tx, mut rx) = broadcast::channel(16);
-        let sender = BusSender::new(
-            "openconnect_server.0".into(),
-            tx,
-            Arc::new(AtomicBool::new(false)),
-        );
+        let sender = server_sender(tx);
 
         let request = r#"{"DeviceID":"TestLM","Units":"Yards","ShotNumber":4,"APIversion":"1","BallData":{"Speed":100.0},"ShotDataOptions":{"ContainsBallData":true}}"#;
         let msg: api::GsProMessage = serde_json::from_str(request).expect("parses");
         let reply = r#"{"Code":200,"Message":"Shot received"}"#;
-        emit_shot(
-            &state,
-            &msg,
-            &RawPayload::Text(request.into()),
-            shot_raw(request, Some(reply)),
-            &sender,
-        );
+        emit_shot(&msg, shot_raw(request, Some(reply)), &sender);
 
-        let mut finished = None;
-        while let Ok(m) = rx.try_recv() {
-            if let FlighthookEvent::ShotFinished { raw, .. } = m.event {
-                finished = raw;
-            }
-        }
-        let raw = finished.expect("shot_finished with raw");
+        let seen: Vec<BusMsg> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        // The raw frames go out just before `shot.finished`.
+        assert!(matches!(
+            seen.last().and_then(BusMsg::as_frp).map(|m| &m.body),
+            Some(FrpBody::ShotFinished(_))
+        ));
+        let raw = captured(&seen).expect("shot_capture with raw");
         assert_eq!(raw.transport, "openconnect-json");
         assert_eq!(raw.frames.len(), 2);
         assert_eq!(raw.frames[0].dir, RawDir::Rx);
@@ -755,55 +788,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The shot `emit_shot` puts on the bus for `request` with the game
-    /// state's player `handed`.
-    fn ingested(request: &str, handed: flighthook::Handedness) -> flighthook::ShotData {
-        let dir = std::env::temp_dir().join(format!(
-            "flighthook-oc-test-{}",
-            crate::state::config::generate_id()
-        ));
-        let (state, writer) = SystemState::new(dir.join("config.toml"));
-        writer.set_handed(handed);
+    /// The shot `emit_shot` puts on the bus for `request`, composed by the
+    /// SDK's aggregator. The player's hand plays no part in the ingest:
+    /// `_handed` names the case.
+    fn ingested(
+        request: &str,
+        _handed: flighthook::Handedness,
+    ) -> crate::actors::simout::OutputShot {
         let (tx, mut rx) = broadcast::channel(16);
-        let sender = BusSender::new(
-            "openconnect_server.0".into(),
-            tx,
-            Arc::new(AtomicBool::new(false)),
-        );
+        let sender = server_sender(tx);
         let msg: api::GsProMessage = serde_json::from_str(request).expect("parses");
-        emit_shot(
-            &state,
-            &msg,
-            &RawPayload::Text(request.into()),
-            shot_raw(request, None),
-            &sender,
-        );
-        let mut acc = None;
+        emit_shot(&msg, shot_raw(request, None), &sender);
+        let mut shots = ShotAggregator::new();
+        let mut done = None;
         while let Ok(m) = rx.try_recv() {
-            match m.event {
-                FlighthookEvent::ShotTrigger { key, .. } => {
-                    acc = Some(flighthook::ShotAccumulator::new(m.actor, key));
-                }
-                FlighthookEvent::Launch {
-                    launch, derived, ..
-                } => {
-                    let acc = acc.as_mut().expect("trigger first");
-                    acc.set_launch(*launch, derived.map(|d| *d));
-                }
-                FlighthookEvent::FlightResult { flight, .. } => {
-                    acc.as_mut().expect("trigger first").set_flight(*flight);
-                }
-                FlighthookEvent::ClubPath { club, .. } => {
-                    acc.as_mut().expect("trigger first").set_club(*club);
-                }
-                FlighthookEvent::FaceImpact { impact, .. } => {
-                    acc.as_mut().expect("trigger first").set_impact(*impact);
-                }
-                _ => {}
+            if let Some(frp) = m.as_frp()
+                && let Some(ShotEvent::Finished(shot)) = shots.feed(frp)
+            {
+                done = Some(shot);
             }
         }
-        let _ = std::fs::remove_dir_all(dir);
-        acc.expect("a shot").finish().expect("shot data")
+        let shot = done.expect("a finished shot");
+        crate::actors::simout::OutputShot {
+            actor: shot.from.clone(),
+            shot_number: shot.key.shot_number,
+            shot_id: Some(shot.key.shot_id.clone()),
+            launch: shot.launch.clone(),
+            flight: shot
+                .flights
+                .iter()
+                .find(|f| f.from == shot.from)
+                .map(|f| f.flight.clone()),
+            club: shot.club.clone(),
+            impact: shot.impact.clone(),
+            ..crate::actors::simout::OutputShot::default()
+        }
     }
 
     /// A shot with every lateral field set, as components and as a total
@@ -838,15 +857,13 @@ mod tests {
     }
 
     /// The spin pair the monitor did not send is completed from the one it
-    /// did: the same reading in the other pair, so nothing is marked
-    /// computed.
+    /// did: the same reading in the other pair, carried in the launch.
     #[test]
     fn the_completed_spin_pair_is_measured() {
         for request in LATERAL_SHOTS {
             let shot = ingested(request, flighthook::Handedness::Right);
             let ball = shot.launch.as_ref().expect("launch");
             assert!(ball.backspin_rpm.is_some() && ball.total_spin_rpm.is_some());
-            assert_eq!(shot.unmeasured_fields().count(), 0, "{request}");
         }
     }
 
@@ -955,8 +972,9 @@ mod tests {
                 c.openconnect_server.insert(
                     "0".into(),
                     flighthook::OpenConnectServerSection {
-                        name: "Uneekor".into(),
+                        name: "Range Bridge".into(),
                         enabled: true,
+                        actor_id: None,
                         bind: bind.map(str::to_string),
                         impact_lead_s: None,
                     },
@@ -1006,16 +1024,16 @@ mod tests {
     /// A process's worth of actors on one bus, sharing one `SystemState`.
     struct Rig {
         state: Arc<SystemState>,
-        writer: crate::state::GameStateWriter,
-        tx: broadcast::Sender<FlighthookMessage>,
-        events: broadcast::Receiver<FlighthookMessage>,
+        writer: crate::state::SessionWriter,
+        tx: broadcast::Sender<BusMsg>,
+        events: broadcast::Receiver<BusMsg>,
         flags: Vec<Arc<AtomicBool>>,
         dir: std::path::PathBuf,
     }
 
     impl Rig {
         /// A rig whose config names Open Connect client 0 `client_name` and
-        /// Open Connect server 0 "Bay Uneekor".
+        /// Open Connect server 0 "Bay Bridge".
         fn new(client_name: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "flighthook-oc-loop-{}",
@@ -1027,14 +1045,16 @@ mod tests {
                     "0".into(),
                     flighthook::OpenConnectClientSection {
                         name: client_name.into(),
+                        actor_id: Some("openconnect_client.0".into()),
                         ..Default::default()
                     },
                 );
                 c.openconnect_server.insert(
                     "0".into(),
                     flighthook::OpenConnectServerSection {
-                        name: "Bay Uneekor".into(),
+                        name: "Bay Bridge".into(),
                         enabled: true,
+                        actor_id: Some("openconnect_server.0".into()),
                         bind: None,
                         impact_lead_s: None,
                     },
@@ -1054,7 +1074,29 @@ mod tests {
         fn sender(&mut self, id: &str) -> BusSender {
             let flag = Arc::new(AtomicBool::new(false));
             self.flags.push(Arc::clone(&flag));
-            BusSender::new(id.into(), self.tx.clone(), flag)
+            BusSender::new(id.into(), self.tx.clone(), flag).with_frp_id(Some(id.into()))
+        }
+
+        /// The session's turn takes `select`, as the system actor applies
+        /// one.
+        fn apply(&self, select: GolferSelect) {
+            let _ = self.writer.apply(&select);
+        }
+
+        /// The session's hand becomes `hand`.
+        fn set_hand(&self, hand: Handedness) {
+            self.apply(GolferSelect {
+                handedness: Some(hand),
+                ..GolferSelect::new("test")
+            });
+        }
+
+        /// The session's club becomes `club`.
+        fn set_club(&self, club: Club) {
+            self.apply(GolferSelect {
+                club: Some(Some(club)),
+                ..GolferSelect::new("test")
+            });
         }
 
         /// Start `openconnect_server.0` on `ip`, on a port the system
@@ -1087,11 +1129,7 @@ mod tests {
         }
 
         /// Every message until `done` holds for one or [`WAIT`] runs out.
-        fn until(
-            &mut self,
-            what: &str,
-            done: impl Fn(&FlighthookMessage) -> bool,
-        ) -> Vec<FlighthookMessage> {
+        fn until(&mut self, what: &str, done: impl Fn(&BusMsg) -> bool) -> Vec<BusMsg> {
             let deadline = Instant::now() + WAIT;
             let mut seen = Vec::new();
             loop {
@@ -1122,50 +1160,74 @@ mod tests {
         }
     }
 
+    /// The card status `card` reports on `msg`, if it is one.
+    fn card_status<'a>(
+        msg: &'a BusMsg,
+        card: &str,
+    ) -> Option<(&'a ActorStatus, &'a HashMap<String, String>)> {
+        match msg.as_local() {
+            Some((c, LocalEvent::CardStatus { status, telemetry })) if c == card => {
+                Some((status, telemetry))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `msg` is a Connected status of `card`.
+    fn connected(msg: &BusMsg, card: &str) -> bool {
+        matches!(card_status(msg, card), Some((ActorStatus::Connected, _)))
+    }
+
     /// The address the server reports listening on, if `msg` says so.
-    fn listening(msg: &FlighthookMessage) -> Option<SocketAddr> {
-        match &msg.event {
-            FlighthookEvent::ActorStatus {
-                status: ActorStatus::Disconnected,
-                telemetry,
-            } if msg.actor == "openconnect_server.0" => {
+    fn listening(msg: &BusMsg) -> Option<SocketAddr> {
+        match card_status(msg, "openconnect_server.0") {
+            Some((ActorStatus::Disconnected, telemetry)) => {
                 telemetry.get("bind").and_then(|b| b.parse().ok())
             }
             _ => None,
         }
     }
 
-    fn alerts(seen: &[FlighthookMessage], actor: &str) -> Vec<String> {
+    /// The alerts `actor` raised: its `bus.alert`s (its actor id is its
+    /// card key here) and its local alerts.
+    fn alerts(seen: &[BusMsg], actor: &str) -> Vec<String> {
         seen.iter()
-            .filter(|m| m.actor == actor)
-            .filter_map(|m| match &m.event {
-                FlighthookEvent::Alert { message, .. } => Some(message.clone()),
+            .filter_map(|m| match m {
+                BusMsg::Frp {
+                    msg:
+                        FrpMessage {
+                            from,
+                            body: FrpBody::BusAlert(alert),
+                        },
+                    ..
+                } if from == actor => Some(alert.message.clone()),
+                BusMsg::Local {
+                    card,
+                    event: LocalEvent::Alert { message, .. },
+                } if card == actor => Some(message.clone()),
                 _ => None,
             })
             .collect()
     }
 
     /// The client's `error` telemetry on `msg`, if it carries one.
-    fn client_error(msg: &FlighthookMessage) -> Option<&str> {
-        match &msg.event {
-            FlighthookEvent::ActorStatus { telemetry, .. }
-                if msg.actor == "openconnect_client.0" =>
-            {
-                telemetry
-                    .get("error")
-                    .map(String::as_str)
-                    .filter(|e| !e.is_empty())
-            }
-            _ => None,
-        }
+    fn client_error(msg: &BusMsg) -> Option<&str> {
+        card_status(msg, "openconnect_client.0").and_then(|(_, telemetry)| {
+            telemetry
+                .get("error")
+                .map(String::as_str)
+                .filter(|e| !e.is_empty())
+        })
     }
 
-    fn server_shot(msg: &FlighthookMessage) -> bool {
-        msg.actor == "openconnect_server.0"
-            && matches!(msg.event, FlighthookEvent::ShotTrigger { .. })
+    fn server_shot(msg: &BusMsg) -> bool {
+        matches!(
+            msg.as_frp(),
+            Some(FrpMessage { from, body: FrpBody::ShotTrigger(_) }) if from == "openconnect_server.0"
+        )
     }
 
-    const SHOT: &str = r#"{"DeviceID":"Uneekor","Units":"Yards","ShotNumber":1,"APIversion":"1","BallData":{"Speed":100.0,"VLA":14.0,"HLA":1.0,"TotalSpin":3000.0,"SpinAxis":2.0},"ShotDataOptions":{"ContainsBallData":true}}"#;
+    const SHOT: &str = r#"{"DeviceID":"Range Bridge","Units":"Yards","ShotNumber":1,"APIversion":"1","BallData":{"Speed":100.0,"VLA":14.0,"HLA":1.0,"TotalSpin":3000.0,"SpinAxis":2.0},"ShotDataOptions":{"ContainsBallData":true}}"#;
 
     #[test]
     fn a_client_pointed_at_its_own_server_is_refused_and_alerted_once() {
@@ -1184,7 +1246,7 @@ mod tests {
             .to_string();
         assert_eq!(
             error,
-            "Refused by this flighthook's own Open Connect Server \"Bay Uneekor\": this \
+            "Refused by this flighthook's own Open Connect Server \"Bay Bridge\": this \
              address points at it, which would loop shots back. Use the simulator's \
              port instead."
         );
@@ -1195,25 +1257,19 @@ mod tests {
             shot_id: "s1".into(),
             shot_number: 1,
         };
-        monitor.send(FlighthookMessage::new(FlighthookEvent::shot_trigger(
-            key.clone(),
-        )));
-        monitor.send(FlighthookMessage::new(FlighthookEvent::Launch {
+        monitor.frp(ShotTrigger::new(key.clone()));
+        monitor.frp(ShotLaunch {
             key: key.clone(),
-            launch: Box::new(flighthook::Launch {
+            launch: flighthook::Launch {
                 launch_speed: Some(flighthook::Velocity::MilesPerHour(100.0)),
                 launch_elevation: Some(14.0),
                 launch_azimuth: Some(1.0),
                 backspin_rpm: Some(3000),
                 sidespin_rpm: Some(100),
                 ..Default::default()
-            }),
-            derived: None,
-        }));
-        monitor.send(FlighthookMessage::new(FlighthookEvent::ShotFinished {
-            key,
-            raw: None,
-        }));
+            },
+        });
+        monitor.frp(ShotFinished { key });
 
         // The retries are refused too, quietly: one alert for the burst.
         let mut refusals = 1;
@@ -1245,25 +1301,11 @@ mod tests {
         assert!(
             !seen[first..]
                 .iter()
-                .any(|m| m.actor == "openconnect_client.0"
-                    && matches!(
-                        m.event,
-                        FlighthookEvent::ActorStatus {
-                            status: ActorStatus::Connected,
-                            ..
-                        }
-                    )),
+                .any(|m| connected(m, "openconnect_client.0")),
             "the client reported Connected after a refusal"
         );
         assert!(
-            !seen.iter().any(|m| m.actor == "openconnect_server.0"
-                && matches!(
-                    m.event,
-                    FlighthookEvent::ActorStatus {
-                        status: ActorStatus::Connected,
-                        ..
-                    }
-                )),
+            !seen.iter().any(|m| connected(m, "openconnect_server.0")),
             "the server never serves its own client"
         );
     }
@@ -1272,41 +1314,64 @@ mod tests {
     fn a_foreign_peer_is_served() {
         let mut rig = Rig::new("GSPro");
         let bind = rig.server([127, 0, 0, 1]);
-        let mut uneekor = TcpStream::connect(bind).expect("monitor connects");
-        uneekor.write_all(SHOT.as_bytes()).expect("send shot");
+        let mut monitor = TcpStream::connect(bind).expect("monitor connects");
+        monitor.write_all(SHOT.as_bytes()).expect("send shot");
         let seen = rig.until("the shot", server_shot);
         assert!(alerts(&seen, "openconnect_server.0").is_empty());
     }
 
     /// The `peer` telemetry the server reports on `msg`: `Some("")` when it
     /// removes the key.
-    fn server_peer(msg: &FlighthookMessage) -> Option<&str> {
-        match &msg.event {
-            FlighthookEvent::ActorStatus { telemetry, .. }
-                if msg.actor == "openconnect_server.0" =>
-            {
-                telemetry.get("peer").map(String::as_str)
-            }
-            _ => None,
-        }
+    fn server_peer(msg: &BusMsg) -> Option<&str> {
+        card_status(msg, "openconnect_server.0")
+            .and_then(|(_, telemetry)| telemetry.get("peer").map(String::as_str))
     }
 
     #[test]
     fn the_peer_is_cleared_when_the_monitor_disconnects() {
         let mut rig = Rig::new("GSPro");
         let bind = rig.server([127, 0, 0, 1]);
-        let mut uneekor = TcpStream::connect(bind).expect("monitor connects");
-        let local = uneekor.local_addr().expect("monitor address").to_string();
-        uneekor.write_all(SHOT.as_bytes()).expect("send shot");
+        let mut monitor = TcpStream::connect(bind).expect("monitor connects");
+        let local = monitor.local_addr().expect("monitor address").to_string();
+        monitor.write_all(SHOT.as_bytes()).expect("send shot");
         let seen = rig.until("the shot", server_shot);
         assert!(
             seen.iter().any(|m| server_peer(m) == Some(local.as_str())),
             "the card shows the peer"
         );
 
-        drop(uneekor);
+        drop(monitor);
         let seen = rig.until("the server listening again", |m| listening(m).is_some());
         assert_eq!(seen.last().and_then(server_peer), Some(""), "{seen:?}");
+    }
+
+    /// The server's `bus.actor`, if `msg` is one.
+    fn server_bus_actor(msg: &BusMsg) -> Option<&BusActor> {
+        match msg.as_frp() {
+            Some(m) if m.from == "openconnect_server.0" => match &m.body {
+                flightrelay::FrpBody::BusActor(a) => Some(a),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A monitor that said it is ready and then disconnects leaves the
+    /// server's input not ready.
+    #[test]
+    fn the_input_is_not_ready_once_its_monitor_disconnects() {
+        const READY: &str = r#"{"DeviceID":"Range Bridge","ShotNumber":0,"APIversion":"1","ShotDataOptions":{"IsHeartBeat":true,"LaunchMonitorIsReady":true}}"#;
+        let mut rig = Rig::new("GSPro");
+        let bind = rig.server([127, 0, 0, 1]);
+        let mut monitor = TcpStream::connect(bind).expect("monitor connects");
+        monitor.write_all(READY.as_bytes()).expect("send ready");
+        rig.until("the input ready", |m| {
+            server_bus_actor(m).is_some_and(BusActor::is_clear)
+        });
+        drop(monitor);
+        rig.until("the input not ready", |m| {
+            server_bus_actor(m).is_some_and(|a| !a.is_clear())
+        });
     }
 
     #[test]
@@ -1321,18 +1386,11 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(50)))
             .expect("timeout");
         rig.until("the client connected", |m| {
-            m.actor == "openconnect_client.0"
-                && matches!(
-                    m.event,
-                    FlighthookEvent::ActorStatus {
-                        status: ActorStatus::Connected,
-                        ..
-                    }
-                )
+            connected(m, "openconnect_client.0")
         });
 
-        let mut uneekor = TcpStream::connect(bind).expect("monitor connects");
-        uneekor.write_all(SHOT.as_bytes()).expect("send shot");
+        let mut monitor = TcpStream::connect(bind).expect("monitor connects");
+        monitor.write_all(SHOT.as_bytes()).expect("send shot");
         let seen = rig.until("the shot on the bus", server_shot);
 
         // GSPro gets the shot.
@@ -1361,7 +1419,7 @@ mod tests {
 
     // -- Player information sent to the monitor ---------------------------------
 
-    const HEARTBEAT: &str = r#"{"DeviceID":"Uneekor","ShotNumber":0,"APIversion":"1","ShotDataOptions":{"IsHeartBeat":true}}"#;
+    const HEARTBEAT: &str = r#"{"DeviceID":"Range Bridge","ShotNumber":0,"APIversion":"1","ShotDataOptions":{"IsHeartBeat":true}}"#;
 
     /// The JSON objects a server writes to a connected monitor, one raw text each.
     struct Monitor {
@@ -1458,9 +1516,8 @@ mod tests {
     #[test]
     fn the_monitor_gets_the_hand_and_club_after_its_first_message() {
         let mut rig = Rig::new("GSPro");
-        rig.writer.set_handed(Handedness::Left);
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Iron7 });
+        rig.set_hand(Handedness::Left);
+        rig.set_club(Club::Iron7);
         let bind = rig.server([127, 0, 0, 1]);
         let mut monitor = Monitor::connect(bind);
         // Nothing before the monitor has spoken.
@@ -1478,9 +1535,8 @@ mod tests {
     #[test]
     fn a_change_of_hand_or_club_sends_one_new_201() {
         let mut rig = Rig::new("GSPro");
-        rig.writer.set_handed(Handedness::Right);
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        rig.set_hand(Handedness::Right);
+        rig.set_club(Club::Driver);
         let bind = rig.server([127, 0, 0, 1]);
         let mut monitor = Monitor::connect(bind);
         monitor.send(HEARTBEAT);
@@ -1492,15 +1548,14 @@ mod tests {
         // No change, no message, however many passes the loop makes.
         monitor.expect_quiet();
 
-        rig.writer.set_handed(Handedness::Left);
+        rig.set_hand(Handedness::Left);
         assert_eq!(
             monitor.expect("the 201 for the hand"),
             player_info(Some("LH"), Some("DR"))
         );
         monitor.expect_quiet();
 
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Putter });
+        rig.set_club(Club::Putter);
         assert_eq!(
             monitor.expect("the 201 for the club"),
             player_info(Some("LH"), Some("PT"))
@@ -1508,9 +1563,8 @@ mod tests {
         monitor.expect_quiet();
 
         // Setting what is already set is no change.
-        rig.writer.set_handed(Handedness::Left);
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Putter });
+        rig.set_hand(Handedness::Left);
+        rig.set_club(Club::Putter);
         monitor.expect_quiet();
 
         // The 200 reply to a later message is still just the 200.
@@ -1519,31 +1573,26 @@ mod tests {
         monitor.expect_quiet();
     }
 
-    /// A hand set in the UI is the game state's hand like any other: the
-    /// system actor stores the UI's `hand_info` and the monitor gets a 201
-    /// with it.
+    /// A hand set in the UI is the session's hand like any other: the
+    /// system actor applies the UI's `golfer.select` and the monitor gets a
+    /// 201 with it.
     #[test]
     fn a_hand_set_in_the_ui_sends_a_201() {
         let mut rig = Rig::new("GSPro");
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        rig.set_club(Club::Driver);
         let bind = rig.server([127, 0, 0, 1]);
         let mut monitor = Monitor::connect(bind);
         monitor.send(HEARTBEAT);
         assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
         assert_eq!(
             monitor.expect("the first 201"),
-            player_info(None, Some("DR"))
+            player_info(Some("RH"), Some("DR"))
         );
 
-        let system = rig.sender("system");
-        let from_ui = FlighthookMessage::new(FlighthookEvent::HandInfo {
-            hand_info: flighthook::HandInfo {
-                handed: Handedness::Left,
-            },
-        })
-        .actor("web");
-        crate::actors::system::handle_game_event(&from_ui.event, &rig.writer, &rig.state, &system);
+        rig.apply(GolferSelect {
+            handedness: Some(Handedness::Left),
+            ..GolferSelect::new("web-1")
+        });
         assert_eq!(
             monitor.expect("the 201 for the hand"),
             player_info(Some("LH"), Some("DR"))
@@ -1562,32 +1611,32 @@ mod tests {
 
         // GSPro always sends the club with the hand: nothing goes out until
         // the club is known, and then the hand goes with it.
-        rig.writer.set_handed(Handedness::Right);
+        rig.set_hand(Handedness::Left);
         monitor.expect_quiet();
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Wood3 });
+        rig.set_club(Club::Wood3);
         assert_eq!(
             monitor.expect("the 201 with both"),
-            player_info(Some("RH"), Some("W3"))
+            player_info(Some("LH"), Some("W3"))
         );
         monitor.expect_quiet();
     }
 
+    /// The session starts right-handed, so a club alone goes out with that
+    /// hand; a later hand follows in a new 201.
     #[test]
-    fn a_club_without_a_hand_is_sent_alone_and_the_hand_follows() {
+    fn a_club_goes_out_with_the_starting_hand_and_a_new_hand_follows() {
         let mut rig = Rig::new("GSPro");
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        rig.set_club(Club::Driver);
         let bind = rig.server([127, 0, 0, 1]);
         let mut monitor = Monitor::connect(bind);
         monitor.send(HEARTBEAT);
         assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
         assert_eq!(
             monitor.expect("the 201 with the club"),
-            player_info(None, Some("DR"))
+            player_info(Some("RH"), Some("DR"))
         );
         monitor.expect_quiet();
-        rig.writer.set_handed(Handedness::Left);
+        rig.set_hand(Handedness::Left);
         assert_eq!(
             monitor.expect("the 201 with both"),
             player_info(Some("LH"), Some("DR"))
@@ -1597,10 +1646,8 @@ mod tests {
     #[test]
     fn the_mini_driver_goes_out_as_the_driver() {
         let mut rig = Rig::new("GSPro");
-        rig.writer.set_handed(Handedness::Right);
-        rig.writer.set_club_info(flighthook::ClubInfo {
-            club: Club::MiniDriver,
-        });
+        rig.set_hand(Handedness::Right);
+        rig.set_club(Club::MiniDriver);
         let bind = rig.server([127, 0, 0, 1]);
         let mut monitor = Monitor::connect(bind);
         monitor.send(HEARTBEAT);
@@ -1611,15 +1658,14 @@ mod tests {
         );
     }
 
-    const MONITOR_SHOT: &str = r#"{"DeviceID":"Uneekor","Units":"Yards","ShotNumber":1,"APIversion":"1","BallData":{"Speed":100.0},"ShotDataOptions":{"ContainsBallData":true}}"#;
+    const MONITOR_SHOT: &str = r#"{"DeviceID":"Range Bridge","Units":"Yards","ShotNumber":1,"APIversion":"1","BallData":{"Speed":100.0},"ShotDataOptions":{"ContainsBallData":true}}"#;
     const OK_SHOT: &str = r#"{"Code":200,"Message":"Shot received"}"#;
 
     #[test]
     fn the_200_arrives_alone_in_its_own_read_before_the_201() {
         let mut rig = Rig::new("GSPro");
-        rig.writer.set_handed(Handedness::Right);
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Iron7 });
+        rig.set_hand(Handedness::Right);
+        rig.set_club(Club::Iron7);
         let bind = rig.server([127, 0, 0, 1]);
         let mut monitor = Monitor::connect(bind);
         monitor.send(HEARTBEAT);
@@ -1632,7 +1678,7 @@ mod tests {
         );
 
         // A change made later is a read of its own as well.
-        rig.writer.set_handed(Handedness::Left);
+        rig.set_hand(Handedness::Left);
         assert_eq!(
             monitor.read_once(WAIT),
             Some(player_info(Some("LH"), Some("I7")))
@@ -1642,9 +1688,8 @@ mod tests {
     #[test]
     fn a_first_message_that_is_a_shot_gets_the_200_then_the_201() {
         let mut rig = Rig::new("GSPro");
-        rig.writer.set_handed(Handedness::Right);
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        rig.set_hand(Handedness::Right);
+        rig.set_club(Club::Driver);
         let bind = rig.server([127, 0, 0, 1]);
         let mut monitor = Monitor::connect(bind);
         monitor.send(MONITOR_SHOT);
@@ -1659,9 +1704,8 @@ mod tests {
     #[test]
     fn the_201_is_never_part_of_a_shots_raw_frames() {
         let mut rig = Rig::new("GSPro");
-        rig.writer.set_handed(Handedness::Right);
-        rig.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Driver });
+        rig.set_hand(Handedness::Right);
+        rig.set_club(Club::Driver);
         let bind = rig.server([127, 0, 0, 1]);
         let mut monitor = Monitor::connect(bind);
         monitor.send(HEARTBEAT);
@@ -1673,7 +1717,7 @@ mod tests {
 
         // A shot sent right after a change of hand: its 200 and the 201 for
         // the change both reach the monitor, in either order.
-        rig.writer.set_handed(Handedness::Left);
+        rig.set_hand(Handedness::Left);
         monitor.send(MONITOR_SHOT);
         let mut got = [monitor.expect("a reply"), monitor.expect("a reply")];
         got.sort();
@@ -1682,13 +1726,9 @@ mod tests {
         assert_eq!(got, want);
 
         let seen = rig.until("the shot finished", |m| {
-            matches!(m.event, FlighthookEvent::ShotFinished { .. })
+            matches!(m.as_frp().map(|m| &m.body), Some(FrpBody::ShotFinished(_)))
         });
-        let Some(FlighthookEvent::ShotFinished { raw: Some(raw), .. }) =
-            seen.into_iter().map(|m| m.event).next_back()
-        else {
-            panic!("shot_finished with raw");
-        };
+        let raw = captured(&seen).expect("shot_capture with raw");
         assert_eq!(raw.frames.len(), 2);
         assert_eq!(raw.frames[0].dir, RawDir::Rx);
         assert_eq!(raw.frames[0].text.as_deref(), Some(MONITOR_SHOT));
@@ -1699,10 +1739,8 @@ mod tests {
     #[test]
     fn a_new_connection_is_told_again() {
         let mut rig = Rig::new("GSPro");
-        rig.writer.set_handed(Handedness::Right);
-        rig.writer.set_club_info(flighthook::ClubInfo {
-            club: Club::Hybrid4,
-        });
+        rig.set_hand(Handedness::Right);
+        rig.set_club(Club::Hybrid4);
         let bind = rig.server([127, 0, 0, 1]);
         for _ in 0..2 {
             let mut monitor = Monitor::connect(bind);
@@ -1726,28 +1764,36 @@ mod tests {
             ("openconnect_components", LATERAL_SHOTS[0]),
             ("openconnect_total_and_carry", WITH_CARRY),
         ] {
-            let dir = std::env::temp_dir().join(format!(
-                "flighthook-oc-test-{}",
-                crate::state::config::generate_id()
-            ));
-            let (state, _writer) = SystemState::new(dir.join("config.toml"));
             let (tx, mut rx) = broadcast::channel(16);
-            let sender = BusSender::new(
-                "openconnect_server.0".into(),
-                tx,
-                Arc::new(AtomicBool::new(false)),
-            );
+            let sender = server_sender(tx);
             let msg: api::GsProMessage = serde_json::from_str(request).expect("parses");
-            emit_shot(
-                &state,
-                &msg,
-                &RawPayload::Text(request.into()),
-                shot_raw(request, None),
-                &sender,
-            );
-            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-            let _ = std::fs::remove_dir_all(dir);
-            crate::test_ball::assert_outputs_pinned(case, &messages);
+            emit_shot(&msg, shot_raw(request, None), &sender);
+            let messages: Vec<BusMsg> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            crate::test_ball::assert_outputs_pinned(case, "openconnect_server.0", None, &messages);
         }
+    }
+
+    /// Strict mode, through the real path: a monitor that sends spin
+    /// components has the completed pair (total and axis) go out too.
+    #[test]
+    fn strict_mode_sends_the_completed_spin_pair() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let sender = server_sender(tx);
+        let dir = crate::actors::web::tests::TempDir(std::env::temp_dir().join(format!(
+            "flighthook-oc-strict-{}",
+            crate::state::config::generate_id()
+        )));
+        let (state, _writer) = SystemState::new(dir.0.join("config.toml"));
+        sender.frp(server_actor(&state, "openconnect_server.0", None));
+        let msg: api::GsProMessage = serde_json::from_str(LATERAL_SHOTS[0]).expect("parses");
+        emit_shot(&msg, shot_raw(LATERAL_SHOTS[0], None), &sender);
+        let messages: Vec<BusMsg> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let frames =
+            crate::test_ball::strict_frames("openconnect_server.0", &messages).expect("sent");
+        let spin = crate::actors::pureplay::codec::BallData::TOTAL_SPIN
+            | crate::actors::pureplay::codec::BallData::BACK_SPIN
+            | crate::actors::pureplay::codec::BallData::SIDE_SPIN
+            | crate::actors::pureplay::codec::BallData::SPIN_AXIS;
+        assert_eq!(frames.ball.valid & spin, spin);
     }
 }

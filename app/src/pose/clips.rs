@@ -32,16 +32,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use flighthook::{
-    BodyTrackingMode, CameraPosition, FlighthookEvent, FlighthookMessage, Handedness, PoseModel,
-    ShotKey,
-};
+use flighthook::{BodyTrackingMode, CameraPosition, Handedness, PoseModel, ShotKey};
 use stance::pose::{PoseConfig, PoseTrack, Rotation};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use super::models::{ModelState, pose_config};
 use super::swing::{SwingInput, SwingWritten, write_report};
+use crate::bus::{BusMsg, LocalEvent};
 use crate::state::SystemState;
 use crate::state::clips::ClipSlot;
 
@@ -65,6 +63,9 @@ pub struct ClipJob {
     pub position: CameraPosition,
     /// The player's hand when the shot triggered.
     pub hand: Option<Handedness>,
+    /// The turn's golfer when the shot triggered, whose height the swing
+    /// analysis reads.
+    pub golfer: Option<String>,
     /// The clip's estimated impact, ns after its first frame (its
     /// sidecar's), when it falls inside the clip.
     pub impact_ns: Option<u64>,
@@ -77,7 +78,7 @@ pub struct ClipJob {
     /// How the estimate was made, for the impact log line.
     pub timing: ClipTiming,
     /// Where `shot_pose` and `shot_swing` go, with the camera as its actor.
-    pub bus: broadcast::Sender<FlighthookMessage>,
+    pub bus: broadcast::Sender<BusMsg>,
 }
 
 /// How a clip's impact was estimated: the launch monitor, its camera
@@ -292,7 +293,7 @@ pub fn request(
     shot_id: &str,
     camera: &str,
     force: bool,
-    bus: &broadcast::Sender<FlighthookMessage>,
+    bus: &broadcast::Sender<BusMsg>,
 ) -> Requested {
     let Some(clip) = state.clips.camera_clip(shot_id, camera) else {
         return Requested::NoClip;
@@ -323,6 +324,7 @@ pub fn request(
         keys: clip.shots.iter().map(|s| s.key.clone()).collect(),
         position: clip.video.position,
         hand: first.and_then(|s| s.hand),
+        golfer: first.and_then(|s| s.golfer.clone()),
         impact_ns: sidecar
             .as_ref()
             .and_then(crate::actors::camera::clip_impact),
@@ -525,7 +527,7 @@ fn process(state: &SystemState, job: &ClipJob, model: PoseModel, analyze: Analyz
     );
     announce(
         job,
-        FlighthookEvent::ShotPose {
+        LocalEvent::ShotPose {
             keys: job.keys.clone(),
             rotation,
         },
@@ -554,11 +556,19 @@ fn timing_line(
     )
 }
 
-/// Send `event` for `job`'s clip, with its camera as the actor.
-fn announce(job: &ClipJob, event: FlighthookEvent) {
-    let mut msg = FlighthookMessage::new(event);
-    msg.actor.clone_from(&job.camera);
-    let _ = job.bus.send(msg);
+/// Send `event` for `job`'s clip, with its camera as the card.
+fn announce(job: &ClipJob, event: LocalEvent) {
+    let _ = job.bus.send(BusMsg::local(job.camera.clone(), event));
+}
+
+/// The facts of a clip's golfer (`golfer`, recorded at the trigger), by the
+/// lookup rule, for its swing report and its grades alike: a clip with no
+/// golfer has no height and the default sex, never the golfer up's.
+pub(crate) fn clip_golfer_facts(
+    state: &SystemState,
+    golfer: Option<&str>,
+) -> flighthook::PlayerSection {
+    state.system.golfer_facts(golfer)
 }
 
 /// Analyze the swing in `track`, `job`'s keypoints, store it beside the
@@ -569,7 +579,7 @@ fn swing(state: &SystemState, job: &ClipJob, track: &PoseTrack) -> bool {
         position: job.position,
         hand: job.hand,
         impact_ns: job.impact_ns,
-        height_cm: state.system.player().height,
+        height_cm: clip_golfer_facts(state, job.golfer.as_deref()).height,
         mirrored: super::swing::mirrored(camera),
     };
     let written = match write_report(camera, track, &job.avi, &input) {
@@ -589,7 +599,7 @@ fn swing(state: &SystemState, job: &ClipJob, track: &PoseTrack) -> bool {
     log_impact(job, &written);
     announce(
         job,
-        FlighthookEvent::ShotSwing {
+        LocalEvent::ShotSwing {
             keys: job.keys.clone(),
         },
     );
@@ -643,12 +653,17 @@ mod tests {
     use flighthook::{CameraPosition, ShotVideo};
 
     fn state() -> (TempDir, Arc<SystemState>) {
+        state_with("")
+    }
+
+    /// A state loaded from config text `toml`, body tracking Live.
+    fn state_with(toml: &str) -> (TempDir, Arc<SystemState>) {
         let dir = TempDir(std::env::temp_dir().join(format!(
             "flighthook-pose-queue-{}",
             uuid::Uuid::new_v4().simple()
         )));
         std::fs::create_dir_all(&dir.0).expect("dir");
-        std::fs::write(dir.0.join("config.toml"), "").expect("config");
+        std::fs::write(dir.0.join("config.toml"), toml).expect("config");
         let (state, _writer) = SystemState::new(dir.0.join("config.toml"));
         state
             .system
@@ -675,6 +690,7 @@ mod tests {
             device: "mock".into(),
             impact_lead_ms: 0,
             hand: None,
+            golfer: None,
         };
         let slot = state
             .clips
@@ -704,6 +720,7 @@ mod tests {
             keys: vec![key(n)],
             position: CameraPosition::GolferFront,
             hand: None,
+            golfer: None,
             impact_ns: None,
             written: Instant::now()
                 .checked_sub(CLIP_DELAY)
@@ -822,8 +839,8 @@ mod tests {
         assert_eq!(video.analyzed_with.as_deref(), Some(stance::VERSION));
         let msg = rx.try_recv().expect("shot_pose");
         assert!(matches!(
-            msg.event,
-            FlighthookEvent::ShotPose { rotation: 90, .. }
+            msg.as_local(),
+            Some((_, crate::bus::LocalEvent::ShotPose { rotation: 90, .. }))
         ));
         // A rotation that is not one of the four is no rotation.
         state
@@ -932,9 +949,8 @@ mod tests {
             Some(pose)
         );
         let msg = rx.try_recv().expect("shot_pose");
-        assert_eq!(msg.actor, "camera.0");
         assert!(
-            matches!(msg.event, FlighthookEvent::ShotPose { ref keys, .. } if keys == &[key(1)])
+            matches!(msg.as_local(), Some(("camera.0", crate::bus::LocalEvent::ShotPose { keys, .. })) if keys == &[key(1)])
         );
         assert!(rx.try_recv().is_err(), "one event");
     }
@@ -942,9 +958,16 @@ mod tests {
     #[test]
     fn the_swing_file_follows_the_pose_file_with_the_shots_hand_impact_and_height() {
         use stance::golf::{Handed, SwingReport, View};
-        let (dir, state) = state();
-        state.system.update(|c| c.player.height = Some(175.0));
+        // The height of the clip's golfer (the turn's at the trigger, here
+        // A's linked game id) is the one used, not the golfer up's (B).
+        let (dir, state) = state_with(
+            "selected_golfer = \"flighthook.b\"\n\
+             [[golfers]]\nidentifiers = [\"flighthook.a\", \"pureplay.local-2\"]\nname = \"A\"\nheight = 175\n\
+             [[golfers]]\nidentifiers = [\"flighthook.b\"]\nname = \"B\"\nheight = 160\n",
+        );
+        assert_eq!(state.golfer_up_facts().height, Some(160.0));
         let mut job = clip(&state, &dir, 1);
+        job.golfer = Some("pureplay.local-2".into());
         let (tx, mut rx) = broadcast::channel(16);
         job.bus = tx;
         job.position = CameraPosition::TargetLine;
@@ -956,11 +979,13 @@ mod tests {
         assert!(kept);
         // shot_pose first, then shot_swing, one each.
         let first = rx.try_recv().expect("shot_pose");
-        assert!(matches!(first.event, FlighthookEvent::ShotPose { .. }));
+        assert!(matches!(
+            first.as_local(),
+            Some((_, crate::bus::LocalEvent::ShotPose { .. }))
+        ));
         let second = rx.try_recv().expect("shot_swing");
-        assert_eq!(second.actor, "camera.0");
         assert!(
-            matches!(second.event, FlighthookEvent::ShotSwing { ref keys } if keys == &[key(1)])
+            matches!(second.as_local(), Some(("camera.0", crate::bus::LocalEvent::ShotSwing { keys })) if keys == &[key(1)])
         );
         assert!(rx.try_recv().is_err());
         let path = job.slot.dir.join("camera.0.swing.json");
@@ -1177,9 +1202,8 @@ mod tests {
         state.pose.clips.push(&state, queued.job, 8);
         let first = rx.blocking_recv().expect("shot_pose");
         assert!(
-            matches!(first.event, FlighthookEvent::ShotPose { ref keys, .. } if keys == &[key(1)])
+            matches!(first.as_local(), Some(("camera.0", crate::bus::LocalEvent::ShotPose { keys, .. })) if keys == &[key(1)])
         );
-        assert_eq!(first.actor, "camera.0");
         assert!(job.slot.dir.join("camera.0.pose.json").exists());
         assert_eq!(
             request(&state, "shot-1", "camera.0", false, &tx),

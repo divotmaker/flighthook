@@ -30,10 +30,10 @@ scratch folder: config, data, flighthook log) and `--no-build`.
 - A network connection the first time: the swing footage (18 MB) and the body
   tracking models (about 75 MB, through flighthook's own model download). Both
   are cached in `target/screenshots/cache`.
-- Linux or macOS. The Shots, Cameras and Devices scenes show cameras, so they
+- Linux or macOS. The Shots, Cameras and Settings scenes show cameras, so they
   run only where flighthook supports cameras (64-bit Linux); elsewhere they are
   reported as skipped.
-- Ports 5971 to 5975 free on localhost: the Devices and routing scenes show
+- Ports 5971 to 5975 free on localhost: the Settings and routing scenes show
   their ports, so they always use these. Every other port is picked free.
 
 `SCREENS_NODE` names the command that runs the Playwright script (default
@@ -68,9 +68,9 @@ the repository mounted at the same path.
 | Scene | Images | What it shows |
 | --- | --- | --- |
 | `shots.js` | `shots.png` | Shots tab, Cards view: a 12-shot 7-iron session from one Open Connect monitor, GSPro connected, a camera recording with video off on the shot cards |
-| `cameras.js` | `cameras.png` | Shots tab, Cameras pane: two cameras playing the swing clips, body tracking Live, shot #2 paused on the impact mark |
-| `devices.js` | `devices.png`, `devices-settings.png` | Devices tab with a Mock and an Open Connect monitor, a test-pattern camera and GSPro; then the camera card's Settings side, its Rotation in sight under the camera |
-| `multi-monitor-routing.js` | `multi-monitor-routing.png` | A GSPro output's card routing full swings, chips and putts to different monitors |
+| `cameras.js` | `cameras.png` | Cameras tab: two cameras playing the swing clips, body tracking Live, shot #2 paused on the impact mark |
+| `devices.js` | `devices.png`, `devices-settings.png` | Settings on the Mock launch monitor's page (an Open Connect monitor, a test-pattern camera and GSPro are in the list too); then the camera's page, its telemetry beside its settings, its Rotation in sight under the camera |
+| `multi-monitor-routing.js` | `multi-monitor-routing.png` | A GSPro output's page, its settings routing full swings and chips to different monitors, putts to any |
 
 ## What keeps the pictures the same
 
@@ -86,7 +86,7 @@ the repository mounted at the same path.
   monitor's client port; a relative clip folder; no HTTP request the Web
   Server card would count beyond a fixed one; a settle across the web server's
   5 s telemetry update; the Mock's first shot (33 s after it starts) comes
-  after the Devices screenshots, and the scene checks it did.
+  after the Settings screenshots, and the scene checks it did.
 - **The page** (`snap.js`): fetches run one at a time in the order the UI
   makes them; a frame runs only once the network is quiet; the page clock
   moves one 60 Hz frame per frame. The UI then draws the same sequence of

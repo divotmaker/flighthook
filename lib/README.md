@@ -96,58 +96,6 @@ REST request/response types shared between the web server and the UI.
 | `ModeRequest`          | `POST /api/mode` -- target detection mode                 |
 | `PostSettingsResponse` | `POST /api/settings` -- lists of restarted/stopped actors |
 
-## WebSocket client (`client` feature)
-
-A synchronous WebSocket client for connecting to a running flighthook server.
-Behind the `client` feature flag (adds `tungstenite`). Not included by default
-so UI/WASM builds are unaffected.
-
-```toml
-[dependencies]
-flighthook = { version = "0.1", features = ["client"] }
-```
-
-| Type               | Description                                              |
-| ------------------ | -------------------------------------------------------- |
-| `FlighthookClient` | WebSocket client. `connect`, `recv`, `try_recv`, `send`. |
-| `ClientError`      | Error enum: `WebSocket`, `Json`, `Closed`                |
-
-### Blocking
-
-```rust
-use flighthook::{FlighthookClient, ShotAggregator};
-
-let mut client = FlighthookClient::connect("ws://localhost:5880/frp", "my-app")?;
-let mut shots = ShotAggregator::new();
-
-loop {
-    let msg = client.recv()?;
-    if let Some(shot) = shots.feed(&msg) {
-        println!("shot #{}: {:?}", shot.shot_number, shot.ball.as_ref().and_then(|b| b.launch_speed));
-    }
-}
-```
-
-### Non-Blocking (Game Loop)
-
-```rust
-use flighthook::{FlighthookClient, ShotAggregator};
-
-let mut client = FlighthookClient::connect("ws://localhost:5880/frp", "my-sim")?;
-client.set_nonblocking(true)?;
-let mut shots = ShotAggregator::new();
-
-loop {
-    // Drain all pending messages
-    while let Ok(Some(msg)) = client.try_recv() {
-        if let Some(shot) = shots.feed(&msg) {
-            println!("shot #{}: {:?}", shot.shot_number, shot.ball.as_ref().and_then(|b| b.launch_speed));
-        }
-    }
-    // ... render frame, physics tick, etc.
-}
-```
-
 ## Game state types
 
 | Type                | Description                                                                                                                   |

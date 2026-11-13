@@ -53,15 +53,14 @@ use tracing::{debug, info, warn};
 
 use crate::actors::backoff::Backoff;
 use crate::actors::{Actor, ReconfigureOutcome};
-use crate::bus::{BusReceiver, BusSender, PollError};
+use crate::bus::{BusReceiver, BusSender, LocalEvent, PollError};
 use crate::pose::live::{self, LiveWorker};
 use crate::pose::{clips::ClipJob, models};
 use crate::state::SystemState;
 use crate::state::clips::{self, ClipShot};
 use flighthook::{
-    ActorStatus, BodyTrackingMode, CameraSection, FlighthookEvent, FlighthookMessage,
-    MAX_IMPACT_LEAD_S, MAX_LATENCY_S, MAX_TRIGGER_DELAY_S, ReplaySection, Severity, ShotKey,
-    ShotVideo,
+    ActorStatus, BodyTrackingMode, CameraSection, MAX_IMPACT_LEAD_S, MAX_LATENCY_S,
+    MAX_TRIGGER_DELAY_S, ReplaySection, Severity, ShotKey, ShotVideo,
 };
 
 /// Recorder history beyond the pre-roll and the longest reach.
@@ -341,7 +340,7 @@ fn live_settings(state: &SystemState, actor: &str) -> live::LiveSettings {
         body: state.system.body_tracking(),
         posture: crate::pose::swing::live_setup(
             position,
-            state.game.snapshot().handed,
+            state.session.turn().handedness,
             crate::pose::swing::mirrored(actor),
         ),
         rotation: stance::pose::Rotation::from_degrees(state.system.camera_rotation(actor))
@@ -538,17 +537,14 @@ fn open_source(
 }
 
 fn status(sender: &BusSender, status: ActorStatus, telemetry: HashMap<String, String>) {
-    sender.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
-        status,
-        telemetry,
-    }));
+    sender.local(LocalEvent::CardStatus { status, telemetry });
 }
 
 fn alert(sender: &BusSender, message: String) {
-    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
+    sender.local(LocalEvent::Alert {
         severity: Severity::Warn,
         message,
-    }));
+    });
 }
 
 /// The camera's display name, for alerts and logs: the actor's configured
@@ -849,7 +845,15 @@ fn drain_bus(
             Err(PollError::Shutdown) => return false,
             Ok(None) => return true,
             Ok(Some(msg)) => {
-                if let FlighthookEvent::ShotTrigger { key, timestamp } = &msg.event {
+                if let Some(flightrelay::FrpMessage {
+                    from,
+                    body:
+                        flightrelay::FrpBody::ShotTrigger(flightrelay::ShotTrigger { key, timestamp }),
+                }) = msg.as_frp()
+                {
+                    // The card of a local launch monitor; a remote one by
+                    // its actor id.
+                    let source = state.card_of_actor(from).unwrap_or_else(|| from.clone());
                     // The strike's time when the trigger carries one, else
                     // its arrival.
                     let at = match timestamp {
@@ -861,15 +865,7 @@ fn drain_bus(
                             at
                         }
                     };
-                    trigger(
-                        state,
-                        recorder,
-                        seen,
-                        &msg.actor,
-                        key,
-                        at,
-                        timestamp.is_some(),
-                    );
+                    trigger(state, recorder, seen, &source, key, at, timestamp.is_some());
                 }
             }
         }
@@ -922,11 +918,13 @@ fn trigger(
     if config.buffer != recorder.config().buffer {
         recorder.set_config(config.clone());
     }
+    let turn = state.session.turn();
     let shot = ClipShot {
         key: key.clone(),
         device: crate::actors::web::device_kind(prefix).to_owned(),
         impact_lead_ms: u64::try_from(lead.as_millis()).unwrap_or(u64::MAX),
-        hand: state.game.snapshot().handed,
+        hand: turn.handedness,
+        golfer: turn.golfer.map(|g| g.as_str().to_owned()),
     };
     let tag = Tag {
         shot,
@@ -1013,6 +1011,7 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
         .map(|t| t.shot.clone())
         .collect();
     let hand = shots.first().and_then(|s| s.hand);
+    let golfer = shots.first().and_then(|s| s.golfer.clone());
     if shots.is_empty() {
         info!("{actor}: history cleared since the swing, clip not saved");
         return;
@@ -1131,6 +1130,7 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
                 keys: keys.clone(),
                 position,
                 hand,
+                golfer,
                 impact_ns: clip_impact(sidecar),
                 written: Instant::now(),
                 on_demand: false,
@@ -1142,7 +1142,7 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
                 .clips
                 .push(state, job, crate::pose::clips::bound(state));
         }
-        sender.send(FlighthookMessage::new(FlighthookEvent::ShotVideo {
+        sender.local(LocalEvent::ShotVideo {
             keys,
             position: video.position,
             duration_ms: video.duration_ms,
@@ -1151,12 +1151,10 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
             impact_offset_ms: video.impact_offset_ms,
             complete: video.complete,
             dropped: video.dropped,
-        }));
+        });
     }
     if !done.removed.is_empty() {
-        sender.send(FlighthookMessage::new(FlighthookEvent::ShotVideoRemoved {
-            keys: done.removed,
-        }));
+        sender.local(LocalEvent::ShotVideoRemoved { keys: done.removed });
     }
 }
 
@@ -1173,6 +1171,7 @@ mod tests {
     use crate::actors::web::WebActor;
     use crate::actors::web::tests::TempDir;
     use crate::actors::{Actor, start_actor};
+    use crate::bus::BusMsg;
     use flighthook::{Launch, Velocity};
 
     /// A system state over a scratch config file holding `config`.
@@ -1203,6 +1202,7 @@ mod tests {
         assert_eq!(ms(&state, "exputt.0"), Some(0));
         assert_eq!(ms(&state, "r10.1"), Some(2000));
         assert_eq!(ms(&state, "openconnect_server.0"), Some(2500));
+        assert_eq!(ms(&state, "pureplay_accessory.0"), Some(900));
         // A launch monitor kind without a better-known value.
         assert_eq!(ms(&state, "newmonitor.0"), Some(1500));
         assert_eq!(ms(&state, flighthook::AUTO_CHIP_ACTOR), None);
@@ -1221,9 +1221,12 @@ mod tests {
             "[mevo.0]\nname = \"Mevo\"\nimpact_lead_s = 0.25\n\n\
              [square.0]\nname = \"Omni\"\nimpact_lead_s = 0\n\n\
              [square.1]\nname = \"Omni 2\"\n\n\
-             [exputt.0]\nname = \"Putt\"\nimpact_lead_s = 5\n",
+             [exputt.0]\nname = \"Putt\"\nimpact_lead_s = 5\n\n\
+             [pureplay_accessory.0]\nname = \"Pureplay\"\nimpact_lead_s = 1.75\n",
         );
         assert_eq!(ms(&state, "mevo.0"), Some(250));
+        assert_eq!(ms(&state, "pureplay_accessory.0"), Some(1750));
+        assert_eq!(ms(&state, "pureplay_accessory.1"), Some(900), "no section");
         // 0 is a value, not "unset".
         assert_eq!(ms(&state, "square.0"), Some(0));
         // No value: the device default.
@@ -1987,6 +1990,7 @@ mod tests {
                     device: "mock".into(),
                     impact_lead_ms: 0,
                     hand: None,
+                    golfer: None,
                 },
                 generation: g,
             };
@@ -2016,7 +2020,10 @@ mod tests {
         let after = clip(state.clips.generation());
         save(&state, &sender, &after);
         let msg = rx.try_recv().expect("shot_video");
-        assert!(matches!(msg.event, FlighthookEvent::ShotVideo { .. }));
+        assert!(matches!(
+            msg.as_local(),
+            Some((_, LocalEvent::ShotVideo { .. }))
+        ));
         assert_eq!(state.clips.videos("shot-1").len(), 1);
     }
 
@@ -2037,12 +2044,18 @@ mod tests {
         assert!(seen.first("mevo.0", &key("a")));
     }
 
+    /// A local event seen on the bus, with its card.
+    struct Seen {
+        actor: String,
+        event: LocalEvent,
+    }
+
     /// A running system, web server and test-pattern camera.
     struct Rig {
         dir: TempDir,
         state: Arc<SystemState>,
-        bus: broadcast::Sender<FlighthookMessage>,
-        rx: broadcast::Receiver<FlighthookMessage>,
+        bus: broadcast::Sender<BusMsg>,
+        rx: broadcast::Receiver<BusMsg>,
         web: WebActor,
         addr: SocketAddr,
     }
@@ -2119,7 +2132,7 @@ mod tests {
                 m.actor == "camera.0"
                     && matches!(
                         m.event,
-                        FlighthookEvent::ActorStatus {
+                        LocalEvent::CardStatus {
                             status: ActorStatus::Connected,
                             ..
                         }
@@ -2155,22 +2168,21 @@ mod tests {
                 shot_id: uuid::Uuid::new_v4().to_string(),
                 shot_number: n,
             };
-            let monitor = self.sender(actor);
-            monitor.send(FlighthookMessage::new(FlighthookEvent::shot_trigger(
-                key.clone(),
-            )));
-            monitor.send(FlighthookMessage::new(FlighthookEvent::Launch {
+            // The card's FRP actor id (its card key when it has none).
+            let frp_id = self
+                .state
+                .actor_of_card(actor)
+                .unwrap_or_else(|| actor.into());
+            let monitor = self.sender(actor).with_frp_id(Some(frp_id));
+            monitor.frp(flightrelay::ShotTrigger::new(key.clone()));
+            monitor.frp(flightrelay::ShotLaunch {
                 key: key.clone(),
-                launch: Box::new(Launch {
+                launch: Launch {
                     launch_speed: Some(Velocity::MilesPerHour(100.0 + f64::from(n))),
                     ..Launch::default()
-                }),
-                derived: None,
-            }));
-            monitor.send(FlighthookMessage::new(FlighthookEvent::ShotFinished {
-                key: key.clone(),
-                raw: None,
-            }));
+                },
+            });
+            monitor.frp(flightrelay::ShotFinished { key: key.clone() });
             key
         }
 
@@ -2178,12 +2190,17 @@ mod tests {
         fn wait_for(
             &mut self,
             timeout: Duration,
-            mut want: impl FnMut(&FlighthookMessage) -> bool,
-        ) -> Option<FlighthookMessage> {
+            mut want: impl FnMut(&Seen) -> bool,
+        ) -> Option<Seen> {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
                 match self.rx.try_recv() {
-                    Ok(m) if want(&m) => return Some(m),
+                    Ok(BusMsg::Local { card, event }) => {
+                        let m = Seen { actor: card, event };
+                        if want(&m) {
+                            return Some(m);
+                        }
+                    }
                     Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                     Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 }
@@ -2194,10 +2211,10 @@ mod tests {
         /// The next `shot_video`'s keys.
         fn next_video(&mut self) -> Option<(Vec<ShotKey>, bool)> {
             self.wait_for(Duration::from_secs(10), |m| {
-                matches!(m.event, FlighthookEvent::ShotVideo { .. })
+                matches!(m.event, LocalEvent::ShotVideo { .. })
             })
             .map(|m| match m.event {
-                FlighthookEvent::ShotVideo { keys, complete, .. } => (keys, complete),
+                LocalEvent::ShotVideo { keys, complete, .. } => (keys, complete),
                 _ => unreachable!(),
             })
         }
@@ -2314,7 +2331,7 @@ mod tests {
                 m.actor == "camera.0"
                     && matches!(
                         m.event,
-                        FlighthookEvent::ActorStatus {
+                        LocalEvent::CardStatus {
                             status: ActorStatus::Disconnected,
                             ..
                         }
@@ -2475,29 +2492,28 @@ mod tests {
             latency_s: Some(0.3),
             ..rig.state.system.camera("0").expect("camera.0")
         };
-        rig.sender("web")
-            .send(FlighthookMessage::new(FlighthookEvent::ConfigCommand {
-                request_id: Some("latency".into()),
-                action: Box::new(flighthook::ConfigAction::UpsertCamera {
-                    index: "0".into(),
-                    section,
-                }),
-            }));
+        rig.sender("web").local(LocalEvent::ConfigCommand {
+            request_id: Some("latency".into()),
+            action: Box::new(flighthook::ConfigAction::UpsertCamera {
+                index: "0".into(),
+                section,
+            }),
+        });
         let mut statuses = Vec::new();
         let outcome = rig
             .wait_for(Duration::from_secs(5), |m| {
                 if m.actor == "camera.0"
-                    && let FlighthookEvent::ActorStatus { status, .. } = &m.event
+                    && let LocalEvent::CardStatus { status, .. } = &m.event
                 {
                     statuses.push(*status);
                 }
                 matches!(
                     &m.event,
-                    FlighthookEvent::ConfigOutcome { request_id: Some(r), .. } if r == "latency"
+                    LocalEvent::ConfigOutcome { request_id: Some(r), .. } if r == "latency"
                 )
             })
             .expect("outcome");
-        let FlighthookEvent::ConfigOutcome {
+        let LocalEvent::ConfigOutcome {
             restarted, stopped, ..
         } = outcome.event
         else {
@@ -2528,7 +2544,7 @@ mod tests {
         assert!(
             rig.wait_for(Duration::from_millis(800), |m| matches!(
                 m.event,
-                FlighthookEvent::ShotVideo { .. }
+                LocalEvent::ShotVideo { .. }
             ))
             .is_none(),
             "one clip"
@@ -2568,7 +2584,7 @@ mod tests {
         assert!(
             rig.wait_for(Duration::from_millis(1500), |m| matches!(
                 m.event,
-                FlighthookEvent::ShotVideo { .. }
+                LocalEvent::ShotVideo { .. }
             ))
             .is_none()
         );
@@ -2583,10 +2599,10 @@ mod tests {
         let b = rig.shot("mock_monitor.0", 2);
         let removed = rig
             .wait_for(Duration::from_secs(10), |m| {
-                matches!(m.event, FlighthookEvent::ShotVideoRemoved { .. })
+                matches!(m.event, LocalEvent::ShotVideoRemoved { .. })
             })
             .expect("shot_video_removed");
-        let FlighthookEvent::ShotVideoRemoved { keys } = removed.event else {
+        let LocalEvent::ShotVideoRemoved { keys } = removed.event else {
             unreachable!()
         };
         assert_eq!(keys, std::slice::from_ref(&a));
@@ -2607,8 +2623,7 @@ mod tests {
         let key = rig.shot("mock_monitor.0", 1);
         rig.next_video().expect("clip");
         assert_eq!(rig.folders(), 1);
-        rig.sender("web")
-            .send(FlighthookMessage::new(FlighthookEvent::ClearShotHistory));
+        rig.sender("web").local(LocalEvent::ClearShotHistory);
         let deadline = Instant::now() + Duration::from_secs(5);
         while rig.folders() > 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -2850,11 +2865,11 @@ mod tests {
         rig.next_video().expect("shot_video");
         let done = rig
             .wait_for(Duration::from_secs(10), |m| {
-                matches!(m.event, FlighthookEvent::ShotPose { .. })
+                matches!(m.event, LocalEvent::ShotPose { .. })
             })
             .expect("shot_pose");
         assert_eq!(done.actor, "camera.0");
-        let FlighthookEvent::ShotPose { keys, .. } = done.event else {
+        let LocalEvent::ShotPose { keys, .. } = done.event else {
             unreachable!()
         };
         assert_eq!(keys, std::slice::from_ref(&a));
@@ -2889,7 +2904,7 @@ mod tests {
         // Then the swing analysis, served the same way.
         let swung = rig
             .wait_for(Duration::from_secs(10), |m| {
-                matches!(m.event, FlighthookEvent::ShotSwing { .. })
+                matches!(m.event, LocalEvent::ShotSwing { .. })
             })
             .expect("shot_swing");
         assert_eq!(swung.actor, "camera.0");
@@ -2926,7 +2941,7 @@ mod tests {
         assert!(file.is_file());
         rig.shot("mock_monitor.0", 2);
         rig.wait_for(Duration::from_secs(10), |m| {
-            matches!(m.event, FlighthookEvent::ShotVideoRemoved { .. })
+            matches!(m.event, LocalEvent::ShotVideoRemoved { .. })
         })
         .expect("shot_video_removed");
         assert!(!file.exists());
@@ -2965,7 +2980,7 @@ mod tests {
         assert_eq!(body["state"], "queued");
         let done = rig
             .wait_for(Duration::from_secs(10), |m| {
-                matches!(m.event, FlighthookEvent::ShotPose { .. })
+                matches!(m.event, LocalEvent::ShotPose { .. })
             })
             .expect("shot_pose");
         assert!(
@@ -2975,7 +2990,7 @@ mod tests {
         );
         assert_eq!(done.actor, "camera.0");
         rig.wait_for(Duration::from_secs(10), |m| {
-            matches!(m.event, FlighthookEvent::ShotSwing { .. })
+            matches!(m.event, LocalEvent::ShotSwing { .. })
         })
         .expect("shot_swing");
         let pose = format!("/api/shots/{id}/video/camera.0.pose.json");
@@ -3019,12 +3034,12 @@ mod tests {
         assert_eq!(rig.post(&analyze_b).0, 202);
         assert_eq!(rig.post(&analyze_b).0, 202);
         rig.wait_for(Duration::from_secs(10), |m| {
-            matches!(m.event, FlighthookEvent::ShotPose { .. })
+            matches!(m.event, LocalEvent::ShotPose { .. })
         })
         .expect("shot_pose");
         assert!(
             rig.wait_for(Duration::from_millis(500), |m| {
-                matches!(m.event, FlighthookEvent::ShotPose { .. })
+                matches!(m.event, LocalEvent::ShotPose { .. })
             })
             .is_none(),
             "tracked once"
@@ -3060,7 +3075,7 @@ mod tests {
         assert_eq!(headers["x-pose-state"], "off");
         assert!(
             rig.wait_for(Duration::from_millis(3500), |m| {
-                matches!(m.event, FlighthookEvent::ShotPose { .. })
+                matches!(m.event, LocalEvent::ShotPose { .. })
             })
             .is_none()
         );
@@ -3108,7 +3123,7 @@ mod tests {
             assert_eq!(headers["x-pose-state"], live_state, "{mode:?}");
             assert!(
                 rig.wait_for(Duration::from_millis(3500), |m| {
-                    matches!(m.event, FlighthookEvent::ShotPose { .. })
+                    matches!(m.event, LocalEvent::ShotPose { .. })
                 })
                 .is_none(),
                 "{mode:?}"
@@ -3136,17 +3151,16 @@ mod tests {
             let mut section = rig.state.system.body_tracking();
             section.mode = mode;
             let request_id = uuid::Uuid::new_v4().to_string();
-            rig.sender("web")
-                .send(FlighthookMessage::new(FlighthookEvent::ConfigCommand {
-                    request_id: Some(request_id.clone()),
-                    action: Box::new(ConfigAction::SetBodyTracking { section }),
-                }));
+            rig.sender("web").local(LocalEvent::ConfigCommand {
+                request_id: Some(request_id.clone()),
+                action: Box::new(ConfigAction::SetBodyTracking { section }),
+            });
             let outcome = rig
                 .wait_for(Duration::from_secs(5), |m| {
-                    matches!(&m.event, FlighthookEvent::ConfigOutcome { request_id: Some(r), .. } if *r == request_id)
+                    matches!(&m.event, LocalEvent::ConfigOutcome { request_id: Some(r), .. } if *r == request_id)
                 })
                 .expect("outcome");
-            let FlighthookEvent::ConfigOutcome { restarted, .. } = outcome.event else {
+            let LocalEvent::ConfigOutcome { restarted, .. } = outcome.event else {
                 unreachable!()
             };
             assert!(restarted.is_empty(), "no camera restart");
@@ -3161,7 +3175,7 @@ mod tests {
         assert!(
             rig.wait_for(
                 crate::pose::clips::CLIP_DELAY + Duration::from_secs(1),
-                |m| { matches!(m.event, FlighthookEvent::ShotPose { .. }) }
+                |m| { matches!(m.event, LocalEvent::ShotPose { .. }) }
             )
             .is_none(),
             "no automatic pass out of Live"
@@ -3180,7 +3194,7 @@ mod tests {
         rig.shot("mock_monitor.0", 3);
         rig.next_video().expect("shot_video");
         rig.wait_for(Duration::from_secs(10), |m| {
-            matches!(m.event, FlighthookEvent::ShotPose { .. })
+            matches!(m.event, LocalEvent::ShotPose { .. })
         })
         .expect("Live tracks the clip");
     }

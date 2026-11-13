@@ -13,6 +13,7 @@
 
 use std::path::Path;
 
+use flighthook::ClubExt;
 use flighthook::{
     BodyGrades, Club, ClubClass, Fit, Handedness, MetricGrade, PlayerSection, ReferenceGrades,
     ReferenceKind, Sex, Side,

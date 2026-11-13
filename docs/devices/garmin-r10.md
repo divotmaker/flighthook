@@ -28,18 +28,18 @@ along with the same spin as backspin and sidespin components. All four are
 the R10's reading, so a tournament round keeps them. A total of 0 has no
 axis.
 
-## Carry and total (beta, simulated)
+## Carry and total (simulated)
 
 The R10 reports launch data, not carry. flighthook simulates carry, apex,
 flight time, descent angle, offline, roll and total from the measured launch
 and shows them in *italics*, as `derived` in the API, and in a
 `sim (estimated, beta)` log line; see the README's
-[Simulated values](../../README.md#simulated-values-beta) section. GSPro still
+[Simulated values](../../README.md#simulated-values) section. GSPro still
 receives the launch data only.
 
 ## Shot export
 
-`GET /api/shots/export` (the **JSONL** link on the Shots tab) saves
+`GET /api/shots/export` (the export icon's **JSONL** item on the Shots tab) saves
 each shot with the protocol messages behind it, one record per message: up
 to 256 messages before the shot event (the shot message among them), as hex,
 each labeled by the driver with its direction and message type
@@ -69,7 +69,7 @@ the device wakes up, which is the same setting the Garmin Golf app exposes.
 Accepts any distance unit (`"7ft"`, `"2.3yd"`, `"2.1m"`) and is converted to the
 yards the R10 protocol expects.
 
-It must be greater than 0. The card's Settings side shows why a value is
+It must be greater than 0. The card's settings show why a value is
 refused and won't save it; a config file holding one loads, and that card does
 not start and shows the error until the value is fixed.
 
@@ -98,6 +98,6 @@ reads 2.0° right takes `-2.0` (the card's **Aim offset** field, or
 the number until a straight chip reads close to 0.
 
 It must be a number from -10 to 10. Blank (or omitted) means 0. The card's
-Settings side shows why a value is refused and won't save it. The offset
+settings show why a value is refused and won't save it. The offset
 applies from the next shot, with no restart. Shots already recorded keep the
 values they had.

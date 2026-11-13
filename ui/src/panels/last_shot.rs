@@ -196,7 +196,9 @@ impl FlighthookApp {
             return;
         };
         let shot = &self.shots[i];
-        let key = self.settings.grades_key();
+        let key = self
+            .settings
+            .grades_key(shot.golfer.as_deref().or(self.turn_golfer.as_deref()));
         let shown_is_newest = self
             .live_strip
             .shown
@@ -282,6 +284,7 @@ mod tests {
 
     fn shot(id: &str, swings: &[&str]) -> ShotRow {
         ShotRow {
+            golfer: None,
             actor: "mock_monitor.0".into(),
             shot_id: id.into(),
             shot_number: 3,

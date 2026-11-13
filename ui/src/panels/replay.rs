@@ -1,6 +1,6 @@
 //! Camera pictures: a camera card's still frame, the replay view, a modal
 //! over the Shots tab that plays a shot's clips side by side, the same
-//! player inline in the Shots tab's Cameras pane (with each clip's swing
+//! player inline in the Cameras tab (with each clip's swing
 //! analysis), and the camera cards in the Cards view's row beside the range
 //! bars, which loop the shown shot's clip.
 //!
@@ -119,7 +119,7 @@ impl Still {
     }
 }
 
-/// A camera card's Still frame button, for its action row. It needs a
+/// A camera page's Still frame icon, for its header. It needs a
 /// running camera and no request out. Returns whether it was clicked: the
 /// caller fetches the frame.
 pub(crate) fn still_button(
@@ -128,8 +128,9 @@ pub(crate) fn still_button(
     still: &mut Still,
     running: bool,
 ) -> bool {
-    let clicked = crate::panels::settings::action_button(
+    let clicked = devices::header_icon(
         ui,
+        theme::Icon::Camera,
         "Still frame",
         &format!("still:{actor}"),
         running && !still.loading,
@@ -1056,8 +1057,16 @@ impl ReplayView {
     }
 
     /// The cameras' columns side by side, each `column` wide, `gap` apart,
-    /// at the playhead, marked under `prefix`.
-    fn columns(&mut self, ui: &mut egui::Ui, prefix: &str, column: f32, gap: f32, draw: PoseDraw) {
+    /// at the playhead, marked under `prefix`; one under the other when
+    /// `stacked`.
+    fn columns(
+        &mut self,
+        ui: &mut egui::Ui,
+        prefix: &str,
+        (column, gap): (f32, f32),
+        stacked: bool,
+        draw: PoseDraw,
+    ) {
         let ctx = ui.ctx().clone();
         let textures: Vec<Option<egui::TextureHandle>> = (0..self.cameras.len())
             .map(|i| self.frame_texture(&ctx, i))
@@ -1065,8 +1074,11 @@ impl ReplayView {
         let errors: Vec<Option<String>> = (0..self.cameras.len())
             .map(|i| self.camera_error(i))
             .collect();
-        ui.horizontal_top(|ui| {
+        let body = |ui: &mut egui::Ui| {
             ui.spacing_mut().item_spacing.x = gap;
+            if stacked {
+                ui.spacing_mut().item_spacing.y = gap;
+            }
             for ((cam, tex), error) in self.cameras.iter().zip(&textures).zip(&errors) {
                 ui.allocate_ui_with_layout(
                     egui::vec2(column, 0.0),
@@ -1086,18 +1098,30 @@ impl ReplayView {
                     },
                 );
             }
-        });
+        };
+        if stacked {
+            ui.vertical(body);
+        } else {
+            ui.horizontal_top(body);
+        }
     }
 
     /// The scrubber and the transport row (play, frame steps, speed, loop),
     /// marked under `prefix`; a spinner while the clips load, or a line when
-    /// none could be. Returns what was clicked.
+    /// none could be. In the portrait layout (`portrait`) the buttons are
+    /// touch-sized and Loop wraps to a second row. Returns what was clicked.
     fn controls(
         &self,
         ui: &mut egui::Ui,
         prefix: &str,
         timeline: &Timeline,
+        portrait: bool,
     ) -> Option<ReplayAction> {
+        let button = if portrait {
+            crate::topbar::TOUCH_TARGET
+        } else {
+            26.0
+        };
         let mut action = None;
         if let (Some(p), Some(span)) = (&self.playback, timeline.span) {
             if let Some(t) = scrubber(
@@ -1112,13 +1136,13 @@ impl ReplayView {
                 action = Some(ReplayAction::Seek(t));
             }
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            let transport = |ui: &mut egui::Ui| {
                 let (icon, hover) = if p.playing {
                     (theme::Icon::Pause, "Pause")
                 } else {
                     (theme::Icon::Play, "Play")
                 };
-                let play = theme::icon(ui, icon, 26.0, theme::ACCENT, true).on_hover_text(hover);
+                let play = theme::icon(ui, icon, button, theme::ACCENT, true).on_hover_text(hover);
                 devices::mark(ui, || format!("{prefix}:play"), &play);
                 if play.clicked() {
                     action = Some(ReplayAction::Toggle);
@@ -1128,7 +1152,7 @@ impl ReplayView {
                     (true, theme::Icon::ChevronRight, "Next frame"),
                 ] {
                     let step =
-                        theme::icon(ui, icon, 26.0, theme::ACCENT, true).on_hover_text(hover);
+                        theme::icon(ui, icon, button, theme::ACCENT, true).on_hover_text(hover);
                     devices::mark(ui, || format!("{prefix}:step:{forward}"), &step);
                     if step.clicked() {
                         action = Some(ReplayAction::Step(forward));
@@ -1142,13 +1166,27 @@ impl ReplayView {
                 if let Some(i) = speed.inner {
                     action = Some(ReplayAction::Speed(Speed::ALL[i]));
                 }
-                ui.add_space(8.0);
-                let looping = theme::pill(ui, p.looping, "Loop");
+                if portrait {
+                    // Loop on the row under the transport.
+                    ui.end_row();
+                } else {
+                    ui.add_space(8.0);
+                }
+                let looping = if portrait {
+                    theme::pill_sized(ui, p.looping, "Loop", egui::vec2(0.0, button))
+                } else {
+                    theme::pill(ui, p.looping, "Loop")
+                };
                 devices::mark(ui, || format!("{prefix}:loop"), &looping);
                 if looping.clicked() {
                     action = Some(ReplayAction::Loop(!p.looping));
                 }
-            });
+            };
+            if portrait {
+                ui.horizontal_wrapped(transport);
+            } else {
+                ui.horizontal(transport);
+            }
         } else if self.cameras.iter().all(|c| c.clip.error.is_some()) {
             ui.label(
                 egui::RichText::new("The clips could not be loaded.").color(theme::TEXT_MUTED),
@@ -1249,6 +1287,7 @@ impl FlighthookApp {
         };
         let draw = self.pose_draw(hand);
         let mode = self.body_tracking().mode;
+        let portrait = self.portrait;
         let settings = &self.settings;
         let Some(view) = &mut self.replay else {
             return;
@@ -1262,7 +1301,13 @@ impl FlighthookApp {
         let gap = PLAYER_GAP;
         let screen = ctx.content_rect().size();
         let aspect = view.aspect();
-        let tallest = (screen.x * VIEW_SHARE - gap * (n as f32 - 1.0)) / n as f32;
+        // In the portrait layout: the screen's width less the margins.
+        let share = if portrait {
+            screen.x - 2.0 * crate::topbar::SIDE_MARGIN - 32.0
+        } else {
+            screen.x * VIEW_SHARE
+        };
+        let tallest = (share - gap * (n as f32 - 1.0)) / n as f32;
         let column = tallest.min(screen.y * PICTURE_SHARE / aspect);
         let width = column * n as f32 + gap * (n as f32 - 1.0);
         let mut action = None;
@@ -1286,9 +1331,9 @@ impl FlighthookApp {
                     });
                 });
                 ui.add_space(8.0);
-                view.columns(ui, "replay", column, gap, draw);
+                view.columns(ui, "replay", (column, gap), false, draw);
                 ui.add_space(10.0);
-                if let Some(a) = view.controls(ui, "replay", &timeline) {
+                if let Some(a) = view.controls(ui, "replay", &timeline, portrait) {
                     action = Some(a);
                 }
             });
@@ -1333,14 +1378,24 @@ impl FlighthookApp {
         max_picture: f32,
     ) -> Option<PlayerLayout> {
         let hand = self.shot_player.as_ref()?.hand;
+        let portrait = self.portrait;
         let draw = self.pose_draw(hand);
         let mode = self.body_tracking().mode;
         let active = self.replay.is_none();
         let ctx = ui.ctx().clone();
         let settings = &self.settings;
+        // The golfer who hit the shot, else the golfer up (as the server
+        // grades a clip that recorded none).
+        let golfer = self
+            .shot_player
+            .as_ref()
+            .and_then(|v| self.shots.iter().rev().find(|r| r.shot_id == v.shot_id))
+            .and_then(|r| r.golfer.as_deref())
+            .or(self.turn_golfer.as_deref());
+        let grades_key = settings.grades_key(golfer);
         let view = self.shot_player.as_mut()?;
         view.set_rotations(|v| settings.saved_rotation(&v.camera).unwrap_or(v.rotation));
-        view.set_grades_key(&settings.grades_key());
+        view.set_grades_key(&grades_key);
         let timeline = view.prepare(&ctx, &self.pending, active, mode);
         // The playhead the pictures below are drawn at.
         let playhead = view.playback.as_ref().map(|p| p.playhead);
@@ -1348,19 +1403,29 @@ impl FlighthookApp {
         let gap = PLAYER_GAP;
         let available = ui.available_width();
         let aspect = view.aspect();
-        let column = ((available - gap * (n - 1.0)) / n)
-            .min(max_picture / aspect)
-            .max(1.0);
-        let row = column * n + gap * (n - 1.0);
+        // In the portrait layout each picture takes the full width, the
+        // cameras one under the other.
+        let column = if portrait {
+            available.max(1.0)
+        } else {
+            ((available - gap * (n - 1.0)) / n)
+                .min(max_picture / aspect)
+                .max(1.0)
+        };
+        let row = if portrait {
+            column
+        } else {
+            column * n + gap * (n - 1.0)
+        };
         let pad = ((available - row) / 2.0).max(0.0);
         let mut action = None;
         ui.horizontal(|ui| {
             ui.add_space(pad);
             ui.vertical(|ui| {
                 ui.set_width(row);
-                view.columns(ui, "player", column, gap, draw);
+                view.columns(ui, "player", (column, gap), portrait, draw);
                 ui.add_space(8.0);
-                action = view.controls(ui, "player", &timeline);
+                action = view.controls(ui, "player", &timeline, portrait);
             });
         });
         view.act(action, &timeline);
@@ -1964,6 +2029,7 @@ pub(crate) mod tests {
 
     pub(crate) fn shot(videos: &[&str]) -> ShotRow {
         ShotRow {
+            golfer: None,
             actor: "mock_monitor.0".into(),
             shot_id: "s1".into(),
             shot_number: 7,
@@ -3251,7 +3317,7 @@ pub(crate) mod tests {
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let timeline = view.prepare(ctx, &pending, true, BodyTrackingMode::Historical);
-                let action = view.controls(ui, "player", &timeline);
+                let action = view.controls(ui, "player", &timeline, false);
                 view.act(action, &timeline);
             });
         });
@@ -3289,6 +3355,46 @@ pub(crate) mod tests {
             view.reply(reply);
         }
         view
+    }
+
+    /// In the portrait layout the transport buttons are touch-sized and
+    /// Loop wraps under them, inside a phone's width.
+    #[test]
+    fn portrait_controls_are_touch_sized_with_loop_on_a_second_row() {
+        use crate::panels::devices::Marks;
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut view = view_with_swings();
+        let pending = net::new_pending();
+        let mut marks = Marks::default();
+        for time in [0.0, 0.1] {
+            ctx.data_mut(|d| d.remove::<Marks>(egui::Id::NULL));
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(390.0, 400.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let timeline = view.prepare(ctx, &pending, true, BodyTrackingMode::Historical);
+                    let action = view.controls(ui, "player", &timeline, true);
+                    view.act(action, &timeline);
+                });
+            });
+            marks = ctx
+                .data(|d| d.get_temp::<Marks>(egui::Id::NULL))
+                .unwrap_or_default();
+        }
+        let play = marks["player:play"].0;
+        let looping = marks["player:loop"].0;
+        let speed = marks["player:speed"].0;
+        assert_eq!(play.size(), egui::vec2(44.0, 44.0));
+        assert_eq!(looping.height(), 44.0);
+        assert!(looping.top() >= play.bottom(), "{looping:?} under {play:?}");
+        assert!(speed.right() <= 390.0, "{speed:?}");
     }
 
     /// The scrubber carries a marker for each event the reports found, at
@@ -3433,7 +3539,7 @@ pub(crate) mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                view.columns(ui, "player", 300.0, 12.0, draw);
+                view.columns(ui, "player", (300.0, 12.0), false, draw);
             });
         });
         let marks = ctx

@@ -140,7 +140,6 @@ pub fn map_face_impact(msg: &api::GsProMessage) -> Option<FaceImpact> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flighthook::ShotData;
 
     fn msg() -> api::GsProMessage {
         api::GsProMessage {
@@ -260,10 +259,10 @@ mod tests {
         assert_eq!(ball.total_spin_rpm, Some(3251));
         assert_eq!(ball.spin_axis, Some(10.0));
 
-        let shot = ShotData {
+        let shot = crate::actors::simout::OutputShot {
             actor: "openconnect_server.0".into(),
             launch: Some(ball),
-            ..ShotData::default()
+            ..crate::actors::simout::OutputShot::default()
         };
         let out = super::super::super::gspro::mapper::map_shot(&shot);
         let (bs, ss) = (3201.0_f64, 564.0_f64);
@@ -303,14 +302,13 @@ mod tests {
     #[test]
     fn ingest_then_gspro_map_shot_round_trips() {
         let m = lateral_msg();
-        let shot = ShotData {
+        let shot = crate::actors::simout::OutputShot {
             actor: "openconnect_server.0".into(),
             shot_number: m.shot_number,
             launch: Some(map_launch(&m)),
             club: Some(map_club(&m)),
             impact: None,
-            derived: None,
-            ..ShotData::default()
+            ..crate::actors::simout::OutputShot::default()
         };
         let out = super::super::super::gspro::mapper::map_shot(&shot);
         let eps = 1e-9;

@@ -7,7 +7,10 @@
 // run.js writes the spec and starts this script with $SCREENS_NODE (default
 // `node`), so it can run wherever Playwright's browsers are installed.
 //
-// Spec: { url, viewport: { width, height }, quietMs, images: [{ out, steps, crop }] }
+// Spec: { url, viewport: { width, height }, quietMs, openSettle, images: [{ out, steps, crop }] }
+// Before the steps the page waits for the nav's accent marker (the top bar
+// is drawn), then for the picture to settle unless `openSettle` is false (a
+// scene whose opening tab has playing camera cards).
 // Steps (canvas coordinates in CSS px):
 //   { click: [x, y] }        click there
 //   { move: [x, y] }         move the pointer there
@@ -19,7 +22,8 @@
 //                            click the middle of the first run of pixels of
 //                            that color, scanning the box row by row
 // Every image ends with a settle (quiet for the spec's quietMs, default
-// 1.2 s); `crop: { card: [x, y], margin }` keeps only the card around (x, y).
+// 1.2 s); `crop: { card: [x, y], margin, height }` keeps only the card around
+// (x, y), at most `height` px of it from its top when `height` is given.
 
 const fs = require('node:fs');
 const { chromium } = require('playwright');
@@ -29,6 +33,8 @@ const spec = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const QUIET_MS = 1200;
 const EVERY_MS = 150;
 const TIMEOUT_MS = 60000;
+/** The nav's accent marker under the selected icon: the top bar is drawn. */
+const NAV_MARKER = { box: [0, 30, 300, 72], rgb: [52, 211, 120], tol: 12, stableMs: 300 };
 
 function near(a, b, tol) {
   return a.every((v, i) => Math.abs(v - b[i]) <= tol);
@@ -39,8 +45,8 @@ async function shoot(page, clip) {
 }
 
 /** Screenshot until the picture is unchanged for `quietMs`; returns that picture. */
-async function settle(page, clip, quietMs = QUIET_MS) {
-  const end = Date.now() + TIMEOUT_MS;
+async function settle(page, clip, quietMs = QUIET_MS, timeoutMs = TIMEOUT_MS) {
+  const end = Date.now() + timeoutMs;
   let last = await shoot(page, clip);
   let since = Date.now();
   for (;;) {
@@ -211,7 +217,8 @@ async function main() {
     await context.addInitScript(frameGate);
     const page = await context.newPage();
     await page.goto(spec.url, { waitUntil: 'networkidle' });
-    await settle(page);
+    await waitPixel(page, NAV_MARKER);
+    if (spec.openSettle !== false) await settle(page);
     for (const image of spec.images) {
       for (const step of image.steps) {
         if (step.click) await page.mouse.click(...step.click);
@@ -230,6 +237,7 @@ async function main() {
       let clip = null;
       if (image.crop) {
         clip = cardBox(png.decode(await settle(page)), image.crop.card, image.crop.margin || 0);
+        if (image.crop.height) clip.height = Math.min(clip.height, image.crop.height);
         console.log(`crop ${JSON.stringify(clip)}`);
       }
       fs.writeFileSync(image.out, await settle(page, clip, spec.quietMs || QUIET_MS));

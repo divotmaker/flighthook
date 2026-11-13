@@ -11,8 +11,10 @@ use crate::types::{ActorStatusResponse, ConnectionState};
 /// Telemetry key a device reports its charge under, as a whole percent.
 const KEY: &str = "battery_pct";
 
-/// Charges below this many percent are drawn red.
+/// Charges below this many percent are drawn yellow.
 const LOW_PCT: u8 = 20;
+/// Charges below this many percent are drawn red.
+const CRITICAL_PCT: u8 = 10;
 
 /// Width and height of the battery body.
 const BODY: egui::Vec2 = egui::vec2(22.0, 11.0);
@@ -21,8 +23,6 @@ const NUB: egui::Vec2 = egui::vec2(2.0, 5.0);
 const NUB_GAP: f32 = 0.5;
 /// Space between the outline and the fill.
 const INSET: f32 = 2.0;
-/// Space between two indicators.
-pub(crate) const GAP: f32 = 6.0;
 
 /// A connected device's charge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +47,22 @@ fn parse_pct(value: &str) -> Option<u8> {
     value.trim().parse::<u8>().ok().filter(|p| *p <= 100)
 }
 
+/// One battery per remote launch monitor whose `bus.actor` reports a valid
+/// `device.battery_pct`, after the local cards' (as on the Devices tab).
+pub(crate) fn remote_batteries(remote: &[crate::panels::remote::RemoteCard]) -> Vec<Battery> {
+    remote
+        .iter()
+        .filter(|c| c.group == crate::panels::cards::CardGroup::LaunchMonitors)
+        .filter_map(|c| {
+            Some(Battery {
+                actor: c.key(),
+                name: c.status.name.clone(),
+                pct: parse_pct(c.status.telemetry.get(KEY)?)?,
+            })
+        })
+        .collect()
+}
+
 /// One battery per actor that is shown Connected and reports a valid
 /// `battery_pct`, in Devices card order.
 pub(crate) fn batteries(
@@ -62,7 +78,7 @@ pub(crate) fn batteries(
                 return None;
             }
             let pct = parse_pct(actor.telemetry.get(KEY)?)?;
-            // The title of the card's Telemetry side.
+            // The title of the card's page.
             let name = Some(actor.name.clone())
                 .filter(|n| !n.is_empty())
                 .or_else(|| {
@@ -80,13 +96,31 @@ pub(crate) fn batteries(
         .collect()
 }
 
-/// Red below [`LOW_PCT`] percent, else green.
+/// Red below [`CRITICAL_PCT`] percent, yellow below [`LOW_PCT`], else green.
 pub(crate) fn fill_color(pct: u8) -> egui::Color32 {
-    if pct < LOW_PCT {
+    if pct < CRITICAL_PCT {
         theme::STATUS_DOWN
+    } else if pct < LOW_PCT {
+        theme::STATUS_PENDING
     } else {
         theme::STATUS_OK
     }
+}
+
+/// The color of the header's energy icon: the lowest charge decides, red
+/// below 10 %, yellow below 20 %, else the normal icon color.
+pub(crate) fn energy_color(batteries: &[Battery]) -> egui::Color32 {
+    match batteries.iter().map(|b| b.pct).min() {
+        Some(pct) if pct < CRITICAL_PCT => theme::DANGER,
+        Some(pct) if pct < LOW_PCT => theme::GOLD,
+        _ => theme::TEXT_MUTED,
+    }
+}
+
+/// The hover text of the energy icon: the device with the lowest charge
+/// (the first in card order on a tie), `Square Omni 18%`.
+pub(crate) fn lowest_tooltip(batteries: &[Battery]) -> Option<String> {
+    batteries.iter().min_by_key(|b| b.pct).map(Battery::tooltip)
 }
 
 /// The room a battery takes: body and nub.
@@ -110,7 +144,7 @@ fn parts(rect: egui::Rect, pct: u8) -> (egui::Rect, egui::Rect, egui::Rect) {
     (body, nub, fill)
 }
 
-/// Draw `battery` and give it its hover text.
+/// Draw `battery`.
 pub(crate) fn show(ui: &mut egui::Ui, battery: &Battery) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(size(), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
@@ -125,7 +159,7 @@ pub(crate) fn show(ui: &mut egui::Ui, battery: &Battery) -> egui::Response {
             egui::StrokeKind::Inside,
         );
     }
-    response.on_hover_text(battery.tooltip())
+    response
 }
 
 #[cfg(test)]
@@ -252,15 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn under_twenty_percent_is_red_otherwise_green() {
-        assert_eq!(fill_color(0), theme::STATUS_DOWN);
-        assert_eq!(fill_color(19), theme::STATUS_DOWN);
-        assert_eq!(fill_color(20), theme::STATUS_OK);
-        assert_eq!(fill_color(100), theme::STATUS_OK);
-        assert_ne!(theme::STATUS_DOWN, theme::STATUS_OK);
-    }
-
-    #[test]
     fn the_fill_is_the_charge_of_the_inner_width() {
         let rect = egui::Rect::from_min_size(egui::pos2(10.0, 5.0), size());
         let inner = BODY.x - 2.0 * INSET;
@@ -274,167 +299,6 @@ mod tests {
         }
     }
 
-    use crate::app::FlighthookApp;
-    use crate::net;
-    use crate::panels::devices::Marks;
-    use egui::{Event, Pos2, Rect, vec2};
-
-    fn flatten(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
-        match shape {
-            egui::Shape::Vec(inner) => inner.iter().for_each(|s| flatten(s, out)),
-            other => out.push(other.clone()),
-        }
-    }
-
-    /// A header with a Mevo+ at 15 %, an Xi without a charge and a Square
-    /// Omni at 74 %, drawn in a window of `size`.
-    fn header(
-        ctx: &egui::Context,
-        app: &mut FlighthookApp,
-        size: egui::Vec2,
-        events: Vec<Event>,
-    ) -> (Marks, Vec<egui::Shape>) {
-        ctx.data_mut(|d| d.remove_temp::<Marks>(egui::Id::NULL));
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
-            events,
-            ..Default::default()
-        };
-        let output = ctx.run(input, |ctx| app.render_header(ctx));
-        let marks = ctx
-            .data(|d| d.get_temp::<Marks>(egui::Id::NULL))
-            .unwrap_or_default();
-        let mut shapes = Vec::new();
-        for clipped in &output.shapes {
-            flatten(&clipped.shape, &mut shapes);
-        }
-        (marks, shapes)
-    }
-
-    fn app_with_batteries(charges: &[(&str, &str, &str)]) -> FlighthookApp {
-        let mut app = FlighthookApp::with_pending(net::new_pending());
-        for (id, name, pct) in charges {
-            let mut a = ActorStatusResponse::new(*name, ActorStatus::Connected);
-            if !pct.is_empty() {
-                a.telemetry.insert(KEY.into(), (*pct).into());
-            }
-            app.actors.insert((*id).into(), a);
-        }
-        app
-    }
-
-    #[test]
-    fn the_icons_sit_left_of_the_title_inside_the_header() {
-        let charges = [
-            ("mevo.0", "Mevo+", "15"),
-            ("mevo.1", "Xi", ""),
-            ("square.0", "Square Omni", "74"),
-        ];
-        for (w, h) in [(1024.0, 768.0), (1600.0, 900.0)] {
-            let ctx = egui::Context::default();
-            theme::install(&ctx);
-            let mut app = app_with_batteries(&charges);
-            let _ = header(&ctx, &mut app, vec2(w, h), Vec::new());
-            let (marks, _) = header(&ctx, &mut app, vec2(w, h), Vec::new());
-            let at = format!("{w}x{h}");
-            assert!(!marks.contains_key("battery:mevo.1"), "{at}");
-            let (mevo, square) = (marks["battery:mevo.0"].0, marks["battery:square.0"].0);
-            let title = marks["title"].0;
-            let club = marks["club"].0;
-            // Card order: the Mevo furthest left.
-            assert!(mevo.right() + GAP - 0.5 <= square.left(), "{at}");
-            assert!(square.right() < title.left(), "{at}");
-            assert!(
-                club.right() < mevo.left(),
-                "{at}: batteries over the club pill"
-            );
-            for r in [mevo, square] {
-                assert!((r.size() - size()).abs().max_elem() < 0.01, "{at}");
-                assert!(r.top() >= 0.0 && r.bottom() <= 58.0, "{at}: {r:?}");
-            }
-            assert!(title.right() <= w, "{at}");
-        }
-    }
-
-    #[test]
-    fn no_batteries_leave_the_header_as_it_was() {
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let mut app = app_with_batteries(&[("r10.0", "R10", "")]);
-        let (marks, _) = header(&ctx, &mut app, vec2(1600.0, 900.0), Vec::new());
-        assert!(!marks.keys().any(|k| k.starts_with("battery:")));
-    }
-
-    #[test]
-    fn the_icons_are_filled_red_or_green_and_hover_names_the_device() {
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let mut app =
-            app_with_batteries(&[("mevo.0", "Mevo+", "15"), ("square.0", "Square Omni", "74")]);
-        let size = vec2(1600.0, 900.0);
-        let _ = header(&ctx, &mut app, size, Vec::new());
-        let (marks, shapes) = header(&ctx, &mut app, size, Vec::new());
-        let fills: Vec<(Rect, egui::Color32)> = shapes
-            .iter()
-            .filter_map(|s| match s {
-                egui::Shape::Rect(r)
-                    if r.fill == theme::STATUS_DOWN || r.fill == theme::STATUS_OK =>
-                {
-                    Some((r.rect, r.fill))
-                }
-                _ => None,
-            })
-            .filter(|(r, _)| {
-                marks
-                    .iter()
-                    .any(|(k, v)| k.starts_with("battery:") && v.0.contains_rect(*r))
-            })
-            .collect();
-        assert_eq!(fills.len(), 2, "{fills:?}");
-        let inner = BODY.x - 2.0 * INSET;
-        let red = fills.iter().find(|f| f.1 == theme::STATUS_DOWN).unwrap();
-        let green = fills.iter().find(|f| f.1 == theme::STATUS_OK).unwrap();
-        assert!(marks["battery:mevo.0"].0.contains_rect(red.0));
-        assert!((red.0.width() - inner * 0.15).abs() < 0.01);
-        assert!(marks["battery:square.0"].0.contains_rect(green.0));
-        assert!((green.0.width() - inner * 0.74).abs() < 0.01);
-
-        // Hover the Omni's icon: the tooltip is the only new text.
-        let over = marks["battery:square.0"].0.center();
-        let texts = |shapes: &[egui::Shape]| -> Vec<String> {
-            shapes
-                .iter()
-                .filter_map(|s| match s {
-                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
-                    _ => None,
-                })
-                .collect()
-        };
-        let before = texts(&shapes);
-        assert!(!before.iter().any(|t| t.contains('%')), "{before:?}");
-        let mut hovered = Vec::new();
-        for (i, t) in [0.0, 0.2, 1.0, 1.2].into_iter().enumerate() {
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
-                time: Some(t),
-                events: if i == 0 {
-                    vec![Event::PointerMoved(over)]
-                } else {
-                    Vec::new()
-                },
-                ..Default::default()
-            };
-            let output = ctx.run(input, |ctx| app.render_header(ctx));
-            let mut shapes = Vec::new();
-            for clipped in &output.shapes {
-                flatten(&clipped.shape, &mut shapes);
-            }
-            hovered = texts(&shapes);
-        }
-        let new: Vec<&String> = hovered.iter().filter(|t| !before.contains(t)).collect();
-        assert_eq!(new, ["Square Omni 74%"]);
-    }
-
     #[test]
     fn the_tooltip_names_the_device_and_the_charge() {
         let b = Battery {
@@ -443,5 +307,49 @@ mod tests {
             pct: 74,
         };
         assert_eq!(b.tooltip(), "Square Omni 74%");
+    }
+
+    /// Green from 20 %, yellow from 10 % to 19 %, red below 10 %.
+    #[test]
+    fn the_fill_is_green_yellow_or_red_by_the_thresholds() {
+        for (pct, color) in [
+            (100, theme::STATUS_OK),
+            (25, theme::STATUS_OK),
+            (20, theme::STATUS_OK),
+            (19, theme::STATUS_PENDING),
+            (15, theme::STATUS_PENDING),
+            (10, theme::STATUS_PENDING),
+            (9, theme::STATUS_DOWN),
+            (5, theme::STATUS_DOWN),
+            (0, theme::STATUS_DOWN),
+        ] {
+            assert_eq!(fill_color(pct), color, "{pct}%");
+        }
+    }
+
+    #[test]
+    fn the_lowest_charge_decides_the_energy_icon() {
+        let at = |pcts: &[u8]| -> Vec<Battery> {
+            pcts.iter()
+                .enumerate()
+                .map(|(i, pct)| Battery {
+                    actor: format!("d.{i}"),
+                    name: format!("Device {i}"),
+                    pct: *pct,
+                })
+                .collect()
+        };
+        assert_eq!(energy_color(&at(&[74, 25])), theme::TEXT_MUTED);
+        assert_eq!(energy_color(&at(&[74, 20])), theme::TEXT_MUTED);
+        assert_eq!(energy_color(&at(&[74, 19])), theme::GOLD);
+        assert_eq!(energy_color(&at(&[74, 15])), theme::GOLD);
+        assert_eq!(energy_color(&at(&[74, 10])), theme::GOLD);
+        assert_eq!(energy_color(&at(&[74, 9])), theme::DANGER);
+        assert_eq!(energy_color(&at(&[74, 15, 5])), theme::DANGER);
+        assert_eq!(
+            lowest_tooltip(&at(&[74, 18, 40])).as_deref(),
+            Some("Device 1 18%")
+        );
+        assert_eq!(lowest_tooltip(&[]), None);
     }
 }

@@ -8,7 +8,8 @@
 
 Acts as a bridge between golf launch monitors and simulation software.
 Connects to launch monitors, decodes shot data, and forwards it to integrations like GSPro.
-Provides a REST and WebSocket API for custom integrations to participate on the central event bus.
+Speaks the [Flight Relay Protocol](https://github.com/flightrelay/spec) (FRP) on its own WebSocket,
+so other programs can feed it shots or follow along, and provides a REST API for the rest.
 
 ![Shots](./screens/shots.png "Shots")
 
@@ -18,8 +19,8 @@ Provides a REST and WebSocket API for custom integrations to participate on the 
 <td width="50%"><a href="./screens/devices.png"><img src="./screens/devices.png" alt="Devices"></a></td>
 </tr>
 <tr>
-<td>Swing replay with body tracking (<a href="#swing-replay-beta">more</a>)</td>
-<td>Launch monitors, cameras and outputs (<a href="#devices">more</a>)</td>
+<td>The Cameras tab: swing replay with body tracking (<a href="#swing-replay">more</a>)</td>
+<td>Settings: launch monitors, cameras and software (<a href="#settings">more</a>)</td>
 </tr>
 </table>
 
@@ -41,7 +42,8 @@ Each device links to its setup notes, quirks, and config reference.
 | [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Supported        |
 | ExPutt RG                                            | WiFi                    | [threeputt](https://crates.io/crates/threeputt) | Alpha            |
 | [Trackball](docs/devices/trackball.md)               | Linux evdev (any mouse) | [thumbswing](https://crates.io/crates/thumbswing) | Alpha (Linux)  |
-| [Uneekor](docs/devices/uneekor.md)                   | TCP (JSON, port 921)    | built-in (Open Connect server)                  | Alpha (untested) |
+| [Pureplay Accessory](docs/devices/pureplay.md)       | WebSocket (JSON, port 9770) | built-in (Pureplay Accessory API)           | Beta             |
+| [Other launch monitor software (Open Connect)](docs/devices/open-connect.md) | TCP (JSON, port 921) | built-in (Open Connect server) | Alpha |
 
 The Trackball turns a trackball or mouse into a launch monitor for testing and
 practice: pull the ball back, push it forward, and the swing becomes a full
@@ -49,10 +51,38 @@ shot. Every value is synthesized from the swing, so it is a virtual launch
 monitor (no tournament rounds). Add it from the Launch monitors (+) menu
 (Linux only).
 
-Uneekor connects through the **Open Connect server** actor, which accepts shots
-from any launch monitor that speaks GSPro Open Connect as a client — Foresight,
-SkyTrak and MLM2PRO also emit it. Add it from the Launch monitors (+) menu:
-**Uneekor (Open Connect)**, or **Open Connect Server** for any other monitor.
+The Pureplay Accessory card (beta) follows a round in Pureplay through
+Pureplay's Accessory API (early access). Pureplay's players show up as golfers
+in flighthook, and the golfer up, their club and their hand become
+flighthook's, so the launch monitors arm for the club picked in Pureplay.
+Pureplay is also a launch monitor for flighthook: a shot of a player at the
+Pureplay computer, from whatever launch monitor Pureplay reads, becomes a
+flighthook shot (Shots tab, camera clips, exports), and Pureplay's result for
+each shot, its stroke and score, is kept on it. Its shots are virtual and never
+go to an output. Add it from the Software (+) menu: **Pureplay Accessory**,
+and approve flighthook in Pureplay once: choose **Aim and Club** to let
+flighthook's header pick the club in Pureplay, or **Read Only** to only follow
+Pureplay. One Pureplay Accessory card is meant to run at a time. See
+[Pureplay](docs/devices/pureplay.md).
+
+#### Launch monitors on other computers (beta)
+
+Any program that speaks FRP and is a launch monitor can connect to flighthook
+at `ws://<host>:5880/frp`, from the same computer or another one. It appears
+as a read-only card under Settings, Devices with its connection and
+telemetry, its battery in the header's energy menu, and its shots in the
+Shots tab and the exports; it can be picked in an output's routing like a
+card flighthook runs itself. The card goes after about six seconds without
+its heartbeat. The program connects to flighthook; flighthook does not dial
+out to it. A remote launch monitor that says its shots are virtual
+is held during a tournament round like the Trackball and the Mock.
+
+Other launch monitor software reaches flighthook through the **Open Connect
+Server** card, which accepts shots from any software that sends GSPro Open
+Connect: point that software at flighthook's address. Add it from the Launch
+monitors (+) menu: **Open Connect Server**. It listens on port 921, so to run
+GSPro on the same computer, move GSPro to port 922 (see
+[Open Connect Server](docs/devices/open-connect.md)).
 
 ### Cameras
 
@@ -62,9 +92,9 @@ SkyTrak and MLM2PRO also emit it. Add it from the Launch monitors (+) menu:
 
 Cameras record a clip of every shot for replay on the Shots tab, from a few
 seconds before the swing to just after the launch monitor reports it, and
-show live in the Shots tab's Cameras pane, with the golfer's skeleton and
-swing numbers under each clip (body tracking, alpha). Add one from the Cameras (+) menu. Not available on
-macOS yet.
+show live in the Cameras tab, with the golfer's skeleton and swing numbers
+under each clip (body tracking, alpha). Add one from the Cameras (+) menu in
+Settings, Cameras. Not available on macOS yet.
 
 ### Simulation Software
 
@@ -76,7 +106,7 @@ macOS yet.
 
 Simulators are reached through the **Open Connect client** output, which sends
 shots to any simulator that accepts GSPro Open Connect. The Open Connect client
-and server are the two halves of the same protocol. Add one from the Outputs
+and server are the two halves of the same protocol. Add one from the Software
 (+) menu: **GSPro (Open Connect)** and **Pureplay (Open Connect)** add the
 same card, named Open Connect, at `127.0.0.1:921`; it works with whichever
 simulator listens on that port, GSPro or Pureplay. **Muni Golf (Open
@@ -88,36 +118,35 @@ address to a free one, so you can set it up for a different port.
 
 ### Custom Integrations
 
-flighthook exposes a REST + WebSocket API on the event bus, so any external software can subscribe to shot data, device telemetry, and raw audit events. See [docs/API.md](docs/API.md).
+flighthook serves the [Flight Relay Protocol](https://github.com/flightrelay/spec)
+(FRP) at `ws://<host>:5880/frp` and a REST API under `/api`, so other software
+can send it shots, follow the shots, golfers and sets it holds, or read and
+change its settings. See [docs/API.md](docs/API.md).
 
 #### Flight Relay Protocol
 
-The WebSocket API speaks the [Flight Relay Protocol](https://github.com/flightrelay/spec)
-(FRP) — an open, vendor-neutral protocol for launch monitor shot data. flighthook
-serves it at `ws://<host>:5880/frp` and negotiates the spec version on connect:
-FRP `0.2.0`.
+FRP is an open, vendor-neutral protocol for launch monitor shot data and the
+programs around it. flighthook speaks FRP `0.3.0` on `/frp`: one WebSocket
+where every connected program, flighthook included, is an actor that
+publishes and receives messages. The messages cover the shot lifecycle
+(`shot.trigger`, `shot.launch`, `shot.flight`, `shot.club`, `shot.impact`,
+`shot.finished`), the session (`golfer.select`, `golfer.turn`, `golfer.profile`,
+practice sets), games (`game.round`, `game.stroke`) and each actor's identity,
+state and heartbeat (`bus.actor`).
 
-Whatever the monitor is — a Mevo+ over its binary TCP protocol, an R10 over BLE,
-a Uneekor over Open Connect — it is normalized into the same FRP event stream, so
-a consumer is written once rather than per device.
+Whatever the monitor is, a Mevo+ over its binary TCP protocol, an R10 over
+BLE, other launch monitor software over Open Connect, it is normalized into the
+same FRP shots, so a consumer is written once rather than per device. A
+launch monitor sends only what it measured; flighthook's Simulation actor adds
+a simulated flight, labeled as such, for a shot whose monitor sent none.
 
-The shot lifecycle events (`shot_trigger`, `launch`, `flight_result`,
-`club_path`, `face_impact`, `shot_finished`) and the device events
-(`device_telemetry`, `alert`) are FRP-compliant and use the spec's own field
-shapes; the types come from the [`flightrelay`](https://crates.io/crates/flightrelay)
-crate. `launch` carries only measured values; a device's carry, apex and the
-rest come in `flight_result` with the basis they were obtained on, and for a
-shot whose device sent none flighthook adds its own simulated one. flighthook
-adds its own event kinds alongside them (player, club and hand info, config
-commands, actor status, shot groups, camera clips), which FRP-only consumers
-ignore per spec.
-
-The spec is CC0 and the Rust SDK is Apache-2.0/MIT, so consumers need not depend
-on flighthook itself.
+The types come from the [`flightrelay`](https://crates.io/crates/flightrelay)
+crate. The spec is CC0 and the Rust SDK is Apache-2.0/MIT, so consumers need
+not depend on flighthook itself.
 
 ## Status
 
-**Beta (0.1.x)** — The API, configuration format, and WebSocket protocol are usable but may still change. Breaking changes will be noted in release notes.
+**Beta (0.2.x)** — The API, configuration format, and WebSocket protocol are usable but may still change. Breaking changes will be noted in release notes.
 
 ## Install
 
@@ -152,32 +181,48 @@ Terminal. Allow it.
 ## Features
 
 - Multi-device support
-- Automatic detection mode switching based on club selection (full / chipping / putting)
+- The shot type (full / chipping / putting, **Shot Type** in the header) is
+  set by the simulator software: an Open Connect client card sets it from the
+  simulator's club, using the chipping and putting club lists on its own card
+  (GW, SW and LW chip and the putter putts by default), and the Pureplay cards
+  set it from the club and the distance to the hole. You can also pick it in
+  the header when a launch monitor takes it as a hint
 - Club selection is forwarded to devices that use it — the Square Golf Omni has no
   separate putting mode, so selecting a putter in the sim puts it in putting mode
-- The player's hand (**RH | LH**, in the header beside the club picker) comes
-  from the simulator, or from the dashboard when no simulator is connected. The
-  Square Golf Omni and the ExPutt follow it, and monitors connected to the
-  Open Connect server are told the hand and club
-- Battery icons in the header for connected devices that report a charge
-  (Mevo+, Square Golf Omni): red under 20 %, hover for the device and percentage
+- The header's **Club** comes from the simulator, or from the dashboard when no
+  simulator is connected. A pick you make while a simulator is connected is set
+  back to the simulator's. The golfer's hand comes from the connected
+  simulator (for example GSPro or Pureplay), else the hand set on the golfer
+  up's page in Settings, Golfers, else right-handed. The Square Golf Omni and the ExPutt follow the hand, and
+  monitors connected to the Open Connect server are told the hand and club
+- Golfers (beta): save golfers with a name, hand, bag, sex and height, pick
+  the one up from the header, and keep each golfer's shots, sets, grades
+  and exports apart — see [Golfers](#golfers-beta)
+- A header with custom icons (beta): Shots, Cameras, Settings and Log on the
+  left; on the right the batteries, Tournament, Follow turns, Auto-Chip, Shot
+  Type, Club and Golfer — see [The header](#the-header-beta)
+- Tournament mode as a switch in the header: while it is on, Auto-Chip is off
+  and the virtual launch monitors (Trackball, Mock) hold their shots
+- Battery icons in the header's energy menu for connected devices that report a charge
+  (Mevo+, Square Golf Omni, and remote launch monitors that send one): yellow
+  under 20 %, red under 10 %
 - Simulated carry, apex, descent, offline, roll and total for launch monitors that
-  measure launch only (beta) — see [Simulated values](#simulated-values-beta)
+  measure launch only — see [Simulated values](#simulated-values)
 - Shot metrics computed from the measured values: total spin and spin axis,
   face to path, spin loft and curve — see [Shot metrics](#shot-metrics)
-- Shot sets: every shot joins a set, and a club change or **New set** starts
-  a new one — see [Shot Tracking](#shot-tracking)
+- Shot sets: every shot joins its golfer's set, and a club change or **New set**
+  starts a new one — see [Shot Tracking](#shot-tracking)
 - Flight chart: a side view of the simulated ball flights of the shown shot's
   set or club, drawn as smooth curves, with the rest of the session faint
   behind (beta)
 - Dispersion chart: a top-down view of where those shots came to rest or
   landed, with a 2σ or 95 % dispersion ellipse (beta)
 - One fixed Shots layout with both charts always on screen, sized from the
-  window
+  window; the Shots and Cameras tabs share one shots navigation
 - Export the session as JSONL with the raw device frames behind each shot, or CSV
 - Swing replay: USB cameras record a clip of every shot, played back from the
   shot with the cameras side by side, slow motion and frame stepping (beta) —
-  see [Swing replay](#swing-replay-beta)
+  see [Swing replay](#swing-replay)
 - Body tracking: the golfer's skeleton drawn over the replays, with each
   swing's tempo (averaged over the cameras), key moments and body angles,
   and the hip turn, shoulder turn, hip sway and spine at the frame on screen,
@@ -186,8 +231,8 @@ Terminal. Allow it.
   found on this computer's CPU with RTMPose; Off (the default), Historical (a clip is
   tracked the first time it is viewed, which keeps the CPU free while you
   play) or Live (every camera live and every clip as it is recorded), set
-  on the Devices tab's Body tracking card (the player's sex and height on the
-  Player card); its models (about 76 MB) are
+  on the Body tracking card under Settings, Cameras (the golfer's sex and
+  height on the Golfers card); its models (about 76 MB) are
   downloaded only after you confirm it, with the download's progress on
   screen (alpha) — see
   [Body tracking](docs/devices/cameras.md#body-tracking-alpha)
@@ -196,9 +241,9 @@ Terminal. Allow it.
   same layout as at 200 %; in the desktop app Ctrl/Cmd + `+` / `-` adjust it and
   Ctrl/Cmd + `0` resets it (beta)
 - Configurable via TOML file with live settings updates
-- REST + WebSocket API for external consumers — subscribe to shot data, device telemetry, and raw audit events in real time. Build custom shot triggers, data loggers, or alternative integrations without touching the core.
+- FRP on `/frp` and a REST API for external consumers — launch monitors, games and loggers join the same bus as flighthook's own cards, and a program can follow shots, golfers and sets in real time without touching the core.
 
-### Simulated values (beta)
+### Simulated values
 
 When a launch monitor doesn't report carry, apex, flight time, descent angle,
 offline, roll or total, flighthook simulates them from the measured launch (ball
@@ -206,7 +251,7 @@ speed, launch angle, launch direction, backspin, sidespin) with the
 [dimple](https://crates.io/crates/dimple) ball-flight model: modern tour ball,
 flat fairway, sea level and 25 °C by default.
 
-`[simulation] mode` (Devices tab → General → Simulation card) picks what is simulated:
+`[simulation] mode` (Settings → General → Simulation card) picks what is simulated:
 
 - `off`: nothing; flighthook shows only what the launch monitor reports.
 - `on` (the default): flighthook fills what the device didn't report, plus
@@ -269,7 +314,7 @@ so treat them as estimates. Known model limits are listed in dimple's
 comparing against another launch monitor, set altitude and temperature to its
 normalization conditions.
 
-Settings live under `[simulation]` (all keys optional) or in the Devices tab's Simulation card:
+Settings live under `[simulation]` (all keys optional) or in the Simulation card under Settings, General:
 
 ```toml
 [simulation]
@@ -277,7 +322,8 @@ mode = "on"               # off | on | force
 altitude = "0ft"          # any distance unit, 0 to 5000 m
 temperature_c = 25.0      # -30 to 50
 surface = "fairway"       # fairway | green | firm_green
-auto_chip = false         # true shows the header's Auto-chip button
+auto_chip = false         # true shows the header's Auto-Chip button
+tournament = false       # written by the header's Tournament switch
 ```
 
 The mode applies per shot: changing it affects new shots only. An altitude or
@@ -306,14 +352,14 @@ monitor sent), never from the simulation. They are in the API
 
 ### Sharing shot data
 
-The Shots tab's export icon (at the right end of the toolbar, left of the trash
-icon) opens a menu of two formats for the current session (also available as
+The export icon in the shots navigation (next to the shot count, left of the
+trash icon) opens a menu of two formats for the current session (also available as
 `GET /api/shots/export`, see [docs/API.md](docs/API.md#get-apishotsexport)):
 
 - **JSONL** — one line per shot: the decoded shot exactly as the
-  dashboard shows it, the settings in effect (device settings, simulation,
-  club and mode), and the raw device frames behind it as hex (or JSON text for
-  Open Connect). Shots the device read nothing usable for are included.
+  dashboard shows it, its golfer and set, the settings in effect (device
+  settings, simulation, club and mode), and the raw device frames behind it as
+  hex (or JSON text for Open Connect). Shots the device read nothing usable for are included.
 - **CSV** — one row per shot with the decoded values in fixed-unit columns.
   No raw frames.
 
@@ -329,11 +375,21 @@ is written to disk.
 
 ### Shot Tracking
 
-Shots are recorded in **sets**: a shot joins the current set unless the club
-in play changed (going back to an earlier club starts a new set too) or you
-pressed **New set**. **New session** closes the set and starts a fresh
-session. Sets are recorded the same way whatever you look at; the Shots tab
-offers three views of them (By set unless the Global card's Default shot view says otherwise):
+The Shots and Cameras tabs (the first two icons of the header) share one
+**shots navigation** on the left: the shot count with the export and trash
+icons, the view selector, a **Device** filter, the shots, and **New set** and
+**New session** at the foot. Clicking a shot shows it in either tab.
+
+Shots are recorded in **sets**, one run of shots per golfer: a shot joins its
+golfer's current set unless the club in play changed (going back to an earlier
+club starts a new set too, even with no shot in between) or you pressed
+**New set**. Changing club before the first shot of a set keeps the set. Each
+golfer has their own set, so a golfer who comes back on the same club
+continues it, and set numbers count per golfer and start again at 1 in each
+new session. **New session** closes the set and starts a fresh session. Sets
+are recorded the same way whatever you look at; the navigation offers three
+views of them (By set unless the Global card's Default shot view says
+otherwise):
 
 - **By set** — the shot list in sections per set, with range bars (total,
   carry, lateral) for the shown shot's set.
@@ -342,23 +398,26 @@ offers three views of them (By set unless the Global card's Default shot view sa
   doesn't reset a club's numbers here; only New session does.
 - **None** — the last shot only: no sections, range bars or set buttons.
 
-New set and New session sit at the foot of the shot list. With shots from
-more than one device, a **Device** filter in the toolbar picks one device
-(All splits the bars by device). It applies to the whole Shots tab: the shot
-list and its counts, the shot on show, the Table, the cards and the charts.
-The export always carries the whole session, each shot with its set.
-The Shots tab and the export show values in the unit system set by **Units**
-(Imperial or Metric) on the Devices tab's Global card.
+With two or more golfers, the Shots tab shows one golfer's shots at a time:
+the one up, or the one picked in the header's Golfer card (see
+[Golfers](#golfers-beta)). With shots from more than one device, the
+navigation's **Device** filter picks one device (All splits the bars by
+device). Both apply to the whole Shots tab: the shot list and its counts, the
+shot on show, the Table, the cards and the charts. The export always carries
+the whole session, each shot with its golfer and set. The Shots tab and the
+export show values in the unit system set by **Units** (Imperial or Metric) on
+the Global card under Settings, General.
 
-Beside the range bars sit up to three cards, as many as the window has room
-for: a stats card (the average, median and standard deviation of each
-bar), a card per connected camera, and face impact. The stats card is on the
-left and face impact on the right; click a card to show something else on
-it.
+The Shots tab has two views of the numbers, picked at its top: **Cards**
+and **Table**. Beside the range bars in Cards sit up to three cards, as many
+as the window has room for: a stats card (the average, median and standard
+deviation of each bar), a card per connected camera, and face impact. The
+stats card is on the left and face impact on the right; click a card to show
+something else on it.
 
 A **camera card** (beta) loops the shown shot's clip from that camera,
 cropped to fill the card, from shortly before impact to the clip end.
-**Show video on shot cards** on the Devices tab's Replay card turns the
+**Show video on shot cards** on the Replay card under Settings, Cameras turns the
 camera cards on or off (on by default).
 
 When any shot in the history has a face impact reading (Square Golf Omni,
@@ -376,7 +435,7 @@ The dashboard loads the whole session the server keeps (the last 1000
 shots), so the views, range bars and charts cover all of it; **Table** lists
 every one of them, a row per shot.
 
-The trash icon at the toolbar's right end (**Clear history**) deletes every shot,
+The trash icon in the shots navigation (**Clear history**) deletes every shot,
 set and camera clip and starts a new session, after a confirmation, in every open
 dashboard. Export first if you want to keep them.
 
@@ -406,14 +465,15 @@ The ellipse holds about 86 % of a normal pattern (**2σ**, the default) or
 path, else by its carry or total and offline (measured or simulated); shots
 without an offline are left out.
 
-#### Swing replay (beta)
+#### Swing replay
 
-With a USB camera added on the Devices tab (Windows and Linux; not macOS
+With a USB camera added under Settings, Cameras (Windows and Linux; not macOS
 yet), flighthook records a clip of every shot, from a few seconds before the
 impact to just after the launch monitor reports it (the ExPutt: just after
 the strike). A shot with clips gets a
-**Replay** button on its header in Cards and in a column of the Table.
-Replay opens playing, with the cameras side by side and a scrubber that
+**Replay** button on its header in Cards and in a column of the Table, and the
+Cameras tab plays the shown shot's clips inline. Replay opens playing, with the
+cameras side by side and a scrubber that
 marks the impact (gold) and where playback starts (green, 2 s before the
 impact by default). It loops until you turn **Loop** off; pause, step frame
 by frame, slow it to ½, ¼ or ⅛, or download a camera's clip as an AVI with
@@ -422,14 +482,13 @@ the download icon next to its name.
 - FlightScope monitors report a shot at impact, and the ExPutt dates each
   putt at its strike. For the others the impact is estimated a fixed time
   before their report (beta); each monitor
-  has a default, and **Camera timing** on its card's Settings side changes
-  it. See [Cameras](docs/devices/cameras.md#when-a-clip-starts-and-ends).
-- A camera mounted on its side gets a **Rotation** (90° or 270°) on its card's
-  Settings side: the picture is turned upright everywhere it is shown and
+  has a default, and **Camera timing** in its settings changes it. See [Cameras](docs/devices/cameras.md#when-a-clip-starts-and-ends).
+- A camera mounted on its side gets a **Rotation** (90° or 270°) in its
+  settings: the picture is turned upright everywhere it is shown and
   tracked, so a face-on camera fits the whole swing from about 2 m (6 ft).
   See [Cameras](docs/devices/cameras.md#rotation-yaw-and-pitch).
 - Clips are kept on disk, the newest 20 by default: about 2 GB for two
-  720p 120 fps cameras. The Devices tab's Replay card sets how many and
+  720p 120 fps cameras. The Replay card under Settings, Cameras sets how many and
   shows the folder; `clip_dir` under `[replay]` in the config file moves it.
 - Clips are never in the export. The dashboard has no login, so anyone who
   can open it on your network can watch them (see
@@ -445,7 +504,7 @@ toward or away from the target, e.g. `3.8 in Toward`, and hip depth as a
 distance toward the ball or back, e.g. `0.8 in Back`.
 
 The numbers are colored against published tour averages (**Tour | Amateur**
-in the toolbar picks the bands): aqua inside the band, blue inside the fade
+in the Cameras tab's toolbar picks the bands): aqua inside the band, blue inside the fade
 band only and green inside the draw band only for the numbers that depend on
 the shot's shape, yellow near, red far, always with words; a line under the
 tiles names each one off its band. Tiles color on a key moment's frame, such
@@ -458,48 +517,114 @@ Setup, camera positions, clip timing and disk use:
 
 #### Auto-chip (beta)
 
-Some launch monitors can't read a very short chip. The **Auto-chip** button
-in the header, right of the **Club** picker, opens a menu of **1 Yard**,
+Some launch monitors can't read a very short chip. The **Auto-Chip** button
+in the header, left of **Shot Type** and **Club**, opens a menu of **1 Yard**,
 **3 Yard** and **5 Yard**: pick one to send a short, straight chip of that
 total distance to the simulator, so the ball gets onto the green and the
 simulator's auto-putt can finish the hole. It is off by default; turn it on
-in Settings → Simulation (the **Auto-chip** checkbox on the Devices tab's
-Simulation card, or `auto_chip = true` under `[simulation]`). It is useful
-with radar launch monitors that miss short chips.
+in Settings → General (**Auto-Chip Helper** on the Global card set to **Show**, or
+`auto_chip = true` under `[simulation]`). It is useful with radar launch
+monitors that miss short chips. It is off while tournament mode is on or a
+simulator's tournament round is held.
 
-- The chip is launched straight at 28° with 100 rpm of backspin per mph of
-  ball speed, no sidespin and no club data. The distance is flighthook's own
+- The chip is launched straight at 45° with 300 rpm of backspin per mph of
+  ball speed, no sidespin and no club data, so it carries about 90% of the
+  distance and stops quickly. The distance is flighthook's own
   estimate: flighthook picks the ball speed so that its
-  [simulation](#simulated-values-beta), in the configured environment and on
+  [simulation](#simulated-values), in the configured environment and on
   the configured surface, comes to rest at the chosen distance (carry plus
   roll). The simulator runs its own physics on that launch, so its green
   speed changes the actual roll.
-- It goes to every connected Open Connect Client, whatever launch monitor
-  each detection mode is routed to. The button is disabled until one is
-  connected.
+- It goes to every connected Open Connect client and Pureplay output,
+  whatever launch monitor each detection mode is routed to. The button is
+  disabled until one is connected.
 - The shot list, the Cards and Table views and the export show it as its own
-  device, **Auto-chip**. It stays out of your shot statistics: it is listed
+  device, **Auto-Chip**. It stays out of your shot statistics: it is listed
   under the set it was hit in, but the set's shot count, the range bars, the
   dispersion ellipse and the flight chart's set leave it out, and the device
   filter does not offer it. Shown on its own, its flight is drawn over the
   set's shots.
 
-### Devices
+### The header (beta)
 
-The Devices tab, where the app opens, has the Global, Simulation and Replay
-settings and the web server under General, then a card for every launch
-monitor, camera and output. A card's **Telemetry | Settings** toggle flips it between the
-device's live status and its settings. Edit a card and **Save** or
-**Cancel** it before moving on; the rest of the dashboard waits until you
-do. The **+** after Launch monitors, Cameras or Outputs adds one. There is one web
-server: it can be edited (its bind address) but not removed or added.
-**Reconnect** on a launch monitor or output card closes its connection and
-starts it again from its saved settings, without restarting flighthook.
-The switch next to a card's name turns that device off or on at once,
-keeping its settings: a device that is off doesn't run, sends no shots and
-shows **DISABLED**.
+The header runs across the top of every tab. On the left, four icons pick the
+tab: **Shots**, **Cameras** (hover text points to Settings while no camera is added),
+**Settings** and **Log**. On the right, by role, from the left:
 
-Each card's badge and left stripe show its connection:
+- **Energy**: the batteries of the devices that report one. It shows only
+  when there is one to show.
+- **Tournament**: a switch for tournament mode (see below).
+- **Follow turns**: with two or more golfers known, on (the default) makes the
+  Shots tab follow the golfer up; off keeps the view on the golfer you picked
+  in the Golfer card. It is not saved: it is on again after a reload.
+- **Auto-Chip**: see [Auto-chip](#auto-chip-beta).
+- **Shot Type**: Full, Chipping or Putting. It shows when a launch monitor
+  takes the shot type as a hint (Mevo, Trackball, Mock) or an output routes
+  chips or putts to a chosen launch monitor.
+- **Club**: the club in play. The picker offers the golfer up's bag, or every
+  club when the golfer has no bag.
+- **Golfer**: the golfer up, shown as an initial. Its card picks who is up
+  and opens Settings, Golfers.
+
+Switching Tournament or Follow turns shows a short message near the bottom of
+the window saying whether it is now on or off.
+
+The Club, Shot Type and Golfer pickers are always editable. While a simulator
+card (Open Connect client or Pureplay Accessory) is
+connected, a pick that differs from the simulator's is set back to the
+simulator's.
+
+**Tournament mode** is a switch while nothing else has set it: on, Auto-Chip is
+off and the virtual launch monitors (Trackball, Mock, and remote ones that say
+they are virtual) hold their shots, so only measured shots count. When a
+simulator holds a tournament round the switch shows it locked on, and it
+cannot be turned off from flighthook until the simulator ends the round. The
+manual switch is saved in `[simulation] tournament`.
+
+### Golfers (beta)
+
+Settings, Golfers lists the golfers flighthook knows. A golfer has a name, a
+hand, a bag (the clubs the Club picker offers), a sex and a height (the swing
+analysis compares against the matching tour averages and gives distances in
+centimeters or inches). flighthook gives each golfer an id of its own and can
+link game ids to a golfer, picked from the players a game currently
+publishes or that the Golfer menu lists from earlier shots: a Pureplay player linked to a golfer plays and records as that
+golfer.
+
+The golfer up owns the header's Club and Shot Type and the hand, and their
+shots carry their name. The hand comes from the connected simulator (for
+example GSPro or Pureplay), else the golfer's saved hand, else right-handed.
+The hand is set on the golfer's page in Settings, Golfers (Right-handed or
+Left-handed, saved as `handed` in `[[golfers]]`); a `POST /api/select` that
+carries `handedness` also saves it for the golfer up. Every golfer has their own sets, last club and grades, and
+the Shots tab shows one golfer's shots at a time. The Golfer card in the
+header also lists golfers that have shots this run but are not known (for
+example a departed Pureplay guest) and **No golfer** while shots with none
+exist; picking one of those only changes the view. A game's players (the
+Pureplay Accessory card) appear as golfers while the round lasts.
+
+### Settings
+
+Settings is one list on the left, in five sections: **General** (Global,
+Web Server and Simulation), **Launch monitors** (local and remote),
+**Software** (every card that talks to another program: the outputs to
+simulators and the Pureplay Accessory card), **Cameras** (each camera, then
+Replay and Body tracking) and **Golfers** (one row per golfer). Each row
+carries its device's status dot; a red dot marks a red device. The selected
+row's page fills the rest: a device's page shows its live telemetry beside
+its settings, and a plain form (Global, Simulation, Replay, Body tracking,
+a golfer) lays out one row per setting. On a phone the list is the page, and
+a row opens its page with a back arrow. Edit a page and **Save** or
+**Cancel** it before moving on; the list and the tabs wait until you do. The
+**+** after Launch monitors, Software, Cameras or Golfers adds one; the
+trash icon on a page removes it. There is one web server: it can be edited
+(its bind address) but not removed or added. The **Reconnect** icon on a
+launch monitor or Software page closes its connection and starts it again
+from its saved settings, without restarting flighthook. The switch next to
+a page's title turns that device off or on at once, keeping its settings: a
+device that is off doesn't run, sends no shots and shows **DISABLED**.
+
+Each device's badge, left stripe and list dot show its connection:
 
 - **CONNECTING** (yellow): not connected yet since it started or since its
   settings were saved (e.g. GSPro not running yet).
@@ -510,20 +635,34 @@ Each card's badge and left stripe show its connection:
   that disconnects from the Open Connect server.
 - **DISABLED** (gray): turned off with its switch. Not an error.
 
-The Devices tab shows a red dot while any card is red.
+The Settings icon in the header shows a red dot while any device is red.
 
-![Device settings](./screens/devices-settings.png "Device settings")
+![Settings, a launch monitor](./screens/devices.png "Settings, a launch monitor's page")
+
+![Camera page](./screens/devices-settings.png "A camera's page")
 
 ### Multi-Monitor Routing
+
+An output's settings route each shot type to a launch monitor:
+full swings, chips and putts can each go to a different monitor, or to any.
+Routing is saved by the monitor's id, so removing a launch monitor card and
+adding it again leaves the routing on "Missing monitor" until the card is
+picked again. An Open Connect client card also holds the **chipping** and
+**putting** club lists that decide which clubs the simulator sends as a chip or
+a putt (GW, SW and LW chip and the putter putts by default; with both lists
+empty the card sends no shot type).
 
 ![Monitor Routing](./screens/multi-monitor-routing.png "Monitor Routing")
 
 ## Architecture
 
-A single `broadcast<FlighthookMessage>` bus connects all components.
-Each message carries a typed event and an optional raw payload (for debugging).
-Session threads, integration bridges, and the web layer all subscribe to the same bus.
-Third-party software can connect via WebSocket and interact with the bus the same way as any built-in integration.
+One internal bus carries Flight Relay messages between flighthook's actors: the
+launch monitor cards, the session (who is up, with which club and hand), the
+practice sets, the simulation, the outputs to simulators, the cameras and the
+web layer. Each actor publishes what it knows and reads what it needs. `/frp`
+joins that bus to other programs: a program that connects there takes part
+like a built-in card, and the dashboard follows the same bus over its own
+socket. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
 
@@ -536,7 +675,7 @@ TOML file auto-created on first run at the platform config directory:
 - **macOS**: `~/Library/Application Support/flighthook/config.toml`
 
 ```toml
-# optional; simulated values (beta), shown at their defaults
+# optional; simulated values, shown at their defaults
 [simulation]
 mode = "on"
 altitude = "0ft"
@@ -595,24 +734,41 @@ mode = "auto"                  # or e.g. "1280x720@120"
 [openconnect_client.0]
 name = "GSPro"
 address = "127.0.0.1:921"
+full_monitor = "mevo.0"        # optional routing, by card; saved as the card's id
+chipping_clubs = ["GW", "SW", "LW"]   # clubs sent as a chip (default); both lists empty: no shot type is sent
+putting_clubs = ["PT"]                # clubs sent as a putt (default)
 
 [openconnect_client.1]
 name = "Muni Golf"
 address = "127.0.0.1:9210"
+
+# golfers (beta); each has an id of its own, written when it is created
+[[golfers]]
+identifiers = ["flighthook.5b0e3c1e-7d2a-4f4b-9a63-0c1f2e8d7a10"]
+name = "Alex"
+handed = "rh"                  # rh | lh
+bag = ["DR", "3W", "5I", "7I", "9I", "PW", "SW", "PT"]   # optional: the clubs the picker offers
+sex = "female"                 # male (default) | female: which tour averages the swing is compared with
+height = 168.0                 # cm, 100 to 250; optional
 ```
 
 `[simulation]` and `[replay]` (camera clips, see
 [Cameras](docs/devices/cameras.md)) are single global tables. Section
 prefixes encode component type: `webserver`, `mevo`, `r10`, `square`,
-`exputt`, `trackball`, `openconnect_server`, `mock_monitor`, `openconnect_client`,
-`random_club`, `camera`. The
-index after the dot (`0`, `1`, ...) identifies the instance. Per-device
+`exputt`, `trackball`, `openconnect_server`, `pureplay_accessory`,
+`mock_monitor`, `openconnect_client`, `pureplay`, `random_club`, `camera`. The
+index after the dot (`0`, `1`, ...) identifies the instance. Each card also
+holds an `actor_id`, generated once and kept, which is how the card is known
+on the bus and in saved routing; `[frp]` holds flighthook's own ids, and
+`selected_golfer` the golfer up at start. Per-device
 options are covered in the [device docs](#launch-monitors). Settings can also
-be edited live on the Devices tab in the UI.
+be edited live under Settings in the UI.
 
 Files in an older format are read too: `[gspro.N]` sections as
-`[openconnect_client.N]`, and a single `[webserver]` table as
-`[webserver.0]`. On the next start flighthook rewrites such a file in the
+`[openconnect_client.N]`, a single `[webserver]` table as `[webserver.0]`,
+`[player]` (sex and height) onto the first golfer, the global `chipping_clubs`
+and `putting_clubs` lists onto every Open Connect client, and an output's
+routing by card name (`full_monitor = "mevo.0"`) as the card's id. On the next start flighthook rewrites such a file in the
 current format, keeping the original next to it as
 `config.pre-<version>.toml` (`config.pre-<version>.1.toml`, ... if that name
 is taken; a backup is never overwritten), and logs where the backup is. The
@@ -703,9 +859,10 @@ To run with a mock device, point `--config` at a TOML file with
 ## Developer Documentation
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Multi-device config model,
-  unified bus, threading, state machine, settings UI design.
-- **[docs/API.md](docs/API.md)** — REST and WebSocket API reference for the web
-  dashboard (`/api/status`, `/api/shots`, `/frp`, etc.).
+  the internal bus and its actors, threading, the session and sets, state
+  machine, UI design.
+- **[docs/API.md](docs/API.md)** — REST API, FRP on `/frp` and the dashboard's
+  socket reference (`/api/status`, `/api/shots`, `/api/select`, `/frp`, etc.).
 - **[docs/SCREENSHOTS.md](docs/SCREENSHOTS.md)** — `make screens` regenerates
   the screenshots in this README; `make screens-check` checks they are current.
 
@@ -729,4 +886,4 @@ To run with a mock device, point `--config` at a TOML file with
 
 ---
 
-Mevo+ and FlightScope are trademarks of FlightScope (Pty) Ltd. Garmin and Approach R10 are trademarks of Garmin Ltd. or its subsidiaries. ExPutt, Square Golf and Square Omni are trademarks of Invant Inc. Uneekor, EYE MINI, EYE XO and QED are trademarks of Uneekor, Inc. GSPro is a trademark of GSP Golf AB. Foresight Sports, SkyTrak, MLM2PRO and Pureplay are trademarks of their respective owners. flighthook is not affiliated with, endorsed by, or sponsored by any of these companies.
+Mevo+ and FlightScope are trademarks of FlightScope (Pty) Ltd. Garmin and Approach R10 are trademarks of Garmin Ltd. or its subsidiaries. ExPutt, Square Golf and Square Omni are trademarks of Invant Inc. GSPro is a trademark of GSP Golf AB. Pureplay is a trademark of its owner. flighthook is not affiliated with, endorsed by, or sponsored by any of these companies.

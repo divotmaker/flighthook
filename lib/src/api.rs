@@ -4,24 +4,20 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    ActorStatus, Club, ConnectionState, Handedness, RoundState, ShotDetectionMode, ShotGroupInfo,
-    ShotGrouping, StatusHistory,
-};
+use crate::{ActorStatus, ConnectionState, RoundState, ShotGrouping, StatusHistory};
 
 /// GET /api/status response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
+    /// Each local card's status, by card key.
     #[serde(default)]
-    pub actors: HashMap<String, ActorStatusResponse>,
+    pub cards: HashMap<String, ActorStatusResponse>,
+    /// Every FRP actor on the bus, local and remote, by actor id.
     #[serde(default)]
-    pub mode: Option<ShotDetectionMode>,
-    /// Club selected in game state; absent when none has been selected.
+    pub actors: HashMap<String, StatusActor>,
+    /// The session's current `golfer.turn`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub club: Option<Club>,
-    /// Player handedness in game state; absent when none has been set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handed: Option<Handedness>,
+    pub turn: Option<flightrelay::GolferTurn>,
     /// The server can record from cameras on its platform (beta). Omitted
     /// when it can't.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -42,6 +38,22 @@ pub struct StatusResponse {
     /// it. Omitted when no round is active.
     #[serde(default, skip_serializing_if = "RoundState::is_inactive")]
     pub round: RoundState,
+}
+
+/// One FRP actor in [`StatusResponse::actors`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusActor {
+    pub name: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// What keeps it from working; empty when it is ready.
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<flightrelay::DeviceInfo>,
+    /// The local card key, when the actor is a flighthook card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<String>,
 }
 
 /// A config file the app could not use at startup, so it runs on the
@@ -190,19 +202,18 @@ impl ActorStatusResponse {
     }
 }
 
-/// POST /api/mode request body.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModeRequest {
-    pub mode: ShotDetectionMode,
-}
-
 /// POST /api/settings response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostSettingsResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restarted: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stopped: Vec<String>,
+    /// For `?scope=golfers`: the golfers as saved, in the order posted,
+    /// each with its own `flighthook.*` id (a new golfer's is given by the
+    /// save).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub golfers: Vec<crate::GolferRecord>,
 }
 
 /// POST /api/find-mat request body: the ExPutt's actor ID, e.g. `exputt.0`.
@@ -211,25 +222,12 @@ pub struct FindMatRequest {
     pub actor: String,
 }
 
-/// POST /api/club request body. `club` is a club code, parsed leniently with
-/// [`Club::from_code`].
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ClubRequest {
-    pub club: String,
-}
-
-/// POST /api/hand request body. `handed` is `rh` or `lh`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct HandRequest {
-    pub handed: String,
-}
-
 /// Actor id of the Auto-chip source: shots sent with `POST /api/auto-chip`
 /// come from this id, a virtual device with no config section.
 pub const AUTO_CHIP_ACTOR: &str = "autochip";
 
 /// Display name of the Auto-chip source.
-pub const AUTO_CHIP_NAME: &str = "Auto-chip";
+pub const AUTO_CHIP_NAME: &str = "Auto-Chip";
 
 /// The total distances, in yards, `POST /api/auto-chip` takes, in menu order.
 pub const AUTO_CHIP_YARDS: [u32; 3] = [1, 3, 5];
@@ -259,25 +257,46 @@ pub struct GroupingRequest {
     pub mode: ShotGrouping,
 }
 
-/// GET /api/shots/groups response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShotGroupsResponse {
-    /// Actor ID of the webserver that produced this list (`"webserver.0"`).
-    pub server: String,
-    /// Default view (`shot_grouping`). It does not change how sets are
-    /// assigned.
-    pub mode: ShotGrouping,
-    /// Current session: starts at 0 and counts up with every "New session".
-    /// Omitted when 0.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub session: u32,
-    /// Id of the open set: the one the next shot joins, unless the club in
-    /// play differs from its club.
+/// POST /api/tournament request body: switch tournament mode on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TournamentRequest {
+    pub on: bool,
+}
+
+/// One practice block in `GET /api/blocks`: the `practice.block` as last
+/// published, whether it is still open, and the stored shots in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockInfo {
+    #[serde(flatten)]
+    pub block: flightrelay::PracticeBlock,
+    /// Not closed by the practice actor yet.
+    pub open: bool,
+    /// Stored shots with data that belong to it.
+    pub shots: u32,
+    /// When its first stored shot was triggered, in milliseconds since the
+    /// Unix epoch; absent before its first shot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current: Option<String>,
-    /// Open groups and groups referenced by a stored shot, ascending `number`.
-    #[serde(default)]
-    pub groups: Vec<ShotGroupInfo>,
+    pub first_shot_at: Option<u64>,
+}
+
+/// `GET /api/blocks` response: every practice block this run, open and
+/// closed, in the order first seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlocksResponse {
+    /// The current practice session (from 1 each run).
+    pub session: u32,
+    pub blocks: Vec<BlockInfo>,
+}
+
+/// `POST /api/blocks` body: a `practice.new_block` from flighthook.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewBlockRequest {
+    /// The golfer whose block to roll; absent for the golfer up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golfer: Option<flightrelay::GolferId>,
+    /// Close every open block and count the session up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new_session: bool,
 }
 
 /// Whether a status change from `from` to `to` ends the telemetry the actor
@@ -300,38 +319,48 @@ fn merge_telemetry(held: &mut HashMap<String, String>, update: &HashMap<String, 
     }
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
-fn is_zero(v: &u32) -> bool {
-    *v == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn status_club_and_hand_are_optional() {
-        let s: StatusResponse = serde_json::from_str(r#"{"actors":{},"mode":"full"}"#).unwrap();
-        assert_eq!(s.club, None);
+    fn status_turn_is_optional_and_actors_name_their_card() {
+        let s: StatusResponse = serde_json::from_str(r#"{"cards":{}}"#).unwrap();
+        assert_eq!(s.turn, None);
         let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, r#"{"actors":{},"mode":"full"}"#);
+        assert_eq!(json, r#"{"cards":{},"actors":{}}"#);
 
         let s = StatusResponse {
-            club: Some(Club::Iron7),
-            handed: Some(Handedness::Left),
+            turn: Some(flightrelay::GolferTurn::new(
+                None,
+                Some(crate::Club::Iron7),
+                crate::Handedness::Left,
+                crate::Mode::Full,
+            )),
+            actors: HashMap::from([(
+                "aaaa".to_string(),
+                StatusActor {
+                    name: "Range".into(),
+                    roles: vec!["launch_monitor".into()],
+                    blockers: vec![],
+                    device: None,
+                    card: Some("mevo.0".into()),
+                },
+            )]),
             ..s
         };
         let v = serde_json::to_value(&s).unwrap();
-        assert_eq!(v["club"], "7I");
-        assert_eq!(v["handed"], "lh");
+        assert_eq!(v["turn"]["club"], "7I");
+        assert_eq!(v["turn"]["handedness"], "lh");
+        assert_eq!(v["actors"]["aaaa"]["card"], "mevo.0");
         let back: StatusResponse = serde_json::from_value(v).unwrap();
-        assert_eq!(back.club, Some(Club::Iron7));
-        assert_eq!(back.handed, Some(Handedness::Left));
+        assert_eq!(back.turn, s.turn);
+        assert_eq!(back.actors, s.actors);
     }
 
     #[test]
     fn actor_status_carries_state_and_red_time() {
-        let mut a = ActorStatusResponse::new("Uneekor", ActorStatus::Connected);
+        let mut a = ActorStatusResponse::new("Range Bridge", ActorStatus::Connected);
         a.observe(ActorStatus::Disconnected, 1_000);
         a.stamp(61_000);
         let v = serde_json::to_value(&a).unwrap();
@@ -473,9 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn club_and_grouping_requests() {
-        let c: ClubRequest = serde_json::from_str(r#"{"club":"I7"}"#).unwrap();
-        assert_eq!(Club::from_code(&c.club), Some(Club::Iron7));
+    fn grouping_requests() {
         let g: GroupingRequest = serde_json::from_str(r#"{"mode":"by_club"}"#).unwrap();
         assert_eq!(g.mode, ShotGrouping::ByClub);
         assert_eq!(
@@ -485,46 +512,5 @@ mod tests {
             .unwrap(),
             r#"{"mode":"none"}"#
         );
-    }
-
-    #[test]
-    fn shot_groups_response_round_trips() {
-        let empty: ShotGroupsResponse =
-            serde_json::from_str(r#"{"server":"webserver.0","mode":"none"}"#).unwrap();
-        assert_eq!(empty.mode, ShotGrouping::None);
-        assert_eq!(empty.current, None);
-        assert_eq!(empty.session, 0);
-        assert!(empty.groups.is_empty());
-        assert_eq!(
-            serde_json::to_string(&empty).unwrap(),
-            r#"{"server":"webserver.0","mode":"none","groups":[]}"#
-        );
-
-        let group = ShotGroupInfo {
-            id: "6f1c2a3b-4d5e-4f60-8a71-92b3c4d5e6f7".into(),
-            number: 1,
-            session: 0,
-            golfer: None,
-            club: Some(Club::Driver),
-            started_at: "2026-10-26T13:58:02.117Z".into(),
-            manual: true,
-            open: true,
-            shots: 0,
-        };
-        let full = ShotGroupsResponse {
-            server: "webserver.0".into(),
-            mode: ShotGrouping::ByClub,
-            session: 2,
-            current: Some(group.id.clone()),
-            groups: vec![group.clone()],
-        };
-        let v = serde_json::to_value(&full).unwrap();
-        assert_eq!(v["mode"], "by_club");
-        assert_eq!(v["current"], group.id.as_str());
-        assert_eq!(v["session"], 2);
-        let back: ShotGroupsResponse = serde_json::from_value(v).unwrap();
-        assert_eq!(back.current, full.current);
-        assert_eq!(back.session, 2);
-        assert_eq!(back.groups, vec![group]);
     }
 }

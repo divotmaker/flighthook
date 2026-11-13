@@ -1,7 +1,11 @@
 # Flighthook Architecture
 
-Multi-launch-monitor bridge with unified bus messaging and club-based shot
-routing.
+A bridge between launch monitors, games and simulators, cameras and a web or
+native dashboard. Inside, every launch monitor, output, game and the flight
+model is a Flight Relay Protocol (FRP) 0.3.0 actor on one internal bus.
+flighthook itself is one more actor: it plays the session (the turn), the
+practice (the Sets) and the collector (the shot store, the dashboard, the
+export) roles.
 
 ## Config Model
 
@@ -10,8 +14,20 @@ no `type` discriminator field needed. Section keys are integer indices starting
 at `"0"`.
 
 ```toml
-chipping_clubs = ["GW", "SW", "LW"]
-putting_clubs = ["PT"]
+default_units = "imperial"
+selected_golfer = "flighthook.5b0c4d2e-0000-4000-8000-000000000001"  # the golfer picked last
+
+[frp]
+actor_id = "..."             # flighthook's own actor, generated once
+auto_chip_actor_id = "..."   # the Auto-Chip launch monitor
+
+[simulation]
+actor_id = "..."             # the Simulation card's flight model actor
+
+[[golfers]]
+identifiers = ["flighthook.5b0c4d2e-0000-4000-8000-000000000001", "pureplay.thill"]
+name = "Eric"
+handed = "rh"
 
 [webserver.0]
 name = "Web Server"
@@ -19,6 +35,7 @@ bind = "0.0.0.0:5880"
 
 [mevo.0]
 name = "Mevo WiFi"
+actor_id = "..."             # every card that is an FRP actor has one
 address = "192.168.2.1:5100"
 ball_type = 1
 track_pct = 80.0
@@ -32,11 +49,27 @@ name = "Garmin R10"
 [openconnect_client.0]
 name = "GSPro"
 address = "127.0.0.1:921"
-# full_monitor = "mevo.0"       # optional: route full-swing shots from specific monitor
-# chipping_monitor = "mevo.0"   # optional: route chipping shots
-# putting_monitor = "mevo.0"    # optional: route putting shots
+# full_monitor = "..."          # optional: the actor id of the launch monitor routed for full swings
+# chipping_monitor = "..."      # optional: the same for chipping shots
+# putting_monitor = "..."       # optional: the same for putts
+# chipping_clubs = ["GW", "SW", "LW"]   # clubs the simulator holds for a chip (default)
+# putting_clubs = ["PT"]                # clubs the simulator holds for a putt (default)
 ```
 
+- `[frp]` -- flighthook's own FRP actors: `actor_id` (the session, practice and
+  collector actor) and `auto_chip_actor_id` (the Auto-Chip launch monitor).
+  Generated at the first start and kept, so flighthook is the same actor
+  across restarts; omitted while empty
+- `selected_golfer` -- the `flighthook.<uuid>` id of the golfer picked last in
+  flighthook; the golfer up at start. Omitted while unset
+- `[[golfers]]` (beta) -- the golfers, in display order (see
+  [Golfers](#golfers-beta)); omitted while empty
+- `[simulation]` -- the flight model (the Simulation card): `mode`, `altitude`,
+  `temperature_c`, `surface`, `auto_chip`, `tournament` and the flight model's
+  `actor_id`; each field omitted at its default
+- `actor_id` -- every launch monitor, output and Pureplay Accessory section
+  carries the card's FRP actor id, generated once and kept (a card's id goes
+  when the card is removed). Cameras and the web server are not FRP actors
 - `[mevo.<idx>]` -- FlightScope device instance (Mevo/Mevo+, or Xi — detected at connect)
 - `[r10.<idx>]` -- Garmin R10 BLE device instance (auto-discovers via Bluetooth)
 - `[square.<idx>]` -- Square Golf Omni BLE device instance
@@ -47,12 +80,16 @@ address = "127.0.0.1:921"
   `club`, `hand`, `cpi`, `report_limit` and the `thresholds` and `tuning`
   tables sit in the same table; a `grab` key is ignored, see "Trackball
   card")
-- `[openconnect_server.<idx>]` -- Open Connect server: GSPro Open Connect ingest listener (Uneekor)
+- `[openconnect_server.<idx>]` -- Open Connect server: GSPro Open Connect ingest listener (launch monitor software that sends Open Connect)
 - `[mock_monitor.<idx>]` -- mock launch monitor instance (flightrelay's mock
   driver; its settings `shot_interval_s`, `arm_delay_s`, `ball_ready_delay_s`,
   `post_shot_delay_s` and `serial` sit in the same table)
 - `[openconnect_client.<idx>]` -- Open Connect client: dials a simulator that
-  accepts GSPro Open Connect (GSPro and Pureplay on 921, Muni Golf on 9210). `[gspro.<idx>]`
+  accepts GSPro Open Connect (GSPro and Pureplay on 921, Muni Golf on 9210).
+  `chipping_clubs` (default GW, SW, LW) and `putting_clubs` (default PT) are
+  the clubs the simulator holds for a chip and a putt: the card sets the shot
+  type from the simulator's club by them, and sends no shot type when both are
+  empty. `[gspro.<idx>]`
   sections are read as `[openconnect_client.<idx>]`; when both name an index,
   `openconnect_client` is used and a warning is logged. Saves write only
   `[openconnect_client.<idx>]`, and the file is rewritten that way on the next
@@ -60,9 +97,15 @@ address = "127.0.0.1:921"
 - `[pureplay.<idx>]` -- Pureplay output (alpha): dials Pureplay (default
   `127.0.0.1:9760`) over Pureplay Connect; same routing keys as
   `openconnect_client` (see [Pureplay output](#pureplay-output-alpha))
+- `[pureplay_accessory.<idx>]` -- Pureplay Accessory card (beta), under
+  Software: dials Pureplay's Accessory API (default `127.0.0.1:9770`),
+  takes Pureplay's club and hand, its local players' shots (`shots`:
+  `auto` | `from_pureplay` | `from_flighthook`) and its results;
+  `impact_lead_s` as other launch monitors; the pairing token kept outside
+  the config (see [Pureplay Accessory card](#pureplay-accessory-card-beta))
 - `[random_club.<idx>]` -- random club cycling integration instance
 - `[camera.<idx>]` -- swing camera (beta): records a clip of every shot (see
-  [Cameras and replay](#cameras-and-replay-beta))
+  [Cameras and replay](#cameras-and-replay))
 - `[webserver.<idx>]` -- web server instance
 - `[replay]` -- global camera clip settings (beta: `keep_shots`, `pre_roll_s`, `post_roll_s`, `start_before_impact_s`, `clip_dir`, `shot_cards`), omitted at its defaults
   like `[simulation]`
@@ -71,10 +114,9 @@ address = "127.0.0.1:921"
   `show_skeleton`), each field
   omitted at its default and the section with them (see
   [Body tracking](#body-tracking-alpha))
-- `[player]` -- facts about the player for the swing analysis (`sex`:
-  `male` (default) | `female`; `height`: cm, 100 to 250, unset by default),
-  each field omitted at its default and the section with them (see
-  [Body tracking](#body-tracking-alpha))
+- A golfer's `sex` (`male` default | `female`) and `height` (cm, 100 to 250,
+  unset by default) feed the swing analysis (see
+  [Body tracking](#body-tracking-alpha)); they sit on the golfer's record
 - `name` is **required** -- the user-visible name, editable (rename) in settings UI
 - `enabled` is on every launch monitor, camera and output section (not
   `[webserver.<idx>]`): default `true`, omitted from the config then, so a
@@ -150,15 +192,41 @@ address = "127.0.0.1:921"
 - Mock sections show only name and Camera timing; the mock driver's settings
   are set in the file or through the API
 - Global IDs = `"{type_prefix}.{index}"` (e.g. `mevo.0`, `openconnect_client.0`)
-- WebSocket actor IDs = `"ws.{8-hex-chars}"`
+- Actor IDs (FRP) = the `actor_id` of the section, a generated identifier kept
+  across restarts; the routing fields of an output (`full_monitor`,
+  `chipping_monitor`, `putting_monitor`) hold the launch monitor's actor id.
+  An id that names no card is kept as written, routes nothing, and the picker
+  shows it as "Missing monitor" until another launch monitor is picked
 
 ### Loading and migration
 
 `state::config::load()` reads the file once at startup (`SystemState::new`).
-A missing file is created with the defaults. The text is parsed as the current
+A missing file is created and written at once, with the defaults and the
+generated actor ids, so flighthook's actors keep their ids from the first start
+on. The text is parsed as the current
 format (which also reads `[gspro.<idx>]` as `[openconnect_client.<idx>]`), or
 failing that as the singleton-`[webserver]` format, which loads as
 `[webserver.0]` (named "Web Server" when unnamed).
+
+A file written by an earlier version is read as follows, then rewritten once
+(below):
+
+- Every actor that has no `actor_id`, or whose id an earlier actor holds,
+  gets a generated one: `[frp] actor_id`, `auto_chip_actor_id`,
+  `[simulation] actor_id` and the `actor_id` of every launch monitor, output
+  and Pureplay Accessory section.
+- An output's routing (`full_monitor`, `chipping_monitor`, `putting_monitor`)
+  that names a card by its key (`mevo.0`) names its actor id from then on. A
+  key that names no card stays as it is and routes nothing.
+- The global `chipping_clubs` and `putting_clubs` lists are copied into every
+  Open Connect client section and then left out.
+- `[player]` (sex and height) moves onto the golfers: the first golfer takes
+  them where it has none; with no golfer, one named "Golfer" is made with
+  them. A `golfer_height` in `[body_tracking]` is read as the height when the
+  player has none.
+- A golfer without a `flighthook.*` identifier gets one. An identifier two
+  golfers list stays with the first in file order (a warning names the
+  other).
 
 After a successful load the config is serialized exactly as a save writes it
 (`toml::to_string_pretty`), and that text and the file's are both parsed as
@@ -207,25 +275,28 @@ On first startup the default config contains only a webserver — no devices or
 integrations. The UI detects this (`FlighthookConfig::has_user_actors()`) and
 shows a setup wizard instead of the normal dashboard, once `/api/status` has
 said whether the server reads a trackball. The wizard lists the same presets as
-the Devices tab's (+) menus (`cards::welcome_options`): every launch monitor
-except the generic Open Connect Server, the Trackball only where the server
-reads one, and every output (GSPro, Pureplay and Muni Golf over Open Connect,
-Pureplay over Pureplay Connect). No cameras. GSPro and Pureplay over Open
+the Settings sections' (+) menus (`cards::welcome_options`): every launch monitor
+(the Open Connect Server included), the Trackball only where the server
+reads one, the Pureplay Accessory card (a Software card, listed with the
+launch monitors as a way to get shots), and every output (GSPro, Pureplay
+and Muni Golf over Open Connect). No cameras. GSPro and Pureplay over Open
 Connect add the same connection (an Open Connect client at `127.0.0.1:921`), so
 checking one unchecks the other. On confirmation it adds each checked preset as
 its (+) menu entry does (`SettingsForm::add_preset`), posts the whole config via
 the existing settings save path, and dismisses. Users can also skip the wizard
-and configure manually on the Devices tab.
+and configure manually in Settings.
 
 ### Rust types
 
-**lib/src/config.rs** (shared config types, used by both app and UI):
+**lib/src/config/** (shared config types, used by both app and UI):
 
 ```rust
 pub struct FlighthookConfig {
     pub default_units: UnitSystem,
-    pub chipping_clubs: Vec<Club>,
-    pub putting_clubs: Vec<Club>,
+    pub frp: FrpSection,                   // [frp]: flighthook's own actor ids
+    pub selected_golfer: Option<String>,   // the golfer picked last
+    pub shot_grouping: ShotGrouping,       // default Shots view
+    pub golfers: Vec<GolferRecord>,        // [[golfers]], display order
     pub simulation: SimulationSection,     // [simulation], omitted at defaults
     pub replay: ReplaySection,             // [replay], omitted at defaults
     pub body_tracking: BodyTrackingSection, // [body_tracking], omitted at defaults
@@ -239,6 +310,7 @@ pub struct FlighthookConfig {
     pub openconnect_server: HashMap<String, OpenConnectServerSection>,
     pub openconnect_client: HashMap<String, OpenConnectClientSection>,  // `gspro` also read
     pub pureplay: HashMap<String, PureplaySection>,  // name, address, full/chipping/putting_monitor
+    pub pureplay_accessory: HashMap<String, PureplayAccessorySection>,
     pub random_club: HashMap<String, RandomClubSection>,
     pub camera: HashMap<String, CameraSection>,
 }
@@ -246,7 +318,8 @@ pub struct FlighthookConfig {
 pub struct ReplaySection { pub keep_shots: u32, pub pre_roll_s: f64, pub post_roll_s: f64, pub start_before_impact_s: f64, pub clip_dir: Option<String>, pub shot_cards: bool }  // 20, 4.0, 1.5, 2.0, None, true (written only when false)
 pub struct CameraSection { pub name: String, pub camera: String, pub camera_name: Option<String>, pub position: CameraPosition, pub mode: String }  // mode "auto" | "WxH@fps"
 pub enum CameraPosition { TargetLine, GolferFront, GolferBack, Overhead }  // default GolferFront
-pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface, pub auto_chip: bool }  // auto_chip default false
+pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface, pub auto_chip: bool, pub tournament: bool, pub actor_id: Option<String> }  // auto_chip and tournament default false; tournament is written only by POST /api/tournament
+pub struct GolferRecord { pub identifiers: Vec<String>, pub name: String, pub handed: Option<Handedness>, pub bag: Vec<Club>, pub sex: Option<Sex>, pub height: Option<f64> }  // identifiers: own `flighthook.<uuid>` first, then game ids
 pub enum SimMode { Off, On, Force }                 // default On
 pub enum SimSurface { Fairway, Green, FirmGreen }
 pub struct WebserverSection { pub name: String, pub bind: String }
@@ -260,34 +333,33 @@ pub struct ExPuttSection { pub name: String, pub enabled: bool, pub impact_lead_
 pub struct TrackballSection { pub name: String, pub enabled: bool, pub driver: TrackballConfig }  // serde via a flat table (thumbswing's Settings flattened): device: Option<String>, club, hand, cpi, report_limit, thresholds, tuning, each left out at its default; driver.config.grab is always false, a `grab` key is read and ignored, none is written; DeviceSection::driver_settings() hands the driver grab = false
 pub struct MockMonitorSection { pub name: String, pub enabled: bool, pub impact_lead_s: Option<f64>, #[serde(flatten)] pub driver: MockConfig }  // flightrelay's MockConfig
 pub struct OpenConnectServerSection { pub name: String, pub bind: Option<String> }
-pub struct OpenConnectClientSection { pub name: String, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String> }
+pub struct OpenConnectClientSection { pub name: String, pub enabled: bool, pub actor_id: Option<String>, pub address: Option<String>, pub full_monitor: Option<String>, pub chipping_monitor: Option<String>, pub putting_monitor: Option<String>, pub chipping_clubs: Vec<Club>, pub putting_clubs: Vec<Club> }  // the monitors are actor ids
 pub struct RandomClubSection { pub name: String }
 ```
 
 **lib/src/api.rs** (shared REST API types, used by both app and UI):
 
 ```rust
-pub struct StatusResponse { pub actors: HashMap<String, ActorStatusResponse>, pub mode: Option<ShotDetectionMode> }
+pub struct StatusResponse { pub cards: HashMap<String, ActorStatusResponse>, pub actors: HashMap<String, StatusActor>, pub turn: Option<GolferTurn>, pub cameras_supported: bool, pub trackball_supported: bool, pub clip_dir: Option<String>, pub config_error: Option<ConfigLoadError>, pub round: RoundState }  // cards by card key, actors by FRP actor id
 pub struct ActorStatusResponse {
     pub name: String, pub status: ActorStatus, pub telemetry: HashMap<String, String>,
     pub state: ConnectionState, pub red_for_ms: u64,  // derived, see "Connection state" below
     /* private, not serialized: StatusHistory */
 }
-pub struct PostSettingsResponse { pub restarted: Vec<String>, pub stopped: Vec<String> }
-pub struct ModeRequest { pub mode: ShotDetectionMode }
+pub struct PostSettingsResponse { pub restarted: Vec<String>, pub stopped: Vec<String>, pub golfers: Vec<GolferRecord> }
 ```
 
 **app/src/actors/mod.rs** (actor resolution from config):
 
 ```rust
 pub struct ResolvedActor {
-    pub id: String,             // global ID (e.g. "mevo.0", "r10.0", "openconnect_client.0")
+    pub id: String,             // card key (e.g. "mevo.0", "r10.0", "openconnect_client.0")
     pub name: String,           // user-visible name
     pub actor: Box<dyn Actor>,  // concrete actor ready to start
 }
 
-pub fn resolve_actors(config: &FlighthookConfig, current_mode: Option<ShotDetectionMode>) -> Vec<ResolvedActor>;
-pub fn start_actor(id: String, actor: Box<dyn Actor>, state: &Arc<SystemState>, bus_tx: &broadcast::Sender<FlighthookMessage>);
+pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor>;
+pub fn start_actor(id: String, actor: Box<dyn Actor>, state: &Arc<SystemState>, bus_tx: &broadcast::Sender<BusMsg>);
 pub fn actor_names(config: &FlighthookConfig) -> HashMap<String, String>;
 ```
 
@@ -298,136 +370,134 @@ so the first status of every actor started after it reaches `/api/status`.
 Helper functions: `global_id(prefix, index) -> String` builds `"{prefix}.{index}"`,
 `load(path)` / `save_to(path, config)` for TOML I/O.
 
-## Type Boundary Rule
+## Actors and the internal bus
 
-**All types that cross the app<->UI boundary (REST API, WebSocket, config)
-MUST live in `flighthook`.** The UI crate never defines its own
-"response" mirror types. Both crates import the canonical type from schemas.
-This eliminates drift between serializer (app) and deserializer (UI) --
-e.g., `ActorStatus` enum vs string, `Severity` enum vs string.
-
-## Unified FlighthookMessage Bus
-
-All communication between components flows through a single
-`broadcast<FlighthookMessage>(1024)` channel. Every message carries an
-optional raw payload (hex-first policy) and a typed event.
-Producers create messages; consumers subscribe and filter by event kind.
+Every component talks over one `broadcast` channel (capacity 1024) that
+carries two kinds of message (`app/src/bus.rs`):
 
 ```rust
-pub struct FlighthookMessage {
-    pub actor: String,                    // actor framework ID (e.g. "mevo.0")
-    pub device: Option<String>,           // FRP physical device ID (e.g. Mevo SSID)
-    pub raw_payload: Option<RawPayload>,
-    pub event: FlighthookEvent,
+pub enum BusMsg {
+    /// An FRP message: from a local actor (`peer: None`) or from a hub peer.
+    /// `cause` is set only on the session's own `golfer.turn`: the actor id
+    /// whose `golfer.select` produced it. Internal; never on the wire.
+    Frp { msg: FrpMessage, peer: Option<PeerId>, cause: Option<String> },
+    /// flighthook's own event. `card` is the card key ("mevo.0") or "system" / "web".
+    Local { card: String, event: LocalEvent },
 }
 ```
 
-All messages use the FRP envelope shape: `{ actor, device?, event: { kind, ... } }`.
-`actor` is a flighthook extension field (actor framework ID). FRP consumers
-ignore unknown fields and unknown `kind` values per spec, so flighthook
-extension kinds (`actor_status`, `player_info`, etc.) are transparent.
+`FrpMessage` is the flightrelay SDK's message (`from`, `body`); a sender's
+`BusSender` stamps `from` with the card's actor id. `peer` exists only for the
+hub rule "never back to the connection it came from". Producers publish;
+consumers subscribe and filter.
 
-### RawPayload
+### Actors
 
-Wire data attached to bus messages. Follows the hex-first policy.
+| Actor | Name | Actor id kept in | FRP roles |
+|---|---|---|---|
+| flighthook | `flighthook` | `[frp] actor_id` | `session`, `practice`, `collector`; issues the golfer namespace `flighthook` |
+| Simulation card | `Simulation` | `[simulation] actor_id` | `flight_model` (off the bus while `[simulation] mode = off`) |
+| Each launch monitor card | the card's name | the card's section | `launch_monitor`, with `device.source` |
+| Auto-Chip | `Auto-Chip` | `[frp] auto_chip_actor_id` | `launch_monitor`, source `virtual` |
+| Each output card (Open Connect client, Pureplay Connect, Random Club) | the card's name | the card's section | none: they send `golfer.select` |
+| Pureplay Accessory card | the card's name | the card's section | `game` (and `launch_monitor` when its Shots setting ingests), namespace `pureplay`, source `virtual` |
 
-```rust
-pub enum RawPayload {
-    Binary(Vec<u8>),    // serializes as lowercase hex string (no spaces)
-    Text(String),       // serializes as-is (e.g. GSPro JSON)
-}
-```
+Cameras are not FRP actors. Every local actor publishes its `bus.actor` every
+2 s on the internal bus (one timer), so the hub forwards it to peers and the
+dashboard's state sees it; local cards never expire.
 
-### FlighthookEvent
+### FRP messages flighthook uses
 
-The typed event payload. Tagged with `kind` in JSON serialization. All variants
-are flat struct variants with named fields (no wrapper types).
+| Message | Sent by | Meaning |
+|---|---|---|
+| `shot.trigger`, `shot.launch`, `shot.flight`, `shot.club`, `shot.impact`, `shot.finished` | launch monitors; the flight model sends `shot.flight` | One shot's life. `shot.launch` holds what the device measured only |
+| `bus.actor`, `bus.alert` | every actor | Presence, blockers (readiness), device identity, battery, telemetry; alerts |
+| `golfer.select` | the dashboard, REST, simulator cards, random club, FRP peers | A request to change golfer, club, hand or mode |
+| `golfer.turn` | flighthook (session) | The current turn: golfer, club, hand, mode |
+| `golfer.profile` | flighthook (saved golfers), the Pureplay Accessory card (players) | A golfer's name, hand, bag, sex, height |
+| `practice.block`, `practice.new_block` | flighthook (practice) / requesters | Sets (see [Sets](#sets)) |
+| `game.round`, `game.ball`, `game.scores`, `game.stroke` | the Pureplay Accessory card | The round, ball lie, scores and each stroke |
 
-```rust
-pub enum FlighthookEvent {
-    // -- FRP-compliant shot lifecycle (correlated by ShotKey) --
-    ShotTrigger { key: ShotKey, timestamp: Option<u64> },
-    Launch { key: ShotKey, launch: Box<Launch>, derived: Option<Box<DerivedFlight>> },
-    FlightResult { key: ShotKey, flight: Box<FlightResult> },
-    ClubPath { key: ShotKey, club: Box<ClubData> },
-    FaceImpact { key: ShotKey, impact: Box<FaceImpact> },
-    ShotFinished { key: ShotKey, raw: Option<Box<ShotRaw>> },
+### Local events
 
-    // -- FRP: Device status --
-    DeviceTelemetry { manufacturer: Option<String>, model: Option<String>, firmware: Option<String>,
-                      source: Option<Provenance>, telemetry: Option<HashMap<String, String>> },
-    Alert { severity: Severity, message: String },
+`LocalEvent` never leaves flighthook:
 
-    // -- FRP: Controller commands --
-    SetDetectionMode { mode: Option<ShotDetectionMode>, handed: Option<Handedness>, club: Option<Club> },
+| Event | Meaning |
+|---|---|
+| `ConfigCommand` / `ConfigOutcome` | Configuration changes and their result (see below) |
+| `CardStatus` | A card's lifecycle (`Starting`, `Connected`, ...) and its display rows (error, address, device label) |
+| `Alert` | An alert of something that is no FRP actor (a camera, the web server) |
+| `RoundState` | The tournament round started or ended |
+| `ClearShotHistory` | Delete the shot history |
+| `FindMat` | The ExPutt card locates its mat again |
+| `ShotVideo`, `ShotVideoRemoved`, `ShotPose`, `ShotSwing` | Camera clips and their analysis (beta, alpha) |
+| `ShotCapture` | A card's raw frames of a shot, for the export |
+| `ShotPath` | The flight model's ball path (FRP has no path field) |
+| `ActorGone` | A remote actor missed its heartbeats and left |
 
-    // -- Flighthook extensions --
-    PlayerInfo { player_info: PlayerInfo },
-    ClubInfo { club_info: ClubInfo },
-    HandInfo { hand_info: HandInfo },
-    ConfigCommand { request_id: Option<String>, action: ConfigAction },
-    ConfigOutcome { request_id: Option<String>, restarted: Vec<String>, stopped: Vec<String>, started: Vec<String> },
-    ActorStatus { status: ActorStatus, telemetry: HashMap<String, String> },
-    NewShotGroup,                                                     // command: new set for the selected club
-    NewShotSession,                                                   // command: close the open set, next session
-    ClearShotHistory,                                                 // command: delete shots and sets, next session
-    FindMat { target: String },                                       // command: the ExPutt `target` locates its mat again
-    ShotGroup { group: ShotGroupInfo, shot: Option<GroupedShot> },    // a set record changed (web layer)
-    ShotVideo { keys: Vec<ShotKey>, position: CameraPosition, duration_ms: u64, fps: f64,
-                trigger_offset_ms: i64, impact_offset_ms: i64, complete: bool, dropped: u32 },  // a camera clip (beta)
-    ShotVideoRemoved { keys: Vec<ShotKey> },                          // these shots' clips are gone (beta)
-    ShotPose { keys: Vec<ShotKey> },                                  // a camera clip's keypoints are written (alpha)
-    ShotSwing { keys: Vec<ShotKey> },                                 // a camera clip's swing analysis is written (alpha)
-}
-```
+### Hub and remote actors
 
-Match variants with `..` (e.g. `FlighthookEvent::Launch { key, launch, .. }`)
-unless every field is needed, so a field added to a variant does not break the
-pattern. Build a trigger with `FlighthookEvent::shot_trigger(key)`.
+`/frp` on the web server port is a plain FRP 0.3.0 hub. A peer that connects
+gets every actor's `bus.actor` and state, then a `bus.sync`; after that every
+message is forwarded to every other peer and onto the internal bus, never back
+to its source (`shot.raw` is never sent). flighthook answers a `bus.sync` by
+republishing its local state. There is no handshake. A message whose `from` is
+one of this process's own actors is dropped, and the link shows an error row on
+the Web Server card (a relay loop, or a second PC restored from this one's
+settings).
 
-The FRP variants mirror FRP 0.2.0 one to one (`launch`, `flight_result`,
-`shot_trigger` with its optional `timestamp`, `device_telemetry` with its
-`source`); `Launch`, `FlightResult`, `ClubData` and `FaceImpact` are the
-`flightrelay` crate's types. `derived` on `Launch` and `raw` on
-`ShotFinished` are flighthook extension fields. `DeviceTelemetry.source` is
-stamped by the actor's `BusSender` from its shot source's provenance
-(`measured` / `virtual`, the FRP values); a trigger's `timestamp` is the
-device's strike time when the device reports one (none does yet).
+A remote actor (beta) is tracked from its `bus.actor`; three missed heartbeats
+(2 s each by default) remove it, its open shots are discarded, and the
+dashboard is told (`ActorGone`). Remote launch monitors appear as read-only
+cards on the Settings Devices section, other remote actors under Software,
+showing their name, device, blockers, battery and telemetry. Two actors that
+both claim `session`, `practice` or `game` (or issue the same namespace)
+each show an error row naming the other; flighthook keeps acting in its own
+roles. flighthook's launch monitor cards, collector, practice actor and
+outputs read only the `golfer.turn` and `practice.block` that flighthook's
+own actor published.
 
-### ShotKey -- shot lifecycle correlation
+### Type boundary
 
-```rust
-pub struct ShotKey {
-    pub shot_id: String,      // UUID v4 string, globally unique
-    pub shot_number: u32,     // session-level monotonic counter per-actor
-}
-```
+Types that cross the app/UI boundary (REST, `/api/ws`, config) live in the
+`flighthook` lib crate; the FRP types are the `flightrelay` crate's, which
+`flighthook` re-exports.
 
-Shot data arrives as correlated events sharing a `ShotKey` and `actor`:
-`ShotTrigger` -> `Launch` / `FlightResult` / `ClubPath` / `FaceImpact` (any
-order) -> `ShotFinished`. Consumers use `ShotAggregator` (lib `event.rs`) to
-collect events into a final `ShotData` (`launch`, the device's `flight`,
-`club`, `impact`, and `derived` from the launch event), with FRP's shot
-lifecycle rules: a shot keeps the first event of each kind, a shot that has
-not finished 45 s (`SHOT_TIMEOUT`, flighthook's accumulator timeout; FRP's
-default is 30 s, and a driver's own shot deadline, ironsight's 30 s, must
-expire first) after its trigger is discarded, and events of a finished or
-discarded shot are ignored for another 45 s. `feed_at(msg, now)` returns the finished shot's
-`ShotAccumulator` (so a consumer can add the raw frames), `feed(msg)` the
-finished `ShotData`. The GSPro bridge, the Pureplay output and the web layer
-each keep one. When it finishes the shot, the accumulator computes
-`ShotData.metrics` (`ShotMetrics`, lib `metrics.rs`) from the measured
-launch, the device's flight result and the club data.
+### Shot composing and the store
 
-`ShotData` reads the shape with one `ball` block (launch and flight values
-together, export schema 1): the launch values go to `launch`, the flight
-values to a `flight` with `basis: modeled`.
+The SDK's `ShotAggregator` composes each shot from its messages until
+`shot.finished` and stamps flighthook's own `golfer.turn` and `practice.block`
+at the trigger. A shot not finished 45 s after its trigger (`SHOT_TIMEOUT`;
+longer than a driver's own shot deadline) is discarded, and the messages of a
+finished or discarded shot are ignored for another 45 s. The Open Connect
+client, the Pureplay Connect output and the collector each keep an aggregator.
+
+The collector stores every finished shot (`ShotData`, `GET /api/shots`) with:
+the launch as the launch monitor sent it; every `shot.flight` with its sender
+(`flights`); club and impact data; the flight model's `path`; the `turn` at the
+trigger (golfer, club, hand, mode) and the `block` it belongs to; the game's
+`stroke`; `golfer_name`; the metrics of what is shown; and camera clips.
+
+A message for a shot already in the store (the flight model's `shot.flight`, a
+Pureplay `game.stroke`) attaches by `shot_id` whenever it arrives, as long as
+the shot is in the 1000-shot history; afterwards it is dropped. Each attach
+updates the stored shot and sends it to the dashboard again. Only a message
+from the shot's own launch monitor after its own `shot.finished` is logged as a
+warning.
+
+**What is shown** is composed per field from the shot's flights: the first
+tracked flight's value, else the launch monitor's own, else the flight model's
+(`force` shows the flight model's first). A value from the flight model or from
+an `assumed` block is shown as simulated (SIM tags, italics in the Table).
+`ShotData::shown` composes the shown launch, the launch monitor's own flight,
+the simulated values (`derived`) and the metrics; metrics are recomputed when
+an addendum arrives.
 
 ### Shot metrics
 
 `ShotMetrics::compute` implements the Flight Relay Protocol's spin relations
 and "Derived Values" once, for every consumer that assembles shots (the web
-layer's history and export, the GSPro bridge, `ShotAggregator` users):
+layer's history and export, the Open Connect client):
 
 - total spin and spin axis from backspin and sidespin, via the SDK's
   `Launch::complete_spin`, only when the device sent both components and
@@ -436,53 +506,55 @@ layer's history and export, the GSPro bridge, `ShotAggregator` users):
 - spin loft, the `dynamic_loft − attack_angle` approximation, only when the
   device sent no `spin_loft`;
 - curve, `carry_offline − carry_distance × tan(launch_azimuth)`, in meters,
-  from the device's flight result and the launch.
+  from the launch monitor's own flight and the launch.
 
 Each field needs every input measured and finite; `metrics` is `None` when no
-field is set. `derived` is never an input: the metrics describe the device's
-shot, the simulation stays in `DerivedFlight`. Lateral values are absolute,
+field is set. Simulated values are never an input: the metrics describe the
+device's shot. Lateral values are absolute,
 + right of the target line. `ShotMetrics` is `#[non_exhaustive]`; `curve`
 converts with the unit system like the rest of `ShotData`.
 
-### Simulated values (beta)
+### Simulated values
 
-The `Launch` event's `derived` field carries values flighthook simulated
-for fields the device did not report: carry, apex, flight time, descent angle,
-carry/roll/total offline, roll and total (`DerivedFlight`, lib crate). A
-device's `carry_offline` or `descent_angle` (FlightScope) is not simulated
-over, except under `force`. The device's `launch` and `flight` are never
-modified, so a field's location says where it came from: under `launch` it
-was measured, under `flight` the device reported it, under `derived` it was
-simulated. A field set in both
-(a measured 0 carry or flight time on a shot that flies, a ground ball's 0
-carry, apex and flight time over a device's other reading, both below, or any
-result field under `force`) is shown with its `derived` value. `ShotData.derived` carries the same block after
-accumulation.
+The flight model (the Simulation card, `app/src/actors/flight_model.rs`) flies
+every shot a launch monitor finishes and publishes what it computed as one
+`shot.flight` addendum under its own actor id (`basis: modeled`, model
+`flighthook <version> (dimple <version>)`). The addendum holds only the result
+fields it computed: carry, apex, flight time, descent angle, carry/roll/total
+offline, roll and total. Nothing waits for it; it attaches to the stored shot
+by `shot_id` whenever it arrives (see [Shot composing and the
+store](#shot-composing-and-the-store)). The launch monitor's launch and flight
+are never modified, so a value's place says where it came from: in the launch,
+measured; in the launch monitor's own flight, the device reported it; in the
+flight model's flight, simulated. A field set in both (a measured 0 carry or
+flight time on a shot that flies, a ground ball's 0 carry, apex and flight
+time over a device's other reading, both below, or any result field under
+`force`) is shown with the simulated value.
 
 `[simulation] mode` (`SimulationSection::mode`, `SimMode`) picks what is
-simulated: `off` nothing, `on` (the default) the fields the device did not
-report, `force` every result field. Under `force` the simulated
-results replace the device's for every device: `derive` treats nothing as measured,
-fills every result field in `derived` and sets
-`DerivedFlight::replaces_measured`, and every consumer gives those values
-precedence over `flight`. `flight` is still never modified, so the device's
-results stay on the wire, in `/api/shots` and in the export. The flag is per
-shot, set from the settings in effect when the shot was simulated; a shot
-that can't be simulated gets no `derived` and shows the device's values.
-Launch values (speed, angles, spin, club data) are never replaced.
-`DerivedFlight::spin_estimated` marks the spin in `launch` as flighthook's
-estimate (the FlightScope card's launch-only chips); the card's hook asks
-for it (`HookCtx::spin_estimated`) and the sink sets it after the
-simulation, on a `derived` that holds only the flag when the shot was not
-simulated, so `derive` never sees it. `DerivedFlight::computed`
-(`Vec<ShotField>`, set with `DerivedFlight::mark_computed`) marks the values
-in the measured blocks that come from a model rather than the device's
-readings. A plain translation of a reading is not computed: the other spin
-pair (the R10's back/side from its total and axis, the pair the Open Connect
-input completes, the Xi's E8 total split by D4's axis), a unit or sign
-conversion, a calibration offset (the Omni's vertical face impact with the
-per-club sticker offset). No driver sets it; it stays for flighthook's own
-model outputs, as `spin_estimated` does for the launch-only spin estimate.
+simulated: `off` nothing (the flight model leaves the bus), `on` (the default)
+the fields the launch monitor's own flight did not report, anchored to its
+measured values, `force` every result field for every launch monitor, with
+nothing counted as measured. Under `force` the launch monitor's own results
+stay on the shot, in `/api/shots` and in the export, but the simulated ones are
+shown. Launch values (speed, angles, spin, club data) are never replaced.
+
+The flight model's input is the shot's launch as the SDK's
+`CompletedShot::launch_for_flight` gives it: the measured values, with a value
+the launch monitor lacks filled from its own flight's `assumed` block. A shot it
+cannot fly, or has no field to add to, gets no addendum.
+
+**Launch-only spin.** The FlightScope card estimates the spin of a launch-only
+chip itself: when the device sent no flight, the card's `launch_only_spin`
+(rpm per mph, default 100, 0 turns it off) is above 0, the launch qualifies
+(speed, no measured spin, the launch angle floor) and the shot's mode is not
+Putting, the card publishes one `shot.flight` of its own before its
+`shot.finished`, holding only `assumed { backspin_rpm, sidespin_rpm: 0 }`. The
+flight model flies the shot with it, the Open Connect client and Pureplay
+Connect output send it as the spin, and the dashboard shows the spin as
+simulated. It does not depend on `[simulation] mode`. Strict (tournament) mode
+ignores every flight, so it never sends the estimate.
+
 A value a device does not measure is left out rather than sent as a
 placeholder: the ExPutt sends no launch elevation, and an Xi shot under the
 E8 spin source without club data sends the E8 total alone (no axis, no
@@ -494,21 +566,12 @@ as TotalSpin and BackSpin with the SideSpin and SpinAxis bits clear and the
 CSV in `backspin_rpm` with sidespin and axis empty (both
 `flighthook::output_backspin`), the dashboard's cards and table show it as
 backspin with no sidespin (`spin_components`), and the simulation flies it
-as backspin. The values stay where outputs read them. `ShotData::unmeasured_fields()` is the one question for "is this
-value measured": it joins both marks (`spin_estimated` names all four spin
-fields), and the round policy is the only reader
-([Tournament rounds](#tournament-rounds)).
+as backspin.
 
 The simulation runs in `app/src/sim.rs` with the
 [dimple](https://crates.io/crates/dimple) crate, an app-only dependency (the
-lib crate and the WASM UI never link it). Every device actor builds its
-`Launch` event (and the `FlightResult` event after it, when the device
-reported flight values) through `sim::launch_events_in_mode`, in the mode
-the card's sink picks: its driver's fixed mode (the ExPutt's Putting), else
-the mode the card's hook sets (the FlightScope card: the session's mode at
-the shot's trigger), else the live mode, on the device thread, so the launch already
-carries `derived` when it reaches the bus, before `ShotFinished`. It costs a few milliseconds per shot. A shot is simulated only
-when:
+lib crate and the WASM UI never link it), on the flight model's thread. It
+costs a few milliseconds per shot. A shot is simulated only when:
 
 - `[simulation] mode` is not `off`;
 - the altitude (0 to 5000 m) and temperature (-30 to 50 °C) are in range;
@@ -521,10 +584,10 @@ when:
   and the simulated flight is valid (positive flight time, finite results).
   A slow, low shot with lift (3 mph at 2°) flies.
 
-Otherwise `derived` is absent. Roll, total and the roll/total offlines also
-need the ground phase to reach rest. Where the device measures carry, total is
-the measured carry plus the simulated roll (the simulated carry plus roll
-under `force`).
+Otherwise the shot gets no addendum. Roll, total and the roll/total offlines
+also need the ground phase to reach rest. Where the device measures carry,
+total is the measured carry plus the simulated roll (the simulated carry plus
+roll under `force`).
 
 **Ground balls (beta).** A shot is a ground ball when the device measured
 its apex as 0 (finite, within 0.01 m), or, on a device that reports no apex
@@ -534,9 +597,9 @@ spin (a putt measured along the ground, as the ExPutt reports it). Anyone can bl
 detection mode don't decide what is a ground ball; a putt is a ground ball
 because its apex is 0, not because it is a putt, and a putting-mode shot
 with an apex above 0 flies like any other. A ground ball never leaves the ground: carry, apex
-and flight time are 0 (in `derived` unless the device measured exactly 0
+and flight time are 0 (simulated values unless the device measured exactly 0
 for that field, so a measured carry or flight time above 0 shows as 0),
-there is no descent angle, and the carry offline is 0 (in `derived` unless the
+there is no descent angle, and the carry offline is 0 (a simulated value unless the
 device measured exactly 0). Its roll comes from
 dimple's ground model (`GroundModel::settle`), started at the tee with the
 launch speed along the launch direction and no spin, so the ball skids,
@@ -544,9 +607,7 @@ then rolls to rest; launch angle and spin are not used. The detection
 mode picks the surface (`sim::ground_surface`): in Putting mode it rolls on
 a green (`green`, 11.4 ft on the stimpmeter, unless the configured surface
 is already `green` or `firm_green`, which is kept); in any other mode on the
-configured surface. The mode is the one in effect for the shot: for the
-FlightScope the session's mode at its trigger, for the ExPutt Putting, for
-other devices the game mode when the shot is processed. A straight 3 m/s ground ball rolls about 2.6 m on the default
+configured surface. The mode is the one in effect for the shot: the session's mode at its trigger, or the launch monitor's fixed mode (the ExPutt's Putting). A straight 3 m/s ground ball rolls about 2.6 m on the default
 `fairway` (8 m/s: about 10.8 m) and about 5.0 m on `green` (8 m/s: about
 18.8 m). Roll and total are the simulated roll
 unless the device measured the total (shown as measured, the roll fitted
@@ -556,11 +617,11 @@ counted as measured. This holds under `on` and `force` for every device.
 
 **Zero readings.** On a shot that flies (not a ground ball), a measured
 carry or flight time of exactly 0 is not a reading (the Mevo+ sends them
-with every shot, 0 when it has none). It counts as not measured: `derived`
-carries the simulated value, alongside the 0 left untouched in `flight`, and
-the path is fitted only to the values the device really measured.
+with every shot, 0 when it has none). It counts as not measured: the flight model
+adds the simulated value, alongside the 0 left untouched in the device's
+flight, and the path is fitted only to the values the device really measured.
 
-`derived.path` (`FlightPath`) is the simulated ball path from the tee to rest:
+The flight model's `path` (`FlightPath`) is the simulated ball path from the tee to rest:
 `[t, x, y, z]` points in seconds and meters (downrange, up, right of the target
 line), split into `flight` (tee to landing) and `ground` (landing to rest,
 empty when the ball did not reach rest). A ground ball's `flight` is the tee
@@ -608,26 +669,27 @@ The carry, roll and total offlines are read from the fitted path: the
 landing's and the rest point's `z`. Where the device measures carry they are
 the offlines at the measured landing, so the path, the offlines and the
 measured distances agree (beta). A measured carry offline is the displayed
-one (not repeated in `derived`), and the roll offline runs from it. The path is then decimated: the tee, apex,
+one (not repeated by the flight model), and the roll offline runs from it. The path is then decimated: the tee, apex,
 landing, rest and the contacts and peaks of hops over 5 cm are kept and the
 rest thinned by Ramer-Douglas-Peucker at 0.25 m, while the segment fits under
 its cap (40 flight and 24 ground points); above the cap the segment is
 resampled uniformly in time, keeping its ends (the flight also keeps its
 apex). Points are rounded to centimeters and milliseconds: about 0.7 KB of
 JSON per path on average, at most 64 points. It is never converted between unit systems, rides on the
-WebSocket event, `/api/shots` and the JSONL export, and is not in the CSV.
+`/api/ws` shot message, `/api/shots` and the JSONL export, and is not in the CSV.
 
-The device actor reads the `[simulation]` section from `SystemConfig` for every
-shot, so settings changes apply on the next shot with no actor restart. The
-GSPro mapper reads `shot.launch` and the device's carry in `shot.flight`
-only, so GSPro output does not change in any simulation mode. The console gets one `sim (estimated, beta): ...`
-line under the device's ball line (ending in `replaces_measured` when set); it is a derived summary, not wire data, so the hex-first audit rules do
-not apply to it.
+The flight model reads the `[simulation]` section for every shot, so
+settings changes apply on the next shot with no restart. The Open Connect
+client sends the launch monitor's own flight only, never the flight model's,
+so GSPro output does not change in any simulation mode. The console gets one
+`sim (estimated, beta): ...` line per simulated shot; it is a summary, not wire
+data, so the hex-first audit rules do not apply to it.
 
 ### Raw capture and shot export
 
-`ShotFinished.raw` (a flighthook extension, omitted when `None`) carries the
-device frames behind the shot as a `ShotRaw` (lib `export.rs`): a transport
+A launch monitor card sends the device frames behind a shot just before its
+`shot.finished` as the local `ShotCapture` event, as a `ShotRaw` (lib
+`export.rs`); the frames never go on FRP. A `ShotRaw` holds a transport
 label, the `RawRecord`s (`t_ms` relative to the trigger, direction, type,
 bus addresses or channel, lowercase hex or JSON text), a `dropped` count and
 an `unavailable` reason.
@@ -637,7 +699,7 @@ Each device card captures on its own thread with `RawCapture`
 (`push`, with their time and whether they are bulk data). Outside a shot
 they go to a pre-roll ring; `mark_trigger_at` (at the shot's trigger) opens
 the shot window with the ring as its head, and `take()` closes it for
-`ShotFinished`, frames sorted by time (a stable sort, so frames of one time
+`ShotCapture`, frames sorted by time (a stable sort, so frames of one time
 keep their order).
 
 | Device | Hook | Window | Excluded | Pre-roll | Max frames | Max bulk bytes |
@@ -655,223 +717,148 @@ anchor, so frames of one millisecond keep the order the driver gave them).
 Pre-roll, caps and the bulk budget come from the driver's raw profile. The
 mock and the trackball have no wire protocol and record none. The FlightScope (ironsight,
 `transport = "flightscope-tcp"`) records every framed message once the
-handshake is done, both directions, labeled `"<type> <src>><dst>"` (e.g.
-`D4 AVR>APP`), pre-roll 8, at most 256 frames, 128 KiB of bulk per-shot data
+handshake is done, both directions, each labeled with its message type and
+direction, pre-roll 8, at most 256 frames, 128 KiB of bulk per-shot data
 (the large tracking records); ironsight withholds every message that can
 identify the unit, its network or the host, the device's free text and debug
 output, and everything of the handshake (audit log only, at trace level). The R10 (tenover, `transport = "r10-ble"`)
-records one frame per GFDI message after the handshake, labeled
-`notify <type>` / `write <type>`, pre-roll 256, at most 256 frames, no bulk
+records one frame per message after the handshake, labeled by its type and
+direction, pre-roll 256, at most 256 frames, no bulk
 data; tenover withholds every message that carries the device's identity or
 keys, every one it cannot classify and everything before the handshake
 finished (those reach the audit log only, at trace level). The Square Golf
 (allsquare, `transport = "square-ble"`) records each notification and each
-command once the device's identity has been read, labeled `notify 11 02`
-(family and type byte in the `0x11` family), `notify 91` (the family byte
-for the others) or `cmd 87` (the command's type byte), pre-roll 64, at most
+command once the device's identity has been read, labeled by kind and type,
+pre-roll 64, at most
 64 frames, no bulk data; characteristic reads, where the identity lives, are
 never frames, and allsquare withholds heartbeats and their acks, the status
 query and its reply, and every notification it does not recognize (audit
 log only, at trace level). The ExPutt (threeputt, `transport =
 "exputt-wifi"`, text) records every message of the session as the JSON text
-that crossed the socket, both ways, labeled with its name (`PuttResult`,
-`PuttShot`, `Test`, `N_ALIVE`, `resyncToMat`, ...), pre-roll 64, at most 64
+that crossed the socket, both ways, labeled with its name, pre-roll 64, at most 64
 frames, no bulk data; the putt's own result is among its shot's frames.
 Camera images (the player's surroundings) and messages threeputt does not
 recognize are never frames (audit log only, at trace level).
 
 The web layer keeps each shot as a `StoredShot` (`app/src/actors/web/mod.rs`):
-when `shot_trigger` arrived, a `ShotContext` snapshot taken then (device kind,
-maker, model and firmware; the club the web layer last saw in a `club_info`
-on the bus, which is also the club its sets use; mode and handedness from
-game state; the
-device's config section without `name`/`address`/`bind`; the `[simulation]`
-section; identity strings to scrub), the `ShotData`, and the `ShotRaw`. A
-shot with raw frames but no decoded data is stored too; `/api/shots` serializes
-`data` only and leaves those out, so its JSON is unchanged. Raw frames share
-a 16 MiB session memory budget across the 1000-shot history, each frame
-charged its hex (two characters per payload byte) or text length plus 256
-bytes for the record and its metadata: past it, the oldest shots lose their
-frames first (`unavailable = "evicted: session raw budget"`),
-and decoded data stays until the shot leaves the history.
+when `shot.trigger` arrived, an export context taken then (device kind, maker,
+model and firmware; the device's config section without `name`/`address`/
+`bind`; the `[simulation]` section; identity strings to scrub), the composed
+shot (`ShotData`, with the turn and block stamped at the trigger) and the
+`ShotRaw`. A shot with raw frames but no decoded data is stored too;
+`/api/shots` serializes `data` only and leaves those out. Raw frames share a
+16 MiB session memory budget across the 1000-shot history, each frame charged
+its hex (two characters per payload byte) or text length plus 256 bytes for
+the record and its metadata: past it, the oldest shots lose their frames first
+(`unavailable = "evicted: session raw budget"`), and decoded data stays until
+the shot leaves the history.
 
 `GET /api/shots/export` (`web/export.rs`, see docs/API.md) streams one JSONL
-`ShotExport` or CSV row per stored shot. It never serializes the FRP `device`
-ID, actor names, telemetry or configured addresses, and replaces identity
-strings in text payloads and device labels with `<redacted>`; hex is never
-rewritten, which is why identity frames are excluded at capture.
+`ShotExport` or CSV row per stored shot. It never serializes device ids, actor
+names, telemetry or configured addresses, and replaces identity strings in
+text payloads and device labels with `<redacted>`; hex is never rewritten,
+which is why identity frames are excluded at capture. The row carries the
+shot's `golfer_id` (the `flighthook.*` id of the golfer the lookup rule finds,
+else the turn's golfer id as sent), its `block`, and `data` with the shot's
+`flights` and the game's `stroke`. Game golfer ids (such as
+`pureplay.thill`, a Pureplay player's name) may appear in `golfer_id`,
+`data.turn.golfer` and `data.stroke.golfer`.
 
-Every bus subscriber gets its own clone of `shot_finished`, so a heavy shot
-(a few hundred KiB for FlightScope Fusion with PRC data) is copied once per
-consumer. Acceptable on a LAN; WebSocket consumers can use `shot_trigger` for
-timing.
+Every bus subscriber gets its own clone of a message, so a heavy shot's frames
+(a few hundred KiB for FlightScope Fusion with PRC data) are copied once per
+consumer. Acceptable on a LAN. The shot's `video` (camera clips, beta) is
+stamped from `ShotVideo` whenever it arrives (see [Cameras and
+replay](#cameras-and-replay)) and is on `/api/shots` only: the export and
+`/api/shots/convert` drop it.
 
-Each stored `ShotData` is stamped by the web layer at `shot_finished`:
-`shot_id` (the `ShotKey`'s), `club_selected` (the trigger-time club from the
-`ShotContext`), `handed` (the trigger-time handedness from the same
-context) and `group` (below). FRP events are untouched; these fields
-exist only on `/api/shots`, the export and `/api/shots/convert`, and are
-omitted when unset, so their JSON is unchanged without them. `video`, the
-shot's camera clips (beta), is stamped from `shot_video` whenever it arrives
-(see [Cameras and replay](#cameras-and-replay-beta)) and is on `/api/shots`
-only: the export and `/api/shots/convert` drop it.
+### Sets
 
-### Shot sets
+The dashboard calls a practice block a **Set**; the API, the wire and the
+export say block. The practice actor (`app/src/state/practice.rs`, driven by
+the system actor) publishes `practice.block` and keeps one open block per
+**resolved golfer** (see [Golfers](#golfers-beta)); `number` counts from 1 per
+golfer within a session, and `session` starts at 1 on each run. A block that has
+had no shot yet is empty; a shot counts for the open block of the golfer up at
+its trigger. A shot that finishes with no data (a no-read), or never finishes,
+counts for nothing, so no gap is left in the numbers.
 
-`WebState.groups` holds a `GroupState` (`app/src/actors/web/groups.rs`): pure
-bookkeeping over the shot history, driven by the web updater from bus events
-in bus order. The UI calls a shot group a **set**; the API, events, export and
-code keep "group". Sets are assigned one way, whatever the persisted
-`shot_grouping` field says (lib `group.rs`: `ShotGrouping { None, ByClub,
-BySet }`, default `BySet`): that field is only the Shots tab's default view,
-and `GET /api/shots/groups` reads it from config as `mode`.
+| Event | Effect |
+|---|---|
+| Start | Opens a block for the golfer up with the turn's club |
+| `golfer.turn` changes | For the golfer up: no open block opens one. An empty open block is republished in place (same `id` and `number`) with the turn's club and golfer. An open block with shots and another club is closed and a new one opens. The same club keeps the block. Other golfers' open blocks stay open |
+| `practice.new_block` | For the named golfer (default: the golfer up): an empty open block is left as it is; otherwise it is closed and a new one opens with that golfer's own club (their open block's club, the turn's club when they have none) |
+| `practice.new_block { new_session: true }` | Closes every open block, counts `session` up and opens a block for the golfer up |
+| Clear history | The collector forgets its shots and blocks, then a new session starts |
 
-- At most one set is open. A shot joins it unless the club in play differs
-  from its club; then the open set closes and a new one opens. Returning to an
-  earlier club opens a new set too: a closed set never reopens.
-- An open set with no shots and none in flight (a fresh New set, or one
-  opened by a trigger that read nothing) adopts the next shot's club instead.
-- A session counter starts at 0 and counts up with every New session. Each
-  set carries the `session` it was created in (`ShotGroupInfo.session`,
-  omitted at 0), and `GET /api/shots/groups` reports the current `session`.
-  The UI's By club view combines a club's sets within one session.
+A golfer who comes back on the club they left with continues their block, and
+alternating golfers each keep their own. A golfer whose block has shots on 7I
+who changes to DR and back to 7I without hitting gets a new 7I block: a closed
+block is history. A header club pick that a connected simulator snaps back
+splits a block the same way when it has shots.
 
-Sets are keyed on `GroupKey { golfer, club }`; `golfer` is reserved and
-always `None`. Sets are global across devices. A record (`ShotGroupInfo`) has
-a UUID v4 `id`, a per-run display `number`, `session`, `club`, `started_at`,
-`manual`, `open` and `shots` (stored shots with data).
+The collector (`app/src/actors/web/blocks.rs`) keeps every block seen this run,
+open or closed, with its stored-shot count, for headers and history
+(`GET /api/blocks`). Membership is the block the aggregator stamped on the
+shot at its trigger. The `shot_grouping` setting (`none`, `by_club`, `by_set`)
+is the Shots navigation's default view; By club combines blocks with the same
+golfer, club and session. Every stored shot carries its block in every view,
+and the export carries it as `block`.
 
-| Bus event | Effect |
-| --- | --- |
-| `shot_trigger` | the device's other unfinished shots end uncounted (a repeat of the trigger changes nothing); then `assign`: the open set when its club is the trigger-time club (or it is empty), else a new set; held on the `PendingShot`. A shot unfinished 45 s after its trigger ends uncounted too (`ShotAggregator`) |
-| `actor_status` other than `connected` | the device's unfinished shots end uncounted; the open set stays open |
-| `shot_finished` | the shot is stamped and `finish` counts it when it has data; a shot with no data and no raw frames still ends its assignment |
-| a shot leaves the 1000-shot history | `release`: count down; a closed set at zero is dropped |
-| `club_info` | `select`: the club `new_shot_group` and the next trigger use |
-| `hand_info` | none (the source's card gets `handed`; the shot takes the trigger-time hand from game state) |
-| `new_shot_group` | no-op while the open set is empty; otherwise close it and open a manual set for the selected club |
-| `new_shot_session` | close the open set and count the session up |
-| `clear_shot_history` | empty the shot history (raw byte count to 0), drop every set, forget the shots in flight, count the session up; set numbers restart at 1; no `shot_group` is emitted |
+### Actor presence and card status
 
-Because the set is decided at the trigger, a club change or New set during
-a flight applies to the next shot. A device that drops out and reconnects
-keeps the open set. Every change is emitted as `shot_group` with the
-webserver's own actor ID; each `[webserver.N]` keeps its own history, ids,
-sets and session, and acts on the same commands. A record is kept while it is
-open, has stored shots, or has a shot in flight; the change that drops it has
-`open: false, shots: 0`. Lock order where both are held: `groups`, then
-`shots`. Every stored shot with data carries its set's `group`, in every
-view; the export carries it too (JSONL top level and `data`, and a CSV column
-after `club_selected`). The display `number` and the `session` are not
-exported.
+Two things describe an actor, and **no key means two things**: an actor sends
+each key through one of them only.
 
-### Game state events
-
-Game state is mutated via typed events on the bus:
-
-- `PlayerInfo { player_info }` -- player name
-- `ClubInfo { club_info }` -- club selection
-- `HandInfo { hand_info }` -- player handedness
-- `SetDetectionMode { mode?, handed?, club? }` -- the FRP controller command the
-  devices follow: detection mode, handedness and/or club (all optional,
-  latched; `club` is a hint and never implies `mode`). Game state takes only
-  its `mode`.
-
-The club and the hand are set the same way by every source: GSPro's player
-message, the UI's club picker and hand control, `POST /api/club` /
-`POST /api/hand`, and the WS `club` / `hand` commands all emit `ClubInfo` /
-`HandInfo`. The last one wins. GSPro is a club and hand source only
-(flighthook never sends it either) and re-sends both with every player
-message, so while it is connected its selection wins.
-
-The `SystemActor` projects both onto the controller command. From `ClubInfo`
-it derives the detection mode (using `config.club_mode()` to map club to
-detection mode via the configurable `chipping_clubs`/`putting_clubs` lists)
-and emits `SetDetectionMode { mode, club }`, carrying the selected club next to
-the mode it implies. From `HandInfo` it emits
-`SetDetectionMode { handed }` when the hand differs from the stored one (or
-none was stored), so a source that repeats the hand does not re-command the
-devices. Sources only emit `ClubInfo` / `HandInfo`; no source emits
-`SetDetectionMode` with a hand. Launch monitor actors react to
-`SetDetectionMode` events to reconfigure the device — they latch the mode and
-only re-arm when the mode actually changes. Handed-only updates (mode
-omitted) do not re-arm a launch monitor. The ExPutt starts a new round, which
-re-locates the mat; the Square Golf driver re-sends the active club with the
-new hand (one club select for a hand and a club that change together). Both
-also take the hand from game state when their session starts.
-Mode and hand are global state, not per-device.
-
-### DeviceTelemetry / ActorStatus split
-
-Device state and actor lifecycle are conveyed via two separate event variants.
-**No key means two things**, and an actor sends each key through one of the
-two only. The device's own state goes in `DeviceTelemetry`: a launch monitor
-on a device driver reports its state keys there, `radar_mode` and
-`tracking_mode` included (the mock does). The web layer merges both into one map per actor, so a card
-reads the same either way; an FRP client on `/frp` sees such keys in
-`device_telemetry` for the driver-based devices only.
-
-- **`DeviceTelemetry`** (FRP-compliant) — what the device reports about itself.
-  Emitted any time a device-reported value changes. Carries identity
-  (manufacturer, model, firmware) and device telemetry. `ready` is the single
-  readiness signal (all device conditions met for a shot, including ball
-  detection where applicable).
-
-  Standard telemetry keys: `ready`, `battery_pct`, `tilt`, `roll`, `temp_c`,
-  `external_power`; a device driver may add its own state keys (the mock's
-  `radar_mode`, `tracking_mode`).
-
-- **`ActorStatus`** (flighthook extension) — what flighthook knows about the
-  actor/connection. Carries a typed status enum and actor-framework telemetry.
-  FRP-only consumers ignore this per spec (unknown `kind` value).
-
-  Standard telemetry keys: `device_info`. Launch monitors on a device
-  driver add `shot_count` and, while a driver reports one, `phase`; the mock's `tracking_mode` and `radar_mode` come
-  from its driver as device telemetry.
-  Integration actors: `club`, `handed`, `name`, `error`.
-  Open Connect clients add: `address`, `last_shot`, `shots_sent`,
-  `monitor_ready`, `response` (see
-  [Open Connect client telemetry](#open-connect-client-telemetry)).
-  Pureplay outputs add: `address`, `last_shot`, `shots_sent`, `ready_state`,
+- **`bus.actor`** (FRP) is what the actor says about itself and its device:
+  `device` (maker, model, firmware, source `measured` / `virtual`, battery),
+  `blockers` (what keeps it from taking a shot; `ready` means none) and
+  `telemetry` (standard keys `ready`, `battery_pct`, `tilt`, `roll`, `temp_c`,
+  `external_power`; a driver may add its own, such as the mock's `radar_mode`
+  and `tracking_mode`). A launch monitor with no session publishes `not_armed`
+  and clears battery, attitude and telemetry.
+- **`CardStatus`** (local) is what flighthook knows about the card and its
+  connection: a status enum and the card's display rows. Standard keys:
+  `device_info`; launch monitors on a device driver add `shot_count` and, while
+  a driver reports one, `phase`; integration cards add `club`, `handed`,
+  `name`, `error`. Open Connect clients add `address`, `last_shot`,
+  `shots_sent`, `monitor_ready`, `response` (see
+  [Open Connect client telemetry](#open-connect-client-telemetry)); Pureplay
+  outputs add `address`, `last_shot`, `shots_sent`, `ready_state`,
   `strict_mode` (see [Pureplay output](#pureplay-output-alpha)).
 
 ```rust
 pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
 ```
 
-`ActorStatusResponse` (in `lib/src/api.rs`) adds a `name` field and is used
-as the cached per-actor state in both the web layer and the UI. The web layer
-merges telemetry from both `DeviceTelemetry` and `ActorStatus` events into
-a single per-actor telemetry map for API consumers. A key in an
-`ActorStatus` replaces the one held; an empty value removes it (how the
-Open Connect client and the web server clear `error`). The UI merges the same
-way. A web server sets `error` to `bind failed` while it cannot bind its
-address, and clears it with every other status.
+`ActorStatusResponse` (in `lib/src/api.rs`) adds a `name` field and is the
+cached per-card state in both the web layer and the dashboard. Both merge a
+card's `bus.actor` telemetry and its status rows into one map per card. A key
+in a status replaces the one held; an empty value removes it (how the Open
+Connect client and the web server clear `error`). A web server sets `error` to
+`bind failed` while it cannot bind its address, and clears it with every other
+status.
 
-A card never shows a lost connection's values. When an actor's status goes
-from `Connected` to `Disconnected` or `Reconnecting`, and on every `Starting`
-(a new instance), the web layer and the UI drop all the telemetry held for
-the actor (device-reported keys, `club`, `handed`, `name`, status keys) and
-then merge the keys that status carries, so `error` and the keys an actor
-sends with a status stay. Later statuses that do not end a connection merge
-as above. Both sides call `ActorStatusResponse::apply_status`. The web layer
-also drops the actor's cached `DeviceTelemetry`, so a WebSocket client that
-connects later is not replayed the lost device's values; the export's device
-identity stays. An actor that reports a static key once per instance sends it
-again with the statuses that clear (the Open Connect client's `address` and
-`last_shot`, see below); the device actors send their keys again with each
-connection. The Devices card then shows its empty state until the actor
-reports: the spinner while not Connected, the connected mark when Connected
-with no rows.
+A card never shows a lost connection's values. When a card's status goes from
+`Connected` to `Disconnected` or `Reconnecting`, and on every `Starting` (a new
+instance), the web layer and the dashboard drop all the telemetry held for the
+card (device-reported keys, `club`, `handed`, `name`, status keys) and then
+merge the keys that status carries, so `error` and the keys a card sends with a
+status stay. Later statuses that do not end a connection merge as above. Both
+sides call `ActorStatusResponse::apply_status`. A card that reports a static key
+once per instance sends it again with the statuses that clear (the Open Connect
+client's `address` and `last_shot`, see below); the device cards send their
+keys again with each connection. The card then shows its empty state until the
+actor reports: the spinner while not Connected, the connected mark when
+Connected with no rows.
 
 ### ConfigCommand / ConfigOutcome -- event-sourced config mutations
 
-Config mutations are routed through the bus as typed events, processed
-exclusively by SystemActor. This parallels the GameState pattern (sole
-writer via `GameStateWriter`).
+Config mutations are routed through the bus as typed local events, processed
+exclusively by SystemActor, the sole writer of the configuration and of the
+session.
 
 ```rust
-// ConfigCommand fields (on FlighthookEvent)
+// ConfigCommand fields (LocalEvent)
 request_id: Option<String>,  // correlation ID for request-reply
 action: ConfigAction,
 
@@ -885,18 +872,21 @@ pub enum ConfigAction {
     UpsertTrackball { index: String, section: TrackballSection },
     UpsertOpenConnectServer { index: String, section: OpenConnectServerSection },
     UpsertOpenConnectClient { index: String, section: OpenConnectClientSection },  // `upsert_gs_pro` also read
+    UpsertPureplay { index: String, section: PureplaySection },
+    UpsertPureplayAccessory { index: String, section: PureplayAccessorySection },
     UpsertWebserver { index: String, section: WebserverSection },
     UpsertMockMonitor { index: String, section: MockMonitorSection },
     UpsertRandomClub { index: String, section: RandomClubSection },
     UpsertCamera { index: String, section: CameraSection },
     Remove { id: String },                          // "mevo.0", "openconnect_client.1", "webserver.0", etc.; "gspro.N" = "openconnect_client.N"
-    SetShotGrouping { mode: ShotGrouping },         // POST /api/shots/grouping, WS `grouping`
+    SetShotGrouping { mode: ShotGrouping },         // POST /api/shots/grouping, UI `grouping`
     SetBodyTracking { section: BodyTrackingSection },  // POST /api/settings?scope=body_tracking
-    SetPlayer { section: PlayerSection },              // POST /api/settings?scope=player
+    SetTournament { on: bool },                     // POST /api/tournament
+    SetGolfers { golfers: Vec<GolferRecord> },      // POST /api/settings?scope=golfers
     Reconnect { id: String },                       // POST /api/actors/{id}/reconnect
 }
 
-// ConfigOutcome fields (on FlighthookEvent)
+// ConfigOutcome fields (LocalEvent)
 request_id: Option<String>,
 restarted: Vec<String>,
 stopped: Vec<String>,
@@ -912,7 +902,7 @@ emit `ConfigCommand` with a `request_id`, subscribe to the bus, and wait for
 view and reconciles no actor; no set changes. `SetBodyTracking` persists the
 `[body_tracking]` section alone and reconciles no actor (it is read live). `/api/settings` answers `400`
 for an unknown scope and `504` when no `ConfigOutcome` arrives within
-`CONFIG_TIMEOUT` (`web/routes.rs`): the longest stop wait of any actor
+`CONFIG_TIMEOUT` (`web/routes/settings.rs`): the longest stop wait of any actor
 (`actors::MAX_STOP_WAIT`, the ExPutt's 18s) plus 4s, so 22s. A command stops
 the actors it restarts or removes together, so it waits at most one longest
 stop wait, and it never waits behind another command's (see below). The UI's
@@ -931,7 +921,7 @@ When they are over the helper reports back over a channel, and SystemActor,
 between bus messages, finishes the command (`system::finish`): it releases
 each stopped actor, starts what is configured now and emits the command's
 `ConfigOutcome`. A command that stops nothing finishes at once. Meanwhile
-SystemActor goes on handling `ClubInfo`, `HandInfo`, `SetDetectionMode` and
+SystemActor goes on handling `golfer.select`, `practice.new_block` and
 further commands. A command that touches a settling actor follows the rule
 for an actor whose old instance is still closing: a removal lists it in
 `stopped` at once and mutes the old instance; a save or re-add starts
@@ -940,37 +930,103 @@ finishes; a reconnect starts nothing more (its request answers `202`). So
 there is never more than one instance of an ID, and a new instance always
 starts after its old one has ended or been retired.
 
-## GameState
+## Session and golfers
 
-`GameState` in `state/game.rs` -- read-only handle for the current round's
-`PlayerInfo` (player name), `ClubInfo` (club selection),
-`ShotDetectionMode` (global detection mode) and `Handedness` (player hand).
-Lives inside `SystemState` as the `game` field. Only exposes `snapshot()`. All actors and the web layer
-can read via `state.game.snapshot()`.
+### The turn
 
-Mutations flow through `GameStateWriter`, a separate write handle that only
-the `SystemActor` holds. `GameState::new()` returns `(GameState, GameStateWriter)`;
-both share the same `Arc<GameStateInner>`. This enforces at the type level
-that only `SystemActor` can mutate game state.
+flighthook's session (`app/src/state/session.rs`, applied by the system actor)
+owns `golfer.turn`: one complete turn of `golfer`, `club`, `handedness` and
+`mode`. It answers every `golfer.select` from any sender (the dashboard,
+`POST /api/select`, an Open Connect client, Pureplay Connect, the Pureplay
+Accessory card, random club, an FRP peer) and publishes the turn when it
+changed, at start and on `bus.sync`. Launch monitor cards read only
+flighthook's own turn and hand the driver its hints (club, hand, mode) when it
+changes, so a repeated select that changes nothing sends a driver nothing.
 
-```rust
-struct GameStateInner {
-    player_info: RwLock<Option<PlayerInfo>>,
-    club_info: RwLock<Option<ClubInfo>>,
-    mode: RwLock<Option<ShotDetectionMode>>,
-    handed: RwLock<Option<Handedness>>,
-}
+- **Start.** The turn is the `selected_golfer` (else the first golfer, else no
+  golfer), that golfer's hand (else right-handed), no club and mode full.
+  Handedness is always present: right-handed until a hand is chosen.
+- **Fields.** A select's `club`, `handedness` and `mode` each replace the
+  turn's; a field the select leaves out stays. **The mode is never derived
+  from the club**: only a select that carries `mode` changes it. A select from
+  flighthook itself (`POST /api/select`) that carries a hand also saves it on
+  the golfer up.
+- **Golfer.** A select's golfer is taken in any namespace, known or not. When
+  it changes the golfer (by the lookup rule below) and gives no club, the
+  golfer gets their own last club this run back (the current club when they
+  have none); when it gives no hand, the hand of the golfer the lookup rule
+  finds. The last club is kept per resolved golfer.
+- **Nothing is refused.** No select is answered `not_allowed`; the last writer
+  wins. Clubs outside a bag are accepted.
+- **A game golfer that is gone.** When the golfer up is a game's and that
+  golfer's profile is removed (the round ended, the card disconnected), the
+  turn goes to the saved golfer who lists that game id, else back to the start
+  golfer, in mode full.
+- **Cause.** With each turn it publishes, the session records the sender of the
+  select that produced it (`cause`, internal to flighthook).
+- `selected_golfer` (the `flighthook.<uuid>` last picked in flighthook) is
+  saved.
 
-pub struct GameState { inner: Arc<GameStateInner> }        // read-only
-pub struct GameStateWriter { inner: Arc<GameStateInner> }  // write handle (SystemActor only)
+### Games and simulators re-assert
 
-pub struct GameStateSnapshot {
-    pub player_info: Option<PlayerInfo>,
-    pub club_info: Option<ClubInfo>,
-    pub mode: Option<ShotDetectionMode>,
-    pub handed: Option<Handedness>,
-}
-```
+Three card types speak for a game or simulator: the Open Connect client,
+Pureplay Connect and the Pureplay Accessory. Without locks, each keeps the turn
+in line with what its game holds (`app/src/actors/simout.rs`):
+
+1. **Complete selects.** Whenever it sends `golfer.select`, it sends everything
+   it holds: golfer, club and hand for the Accessory while a local player is
+   up; club, hand and, when it holds one, the mode for the Open Connect client
+   and Pureplay Connect. It sends one whenever its simulator reports them.
+2. **Re-assert.** While connected, when flighthook's turn differs from what the
+   card holds, it sends its complete select again at once, unless the turn's
+   cause is a game or simulator card (itself included). Turn changes from the
+   dashboard, `POST /api/select`, random club, the Open Connect server input or
+   an FRP peer are re-asserted against.
+3. **Last sender wins** between game and simulator cards. Nothing loops: a card
+   never answers another card's change.
+
+So a header pick with a simulator connected is snapped back to the simulator's
+club and hand, and the header always shows the result. A card that holds
+nothing yet re-asserts nothing.
+
+**Shot type.** The Open Connect client sets the mode from the simulator's club
+by its own lists, `chipping_clubs` and `putting_clubs` (a putting club:
+putting, a chipping club: chipping, any other: full); with both lists empty it
+sends no mode. Pureplay Connect applies one shared rule (`simout.rs`, `mode_for_lie`): the
+putter is putting; a `SetShotContext` distance under 30 yards is chipping; any
+other club or distance is full. The Pureplay Accessory sets the mode itself on
+each turn by the same rule. Shot Type in the header sends a select carrying
+`mode`.
+
+**Shot Type visibility.** The header's Shot Type control shows while an enabled
+launch monitor card uses the hint (FlightScope, Trackball and Mock do; the
+other drivers ignore it), or an enabled output routes Chipping or Putting to a
+specific launch monitor. When neither holds and the mode is not Full, flighthook
+sets it to Full once (`ShotTypeReset`), unless a simulator card holds the mode.
+
+### Golfers (beta)
+
+`[[golfers]]` holds the golfers. Each record has `identifiers` (always its own
+`flighthook.<uuid>`, written when the golfer is created, plus any game ids it
+is linked to, e.g. `pureplay.thill`), `name`, and optionally `handed`, `bag`
+(club codes), `sex` and `height`. An id may appear in one golfer only; a save
+that lists one id twice is refused (`400`), and a file that does it keeps the id
+with the first golfer. flighthook publishes each golfer as `golfer.profile`
+under its `flighthook.*` id (name, hand, bag, sex, height) at start, on every
+change and on `bus.sync`; game ids are never published by flighthook.
+
+**The lookup rule.** Every place that needs to know which flighthook golfer a
+golfer id means uses one rule (`FlighthookConfig::golfer_of` and `golfer_key`):
+the golfer whose `identifiers` contain it. No match means the id stands on its
+own, shown under its own `golfer.profile` name and keyed by itself; no golfer
+(`null`) is its own key. The rule serves the header's golfer name, the Shots
+views, the export's `golfer_id`, the session's last club, the practice actor's
+blocks and the game cards' re-assert. With no `[[golfers]]` the turn's golfer is
+`null` and shots carry no golfer; the first saved golfer becomes the golfer up.
+
+The Golfers card in Settings adds, edits and removes golfers; a game id is
+added from a picker of the profiles the game currently publishes and removed
+with its Remove button.
 
 ## ActorStatus Lifecycle
 
@@ -1031,7 +1087,7 @@ The web layer records every `ActorStatus` into its per-actor
 does not depend on any UI being connected. `GET /api/status` stamps each
 actor's `state` and `red_for_ms` (the alert time left) at reply time. The UI
 rebuilds the history from a reply (`received`, the red time counting down from
-receipt on its own clock), then applies live `actor_status` events and
+receipt on its own clock), then applies live card status events and
 `ConfigOutcome.restarted` to it the same way the server does.
 
 All actors use linear backoff on connection failure: starts at 1s, adds 1s per
@@ -1061,7 +1117,7 @@ attempts until a session succeeds again; it makes one attempt at a time.
 
 ### Reconnect
 
-The Reconnect button on a Launch monitors or Outputs card
+The Reconnect button on a Launch monitors or Software card
 (`POST /api/actors/{id}/reconnect`) stops that one actor, waits for it to let
 go of its device or connection, and starts a new instance from the saved
 settings: what a flighthook restart does for that device. It goes through
@@ -1101,7 +1157,7 @@ actor and the command waits for it on a helper thread (see
    settings by itself (`system::restart_closed`) and emits a `ConfigOutcome`
    without `request_id` listing it in `restarted`. Until then a reconnect, a
    save or a re-add of that ID starts nothing.
-3. Emit `ActorStatus { Starting }` for the card, clearing an earlier `error`,
+3. Emit a `Starting` status for the card, clearing an earlier `error`,
    and start the new instance (`start_actor`). The outcome lists it in
    `restarted`, so the card begins a new history; it then shows the actor's
    own statuses as it connects.
@@ -1130,7 +1186,7 @@ round never counts it: turning it off forgets it as a shot source, as a
 removal does (`RoundPolicy::forget_source` in `system::finish`), the Pureplay
 output's `monitor_names` leaves it out, and a mode routed to it by ID counts
 for nothing (`Relay::feeds` keeps a routed ID only when it is a known
-monitor), so a mock that is off does not refuse a round. The Shots tab's live view and its per-camera
+monitor), so a mock that is off does not refuse a round. The Cameras tab's live view and its per-camera
 clip status show only the cameras that are on (`SettingsForm::cameras_on`).
 
 ### One card per address
@@ -1200,14 +1256,14 @@ What a stop does, by actor:
 on `DriverActor` (`actors::mevo::MevoHooks`: section `MevoSection`, source
 `Mevo`). The driver connects over TCP to `address` (`phase: connecting`, at
 most 5 s), runs the handshake (`phase: handshaking`) and configures the
-model it detected in the latched detection mode (`phase: configuring`); the
+model it detected in the turn's mode (`phase: configuring`); the
 card is then `Connected` (`device_info` "FlightScope Mevo+", "FlightScope
-Mevo Gen2" or "FlightScope Xi") with `device_telemetry` `manufacturer:
+Mevo Gen2" or "FlightScope Xi") with `bus.actor` device `manufacturer:
 "FlightScope"`, model `Mevo+`, `Mevo Gen2` or `Xi` and the device's firmware
 (version and build date), and once armed `phase: measuring`, `ready=true`.
 The FRP device id is the camera Pi's WiFi name, or "FlightScope Xi
 (<address>)" on an Xi (and on a Mevo whose Pi reports none). Every session
-starts in the latched mode, so a mode change during a reconnect is kept. A
+starts in the turn's mode, so a mode change during a reconnect is kept. A
 mode change that reaches the device reconfigures and re-arms it (`phase:
 configuring` and `ready=false`, then `measuring` and `ready=true`): at once
 when the device is armed, else once the shot in progress is done; on the Xi,
@@ -1215,12 +1271,12 @@ Chipping ↔ Putting sends nothing. Hand and club don't apply. A Fusion camera
 mode goes out after the camera's 15 s warmup (timed from the handshake),
 between shots. Telemetry keys: `ready`, `tilt`, `roll`, and on a Mevo+
 `battery_pct`, `temp_c` and `external_power` (a Gen2's or Xi's status has
-none), each sent when it changes. A shot is trigger (timestamped with the
-host time the driver saw it, which is when it reaches the bus), `launch`
-and `flight_result` as soon as the full result (D4) arrives (the launch
-with total spin and axis next to back and side spin; the flight result
+none), each sent when it changes. A shot is `shot.trigger` (timestamped with the
+host time the driver saw it, which is when it reaches the bus), `shot.launch`
+and `shot.flight` as soon as the full result (D4) arrives (the launch
+with total spin and axis next to back and side spin; the flight
 `basis: modeled`, with the device's total and roll distance when it reports
-them), `club_path` once the shot has a ball result, and `shot_finished`
+them), `shot.club` once the shot has a ball result, and `shot.finished`
 when the device is done. A launch-only full result (launch angle of 5° or
 more, no spin and no flight values: very short chips on the Xi) is a launch
 without spin and no flight result. With `use_estimated` on, a shot without
@@ -1230,21 +1286,16 @@ shot; a message the session cannot decode is an alert naming the error,
 never its bytes, and the session carries on; the device closing the
 connection, an operation timing out, or 10 s without a message from the
 device ends the session (the alert is the error, e.g. "connection closed by
-device"). The card's hook adds two things on a launch:
-
-- the shot is simulated in the detection mode the session ran in at the
-  shot's trigger (`HookCtx::session_mode`: the latched mode the host handed
-  the driver before that `poll` pass), so a mode change between the trigger
-  and the full result, seconds later, does not change how it rolls. It is
-  the mode the driver itself takes for the shot (the Xi's `auto` spin
-  source reads it), so the simulation and the spin choice agree even when a
-  mode change lands in the trigger's pass; the game state's mode, which the
-  system actor updates on its own thread, can be a pass ahead or behind;
-- a launch with no flight result, no spin, a launch angle of 5° or more
-  and a mode at the trigger other than Putting gets an estimated backspin
-  of `launch_only_spin` × ball speed (mph) and sidespin 0, marked
-  `derived.spin_estimated` (beta); a launch the Xi sends with its early
-  result's total spin (`spin_source` `e8` or `auto`) keeps that.
+device"). The card's hook adds one thing on a launch: a launch with no flight result, no
+spin, a launch angle of 5° or more and a mode at the trigger other than Putting
+gets an estimated backspin of `launch_only_spin` × ball speed (mph) and
+sidespin 0. The card publishes it as its own `shot.flight` holding only
+`assumed` spin, before `shot.finished` (see [Simulated values](#simulated-values)); `shot.launch` carries only what the device
+measured. A launch the Xi sends with its early result's total spin
+(`spin_source` `e8` or `auto`) keeps that. The mode at the trigger is the
+session's mode the host handed the driver before that `poll` pass, the mode the
+driver itself takes for the shot, so a mode change between the trigger and the
+full result, seconds later, changes nothing.
 
 The driver is not exclusive: a new instance connects while an old one still
 closes.
@@ -1254,13 +1305,13 @@ closes.
 processing of its own). The driver finds a paired R10 over BLE (`phase:
 discovering`), runs the handshake (`phase: handshaking`, at most 10 s from its
 start), then the card is `Connected` (`device_info` "Garmin R10 (<address>)")
-with `device_telemetry` `manufacturer: "Garmin"`, `model: "R10"`. It sends the
+with `bus.actor` device `manufacturer: "Garmin"`, `model: "R10"`. It sends the
 card's `range` as the tee distance once the device wakes (a changed range
 restarts the card). Telemetry keys: `ready`, `tilt`, `roll`, `device_state`
 (`waiting` | `recording` | `processing`); a device error is an alert with its
-tilt as `tilt`/`roll`. A shot is trigger, `launch` (total spin and axis plus
-back/side spin, all measured; a total of 0 has no axis), `club_path` when the
-club was tracked, `shot_finished`, then `ready=false`; the R10 has no wall
+tilt as `tilt`/`roll`. A shot is trigger, `shot.launch` (total spin and axis plus
+back/side spin, all measured; a total of 0 has no axis), `shot.club` when the
+club was tracked, `shot.finished`, then `ready=false`; the R10 has no wall
 clock, so the trigger carries no timestamp. Commands are ignored (no mode,
 hand or club on the R10). The BLE address is the FRP device id. On Windows
 and macOS closing the session disconnects the R10 (at most 4 s); on Linux the
@@ -1273,10 +1324,10 @@ the one `address` pins: advertised name, BLE address, or the macOS peripheral
 UUID; blank or the all-zero placeholder discovers), `phase: discovering`,
 connects without pairing and reads its identity, then the card is
 `Connected` (`device_info` "Square Golf <model> <name> (<address>)", so the
-address can be copied into the config) with `device_telemetry`
+address can be copied into the config) with a `bus.actor` device
 `manufacturer: "Invant"`, the model the device reports and its `lm`
 firmware. It arms on its first poll (`ready=false`) with the club and hand
-in play: the latched game state, else the section's `club` (default `7I`)
+in play: the session's turn, else the section's `club` (default `7I`)
 and a right-handed player. A club or hand change re-sends one club select
 carrying both, only when either differs; a club the Omni has no code for is
 armed as the nearest club of the same kind, the stronger loft on a tie;
@@ -1301,16 +1352,15 @@ the card is exclusive: a new instance waits for the old one to close.
 `ExPutt`; its `action` turns a `FindMat` for this card into the driver's
 `Action::FindMat`). With no address the driver waits for the device to
 announce itself on the network (`phase: discovering`, 250 ms at a time), then
-connects (`phase: connecting`) and starts measuring with the latched hand
-(the game state's, right-handed when unknown; `phase: measuring`, which the
+connects (`phase: connecting`) and starts measuring with the turn's hand
+(the session's, right-handed when unknown; `phase: measuring`, which the
 `Connected` status keeps). The card is then `Connected` (`device_info`
-"ExPutt RG (<ip>)", which is also the FRP device id) with `device_telemetry`
+"ExPutt RG (<ip>)", which is also the FRP device id) with a `bus.actor` device
 `model: "ExPutt RG"` (and the device software version as `firmware` when it
-was discovered). The device card's Find mat button (`POST /api/find-mat`, a
+was discovered). The device page's Find mat icon (`POST /api/find-mat`, a
 `FindMat` bus command) has the device locate the mat again without
 reconnecting; one pressed while the card has no session is dropped. A
-handedness change (from any source, via the system actor's
-`SetDetectionMode { handed }`) starts a new round with the new hand, which
+handedness change (from any source, through the session's turn) starts a new round with the new hand, which
 locates the mat the same way; the detection mode and the club do not apply.
 Mat searches are at least 10 s apart (the one at session start counts):
 requests inside that time are folded into one search with the latest hand,
@@ -1329,7 +1379,7 @@ came since it was last ready, so the cameras date the putt at its stroke),
 elevation and no spin, which the device does not measure), `club_path` with
 path and face angle when the putter was tracked, `shot_finished`. Putts are
 simulated in Putting mode (the driver's fixed mode, rolled on the green)
-whatever the game's mode, and the web layer files them with club `PT` and
+whatever the turn's mode, and the web layer files them with club `PT` and
 detection mode Putting whatever club is in play. Shot numbers continue
 across reconnects. Stopping ends the match and closes the session; the
 device takes one connection at a time, so the card is exclusive. A closed
@@ -1361,20 +1411,18 @@ and left out of the next save (the config load does not count it as a
 difference, so it alone never rewrites the file). The card is then `Connected`
 (`device_info` "thumbswing (<the name the device reports>)"; the FRP
 device id is the input's `/dev/input/by-id` link name, else the reported
-name) with `device_telemetry` `manufacturer: "divotmaker"`, `model:
+name) with a `bus.actor` device `manufacturer: "divotmaker"`, `model:
 "thumbswing trackball"`, the crate version as `firmware` and `source:
 virtual`. Telemetry keys: `ready`, `synthetic` (`true`), `input` (the
 reported name), `cpi`, `profile` (the club in play) and `handed` (`rh` |
 `lh`). The club and the hand start as the section's `club` and `hand` and
-follow the game's `SetDetectionMode` (a club the game names replaces the
+follow the session's turn (a club the turn names replaces the
 setting); Putting mode selects the putter whatever the club. Each swing (a
-pull back, then a push) is a shot: trigger (timestamped with the end of the
-push), `launch` (speed, launch angle and direction, both spin pairs),
-`club_path` (club speed, path, face angle, attack angle, dynamic loft,
-smash factor, swing plane), `shot_finished`. The launch is held to the
-finish, as for every driver ([Device drivers](#device-drivers)), so the bus
-order is `ShotTrigger`, `ClubPath`, `BallFlight`, `ShotFinished`. There is
-no flight result (the simulation flies it) and no raw frames. Everything is
+pull back, then a push) is a shot: `shot.trigger` (timestamped with the end of the
+push), `shot.launch` (speed, launch angle and direction, both spin pairs),
+`shot.club` (club speed, path, face angle, attack angle, dynamic loft,
+smash factor, swing plane), `shot.finished`. There is
+no flight result (the flight model flies it) and no raw frames. Everything is
 synthesized, so the source is virtual: during a tournament round the driver
 is told to hold shots, and a swing then is dropped with an info log line and takes no shot
 number. When the input goes away the session stays up: `ready` turns false,
@@ -1400,6 +1448,14 @@ successful session emits `Reconnecting`; failure before ever connecting stays
 at `Starting`. A refused, failed or closed connection is shown only through
 this status and the log, with no alert: a simulator not running is normal when
 another one is in use.
+
+**Open Connect server (input)** is a launch monitor actor with source `measured`
+(another vendor's companion software counts as measured). It publishes
+`shot.*` from the Open Connect shots, and its own flight with `basis: modeled`
+unless it knows the values were tracked. The player information it sends back
+in its `201` (hand, club) comes from flighthook's `golfer.turn`; because the turn
+always has a hand, `Handed` is always sent (`RH` until a hand is chosen). It does
+not re-assert.
 
 **Open Connect self-loop guard**: an Open Connect client pointed at this
 process's own Open Connect server (e.g. client `127.0.0.1:921`, server bind
@@ -1452,10 +1508,67 @@ is not retried. A write to the simulator that blocks for more than 2s fails like
 other, ending the connection and starting a reconnect, with no alert. The JSON
 sent for a shot is the same whatever happened to the connection before it.
 
-**Integration readiness**: the Open Connect client actor tracks device readiness from
-`DeviceTelemetry` (`"ready"` key) and uses it to set both
+**Integration readiness**: the Open Connect client tracks the routed launch
+monitor's readiness from its `bus.actor` (no blockers means ready; under "Any",
+any launch monitor that may feed a simulator) and uses it to set both
 `launch_monitor_is_ready` and `launch_monitor_ball_detected` in heartbeats
 and shot messages.
+
+**Open Connect client on FRP.** The client composes each shot with an SDK
+aggregator fed only flighthook's own turn and sends a finished shot when its
+launch monitor is the one routed for the mode of flighthook's turn as the shot
+finishes (routing names launch monitors by actor id; Auto-Chip always passes; a
+game's launch monitor, the Pureplay Accessory card, never does). The launch it
+sends is the measured launch with a missing value filled from the launch
+monitor's own flight's `assumed` (the FlightScope launch-only spin); the carry
+and other results come from the launch monitor's own flight only, never the
+flight model's, and an Auto-Chip's launch goes alone. Whenever the simulator's
+player information arrives, the card sends one complete `golfer.select` (club,
+hand and, with club lists set, the mode) and re-asserts it by the rule in
+[Games and simulators re-assert](#games-and-simulators-re-assert). A routing
+that names an actor no card holds shows "Missing monitor" and routes nothing
+for that shot type until another is picked.
+
+**Simulator sources feed no simulator output.** A simulator output (the Open
+Connect client, the Pureplay Connect output) never takes shots, readiness or
+a place among a round's feeds from a simulator source, under "Any" and by ID,
+with no address comparison: `Feed::feeds_simulators(actor)` (`simout.rs`) is false
+for an actor whose registered `ShotSource::is_simulator()` (the Pureplay
+card) or whose ID starts `pureplay_accessory.` (before it registers). It is
+the one predicate behind `Feed::passes`, the outputs' readiness (`Feed::ready`)
+and the monitors they report (ready, connection state, battery), `monitor_names`
+and `Relay::feeds`. The
+Open Connect client's `Relay` holds a `gspro::Registry` (the `RoundPolicy`
+clone, for the source types, and the send registry) for it. A save that
+routes an output to a `pureplay_accessory.N` ID is refused with `400` ("An
+output can't take shots from Pureplay", `FlighthookConfig::simulator_routes`
+in `invalid_setting`); a config file with one loads with a warning, and the
+route passes nothing. The UI's routing pickers leave the card out
+(`devices::routing_monitors`). Every other consumer (Shots tab, cameras,
+exports, `/frp`) takes the card's shots like any shot. 
+
+**Send registry.** `SystemState.sent_shots` (`state/sent_shots.rs`,
+`SentShots`) is how the Pureplay Accessory card tells Pureplay's return of a shot an
+output sent from a shot of its own. Each simulator output records
+`(ShotKey, SimAddr, Instant)` just before it writes a shot (only shots it
+writes: not one strict mode keeps back or one dropped as stale), with the
+key the bus carried (the shot's own number, before the Open Connect client
+raises it). A write that fails takes its record back (`SentShots::forget`;
+for Pureplay Connect, a failed BallData write). `SimAddr::of(local, peer)`
+is fixed per connection: the simulator's address and whether it is this
+computer (loopback, unspecified, or the connection's two ends share an
+address); the card makes one for its own connection the same way. At most
+64 records are kept; records older than `ECHO_WINDOW` (5 s) expire.
+`take_echo(card's SimAddr, now)` consumes the oldest unexpired record and
+every other record of the same shot (a second output's send of it, so it
+cannot become the next shot's echo); when records to more than one
+simulator are unexpired, the oldest to the card's host is preferred (the
+same address, or both this computer). The address only breaks ties: a lone
+record is the echo whatever its address, since the card on the LAN address
+and an output on `127.0.0.1` reach the same Pureplay. Records are kept for
+sends to every simulator, GSPro and Muni Golf included: a lone record of a
+GSPro send matches a Pureplay shot inside the window in Auto. A send
+Pureplay never plays (it was not ready) stays until it expires.
 
 #### Open Connect client telemetry
 
@@ -1473,8 +1586,7 @@ key only when its value changes:
 | `response` | the simulator's last response, code and message | `201 GSPro Player Information` | the connection |
 
 `club` and `handed` on the card are the simulator's player information: the
-client puts `ClubInfo`/`HandInfo` on the bus and the web layer (and the UI)
-show them on the client's card. Until the 1 s refusal verdict the keys wait
+client sends them as a `golfer.select` and shows them on its card. Until the 1 s refusal verdict the keys wait
 and go out with `Connected`; after it, with a `Connected` status as they
 change. When the connection ends, the status that says so removes the
 connection's keys and `club` and `handed` (empty values). The first status of
@@ -1504,14 +1616,13 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   Payloads decode their known prefix and ignore any appended bytes;
   enumerated fields stay raw bytes, so an enumerator added later passes
   through. The spec's worked examples are golden tests, byte for byte.
-- `mapper.rs` maps a finished shot (`map_shot`), or during a round the
-  shot the round policy certified (`map_certified`), to BallData and, when
+- `mapper.rs` maps a finished shot (`map_shot`) to BallData and, when
   any club value or face impact was measured, ClubData with the same ShotId.
   A ValidMask bit is set only for a value present (and finite) in the shot's
-  measured blocks (`launch`, `club`, `impact`); `flight` and `derived` are
-  never read. A
-  certified shot has its unmeasured values removed, so they go out with the
-  bit clear (0.0).
+  launch monitor's own `launch`, `club` and `impact` (a missing launch value
+  may be filled from its flight's `assumed` outside strict mode); a flight
+  result is never read. In strict mode the values go out as the launch monitor
+  sent them.
   A total spin with no axis and no components also goes out as BackSpin
   (`flighthook::output_backspin`). Nothing is computed (no total/axis from
   the components, no smash factor):
@@ -1525,12 +1636,12 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   `club_from_pureplay` (0 driver, 1-8 woods 2-9, 9-16 hybrids 2-9, 17-25
   irons 1-9, 26-29 PW/GW/SW/LW, 30 putter).
 - `mod.rs` runs the link like the Open Connect client runs its connection:
-  the detection mode starts as the game state's at `start` and follows
-  `SetDetectionMode`, the bus is drained the whole time (shots still
-  unfinished 45 s after their trigger are let go, the shared `ShotAggregator`
-  rule), the same backoff (1 s, +1 s, cap 3 s,
-  reset after a 10 s link), the same per-mode routing (`GsProRouting`,
-  `gspro::shot_matches_routing`, Auto-chip always accepted), shots queued
+  the mode is flighthook's turn mode when a shot finishes, the bus is drained
+  the whole time (shots still unfinished 45 s after their trigger are let go,
+  the shared `ShotAggregator` rule), the same backoff (1 s, +1 s, cap 3 s,
+  reset after a 10 s link), the same per-mode routing by launch monitor actor
+  id (`GsProRouting`, `Feed::passes`, Auto-Chip always
+  accepted), shots queued
   only while the link is up and dropped when older than 5 s. A link: TCP
   connect (5 s), Hello (ProtocolVersion 1; DeviceCaps BatteryPowered when the
   monitor that stands for the device has reported `battery_pct`;
@@ -1540,30 +1651,24 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   status goes `Connected`, the ReadyState is pushed and every change after
   it, and each routed shot goes out as BallData (+ ClubData), ShotId
   counting from 1 on every link.
-- The device's state comes from the launch monitor actors (the actors the
-  round policy has registered as an `actors::provenance::ShotSource` that
-  is a launch monitor: `mevo`, `r10`, `square`, `exputt`, `trackball`,
-  `mock_monitor`, `openconnect_server`) on the bus:
-  `ActorStatus` (and its `error` key), `DeviceTelemetry` `ready` and
-  `battery_pct`, and `ShotTrigger`/`ShotFinished`. `ready=true` from a
-  monitor with no status seen yet (the output started while it was
-  connected) counts as Connected. ReadyState: NotReady while the monitor is
-  not Connected or not ready, Processing from a trigger until its shot
+- The device's state comes from the routed launch monitors' `bus.actor`
+  (blockers, battery) and card status (connection, `error`), and
+  `shot.trigger`/`shot.finished`. ReadyState: NotReady while the monitor is
+  not Connected or has blockers, Processing from a trigger until its shot
   finishes (at most 10 s), Ready otherwise; never BallDetected.
   ConnectionState: Connected, Connecting (`Starting`), Reconnecting, Error
-  (an `error` key while not connected) or Disconnected. The `error` key is
-  read as the monitor's card holds it: set or removed by a status carrying
-  it, dropped by `Starting` and by a drop from Connected. The monitor read is
+  (an `error` key while not connected) or Disconnected. The monitor read is
   the one routed for the current mode; with Any, the best state of every
   monitor, and the battery and name of the only configured monitor, if there
   is one. During a round only the monitors the policy counts (measured ones)
   make the ReadyState and ConnectionState.
 - Host commands: Ping → Heartbeat (ConnectionState, ReadyState, battery
-  0-100 or 0xFF). SetClubInfo → `HandInfo` then `ClubInfo` on the bus, as a
-  simulator's player information (unknown values logged and ignored); the
-  card shows them as `club`/`handed` and the UI's club and hand selectors are
-  read-only while a `pureplay.*` actor is Connected (`app::set_by_simulator`).
-  SetDetect, SetBallType and SetShotContext are logged only. SetStrictMode
+  0-100 or 0xFF). SetClubInfo → one complete `golfer.select` (club and hand) on the bus, as a
+  simulator's player information (unknown values logged and ignored), which the
+  card re-asserts when flighthook's turn differs; the card shows the values as
+  `club`/`handed`. SetShotContext: the putter selects putting, a distance under
+  30 yards chipping, anything else full, sent as the mode in the select.
+  SetDetect and SetBallType are logged only. SetStrictMode
   asks the round policy for a tournament round, below. Strict mode starts
   off on every link.
   Error from the host → a Warn alert, one per burst of Errors less than 30 s
@@ -1576,48 +1681,301 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   resynchronizing, as hex.
 
 Strict mode on the link. SetStrictMode(1) asks the round policy for a
-round (`RoundPolicy::begin_round`) with the holder's card name and the
-launch monitors routed to the output (`GsProRouting::feeds`: each mode's
-monitor; "Any" = every configured one from the live config plus every one
-seen on the bus) and acks the answer: StrictModeAck(1, "") with the
+round (`RoundPolicy::begin_round`) with the holder's card name ("Pureplay
+Connect" when the card has none, so the round never reads as the Pureplay
+Accessory card's) and the launch monitors routed to the output
+(`GsProRouting::feeds`: each mode's monitor; "Any" = every configured one
+from the live config plus every one seen on the bus; a simulator source
+never) and acks the answer: StrictModeAck(1, "") with the
 `RoundGuard` held by the link, or StrictModeAck(0, reason) with strict mode
 off and a Warn alert ("Pureplay strict mode refused: `<reason>`. Tournament
 rounds take only shots a launch monitor measured."), one
 per 30 s burst (Pureplay closes the link and every reconnect asks again).
 SetStrictMode(0) → StrictModeAck(1), off. The guard drops with
 SetStrictMode(0), a refusal, the end of the link or the actor's stop. While
-it is held each shot goes out as `RoundGuard::certify` gives it: a shot that
-is not measured is not sent and takes no ShotId (an info log line once per
-source per link); ClubData with nothing left is not sent.
+it is held, a shot of a launch monitor that is not measured is not sent and
+takes no ShotId (an info log line once per source per link), and every
+`shot.flight` is ignored, so an estimated spin is never sent and nothing
+waits for it.
+
+#### Pureplay Accessory card (beta)
+
+`actors/pureplay_accessory/` (actor `pureplay_accessory.N`, config
+`[pureplay_accessory.N]`, `PureplayAccessorySection` = `name`, `enabled`,
+`address`, `shots`, `impact_lead_s`; UI type label and card name
+"Pureplay Accessory", under Software, (+) entry "Pureplay Accessory", on the
+welcome screen among the launch monitors, not offered by the outputs'
+routing dropdowns) follows a round in
+Pureplay
+through its Accessory API, Pureplay's published WebSocket API (version 1,
+early access): `ws://<address>/` (default `127.0.0.1:9770`), subprotocol
+`binary`. It is a public, documented API, like Pureplay Connect, so the card
+needs no driver crate. The user guide is
+[devices/pureplay.md](devices/pureplay.md).
+
+- `protocol.rs` reads the messages (`hello`, `pairing.pending`, `paired`,
+  `response`, `event` and the payloads the card uses; unknown fields,
+  message types and events ignored; names compared without regard to case;
+  `null` read as absent, a `null` list or flag as empty or `false`) and
+  builds `pair`, `subscribe` and `state.get`.
+  Pureplay's 31 club types map to flighthook clubs (`club`; flighthook's MD
+  and 1H have none), `RH`/`LH` to the hand (`Unknown` to none). Every JSON
+  example of Pureplay's document is a parser fixture (`fixtures.rs`).
+- `token.rs`: the pairing token is kept in `pureplay-tokens.json` in
+  flighthook's data folder (`SystemState::pureplay_tokens`, a `TokenStore`;
+  tests use a fresh temporary file per state), never in the config file.
+  Entries `{ token, clientId, paired_at }` are keyed by the card's address
+  normalized (`flighthook::address_key`), so changing the address pairs
+  again. Written whole and atomically (a temporary file, then a rename),
+  readable by its owner only (0600 on Unix). A file that is not a token file
+  reads as empty (warned once) and is copied to `pureplay-tokens.json.bad`
+  before the next write replaces it. `Token`'s `Debug` prints `<redacted>`,
+  and every frame's text has each token seen (as written and JSON-escaped)
+  replaced by `<redacted>` before it is logged or put on the bus (`redact`),
+  the rest byte for byte the wire text. A `paired` frame's token is learned
+  from the frame's JSON before the typed parse, so a `paired` that does not
+  parse is still logged redacted; a frame that is not JSON is logged by its
+  length only. Parse errors and response texts are redacted too. The app's
+  log filter holds tungstenite at `warn` (its trace lines print whole
+  frames).
+- `model.rs` keeps the round: per player `isLocal`, the profile slot, name,
+  handedness, held club, bag, ball and distance to the hole, the active player
+  (`turn.activeShooterId`), the hole and the readiness, from the snapshot and
+  the `player.*`, `turn.changed`, `hole.started`, `shot.ready_changed` and
+  `context.invalidated` events. For the **active local player** only (a
+  remote player's club, hand and turn give nothing) it holds the turn the card
+  wants: the player's golfer id, club, hand and mode, sent whole in one
+  `golfer.select` when Pureplay reports a change (snapshot, `turn.changed`,
+  `player.changed`, the player's `player.club_changed` whatever its `reason`, a
+  `shot.initialized` distance that changes the mode) and flighthook's turn
+  differs from it, and again whenever flighthook's turn differs from it, unless
+  a game or simulator card caused that turn. The golfer differs when the turn's
+  golfer and the player's id do not resolve to the same golfer (the lookup
+  rule). The mode is the shared club + distance rule: the putter putts, a
+  distance to the hole under 30 yards chips, anything else is a full swing.
+  `player.changed` clears, on an explicit `null`, only the identity fields it
+  reports (profile, name, hand, team, handicap). A snapshot of the results
+  screen (`matchActive` false for the match that just ended) brings no players
+  and no shooter. While a club pick is outstanding (`Model::hold_club`) the
+  card neither sends nor compares the club; while a `golfer.select` awaits its
+  reply the turn on the bus is not final and nothing is compared with it. A new
+  `serverInstanceId` (Pureplay restarted) drops the model.
+- `game.rs` publishes the round on the bus as the `game` actor: every player as
+  `golfer.profile` `pureplay.<name>` (a player without a name as
+  `pureplay.player-<playerId>`; name, hand, bag), the match as `game.round`,
+  the ball about to be played as `game.ball` and the scores as `game.scores`.
+  A player who leaves, `match.ended` and `context.invalidated` remove what they
+  published. `game.aim` is answered `unsupported`.
+- `mod.rs` runs the connection on the actor's thread with tungstenite's
+  blocking client over `connect_tcp` (5 s), a 100 ms read timeout so the
+  bus is drained throughout, the WebSocket handshake included (resumed
+  after each poll, 2.5 s at most). It waits for `hello` (5 s), checks
+  `protocol` = `ppaccessory` and `version` = 1, sends `pair` (`client`
+  "flighthook", `version` the app version, the saved token or `null`) as its
+  first message, then `subscribe` (the events of its list that
+  `hello.capabilities.events` names, all of them when it names none; a list
+  naming none of them is an `error`, "Pureplay offers none of the events
+  flighthook follows", retried every 30 s) with `snapshot: true`, and is
+  Connected once the snapshot is applied. A gap in the events' `seq` is
+  counted (`missed_events`) and, like `context.invalidated`,
+  `match.started` or an event naming a player the card does not hold
+  (`turn.changed`, `shot.initialized`, `shot.launched`,
+  `player.club_changed`), asks for `state.get`: one unanswered at a time
+  (answered by the snapshot with its `requestId`), at least 1 s apart. A
+  player a snapshot asked for did not bring is not asked for again until
+  `match.started`, `context.invalidated`, `player.joined` or a reconnect. A
+  request that gets no snapshot (no answer in 5 s, or an error response to
+  its id such as `rate_limited`) marks nobody: it is sent again after 5 s,
+  10 s, then every 30 s (or the response's `retryAfterMs` when longer) until
+  a snapshot comes, asking for its players and any named meanwhile; a player
+  named while a request is out is asked for by the next one. A `seq` lower than
+  the last is logged. With nothing received for 20 s the card sends a
+  WebSocket ping; after two unanswered (60 s quiet) the link is lost (`PING`
+  switches this off). It keeps `hello.capabilities.commands` and the
+  pairing's scopes (both logged). It sends text frames and reads binary and
+  text (`SEND_BINARY` switches what it sends). Its only commands are club
+  out's.
+- Club out (`club_out.rs`, `ClubOut`): a `golfer.select` carrying a club that
+  the card drains while following the round is a pick when its sender is
+  neither the card nor another game or simulator card (the header, the API,
+  random club, a launch monitor or a third-party tool; a simulator's club is
+  Pureplay's own coming back; `SystemState::is_game_card`); the latest pick
+  of a drain is taken. Usable (`club_out` `on`) with `control` in the
+  pairing's scopes (Pureplay's prompt grants `read` for **Read Only** and
+  `read` + `control` for **Aim and Club**; `scopes: null` grants nothing),
+  `club.set`, `club.next` or `club.prev` in `hello.capabilities.commands`,
+  the master switch not known off (`controls_disabled` in the readiness,
+  or `forbidden_scope` on a command until a later readiness is
+  `controllable` without `controls_disabled`), and, while a local player is
+  up, a bag for that player (none or empty: `not supported`). Each pairing
+  sets the grant again (`ClubOut::link`), so a new pairing with another
+  grant changes `club_out` without a restart. A pick is for the active
+  local player (none up: ignored, nothing put back) and resolves to the
+  first bag entry of its type, looked up when the command goes; a type not
+  in the bag drops it. While the readiness is not `controllable` or names
+  no player or another player, the pick is pending (`PICKS_WAIT`, the one
+  switch: `false` drops it). A readiness that is `controllable` and names
+  the player but does not list the command drops it at once ("Pureplay
+  does not take club changes here"). When the command could go, Pureplay
+  holding the pick's type already sends nothing. `club.set { playerId,
+  clubId }`, or without `club.set` `club.next`/`club.prev { playerId }` steps
+  toward the type (direction by bag position, one step in flight, at most
+  the bag's length, each reply naming the club reached; a reply naming the
+  club held before the step (by id, else by type) did not move: the
+  direction turns once when the other command is offered, else, or the
+  second time, it gives up; a newer pick takes over at the next reply, from
+  the club reached). Ids `c-N`, one command in flight; picks meanwhile
+  replace the pending one. The pending pick is dropped on `turn.changed`
+  to another player, `context.invalidated`, the connection's end (so a new
+  `serverInstanceId`), a snapshot naming another active player, and the
+  player's `user_selected` change; a `turn.changed` naming its own player
+  (a new hole in a one-player round) keeps it for the new turn, a command in
+  flight included. A turn change while a command from an earlier turn is in
+  flight drops nothing. An `auto` change keeps the pick, and an `auto`
+  change for the shot (readiness `shotId` at the send) a `club.set` just
+  succeeded for re-sends the pick once (a second is accepted), unless a
+  newer pick or the player's `user_selected` change came since; an `auto`
+  change seen while a command is in flight came before that command and is
+  not answered. Replies (matched by `id`): success updates the model with
+  the reply's `club`/`clubId`; `not_ready` → pending again, sent at the next
+  readiness (`shot.ready_changed` or a snapshot) or after 1 s
+  (`NOT_READY_RETRY`), whichever comes first, at most three times
+  (`NOT_READY_RETRIES`), then dropped; `rate_limited` → one retry after
+  `retryAfterMs` (100 ms when it names none); any other refusal, or no reply
+  in 5 s (`COMMAND_TIMEOUT`), drops it, and a reply after that is ignored.
+  While a pick is pending or in flight for the turn (`ClubOut::holds_club`)
+  Pureplay's club changes stay off the bus (the steps' and the command's
+  own `api_command` changes included); when a pick ends (applied, refused,
+  dropped, or not usable), `Action::SnapBack` puts Pureplay's club on the
+  bus when flighthook holds another (`Model::sync`) as the card's complete
+  select.
+- Shots (`shots.rs`): the card is a virtual launch monitor and a game
+  (`ShotSource::PureplayAccessory`, declared through `Actor::source()`, source
+  `virtual`). It never joins a round, never blocks one (it feeds no simulator
+  output) and does not ask `allows`/`send_if_allowed`. A `shot.launched` (live
+  only, never from a snapshot) is a candidate when its `playerId` is a local
+  player. The Shots setting, read from the config at each shot
+  (`shots::decide`): Auto takes the candidate unless `sent_shots.take_echo`
+  finds the send it echoes; "From Pureplay" takes every candidate and matches
+  nothing (`shots::matches_echoes`, the one switch); "From flighthook" takes
+  none and still matches. A taken shot gets a fresh UUID and goes on the bus as
+  `shot.trigger` (no timestamp: Pureplay's clock is not flighthook's; the
+  camera dates it on arrival and the impact lead, default 0.9 s, covers the
+  delay), `shot.launch` (`ballSpeedMs` m/s, `launchAngleDeg`, `directionDeg` +
+  right, spins rounded, `sideSpinRpm` times `shots::SIDE_SPIN_SIGN`; no flight,
+  club or impact) and `shot.finished`. A matched echo puts nothing on the bus.
+  A `shot.launched` whose `shotId` the card already holds is logged and not
+  taken again. `ShotMap` keeps Pureplay's `shotId` against the `shot_id` of the
+  shot it stands for (a taken shot or a matched echo; the newest 256), kept
+  across a reconnect to the same `serverInstanceId` and cleared on a new one.
+  `shot.completed` finds its shot there (never by time) and goes on the bus as
+  `game.stroke` (stroke id, shot id, golfer, hole, stroke number, the launch
+  values flown, a modeled flight with Pureplay's carry, total and apex, the
+  outcome `in_play`, `green`, `holed`, `out_of_bounds`, `water`, `lost`,
+  `unplayable`, `gimme`, `auto_putt` or `penalty_only`, the putt and penalty
+  strokes, lie and distances to the hole); a Gimme, AutoPutt or PenaltyOnly has
+  no shot id. `shot.cancelled` `discarded` (a scramble shot the team did not
+  pick) sends no stroke and retracts none. `score.updated` is `game.scores`. A
+  remote player's shot is logged and stored nowhere. The `ShotMap` and the
+  card's shot count belong to the actor: the card's Reconnect, an address
+  change or turning it off and on starts a new one, which forgets them.
+- Readiness: the card's `bus.actor` `blockers` are Pureplay's readiness
+  blockers (empty when `readiness.ready`; from the snapshot and
+  `shot.ready_changed`); the first carries the device identity (manufacturer
+  "Pureplay", model "Accessory API", firmware `gameVersion`). A connection that
+  said ready and ends publishes a blocker again.
+- Connection and pairing: refused or dropped without a close frame →
+  Reconnecting, backoff 1, 2, 4 ... 30 s (reset once a connection has held
+  30 s), the token kept, an `error` from Pureplay (version, events) cleared.
+  `4429` before `hello` → Reconnecting, `pairing` "Pureplay has too
+  many apps connected", backoff. A `hello` of another protocol or version →
+  Reconnecting, `error`, retried every 30 s. Waiting in Pureplay's queue,
+  then `pairing.pending` → Starting, `pairing` "Waiting for Pureplay", then
+  "Approve flighthook in Pureplay (42 s)" counted down once a second from
+  `expiresInSec`; only a `pair` without a token waits without limit, one
+  with a token gives up after 5 s (Reconnecting). `bad_request` to a `pair`
+  without a token (another app on the address is waiting) → the card
+  closes, Reconnecting, retried in 10 s; the sixth in a row → Disconnected
+  with Pureplay's `message` in `pairing`.
+  A refusal, told apart by the response before the close and the close code:
+  `forbidden_scope` + `4403` ("Turn on Ask about new apps in Pureplay's
+  Settings > Accessories"), `unauthorised` + `4403` ("Pureplay turned the
+  request down"), `unauthorised` + `4408` ("The request timed out in
+  Pureplay") → Disconnected, no retry. `rate_limited` + `4429` (the cooldown)
+  → Disconnected, "Pureplay asks to wait (1:42)" counted down from
+  `retryAfterMs`, then the same attempt once more; a second cooldown answer
+  counts down to "Press Reconnect to pair again.". `unauthorised` echoing the
+  `pair` + `4401` with a saved token → the token is deleted and the card pairs
+  once without one, when this actor start has not sent its one `pair`
+  without a token yet (else "Removed in Pureplay. Press Reconnect to pair
+  again."). After a removal in Pureplay that `pair` meets Pureplay's
+  cooldown, so the card counts the wait down and then asks once more, which
+  shows the prompt. An unprompted `unauthorised` (`id: null`) then `4401`
+  while connected (removed in Pureplay) → the token deleted, Disconnected,
+  "Removed in Pureplay. Press Reconnect to pair again.", no retry. When the
+  socket ends without a close frame (or none comes within 1 s), the refused
+  response decides: `unauthorised` to a `pair` without a token → "Pureplay
+  turned the request down", with a token → the dead-token rule,
+  `forbidden_scope` → the Ask-about-new-apps text, `rate_limited` → the
+  cooldown, an unprompted `unauthorised` while connected → the removal. A
+  `pair` without a token is sent by itself at most once per actor start;
+  after that only a Reconnect (a new start) sends another.
+- Telemetry (card status rows, each key only while it has a value): connected,
+  `name`, `club`, `handed` (the active local player), `hole`, `blockers`
+  (while the readiness is not ready: its blockers, `controls_disabled` not
+  one), `club_out` (`on`, `read only`, `off in Pureplay`, `not supported`;
+  see Club out above),
+  `shots` (`auto`, `auto: last from Pureplay`, `auto: last from
+  flighthook`, `from Pureplay`, `from flighthook`), `missed_events`,
+  `pureplay` (`gameVersion`); `last_shot` (`#12 at 16:41:07`, the shot the
+  card took last) for the actor; otherwise `pairing` and `error`. Every
+  status change carries every row; between changes only what changed. The
+  rows are checked on every pass of the follow loop (100 ms), so `shots`
+  follows a Shots setting change while Pureplay is quiet.
+- Forget pairing: `POST /api/actors/{id}/forget-pairing` deletes the card's
+  token (on a blocking worker), then reconnects it through the reconnect
+  path; a reconnect of the card already in flight answers 409 first and
+  keeps the token.
+- Audit log (`audit` target): every frame sent and received as its frame
+  type and its JSON text, tokens redacted; close frames with their code.
+  The messages a frame produces carry that text as their raw payload. Each
+  shot decision is logged: taken (with the card's shot number), the echo of
+  which flighthook shot, or not taken and why. Each club pick is logged: sent,
+  waiting, set, refused (with the code) or dropped and why.
+- The game's view of a shot attaches in the collector: a `game.stroke` joins
+  the stored shot with the same `shot_id` whenever it arrives (a shot the
+  history no longer holds is skipped). The Shots tab does not show it; the JSONL
+  export carries it in `data.stroke`, CSV does not. `/frp` forwards it like any
+  FRP message. The export's device kind is `pureplay`.
 
 ### Tournament rounds
 
 A tournament round is system-wide policy, not an output's: `state::round`
-(`SystemState::round`, a `RoundPolicy`). No output but Pureplay asks for one
-today, and nothing in the policy is Pureplay's.
+(`SystemState::round`, a `RoundPolicy`). Pureplay Connect's strict mode asks
+for one, the Tournament toggle in the header sets one by hand, and nothing in
+the policy is Pureplay's.
 
-- **Provenance.** `flighthook::Provenance` is a wire type and says where a
-  shot comes from, nothing more: `Measured` (a launch monitor measured it: a
+- **Source.** A launch monitor's `source` (FRP's `device.source`) says where a
+  shot comes from, nothing more: `measured` (a launch monitor measured it: a
   driver reads the hardware, or a monitor's own app sends it to the Open
-  Connect input) or `Virtual` (the trackball, the mock monitor and
-  Auto-chip). How each value was obtained is
-  a separate question (`ShotData::unmeasured_fields`). Every shot source is an `actors::provenance::ShotSource`
-  (`Mevo`, `R10`, `Square`, `ExPutt`, `Trackball`, `MockMonitor`,
-  `OpenConnectServer`, `AutoChip`); `ShotSource::provenance()` is the single
-  exhaustive match.
-  An actor type declares its source (`Actor::source()`; `None` for actors
-  that put no shots on the bus). `start_actor` registers it in the policy by
-  actor ID and gives the actor's `BusSender` that provenance, which it
-  stamps on the envelope of every `ShotTrigger` the actor sends. Auto-chip
-  registers itself and stamps its triggers where it makes them. Consumers
-  copy the envelope's provenance into the shot (`ShotAccumulator::
-  with_provenance`), so it travels with `ShotData.provenance`; a shot stored
-  without it reads as `None`, which the policy treats as not measured. A
-  test resolves one actor per config section and checks each declares its
-  source or is a listed non-source (webserver, camera, openconnect_client,
-  pureplay, random_club).
+  Connect input) or `virtual` (the trackball, the mock monitor, Auto-Chip and
+  the Pureplay Accessory card). Every local shot source is an
+  `actors::provenance::ShotSource` (`Mevo`, `R10`, `Square`, `ExPutt`,
+  `Trackball`, `MockMonitor`, `OpenConnectServer`, `AutoChip`,
+  `PureplayAccessory`) whose single exhaustive match gives the source;
+  `is_simulator()` (the Pureplay Accessory card) keeps a source out of every
+  simulator output. An actor type declares its source (`Actor::source()`;
+  `None` for actors that put no shots on the bus), and `start_actor` registers
+  it in the policy by actor ID. A remote launch monitor's source is read from
+  its `bus.actor` (unknown counts as not measured).
+- **Simulator sources.** The Pureplay Accessory card is `virtual`, so it never joins a
+  round; it never blocks one either, because no simulator output counts it
+  among its feeds (see the Open Connect client's routing rule), which is a
+  routing fact, not a round special case; and it is not switched off
+  during a round, since a simulator's own shots are not flighthook's to
+  switch off.
 - **Acceptance.** `begin_round(&RoundRequest { holder, feeds })` accepts
-  when every launch monitor in `feeds` is `Measured` by its registered
+  when every launch monitor in `feeds` is measured by its registered
   source; otherwise `Refusal` names the first, in actor ID order: "`<name>`
   is a virtual launch monitor", or "`<name>` is not a launch monitor
   flighthook reads" (no registered source); a blank name gives the actor
@@ -1630,22 +1988,36 @@ today, and nothing in the policy is Pureplay's.
 - **The guard.** `RoundGuard` ends the round when it drops. Several holders
   may hold rounds at once; the round is active while any does, and the
   first still held names it.
-- **Which shots and values count.** `RoundGuard::certify(&ShotData) ->
-  Option<CertifiedShot>`: `None` unless the shot's provenance is `Measured`;
-  otherwise a copy with every `ShotData::unmeasured_fields()` value removed
-  (`ShotData::clear_field`) and flighthook's own `derived` and `metrics`
-  dropped.
-- **Readiness.** `RoundGuard::counts(provenance)`: only a measured launch
-  monitor counts for the holder's ready state and heartbeat.
-- **Virtual producers.** Auto-chip (`autochip::send`, the single firing
+- **Tournament mode.** `RoundPolicy::set_manual(on)` is the manual holder,
+  named `"Manual"` (`round::MANUAL_HOLDER`). It feeds no output, so there is
+  no acceptance check and no refusal: it only turns the virtual producers
+  off. A simulator's round on top of it is named by the simulator, and its
+  end falls back to the setting. The setting is `[simulation] tournament`:
+  `SystemState::new` applies it at start-up, `POST /api/tournament` writes
+  it through `ConfigAction::SetTournament` (applied before the outcome goes
+  out), and the system actor applies the saved value again after every
+  config command.
+- **Which shots count.** In a Pureplay Connect strict-mode round the output
+  sends only the shots of measured launch monitors and ignores every
+  `shot.flight`, so it never sends a simulated or estimated value. It sends
+  `launch`, `club` and `impact` as the launch monitor sent them, so the
+  values a real launch monitor reports (the R10's back and side spin, the Xi's
+  spin from its early result, the Omni's vertical impact, the Open Connect
+  input's completed spin pair) go out.
+- **Readiness.** `RoundGuard::counts(source)`: only a measured launch
+  monitor counts for the holder's ready state and heartbeat, remote ones
+  included.
+- **Virtual producers.** Auto-Chip (`autochip::send`, the single firing
   point) and the mock monitor send a shot's trigger through
-  `RoundPolicy::send_if_allowed(Provenance::Virtual, ..)`, which runs the
-  send only while no round is active and holds the policy while it runs, so
-  no round can begin between the check and the trigger. Auto-chip also asks
+  `RoundPolicy::send_if_allowed(Source::Virtual, ..)`, which runs the
+  send only while no round is active (tournament mode on counts as active) and holds the policy while it runs, so
+  no round can begin between the check and the trigger. A remote launch monitor
+  that declares itself virtual is held the same way
+  (`RoundPolicy::admits_remote`): while any round is active, its
+  `shot.trigger` and the rest of that shot are not put on the bus. Auto-Chip also asks
   `RoundPolicy::allows` before its solve, to answer at once. Refused, it
   returns `SolveError::RoundActive`, which `POST /api/auto-chip` answers
-  with `409 {"error":"Auto-chip is off during a Pureplay strict-mode
-  round"}`; nothing is put on the bus and no number is taken. A device
+  with `409 {"error":"Auto-Chip is off during a tournament round"}`; nothing is put on the bus and no number is taken. A device
   driver of a virtual source (the mock, the trackball) asks
   `Events::shots_allowed()`, which its `DriverActor` sets from
   `RoundPolicy::allows` before every poll, before it numbers a shot: a held
@@ -1655,15 +2027,19 @@ today, and nothing in the policy is Pureplay's.
   `send_if_allowed` as the backstop: a shot that starts anyway is dropped
   whole.
 - **State.** `RoundPolicy::state()` is a `flighthook::RoundState { active,
-  holder }`. `main` attaches the bus, and every change goes out as a
-  `round_state` event (actor `system`); `GET /api/status` carries it as
-  `round` (omitted while inactive) and the WebSocket sends it after the
-  replayed statuses. The UI keeps it in `FlighthookApp::round`: the header's
-  Auto-chip chip is disabled from it, and the Tournament banner shows from
-  it. A WebSocket that closes or fails resets it (`handle_ws_event`), so
-  the banner does not outlive the server.
+  holder, manual, held }` (`manual`: tournament mode is on; `held`: a
+  simulator holds the round). `main` attaches the bus, and every change goes out as a
+  local `RoundState` event; `GET /api/status` carries it as `round` (omitted
+  while inactive) and `/api/ws` sends it in the snapshot and on every change.
+  The UI keeps it in `FlighthookApp::round`: the header's
+  Tournament icon (off, on, or held with a lock) and center title show it,
+  and the Auto-Chip icon is disabled from it. A click on the icon sends
+  `POST /api/tournament` while off or on, and opens the held round's card
+  (no request) while a simulator holds it; the icon waits while Settings has
+  unsaved edits. A dashboard connection that closes or fails resets the round, so it does
+  not outlive the server.
 
-Pureplay telemetry (`ActorStatus`, each key only when it changes):
+Pureplay card rows (each key only when it changes):
 
 | Key | Value | Example | Holds for |
 |---|---|---|---|
@@ -1676,10 +2052,9 @@ Pureplay telemetry (`ActorStatus`, each key only when it changes):
 
 As for the Open Connect client, a connection refused or closed is a status,
 never an `error` or an alert, and `club`/`handed` are removed when the link
-ends. The state of a launch monitor is learned only from its own bus events,
-so an output that starts while a monitor is already connected reports it
-NotReady/Disconnected until the monitor's next status or its next
-`ready=true`.
+ends. The state of a launch monitor is learned from its `bus.actor` (every local
+actor publishes it each heartbeat), so an output that starts while a monitor is
+already connected learns its state within one heartbeat.
 
 ## Device drivers
 
@@ -1694,8 +2069,8 @@ session, shots, telemetry, raw frames); `actors::driver::DriverActor<D, H>`
 is the host around it, one thread per card. What a card adds is its
 `Hooks<D>`: its config section (`H::Section`, a lib `DeviceSection`), its
 shot source (`H::SOURCE`) and optional processing (`on_frp`, `action`).
-The FlightScope's are `actors::mevo::MevoHooks` (its `on_frp` simulates a
-shot in the mode at its trigger and estimates a launch-only chip's spin),
+The FlightScope's are `actors::mevo::MevoHooks` (its `on_frp` estimates a
+launch-only chip's spin and publishes it as the card's own `assumed` flight),
 the R10's `actors::r10::R10Hooks`, the Square Golf's
 `actors::square::SquareHooks`, the ExPutt's `actors::exputt::ExPuttHooks`
 (its `action` is Find mat, its `on_frp` puts the driver's discovery hint in
@@ -1715,8 +2090,7 @@ driver may raise on every retry, once).
 **Config.** A `DeviceSection` is flighthook's own fields (`name`,
 `enabled`, `impact_lead_s`) with the driver's config `#[serde(flatten)]`ed
 next to them, so the file and the REST JSON hold one flat table per card;
-every driver field is left out while at its default, so a default section
-writes what it wrote before. The actor builds and updates the driver from
+every driver field is left out while at its default. The actor builds and updates the driver from
 `DeviceSection::driver_settings()`: the section's driver config as it is,
 except where the host decides a setting itself (the Trackball's grab is
 always off). `FlighthookConfig::device_error()` runs every
@@ -1744,49 +2118,39 @@ card's source class is its driver's declared source.
 **Run loop.** `D::new(config)`; a refused config sends Disconnected with
 the error as the card's `error` and the actor waits for its stop. Then
 Starting (once), and per attempt `connect` with a `ConnectCtx` whose host
-is the actor: `tick()` drains the bus into the latched command (game
-state's mode, hand and club at start; `set_detection_mode` and `club_info`
-afterwards) and queues the card's actions (actions still queued when a
-connect starts were asked while no session ran, and are dropped). A
-session: Connected with
-`device_info` (the identity's label) and `shot_count`, then a
-`device_telemetry` with the identity (and `source`, stamped by the bus
-sender) before any shot; each pass drains the bus into one `command` (the
-pass's messages merged field by field, so a hand and a club that change
-together reach the driver together) and its `action`s, hands a live config to `apply_config`, sets `wants_raw` (always)
-and `shots_allowed` (the round policy), and polls for 50 ms; launches
-still held go out at the end of the pass (below). A session
-error releases held launches, sends `ready=false` and then Reconnecting;
+is the actor: flighthook's own `golfer.turn` becomes the driver's `TurnHints`
+(club, hand, mode), handed to a connect through `hints()` and to the session
+whenever the turn changes (each turn is complete), and the card's actions are
+queued (actions still queued when a connect starts were asked while no session
+ran, and are dropped). A session: Connected with `device_info` (the identity's
+label) and `shot_count`, then a `bus.actor` carrying the identity and
+`device.source` before any shot; each pass drains the bus into the hints and
+the card's `action`s, hands a live config to `apply_config`, sets `wants_raw`
+(always) and `shots_allowed` (the round policy), and polls for 50 ms. A
+session error sends `not_armed` and then Reconnecting;
 the driver's `retry_delay` (its own alerts, an SDK `Backoff`) is slept with
 the bus drained; `None` gives up with Disconnected and the error. A stop
 closes the session (`close`) and ends Disconnected. A panic in the driver
-(any of its calls) is caught on the actor's thread: `ready=false`, then
+(any of its calls) is caught on the actor's thread: `not_armed`, then
 Disconnected with `error = "the device driver failed; press Reconnect"`,
 and the thread ends, so a card never stays Connected over a dead driver. `stop_wait()` is
 `D::STOP_WAIT`; a driver whose device takes one connection at a time
 (`exclusive`) is not replaceable while stopping.
 
-**Events.** Each driver event goes on the bus with the session's device id:
+**Events.** Each driver event goes on the bus under the card's actor id as soon
+as the driver gives it; nothing is held:
 
 | Driver event | Bus |
 |---|---|
-| `shot_trigger` | `ShotTrigger` (with the driver's timestamp) through `RoundPolicy::send_if_allowed`; opens the raw capture window at the trigger's time; refused, the whole shot is dropped |
-| `launch` | held until the shot's `flight_result`, its `shot_finished` or the end of the `poll` pass it came in; then `on_frp` (with the flight result in view), the simulation once (the driver's fixed mode, else the live mode, or the mode the hook set in `HookCtx::mode`) and `Launch` with `derived`, then `FlightResult` |
-| `flight_result` | releases the held launch; one that comes first waits for its launch |
-| `club_path`, `face_impact`, `alert` | `ClubPath`, `FaceImpact`, `Alert` |
-| `shot_finished` | `ShotFinished` with the shot's raw frames (`"<kind> device has no wire protocol"` without a raw profile), then the card's `shot_count` |
-| `device_telemetry` | merged into the session's map and published in full; during a connect only merged, and published with the identity when the session connects (its own identity fields are not used then: a driver puts manufacturer, model and firmware in its `DeviceIdentity`) |
+| `shot.trigger` | `shot.trigger` (with the driver's timestamp) through `RoundPolicy::send_if_allowed`; opens the raw capture window at the trigger's time; refused, the whole shot is dropped |
+| `shot.launch`, `shot.flight`, `shot.club`, `shot.impact` | the same messages, after the card's `on_frp` hook (the FlightScope hook may add its own `assumed` flight) |
+| `shot.finished` | the shot's raw frames as the local `ShotCapture` (`"<kind> device has no wire protocol"` without a raw profile), then `shot.finished`, then the card's `shot_count` |
+| `alert` | `bus.alert` |
+| status and identity | the card's `bus.actor` (blockers, battery, attitude, telemetry, device), published when it changes |
 | `raw_frame` | numbered per device id across sessions (frames of the first connect, before the id is known, number on into it), a hex line at the `audit` target, recorded for the export ([raw capture](#raw-capture-and-shot-export)); never on the bus |
 | `Phase` | the card's `phase`; the Connected status removes a phase set during the connect (`phase: ""`), unless the connect's last phase was `measuring` (the session's own phase in the driver contract's list), which it keeps. A connect that fails removes its phase before the retry delay, and a stop during a connect leaves the card Disconnected without it |
 | `Log` | tracing; trace lines at the `audit` target |
 | `ShotDiscarded` | the pre-roll is cleared |
-
-Contract: a driver sends a shot's `flight_result` in the `poll` pass of its
-`launch`. Every launch still held goes out at the end of the pass (a
-launch-only result reaches the bus at once, not when the device finishes the
-shot), and when a session ends; a flight result that comes in a later pass
-goes out alone. One held past `flighthook::SHOT_TIMEOUT` (45 s, when every
-consumer has given up on its shot) is dropped, a backstop.
 
 **Live config.** `reconfigure` reads the card's section: unchanged or a
 host field only is Applied; a driver change that `restart_needed` calls
@@ -1797,13 +2161,13 @@ doing: between session polls, before each connect, every 100 ms of a retry
 delay and while it waits for its stop, so a change takes effect at the next
 shot or connect (the hooks see the new section at once).
 
-## Cameras and replay (beta)
+## Cameras and replay
 
 USB cameras record a clip of every swing; the Shots tab replays it beside
 the shot. Capture, the pre-roll and clip cutting are the
 [stance](https://github.com/divotmaker/stance) crate's; flighthook
 supplies the triggers, stores the clips and serves them. Frames never travel
-on the bus: only one `shot_video` event per finished clip.
+on the bus: only one local `ShotVideo` event per finished clip.
 
 ### Camera actor
 
@@ -1812,7 +2176,7 @@ thread. It opens its source with stance's `Capture::start` (which
 blocks while the camera opens; the camera then runs on a capture thread of
 its own, frames going into a bounded ring) and loops:
 
-- every waiting bus message is read first; each `shot_trigger` becomes a
+- every waiting bus message is read first; each `shot.trigger` becomes a
   recorder trigger (below);
 - frames newer than its cursor (`Capture::wait_frames_after`, waiting at
   most 10 ms) are restamped (below) and go to a `ClipRecorder`, which keeps
@@ -1824,8 +2188,8 @@ its own, frames going into a bounded ring) and loops:
   its live slot, at most `LIVE_FPS` (15) a second, or with body tracking
   in Live mode through the camera's body tracking worker, which puts it
   there with its pose (see [Body tracking](#body-tracking-alpha));
-- every 2 s, telemetry (`fps`, `dropped`, `position`) goes out in an
-  `actor_status`, only when it changed; `fps` moves only when the measured
+- every 2 s, telemetry (`fps`, `dropped`, `position`) goes out in a
+  card status, only when it changed; `fps` moves only when the measured
   rate is 2 % of the mode's rate (at least 1 fps) away from the value last
   sent, so a camera hovering around its rate stays quiet; one `warn` alert
   when the frame rate stays under half the mode's for 10 s.
@@ -1851,7 +2215,7 @@ platform has no camera backend (macOS) the actor reports `disconnected` with
 
 ### Live frames
 
-The Shots tab's Live view shows each camera live through the actor's **live slot** in
+The Cameras tab's Live view shows each camera live through the actor's **live slot** in
 `SystemState::cameras` (`state/cameras.rs`): one frame, the JPEG as the
 camera sent it, with a sequence number and its time. The number counts up
 over every camera's live frames and never repeats while the server runs;
@@ -1878,38 +2242,31 @@ the time is the frame's host time less the camera's latency
 
 The still slot and its route are separate and unchanged by watching.
 
-The **Cameras pane** (`ui/src/panels/cameras.rs`) is part of the Shots
-tab, shown when the server can record from cameras (`cameras_supported`,
-as for the Devices tab's Cameras (+)) and the saved config has a camera
-(`FlighthookApp::cameras_shown`). The toolbar gets a **Data | Cameras**
-switch as its first control in both views (`ShotsPane`, kept in local UI
-storage under `shots_pane`): Data | Cameras is the parent, Cards | Table
-the way Data is shown. Right of it the Cards | Table switch shows while
-Data is showing; while the Cameras pane shows (`cameras_pane_shown`) an
-on/off **Live** switch takes its slot (`render_live_toggle`,
-`theme::switch_pill`, `live_selected`), followed by the **Tour | Amateur**
-reference picker (`render_reference_picker`, `theme::segmented_pills`,
+The **Cameras tab** (`ui/src/panels/cameras/`) is the second nav icon, enabled
+when the server can record from cameras (`cameras_supported`, as for the
+Settings Cameras section's (+)) and the saved config has a camera
+(`FlighthookApp::cameras_shown`); without one its hover text says so. The Shots
+and Cameras tabs share one shots navigation (the left column: shot list, view
+selector, device filter, export, Clear history, New set, New session), so the
+selected shot, the scroll position, the grouping and the device filter are the
+same in both. The Cameras tab has its own small toolbar: an on/off **Live**
+switch (`render_live_toggle`, `theme::switch_pill`) followed by the **Tour |
+Amateur** reference picker (`render_reference_picker`,
 `FlighthookApp::body_reference`, kept in local UI storage under
-`body_reference`; marks `body_reference`, `body_reference:<key>`), and the
-Cards | Table choice is kept for Data. One helper says what the tab lays out,
-`FlighthookApp::shots_layout` -> `ShotsLayout` `Cards | Table | Cameras`
-(Cameras whenever the pane is chosen, whatever the view); the panel, the
-toolbar's legend and the card clips all go by it. With Cameras picked the
-pane takes everything right of the Cards view's shot list (the list keeps
-the Cards view's panel and default width, so the screen is the same from
-either view): the Dispersion column and the bottom chart row are not laid
-out, and the card row's camera clips are dropped. Live is part of the
-Cameras pane: picking Data leaves Live, picking a shot leaves Live, turning
-Live off shows the shot the list shows, and a new shot keeps Live (the
-newest shot is selected underneath, as in Data).
+`body_reference`). The Shots tab keeps its own Cards | Table choice. One helper
+says what the tab lays out, `FlighthookApp::shots_layout` -> `ShotsLayout`
+`Cards | Table | Cameras`; the panel and the card clips go by it. The Cameras
+tab takes everything right of the shots navigation: the Dispersion column and
+the bottom chart row are not laid out, and the card row's camera clips are
+dropped. Live is part of the Cameras tab: picking a shot leaves Live, turning
+Live off shows the shot the list shows, and a new shot keeps Live (the newest
+shot is selected underneath).
 
-Each time the pane comes on screen (`sync_cameras_pane`, comparing with
-`cameras_pane_was_shown`; called at the start of each update, in the
-toolbar after the Data | Cameras switch and after the toolbar, so a click
-that shows the pane is applied before it draws), the shot focus follows the
-latest shot again (any pin dropped) and Live is turned on exactly when
-there is then no shot to show under the device filter. Clear history marks
-the pane as not shown, so a pane on screen turns Live on.
+Each time the tab comes on screen (`sync_cameras_pane`, comparing with
+`cameras_pane_was_shown`, called at the start of each update), the shot focus
+follows the latest shot again (any pin dropped) and Live is turned on exactly
+when there is then no shot to show under the device filter. Clear history marks
+the tab as not shown, so a tab on screen turns Live on.
 
 - **Live's Last shot strip** (`panels/last_shot.rs`, alpha): while Live
   shows, `sync_last_shot` follows the newest shot under the device filter
@@ -1987,7 +2344,7 @@ the pane as not shown, so a pane on screen turns Live on.
   size, rounded).
   **Grades** (alpha): once a column's swing report is in, the player
   fetches `GET /api/shots/{shot_id}/grades/{camera}` (`Fetch::Grades`,
-  `ReplayReply::Grades`), and again whenever the saved Player card changes
+  `ReplayReply::Grades`), and again whenever the saved Golfers card changes
   (`SettingsForm::grades_key`, `ReplayView::set_grades_key`; the grades
   shown stay until the new ones arrive); `PlayerColumn::grades`. The pane
   reads the picked reference's `ReferenceGrades` and colors by `Fit`
@@ -2033,11 +2390,11 @@ the pane as not shown, so a pane on screen turns Live on.
   the last one is answered, asking `after` the newest frame it holds; a
   frame is decoded (`ensure_huffman` + zune-jpeg) into the view's texture on
   the next update, and only a frame asks for a repaint. A failed request
-  waits 1 s. The views exist only while Live is on screen (the Shots tab,
-  the Cameras pane in either view, Live on, the window not minimized, not a
+  waits 1 s. The views exist only while Live is on screen (the Cameras tab,
+  Live on, the window not minimized, not a
   hidden browser tab); otherwise they are dropped and their late replies
   ignored.
-  A camera that is not Connected shows its Devices card's badge and `error`
+  A camera that is not Connected shows its Settings card's badge and `error`
   instead of a picture. Each picture carries the skeleton of the pose that
   came with it, and under it the posture tiles of the camera's view from the
   same `X-Pose` (golfer_front: Side bend, Shoulder tilt, Lead elbow;
@@ -2089,7 +2446,7 @@ drawn:
   and the posture's frame width are the turned frame's.
 - **Display**: the JPEGs on the wire are unrotated. The UI takes each
   camera's rotation from the saved config it holds
-  (`SettingsForm::saved_rotation`; a clip whose camera is no longer
+  (`SettingsForm::saved_rotation`; a clip whose camera is not
   configured uses the rotation it was tracked with) and paints the texture
   turned about its center (`pose::paint_turned`: `egui::Image::rotate` in
   the rect of the unturned size, `turned_size` swapping width and height for
@@ -2098,7 +2455,7 @@ drawn:
   frame (with the card's unsaved rotation). `Fit` takes the turned
   `(width, height)`, so the skeleton lands on the turned picture.
 
-Yaw and pitch are not used by any measurement or grade. The Cameras pane
+Yaw and pitch are not used by any measurement or grade. The Cameras tab
 shows one line over a Golfer Front camera's swing numbers when its
 `|yaw_deg|` is 5 or more (`cameras::yaw_warning`).
 
@@ -2121,7 +2478,7 @@ therefore finishes `L` later. The ring holds the dated frames, which stop
 
 ### Triggers
 
-A `shot_trigger` from a launch monitor is dated on the host monotonic
+A `shot.trigger` from a launch monitor is dated on the host monotonic
 clock (`stance::clock::now_ns`): at its `timestamp` (UTC ms, the strike) when
 it carries one (`camera::trigger_time`; a timestamp ahead of the host's UTC
 clock counts as now), else when the actor reads it. The ExPutt's triggers
@@ -2183,7 +2540,7 @@ clip folder (`[replay] clip_dir`, default `dirs::data_local_dir()/flighthook/cli
 on the clip and `finish`/`abandon` count it off; the camera checks the slot
 is still current (`ClipStore::is_current`) before writing, so a clip
 cleared meanwhile costs no write. The camera actor then emits
-`shot_video` (`keys`, `position`, `duration_ms`, `fps`, `trigger_offset_ms`,
+`ShotVideo` (`keys`, `position`, `duration_ms`, `fps`, `trigger_offset_ms`,
 `impact_offset_ms`, `complete`, `dropped`, from the sidecar) and, when the
 prune deleted clips, `shot_video_removed { keys }`. A failed write raises a
 `warn` alert and leaves no folder.
@@ -2191,7 +2548,7 @@ prune deleted clips, `shot_video_removed { keys }`. A failed write raises a
 The store indexes shot id → clip. Pruning keeps the newest `keep_shots`
 clip folders (read live, held to 1 to 1000) after every clip and at startup
 (`main` loads the folder, indexes every folder with a `shot.json`, deletes
-the rest and emits `shot_video_removed` as `system`). It skips folders with
+the rest and emits `ShotVideoRemoved` as `system`). It skips folders with
 a writer and the clip just finished; those stay over the count until a later
 prune. Clear history (`clear_shot_history`, handled by the system actor)
 deletes every clip and counts the store's generation up; a clip begun before
@@ -2203,18 +2560,18 @@ When a config change moves `clip_dir`, the system actor calls
 `ClipStore::reindex`: the store forgets the clips of other folders (their
 files stay), keeps clips still being written until they finish, indexes the
 new folder like at startup, and the shots that lost their clips go out in
-one `shot_video_removed` from `system`. Clips in an earlier folder are never
+one `ShotVideoRemoved` from `system`. Clips in an earlier folder are never
 deleted by flighthook afterward.
 
 ### Web
 
-Each web server stamps a `shot_video` onto the shots it names, found by
+Each web server stamps a `ShotVideo` onto the shots it names, found by
 `shot_id` whatever actor took them: a pending shot keeps it until
 `shot_finished`, a stored shot gets it in `data.video` (one entry per camera,
-replacing that camera's earlier one). `shot_video_removed` clears `video` on
+replacing that camera's earlier one). `ShotVideoRemoved` clears `video` on
 its shots, `shot_pose` sets `pose`, `rotation` and `analyzed_with` on its
 camera's entry and `shot_swing` sets `swing`. Routes
-(`web/routes.rs`):
+(`web/routes/video.rs`):
 
 - `GET /api/shots/{shot_id}/video`: the clip's finished cameras
   (`ClipStore::videos`).
@@ -2288,21 +2645,16 @@ enum like `model`: an unknown value is an invalid body (the JSON extractor's
 `historical`; a section with neither is `off`. Only `mode` is written, so
 such a file is brought up to date with a backup at load, and a config
 without the section stays byte-identical. The Body
-tracking card (General) edits every field, saved with the General cards.
+tracking card (Cameras) edits every field, saved with the global cards.
 
-The player's facts are `[player]` (`PlayerSection`, read live through
-`SystemConfig::player()`, a height out of range is none): `sex` (`male` |
-`female`, for the tour averages) and `height` (100 to 250 cm: the swing
-analysis' distances in cm). The Player card (General) edits both (height
-typed in inches with imperial default units, centimeters with metric),
-saved with the General cards; `POST /api/settings?scope=player`
-(`SetPlayer`) writes the section alone. `[body_tracking] golfer_height` is
-read by `BodyTrackingRaw` into the hidden, never-serialized
-`BodyTrackingSection::legacy_golfer_height` (left out of equality), and
-`FlighthookConfig`'s `Deserialize` moves it to `player.height` when that is
-unset; since it is never written, a file holding it is rewritten once at
-load with a backup (see [Loading and migration](#loading-and-migration)). A
-`scope=body_tracking` save carrying it saves the section without it. Turning body tracking on from
+The golfer's facts are the record of the golfer the shot names, by the lookup
+rule (`SystemConfig::golfer_facts`, read live; a height out of range is none): `sex` (`male` | `female`, for the
+tour averages) and `height` (100 to 250 cm: the swing analysis' distances in
+cm). The Golfers card (Settings, Golfers) edits both (height typed in inches
+with imperial default units, centimeters with metric) and saves with
+`POST /api/settings?scope=golfers` (`SetGolfers`). A `[player]` section or a
+`[body_tracking] golfer_height` in an older file is moved onto the golfers at
+load (see [Loading and migration](#loading-and-migration)). Turning body tracking on from
 Off saves the mode at once through
 `POST /api/settings?scope=body_tracking` (`SetBodyTracking`: that section
 alone, so it never writes another setting).
@@ -2401,7 +2753,7 @@ watched; after that the camera's live frames go out without a pose and
 `X-Pose-State` is `failed` for it (`BodyTracking::set_live_failed`) until
 the watch lapses or tracking leaves Live mode. For a
 camera at golfer_front or target_line (`swing::live_setup`, read per frame
-with the player's hand from the game state and `swing::mirrored`), the
+with the golfer up's hand from the session and `swing::mirrored`), the
 worker also measures the found pose's posture for that view
 (`stance::golf::posture`, on `stance::golf::unmirror`ed keypoints for a
 mirrored picture), smoothed by a
@@ -2415,7 +2767,7 @@ download runs, `ready`, `failed` with `X-Pose-Error`: the model's load, or
 the camera's live worker) on every answer, the `204` included.
 
 **Recorded swings** (`pose::clips`). In Live mode a camera's clip is queued
-for body tracking when it is saved and announced (`shot_video`), to start no
+for body tracking when it is saved and announced (`ShotVideo`), to start no
 sooner than 3 s after it was written (`CLIP_DELAY`), so the pass stays clear
 of the shot itself. A viewer's request (`clips::request`, from
 `POST /api/shots/{shot_id}/video/{camera}/analyze`; the UI sends it in
@@ -2465,7 +2817,7 @@ the shot (the game's hand when the camera saw the trigger, carried with the
 recorder's tag; right-handed when unknown), the clip's estimated impact (the
 sidecar's `impact_ns`, the launch monitor's impact shifted by its camera
 timing, when it falls inside the clip's frames: at or after the first, at
-or before the last), the player's height (`SystemConfig::player()`), and whether the
+or before the last), the golfer's height (`SystemConfig::golfer_facts`), and whether the
 camera's picture is mirrored (`swing::mirrored`, the one place a mirror
 setting plugs in; no camera is mirrored yet). stance takes the impact as a
 prior: it moves it to the hands' low point within 0.3 s (`refined`), or,
@@ -2492,8 +2844,8 @@ served) and grades it with stance's built-in band table
 for the tour and the amateur reference. The context: the club class from
 the stored shot's `club_selected` (`Club::class`, lib `ClubClass` mapped to
 stance's; a putter or no club grades nothing), the sex from
-`SystemConfig::player()`, and the height: when the report has the upright
-torso length, its `scale.cm_per_px` is recomputed from the Player card's
+the golfer's record, and the height: when the report has the upright
+torso length, its `scale.cm_per_px` is recomputed from the golfer's
 height now (none without one, so stance assumes 177 / 164 cm) and the
 analysis-time `cm` dropped. A report whose impact was `given` grades only
 its tempo. Each stance `Grade` becomes a lib `MetricGrade` (`grades.rs` in
@@ -2508,7 +2860,7 @@ fitted to the rect at its aspect, keypoints under `min_score` hidden with
 their bones, the lead side (a right-hander's left; the game's hand) in teal,
 the trail side in orange, the midline light. While the models are not
 ready a band at the bottom of the picture says what they are doing. The
-replay and the Cameras pane's player fetch each tracked clip's
+replay and the Cameras tab's player fetch each tracked clip's
 `.pose.json` once (when the row's video has `pose`, or when `shot_pose`
 arrives while they are open) and draw the pose frame whose `t_ns` equals
 the shown frame's, with the shot's hand.
@@ -2521,7 +2873,7 @@ the player and the replay send one analyze request per clip without `pose`
 (done already: the files are fetched at once), otherwise `shot_pose` and
 `shot_swing` bring them as for a recorded clip, and until then the clip
 plays without them, as while any clip is tracked. A clip keeps the tracking
-it was given. When the Cameras pane shows a shot with a clip tracked
+it was given. When the Cameras tab shows a shot with a clip tracked
 (`pose`) at a `rotation` other than its camera's saved one
 (`cameras::retrack_due`), it posts `analyze?force=1` once per (shot,
 camera) per session (`FlighthookApp::retracked`) and drops that clip's pose
@@ -2529,65 +2881,64 @@ and analysis from the row and the player (`types::forget_analysis`,
 `ReplayView::forget_analysis`) until `shot_pose` and `shot_swing` bring the
 new ones.
 With `show_skeleton` false no skeleton is drawn anywhere (Live, the
-Cameras pane's player, the replay); the poses are still fetched and the
+Cameras tab's player, the replay); the poses are still fetched and the
 swing numbers shown. In Live mode a line under the live views reads out the
 values (`skeleton off` while it is hidden) and each camera's measured live
 rate and pose time.
 
 ## SystemActor
 
-The `SystemActor` (`actors/system.rs`) is a default actor that always runs,
-independent of config. It holds the sole `GameStateWriter`, `Arc<SystemState>`,
-and `broadcast::Sender`, enforcing at the type level that only `SystemActor`
-can mutate game state and process config mutations. It handles:
+The `SystemActor` (`actors/system/`) is a default actor that always runs,
+independent of config. It holds the sole `SessionWriter`, the practice
+bookkeeping, `Arc<SystemState>` and the bus sender, so only it mutates the
+session and the configuration. It is the body of the flighthook FRP actor (the
+session and practice roles). It handles:
 
-- **Game state**: subscribes to `PlayerInfo`, `ClubInfo`, `HandInfo` and
-  `SetDetectionMode` bus events, updates game state via the writer.
-  **Projects the club and the hand onto the controller command**: when
-  `ClubInfo` is received, calls `club_mode()` and emits
-  `SetDetectionMode { mode, club }`; when `HandInfo` carries a hand that differs
-  from the stored one (or none was stored), emits
-  `SetDetectionMode { handed }`. From `SetDetectionMode` only the mode is
-  stored, so its own command coming back round changes nothing. This
-  centralizes the device commands so every source triggers them the same way.
-- **Config mutations**: subscribes to `ConfigCommand` bus events (from the
-  REST API). Applies the mutation to `SystemConfig`, calls
-  `apply_config_reload()` to reconcile actors, and emits a `ConfigOutcome`
-  on the bus once the actors it stopped have ended. This provides natural
-  sequencing -- all config mutations are processed one at a time on the
-  SystemActor thread; the stop waits run on helper threads, so game events
-  and further commands are handled meanwhile.
-- **Clear history**: on `clear_shot_history` it deletes every replay clip
-  (`SystemState::clips`), once for the process, whichever web server or
-  client sent it.
+- **The session**: applies every `golfer.select` on the bus (see [The
+  turn](#the-turn)), publishes `golfer.turn` when it changed (with the select's
+  sender as the cause), replies to the select after the turn, republishes the
+  turn and the golfers' `golfer.profile`s on `bus.sync`, and resets a mode left
+  unheld to Full once when the Shot Type control disappears (`ShotTypeReset`).
+- **Practice**: follows the turn, every shot's trigger, data and finish and
+  `practice.new_block`, and publishes the `practice.block`s (see
+  [Sets](#sets)).
+- **Remote actors**: announces an actor that missed its heartbeats as
+  `ActorGone` (once a second it looks), and tells the round policy.
+- **Config mutations**: subscribes to `ConfigCommand` events (from the REST
+  API). Applies the mutation to `SystemConfig`, calls `apply_config_reload()` to
+  reconcile actors, and emits a `ConfigOutcome` once the actors it stopped have
+  ended. All config mutations are processed one at a time on the SystemActor
+  thread; the stop waits run on helper threads, so selects and further commands
+  are handled meanwhile.
+- **Clear history**: on `ClearShotHistory` it deletes every replay clip
+  (`SystemState::clips`), once for the process, whichever web server sent it,
+  and starts a new session.
 - **Clip folder**: after a config command that moves `[replay] clip_dir`, it
   reindexes the clip store (see [Clip store](#clip-store)).
-- Ensures game state and config are consistent even without the web server
 
-Created via `SystemActor::new(writer, state, bus_tx)` in `main()` before
-config-driven actors, registered with ID `"system"`. Skipped by
-`apply_config_reload()` (not config-driven).
+Created in `main()` before config-driven actors, registered with ID `"system"`.
+Skipped by `apply_config_reload()` (not config-driven). The reconciliation
+function lives in `actors/system/reload.rs`.
 
-`actors/system.rs` also contains the `apply_config_reload()` reconciliation
-function.
-
-The web layer's `state_updater` task does NOT update game state -- it only
-caches club and player name values in the per-actor telemetry map for the UI. It
-also handles `ConfigOutcome` events to refresh actor name caches.
+The web layer's `state_updater` task changes none of this. It keeps the bus
+state (every actor's FRP state), the card status cache and the shot store for
+the dashboard and the API, and handles `ConfigOutcome` events to refresh actor
+name caches.
 
 ## Component Identity
 
-All components are identified by type-prefixed global IDs: `mevo.0`, `r10.0`,
+Cards are identified by type-prefixed card keys: `mevo.0`, `r10.0`,
 `openconnect_client.0`, `mock_monitor.0`, `random_club.0`, `camera.0`,
-`webserver.0`, `ws.a1b2c3d4`. The `system`
-actor has a fixed ID of `"system"`. The type prefix encodes the component type;
-the index is the key within that type's config section. `autochip` is the
-one id with no index and no config section: the virtual source of Auto-chip
-shots (`POST /api/auto-chip`).
+`webserver.0`. The `system` card has a fixed key of `"system"`. The type
+prefix encodes the component type; the index is the key within that type's
+config section. `autochip` is the one key with no index and no config section:
+the virtual source of Auto-Chip shots (`POST /api/auto-chip`).
 
-`FlighthookMessage.actor` carries the global ID of the message originator.
-Inner event types carry no ID or name fields; identity lives on the
-`FlighthookMessage` envelope.
+On the bus, an FRP message's `from` is the sender's actor id. `SystemState`
+keeps the map between card keys and actor ids (with the card type), so the
+dashboard, the export, the outputs and the re-assert rule can name a local
+card. Inner message types carry no name fields; identity lives on `from` and
+in the actor's `bus.actor`.
 
 ## SystemState
 
@@ -2597,24 +2948,25 @@ Root entry point for all managed application state, passed as
 ```rust
 pub struct SystemState {
     pub system: SystemConfig,     // cached config (RwLock + disk persistence + reload lock)
-    pub game: GameState,          // read-only game state for the current round
+    pub session: Session,         // read side of the turn (golfer, club, hand, mode)
+    pub beats: Beats,             // the newest bus.actor of every local actor, re-sent each heartbeat
     pub local_clients: Arc<LocalClients>,  // this process's Open Connect clients
+    pub sent_shots: Arc<SentShots>,        // the shots the simulator outputs wrote (5 s)
+    pub round: RoundPolicy,       // tournament rounds (strict mode, manual tournament mode)
     pub clips: ClipStore,         // replay clips on disk (beta)
     pub cameras: Cameras,         // camera actors' latest frames + the camera list (beta)
     pub pose: BodyTracking,       // body tracking models + the recorded-clip queue (alpha)
+    pub pureplay_tokens: Arc<TokenStore>,  // Pureplay Accessory pairing tokens
     actors: RwLock<HashMap<String, Registered>>,  // the actor + its ActorHandle
 }
 ```
 
-`SystemState::new()` returns `(Self, GameStateWriter)`. The writer is passed
-to `SystemActor` at construction time.
-
 `system` provides cached read/write access to the persisted TOML config.
 Config mutations are serialized through the bus (SystemActor processes
 `ConfigCommand` events one at a time on its thread), so no external lock
-is needed. `game` is a read-only handle for player info, club, mode and hand;
-mutations go through `GameStateWriter` held by `SystemActor`. `actors` is a
-registry of all running actors, keyed by global ID. Each entry stores the
+is needed. `session` is a read-only handle for the turn; mutations go through
+the `SessionWriter` held by `SystemActor`. `actors` is a
+registry of all running actors, keyed by card key. Each entry stores the
 actor and its `ActorHandle`: the per-actor shutdown flag (`Arc<AtomicBool>`),
 the flag that mutes its bus sender, and its thread (the `JoinHandle` `start()`
 returns). Methods: `register_actor(id, actor, handle)`, `stop_actor(id)`
@@ -2630,98 +2982,44 @@ Actors are registered right after `start()` returns their thread.
 
 ## Log
 
-The Log tab in the UI streams all bus events in real-time with per-message-type
-filter checkboxes. Raw wire data is carried via `raw_payload` on bus messages.
-Binary payloads serialize as hex strings; GSPro JSON payloads serialize as-is.
-Events without a `raw_payload` (e.g. `actor_status`, `config_outcome`) display
-the event's JSON serialization as the payload instead. The log retains the last
-500 events. Protocol-level tracing is always emitted to the `audit` tracing
-target (filtered by `RUST_LOG`, not shown by default). `shot_video` and
-`shot_video_removed` sit in their own Camera filter group, each with a
-one-line summary (the clip's shots, camera, length, frame rate,
-completeness and dropped frames; how many shots' clips were removed).
+The Log tab in the dashboard streams the messages the `/api/ws` socket carries
+(FRP messages, local events and the store's shots) in real time, with
+per-message-type filter checkboxes and a one-line summary per message. Raw wire
+data of a protocol is logged to the `audit` tracing target (hex first; raw JSON
+for JSON protocols). The log retains the last 500 events. Protocol-level
+tracing is always emitted to the `audit` tracing target (filtered by
+`RUST_LOG`, not shown by default). `ShotVideo` and `ShotVideoRemoved` sit in
+their own Camera filter group, each with a one-line summary (the clip's shots,
+camera, length, frame rate, completeness and dropped frames; how many shots'
+clips were removed).
 
-## WebSocket Init Protocol
+## The FRP hub and the dashboard socket
 
-WS connection at `/frp`, three-phase handshake with version negotiation:
+**`/frp`** is a plain FRP 0.3.0 hub (see [Hub and remote
+actors](#hub-and-remote-actors)); there is no handshake and no version
+negotiation. The binding's greeting (every actor's `bus.actor` and state, then
+a `bus.sync`) is the first thing a peer receives; every later bus message goes
+to it unless it sent it or it is `shot.raw`. What a peer sends is checked
+against the own-id guard and put on the bus. A message from a remote virtual
+launch monitor during a tournament round is held (see [Tournament
+rounds](#tournament-rounds)). External programs use the flightrelay SDK
+(`FrpEndpoint`) to connect.
 
-1. Client sends: `{ "kind": "start", "version": ["0.2.0"], "name": "My Dashboard" }`
-2. Server accepts its FRP version (`FRP_VERSION`, the `flightrelay` crate's
-   `SPEC_VERSION`) when the client proposes it. If not, it sends a
-   `critical` alert and closes the connection. A `raw_frames` request is
-   ignored: flighthook sends no raw frames.
-3. Server responds: `{ "kind": "init", "version": "0.2.0", "actor_id": "ws.a1b2c3d4", "global_state": { ... } }`,
-   then replays each actor's last `actor_status` and its device's current
-   state as one `device_telemetry` (`ws::telemetry_replay`): the web layer
-   keeps `cached_device_telemetry` merged per actor
-   (`merge_device_telemetry`: every identity field, `source` and
-   `telemetry` key at its latest value; a message for another device id
-   replaces the entry), so a device that sends its identity and its keys
-   apart is replayed whole. Then the current `round_state`.
-4. Server streams `FlighthookMessage` events (serialized directly as JSON),
-   each passed through the connection's `FrpOutput` (`web/frp_out.rs`)
-
-Supported FRP version: `0.2.0`, and only that one. A client that does not
-offer it — including one that sends no `version` array — receives a
-`critical` alert and is disconnected. The dashboard proposes `FRP_VERSION`
-(`ui/src/net.rs`), and `FlighthookClient` (lib `client.rs`) does the same.
-
-`FrpOutput` applies FRP 0.2.0's forwarding rules per connection, the
-dashboard's included (it builds its shot rows from this stream):
-
-- flightrelay's `ForwardFilter` drops repeats: a shot event once per (FRP
-  device, shot id, kind) within its window, `SHOT_TIMEOUT` (45 s, so no
-  repeat of a shot the consumers still hold passes); `device_telemetry`
-  only when it changes something. The filter reads each message as its FRP
-  envelope built directly from the bus event (`frp_envelope`, no JSON round
-  trip). The FRP device is the message's `device`, else its `actor`. Alerts
-  pass every time, a device's too (each is raised anew by an actor, and
-  flighthook takes no FRP events in, so nothing can come back around a
-  loop), and so do flighthook's extension events. An
-  `actor_status` other than Connected makes the filter forget the actor's
-  devices (`ForwardFilter::forget_device`), so a reconnected device's
-  telemetry reaches the dashboard again after it dropped the lost
-  connection's values.
-- The launch goes out measured-only: `flighthook::measured_launch` moves the
-  values `derived` marks (the spin when `spin_estimated`, any launch field in
-  `computed`) out of it; `derived` stays on the event.
-- flighthook adds its own flight result for a shot whose device sent none:
-  built from the launch event's `derived` (`DerivedFlight::flight_result`:
-  `basis: modeled`, `model` `FLIGHT_MODEL` = `"flighthook simulation
-  (dimple)"`, every derived flight value, the moved launch values in
-  `assumed`) and sent when the shot's `shot_finished` arrives, before it,
-  only if `ForwardFilter` passes it (no `flight_result` was forwarded for the
-  shot). Nothing to send (no simulated value, nothing assumed) sends none.
-- The dashboard (`ShotRow::apply_flight`) keeps a device's flight result in
-  the row's `flight`; from flighthook's own (`flighthook::is_flighthook_flight`)
-  it only fills the launch's missing values from `assumed`, so the row is the
-  shot `/api/shots` serves (estimated spin in `launch`, simulated values in
-  `derived`).
-
-Bus events are serialized using the FRP envelope shape with `kind` inside
-`event`. Consumers filter by `event.kind`.
-
-Client -> server commands:
-
-```json
-{ "cmd": "mode", "mode": "putting" }
-{ "cmd": "club", "club": "7I" }
-{ "cmd": "hand", "handed": "lh" }
-{ "cmd": "new_group" }
-{ "cmd": "new_session" }
-{ "cmd": "clear_history" }
-{ "cmd": "grouping", "mode": "by_club" }
-```
-
-Mode commands emit `SetDetectionMode` on the bus (mode is global,
-not per-device). `club` emits `ClubInfo`, `hand` emits `HandInfo`,
-`new_group` / `new_session` /
-`clear_history` emit `NewShotGroup` / `NewShotSession` / `ClearShotHistory`,
-and `grouping` emits a fire-and-forget
-`ConfigCommand` (`SetShotGrouping`), each with the socket's actor ID. Each has
-a REST twin (`POST /api/club`, `/api/hand`, `/api/shots/groups`, `/api/shots/session`,
-`/api/shots/clear`, `/api/shots/grouping`). Config updates go through `POST /api/settings` ->
-`ConfigCommand` on the bus -> SystemActor processes -> `ConfigOutcome` reply.
+**`/api/ws`** is the dashboard's private socket (the dashboard is part of the
+flighthook actor). On connect the server sends one snapshot (flighthook's actor
+id, the card keys by actor id, every FRP state on the bus, each local card's
+status, the round, the configuration generation), then every bus message in
+order as `{"frp": ...}` or `{"local": ...}`, and `{"shot": ...}` each time the
+store finishes or updates a shot (see [API.md](API.md) for the wire).
+The dashboard sends FRP command bodies (`golfer.select`, `practice.new_block`)
+with its own `ref`; the server prefixes the `ref` with a per-connection tag
+(two windows share the flighthook actor), puts the command on the bus as the
+flighthook actor and returns the matching `bus.reply` to that connection only.
+Local commands: `grouping` and `clear_history`. Each has a REST twin
+(`POST /api/select`, `/api/blocks`, `/api/shots/clear`, `/api/shots/grouping`).
+The dashboard keeps a plain state map keyed by FRP state key; the server does
+the expiry (the SDK's `BusState` uses `Instant`, which does not run in the
+browser).
 
 ## Threading Model
 
@@ -2729,33 +3027,26 @@ a REST twin (`POST /api/club`, `/api/hand`, `/api/shots/groups`, `/api/shots/ses
 main thread (eframe)       std::thread per actor              tokio runtime (background)
 +-----------------+        +------------------------+        +------------------------+
 | eframe::run_    |        | actors::system         |        | axum web server        |
-|   native() or   |        |   (GameState updates)  |        | state_updater task     |
-| ctrl-c (headless|        | actors::mevo           |        | drain subscriber       |
-+-----------------+        | actors::r10            |        +------------------------+
-                           | actors::camera (beta)  |
-                           | actors::driver (mock)  |
-  GUI --ehttp/ws---->      | polls bus via poll()    |            ^
-  (to local web server)    +------------------------+            |
-                                     ^                            |
-                                     +--- single broadcast<FlighthookMessage>(1024) ---+
-                                     |                            |
-                           +---------------------+       +--------------------+
-                           | actors::gspro       |       | actors::mock::     |
-                           | Open Connect client |       |   randomclub       |
-                           +---------------------+       +--------------------+
+|   native() or   |        |   (session, practice)  |        | state_updater task     |
+| ctrl-c (headless|        | launch monitor cards   |        |   (/frp, /api/ws)      |
++-----------------+        | actors::flight_model   |        | drain subscriber       |
+                           | actors::camera (beta)  |        +------------------------+
+  GUI --ehttp/ws---->      | outputs (Open Connect, |
+  (to local web server)    |   Pureplay, Accessory) |                ^
+                           +------------------------+                |
+                                     ^                               |
+                                     +--- single broadcast<BusMsg>(1024) ---+
 ```
 
-**Bus-based command delivery**: actor threads poll the bus via `BusReceiver::poll()`
-in their event loop. They filter for `SetDetectionMode` events (mode, hand
-and club changes). The `SystemActor` derives these commands from
-`ClubInfo` (mode and club, using `club_mode()`) and `HandInfo` (hand), so integrations
-only need to emit `ClubInfo` and `HandInfo`. There is
-no per-device `mpsc` channel and no centralized router task.
+**Bus-based delivery**: actor threads poll the bus via `BusReceiver::poll()` in
+their event loop. Launch monitor cards read flighthook's own `golfer.turn` and
+hand their driver the hints; outputs read the shots, readiness and the turn.
+There is no per-device `mpsc` channel and no centralized router task.
 
 **Actor trait and bus wrappers**: all actors implement the `Actor` trait
 (`start()` + `stop()` + `reconfigure()`) and receive a `BusSender`/`BusReceiver`
 pair on startup. `BusSender` wraps `broadcast::Sender` and auto-stamps the
-actor's global ID on every outbound message. `BusSender` provides
+actor's id on every outbound FRP message. `BusSender` provides
 `send()` for bus messages and `subscribe()` for creating new receivers.
 `BusReceiver` wraps `broadcast::Receiver` with `poll()` (non-blocking drain;
 returns `Ok(None)` if empty, `Err(PollError::Shutdown)` if the per-actor
@@ -2773,11 +3064,11 @@ start/stop/reconfigure.
 config-driven). Then each config section constructs an actor struct and calls
 `actor.start(state, sender, receiver)`. Each actor gets a per-actor
 `Arc<AtomicBool>` shutdown flag shared between the `BusReceiver` and the
-registry. Launch monitor actors (mevo, r10, the mock's `DriverActor`) run event loops polling
-the bus. Integration actors (the Open Connect client in `actors::gspro`, the
-Pureplay output in `actors::pureplay`, mock::randomclub) subscribe to the bus
-and emit `ClubInfo` / `HandInfo` (for club and hand changes) and `ActorStatus`
-(for connection status) back onto the bus.
+registry. Launch monitor actors (the `DriverActor` cards) run event loops
+polling the bus. Output actors (the Open Connect client in `actors::gspro`, the
+Pureplay output in `actors::pureplay`, the Accessory card, random club)
+subscribe to the bus and send `golfer.select` (for club and hand changes) and
+card status (for connection status).
 
 **Drain subscriber**: a tokio task that consumes all bus messages to keep the
 broadcast channel healthy when no other subscriber is active.
@@ -2792,13 +3083,13 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
   `ConfigOutcome` (request-reply pattern, 10s timeout; `504` with a JSON
   `error` body when it doesn't come).
 - **Global settings** -- `POST /api/settings?scope=global` emits
-  `ReplaceGlobal`: units, chipping/putting clubs, default view, simulation,
-  replay, body tracking and player from the body, every actor section of the
+  `ReplaceGlobal`: units, default view, simulation,
+  replay and body tracking from the body, every actor section of the
   live config kept.
 - **Body tracking** -- `POST /api/settings?scope=body_tracking` emits
   `SetBodyTracking`: the body's `[body_tracking]` alone.
-- **Player** -- `POST /api/settings?scope=player` emits `SetPlayer`: the
-  body's `[player]` alone, no actor reconciled.
+- **Golfers** -- `POST /api/settings?scope=golfers` emits `SetGolfers`: the
+  body's `[[golfers]]` alone, no actor reconciled.
 - **Per-section upserts** -- `POST /api/settings?scope=<id>` emits a scoped
   `ConfigAction` variant (e.g. `UpsertMevo`), writing only that section and
   reconciling only that actor. A scope naming a section the body omits emits
@@ -2817,9 +3108,9 @@ as `ConfigCommand` events, processed exclusively by `SystemActor`:
    finishes the plan (`system::finish`) and emits `ConfigOutcome` on the bus
    (always, not just for request-reply; at once when nothing was stopped)
 
-`apply_config_reload()` (in `actors/system.rs`) orchestrates actor lifecycle:
+`apply_config_reload()` (in `actors/system/reload.rs`) orchestrates actor lifecycle:
 
-1. Snapshot the new config and build a `ResolvedConfig`
+1. Snapshot the new config and resolve it into the expected actors (`resolve_actors`)
 2. Compute current vs expected actor IDs
 3. **Deleted actors** (current but not expected): stopped, then released
 4. **Existing actors**: call `reconfigure()` on each
@@ -2844,7 +3135,7 @@ nothing) and remove stopped actors. `GET /api/status` names each actor from
 the config as it is at the request, so it has a new name before the bus
 event reaches that cache. Every UI fetches the status again on any
 `ConfigOutcome`, so a rename shows in every open window without a reload:
-card titles, the Shots tab's device filter and labels, and alert banners.
+card titles, the Shots navigation's device filter and labels, and alert banners.
 
 `ReconfigureOutcome` enum:
 
@@ -2859,8 +3150,7 @@ to 1920×1080 points. With `w` × `h` the window's size in points at zoom 1
 (physical pixels over the screen's native pixels per point, so the display
 scale or device pixel ratio counts), the zoom is `min(w / 1920, h / 1080)`
 (at most 3.0) when that is above 1, else `min(w / 1024, h / 768)` (at least
-0.8, so a phone keeps readable text and scrolls) when that is below 1, else
-1. Both are rounded down to a multiple of 1/32, so resizing a window changes
+0.8) when that is below 1, else 1. Both are rounded down to a multiple of 1/32, so resizing a window changes
 the zoom only now and then and the design size still fits. A 4K screen at
 100 % therefore looks almost as it does at 200 %, at 300 % it zooms out until
 768 points of height fit, and a 1920×1080 screen at 150 % lays out at about
@@ -2874,85 +3164,123 @@ which the fit absorbs while the page is larger than 1920×1080 CSS pixels.
 The browser also caps the effective pixel ratio at 2.0 on screens above 2.0,
 so text and layout use at most 2 pixels per point there.
 
-## Devices Tab
+A window under 600 points wide at zoom 1 and taller than wide (a phone held
+upright, or a narrow desktop or native window) gets the portrait layout
+(`scale::portrait`): zoom 1, no browser cap on the pixel ratio, one header
+row and a tab bar at the bottom (see [Header and navigation](#header-and-navigation)),
+the shot list on top of the Shots tab with the shot's data under it (Cards
+shows its charts under the cards), Settings as a list that opens one page at
+a time, controls 44 points tall, and the Log's lines wrapped at the screen's
+edge. On a touch screen a tap on a disabled control, or a long press on an
+icon, shows its hover text until the next tap.
 
-The Devices tab is where the app opens. It holds the global settings, the
-web server, and every launch monitor, camera and output, each device with
-its live telemetry and its settings.
-Four groups of cards, each group a wrapping grid: as many columns as fit at
-a 420 px minimum card width, cards at most 620 px wide, one column on a
-narrow window; card `i` goes in column `i % columns`. Every card is the same
-height, so the rows line up and the tab scrolls as a whole when there are
-more rows than fit (see [Card height](#card-height)).
+## Header and navigation
+
+The header is one 52 px row of icon buttons (custom icons, beta; plain line
+glyphs at rest, brand-style on hover or selection) with no text except the
+center title. Every button is 40 px with a 6 px gap and no dividers.
+In the portrait layout the header is one row of the right-hand icons (and
+the title while it fits), and the tabs move to a 52 px bar of four equal tabs
+at the bottom of the window.
 
 ```
-  [Devices] [Shots] [Log]  |  [Full] [Chipping] [Putting]  [RH|LH]  CLUB [7I]  [##] FLIGHTHOOK
-
-  GENERAL
-  | Global                           [API Docs] | Simulation [beta]
-  | Units:             [Imperial v]             | Simulation:   [On v]  (Off | On | Force)
-  | Default shot view: [By set | By club | None]| Altitude:     [0] [ft v]   (grayed while Off)
-  | Chipping Clubs:    [PW GW SW LW]            | Temperature:  [77] °F      (°C when Metric)
-  | Putting Clubs:     [PT]                     | Surface:      [Fairway v]
-  | Web Server [CONNECTED] [Telemetry|Settings]
-  |   bind        0.0.0.0:5880
-  |   websockets  1
-
-  LAUNCH MONITORS (+)
-  | Mevo WiFi [Mevo] [CONNECTED] [Telemetry|Settings] | Garmin R10 [R10]       [Telemetry|Settings]
-  |   battery_pct  85                                  | Name:            [Garmin R10]
-  |   ready        true                                | Monitor-to-Ball: [8] [ft v]
-  |   tilt         0.5                                 |
-  |                                     [Reconnect]   |                               [Remove]
-
-  CAMERAS (+)
-  | Golfer Back [Camera] [CONNECTED] [Telemetry|Settings]
-  |   camera      Test pattern
-  |   fps         60
-  |   position    golfer_back
-  |   resolution  1280x720
-  |                                   [Still frame]
-
-  OUTPUTS (+)
-  | GSPro [Open Connect Client] [Cancel] [Save]   | Muni Golf [Open Connect Client] [CONNECTED] [Telemetry|Settings]
-  |                  Save or cancel your changes |   address     127.0.0.1:9210
-  | Name:             [GSPro]                    |                                [Reconnect]
-  | Address:          [127.0.0.1:921]            |
-  | Full Monitor:     [Mevo WiFi v]              |
-  | Chipping Monitor: [Any v]                    |
-  | Putting Monitor:  [Any v]                    |
-  |                                     [Remove] |
+  [Shots][Cameras][Settings][Log]    FLIGHTHOOK v0.2.1    [Energy][Tournament][Follow] [Auto-Chip][Shot Type] [Club][Golfer]
+   nav icons (the tabs)               title, when it fits  status/mode            actions              selections
 ```
 
-At 1600 px wide the General row is Global, Simulation, Replay, with the Web
-Server card under Global; at 1024 px Replay sits under Global and the Web
-Server under Simulation.
+**Left, the tabs:** Shots, Cameras, Settings, Log. The app opens on Shots (the
+first-run welcome screen comes first). Cameras is disabled while no camera is
+configured. A red dot on Settings (and on the Settings section that holds the
+card) shows while any card lost its connection less than 10 minutes ago, see
+[Connection state](#connection-state). The nav icons are disabled while Settings
+has unsaved edits.
 
-Groups and order (`ui/src/panels/cards.rs`):
+**Center title.** `FLIGHTHOOK v<version>` is drawn at the true center of the bar
+only while it keeps 24 px clear of both icon groups; otherwise it is not drawn.
+While a tournament round is on, the title reads `TOURNAMENT · <holder>`
+(`Manual` when the toggle alone holds it; the simulator's card name when a
+simulator holds it), shortening to `TOURNAMENT` and then to nothing as room
+shrinks; the Tournament icon carries the signal then.
 
-| Group | Cards, in order | (+) offers |
+**Right, by role,** left to right:
+
+| Icon | Shown when | What it does |
 |---|---|---|
-| General | Global card, Simulation card, Replay card, Body tracking card, Player card, `webserver` | -- (no (+)) |
-| Launch monitors | `mevo`, `r10`, `square`, `exputt`, `trackball`, `mock_monitor`, `openconnect_server` | Mevo, R10, Square Golf Omni, ExPutt, Trackball (only while `/api/status` says `trackball_supported`), Uneekor (Open Connect), Open Connect Server |
-| Cameras | `camera` | Camera (only while `/api/status` says `cameras_supported`; without it the group shows the cameras already configured and no (+)) |
-| Outputs | `openconnect_client`, `pureplay`, `random_club` (and any type the UI does not know) | GSPro (Open Connect), Pureplay (Open Connect), Muni Golf (Open Connect) (no entry adds a `pureplay` card; one comes only from the config file) |
+| Energy | a device reports a battery charge | Opens the "Batteries" list: one row per device with its charge. The icon turns yellow when any device is below 20 % and red below 10 % |
+| Tournament | always | A toggle for tournament mode (`POST /api/tournament`). On, it applies the narrow policy: Auto-Chip is off and the virtual launch monitors (Trackball, Mock, and remote ones that declare themselves virtual) hold their shots. A simulator's round (Pureplay strict mode) shows the icon locked in gold: it can't be toggled off, and clicking it opens a card naming the holder |
+| Follow turns | two or more golfers are known | A toggle (on by default, for the session only). On, the view follows every change of the golfer up; off, the view stays put and a pick in the Golfer card changes only the view |
+| Auto-Chip | `[simulation] auto_chip` is on | Opens the "Auto-Chip" menu (`1 Yard`, `3 Yard`, `5 Yard`); disabled, with the reason as hover text, during a round, while no simulator is connected and while a chip is in flight |
+| Shot Type | an enabled launch monitor uses the hint, or an output routes Chipping or Putting to a specific monitor (see [Shot Type visibility](#games-and-simulators-re-assert)) | Opens "Shot Type": Full, Chip, Putt, sent as a `golfer.select` carrying `mode`. A tip says some launch monitors use it as a hint for the shot to expect |
+| Club | always | Shows the club in play (the club's shape with its code; an iron with "-" when none). Opens the club picker filtered to the golfer up's bag, the club in play always shown; a pick sends the club only |
+| Golfer | always | Shows the viewed golfer's initial in an avatar circle (an outline when there is no golfer). Opens the Golfer card |
+
+Every picker is always editable: a pick is a `golfer.select`, and a connected
+simulator that holds something else sends its own back, so the header shows the
+result. The hand control lives in the **Golfer card**, with the viewed golfer's
+full name, a settings icon that opens Settings, Golfers, and one row per known
+golfer (saved golfers, a game's current players, and golfers with shots this
+run who are not saved or in a game any more, plus a "No golfer" row while unassigned shots
+exist). With Follow on, a pick makes that golfer the golfer up; with Follow off,
+or for a golfer who can't be made the golfer up, it changes the view only.
+
+**The golfer view.** The viewed golfer decides whose shots and Sets the Shots and
+Cameras tabs show (there is no separate golfer filter); with Follow on it is the
+golfer up. Club, Shot Type and Auto-Chip act on the golfer up and the devices,
+not the view. Export is unchanged: every golfer's shots, with `golfer_id`.
+Clear history clears every golfer's shots.
+
+An error banner above the tabs shows a card's `error` (and a failed Auto-Chip or
+tournament request) until the card's next status or the next press.
+
+## Settings
+
+Settings is the second-level page on the Settings tab: one list on the left
+(`settings_nav.rs`) and the selected item's page filling the rest. The list
+has a heading per section, with its (+) where it has one, and a row per item
+(the shot list's look), each with its status dot: the color of the device's
+stripe, the red of an alert on a red device; plain forms have none. The item
+last shown is kept for the session (`settings_section`, `settings_item`); one
+no longer listed gives way to its section's first item, and Settings first
+opens on the first launch monitor. A deep link into Settings (the Golfer
+card's gear) picks a section and shows its first item.
+
+On a phone held upright (`scale::portrait`) the list is the Settings page,
+its rows touch-sized; a row opens its page full width under a back icon,
+which returns to the list (disabled while the page has unsaved edits). When
+the open item goes (Cancel on a new card, Remove), the list shows again. The
+page's header puts the back icon, title and on/off switch on one row and the
+rest on a second row, or on the first when it fits there.
+
+| Section | Rows, in order | (+) offers |
+|---|---|---|
+| General | Global (units, default shot view, API Docs), Web Server, Simulation (flight model and Auto-Chip) | -- (no (+)) |
+| Devices | `mevo`, `r10`, `square`, `exputt`, `trackball`, `mock_monitor`, `openconnect_server`, then remote launch monitors (read-only, beta) | Mevo, R10, Square Golf Omni, ExPutt, Trackball (only while `/api/status` says `trackball_supported`), Open Connect Server |
+| Software | `openconnect_client`, `pureplay`, `pureplay_accessory` (beta), `random_club`, then other remote actors (read-only, beta) | GSPro (Open Connect), Pureplay (Open Connect), Muni Golf (Open Connect), Pureplay Accessory (at `127.0.0.1:9770`) (no entry adds a `pureplay` card; one comes only from the config file) |
+| Cameras | `camera`, Replay (clips), Body tracking | Camera (only while `/api/status` says `cameras_supported`; without it the section shows the cameras already configured and no (+)) |
+| Golfers (beta) | one row per golfer | a golfer, "Golfer N" |
+
+When the unsaved-edits lock is on, the list's rows and (+) and the nav icons
+are disabled until Save or Cancel. `ui/src/panels/devices/` renders the whole
+Settings page; `ui/src/panels/settings/` holds its form.
 
 Each (+) entry is a preset (`cards::AddPreset`): an actor type plus the new
 card's name and address. The Open Connect and Pureplay presets:
 
 | Entry | Type | Name | Address |
 |---|---|---|---|
-| Uneekor (Open Connect) | `openconnect_server` | Uneekor | bind `0.0.0.0:921` |
 | Open Connect Server | `openconnect_server` | Open Connect Server | bind `0.0.0.0:921` |
 | GSPro (Open Connect) | `openconnect_client` | Open Connect | `127.0.0.1:921` |
 | Pureplay (Open Connect) | `openconnect_client` | Open Connect | `127.0.0.1:921` |
 | Muni Golf (Open Connect) | `openconnect_client` | Muni Golf | `127.0.0.1:9210` |
+| Pureplay Accessory | `pureplay_accessory` | Pureplay Accessory | `127.0.0.1:9770` |
 
-The generic Open Connect Server entry is for any other monitor that speaks
-Open Connect. GSPro and Pureplay both listen for Open Connect on 921, so
+The Open Connect Server entry is for launch monitor software that sends Open
+Connect (its welcome-screen hover says flighthook binds port 921, so GSPro on
+the same host moves to 922 with OpenAPIUseAltPort). GSPro and Pureplay both listen for Open Connect on 921, so
 their two entries add the same card, named "Open Connect", which sends to
 whichever simulator listens there; any other simulator is a card with its
-address changed.
+address changed. A new Open Connect client's chipping and putting club lists
+default to GW, SW, LW and PT.
 
 One card per address may be on (see [One card per address](#one-card-per-address)).
 No (+) entry is ever disabled for a duplicate address: it adds its card, and
@@ -2962,36 +3290,50 @@ off, so it can be set up for another address.
 A card's type label names the actor type, "Open Connect Server" or
 "Open Connect Client", whichever preset created it, and "Pureplay Connect"
 for a `pureplay` card. The Open Connect card has no tournament mode; tournament (strict) mode needs
-a Pureplay Connect output, which the (+) menu does not offer yet.
+a Pureplay Connect output, which the (+) menu does not offer.
 
 flighthook runs one web server, the one serving this UI. Its card has no
 Remove and no menu adds another; the config API refuses both (`400`, see
 [API.md](API.md)). A config file that already holds several `[webserver.N]`
 sections loads and runs them all, a card each, every one editable.
 
-Within a group, cards sort by type (the order above), then by instance index
+Within a section, cards sort by type (the order above), then by instance index
 (numerically). The Open Connect server is a launch monitor: it receives shots.
-Random Club consumes shots (it picks the next club on each one), so it sits
-with the outputs. A card is every configured instance plus every running
-actor the settings don't list (`ui/src/panels/devices.rs`
-`device_card_order`), so two simulator connections or two launch monitors are two
-cards, and the cards show (Telemetry only) before the settings have loaded.
+Software holds every card that talks to another program: the outputs, the
+Pureplay Accessory card (whose shots still count as a launch monitor's for
+routing; only its place on the page is Software's) and Random Club, which
+consumes shots (it picks the next club on each one). A card is every configured instance plus every running
+actor the settings don't list (`device_card_order`), so two simulator
+connections or two launch monitors are two cards, and the cards show
+(Telemetry only) before the settings have loaded.
 
-### Device cards
+**Remote actors (beta).** An FRP program on the hub (see [Hub and remote
+actors](#hub-and-remote-actors)) gets a read-only card: launch monitors in
+Devices, the rest in Software. The card shows its name, device (maker, model,
+firmware), the `ready` row (or its blockers), battery and telemetry; no
+settings, no Reconnect. It appears with its first `bus.actor` and goes when the
+actor expires or reports `removed`. An ownership conflict shows an error row
+naming the other actor.
 
-Each web server, launch monitor, camera and output card has a small segmented
-toggle in its header, **Telemetry | Settings**, Telemetry by default,
-remembered per card for the session. The card's name sits on the left of
-the header; on the right, just left of the toggle, sits the status badge on
-the Telemetry side and the type tag on the Settings side:
+### Device pages
+
+Each web server, launch monitor, camera and output has a page: its header,
+then its telemetry beside its settings, both visible. The telemetry sits on
+the left in a block of fixed height (240 points) that scrolls inside, so
+nothing beside or under it moves as rows come and go; a camera's still frame
+shows under it. The settings fill the rest of the page and scroll inside it.
+On the phone the telemetry block goes over the settings. A remote actor's
+page, or a running actor's the settings don't list, shows its telemetry only.
+The header holds the name on the left; on the right the type tag, the
+status badge and the icons:
 
 ```
-Telemetry:          [Name …]  ........  [STATUS BADGE] [Telemetry|Settings]
-Settings:           [Name …]  ........  [type tag] [Telemetry|Settings]
-Settings, unsaved:  [Name …]  ........  [type tag] [Cancel] [Save]
+[Name …] [on/off]  ........  [type tag] [STATUS BADGE] [Reconnect] [Remove]
+unsaved:  [Name …] [on/off]  ........  [type tag] [STATUS BADGE] [Cancel] [Save]
 ```
 
-Right of the name, on both sides, every launch monitor, camera and output
+The title is the running actor's name, the form's while it has unsaved
+edits. Right of the name every launch monitor, camera and output
 card has a compact on/off switch (`theme::on_off_switch`, accent with its
 knob right while on, gray with its knob left while off; hover "Turn off" /
 "Turn on"; mark `enabled:<id>`). The web server's card has none, nor does a
@@ -3009,21 +3351,21 @@ settings) its state is **Disabled**: gray `DISABLED` badge and stripe
 the spinner, Reconnect disabled. It shows so as soon as the switch is
 flipped, before the server has stopped the actor, and a `ConfigOutcome`
 that stops a card turned off leaves it Disabled rather than dropping it.
-Disabled is never an alert: no red, no dot on the Devices tab, no error row
+Disabled is never an alert: no red, no dot on the Settings icon, no error row
 or banner. Its settings stay editable.
 
 ```
-Telemetry, off:     [Name …] [o  ]  ........  [DISABLED] [Telemetry|Settings]
+off:     [Name …] [o  ]  ........  [type tag] [DISABLED] [Reconnect] [Remove]
 ```
 
-Hovering the name or the tag says what the type is and how it connects (the
-name's hover on the Telemetry side too). The tag is left out when the name
-reads the same as the type, ignoring case: the web server at its default
-name "Web Server", or an "Open Connect Server" card at its default name. The toggle, Save, Cancel and the status badge keep their
-size; a long name is cut short with "…" first, then the type tag, which is
-left out once it would be cut to a stub. The toggle flips the card body:
+Hovering the name or the tag says what the type is and how it connects. The
+tag is left out when the name reads the same as the type, ignoring case: the
+web server at its default name "Web Server", or an "Open Connect Server"
+card at its default name. The icons, Save, Cancel and the status badge keep
+their size; a long name is cut short with "…" first, then the type tag,
+which is left out once it would be cut to a stub.
 
-- **Telemetry**: the actor's name and connection state badge
+- **Telemetry**: the connection state badge
   (`CONNECTING` yellow, `CONNECTED` green, `RECONNECTING` red for 10 minutes
   after the connection was lost, then yellow, `DISABLED` gray; see
   [Connection state](#connection-state)), then its
@@ -3042,7 +3384,8 @@ left out once it would be cut to a stub. The toggle flips the card body:
   Only a spinner on screen asks for repaints (about 30 a second). Every launch
   monitor and output card (Mevo/Xi, R10, Square Golf, ExPutt, Trackball, the
   Open Connect server, the mock monitor, the Open Connect clients, Random club
-  and any other output) has **Reconnect** in its action row: it stops the
+  and any other output) has the **Reconnect** icon (Codicons `refresh`) in
+  its header: it stops the
   actor, waits for its connection to close and starts it again from the saved
   settings (see [Reconnect](#reconnect)); the card then shows the usual
   statuses as it connects. Reconnect is disabled while that card's request is
@@ -3055,69 +3398,65 @@ left out once it would be cut to a stub. The toggle flips the card body:
   own `error` row, such as the old connection still closing, already says
   why), shows its reason as the card's `error` row and in the error banner,
   as an error the actor reports does, until the actor's next status or the
-  next press. An ExPutt's **Find mat** sits beside it (enabled while the ExPutt is connected), and a camera has **Still frame**
-  instead, its frame shown in the card's body. The General cards and the
+  next press. An ExPutt's **Find mat** icon (Codicons `search`) sits left of it (enabled while the ExPutt is
+  connected), and a camera has the **Still frame** icon (Codicons `device-camera`) instead, its frame shown under
+  the telemetry. Each header icon shows its name as its hover (or touch) tip. The plain forms and the
   cameras have no Reconnect.
-- **Settings**: the instance's name, its type tag and its fields in a label
-  column, with **Remove** in its action row (every card but the web
-  server's), which asks for confirmation in a modal dialog and then saves the
-  removal (`?scope=<actor_id>`, the section left out); the card goes when the
-  server confirms it.
+- **Settings**: the instance's fields in a label column. The **Remove**
+  icon (Codicons `trash`; every card but the web server's) asks for
+  confirmation in a modal dialog and then saves the removal
+  (`?scope=<actor_id>`, the section left out); the page goes when the
+  server confirms it. A Pureplay Accessory card has the **Forget pairing** icon (Codicons `debug-disconnect`) left of the others
+  (`POST /api/actors/{id}/forget-pairing`, sent and tracked like Reconnect:
+  disabled while one is in flight, while the card is off and while the tab
+  is locked).
 
-#### Card height
+#### Page height
 
-Every card on the tab (General, Launch monitors, Cameras, Outputs) is one
-fixed height, 280 points (`devices::CARD_HEIGHT`, scaled with the UI zoom like
-every other size), on both its Telemetry and Settings sides. Telemetry that
-arrives, a side flip, an edit, a validation message, an error line or a still
-frame never changes a card's height or moves another card. Inside a card:
+Every page is as tall as Settings. Telemetry that arrives, an edit, a
+validation message, an error line or a still frame never changes its
+height. Inside a page the header stays at the top, with the "Save or cancel
+your changes" hint and a failed save's line under it; the settings (or a
+plain form's rows) scroll inside the page when they do not fit, with egui's
+thin scroll bar shown only then, each keeping its own scroll position, keyed
+by its ID, for the session.
 
-- the header (name, badge or type tag, toggle, or Save and Cancel while it has
-  unsaved edits) stays at the top, with the "Save or cancel your changes" hint
-  and a failed save's line under it;
-- the action row (Reconnect, Find mat, Still frame, Remove) stays at the
-  bottom, right-aligned;
-- the body between them scrolls inside the card when it does not fit, with
-  egui's thin scroll bar shown only then. The mouse wheel over a card scrolls
-  that card first and the tab only once the card can scroll no further. Each
-  card keeps its own scroll position, keyed by its ID, for the session.
+Long names in the header and in text fields, and long entries in a dropdown,
+are cut short inside the page rather than widening it.
 
-At 280 the Telemetry side of a connected Mevo+, Square Golf Omni and
-Open Connect client and the Settings side of the Global card fit without
-scrolling, as do the other General cards and most Settings sides. A Mevo's
-Settings side and a camera card showing a still frame scroll.
+The colored stripe down the left edge of a page is the color of the actor's
+connection state (the badge's), dim while the actor is not running (unsaved,
+or not started yet). The plain forms' stripe is the heading blue.
 
-Every card is exactly its grid column's width, on both sides: long names in
-the header and in text fields, and long entries in a dropdown, are cut short
-inside the card rather than widening it over its neighbor or the cards
-under it.
+#### Plain forms
 
-The colored stripe down the left edge of a card is the color of the actor's
-connection state (the badge's), on both sides, dim while the actor is not running (unsaved, or not
-started yet). The General cards' stripe is the heading blue; they have no
-toggle (settings only).
+Global, Simulation, Replay, Body tracking and each golfer have a page with
+their title (and tag), Save and Cancel while they have unsaved edits, and
+their settings as grouped rows (`settings::form_rows`): one row per setting
+across the form, at most 900 points wide, the label on the left (45 % of the
+row), the control on the right, a rule between rows. A golfer's page has a
+trash icon that removes the golfer from the form (saved with Save).
 
 ### Unsaved changes
 
-When a card's settings have unsaved changes, its toggle is replaced by
+When a card's settings have unsaved changes, its icons are replaced by
 **Cancel** and **Save** (Save accent-filled, disabled while that card's
 fields are invalid; each reason shows under its field), with the hint "Save
 or cancel your changes" under them. Save
 persists only that card (scoped request, below); Cancel puts the card back to
-the settings last loaded or saved. The card stays on its Settings side after
-either.
+the settings last loaded or saved.
 
 The Global and Simulation cards share one save request (`build_global_request`).
 Each shows the pair while it has unsaved edits, and an edit on either card
 leaves both editable: Save on either saves both, Cancel on either reverts
-both. The Shots tab's units are the Global card's **Units** value
+both. The units are the Global card's **Units** value
 (`FlighthookApp::units` reads `SettingsForm::default_units`, the persisted
-`default_units`; there is no separate toolbar toggle), so they follow an edit
+`default_units`; there is no separate units toggle), so they follow an edit
 at once and Cancel puts the saved value back.
 
-While anything is unsaved the tab is **locked** to it: the tab bar, the other
-cards' toggles and edit controls, and both (+) buttons are disabled (the
-mode selector and club picker in the header stay live). Escape doesn't
+While anything is unsaved the page is **locked** to it: the nav icons, the
+list, the other cards' switches and edit controls, and the (+) buttons
+are disabled (the Club, Shot Type and Golfer pickers in the header stay live). Escape doesn't
 discard. While a save is out the tab is locked too, and every card's
 controls (the saving card's fields, Save, Cancel and Remove included) wait
 for its reply.
@@ -3134,11 +3473,13 @@ take the server's values.
 
 ### Adding
 
-A (+) after the Launch monitors and Outputs headings (Codicons `add`, muted,
-accent on hover; hover text "Add a launch monitor" / "Add an output") opens a
-menu of that group's types. The new card appears on its Settings side,
-unsaved, with Save and Cancel; Cancel removes it. The (+) is disabled until
-the settings have loaded.
+A (+) after the Launch monitors, Cameras and Software headings (Codicons
+`add`, muted, accent on hover; hover text "Add a launch monitor" / "Add a
+camera" / "Add software") opens a
+menu of that group's types. The new card's page opens, unsaved, with Save
+and Cancel; Cancel removes it. The (+) after Golfers ("Add a golfer") adds a
+golfer and opens its page. The (+) is disabled until the settings have
+loaded.
 
 ### Fields
 
@@ -3165,10 +3506,17 @@ displayed).
 - Open Connect Server cards show name and Bind Address, the `ip:port` the
   server listens on; blank means `0.0.0.0:921`, anything else must parse as
   `ip:port`. A bind change restarts the actor
-- Open Connect Client cards show name, Address (`ip:port` of the simulator)
-  and the three routing dropdowns
-- Pureplay cards show the same: name, Address (`ip:port` of Pureplay) and the
-  three routing dropdowns
+- Open Connect Client cards show name, Address (`ip:port` of the simulator),
+  the three routing dropdowns (launch monitors by name; a stored id that names
+  no card reads "Missing monitor") and the Chipping Clubs and Putting Clubs
+  toggles (the clubs the simulator holds for a chip and a putt)
+- Pureplay Connect cards show the same: name, Address (`ip:port` of
+  Pureplay) and the three routing dropdowns
+- Pureplay Accessory cards (`pureplay_accessory`, beta) show name, Address (the
+  `ip:port` of Pureplay's Accessory API; blank means `127.0.0.1:9770`,
+  anything else must parse as `ip:port`), Shots (Auto / From Pureplay /
+  From flighthook) and Camera timing. An address change restarts the card
+  and pairs again; the other two apply without a restart
 - The Web Server card shows name and Bind Address, the `ip:port` it listens
   on (`0.0.0.0` accepts other computers, `127.0.0.1` only this one). A bind
   change restarts it
@@ -3180,17 +3528,16 @@ displayed).
   camera's modes, `1280×720 @ 120`; a saved mode the list lacks stays
   selectable), in this order: Camera, Rotation (`0° | 90° | 180° | 270°`
   pills, marks `camera_rotation:<id>` and `camera_rotation:<id>:<deg>`;
-  right under the camera, so it shows without scrolling at the fixed card
-  height), Position, Video mode, Latency, Yaw (`camera_yaw:<id>`, with the
+  right under the camera, so it shows without scrolling), Position, Video mode, Latency, Yaw (`camera_yaw:<id>`, with the
   sign in words under it) and Pitch (`camera_pitch:<id>`), the angles' range
   under them while out of range. The body scrolls to Yaw and Pitch. Save needs a camera, a mode
   and every value in range. They are left out of the
-  Open Connect clients' routing dropdowns. The Telemetry side ends in
-  **Still frame**, enabled while the camera is connected: it fetches
+  Open Connect clients' routing dropdowns. Its page's header holds
+  the **Still frame** icon, enabled while the camera is connected: it fetches
   [`GET /api/cameras/{actor}/still`](API.md#get-apicamerasactorstill) and
-  shows the frame at the card's width (decoded like the replay's frames),
+  shows the frame under the telemetry, at its width (decoded like the replay's frames),
   turned by the card's rotation
-- The Body tracking card (alpha, General, after Replay) holds every
+- The Body tracking card (alpha, Cameras, after Replay) holds every
   `[body_tracking]` field, in this order: Mode (`mode`, Off | Historical |
   Live, pills like Model's), Model (`model`, RTMPose-m | RTMPose-s), Show
   skeleton (`show_skeleton`, a checkbox), Minimum score (`min_score`),
@@ -3199,7 +3546,7 @@ displayed).
   shows in every mode; each number is checked like the server's
   (`BodyTrackingSection::error`, one field at a time) with its range under
   it while out of range, and a field left as loaded saves its loaded value
-  exactly. It saves and cancels with the other General cards. Picking
+  exactly. It saves and cancels with the other global cards. Picking
   Historical or Live
   while the mode in effect is Off is not a form edit: it goes through the
   model download prompt (`panels/body_models.rs`, below), which saves the
@@ -3221,15 +3568,21 @@ displayed).
   the POST) shows the error, a one-line firewall/proxy hint, **Retry** and
   **Turn off**. With the mode already on, the same check runs once per
   model per on-period the first time something needs the models (a shot's
-  clips in the Cameras pane, Live in Live mode, Replay); its Cancel leaves
+  clips in the Cameras tab, Live in Live mode, Replay); its Cancel leaves
   the mode as it is. No hover text
-- The Player card (General, after Body tracking) holds `[player]`: Sex
-  (Men's | Women's pills, marks `player_sex`, `player_sex:male|female`) and
-  Height (`player_height`; inches with imperial default units, centimeters
-  with metric, converted when the units change; empty is none; its range
-  under it while out of range, checked by `PlayerSection::error`). It saves
-  and cancels with the other General cards (`scope=global`)
-- The Replay card (beta, General) holds `[replay]`: Keep clips, Pre-roll,
+- The Golfers card (beta, Golfers) lists the golfer records, each with a
+  name, bag, Gender (Male | Female pills), Hand (Right-handed | Left-handed
+  pills, `handed`; Right-handed while unset), Height (inches with imperial default
+  units, centimeters with metric, converted when the units change; empty is
+  none; its range under it while out of range, checked by
+  `PlayerSection::error`) and the game ids linked to it, each with a Remove
+  button, under them a picker of the game profiles on the bus that no golfer
+  is linked to (`golfer.profile` under ids other than `flighthook.*`, shown
+  as "Pureplay: name", the same way a linked id reads, with the id's
+  own part when the player's name is not known; disabled with a hover reason
+  while there is none). The card has its own Save (`scope=golfers`); a saved
+  hand for the golfer up reaches the turn at once.
+- The Replay card (Cameras) holds `[replay]`: Keep clips, Pre-roll,
   Post-roll and Start before impact in seconds, a **Show video on shot
   cards** checkbox (`shot_cards`), and the clip folder,
   read-only (`/api/status` `clip_dir`). It saves and cancels with the Global and Simulation cards
@@ -3259,76 +3612,18 @@ displayed).
 (`ReplaceAll`; `ReplaceGlobal` for `scope=global`; an `Upsert*` or `Remove`
 for an actor scope) on the bus and waits for a `ConfigOutcome` reply.
 
-### Header
-
-Detection mode is **global state** (not per-device). The mode selector
-buttons are in the tab bar, between the tab selectors and the title.
-Clicking a mode button emits `SetDetectionMode` on the bus.
-Launch monitor actors react to `SetDetectionMode` events to reconfigure the device.
-
-The **club picker** sits right of the hand control on every tab: a pill with
-the club in play (`—` when none), from `/api/status.club`, the WebSocket
-`init.global_state` and every `club_info` event. Clicking it opens a popup of
-all 33 clubs in bag rows (driver + mini driver, woods, hybrids, irons, wedges,
-putter); hovering a
-club names the mode it switches to when that is Chipping or Putting. A pick
-sends the WebSocket `club` command (`POST /api/club` when the socket is down),
-and the SystemActor then derives the detection mode as for a simulator club
-change. While any `openconnect_client.*` or `pureplay.*` actor is Connected
-the pill is read-only, with the hover text "Set by the simulator": the simulator replaces
-the club on its next player message, so its telemetry `club` and the pill
-agree.
-
-The **hand control** sits between the mode selector and the club picker: an
-RH | LH segmented control with the player's hand, from `/api/status.handed`,
-the WebSocket `init.global_state` and every `hand_info` event; RH while no hand
-is set, the hand the devices use then. A click sends the WebSocket `hand`
-command (`POST /api/hand` when the socket is down); the SystemActor then tells
-the devices, as for a hand from the simulator. Like the club pill it is
-read-only while any `openconnect_client.*` or `pureplay.*` actor is Connected (a static pill
-with the hover text "Set by the simulator"): the simulator replaces the hand
-with its next player message. Hovering the live control says "Player's hand.
-Devices that follow it are told on a change."
-
-The **Auto-chip** chip sits right of the club picker, a gap after it, and
-shows on every tab (see [Auto-chip](#auto-chip-beta) below).
-
-**Battery indicators** sit left of the FLIGHTHOOK title, one small battery per
-device that is shown Connected and reports `battery_pct` as a whole number from
-0 to 100, in Devices card order (the first device furthest left). The fill is
-that percentage of the battery and is red below 20 %, otherwise green; hovering
-one says which device it is for and what is left (`Square Omni 74%`). A device
-that is not Connected, or has no readable charge, has none.
-
-The **Tournament banner** shows while a tournament round is active
-(`FlighthookApp::round`, see [Tournament rounds](#tournament-rounds)): a slim
-strip under the header (`render_tournament_banner`, its own top panel) with a
-gold dot and `TOURNAMENT` centered. It sits outside the header row so the
-controls never move or crowd for it, whatever the window width and the number
-of batteries; it goes when the round ends or the link drops. Hovering it says
-"`<holder>` tournament round: only shots a launch monitor measured are sent.
-Auto-chip is off until the round ends." (`tournament_hint`).
-
-The tab bar is a segmented control, the same look as the mode selector beside
-it (`theme::segmented`). While any card is red (an actor of any kind lost
-its connection less than 10 minutes ago, see
-[Connection state](#connection-state)), the Devices segment carries a small
-red notification dot at the top center, overlapping its top edge, whatever its
-selection state. Nothing else lights it: not an actor that has not connected
-since it started, and not an `error` in an actor's telemetry, which shows on
-its card and in the error banner instead. The UI asks for a repaint when the
-first red card is due to turn yellow, so the dot goes out on time without a
-new event. The
-web layer caches telemetry from `ActorStatus` events plus club from `ClubInfo`
-and name from `PlayerInfo` events so reconnecting clients recover latest
-values immediately.
-
 ## Shots Tab
 
+The Shots and Cameras tabs share one **shots navigation** on the left (the
+header row with the shot count, the export icon and the Clear history trash;
+the `By set | By club | None` selector; the device filter; the shot list; the
+New set and New session foot). The Shots tab's own toolbar to the right of it
+holds `Cards | Table` and, in Table, the "italic = simulated" legend.
+
 ```
-  [Data|Cameras]  [Cards|Table]  DEVICE [All|Mevo+|Omni]                 [export] [trash]
-  (cameras only,  (Data only;      (2+ devices)                          (JSONL | CSV menu)
-   both views)     Cameras: Live)
+  SHOTS 42 [export] [trash]   [Cards|Table]
+  [By set|By club|None]       (Table: italic = simulated)
+  DEVICE [All v]  (2+ devices)
 
   Layout: the charts are always shown, sized from the window (not resizable)
 
@@ -3393,23 +3688,23 @@ values immediately.
   +--------------------------------------------+
 ```
 
-A toolbar (the Data | Cameras switch when cameras are configured, in both
-views, the Cards | Table switch, which Cameras hides, the device filter, the
-export icon and Clear history) sits above both views. Only
-the Table view's Data pane adds the "italic = simulated" legend, since only Table draws simulated
-values in italics (`ShotsView::shows_simulated_legend`). The chosen view
-(`ShotsView` in `panels/shots.rs`) lasts for the session and is not saved.
+The Shots toolbar (the Cards | Table switch, and in Table the "italic = simulated"
+legend, since only Table draws simulated values in italics:
+`ShotsView::shows_simulated_legend`) sits above both views. The chosen view
+(`ShotsView` in `panels/shots/views.rs`) lasts for the session and is not saved.
+The viewed golfer decides which golfer's shots, Sets and numbers are shown (see
+[Header and navigation](#header-and-navigation)); there is no golfer filter.
 
-The **device filter** (`DEVICE [All | <device>…]`, its own group after the
-units, styled like them) shows in both views, in every grouping, while the
+The **device filter** (`DEVICE [All v]`, a compact dropdown in the shots
+navigation) shows in both tabs, in every grouping, while the
 session's shots come from two or more devices (`device_options`); each
 device is labeled by `chart::device_label`. It lasts for the session
 (`FlighthookApp::device_filter`) and falls back to All when its device
-leaves the history. One filter applies to everything on the Shots tab,
-through one predicate (`chart::in_filter`): the shot list and its section
+leaves the history. One filter applies to everything on the Shots and Cameras tabs,
+through one predicate (`ShotFilter::passes`): the shot list and its section
 counts, the shot on show, the Table's rows, the view's members (range bars,
 stats and face impact cards, Flight, Dispersion) and the charts' faint
-shots. An Auto-chip is no device, so a filter hides it like any other
+shots. An Auto-Chip is no device, so a filter hides it like any other
 device's shot. With All, the bars, Flight and Dispersion keep their device
 colors and sub-bands. The JSONL/CSV export and the server are not
 filtered: the export is always the whole session. Every cache that depends
@@ -3418,7 +3713,7 @@ the chart scenes) and the Table's rows (`FlighthookApp::filtered_rows`, on
 the shots revision and the filter).
 
 Both views always show their charts, in one fixed layout per window size
-(`chart_slots` in `panels/shots.rs`); nothing is toggled or dragged, and
+(`chart_slots` in `panels/shots/views.rs`); nothing is toggled or dragged, and
 every size follows from the window's, so the layout holds still until the
 window changes.
 With the window at least 1200 px wide, **Dispersion** fills a full-height
@@ -3459,7 +3754,7 @@ was on show. While an older shot is on show, the header's LATEST chip is
 replaced by a **Back to latest** chip. The selection survives the shot list
 being reloaded (e.g. after a reconnect): the shot is found again by actor and
 shot id when both sides have one, else by actor and shot number, and if it is gone the
-view falls back to the latest shot (`ShotFocus` in `panels/shots.rs`).
+view falls back to the latest shot (`ShotFocus` in `panels/shots/selection.rs`).
 
 Under a device filter the list holds only that device's shots: a set or club
 section counts only that device's shots in its header (`chart::set_shot_count`
@@ -3473,13 +3768,14 @@ filtered device stays on show.
 
 Under the count line, a selector picks the **view** (By set | By club |
 None). It starts on the `shot_grouping` setting (default By set); a click
-applies it at once and saves it as the default view, over the WebSocket,
-else `POST /api/shots/grouping`. The view only changes what the tab shows:
-sets are recorded the same way in every view. The list scrolls between the
+applies it at once and saves it as the default view, over `/api/ws`, else
+`POST /api/shots/grouping`. The view only changes what the tab shows: Sets are
+recorded the same way in every view (see [Sets](#sets)). The list scrolls between the
 selector and its **foot**, pinned at the bottom of the column: a hairline, a
-one-line hint when there is one, then **New set** (`new_group`; disabled
-while the open set has no shots) and **New session** (disabled while no set
-is open). The hint reads "Next shot starts a new set (DR)" in By set when the
+one-line hint when there is one, then **New set** (a `practice.new_block` for the
+viewed golfer; disabled while their open Set has no shots) and **New session**
+(`practice.new_block { new_session }`, closing every golfer's open Set; disabled
+while no Set is open). The hint reads "Next shot starts a new set (DR)" in By set when the
 club in play differs from the open set's, and "No club selected" when no club
 is in play. The view `none` has no foot.
 
@@ -3491,7 +3787,7 @@ accent while the set is open and muted once closed. The set the next shot
 joins, while it is empty, gets a gold header at the top (`SET 4 · 7I · NEXT
 SHOT`). **By club** clusters the list: one section per club and session,
 combining every set with that club since the last New session, newest shot
-first, under a header named by its club (`club_name` in `groups.rs`):
+first, under a header named by its club (`club_name` in `ui/src/groups.rs`):
 `7 IRON · 2 SETS · 14 SHOTS` (the set count shows when there are two or
 more), `NO CLUB · …` for shots hit with no club, and a muted `7 IRON ·
 EARLIER · 4 SHOTS` for a section from an earlier session (its set count is
@@ -3508,27 +3804,27 @@ session's section only sinks. Selections are tracked client-side
 (`ShotGroups::observe_club`, each frame), each placed after the newest row
 with data at the time, so shots and selections order on one history.
 
-The UI learns the session from `GET /api/shots/groups` (`session`), counts it
-up on every `new_shot_session` and `clear_shot_history` it sees on the
-WebSocket, and never holds it
-below a listed set's `session` (`ShotGroups::session`). Header counts are the
-server's, so they cover shots older than the list holds. Rows without data
-(a shot in flight, a dead trigger) never break a run. The rows before the
-first row of a known set (a shot in flight, rows with data whose set is not
-known yet) come first, under a dim `NOT IN A SET` header when a header is
-above them. Later rows in no known set get the same header: in place in By
-set, gathered in one last section in By club.
+The dashboard learns the Sets from `practice.block` messages and the store's
+block records (`GET /api/blocks`), counts the session up on every new session
+and clear it sees, and never holds it below a listed Set's `session`
+(`ShotGroups::session`). Header counts are the server's, so they cover shots
+older than the list holds. Rows without data (a shot in flight, a dead
+trigger) never break a run. The rows before the first row of a known Set (a
+shot in flight, rows with data whose Set is not known yet) come first, under a
+dim `NOT IN A SET` header when a header is above them. Later rows in no known
+Set get the same header: in place in By set, gathered in one last section in By
+club.
 
-**Export** is an icon immediately left of the trash (`export_menu` in
-`panels/shots.rs`: `theme::icon` with `Icon::Export`, Codicons `export`
+**Export** is an icon immediately left of the trash in the shots navigation's
+header row (`export_menu` in `panels/shots/panel.rs`: `theme::icon` with `Icon::Export`, Codicons `export`
 U+EBAC, the same height as the trash, muted at rest and accent on hover,
 hover text "Export session"). A click opens an `egui::Popup::menu` listing
 **JSONL** and **CSV** (`EXPORT_FORMATS`); a pick opens
-`GET /api/shots/export?format=…&units=…` in the shown units, the same URLs the
-toolbar's links used. It is always enabled (an empty session exports an empty
+`GET /api/shots/export?format=…&units=…` in the shown units, the same URLs a
+link would use. It is always enabled (an empty session exports an empty
 file).
 
-**Clear history** is the trash icon at the toolbar's right end: a Codicons glyph
+**Clear history** is the trash icon at the right end of the shots navigation's header row: a Codicons glyph
 (`theme::icon` with `Icon::Trash`; the
 font is `ui/assets/fonts/codicon.ttf`, compiled in with `include_bytes!` and
 registered as its own font family by `theme::install`), as tall as the
@@ -3536,9 +3832,9 @@ export icon, muted at rest and alert red on hover. It is disabled while
 there are no shots. A click opens a modal: "Delete all N shots and sets?
 This can't be undone. Export first if you want to keep them." with Cancel
 and a red Delete; Escape or a click outside cancels. Delete sends
-`clear_history` over the WebSocket, else `POST /api/shots/clear`. Every
-dashboard that sees `clear_shot_history` on the WebSocket clears at once
-(`FlighthookApp::clear_shot_history`): shots, sets (the session counts up),
+`clear_history` over `/api/ws`, else `POST /api/shots/clear`. Every
+dashboard that sees the clear on `/api/ws` clears at once
+(`FlighthookApp::clear_shot_history`): shots, Sets (the session counts up),
 the shown shot, the device filter, the caches and an open confirmation. The
 Shots tab then shows its empty state.
 
@@ -3546,9 +3842,9 @@ Shots tab then shows its empty state.
 video icon) on the Cards view's shot header line, after LATEST or Back to
 latest, and the Table view a **Replay** column after Club, shown only while
 some row has clips. Rows take `video` from `/api/shots`, from each
-`shot_video` (every row whose `shot_id` is in its `keys`, whatever device
+`ShotVideo` (every row whose `shot_id` is in its `keys`, whatever device
 took it, before or after `shot_finished`; a camera's newer clip replaces its
-older one) and lose it on `shot_video_removed`.
+older one) and lose it on `ShotVideoRemoved`.
 
 The chip opens the replay, an `egui::Modal` over the Shots tab
 (`ui/src/panels/replay.rs`, logic in `ui/src/replay.rs`): the shot's cameras
@@ -3557,7 +3853,7 @@ by a download icon (Codicons `download`, hover "Download"; the `.avi`); a scrubb
 and the estimated impact as a gold tick; play/pause; previous/next frame;
 speed 1× · ½ · ¼ · ⅛; a Loop toggle (on whenever a replay opens, UI state only). Close, Escape
 or the backdrop closes it, and so do Clear history and a
-`shot_video_removed` naming its shot. Each camera's track
+`ShotVideoRemoved` naming its shot. Each camera's track
 is its sidecar: frame `i` is at `start_ns + frames[i].t_ns` on the server's
 clock, so the cameras line up, and each shows its last frame at or before
 the playhead. It opens playing from `[replay] start_before_impact_s` before the
@@ -3584,65 +3880,65 @@ playhead follows the wall clock, so when decoding can't keep up (1× on a
 phone) frames are skipped and the clip keeps its time. The view never
 fetches a whole clip.
 
-<a id="auto-chip-beta"></a>**Auto-chip** (beta) is a menu chip (`theme::menu_chip`: a `chip_button`
-with a drawn chevron) in the header, right of the club picker
-(`panels/auto_chip.rs`; it is not part of the Shots tab, which shows live and
-historical data rather than controls). It shows while `[simulation]
-auto_chip` (default `false`, serde-omitted at the default; the Simulation
-card's **Auto-chip** checkbox; `SimulationSection::auto_chip`) is on in the
-*saved* settings, and not before they have loaded. It is off by default; turn
-it on in Settings → Simulation (useful with radar launch monitors that miss
-short chips). With it off the chip is not drawn and `POST /api/auto-chip` answers `409`. The header has room for
-it down to the smallest window the UI fits, 1024 px wide. Its menu (`egui::Popup::menu`)
-lists `1 Yard`, `3 Yard`, `5 Yard` (`flighthook::AUTO_CHIP_YARDS`); a pick
-sends `POST /api/auto-chip` (`net::post_auto_chip`). The button is disabled,
-with the reason on hover, while a tournament round is active (the server's
-`round_state`, `FlighthookApp::round`; the server fires no chip then),
-while no `openconnect_client.*` or `pureplay.*`
-actor is Connected (`app::set_by_simulator`) and while a chip is waiting for its reply
-(`auto_chip_in_flight`). A failed reply shows in the error banner above the
-tabs (`Auto-chip: <status> <error>`) until the next pick. Auto-chip shots
-already recorded display as before when the setting is turned off.
+<a id="auto-chip-beta"></a>**Auto-Chip** (beta) is a header icon (`panels/auto_chip.rs`; it is
+not part of the Shots tab, which shows live and historical data rather than
+controls). It shows while `[simulation] auto_chip` (default `false`,
+serde-omitted at the default; the Simulation card's **Auto-Chip** checkbox;
+`SimulationSection::auto_chip`) is on in the *saved* settings, and not before
+they have loaded. It is off by default; turn it on in Settings → General →
+Simulation (useful with radar launch monitors that miss short chips). With it
+off the icon is not drawn and `POST /api/auto-chip` answers `409`. Its menu,
+titled "Auto-Chip", lists `1 Yard`, `3 Yard`, `5 Yard`
+(`flighthook::AUTO_CHIP_YARDS`); a pick sends `POST /api/auto-chip`
+(`net::post_auto_chip`). The icon is disabled, with the reason on hover, while
+a round is active (tournament mode on, or a simulator's round: the server's
+`RoundState`, `FlighthookApp::round`; the server fires no chip then), while no
+simulator card is connected (an Open Connect client or a Pureplay Connect
+output) and while a chip is waiting for its reply (`auto_chip_in_flight`). A
+failed reply shows in the error banner above the tabs (`Auto-Chip: <status>
+<error>`) until the next pick. Auto-Chip shots already recorded display as
+before when the setting is turned off.
 
 On the server (`app/src/autochip.rs`), `solve_speed` bisects the ball speed
 (0.1-60 mph, to 1e-4 mph) at which dimple, with the `[simulation]`
 environment and surface and `BallModel::TOUR`, rests at the chosen total
-for a straight 28° launch with backspin `round(DEFAULT_LAUNCH_ONLY_SPIN ×
-mph)` and no sidespin; the total rises with speed. `send` emits
-`ShotTrigger`, `sim::simulated_launch_events(.., Some(Chipping))`
-(simulated whatever `[simulation] mode`, `off` included) and `ShotFinished`
-as actor and FRP `device` `autochip` (`flighthook::AUTO_CHIP_ACTOR`), right
-after a `DeviceTelemetry` carrying only `source: virtual` (so an FRP client
-learns the device's source before its first shot), keyed by a fresh UUID
-and the next `WebState::auto_chip_shots`, from `spawn_blocking`; the counter
-moves only once the solve has succeeded. `shot_context` stamps an Auto-chip's
-`detection_mode` Chipping, whatever the game mode. The UI labels the actor
-`Auto-chip` (`chart::device_label`); it has no config section and sends no
-status, so it gets no Devices card. The Open Connect client's routing check
-(`shot_matches_routing`) takes `autochip` shots in every mode whatever
-monitor is routed: the chip stands in for a read the routed monitor missed.
-The client's `Relay::next_shot` sends `max(shot_number, last sent + 1)` as
-the `ShotNumber`, so device and Auto-chip numbers never repeat.
+for a straight 45° launch with backspin `round(SPIN_PER_MPH (300) ×
+mph)` and no sidespin; the total rises with speed. `send` publishes the
+Auto-Chip launch monitor's `bus.actor` (source `virtual`), `shot.trigger`,
+`shot.launch`, a modeled `shot.flight` (simulated whatever `[simulation]
+mode`, `off` included, in Chipping mode), a local `ShotCapture` and
+`shot.finished`, all under the Auto-Chip actor id (`[frp] auto_chip_actor_id`),
+keyed by a fresh UUID and the next `WebState::auto_chip_shots`, from
+`spawn_blocking`; the counter moves only once the solve has succeeded. The
+stored shot's mode is Chipping, whatever the turn's. The dashboard labels the
+actor `Auto-Chip` (`chart::device_label`); it has no config section, so it gets
+no Settings card. The Open Connect client's routing check
+(`Feed::passes`) takes Auto-Chip shots in every mode whatever monitor is
+routed, and sends its launch alone: the chip stands in for a read the routed
+monitor missed. The client's `Relay::next_shot` sends `max(shot_number, last
+sent + 1)` as the `ShotNumber`, so device and Auto-Chip numbers never repeat.
+Auto-Chip is enabled while an Open Connect client or Pureplay Connect card is
+connected.
 
-The server sets count an Auto-chip like any shot. The UI keeps it out of
+The server sets count an Auto-Chip like any shot. The UI keeps it out of
 every statistic through one predicate, `chart::is_auto_chip`: it is never a
 view member (`chart::members_for`), so the range bars, stats and face impact cards,
 dispersion ellipse and flight set overlay leave it out; it is not in
 `chart::device_ids`, so it has no device filter option, band or color; and
 list and range-bar headers count a set as `chart::set_shot_count` (the
-set's `shots` less its Auto-chip rows). It stays in the shot list under its
+set's `shots` less its Auto-Chip rows). It stays in the shot list under its
 set, in the Table and on the Cards; shown, it is the charts' gold shot
 (`flight::drawn_sets`) but not part of the ellipse.
 
-The UI loads the shots with `GET /api/shots?limit=1000` (`net::SHOTS_LIMIT`,
-the server's whole history) and the sets with `GET /api/shots/groups`, on
-connect and whenever the sets fall out of step. Each fetch is tagged with
-the UI's history generation (`FlighthookApp::history_generation`), which
-counts up on every `clear_shot_history` and `new_shot_session`. A shots or
-sets reply requested before a Clear history is dropped when it lands, so a
-fetch still in flight can't bring the cleared rows back; the empty history
-and the live events since are all there is. A sets reply requested before a
-New session is dropped and fetched again, so it can't wind the session back.
+The dashboard gets the shots from `/api/ws`: the snapshot on connect, then a
+`shot` message each time the store finishes or updates a shot; it loads
+`GET /api/shots?limit=1000` (`net::SHOTS_LIMIT`, the server's whole history) and
+`GET /api/blocks` on connect and whenever its Sets fall out of step. Each fetch
+is tagged with the UI's history generation (`FlighthookApp::history_generation`),
+which counts up on every clear and new session. A reply requested before a Clear
+history is dropped when it lands, so a fetch still in flight can't bring the
+cleared rows back; a Sets reply requested before a new session is dropped and
+fetched again, so it can't wind the session back.
 
 The cards show a header (shot number, device name, LATEST or Back to
 latest), a headline row of five large cards, then the Ball, Flight and Club
@@ -3681,7 +3977,7 @@ open or current, muted closed or earlier, gold for an empty open set), with a
 legend on the right; when the title and the legend (with its device chips)
 don't both fit on the line, the legend moves to a row of its own under the
 title (`legend_place`), so the two never overlap. The device filter (in the
-toolbar, above) applies before the view; with All and two or more devices,
+shots navigation, above) applies before the view; with All and two or more devices,
 each bar's band splits into one sub-band per device, colored by device. The
 members are cached on `chart::MembersKey` (shot and set revisions, view,
 device filter, shown shot, club in play) by
@@ -3731,7 +4027,7 @@ it beside the title (`settle_legend`).
 
 The sources, in cycle order (`ui/src/panels/card_row.rs`): **Stats**,
 always (below). **Camera** (beta), one per camera actor that is
-Connected, in Devices card order (below). **Face impact**, while any shot in
+Connected, in Settings card order (below). **Face impact**, while any shot in
 the history has face impact on either axis. By default the leftmost card is
 Stats, face impact is the rightmost, and cameras fill the cards between in
 order. The first time face impact is available in the session (and again
@@ -3750,7 +4046,7 @@ from the right, but face impact keeps the rightmost card when it was on
 screen. Nothing shows on two cards at once. The choices are UI state for
 the session (`CardRow`).
 
-The **stats card** (`stats_card` in `panels/shots.rs`) reads on its own,
+The **stats card** (`stats_card` in `panels/shots/range.rs`) reads on its own,
 wherever it sits in the row. `STATS` sits in its top-left in the headline
 cards' label style. Under it, a table: column headers `AVG`, `MED`, `SD` in
 small muted capitals, then one row per bar in bar order, named like the bars
@@ -3779,7 +4075,7 @@ scaled by box averaging (nearest when scaling up) to the body's pixel size
 (`ctx.pixels_per_point()`, each side rounded up to an even number). Nothing else is drawn on the
 picture. Without a clip of the shown shot from that camera (still recording,
 an older shot, a discarded recording) the card shows its name over an empty
-body and fetches nothing; the clip starts when it arrives (`shot_video`, the
+body and fetches nothing; the clip starts when it arrives (`ShotVideo`, the
 row's `video`). It fetches like the replay view: the sidecar, then range
 windows around the playhead and 300 ms ahead (from the start point again
 past the end), two requests at most, into a 24 MiB byte cache. A card keeps
@@ -3805,7 +4101,7 @@ while the replay view is open. A click cycles the card; the shot header's
 Replay chip opens the replay. With `[replay] shot_cards` false in the saved
 settings (`SettingsForm::shot_cards_enabled`, true until they load) the row's
 sources hold no cameras, so it lays out as with no camera connected, and
-`drop_hidden_card_clips` drops every card's clip; recording, the Cameras pane
+`drop_hidden_card_clips` drops every card's clip; recording, the Cameras tab
 and the replay view are unchanged. Turned on again, the cards return for the
 shown shot.
 
@@ -3844,7 +4140,7 @@ on the charts.
 **Flight** (beta, `ui/src/panels/flight.rs`) is a side view of the ball
 flights in the Cards view's bottom row (see the layout above). The chart is
 painted with egui's painter (no plotting crate). It plots each shot's
-simulated path (`derived.path`): horizontal
+simulated path (`path`): horizontal
 distance from the tee, `hypot(x, z)`, so the landing sits at the carry and
 the rest at the total, against height, in yd and ft (imperial) or m
 (metric). The two axes scale independently ("stretched") over the bright
@@ -3997,17 +4293,17 @@ only when that is not enough does that card's numeral shrink. The Table
 keeps signed numbers. A table cell shows the simulated
 value in italics with the same hover, else the measured one plainly, else a
 dash. Backspin and Sidespin (card and column) always show the `launch` value,
-styled as simulated (`SIM` tag, italics) when `derived.spin_estimated` is
-set. Derived wins when both are present: the server sets a field in both
-only when the simulated value is the one to show (a `force` shot's
-`replaces_measured`, a measured 0 carry or flight time on a shot that flies,
-a ground ball's 0 carry, apex and flight time). One helper, `pick` in
-`ui/src/panels/shots.rs`, makes this choice for the cards, the shot list, the
+styled as simulated (`SIM` tag, italics) when the spin came from an `assumed`
+block. The simulated value wins when both are present: the flight model sets
+a field the launch monitor also reported only when the simulated value is the
+one to show (a `force` shot, a measured 0 carry or flight time on a shot that
+flies, a ground ball's 0 carry, apex and flight time). One helper, `pick` in
+`ui/src/panels/shots/mod.rs`, makes this choice for the cards, the shot list, the
 table, the range bars and the Flight and Dispersion charts. Both views follow the
 Imperial/Metric toggle. When the
 device reports no smash factor, the Smash card and table column show ball
 speed over club speed when both are known; this is display only, and the bus,
-GSPro output and export carry the device's value. When a new shot arrives the
+Open Connect output and export carry the device's value. When a new shot arrives the
 cards glow with the accent color, a few pixels wide and following their
 rounded corners, and the table's latest row gets an accent outline; both fade
 over 1.5 s.

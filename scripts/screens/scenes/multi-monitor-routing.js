@@ -1,7 +1,7 @@
 'use strict';
-// screens/multi-monitor-routing.png: a GSPro output's card on its Settings
-// side, routing full swings to the Mock and chips to an Open Connect
-// monitor, putts to any. Cropped to the card.
+// screens/multi-monitor-routing.png: a GSPro output's page, its settings
+// routing full swings to the Mock and chips to an Open Connect monitor,
+// putts to any. Cropped to the page's header, telemetry and settings rows.
 
 const { until } = require('../lib/util');
 const { Simulator } = require('../lib/openconnect');
@@ -45,7 +45,7 @@ chipping_monitor = "openconnect_server.0"
 
   async drive(ctx) {
     await until('GSPro connected', async () => {
-      const { actors } = await ctx.fh.get('/api/status');
+      const { cards: actors } = await ctx.fh.get('/api/status');
       return actors['openconnect_client.0'] && actors['openconnect_client.0'].status === 'connected';
     });
   },
@@ -55,11 +55,11 @@ chipping_monitor = "openconnect_server.0"
     images: [{
       name: 'multi-monitor-routing',
       steps: [
-        { click: [55, 27] }, // Devices tab
-        { click: [478, 1132] }, // Local GSPro: Settings
+        { click: [124, 26] }, // Settings
+        { click: [134, 477] }, // Local GSPro's row
         { move: [1590, 1390] },
       ],
-      crop: { card: [270, 1250], margin: 2 },
+      crop: { card: [300, 300], margin: 2, height: 300 },
     }],
   }),
 };

@@ -1,8 +1,46 @@
-//! Shot sets as the UI knows them: the `/api/shots/groups` list of the
-//! webserver the UI talks to, kept current by its `shot_group` events, plus
+//! Shot sets as the UI knows them: the practice blocks of `/api/blocks`,
+//! fetched again whenever flighthook's practice actor publishes one, plus
 //! the session they are counted in.
 
-use crate::types::{Club, ShotGroupInfo, ShotGrouping, ShotGroupsResponse, ShotKey, ShotRow};
+use crate::types::{BlockInfo, BlocksResponse, Club, ShotGrouping, ShotKey, ShotRow};
+
+/// A set: one practice block as the Shots tab shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetInfo {
+    /// The block's id (UUID v4); a stored shot's `group`.
+    pub(crate) id: String,
+    /// Display ordinal ("SET 3"): counts from 1 within the session.
+    pub(crate) number: u32,
+    /// The practice session the set belongs to (from 1 each run).
+    pub(crate) session: u32,
+    /// Club the set is hit with; `None` for no club.
+    pub(crate) club: Option<Club>,
+    /// When the set started, in milliseconds since the Unix epoch: its
+    /// first shot, else when it opened.
+    pub(crate) started_at: u64,
+    /// Not closed by the practice actor yet.
+    pub(crate) open: bool,
+    /// Stored shots with data that belong to it.
+    pub(crate) shots: u32,
+    /// The block's golfer id, as the wire carries it (resolve it with the
+    /// lookup rule).
+    pub(crate) golfer: Option<String>,
+}
+
+impl From<BlockInfo> for SetInfo {
+    fn from(b: BlockInfo) -> Self {
+        Self {
+            id: b.block.id,
+            number: b.block.number,
+            session: b.block.session,
+            club: b.block.club,
+            started_at: b.first_shot_at.unwrap_or(b.block.started_at),
+            open: b.open,
+            shots: b.shots,
+            golfer: b.block.golfer.map(|g| g.as_str().to_owned()),
+        }
+    }
+}
 
 /// Full name of `club`, as group headers show it ("7 Iron").
 pub(crate) fn club_name(club: Club) -> &'static str {
@@ -40,6 +78,7 @@ pub(crate) fn club_name(club: Club) -> &'static str {
         Club::SandWedge => "Sand Wedge",
         Club::LobWedge => "Lob Wedge",
         Club::Putter => "Putter",
+        _ => "Club",
     }
 }
 
@@ -74,36 +113,74 @@ pub(crate) struct Strip {
 /// The shot sets of one webserver.
 #[derive(Default, Debug)]
 pub(crate) struct ShotGroups {
-    /// Actor id of the webserver the sets come from; `None` until
-    /// `/api/shots/groups` answers. `shot_group` events from any other
-    /// actor are ignored.
-    pub(crate) server: Option<String>,
-    /// The view shown: the server's default view (`shot_grouping`), or the
+    /// The view shown: the saved default view (`shot_grouping`), or the
     /// one picked since.
     pub(crate) mode: ShotGrouping,
-    /// Ascending `number`.
-    list: Vec<ShotGroupInfo>,
-    /// Current session: the server's, counted up by every `new_shot_session`
-    /// and `clear_shot_history` seen since, and never below a listed set's.
+    /// Ascending session, then `number`.
+    list: Vec<SetInfo>,
+    /// Current session: the server's, and never below a listed set's.
     session: u32,
-    /// The club in play when last observed; `None` before the first
-    /// observation.
-    observed: Option<Option<Club>>,
-    /// Where in the shot history each club was last selected.
+    /// The golfer up (as the wire names it) and the club in play when last
+    /// observed; `None` before the first observation.
+    observed: Option<(Option<String>, Option<Club>)>,
+    /// Where in the shot history each golfer last selected each club.
     selections: Vec<Selection>,
     /// Count of observed selections, ordering selections at one place.
     seq: u64,
-    /// Bumped by every `replace`, every applied `shot_group` event, every
-    /// new session and every clear, so caches of what the sets cover know
-    /// when to rebuild.
+    /// Bumped by every `replace` and every clear, so caches of what the
+    /// sets cover know when to rebuild.
     rev: u64,
+    /// The empty open set this UI asked for with New set, per golfer key:
+    /// shown before its first shot. Any other empty open set is hidden.
+    manual: std::collections::BTreeMap<Option<String>, String>,
+    /// New set was sent for the golfer with this key (the viewed golfer
+    /// then); the next reply's empty open set of that golfer goes into
+    /// [`Self::manual`].
+    asked_new: Option<Option<String>>,
+    /// Resolves a shot's or set's golfer id to its golfer (the lookup rule).
+    golfers: GolferKeys,
+    /// The turn's golfer id, as the wire names it.
+    up: Option<String>,
+    /// The viewed golfer's key, when the view is on a golfer other than
+    /// the golfer up; `None` while the view is the golfer up.
+    view: Option<Option<String>>,
 }
 
-/// A club selection, placed in the shot history: after the row `after`,
-/// the newest row with data when the club was selected (`None` when there
-/// was none).
+/// The lookup rule over the saved golfers, cached: each identifier a golfer
+/// lists mapped to its key by [`flighthook::FlighthookConfig::golfer_key`].
+/// An id no golfer lists is its own key.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GolferKeys(std::collections::BTreeMap<String, String>);
+
+impl GolferKeys {
+    /// The keys of `config`'s golfers.
+    pub(crate) fn of(config: Option<&flighthook::FlighthookConfig>) -> Self {
+        let mut map = std::collections::BTreeMap::new();
+        if let Some(config) = config {
+            for id in config.golfers.iter().flat_map(|g| &g.identifiers) {
+                if let Some(key) = config.golfer_key(Some(id)) {
+                    map.entry(id.clone()).or_insert(key);
+                }
+            }
+        }
+        Self(map)
+    }
+
+    /// The key golfer id `id` counts under: its golfer's own id, else
+    /// `id`. `None` (no golfer) is its own key.
+    pub(crate) fn key<'a>(&'a self, id: Option<&'a str>) -> Option<&'a str> {
+        let id = id?;
+        Some(self.0.get(id).map_or(id, String::as_str))
+    }
+}
+
+/// A club selection by the golfer up, placed in the shot history: after
+/// the row `after`, the newest row with data when the club was selected
+/// (`None` when there was none).
 #[derive(Debug)]
 struct Selection {
+    /// The golfer up, as the wire names them.
+    golfer: Option<String>,
     club: Option<Club>,
     after: Option<(String, ShotKey)>,
     seq: u64,
@@ -114,36 +191,37 @@ struct Selection {
 /// `(2i + 3, seq)`, and one made before any row is `(1, seq)`.
 pub(crate) type Activity = (usize, u64);
 
-/// What a `shot_group` event did.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum GroupEvent {
-    /// From another webserver, or before the REST list arrived: ignored.
-    Foreign,
-    /// Applied.
-    Applied,
-    /// Applied, but the UI's rows look out of step with the server (the
-    /// joined shot's row is missing, or a newer row with data never got its
-    /// group): refetch groups and shots.
-    OutOfStep,
-}
-
 impl ShotGroups {
-    /// Replace everything with a `/api/shots/groups` reply.
-    pub(crate) fn replace(&mut self, resp: ShotGroupsResponse) {
-        self.server = Some(resp.server);
-        self.mode = resp.mode;
-        self.list = resp.groups;
-        self.list.sort_by_key(|g| g.number);
+    /// Replace every set with a `/api/blocks` reply.
+    pub(crate) fn replace(&mut self, resp: BlocksResponse) {
+        self.list = resp.blocks.into_iter().map(SetInfo::from).collect();
+        self.list.sort_by_key(|g| (g.session, g.number));
         self.session = self
             .list
             .iter()
             .map(|g| g.session)
             .fold(resp.session, u32::max);
+        if let Some(key) = self.asked_new.clone()
+            && let Some(open) = self.open_set_of(key.as_deref()).filter(|g| g.shots == 0)
+        {
+            let id = open.id.clone();
+            self.manual.insert(key, id);
+            self.asked_new = None;
+        }
+        let list = &self.list;
+        self.manual
+            .retain(|_, id| list.iter().any(|g| g.open && g.id == *id));
         self.rev += 1;
     }
 
-    /// Revision of the set list: changes with every `replace`, every
-    /// applied `shot_group` event, every new session and every clear.
+    /// This UI sent New set for the viewed golfer: the empty open set the
+    /// reply brings is shown.
+    pub(crate) fn asked_new_set(&mut self) {
+        self.asked_new = Some(self.view_key().map(str::to_owned));
+    }
+
+    /// Revision of the set list: changes with every `replace` and every
+    /// clear.
     pub(crate) fn rev(&self) -> u64 {
         self.rev
     }
@@ -153,19 +231,13 @@ impl ShotGroups {
         self.session
     }
 
-    /// A `new_shot_session` command went over the bus: the server counts
-    /// its session up, and so does the UI.
-    pub(crate) fn new_session(&mut self) {
-        self.session += 1;
-        self.rev += 1;
-    }
-
-    /// A `clear_shot_history` command went over the bus: the server drops
-    /// every set and counts its session up, and so does the UI. The club in
-    /// play is observed afresh.
+    /// The server cleared its shot history: every set goes (the next
+    /// session's block comes with the next fetch). The club in play is
+    /// observed afresh.
     pub(crate) fn clear(&mut self) {
         self.list.clear();
-        self.session += 1;
+        self.manual.clear();
+        self.asked_new = None;
         self.observed = None;
         self.selections.clear();
         self.rev += 1;
@@ -177,20 +249,96 @@ impl ShotGroups {
     }
 
     /// The group with id `id`.
-    pub(crate) fn get(&self, id: &str) -> Option<&ShotGroupInfo> {
+    pub(crate) fn get(&self, id: &str) -> Option<&SetInfo> {
         self.list.iter().find(|g| g.id == id)
     }
 
-    /// The open set (the server keeps at most one open).
-    pub(crate) fn open_set(&self) -> Option<&ShotGroupInfo> {
-        self.list.iter().filter(|g| g.open).max_by_key(|g| g.number)
+    /// Take the saved golfers (`keys`) and the turn's golfer id (`up`).
+    /// A change of either changes [`Self::rev`].
+    pub(crate) fn set_golfers(&mut self, keys: GolferKeys, up: Option<&str>) {
+        if self.golfers != keys || self.up.as_deref() != up {
+            self.golfers = keys;
+            self.up = up.map(str::to_owned);
+            self.rev += 1;
+        }
     }
 
-    /// The set the next shot joins when `club` is in play: the open set,
-    /// when it has no shots yet (it takes the first shot's club) or its club
-    /// is `club`. `None` when the next shot starts a new set.
-    pub(crate) fn current_group(&self, club: Option<Club>) -> Option<&ShotGroupInfo> {
-        self.open_set().filter(|g| g.shots == 0 || g.club == club)
+    /// The keys that resolve a golfer id (the lookup rule).
+    pub(crate) fn golfers(&self) -> &GolferKeys {
+        &self.golfers
+    }
+
+    /// The key of the golfer up.
+    pub(crate) fn up_key(&self) -> Option<&str> {
+        self.golfers.key(self.up.as_deref())
+    }
+
+    /// Take the viewed golfer's key: `None` while the view is the golfer
+    /// up, else `Some(key)`. A change changes [`Self::rev`].
+    pub(crate) fn set_view(&mut self, view: Option<Option<String>>) {
+        if self.view != view {
+            self.view = view;
+            self.rev += 1;
+        }
+    }
+
+    /// The key of the viewed golfer: the golfer up unless the view is on
+    /// someone else.
+    pub(crate) fn view_key(&self) -> Option<&str> {
+        match &self.view {
+            Some(key) => key.as_deref(),
+            None => self.up_key(),
+        }
+    }
+
+    /// Whether the view is on the golfer up.
+    pub(crate) fn viewing_up(&self) -> bool {
+        self.view_key() == self.up_key()
+    }
+
+    /// The viewed golfer's open set (the practice actor keeps one open per
+    /// golfer).
+    pub(crate) fn open_set(&self) -> Option<&SetInfo> {
+        self.open_set_of(self.view_key())
+    }
+
+    /// The open set of the golfer with key `key`.
+    fn open_set_of(&self, key: Option<&str>) -> Option<&SetInfo> {
+        self.list
+            .iter()
+            .filter(|g| g.open && self.golfers.key(g.golfer.as_deref()) == key)
+            .max_by_key(|g| g.number)
+    }
+
+    /// Whether set `id` is an empty set this UI asked for with New set.
+    fn asked_for(&self, id: &str) -> bool {
+        self.manual.values().any(|m| m == id)
+    }
+
+    /// The set the viewed golfer's next shot joins when `club` is in play:
+    /// the open set, when it has no shots yet (it takes the first shot's
+    /// club) or, while the view is the golfer up, its club is `club`. The
+    /// club in play is the golfer up's, so for anyone else only an empty
+    /// open set counts. `None` when the next shot starts a new set.
+    pub(crate) fn current_group(&self, club: Option<Club>) -> Option<&SetInfo> {
+        let up = self.viewing_up();
+        self.open_set()
+            .filter(|g| g.shots == 0 || (up && g.club == club))
+    }
+
+    /// The open set as the list shows it: one with shots, or the empty set
+    /// this UI asked for with New set. An empty open set is hidden
+    /// otherwise.
+    pub(crate) fn shown_open(&self) -> Option<&SetInfo> {
+        self.open_set()
+            .filter(|g| g.shots > 0 || self.asked_for(&g.id))
+    }
+
+    /// [`Self::current_group`] among the shown sets ([`Self::shown_open`]):
+    /// `None` when the next shot starts a set the list does not show yet.
+    pub(crate) fn shown_current(&self, club: Option<Club>) -> Option<&SetInfo> {
+        self.current_group(club)
+            .filter(|g| g.shots > 0 || self.asked_for(&g.id))
     }
 
     /// The foot's buttons and hint when `club` is in play. The view `none`
@@ -206,27 +354,33 @@ impl ShotGroups {
         }
         let hint = match club {
             None => Some("No club selected".to_owned()),
-            Some(c) if self.mode == ShotGrouping::BySet && self.current_group(club).is_none() => {
+            Some(c) if self.mode == ShotGrouping::BySet && self.shown_current(club).is_none() => {
                 Some(format!("Next shot starts a new set ({c})"))
             }
             Some(_) => None,
         };
-        let open = self.open_set();
+        let open = self.shown_open();
+        let has_shots = self
+            .list
+            .iter()
+            .any(|g| g.session == self.session && g.shots > 0);
         Strip {
             actions: true,
             new_group: open.is_none_or(|g| g.shots > 0),
-            new_session: open.is_some(),
+            new_session: has_shots || open.is_some(),
             hint,
         }
     }
 
-    /// Note the club in play; a change is a selection of `club`, placed
-    /// after the newest row with data in `shots`.
+    /// Note the club in play; a change of it or of the golfer up is a
+    /// selection of `club` by the golfer up, placed after the newest row
+    /// with data in `shots`.
     pub(crate) fn observe_club(&mut self, club: Option<Club>, shots: &[ShotRow]) {
-        if self.observed == Some(club) {
+        let now = (self.up.clone(), club);
+        if self.observed.as_ref() == Some(&now) {
             return;
         }
-        self.observed = Some(club);
+        self.observed = Some(now);
         self.seq += 1;
         let after = shots.iter().rfind(|r| r.has_data()).map(|r| {
             let key = ShotKey {
@@ -236,77 +390,79 @@ impl ShotGroups {
             (r.actor.clone(), key)
         });
         let selection = Selection {
+            golfer: self.up.clone(),
             club,
             after,
             seq: self.seq,
         };
-        match self.selections.iter_mut().find(|s| s.club == club) {
+        match self
+            .selections
+            .iter_mut()
+            .find(|s| s.club == club && s.golfer == selection.golfer)
+        {
             Some(s) => *s = selection,
             None => self.selections.push(selection),
         }
     }
 
-    /// Where `club` was last selected in `shots`. A selection whose row has
-    /// left `shots` is older than every row.
-    pub(crate) fn selected_at(&self, club: Option<Club>, shots: &[ShotRow]) -> Option<Activity> {
-        let s = self.selections.iter().find(|s| s.club == club)?;
-        let at = s
-            .after
-            .as_ref()
-            .and_then(|(actor, key)| find_row(shots, actor, key))
-            .map_or(1, |i| 2 * i + 3);
-        Some((at, s.seq))
+    /// Where the golfer keyed `golfer` (the lookup rule) last selected
+    /// `club` in `shots`. A selection whose row has left `shots` is older
+    /// than every row.
+    pub(crate) fn selected_at(
+        &self,
+        golfer: Option<&str>,
+        club: Option<Club>,
+        shots: &[ShotRow],
+    ) -> Option<Activity> {
+        self.selections
+            .iter()
+            .filter(|s| s.club == club && self.golfers.key(s.golfer.as_deref()) == golfer)
+            .map(|s| {
+                let at = s
+                    .after
+                    .as_ref()
+                    .and_then(|(actor, key)| find_row(shots, actor, key))
+                    .map_or(1, |i| 2 * i + 3);
+                (at, s.seq)
+            })
+            .max()
     }
 
-    /// Every set, ascending `number`.
-    pub(crate) fn iter_sets(&self) -> impl Iterator<Item = &ShotGroupInfo> {
-        self.list.iter()
-    }
-
-    /// Store `group`, replacing the record with the same id. A closed group
-    /// with no shots left is removed.
-    fn upsert(&mut self, group: ShotGroupInfo) {
-        self.rev += 1;
-        self.session = self.session.max(group.session);
-        let existing = self.list.iter().position(|g| g.id == group.id);
-        if !group.open && group.shots == 0 {
-            if let Some(i) = existing {
-                self.list.remove(i);
-            }
-            return;
-        }
-        match existing {
-            Some(i) => self.list[i] = group,
-            None => {
-                let at = self.list.partition_point(|g| g.number <= group.number);
-                self.list.insert(at, group);
-            }
-        }
-    }
-
-    /// Apply a `shot_group` event sent by `actor`. When it names a shot
-    /// that joined the group, that shot's row in `shots` is stamped with the
-    /// group and its club.
-    pub(crate) fn apply(
-        &mut self,
-        actor: &str,
-        group: ShotGroupInfo,
-        joined: Option<(&str, &ShotKey)>,
-        shots: &mut [ShotRow],
-    ) -> GroupEvent {
-        if self.server.as_deref() != Some(actor) {
-            return GroupEvent::Foreign;
-        }
-        let id = group.id.clone();
-        let club = group.club;
-        self.upsert(group);
-        let Some((shot_actor, key)) = joined else {
-            return GroupEvent::Applied;
+    /// Sets `list` in view `mode`, as a `/api/blocks` reply listing them
+    /// would leave it after this UI's New set: an empty open set in `list`
+    /// is shown (tests).
+    #[cfg(test)]
+    pub(crate) fn with_sets(mode: ShotGrouping, list: Vec<SetInfo>) -> Self {
+        let mut g = Self {
+            mode,
+            ..Self::default()
         };
-        match stamp(shots, shot_actor, key, &id, club) {
-            Some(i) if !ungrouped_after_grouped(&shots[..i]) => GroupEvent::Applied,
-            _ => GroupEvent::OutOfStep,
+        g.session = list.iter().map(|s| s.session).max().unwrap_or(1);
+        g.manual = list
+            .iter()
+            .filter(|s| s.open && s.shots == 0)
+            .map(|s| (s.golfer.clone(), s.id.clone()))
+            .collect();
+        g.list = list;
+        g.list.sort_by_key(|s| (s.session, s.number));
+        g.rev += 1;
+        g
+    }
+
+    /// What the `/api/blocks` reply after a New session holds (tests): the
+    /// open set closed, the session counted up.
+    #[cfg(test)]
+    pub(crate) fn new_session(&mut self) {
+        for g in &mut self.list {
+            g.open = false;
         }
+        self.session += 1;
+        self.rev += 1;
+    }
+
+    /// Every set, ascending session and `number`.
+    pub(crate) fn iter_sets(&self) -> impl Iterator<Item = &SetInfo> {
+        self.list.iter()
     }
 }
 
@@ -354,47 +510,73 @@ pub(crate) fn multiple_devices(shots: &[ShotRow]) -> bool {
     false
 }
 
-/// Stamp the row for the shot `key` from `actor` with `group` and `club`.
-/// Returns the row's index.
-fn stamp(
-    shots: &mut [ShotRow],
-    actor: &str,
-    key: &ShotKey,
-    group: &str,
-    club: Option<Club>,
-) -> Option<usize> {
-    let i = find_row(shots, actor, key)?;
-    let row = &mut shots[i];
-    row.group = Some(group.to_owned());
-    row.club_selected = club;
-    Some(i)
-}
-
-/// Whether a row with data but no set follows a row in a set. Rows older
-/// than every row in a set (from before the server's history) do not count.
-fn ungrouped_after_grouped(shots: &[ShotRow]) -> bool {
-    let Some(first) = shots.iter().position(|r| r.group.is_some()) else {
-        return false;
-    };
-    shots[first..]
-        .iter()
-        .any(|r| r.group.is_none() && r.has_data())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::Launch;
 
-    fn info(id: &str, number: u32, open: bool, shots: u32) -> ShotGroupInfo {
-        ShotGroupInfo {
+    /// A set and a shot row carry their golfer id as the wire named it.
+    #[test]
+    fn sets_and_rows_carry_their_golfer() {
+        let golfer: flighthook::GolferId = "pureplay.local-3".parse().expect("id");
+        let mut block = flighthook::PracticeBlock {
+            id: "b".into(),
+            golfer: Some(golfer.clone()),
+            club: Some(Club::Iron7),
+            number: 1,
+            session: 1,
+            started_at: 0,
+        };
+        let info = |block: flighthook::PracticeBlock| BlockInfo {
+            block,
+            open: true,
+            shots: 0,
+            first_shot_at: None,
+        };
+        let set = SetInfo::from(info(block.clone()));
+        assert_eq!(set.golfer.as_deref(), Some("pureplay.local-3"));
+        block.golfer = None;
+        assert_eq!(SetInfo::from(info(block)).golfer, None);
+        let shot = crate::types::ShotData {
+            turn: Some(flighthook::GolferTurn::new(
+                Some(golfer),
+                Some(Club::Iron7),
+                flighthook::Handedness::Right,
+                flighthook::Mode::Full,
+            )),
+            ..crate::types::ShotData::default()
+        };
+        assert_eq!(
+            ShotRow::from(shot).golfer.as_deref(),
+            Some("pureplay.local-3")
+        );
+    }
+
+    fn in_mode(mode: ShotGrouping, groups: Vec<SetInfo>) -> ShotGroups {
+        let mut g = served(groups);
+        g.mode = mode;
+        g
+    }
+
+    fn club_group(id: &str, number: u32, club: Club, open: bool, shots: u32) -> SetInfo {
+        SetInfo {
+            club: Some(club),
+            ..info(id, number, open, shots)
+        }
+    }
+
+    fn current(g: &ShotGroups, club: Option<Club>) -> Option<&str> {
+        g.current_group(club).map(|g| g.id.as_str())
+    }
+
+    fn info(id: &str, number: u32, open: bool, shots: u32) -> SetInfo {
+        SetInfo {
+            golfer: None,
             id: id.into(),
             number,
-            session: 0,
-            golfer: None,
+            session: 1,
             club: Some(Club::Iron7),
-            started_at: "2026-10-26T15:41:28.300Z".into(),
-            manual: false,
+            started_at: 0,
             open,
             shots,
         }
@@ -402,6 +584,7 @@ mod tests {
 
     fn row(n: u32, id: &str) -> ShotRow {
         ShotRow {
+            golfer: None,
             actor: "mevo.0".into(),
             shot_id: id.into(),
             shot_number: n,
@@ -425,113 +608,8 @@ mod tests {
         }
     }
 
-    fn served(groups: Vec<ShotGroupInfo>) -> ShotGroups {
-        let mut g = ShotGroups::default();
-        g.replace(ShotGroupsResponse {
-            server: "webserver.0".into(),
-            mode: ShotGrouping::BySet,
-            session: 0,
-            current: None,
-            groups,
-        });
-        g
-    }
-
-    fn numbers(g: &ShotGroups) -> Vec<u32> {
-        g.iter_sets().map(|g| g.number).collect()
-    }
-
-    #[test]
-    fn foreign_server_events_are_ignored() {
-        let mut shots = vec![row(1, "s1")];
-        // Before the REST list arrives, every event is foreign.
-        let mut g = ShotGroups::default();
-        let ev = g.apply("webserver.0", info("a", 1, true, 1), None, &mut shots);
-        assert_eq!(ev, GroupEvent::Foreign);
-        assert_eq!(g.iter_sets().count(), 0);
-
-        let mut g = served(vec![]);
-        let rev = g.rev();
-        let joined = Some(("mevo.0", &key(1, "s1")));
-        let ev = g.apply("webserver.1", info("b", 1, true, 1), joined, &mut shots);
-        assert_eq!(ev, GroupEvent::Foreign);
-        assert_eq!(g.iter_sets().count(), 0);
-        assert_eq!(shots[0].group, None, "a foreign event stamps nothing");
-        assert_eq!(g.rev(), rev, "a foreign event changes nothing");
-
-        let ev = g.apply("webserver.0", info("a", 1, true, 1), joined, &mut shots);
-        assert_eq!(ev, GroupEvent::Applied);
-        assert_eq!(shots[0].group.as_deref(), Some("a"));
-        assert!(g.rev() > rev);
-        let rev = g.rev();
-        g.replace(ShotGroupsResponse {
-            server: "webserver.0".into(),
-            mode: ShotGrouping::None,
-            session: 0,
-            current: None,
-            groups: vec![],
-        });
-        assert!(g.rev() > rev);
-    }
-
-    #[test]
-    fn shot_group_upserts_by_id_in_number_order() {
-        let mut g = served(vec![info("c", 3, true, 0), info("a", 1, false, 4)]);
-        assert_eq!(numbers(&g), [1, 3]);
-        let mut shots = vec![];
-        // A new group lands in number order, whatever its id sorts as.
-        g.apply("webserver.0", info("0-b", 2, true, 0), None, &mut shots);
-        assert_eq!(numbers(&g), [1, 2, 3]);
-        // Same id: replaced, not duplicated.
-        g.apply("webserver.0", info("0-b", 2, false, 5), None, &mut shots);
-        assert_eq!(numbers(&g), [1, 2, 3]);
-        let b = g.get("0-b").unwrap();
-        assert!(!b.open);
-        assert_eq!(b.shots, 5);
-    }
-
-    #[test]
-    fn closed_empty_group_is_deleted() {
-        let mut g = served(vec![info("a", 1, false, 1), info("b", 2, true, 0)]);
-        let mut shots = vec![];
-        // An open empty group stays.
-        g.apply("webserver.0", info("b", 2, true, 0), None, &mut shots);
-        assert!(g.get("b").is_some());
-        // Its last shot left the history and it is closed: gone.
-        g.apply("webserver.0", info("a", 1, false, 0), None, &mut shots);
-        assert!(g.get("a").is_none());
-        // A drop for a group the UI never saw is a no-op.
-        g.apply("webserver.0", info("z", 9, false, 0), None, &mut shots);
-        assert_eq!(numbers(&g), [2]);
-    }
-
-    #[test]
-    fn stamping_finds_rows_by_id_else_by_actor_and_number() {
-        let mut g = served(vec![]);
-        let mut shots = vec![row(7, "s7"), row(8, ""), row(8, "s8")];
-        let mut grp = info("a", 1, true, 1);
-        grp.club = Some(Club::Driver);
-        // By id: the row with that id, though another row has the number.
-        let ev = g.apply(
-            "webserver.0",
-            grp.clone(),
-            Some(("mevo.0", &key(8, "s8"))),
-            &mut shots,
-        );
-        assert_eq!(ev, GroupEvent::Applied);
-        assert_eq!(shots[2].group.as_deref(), Some("a"));
-        assert_eq!(shots[2].club_selected, Some(Club::Driver));
-        assert_eq!(shots[1].group, None);
-        // A row with no id: by actor and number.
-        let mut shots = vec![row(9, "")];
-        let ev = g.apply(
-            "webserver.0",
-            grp,
-            Some(("mevo.0", &key(9, "s9"))),
-            &mut shots,
-        );
-        assert_eq!(ev, GroupEvent::Applied);
-        assert_eq!(shots[0].group.as_deref(), Some("a"));
+    fn served(groups: Vec<SetInfo>) -> ShotGroups {
+        ShotGroups::with_sets(ShotGrouping::BySet, groups)
     }
 
     #[test]
@@ -574,60 +652,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_row_or_ungrouped_row_asks_for_a_refetch() {
-        let mut g = served(vec![]);
-        let mut shots = vec![row(1, "s1")];
-        let ev = g.apply(
-            "webserver.0",
-            info("a", 1, true, 1),
-            Some(("mevo.0", &key(5, "s5"))),
-            &mut shots,
-        );
-        assert_eq!(ev, GroupEvent::OutOfStep, "the joined shot has no row");
-
-        // s1 grouped, s2 has data but missed its event, s3 joins now.
-        let mut shots = vec![row(1, "s1"), row(2, "s2"), row(3, "s3")];
-        shots[0].group = Some("a".into());
-        let ev = g.apply(
-            "webserver.0",
-            info("a", 1, true, 3),
-            Some(("mevo.0", &key(3, "s3"))),
-            &mut shots,
-        );
-        assert_eq!(ev, GroupEvent::OutOfStep);
-
-        // Ungrouped rows older than every grouped row are history, and a
-        // pending row (no data yet) is not missing anything.
-        let mut shots = vec![row(1, "s1"), row(2, "s2"), row(3, "s3"), row(4, "s4")];
-        shots[1].group = Some("a".into());
-        shots[2].launch = None;
-        let ev = g.apply(
-            "webserver.0",
-            info("a", 1, true, 2),
-            Some(("mevo.0", &key(4, "s4"))),
-            &mut shots,
-        );
-        assert_eq!(ev, GroupEvent::Applied);
-    }
-
-    fn in_mode(mode: ShotGrouping, groups: Vec<ShotGroupInfo>) -> ShotGroups {
-        let mut g = served(groups);
-        g.mode = mode;
-        g
-    }
-
-    fn club_group(id: &str, number: u32, club: Club, open: bool, shots: u32) -> ShotGroupInfo {
-        ShotGroupInfo {
-            club: Some(club),
-            ..info(id, number, open, shots)
-        }
-    }
-
-    fn current(g: &ShotGroups, club: Option<Club>) -> Option<&str> {
-        g.current_group(club).map(|g| g.id.as_str())
-    }
-
-    #[test]
     fn current_group_is_the_open_set_unless_the_club_differs() {
         let groups = vec![
             club_group("a", 1, Club::Iron7, false, 3),
@@ -664,77 +688,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_drops_every_set_and_counts_the_session_up() {
-        let mut g = ShotGroups::default();
-        g.replace(ShotGroupsResponse {
-            server: "webserver.0".into(),
-            mode: ShotGrouping::ByClub,
-            session: 2,
-            current: Some("b".into()),
-            groups: vec![info("a", 1, false, 4), info("b", 2, true, 1)],
-        });
-        let shots = [row(1, "a"), row(2, "b")];
-        g.observe_club(Some(Club::Iron7), &shots);
-        let rev = g.rev();
-        g.clear();
-        assert!(g.is_empty());
-        assert!(g.open_set().is_none());
-        assert_eq!(g.session(), 3);
-        assert!(g.rev() > rev, "the caches rebuild");
-        assert_eq!(g.selected_at(Some(Club::Iron7), &[]), None);
-        // The server and the view stay; its next set is applied.
-        assert_eq!(g.server.as_deref(), Some("webserver.0"));
-        assert_eq!(g.mode, ShotGrouping::ByClub);
-        let mut next = info("c", 1, true, 0);
-        next.session = 3;
-        assert_eq!(
-            g.apply("webserver.0", next, None, &mut []),
-            GroupEvent::Applied
-        );
-        assert_eq!(g.iter_sets().count(), 1);
-        // The club in play is observed again, before any row.
-        g.observe_club(Some(Club::Iron7), &[]);
-        assert_eq!(g.selected_at(Some(Club::Iron7), &[]).map(|a| a.0), Some(1));
-    }
-
-    #[test]
-    fn session_follows_the_server_and_new_session_commands() {
-        let mut later = info("b", 2, true, 1);
-        later.session = 3;
-        let mut g = ShotGroups::default();
-        g.replace(ShotGroupsResponse {
-            server: "webserver.0".into(),
-            mode: ShotGrouping::ByClub,
-            session: 2,
-            current: None,
-            groups: vec![info("a", 1, false, 4), later.clone()],
-        });
-        assert_eq!(g.session(), 3, "never below a listed set's");
-        let rev = g.rev();
-        g.new_session();
-        assert_eq!(g.session(), 4);
-        assert!(g.rev() > rev, "a new session rebuilds the caches");
-        // A set from a later session lifts it.
-        let mut newer = info("c", 3, true, 0);
-        newer.session = 6;
-        g.apply("webserver.0", newer, None, &mut []);
-        assert_eq!(g.session(), 6);
-        // A closed record from an earlier session leaves it.
-        later.open = false;
-        g.apply("webserver.0", later, None, &mut []);
-        assert_eq!(g.session(), 6);
-        // The reply replaces it.
-        g.replace(ShotGroupsResponse {
-            server: "webserver.0".into(),
-            mode: ShotGrouping::ByClub,
-            session: 1,
-            current: None,
-            groups: vec![],
-        });
-        assert_eq!(g.session(), 1);
-    }
-
-    #[test]
     fn selections_sit_after_the_newest_row_with_data() {
         let mut g = served(vec![]);
         let mut shots = vec![row(1, "s1"), row(2, "s2"), row(3, "s3")];
@@ -743,16 +696,22 @@ mod tests {
         // a pending row is newer.
         g.observe_club(Some(Club::Iron7), &[]);
         g.observe_club(Some(Club::Driver), &shots);
-        assert_eq!(g.selected_at(Some(Club::Iron7), &shots), Some((1, 1)));
-        assert_eq!(g.selected_at(Some(Club::Driver), &shots), Some((5, 2)));
-        assert_eq!(g.selected_at(Some(Club::PitchingWedge), &shots), None);
+        assert_eq!(g.selected_at(None, Some(Club::Iron7), &shots), Some((1, 1)));
+        assert_eq!(
+            g.selected_at(None, Some(Club::Driver), &shots),
+            Some((5, 2))
+        );
+        assert_eq!(g.selected_at(None, Some(Club::PitchingWedge), &shots), None);
         // A later selection replaces the club's earlier one.
         g.observe_club(Some(Club::Iron7), &shots);
-        assert_eq!(g.selected_at(Some(Club::Iron7), &shots), Some((5, 3)));
+        assert_eq!(g.selected_at(None, Some(Club::Iron7), &shots), Some((5, 3)));
         // Once its row leaves the history, a selection is older than every
         // row still held.
         let trimmed = vec![row(4, "s4")];
-        assert_eq!(g.selected_at(Some(Club::Driver), &trimmed), Some((1, 2)));
+        assert_eq!(
+            g.selected_at(None, Some(Club::Driver), &trimmed),
+            Some((1, 2))
+        );
     }
 
     #[test]
@@ -797,7 +756,9 @@ mod tests {
 
         // Only closed sets (after New session): New session is disabled.
         let closed = club_group("c", 1, Club::Iron7, false, 3);
-        let s = in_mode(ShotGrouping::ByClub, vec![closed]).strip(Some(Club::Iron7));
+        let mut after = in_mode(ShotGrouping::ByClub, vec![closed]);
+        after.new_session();
+        let s = after.strip(Some(Club::Iron7));
         assert!(s.new_group && !s.new_session);
 
         // No club selected, in either view.
@@ -805,5 +766,159 @@ mod tests {
             let s = in_mode(mode, vec![open7.clone()]).strip(None);
             assert_eq!(s.hint.as_deref(), Some("No club selected"));
         }
+    }
+
+    /// `/api/blocks` as the server sends it: `(id, session, club, open,
+    /// shots, first shot at)`, numbered in order.
+    type Block<'a> = (&'a str, u32, Club, bool, u32, Option<u64>);
+
+    fn reply(session: u32, sets: &[Block<'_>]) -> BlocksResponse {
+        BlocksResponse {
+            session,
+            blocks: sets
+                .iter()
+                .zip(1..)
+                .map(
+                    |(&(id, session, club, open, shots, first), number)| BlockInfo {
+                        block: flighthook::PracticeBlock {
+                            id: id.into(),
+                            golfer: None,
+                            club: Some(club),
+                            number,
+                            session,
+                            started_at: 1_000,
+                        },
+                        open,
+                        shots,
+                        first_shot_at: first,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    /// With the server's shape (an empty open block at start and after a
+    /// club change), the empty set is hidden: no next-shot
+    /// set, New session only once the session has shots, the hint as
+    /// before; New set from this UI shows the set it opened. A set's time
+    /// is its first shot's.
+    #[test]
+    fn an_empty_open_block_is_hidden_unless_new_set_asked_for_it() {
+        let mut g = ShotGroups {
+            mode: ShotGrouping::BySet,
+            ..ShotGroups::default()
+        };
+        // Start: the practice actor's first block, no shots.
+        g.replace(reply(1, &[("a", 1, Club::Iron7, true, 0, None)]));
+        assert_eq!(g.shown_open(), None);
+        assert_eq!(g.shown_current(Some(Club::Iron7)), None);
+        let s = g.strip(Some(Club::Iron7));
+        assert!(s.new_group && !s.new_session);
+        assert_eq!(s.hint.as_deref(), Some("Next shot starts a new set (7I)"));
+        // Two 7I shots, then DR: block a closed, b open and empty.
+        g.replace(reply(
+            1,
+            &[
+                ("a", 1, Club::Iron7, false, 2, Some(5_000)),
+                ("b", 1, Club::Driver, true, 0, None),
+            ],
+        ));
+        assert_eq!(g.get("a").map(|s| s.started_at), Some(5_000), "first shot");
+        assert_eq!(g.shown_current(Some(Club::Driver)), None);
+        let s = g.strip(Some(Club::Driver));
+        assert!(s.new_group && s.new_session);
+        assert_eq!(s.hint.as_deref(), Some("Next shot starts a new set (DR)"));
+        // New set from this UI: the block it leaves open is shown.
+        g.asked_new_set();
+        g.replace(reply(
+            1,
+            &[
+                ("a", 1, Club::Iron7, false, 2, Some(5_000)),
+                ("b", 1, Club::Driver, true, 0, None),
+            ],
+        ));
+        assert_eq!(
+            g.shown_current(Some(Club::Driver)).map(|s| s.id.as_str()),
+            Some("b")
+        );
+        let s = g.strip(Some(Club::Driver));
+        assert!(!s.new_group && s.new_session && s.hint.is_none());
+        // New session: nothing of the new session has shots.
+        g.replace(reply(
+            2,
+            &[
+                ("a", 1, Club::Iron7, false, 2, Some(5_000)),
+                ("b", 1, Club::Driver, false, 0, None),
+                ("c", 2, Club::Driver, true, 0, None),
+            ],
+        ));
+        let s = g.strip(Some(Club::Driver));
+        assert!(s.new_group && !s.new_session);
+        assert_eq!(g.shown_open(), None);
+    }
+
+    /// New set for two golfers: each golfer's asked-for empty set shows
+    /// while that golfer is up, and a golfer change between the click and
+    /// the reply marks the asker's set, not the new golfer's.
+    #[test]
+    fn each_golfer_keeps_the_empty_set_it_asked_for() {
+        let set = |id: &str, golfer: &str, number: u32, open: bool, shots: u32| BlockInfo {
+            block: flighthook::PracticeBlock {
+                id: id.into(),
+                golfer: Some(golfer.parse().expect("id")),
+                club: Some(Club::Iron7),
+                number,
+                session: 1,
+                started_at: 1_000,
+            },
+            open,
+            shots,
+            first_shot_at: None,
+        };
+        let reply = |blocks: Vec<BlockInfo>| BlocksResponse { session: 1, blocks };
+        let mut g = ShotGroups {
+            mode: ShotGrouping::BySet,
+            ..ShotGroups::default()
+        };
+        let keys = GolferKeys::default();
+        let shown = |g: &ShotGroups| g.shown_open().map(|s| s.id.clone());
+        // Eric presses New set.
+        g.set_golfers(keys.clone(), Some("flighthook.e"));
+        g.asked_new_set();
+        g.replace(reply(vec![
+            set("e1", "flighthook.e", 1, false, 2),
+            set("e2", "flighthook.e", 2, true, 0),
+        ]));
+        assert_eq!(shown(&g).as_deref(), Some("e2"));
+        // Sam comes up and presses New set.
+        g.set_golfers(keys.clone(), Some("flighthook.s"));
+        g.asked_new_set();
+        g.replace(reply(vec![
+            set("e1", "flighthook.e", 1, false, 2),
+            set("e2", "flighthook.e", 2, true, 0),
+            set("s1", "flighthook.s", 1, false, 1),
+            set("s2", "flighthook.s", 2, true, 0),
+        ]));
+        assert_eq!(shown(&g).as_deref(), Some("s2"));
+        // Eric back: his empty set still shows.
+        g.set_golfers(keys.clone(), Some("flighthook.e"));
+        assert_eq!(shown(&g).as_deref(), Some("e2"));
+
+        // Eric clicks; Sam is up before the reply comes.
+        let mut g = ShotGroups {
+            mode: ShotGrouping::BySet,
+            ..ShotGroups::default()
+        };
+        g.set_golfers(keys.clone(), Some("flighthook.e"));
+        g.asked_new_set();
+        g.set_golfers(keys.clone(), Some("flighthook.s"));
+        g.replace(reply(vec![
+            set("e1", "flighthook.e", 1, false, 2),
+            set("e2", "flighthook.e", 2, true, 0),
+            set("s1", "flighthook.s", 1, true, 0),
+        ]));
+        assert_eq!(shown(&g), None, "Sam's hidden empty set stays hidden");
+        g.set_golfers(keys, Some("flighthook.e"));
+        assert_eq!(shown(&g).as_deref(), Some("e2"));
     }
 }

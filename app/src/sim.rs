@@ -33,10 +33,9 @@
 //! launch direction and of every `*_offline` value.
 //!
 //! The values a device measured are its launch; its flight values (carry,
-//! apex and so on) come in its flight result. Device actors call
-//! [`launch_events`] to build every `Launch` bus event (and the
-//! `FlightResult` event after it when the device sent flight values), so the
-//! launch leaves the actor already carrying `derived`.
+//! apex and so on) come in its flight result. The flight model
+//! ([`crate::actors::flight_model`]) and Auto-chip fly a shot with
+//! [`model`], which turns the simulation into a `shot.flight` result.
 
 use std::sync::Mutex;
 
@@ -46,12 +45,15 @@ use dimple::ground::{BallState, GroundModel, GroundResult, Surface, Termination}
 use dimple::stats::ShotStats;
 use dimple::trajectory::{ShotInput, ShotResult, simulate_shot};
 use flighthook::{
-    DerivedFlight, Distance, FlightPath, FlightResult, FlighthookEvent, Launch, ShotDetectionMode,
-    ShotKey, SimMode, SimSurface, SimulationSection,
+    Basis, DerivedFlight, Distance, FlightPath, FlightResult, Launch, Mode, SimMode, SimSurface,
+    SimulationSection,
 };
 use glam::DVec3;
-use tracing::{debug, info, warn};
+#[cfg(test)]
+use tracing::info;
+use tracing::{debug, warn};
 
+#[cfg(test)]
 use crate::state::SystemState;
 
 /// A measured apex within this of 0 (m) makes a ground ball.
@@ -63,11 +65,6 @@ const GROUND_MAX_LAUNCH_DEG: f64 = 0.5;
 /// The last invalid environment warned about, so the warning is logged once
 /// per distinct invalid setting rather than on every shot.
 static WARNED_ENVIRONMENT: Mutex<Option<String>> = Mutex::new(None);
-
-/// Whether shots should be simulated at all: the mode is not `off`.
-pub(crate) fn should_simulate(cfg: &SimulationSection) -> bool {
-    cfg.mode != SimMode::Off
-}
 
 /// Whether a shot is a ground ball, rolled rather than flown: the device's
 /// apex is 0 (finite, within [`GROUND_MAX_APEX_M`]), or it reported no apex
@@ -103,9 +100,9 @@ pub(crate) fn surface(s: SimSurface) -> Surface {
 /// The surface a ground ball rolls on: in Putting mode a green (the
 /// configured one when it is a green, else [`Surface::GREEN`]); in any other
 /// mode, or with no mode, the configured surface.
-fn ground_surface(configured: SimSurface, mode: Option<ShotDetectionMode>) -> Surface {
+fn ground_surface(configured: SimSurface, mode: Option<Mode>) -> Surface {
     match (mode, configured) {
-        (Some(ShotDetectionMode::Putting), SimSurface::Fairway) => Surface::GREEN,
+        (Some(Mode::Putting), SimSurface::Fairway) => Surface::GREEN,
         _ => surface(configured),
     }
 }
@@ -201,7 +198,7 @@ fn derive_with_error(
     launch: &Launch,
     flight: Option<&FlightResult>,
     cfg: &SimulationSection,
-    mode: Option<ShotDetectionMode>,
+    mode: Option<Mode>,
     env_err: Option<&str>,
 ) -> Option<DerivedFlight> {
     if env_err.is_some() {
@@ -297,7 +294,10 @@ fn derive_with_error(
         };
         if let Some(total_offline) = total_offline {
             d.roll_offline = Some(Distance::Meters(total_offline - carry_offline));
-            d.total_offline = Some(Distance::Meters(total_offline));
+            // A measured rest offline is the one shown.
+            if measured.total_offline.is_none() {
+                d.total_offline = Some(Distance::Meters(total_offline));
+            }
         }
     }
     d.path = anchored.map(|p| p.decimated());
@@ -541,6 +541,8 @@ struct Measured {
     descent: Option<f64>,
     total: Option<f64>,
     roll: Option<f64>,
+    /// Rest point right (+) of the target line.
+    total_offline: Option<f64>,
 }
 
 impl Measured {
@@ -564,6 +566,10 @@ impl Measured {
             descent: f.descent_angle.filter(|v| v.is_finite()),
             total: f.total_distance.map(Distance::as_meters),
             roll: f.roll_distance.map(Distance::as_meters),
+            total_offline: f
+                .total_offline
+                .map(Distance::as_meters)
+                .filter(|v| v.is_finite()),
         }
     }
 
@@ -1186,80 +1192,65 @@ fn warn_invalid_environment(cfg: &SimulationSection, env_err: Option<&str>) {
     }
 }
 
-/// Build the bus events for a device's measured `launch` and its `flight`
-/// result, taken in the current detection mode (the live game mode); see
-/// [`launch_events_in_mode`].
-pub(crate) fn launch_events(
-    state: &SystemState,
-    key: ShotKey,
-    launch: Launch,
-    flight: Option<FlightResult>,
-) -> Vec<FlighthookEvent> {
-    let mode = state.game.snapshot().mode;
-    launch_events_in_mode(state, key, launch, flight, mode)
+/// The flight model's name on its `shot.flight`: flighthook's and dimple's
+/// versions.
+pub(crate) fn model_name() -> String {
+    format!(
+        "flighthook {} (dimple {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("DIMPLE_VERSION")
+    )
 }
 
-/// Build the bus events for a device's measured `launch` and its `flight`
-/// result, taken in detection mode `mode`: the `Launch` event, then the
-/// `FlightResult` event when the device sent one. Reads the live
-/// `[simulation]` settings, simulates the missing values into the launch's
-/// `derived` (every result value under `force`; a roll for a ground ball, on
-/// the green in Putting mode), and logs the `sim` line under the device's
-/// own ball line. For a device that captures the mode at its trigger, `mode`
-/// is that capture.
-pub(crate) fn launch_events_in_mode(
-    state: &SystemState,
-    key: ShotKey,
-    launch: Launch,
-    flight: Option<FlightResult>,
-    mode: Option<ShotDetectionMode>,
-) -> Vec<FlighthookEvent> {
-    let cfg = state.system.simulation();
-    if should_simulate(&cfg) {
-        simulated_launch_events(&cfg, key, launch, flight, mode)
-    } else {
-        events(key, launch, None, flight)
-    }
+/// What the flight model computed for one shot: its flight result (only
+/// the fields it computed; `None` when there is none to add) and the path.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Modeled {
+    pub flight: Option<FlightResult>,
+    pub path: Option<FlightPath>,
+    /// Every value as the simulation gave it, for the log line.
+    pub derived: DerivedFlight,
 }
 
-/// Like [`launch_events_in_mode`] under `cfg`, but simulated whatever
-/// `cfg.mode` (`off` included): for a shot that is wholly flighthook's own,
-/// such as an Auto-chip, whose results exist only as simulated values.
-pub(crate) fn simulated_launch_events(
+/// Fly `launch` (the shot's launch for a flight model: measured values plus
+/// the launch monitor's own assumed ones) under `cfg`, anchored on the
+/// launch monitor's own flight `device`: the fields [`derive_with_error`]
+/// chose (under `on` the ones `device` lacks and the ones the model wins
+/// over a measured value; every result field under `force`),
+/// with a ground ball rolled on the surface for `mode` (the mode at the
+/// shot's trigger). `None` when the shot can't be flown or the environment
+/// is invalid. `name` is the flight result's `model`.
+pub(crate) fn model(
     cfg: &SimulationSection,
-    key: ShotKey,
-    launch: Launch,
-    flight: Option<FlightResult>,
-    mode: Option<ShotDetectionMode>,
-) -> Vec<FlighthookEvent> {
+    launch: &Launch,
+    device: Option<&FlightResult>,
+    mode: Option<Mode>,
+    name: &str,
+) -> Option<Modeled> {
     let env_err = cfg.environment_error();
     warn_invalid_environment(cfg, env_err.as_deref());
-    let derived = derive_with_error(&launch, flight.as_ref(), cfg, mode, env_err.as_deref());
-    if let Some(ref d) = derived {
-        info!("  {}", log_line(d));
-    }
-    events(key, launch, derived, flight)
-}
-
-/// The `Launch` event, then the `FlightResult` event when there is one.
-fn events(
-    key: ShotKey,
-    launch: Launch,
-    derived: Option<DerivedFlight>,
-    flight: Option<FlightResult>,
-) -> Vec<FlighthookEvent> {
-    let mut events = vec![FlighthookEvent::Launch {
-        key: key.clone(),
-        launch: Box::new(launch),
-        derived: derived.map(Box::new),
-    }];
-    if let Some(flight) = flight {
-        events.push(FlighthookEvent::FlightResult {
-            key,
-            flight: Box::new(flight),
-        });
-    }
-    events
+    let derived = derive_with_error(launch, device, cfg, mode, env_err.as_deref())?;
+    let flight = FlightResult {
+        model: Some(name.to_owned()),
+        carry_distance: derived.carry_distance,
+        carry_offline: derived.carry_offline,
+        total_distance: derived.total_distance,
+        total_offline: derived.total_offline,
+        roll_distance: derived.roll_distance,
+        max_height: derived.max_height,
+        flight_time: derived.flight_time,
+        descent_angle: derived.descent_angle,
+        ..FlightResult::new(Basis::Modeled)
+    };
+    let empty = FlightResult {
+        model: Some(name.to_owned()),
+        ..FlightResult::new(Basis::Modeled)
+    };
+    Some(Modeled {
+        flight: (flight != empty).then_some(flight),
+        path: derived.path.clone(),
+        derived,
+    })
 }
 
 #[cfg(test)]
@@ -1267,6 +1258,93 @@ mod tests {
     use super::*;
     use crate::test_ball::Ball;
     use flighthook::{Club, Velocity};
+
+    // What a device's shot made, with the simulation in `derived`: the
+    // harness of the tests below.
+
+    /// A device's launch with the simulated values, or its own flight
+    /// result.
+    #[derive(Debug)]
+    enum Ev {
+        Launch {
+            launch: Box<Launch>,
+            derived: Option<Box<DerivedFlight>>,
+        },
+        FlightResult {
+            flight: Box<FlightResult>,
+        },
+    }
+
+    /// Whether shots should be simulated at all: the mode is not `off`.
+    fn should_simulate(cfg: &SimulationSection) -> bool {
+        cfg.mode != SimMode::Off
+    }
+
+    /// Build the bus events for a device's measured `launch` and its `flight`
+    /// result, taken in the current detection mode (the live game mode); see
+    /// [`launch_events_in_mode`].
+    fn launch_events(state: &SystemState, launch: Launch, flight: Option<FlightResult>) -> Vec<Ev> {
+        let mode = Some(state.session.mode());
+        launch_events_in_mode(state, launch, flight, mode)
+    }
+
+    /// Build the bus events for a device's measured `launch` and its `flight`
+    /// result, taken in detection mode `mode`: the `Launch` event, then the
+    /// `FlightResult` event when the device sent one. Reads the live
+    /// `[simulation]` settings, simulates the missing values into the launch's
+    /// `derived` (every result value under `force`; a roll for a ground ball, on
+    /// the green in Putting mode), and logs the `sim` line under the device's
+    /// own ball line. For a device that captures the mode at its trigger, `mode`
+    /// is that capture.
+    fn launch_events_in_mode(
+        state: &SystemState,
+        launch: Launch,
+        flight: Option<FlightResult>,
+        mode: Option<Mode>,
+    ) -> Vec<Ev> {
+        let cfg = state.system.simulation();
+        if should_simulate(&cfg) {
+            simulated_launch_events(&cfg, launch, flight, mode)
+        } else {
+            events(launch, None, flight)
+        }
+    }
+
+    /// Like [`launch_events_in_mode`] under `cfg`, but simulated whatever
+    /// `cfg.mode` (`off` included): for a shot that is wholly flighthook's own,
+    /// such as an Auto-chip, whose results exist only as simulated values.
+    fn simulated_launch_events(
+        cfg: &SimulationSection,
+        launch: Launch,
+        flight: Option<FlightResult>,
+        mode: Option<Mode>,
+    ) -> Vec<Ev> {
+        let env_err = cfg.environment_error();
+        warn_invalid_environment(cfg, env_err.as_deref());
+        let derived = derive_with_error(&launch, flight.as_ref(), cfg, mode, env_err.as_deref());
+        if let Some(ref d) = derived {
+            info!("  {}", log_line(d));
+        }
+        events(launch, derived, flight)
+    }
+
+    /// The `Launch` event, then the `FlightResult` event when there is one.
+    fn events(
+        launch: Launch,
+        derived: Option<DerivedFlight>,
+        flight: Option<FlightResult>,
+    ) -> Vec<Ev> {
+        let mut events = vec![Ev::Launch {
+            launch: Box::new(launch),
+            derived: derived.map(Box::new),
+        }];
+        if let Some(flight) = flight {
+            events.push(Ev::FlightResult {
+                flight: Box::new(flight),
+            });
+        }
+        events
+    }
 
     // The functions under test, taking a test shot block.
 
@@ -1287,17 +1365,12 @@ mod tests {
     }
 
     /// The `Launch` event of `b` (its first event).
-    fn ball_flight_event(state: &SystemState, key: ShotKey, b: Ball) -> FlighthookEvent {
-        launch_events(state, key, b.launch(), b.flight()).remove(0)
+    fn ball_flight_event(state: &SystemState, b: Ball) -> Ev {
+        launch_events(state, b.launch(), b.flight()).remove(0)
     }
 
-    fn ball_flight_event_in_mode(
-        state: &SystemState,
-        key: ShotKey,
-        b: Ball,
-        mode: Option<ShotDetectionMode>,
-    ) -> FlighthookEvent {
-        launch_events_in_mode(state, key, b.launch(), b.flight(), mode).remove(0)
+    fn ball_flight_event_in_mode(state: &SystemState, b: Ball, mode: Option<Mode>) -> Ev {
+        launch_events_in_mode(state, b.launch(), b.flight(), mode).remove(0)
     }
 
     fn ball(speed_mph: f64, vla: f64, hla: f64, back: i32, side: i32) -> Ball {
@@ -1342,8 +1415,30 @@ mod tests {
 
     struct TestState {
         state: SystemState,
-        writer: crate::state::GameStateWriter,
+        writer: crate::state::SessionWriter,
         dir: std::path::PathBuf,
+    }
+
+    /// Test shorthands on the session writer: a `golfer.select` of one field.
+    trait SelectExt {
+        fn set_mode(&self, mode: Mode);
+        fn set_club(&self, club: Club);
+    }
+
+    impl SelectExt for crate::state::SessionWriter {
+        fn set_mode(&self, mode: Mode) {
+            let _ = self.apply(&flightrelay::GolferSelect {
+                mode: Some(mode),
+                ..flightrelay::GolferSelect::new("test")
+            });
+        }
+
+        fn set_club(&self, club: Club) {
+            let _ = self.apply(&flightrelay::GolferSelect {
+                club: Some(Some(club)),
+                ..flightrelay::GolferSelect::new("test")
+            });
+        }
     }
 
     impl Drop for TestState {
@@ -1360,13 +1455,6 @@ mod tests {
         let (state, writer) = SystemState::new(dir.join("config.toml"));
         state.system.update(|c| c.simulation = sim);
         TestState { state, writer, dir }
-    }
-
-    fn key() -> ShotKey {
-        ShotKey {
-            shot_id: "abc".into(),
-            shot_number: 1,
-        }
     }
 
     // -- 1. Measured value wins ------------------------------------------------
@@ -1492,8 +1580,8 @@ mod tests {
             mode: SimMode::Off,
             ..cfg()
         });
-        let ev = ball_flight_event(&t.state, key(), fully_measured());
-        assert!(matches!(ev, FlighthookEvent::Launch { derived: None, .. }));
+        let ev = ball_flight_event(&t.state, fully_measured());
+        assert!(matches!(ev, Ev::Launch { derived: None, .. }));
         // No spin reading: no `derived`, so consumers show the device values.
         let mut no_spin = fully_measured();
         no_spin.backspin_rpm = Some(0);
@@ -1507,8 +1595,8 @@ mod tests {
     fn event_keeps_ball_and_flags_derived() {
         let t = state_with(cfg());
         let b = square_like();
-        let ev = ball_flight_event(&t.state, key(), b.clone());
-        let FlighthookEvent::Launch {
+        let ev = ball_flight_event(&t.state, b.clone());
+        let Ev::Launch {
             launch: out,
             derived,
             ..
@@ -1518,11 +1606,11 @@ mod tests {
         };
         assert_eq!(**out, b.launch());
         assert!(derived.is_some());
-        let json = serde_json::to_value(&ev).expect("serializes");
+        let json = serde_json::json!({ "launch": out, "derived": derived });
         assert!(json["derived"]["carry_distance"].is_string(), "{json}");
         assert!(json["launch"].get("carry_distance").is_none(), "{json}");
         // A launch-only device sends no flight result.
-        let events = launch_events(&t.state, key(), b.launch(), b.flight());
+        let events = launch_events(&t.state, b.launch(), b.flight());
         assert_eq!(events.len(), 1);
     }
 
@@ -1533,12 +1621,8 @@ mod tests {
         for sim in [cfg(), forced()] {
             let t = state_with(sim);
             let b = fully_measured();
-            let events = launch_events(&t.state, key(), b.launch(), b.flight());
-            let [
-                FlighthookEvent::Launch { launch, .. },
-                FlighthookEvent::FlightResult { flight, .. },
-            ] = &events[..]
-            else {
+            let events = launch_events(&t.state, b.launch(), b.flight());
+            let [Ev::Launch { launch, .. }, Ev::FlightResult { flight, .. }] = &events[..] else {
                 panic!("not a launch and a flight result: {events:?}");
             };
             assert_eq!(**launch, b.launch());
@@ -1550,8 +1634,8 @@ mod tests {
     fn replacing_event_keeps_the_measured_ball() {
         let t = state_with(forced());
         let b = fully_measured();
-        let ev = ball_flight_event(&t.state, key(), b.clone());
-        let FlighthookEvent::Launch {
+        let ev = ball_flight_event(&t.state, b.clone());
+        let Ev::Launch {
             launch: out,
             derived,
             ..
@@ -1561,7 +1645,7 @@ mod tests {
         };
         assert_eq!(**out, b.launch());
         assert!(derived.as_ref().is_some_and(|d| d.replaces_measured));
-        let json = serde_json::to_value(&ev).expect("serializes");
+        let json = serde_json::json!({ "launch": out, "derived": derived });
         assert_eq!(json["derived"]["replaces_measured"], true, "{json}");
         assert_eq!(
             json["launch"],
@@ -1573,17 +1657,17 @@ mod tests {
     #[test]
     fn disabling_simulation_removes_derived_without_restart() {
         let t = state_with(cfg());
-        let on = ball_flight_event(&t.state, key(), square_like());
+        let on = ball_flight_event(&t.state, square_like());
         assert!(matches!(
             on,
-            FlighthookEvent::Launch {
+            Ev::Launch {
                 derived: Some(_),
                 ..
             }
         ));
         t.state.system.update(|c| c.simulation.mode = SimMode::Off);
-        let off = ball_flight_event(&t.state, key(), square_like());
-        assert!(matches!(off, FlighthookEvent::Launch { derived: None, .. }));
+        let off = ball_flight_event(&t.state, square_like());
+        assert!(matches!(off, Ev::Launch { derived: None, .. }));
     }
 
     // -- 3. Sign mapping, pinned by observable direction -----------------------
@@ -1771,12 +1855,11 @@ mod tests {
         let t = state_with(cfg());
         let mut b = straight_shot();
         b.max_height = Some(Distance::Meters(10.0));
-        t.writer.set_mode(ShotDetectionMode::Full);
-        let full = event_derived(&ball_flight_event(&t.state, key(), b.clone()));
-        t.writer.set_mode(ShotDetectionMode::Putting);
-        t.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Putter });
-        let putting = event_derived(&ball_flight_event(&t.state, key(), b.clone()));
+        t.writer.set_mode(Mode::Full);
+        let full = event_derived(&ball_flight_event(&t.state, b.clone()));
+        t.writer.set_mode(Mode::Putting);
+        t.writer.set_club(Club::Putter);
+        let putting = event_derived(&ball_flight_event(&t.state, b.clone()));
         assert_eq!(putting, full);
         assert!(m(putting.carry_distance) > 50.0);
         assert!(putting.descent_angle.is_some());
@@ -1785,8 +1868,8 @@ mod tests {
     }
 
     /// The `derived` block of a `Ball` event.
-    fn event_derived(ev: &FlighthookEvent) -> DerivedFlight {
-        let FlighthookEvent::Launch { derived, .. } = ev else {
+    fn event_derived(ev: &Ev) -> DerivedFlight {
+        let Ev::Launch { derived, .. } = ev else {
             panic!("not a ball flight: {ev:?}");
         };
         *derived.clone().expect("derived")
@@ -2505,11 +2588,10 @@ mod tests {
         let mut b = mevo_like();
         b.max_height = Some(Distance::Meters(0.0));
         let t = state_with(cfg());
-        t.writer.set_mode(ShotDetectionMode::Full);
-        t.writer
-            .set_club_info(flighthook::ClubInfo { club: Club::Iron7 });
-        let ev = ball_flight_event(&t.state, key(), b.clone());
-        let FlighthookEvent::Launch { launch: out, .. } = &ev else {
+        t.writer.set_mode(Mode::Full);
+        t.writer.set_club(Club::Iron7);
+        let ev = ball_flight_event(&t.state, b.clone());
+        let Ev::Launch { launch: out, .. } = &ev else {
             panic!("not a launch");
         };
         assert_eq!(**out, b.launch());
@@ -2537,16 +2619,12 @@ mod tests {
 
     #[test]
     fn a_measured_zero_apex_rolls_and_keeps_its_zeros() {
-        for mode in [
-            ShotDetectionMode::Full,
-            ShotDetectionMode::Chipping,
-            ShotDetectionMode::Putting,
-        ] {
+        for mode in [Mode::Full, Mode::Chipping, Mode::Putting] {
             let t = state_with(cfg());
             t.writer.set_mode(mode);
             let b = bladed(3.0, 1.5);
-            let ev = ball_flight_event(&t.state, key(), b.clone());
-            let FlighthookEvent::Launch { launch: out, .. } = &ev else {
+            let ev = ball_flight_event(&t.state, b.clone());
+            let Ev::Launch { launch: out, .. } = &ev else {
                 panic!("not a launch");
             };
             assert_eq!(**out, b.launch());
@@ -2709,17 +2787,13 @@ mod tests {
     /// The rolled total of a straight 3 m/s ground ball under `sim`, built
     /// as a device that captured `mode` at its trigger while the live game
     /// mode is `live` (m).
-    fn roll_in_mode(
-        sim: SimulationSection,
-        live: Option<ShotDetectionMode>,
-        mode: Option<ShotDetectionMode>,
-    ) -> f64 {
+    fn roll_in_mode(sim: SimulationSection, live: Option<Mode>, mode: Option<Mode>) -> f64 {
         let t = state_with(sim);
         if let Some(live) = live {
             t.writer.set_mode(live);
         }
         let b = bladed(3.0, 0.0);
-        let ev = ball_flight_event_in_mode(&t.state, key(), b.clone(), mode);
+        let ev = ball_flight_event_in_mode(&t.state, b.clone(), mode);
         let d = event_derived(&ev);
         assert_rolls_from_the_tee(&b, &d);
         m(d.total_distance)
@@ -2727,28 +2801,24 @@ mod tests {
 
     /// The rolled total of a straight 3 m/s ground ball under `sim` with
     /// the live game mode `live` (m).
-    fn roll_live(sim: SimulationSection, live: Option<ShotDetectionMode>) -> f64 {
+    fn roll_live(sim: SimulationSection, live: Option<Mode>) -> f64 {
         let t = state_with(sim);
         if let Some(live) = live {
             t.writer.set_mode(live);
         }
         let b = bladed(3.0, 0.0);
-        let d = event_derived(&ball_flight_event(&t.state, key(), b.clone()));
+        let d = event_derived(&ball_flight_event(&t.state, b.clone()));
         assert_rolls_from_the_tee(&b, &d);
         m(d.total_distance)
     }
 
     #[test]
     fn putting_mode_rolls_a_ground_ball_on_the_green() {
-        let putting = roll_live(cfg(), Some(ShotDetectionMode::Putting));
+        let putting = roll_live(cfg(), Some(Mode::Putting));
         assert!((putting - 5.03).abs() < 0.01, "{putting}");
         assert_eq!(putting, roll_on(3.0, SimSurface::Green));
         // Any other mode, or none yet, rolls on the configured fairway.
-        for live in [
-            Some(ShotDetectionMode::Full),
-            Some(ShotDetectionMode::Chipping),
-            None,
-        ] {
+        for live in [Some(Mode::Full), Some(Mode::Chipping), None] {
             let fairway = roll_live(cfg(), live);
             assert!((fairway - 2.61).abs() < 0.01, "{live:?} {fairway}");
             assert_eq!(fairway, roll_on(3.0, SimSurface::Fairway), "{live:?}");
@@ -2760,18 +2830,10 @@ mod tests {
         let green = roll_on(3.0, SimSurface::Green);
         let fairway = roll_on(3.0, SimSurface::Fairway);
         // Triggered in Putting, switched to Full before the result arrived.
-        let putt = roll_in_mode(
-            cfg(),
-            Some(ShotDetectionMode::Full),
-            Some(ShotDetectionMode::Putting),
-        );
+        let putt = roll_in_mode(cfg(), Some(Mode::Full), Some(Mode::Putting));
         assert_eq!(putt, green);
         // Triggered in Full, switched to Putting before the result arrived.
-        let full = roll_in_mode(
-            cfg(),
-            Some(ShotDetectionMode::Putting),
-            Some(ShotDetectionMode::Full),
-        );
+        let full = roll_in_mode(cfg(), Some(Mode::Putting), Some(Mode::Full));
         assert_eq!(full, fairway);
     }
 
@@ -2779,9 +2841,9 @@ mod tests {
     fn a_configured_green_is_kept_in_putting_mode() {
         for surface in [SimSurface::Green, SimSurface::FirmGreen] {
             let sim = SimulationSection { surface, ..cfg() };
-            let putting = roll_live(sim.clone(), Some(ShotDetectionMode::Putting));
+            let putting = roll_live(sim.clone(), Some(Mode::Putting));
             assert_eq!(putting, roll_on(3.0, surface), "{surface:?}");
-            assert_eq!(putting, roll_live(sim, Some(ShotDetectionMode::Full)));
+            assert_eq!(putting, roll_live(sim, Some(Mode::Full)));
         }
         let firm = roll_on(3.0, SimSurface::FirmGreen);
         assert!((firm - 5.37).abs() < 0.01, "{firm}");
@@ -3095,8 +3157,8 @@ mod tests {
     }
 
     /// The fit keeps the measured launch direction and lands on the
-    /// measured offline (the shape probed in review: a 4° start with a hook
-    /// back to 6 m left).
+    /// measured offline (including a 4° start with a hook back to 6 m
+    /// left).
     #[test]
     fn offline_fit_keeps_the_launch_direction() {
         for (azimuth, offline) in [(4.0, -6.0), (0.8, -3.0), (0.8, 12.0), (-2.5, 5.0)] {
@@ -3246,5 +3308,27 @@ mod tests {
         b.carry_offline = Some(Distance::Meters(0.0));
         let d = derive(&b, &cfg()).expect("rolled");
         assert_eq!(d.carry_offline, None);
+    }
+
+    /// A flight that already holds every value the model computes (an
+    /// Auto-chip's own) gets nothing from the model under `on`, and every
+    /// value under `force`.
+    #[test]
+    fn the_model_repeats_no_value_of_the_launch_monitors_flight() {
+        let b = ball(10.4, 28.0, 0.0, 1041, 0);
+        let own = model(&cfg(), &b.launch(), None, None, "own")
+            .and_then(|m| m.flight)
+            .expect("flown");
+        let on = model(&cfg(), &b.launch(), Some(&own), None, "model").expect("flown");
+        assert_eq!(on.flight, None);
+        let force = SimulationSection {
+            mode: SimMode::Force,
+            ..cfg()
+        };
+        let forced = model(&force, &b.launch(), Some(&own), None, "model")
+            .and_then(|m| m.flight)
+            .expect("forced");
+        assert_eq!(forced.total_distance, own.total_distance);
+        assert_eq!(forced.total_offline, own.total_offline);
     }
 }

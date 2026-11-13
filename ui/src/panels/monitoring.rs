@@ -132,7 +132,8 @@ pub(crate) fn no_telemetry(
 
 impl FlighthookApp {
     /// One banner per actor reporting an `error` (or whose reconnect
-    /// request failed), then one for a failed Auto-chip.
+    /// request failed), then one for a failed Auto-chip, then one for a
+    /// failed tournament mode switch.
     pub(crate) fn render_error_banner(&self, ui: &mut egui::Ui) {
         if let Some(error) = &self.config_error {
             config_error_frame(ui, error);
@@ -154,6 +155,9 @@ impl FlighthookApp {
         }
         if let Some(err) = &self.auto_chip_error {
             error_banner(ui, &format!("{}: {err}", flighthook::AUTO_CHIP_NAME));
+        }
+        if let Some(err) = &self.tournament_error {
+            error_banner(ui, &format!("Tournament mode: {err}"));
         }
     }
 }
@@ -200,6 +204,48 @@ mod tests {
 
     use super::*;
     use crate::types::ActorStatus;
+
+    /// The texts the error banner paints for `app`.
+    fn banner_texts(app: &FlighthookApp) -> Vec<String> {
+        fn collect(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, texts)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.render_error_banner(ui));
+        });
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    /// A failed tournament mode switch shows in the error banner, as a
+    /// failed Auto-chip does; the next switch clears it and a good reply
+    /// leaves it clear.
+    #[test]
+    fn a_failed_tournament_switch_shows_in_the_error_banner() {
+        let mut app = FlighthookApp::with_pending(crate::net::new_pending());
+        let ctx = egui::Context::default();
+        app.set_tournament(&ctx, true);
+        app.pending.lock().expect("pending").tournament =
+            Some(Err("504 timed out waiting for the config change".into()));
+        app.apply_pending();
+        assert_eq!(
+            banner_texts(&app),
+            ["Tournament mode: 504 timed out waiting for the config change"]
+        );
+        app.set_tournament(&ctx, true);
+        assert!(banner_texts(&app).is_empty(), "the next switch clears it");
+        app.pending.lock().expect("pending").tournament = Some(Ok(()));
+        app.apply_pending();
+        assert!(banner_texts(&app).is_empty());
+    }
 
     /// The repaint asked for after a few passes drawing `add`, on a
     /// 400×300 screen.

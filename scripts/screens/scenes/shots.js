@@ -1,7 +1,7 @@
 'use strict';
-// screens/shots.png: the Shots tab, Cards view, Data pane, after a 7-iron
-// session of 12 shots from one Open Connect launch monitor (a Uneekor),
-// with GSPro connected and a camera recording (no video on the shot cards).
+// screens/shots.png: the Shots tab, Cards view, after a 7-iron
+// session of 12 shots from one Open Connect launch monitor, with GSPro
+// connected and a camera recording (no video on the shot cards).
 
 const { until } = require('../lib/util');
 const { Monitor, Simulator } = require('../lib/openconnect');
@@ -65,7 +65,7 @@ name = "Web Server"
 bind = "127.0.0.1:${ports.web}"
 
 [openconnect_server.0]
-name = "Uneekor"
+name = "Open Connect Server"
 bind = "127.0.0.1:${ports.monitor}"
 impact_lead_s = 0.0
 
@@ -89,10 +89,10 @@ address = "127.0.0.1:${ports.gspro}"
   async drive(ctx) {
     const { fh, gspro } = ctx;
     await gspro.connected();
-    await until('the club from GSPro', async () => (await fh.get('/api/status')).club === '7I');
+    await until('the club from GSPro', async () => ((await fh.get('/api/status')).turn || {}).club === '7I');
     await until('the camera', async () => {
       const status = await fh.get('/api/status');
-      return status.actors['camera.0'] && status.actors['camera.0'].status === 'connected';
+      return status.cards['camera.0'] && status.cards['camera.0'].status === 'connected';
     });
     const monitor = new Monitor(ctx.ports.monitor);
     ctx.cleanup.push(() => monitor.close());
@@ -110,11 +110,13 @@ address = "127.0.0.1:${ports.gspro}"
   },
 
   snap: () => ({
+    // The app opens on Shots, whose camera cards keep playing.
+    openSettle: false,
     viewport: { width: 1600, height: 900 },
     images: [{
       name: 'shots',
       steps: [
-        { click: [125, 27] }, // Shots tab
+        { click: [32, 26] }, // Shots
         { move: [800, 890] },
       ],
     }],

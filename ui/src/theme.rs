@@ -242,29 +242,6 @@ pub(crate) fn pill_sized(
     pill_with(ui, selected, text, VEIL, min_size, PILL_FONT)
 }
 
-/// A pill that shows a value it does not let you change: outlined, muted
-/// label, no hover state or pointer cursor.
-pub(crate) fn pill_static(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text.to_string(), FontId::proportional(14.0), TEXT_MUTED);
-    let size = galley.size() + egui::vec2(28.0, 12.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let radius = CornerRadius::same((rect.height() / 2.0) as u8);
-        let painter = ui.painter();
-        painter.rect(
-            rect,
-            radius,
-            Color32::TRANSPARENT,
-            Stroke::new(1.0, BORDER),
-            egui::StrokeKind::Inside,
-        );
-        painter.galley(rect.center() - galley.size() / 2.0, galley, TEXT_MUTED);
-    }
-    response
-}
-
 /// Label size of a pill.
 pub(crate) const PILL_FONT: f32 = 14.0;
 
@@ -757,65 +734,6 @@ pub(crate) fn chip_button(
     }
 }
 
-/// A [`chip_button`] with a down chevron after the label, for a button that
-/// opens a menu. At least `min_size` big; disabled, it is dimmed and takes no
-/// clicks.
-pub(crate) fn menu_chip(
-    ui: &mut egui::Ui,
-    text: &str,
-    enabled: bool,
-    min_size: egui::Vec2,
-) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        FontId::proportional(12.0),
-        Color32::PLACEHOLDER,
-    );
-    let chevron = 8.0;
-    let size = (galley.size() + egui::vec2(chevron + 30.0, 8.0)).max(min_size);
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(size, sense);
-    if ui.is_rect_visible(rect) {
-        let (fill, color) = match (enabled, response.hovered()) {
-            (false, _) => (Color32::TRANSPARENT, TEXT_DIM),
-            (true, false) => (VEIL, ACCENT),
-            (true, true) => (VEIL_HOVER, ACCENT_BRIGHT),
-        };
-        let radius = CornerRadius::same((rect.height() / 2.0) as u8);
-        let painter = ui.painter();
-        painter.rect(
-            rect,
-            radius,
-            fill,
-            Stroke::new(1.0, color),
-            egui::StrokeKind::Inside,
-        );
-        let label_width = galley.size().x;
-        let left = rect.center().x - (label_width + 6.0 + chevron) / 2.0;
-        let pos = egui::pos2(left, rect.center().y - galley.size().y / 2.0);
-        painter.galley(pos, galley, color);
-        let x = left + label_width + 6.0 + chevron / 2.0;
-        let y = rect.center().y;
-        painter.line(
-            vec![
-                egui::pos2(x - chevron / 2.0, y - chevron / 4.0),
-                egui::pos2(x, y + chevron / 4.0),
-                egui::pos2(x + chevron / 2.0, y - chevron / 4.0),
-            ],
-            Stroke::new(1.5, color),
-        );
-    }
-    if enabled {
-        response.on_hover_cursor(egui::CursorIcon::PointingHand)
-    } else {
-        response
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Icons
 // ---------------------------------------------------------------------------
@@ -852,6 +770,14 @@ pub(crate) enum Icon {
     Download,
     /// `export`.
     Export,
+    /// `info`.
+    Info,
+    /// `search`.
+    Search,
+    /// `device-camera`.
+    Camera,
+    /// `debug-disconnect`.
+    Disconnect,
 }
 
 impl Icon {
@@ -868,6 +794,10 @@ impl Icon {
             Icon::Refresh => '\u{eb37}',
             Icon::Download => '\u{ec74}',
             Icon::Export => '\u{ebac}',
+            Icon::Info => '\u{ea74}',
+            Icon::Search => '\u{ea6d}',
+            Icon::Camera => '\u{eada}',
+            Icon::Disconnect => '\u{ead0}',
         }
     }
 }
@@ -1026,7 +956,8 @@ mod tests {
     fn replay_icons_are_codicons_glyphs() {
         // Codepoints from Codicons' mapping.json: play 60204, debug-pause
         // 60113, chevron-left 60085, chevron-right 60086,
-        // device-camera-video 60121, refresh 60215, download 60532, export 60332.
+        // device-camera-video 60121, refresh 60215, download 60532, export
+        // 60332, search 60013, device-camera 60122, debug-disconnect 60112.
         let icons = [
             (Icon::Play, '\u{eb2c}'),
             (Icon::Pause, '\u{ead1}'),
@@ -1036,6 +967,9 @@ mod tests {
             (Icon::Refresh, '\u{eb37}'),
             (Icon::Download, '\u{ec74}'),
             (Icon::Export, '\u{ebac}'),
+            (Icon::Search, '\u{ea6d}'),
+            (Icon::Camera, '\u{eada}'),
+            (Icon::Disconnect, '\u{ead0}'),
         ];
         let ctx = egui::Context::default();
         install(&ctx);

@@ -1,4 +1,4 @@
-//! Auto-chip (beta): a menu chip in the header, right of the club picker,
+//! Auto-Chip (beta): a menu chip in the header, right of the club picker,
 //! that sends a short straight chip to the sim (`POST /api/auto-chip`). It
 //! shows while the `[simulation] auto_chip` setting enables it and is
 //! disabled, with the reason as its hover text, while a tournament round is
@@ -8,70 +8,56 @@
 
 use std::collections::HashMap;
 
-use super::devices;
 use crate::app::FlighthookApp;
-use crate::theme;
 use crate::types::{ActorStatusResponse, RoundState};
 
 /// Hover text on the Auto-chip button.
-const AUTO_CHIP_HINT: &str =
+pub(crate) const AUTO_CHIP_HINT: &str =
     "Send a short straight chip to the sim, for chips your launch monitor can't read.";
 
 /// The Auto-chip menu's items, in order: label and total distance (yards).
-fn auto_chip_items() -> [(String, u32); 3] {
+pub(crate) fn auto_chip_items() -> [(String, u32); 3] {
     flighthook::AUTO_CHIP_YARDS.map(|yards| (format!("{yards} Yard"), yards))
 }
 
-/// Why the Auto-chip button is disabled, or `None` when it is enabled: a
-/// tournament round is active (the server fires no Auto-chip during one),
-/// a chip is on its way, or no output that forwards shots (an Open Connect
-/// client or Pureplay) is connected.
-fn auto_chip_blocked(
+/// Why the Auto-Chip button is disabled, or `None` when it is enabled: a
+/// tournament round is active (the server fires no Auto-Chip during one;
+/// the reason names the simulator holding it, or tournament mode), a chip
+/// is on its way, or no output that forwards shots (an Open Connect client
+/// or Pureplay) is connected.
+pub(crate) fn auto_chip_blocked(
     round: &RoundState,
     actors: &HashMap<String, ActorStatusResponse>,
     in_flight: Option<u32>,
-) -> Option<&'static str> {
-    if round.active {
-        Some("Auto-chip is off during a Pureplay strict-mode round.")
+) -> Option<String> {
+    if round.held {
+        Some(format!(
+            "{} tournament round",
+            round.holder.as_deref().unwrap_or("Simulator")
+        ))
+    } else if round.active {
+        Some("Tournament mode is on".to_owned())
     } else if in_flight.is_some() {
-        Some("Sending the chip\u{2026}")
-    } else if !crate::app::set_by_simulator(actors) {
-        Some("Auto-chip: no simulator connected. Connect an Open Connect Client first.")
+        Some("Sending the chip\u{2026}".to_owned())
+    } else if !crate::app::simulator_connected(actors) {
+        Some("Auto-Chip: no simulator connected. Connect an Open Connect Client first.".to_owned())
     } else {
         None
     }
 }
 
 impl FlighthookApp {
-    /// The header's Auto-chip chip, a gap right of the club pill, while the
-    /// settings enable it ([`SimulationSection::auto_chip`]). Returns the
-    /// distance picked this frame.
-    pub(crate) fn header_auto_chip(&self, ui: &mut egui::Ui) -> Option<u32> {
-        if !self.settings.auto_chip_enabled() {
-            return None;
+    /// Switch tournament mode to `on`: one request; the server's round
+    /// redraws the header, and a failed reply shows in the error banner.
+    pub(crate) fn set_tournament(&mut self, ctx: &egui::Context, on: bool) {
+        self.tournament_error = None;
+        #[cfg(not(test))]
+        crate::net::post_tournament(ctx, &self.pending, on);
+        #[cfg(test)]
+        {
+            let _ = ctx;
+            self.tournament_sent.push(on);
         }
-        ui.add_space(10.0);
-        self.render_auto_chip(ui)
-    }
-
-    /// The Auto-chip button and its menu ([`auto_chip_items`]). Returns the
-    /// distance picked this frame.
-    fn render_auto_chip(&self, ui: &mut egui::Ui) -> Option<u32> {
-        let blocked = auto_chip_blocked(&self.round, &self.actors, self.auto_chip_in_flight);
-        let button = theme::menu_chip(ui, "Auto-chip", blocked.is_none(), egui::vec2(0.0, 26.0));
-        devices::mark(ui, || "auto-chip".to_owned(), &button);
-        let button = button.on_hover_text(blocked.unwrap_or(AUTO_CHIP_HINT));
-        let mut picked = None;
-        egui::Popup::menu(&button).show(|ui| {
-            for (label, yards) in auto_chip_items() {
-                let item = ui.button(label.as_str());
-                devices::mark(ui, || format!("auto-chip:{label}"), &item);
-                if item.clicked() {
-                    picked = Some(yards);
-                }
-            }
-        });
-        picked
     }
 
     /// Send an Auto-chip of `yards`: the button waits for the reply, and a
@@ -91,6 +77,7 @@ impl FlighthookApp {
 mod tests {
     use super::*;
     use crate::panels::devices::Marks;
+    use crate::theme;
 
     /// An app whose settings have loaded with Auto-chip as configured by
     /// `auto_chip`.
@@ -123,7 +110,7 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| app.render_header(ctx));
+            let _ = ctx.run(input, |ctx| app.render_header_in_test(ctx));
             ctx.data(|d| d.get_temp::<Marks>(egui::Id::NULL))
                 .unwrap_or_default()
         };
@@ -161,7 +148,7 @@ mod tests {
             "openconnect_client.0".into(),
             ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Connected),
         );
-        // The club pill turns read-only and the chip moves with it.
+        // A frame for the header to take the new status.
         frame(&mut app, Vec::new());
         let button = frame(&mut app, Vec::new())["auto-chip"].0;
         let marks = click(&mut app, button.center());
@@ -220,7 +207,44 @@ mod tests {
         RoundState {
             active: true,
             holder: Some("Pureplay".into()),
+            held: true,
+            manual: false,
         }
+    }
+
+    /// The round the server reports while only tournament mode is on.
+    fn manual() -> RoundState {
+        RoundState {
+            active: true,
+            holder: Some("Manual".into()),
+            held: false,
+            manual: true,
+        }
+    }
+
+    /// Both on states turn the chip off with their own reason: tournament
+    /// mode says so, a held round names the simulator holding it (also
+    /// with tournament mode on underneath).
+    #[test]
+    fn auto_chip_is_off_in_both_tournament_states_with_its_reason() {
+        let mut actors = HashMap::new();
+        actors.insert(
+            "openconnect_client.0".into(),
+            ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Connected),
+        );
+        assert_eq!(
+            auto_chip_blocked(&manual(), &actors, None).as_deref(),
+            Some("Tournament mode is on")
+        );
+        let held = RoundState {
+            holder: Some("Pureplay Connect".into()),
+            manual: true,
+            ..active()
+        };
+        assert_eq!(
+            auto_chip_blocked(&held, &actors, None).as_deref(),
+            Some("Pureplay Connect tournament round")
+        );
     }
 
     /// An active round turns the chip off, whatever else is connected,
@@ -228,7 +252,7 @@ mod tests {
     /// part.
     #[test]
     fn a_strict_round_turns_auto_chip_off_until_it_ends() {
-        let strict = "Auto-chip is off during a Pureplay strict-mode round.";
+        let strict = Some("Pureplay tournament round".to_owned());
         let mut actors = HashMap::new();
         actors.insert(
             "openconnect_client.0".into(),
@@ -242,8 +266,8 @@ mod tests {
             None,
             "no round reported"
         );
-        assert_eq!(auto_chip_blocked(&active(), &actors, None), Some(strict));
-        assert_eq!(auto_chip_blocked(&active(), &actors, Some(3)), Some(strict));
+        assert_eq!(auto_chip_blocked(&active(), &actors, None), strict);
+        assert_eq!(auto_chip_blocked(&active(), &actors, Some(3)), strict);
     }
 
     /// In the header the chip stays where it is, disabled: a click opens no
@@ -281,7 +305,7 @@ mod tests {
                     events,
                     ..Default::default()
                 };
-                let _ = ctx.run(input, |ctx| app.render_header(ctx));
+                let _ = ctx.run(input, |ctx| app.render_header_in_test(ctx));
             }
             header_marks(&ctx, app, 1600.0)
         };
@@ -308,66 +332,8 @@ mod tests {
             )),
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| app.render_header(ctx));
+        let _ = ctx.run(input, |ctx| app.render_header_in_test(ctx));
         ctx.data(|d| d.get_temp::<Marks>(egui::Id::NULL))
             .unwrap_or_default()
-    }
-
-    /// The chip sits in the header right of the Club picker, on its center
-    /// line, and is gone from the Shots toolbar; with the setting off, or
-    /// before the settings have loaded, there is no chip at all.
-    #[test]
-    fn the_chip_is_in_the_header_right_of_club_and_only_while_enabled() {
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-
-        let mut app = enabled_app();
-        header_marks(&ctx, &mut app, 1600.0);
-        let marks = header_marks(&ctx, &mut app, 1600.0);
-        let (chip, club) = (marks["auto-chip"].0, marks["club"].0);
-        assert!(club.right() < chip.left(), "right of the club picker");
-        assert!(chip.left() - club.right() < 40.0, "next to it");
-        assert!((chip.center().y - club.center().y).abs() <= 2.5, "one line");
-        assert!(chip.right() < 1600.0 - 160.0, "clear of the title");
-
-        // Read-only club (a simulator connected): the chip is still there.
-        app.actors.insert(
-            "openconnect_client.0".into(),
-            ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Connected),
-        );
-        header_marks(&ctx, &mut app, 1600.0);
-        let marks = header_marks(&ctx, &mut app, 1600.0);
-        assert!(marks["club"].0.right() < marks["auto-chip"].0.left());
-
-        // Disabled in the settings, which is the default: no chip.
-        let mut loaded = FlighthookApp::with_pending(crate::net::new_pending());
-        loaded
-            .settings
-            .load_from(&crate::types::FlighthookConfig::default());
-        header_marks(&ctx, &mut loaded, 1600.0);
-        assert!(!header_marks(&ctx, &mut loaded, 1600.0).contains_key("auto-chip"));
-        // Explicitly off is the same.
-        let mut off = app_with_setting(false);
-        header_marks(&ctx, &mut off, 1600.0);
-        assert!(!header_marks(&ctx, &mut off, 1600.0).contains_key("auto-chip"));
-        // Settings not loaded yet: none either.
-        let mut fresh = FlighthookApp::with_pending(crate::net::new_pending());
-        header_marks(&ctx, &mut fresh, 1600.0);
-        assert!(!header_marks(&ctx, &mut fresh, 1600.0).contains_key("auto-chip"));
-    }
-
-    /// The header still holds the chip at the smallest window the UI fits
-    /// (1024 wide): the tabs, mode, hand, club, chip and title all fit on
-    /// the one row without overlapping.
-    #[test]
-    fn the_header_fits_the_chip_at_1024_wide() {
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let mut app = enabled_app();
-        header_marks(&ctx, &mut app, 1024.0);
-        let marks = header_marks(&ctx, &mut app, 1024.0);
-        let (chip, title) = (marks["auto-chip"].0, marks["title"].0);
-        assert!(chip.right() <= title.left() - 8.0, "{chip:?} vs {title:?}");
-        assert!(chip.right() <= 1024.0);
     }
 }

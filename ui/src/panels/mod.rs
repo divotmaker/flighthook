@@ -10,44 +10,33 @@ pub(crate) mod impact;
 pub(crate) mod last_shot;
 pub(crate) mod log;
 pub(crate) mod monitoring;
+pub(crate) mod remote;
 pub(crate) mod replay;
 pub(crate) mod settings;
+pub(crate) mod settings_nav;
 pub(crate) mod shots;
 pub(crate) mod signs;
 
 use std::collections::HashMap;
 
-use crate::app::FlighthookApp;
-use crate::theme;
 use crate::types::ActorStatusResponse;
 
+/// What the nav shows: Settings (the device, output and global cards), the Shots and
+/// Cameras tabs (`Shots`, with [`ShotsPane`](cameras::ShotsPane) picking which) or the Log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tab {
+    /// Settings: the cards of the devices, outputs and global settings.
     Devices,
     Shots,
     Log,
 }
 
-/// The tab bar, in order. The app opens on the first.
-pub(crate) const TABS: [(Tab, &str); 3] = [
-    (Tab::Devices, "Devices"),
-    (Tab::Shots, "Shots"),
-    (Tab::Log, "Log"),
-];
-
-/// The tab that carries the red notification dot, as an index into
-/// [`TABS`]: Devices, while any card is red at `now_ms`, i.e. an actor lost
-/// its connection less than
-/// [`RECONNECT_ALERT_MS`](crate::types::RECONNECT_ALERT_MS) ago. Every actor counts
-/// alike, outputs and servers included; nothing else lights it.
-pub(crate) fn tab_alert(
-    actors: &HashMap<String, ActorStatusResponse>,
-    now_ms: u64,
-) -> Option<usize> {
-    if !actors.values().any(|a| a.red(now_ms)) {
-        return None;
-    }
-    TABS.iter().position(|(tab, _)| *tab == Tab::Devices)
+/// Whether the Settings nav icon carries the red notification dot: while
+/// any card is red at `now_ms`, i.e. an actor lost its connection less than
+/// [`RECONNECT_ALERT_MS`](crate::types::RECONNECT_ALERT_MS) ago. Every
+/// actor counts alike, outputs and servers included; nothing else lights it.
+pub(crate) fn settings_alert(actors: &HashMap<String, ActorStatusResponse>, now_ms: u64) -> bool {
+    actors.values().any(|a| a.red(now_ms))
 }
 
 /// Milliseconds until the first red card turns yellow, if any card is red.
@@ -60,33 +49,6 @@ pub(crate) fn next_alert_change(
         .map(|a| a.red_for_ms_at(now_ms))
         .filter(|ms| *ms > 0)
         .min()
-}
-
-impl FlighthookApp {
-    /// The tab bar. Disabled while the Devices tab has unsaved edits.
-    pub(crate) fn render_tabs(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        let selected = TABS
-            .iter()
-            .position(|(tab, _)| *tab == self.active_tab)
-            .unwrap_or(0);
-        let labels = TABS.map(|(_, label)| label);
-        let alert = tab_alert(&self.actors, self.now_ms);
-        // A red card turns yellow on time, with no event to wake the UI.
-        if let Some(ms) = next_alert_change(&self.actors, self.now_ms) {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(ms));
-        }
-        let tabs = ui
-            .add_enabled_ui(!self.settings.locked(), |ui| {
-                theme::segmented(ui, &labels, selected, alert)
-            })
-            .inner;
-        devices::mark(ui, || "tabs".into(), &tabs.response);
-        if let Some(i) = tabs.inner {
-            self.active_tab = TABS[i].0;
-        }
-        tabs.response
-    }
 }
 
 /// Extract the time portion from an ISO 8601 timestamp string.

@@ -3,10 +3,9 @@
 //! Only values on the bus's measured blocks (`ball`, `club`, `impact`) are
 //! sent, each with its ValidMask bit; nothing is computed here, and
 //! flighthook's simulated values (`derived`) are never sent. During a
-//! tournament round the shot comes certified by the round policy
-//! ([`map_certified`]), with the values that are not the device's reading
-//! already removed. A field the device did not report, or whose value is
-//! not finite, is sent as 0.0 with its bit clear.
+//! tournament round the shot holds only what the launch monitor sent. A
+//! field the device did not report, or whose value is not finite, is sent
+//! as 0.0 with its bit clear.
 //!
 //! Signs need no change: flighthook's lateral values are absolute (positive
 //! = right of the target line for both hands), as Pureplay's HLA, SpinAxis,
@@ -17,8 +16,8 @@
 //! curves right) through [`side_spin`], the one place that sets it.
 
 use super::codec::{BallData, ClubData};
-use crate::state::round::CertifiedShot;
-use flighthook::{Club, ShotData};
+use crate::actors::simout::OutputShot;
+use flighthook::Club;
 
 /// The two telemetry messages for one shot.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,21 +49,12 @@ fn field(mask: &mut u16, bit: u16, value: Option<f64>) -> f32 {
     }
 }
 
-/// Map a shot certified for a tournament round: only the device's readings
-/// are left in it, so a value that is not one (an estimated spin, any value
-/// marked computed) goes out as 0.0 with its bit clear. As [`map_shot`]
-/// otherwise.
-#[must_use]
-pub fn map_certified(shot: &CertifiedShot, shot_id: u32) -> Option<ShotFrames> {
-    map_shot(shot.shot(), shot_id)
-}
-
 /// Map a finished shot to BallData (and ClubData when the device measured
 /// any club field), both numbered `shot_id`. Returns `None` for a shot
 /// without a ball field to send: Pureplay drops club data that has no ball
 /// data.
 #[must_use]
-pub fn map_shot(shot: &ShotData, shot_id: u32) -> Option<ShotFrames> {
+pub fn map_shot(shot: &OutputShot, shot_id: u32) -> Option<ShotFrames> {
     let b = shot.launch.as_ref()?;
     let mut valid = 0;
     let mut ball = BallData {
@@ -216,31 +206,12 @@ pub fn club_from_pureplay(n: u8) -> Option<Club> {
 pub(super) mod tests {
     use super::*;
     use flighthook::{
-        Basis, ClubData as FhClubData, DerivedFlight, Distance, FaceImpact, FlightResult, Launch,
-        Provenance, ShotField, Velocity,
+        Basis, ClubData as FhClubData, Distance, FaceImpact, FlightResult, Launch, Velocity,
     };
 
-    /// Map `shot` as a tournament round sends it: certified by a held
-    /// round, from a measured source.
-    fn map_strict(shot: &ShotData, shot_id: u32) -> Option<ShotFrames> {
-        let measured = ShotData {
-            provenance: Some(Provenance::Measured),
-            ..shot.clone()
-        };
-        let round = crate::state::round::RoundPolicy::default();
-        let guard = round
-            .begin_round(&crate::state::round::RoundRequest {
-                holder: "Pureplay",
-                feeds: &[],
-            })
-            .expect("accepted");
-        let certified = guard.certify(&measured).expect("measured");
-        map_certified(&certified, shot_id)
-    }
-
     /// A full shot: ball with both spin pairs, club, face impact.
-    pub(crate) fn full_shot() -> ShotData {
-        ShotData {
+    pub(crate) fn full_shot() -> OutputShot {
+        OutputShot {
             actor: "square.0".into(),
             shot_number: 3,
             launch: Some(Launch {
@@ -270,13 +241,13 @@ pub(super) mod tests {
                 lateral: Some(Distance::Millimeters(5.0)),
                 vertical: Some(Distance::Millimeters(-2.0)),
             }),
-            ..ShotData::default()
+            ..OutputShot::default()
         }
     }
 
     /// A launch-only ball: speed and angles, back and side spin only.
-    pub(crate) fn ball_only_shot() -> ShotData {
-        ShotData {
+    pub(crate) fn ball_only_shot() -> OutputShot {
+        OutputShot {
             actor: "mevo.0".into(),
             shot_number: 4,
             launch: Some(Launch {
@@ -287,7 +258,7 @@ pub(super) mod tests {
                 sidespin_rpm: Some(400),
                 ..Launch::default()
             }),
-            ..ShotData::default()
+            ..OutputShot::default()
         }
     }
 
@@ -371,8 +342,7 @@ pub(super) mod tests {
         );
     }
 
-    /// The simulated block is never read: a shot whose ball has only speed
-    /// sends only speed, however much flighthook simulated.
+    /// A shot whose launch has only speed sends only speed.
     #[test]
     fn simulated_values_are_never_sent() {
         let mut shot = ball_only_shot();
@@ -381,9 +351,6 @@ pub(super) mod tests {
         ball.sidespin_rpm = None;
         ball.launch_elevation = None;
         ball.launch_azimuth = None;
-        let mut derived = DerivedFlight::default();
-        derived.carry_distance = Some(Distance::Meters(120.0));
-        shot.derived = Some(derived);
         let f = map_shot(&shot, 1).expect("frames");
         assert_eq!(f.ball.valid, BallData::BALL_SPEED);
     }
@@ -431,139 +398,13 @@ pub(super) mod tests {
         assert_eq!(map_shot(&shot, 1), None);
     }
 
-    fn estimated_spin_shot() -> ShotData {
-        let mut shot = ball_only_shot();
-        let ball = shot.launch.as_mut().expect("launch");
-        ball.backspin_rpm = Some(2400);
-        ball.sidespin_rpm = Some(0);
-        let mut derived = DerivedFlight::default();
-        derived.spin_estimated = true;
-        shot.derived = Some(derived);
-        shot
-    }
-
-    /// flighthook's spin estimate goes out like a measurement normally, and
-    /// with every spin bit clear in strict mode; the launch values stay.
-    #[test]
-    fn strict_mode_clears_an_estimated_spin() {
-        let shot = estimated_spin_shot();
-        let normal = map_shot(&shot, 1).expect("frames");
-        assert_eq!(normal.ball.valid & BallData::BACK_SPIN, BallData::BACK_SPIN);
-        assert_eq!(normal.ball.back_spin_rpm, 2400.0);
-
-        let strict = map_strict(&shot, 1).expect("frames");
-        assert_eq!(
-            strict.ball.valid,
-            BallData::BALL_SPEED | BallData::VLA | BallData::HLA
-        );
-        assert_eq!(strict.ball.back_spin_rpm, 0.0);
-        assert_eq!(strict.ball.side_spin_rpm, 0.0);
-    }
-
-    /// A measured spin is untouched by strict mode.
-    #[test]
-    fn strict_mode_keeps_a_measured_spin() {
-        let shot = full_shot();
-        assert_eq!(map_strict(&shot, 1), map_shot(&shot, 1));
-    }
-
-    /// A shot with `fields` marked computed (a model's values).
-    fn with_computed(mut shot: ShotData, fields: &[ShotField]) -> ShotData {
-        let mut derived = shot.derived.take().map(Box::new);
-        DerivedFlight::mark_computed(&mut derived, fields);
-        shot.derived = derived.map(|d| *d);
-        shot
-    }
-
-    /// Strict mode sends only the spin values that are not computed: with
-    /// back and side marked computed, total and axis go out, and the
-    /// computed pair goes out as 0.0 with its bits clear. Without strict
-    /// mode all four go out.
-    #[test]
-    fn strict_mode_withholds_a_computed_spin_pair() {
-        let shot = with_computed(
-            full_shot(),
-            &[ShotField::BackspinRpm, ShotField::SidespinRpm],
-        );
-        let normal = map_shot(&shot, 1).expect("frames");
-        assert_eq!(normal, map_shot(&full_shot(), 1).expect("frames"));
-
-        let strict = map_strict(&shot, 1).expect("frames");
-        assert_eq!(
-            strict.ball.valid,
-            BallData::BALL_SPEED
-                | BallData::VLA
-                | BallData::HLA
-                | BallData::TOTAL_SPIN
-                | BallData::SPIN_AXIS
-        );
-        assert_eq!(strict.ball.back_spin_rpm, 0.0);
-        assert_eq!(strict.ball.side_spin_rpm, 0.0);
-        assert_eq!(strict.ball.total_spin_rpm, 2468.0);
-        assert_eq!(strict.ball.spin_axis_deg, -6.98);
-        assert_eq!(strict.club, normal.club, "club data is untouched");
-
-        // The other way round (total and axis marked computed).
-        let shot = with_computed(full_shot(), &[ShotField::TotalSpinRpm, ShotField::SpinAxis]);
-        let strict = map_strict(&shot, 1).expect("frames");
-        assert_eq!(
-            strict.ball.valid & BallData::SPIN,
-            BallData::BACK_SPIN | BallData::SIDE_SPIN
-        );
-        assert_eq!(
-            (strict.ball.total_spin_rpm, strict.ball.spin_axis_deg),
-            (0.0, 0.0)
-        );
-    }
-
-    /// A launch angle or an impact height marked computed is withheld in
-    /// strict mode; the measured values beside them go out.
-    #[test]
-    fn strict_mode_withholds_computed_launch_and_impact_values() {
-        let putt = with_computed(ball_only_shot(), &[ShotField::LaunchElevation]);
-        assert_eq!(
-            map_shot(&putt, 1).expect("frames").ball.valid & BallData::VLA,
-            BallData::VLA
-        );
-        let strict = map_strict(&putt, 1).expect("frames");
-        assert_eq!(strict.ball.valid & BallData::VLA, 0);
-        assert_eq!(strict.ball.vla, 0.0);
-        assert_eq!(
-            strict.ball.valid & BallData::BALL_SPEED,
-            BallData::BALL_SPEED
-        );
-
-        let omni = with_computed(full_shot(), &[ShotField::ImpactVertical]);
-        let club = map_strict(&omni, 1).expect("frames").club.expect("club");
-        assert_eq!(club.valid & ClubData::IMPACT_POINT_Y, 0);
-        assert_eq!(club.impact_point_y_mm, 0.0);
-        assert_eq!(
-            club.valid & ClubData::IMPACT_POINT_X,
-            ClubData::IMPACT_POINT_X
-        );
-        assert_eq!(club.impact_point_x_mm, 5.0);
-
-        // Club data left with nothing to send is not sent.
-        let mut only_height = with_computed(ball_only_shot(), &[ShotField::ImpactVertical]);
-        only_height.impact = Some(FaceImpact {
-            lateral: None,
-            vertical: Some(Distance::Millimeters(4.0)),
-        });
-        assert!(map_shot(&only_height, 1).expect("frames").club.is_some());
-        assert!(map_strict(&only_height, 1).expect("frames").club.is_none());
-    }
-
     /// Lateral values are absolute and face impact golfer-relative, so a
-    /// left-hander's shot goes out with exactly the signs it has on the bus:
-    /// a push right is + for either hand, a toe strike is + for either hand.
+    /// shot goes out with exactly the signs it has on the bus whatever the
+    /// player's hand (the mapper takes no hand): a push right is +, a toe
+    /// strike is +.
     #[test]
-    fn a_left_handed_shot_keeps_its_signs() {
-        let rh = full_shot();
-        let mut lh = full_shot();
-        lh.handed = Some(flighthook::Handedness::Left);
-        let rh_frames = map_shot(&rh, 1).expect("rh");
-        let lh_frames = map_shot(&lh, 1).expect("lh");
-        assert_eq!(rh_frames, lh_frames);
+    fn a_shot_keeps_its_signs() {
+        let lh_frames = map_shot(&full_shot(), 1).expect("frames");
         assert_eq!(lh_frames.ball.hla, -1.5);
         assert_eq!(lh_frames.ball.spin_axis_deg, -6.98);
         let club = lh_frames.club.expect("club");

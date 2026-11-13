@@ -9,9 +9,8 @@ use std::time::Duration;
 
 use crate::replay::Window;
 use crate::types::{
-    self, AutoChipRequest, CameraListResponse, Club, FindMatRequest, FlighthookConfig,
-    FlighthookMessage, GameStateSnapshot, HandRequest, Handedness, LivePose, PostSettingsResponse,
-    ShotData, ShotGrouping, ShotGroupsResponse, StatusResponse,
+    self, AutoChipRequest, CameraListResponse, Club, FindMatRequest, FlighthookConfig, LivePose,
+    PostSettingsResponse, ShotData, ShotGrouping, StatusResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -25,7 +24,7 @@ pub struct Pending {
     pub shots: Option<Vec<ShotData>>,
     /// The shot history generation `shots` was requested under.
     pub shots_generation: u64,
-    pub groups: Option<ShotGroupsResponse>,
+    pub groups: Option<flighthook::BlocksResponse>,
     /// The shot history generation `groups` was requested under.
     pub groups_generation: u64,
     pub settings: Option<FlighthookConfig>,
@@ -37,6 +36,8 @@ pub struct Pending {
     pub groups_posted: bool,
     /// The reply to a `POST /api/auto-chip`: sent, or why not.
     pub auto_chip: Option<Result<(), String>>,
+    /// The reply to a `POST /api/tournament`: applied, or why not.
+    pub tournament: Option<Result<(), String>>,
     /// The reply to `GET /api/cameras`: the camera list, or why not.
     pub cameras: Option<Result<CameraListResponse, String>>,
     /// Still frames by camera actor: the JPEG, or why there is none.
@@ -206,9 +207,9 @@ fn ws_url() -> String {
     let host = location.host().unwrap_or_default();
     let ws_proto = if protocol == "https:" { "wss:" } else { "ws:" };
     if host.is_empty() {
-        "ws://127.0.0.1:5880/frp".to_string()
+        format!("ws://127.0.0.1:5880{}", flighthook::UI_WS_PATH)
     } else {
-        format!("{ws_proto}//{host}/frp")
+        format!("{ws_proto}//{host}{}", flighthook::UI_WS_PATH)
     }
 }
 
@@ -236,7 +237,7 @@ fn ws_url() -> String {
     let ws_base = base
         .replace("http://", "ws://")
         .replace("https://", "wss://");
-    format!("{ws_base}/frp")
+    format!("{ws_base}{}", flighthook::UI_WS_PATH)
 }
 
 /// Download URL for the session export (`format`: `"jsonl"` or `"csv"`).
@@ -297,15 +298,15 @@ pub fn fetch_shots(ctx: &egui::Context, pending: &PendingHandle, generation: u64
     });
 }
 
-/// Fetch the shot sets, tagged with the history `generation` they are
-/// requested under.
+/// Fetch the shot sets (`GET /api/blocks`), tagged with the history
+/// `generation` they are requested under.
 pub fn fetch_groups(ctx: &egui::Context, pending: &PendingHandle, generation: u64) {
     let ctx = ctx.clone();
     let pending = Arc::clone(pending);
-    let url = format!("{}/api/shots/groups", api_base());
+    let url = format!("{}/api/blocks", api_base());
     ehttp::fetch(ehttp::Request::get(&url), move |result| {
         if let Ok(resp) = result
-            && let Ok(groups) = serde_json::from_slice::<ShotGroupsResponse>(&resp.bytes)
+            && let Ok(groups) = serde_json::from_slice::<flighthook::BlocksResponse>(&resp.bytes)
             && let Ok(mut p) = pending.lock()
         {
             p.groups = Some(groups);
@@ -401,8 +402,9 @@ fn error_reason(resp: &ehttp::Response) -> String {
     }
 }
 
-/// A `POST /api/auto-chip` reply as sent (`Ok`) or not (`Err` with a short
-/// reason: a network error or a non-2xx status).
+/// A `POST /api/auto-chip` or `POST /api/tournament` reply as applied
+/// (`Ok`) or not (`Err` with a short reason: a network error or a non-2xx
+/// status).
 pub(crate) fn auto_chip_reply(result: Result<ehttp::Response, String>) -> Result<(), String> {
     let resp = result?;
     if resp.ok {
@@ -477,6 +479,33 @@ pub fn post_reconnect(ctx: &egui::Context, pending: &PendingHandle, id: &str) {
     let pending = Arc::clone(pending);
     let id = id.to_owned();
     ehttp::fetch(reconnect_request(&id), move |result| {
+        let reply = reconnect_reply(result);
+        if let Ok(mut p) = pending.lock() {
+            p.reconnects.push((id, reply));
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// The `POST /api/actors/{id}/forget-pairing` request for Pureplay Accessory card
+/// `id`.
+pub(crate) fn forget_pairing_request(id: &str) -> ehttp::Request {
+    let url = format!("{}/api/actors/{id}/forget-pairing", api_base());
+    ehttp::Request {
+        headers: ehttp::Headers::new(&[("Accept", "*/*")]),
+        timeout: Some(CONFIG_REQUEST_TIMEOUT),
+        ..ehttp::Request::post(&url, Vec::new())
+    }
+}
+
+/// Forget Pureplay Accessory card `id`'s pairing and reconnect it (`POST
+/// /api/actors/{id}/forget-pairing`); the reply lands in `reconnects`, as a
+/// reconnect's does.
+pub fn post_forget_pairing(ctx: &egui::Context, pending: &PendingHandle, id: &str) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    let id = id.to_owned();
+    ehttp::fetch(forget_pairing_request(&id), move |result| {
         let reply = reconnect_reply(result);
         if let Ok(mut p) = pending.lock() {
             p.reconnects.push((id, reply));
@@ -883,26 +912,19 @@ pub(crate) fn fetch_frames(
     });
 }
 
+/// Select the mode (`POST /api/select`).
 pub fn post_mode(ctx: &egui::Context, mode: &str) {
-    post_json(ctx, "/api/mode", format!(r#"{{"mode":"{mode}"}}"#));
+    post_json(ctx, "/api/select", select_body("mode", mode));
 }
 
-/// Select the club in play (`POST /api/club`).
+/// Select the club in play (`POST /api/select`).
 pub fn post_club(ctx: &egui::Context, club: Club) {
-    post_json(ctx, "/api/club", format!(r#"{{"club":"{club}"}}"#));
+    post_json(ctx, "/api/select", select_body("club", &club.to_string()));
 }
 
-/// Set the player's hand (`POST /api/hand`).
-pub fn post_hand(ctx: &egui::Context, handed: Handedness) {
-    post_json(ctx, "/api/hand", hand_body(handed));
-}
-
-/// The `POST /api/hand` body for `handed`.
-pub(crate) fn hand_body(handed: Handedness) -> String {
-    serde_json::to_string(&HandRequest {
-        handed: handed.to_string(),
-    })
-    .unwrap_or_default()
+/// The `POST /api/select` body selecting `value` for `field`.
+pub(crate) fn select_body(field: &str, value: &str) -> String {
+    serde_json::json!({ field: value }).to_string()
 }
 
 /// Have ExPutt `actor` locate its mat again (`POST /api/find-mat`).
@@ -914,24 +936,26 @@ pub fn post_find_mat(ctx: &egui::Context, actor: &str) {
     post_json(ctx, "/api/find-mat", body);
 }
 
-/// Start a new shot group (`POST /api/shots/groups`); sets
-/// `groups_posted` once answered.
-pub fn post_new_group(ctx: &egui::Context, pending: &PendingHandle) {
-    post_groups_change(ctx, pending, "/api/shots/groups");
-}
-
-/// Close every open shot group (`POST /api/shots/session`); sets
-/// `groups_posted` once answered.
-pub fn post_new_session(ctx: &egui::Context, pending: &PendingHandle) {
-    post_groups_change(ctx, pending, "/api/shots/session");
-}
-
-/// Bodiless POST to `path` that sets `groups_posted` on a success reply.
-fn post_groups_change(ctx: &egui::Context, pending: &PendingHandle, path: &str) {
+/// Start a new set, or with `new_session` a new session (`POST
+/// /api/blocks`); sets `groups_posted` once answered.
+pub fn post_new_block(
+    ctx: &egui::Context,
+    pending: &PendingHandle,
+    golfer: Option<flighthook::GolferId>,
+    new_session: bool,
+) {
     let ctx = ctx.clone();
     let pending = pending.clone();
-    let url = format!("{}{path}", api_base());
-    ehttp::fetch(ehttp::Request::post(&url, Vec::new()), move |result| {
+    let url = format!("{}/api/blocks", api_base());
+    let body = serde_json::to_vec(&flighthook::NewBlockRequest {
+        golfer,
+        new_session,
+    })
+    .unwrap_or_default();
+    let mut req = ehttp::Request::post(&url, body);
+    req.headers
+        .insert("Content-Type".to_string(), "application/json".to_string());
+    ehttp::fetch(req, move |result| {
         if result.is_ok_and(|r| r.ok)
             && let Ok(mut p) = pending.lock()
         {
@@ -953,6 +977,33 @@ pub fn post_grouping(ctx: &egui::Context, mode: ShotGrouping) {
     post_json(ctx, "/api/shots/grouping", body);
 }
 
+/// The `POST /api/tournament` request switching tournament mode to `on`.
+/// The server answers once the config command is applied, so it gets the
+/// config requests' timeout.
+pub(crate) fn tournament_request(on: bool) -> ehttp::Request {
+    let url = format!("{}/api/tournament", api_base());
+    let body = serde_json::json!({ "on": on }).to_string().into_bytes();
+    ehttp::Request {
+        headers: ehttp::Headers::new(&[("Accept", "*/*"), ("Content-Type", "application/json")]),
+        timeout: Some(CONFIG_REQUEST_TIMEOUT),
+        ..ehttp::Request::post(&url, body)
+    }
+}
+
+/// Switch tournament mode on or off (`POST /api/tournament`); the reply
+/// lands in `tournament` (a failure shows in the error banner, like
+/// Auto-chip's). The server's `round_state` event redraws the header.
+pub fn post_tournament(ctx: &egui::Context, pending: &PendingHandle, on: bool) {
+    let ctx = ctx.clone();
+    let pending = Arc::clone(pending);
+    ehttp::fetch(tournament_request(on), move |result| {
+        if let Ok(mut p) = pending.lock() {
+            p.tournament = Some(auto_chip_reply(result));
+        }
+        ctx.request_repaint();
+    });
+}
+
 /// Fire-and-forget POST of a JSON body (`body` may be empty) to `path`.
 fn post_json(ctx: &egui::Context, path: &str, body: String) {
     let ctx = ctx.clone();
@@ -972,11 +1023,7 @@ fn post_json(ctx: &egui::Context, path: &str, body: String) {
 pub fn connect_ws() -> Option<(ewebsock::WsSender, ewebsock::WsReceiver)> {
     let url = ws_url();
     match ewebsock::connect(&url, ewebsock::Options::default()) {
-        Ok((tx, rx)) => {
-            // Don't send the start handshake yet — in WASM the WebSocket is
-            // still CONNECTING. Send it after we receive WsEvent::Opened.
-            Some((tx, rx))
-        }
+        Ok(pair) => Some(pair),
         Err(e) => {
             log::error!("WebSocket connect failed: {e}");
             None
@@ -984,34 +1031,50 @@ pub fn connect_ws() -> Option<(ewebsock::WsSender, ewebsock::WsReceiver)> {
     }
 }
 
-/// The `start` the dashboard sends: it proposes the FRP version flighthook
-/// speaks ([`flighthook::FRP_VERSION`]).
-fn ws_start() -> String {
-    serde_json::json!({
-        "kind": "start",
-        "version": [flighthook::FRP_VERSION],
-        "name": "Flighthook Dashboard",
-    })
-    .to_string()
+/// Send `command` on the UI socket.
+pub fn send_command(tx: &mut ewebsock::WsSender, command: &flighthook::UiCommand) {
+    if let Ok(text) = serde_json::to_string(command) {
+        tx.send(ewebsock::WsMessage::Text(text));
+    }
 }
 
-/// Send the init handshake after the WebSocket is confirmed open.
-pub fn send_ws_start(tx: &mut ewebsock::WsSender) {
-    tx.send(ewebsock::WsMessage::Text(ws_start()));
+/// A `ref` for a command this UI sends.
+fn next_ref() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .to_string()
+}
+
+/// A `golfer.select` with `change` applied, as the UI socket takes it (the
+/// server stamps `from`).
+#[must_use]
+pub fn select_command(change: impl FnOnce(&mut flighthook::GolferSelect)) -> flighthook::UiCommand {
+    let mut select = flighthook::GolferSelect::new(next_ref());
+    change(&mut select);
+    flighthook::UiCommand::Frp(Box::new(flighthook::BusMessage::new("ui", select)))
+}
+
+/// A `practice.new_block` for `golfer` (`None` = the golfer up; a new
+/// session with `new_session`).
+#[must_use]
+pub fn new_block_command(
+    golfer: Option<flighthook::GolferId>,
+    new_session: bool,
+) -> flighthook::UiCommand {
+    let block = flighthook::PracticeNewBlock {
+        r#ref: next_ref(),
+        golfer: golfer.map(Some),
+        new_session,
+    };
+    flighthook::UiCommand::Frp(Box::new(flighthook::BusMessage::new("ui", block)))
 }
 
 /// Result from polling the WebSocket.
 pub enum WsPollEvent {
     /// Browser WebSocket opened (WASM: onopen fired).
     Opened,
-    /// Init handshake completed — server assigned a actor_id and sent the
-    /// global state.
-    Init {
-        actor_id: String,
-        global_state: Option<GameStateSnapshot>,
-    },
-    /// A bus event from the server.
-    Message(FlighthookMessage),
+    /// A message of the UI socket.
+    Message(Box<flighthook::UiMessage>),
     /// WebSocket error.
     Error(String),
     /// WebSocket connection lost.
@@ -1029,11 +1092,9 @@ pub fn poll_ws(rx: &mut ewebsock::WsReceiver) -> (Vec<WsPollEvent>, u64) {
                 events.push(WsPollEvent::Opened);
             }
             ewebsock::WsEvent::Message(ewebsock::WsMessage::Text(text)) => {
-                // Try init response first (has "kind" field)
-                if let Some(init) = parse_init_response(&text) {
-                    events.push(init);
-                } else if let Some(msg) = types::parse_ws_message(&text) {
-                    events.push(WsPollEvent::Message(msg));
+                match serde_json::from_str::<flighthook::UiMessage>(&text) {
+                    Ok(msg) => events.push(WsPollEvent::Message(Box::new(msg))),
+                    Err(e) => log::warn!("UI socket: unreadable message: {e}"),
                 }
             }
             ewebsock::WsEvent::Error(e) => {
@@ -1051,103 +1112,54 @@ pub fn poll_ws(rx: &mut ewebsock::WsReceiver) -> (Vec<WsPollEvent>, u64) {
     (events, raw_count)
 }
 
-/// Parse a WS init response:
-/// `{ "kind": "init", "version": "0.2.0", "actor_id": "...", "global_state": {...} }`
-fn parse_init_response(text: &str) -> Option<WsPollEvent> {
-    #[derive(serde::Deserialize)]
-    struct InitMsg {
-        kind: String,
-        actor_id: Option<String>,
-        global_state: Option<GameStateSnapshot>,
-    }
-    let msg: InitMsg = serde_json::from_str(text).ok()?;
-    if msg.kind == "init" {
-        Some(WsPollEvent::Init {
-            actor_id: msg.actor_id.unwrap_or_default(),
-            global_state: msg.global_state,
-        })
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Handedness;
 
-    /// The dashboard proposes the FRP version its server speaks.
+    /// The UI socket's commands: a select and a new block go as FRP
+    /// messages with a fresh `ref`; the server stamps `from`.
     #[test]
-    fn start_proposes_frp_0_2_0() {
-        let start: serde_json::Value = serde_json::from_str(&ws_start()).expect("json");
-        assert_eq!(start["kind"], "start");
-        assert_eq!(start["version"], serde_json::json!(["0.2.0"]));
-        assert_eq!(start["name"], "Flighthook Dashboard");
-        assert_eq!(flighthook::FRP_VERSION, "0.2.0");
+    fn commands_go_as_frp_messages_with_a_fresh_ref() {
+        let a = serde_json::to_value(select_command(|s| s.club = Some(Some(Club::Iron7))))
+            .expect("json");
+        assert_eq!(a["frp"]["kind"], "golfer.select");
+        assert_eq!(a["frp"]["club"], "7I");
+        let b = serde_json::to_value(new_block_command(None, true)).expect("json");
+        assert_eq!(b["frp"]["kind"], "practice.new_block");
+        assert_eq!(b["frp"]["new_session"], true);
+        assert_ne!(a["frp"]["ref"], b["frp"]["ref"]);
     }
 
-    #[test]
-    fn init_carries_the_global_club() {
-        let text = r#"{"kind":"init","version":"0.2.0","actor_id":"ws.1",
-            "global_state":{"player_info":null,"club_info":{"club":"7I"},"mode":"full","handed":null}}"#;
-        let Some(WsPollEvent::Init {
-            actor_id,
-            global_state,
-        }) = parse_init_response(text)
-        else {
-            panic!("not an init");
-        };
-        assert_eq!(actor_id, "ws.1");
-        assert_eq!(global_state.unwrap().club_info.unwrap().club, Club::Iron7);
-        // A bus message is not an init.
-        assert!(
-            parse_init_response(r#"{"actor":"x","event":{"kind":"new_shot_group"}}"#).is_none()
-        );
-    }
-
-    /// The hand reaches the UI the way the server sends it: in the init's
-    /// game state, as `hand_info` on the bus and in the status reply; and
-    /// the UI posts it in the body the server takes.
+    /// The hand reaches the UI the way the server sends it: in flighthook's
+    /// `golfer.turn` on the socket and in the status reply; and the UI posts
+    /// it in the body the server takes.
     #[test]
     fn the_hand_round_trips_on_the_wire() {
-        use crate::types::{FlighthookEvent, HandInfo};
-
-        let init = r#"{"kind":"init","version":"0.2.0","actor_id":"ws.1",
-            "global_state":{"player_info":null,"club_info":null,"mode":null,"handed":"lh"}}"#;
-        let Some(WsPollEvent::Init { global_state, .. }) = parse_init_response(init) else {
-            panic!("not an init");
+        let text = r#"{"frp":{"kind":"golfer.turn","from":"me","golfer":null,"club":null,
+            "handedness":"lh","mode":"full"}}"#;
+        let msg: flighthook::UiMessage = serde_json::from_str(text).expect("socket message");
+        let flighthook::UiMessage::Frp(frp) = msg else {
+            panic!("not frp");
         };
-        assert_eq!(global_state.unwrap().handed, Some(Handedness::Left));
+        let flighthook::FrpBody::GolferTurn(turn) = frp.body else {
+            panic!("not a turn");
+        };
+        assert_eq!(turn.handedness, Some(Handedness::Left));
 
-        let sent = FlighthookMessage::new(FlighthookEvent::HandInfo {
-            hand_info: HandInfo {
-                handed: Handedness::Left,
-            },
-        })
-        .actor("web");
-        let text = serde_json::to_string(&sent).expect("ser");
-        assert!(
-            text.contains(r#""kind":"hand_info","hand_info":{"handed":"lh"}"#),
-            "{text}"
+        let status: StatusResponse = serde_json::from_str(
+            r#"{"cards":{},"turn":{"golfer":null,"club":"7I","handedness":"rh","mode":"full"}}"#,
+        )
+        .expect("status");
+        assert_eq!(
+            status.turn.and_then(|t| t.handedness),
+            Some(Handedness::Right)
         );
-        assert!(parse_init_response(&text).is_none());
-        let got = types::parse_ws_message(&text).expect("a bus message");
-        assert_eq!(got.actor, "web");
-        assert!(matches!(
-            got.event,
-            FlighthookEvent::HandInfo {
-                hand_info: HandInfo {
-                    handed: Handedness::Left
-                }
-            }
-        ));
 
-        let status: StatusResponse =
-            serde_json::from_str(r#"{"actors":{},"mode":"full","club":"7I","handed":"rh"}"#)
-                .expect("status");
-        assert_eq!(status.handed, Some(Handedness::Right));
-
-        assert_eq!(hand_body(Handedness::Left), r#"{"handed":"lh"}"#);
-        assert_eq!(hand_body(Handedness::Right), r#"{"handed":"rh"}"#);
+        assert_eq!(
+            select_body("club", &Club::Iron7.to_string()),
+            r#"{"club":"7I"}"#
+        );
     }
 
     fn response(status: u16, status_text: &str, body: &str) -> ehttp::Response {
@@ -1371,10 +1383,8 @@ mod tests {
     /// The camera additions reach the UI the way the server sends them.
     #[test]
     fn camera_replies_and_events_round_trip_on_the_wire() {
-        use crate::types::{CameraPosition, FlighthookEvent, ShotKey};
-
         let status: StatusResponse = serde_json::from_str(
-            r#"{"actors":{},"mode":null,"cameras_supported":true,"clip_dir":"/data/clips"}"#,
+            r#"{"cards":{},"cameras_supported":true,"clip_dir":"/data/clips"}"#,
         )
         .expect("status");
         assert!(status.cameras_supported);
@@ -1393,37 +1403,6 @@ mod tests {
         assert_eq!(list.cameras.len(), 2);
         assert_eq!(list.cameras[0].in_use_by.as_deref(), Some("camera.0"));
         assert_eq!(list.cameras[1].usb, None);
-
-        let key = |n: u32| ShotKey {
-            shot_id: format!("s{n}"),
-            shot_number: n,
-        };
-        let sent = FlighthookMessage::new(FlighthookEvent::ShotVideo {
-            keys: vec![key(1), key(2)],
-            position: CameraPosition::GolferFront,
-            duration_ms: 5500,
-            fps: 120.0,
-            trigger_offset_ms: 4000,
-            impact_offset_ms: 4000,
-            complete: true,
-            dropped: 0,
-        })
-        .actor("camera.0");
-        let text = serde_json::to_string(&sent).expect("ser");
-        assert!(text.contains(r#""kind":"shot_video""#), "{text}");
-        assert!(text.contains(r#""position":"golfer_front""#), "{text}");
-        let got = types::parse_ws_message(&text).expect("a bus message");
-        assert_eq!(got.actor, "camera.0");
-        let FlighthookEvent::ShotVideo { keys, fps, .. } = got.event else {
-            panic!("not shot_video");
-        };
-        assert_eq!((keys.len(), fps), (2, 120.0));
-
-        let text = r#"{"actor":"camera.0","event":{"kind":"shot_video_removed","keys":[{"shot_id":"s1","shot_number":1}]}}"#;
-        let got = types::parse_ws_message(text).expect("a bus message");
-        assert!(
-            matches!(got.event, FlighthookEvent::ShotVideoRemoved { ref keys } if keys == &[key(1)])
-        );
     }
 
     #[test]

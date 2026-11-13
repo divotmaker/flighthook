@@ -1,10 +1,11 @@
 //! Axum web server — REST endpoints + WebSocket event streaming.
 
+pub mod blocks;
 pub mod export;
-mod frp_out;
-pub mod groups;
 pub mod routes;
+pub(crate) mod stored;
 pub mod types;
+pub mod ui_socket;
 pub mod ws;
 
 use std::collections::{HashMap, VecDeque};
@@ -21,14 +22,14 @@ use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::CorsLayer;
 
 use crate::actors::{Actor, ReconfigureOutcome, actor_names};
-use crate::bus::{BusReceiver, BusSender};
+use crate::bus::{BusMsg, BusReceiver, BusSender, LocalEvent};
 use crate::state::SystemState;
+use blocks::BlockStore;
 use flighthook::{
-    ActorStatus, ActorStatusResponse, Club, ExportDevice, FlighthookConfig, FlighthookEvent,
-    FlighthookMessage, GroupKey, GroupedShot, Handedness, ShotAggregator, ShotData,
-    ShotDetectionMode, ShotGroupInfo, ShotKey, ShotRaw, ShotVideo, SimulationSection,
+    ActorStatus, ActorStatusResponse, ExportDevice, FlightPath, FlighthookConfig, Mode,
+    SHOT_TIMEOUT, ShotData, ShotKey, ShotRaw, ShotVideo, SimulationSection,
 };
-use groups::GroupState;
+use flightrelay::{CompletedShot, FrpBody, ShotAggregator, ShotEvent};
 
 /// Shots kept in the session history.
 pub const MAX_SHOTS: usize = 1000;
@@ -67,9 +68,14 @@ pub struct StoredShot {
     pub received_at: DateTime<Utc>,
     pub key: ShotKey,
     /// What was true when the trigger arrived.
-    pub context: ShotContext,
+    pub context: ExportContext,
     pub data: ShotData,
     pub raw: Option<ShotRaw>,
+    /// The shot as composed from its FRP messages, addenda included; `data`
+    /// is built from it.
+    pub frp: Option<CompletedShot>,
+    /// The flight model's path.
+    pub path: Option<FlightPath>,
 }
 
 impl StoredShot {
@@ -78,43 +84,72 @@ impl StoredShot {
     }
 }
 
-/// Settings and identity in effect when a shot was triggered.
+/// Settings and identity in effect when a shot was triggered, for the
+/// export.
 #[derive(Debug, Clone, Default)]
-pub struct ShotContext {
+pub struct ExportContext {
     /// Kind, maker, model and firmware only.
     pub device: ExportDevice,
-    /// The last club seen on the bus (`club_info`) when the shot triggered.
-    pub club_selected: Option<Club>,
-    pub handed: Option<Handedness>,
-    pub detection_mode: Option<ShotDetectionMode>,
+    pub detection_mode: Option<Mode>,
     /// The actor's config section with `name`, `address` and `bind` removed.
     pub device_section: serde_json::Value,
     pub simulation: SimulationSection,
     /// Identity strings scrubbed from text payloads and device labels on
     /// export: device IDs, configured and peer addresses.
     pub scrub: Vec<String>,
+    /// The card key of each local actor at the trigger, by actor id: the
+    /// export names local actors by card key.
+    pub card_keys: HashMap<String, String>,
 }
 
-/// What the web layer keeps for a shot between `shot_trigger` and
-/// `shot_finished`, next to its data in [`PendingShots`].
+/// What the web layer keeps for a shot between `shot.trigger` and
+/// `shot.finished`, next to its messages in [`PendingShots`].
 pub(crate) struct PendingShot {
     received_at: DateTime<Utc>,
-    context: ShotContext,
-    /// Set assigned at the trigger.
-    group: String,
+    /// The launch monitor's card key (its actor id for a remote one).
+    actor: String,
+    context: ExportContext,
+    /// The session's turn at the trigger, for a shot the aggregator stamped
+    /// no turn on.
+    turn: Option<flightrelay::GolferTurn>,
+    /// The launch monitor arms only for putts (its driver's fixed mode at
+    /// the trigger): its shot is a putter shot whatever club is in play.
+    putting: bool,
     /// Camera clips that finished before the shot did.
     video: Vec<ShotVideo>,
+    /// The game's stroke, when it came before the shot finished.
+    stroke: Option<flightrelay::GameStroke>,
+    /// The device frames, from the launch monitor card's capture.
+    raw: Option<ShotRaw>,
+    /// The flight model's path, when it came before the shot finished.
+    path: Option<FlightPath>,
+    /// When the trigger arrived.
+    started: Instant,
 }
 
-/// The shots between `shot_trigger` and `shot_finished`: their data,
-/// assembled with FRP's shot lifecycle rules (first event of each kind,
-/// flighthook's [`SHOT_TIMEOUT`](flighthook::SHOT_TIMEOUT), closed shots
-/// ignored), and the web layer's own per-shot state, both by actor and shot
-/// id.
-#[derive(Default)]
+/// The shots between `shot.trigger` and `shot.finished`: their messages,
+/// composed by the SDK's [`ShotAggregator`] (flighthook's
+/// [`SHOT_TIMEOUT`], fed only flighthook's own turn), and the web layer's
+/// own per-shot state, by shot id.
 pub(crate) struct PendingShots {
     data: ShotAggregator,
-    shots: HashMap<(String, String), PendingShot>,
+    /// Each shot's launch monitor: only it sends the shot's parts.
+    owners: crate::actors::simout::ShotOwners,
+    /// The actors whose last `bus.actor` holds the `game` role: only a
+    /// game's `game.stroke` joins a shot.
+    games: std::collections::HashSet<String>,
+    shots: HashMap<String, PendingShot>,
+}
+
+impl Default for PendingShots {
+    fn default() -> Self {
+        Self {
+            data: ShotAggregator::new().with_timeout(SHOT_TIMEOUT),
+            owners: crate::actors::simout::ShotOwners::default(),
+            games: std::collections::HashSet::new(),
+            shots: HashMap::new(),
+        }
+    }
 }
 
 impl PendingShots {
@@ -122,27 +157,34 @@ impl PendingShots {
         Self::default()
     }
 
-    /// Every pending shot's state, with its actor and shot id.
-    fn iter_mut(&mut self) -> impl Iterator<Item = (&(String, String), &mut PendingShot)> {
+    /// Every pending shot's state, with its shot id.
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut PendingShot)> {
         self.shots.iter_mut()
     }
 
-    /// End `actor`'s pending shots, except the shot `keep` (a shot id), and
-    /// return their sets.
-    fn discard_actor(&mut self, actor: &str, keep: Option<&str>, now: Instant) -> Vec<String> {
-        let ended: Vec<(String, String)> = self
+    /// End `actor`'s pending shots (a card key), except the shot `keep` (a
+    /// shot id). The aggregator discards each of them as on a timeout, so
+    /// their later messages and finish are ignored.
+    fn discard_actor(&mut self, actor: &str, keep: Option<&str>) {
+        let ended: Vec<String> = self
             .shots
-            .keys()
-            .filter(|(a, id)| a == actor && Some(id.as_str()) != keep)
-            .cloned()
+            .iter()
+            .filter(|(id, p)| p.actor == actor && Some(id.as_str()) != keep)
+            .map(|(id, _)| id.clone())
             .collect();
-        ended
-            .into_iter()
-            .filter_map(|id| {
-                self.data.discard(&id.0, &id.1, now);
-                self.shots.remove(&id).map(|p| p.group)
-            })
-            .collect()
+        for id in ended {
+            self.data.discard(&id);
+            self.shots.remove(&id);
+        }
+    }
+
+    /// Discard every open shot of the gone actor `actor_id` (card key
+    /// `card`), so nothing it sent before it went is stored.
+    fn forget_actor(&mut self, card: &str, actor_id: &str) {
+        self.discard_actor(card, None);
+        self.data.forget_actor(actor_id);
+        self.owners.forget_actor(actor_id);
+        self.games.remove(actor_id);
     }
 
     #[cfg(test)]
@@ -150,20 +192,25 @@ impl PendingShots {
         self.shots.is_empty() && self.data.pending_count() == 0
     }
 
-    /// The actor and shot id of every pending shot.
+    /// The shot id of every pending shot.
     #[cfg(test)]
-    fn keys(&self) -> impl Iterator<Item = &(String, String)> {
+    fn keys(&self) -> impl Iterator<Item = &String> {
         self.shots.keys()
     }
 
-    /// End the pending shots that have not finished within the shot timeout,
-    /// and return their sets.
-    fn discard_expired(&mut self, now: Instant) -> Vec<String> {
-        self.data
-            .discard_expired_at(now)
-            .into_iter()
-            .filter_map(|(actor, key)| self.shots.remove(&(actor, key.shot_id)).map(|p| p.group))
-            .collect()
+    /// End the pending shots that have not finished within the shot timeout.
+    fn discard_expired(&mut self, now: Instant) {
+        self.data.discard_expired();
+        let expired: Vec<String> = self
+            .shots
+            .iter()
+            .filter(|(_, p)| now.saturating_duration_since(p.started) > SHOT_TIMEOUT)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.data.discard(&id);
+            self.shots.remove(&id);
+        }
     }
 }
 
@@ -231,27 +278,24 @@ pub(crate) fn actor_statuses(
 /// Shared state for the web layer.
 pub struct WebState {
     pub root: Arc<SystemState>,
-    pub bus_tx: broadcast::Sender<FlighthookMessage>,
+    pub bus_tx: broadcast::Sender<BusMsg>,
     /// Per-actor state, with each actor's connection history since it last
     /// started (kept across UI connections).
     pub actors: RwLock<HashMap<String, ActorStatusResponse>>,
     /// Origin of the connection-history clock ([`WebState::now_ms`]).
     pub epoch: std::time::Instant,
     pub shots: RwLock<VecDeque<StoredShot>>,
-    /// Shot sets over `shots`. Lock order where both are held: `groups`,
-    /// then `shots`.
-    pub groups: RwLock<GroupState>,
+    /// The practice blocks seen this run, with their shots in `shots`.
+    /// Lock order where both are held: `blocks`, then `shots`.
+    pub blocks: RwLock<BlockStore>,
     /// Raw frame memory held in `shots`, as counted by [`raw_held_bytes`].
     pub raw_bytes: AtomicUsize,
-    /// Device identity per actor, merged from `DeviceTelemetry` (which sends
-    /// it once, on connect).
-    pub device_identity: RwLock<HashMap<String, ExportDevice>>,
-    /// Last `ActorStatus` message per actor — replayed to new WS clients.
-    pub cached_actor_status: RwLock<HashMap<String, FlighthookMessage>>,
-    /// Each actor's current device state as one `DeviceTelemetry` message,
-    /// every field and telemetry key at its latest value
-    /// ([`merge_device_telemetry`]) — replayed to new WS clients.
-    pub cached_device_telemetry: RwLock<HashMap<String, FlighthookMessage>>,
+    /// Every FRP state on the bus, local and remote actors.
+    pub bus_state: Mutex<flightrelay::BusState>,
+    /// What `/api/ws` sends, in bus order ([`ui_socket`]).
+    pub ui_out: broadcast::Sender<Arc<flighthook::UiMessage>>,
+    /// Counts up with every applied configuration change.
+    pub config_generation: AtomicU64,
     pub addr: SocketAddr,
     pub actor_id: String,
     pub ws_count: AtomicU64,
@@ -260,9 +304,37 @@ pub struct WebState {
     pub auto_chip_shots: AtomicU32,
     /// Actors with a reconnect in flight (`POST /api/actors/{id}/reconnect`).
     pub reconnecting: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The inbound `/frp` links that sent this process's own messages back
+    /// (the own-id guard): the Web Server card shows an error while any is open.
+    pub looped_links: std::sync::Mutex<std::collections::HashSet<crate::bus::PeerId>>,
 }
 
 impl WebState {
+    /// The own-id guard dropped a message of the link `peer`. Returns true
+    /// the first time for that link.
+    pub(crate) fn own_back(&self, peer: crate::bus::PeerId) -> bool {
+        self.looped_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer)
+    }
+
+    /// The hub link `peer` closed.
+    pub(crate) fn link_closed(&self, peer: crate::bus::PeerId) {
+        self.looped_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&peer);
+    }
+
+    fn looped(&self) -> bool {
+        !self
+            .looped_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     /// Milliseconds since [`epoch`](Self::epoch): the clock of the actors'
     /// connection histories.
     pub fn now_ms(&self) -> u64 {
@@ -271,11 +343,7 @@ impl WebState {
 }
 
 /// Emit current telemetry as an ActorStatus event on the bus.
-fn emit_status(
-    status: ActorStatus,
-    state: &WebState,
-    bus_tx: &broadcast::Sender<FlighthookMessage>,
-) {
+fn emit_status(status: ActorStatus, state: &WebState, bus_tx: &broadcast::Sender<BusMsg>) {
     let mut telemetry = HashMap::from([
         ("bind".into(), state.addr.to_string()),
         (
@@ -290,37 +358,33 @@ fn emit_status(
     // An empty value removes the key, so a successful bind clears the error.
     let error = if status == ActorStatus::Disconnected {
         "bind failed"
+    } else if state.looped() {
+        ws::OWN_MESSAGES_BACK
     } else {
         ""
     };
     telemetry.insert("error".into(), error.into());
-    let _ = bus_tx.send(
-        FlighthookMessage::new(FlighthookEvent::ActorStatus { status, telemetry })
-            .actor(&state.actor_id),
-    );
+    let _ = bus_tx.send(BusMsg::local(
+        state.actor_id.clone(),
+        LocalEvent::CardStatus { status, telemetry },
+    ));
 }
 
-/// Emit a `shot_group` event for a changed group record, as this webserver.
-fn emit_group(state: &WebState, group: ShotGroupInfo, shot: Option<GroupedShot>) {
-    let _ = state.bus_tx.send(
-        FlighthookMessage::new(FlighthookEvent::ShotGroup { group, shot }).actor(&state.actor_id),
-    );
-}
-
-/// Host-clock RFC 3339 UTC timestamp for a group's `started_at`.
-fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
-/// A `GroupState` for the club in play.
-fn initial_groups(root: &SystemState) -> GroupState {
-    let mut groups = GroupState::new();
-    groups.select(root.game.snapshot().club_info.map(|c| c.club));
-    groups
+/// Send `practice.new_block` to the practice actor as the flighthook actor.
+pub(crate) fn send_new_block(state: &WebState, new_session: bool) {
+    let command = flightrelay::PracticeNewBlock {
+        r#ref: format!("web-{}", crate::state::config::generate_id()),
+        golfer: None,
+        new_session,
+    };
+    let _ = state.bus_tx.send(BusMsg::frp(flightrelay::FrpMessage::new(
+        state.root.flighthook_id(),
+        command,
+    )));
 }
 
 /// Emit Connected telemetry (convenience for periodic emitter + ws handlers).
-pub(super) fn emit_telemetry(state: &WebState, bus_tx: &broadcast::Sender<FlighthookMessage>) {
+pub(super) fn emit_telemetry(state: &WebState, bus_tx: &broadcast::Sender<BusMsg>) {
     emit_status(ActorStatus::Connected, state, bus_tx);
 }
 
@@ -357,6 +421,15 @@ impl Actor for WebActor {
         // Subscribed here, before `start` returns, so no status an actor
         // started after this one emits is missed.
         let bus_rx = bus_tx.subscribe();
+        // Every actor republishes its state for this server's store and
+        // greetings: what was published before it subscribed (the
+        // session's first turn and block at startup, everything after a
+        // restart for a new address). The web server is no FRP actor, so
+        // the sync goes out as the flighthook actor.
+        let _ = bus_tx.send(BusMsg::frp(flightrelay::FrpMessage::new(
+            state.flighthook_id(),
+            flightrelay::BusSync::new(),
+        )));
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         *self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(shutdown_tx);
 
@@ -414,8 +487,8 @@ async fn run(
     addr: SocketAddr,
     actor_id: String,
     root: Arc<SystemState>,
-    bus_tx: broadcast::Sender<FlighthookMessage>,
-    bus_rx: broadcast::Receiver<FlighthookMessage>,
+    bus_tx: broadcast::Sender<BusMsg>,
+    bus_rx: broadcast::Receiver<BusMsg>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     // Pre-populate per-actor state from config: a card that is off shows
@@ -428,24 +501,38 @@ async fn run(
     }
     follow_disabled(&mut actors, &names, &snap.disabled_actors());
 
-    let groups = initial_groups(&root);
     let state = Arc::new(WebState {
         root,
         bus_tx: bus_tx.clone(),
         actors: RwLock::new(actors),
         epoch: std::time::Instant::now(),
         shots: RwLock::new(VecDeque::with_capacity(MAX_SHOTS)),
-        groups: RwLock::new(groups),
+        blocks: RwLock::new(BlockStore::new()),
         raw_bytes: AtomicUsize::new(0),
-        device_identity: RwLock::new(HashMap::new()),
-        cached_actor_status: RwLock::new(HashMap::new()),
-        cached_device_telemetry: RwLock::new(HashMap::new()),
+        bus_state: Mutex::default(),
+        ui_out: broadcast::channel(1024).0,
+        config_generation: AtomicU64::new(0),
         addr,
         actor_id,
         ws_count: AtomicU64::new(0),
         request_count: AtomicU64::new(0),
         auto_chip_shots: AtomicU32::new(0),
         reconnecting: std::sync::Mutex::default(),
+        looped_links: std::sync::Mutex::default(),
+    });
+
+    // Background task: every local actor's `bus.actor` again each heartbeat
+    let beat_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(flightrelay::DEFAULT_HEARTBEAT);
+        // After a stall, one heartbeat, not one per missed tick.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let root = &beat_state.root;
+            root.beats
+                .beat(&beat_state.bus_tx, |from| root.is_live_local(from));
+        }
     });
 
     // Background task: keep web state current from the bus
@@ -510,23 +597,26 @@ async fn run(
         .route("/api/cameras/{actor}/still", get(routes::get_camera_still))
         .route("/api/cameras/{actor}/live", get(routes::get_camera_live))
         .route(
-            "/api/shots/groups",
-            get(routes::get_shot_groups).post(routes::post_new_shot_group),
+            "/api/blocks",
+            get(routes::get_blocks).post(routes::post_blocks),
         )
-        .route("/api/shots/session", post(routes::post_new_shot_session))
         .route("/api/shots/clear", post(routes::post_clear_shot_history))
         .route("/api/shots/grouping", post(routes::post_shot_grouping))
-        .route("/api/club", post(routes::post_club))
-        .route("/api/hand", post(routes::post_hand))
-        .route("/api/mode", post(routes::post_mode))
+        .route("/api/select", post(routes::post_select))
         .route("/api/auto-chip", post(routes::post_auto_chip))
+        .route("/api/tournament", post(routes::post_tournament))
         .route("/api/find-mat", post(routes::post_find_mat))
         .route("/api/actors/{id}/reconnect", post(routes::post_reconnect))
+        .route(
+            "/api/actors/{id}/forget-pairing",
+            post(routes::post_forget_pairing),
+        )
         .route(
             "/api/settings",
             get(routes::get_settings).post(routes::post_settings),
         )
         .route(flighthook::FRP_PATH, get(ws::ws_upgrade))
+        .route(flighthook::UI_WS_PATH, get(ui_socket::upgrade))
         .layer(count_middleware)
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
@@ -557,9 +647,8 @@ async fn run(
 }
 
 /// Background task that drains the bus and keeps WebState current.
-async fn state_updater(state: Arc<WebState>, mut bus_rx: broadcast::Receiver<FlighthookMessage>) {
+async fn state_updater(state: Arc<WebState>, mut bus_rx: broadcast::Receiver<BusMsg>) {
     let mut accumulators = PendingShots::new();
-
     loop {
         match bus_rx.recv().await {
             Ok(msg) => apply_bus_event(&state, &msg, &mut accumulators).await,
@@ -571,12 +660,18 @@ async fn state_updater(state: Arc<WebState>, mut bus_rx: broadcast::Receiver<Fli
     }
 }
 
-/// Whether `actor` is a device that only measures putts: its shots are putter
-/// shots whatever club is in play.
-fn is_putting_device(actor: &str) -> bool {
-    actor
-        .split_once('.')
-        .is_some_and(|(prefix, _)| prefix == "exputt")
+/// A remote actor is gone ([`LocalEvent::ActorGone`]): forget its state
+/// (the UI is told) and its open shots.
+fn actor_gone(state: &WebState, actor: &str, accumulators: &mut PendingShots) {
+    ui_socket::gone(state, actor);
+    accumulators.forget_actor(&stored::card_of(&state.root, actor), actor);
+}
+
+/// Whether the launch monitor `from` (actor id) arms only for putts: its
+/// driver's fixed mode while its card runs. A remote actor's `bus.actor`
+/// carries no fixed mode, so a remote launch monitor never is one.
+fn putting_device(state: &WebState, from: &str) -> bool {
+    state.root.fixed_mode(from) == Some(Mode::Putting)
 }
 
 /// Stable device kind for an actor type prefix.
@@ -589,13 +684,15 @@ pub(crate) fn device_kind(prefix: &str) -> &str {
         "r10" => "garmin_r10",
         "openconnect_server" => "openconnect",
         "mock_monitor" => "mock",
+        "pureplay_accessory" => "pureplay",
         other => other,
     }
 }
 
 /// The actor's config section with `name`, `address`, `bind`, a trackball's
-/// `device` (a device name, which can carry a serial number) and unset
-/// fields removed, plus the removed values (to scrub on export).
+/// `device` (a device name, which can carry a serial number), the card's
+/// FRP `actor_id` (no shot condition) and unset fields removed, plus the
+/// removed address values (to scrub on export).
 fn device_section(
     config: &FlighthookConfig,
     prefix: &str,
@@ -614,12 +711,14 @@ fn device_section(
         "r10" => value(config.r10.get(index)),
         "openconnect_server" => value(config.openconnect_server.get(index)),
         "mock_monitor" => value(config.mock_monitor.get(index)),
+        "pureplay_accessory" => value(config.pureplay_accessory.get(index)),
         _ => value::<()>(None),
     };
     let mut removed = Vec::new();
     if let Some(map) = section.as_object_mut() {
         map.retain(|_, v| !v.is_null());
         map.remove("name");
+        map.remove("actor_id");
         // Only the trackball's `device` names a unit; no other section's is
         // removed.
         let device = (prefix == "trackball").then_some("device");
@@ -632,43 +731,9 @@ fn device_section(
     (section, removed)
 }
 
-/// Snapshot the settings and identity in effect for a shot from `msg.actor`,
-/// hit with `club_selected`.
-async fn shot_context(
-    state: &WebState,
-    msg: &FlighthookMessage,
-    club_selected: Option<Club>,
-) -> ShotContext {
-    let game = state.root.game.snapshot();
-    let config = state.root.system.snapshot();
-    let (prefix, index) = msg
-        .actor
-        .split_once('.')
-        .unwrap_or((msg.actor.as_str(), ""));
-
-    let mut device = state
-        .device_identity
-        .read()
-        .await
-        .get(&msg.actor)
-        .cloned()
-        .unwrap_or_default();
-    device.kind = device_kind(prefix).to_string();
-
-    let (device_section, mut scrub) = device_section(&config, prefix, index);
-    // The FRP device ID identifies the unit (network name, BLE name or
-    // address). Open Connect's is the monitor's product label, and is kept.
-    if prefix != "openconnect_server"
-        && let Some(id) = &msg.device
-    {
-        scrub.push(id.clone());
-    }
-    if let Some(actor) = state.actors.read().await.get(&msg.actor)
-        && let Some(v) = actor.telemetry.get("peer")
-    {
-        scrub.push(v.clone());
-    }
-    // An address may also appear without its port.
+/// Add the host of each address in `scrub` (an address may also appear
+/// without its port), then sort and dedup.
+fn normalize_scrub(scrub: &mut Vec<String>) {
     let hosts: Vec<String> = scrub
         .iter()
         .filter_map(|s| s.parse::<SocketAddr>().ok())
@@ -679,23 +744,71 @@ async fn shot_context(
     scrub.extend(hosts);
     scrub.sort();
     scrub.dedup();
+}
 
-    ShotContext {
+/// Snapshot the settings and identity in effect for a shot from the card
+/// `actor` (actor id `from`; `remote` when it came in on a hub link, whose
+/// device kind is `frp`). The device identity comes from the actor's
+/// `bus.actor`.
+async fn shot_context(
+    state: &WebState,
+    actor: &str,
+    from: &str,
+    putting: bool,
+    remote: bool,
+) -> ExportContext {
+    let turn = state.root.session.turn();
+    let config = state.root.system.snapshot();
+    let (prefix, index) = actor.split_once('.').unwrap_or((actor, ""));
+
+    let identity = state.bus_state.lock().ok().and_then(|bus| {
+        bus.actors()
+            .find(|(id, _)| *id == from)
+            .and_then(|(_, a)| a.device.clone())
+    });
+    // A remote actor's shot (`remote`): its id says nothing about the device.
+    let device = ExportDevice {
+        kind: if remote { "frp" } else { device_kind(prefix) }.to_string(),
+        manufacturer: identity.as_ref().and_then(|d| d.manufacturer.clone()),
+        model: identity.as_ref().and_then(|d| d.model.clone()),
+        firmware: identity.and_then(|d| d.firmware),
+    };
+
+    let (device_section, mut scrub) = device_section(&config, prefix, index);
+    // The device id identifies the unit (network name, BLE name or
+    // address). Open Connect's is the monitor's product label, and is kept.
+    if prefix != "openconnect_server"
+        && let Some(id) = state
+            .actors
+            .read()
+            .await
+            .get(actor)
+            .and_then(|a| a.telemetry.get("device_info"))
+    {
+        scrub.push(id.clone());
+    }
+    if let Some(actor) = state.actors.read().await.get(actor)
+        && let Some(v) = actor.telemetry.get("peer")
+    {
+        scrub.push(v.clone());
+    }
+    normalize_scrub(&mut scrub);
+
+    ExportContext {
         device,
-        club_selected,
-        handed: game.handed,
-        // An Auto-chip is simulated as a chip whatever the game mode, and a
+        // An Auto-chip is simulated as a chip whatever the mode, and a
         // putting device's shot as a putt.
-        detection_mode: if msg.actor == flighthook::AUTO_CHIP_ACTOR {
-            Some(ShotDetectionMode::Chipping)
-        } else if is_putting_device(&msg.actor) {
-            Some(ShotDetectionMode::Putting)
+        detection_mode: if actor == flighthook::AUTO_CHIP_ACTOR {
+            Some(Mode::Chipping)
+        } else if putting {
+            Some(Mode::Putting)
         } else {
-            game.mode
+            turn.mode
         },
         device_section,
         simulation: config.simulation,
         scrub,
+        card_keys: state.root.card_keys(),
     }
 }
 
@@ -736,88 +849,9 @@ fn store_shot(
     evicted
 }
 
-/// Merge the `DeviceTelemetry` message `msg` into its actor's entry of
-/// `held`, the actor's current device state: every field and telemetry key
-/// at its latest value. A device that sends its identity and its keys in
-/// separate messages is replayed with all of them. A merged entry carries no
-/// raw payload. A message for another device id than the one held replaces
-/// the entry.
-fn merge_device_telemetry(held: &mut HashMap<String, FlighthookMessage>, msg: &FlighthookMessage) {
-    let Some(current) = held
-        .get_mut(&msg.actor)
-        .filter(|current| current.device == msg.device)
-    else {
-        held.insert(msg.actor.clone(), msg.clone());
-        return;
-    };
-    if let (
-        FlighthookEvent::DeviceTelemetry {
-            manufacturer,
-            model,
-            firmware,
-            source,
-            telemetry,
-        },
-        FlighthookEvent::DeviceTelemetry {
-            manufacturer: new_manufacturer,
-            model: new_model,
-            firmware: new_firmware,
-            source: new_source,
-            telemetry: new_telemetry,
-        },
-    ) = (&mut current.event, &msg.event)
-    {
-        for (field, new) in [
-            (manufacturer, new_manufacturer),
-            (model, new_model),
-            (firmware, new_firmware),
-        ] {
-            if new.is_some() {
-                field.clone_from(new);
-            }
-        }
-        if new_source.is_some() {
-            *source = *new_source;
-        }
-        if let Some(new) = new_telemetry {
-            telemetry
-                .get_or_insert_with(HashMap::new)
-                .extend(new.iter().map(|(k, v)| (k.clone(), v.clone())));
-        }
-        // The merged state is no single wire message.
-        current.raw_payload = None;
-    } else {
-        *current = msg.clone();
-    }
-}
-
-/// End `actor`'s pending shots uncounted, emitting the group records that
-/// changed.
-async fn drop_pending(
-    state: &WebState,
-    accumulators: &mut PendingShots,
-    actor: &str,
-    keep: Option<&str>,
-) {
-    let groups = accumulators.discard_actor(actor, keep, Instant::now());
-    finish_uncounted(state, groups).await;
-}
-
-/// Finish the sets `groups` of shots that ended without data.
-async fn finish_uncounted(state: &WebState, groups: Vec<String>) {
-    if groups.is_empty() {
-        return;
-    }
-    let changes: Vec<ShotGroupInfo> = {
-        let mut state_groups = state.groups.write().await;
-        groups
-            .iter()
-            .filter_map(|id| state_groups.finish(id, false))
-            .collect()
-    };
-    for group in changes {
-        emit_group(state, group, None);
-    }
+/// End `actor`'s pending shots uncounted.
+fn drop_pending(accumulators: &mut PendingShots, actor: &str, keep: Option<&str>) {
+    accumulators.discard_actor(actor, keep);
 }
 
 /// Put a camera's clip on shot `shot_id`, replacing that camera's earlier
@@ -838,7 +872,7 @@ fn stamp_video(
         }
         None => list.clear(),
     };
-    for ((_, id), p) in pending.iter_mut() {
+    for (id, p) in pending.iter_mut() {
         if id == shot_id {
             apply(&mut p.video);
         }
@@ -879,7 +913,7 @@ fn mark_video(
             set(video);
         }
     };
-    for ((_, id), p) in pending.iter_mut() {
+    for (id, p) in pending.iter_mut() {
         if id == shot_id {
             apply(&mut p.video);
         }
@@ -889,190 +923,380 @@ fn mark_video(
     }
 }
 
-async fn apply_bus_event(
+async fn apply_bus_event(state: &WebState, msg: &BusMsg, accumulators: &mut PendingShots) {
+    // A `shot.finished` reaches the UI after the store's shot, so a row
+    // with data never reads as no read for a moment.
+    if matches!(
+        msg.as_frp().map(|m| &m.body),
+        Some(FrpBody::ShotFinished(_))
+    ) {
+        store_bus_event(state, msg, accumulators).await;
+        ui_socket::follow(state, msg);
+    } else {
+        ui_socket::follow(state, msg);
+        store_bus_event(state, msg, accumulators).await;
+    }
+}
+
+/// The store's part of [`apply_bus_event`].
+async fn store_bus_event(state: &WebState, msg: &BusMsg, accumulators: &mut PendingShots) {
+    let now = Instant::now();
+    accumulators.discard_expired(now);
+    // Who holds `game` is what the actor last said.
+    if let Some(m) = msg.as_frp()
+        && let FrpBody::BusActor(actor) = &m.body
+    {
+        if actor.has_role(flightrelay::types::roles::GAME) {
+            accumulators.games.insert(m.from.clone());
+        } else {
+            accumulators.games.remove(&m.from);
+        }
+    }
+    match msg {
+        BusMsg::Local { card, event } => match event {
+            LocalEvent::ActorGone { actor } => actor_gone(state, actor, accumulators),
+            LocalEvent::ShotCapture { key, raw, scrub } => {
+                if let Some(p) = accumulators.shots.get_mut(&key.shot_id) {
+                    p.raw = Some((**raw).clone());
+                    p.context.scrub.extend(scrub.iter().cloned());
+                    normalize_scrub(&mut p.context.scrub);
+                }
+            }
+            LocalEvent::ShotPath { key, path } => {
+                if let Some(p) = accumulators.shots.get_mut(&key.shot_id) {
+                    p.path = Some(path.clone());
+                } else {
+                    attach(state, &key.shot_id, |stored| {
+                        stored.path = Some(path.clone());
+                    })
+                    .await;
+                }
+            }
+            _ => apply_local(state, card, event, accumulators).await,
+        },
+        BusMsg::Frp { msg: frp, .. } if !accumulators.owners.admits(frp, now) => {}
+        BusMsg::Frp { msg: frp, peer, .. } => match &frp.body {
+            FrpBody::BusActor(actor)
+                if actor.has_role(flightrelay::types::roles::LAUNCH_MONITOR) =>
+            {
+                accumulators.data.feed(frp);
+                apply_device(state, &frp.from, actor).await;
+            }
+            FrpBody::ShotTrigger(trigger) => {
+                let id = trigger.key.shot_id.clone();
+                if stored(state, &id).await || accumulators.shots.contains_key(&id) {
+                    return;
+                }
+                let card = stored::card_of(&state.root, &frp.from);
+                // A device runs one shot at a time: a new trigger ends its
+                // earlier unfinished shots uncounted.
+                drop_pending(accumulators, &card, Some(&id));
+                // The aggregator stamps the turn and the golfer's open block
+                // now, so commands and club changes during the flight apply
+                // to the next shot.
+                accumulators.data.feed(frp);
+                let putting = putting_device(state, &frp.from);
+                let context = shot_context(state, &card, &frp.from, putting, peer.is_some()).await;
+                accumulators.shots.insert(
+                    id,
+                    PendingShot {
+                        received_at: Utc::now(),
+                        actor: card,
+                        context,
+                        turn: Some(state.root.session.turn()),
+                        putting,
+                        video: Vec::new(),
+                        stroke: None,
+                        raw: None,
+                        path: None,
+                        started: now,
+                    },
+                );
+            }
+            FrpBody::ShotLaunch(_)
+            | FrpBody::ShotClub(_)
+            | FrpBody::ShotImpact(_)
+            | FrpBody::ShotFlight(_) => {
+                let id = frp
+                    .body
+                    .shot_key()
+                    .map(|k| k.shot_id.clone())
+                    .unwrap_or_default();
+                // One attach path: a message for a stored shot attaches
+                // there, whenever it arrives.
+                if stored(state, &id).await {
+                    attach(state, &id, |s| {
+                        if let Some(shot) = &mut s.frp
+                            && (frp.from == shot.from || matches!(frp.body, FrpBody::ShotFlight(_)))
+                        {
+                            if let Some(warning) = late_warning(shot, &frp.from, &frp.body) {
+                                tracing::warn!("{warning}");
+                            }
+                            attach_message(shot, &frp.from, &frp.body);
+                        }
+                    })
+                    .await;
+                } else {
+                    accumulators.data.feed(frp);
+                }
+            }
+            FrpBody::ShotFinished(finished) => {
+                if let Some(ShotEvent::Finished(shot)) = accumulators.data.feed(frp) {
+                    finish_shot(state, accumulators, &finished.key, shot).await;
+                }
+            }
+            FrpBody::GameStroke(stroke) => {
+                // One attach path: the stroke joins the shot by `shot_id`,
+                // pending or stored, whenever it arrives, from the actor
+                // holding `game` only.
+                if !accumulators.games.contains(&frp.from) {
+                    return;
+                }
+                let Some(id) = stroke.shot_id.clone() else {
+                    return;
+                };
+                if let Some(p) = accumulators.shots.get_mut(&id) {
+                    p.stroke = Some(stroke.clone());
+                } else {
+                    attach(state, &id, |s| s.data.stroke = Some(stroke.clone())).await;
+                }
+            }
+            FrpBody::GolferTurn(_) if frp.from == state.root.flighthook_id() => {
+                accumulators.data.feed(frp);
+            }
+            FrpBody::PracticeBlock(_) | FrpBody::Removed(_)
+                if frp.from == state.root.flighthook_id() =>
+            {
+                accumulators.data.feed(frp);
+                state.blocks.write().await.apply(&frp.body);
+            }
+            FrpBody::GolferTurn(_) | FrpBody::PracticeBlock(_) | FrpBody::GolferSelect(_) => {}
+            _ => {
+                accumulators.data.feed(frp);
+            }
+        },
+    }
+}
+
+/// Whether the history holds shot `shot_id`.
+async fn stored(state: &WebState, shot_id: &str) -> bool {
+    state
+        .shots
+        .read()
+        .await
+        .iter()
+        .rev()
+        .any(|s| s.key.shot_id == shot_id)
+}
+
+/// The warning for a message from the shot's own launch monitor after its
+/// `shot.finished`, which is out of order. A message from any other actor,
+/// such as a flight model's `shot.flight`, is an addendum and gets none.
+fn late_warning(shot: &CompletedShot, from: &str, body: &FrpBody) -> Option<String> {
+    (from == shot.from).then(|| {
+        format!(
+            "{} from {from} arrived after shot {} ({}) finished",
+            body.kind(),
+            shot.key.shot_number,
+            shot.key.shot_id
+        )
+    })
+}
+
+/// One message for a shot already composed: a flight always attaches; a
+/// launch, club or impact only when the shot has none.
+fn attach_message(shot: &mut CompletedShot, from: &str, body: &FrpBody) {
+    match body {
+        FrpBody::ShotLaunch(m) => {
+            shot.launch.get_or_insert_with(|| m.launch.clone());
+        }
+        FrpBody::ShotClub(m) => {
+            shot.club.get_or_insert_with(|| m.club.clone());
+        }
+        FrpBody::ShotImpact(m) => {
+            shot.impact.get_or_insert_with(|| m.impact.clone());
+        }
+        FrpBody::ShotFlight(m) => shot.flights.push(flightrelay::Flight {
+            from: from.to_owned(),
+            flight: m.flight.clone(),
+        }),
+        _ => {}
+    }
+}
+
+/// Change the stored shot `shot_id` with `change`, rebuild its data, and
+/// send the UI its ball again. A shot the history no longer holds is left
+/// alone.
+async fn attach(state: &WebState, shot_id: &str, change: impl FnOnce(&mut StoredShot)) {
+    let mut shots = state.shots.write().await;
+    let Some(stored) = shots.iter_mut().rev().find(|s| s.key.shot_id == shot_id) else {
+        return;
+    };
+    change(stored);
+    rebuild(stored);
+    let data = stored.data.clone();
+    drop(shots);
+    ui_socket::send_shot(state, data);
+}
+
+/// Rebuild `stored.data` from its composed shot, keeping what the web layer
+/// stamped on it.
+fn rebuild(stored: &mut StoredShot) {
+    let Some(shot) = &stored.frp else {
+        return;
+    };
+    let fresh = stored::stored_data(shot, stored.data.card.as_deref(), stored.path.as_ref());
+    let data = &mut stored.data;
+    data.launch = fresh.launch;
+    data.club = fresh.club;
+    data.impact = fresh.impact;
+    data.metrics = fresh.metrics;
+    data.source = fresh.source;
+    data.flights = fresh.flights;
+    data.path = fresh.path;
+}
+
+/// The `bus.actor` name of the remote actor `from`, while it is on the bus.
+fn remote_name(state: &WebState, from: &str) -> Option<String> {
+    state.bus_state.lock().ok().and_then(|bus| {
+        bus.actors()
+            .find(|(id, _)| *id == from)
+            .map(|(_, a)| a.name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+    })
+}
+
+/// The name a game's `golfer.profile` gives golfer `id` while it is on the
+/// bus. A flighthook golfer is named by its saved record.
+fn game_golfer_name(state: &WebState, id: Option<&flightrelay::GolferId>) -> Option<String> {
+    let id = id.filter(|id| id.namespace() != flighthook::GOLFER_NAMESPACE)?;
+    state.bus_state.lock().ok().and_then(|bus| {
+        bus.of_kind(flightrelay::StateKind::GolferProfile)
+            .find_map(|m| match &m.body {
+                FrpBody::GolferProfile(p) if p.id == *id => Some(p.name.trim().to_owned()),
+                _ => None,
+            })
+            .filter(|name| !name.is_empty())
+    })
+}
+
+/// Store the shot `key` that just finished, composed as `shot`, count it in
+/// its block and send it to the UI sockets.
+async fn finish_shot(
     state: &WebState,
-    msg: &FlighthookMessage,
+    accumulators: &mut PendingShots,
+    key: &ShotKey,
+    shot: CompletedShot,
+) {
+    let Some(PendingShot {
+        received_at,
+        context,
+        turn,
+        putting,
+        video,
+        stroke,
+        raw,
+        path,
+        ..
+    }) = accumulators.shots.remove(&key.shot_id)
+    else {
+        return;
+    };
+    let card = state.root.card_of_actor(&shot.from);
+    let mut data = stored::stored_data(&shot, card.as_deref(), path.as_ref());
+    // A shot the device read nothing for is kept for the export when its
+    // raw frames are; `/api/shots` leaves it out.
+    let counted = data.has_data();
+    if !counted && raw.is_none() {
+        return;
+    }
+    let block = shot.block.clone();
+    data.turn = shot.turn.clone().or(turn);
+    data.club_selected = if putting {
+        Some(flighthook::Club::Putter)
+    } else {
+        data.turn.as_ref().and_then(|t| t.club)
+    };
+    data.video = video;
+    data.stroke = stroke;
+    if card.is_none() {
+        data.from_name = remote_name(state, &shot.from);
+    }
+    data.golfer_name = game_golfer_name(state, data.turn.as_ref().and_then(|t| t.golfer.as_ref()));
+    if counted {
+        data.block.clone_from(&block);
+    }
+    let stored = StoredShot {
+        received_at,
+        key: key.clone(),
+        context,
+        data,
+        raw,
+        frp: Some(shot),
+        path,
+    };
+    let data = stored.data.clone();
+
+    {
+        let mut blocks = state.blocks.write().await;
+        if counted && let Some(id) = block.as_deref() {
+            let at = u64::try_from(received_at.timestamp_millis()).unwrap_or(0);
+            blocks.count(id, at);
+        }
+        let mut shots = state.shots.write().await;
+        let evicted = store_shot(&mut shots, &state.raw_bytes, stored, RAW_BUDGET_BYTES);
+        if let Some(id) = evicted.and_then(|old| old.data.block) {
+            blocks.release(&id);
+        }
+    }
+    ui_socket::send_shot(state, data);
+}
+
+/// Keep the web state current from a launch monitor's `bus.actor`: its
+/// rows (`ready`, battery, the actor's own telemetry) on its card.
+async fn apply_device(state: &WebState, from: &str, actor: &flightrelay::BusActor) {
+    let card = stored::card_of(&state.root, from);
+    let rows = flighthook::bus_actor_rows(actor);
+    let mut actors = state.actors.write().await;
+    if let Some(entry) = actors.get_mut(&card) {
+        // An empty row is one the actor no longer has.
+        for (k, v) in rows {
+            if v.is_empty() {
+                entry.telemetry.remove(&k);
+            } else {
+                entry.telemetry.insert(k, v);
+            }
+        }
+    }
+}
+
+/// Keep the web state current from one local event of card `card` (card
+/// statuses, cameras, Clear history and config outcomes).
+async fn apply_local(
+    state: &WebState,
+    card: &str,
+    event: &LocalEvent,
     accumulators: &mut PendingShots,
 ) {
-    let now = Instant::now();
-    let expired = accumulators.discard_expired(now);
-    finish_uncounted(state, expired).await;
-    match &msg.event {
-        FlighthookEvent::ActorStatus { status, telemetry } => {
+    match event {
+        LocalEvent::CardStatus { status, telemetry } => {
             let mut actors = state.actors.write().await;
-            let actor = actors.entry(msg.actor.clone()).or_insert_with(|| {
+            let actor = actors.entry(card.to_owned()).or_insert_with(|| {
                 let snap = state.root.system.snapshot();
                 let names = actor_names(&snap);
-                let name = names.get(&msg.actor).cloned().unwrap_or_default();
+                let name = names.get(card).cloned().unwrap_or_default();
                 new_actor(name)
             });
             // A lost connection or a new instance drops the telemetry held
-            // for the actor, the device's values replayed to new WS clients
-            // with it (the export's device identity stays).
-            let cleared = actor.apply_status(*status, telemetry, state.now_ms());
-            // Cache the raw message for WS replay
-            state
-                .cached_actor_status
-                .write()
-                .await
-                .insert(msg.actor.clone(), msg.clone());
+            // for the actor.
+            actor.apply_status(*status, telemetry, state.now_ms());
             drop(actors);
-            if cleared {
-                state
-                    .cached_device_telemetry
-                    .write()
-                    .await
-                    .remove(&msg.actor);
-            }
             // Out of session, the device finishes none of its pending shots.
             if *status != ActorStatus::Connected {
-                drop_pending(state, accumulators, &msg.actor, None).await;
+                drop_pending(accumulators, card, None);
             }
         }
-        FlighthookEvent::ShotTrigger { key, .. } => {
-            // A device runs one shot at a time: a new trigger ends its
-            // earlier unfinished shots uncounted. A repeat of a trigger
-            // changes nothing: a shot keeps its first.
-            drop_pending(state, accumulators, &msg.actor, Some(&key.shot_id)).await;
-            let id = (msg.actor.clone(), key.shot_id.clone());
-            accumulators.data.feed_at(msg, now);
-            if accumulators.shots.contains_key(&id)
-                || !accumulators.data.is_pending(&msg.actor, &key.shot_id)
-            {
-                return;
-            }
-            // The set and the stored shot's club are decided now, from the
-            // club the sets last saw on the bus, so commands and club
-            // changes during the flight apply to the next shot.
-            let (club, (group, changes)) = {
-                let mut groups = state.groups.write().await;
-                let club = if is_putting_device(&msg.actor) {
-                    Some(Club::Putter)
-                } else {
-                    groups.selected_club()
-                };
-                let key_for_group = GroupKey { golfer: None, club };
-                (club, groups.assign(key_for_group, &now_rfc3339()))
-            };
-            let context = shot_context(state, msg, club).await;
-            let pending = PendingShot {
-                received_at: Utc::now(),
-                context,
-                group,
-                video: Vec::new(),
-            };
-            accumulators.shots.insert(id, pending);
-            for group in changes {
-                emit_group(state, group, None);
-            }
-        }
-        FlighthookEvent::Launch { .. }
-        | FlighthookEvent::FlightResult { .. }
-        | FlighthookEvent::FaceImpact { .. }
-        | FlighthookEvent::ClubPath { .. } => {
-            accumulators.data.feed_at(msg, now);
-        }
-        FlighthookEvent::ShotFinished { key, raw } => {
-            let finished = accumulators.data.feed_at(msg, now);
-            let pending = accumulators
-                .shots
-                .remove(&(msg.actor.clone(), key.shot_id.clone()));
-            let (
-                Some(mut acc),
-                Some(PendingShot {
-                    received_at,
-                    context,
-                    group,
-                    video,
-                }),
-            ) = (finished, pending)
-            else {
-                return;
-            };
-            acc.set_raw(raw.as_deref().cloned());
-            let (data, raw) = acc.into_parts();
-            // A shot the device read nothing for is kept for the export when
-            // its raw frames are; `/api/shots` leaves it out.
-            let mut data = match (data, &raw) {
-                (Some(data), _) => data,
-                (None, Some(_)) => ShotData {
-                    actor: msg.actor.clone(),
-                    shot_number: key.shot_number,
-                    ..ShotData::default()
-                },
-                (None, None) => {
-                    if let Some(dropped) = state.groups.write().await.finish(&group, false) {
-                        emit_group(state, dropped, None);
-                    }
-                    return;
-                }
-            };
-            let counted = data.has_data();
-            data.shot_id = Some(key.shot_id.clone());
-            data.club_selected = context.club_selected;
-            data.handed = context.handed;
-            data.video = video;
-            if counted {
-                data.group = Some(group.clone());
-            }
-            let shot = StoredShot {
-                received_at,
-                key: key.clone(),
-                context,
-                data,
-                raw,
-            };
-
-            let mut changes = Vec::new();
-            {
-                let mut groups = state.groups.write().await;
-                if let Some(change) = groups.finish(&group, counted) {
-                    let joined = counted.then(|| GroupedShot {
-                        actor: msg.actor.clone(),
-                        key: key.clone(),
-                    });
-                    changes.push((change, joined));
-                }
-                let mut shots = state.shots.write().await;
-                let evicted = store_shot(&mut shots, &state.raw_bytes, shot, RAW_BUDGET_BYTES);
-                if let Some(id) = evicted.and_then(|old| old.data.group)
-                    && let Some(change) = groups.release(&id)
-                {
-                    changes.push((change, None));
-                }
-            }
-            for (group, shot) in changes {
-                emit_group(state, group, shot);
-            }
-        }
-        FlighthookEvent::PlayerInfo { player_info } => {
-            if let Some(ref name) = player_info.name {
-                let mut actors = state.actors.write().await;
-                if let Some(actor) = actors.get_mut(&msg.actor) {
-                    actor.telemetry.insert("name".into(), name.clone());
-                }
-            }
-        }
-        FlighthookEvent::ClubInfo { club_info } => {
-            state.groups.write().await.select(Some(club_info.club));
-            let mut actors = state.actors.write().await;
-            if let Some(actor) = actors.get_mut(&msg.actor) {
-                actor
-                    .telemetry
-                    .insert("club".into(), club_info.club.to_string());
-            }
-        }
-        // The shot context reads the hand from game state at the trigger;
-        // here only the source's card learns it.
-        FlighthookEvent::HandInfo { hand_info } => {
-            let mut actors = state.actors.write().await;
-            if let Some(actor) = actors.get_mut(&msg.actor) {
-                actor
-                    .telemetry
-                    .insert("handed".into(), hand_info.handed.to_string());
-            }
-        }
-        FlighthookEvent::ShotVideo {
+        LocalEvent::ShotVideo {
             keys,
             position,
             duration_ms,
@@ -1083,7 +1307,7 @@ async fn apply_bus_event(
             dropped,
         } => {
             let video = ShotVideo {
-                camera: msg.actor.clone(),
+                camera: card.to_owned(),
                 position: *position,
                 duration_ms: *duration_ms,
                 fps: *fps,
@@ -1101,54 +1325,49 @@ async fn apply_bus_event(
                 stamp_video(&mut shots, accumulators, &key.shot_id, Some(&video));
             }
         }
-        FlighthookEvent::ShotVideoRemoved { keys } => {
+        LocalEvent::ShotVideoRemoved { keys } => {
             let mut shots = state.shots.write().await;
             for key in keys {
                 stamp_video(&mut shots, accumulators, &key.shot_id, None);
             }
         }
-        FlighthookEvent::ShotPose { keys, rotation } => {
+        LocalEvent::ShotPose { keys, rotation } => {
             let mut shots = state.shots.write().await;
             for key in keys {
-                mark_video(&mut shots, accumulators, &key.shot_id, &msg.actor, |v| {
+                mark_video(&mut shots, accumulators, &key.shot_id, card, |v| {
                     v.pose = true;
                     v.rotation = *rotation;
                     v.analyzed_with = Some(stance::VERSION.to_owned());
                 });
             }
         }
-        FlighthookEvent::ShotSwing { keys } => {
+        LocalEvent::ShotSwing { keys } => {
             let mut shots = state.shots.write().await;
             for key in keys {
-                mark_video(&mut shots, accumulators, &key.shot_id, &msg.actor, |v| {
+                mark_video(&mut shots, accumulators, &key.shot_id, card, |v| {
                     v.swing = true;
                 });
             }
         }
-        FlighthookEvent::NewShotGroup => {
-            let changes = state.groups.write().await.new_group(&now_rfc3339());
-            for group in changes {
-                emit_group(state, group, None);
-            }
-        }
-        FlighthookEvent::NewShotSession => {
-            let changes = state.groups.write().await.new_session();
-            for group in changes {
-                emit_group(state, group, None);
-            }
-        }
-        FlighthookEvent::ClearShotHistory => {
+        LocalEvent::ClearShotHistory => {
             // Shots in flight belong to the history being cleared: they end
-            // here, so a late `shot_finished` finds nothing to store. No
-            // `shot_group` is emitted; UIs clear on this event.
-            *accumulators = PendingShots::new();
-            let mut groups = state.groups.write().await;
-            groups.clear();
-            let mut shots = state.shots.write().await;
-            shots.clear();
-            state.raw_bytes.store(0, Ordering::Relaxed);
+            // here, so a late `shot.finished` finds nothing to store. The
+            // store forgets its shots and blocks, then asks for a new
+            // session. The aggregator keeps the turn and the open blocks it
+            // follows.
+            for (id, _) in accumulators.shots.drain() {
+                accumulators.data.discard(&id);
+            }
+            {
+                let mut blocks = state.blocks.write().await;
+                blocks.clear();
+                let mut shots = state.shots.write().await;
+                shots.clear();
+                state.raw_bytes.store(0, Ordering::Relaxed);
+            }
+            send_new_block(state, true);
         }
-        FlighthookEvent::ConfigOutcome {
+        LocalEvent::ConfigOutcome {
             started,
             stopped,
             restarted,
@@ -1186,66 +1405,8 @@ async fn apply_bus_event(
             }
             // A card turned off shows as Disabled, whether or not an
             // instance of it was running.
-            let turned_off = follow_disabled(&mut actors, &names, &disabled);
-            drop(actors);
-            // Clean up cached messages for stopped actors
-            for id in stopped.iter().chain(&turned_off) {
-                state.cached_actor_status.write().await.remove(id);
-                state.cached_device_telemetry.write().await.remove(id);
-                state.device_identity.write().await.remove(id);
-            }
+            follow_disabled(&mut actors, &names, &disabled);
         }
-        FlighthookEvent::DeviceTelemetry {
-            manufacturer,
-            model,
-            firmware,
-            telemetry,
-            ..
-        } if manufacturer.is_some() || model.is_some() || firmware.is_some() => {
-            {
-                let mut ids = state.device_identity.write().await;
-                let id = ids.entry(msg.actor.clone()).or_default();
-                if manufacturer.is_some() {
-                    id.manufacturer.clone_from(manufacturer);
-                }
-                if model.is_some() {
-                    id.model.clone_from(model);
-                }
-                if firmware.is_some() {
-                    id.firmware.clone_from(firmware);
-                }
-            }
-            if let Some(tel) = telemetry {
-                let mut actors = state.actors.write().await;
-                if let Some(actor) = actors.get_mut(&msg.actor) {
-                    for (k, v) in tel {
-                        actor.telemetry.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            merge_device_telemetry(&mut *state.cached_device_telemetry.write().await, msg);
-        }
-        FlighthookEvent::DeviceTelemetry {
-            telemetry: Some(tel),
-            ..
-        } => {
-            let mut actors = state.actors.write().await;
-            if let Some(actor) = actors.get_mut(&msg.actor) {
-                for (k, v) in tel {
-                    actor.telemetry.insert(k.clone(), v.clone());
-                }
-            }
-            // Held for the WS replay
-            merge_device_telemetry(&mut *state.cached_device_telemetry.write().await, msg);
-        }
-        FlighthookEvent::DeviceTelemetry {
-            telemetry: None, ..
-        } => {
-            // Identity-only DeviceTelemetry too (e.g. a `source` alone)
-            merge_device_telemetry(&mut *state.cached_device_telemetry.write().await, msg);
-        }
-        // Alert, SetDetectionMode, ConfigCommand, ShotGroup — no web state
-        // update needed
         _ => {}
     }
 }
@@ -1253,9 +1414,11 @@ async fn apply_bus_event(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::state::GameStateWriter;
+    use crate::actors::web::blocks::BlockRecord;
+    use crate::state::SessionWriter;
+    use flighthook::{Club, Handedness};
     use flighthook::{
-        ClubInfo, ConnectionState, DerivedFlight, Distance, Launch, MevoSection, RawDir, RawRecord,
+        ConnectionState, DerivedFlight, Distance, Launch, MevoSection, RawDir, RawRecord,
         ShotGrouping, Velocity,
     };
 
@@ -1266,6 +1429,89 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// One test message, as [`Updater::send`] and [`feed`] put it on the bus
+    /// for a card.
+    #[derive(Clone)]
+    #[allow(clippy::large_enum_variant)] // test messages, built and sent at once
+    pub(crate) enum Ev {
+        /// An FRP message from the card's actor (its id = the card key).
+        Frp(FrpBody),
+        /// A local event of the card.
+        Local(LocalEvent),
+        /// `shot.finished`, after the card's capture of the shot's raw
+        /// frames when there is one.
+        Finished(ShotKey, Option<Box<ShotRaw>>),
+        /// The session's `golfer.turn`, from flighthook.
+        Turn(flightrelay::GolferTurn),
+    }
+
+    impl Ev {
+        pub(crate) fn frp(body: impl Into<FrpBody>) -> Self {
+            Self::Frp(body.into())
+        }
+
+        pub(crate) fn trigger(key: ShotKey) -> Self {
+            Self::frp(flightrelay::ShotTrigger::new(key))
+        }
+
+        /// The card's launch monitor `bus.actor` with `device` and
+        /// `telemetry`, ready (no blockers).
+        pub(crate) fn device(device: flightrelay::DeviceInfo, telemetry: &[(&str, &str)]) -> Self {
+            let mut actor = flightrelay::BusActor::new("test", 5.0)
+                .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+            actor.device = Some(device);
+            actor.telemetry = (!telemetry.is_empty()).then(|| {
+                telemetry
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect()
+            });
+            Self::frp(actor)
+        }
+
+        /// The bus messages of `self` sent for card `card`.
+        pub(crate) fn bus(self, root: &SystemState, card: &str) -> Vec<BusMsg> {
+            let frp = |body: FrpBody| BusMsg::frp(flightrelay::FrpMessage::new(card, body));
+            match self {
+                Self::Frp(body) => vec![frp(body)],
+                Self::Local(event) => vec![BusMsg::local(card, event)],
+                Self::Finished(key, raw) => {
+                    let mut out = Vec::new();
+                    if let Some(raw) = raw {
+                        out.push(BusMsg::local(
+                            card,
+                            LocalEvent::ShotCapture {
+                                key: key.clone(),
+                                raw,
+                                scrub: Vec::new(),
+                            },
+                        ));
+                    }
+                    out.push(frp(flightrelay::ShotFinished { key }.into()));
+                    out
+                }
+                Self::Turn(turn) => vec![BusMsg::frp(flightrelay::FrpMessage::new(
+                    root.flighthook_id(),
+                    turn,
+                ))],
+            }
+        }
+    }
+
+    /// The session's turn after `writer` selects `club`, as the session's
+    /// own `golfer.turn` on the bus.
+    pub(crate) fn turn_to(root: &SystemState, writer: &SessionWriter, club: Club) -> BusMsg {
+        let select = flightrelay::GolferSelect {
+            club: Some(Some(club)),
+            ..flightrelay::GolferSelect::new("test")
+        };
+        writer.apply(&select);
+        BusMsg::frp(flightrelay::FrpMessage::new(
+            root.flighthook_id(),
+            writer.turn(),
+        ))
     }
 
     fn kv(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -1280,48 +1526,26 @@ pub(crate) mod tests {
     async fn connected_mevo(up: &mut Updater<'_>) {
         up.send(
             "mevo.0",
-            FlighthookEvent::ActorStatus {
+            Ev::Local(LocalEvent::CardStatus {
                 status: ActorStatus::Connected,
                 telemetry: kv(&[("device_info", "FlightScope Xi")]),
-            },
+            }),
         )
         .await;
+        let device = flightrelay::DeviceInfo {
+            manufacturer: Some("FlightScope".into()),
+            model: Some("Mevo+".into()),
+            battery_pct: Some(80),
+            ..flightrelay::DeviceInfo::default()
+        };
+        up.send("mevo.0", Ev::device(device, &[("tilt_state", "ok")]))
+            .await;
         up.send(
             "mevo.0",
-            FlighthookEvent::DeviceTelemetry {
-                manufacturer: Some("FlightScope".into()),
-                model: Some("Mevo+".into()),
-                firmware: None,
-                source: None,
-                telemetry: Some(kv(&[("ready", "true"), ("battery_pct", "80")])),
-            },
-        )
-        .await;
-        up.send(
-            "mevo.0",
-            FlighthookEvent::DeviceTelemetry {
-                manufacturer: None,
-                model: None,
-                firmware: None,
-                source: None,
-                telemetry: Some(kv(&[("tilt", "ok")])),
-            },
-        )
-        .await;
-        up.send(
-            "mevo.0",
-            FlighthookEvent::ClubInfo {
-                club_info: ClubInfo { club: Club::Iron7 },
-            },
-        )
-        .await;
-        up.send(
-            "mevo.0",
-            FlighthookEvent::HandInfo {
-                hand_info: flighthook::HandInfo {
-                    handed: flighthook::Handedness::Left,
-                },
-            },
+            Ev::Local(LocalEvent::CardStatus {
+                status: ActorStatus::Connected,
+                telemetry: kv(&[("club", "7I"), ("handed", "lh")]),
+            }),
         )
         .await;
     }
@@ -1336,40 +1560,28 @@ pub(crate) mod tests {
             let (state, _writer, _dir) = test_state();
             let mut up = Updater::new(&state);
             connected_mevo(&mut up).await;
+            // device_info, club, handed and the bus.actor's rows: ready,
+            // battery_pct, tilt_state (no tilt or roll: empty rows are
+            // left out).
             assert_eq!(held(&state).await.len(), 6, "{:?}", held(&state).await);
-            assert!(
-                state
-                    .cached_device_telemetry
-                    .read()
-                    .await
-                    .contains_key("mevo.0")
-            );
 
             up.send(
                 "mevo.0",
-                FlighthookEvent::ActorStatus {
+                Ev::Local(LocalEvent::CardStatus {
                     status: lost,
                     telemetry: kv(&[("error", "gone")]),
-                },
+                }),
             )
             .await;
             assert_eq!(held(&state).await, kv(&[("error", "gone")]), "{lost:?}");
             assert_eq!(state.actors.read().await["mevo.0"].status, lost);
-            // New WS clients are not replayed the lost device's values, and
-            // the export keeps the device's identity.
-            assert!(
-                !state
-                    .cached_device_telemetry
-                    .read()
-                    .await
-                    .contains_key("mevo.0")
-            );
-            assert_eq!(
-                state.device_identity.read().await["mevo.0"]
-                    .model
-                    .as_deref(),
-                Some("Mevo+")
-            );
+            // The export keeps the device's identity: its `bus.actor`.
+            let model = state.bus_state.lock().ok().and_then(|bus| {
+                bus.actors()
+                    .find(|(id, _)| *id == "mevo.0")
+                    .and_then(|(_, a)| a.device.clone()?.model)
+            });
+            assert_eq!(model.as_deref(), Some("Mevo+"));
         }
     }
 
@@ -1382,17 +1594,18 @@ pub(crate) mod tests {
         // Values reported after the loss are held until the next start.
         up.send(
             "mevo.0",
-            FlighthookEvent::ClubInfo {
-                club_info: ClubInfo { club: Club::Driver },
-            },
+            Ev::Local(LocalEvent::CardStatus {
+                status: ActorStatus::Disconnected,
+                telemetry: kv(&[("club", "DR")]),
+            }),
         )
         .await;
         up.send(
             "mevo.0",
-            FlighthookEvent::ActorStatus {
+            Ev::Local(LocalEvent::CardStatus {
                 status: ActorStatus::Starting,
                 telemetry: kv(&[("address", "1.2.3.4:5")]),
-            },
+            }),
         )
         .await;
         assert_eq!(held(&state).await, kv(&[("address", "1.2.3.4:5")]));
@@ -1405,28 +1618,28 @@ pub(crate) mod tests {
         connected_mevo(&mut up).await;
         up.send(
             "mevo.0",
-            FlighthookEvent::ActorStatus {
+            Ev::Local(LocalEvent::CardStatus {
                 status: ActorStatus::Connected,
                 telemetry: kv(&[("shot_count", "1")]),
-            },
+            }),
         )
         .await;
         assert_eq!(held(&state).await.len(), 7);
         up.send(
             "mevo.0",
-            FlighthookEvent::ActorStatus {
+            Ev::Local(LocalEvent::CardStatus {
                 status: ActorStatus::Disconnected,
                 telemetry: kv(&[("error", "a")]),
-            },
+            }),
         )
         .await;
         for status in [ActorStatus::Reconnecting, ActorStatus::Disconnected] {
             up.send(
                 "mevo.0",
-                FlighthookEvent::ActorStatus {
+                Ev::Local(LocalEvent::CardStatus {
                     status,
                     telemetry: kv(&[("phase", "connecting")]),
-                },
+                }),
             )
             .await;
         }
@@ -1483,6 +1696,172 @@ pub(crate) mod tests {
         body.to_string()
     }
 
+    /// A free local port.
+    fn free_addr() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port")
+    }
+
+    /// GET `path` until `done` holds for the parsed body, at most 5 s.
+    fn get_until<T: serde::de::DeserializeOwned>(
+        addr: SocketAddr,
+        path: &str,
+        done: impl Fn(&T) -> bool,
+    ) -> T {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let body = http_get(addr, path);
+            if let Ok(value) = serde_json::from_str::<T>(&body)
+                && done(&value)
+            {
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{path} never as wanted: {body}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// The (owner, kind) of flighthook's own states in `states`.
+    fn own_kinds(states: &[flightrelay::FrpMessage], me: &str) -> Vec<String> {
+        let mut kinds: Vec<String> = states
+            .iter()
+            .filter(|m| m.from == me)
+            .map(|m| m.body.kind().to_owned())
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    /// The UI snapshot `/api/ws` sends first.
+    fn ui_snapshot(addr: SocketAddr) -> flighthook::UiSnapshot {
+        let url = format!("ws://{addr}{}", flighthook::UI_WS_PATH);
+        let (mut ws, _) = tungstenite::connect(url).expect("connect");
+        loop {
+            if let tungstenite::Message::Text(text) = ws.read().expect("read") {
+                match serde_json::from_str(&text).expect("a UI message") {
+                    flighthook::UiMessage::Snapshot(snapshot) => return *snapshot,
+                    other => panic!("not a snapshot first: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The `/frp` greeting, up to its `bus.sync`.
+    fn frp_greeting(addr: SocketAddr) -> Vec<flightrelay::FrpMessage> {
+        let url = format!("ws://{addr}{}", flighthook::FRP_PATH);
+        let (mut ws, _) = tungstenite::connect(url).expect("connect");
+        let mut out = Vec::new();
+        loop {
+            if let tungstenite::Message::Text(text) = ws.read().expect("read") {
+                let msg: flightrelay::FrpMessage = serde_json::from_str(&text).expect("FRP");
+                if msg.body.kind() == "bus.sync" {
+                    return out;
+                }
+                out.push(msg);
+            }
+        }
+    }
+
+    /// What a client of the server at `addr` sees of the session: the first
+    /// block known, a shot from a launch monitor `lm` filed in Set 1, and
+    /// flighthook's actor, turn and block in the UI snapshot and the `/frp`
+    /// greeting.
+    fn sees_the_session(
+        addr: SocketAddr,
+        root: &SystemState,
+        bus_tx: &broadcast::Sender<BusMsg>,
+        shot: u32,
+    ) {
+        let me = root.flighthook_id();
+        let blocks: flighthook::BlocksResponse =
+            get_until(addr, "/api/blocks", |b: &flighthook::BlocksResponse| {
+                !b.blocks.is_empty()
+            });
+        let first = &blocks.blocks[0].block;
+        assert_eq!(first.number, 1, "the first Set shown is Set 1");
+        let key = ShotKey::new(format!("lm-shot-{shot}"), shot);
+        for body in [
+            FrpBody::from(flightrelay::ShotTrigger::new(key.clone())),
+            flightrelay::ShotLaunch {
+                key: key.clone(),
+                launch: ball(),
+            }
+            .into(),
+            flightrelay::ShotFinished { key: key.clone() }.into(),
+        ] {
+            let _ = bus_tx.send(BusMsg::frp(flightrelay::FrpMessage::new("lm", body)));
+        }
+        let shots: Vec<ShotData> = get_until(addr, "/api/shots", |s: &Vec<ShotData>| {
+            s.iter().any(|d| d.shot_number == shot)
+        });
+        let stored = shots.iter().find(|d| d.shot_number == shot).expect("shot");
+        assert_eq!(stored.block.as_deref(), Some(first.id.as_str()));
+        let want = ["bus.actor", "golfer.turn", "practice.block"];
+        assert_eq!(own_kinds(&ui_snapshot(addr).states, &me), want);
+        assert_eq!(own_kinds(&frp_greeting(addr), &me), want);
+    }
+
+    /// Started as `main` starts it (the system actor, then every actor
+    /// from the config, the web server first; nothing seeded by hand), the
+    /// web server knows the session; again after a bind-address save, and
+    /// local actors outlive the 6 s expiry on their heartbeats.
+    #[test]
+    fn started_in_main_order_the_web_server_knows_the_session() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-main-order-{}",
+            crate::state::config::generate_id()
+        )));
+        let (root, writer) = SystemState::new(dir.0.join("config.toml"));
+        let root = Arc::new(root);
+        let addr = free_addr();
+        root.system.update(|c| {
+            c.webserver.insert(
+                "0".into(),
+                flighthook::WebserverSection {
+                    name: "Web Server".into(),
+                    bind: addr.to_string(),
+                },
+            );
+        });
+        let (bus_tx, _) = broadcast::channel(1024);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::actors::system::start_for_test(writer, &root, &bus_tx, Arc::clone(&shutdown));
+        for ra in crate::actors::resolve_actors(&root.system.snapshot()) {
+            crate::actors::start_actor(ra.id, ra.actor, &root, &bus_tx);
+        }
+        sees_the_session(addr, &root, &bus_tx, 1);
+
+        // Past the expiry: the heartbeats keep flighthook's states.
+        std::thread::sleep(flightrelay::DEFAULT_HEARTBEAT * 3 + std::time::Duration::from_secs(1));
+        let me = root.flighthook_id();
+        let want = ["bus.actor", "golfer.turn", "practice.block"];
+        assert_eq!(own_kinds(&ui_snapshot(addr).states, &me), want);
+        assert_eq!(own_kinds(&frp_greeting(addr), &me), want);
+
+        // A bind-address save starts a new server with an empty store.
+        let moved = free_addr();
+        let _ = bus_tx.send(BusMsg::local(
+            "web",
+            LocalEvent::ConfigCommand {
+                request_id: None,
+                action: Box::new(flighthook::ConfigAction::UpsertWebserver {
+                    index: "0".into(),
+                    section: flighthook::WebserverSection {
+                        name: "Web Server".into(),
+                        bind: moved.to_string(),
+                    },
+                }),
+            },
+        ));
+        sees_the_session(moved, &root, &bus_tx, 2);
+        let _ = root.stop_all_and_wait(std::time::Duration::from_secs(3));
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[test]
     fn a_status_sent_right_after_the_web_server_starts_is_in_api_status() {
         let dir = TempDir(std::env::temp_dir().join(format!(
@@ -1510,34 +1889,34 @@ pub(crate) mod tests {
             bus_tx,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        monitor.send(FlighthookMessage::new(FlighthookEvent::ActorStatus {
+        monitor.local(LocalEvent::CardStatus {
             status: ActorStatus::Starting,
             telemetry: HashMap::from([("bind".into(), "first".into())]),
-        }));
+        });
 
         let body = http_get(addr, "/api/status");
         web.stop();
         let status: flighthook::StatusResponse = serde_json::from_str(&body).expect("json");
-        let monitor = &status.actors["mock_monitor.0"];
+        let monitor = &status.cards["mock_monitor.0"];
         assert_eq!(monitor.status, ActorStatus::Starting);
         assert_eq!(monitor.telemetry["bind"], "first");
     }
 
-    fn status_event(status: ActorStatus) -> FlighthookEvent {
-        FlighthookEvent::ActorStatus {
+    fn status_event(status: ActorStatus) -> Ev {
+        Ev::Local(LocalEvent::CardStatus {
             status,
             telemetry: HashMap::new(),
-        }
+        })
     }
 
-    fn outcome(started: &[&str], stopped: &[&str], restarted: &[&str]) -> FlighthookEvent {
+    fn outcome(started: &[&str], stopped: &[&str], restarted: &[&str]) -> Ev {
         let ids = |ids: &[&str]| ids.iter().map(|s| (*s).to_owned()).collect();
-        FlighthookEvent::ConfigOutcome {
+        Ev::Local(LocalEvent::ConfigOutcome {
             request_id: None,
             restarted: ids(restarted),
             stopped: ids(stopped),
             started: ids(started),
-        }
+        })
     }
 
     #[tokio::test]
@@ -1623,7 +2002,10 @@ pub(crate) mod tests {
             ActorStatus::Connected,
             ActorStatus::Disconnected,
         ] {
-            server.send(FlighthookMessage::new(status_event(status)));
+            server.local(LocalEvent::CardStatus {
+                status,
+                telemetry: HashMap::new(),
+            });
         }
 
         // Each page load (a UI connecting) reads the same history, the red
@@ -1631,7 +2013,7 @@ pub(crate) mod tests {
         let red = |body: &str| {
             let status: flighthook::StatusResponse = serde_json::from_str(body).expect("json");
             status
-                .actors
+                .cards
                 .get("openconnect_server.0")
                 .filter(|a| a.state == flighthook::ConnectionState::Reconnecting)
                 .map(|a| a.red_for_ms)
@@ -1657,31 +2039,43 @@ pub(crate) mod tests {
     /// A webserver's state over `root`, on `bus_tx`, as `actor_id`.
     pub(crate) fn web_state(
         root: Arc<SystemState>,
-        bus_tx: broadcast::Sender<FlighthookMessage>,
+        bus_tx: broadcast::Sender<BusMsg>,
         actor_id: &str,
     ) -> WebState {
-        let groups = initial_groups(&root);
         WebState {
             root,
             bus_tx,
             actors: RwLock::new(HashMap::new()),
             epoch: std::time::Instant::now(),
             shots: RwLock::new(VecDeque::new()),
-            groups: RwLock::new(groups),
+            blocks: RwLock::new(BlockStore::new()),
             raw_bytes: AtomicUsize::new(0),
-            device_identity: RwLock::new(HashMap::new()),
-            cached_actor_status: RwLock::new(HashMap::new()),
-            cached_device_telemetry: RwLock::new(HashMap::new()),
+            bus_state: Mutex::default(),
+            ui_out: broadcast::channel(1024).0,
+            config_generation: AtomicU64::new(0),
             addr: "127.0.0.1:0".parse().expect("addr"),
             actor_id: actor_id.into(),
             ws_count: AtomicU64::new(0),
             request_count: AtomicU64::new(0),
             auto_chip_shots: AtomicU32::new(0),
             reconnecting: std::sync::Mutex::default(),
+            looped_links: std::sync::Mutex::default(),
         }
     }
 
-    pub(crate) fn test_state() -> (WebState, GameStateWriter, TempDir) {
+    /// A web state over `root` that has taken `msgs` off the bus, as the
+    /// running web server folds them.
+    pub(crate) async fn folded(root: Arc<SystemState>, msgs: &[BusMsg]) -> Arc<WebState> {
+        let (bus_tx, _) = broadcast::channel(1024);
+        let state = Arc::new(web_state(root, bus_tx, "webserver.0"));
+        let mut accumulators = PendingShots::new();
+        for msg in msgs {
+            apply_bus_event(&state, msg, &mut accumulators).await;
+        }
+        state
+    }
+
+    pub(crate) fn test_state() -> (WebState, SessionWriter, TempDir) {
         let dir = TempDir(std::env::temp_dir().join(format!(
             "flighthook-web-test-{}",
             crate::state::config::generate_id()
@@ -1713,8 +2107,8 @@ pub(crate) mod tests {
     }
 
     /// `shot_video` from `camera` for `keys`, lasting `duration_ms`.
-    fn shot_video(keys: &[&ShotKey], duration_ms: u64) -> FlighthookEvent {
-        FlighthookEvent::ShotVideo {
+    fn shot_video(keys: &[&ShotKey], duration_ms: u64) -> Ev {
+        Ev::Local(LocalEvent::ShotVideo {
             keys: keys.iter().map(|k| (*k).clone()).collect(),
             position: flighthook::CameraPosition::GolferFront,
             duration_ms,
@@ -1723,7 +2117,7 @@ pub(crate) mod tests {
             impact_offset_ms: 4000,
             complete: true,
             dropped: 0,
-        }
+        })
     }
 
     /// The camera actors of the stored shot `shot_id`'s clips, with their
@@ -1745,35 +2139,39 @@ pub(crate) mod tests {
             .unwrap_or_default()
     }
 
-    /// A stored shot keeps the provenance its trigger carried; one whose
-    /// trigger had none is stored without it.
+    /// A stored shot keeps the source its launch monitor declared in its
+    /// `bus.actor`; one from a launch monitor that declared none is stored
+    /// without it.
     #[tokio::test]
     async fn a_stored_shot_keeps_its_provenance() {
         let (state, _writer, _dir) = test_state();
         let mut pending = PendingShots::new();
         for (n, actor, provenance) in [
-            (1, "square.0", Some(flighthook::Provenance::Measured)),
-            (2, "mock_monitor.0", Some(flighthook::Provenance::Virtual)),
-            (3, "square.0", None),
+            (1, "square.0", Some(flighthook::Source::Measured)),
+            (2, "mock_monitor.0", Some(flighthook::Source::Virtual)),
+            (3, "exputt.0", None),
         ] {
             let key = ShotKey {
                 shot_id: format!("uuid-{n}"),
                 shot_number: n,
             };
-            let mut trigger =
-                FlighthookMessage::new(FlighthookEvent::shot_trigger(key.clone())).actor(actor);
-            trigger.provenance = provenance;
-            apply_bus_event(&state, &trigger, &mut pending).await;
+            let mut declared = flightrelay::BusActor::new(actor, 5.0)
+                .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+            declared.device = Some(flightrelay::DeviceInfo {
+                source: provenance,
+                ..flightrelay::DeviceInfo::default()
+            });
+            let declared = BusMsg::frp(flightrelay::FrpMessage::new(actor, declared));
+            apply_bus_event(&state, &declared, &mut pending).await;
+            apply_ev(&state, actor, Ev::trigger(key.clone()), &mut pending).await;
             for event in [
-                FlighthookEvent::Launch {
+                Ev::frp(flightrelay::ShotLaunch {
                     key: key.clone(),
-                    launch: Box::new(ball()),
-                    derived: None,
-                },
-                FlighthookEvent::ShotFinished { key, raw: None },
+                    launch: ball(),
+                }),
+                Ev::Finished(key, None),
             ] {
-                let msg = FlighthookMessage::new(event).actor(actor);
-                apply_bus_event(&state, &msg, &mut pending).await;
+                apply_ev(&state, actor, event, &mut pending).await;
             }
         }
         let stored: Vec<_> = state
@@ -1781,13 +2179,13 @@ pub(crate) mod tests {
             .read()
             .await
             .iter()
-            .map(|s| (s.key.shot_number, s.data.provenance))
+            .map(|s| (s.key.shot_number, s.data.source))
             .collect();
         assert_eq!(
             stored,
             [
-                (1, Some(flighthook::Provenance::Measured)),
-                (2, Some(flighthook::Provenance::Virtual)),
+                (1, Some(flighthook::Source::Measured)),
+                (2, Some(flighthook::Source::Virtual)),
                 (3, None),
             ]
         );
@@ -1805,37 +2203,27 @@ pub(crate) mod tests {
             shot_id: "uuid-b".into(),
             shot_number: 1,
         };
-        let mut apply = async |actor: &str, event: FlighthookEvent| {
-            let msg = FlighthookMessage::new(event).actor(actor);
-            apply_bus_event(&state, &msg, &mut pending).await;
+        let mut apply = async |actor: &str, event: Ev| {
+            apply_ev(&state, actor, event, &mut pending).await;
         };
         // a: stored before its clip; b (another device): still pending.
-        apply("mevo.0", FlighthookEvent::shot_trigger(a.clone())).await;
+        apply("mevo.0", Ev::trigger(a.clone())).await;
         apply(
             "mevo.0",
-            FlighthookEvent::Launch {
+            Ev::frp(flightrelay::ShotLaunch {
                 key: a.clone(),
-                launch: Box::new(ball()),
-                derived: None,
-            },
+                launch: ball(),
+            }),
         )
         .await;
-        apply(
-            "mevo.0",
-            FlighthookEvent::ShotFinished {
-                key: a.clone(),
-                raw: None,
-            },
-        )
-        .await;
-        apply("r10.0", FlighthookEvent::shot_trigger(b.clone())).await;
+        apply("mevo.0", Ev::Finished(a.clone(), None)).await;
+        apply("r10.0", Ev::trigger(b.clone())).await;
         apply(
             "r10.0",
-            FlighthookEvent::Launch {
+            Ev::frp(flightrelay::ShotLaunch {
                 key: b.clone(),
-                launch: Box::new(ball()),
-                derived: None,
-            },
+                launch: ball(),
+            }),
         )
         .await;
 
@@ -1855,14 +2243,7 @@ pub(crate) mod tests {
         );
         assert!(stored_video(&state, "uuid-b").await.is_empty(), "pending");
 
-        apply(
-            "r10.0",
-            FlighthookEvent::ShotFinished {
-                key: b.clone(),
-                raw: None,
-            },
-        )
-        .await;
+        apply("r10.0", Ev::Finished(b.clone(), None)).await;
         assert_eq!(
             stored_video(&state, "uuid-b").await,
             [("camera.0".to_owned(), 5000)]
@@ -1883,9 +2264,9 @@ pub(crate) mod tests {
         assert_eq!(rows[1]["video"][0]["duration_ms"], 5000);
         apply(
             "camera.0",
-            FlighthookEvent::ShotVideoRemoved {
+            Ev::Local(LocalEvent::ShotVideoRemoved {
                 keys: vec![a.clone()],
-            },
+            }),
         )
         .await;
         assert!(stored_video(&state, "uuid-a").await.is_empty());
@@ -1900,18 +2281,16 @@ pub(crate) mod tests {
             shot_id: "uuid-a".into(),
             shot_number: 1,
         };
-        let mut apply = async |actor: &str, event: FlighthookEvent| {
-            let msg = FlighthookMessage::new(event).actor(actor);
-            apply_bus_event(&state, &msg, &mut pending).await;
+        let mut apply = async |actor: &str, event: Ev| {
+            apply_ev(&state, actor, event, &mut pending).await;
         };
-        apply("mevo.0", FlighthookEvent::shot_trigger(a.clone())).await;
+        apply("mevo.0", Ev::trigger(a.clone())).await;
         apply(
             "mevo.0",
-            FlighthookEvent::Launch {
+            Ev::frp(flightrelay::ShotLaunch {
                 key: a.clone(),
-                launch: Box::new(ball()),
-                derived: None,
-            },
+                launch: ball(),
+            }),
         )
         .await;
         apply("camera.0", shot_video(&[&a], 5000)).await;
@@ -1919,20 +2298,13 @@ pub(crate) mod tests {
         // Pending still: marked, and stored with the mark.
         apply(
             "camera.1",
-            FlighthookEvent::ShotPose {
+            Ev::Local(LocalEvent::ShotPose {
                 keys: vec![a.clone()],
                 rotation: 0,
-            },
+            }),
         )
         .await;
-        apply(
-            "mevo.0",
-            FlighthookEvent::ShotFinished {
-                key: a.clone(),
-                raw: None,
-            },
-        )
-        .await;
+        apply("mevo.0", Ev::Finished(a.clone(), None)).await;
         let poses = |state: &WebState| {
             let shots = state.shots.try_read().expect("shots");
             shots
@@ -1944,10 +2316,10 @@ pub(crate) mod tests {
         assert_eq!(poses(&state), [false, true]);
         apply(
             "camera.0",
-            FlighthookEvent::ShotPose {
+            Ev::Local(LocalEvent::ShotPose {
                 keys: vec![a.clone()],
                 rotation: 0,
-            },
+            }),
         )
         .await;
         assert_eq!(poses(&state), [true, true]);
@@ -1959,9 +2331,9 @@ pub(crate) mod tests {
         );
         apply(
             "camera.1",
-            FlighthookEvent::ShotSwing {
+            Ev::Local(LocalEvent::ShotSwing {
                 keys: vec![a.clone()],
-            },
+            }),
         )
         .await;
         let rows = serde_json::to_value(&state.shots.read().await[0].data).expect("ser");
@@ -1974,7 +2346,7 @@ pub(crate) mod tests {
     /// effect, as the web layer stores them.
     pub(crate) async fn export_lines(
         config: &flighthook::FlighthookConfig,
-        messages: &[FlighthookMessage],
+        messages: &[BusMsg],
     ) -> Vec<String> {
         let (state, _writer, _dir) = test_state();
         state.root.system.update(|c| *c = config.clone());
@@ -1985,18 +2357,49 @@ pub(crate) mod tests {
         let shots = state.shots.read().await;
         shots
             .iter()
-            .map(|s| super::export::jsonl_line(s, "t", None, true))
+            .map(|s| super::export::jsonl_line(s, "t", None, true, config))
             .collect()
     }
 
-    pub(crate) async fn feed(state: &WebState, actor: &str, events: Vec<FlighthookEvent>) {
+    /// One message of card `actor`, folded.
+    pub(crate) async fn apply_ev(
+        state: &WebState,
+        actor: &str,
+        event: Ev,
+        accumulators: &mut PendingShots,
+    ) {
+        for msg in event.bus(&state.root, actor) {
+            apply_bus_event(state, &msg, accumulators).await;
+        }
+    }
+
+    /// Messages of card `actor`, folded in order.
+    pub(crate) async fn feed(state: &WebState, actor: &str, events: Vec<Ev>) {
         let mut acc = PendingShots::new();
         for event in events {
-            let msg = FlighthookMessage::new(event)
-                .actor(actor)
-                .device("FS M2-000001");
-            apply_bus_event(state, &msg, &mut acc).await;
+            for msg in event.bus(&state.root, actor) {
+                apply_bus_event(state, &msg, &mut acc).await;
+            }
         }
+    }
+
+    /// Local events of `card`, folded in order.
+    pub(crate) async fn feed_local(state: &WebState, card: &str, events: Vec<LocalEvent>) {
+        let mut acc = PendingShots::new();
+        for event in events {
+            apply_bus_event(state, &BusMsg::local(card, event), &mut acc).await;
+        }
+    }
+
+    /// The session's turn with `club` in play, as the session's
+    /// `golfer.turn`.
+    pub(crate) fn turn_event(club: Club) -> Ev {
+        Ev::Turn(flightrelay::GolferTurn::new(
+            None,
+            Some(club),
+            flighthook::Handedness::Right,
+            Mode::Full,
+        ))
     }
 
     fn ball() -> Launch {
@@ -2005,6 +2408,110 @@ pub(crate) mod tests {
             launch_elevation: Some(20.0),
             ..Launch::default()
         }
+    }
+
+    /// A message from the shot's own launch monitor after its finish logs a
+    /// warning; a flight model's addendum does not.
+    #[test]
+    fn only_the_launch_monitors_own_late_message_warns() {
+        let mut agg = flightrelay::ShotAggregator::new();
+        let from = "monitor-id";
+        agg.feed(&flightrelay::FrpMessage::new(
+            from,
+            flightrelay::ShotTrigger::new(key(1)),
+        ));
+        let Some(flightrelay::ShotEvent::Finished(shot)) = agg.feed(&flightrelay::FrpMessage::new(
+            from,
+            flightrelay::ShotFinished { key: key(1) },
+        )) else {
+            panic!("finished");
+        };
+        let body: FrpBody = flightrelay::ShotFlight {
+            key: key(1),
+            flight: flightrelay::FlightResult::new(flightrelay::Basis::Modeled),
+        }
+        .into();
+        let warning = late_warning(&shot, from, &body).expect("a warning");
+        assert_eq!(
+            warning,
+            "shot.flight from monitor-id arrived after shot 1 (shot-1) finished"
+        );
+        assert_eq!(late_warning(&shot, "flight-model-id", &body), None);
+    }
+
+    /// The device's own id that a card's capture carries is scrubbed from
+    /// the exported frames, even when the card's `device_info` text does
+    /// not name it.
+    #[tokio::test]
+    async fn a_raw_frame_with_the_bare_device_id_is_scrubbed_on_export() {
+        const SSID: &str = "FS M2-123456";
+        const BLE: &str = "C4:3A:11:22:33:44";
+        let (state, _writer, _dir) = test_state();
+        let mut acc = PendingShots::new();
+        apply_bus_event(
+            &state,
+            &BusMsg::local(
+                "mevo.0",
+                LocalEvent::CardStatus {
+                    status: ActorStatus::Connected,
+                    telemetry: HashMap::from([("device_info".into(), "FlightScope Xi".into())]),
+                },
+            ),
+            &mut acc,
+        )
+        .await;
+        apply_ev(&state, "mevo.0", Ev::trigger(key(1)), &mut acc).await;
+        let raw = ShotRaw {
+            transport: "flightscope-tcp".into(),
+            frames: vec![
+                RawRecord::text(RawDir::Rx, format!("ssid={SSID}")),
+                RawRecord::text(RawDir::Rx, format!("peer {BLE} up")),
+            ],
+            ..ShotRaw::default()
+        };
+        apply_bus_event(
+            &state,
+            &BusMsg::local(
+                "mevo.0",
+                LocalEvent::ShotCapture {
+                    key: key(1),
+                    raw: Box::new(raw),
+                    scrub: vec![SSID.into(), BLE.into()],
+                },
+            ),
+            &mut acc,
+        )
+        .await;
+        apply_bus_event(
+            &state,
+            &BusMsg::frp(flightrelay::FrpMessage::new(
+                "mevo.0",
+                flightrelay::ShotFinished { key: key(1) },
+            )),
+            &mut acc,
+        )
+        .await;
+
+        let shots = state.shots.read().await;
+        let line = export::build_export_line(
+            &shots[0],
+            "now",
+            None,
+            true,
+            &flighthook::FlighthookConfig::default(),
+        );
+        let json = serde_json::to_string(&line).expect("json");
+        assert!(!json.contains(SSID), "{json}");
+        assert!(!json.contains(BLE), "{json}");
+        let texts: Vec<_> = line
+            .raw
+            .as_ref()
+            .expect("raw")
+            .frames
+            .iter()
+            .filter_map(|f| f.text.as_deref())
+            .collect();
+        assert_eq!(texts, ["ssid=<redacted>", "peer <redacted> up"]);
     }
 
     #[tokio::test]
@@ -2016,31 +2523,38 @@ pub(crate) mod tests {
             &state,
             "square.0",
             vec![
-                FlighthookEvent::shot_trigger(key(1)),
-                FlighthookEvent::Launch {
+                Ev::trigger(key(1)),
+                Ev::frp(flightrelay::ShotLaunch {
                     key: key(1),
-                    launch: Box::new(Launch::default()),
-                    derived: Some(Box::new(derived.clone())),
-                },
-                FlighthookEvent::ShotFinished {
-                    key: key(1),
-                    raw: None,
-                },
+                    launch: ball(),
+                }),
+                Ev::Finished(key(1), None),
             ],
+        )
+        .await;
+        // The flight model flies the finished shot from its own actor.
+        feed(
+            &state,
+            &state.root.flight_model_id(),
+            vec![Ev::frp(flightrelay::ShotFlight {
+                key: key(1),
+                flight: flighthook::FlightResult {
+                    carry_distance: Some(Distance::Meters(150.9)),
+                    ..flighthook::FlightResult::new(flighthook::Basis::Modeled)
+                },
+            })],
         )
         .await;
         let shots = state.shots.read().await;
         assert_eq!(shots.len(), 1);
-        assert_eq!(shots[0].data.derived, Some(derived));
+        assert_eq!(shots[0].data.shown().derived, Some(derived));
         assert!(shots[0].raw.is_none());
     }
 
     #[tokio::test]
     async fn trigger_snapshots_context_and_finish_stores_raw() {
         let (state, writer, _dir) = test_state();
-        writer.set_club_info(ClubInfo { club: Club::Iron8 });
-        writer.set_mode(ShotDetectionMode::Full);
-        writer.set_handed(Handedness::Right);
+        let iron8 = turn_to(&state.root, &writer, Club::Iron8);
         state.root.system.update(|c| {
             c.mevo.insert(
                 "0".into(),
@@ -2056,65 +2570,58 @@ pub(crate) mod tests {
                 },
             );
         });
-        apply_bus_event(
-            &state,
-            &FlighthookMessage::new(FlighthookEvent::DeviceTelemetry {
-                manufacturer: Some("FlightScope".into()),
-                model: Some("Xi".into()),
-                firmware: None,
-                source: None,
-                telemetry: None,
-            })
-            .actor("mevo.0"),
-            &mut PendingShots::new(),
-        )
-        .await;
-
         let mut acc = PendingShots::new();
-        let msg = |event| {
-            FlighthookMessage::new(event)
-                .actor("mevo.0")
-                .device("FS M2-000001")
-        };
-        let club = |club| {
-            FlighthookMessage::new(FlighthookEvent::ClubInfo {
-                club_info: ClubInfo { club },
-            })
-            .actor("openconnect_client.0")
-        };
-        apply_bus_event(&state, &club(Club::Iron8), &mut acc).await;
+        // The card's session: Connected with its card text (here the
+        // device's id), then its `bus.actor` with the device's identity.
         apply_bus_event(
             &state,
-            &msg(FlighthookEvent::shot_trigger(key(1))),
+            &BusMsg::local(
+                "mevo.0",
+                LocalEvent::CardStatus {
+                    status: ActorStatus::Connected,
+                    telemetry: HashMap::from([("device_info".into(), "FS M2-000001".into())]),
+                },
+            ),
             &mut acc,
         )
         .await;
+        let mut declared = flightrelay::BusActor::new("mevo.0", 5.0)
+            .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+        declared.device = Some(flightrelay::DeviceInfo {
+            manufacturer: Some("FlightScope".into()),
+            model: Some("Xi".into()),
+            ..flightrelay::DeviceInfo::default()
+        });
+        apply_bus_event(
+            &state,
+            &BusMsg::frp(flightrelay::FrpMessage::new("mevo.0", declared)),
+            &mut acc,
+        )
+        .await;
+
+        apply_bus_event(&state, &iron8, &mut acc).await;
+        apply_ev(&state, "mevo.0", Ev::trigger(key(1)), &mut acc).await;
         // A club change after the trigger does not change the shot's club.
-        writer.set_club_info(ClubInfo { club: Club::Driver });
-        apply_bus_event(&state, &club(Club::Driver), &mut acc).await;
+        let driver = turn_to(&state.root, &writer, Club::Driver);
+        apply_bus_event(&state, &driver, &mut acc).await;
         for event in [
-            FlighthookEvent::Launch {
+            Ev::frp(flightrelay::ShotLaunch {
                 key: key(1),
-                launch: Box::new(ball()),
-                derived: None,
-            },
-            FlighthookEvent::ShotFinished {
-                key: key(1),
-                raw: Some(Box::new(raw(3, 4))),
-            },
+                launch: ball(),
+            }),
+            Ev::Finished(key(1), Some(Box::new(raw(3, 4)))),
         ] {
-            apply_bus_event(&state, &msg(event), &mut acc).await;
+            apply_ev(&state, "mevo.0", event, &mut acc).await;
         }
 
         let shots = state.shots.read().await;
         let s = &shots[0];
         assert!(s.received_at <= Utc::now());
         assert_eq!(s.key, key(1));
-        assert_eq!(s.context.club_selected, Some(Club::Iron8));
-        assert_eq!(s.context.detection_mode, Some(ShotDetectionMode::Full));
-        assert_eq!(s.context.handed, Some(Handedness::Right));
-        // `/api/shots` carries it on the shot itself.
-        assert_eq!(s.data.handed, Some(Handedness::Right));
+        assert_eq!(s.data.club_selected(), Some(Club::Iron8));
+        assert_eq!(s.context.detection_mode, Some(Mode::Full));
+        // `/api/shots` carries the turn on the shot itself.
+        assert_eq!(s.data.handed(), Some(Handedness::Right));
         assert_eq!(s.context.device.kind, "flightscope");
         assert_eq!(
             s.context.device.manufacturer.as_deref(),
@@ -2146,16 +2653,10 @@ pub(crate) mod tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::shot_trigger(key(1)),
-                FlighthookEvent::ShotFinished {
-                    key: key(1),
-                    raw: Some(Box::new(raw(2, 8))),
-                },
-                FlighthookEvent::shot_trigger(key(2)),
-                FlighthookEvent::ShotFinished {
-                    key: key(2),
-                    raw: None,
-                },
+                Ev::trigger(key(1)),
+                Ev::Finished(key(1), Some(Box::new(raw(2, 8)))),
+                Ev::trigger(key(2)),
+                Ev::Finished(key(2), None),
             ],
         )
         .await;
@@ -2184,16 +2685,12 @@ pub(crate) mod tests {
             &state,
             "mevo.0",
             vec![
-                FlighthookEvent::shot_trigger(key(1)),
-                FlighthookEvent::Launch {
+                Ev::trigger(key(1)),
+                Ev::frp(flightrelay::ShotLaunch {
                     key: key(1),
-                    launch: Box::new(ball()),
-                    derived: None,
-                },
-                FlighthookEvent::ShotFinished {
-                    key: key(1),
-                    raw: Some(Box::new(raw(2, 2))),
-                },
+                    launch: ball(),
+                }),
+                Ev::Finished(key(1), Some(Box::new(raw(2, 2)))),
             ],
         )
         .await;
@@ -2222,17 +2719,17 @@ pub(crate) mod tests {
         StoredShot {
             received_at: Utc::now(),
             key: key(n),
-            context: ShotContext::default(),
+            context: ExportContext::default(),
             data: ShotData {
-                actor: "mevo.0".into(),
+                from: "mevo-id".into(),
+                card: Some("mevo.0".into()),
                 shot_number: n,
                 launch: Some(ball()),
-                club: None,
-                impact: None,
-                derived: None,
                 ..ShotData::default()
             },
             raw,
+            frp: None,
+            path: None,
         }
     }
 
@@ -2289,23 +2786,69 @@ pub(crate) mod tests {
     // -- Shot groups ---------------------------------------------------------
 
     /// Feeds bus messages through one shared set of pending shots, so a
-    /// shot's trigger and finish can be split around other events.
-    struct Updater<'a> {
+    /// shot's trigger and finish can be split around other events, with
+    /// the practice actor running beside the web layer: it sees every
+    /// message the web layer folds, and what it publishes is folded next.
+    pub(crate) struct Updater<'a> {
         state: &'a WebState,
         pending: PendingShots,
+        practice: crate::state::practice::Practice,
+        system: BusSender,
+        rx: broadcast::Receiver<BusMsg>,
     }
 
     impl<'a> Updater<'a> {
-        fn new(state: &'a WebState) -> Self {
+        pub(crate) fn new(state: &'a WebState) -> Self {
+            let rx = state.bus_tx.subscribe();
+            let system = BusSender::new("system".into(), state.bus_tx.clone(), Arc::default())
+                .with_frp_id(Some(state.root.flighthook_id()));
+            let (practice, first) = crate::state::practice::Practice::with_config(
+                state.root.system.view(),
+                state.root.session.turn(),
+                0,
+            );
+            crate::actors::system::publish_blocks(first, &system);
             Self {
                 state,
                 pending: PendingShots::new(),
+                practice,
+                system,
+                rx,
             }
         }
 
-        async fn send(&mut self, actor: &str, event: FlighthookEvent) {
-            let msg = FlighthookMessage::new(event).actor(actor);
-            apply_bus_event(self.state, &msg, &mut self.pending).await;
+        pub(crate) async fn send(&mut self, actor: &str, event: Ev) {
+            for m in event.bus(&self.state.root, actor) {
+                apply_bus_event(self.state, &m, &mut self.pending).await;
+                crate::actors::system::handle_practice(&m, &mut self.practice, &self.system);
+            }
+            self.settle().await;
+        }
+
+        /// New set (or New session) from flighthook, as `POST /api/blocks`
+        /// sends it.
+        pub(crate) async fn new_block(&mut self, new_session: bool) {
+            send_new_block(self.state, new_session);
+            self.settle().await;
+        }
+
+        /// A bus message as it is.
+        async fn bus(&mut self, msg: &BusMsg) {
+            apply_bus_event(self.state, msg, &mut self.pending).await;
+            crate::actors::system::handle_practice(msg, &mut self.practice, &self.system);
+            self.settle().await;
+        }
+
+        /// Fold what is on the bus (the practice actor's blocks, the web
+        /// layer's own commands) until nothing new arrives.
+        async fn settle(&mut self) {
+            while let Ok(msg) = self.rx.try_recv() {
+                if msg.as_local().is_some() {
+                    continue;
+                }
+                apply_bus_event(self.state, &msg, &mut self.pending).await;
+                crate::actors::system::handle_practice(&msg, &mut self.practice, &self.system);
+            }
         }
 
         async fn trigger(&mut self, n: u32) {
@@ -2316,28 +2859,26 @@ pub(crate) mod tests {
             self.finish_as("mevo.0", key(n)).await;
         }
 
-        async fn shot(&mut self, n: u32) {
+        pub(crate) async fn shot(&mut self, n: u32) {
             self.trigger(n).await;
             self.finish(n).await;
         }
 
         async fn trigger_as(&mut self, actor: &str, key: ShotKey) {
-            self.send(actor, FlighthookEvent::shot_trigger(key)).await;
+            self.send(actor, Ev::trigger(key)).await;
         }
 
         /// Ball data, then the finish.
         async fn finish_as(&mut self, actor: &str, key: ShotKey) {
             self.send(
                 actor,
-                FlighthookEvent::Launch {
+                Ev::frp(flightrelay::ShotLaunch {
                     key: key.clone(),
-                    launch: Box::new(ball()),
-                    derived: None,
-                },
+                    launch: ball(),
+                }),
             )
             .await;
-            self.send(actor, FlighthookEvent::ShotFinished { key, raw: None })
-                .await;
+            self.send(actor, Ev::Finished(key, None)).await;
         }
 
         async fn shot_as(&mut self, actor: &str, key: ShotKey) {
@@ -2348,10 +2889,10 @@ pub(crate) mod tests {
         async fn status(&mut self, actor: &str, status: ActorStatus) {
             self.send(
                 actor,
-                FlighthookEvent::ActorStatus {
+                Ev::Local(LocalEvent::CardStatus {
                     status,
                     telemetry: HashMap::new(),
-                },
+                }),
             )
             .await;
         }
@@ -2369,17 +2910,35 @@ pub(crate) mod tests {
             }
         }
 
-        /// A club change as the bus carries it: game state (the system
-        /// actor's write) and the `club_info` message.
-        async fn club(&mut self, writer: &GameStateWriter, club: Club) {
-            writer.set_club_info(ClubInfo { club });
-            self.send(
-                "web",
-                FlighthookEvent::ClubInfo {
-                    club_info: ClubInfo { club },
-                },
-            )
-            .await;
+        /// A club change as the bus carries it: the session's turn (the
+        /// system actor's write) and its `golfer.turn`.
+        pub(crate) async fn club(&mut self, writer: &SessionWriter, club: Club) {
+            let turn = turn_to(&self.state.root, writer, club);
+            self.bus(&turn).await;
+        }
+
+        /// A golfer and club pick as the bus carries it: the session's
+        /// turn and its `golfer.turn`.
+        async fn pick(&mut self, writer: &SessionWriter, golfer: &str, club: Club) {
+            let select = flightrelay::GolferSelect {
+                golfer: Some(Some(golfer.parse().expect("golfer id"))),
+                club: Some(Some(club)),
+                ..flightrelay::GolferSelect::new("test")
+            };
+            writer.apply(&select);
+            let turn = BusMsg::frp(flightrelay::FrpMessage::new(
+                self.state.root.flighthook_id(),
+                writer.turn(),
+            ));
+            self.bus(&turn).await;
+        }
+
+        /// A golfers save as the system actor follows it: the practice
+        /// actor keys its open blocks again.
+        async fn golfers_saved(&mut self) {
+            let changes = self.practice.rekey(0);
+            crate::actors::system::publish_blocks(changes, &self.system);
+            self.settle().await;
         }
 
         /// A persisted grouping change, as the system actor applies it.
@@ -2387,28 +2946,118 @@ pub(crate) mod tests {
             self.state.root.system.update(|c| c.shot_grouping = mode);
             self.send(
                 "system",
-                FlighthookEvent::ConfigOutcome {
+                Ev::Local(LocalEvent::ConfigOutcome {
                     request_id: None,
                     restarted: Vec::new(),
                     stopped: Vec::new(),
                     started: Vec::new(),
-                },
+                }),
             )
             .await;
         }
     }
 
-    /// `shot_group` events on the bus so far, as `(actor, group, shot)`.
-    fn group_events(
-        rx: &mut broadcast::Receiver<FlighthookMessage>,
-    ) -> Vec<(String, ShotGroupInfo, Option<GroupedShot>)> {
+    /// A practice block change on the bus.
+    #[derive(Debug, Clone, PartialEq)]
+    enum BlockEvent {
+        /// `practice.block`: opened, or republished in place.
+        Open(flightrelay::PracticeBlock),
+        /// The block's removal: closed.
+        Closed(String),
+    }
+
+    impl BlockEvent {
+        fn open(&self) -> Option<&flightrelay::PracticeBlock> {
+            match self {
+                Self::Open(b) => Some(b),
+                Self::Closed(_) => None,
+            }
+        }
+    }
+
+    /// The practice actor's block changes on the bus so far, as
+    /// `(from, change)`.
+    fn group_events(rx: &mut broadcast::Receiver<BusMsg>) -> Vec<(String, BlockEvent)> {
         let mut out = Vec::new();
         while let Ok(msg) = rx.try_recv() {
-            if let FlighthookEvent::ShotGroup { group, shot } = msg.event {
-                out.push((msg.actor, group, shot));
+            let Some(frp) = msg.as_frp() else { continue };
+            match &frp.body {
+                FrpBody::PracticeBlock(b) => {
+                    out.push((frp.from.clone(), BlockEvent::Open(b.clone())));
+                }
+                FrpBody::Removed(r) if r.kind == flightrelay::StateKind::PracticeBlock => {
+                    let id = r.id.clone().unwrap_or_default();
+                    out.push((frp.from.clone(), BlockEvent::Closed(id)));
+                }
+                _ => {}
             }
         }
         out
+    }
+
+    /// A set as the store holds it.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Set {
+        id: String,
+        number: u32,
+        session: u32,
+        club: Option<Club>,
+        open: bool,
+        shots: u32,
+    }
+
+    impl From<&BlockRecord> for Set {
+        fn from(r: &BlockRecord) -> Self {
+            Self {
+                id: r.block.id.clone(),
+                number: r.block.number,
+                session: r.block.session,
+                club: r.block.club,
+                open: r.open,
+                shots: r.shots,
+            }
+        }
+    }
+
+    /// The sets as the UI is told of them: every block that is open or has
+    /// stored shots, and the open block of the golfer up.
+    struct GroupsView {
+        list: Vec<Set>,
+        current: Option<Set>,
+        session: u32,
+    }
+
+    impl GroupsView {
+        fn list(&self) -> Vec<Set> {
+            self.list.clone()
+        }
+
+        fn current(&self) -> Option<Set> {
+            self.current.clone()
+        }
+
+        fn session(&self) -> u32 {
+            self.session
+        }
+    }
+
+    async fn groups_view(state: &WebState) -> GroupsView {
+        let golfer = state.root.session.turn().golfer;
+        let blocks = state.blocks.read().await;
+        GroupsView {
+            list: blocks
+                .all()
+                .iter()
+                .filter(|r| r.open || r.shots > 0)
+                .map(Set::from)
+                .collect(),
+            current: blocks
+                .all()
+                .iter()
+                .find(|r| r.open && r.block.golfer == golfer)
+                .map(Set::from),
+            session: blocks.session(),
+        }
     }
 
     async fn group_of(state: &WebState, n: u32) -> Option<String> {
@@ -2420,14 +3069,12 @@ pub(crate) mod tests {
             .find(|s| s.key.shot_number == n)
             .expect("stored")
             .data
-            .group
+            .block
             .clone()
     }
 
-    async fn group_info(state: &WebState, id: &str) -> ShotGroupInfo {
-        state
-            .groups
-            .read()
+    async fn group_info(state: &WebState, id: &str) -> Set {
+        groups_view(state)
             .await
             .list()
             .into_iter()
@@ -2436,7 +3083,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn stored_shot_is_stamped_with_id_club_and_group() {
+    async fn stored_shot_is_stamped_with_id_club_block_and_turn() {
         let (state, writer, _dir) = test_state();
         let mut up = Updater::new(&state);
         up.grouping(ShotGrouping::ByClub).await;
@@ -2444,25 +3091,19 @@ pub(crate) mod tests {
         up.shot(1).await;
         // Dataless, raw only: stored for the export, never counted.
         up.trigger(2).await;
-        up.send(
-            "mevo.0",
-            FlighthookEvent::ShotFinished {
-                key: key(2),
-                raw: Some(Box::new(raw(1, 2))),
-            },
-        )
-        .await;
+        up.send("mevo.0", Ev::Finished(key(2), Some(Box::new(raw(1, 2)))))
+            .await;
 
         let shots = state.shots.read().await.clone();
-        let current = state.groups.read().await.current().cloned().expect("open");
+        let current = groups_view(&state).await.current().expect("open");
         let s1 = &shots[0].data;
         assert_eq!(s1.shot_id.as_deref(), Some("shot-1"));
-        assert_eq!(s1.club_selected, Some(Club::Iron7));
-        assert_eq!(s1.group.as_deref(), Some(current.id.as_str()));
+        assert_eq!(s1.club_selected(), Some(Club::Iron7));
+        assert_eq!(s1.block.as_deref(), Some(current.id.as_str()));
         let s2 = &shots[1].data;
         assert_eq!(s2.shot_id.as_deref(), Some("shot-2"));
-        assert_eq!(s2.club_selected, Some(Club::Iron7));
-        assert_eq!(s2.group, None);
+        assert_eq!(s2.club_selected(), Some(Club::Iron7));
+        assert_eq!(s2.block, None);
         assert_eq!(current.shots, 1, "the dataless shot is not counted");
 
         let listed = routes::get_shots(
@@ -2477,8 +3118,10 @@ pub(crate) mod tests {
         assert_eq!(listed.len(), 1);
         let v = serde_json::to_value(&listed[0]).expect("ser");
         assert_eq!(v["shot_id"], "shot-1");
-        assert_eq!(v["club_selected"], "7I");
-        assert_eq!(v["group"], current.id.as_str());
+        assert_eq!(v["block"], current.id.as_str());
+        // The turn the shot was hit in (no golfer yet).
+        assert_eq!(v["turn"]["club"], "7I");
+        assert!(v["turn"]["golfer"].is_null());
     }
 
     #[tokio::test]
@@ -2489,11 +3132,11 @@ pub(crate) mod tests {
         up.grouping(ShotGrouping::None).await;
         up.club(&writer, Club::Iron7).await;
         up.shot(1).await;
-        up.send("web", FlighthookEvent::NewShotGroup).await;
+        up.new_block(false).await;
         up.shot(2).await;
         up.club(&writer, Club::Driver).await;
         up.shot(3).await;
-        up.send("web", FlighthookEvent::NewShotSession).await;
+        up.new_block(true).await;
         up.shot(4).await;
 
         let mut ids = Vec::new();
@@ -2504,11 +3147,11 @@ pub(crate) mod tests {
         for pair in ids.windows(2) {
             assert_ne!(pair[0], pair[1]);
         }
-        let list = state.groups.read().await.list();
+        let list = groups_view(&state).await.list();
         assert_eq!(list.len(), 4);
         assert_eq!(
             list.iter().map(|g| g.session).collect::<Vec<_>>(),
-            [0, 0, 0, 1]
+            [1, 1, 1, 2]
         );
         assert!(!group_events(&mut rx).is_empty(), "shot_group events flow");
 
@@ -2524,7 +3167,7 @@ pub(crate) mod tests {
         .0;
         assert_eq!(listed.len(), 4);
         for (shot, id) in listed.iter().zip(&ids) {
-            assert_eq!(shot.group.as_deref(), Some(id.as_str()));
+            assert_eq!(shot.block.as_deref(), Some(id.as_str()));
         }
     }
 
@@ -2535,43 +3178,49 @@ pub(crate) mod tests {
         let mut up = Updater::new(&state);
         up.club(&writer, Club::Iron7).await;
         up.shot(1).await;
-        up.send("web", FlighthookEvent::NewShotGroup).await;
+        up.new_block(false).await;
         up.trigger(2).await;
-        up.send(
-            "mevo.0",
-            FlighthookEvent::ShotFinished {
-                key: key(2),
-                raw: Some(Box::new(raw(3, 64))),
-            },
-        )
-        .await;
+        up.send("mevo.0", Ev::Finished(key(2), Some(Box::new(raw(3, 64)))))
+            .await;
         up.club(&writer, Club::Driver).await;
         up.shot(3).await;
         assert_eq!(state.shots.read().await.len(), 3);
         assert!(state.raw_bytes.load(Ordering::Relaxed) > 0);
-        assert_eq!(state.groups.read().await.list().len(), 2);
+        assert_eq!(groups_view(&state).await.list().len(), 2);
         let _ = group_events(&mut rx);
 
-        up.send("web", FlighthookEvent::ClearShotHistory).await;
+        up.send("web", Ev::Local(LocalEvent::ClearShotHistory))
+            .await;
         assert!(state.shots.read().await.is_empty());
         assert_eq!(state.raw_bytes.load(Ordering::Relaxed), 0);
         {
-            let groups = state.groups.read().await;
-            assert!(groups.list().is_empty());
-            assert!(groups.current().is_none());
-            assert_eq!(groups.session(), 1);
+            // The store forgot every block; the practice actor opened the
+            // new session's first block, still empty.
+            let groups = groups_view(&state).await;
+            let current = groups.current().expect("open");
+            assert_eq!(groups.list(), vec![current.clone()]);
+            assert_eq!((current.number, current.session, current.shots), (1, 2, 0));
+            assert_eq!(groups.session(), 2);
         }
-        assert!(group_events(&mut rx).is_empty(), "UIs clear on the command");
+        // The practice actor closes the open block and opens the new
+        // session's.
+        let events = group_events(&mut rx);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(events[0].1, BlockEvent::Closed(_)));
+        assert_eq!(
+            events[1].1.open().map(|b| (b.number, b.session)),
+            Some((1, 2))
+        );
 
-        // The next shot starts set 1 in the new session, with the club in
+        // The next shot joins set 1 of the new session, with the club in
         // play kept.
         up.shot(4).await;
         let shots = state.shots.read().await.clone();
         assert_eq!(shots.len(), 1);
-        assert_eq!(shots[0].data.club_selected, Some(Club::Driver));
-        let id = shots[0].data.group.clone().expect("grouped");
+        assert_eq!(shots[0].data.club_selected(), Some(Club::Driver));
+        let id = shots[0].data.block.clone().expect("grouped");
         let info = group_info(&state, &id).await;
-        assert_eq!((info.number, info.session, info.shots), (1, 1, 1));
+        assert_eq!((info.number, info.session, info.shots), (1, 2, 1));
         assert_eq!(info.club, Some(Club::Driver));
     }
 
@@ -2585,20 +3234,23 @@ pub(crate) mod tests {
         up.trigger(2).await;
         up.send(
             "mevo.0",
-            FlighthookEvent::Launch {
+            Ev::frp(flightrelay::ShotLaunch {
                 key: key(2),
-                launch: Box::new(ball()),
-                derived: None,
-            },
+                launch: ball(),
+            }),
         )
         .await;
         let _ = group_events(&mut rx);
 
-        up.send("web", FlighthookEvent::ClearShotHistory).await;
+        up.send("web", Ev::Local(LocalEvent::ClearShotHistory))
+            .await;
+        let _ = group_events(&mut rx);
         // The device finishes the shot it triggered before the clear.
         up.finish(2).await;
         assert!(state.shots.read().await.is_empty(), "nothing stored");
-        assert!(state.groups.read().await.list().is_empty());
+        let list = groups_view(&state).await.list();
+        assert_eq!(list.len(), 1, "the new session's empty block: {list:?}");
+        assert_eq!(list[0].shots, 0);
         assert!(group_events(&mut rx).is_empty(), "no set comes back");
         // A dropout afterward has nothing to end.
         up.reconnect("mevo.0").await;
@@ -2609,12 +3261,12 @@ pub(crate) mod tests {
         let shots = state.shots.read().await.clone();
         assert_eq!(shots.len(), 1);
         assert_eq!(shots[0].key.shot_number, 3);
-        let id = shots[0].data.group.clone().expect("grouped");
+        let id = shots[0].data.block.clone().expect("grouped");
         assert_eq!(group_info(&state, &id).await.number, 1);
     }
 
     #[tokio::test]
-    async fn exported_lines_carry_the_set_in_every_view() {
+    async fn exported_lines_carry_the_block_in_every_view() {
         for view in [
             ShotGrouping::BySet,
             ShotGrouping::ByClub,
@@ -2626,12 +3278,23 @@ pub(crate) mod tests {
             up.club(&writer, Club::Iron7).await;
             up.shot(1).await;
             let stored = state.shots.read().await[0].clone();
-            let id = stored.data.group.clone().expect("grouped");
-            let line: serde_json::Value =
-                serde_json::from_str(&export::jsonl_line(&stored, "t", None, false)).expect("json");
-            assert_eq!(line["group"], id.as_str(), "{view:?}");
-            assert_eq!(line["data"]["group"], id.as_str(), "{view:?}");
-            let row = export::to_csv_row(&stored, flighthook::UnitSystem::Imperial);
+            let id = stored.data.block.clone().expect("grouped");
+            let line: serde_json::Value = serde_json::from_str(&export::jsonl_line(
+                &stored,
+                "t",
+                None,
+                false,
+                &flighthook::FlighthookConfig::default(),
+            ))
+            .expect("json");
+            assert_eq!(line["block"], id.as_str(), "{view:?}");
+            assert_eq!(line["data"]["block"], id.as_str(), "{view:?}");
+            let row = export::to_csv_row(
+                &stored,
+                flighthook::UnitSystem::Imperial,
+                false,
+                &flighthook::FlighthookConfig::default(),
+            );
             assert!(row.split(',').any(|cell| cell == id), "{view:?}: {row}");
         }
     }
@@ -2643,16 +3306,15 @@ pub(crate) mod tests {
         up.grouping(ShotGrouping::BySet).await;
         up.club(&writer, Club::Iron7).await;
         up.trigger(1).await;
-        up.send("web", FlighthookEvent::NewShotGroup).await;
+        up.new_block(false).await;
         up.finish(1).await;
 
         let old = group_of(&state, 1).await.expect("grouped");
         let old_info = group_info(&state, &old).await;
         assert_eq!(old_info.shots, 1);
         assert!(!old_info.open, "New group closed it");
-        let new = state.groups.read().await.current().cloned().expect("open");
+        let new = groups_view(&state).await.current().expect("open");
         assert_ne!(new.id, old);
-        assert!(new.manual);
         assert_eq!(new.shots, 0, "the new group is still empty");
 
         up.shot(2).await;
@@ -2672,7 +3334,7 @@ pub(crate) mod tests {
         let info = group_info(&state, &first).await;
         assert_eq!(info.club, Some(Club::Iron7));
         assert_eq!(
-            state.shots.read().await[0].data.club_selected,
+            state.shots.read().await[0].data.club_selected(),
             Some(Club::Iron7)
         );
 
@@ -2696,7 +3358,7 @@ pub(crate) mod tests {
             up.shot(n).await;
             out.push(group_of(&state, n).await.expect("grouped"));
         }
-        assert_eq!(state.groups.read().await.list().len(), 3);
+        assert_eq!(groups_view(&state).await.list().len(), 3);
         out
     }
 
@@ -2728,7 +3390,7 @@ pub(crate) mod tests {
         let mut up = Updater::new(&state);
         up.club(&writer, Club::Iron7).await;
         up.shot(1).await;
-        let set = state.groups.read().await.current().cloned().expect("open");
+        let set = groups_view(&state).await.current().expect("open");
         group_events(&mut rx);
         for view in [
             ShotGrouping::None,
@@ -2737,7 +3399,7 @@ pub(crate) mod tests {
         ] {
             up.grouping(view).await;
             assert!(group_events(&mut rx).is_empty(), "{view:?}");
-            let current = state.groups.read().await.current().cloned();
+            let current = groups_view(&state).await.current();
             assert_eq!(current.as_ref(), Some(&set), "{view:?}");
         }
         up.shot(2).await;
@@ -2745,55 +3407,56 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn shot_group_events_on_create_join_and_session() {
+    async fn practice_blocks_on_create_retarget_and_session() {
         let (state, writer, _dir) = test_state();
+        let me = state.root.flighthook_id();
         let mut rx = state.bus_tx.subscribe();
         let mut up = Updater::new(&state);
         up.grouping(ShotGrouping::ByClub).await;
         up.club(&writer, Club::Iron7).await;
         up.shot(1).await;
 
+        // The first block opens at start with no club and takes the 7-iron
+        // in place while empty; the shot joining it is the store's count.
         let events = group_events(&mut rx);
         assert_eq!(events.len(), 2, "{events:?}");
-        let (actor, created, shot) = &events[0];
-        assert_eq!(actor, "webserver.0");
-        assert_eq!(created.shots, 0);
-        assert!(created.open);
-        assert_eq!(created.number, 1);
-        assert_eq!(*shot, None, "create carries no shot");
-        let (actor, joined, shot) = &events[1];
-        assert_eq!(actor, "webserver.0");
-        assert_eq!(joined.id, created.id);
-        assert_eq!(joined.shots, 1);
-        assert_eq!(
-            *shot,
-            Some(GroupedShot {
-                actor: "mevo.0".into(),
-                key: key(1),
-            })
-        );
+        assert!(events.iter().all(|(from, _)| *from == me), "{events:?}");
+        let created = events[0].1.open().expect("open").clone();
+        assert_eq!((created.number, created.club), (1, None));
+        let moved = events[1].1.open().expect("open");
+        assert_eq!((moved.id.as_str(), moved.number), (created.id.as_str(), 1));
+        assert_eq!(moved.club, Some(Club::Iron7));
+        let joined = group_info(&state, &created.id).await;
+        assert_eq!((joined.shots, joined.open), (1, true));
 
         // DR closes the 7-iron set and starts set 2.
         up.club(&writer, Club::Driver).await;
         up.shot(2).await;
         let events = group_events(&mut rx);
-        assert_eq!(events.len(), 3, "{events:?}");
-        assert_eq!(events[0].1.number, 1);
-        assert!(!events[0].1.open);
-        assert_eq!((events[1].1.number, events[1].1.open), (2, true));
-        assert_eq!(events[2].1.shots, 1);
-        up.send("web", FlighthookEvent::NewShotSession).await;
-        let closed = group_events(&mut rx);
-        assert_eq!(closed.len(), 1, "the open set");
-        let (a, g, s) = &closed[0];
-        assert_eq!(a, "webserver.0");
-        assert!(!g.open && s.is_none());
-        assert_eq!(g.number, 2);
-        assert_eq!(g.session, 0, "closed in the session it belongs to");
-        // The next shot starts set 3 in session 1.
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].1, BlockEvent::Closed(created.id.clone()));
+        let second = events[1].1.open().expect("open").clone();
+        assert_eq!((second.number, second.club), (2, Some(Club::Driver)));
+        assert_eq!(group_info(&state, &second.id).await.shots, 1);
+        assert!(!group_info(&state, &created.id).await.open);
+
+        up.new_block(true).await;
+        let events = group_events(&mut rx);
+        assert_eq!(
+            events.len(),
+            2,
+            "the open set closes, set 1 of session 2 opens"
+        );
+        assert_eq!(events[0].1, BlockEvent::Closed(second.id.clone()));
+        let closed = group_info(&state, &second.id).await;
+        assert_eq!(closed.session, 1, "closed in the session it belongs to");
+        let opened = events[1].1.open().expect("open").clone();
+        assert_eq!((opened.number, opened.session), (1, 2));
+        // The next shot joins it.
         up.shot(3).await;
-        let created = &group_events(&mut rx)[0].1;
-        assert_eq!((created.number, created.session), (3, 1));
+        assert!(group_events(&mut rx).is_empty());
+        assert_eq!(group_of(&state, 3).await, Some(opened.id.clone()));
+        assert_eq!(group_info(&state, &opened.id).await.shots, 1);
     }
 
     #[tokio::test]
@@ -2805,22 +3468,25 @@ pub(crate) mod tests {
         up.club(&writer, Club::Iron7).await;
         up.shot(1).await;
         let i7 = group_of(&state, 1).await.expect("grouped");
-        // The bus message alone moves the selection; game state is not read.
+        // The bus message alone moves the selection; the session is not read.
         up.send(
-            "openconnect_client.0",
-            FlighthookEvent::ClubInfo {
-                club_info: ClubInfo { club: Club::Driver },
-            },
+            "system",
+            Ev::Turn(flightrelay::GolferTurn::new(
+                None,
+                Some(Club::Driver),
+                flighthook::Handedness::Right,
+                Mode::Full,
+            )),
         )
         .await;
-        group_events(&mut rx);
-        up.send("web", FlighthookEvent::NewShotGroup).await;
+        // The turn alone rolls the set: the 7-iron set has a shot.
         let events = group_events(&mut rx);
-        assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(events[0].1.id, i7);
-        assert!(!events[0].1.open, "the 7-iron set closes");
-        assert_eq!(events[1].1.club, Some(Club::Driver));
-        assert!(events[1].1.manual && events[1].1.open);
+        let events = &events[events.len() - 2..];
+        assert_eq!(events[0].1, BlockEvent::Closed(i7), "the 7-iron set closes");
+        assert_eq!(events[1].1.open().and_then(|b| b.club), Some(Club::Driver));
+        // New set on the empty driver set changes nothing.
+        up.new_block(false).await;
+        assert!(group_events(&mut rx).is_empty());
     }
 
     /// A card turned off shows Disabled, with nothing held and never red,
@@ -2837,17 +3503,20 @@ pub(crate) mod tests {
                     flighthook::MockMonitorSection {
                         name: "Mock".into(),
                         enabled,
+                        actor_id: None,
                         impact_lead_s: None,
                         driver: Default::default(),
                     },
                 );
             });
         };
-        let outcome = |stopped: &[&str], started: &[&str]| FlighthookEvent::ConfigOutcome {
-            request_id: None,
-            restarted: Vec::new(),
-            stopped: stopped.iter().map(|s| (*s).to_owned()).collect(),
-            started: started.iter().map(|s| (*s).to_owned()).collect(),
+        let outcome = |stopped: &[&str], started: &[&str]| {
+            Ev::Local(LocalEvent::ConfigOutcome {
+                request_id: None,
+                restarted: Vec::new(),
+                stopped: stopped.iter().map(|s| (*s).to_owned()).collect(),
+                started: started.iter().map(|s| (*s).to_owned()).collect(),
+            })
         };
         let shown = |state: &WebState| {
             let names = actor_names(&state.root.system.snapshot());
@@ -2873,7 +3542,6 @@ pub(crate) mod tests {
         assert_eq!(off.red_for_ms, 0);
         assert_eq!(off.name, "Mock");
         assert!(off.telemetry.is_empty());
-        assert!(!state.cached_actor_status.read().await.contains_key(id));
 
         set(true);
         up.status(id, ActorStatus::Starting).await;
@@ -2906,42 +3574,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn every_webserver_groups_independently_under_its_own_actor_id() {
-        let (one, writer, _dir) = test_state();
-        let two = web_state(Arc::clone(&one.root), one.bus_tx.clone(), "webserver.1");
-        let mut rx = one.bus_tx.subscribe();
-        writer.set_club_info(ClubInfo { club: Club::Iron7 });
-        one.root
-            .system
-            .update(|c| c.shot_grouping = ShotGrouping::BySet);
-        let outcome = FlighthookEvent::ConfigOutcome {
-            request_id: None,
-            restarted: Vec::new(),
-            stopped: Vec::new(),
-            started: Vec::new(),
-        };
-        let mut a = Updater::new(&one);
-        let mut b = Updater::new(&two);
-        a.send("system", outcome.clone()).await;
-        b.send("system", outcome).await;
-        a.shot(1).await;
-        b.shot(1).await;
-
+    async fn the_sets_come_from_flighthooks_practice_actor_whatever_the_webserver() {
+        let (state, writer, _dir) = test_state();
+        let two = web_state(Arc::clone(&state.root), state.bus_tx.clone(), "webserver.1");
+        let mut rx = state.bus_tx.subscribe();
+        let mut up = Updater::new(&two);
+        up.club(&writer, Club::Iron7).await;
+        up.shot(1).await;
         let events = group_events(&mut rx);
-        let by = |actor: &str| -> Vec<ShotGroupInfo> {
-            events
-                .iter()
-                .filter(|(a, _, _)| a == actor)
-                .map(|(_, g, _)| g.clone())
-                .collect()
-        };
-        let (e1, e2) = (by("webserver.0"), by("webserver.1"));
-        assert_eq!(e1.len(), 2);
-        assert_eq!(e2.len(), 2);
-        assert_eq!(e1.len() + e2.len(), events.len());
-        assert_ne!(e1[0].id, e2[0].id, "each server has its own ids");
-        assert_eq!(group_of(&one, 1).await.as_deref(), Some(e1[0].id.as_str()));
-        assert_eq!(group_of(&two, 1).await.as_deref(), Some(e2[0].id.as_str()));
+        assert!(!events.is_empty());
+        let me = state.root.flighthook_id();
+        assert!(events.iter().all(|(from, _)| *from == me), "{events:?}");
+        let open = events.last().and_then(|(_, e)| e.open()).expect("open");
+        assert_eq!(group_of(&two, 1).await.as_deref(), Some(open.id.as_str()));
     }
 
     #[tokio::test]
@@ -2960,20 +3605,24 @@ pub(crate) mod tests {
         assert_eq!(state.shots.read().await.len(), MAX_SHOTS);
 
         let mut rx = state.bus_tx.subscribe();
+        let before = group_info(&state, &second).await.shots;
         up.shot(5000).await;
-        let events = group_events(&mut rx);
-        assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(events[0].1.id, second);
-        assert!(events[0].2.is_some(), "join");
-        let (_, released, shot) = &events[1];
-        assert_eq!(released.id, first);
-        assert_eq!(*shot, None);
+        // The store counts; the practice actor's blocks are untouched.
+        assert!(group_events(&mut rx).is_empty());
+        assert_eq!(group_info(&state, &second).await.shots, before + 1);
+        let released = state
+            .blocks
+            .read()
+            .await
+            .all()
+            .iter()
+            .find(|r| r.block.id == first)
+            .map(Set::from)
+            .expect("kept");
         assert!(!released.open);
         assert_eq!(released.shots, 0, "dropped");
         assert!(
-            state
-                .groups
-                .read()
+            groups_view(&state)
                 .await
                 .list()
                 .iter()
@@ -2988,24 +3637,20 @@ pub(crate) mod tests {
         up.grouping(ShotGrouping::BySet).await;
         up.club(&writer, Club::Iron7).await;
         up.trigger(0).await;
-        up.send(
-            "mevo.0",
-            FlighthookEvent::ShotFinished {
-                key: key(0),
-                raw: Some(Box::new(raw(1, 1))),
-            },
-        )
-        .await;
+        up.send("mevo.0", Ev::Finished(key(0), Some(Box::new(raw(1, 1)))))
+            .await;
         for n in 1..u32::try_from(MAX_SHOTS).expect("fits") {
             up.shot(n).await;
         }
         let group = group_of(&state, 1).await.expect("grouped");
         let mut rx = state.bus_tx.subscribe();
         up.shot(5000).await;
-        let events = group_events(&mut rx);
-        assert_eq!(events.len(), 1, "the join only: {events:?}");
-        assert_eq!(events[0].1.id, group);
-        assert_eq!(events[0].1.shots, u32::try_from(MAX_SHOTS).expect("fits"));
+        assert!(group_events(&mut rx).is_empty());
+        assert_eq!(
+            group_info(&state, &group).await.shots,
+            u32::try_from(MAX_SHOTS).expect("fits"),
+            "the join only"
+        );
     }
 
     /// A putting device's shot is a putter shot, filed in a putter set,
@@ -3015,22 +3660,33 @@ pub(crate) mod tests {
         let (state, writer, _dir) = test_state();
         let mut up = Updater::new(&state);
         up.club(&writer, Club::Iron7).await;
-        writer.set_mode(ShotDetectionMode::Full);
+        writer.apply(&flightrelay::GolferSelect {
+            mode: Some(flighthook::Mode::Full),
+            ..flightrelay::GolferSelect::new("test")
+        });
+        // The ExPutt's driver arms only for putts (its card's thread holds
+        // the fixed mode); the card key decides nothing.
+        let _putting = state.root.set_fixed_mode("putter-actor", Mode::Putting);
         up.shot_as("square.0", key_id(1, "omni")).await;
-        up.shot_as("exputt.0", key_id(1, "putt")).await;
+        up.shot_as("putter-actor", key_id(1, "putt")).await;
+        up.shot_as("exputt.1", key_id(2, "no-fixed-mode")).await;
 
         let shots = state.shots.read().await;
         let omni = &shots[0];
         let putt = &shots[1];
-        assert_eq!(omni.data.club_selected, Some(Club::Iron7));
-        assert_eq!(omni.context.detection_mode, Some(ShotDetectionMode::Full));
-        assert_eq!(putt.data.club_selected, Some(Club::Putter));
+        assert_eq!(omni.data.club_selected(), Some(Club::Iron7));
+        assert_eq!(omni.context.detection_mode, Some(Mode::Full));
+        assert_eq!(putt.data.club_selected(), Some(Club::Putter));
+        assert_eq!(putt.data.club_selected, Some(Club::Putter), "stamped");
+        assert_eq!(putt.context.detection_mode, Some(Mode::Putting));
         assert_eq!(
-            putt.context.detection_mode,
-            Some(ShotDetectionMode::Putting)
+            omni.data.block, putt.data.block,
+            "blocks follow the turn, whatever the device"
         );
-        assert_eq!(putt.context.device.kind, "exputt");
-        assert_ne!(omni.data.group, putt.data.group, "a putter set");
+        assert_eq!(shots[2].data.club_selected(), Some(Club::Iron7));
+        // `/api/shots` carries the stamped club.
+        let json = serde_json::to_value(&putt.data).expect("json");
+        assert_eq!(json["club_selected"], "PT");
     }
 
     #[tokio::test]
@@ -3039,23 +3695,16 @@ pub(crate) mod tests {
         let mut up = Updater::new(&state);
         up.grouping(ShotGrouping::BySet).await;
         up.club(&writer, Club::Iron7).await;
-        up.send("web", FlighthookEvent::NewShotGroup).await;
-        let set = state.groups.read().await.current().cloned().expect("open");
+        up.new_block(false).await;
+        let set = groups_view(&state).await.current().expect("open");
         // Shot 1 never finishes; shot 2 does.
         up.trigger(1).await;
         up.shot(2).await;
         // Another device's shot in flight is not this device's to end.
-        up.send("square.0", FlighthookEvent::shot_trigger(key(7)))
-            .await;
+        up.send("square.0", Ev::trigger(key(7))).await;
         up.trigger(3).await;
-        up.send(
-            "square.0",
-            FlighthookEvent::ShotFinished {
-                key: key(7),
-                raw: Some(Box::new(raw(1, 1))),
-            },
-        )
-        .await;
+        up.send("square.0", Ev::Finished(key(7), Some(Box::new(raw(1, 1)))))
+            .await;
         up.finish(3).await;
         assert_eq!(group_info(&state, &set.id).await.shots, 2);
         assert_eq!(group_of(&state, 2).await.as_deref(), Some(set.id.as_str()));
@@ -3063,8 +3712,8 @@ pub(crate) mod tests {
         assert_eq!(state.shots.read().await.len(), 3);
 
         // Re-triggering the same shot ends its first assignment too.
-        up.send("web", FlighthookEvent::NewShotGroup).await;
-        let fresh = state.groups.read().await.current().cloned().expect("open");
+        up.new_block(false).await;
+        let fresh = groups_view(&state).await.current().expect("open");
         up.trigger(4).await;
         up.trigger(4).await;
         up.finish(4).await;
@@ -3080,8 +3729,8 @@ pub(crate) mod tests {
         up.grouping(ShotGrouping::BySet).await;
         up.club(&writer, Club::Iron7).await;
         up.shot(1).await;
-        up.send("web", FlighthookEvent::NewShotGroup).await;
-        let set = state.groups.read().await.current().cloned().expect("open");
+        up.new_block(false).await;
+        let set = groups_view(&state).await.current().expect("open");
         for status in [
             ActorStatus::Reconnecting,
             ActorStatus::Disconnected,
@@ -3090,23 +3739,27 @@ pub(crate) mod tests {
             up.trigger(2).await;
             up.send(
                 "mevo.0",
-                FlighthookEvent::ActorStatus {
+                Ev::Local(LocalEvent::CardStatus {
                     status,
                     telemetry: HashMap::new(),
-                },
+                }),
             )
             .await;
             assert!(up.pending.is_empty(), "{status:?}");
-            // The set is empty again: New set is a no-op...
-            group_events(&mut rx);
-            up.send("web", FlighthookEvent::NewShotGroup).await;
-            assert!(group_events(&mut rx).is_empty(), "{status:?}");
-            let current = state.groups.read().await.current().cloned();
-            assert_eq!(current.map(|g| g.id), Some(set.id.clone()), "{status:?}");
+            // Nothing was stored for the set, and the set stays open.
+            let current = groups_view(&state).await.current();
+            assert_eq!(
+                current.map(|g| (g.id, g.shots)),
+                Some((set.id.clone(), 0)),
+                "{status:?}"
+            );
         }
-        // ...and it still takes the next shot's club.
+        group_events(&mut rx);
+        // The trigger counted for the practice actor: the set is not empty,
+        // so another club starts the next one.
         up.club(&writer, Club::Driver).await;
         up.shot(3).await;
+        let set = groups_view(&state).await.current().expect("open");
         assert_eq!(group_of(&state, 3).await.as_deref(), Some(set.id.as_str()));
         let info = group_info(&state, &set.id).await;
         assert_eq!(info.club, Some(Club::Driver));
@@ -3115,10 +3768,10 @@ pub(crate) mod tests {
         up.trigger(4).await;
         up.send(
             "mevo.0",
-            FlighthookEvent::ActorStatus {
+            Ev::Local(LocalEvent::CardStatus {
                 status: ActorStatus::Connected,
                 telemetry: HashMap::new(),
-            },
+            }),
         )
         .await;
         up.finish(4).await;
@@ -3132,29 +3785,53 @@ pub(crate) mod tests {
         up.grouping(ShotGrouping::BySet).await;
         up.club(&writer, Club::Driver).await;
         up.shot(1).await;
-        // 7I as the bus carries it before the system actor writes game state.
+        // 7I as the bus carries it before the session reads it.
         up.send(
-            "web",
-            FlighthookEvent::ClubInfo {
-                club_info: ClubInfo { club: Club::Iron7 },
-            },
+            "system",
+            Ev::Turn(flightrelay::GolferTurn::new(
+                None,
+                Some(Club::Iron7),
+                flighthook::Handedness::Right,
+                Mode::Full,
+            )),
         )
         .await;
         assert_eq!(
-            state.root.game.snapshot().club_info.map(|c| c.club),
+            state.root.session.turn().club,
             Some(Club::Driver),
-            "game state still lags"
+            "the session still lags"
         );
-        up.send("web", FlighthookEvent::NewShotGroup).await;
-        let set = state.groups.read().await.current().cloned().expect("open");
+        up.new_block(false).await;
+        let set = groups_view(&state).await.current().expect("open");
         assert_eq!(set.club, Some(Club::Iron7));
         up.shot(2).await;
         let stored = state.shots.read().await[1].data.clone();
-        assert_eq!(stored.club_selected, Some(Club::Iron7));
-        assert_eq!(stored.group.as_deref(), Some(set.id.as_str()));
+        assert_eq!(stored.club_selected(), Some(Club::Iron7));
+        assert_eq!(stored.block.as_deref(), Some(set.id.as_str()));
         let info = group_info(&state, &set.id).await;
         assert_eq!(info.club, Some(Club::Iron7), "not re-keyed to DR");
         assert_eq!(info.shots, 1);
+    }
+
+    /// The UI gets the store's shot before its `shot.finished`, so a row
+    /// with data never reads as no read for a moment.
+    #[tokio::test]
+    async fn the_ui_gets_the_shot_before_its_finish() {
+        let (state, _writer, _dir) = test_state();
+        let mut ui = state.ui_out.subscribe();
+        let mut up = Updater::new(&state);
+        up.shot(1).await;
+        let mut order = Vec::new();
+        while let Ok(msg) = ui.try_recv() {
+            match &*msg {
+                flighthook::UiMessage::Shot(_) => order.push("shot"),
+                flighthook::UiMessage::Frp(m) if m.body.kind() == "shot.finished" => {
+                    order.push("finished");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(order, ["shot", "finished"]);
     }
 
     #[tokio::test]
@@ -3165,21 +3842,19 @@ pub(crate) mod tests {
         up.club(&writer, Club::Iron7).await;
         // No data and no raw: nothing is stored.
         up.trigger(1).await;
-        up.send(
-            "mevo.0",
-            FlighthookEvent::ShotFinished {
-                key: key(1),
-                raw: None,
-            },
-        )
-        .await;
+        up.send("mevo.0", Ev::Finished(key(1), None)).await;
         assert!(state.shots.read().await.is_empty());
-        let current = state.groups.read().await.current().cloned().expect("open");
-        assert_eq!(current.shots, 0);
-        // Nothing pending: a different club adopts the empty group.
+        let current = groups_view(&state).await.current().expect("open");
+        assert_eq!(current.shots, 0, "nothing stored for it");
+        // A no-read gives its count back at its finish, so the set is
+        // still empty: a different club takes it over in place, and the
+        // first set shown stays Set 1.
         up.club(&writer, Club::Driver).await;
         up.shot(2).await;
-        assert_eq!(group_of(&state, 2).await, Some(current.id));
+        let next = group_of(&state, 2).await.expect("grouped");
+        assert_eq!(next, current.id);
+        let info = group_info(&state, &next).await;
+        assert_eq!((info.club, info.number), (Some(Club::Driver), 1));
     }
 
     // -- A device reconnecting keeps its set ---------------------------------
@@ -3200,12 +3875,12 @@ pub(crate) mod tests {
             .find(|s| s.key.shot_id == shot_id)
             .expect("stored")
             .data
-            .group
+            .block
             .clone()
     }
 
     async fn selected_club(state: &WebState) -> Option<Club> {
-        state.groups.read().await.selected_club()
+        state.root.session.turn().club
     }
 
     #[tokio::test]
@@ -3218,7 +3893,7 @@ pub(crate) mod tests {
         for n in 1..=3 {
             up.shot(n).await;
         }
-        let set = state.groups.read().await.current().cloned().expect("open");
+        let set = groups_view(&state).await.current().expect("open");
         assert_eq!(set.shots, 3);
         group_events(&mut rx);
 
@@ -3228,7 +3903,7 @@ pub(crate) mod tests {
             "no set is closed, rotated or created"
         );
         assert_eq!(selected_club(&state).await, Some(Club::Iron7));
-        let current = state.groups.read().await.current().cloned();
+        let current = groups_view(&state).await.current();
         assert_eq!(current.map(|g| g.id), Some(set.id.clone()));
 
         up.shot(4).await;
@@ -3236,7 +3911,7 @@ pub(crate) mod tests {
         let info = group_info(&state, &set.id).await;
         assert_eq!(info.shots, 4);
         assert!(info.open);
-        assert_eq!(state.groups.read().await.list().len(), 1);
+        assert_eq!(groups_view(&state).await.list().len(), 1);
     }
 
     #[tokio::test]
@@ -3248,7 +3923,7 @@ pub(crate) mod tests {
         up.club(&writer, Club::Iron7).await;
         up.shot(1).await;
         up.shot(2).await;
-        let set = state.groups.read().await.current().cloned().expect("open");
+        let set = groups_view(&state).await.current().expect("open");
         // Shot 3 is in flight when the connection drops.
         up.trigger(3).await;
         group_events(&mut rx);
@@ -3272,17 +3947,17 @@ pub(crate) mod tests {
             .map(|s| s.key.shot_number)
             .collect();
         assert_eq!(numbers, [1, 2, 4]);
-        assert_eq!(state.groups.read().await.list().len(), 1);
+        assert_eq!(groups_view(&state).await.list().len(), 1);
         assert_eq!(selected_club(&state).await, Some(Club::Iron7));
 
         // A set opened by the dropped shot's own trigger stays open, and the
         // next shot joins it.
-        up.send("web", FlighthookEvent::NewShotSession).await;
+        up.new_block(true).await;
         up.trigger(5).await;
-        let opened = state.groups.read().await.current().cloned().expect("open");
+        let opened = groups_view(&state).await.current().expect("open");
         assert_ne!(opened.id, set.id);
         up.reconnect("mevo.0").await;
-        let current = state.groups.read().await.current().cloned();
+        let current = groups_view(&state).await.current();
         assert_eq!(current.map(|g| g.id), Some(opened.id.clone()));
         up.shot(6).await;
         assert_eq!(group_of(&state, 6).await, Some(opened.id.clone()));
@@ -3323,7 +3998,7 @@ pub(crate) mod tests {
             assert_eq!(group_of_id(&state, "m2").await, Some(driver.clone()));
             let info = group_info(&state, &driver).await;
             assert_eq!((info.shots, info.open), (3, true), "{view:?}");
-            assert_eq!(state.groups.read().await.list().len(), 2);
+            assert_eq!(groups_view(&state).await.list().len(), 2);
         }
     }
 
@@ -3369,12 +4044,17 @@ pub(crate) mod tests {
         assert_eq!((first.shots, first.open), (3, false));
         let second = group_info(&state, &second).await;
         assert_eq!((second.shots, second.open), (2, true));
-        // Each join names the shot by its own id.
-        let joined: Vec<String> = group_events(&mut rx)
-            .into_iter()
-            .filter_map(|(_, _, shot)| shot.map(|s| s.key.shot_id))
+        // Each shot joined by its own id.
+        let joined: Vec<String> = state
+            .shots
+            .read()
+            .await
+            .iter()
+            .filter(|s| s.data.block.as_deref() == Some(second.id.as_str()))
+            .map(|s| s.key.shot_id.clone())
             .collect();
         assert_eq!(joined, ["b2", "b3"]);
+        let _ = group_events(&mut rx);
         assert!(up.pending.is_empty());
     }
 
@@ -3385,13 +4065,13 @@ pub(crate) mod tests {
         up.grouping(ShotGrouping::BySet).await;
         up.club(&writer, Club::Iron7).await;
         up.shot_as("mevo.0", key_id(1, "a1")).await;
-        let set = state.groups.read().await.current().cloned().expect("open");
+        let set = groups_view(&state).await.current().expect("open");
         // Both in flight; A drops before its finish, B finishes.
         up.trigger_as("mevo.0", key_id(2, "a2")).await;
         up.trigger_as("square.0", key_id(1, "b1")).await;
         up.status("mevo.0", ActorStatus::Disconnected).await;
-        let left: Vec<&str> = up.pending.keys().map(|(a, _)| a.as_str()).collect();
-        assert_eq!(left, ["square.0"], "only A's shot is dropped");
+        let left: Vec<&str> = up.pending.keys().map(String::as_str).collect();
+        assert_eq!(left, ["b1"], "only A's shot is dropped");
         up.finish_as("square.0", key_id(1, "b1")).await;
         // B's next trigger lands while A is still away.
         up.status("mevo.0", ActorStatus::Reconnecting).await;
@@ -3417,65 +4097,331 @@ pub(crate) mod tests {
         assert!(up.pending.is_empty());
     }
 
-    /// A device that sends its identity, its `source` and its keys in
-    /// separate messages is replayed to a client that connects later with
-    /// all of them in one `device_telemetry`, every key at its latest value.
-    /// A message for another device id starts over.
-    #[tokio::test]
-    async fn a_late_client_gets_the_devices_merged_telemetry() {
-        let (state, _writer, _dir) = test_state();
-        let mut up = Updater::new(&state);
-        let telemetry = |manufacturer: Option<&str>,
-                         source: Option<flighthook::Provenance>,
-                         pairs: &[(&str, &str)]| {
-            FlighthookEvent::DeviceTelemetry {
-                manufacturer: manufacturer.map(str::to_owned),
-                model: None,
-                firmware: None,
-                source,
-                telemetry: (!pairs.is_empty()).then(|| kv(pairs)),
+    // -- Remote actors gone ---------------------------------------------------
+
+    /// A message from a remote actor, as it arrives on a hub link.
+    fn from_peer(from: &str, body: impl Into<FrpBody>) -> BusMsg {
+        BusMsg::from_peer(
+            flightrelay::FrpMessage::new(from, body),
+            crate::bus::PeerId(42),
+        )
+    }
+
+    /// Run the system actor's remote tracker over `msgs` at `heard`, then
+    /// look for gone actors at `now`; the `ActorGone` events it sends.
+    fn track(root: &SystemState, msgs: &[BusMsg], heard: Instant, now: Instant) -> Vec<BusMsg> {
+        let (tx, mut rx) = broadcast::channel(16);
+        let sender = BusSender::new("system".into(), tx, Arc::default())
+            .with_frp_id(Some(root.flighthook_id()));
+        let mut remotes = crate::state::remotes::Remotes::new();
+        for m in msgs {
+            if let BusMsg::Frp {
+                msg, peer: Some(_), ..
+            } = m
+            {
+                remotes.hear(msg, heard);
             }
-        };
-        up.send("mock_monitor.0", telemetry(Some("Mock"), None, &[]))
-            .await;
-        up.send(
-            "mock_monitor.0",
-            telemetry(None, Some(flighthook::Provenance::Virtual), &[]),
-        )
-        .await;
-        up.send(
-            "mock_monitor.0",
-            telemetry(None, None, &[("ready", "false"), ("battery_pct", "80")]),
-        )
-        .await;
-        up.send(
-            "mock_monitor.0",
-            telemetry(None, None, &[("ready", "true")]),
-        )
-        .await;
+            let _ = crate::actors::system::follow_remote(root, &mut remotes, m);
+        }
+        crate::actors::system::expire_remotes(root, &mut remotes, &sender, now, now);
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
 
-        let mut output = super::frp_out::FrpOutput::new();
-        let replay = super::ws::telemetry_replay(&state, &mut output).await;
-        assert_eq!(replay.len(), 1);
-        let json = |event: &FlighthookEvent| serde_json::to_value(event).expect("ser");
-        assert_eq!(
-            json(&replay[0].event),
-            json(&FlighthookEvent::DeviceTelemetry {
-                manufacturer: Some("Mock".into()),
-                model: None,
-                firmware: None,
-                source: Some(flighthook::Provenance::Virtual),
-                telemetry: Some(kv(&[("ready", "true"), ("battery_pct", "80")])),
-            })
+    /// The timers fall more than 6 s behind (an injected clock): no
+    /// local actor expires, only the silent remote one. flighthook's turn
+    /// and Set stay, and the next shot lands in Set 1 with its turn.
+    #[tokio::test]
+    async fn a_stall_past_the_expiry_keeps_the_local_turn_and_set() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        let mut seen = state.bus_tx.subscribe();
+        up.club(&writer, Club::Iron7).await;
+        up.send(
+            "mevo.0",
+            Ev::device(flightrelay::DeviceInfo::default(), &[]),
+        )
+        .await;
+        let lm = flightrelay::BusActor::new("Trackball", 2.0)
+            .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+        up.bus(&from_peer("aaaa000000000001", lm)).await;
+        let mut msgs: Vec<BusMsg> = std::iter::from_fn(|| seen.try_recv().ok()).collect();
+        msgs.push(from_peer(
+            "aaaa000000000001",
+            flightrelay::BusActor::new("Trackball", 2.0),
+        ));
+        let t0 = Instant::now();
+        let gone = track(
+            &state.root,
+            &msgs,
+            t0,
+            t0 + std::time::Duration::from_secs(8),
         );
+        let gone_ids: Vec<&str> = gone
+            .iter()
+            .filter_map(|m| match m.as_local() {
+                Some((_, LocalEvent::ActorGone { actor })) => Some(actor.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gone_ids, ["aaaa000000000001"], "local actors never expire");
+        for m in &gone {
+            up.bus(m).await;
+        }
+        let own = state.root.flighthook_id();
+        {
+            let bus = state.bus_state.lock().unwrap();
+            assert!(bus.actor("aaaa000000000001").is_none());
+            assert!(
+                bus.actor("mevo.0").is_some(),
+                "the local launch monitor stays"
+            );
+            assert!(
+                bus.of_kind(flightrelay::StateKind::GolferTurn)
+                    .any(|m| m.from == own)
+            );
+            assert!(
+                bus.of_kind(flightrelay::StateKind::PracticeBlock)
+                    .any(|m| m.from == own)
+            );
+        }
+        up.shot(1).await;
+        let current = groups_view(&state).await.current().expect("open");
+        let shots = state.shots.read().await.clone();
+        assert_eq!(shots[0].data.block.as_deref(), Some(current.id.as_str()));
+        assert_eq!(current.number, 1);
+        assert_eq!(shots[0].data.club_selected(), Some(Club::Iron7));
+    }
 
-        let other = FlighthookMessage::new(telemetry(None, None, &[("ready", "false")]))
-            .actor("mock_monitor.0")
-            .device("another");
-        apply_bus_event(&state, &other, &mut up.pending).await;
-        let replay =
-            super::ws::telemetry_replay(&state, &mut super::frp_out::FrpOutput::new()).await;
-        assert_eq!(replay.len(), 1);
-        assert_eq!(json(&replay[0].event), json(&other.event));
+    /// A remote launch monitor dies mid-shot (trigger, then silence):
+    /// once it is gone the count goes back, so the next club's Set is still
+    /// Set 1.
+    #[tokio::test]
+    async fn the_first_set_stays_set_1_after_a_remote_monitor_died_mid_shot() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.club(&writer, Club::Iron7).await;
+        let lm = flightrelay::BusActor::new("Trackball", 2.0)
+            .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+        let msgs = [
+            from_peer("aaaa000000000001", lm),
+            from_peer("aaaa000000000001", flightrelay::ShotTrigger::new(key(1))),
+        ];
+        for m in &msgs {
+            up.bus(m).await;
+        }
+        let t0 = Instant::now();
+        for m in track(
+            &state.root,
+            &msgs,
+            t0,
+            t0 + std::time::Duration::from_secs(7),
+        ) {
+            up.bus(&m).await;
+        }
+        up.club(&writer, Club::Driver).await;
+        let view = groups_view(&state).await;
+        let list = view.list();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!((list[0].number, list[0].club), (1, Some(Club::Driver)));
+    }
+
+    /// The club changes while the remote
+    /// monitor's shot is in flight, then the monitor dies. The new Set is
+    /// still Set 1.
+    #[tokio::test]
+    async fn a_club_change_before_a_remote_monitor_dies_leaves_set_1() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.club(&writer, Club::Iron7).await;
+        let lm = flightrelay::BusActor::new("Trackball", 2.0)
+            .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+        let msgs = [
+            from_peer("aaaa000000000001", lm),
+            from_peer("aaaa000000000001", flightrelay::ShotTrigger::new(key(1))),
+        ];
+        for m in &msgs {
+            up.bus(m).await;
+        }
+        up.club(&writer, Club::Driver).await;
+        let t0 = Instant::now();
+        for m in track(
+            &state.root,
+            &msgs,
+            t0,
+            t0 + std::time::Duration::from_secs(7),
+        ) {
+            up.bus(&m).await;
+        }
+        let view = groups_view(&state).await;
+        let list = view.list();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!((list[0].number, list[0].club), (1, Some(Club::Driver)));
+    }
+
+    /// A game id linked to Eric while it is up with an open Set: the store
+    /// files later shots in the Sets the club changes open, never in a stale
+    /// one, and every Set's count is its own shots.
+    #[tokio::test]
+    async fn after_a_link_shots_land_in_the_new_sets() {
+        let (state, writer, _dir) = test_state();
+        state.root.system.update(|c| {
+            c.golfers = vec![
+                flighthook::GolferRecord::new("flighthook.e", "Eric"),
+                flighthook::GolferRecord::new("flighthook.s", "Sam"),
+            ];
+        });
+        let mut up = Updater::new(&state);
+        up.pick(&writer, "flighthook.e", Club::Driver).await;
+        up.shot(1).await;
+        up.pick(&writer, "pureplay.local-3", Club::Iron7).await;
+        up.shot(2).await;
+        up.shot(3).await;
+        state.root.system.update(|c| {
+            c.golfers[0].identifiers.push("pureplay.local-3".into());
+        });
+        up.golfers_saved().await;
+        up.club(&writer, Club::Iron8).await;
+        for n in 4..10 {
+            up.shot(n).await;
+        }
+        up.club(&writer, Club::Iron9).await;
+        for n in 10..14 {
+            up.shot(n).await;
+        }
+        let view = groups_view(&state).await;
+        let sets: Vec<(u32, Option<Club>, bool, u32)> = view
+            .list()
+            .iter()
+            .map(|s| (s.number, s.club, s.open, s.shots))
+            .collect();
+        assert_eq!(
+            sets,
+            vec![
+                (1, Some(Club::Driver), false, 1),
+                (1, Some(Club::Iron7), false, 2),
+                (2, Some(Club::Iron8), false, 6),
+                (3, Some(Club::Iron9), true, 4),
+            ]
+        );
+    }
+
+    /// A game golfer's name is stored on its shot while the profile is on
+    /// the bus, so the shot keeps its name after the round: a later list of
+    /// shots (a UI that connects then) carries it.
+    #[tokio::test]
+    async fn a_game_golfers_name_stays_on_its_shot_after_the_round() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        let id: flightrelay::GolferId = "pureplay.player-1".parse().expect("id");
+        up.bus(&BusMsg::frp(flightrelay::FrpMessage::new(
+            "pureplay.0",
+            flightrelay::GolferProfile::new(id.clone(), "Joe"),
+        )))
+        .await;
+        up.pick(&writer, "pureplay.player-1", Club::Iron7).await;
+        up.shot(1).await;
+        // The round ends: the profile goes.
+        up.bus(&BusMsg::frp(flightrelay::FrpMessage::new(
+            "pureplay.0",
+            flightrelay::Removal::of_id(flightrelay::StateKind::GolferProfile, id.as_str()),
+        )))
+        .await;
+        up.shot(2).await;
+        let shots = state.shots.read().await.clone();
+        assert_eq!(shots[0].data.golfer_name.as_deref(), Some("Joe"));
+        assert_eq!(shots[1].data.golfer_name, None, "no profile, no name");
+        let json = serde_json::to_string(&shots[0].data).expect("json");
+        assert!(json.contains(r#""golfer_name":"Joe""#), "{json}");
+        // A flighthook golfer is named by its record, not stored.
+        up.pick(&writer, "flighthook.sam", Club::Iron7).await;
+        up.shot(3).await;
+        assert_eq!(state.shots.read().await[2].data.golfer_name, None);
+    }
+
+    /// Another actor's `shot.launch` for a local shot is dropped by the
+    /// store, before and after the shot is stored; a flight is kept.
+    #[tokio::test]
+    async fn the_store_takes_a_shots_parts_from_its_launch_monitor_only() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.club(&writer, Club::Iron7).await;
+        let fast = Launch {
+            launch_speed: Some(Velocity::MetersPerSecond(99.0)),
+            ..Launch::default()
+        };
+        up.trigger_as("mevo.0", key(1)).await;
+        up.bus(&from_peer(
+            "intruder",
+            flightrelay::ShotLaunch {
+                key: key(1),
+                launch: fast.clone(),
+            },
+        ))
+        .await;
+        up.finish_as("mevo.0", key(1)).await;
+        up.bus(&from_peer(
+            "intruder",
+            flightrelay::ShotLaunch {
+                key: key(1),
+                launch: fast,
+            },
+        ))
+        .await;
+        let shots = state.shots.read().await.clone();
+        let frp = shots[0].frp.as_ref().expect("shot");
+        assert_eq!(
+            frp.launch.as_ref().and_then(|l| l.launch_speed),
+            Some(Velocity::MetersPerSecond(40.0))
+        );
+    }
+
+    /// A remote launch monitor's shot is exported with device kind
+    /// `frp`, never its actor id.
+    #[tokio::test]
+    async fn a_remote_shot_exports_device_kind_frp() {
+        let (state, writer, _dir) = test_state();
+        let mut up = Updater::new(&state);
+        up.club(&writer, Club::Iron7).await;
+        let remote = "aaaa000000000001";
+        let lm = from_peer(
+            remote,
+            flightrelay::BusActor::new("Trackball", 2.0)
+                .with_role(flightrelay::types::roles::LAUNCH_MONITOR),
+        );
+        super::ui_socket::follow(&state, &lm);
+        up.bus(&lm).await;
+        up.bus(&from_peer(remote, flightrelay::ShotTrigger::new(key(1))))
+            .await;
+        up.bus(&from_peer(
+            remote,
+            flightrelay::ShotLaunch {
+                key: key(1),
+                launch: ball(),
+            },
+        ))
+        .await;
+        up.bus(&from_peer(
+            remote,
+            flightrelay::ShotFinished { key: key(1) },
+        ))
+        .await;
+        let stored = state.shots.read().await[0].clone();
+        let line: serde_json::Value = serde_json::from_str(&export::jsonl_line(
+            &stored,
+            "t",
+            None,
+            false,
+            &flighthook::FlighthookConfig::default(),
+        ))
+        .expect("json");
+        assert_eq!(line["device"]["kind"], "frp", "{line}");
+        // The remote actor's name is kept on the shot for the UI, never in
+        // the export.
+        assert_eq!(stored.data.from_name.as_deref(), Some("Trackball"));
+        assert!(!line.to_string().contains("Trackball"), "{line}");
+        // A local card's shot carries no name.
+        up.shot(2).await;
+        let local = state.shots.read().await[1].clone();
+        assert_eq!(local.data.from_name, None);
     }
 }

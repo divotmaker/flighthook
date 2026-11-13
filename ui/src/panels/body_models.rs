@@ -634,6 +634,11 @@ mod tests {
                 events,
                 ..Default::default()
             };
+            // The Body tracking card is in the Cameras section.
+            app.select_item(
+                crate::panels::settings_nav::SettingsSection::Cameras,
+                crate::panels::settings_nav::SettingsItem::BodyTracking,
+            );
             let _ = self.0.run(input, |ctx| {
                 app.drive_body_models(ctx);
                 egui::CentralPanel::default().show(ctx, |ui| {

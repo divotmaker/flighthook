@@ -1,11 +1,14 @@
 pub mod cameras;
 pub mod clips;
 pub mod config;
-mod game;
 pub mod local_clients;
+pub mod practice;
+pub mod remotes;
 pub mod round;
+pub mod sent_shots;
+pub mod session;
 
-pub use game::{GameState, GameStateWriter};
+pub use session::{Session, SessionWriter};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -21,16 +24,23 @@ use clips::ClipStore;
 use config::SystemConfig;
 use local_clients::LocalClients;
 use round::RoundPolicy;
+use sent_shots::SentShots;
 
 /// Root entry point for all managed application state.
 ///
 /// Passed as `Arc<SystemState>` to all actors and the web layer.
 pub struct SystemState {
     pub system: SystemConfig,
-    pub game: GameState,
+    /// flighthook's `golfer.turn`.
+    pub session: Session,
+    /// The newest `bus.actor` of every local actor, for the heartbeat timer.
+    pub beats: crate::bus::Beats,
     /// This process's connected Open Connect clients, which its Open Connect
     /// servers refuse.
     pub local_clients: Arc<LocalClients>,
+    /// The shots the simulator outputs sent, which the Pureplay Accessory card tells
+    /// the simulator's echoes by.
+    pub sent_shots: Arc<SentShots>,
     /// The tournament round policy, and every shot source's type.
     pub round: RoundPolicy,
     /// The replay clips on disk, shared by the camera actors (beta).
@@ -39,6 +49,11 @@ pub struct SystemState {
     pub cameras: Cameras,
     /// Body tracking's models and recorded-clip queue (alpha).
     pub pose: crate::pose::BodyTracking,
+    /// The Pureplay Accessory cards' pairing tokens (beta), kept out of the config.
+    pub pureplay_tokens: Arc<crate::actors::pureplay_accessory::token::TokenStore>,
+    /// The mode each running local launch monitor with a fixed mode arms
+    /// in (the ExPutt: putting), by actor id.
+    fixed_modes: FixedModes,
     actors: RwLock<HashMap<String, Registered>>,
     /// Actors taken out of the registry whose thread is still ending while
     /// it holds their device or port: by ID, whether it has ended since.
@@ -111,6 +126,38 @@ fn body_tracking() -> crate::pose::BodyTracking {
     }
 }
 
+/// The Pureplay token file: the user's data folder; in tests a file of
+/// each state's own in a fresh temporary folder.
+fn pureplay_tokens() -> Arc<crate::actors::pureplay_accessory::token::TokenStore> {
+    use crate::actors::pureplay_accessory::token::{FILE_NAME, TokenStore, default_path};
+    let path = if cfg!(test) {
+        std::env::temp_dir()
+            .join(format!(
+                "flighthook-test-pp-tokens-{}",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .join(FILE_NAME)
+    } else {
+        default_path()
+    };
+    Arc::new(TokenStore::new(path))
+}
+
+/// A test state's token folder goes with the state.
+#[cfg(test)]
+impl Drop for SystemState {
+    fn drop(&mut self) {
+        if let Some(dir) = self.pureplay_tokens.path().parent()
+            && dir.file_name().is_some_and(|n| {
+                n.to_string_lossy()
+                    .starts_with("flighthook-test-pp-tokens-")
+            })
+        {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 /// How often [`SystemState::wait_for_exit`] looks at the thread.
 const EXIT_POLL: Duration = Duration::from_millis(10);
 
@@ -123,23 +170,177 @@ fn join(id: &str, thread: JoinHandle<()>) {
 }
 
 impl SystemState {
-    pub fn new(config_path: PathBuf) -> (Self, GameStateWriter) {
-        let (game, writer) = GameState::new();
+    /// The facts (sex, height) of the golfer up, by the lookup rule: the
+    /// defaults while the turn names no golfer of the config.
+    #[cfg(test)]
+    pub fn golfer_up_facts(&self) -> flighthook::PlayerSection {
+        let turn = self.session.turn();
+        self.system
+            .golfer_facts(turn.golfer.as_ref().map(flightrelay::GolferId::as_str))
+    }
+
+    pub fn new(config_path: PathBuf) -> (Self, SessionWriter) {
+        let system = SystemConfig::new(config_path);
+        let (session, writer) = Session::with_config(system.view());
+        // Tournament mode starts as the file says.
+        let round = RoundPolicy::default();
+        round.set_manual(system.simulation().tournament);
         (
             Self {
-                system: SystemConfig::new(config_path),
-                game,
+                system,
+                session,
                 local_clients: Arc::default(),
-                round: RoundPolicy::default(),
+                sent_shots: Arc::default(),
+                round,
                 clips: ClipStore::default(),
                 cameras: Cameras::default(),
                 pose: body_tracking(),
+                pureplay_tokens: pureplay_tokens(),
+                fixed_modes: FixedModes::default(),
+                beats: crate::bus::Beats::default(),
                 actors: RwLock::new(HashMap::new()),
                 closing: Arc::default(),
                 settling: Mutex::default(),
             },
             writer,
         )
+    }
+
+    // ----- FRP actor ids -----
+
+    /// Whether `actor_id` is one of this process's own actors that is
+    /// running: flighthook, Auto-chip, the flight model or a started card.
+    pub fn is_live_local(&self, actor_id: &str) -> bool {
+        match self.card_of_actor(actor_id).as_deref() {
+            None => false,
+            Some(flighthook::AUTO_CHIP_ACTOR | crate::actors::flight_model::CARD | "system") => {
+                true
+            }
+            Some(card) => self.with_actor(card, |_| ()).is_some(),
+        }
+    }
+
+    /// The flighthook actor's id (session, collector): `[frp] actor_id`.
+    pub fn flighthook_id(&self) -> String {
+        self.system
+            .snapshot()
+            .frp
+            .actor_id
+            .unwrap_or_else(|| "flighthook".into())
+    }
+
+    /// Auto-chip's actor id: `[frp] auto_chip_actor_id`.
+    pub fn auto_chip_id(&self) -> String {
+        self.system
+            .snapshot()
+            .frp
+            .auto_chip_actor_id
+            .unwrap_or_else(|| "autochip".into())
+    }
+
+    /// The flight model's actor id (the Simulation card):
+    /// `[simulation] actor_id`.
+    pub fn flight_model_id(&self) -> String {
+        self.system
+            .simulation()
+            .actor_id
+            .unwrap_or_else(|| "simulation".into())
+    }
+
+    /// The actor id of the card `key` (`mevo.0`); flighthook's own actors
+    /// by their card key (`autochip`, `simulation`, `system`).
+    pub fn actor_of_card(&self, key: &str) -> Option<String> {
+        match key {
+            flighthook::AUTO_CHIP_ACTOR => Some(self.auto_chip_id()),
+            crate::actors::flight_model::CARD => Some(self.flight_model_id()),
+            "system" | "web" => Some(self.flighthook_id()),
+            _ => self.system.actor_of_card(key),
+        }
+    }
+
+    /// The card key of every local actor, by actor id: the configured
+    /// cards, Auto-chip and the flight model.
+    pub fn card_keys(&self) -> std::collections::HashMap<String, String> {
+        let config = self.system.snapshot();
+        let mut keys: std::collections::HashMap<String, String> = config
+            .card_actors()
+            .into_iter()
+            .filter_map(|(card, id)| Some((id?.to_owned(), card)))
+            .collect();
+        let own = self.system.own_actor_ids();
+        if let Some(id) = own.auto_chip {
+            keys.insert(id, flighthook::AUTO_CHIP_ACTOR.into());
+        }
+        if let Some(id) = own.flight_model {
+            keys.insert(id, crate::actors::flight_model::CARD.into());
+        }
+        keys
+    }
+
+    /// Whether `key` is the key of one of this process's cards (`mevo.0`,
+    /// `system`, the Simulation card, Auto-chip, the web server).
+    /// A configured card's key is `<type>.<index>`, so a key with no dot
+    /// (a generated actor id) is only checked against the fixed names, and
+    /// the config is read in place, never cloned.
+    pub fn is_card_key(&self, key: &str) -> bool {
+        matches!(
+            key,
+            "system" | "web" | flighthook::AUTO_CHIP_ACTOR | crate::actors::flight_model::CARD
+        ) || (key.contains('.')
+            && crate::actors::actor_names(&self.system.view().read()).contains_key(key))
+    }
+
+    /// The card key of the local actor `actor_id`, if it is one.
+    pub fn card_of_actor(&self, actor_id: &str) -> Option<String> {
+        let own = self.system.own_actor_ids();
+        if own.auto_chip.as_deref() == Some(actor_id) {
+            return Some(flighthook::AUTO_CHIP_ACTOR.into());
+        }
+        if own.flight_model.as_deref() == Some(actor_id) {
+            return Some(crate::actors::flight_model::CARD.into());
+        }
+        if own.flighthook.as_deref() == Some(actor_id) {
+            return Some("system".into());
+        }
+        self.system.card_of_actor(actor_id)
+    }
+
+    /// Record that the launch monitor `actor_id` always arms in `mode`,
+    /// while the returned guard lives (the card's actor thread).
+    #[must_use]
+    pub fn set_fixed_mode(&self, actor_id: &str, mode: flighthook::Mode) -> FixedModeGuard {
+        let token = self.fixed_modes.next.fetch_add(1, Ordering::Relaxed);
+        self.fixed_modes
+            .map
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(actor_id.to_owned(), (mode, token));
+        FixedModeGuard {
+            map: Arc::clone(&self.fixed_modes.map),
+            actor_id: actor_id.to_owned(),
+            token,
+        }
+    }
+
+    /// The mode the launch monitor `actor_id` always arms in, if it has one.
+    pub fn fixed_mode(&self, actor_id: &str) -> Option<flighthook::Mode> {
+        self.fixed_modes
+            .map
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(actor_id)
+            .map(|(mode, _)| *mode)
+    }
+
+    /// Whether `actor_id` is a game or simulator card: an Open Connect
+    /// client, a Pureplay Connect output or a Pureplay Accessory card.
+    pub fn is_game_card(&self, actor_id: &str) -> bool {
+        self.card_of_actor(actor_id).is_some_and(|card| {
+            matches!(
+                card.split_once('.').map(|(kind, _)| kind),
+                Some("openconnect_client" | "pureplay" | "pureplay_accessory")
+            )
+        })
     }
 
     // ----- Actor registry -----
@@ -432,5 +633,34 @@ impl SystemState {
             .get(id)
             .and_then(|r| r.handle.thread.as_ref())
             .map(|t| t.thread().id())
+    }
+}
+
+/// The fixed modes of the running local launch monitors, by actor id, each
+/// with the token of the guard that holds it.
+#[derive(Default)]
+struct FixedModes {
+    map: Arc<RwLock<HashMap<String, (flighthook::Mode, u64)>>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+/// Holds a launch monitor's fixed mode: dropping it (the card's actor
+/// thread ends) forgets the mode, unless a newer thread of the same actor
+/// set it since.
+pub struct FixedModeGuard {
+    map: Arc<RwLock<HashMap<String, (flighthook::Mode, u64)>>>,
+    actor_id: String,
+    token: u64,
+}
+
+impl Drop for FixedModeGuard {
+    fn drop(&mut self) {
+        let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
+        if map
+            .get(&self.actor_id)
+            .is_some_and(|(_, t)| *t == self.token)
+        {
+            map.remove(&self.actor_id);
+        }
     }
 }

@@ -3,7 +3,7 @@ use std::io::Write;
 use super::BridgeError;
 use super::api;
 use crate::bus::BusSender;
-use flighthook::{Club, ClubInfo, FlighthookEvent, FlighthookMessage, HandInfo, Severity};
+use flighthook::{Club, ClubExt, Handedness, Severity};
 
 pub(crate) fn send_message(
     stream: &mut impl Write,
@@ -63,10 +63,14 @@ pub(crate) struct Heard {
     pub last: Option<(i32, String)>,
     /// Whether a response carried player information.
     pub player: bool,
+    /// The simulator's player information, the last of the read: its hand
+    /// and club, each when it named one flighthook knows.
+    pub info: Option<(Option<Handedness>, Option<Club>)>,
 }
 
-/// Handle the responses in `buf`: player and club information goes on the
-/// bus, a code outside 2xx raises an alert. Returns what they carried.
+/// Handle the responses in `buf`: a code outside 2xx, an unknown club code
+/// or text that is not a response raises an alert. Returns what they
+/// carried; the player information is the card's to send.
 pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) -> Heard {
     let stream = serde_json::Deserializer::from_slice(buf).into_iter::<api::GsProResponse>();
     let mut parsed_any = false;
@@ -81,41 +85,35 @@ pub(crate) fn handle_response(buf: &[u8], sender: &BusSender) -> Heard {
                     tracing::info!("gspro <- {}: {}", resp.code, resp.message);
                 } else {
                     tracing::warn!("gspro <- GSPro returned {}: {}", resp.code, resp.message);
-                    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                        severity: Severity::Warn,
-                        message: format!("GSPro returned {}: {}", resp.code, resp.message),
-                    }));
+                    sender.alert(
+                        Severity::Warn,
+                        format!("GSPro returned {}: {}", resp.code, resp.message),
+                    );
                 }
 
-                // Emit player/club info if present
                 if let Some(ref player) = resp.player {
-                    if let Some(handed) = player.handed.as_deref().and_then(api::hand_from_code) {
-                        sender.send(FlighthookMessage::new(FlighthookEvent::HandInfo {
-                            hand_info: HandInfo { handed },
-                        }));
-                    }
-                    if let Some(ref club_str) = player.club {
-                        if let Some(club) = Club::from_code(club_str) {
-                            sender.send(FlighthookMessage::new(FlighthookEvent::ClubInfo {
-                                club_info: ClubInfo { club },
-                            }));
-                        } else {
-                            tracing::warn!("gspro: unknown club code '{club_str}', ignoring");
-                            sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                                severity: Severity::Warn,
-                                message: format!("GSPro: unknown club code '{club_str}'"),
-                            }));
+                    let handed = player.handed.as_deref().and_then(api::hand_from_code);
+                    let club = player.club.as_deref().and_then(|code| {
+                        let club = Club::from_code(code);
+                        if club.is_none() {
+                            tracing::warn!("gspro: unknown club code '{code}', ignoring");
+                            sender.alert(
+                                Severity::Warn,
+                                format!("GSPro: unknown club code '{code}'"),
+                            );
                         }
-                    }
+                        club
+                    });
+                    heard.info = Some((handed, club));
                 }
             }
             Err(e) => {
                 if !parsed_any {
                     tracing::warn!("gspro <- parse error: {e}");
-                    sender.send(FlighthookMessage::new(FlighthookEvent::Alert {
-                        severity: Severity::Warn,
-                        message: format!("Could not parse GSPro response: {e}"),
-                    }));
+                    sender.alert(
+                        Severity::Warn,
+                        format!("Could not parse GSPro response: {e}"),
+                    );
                 }
                 break;
             }
@@ -154,67 +152,46 @@ mod tests {
             let buf = format!(
                 r#"{{"Code":201,"Message":"GSPro Player Information","Player":{{"Club":"{code}"}}}}"#
             );
-            let _ = handle_response(buf.as_bytes(), &sender);
-            let msg = rx.try_recv().expect("club info");
-            let FlighthookEvent::ClubInfo { club_info } = msg.event else {
-                panic!("{code}: expected ClubInfo, got {:?}", msg.event);
-            };
-            assert_eq!(club_info.club, club, "{code}");
+            let heard = handle_response(buf.as_bytes(), &sender);
+            assert_eq!(heard.info, Some((None, Some(club))), "{code}");
+            assert!(heard.player, "{code}");
             assert!(rx.try_recv().is_err(), "{code}: no alert expected");
         }
     }
 
-    /// GSPro's player message sets the hand the way every source does, with
-    /// `hand_info`; it does not command the devices itself. Each repeat is
-    /// passed on: the system actor tells the devices only about a change.
+    /// GSPro's player message gives the hand and club to the card, which
+    /// sends them in its own select; reading it sends nothing on the bus.
+    /// Each repeat is reported again.
     #[test]
-    fn the_player_hand_becomes_hand_info() {
+    fn the_player_hand_is_heard() {
         let (bus_tx, mut rx) = broadcast::channel(16);
         let sender = BusSender::new("openconnect_client.0".into(), bus_tx, Arc::default());
         let buf = r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"LH","Club":"I7"}}"#;
         for _ in 0..2 {
-            let _ = handle_response(buf.as_bytes(), &sender);
-            let events: Vec<FlighthookEvent> =
-                std::iter::from_fn(|| rx.try_recv().ok().map(|m| m.event)).collect();
-            assert!(
-                matches!(
-                    events.as_slice(),
-                    [
-                        FlighthookEvent::HandInfo {
-                            hand_info: HandInfo {
-                                handed: flighthook::Handedness::Left
-                            }
-                        },
-                        FlighthookEvent::ClubInfo { club_info },
-                    ] if club_info.club == Club::Iron7
-                ),
-                "{events:?}"
+            let heard = handle_response(buf.as_bytes(), &sender);
+            assert_eq!(
+                heard.info,
+                Some((Some(Handedness::Left), Some(Club::Iron7)))
             );
+            assert!(rx.try_recv().is_err());
         }
     }
 
-    /// A hand GSPro does not define, or omits, is ignored: no `hand_info`,
-    /// and a club in the same message still comes through.
+    /// A hand GSPro does not define, or omits, is ignored, and a club in the
+    /// same message still comes through.
     #[test]
     fn an_unknown_or_omitted_hand_is_ignored() {
         let (bus_tx, mut rx) = broadcast::channel(16);
         let sender = BusSender::new("openconnect_client.0".into(), bus_tx, Arc::default());
         let unknown =
             r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"XX"}}"#;
-        let _ = handle_response(unknown.as_bytes(), &sender);
+        let heard = handle_response(unknown.as_bytes(), &sender);
+        assert_eq!(heard.info, Some((None, None)));
         assert!(rx.try_recv().is_err());
 
         let omitted = r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Club":"I7"}}"#;
-        let _ = handle_response(omitted.as_bytes(), &sender);
-        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|m| m.event)
-            .collect();
-        assert!(
-            matches!(
-                events.as_slice(),
-                [FlighthookEvent::ClubInfo { club_info }] if club_info.club == Club::Iron7
-            ),
-            "{events:?}"
-        );
+        let heard = handle_response(omitted.as_bytes(), &sender);
+        assert_eq!(heard.info, Some((None, Some(Club::Iron7))));
+        assert!(rx.try_recv().is_err());
     }
 }

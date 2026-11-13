@@ -36,6 +36,9 @@ pub(crate) const ZOOM: RangeInclusive<f32> = 0.5..=4.0;
 const TOLERANCE: f32 = 0.005;
 /// Highest effective pixel ratio in the browser.
 const WEB_MAX_PIXELS_PER_POINT: f32 = 2.0;
+/// A window narrower than this at zoom 1, and taller than wide, is a phone
+/// held upright: it gets the portrait layout.
+pub(crate) const PORTRAIT_MAX_WIDTH: f32 = 600.0;
 /// The automatic zoom is rounded down to a multiple of `1 / GRID`, so a
 /// window being resized changes it (and re-rasterizes the text) only now and
 /// then, and the rounded zoom still fits the design size.
@@ -48,8 +51,17 @@ const ZOOM_IN: [KeyboardShortcut; 2] = [
 const ZOOM_OUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus);
 const ZOOM_RESET: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0);
 
+/// Whether a window `base` points in size at zoom 1 gets the portrait
+/// layout: under [`PORTRAIT_MAX_WIDTH`] wide and taller than wide.
+#[must_use]
+pub(crate) fn portrait(base: Vec2) -> bool {
+    base.x > 0.0 && base.x < PORTRAIT_MAX_WIDTH && base.y > base.x
+}
+
 /// The automatic zoom for a window `base` points in size at zoom 1
 /// (physical pixels / the monitor's native pixels per point).
+///
+/// A [`portrait`] window gets 1.
 ///
 /// `grow = min(w / 1920, h / 1080)` and `shrink = min(w / 1024, h / 768)`:
 /// `grow` (at most [`AUTO_MAX`]) when it is above 1, else `shrink` (at least
@@ -60,7 +72,7 @@ const ZOOM_RESET: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, K
 #[must_use]
 pub(crate) fn auto_zoom(base: Vec2) -> f32 {
     let (w, h) = (base.x, base.y);
-    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) || portrait(base) {
         return 1.0;
     }
     let grow = (w / DESIGN_MAX.0).min(h / DESIGN_MAX.1);
@@ -139,20 +151,24 @@ impl UiScale {
     /// Handles (and consumes) the zoom shortcuts in the native window, then
     /// sets the zoom for the current window when it differs from the applied
     /// one. Call before any layout. A changed zoom discards the pass, so the
-    /// next pass lays out at the new zoom.
-    pub(crate) fn apply(&mut self, ctx: &egui::Context) {
+    /// next pass lays out at the new zoom. Returns whether the window is
+    /// [`portrait`]; a portrait window is not web-capped, so a phone lays out
+    /// at its own width.
+    pub(crate) fn apply(&mut self, ctx: &egui::Context) -> bool {
         if !cfg!(target_arch = "wasm32") {
             self.shortcuts(ctx);
         }
         let (base, native) = base_size(ctx);
+        let portrait = portrait(base);
         let mut zoom = self.zoom(base);
-        if cfg!(target_arch = "wasm32") {
+        if cfg!(target_arch = "wasm32") && !portrait {
             zoom = web_capped(zoom, native);
         }
         if (zoom - ctx.zoom_factor()).abs() > TOLERANCE {
             ctx.set_zoom_factor(zoom);
             ctx.request_discard("UI zoom changed");
         }
+        portrait
     }
 
     /// Ctrl/Cmd + `=`/`+`, `-` and `0`, consumed. With Alt held (`AltGr` on
@@ -236,6 +252,31 @@ mod tests {
         // Wide but short or tall but narrow: neither limit applies.
         assert_eq!(zoom_at(3000.0, 900.0), 1.0);
         assert_eq!(zoom_at(1200.0, 1500.0), 1.0);
+    }
+
+    #[test]
+    fn phones_upright_are_portrait_at_zoom_one() {
+        for (w, h) in [
+            (360.0, 780.0),
+            (390.0, 844.0),
+            (430.0, 932.0),
+            (599.0, 600.0),
+        ] {
+            assert!(portrait(egui::vec2(w, h)), "{w}x{h}");
+            assert_eq!(zoom_at(w, h), 1.0, "{w}x{h}");
+        }
+        // Landscape phones, tablets, desktops and squares keep their zoom.
+        for (w, h) in [
+            (844.0, 390.0),
+            (744.0, 1133.0),
+            (600.0, 900.0),
+            (1920.0, 1080.0),
+            (500.0, 500.0),
+            (0.0, 100.0),
+        ] {
+            assert!(!portrait(egui::vec2(w, h)), "{w}x{h}");
+        }
+        assert_eq!(zoom_at(844.0, 390.0), AUTO_MIN);
     }
 
     #[test]

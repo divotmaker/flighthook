@@ -63,6 +63,10 @@ pub struct ClipShot {
     /// The player's hand when it triggered, for the swing analysis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hand: Option<Handedness>,
+    /// The turn's golfer id when it triggered (raw, as the turn named it),
+    /// whose facts the swing analysis and grades read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golfer: Option<String>,
 }
 
 /// `shot.json`.
@@ -617,6 +621,7 @@ mod tests {
             device: "mock".into(),
             impact_lead_ms: 0,
             hand: None,
+            golfer: None,
         }
     }
 
@@ -644,6 +649,31 @@ mod tests {
         std::fs::write(slot.dir.join(format!("{camera}.avi")), b"RIFF").expect("avi");
         std::fs::write(slot.dir.join(format!("{camera}.json")), b"{}").expect("json");
         store.finish(&slot, video(camera), keep)
+    }
+
+    /// A clip records its shot's golfer (the turn's raw id at the trigger)
+    /// in `shot.json`, and a reload reads it back.
+    #[test]
+    fn a_clip_keeps_its_golfer_across_a_reload() {
+        let dir = temp();
+        let store = ClipStore::default();
+        let mut s = shot("a");
+        s.golfer = Some("pureplay.local-3".into());
+        let slot = store
+            .begin(&dir.0, &[s], store.generation())
+            .expect("begin");
+        std::fs::write(slot.dir.join("camera.0.avi"), b"RIFF").expect("avi");
+        std::fs::write(slot.dir.join("camera.0.json"), b"{}").expect("json");
+        assert!(store.finish(&slot, video("camera.0"), 5).kept);
+        let file = std::fs::read_to_string(slot.dir.join("shot.json")).expect("shot.json");
+        assert!(file.contains("\"golfer\": \"pureplay.local-3\""), "{file}");
+        let reloaded = ClipStore::default();
+        reloaded.load(&dir.0, 5);
+        let clip = reloaded.camera_clip("a", "camera.0").expect("clip");
+        assert_eq!(clip.shots[0].golfer.as_deref(), Some("pureplay.local-3"));
+        // A shot with no golfer writes none.
+        let none = serde_json::to_string(&shot("b")).expect("json");
+        assert!(!none.contains("golfer"), "{none}");
     }
 
     #[test]
