@@ -1124,9 +1124,12 @@ mod tests {
         let (severity, _) = alert(seen.last().unwrap()).unwrap();
         assert_eq!(severity, Severity::Warn);
 
-        // Attempts go on (the next after the host's 2 s), silently.
-        std::thread::sleep(Duration::from_millis(2600));
-        assert_eq!(alerts(&card.drain()), Vec::<String>::new());
+        // Attempts go on (the next after the host's 2 s), silently: nothing
+        // is alerted up to the next attempt.
+        let next = card.until("the next attempt", |m| {
+            phases(std::slice::from_ref(m)) == ["connecting"]
+        });
+        assert_eq!(alerts(&next), Vec::<String>::new());
     }
 
     #[test]
