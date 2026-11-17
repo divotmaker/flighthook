@@ -281,8 +281,17 @@ mod tests {
         rig.until(Duration::from_secs(5), |m| {
             actor(m).is_some_and(|a| a.device.is_some() && a.blockers.is_empty())
         });
-        std::thread::sleep(Duration::from_millis(500));
-        let held: Vec<BusMsg> = std::iter::from_fn(|| rig.rx.try_recv().ok()).collect();
+        // Two bus.sync answers: the card answers while it drains, before
+        // each step, so at least one step (a shot each step when allowed)
+        // ran between them.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let _ = rig.tx.send(BusMsg::frp(flightrelay::FrpMessage::new(
+                rig.state.flighthook_id(),
+                flightrelay::BusSync::new(),
+            )));
+            held.extend(rig.until(crate::actors::GIVE_UP, |m| actor(m).is_some()));
+        }
         assert!(
             !held
                 .iter()
