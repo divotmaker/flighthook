@@ -121,12 +121,23 @@ impl LiveWorker {
         build: Build,
         publish: Publish,
     ) -> std::io::Result<Self> {
+        Self::start_on(actor, settings, build, publish, Instant::now)
+    }
+
+    /// [`LiveWorker::start`], pacing frames on the clock `now`.
+    fn start_on(
+        actor: &str,
+        settings: Settings,
+        build: Build,
+        publish: Publish,
+        now: impl Fn() -> Instant + Send + 'static,
+    ) -> std::io::Result<Self> {
         let handoff = Arc::new(Handoff::default());
         let shared = Arc::clone(&handoff);
         let name = actor.to_owned();
         let thread = std::thread::Builder::new()
             .name(format!("pose:{actor}"))
-            .spawn(move || run(&name, &shared, &settings, build, publish))?;
+            .spawn(move || run(&name, &shared, &settings, build, publish, &now))?;
         Ok(Self {
             handoff,
             thread: Some(thread),
@@ -184,13 +195,14 @@ fn take(handoff: &Handoff) -> Option<Offer> {
     }
 }
 
-/// Sleep until `until`, or less once stopped. False when stopped.
-fn pace(handoff: &Handoff, until: Instant) -> bool {
+/// Sleep until `until` on the clock `now`, or less once stopped. False
+/// when stopped.
+fn pace(handoff: &Handoff, until: Instant, now: &dyn Fn() -> Instant) -> bool {
     loop {
         if handoff.stop.load(Ordering::Acquire) {
             return false;
         }
-        let now = Instant::now();
+        let now = now();
         if now >= until {
             return true;
         }
@@ -217,6 +229,7 @@ fn run(
     settings: &Settings,
     mut build: Build,
     mut publish: Publish,
+    now: &dyn Fn() -> Instant,
 ) {
     let mut current: Option<Current> = None;
     let mut build_after: Option<Instant> = None;
@@ -227,14 +240,14 @@ fn run(
     let mut warned = false;
     loop {
         if let Some(start) = last_start
-            && !pace(handoff, start + LIVE_EVERY)
+            && !pace(handoff, start + LIVE_EVERY, now)
         {
             return;
         }
         let Some(offer) = take(handoff) else {
             return;
         };
-        last_start = Some(Instant::now());
+        last_start = Some(now());
         // The filters need time to move forwards.
         if last_time.is_some_and(|t| offer.time_ns <= t) {
             smoother.reset();
@@ -415,6 +428,46 @@ pub(crate) mod tests {
         pub(crate) delay: Duration,
         pub(crate) calls: Arc<AtomicUsize>,
         pub(crate) scores: VecDeque<f32>,
+        /// When given, each estimate waits for its pass.
+        pub(crate) gate: Option<Arc<Gate>>,
+    }
+
+    /// Holds each estimate until the test lets one through, and tells how
+    /// many have started.
+    #[derive(Default)]
+    pub(crate) struct Gate {
+        /// Estimates started, then passes left.
+        inner: Mutex<(usize, usize)>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        /// Let `n` more estimates through.
+        fn open(&self, n: usize) {
+            self.inner.lock().unwrap().1 += n;
+            self.changed.notify_all();
+        }
+
+        /// Wait until `n` estimates have started.
+        fn started(&self, n: usize) {
+            let deadline = Instant::now() + crate::actors::GIVE_UP;
+            let mut inner = self.inner.lock().unwrap();
+            while inner.0 < n {
+                assert!(Instant::now() < deadline, "{} of {n} estimates", inner.0);
+                inner = self.changed.wait_timeout(inner, STOP_POLL).unwrap().0;
+            }
+        }
+
+        /// Start an estimate and wait for its pass.
+        fn pass(&self) {
+            let mut inner = self.inner.lock().unwrap();
+            inner.0 += 1;
+            self.changed.notify_all();
+            while inner.1 == 0 {
+                inner = self.changed.wait(inner).unwrap();
+            }
+            inner.1 -= 1;
+        }
     }
 
     impl PoseEngine for FakePose {
@@ -425,6 +478,9 @@ pub(crate) mod tests {
             "fake-pose"
         }
         fn estimate(&mut self, image: &Image, bbox: &BBox) -> stance::Result<Pose> {
+            if let Some(gate) = &self.gate {
+                gate.pass();
+            }
             std::thread::sleep(self.delay);
             self.calls.fetch_add(1, Ordering::SeqCst);
             let shade = f32::from(image.pixel(0, 0).map_or(0, |p| p[0]));
@@ -443,6 +499,7 @@ pub(crate) mod tests {
                 delay: self.delay,
                 calls: Arc::clone(&self.calls),
                 scores: self.scores.clone(),
+                gate: self.gate.clone(),
             })
         }
     }
@@ -480,12 +537,39 @@ pub(crate) mod tests {
         found: bool,
         detect_every: u32,
     ) -> Box<dyn Estimate> {
-        Box::new(PoseTracker::new(
+        tracker(
             FakePose {
                 delay,
                 calls: Arc::clone(calls),
                 scores: VecDeque::new(),
+                gate: None,
             },
+            found,
+            detect_every,
+        )
+    }
+
+    /// A fake tracker whose estimates pass `gate` one by one.
+    fn gated_tracker(
+        gate: &Arc<Gate>,
+        calls: &Arc<AtomicUsize>,
+        detect_every: u32,
+    ) -> Box<dyn Estimate> {
+        tracker(
+            FakePose {
+                delay: Duration::ZERO,
+                calls: Arc::clone(calls),
+                scores: VecDeque::new(),
+                gate: Some(Arc::clone(gate)),
+            },
+            true,
+            detect_every,
+        )
+    }
+
+    fn tracker(pose: FakePose, found: bool, detect_every: u32) -> Box<dyn Estimate> {
+        Box::new(PoseTracker::new(
+            pose,
             FakeDetector { found },
             stance::pose::PoseConfig {
                 detect_every,
@@ -507,7 +591,8 @@ pub(crate) mod tests {
     }
 
     fn wait_for(published: &Published, n: usize) {
-        for _ in 0..500 {
+        let deadline = Instant::now() + crate::actors::GIVE_UP;
+        while Instant::now() < deadline {
             if published.lock().unwrap().len() >= n {
                 return;
             }
@@ -594,28 +679,23 @@ pub(crate) mod tests {
     fn the_newest_frame_wins_and_frames_offered_while_busy_are_skipped() {
         let calls = Arc::new(AtomicUsize::new(0));
         let built = Arc::clone(&calls);
-        // A slow model: 120 ms a frame.
-        let build: Build = Box::new(move |s, _| {
-            Some(fake_tracker(
-                Duration::from_millis(120),
-                &built,
-                true,
-                s.detect_every,
-            ))
-        });
+        // A model that runs only when the test lets it.
+        let gate = Arc::new(Gate::default());
+        let held = Arc::clone(&gate);
+        let build: Build = Box::new(move |s, _| Some(gated_tracker(&held, &built, s.detect_every)));
         let (publish, published) = publisher();
         let worker =
             LiveWorker::start("camera.0", settings(live_section()), build, publish).unwrap();
         // The first frame starts a pose; four more arrive while it runs.
         assert!(!worker.offer(1, numbered_jpeg(10)));
-        std::thread::sleep(Duration::from_millis(30));
+        gate.started(1);
         let mut skipped = 0;
         for n in 2..=5u8 {
             skipped += usize::from(worker.offer(u64::from(n), numbered_jpeg(n * 10)));
         }
         assert_eq!(skipped, 3, "each replaced the one waiting");
+        gate.open(2);
         wait_for(&published, 2);
-        std::thread::sleep(Duration::from_millis(200));
         drop(worker);
         let times: Vec<u64> = published.lock().unwrap().iter().map(|(t, _)| *t).collect();
         // Frame 1, then straight to the newest: 2 to 4 never went out.
@@ -623,6 +703,8 @@ pub(crate) mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// At most one frame per `LIVE_EVERY` on the worker's clock, the
+    /// newest one: a frame offered sooner waits, and is replaced by the next.
     #[test]
     fn the_rate_is_held_to_the_live_rate() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -630,20 +712,45 @@ pub(crate) mod tests {
         let build: Build =
             Box::new(move |s, _| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
         let (publish, published) = publisher();
-        let worker =
-            LiveWorker::start("camera.0", settings(live_section()), build, publish).unwrap();
-        // A 120 fps camera for 0.5 s.
-        let started = Instant::now();
-        let mut n = 0u64;
-        while started.elapsed() < Duration::from_millis(500) {
-            n += 1;
-            worker.offer(n, numbered_jpeg(1));
-            std::thread::sleep(Duration::from_micros(8_333));
+        let t0 = Instant::now();
+        let clock = Arc::new(Mutex::new(t0));
+        let read = Arc::clone(&clock);
+        let worker = LiveWorker::start_on(
+            "camera.0",
+            settings(live_section()),
+            build,
+            publish,
+            move || *read.lock().unwrap(),
+        )
+        .unwrap();
+        let set = |t: Instant| *clock.lock().unwrap() = t;
+        // A 120 fps camera: frame k at (k − 1)/120 s.
+        let frame = Duration::from_nanos(8_333_333);
+        let mut n = 1u64;
+        worker.offer(n, numbered_jpeg(1));
+        wait_for(&published, 1);
+        for round in 1..=3u32 {
+            let due = t0 + LIVE_EVERY * round;
+            // Every frame before the next start waits: each one offered
+            // replaces the one before it.
+            let mut replaced = 0;
+            loop {
+                let at = t0 + frame * u32::try_from(n).unwrap();
+                if at >= due {
+                    break;
+                }
+                set(at);
+                n += 1;
+                replaced += usize::from(worker.offer(n, numbered_jpeg(1)));
+            }
+            assert!(replaced >= 6, "round {round}: {replaced} replaced");
+            set(due);
+            wait_for(&published, 1 + round as usize);
         }
         drop(worker);
-        let out = published.lock().unwrap().len();
-        // 15 a second: 8 in half a second, give or take one.
-        assert!((6..=9).contains(&out), "{out} frames");
+        let times: Vec<u64> = published.lock().unwrap().iter().map(|(t, _)| *t).collect();
+        // The newest frame before each 1/15 s: 8 frames apart at 120 fps.
+        assert_eq!(times, [1, 9, 17, 25]);
     }
 
     #[test]
@@ -895,30 +1002,28 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         drop(worker);
-        // A slow model: dropping the worker mid-pose returns at once.
+        // Dropping the worker mid-pose returns at once (were it to wait,
+        // the held pose would never end).
         let calls = Arc::new(AtomicUsize::new(0));
         let built = Arc::clone(&calls);
-        let build: Build = Box::new(move |s, _| {
-            Some(fake_tracker(
-                Duration::from_millis(400),
-                &built,
-                true,
-                s.detect_every,
-            ))
-        });
+        let gate = Arc::new(Gate::default());
+        let held = Arc::clone(&gate);
+        let build: Build = Box::new(move |s, _| Some(gated_tracker(&held, &built, s.detect_every)));
         let (publish, published) = publisher();
         let worker =
             LiveWorker::start("camera.0", settings(live_section()), build, publish).unwrap();
         worker.offer(1, numbered_jpeg(1));
-        // Mid-pose.
-        std::thread::sleep(Duration::from_millis(100));
+        gate.started(1);
         drop(worker);
-        // It ends by itself and publishes nothing after being dropped.
-        while calls.load(Ordering::SeqCst) == 0 {
-            assert!(Instant::now() < deadline, "the pose did not finish");
+        gate.open(1);
+        // It ends by itself, dropping its publisher, and publishes nothing
+        // after being dropped.
+        let deadline = Instant::now() + crate::actors::GIVE_UP;
+        while Arc::strong_count(&published) > 1 {
+            assert!(Instant::now() < deadline, "the worker did not end");
             std::thread::sleep(Duration::from_millis(5));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(published.lock().unwrap().is_empty());
     }
 

@@ -1442,6 +1442,7 @@ mod tests {
                 delay: Duration::ZERO,
                 calls: Arc::default(),
                 scores: VecDeque::new(),
+                gate: None,
             },
             PriorityDetector(Arc::clone(&seen)),
         );
