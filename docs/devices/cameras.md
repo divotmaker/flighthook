@@ -463,14 +463,15 @@ color, and none when two face-on cameras differ.
   words: `Tour · fade 36–46° · draw 30–40° · 44° Open · more open: fade side`.
   Bands in inches follow the Units switch (rounded after the conversion).
 - The **Notes** box, beside the tables (under them when the pane is too
-  narrow), lists each table number outside its band, yellow or red, with what
-  that miss tends to produce: `• Shoulder turn — less open than tour:
-  shoulders behind, push or hook`. The notes are grouped under the key
-  position they belong to, in the tables' order, and a number graded the same
-  by both cameras is listed once. The box follows the Tour | Amateur switch
-  and stays the same while the clip plays. With every number inside its band
-  it reads `All measurements within the tour range`; a shot without bands
-  (no club, or a putter) has no box.
+  narrow), lists each tempo tile and table number outside its band, yellow or
+  red, with what that miss tends to produce: `• Shoulder turn — less open
+  than tour: shoulders behind, push or hook`. The tempo comes first, under
+  **Tempo**, then the notes grouped under the key position they belong to, in
+  the tables' order. A number both cameras give the same words is listed
+  once, in the worse color (red over yellow). The box follows the Tour |
+  Amateur switch and stays the same while the clip plays. With every number
+  inside its band it reads `All measurements within the tour range`; a shot
+  without bands (no club, or a putter) has no box.
 
 **What is not colored.** A turn measured by one camera is colored at impact
 only: at the top one camera reads it well short of its 3D value (see

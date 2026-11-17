@@ -68,9 +68,11 @@ impl FlighthookApp {
                 let column_w = layout.columns.first().map_or(0.0, |c| c.width);
                 let n = across as f32;
                 let row = column_w * n + layout.gap * (n - 1.0);
-                // The Notes box of the tables, beside them when it fits (the
-                // tables narrow for it, keeping their positions), else under
-                // them.
+                // One tempo for the shot, across its cameras' columns.
+                let tempo = tempo_values(&swings);
+                // The Notes box of the tempo and the tables, beside the
+                // tables when it fits (they narrow for it, keeping their
+                // positions), else under them.
                 let tables: Vec<(&SwingReportFile, Option<&ReferenceGrades>)> = layout
                     .columns
                     .iter()
@@ -79,14 +81,12 @@ impl FlighthookApp {
                         Some((report, grades(c)))
                     })
                     .collect();
-                let notes = swing_notes(&tables, imperial, table_positions(column_w));
+                let notes = swing_notes(&tempo, &tables, imperial, table_positions(column_w));
                 let beside = notes.as_ref().and(notes_beside(
                     available, layout.pad, column_w, across, layout.gap,
                 ));
                 let table_w = beside.unwrap_or(column_w);
                 if !swings.is_empty() {
-                    // One tempo for the shot, across its cameras' columns.
-                    let tempo = tempo_values(&swings);
                     ui.horizontal_top(|ui| {
                         ui.add_space(layout.pad);
                         tempo_row(ui, &tempo, row);
@@ -147,7 +147,7 @@ impl FlighthookApp {
                 // The Notes box after the last table, out to the clips'
                 // right edge, or into the pane's margin when that is too
                 // narrow.
-                let box_beside = |ui: &mut egui::Ui, notes: &[(SwingPosition, Vec<SwingNote>)]| {
+                let box_beside = |ui: &mut egui::Ui, notes: &[(NoteGroup, Vec<SwingNote>)]| {
                     let left = ui.cursor().min.x;
                     let width = (origin + layout.pad + row - left)
                         .max(NOTES_MIN_W)

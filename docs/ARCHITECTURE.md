@@ -2494,16 +2494,21 @@ the tab as not shown, so a tab on screen turns Live on.
   inches in the Units system, rounded after the conversion), the value as a
   tile reads it, and the words.
   The **Notes** box (`swing_notes`, `notes_box`; mark `swing_notes`, a
-  bullet `swing_note:<metric>:<position>`) lists the table cells off their
-  band (`off_band`: `Near` or `Far`, the yellow and red cells) at the
-  positions the tables show, grouped under each position's name in small
-  capitals in table order (positions without notes left out), each bullet
+  bullet `swing_note:<metric>:<group>`, the group `tempo` or the position's
+  key) lists the tempo tiles and the table cells off their band (`off_band`:
+  `Near` or `Far`, the yellow and red cells). First the `Tempo` group: each
+  tempo tile off its band, graded as the tile shows it (`tempo_values`'
+  `FrameValue::grade`), in tile order. Then the cells at the positions the
+  tables show, grouped under each position's name in table order (groups
+  without notes left out). Headings are in small capitals; each bullet is
   the metric's name muted, ` — `, and the grade's `word` in its fit's color
-  (13 pt, lines hanging after the bullet; the cell's `worded` value when the
-  grade has no words). A metric graded the same at the same position by two
-  cameras is one bullet. With no graded cell there is no box; with graded
-  cells all inside, the box is the muted line `All measurements within the
-  tour range` (`amateur range` for the Amateur reference). It depends only
+  (13 pt, lines hanging after the bullet; the tile's value or the cell's
+  `worded` value when the grade has no words). At a position, the notes of
+  one metric with the same words are one bullet (key: metric, position,
+  words), in the worse fit's color (`Far` over `Near`). With no graded tempo
+  tile or cell there is no box; with every graded one inside, the box is the
+  muted line `All measurements within the tour range` (`amateur range` for
+  the Amateur reference). It depends only
   on the shot, the reference and the pane's width, never on the playhead.
   It sits right of the tables, level with their top, when `notes_beside`
   finds room: each table narrowed from its column's width as far as a box of

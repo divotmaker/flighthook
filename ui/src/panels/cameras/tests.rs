@@ -3007,6 +3007,7 @@ fn the_frame_tiles_carry_no_grade_at_a_key_frame() {
         );
         let ungraded = frame_tiles(&plain(&[(&fo, at)]), false);
         assert!(graded.iter().all(|t| t.color == theme::TEXT), "{frame}");
+        assert!(graded.iter().all(|t| t.grade.is_none()), "{frame}");
         assert_eq!(frame_texts(&graded), frame_texts(&ungraded), "{frame}");
         assert_eq!(graded[0].word, None, "a one-camera turn has no word");
     }
@@ -3064,6 +3065,7 @@ fn note(id: &str, label: &str, words: &str, fit: Fit) -> SwingNote {
 
 #[test]
 fn the_notes_list_the_cells_off_their_band_by_position_once() {
+    use NoteGroup::At;
     use SwingPosition::{Address, Finish, Impact, Top};
     let positions = [Address, Top, Impact, Finish];
     let (a, b) = (report(false), report(false));
@@ -3125,7 +3127,7 @@ fn the_notes_list_the_cells_off_their_band_by_position_once() {
                 4.0,
                 Some("further toward the target than tour: slide"),
             ),
-            // Graded otherwise: its own note.
+            // Other words: its own note.
             grade_of(
                 "lateral_spine_tilt",
                 "address",
@@ -3133,15 +3135,28 @@ fn the_notes_list_the_cells_off_their_band_by_position_once() {
                 8.0,
                 Some("less than tour: Z"),
             ),
+            // The same words as the first camera's, farther: one red note.
+            grade_of(
+                "lateral_spine_tilt",
+                "impact",
+                Fit::Far,
+                23.0,
+                Some("more than tour: Y"),
+            ),
         ],
         Vec::new(),
     );
-    let notes = swing_notes(&[(&a, Some(&first)), (&b, Some(&second))], true, &positions);
+    let notes = swing_notes(
+        &[],
+        &[(&a, Some(&first)), (&b, Some(&second))],
+        true,
+        &positions,
+    );
     assert_eq!(
         notes,
         Some(vec![
             (
-                Address,
+                At(Address),
                 vec![
                     note(
                         "lateral_spine_tilt",
@@ -3158,7 +3173,7 @@ fn the_notes_list_the_cells_off_their_band_by_position_once() {
                 ]
             ),
             (
-                Impact,
+                At(Impact),
                 vec![
                     note(
                         "hip_sway",
@@ -3170,12 +3185,12 @@ fn the_notes_list_the_cells_off_their_band_by_position_once() {
                         "lateral_spine_tilt",
                         "Side bend",
                         "more than tour: Y",
-                        Fit::Near
+                        Fit::Far
                     ),
                 ]
             ),
             (
-                Finish,
+                At(Finish),
                 vec![note(
                     "shoulder_tilt",
                     "Shoulder tilt",
@@ -3202,11 +3217,40 @@ fn the_notes_list_the_cells_off_their_band_by_position_once() {
         Vec::new(),
     );
     assert_eq!(
-        swing_notes(&[(&a, Some(&inside))], true, &positions),
+        swing_notes(&[], &[(&a, Some(&inside))], true, &positions),
         Some(Vec::new())
     );
-    // No grades, or none on a table cell: no box.
-    assert_eq!(swing_notes(&[(&a, None)], true, &positions), None);
+    // Red on one camera, then gold with the same words on the other: red.
+    let far = reference_grades(
+        ReferenceKind::Tour,
+        vec![grade_of("hip_sway", "impact", Fit::Far, 4.0, Some("slide"))],
+        Vec::new(),
+    );
+    let near = reference_grades(
+        ReferenceKind::Tour,
+        vec![grade_of(
+            "hip_sway",
+            "impact",
+            Fit::Near,
+            3.0,
+            Some("slide"),
+        )],
+        Vec::new(),
+    );
+    assert_eq!(
+        swing_notes(
+            &[],
+            &[(&a, Some(&far)), (&b, Some(&near))],
+            true,
+            &positions
+        ),
+        Some(vec![(
+            At(Impact),
+            vec![note("hip_sway", "Hip sway", "slide", Fit::Far)]
+        )])
+    );
+    // No grades: no box.
+    assert_eq!(swing_notes(&[], &[(&a, None)], true, &positions), None);
     let tempo_only = reference_grades(
         ReferenceKind::Tour,
         Vec::new(),
@@ -3219,14 +3263,103 @@ fn the_notes_list_the_cells_off_their_band_by_position_once() {
         )],
     );
     assert_eq!(
-        swing_notes(&[(&a, Some(&tempo_only))], true, &positions),
-        None
+        swing_notes(&[], &[(&a, Some(&tempo_only))], true, &positions),
+        None,
+        "no tempo tiles"
     );
-    assert_eq!(swing_notes(&[], true, &positions), None);
+    assert_eq!(swing_notes(&[], &[], true, &positions), None);
     assert_eq!(
         notes_all_inside(ReferenceKind::Amateur),
         "All measurements within the amateur range"
     );
+}
+
+#[test]
+fn the_notes_start_with_the_tempo_tiles_off_their_band() {
+    use NoteGroup::{At, Tempo};
+    use SwingPosition::{Address, Finish, Impact, Top};
+    let positions = [Address, Top, Impact, Finish];
+    let a = report(false);
+    let tempo_of = |grades| {
+        tempo_values(&[Swing {
+            report: &a,
+            t_ns: None,
+            grades: Some(grades),
+        }])
+    };
+    let graded = reference_grades(
+        ReferenceKind::Tour,
+        vec![grade_of("hip_sway", "impact", Fit::Far, 4.0, Some("slide"))],
+        vec![
+            grade_of("tempo_ratio", "swing", Fit::Near, 2.5, Some("quick back")),
+            grade_of("backswing", "swing", Fit::Both, 0.75, None),
+            // No words of its own: the tile's value.
+            grade_of("downswing_time", "swing", Fit::Far, 0.3, None),
+        ],
+    );
+    let tempo = tempo_of(&graded);
+    assert_eq!(
+        swing_notes(&tempo, &[(&a, Some(&graded))], true, &positions),
+        Some(vec![
+            (
+                Tempo,
+                vec![
+                    note("tempo_ratio", "Tempo", "quick back", Fit::Near),
+                    note("downswing_time", "Downswing", "300 ms", Fit::Far),
+                ]
+            ),
+            (
+                At(Impact),
+                vec![note("hip_sway", "Hip sway", "slide", Fit::Far)]
+            ),
+        ]),
+        "the tempo first, the backswing on its band left out"
+    );
+    // Only tempo grades: a box with the tempo alone, or the inside line.
+    let tempo_only = |fit| {
+        reference_grades(
+            ReferenceKind::Tour,
+            Vec::new(),
+            vec![grade_of(
+                "tempo_ratio",
+                "swing",
+                fit,
+                2.5,
+                Some("quick back"),
+            )],
+        )
+    };
+    let far = tempo_only(Fit::Far);
+    assert_eq!(
+        swing_notes(&tempo_of(&far), &[(&a, Some(&far))], true, &positions),
+        Some(vec![(
+            Tempo,
+            vec![note("tempo_ratio", "Tempo", "quick back", Fit::Far)]
+        )])
+    );
+    let inside = tempo_only(Fit::Both);
+    assert_eq!(
+        swing_notes(&tempo_of(&inside), &[(&a, Some(&inside))], true, &positions),
+        Some(Vec::new())
+    );
+    // The box takes the grade the tile shows: none when two face-on
+    // cameras disagree.
+    let b = report(false);
+    let near = tempo_only(Fit::Near);
+    let split = tempo_values(&[
+        Swing {
+            report: &a,
+            t_ns: None,
+            grades: Some(&far),
+        },
+        Swing {
+            report: &b,
+            t_ns: None,
+            grades: Some(&near),
+        },
+    ]);
+    assert_eq!(split[0].color, theme::TEXT);
+    assert_eq!(swing_notes(&split, &[(&a, None)], true, &positions), None);
 }
 
 #[test]

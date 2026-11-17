@@ -132,6 +132,7 @@ pub(crate) fn tempo_values<'a>(swings: &[Swing<'a>]) -> Vec<FrameValue> {
                 color: grade.as_ref().map_or(theme::TEXT, |g| grade_color(g.fit)),
                 text,
                 word: None,
+                grade,
             }
         })
         .collect()
@@ -402,8 +403,8 @@ pub(crate) fn off_band(fit: Fit) -> bool {
     matches!(fit, Fit::Near | Fit::Far)
 }
 
-/// A bullet of the Notes box: a metrics table cell off its band, with its
-/// metric's id and name, its words and its fit.
+/// A bullet of the Notes box: a tempo tile or a metrics table cell off its
+/// band, with its metric's id and name, its words and its fit.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SwingNote {
     pub(crate) id: String,
@@ -412,30 +413,94 @@ pub(crate) struct SwingNote {
     pub(crate) fit: Fit,
 }
 
-/// The Notes box of the metrics tables of `tables` (each camera's report
-/// and its grades against the picked reference, in column order) at
-/// `positions`: per key position, in table order, each cell off its band
-/// ([`off_band`]) with its grade's words, the words its hover text ends with
-/// ([`band_tip`]; the value as its tile reads it when the grade has none).
-/// A metric graded the same at the same position by two cameras is one
-/// note, and a position without notes is left out. Empty when every graded
-/// cell is inside its band; `None` when no cell is graded.
+/// A group of the Notes box: the tempo, or a key position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum NoteGroup {
+    Tempo,
+    At(SwingPosition),
+}
+
+impl NoteGroup {
+    /// The group's heading.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Tempo => "Tempo",
+            Self::At(position) => position.label(),
+        }
+    }
+
+    /// The group's key in its notes' marks.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Tempo => "tempo",
+            Self::At(position) => position.key(),
+        }
+    }
+}
+
+/// The worse of two fits off a band: far over near.
+fn worse(a: Fit, b: Fit) -> Fit {
+    if a == Fit::Far || b == Fit::Far {
+        Fit::Far
+    } else {
+        a
+    }
+}
+
+/// Adds `note` to `notes` unless a note of the same metric with the same
+/// words is there, which then takes the worse of the two fits.
+fn add_note(notes: &mut Vec<SwingNote>, note: SwingNote) {
+    match notes
+        .iter_mut()
+        .find(|n| n.id == note.id && n.words == note.words)
+    {
+        Some(same) => same.fit = worse(same.fit, note.fit),
+        None => notes.push(note),
+    }
+}
+
+/// The Notes box of a shot's `tempo` tiles ([`tempo_values`], graded as
+/// they show) and the metrics tables of `tables` (each camera's report and
+/// its grades against the picked reference, in column order) at
+/// `positions`. First the tempo: each tempo tile off its band ([`off_band`])
+/// with its grade's words (its value when the grade has none). Then per key
+/// position, in table order, each cell off its band with its grade's words,
+/// the words its hover text ends with ([`band_tip`]; the value as its tile
+/// reads it when the grade has none). A metric with the same words at the
+/// same position on two cameras is one note, in the worse fit's color; a
+/// group without notes is left out. Empty when every graded tile and cell is
+/// inside its band; `None` when none is graded.
 pub(crate) fn swing_notes(
+    tempo: &[FrameValue],
     tables: &[(&SwingReportFile, Option<&ReferenceGrades>)],
     imperial: bool,
     positions: &[SwingPosition],
-) -> Option<Vec<(SwingPosition, Vec<SwingNote>)>> {
+) -> Option<Vec<(NoteGroup, Vec<SwingNote>)>> {
     let rows: Vec<(String, Vec<Cell>)> = tables
         .iter()
         .flat_map(|(report, grades)| metric_rows(report, imperial, positions, *grades))
         .collect();
-    if !rows
-        .iter()
-        .any(|(_, cells)| cells.iter().any(|c| c.grade.is_some()))
+    let tempo_graded = tempo.iter().any(|t| t.grade.is_some());
+    if !tempo_graded
+        && !rows
+            .iter()
+            .any(|(_, cells)| cells.iter().any(|c| c.grade.is_some()))
     {
         return None;
     }
-    let notes = positions.iter().enumerate().filter_map(|(k, &position)| {
+    let tempo_notes: Vec<SwingNote> = tempo
+        .iter()
+        .filter_map(|t| {
+            let grade = t.grade.as_ref().filter(|g| off_band(g.fit))?;
+            Some(SwingNote {
+                id: t.id.to_owned(),
+                label: t.label.to_owned(),
+                words: grade.word.clone().unwrap_or_else(|| t.text.clone()),
+                fit: grade.fit,
+            })
+        })
+        .collect();
+    let at = positions.iter().enumerate().filter_map(|(k, &position)| {
         let mut notes: Vec<SwingNote> = Vec::new();
         for (label, cells) in &rows {
             let Some(cell) = cells.get(k) else {
@@ -451,19 +516,20 @@ pub(crate) fn swing_notes(
                     Some(word) => format!("{} {word}", cell.worded.text),
                     None => cell.worded.text.clone(),
                 });
-            let note = SwingNote {
-                id: grade.id.clone(),
-                label: label.clone(),
-                words,
-                fit: grade.fit,
-            };
-            if !notes.contains(&note) {
-                notes.push(note);
-            }
+            add_note(
+                &mut notes,
+                SwingNote {
+                    id: grade.id.clone(),
+                    label: label.clone(),
+                    words,
+                    fit: grade.fit,
+                },
+            );
         }
-        (!notes.is_empty()).then_some((position, notes))
+        (!notes.is_empty()).then_some((NoteGroup::At(position), notes))
     });
-    Some(notes.collect())
+    let tempo = (!tempo_notes.is_empty()).then_some((NoteGroup::Tempo, tempo_notes));
+    Some(tempo.into_iter().chain(at).collect())
 }
 
 /// Size of the Notes box's text.
@@ -514,8 +580,8 @@ pub(crate) fn note_job(note: &SwingNote, width: f32) -> egui::text::LayoutJob {
     job
 }
 
-/// The line the Notes box shows when every graded cell is inside its band
-/// of `reference`.
+/// The line the Notes box shows when every graded tempo tile and table cell
+/// is inside its band of `reference`.
 pub(crate) fn notes_all_inside(reference: ReferenceKind) -> String {
     format!(
         "All measurements within the {} range",
@@ -523,13 +589,13 @@ pub(crate) fn notes_all_inside(reference: ReferenceKind) -> String {
     )
 }
 
-/// The Notes box, `width` wide (mark `swing_notes`): per key position with
-/// notes, its name in small capitals, then a bullet per note
-/// (`swing_note:<metric>:<position>`), its lines hanging after the bullet;
-/// with no notes, the muted [`notes_all_inside`] line.
+/// The Notes box, `width` wide (mark `swing_notes`): per group with notes
+/// (the tempo, then key positions), its name in small capitals, then a
+/// bullet per note (`swing_note:<metric>:<group key>`), its lines hanging
+/// after the bullet; with no notes, the muted [`notes_all_inside`] line.
 pub(super) fn notes_box(
     ui: &mut egui::Ui,
-    notes: &[(SwingPosition, Vec<SwingNote>)],
+    notes: &[(NoteGroup, Vec<SwingNote>)],
     reference: ReferenceKind,
     width: f32,
 ) {
@@ -556,10 +622,10 @@ pub(super) fn notes_box(
         );
         items.push(Item::Line(ui.fonts_mut(|f| f.layout_job(line))));
     }
-    for (position, group) in notes {
+    for (group_of, group) in notes {
         let heading = ui.fonts_mut(|f| {
             f.layout_no_wrap(
-                position.label().to_uppercase(),
+                group_of.label().to_uppercase(),
                 egui::FontId::proportional(10.0),
                 theme::TEXT_MUTED,
             )
@@ -567,7 +633,7 @@ pub(super) fn notes_box(
         items.push(Item::Heading(heading));
         for note in group {
             let galley = ui.fonts_mut(|f| f.layout_job(note_job(note, inner - indent)));
-            let key = format!("swing_note:{}:{}", note.id, position.key());
+            let key = format!("swing_note:{}:{}", note.id, group_of.key());
             items.push(Item::Note(key, galley));
         }
     }
@@ -674,14 +740,16 @@ pub(super) const SPINE_FACE_ON: FrameTile = FrameTile {
     id: "lateral_spine_tilt",
 };
 
-/// One tile's content: the metric's id, its name, and its value on screen
-/// (with a direction word) in its color.
+/// One tile's content: the metric's id, its name, its value on screen
+/// (with a direction word) in its color, and the grade it is colored by
+/// (a tempo tile's; the frame tiles are never graded).
 pub(crate) struct FrameValue {
     pub(crate) id: &'static str,
     pub(crate) label: &'static str,
     pub(crate) text: String,
     pub(crate) word: Option<&'static str>,
     pub(crate) color: egui::Color32,
+    pub(crate) grade: Option<MetricGrade>,
 }
 
 /// The body at the replay's position: per tile, the metric from each
@@ -726,6 +794,7 @@ pub(crate) fn frame_tiles(swings: &[Swing], imperial: bool) -> Vec<FrameValue> {
                 text: shown.text,
                 word: shown.word,
                 color: shown.color,
+                grade: None,
             }
         })
         .collect()
