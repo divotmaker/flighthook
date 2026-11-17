@@ -67,9 +67,9 @@ fn turn_for(want: &Want) -> GolferTurn {
 
 /// The card sent `want` and the session answered: flighthook holds it.
 fn answered(model: &mut Model, want: &Want) {
-    model.select_sent("c", now());
+    model.select_sent("c", Some(want.clone()), now());
     model.flighthook_holds(&turn_for(want));
-    assert!(model.select_answered("c"));
+    assert!(model.select_answered("c", true));
 }
 
 #[test]
@@ -117,10 +117,10 @@ fn a_turn_to_a_second_local_player_sends_one_complete_select() {
     assert_eq!(ann.club, Some(Club::Driver));
     assert_eq!(ann.hand, Some(Handedness::Left));
     // Nothing more until it is answered, and nothing after.
-    model.select_sent("c2", now());
+    model.select_sent("c2", Some(ann.clone()), now());
     assert_eq!(model.sync(now()), None);
     model.flighthook_holds(&turn_for(&ann));
-    model.select_answered("c2");
+    model.select_answered("c2", true);
     assert_eq!(model.sync(now()), None);
 }
 
@@ -180,7 +180,7 @@ fn the_card_reasserts_against_changes_no_game_card_made() {
     assert_eq!(want.club, Some(Club::Iron9));
 }
 
-/// A1: the golfer compares by id. A flighthook golfer that lists the
+/// The golfer compares by id. A flighthook golfer that lists the
 /// player's id is another golfer, so the card re-asserts the Pureplay id.
 #[test]
 fn a_linked_golfer_is_another_golfer_by_id() {
@@ -244,7 +244,7 @@ fn a_held_pick_keeps_the_club_out_of_the_select() {
     assert_eq!(model.sync(now()), Some(joe));
 }
 
-/// A10: a select unanswered for 5 s is forgotten, and the turn is compared
+/// A select unanswered for 5 s is forgotten, and the turn is compared
 /// again.
 #[test]
 fn an_unanswered_select_is_forgotten_after_5_s() {
@@ -252,7 +252,7 @@ fn an_unanswered_select_is_forgotten_after_5_s() {
     model.apply_snapshot(&snapshot(1));
     let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
-    model.select_sent("w-1", now());
+    model.select_sent("w-1", None, now());
     model.flighthook_holds(&GolferTurn {
         club: Some(Club::Driver),
         ..turn_for(&joe)
@@ -260,7 +260,7 @@ fn an_unanswered_select_is_forgotten_after_5_s() {
     let later = now() + SELECT_FORGOTTEN - Duration::from_millis(1);
     assert_eq!(model.sync(later), None, "unanswered");
     assert_eq!(model.sync(now() + SELECT_FORGOTTEN), Some(joe));
-    assert!(!model.select_answered("w-1"));
+    assert!(!model.select_answered("w-1", true));
 }
 
 #[test]
@@ -278,9 +278,9 @@ fn an_unknown_hand_or_club_is_left_out() {
     // A turn that already holds no club is the same.
     let mut turn = turn_for(&want);
     turn.club = None;
-    model.select_sent("c", now());
+    model.select_sent("c", Some(want.clone()), now());
     model.flighthook_holds(&turn);
-    model.select_answered("c");
+    model.select_answered("c", true);
     assert_eq!(model.sync(now()), None);
     // The header's club on it is put back to none.
     turn.club = Some(Club::Driver);

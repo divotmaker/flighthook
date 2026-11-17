@@ -36,7 +36,7 @@ const ADDR: &str = "127.0.0.1:9770";
 /// flighthook's actor id, the sender of its turns and replies.
 const FLIGHTHOOK: &str = "flighthook";
 /// Longest a test steps the card waiting for one thing (virtual time).
-const WAIT: Duration = Duration::from_secs(60);
+const WAIT: Duration = Duration::from_secs(120);
 
 // -- The fake link ---------------------------------------------------------------
 

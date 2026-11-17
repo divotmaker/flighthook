@@ -40,7 +40,7 @@
 //! again whenever the turn's hand or club ([`FrpSession::hints`]) differs
 //! from what the monitor was last told, the monitor is sent a 201 with the
 //! hand and club (as GSPro does). Nothing is sent while the club is not
-//! known. The 201 waits until the last 200 is [`PLAYER_INFO_GAP`] old, so
+//! known. The 201 waits until the last 200 is 50 ms old, so
 //! the two objects, which carry no terminator, never arrive in one read.
 //!
 //! **This process's own clients.** A connection from an Open Connect client
@@ -67,7 +67,7 @@ pub mod mapper;
 mod session;
 
 #[cfg(feature = "driver")]
-pub use session::{Error, PLAYER_INFO_GAP, Server, Session};
+pub use session::{Error, Server, Session};
 
 use std::net::SocketAddr;
 

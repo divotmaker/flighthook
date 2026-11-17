@@ -184,7 +184,7 @@ fn a_header_golfer_pick_is_reasserted() {
     rig.turn_until(is_joe);
 }
 
-/// A1: a golfer linked to the game's player (a saved golfer listing
+/// A golfer linked to the game's player (a saved golfer listing
 /// `pureplay.Joe`) is another golfer by id: the card selects Joe again.
 #[test]
 fn a_linked_golfers_turn_is_reasserted_by_id() {
@@ -1031,4 +1031,25 @@ fn a_player_the_snapshot_did_not_bring_is_asked_for_again_after_a_context_change
     names_nine(&mut rig, 6);
     let again = rig.next_state_get();
     assert_ne!(again["id"], get["id"], "player 9 asked for again");
+}
+
+/// Another simulator card's select already made flighthook's turn match
+/// Pureplay's change, and the host does not hand the card that turn. The
+/// card's own select then changes nothing; its `ok` reply means flighthook
+/// holds the turn, so the card sends it once.
+#[test]
+fn a_turn_another_card_already_matched_is_selected_once() {
+    let mut rig = rig();
+    let mut turn = rig.turn.clone();
+    turn.club = Some(Club::Putter);
+    turn.mode = Some(Mode::Putting);
+    rig.turn = turn;
+    let before = rig.selects().len();
+    rig.event(
+        "player.club_changed",
+        2,
+        &json!({ "playerId": 1, "current": "Putter", "currentClubId": "b-pt", "reason": "user_selected" }),
+    );
+    rig.run_for(Duration::from_secs(1));
+    assert_eq!(rig.selects().len() - before, 1);
 }

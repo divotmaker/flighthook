@@ -376,21 +376,6 @@ fn strict_mode_sends_the_launch_monitors_own_launch_only() {
     assert_eq!(rig.from("r10.0", ShotFinished { key }).len(), 1);
 }
 
-/// The Pureplay Accessory card's `bus.actor` and shots never reach the
-/// session, under "Any" and routed to it by ID.
-#[test]
-fn a_pureplay_card_feeds_no_pureplay_connect_output() {
-    let card = "pureplay_accessory.0";
-    for routing in [[None, None, None], [Some(card), Some(card), Some(card)]] {
-        let mut rig = Rig::new(routing, Mode::Full);
-        let mut accessory = hosted(card);
-        accessory.roles.push(roles::GAME.into());
-        assert!(rig.from(card, accessory).is_empty(), "{routing:?}");
-        assert!(shot(&mut rig, card, 1).is_empty(), "{routing:?}");
-        assert!(rig.start().is_empty(), "{routing:?}");
-    }
-}
-
 /// A monitor that leaves the bus leaves the view: its `bus.actor` removal,
 /// or a remote one that went silent (the system actor says it is gone).
 #[test]

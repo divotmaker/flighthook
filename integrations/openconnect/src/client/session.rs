@@ -35,11 +35,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a connection must stay up before the connect succeeds: an Open
 /// Connect server refuses its own client as soon as it accepts it, well
 /// within this, so a refused connection never shows as connected.
-pub const REFUSAL_VERDICT: Duration = Duration::from_secs(1);
+pub(crate) const REFUSAL_VERDICT: Duration = Duration::from_secs(1);
 
 /// How often the session sends a heartbeat. The first goes out 1 s after
 /// the session starts.
-pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
+pub(crate) const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
 
 /// When the first heartbeat goes out, after the session starts.
 const FIRST_HEARTBEAT: Duration = Duration::from_secs(1);
@@ -112,7 +112,7 @@ impl FrpDriver for Client {
     }
 
     /// The TCP connect, the connection registered as this process's own,
-    /// then [`REFUSAL_VERDICT`] for this process's own server to refuse it.
+    /// then 1 s for this process's own server to refuse it.
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Session<TcpStream>, Error> {
         let addr = self
             .config

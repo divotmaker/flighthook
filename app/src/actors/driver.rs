@@ -1246,15 +1246,23 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
     }
 
     /// The device's status changed from telemetry `old`: in the card's
-    /// `bus.actor` while a session is up; during a connect, the telemetry
-    /// change goes to the card as rows (the `bus.actor` waits for the
-    /// identity).
+    /// `bus.actor` while a session is up, with each key that left sent to
+    /// the card as an empty row (the `bus.actor` lists only the keys the
+    /// device has); during a connect, the telemetry change goes to the card
+    /// as rows (the `bus.actor` waits for the identity).
     fn status_changed(&mut self, old: &BTreeMap<String, String>) {
+        let mut telemetry = telemetry_rows(old, &self.device_status.telemetry);
         if !self.connecting {
             self.publish_actor();
+            telemetry.retain(|k, _| !self.device_status.telemetry.contains_key(k));
+            if !telemetry.is_empty() {
+                self.sender.local(LocalEvent::CardStatus {
+                    status: self.status,
+                    telemetry,
+                });
+            }
             return;
         }
-        let mut telemetry = telemetry_rows(old, &self.device_status.telemetry);
         if !telemetry.is_empty() {
             self.hold_connect_error(&mut telemetry);
             self.sender.local(LocalEvent::CardStatus {
@@ -2202,6 +2210,44 @@ pub(crate) mod tests {
         let seen = drain(&mut rx);
         let (_, telemetry) = card_status(&seen[0]).expect("a card status");
         assert!(!telemetry.contains_key("phase"));
+    }
+
+    /// A telemetry key the driver drops during a session leaves the card:
+    /// the `bus.actor` lists only the keys the device has, and the key that
+    /// went follows as an empty row.
+    #[test]
+    fn a_telemetry_key_dropped_in_a_session_leaves_the_card() {
+        let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
+        let mut card = flighthook::ActorStatusResponse::new("Fake", ActorStatus::Starting);
+        let mut rows = |seen: &[BusMsg]| {
+            for m in seen {
+                if let Some((status, telemetry)) = card_status(m) {
+                    card.apply_status(status, telemetry, 0);
+                } else if let FrpBody::BusActor(actor) = body(m) {
+                    for (k, v) in flighthook::bus_actor_rows(actor) {
+                        if v.is_empty() {
+                            card.telemetry.remove(&k);
+                        } else {
+                            card.telemetry.insert(k, v);
+                        }
+                    }
+                }
+            }
+            card.telemetry.clone()
+        };
+        rows(&drain(&mut rx));
+        sink.handle(DeviceEvent::Status(
+            DeviceStatus::new()
+                .with_telemetry("ready", "false")
+                .with_telemetry("blockers", "shot in progress"),
+        ));
+        assert_eq!(rows(&drain(&mut rx))["blockers"], "shot in progress");
+        sink.handle(DeviceEvent::Status(
+            DeviceStatus::new().with_telemetry("ready", "true"),
+        ));
+        let card = rows(&drain(&mut rx));
+        assert_eq!(card["ready"], "true");
+        assert!(!card.contains_key("blockers"), "{card:?}");
     }
 
     /// A discarded shot's frames leave the pre-roll.

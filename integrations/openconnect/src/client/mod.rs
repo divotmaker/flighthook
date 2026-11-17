@@ -5,8 +5,9 @@
 //! The driver ([`Client`], feature `driver`) connects to the simulator, and
 //! each [`Session`] runs one connection. The connection is registered as
 //! this process's own before anything is sent; the connect then waits
-//! [`REFUSAL_VERDICT`], and a refusal by this process's own Open Connect server (the client points at it, which would loop shots
-//! back) fails the connect with the server's reason. The session then:
+//! 1 s, and a refusal by this process's own Open Connect server (the client
+//! points at it, which would loop shots back) fails the connect with the
+//! server's reason. The session then:
 //!
 //! - sends each finished shot as one shot message. Its `ShotNumber` is the
 //!   shot's own number, or one more than the last one sent when that is
@@ -50,7 +51,7 @@ mod session;
 mod shot;
 
 #[cfg(feature = "driver")]
-pub use session::{Client, Error, HEARTBEAT_EVERY, REFUSAL_VERDICT, Session};
+pub use session::{Client, Error, Session};
 #[cfg(feature = "driver")]
 pub use shot::{OutputShot, output_shot};
 

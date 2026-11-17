@@ -670,6 +670,32 @@ fn a_new_connection_is_told_again() {
     }
 }
 
+/// A monitor that connects while the turn already holds a hand and club is
+/// told them, though the turn does not change afterwards.
+#[test]
+fn a_monitor_connecting_under_a_set_turn_is_told_the_player() {
+    let (mut server, addr) = server_on_bound_socket();
+    let mut host = TestHost::new().with_hints(
+        TurnHints::default()
+            .with_handedness(Handedness::Right)
+            .with_club(Club::Iron7),
+    );
+    host.flags.set_wants_raw(true);
+    let mut monitor = TcpStream::connect(addr).expect("connects");
+    monitor.write_all(SHOT.as_bytes()).expect("sends");
+    let mut session = host.connect(&mut server).expect("the first message");
+    host.with(|now, out| session.step(now, out))
+        .expect("the shot");
+    host.advance(PLAYER_INFO_GAP);
+    host.with(|now, out| session.step(now, out)).expect("steps");
+    let kinds = kinds(&host.take());
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "tx:player").count(),
+        1,
+        "{kinds:?}"
+    );
+}
+
 // -- The connection's end ----------------------------------------------------------
 
 /// The monitor closing the connection ends the session with no alert, and

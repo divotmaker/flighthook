@@ -29,7 +29,7 @@ const REFUSAL_BURST_GAP: Duration = Duration::from_secs(30);
 
 /// How long after a reply (200) the player information (201) waits, so the
 /// two never arrive in the same read on the monitor's side.
-pub const PLAYER_INFO_GAP: Duration = Duration::from_millis(50);
+pub(crate) const PLAYER_INFO_GAP: Duration = Duration::from_millis(50);
 
 /// What a connect or a session failed with.
 #[derive(Debug, thiserror::Error)]
@@ -265,7 +265,7 @@ impl Server {
                         let identity = DeviceIdentity::new(peer.to_string())
                             .with_model(first.device_id.clone())
                             .with_label(format!("{} ({peer})", first.device_id));
-                        return Ok(Session::new(
+                        let mut session = Session::new(
                             stream,
                             peer,
                             identity,
@@ -273,7 +273,9 @@ impl Server {
                             self.refusals.clone(),
                             reason,
                             self.ids.clone(),
-                        ));
+                        );
+                        session.set_hints(ctx.hints());
+                        return Ok(session);
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => ctx.wait(IDLE)?,
@@ -414,8 +416,9 @@ impl<S: Read + Write> Session<S> {
         self.hints = *hints;
     }
 
-    /// One pass at `now`: a look at who the peer is, the messages waiting,
-    /// what the peer sent, then the player information when it is due.
+    /// One pass at `now`: a look at who the peer is, a read of what the
+    /// peer sent, the messages waiting, then the player information when it
+    /// is due.
     ///
     /// # Errors
     ///
@@ -426,8 +429,8 @@ impl<S: Read + Write> Session<S> {
             refuse(&self.refusals, &client, self.peer, &self.reason, now, out);
             return Err(Error::OwnClient);
         }
-        let handled = self.drain(now, out)?;
         let read = read_into(&mut self.stream, &mut self.buf)?.is_some();
+        let handled = self.drain(now, out)?;
         let told = self.send_player_info(now, out)?;
         Ok(if handled || read || told {
             Activity::Active

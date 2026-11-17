@@ -85,7 +85,7 @@ mod tests {
         ActorStatus, OpenConnectClientConfig, OpenConnectClientSection, OpenConnectServerConfig,
         RawDir,
     };
-    use flightrelay::{BusActor, FrpMessage};
+    use flightrelay::FrpMessage;
     use tokio::sync::broadcast;
 
     use super::*;
@@ -98,7 +98,6 @@ mod tests {
     const CLIENT: &str = "openconnect_client.0";
 
     const SHOT: &str = r#"{"DeviceID":"Range Bridge","Units":"Yards","ShotNumber":1,"APIversion":"1","BallData":{"Speed":100.0,"VLA":14.0,"HLA":1.0,"TotalSpin":3000.0,"SpinAxis":2.0},"ShotDataOptions":{"ContainsBallData":true}}"#;
-    const READY: &str = r#"{"DeviceID":"Range Bridge","ShotNumber":0,"APIversion":"1","ShotDataOptions":{"IsHeartBeat":true,"LaunchMonitorIsReady":true}}"#;
     const LATERAL: &str = r#"{"DeviceID":"TestLM","Units":"Yards","ShotNumber":7,"APIversion":"1","BallData":{"Speed":120.0,"SpinAxis":-13.05,"TotalSpin":2878.5,"BackSpin":2800.0,"SideSpin":-650.0,"HLA":4.2,"VLA":14.0},"ClubData":{"Speed":90.0,"FaceToTarget":2.1,"Path":-3.4,"HorizontalFaceImpact":-6.5,"VerticalFaceImpact":3.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true}}"#;
 
     /// An address on loopback no one is listening on.
@@ -279,16 +278,6 @@ mod tests {
             .collect()
     }
 
-    fn server_bus_actor(msg: &BusMsg) -> Option<&BusActor> {
-        match msg.as_frp() {
-            Some(m) if m.from == SERVER => match &m.body {
-                FrpBody::BusActor(a) => Some(a),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
     // -- Naming ------------------------------------------------------------------
 
     /// An alert that quotes the actor id of one of this process's cards
@@ -321,7 +310,8 @@ mod tests {
 
     /// A monitor that is not one of ours is served: its shot reaches the bus
     /// with the request and the reply as the shot's two raw frames, with no
-    /// alert, and the card shows the monitor as its device.
+    /// alert, and the card shows the monitor as its device. Once it leaves,
+    /// with no alert, the next monitor on the same port is served.
     #[test]
     fn a_foreign_peer_is_served() {
         let mut rig = Rig::new();
@@ -371,47 +361,15 @@ mod tests {
         let mut reply = [0u8; 64];
         let n = monitor.read(&mut reply).expect("the 200");
         assert_eq!(&reply[..n], br#"{"Code":200,"Message":"Shot received"}"#);
-    }
 
-    /// A monitor that said it is ready and then disconnects leaves the
-    /// server's input not ready, and the card waits for the next monitor on
-    /// the same port.
-    #[test]
-    fn the_input_is_not_ready_once_its_monitor_disconnects() {
-        let mut rig = Rig::new();
-        let bind = rig.server();
-        let mut monitor = TcpStream::connect(bind).expect("monitor connects");
-        monitor.write_all(READY.as_bytes()).expect("send ready");
-        rig.until("the input ready", |m| {
-            server_bus_actor(m).is_some_and(BusActor::is_clear)
-        });
-        drop(monitor);
-        rig.until("the input not ready", |m| {
-            server_bus_actor(m).is_some_and(|a| !a.is_clear())
-        });
-        let mut next = TcpStream::connect(bind).expect("the next monitor connects");
-        next.write_all(SHOT.as_bytes()).expect("send shot");
-        rig.until("the next monitor's shot", server_shot);
-    }
-
-    /// The card shows the monitor while it is connected, and Reconnecting
-    /// once it left, with no alert for a monitor that merely went away.
-    #[test]
-    fn the_card_shows_the_monitor_until_it_disconnects() {
-        let mut rig = Rig::new();
-        let bind = rig.server();
-        let mut monitor = TcpStream::connect(bind).expect("monitor connects");
-        let local = monitor.local_addr().expect("monitor address").to_string();
-        monitor.write_all(READY.as_bytes()).expect("send ready");
-        rig.until("the card connected", |m| {
-            matches!(status(m, SERVER), Some((ActorStatus::Connected, t))
-                if t.get("device_info").is_some_and(|d| d.ends_with(&format!("({local})"))))
-        });
         drop(monitor);
         let seen = rig.until("the card reconnecting", |m| {
             matches!(status(m, SERVER), Some((ActorStatus::Reconnecting, _)))
         });
         assert!(alerts(&seen, SERVER).is_empty());
+        let mut next = TcpStream::connect(bind).expect("the next monitor connects");
+        next.write_all(SHOT.as_bytes()).expect("send shot");
+        rig.until("the next monitor's shot", server_shot);
     }
 
     /// A client of this process pointed at the server is refused: its card

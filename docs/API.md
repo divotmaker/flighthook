@@ -306,13 +306,13 @@ reported by one source only:
   only` when it grants `read` alone (**Read Only**) or no scopes at all;
   `off in Pureplay` when Pureplay's "Let Apps Change Aim and Club" is off;
   `not supported` when Pureplay offers no club command, or the player who
-  is up has no bag), `shots` (the Shots setting: `auto`, `auto: last
-  from Pureplay`, `auto: last from flighthook`, `from Pureplay` or `from
-  flighthook`), `missed_events` (gaps in Pureplay's event numbers, only
-  above 0; each one asks Pureplay for its state again) and `pureplay` (the
-  game's version); each only while it has a value; these ride the card's
-  `bus.actor` telemetry. `device_info` is Pureplay's address, `shot_count`
-  the shots the card put on the bus, and `last_shot` the shot the card took
+  is up has no bag), `missed_events` (gaps in Pureplay's event numbers,
+  only above 0; each one asks Pureplay for its state again) and `pureplay`
+  (the game's version); each only while it has a value; these ride the
+  card's `bus.actor` telemetry. `device_info` is Pureplay's address,
+  `shot_count` the shots the card put on the bus, `shots` the Shots setting
+  (`auto`, `auto: last from Pureplay`, `auto: last from flighthook`, `from
+  Pureplay` or `from flighthook`), and `last_shot` the shot the card took
   last and the local time (`#12 at 16:41:07`; the card numbers every shot of
   a local player, so a shot Pureplay echoes skips a number). Pureplay's
   readiness is the card's

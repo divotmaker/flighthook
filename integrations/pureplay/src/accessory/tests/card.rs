@@ -438,7 +438,7 @@ fn pairing_rows(rig: &Rig) -> Vec<String> {
         .collect()
 }
 
-/// A8: while the card waits out a cooldown the host shows Starting before
+/// While the card waits out a cooldown the host shows Starting before
 /// the first session and Reconnecting after one, never Disconnected; the
 /// `pairing` row counts down meanwhile.
 #[test]
@@ -1036,8 +1036,7 @@ fn malformed_frames_are_ignored() {
 #[test]
 fn a_quiet_link_is_lost_after_two_unanswered_pings() {
     let mut rig = connected("PPA-QUIET");
-    let every = Duration::from_secs(1);
-    rig.session.as_mut().expect("a link").ping_every = every;
+    let every = PING_EVERY;
     let pipe = Rc::clone(&rig.pipe);
     let quiet = rig.host.now();
     rig.link_ends();
@@ -1056,8 +1055,7 @@ fn a_quiet_link_is_lost_after_two_unanswered_pings() {
 #[test]
 fn answered_pings_keep_the_link() {
     let mut rig = connected("PPA-ALIVE");
-    let every = Duration::from_secs(1);
-    rig.session.as_mut().expect("a link").ping_every = every;
+    let every = PING_EVERY;
     rig.pipe.borrow_mut().pong = true;
     rig.run_for(every * 10);
     let pings = rig.pipe.borrow().pings;
@@ -1131,7 +1129,7 @@ fn launches(rig: &Rig) -> Vec<(ShotKey, flightrelay::Launch)> {
         .collect()
 }
 
-/// A6: a local player's shot in Pureplay is reported as the card's own
+/// A local player's shot in Pureplay is reported as the card's own
 /// shot (`shot.trigger`, `shot.launch`, `shot.finished` under the card's
 /// own key and count, a virtual source), and Pureplay's result goes out as
 /// a stroke with that key's `shot_id`.
@@ -1162,7 +1160,7 @@ fn a_local_shot_is_reported_as_the_cards_own() {
     assert_eq!(strokes[0].golfer.as_str(), "pureplay.Joe");
 }
 
-/// A6: a shot of a player at another machine is not reported; its stroke
+/// A shot of a player at another machine is not reported; its stroke
 /// names no shot.
 #[test]
 fn a_remote_players_shot_is_ignored() {
@@ -1214,7 +1212,7 @@ fn launchless_outcomes_report_no_shot() {
     );
 }
 
-/// A6: a `shot.launched` repeating a `shotId` the card already holds is
+/// A `shot.launched` repeating a `shotId` the card already holds is
 /// not reported again; the next shot is.
 #[test]
 fn a_repeated_launch_is_not_taken_again() {
@@ -1229,7 +1227,7 @@ fn a_repeated_launch_is_not_taken_again() {
     assert_eq!(numbers, [1, 2], "pp-1 once, then pp-2");
 }
 
-/// A6: a shot Pureplay discards sends no stroke for a result after the
+/// A shot Pureplay discards sends no stroke for a result after the
 /// discard; a stroke sent before it stands.
 #[test]
 fn a_discard_stops_a_later_stroke_and_keeps_an_earlier_one() {
@@ -1427,14 +1425,14 @@ fn a_player_the_snapshot_did_not_bring_is_asked_for_once_until_cleared() {
     );
 }
 
-// -- Selects (A10) -------------------------------------------------------------------
+// -- Selects -------------------------------------------------------------------------
 
-/// A10: a `golfer.select` that gets no `bus.reply` holds back the card's
+/// A `golfer.select` that gets no `bus.reply` holds back the card's
 /// next select for [`model::SELECT_FORGOTTEN`]; then it is forgotten and
 /// the card asserts its turn again.
 #[test]
 fn an_unanswered_select_blocks_the_cards_selects_until_it_is_forgotten() {
-    let mut rig = connected("PPA-A10");
+    let mut rig = connected("PPA-SELECT");
     let before = rig.selects().len();
     rig.answers = false;
     rig.event(

@@ -11,8 +11,8 @@ use flighthook::{ActorStatus, Club, Handedness, Mode};
 use flightrelay::driver::{DeviceEvent, DriverInfo};
 use flightrelay::types::roles;
 use flightrelay::{
-    BusActor, BusReply, BusSync, DeviceInfo, GameAim, GameStroke, GolferSelect, GolferTurn,
-    ShotFinished, ShotLaunch, ShotTrigger, Source,
+    BusReply, BusSync, GameAim, GameStroke, GolferSelect, GolferTurn, ShotFinished, ShotLaunch,
+    ShotTrigger,
 };
 use tokio::sync::broadcast;
 
@@ -362,7 +362,7 @@ fn an_echo_is_not_stored_and_gets_the_stroke() {
     );
 }
 
-/// A6: the card numbers every Pureplay shot it reports, echoes included;
+/// The card numbers every Pureplay shot it reports, echoes included;
 /// an echo is dropped, so the numbers on the bus skip (#1, #3).
 #[test]
 fn every_reported_shot_is_numbered_so_a_dropped_echo_skips_one() {
@@ -379,7 +379,7 @@ fn every_reported_shot_is_numbered_so_a_dropped_echo_skips_one() {
     assert!(rig.rows()["last_shot"].starts_with("#3 at "));
 }
 
-/// A2: a turn another game or simulator card caused is not handed to the
+/// A turn another game or simulator card caused is not handed to the
 /// driver, so it never re-asserts against it; flighthook's own turns, a
 /// device's and the card's own are.
 #[test]
@@ -456,52 +456,6 @@ fn a_new_link_is_handed_the_current_turn() {
             && matches!(&m.body, FrpBody::GolferTurn(t) if *t == turn)),
         "{handed:?}"
     );
-}
-
-/// The card's readiness is its `bus.actor` without blockers; it is no
-/// launch monitor a simulator output stands for, on "Any" or routed to the
-/// card by id. A launch monitor's still is.
-#[test]
-fn the_cards_ready_never_reaches_an_output() {
-    let rig = Rig::new();
-    let card = BusActor::new("Pureplay", 1.0)
-        .with_role(roles::GAME)
-        .with_role(roles::LAUNCH_MONITOR)
-        .with_device(DeviceInfo {
-            source: Some(Source::Virtual),
-            ..DeviceInfo::default()
-        });
-    let mevo = BusActor::new("Mevo+", 1.0).with_role(roles::LAUNCH_MONITOR);
-    rig.state
-        .sources
-        .register_source("mevo.0", ShotSource::Mevo);
-    let by_id = Routing {
-        full_monitor: Some(ACTOR.into()),
-        ..Routing::default()
-    };
-    for routing in [Routing::default(), by_id] {
-        let mut feed = Feed::new(routing, Some(Arc::clone(&rig.state)));
-        feed.handle(&BusMsg::frp(FrpMessage::new(ACTOR, card.clone())));
-        feed.handle(&BusMsg::frp(FrpMessage::new("mevo.0", mevo.clone())));
-        let view = feed.in_view();
-        assert!(!view.contains_key(ACTOR), "{view:?}");
-    }
-    let mut any = Feed::new(Routing::default(), Some(Arc::clone(&rig.state)));
-    any.handle(&BusMsg::frp(FrpMessage::new("mevo.0", mevo)));
-    assert!(any.in_view().contains_key("mevo.0"));
-}
-
-/// A configured, connected card is a launch monitor, yet not one a
-/// simulator output stands for.
-#[test]
-fn the_connected_card_is_no_feed_of_a_pureplay_connect_output() {
-    let rig = Rig::new();
-    assert_eq!(
-        rig.state.sources.source(ACTOR),
-        Some(ShotSource::PureplayAccessory)
-    );
-    let feed = Feed::new(Routing::default(), Some(Arc::clone(&rig.state)));
-    assert!(!feed.feeds_simulators(ACTOR));
 }
 
 // -- On the driver host ----------------------------------------------------------

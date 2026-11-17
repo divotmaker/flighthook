@@ -572,7 +572,8 @@ impl Card {
         self.selects += 1;
         let select = want.select(format!("{}-{}", self.select_prefix, self.selects));
         out.log(Level::Info, format!("{want:?} from Pureplay"));
-        self.model.select_sent(&select.r#ref, now);
+        self.model
+            .select_sent(&select.r#ref, Some(want.clone()), now);
         out.frp(select);
     }
 
@@ -590,13 +591,13 @@ impl Card {
         match &msg.body {
             FrpBody::GolferTurn(turn) => self.model.flighthook_holds(turn),
             FrpBody::BusReply(reply) if reply.command == "golfer.select" => {
-                self.model.select_answered(&reply.r#ref);
+                self.model.select_answered(&reply.r#ref, reply.ok);
             }
             FrpBody::GolferSelect(select) => {
                 if let Some(Some(club)) = select.club
                     && self.following
                 {
-                    self.model.select_sent(&select.r#ref, now);
+                    self.model.select_sent(&select.r#ref, None, now);
                     self.picked = Some(club);
                 }
             }
@@ -1184,8 +1185,6 @@ pub struct Session<L = WsLink> {
     removal: bool,
     pings: u32,
     last_seq: Option<u64>,
-    /// A quiet link is pinged this often.
-    pub(crate) ping_every: Duration,
     capabilities: Option<Capabilities>,
     /// The token the link pairs with.
     saved: Option<Token>,
@@ -1228,7 +1227,6 @@ impl<L: Link> Session<L> {
             removal: false,
             pings: 0,
             last_seq: None,
-            ping_every: PING_EVERY,
             capabilities: None,
             saved: None,
         }
@@ -1766,9 +1764,9 @@ impl<L: Link> Session<L> {
     /// Ping a link that has gone quiet; lost after [`PINGS_UNANSWERED`].
     fn ping(&mut self, now: Instant, out: &mut Events<'_>) -> Result<(), Error> {
         let quiet = now.saturating_duration_since(self.heard.unwrap_or(now));
-        if quiet < self.ping_every {
+        if quiet < PING_EVERY {
             self.pings = 0;
-        } else if quiet >= self.ping_every * (self.pings + 1) {
+        } else if quiet >= PING_EVERY * (self.pings + 1) {
             if self.pings >= PINGS_UNANSWERED {
                 out.log(
                     Level::Info,

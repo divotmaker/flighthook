@@ -11,7 +11,9 @@
 //! golfer id, club, hand and mode, sent whole in one `golfer.select`
 //! ([`Model::sync`]) whenever flighthook's turn, as the card is handed it,
 //! differs from it. The host hands the card no turn another game or
-//! simulator card caused, so between those the last sender wins.
+//! simulator card caused, so between those the last sender wins. An `ok`
+//! reply to the card's select means flighthook holds what it carried, so
+//! the card's copy of the turn takes it even when no turn followed.
 //!
 //! The golfer differs when the turn's golfer id is not the player's. A
 //! remote player up gives nothing: the turn keeps the last local golfer. The mode is the shared
@@ -306,10 +308,10 @@ pub struct Model {
     /// A club pick is outstanding: the club is neither sent nor compared.
     club_held: bool,
     /// The `golfer.select`s awaiting their `bus.reply`, by `ref`, with when
-    /// each went out: the card's own and the picks from outside. While any
-    /// is unanswered, the turn on the bus is not final and nothing is
-    /// compared with it.
-    unanswered: BTreeMap<String, Instant>,
+    /// each went out and, for the card's own, the turn it carried: the
+    /// card's own and the picks from outside. While any is unanswered, the
+    /// turn on the bus is not final and nothing is compared with it.
+    unanswered: BTreeMap<String, (Instant, Option<Want>)>,
 }
 
 impl Model {
@@ -467,18 +469,34 @@ impl Model {
         self.turn = Some(turn.clone());
     }
 
-    /// Note a `golfer.select` with `r#ref` that went out at `now` (the
-    /// card's own or a pick from outside): until its `bus.reply`, or for
-    /// [`SELECT_FORGOTTEN`], nothing is compared with flighthook's turn.
-    pub fn select_sent(&mut self, r#ref: &str, now: Instant) {
-        self.unanswered.insert(r#ref.to_owned(), now);
+    /// Note a `golfer.select` with `r#ref` that went out at `now`: the
+    /// card's own, carrying `want`, or a pick from outside (`None`). Until
+    /// its `bus.reply`, or for [`SELECT_FORGOTTEN`], nothing is compared
+    /// with flighthook's turn.
+    pub fn select_sent(&mut self, r#ref: &str, want: Option<Want>, now: Instant) {
+        self.unanswered.insert(r#ref.to_owned(), (now, want));
     }
 
-    /// Note the `bus.reply` to the select `r#ref`. Returns true when it was
-    /// the last one unanswered: the turn on the bus is final (the session
-    /// publishes a turn before its reply).
-    pub fn select_answered(&mut self, r#ref: &str) -> bool {
-        self.unanswered.remove(r#ref).is_some() && self.unanswered.is_empty()
+    /// Note the `bus.reply` to the select `r#ref`. An `ok` reply to the
+    /// card's own select means flighthook holds what it carried, whether or
+    /// not that changed the turn, so the card's copy of the turn takes it.
+    /// Returns true when it was the last one unanswered: the turn on the
+    /// bus is final (the session publishes a turn before its reply).
+    pub fn select_answered(&mut self, r#ref: &str, ok: bool) -> bool {
+        let Some((_, want)) = self.unanswered.remove(r#ref) else {
+            return false;
+        };
+        if let (true, Some(want), Some(turn)) = (ok, want, self.turn.as_mut()) {
+            turn.golfer = Some(want.golfer);
+            if want.club.is_some() || want.unmapped {
+                turn.club = want.club;
+            }
+            if want.hand.is_some() {
+                turn.handedness = want.hand;
+            }
+            turn.mode = Some(want.mode);
+        }
+        self.unanswered.is_empty()
     }
 
     /// Forget the selects awaiting a reply. Called when the connection
@@ -520,7 +538,7 @@ impl Model {
     /// from it.
     pub fn sync(&mut self, now: Instant) -> Option<Want> {
         self.unanswered
-            .retain(|_, sent| now.saturating_duration_since(*sent) < SELECT_FORGOTTEN);
+            .retain(|_, (sent, _)| now.saturating_duration_since(*sent) < SELECT_FORGOTTEN);
         if !self.unanswered.is_empty() {
             return None;
         }
