@@ -1,3 +1,6 @@
+//! flighthook's event bus types and schemas, shared by the app, the UI and
+//! the cameras. Internal to flighthook: not published to crates.io.
+
 mod address;
 mod api;
 mod club;

@@ -47,18 +47,12 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
-  publish:
-    name: Publish crates
+  version-check:
+    name: Version check
     needs: test
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Packaging builds the driver crates; tenover's build script needs protoc.
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Verify tag matches Cargo.toml version
         run: |
@@ -69,24 +63,9 @@ jobs:
             exit 1
           fi
 
-      - name: Publish flighthook-pureplay to crates.io
-        run: cargo publish -p flighthook-pureplay --all-features
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Publish flighthook-openconnect to crates.io
-        run: cargo publish -p flighthook-openconnect --all-features
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Publish flighthook to crates.io
-        run: cargo publish -p flighthook --all-features
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
   version-bump:
     name: Version bump
-    needs: [test, publish]
+    needs: [test, version-check]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

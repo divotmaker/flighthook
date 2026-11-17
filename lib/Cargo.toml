@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 keywords = ["golf", "launch-monitor"]
 categories = ["data-structures"]
 repository = "https://github.com/divotmaker/flighthook"
+publish = false
 
 [features]
 clap = ["dep:clap"]

@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 keywords = ["golf", "launch-monitor"]
 repository = "https://github.com/divotmaker/flighthook"
 readme = false
+publish = false
 
 [features]
 default = ["driver"]

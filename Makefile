@@ -73,16 +73,6 @@ buildtools:
 stop:
 	@pkill -x flighthook 2>/dev/null && echo "stopped" || echo "nothing running"
 
-# Publish the integration crates and lib to crates.io, the crates first (lib
-# depends on them). Dry-runs first to catch errors before any real publish.
-publish:
-	cargo publish -p flighthook-pureplay --dry-run
-	cargo publish -p flighthook-pureplay
-	cargo publish -p flighthook-openconnect --dry-run
-	cargo publish -p flighthook-openconnect
-	cargo publish -p flighthook --dry-run
-	cargo publish -p flighthook
-
 lint:
 	cargo clippy --workspace
 	cargo test --workspace --doc
@@ -91,4 +81,4 @@ clean:
 	cd app && cargo clean
 	rm -rf ui/dist
 
-.PHONY: build build-windows release ui test clippy lint run deploy stop clean buildtools publish screens screens-check
+.PHONY: build build-windows release ui test clippy lint run deploy stop clean buildtools screens screens-check
