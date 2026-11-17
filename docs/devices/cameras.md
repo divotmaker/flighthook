@@ -683,12 +683,10 @@ which happens only after you confirm it.
 
 A clip runs from `pre_roll_s` before the **estimated impact** to
 `post_roll_s` after the shot's trigger time: when the launch monitor
-reported the shot, or, for the ExPutt, the moment it saw the ball struck,
-which it sends along with the putt's result.
+reported the shot.
 
 A FlightScope (Mevo+, Gen2, Xi) reports the shot at impact (its trigger is
-dated the moment it arrives), and the ExPutt dates each putt at its
-strike. The others report once the shot is measured,
+dated the moment it arrives). The others report once the shot is measured,
 so flighthook estimates the impact a fixed time before their report: the
 monitor's **camera timing**. Every launch monitor has a default, and the
 default for a kind of monitor without a better-known value is 1.5 s. These
@@ -697,7 +695,7 @@ are **beta estimates**, to be measured with a camera:
 | Launch monitor | Default camera timing |
 | --- | --- |
 | FlightScope Mevo+ / Gen2 / Xi | 0 s |
-| ExPutt | 0 s |
+| ExPutt | 1.5 s |
 | Square Golf Omni | 1 s |
 | Garmin R10 | 2 s |
 | Pureplay Accessory card | 0.9 s |
@@ -706,11 +704,6 @@ are **beta estimates**, to be measured with a camera:
 
 With the default 4 s pre-roll the backswing is in the clip even when an
 estimate is off by a second.
-
-An ExPutt putt reported without the ball-struck message has no strike time:
-it is dated when its result arrives, with the 1.5 s of a monitor without a
-better-known value, whatever the ExPutt's camera timing (which counts from
-the strike).
 
 ### Setting the camera timing
 
@@ -793,10 +786,7 @@ range in the config file is held to 1 to 1000, with a warning in the log.
 
 Each camera keeps the pre-roll plus the longest camera timing in effect plus
 0.5 s in memory: about 70 MB at 720p120 with the default 4 s pre-roll and an
-Open Connect monitor's 2.5 s. With an ExPutt it keeps 5 s more than its
-camera timing, because the ExPutt sends a putt seconds after the strike it
-is dated at: a putt reported up to 5.5 s after its strike still gets the
-whole pre-roll, a later one less of it.
+Open Connect monitor's 2.5 s.
 
 Each clip is a folder in the clip folder (shown on the Replay card under Settings, Cameras): one
 `<camera>.avi` (plays in VLC, Kinovea, Windows Media Player) and

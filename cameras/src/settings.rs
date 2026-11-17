@@ -45,17 +45,13 @@ pub fn impact_lead_s(config: &FlighthookConfig, actor: &str) -> Option<f64> {
 
 /// How far before a trigger's arrival the cameras' history has to reach
 /// for the configured launch monitors, seconds (0 with none): the largest
-/// impact lead in effect plus the monitor type's trigger delay
-/// ([`flighthook::trigger_delay_s`]).
+/// impact lead in effect.
 #[must_use]
 pub fn longest_reach_s(config: &FlighthookConfig) -> f64 {
     config
         .launch_monitor_leads()
         .into_iter()
-        .filter_map(|(kind, _, lead)| {
-            flighthook::impact_lead_in_effect_s(kind, lead)
-                .map(|lead| lead + flighthook::trigger_delay_s(kind))
-        })
+        .filter_map(|(kind, _, lead)| flighthook::impact_lead_in_effect_s(kind, lead))
         .fold(0.0, f64::max)
 }
 

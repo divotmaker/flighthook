@@ -12,16 +12,15 @@ pub const MAX_IMPACT_LEAD_S: f64 = 5.0;
 /// time of the monitor's `shot_trigger` the ball was struck. A trigger's
 /// time is its `timestamp` when it carries one, else its arrival. `None`
 /// for Auto-chip and the trackball, whose shots are no swing a camera
-/// films. Any other source is a launch
-/// monitor and gets [`DEFAULT_IMPACT_LEAD_S`] unless a value is better
-/// known.
+/// films. Any other source is a launch monitor and gets
+/// [`DEFAULT_IMPACT_LEAD_S`] unless a value is better known.
 #[must_use]
 pub fn impact_lead_default_s(prefix: &str) -> Option<f64> {
     match prefix {
         // Not a swing a camera films: Auto-chip, and the trackball.
         crate::api::AUTO_CHIP_ACTOR | "trackball" => None,
-        // Reports at impact, or dates its trigger at the strike.
-        "mevo" | "mock_monitor" | "exputt" => Some(0.0),
+        // Reports at impact.
+        "mevo" | "mock_monitor" => Some(0.0),
         "square" => Some(1.0),
         "r10" => Some(2.0),
         "openconnect_server" => Some(2.5),
@@ -30,35 +29,6 @@ pub fn impact_lead_default_s(prefix: &str) -> Option<f64> {
         "pureplay_accessory" => Some(0.9),
         _ => Some(DEFAULT_IMPACT_LEAD_S),
     }
-}
-
-/// How long after the time its `shot_trigger` carries a launch monitor of
-/// type `prefix` can deliver it, seconds: the cameras keep that much more
-/// history, so a clip still reaches back to the stroke. The ExPutt dates
-/// its trigger at the strike and sends it with the putt's result, seconds
-/// later; the others send it at once.
-#[must_use]
-pub fn trigger_delay_s(prefix: &str) -> f64 {
-    match prefix {
-        "exputt" => MAX_TRIGGER_DELAY_S,
-        _ => 0.0,
-    }
-}
-
-/// Longest [`trigger_delay_s`], seconds.
-pub const MAX_TRIGGER_DELAY_S: f64 = 5.0;
-
-/// The impact lead of a `shot_trigger` without a `timestamp` from launch
-/// monitor type `prefix`, seconds, when the type dates its triggers at the
-/// strike and delivers them late (a [`trigger_delay_s`] above 0): such a
-/// trigger (an ExPutt putt reported without its strike message) is dated at
-/// its arrival, with the result, so [`DEFAULT_IMPACT_LEAD_S`] applies in
-/// place of the type's lead and its `impact_lead_s`, which count from the
-/// strike. `None` for every other type: its lead in effect applies to every
-/// trigger.
-#[must_use]
-pub fn undated_impact_lead_s(prefix: &str) -> Option<f64> {
-    (trigger_delay_s(prefix) > 0.0).then_some(DEFAULT_IMPACT_LEAD_S)
 }
 
 /// Whether `v`, a section's `impact_lead_s`, is acceptable: absent, or finite

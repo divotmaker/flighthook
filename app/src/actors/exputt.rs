@@ -10,8 +10,10 @@
 //! connections: the silence limits, the spacing of mat searches, the wait
 //! after a stall, quick retries after a measuring session, and one "not
 //! answering" alert per outage. Putts are simulated in putting mode
-//! whatever the game's mode is (the driver's fixed mode), and each shot's
-//! trigger carries the time the ball was struck, which the cameras use.
+//! whatever the game's mode is (the driver's fixed mode). The device reports
+//! a ball when it is set down, not at the stroke, so a shot's trigger carries
+//! no time and the cameras date it when it arrives, like any monitor that
+//! reports once the putt is measured.
 //!
 //! The card adds its section ([`ExPuttSection`]), its shot source, the
 //! Find mat button (a `find_mat` for this card asks the driver to locate the

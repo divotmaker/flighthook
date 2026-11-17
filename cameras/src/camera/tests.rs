@@ -45,7 +45,7 @@ fn impact_leads_default_by_device_kind() {
     assert_eq!(ms(&config, "mevo.0"), Some(0));
     assert_eq!(ms(&config, "mock_monitor.3"), Some(0));
     assert_eq!(ms(&config, "square.0"), Some(1000));
-    assert_eq!(ms(&config, "exputt.0"), Some(0));
+    assert_eq!(ms(&config, "exputt.0"), Some(1500));
     assert_eq!(ms(&config, "r10.1"), Some(2000));
     assert_eq!(ms(&config, "openconnect_server.0"), Some(2500));
     assert_eq!(ms(&config, "pureplay_accessory.0"), Some(900));
@@ -204,60 +204,6 @@ fn a_trigger_is_dated_by_its_timestamp() {
     assert_eq!(trigger_time(MS, Some(utc_ms() - 3400)), 0);
 }
 
-/// The ExPutt dates its trigger at the strike and sends it with the
-/// putt's result, seconds later: the history reaches back over its
-/// trigger delay, so a putt reported 3.4 s after its strike still gets
-/// its whole pre-roll, with the impact at the strike.
-/// The ExPutt dates its trigger at the strike and sends it with the
-/// putt's result, seconds later: the history reaches back over its
-/// trigger delay, so a putt reported 3.4 s after its strike still gets
-/// its whole pre-roll, with the impact at the strike.
-#[test]
-fn an_exputt_clip_reaches_back_to_its_strike() {
-    let config = config_of("[exputt.0]\nname = \"Putt\"\n");
-    assert_eq!(ms(&config, "exputt.0"), Some(0));
-    assert_eq!(
-        longest_reach(&config),
-        Duration::from_secs_f64(flighthook::MAX_TRIGGER_DELAY_S)
-    );
-    let replay = config.replay.clone();
-    let mut recording = Recording::new(&config);
-    recording.set_fps(100.0);
-    assert_eq!(
-        recording.recorder.config().buffer,
-        roll(replay.pre_roll_s) + Duration::from_secs(5) + BUFFER_MARGIN
-    );
-    // 12 s of frames at 100 fps; the result arrives at 12 s, its strike
-    // was at 8.6 s.
-    let mut events = Vec::new();
-    for i in 0..=1200 {
-        events.extend(recording.push(at(i * 10 * MS, None)));
-    }
-    assert!(events.is_empty());
-    let key = ShotKey {
-        shot_id: "putt".into(),
-        shot_number: 1,
-    };
-    trigger(
-        &config,
-        &mut recording,
-        &shot("exputt.0", &key, true),
-        8600 * MS,
-    );
-    let mut i = 1201;
-    while events.is_empty() {
-        events.extend(recording.push(at(i * 10 * MS, None)));
-        i += 1;
-    }
-    let [RecorderEvent::Finished(clip)] = events.as_slice() else {
-        panic!("one clip: {events:?}");
-    };
-    assert_eq!(clip.impact_ns, 8600 * MS);
-    assert!(!clip.short_buffer);
-    let pre_roll = u64::try_from(roll(replay.pre_roll_s).as_nanos()).expect("ns");
-    assert_eq!(clip.frames[0].host_ns, 8600 * MS - pre_roll);
-}
-
 #[test]
 fn a_clip_short_of_its_pre_roll_is_told() {
     let pre = Duration::from_secs(4);
@@ -269,74 +215,6 @@ fn a_clip_short_of_its_pre_roll_is_told() {
     );
     // An impact earlier than the pre-roll reaches.
     assert_eq!(pre_roll_shortfall(0, 3000 * MS, pre), None);
-}
-
-/// An ExPutt putt reported without its strike message carries no
-/// timestamp: it is dated at its arrival, with the result, so it takes
-/// the generic 1.5 s lead, not the ExPutt's strike-based lead or its
-/// Camera timing (which count from the strike), and the history needs
-/// no trigger delay for it.
-#[test]
-fn an_exputt_putt_without_a_strike_takes_the_generic_lead() {
-    let config = config_of("[exputt.0]\nname = \"Putt\"\nimpact_lead_s = 0.2\n");
-    assert_eq!(ms(&config, "exputt.0"), Some(200));
-    let mut recording = Recording::new(&config);
-    recording.set_fps(100.0);
-    let buffer = recording.recorder.config().buffer;
-    // 12 s of frames at 100 fps; the result arrives at 12 s.
-    let mut events = Vec::new();
-    for i in 0..=1200 {
-        events.extend(recording.push(at(i * 10 * MS, None)));
-    }
-    let key = ShotKey {
-        shot_id: "putt".into(),
-        shot_number: 1,
-    };
-    trigger(
-        &config,
-        &mut recording,
-        &shot("exputt.0", &key, false),
-        12_000 * MS,
-    );
-    assert_eq!(
-        recording.recorder.config().buffer,
-        buffer,
-        "the history is enough"
-    );
-    let mut i = 1201;
-    while events.is_empty() {
-        events.extend(recording.push(at(i * 10 * MS, None)));
-        i += 1;
-    }
-    let [RecorderEvent::Finished(clip)] = events.as_slice() else {
-        panic!("one clip: {events:?}");
-    };
-    assert_eq!(clip.impact_ns, 10_500 * MS);
-    assert_eq!(clip.tags[0].shot.impact_lead_ms, 1500);
-
-    // The same putt with its strike time keeps the configured lead.
-    let mut recording = Recording::new(&config);
-    recording.set_fps(100.0);
-    let mut events = Vec::new();
-    for i in 0..=1200 {
-        events.extend(recording.push(at(i * 10 * MS, None)));
-    }
-    trigger(
-        &config,
-        &mut recording,
-        &shot("exputt.0", &key, true),
-        8600 * MS,
-    );
-    let mut i = 1201;
-    while events.is_empty() {
-        events.extend(recording.push(at(i * 10 * MS, None)));
-        i += 1;
-    }
-    let [RecorderEvent::Finished(clip)] = events.as_slice() else {
-        panic!("one clip: {events:?}");
-    };
-    assert_eq!(clip.impact_ns, 8400 * MS);
-    assert_eq!(clip.tags[0].shot.impact_lead_ms, 200);
 }
 #[test]
 fn the_latency_in_effect_is_read_live_and_clamped() {

@@ -9,10 +9,10 @@ fn defaults_by_launch_monitor_kind() {
         ("mevo", 0.0),
         ("mock_monitor", 0.0),
         ("square", 1.0),
-        ("exputt", 0.0),
         ("r10", 2.0),
         ("openconnect_server", 2.5),
         // A kind added later, or one without a better-known value.
+        ("exputt", 1.5),
         ("someday", 1.5),
     ] {
         assert_eq!(impact_lead_default_s(prefix), Some(s), "{prefix}");
@@ -22,24 +22,6 @@ fn defaults_by_launch_monitor_kind() {
     assert_eq!(impact_lead_default_s("trackball"), None);
     assert_eq!(impact_lead_default_s("pureplay_accessory"), Some(0.9));
     assert_eq!(impact_lead_in_effect_s("trackball", Some(1.0)), None);
-}
-
-#[test]
-fn only_the_exputt_delivers_its_trigger_late() {
-    assert_eq!(trigger_delay_s("exputt"), MAX_TRIGGER_DELAY_S);
-    assert_eq!(undated_impact_lead_s("exputt"), Some(DEFAULT_IMPACT_LEAD_S));
-    for prefix in [
-        "mevo",
-        "mock_monitor",
-        "square",
-        "r10",
-        "openconnect_server",
-        "trackball",
-        AUTO_CHIP_ACTOR,
-    ] {
-        assert_eq!(trigger_delay_s(prefix), 0.0, "{prefix}");
-        assert_eq!(undated_impact_lead_s(prefix), None, "{prefix}");
-    }
 }
 
 #[test]

@@ -1985,9 +1985,8 @@ Full persisted config (mirrors `config.toml`).
   optional `impact_lead_s`:
   seconds, 0 to 5, from the ball's impact to the monitor's `shot.trigger`,
   used to place the cameras' clips (beta). Omitted when unset, which uses the
-  device's default (FlightScope, ExPutt and mock 0, the Pureplay Accessory
-  card 0.9, Square 1, R10 2, Open Connect 2.5, any other 1.5). The ExPutt dates its trigger at the strike,
-  so its timing counts from the strike, not from the putt's report. A save with a value below 0, above 5 or not
+  device's default (FlightScope and mock 0, the Pureplay Accessory
+  card 0.9, Square 1, R10 2, Open Connect 2.5, any other, ExPutt included, 1.5). A save with a value below 0, above 5 or not
   finite is rejected with `400`; one outside that range in the config file is
   ignored. Changes apply from the next shot without restarting anything
 - `camera` sections take an optional `latency_s`: seconds, 0 to 10, a frame is

@@ -4,15 +4,14 @@
 //! It runs a stance [`Capture`] (the camera on its own thread, frames into a
 //! bounded ring) and feeds every frame to a [`ClipRecorder`], which keeps the
 //! pre-roll. Each launch monitor's [`Trigger`] becomes a recorder trigger,
-//! dated by the trigger's own `timestamp` when it carries one (the strike),
-//! else when the camera reads it (the host is asked for triggers before the
+//! dated by the trigger's own `timestamp` when it carries one, else when
+//! the camera reads it (the host is asked for triggers before the
 //! frames on every pass, and a pass waits at most [`FRAME_WAIT`] for frames,
 //! so a stamp is at most that late), with the impact estimated
 //! [`impact_lead`] earlier: the monitor's own `impact_lead_s` setting, else
 //! the default for that kind of monitor, both read live at every trigger.
-//! The history reaches back over the longest lead plus the trigger delay of
-//! the monitors' types ([`longest_reach`]), so a trigger dated at a strike
-//! seconds before it arrived (the ExPutt's) still finds its frames.
+//! The history reaches back over the longest lead of the configured
+//! monitors ([`longest_reach`]), so a trigger finds the frames of its impact.
 //! Pre- and post-roll come from the live `[replay]` section the same way.
 //! A camera that delivers late (a buffered network stream) has a `latency_s`:
 //! every frame is dated that much earlier than it arrived ([`Restamp`]), so
@@ -65,7 +64,7 @@ use crate::settings;
 use crate::{Cameras, Event, Out};
 use flighthook::{
     ActorStatus, BodyTrackingMode, CameraSection, FlighthookConfig, GolferTurn, MAX_IMPACT_LEAD_S,
-    MAX_TRIGGER_DELAY_S, ReplaySection, ShotKey, ShotVideo,
+    ReplaySection, ShotKey, ShotVideo,
 };
 use flightrelay::driver::Backoff;
 
@@ -112,21 +111,11 @@ fn impact_lead(config: &FlighthookConfig, actor: &str) -> Option<Duration> {
     settings::impact_lead_s(config, actor).map(lead)
 }
 
-/// A lead in seconds as a duration, clamped to the valid range.
+/// A lead in seconds as a duration, clamped to 0..=[`MAX_IMPACT_LEAD_S`]
+/// (0 when not finite).
 fn lead(seconds: f64) -> Duration {
-    clamped(seconds, MAX_IMPACT_LEAD_S)
-}
-
-/// A reach in seconds (a lead plus a trigger delay) as a duration, clamped
-/// to the valid range.
-fn reach(seconds: f64) -> Duration {
-    clamped(seconds, MAX_IMPACT_LEAD_S + MAX_TRIGGER_DELAY_S)
-}
-
-/// `seconds` as a duration, clamped to 0..=`max` (0 when not finite).
-fn clamped(seconds: f64, max: f64) -> Duration {
     let s = if seconds.is_finite() {
-        seconds.clamp(0.0, max)
+        seconds.clamp(0.0, MAX_IMPACT_LEAD_S)
     } else {
         0.0
     };
@@ -383,10 +372,9 @@ fn recorder_config(
 }
 
 /// How far before a trigger's arrival its impact can lie, over the
-/// configured launch monitors: the longest impact lead in effect plus the
-/// monitor type's trigger delay (`flighthook::trigger_delay_s`).
+/// configured launch monitors: the longest impact lead in effect.
 fn longest_reach(config: &FlighthookConfig) -> Duration {
-    reach(settings::longest_reach_s(config))
+    lead(settings::longest_reach_s(config))
 }
 
 /// When a trigger read at `now_ns` (host monotonic clock) happened: its
@@ -394,8 +382,8 @@ fn longest_reach(config: &FlighthookConfig) -> Duration {
 /// ahead of the host's UTC clock counts as now. The UTC clock is read
 /// afresh for each trigger: a step of the host's wall clock (an NTP
 /// correction) between the driver's stamp and this read moves the clip by
-/// the step. Steps are rare and a stamp is at most seconds old (the
-/// ExPutt's), so no anchor is kept.
+/// the step. Steps are rare and a stamp is at most seconds old, so no
+/// anchor is kept.
 fn trigger_time(now_ns: u64, timestamp: Option<u64>) -> u64 {
     let Some(timestamp) = timestamp else {
         return now_ns;
@@ -446,7 +434,7 @@ pub struct Trigger {
     /// The kind of device, for the clip's shot (e.g. `flightscope`).
     pub device: String,
     pub key: ShotKey,
-    /// The strike's time (UTC ms) when the trigger carries one.
+    /// The time (UTC ms) of the strike when the trigger carries one.
     pub timestamp: Option<u64>,
 }
 
@@ -495,11 +483,7 @@ impl Recording {
     /// else its arrival. Auto-chip, and repeats are ignored. The lead and
     /// the rolls come from `config` (the source's `impact_lead_s`, the
     /// `[replay]` section), the clip's hand and golfer from `turn`, and
-    /// `generation` is the clip store's. A trigger without a timestamp from
-    /// a type that dates its triggers at the strike and sends them late (an
-    /// ExPutt putt reported without its strike message) takes the generic
-    /// lead instead ([`flighthook::undated_impact_lead_s`]): it is dated at
-    /// the result's arrival.
+    /// `generation` is the clip store's.
     fn trigger(
         &mut self,
         config: &FlighthookConfig,
@@ -510,31 +494,18 @@ impl Recording {
     ) {
         let source = t.card.as_str();
         let key = &t.key;
-        let Some(mut lead) = impact_lead(config, source) else {
+        let Some(lead) = impact_lead(config, source) else {
             return;
         };
         if !self.seen.first(source, key) {
             debug!("camera: repeated trigger for {source} shot {}", key.shot_id);
             return;
         }
-        let prefix = source.split_once('.').map_or(source, |(p, _)| p);
-        let mut delay = reach(flighthook::trigger_delay_s(prefix));
-        if t.timestamp.is_none()
-            && let Some(undated) = flighthook::undated_impact_lead_s(prefix)
-        {
-            debug!(
-                "camera: {source} shot {} has no strike time; dated at its arrival, {undated} s lead",
-                key.shot_number
-            );
-            lead = self::lead(undated);
-            // It arrived when it is dated: nothing late to reach back over.
-            delay = Duration::ZERO;
-        }
         let recorder = &mut self.recorder;
         // The history covers this monitor's reach even if its section is gone.
         let mut cut = recorder_config(
             &config.replay,
-            longest_reach(config).max(lead + delay),
+            longest_reach(config).max(lead),
             recorder.config().fps,
         );
         cut.merge_window = recorder.config().merge_window;

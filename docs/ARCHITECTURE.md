@@ -1381,15 +1381,15 @@ Mat searches are at least 10 s apart (the one at session start counts):
 requests inside that time are folded into one search with the latest hand,
 run when it ends, and a hand changed back to the one in effect needs none;
 `ready` is false while one waits. Telemetry keys: `ready` (true when the
-device is ready for a putt, false from a strike until it is ready again, and
+device is ready for a putt, false from a ball being detected until it is ready again, and
 false when the connection is lost, before `reconnecting`), `device_state`
-(`finding mat` | `mat found` | `ready` | `ball struck`; a putt result
+(`finding mat` | `mat found` | `ready` | `ball detected`; a putt result
 changes neither key). After 30 s of discovery without finding the device,
 one `alert` (`warn`) suggests entering its IP address on the device card
 (the driver's hint, worded for the card by the card's `on_frp`). Each putt
 is a shot:
-trigger (timestamped with the arrival of the device's strike message when one
-came since it was last ready, so the cameras date the putt at its stroke),
+trigger (no timestamp: the device reports a ball when it is set down, not at the
+stroke, so the cameras date the putt when its trigger arrives),
 `launch` (ball speed, launch direction as `launch_azimuth`; no launch
 elevation and no spin, which the device does not measure), `club_path` with
 path and face angle when the putter was tracked, `shot_finished`. Putts are
@@ -1398,7 +1398,7 @@ whatever the turn's mode, and the web layer files them with club `PT` and
 detection mode Putting whatever club is in play. Shot numbers continue
 across reconnects. Stopping ends the match and closes the session; the
 device takes one connection at a time, so the card is exclusive. A closed
-connection, or no event for 90 s (120 s after a strike, until the putt's
+connection, or no event for 90 s (120 s while a ball is detected, until the putt's
 result or the device is ready again), ends the session; a quiet spell past
 10 s logs one warning and makes `ready` false until the device sends again
 (then it is what the device last reported). Each failed attempt is an
@@ -2608,11 +2608,10 @@ therefore finishes `L` later. The ring holds the dated frames, which stop
 ### Triggers
 
 A `shot.trigger` from a launch monitor is dated on the host monotonic
-clock (`stance::clock::now_ns`): at its `timestamp` (UTC ms, the strike) when
+clock (`stance::clock::now_ns`): at its `timestamp` (UTC ms) when
 it carries one (`camera::trigger_time`; a timestamp ahead of the host's UTC
-clock counts as now), else when the actor reads it. The ExPutt's triggers
-carry the arrival of the device's strike message and reach the bus with the
-putt's result, seconds later; the Square Golf's carry the arrival of the
+clock counts as now), else when the actor reads it. The ExPutt's triggers carry
+none; the Square Golf's carry the arrival of the
 ball notification, which is when they reach the bus too. The actor reads the
 bus at least every 10 ms while capturing, so a stamp on arrival lags the
 trigger by 10 ms at most (100 ms while the camera is being reopened, when
@@ -2630,19 +2629,16 @@ applies to the next shot; neither the camera nor the monitor restarts
 | Source | Default impact lead |
 | --- | --- |
 | `mevo`, `mock_monitor` | 0 |
-| `exputt` | 0 (its trigger is dated at the strike) |
 | `square` | 1000 ms |
 | `r10` | 2000 ms |
 | `openconnect_server` | 2500 ms |
-| any other launch monitor (`DEFAULT_IMPACT_LEAD_S`) | 1500 ms |
+| any other launch monitor, `exputt` included (`DEFAULT_IMPACT_LEAD_S`) | 1500 ms |
 | `autochip`, `trackball` | not recorded (no swing a camera films) |
 
 Pre- and post-roll come from the live `[replay]` section at every trigger;
 the recorder's history is the pre-roll plus the longest reach in effect over
 the configured launch monitors plus 0.5 s: a monitor's reach is its impact
-lead (setting or default, at most 5 s) plus its type's trigger delay
-(`flighthook::trigger_delay_s`: 5 s for the ExPutt, whose trigger arrives
-seconds after the strike it is dated at; 0 for the others). A trigger dated
+lead (setting or default, at most 5 s). A trigger dated
 further back than the history starts its clip at the oldest frame kept. It is re-applied at every trigger, so a setting raised
 above the history takes effect at its next shot. The lead used is recorded
 in the clip's `shot.json`. The
