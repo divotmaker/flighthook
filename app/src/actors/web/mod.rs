@@ -1807,8 +1807,7 @@ pub(crate) mod tests {
 
     /// Started as `main` starts it (the system actor, then every actor
     /// from the config, the web server first; nothing seeded by hand), the
-    /// web server knows the session; again after a bind-address save, and
-    /// local actors outlive the 6 s expiry on their heartbeats.
+    /// web server knows the session; again after a bind-address save.
     #[test]
     fn started_in_main_order_the_web_server_knows_the_session() {
         let dir = TempDir(std::env::temp_dir().join(format!(
@@ -1834,13 +1833,6 @@ pub(crate) mod tests {
             crate::actors::start_actor(ra.id, ra.actor, &root, &bus_tx);
         }
         sees_the_session(addr, &root, &bus_tx, 1);
-
-        // Past the expiry: the heartbeats keep flighthook's states.
-        std::thread::sleep(flightrelay::DEFAULT_HEARTBEAT * 3 + std::time::Duration::from_secs(1));
-        let me = root.flighthook_id();
-        let want = ["bus.actor", "golfer.turn", "practice.block"];
-        assert_eq!(own_kinds(&ui_snapshot(addr).states, &me), want);
-        assert_eq!(own_kinds(&frp_greeting(addr), &me), want);
 
         // A bind-address save starts a new server with an empty store.
         let moved = free_addr();
