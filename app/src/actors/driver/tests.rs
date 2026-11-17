@@ -1075,8 +1075,8 @@ fn section(script: u64) -> FakeSection {
 /// The card reads Starting before the first attempt (a failed attempt
 /// repeats the status only to carry its error), Connected for each
 /// session and Reconnecting once a session has been established, with
-/// `ready=false` just before it; each failure is the driver's alert. A
-/// stop closes the session and ends Disconnected.
+/// `ready=false` just before it; each failure is the driver's alert. Every
+/// session is closed, the lost one too; a stop ends Disconnected.
 #[test]
 fn the_card_reads_starting_connected_then_reconnecting() {
     let ready = |_: &str| DeviceEvent::Status(DeviceStatus::new());
@@ -1124,7 +1124,7 @@ fn the_card_reads_starting_connected_then_reconnecting() {
         "close says not ready: {:?}",
         kinds(&end)
     );
-    assert_eq!(lock(&script).closes, 1);
+    assert_eq!(lock(&script).closes, 2);
 }
 
 /// A stop ends a connect that is still waiting within the driver's
@@ -1841,6 +1841,32 @@ fn a_hook_drops_a_whole_shot_at_its_trigger() {
     *sink.dropped.get_mut("shot-13").expect("dropped") = old;
     sink.prune_shots();
     assert!(sink.dropped.is_empty(), "forgotten after the shot timeout");
+}
+
+/// A session that ends with a shot open finishes it at once, as a
+/// finished shot goes out: its raw capture, `shot.finished`, the shot
+/// count; then the card is `not_armed` and Reconnecting.
+#[test]
+fn a_lost_sessions_open_shot_is_finished() {
+    let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
+    for body in [trigger(key(7)), launch_of(key(7), launch())] {
+        sink.handle(frp(body));
+    }
+    drain(&mut rx);
+    let TestSink { sink, hooked } = &mut sink;
+    sink.session_lost(hooked);
+    let seen = drain(&mut rx);
+    assert_eq!(
+        kinds(&seen),
+        ["capture", "finished", "status", "actor", "status"]
+    );
+    let FrpBody::ShotFinished(finished) = body(&seen[1]) else {
+        unreachable!()
+    };
+    assert_eq!(finished.key, key(7));
+    assert_eq!(card_status(&seen[2]).expect("count").1["shot_count"], "1");
+    assert!(is_not_armed(&seen[3]));
+    assert!(is_status(&seen[4], ActorStatus::Reconnecting));
 }
 
 /// A card's `bus.actor` has its driver's roles and namespaces, the

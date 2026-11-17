@@ -2207,11 +2207,14 @@ label) and, for a launch monitor, `shot_count`, then a `bus.actor` carrying the 
 the card's `action`s, hands a live config to `apply_config`, sets `wants_raw`
 (always; `shots_allowed` stays at its default, on), and steps the session once
 (`step`), waiting the driver contract's `IDLE` (5 ms) after a step with nothing
-to do. A
-session error sends `not_armed` and then Reconnecting;
+to do. Every
+session is closed (`close`) when it ends, after an error too. A shot the
+session left open is finished at once (its raw capture, `shot.finished`, the
+shot count), so outputs get it without waiting for the shot timeout. A
+session error then sends `not_armed` and Reconnecting;
 the driver's `retry_delay` (its own alerts, an SDK `Backoff`) is slept with
 the bus drained; `None` gives up with Disconnected and the error. A stop
-closes the session (`close`) and ends Disconnected. A panic in the driver
+ends Disconnected. A panic in the driver
 (any of its calls) is caught on the actor's thread: `not_armed`, then
 Disconnected with `error = "the device driver failed; press Reconnect"`,
 and the thread ends, so a card never stays Connected over a dead driver. `stop_wait()` is

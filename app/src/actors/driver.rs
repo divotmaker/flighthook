@@ -406,7 +406,7 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
         }));
         if let Err(panic) = ran {
             error!("{actor}: the device driver failed: {}", panic_text(&*panic));
-            sink.session_ended();
+            sink.session_ended(&mut self.hooked.borrow_mut());
             let mut telemetry = HashMap::from([("error".into(), DRIVER_FAILED.into())]);
             sink.end_phase(&mut telemetry);
             sink.status(ActorStatus::Disconnected, telemetry);
@@ -479,19 +479,18 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                             h.session_ended(ctx);
                         },
                     );
+                    {
+                        let mut emit = |e| sink.handle(e, &mut self.hooked.borrow_mut());
+                        if let Err(e) = session.close(&mut Events::new(&mut emit, flags)) {
+                            warn!("{actor}: the device was not released cleanly: {e}");
+                        }
+                    }
                     match ended {
                         Err(e) if !host.stopped() => {
-                            drop(session);
-                            sink.session_lost();
+                            sink.session_lost(&mut self.hooked.borrow_mut());
                             (e, Some(since.elapsed()))
                         }
-                        _ => {
-                            let mut emit = |e| sink.handle(e, &mut self.hooked.borrow_mut());
-                            if let Err(e) = session.close(&mut Events::new(&mut emit, flags)) {
-                                warn!("{actor}: the device was not released cleanly: {e}");
-                            }
-                            break;
-                        }
+                        _ => break,
                     }
                 }
             };
@@ -519,7 +518,7 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
         }
         // A stop that ended a connect leaves no phase and no connect error
         // on the card.
-        sink.session_ended();
+        sink.session_ended(&mut self.hooked.borrow_mut());
         let mut telemetry = HashMap::new();
         sink.end_phase(&mut telemetry);
         sink.end_connect_error(&mut telemetry);
@@ -1154,16 +1153,30 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         }
     }
 
-    /// The session failed: `not_armed`, then Reconnecting, so a card never
-    /// shows a lost connection's values.
-    fn session_lost(&mut self) {
-        self.session_ended();
+    /// The session failed: its open shots finished, `not_armed`, then
+    /// Reconnecting, so a card never shows a lost connection's values.
+    fn session_lost(&mut self, hooked: &mut Hooked<D, H>) {
+        self.session_ended(hooked);
         self.status(ActorStatus::Reconnecting, HashMap::new());
     }
 
-    /// No session: the card's `bus.actor` is `not_armed`, with no battery,
-    /// attitude or telemetry, and its shots in progress are forgotten.
-    fn session_ended(&mut self) {
+    /// No session: every shot it left open is finished, so outputs get it
+    /// at once; the card's `bus.actor` is `not_armed`, with no battery,
+    /// attitude or telemetry.
+    fn session_ended(&mut self, hooked: &mut Hooked<D, H>) {
+        let mut open: Vec<(Instant, ShotKey)> = self
+            .shots
+            .values()
+            .map(|(shot, since)| (*since, shot.key.clone()))
+            .collect();
+        open.sort_by_key(|(since, key)| (*since, key.shot_number));
+        for (_, key) in open {
+            warn!(
+                "{}: finishing shot #{}: the session ended",
+                self.actor, key.shot_number
+            );
+            self.finished(key, hooked);
+        }
         self.device_status = DeviceStatus::not_armed();
         self.identity = None;
         self.shots.clear();
