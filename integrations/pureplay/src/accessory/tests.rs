@@ -18,11 +18,13 @@ use std::rc::Rc;
 use flightrelay::driver::DeviceEvent;
 use flightrelay::testing::TestHost;
 use flightrelay::{
-    BusSync, GameAim, GolferId, GolferSelect, GolferTurn, Handedness, Mode, ShotKey,
+    BusReply, BusSync, Club, FrpBody, GameAim, GolferId, GolferSelect, GolferTurn, Handedness,
+    Mode, ReplyError, ShotKey,
 };
 use serde_json::{Value, json};
 
 use super::*;
+use crate::accessory::token::{self, TokenStore};
 
 #[path = "tests/card.rs"]
 mod card;

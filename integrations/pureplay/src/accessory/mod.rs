@@ -18,6 +18,8 @@
 //! Feature `config` builds [`Config`] only (serde), feature `driver` the rest.
 
 #[cfg(feature = "driver")]
+mod card;
+#[cfg(feature = "driver")]
 pub(crate) mod club_out;
 #[cfg(feature = "driver")]
 pub(crate) mod game;

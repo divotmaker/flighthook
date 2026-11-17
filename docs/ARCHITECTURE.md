@@ -749,7 +749,7 @@ frames, no bulk data; the putt's own result is among its shot's frames.
 Camera images (the player's surroundings) and messages threeputt does not
 recognize are never frames (audit log only, at trace level).
 
-The web layer keeps each shot as a `StoredShot` (`app/src/actors/web/mod.rs`):
+The web layer keeps each shot as a `StoredShot` (`app/src/actors/web/store.rs`):
 when `shot.trigger` arrived, an export context taken then (device kind, maker,
 model and firmware; the device's config section without `name`/`address`/
 `bind`; the `[simulation]` section; identity strings to scrub), the composed
