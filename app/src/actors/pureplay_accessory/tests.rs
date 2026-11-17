@@ -1462,7 +1462,8 @@ fn a_denial_without_a_close_frame_is_not_asked_again() {
     peer.hello();
     assert_eq!(peer.pair(), None);
     peer.refuse(Some(protocol::PAIR_ID), "unauthorised", &json!({}));
-    std::thread::sleep(Duration::from_millis(100));
+    // The card has read the refusal when it answers a later ping.
+    peer.pong();
     drop(peer);
     card.shows_row(ActorStatus::Disconnected, "pairing", DENIED);
     assert!(!mock.reconnects(), "denied: no new pair by itself");
@@ -1476,7 +1477,7 @@ fn a_removal_without_a_close_frame_is_not_asked_again() {
     let mock = Mock::new();
     let (mut card, mut peer) = connected(&mock, new_state(), "PPA-GONE");
     peer.refuse(None, "unauthorised", &json!({}));
-    std::thread::sleep(Duration::from_millis(100));
+    peer.pong();
     drop(peer);
     card.shows_row(ActorStatus::Disconnected, "pairing", REMOVED);
     assert_eq!(card.tokens().get(&token_key(mock.addr)), None);

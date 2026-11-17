@@ -976,7 +976,6 @@ fn player_one_named(peer: &mut Peer, seq: u64, n: u64) {
             &json!({ "matchId": "m-2", "previousPlayerId": null, "currentPlayerId": 1,
                      "holeNumber": 1, "reason": "next_player" }),
         );
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -995,21 +994,18 @@ fn answer_and_take_the_shot(card: &mut Card, peer: &mut Peer, get: &Value, seq: 
     assert_eq!(card.triggers().len(), triggers + 1, "the shot is taken");
 }
 
-/// A `state.get` that gets no answer at a second match marks nobody:
-/// events naming player 1 after it timed out ask for the state again, and
-/// the shot is taken once a snapshot brings the player.
+/// A `state.get` that gets no answer at a second match marks nobody: it
+/// goes again after the timeout and the wait, and the shot is taken once a
+/// snapshot brings the player.
 #[test]
 fn an_unanswered_state_get_asks_for_the_player_again() {
     let (mut card, mut peer, _tx, _mock) = rig();
     first_match_with_a_shot(&mut card, &mut peer);
     second_match_events(&mut peer, 5);
     let first = peer.state_get();
-    // Past the timeout.
-    std::thread::sleep(SNAPSHOT_TIMEOUT + Duration::from_millis(100));
-    player_one_named(&mut peer, 9, 10);
     let again = peer.state_get();
     assert_ne!(again["id"], first["id"], "a new request");
-    answer_and_take_the_shot(&mut card, &mut peer, &again, 19);
+    answer_and_take_the_shot(&mut card, &mut peer, &again, 9);
     card.stop();
 }
 
@@ -1024,10 +1020,9 @@ fn a_refused_state_get_is_asked_again_after_a_wait() {
     peer.send(&json!({ "type": "response", "id": first["id"], "ok": false,
                        "error": { "code": "rate_limited", "message": "Slow down.",
                                   "retryAfterMs": 50 } }));
-    player_one_named(&mut peer, 9, 3);
     let again = peer.state_get();
     assert_ne!(again["id"], first["id"], "a new request");
-    answer_and_take_the_shot(&mut card, &mut peer, &again, 12);
+    answer_and_take_the_shot(&mut card, &mut peer, &again, 9);
     card.stop();
 }
 
