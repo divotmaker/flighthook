@@ -80,6 +80,26 @@ const _: () = assert!(
     <thumbswing::driver::Thumbswing as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
+const _: () = assert!(
+    <flighthook_pureplay::connect::Connect as flightrelay::driver::FrpDriver>::STOP_WAIT
+        .as_millis()
+        <= MAX_STOP_WAIT.as_millis()
+);
+const _: () = assert!(
+    <flighthook_pureplay::accessory::Accessory as flightrelay::driver::FrpDriver>::STOP_WAIT
+        .as_millis()
+        <= MAX_STOP_WAIT.as_millis()
+);
+const _: () = assert!(
+    <flighthook_openconnect::client::Client as flightrelay::driver::FrpDriver>::STOP_WAIT
+        .as_millis()
+        <= MAX_STOP_WAIT.as_millis()
+);
+const _: () = assert!(
+    <flighthook_openconnect::server::Server as flightrelay::driver::FrpDriver>::STOP_WAIT
+        .as_millis()
+        <= MAX_STOP_WAIT.as_millis()
+);
 
 /// Common trait for self-managed actors. Each actor struct holds its own config;
 /// `start()` clones what it needs and spawns a thread.
