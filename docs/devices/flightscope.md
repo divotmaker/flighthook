@@ -4,6 +4,9 @@
 [ironsight](https://crates.io/crates/ironsight) over the device's binary TCP
 protocol on port 5100.
 
+Driver: [ironsight](https://github.com/divotmaker/ironsight)
+([docs.rs](https://docs.rs/ironsight)).
+
 All three use the same `[mevo.N]` device. flighthook detects which one it is
 talking to when it connects. See [FlightScope Xi](#flightscope-xi) for
 how the Xi differs.
@@ -227,6 +230,27 @@ in standard mode and arms the device anyway, so ball flight keeps working withou
 Fusion club data.
 
 Face impact is not reported in any mode.
+
+## Settings
+
+Add the card from Settings > Devices: the **+** after Launch monitors,
+**Mevo**. Its page holds these fields:
+
+| Field | What it does |
+| --- | --- |
+| **Name** | The card's name in the UI and the logs. |
+| **Address** | The device's IP address and port, `ip:port`. Default `192.168.2.1:5100`, the address on the device's own WiFi network: join that network first. Change it only when the device is reached at another address. |
+| **Ball Type** | **RCT** (FlightScope's Radar Capture Technology balls) or **Standard** (any regular golf ball). Default RCT. Set it to the balls you hit. |
+| **Tee Height** | The height of the tee above the hitting surface. Default 1.5 in. |
+| **Monitor-to-Ball** | The distance from the front of the launch monitor to the ball. Default 8 ft; the Mevo+ reads best from 7 to 9 ft. Measure it and set it to match. |
+| **Surface Height** | The height of the hitting surface above the monitor. Default 0: the ball and the monitor stand on the same level. Set it when the device stands lower or higher than the mat. |
+| **Track %** | The least outdoor tracking, 0 to 100 %. Default 80. A lower value accepts shots tracked for a shorter part of their flight. |
+| **Use Estimated Shots** | Off by default: a shot the device only estimated (a flight too short to read in Outdoor mode, a very short chip) is skipped. On keeps it; such a shot may lack sidespin and carries less data. See [Estimated shots](#estimated-shots). |
+| **Environment** | **Limited flight (sim/indoor)** for nets and simulator screens (the default), or **Outdoor (full flight)**, which needs about 40 yd of unobstructed flight. See [Environment](#environment). |
+| **Spin source (Xi)** | FlightScope Xi only: which of its two backspin values to send. **D4 (matches FS Golf)** is the default, **E8** the second value, **Auto (E8 on full swings)** uses E8 only in Full mode. A Mevo+ or Gen2 reports the same spin either way. See [Spin on the Xi](#spin-on-the-xi). |
+| **Launch-only spin** | Backspin, in rpm per mph of ball speed, for a shot the device measured launch but no spin for (very short chips on the Xi), 0 to 1000. Default 100; 0 sends the shot as the device read it. See [Launch-only chips](#launch-only-chips-beta). |
+| **Camera Mode** | **Standard (radar only)** (the default) reports ball flight and radar club data. **Raw Fusion — BM17.04+** and **Fusion — older firmware** add the full club data set and need the Pro Package on the device; pick the one that fits the firmware. See [Club data and camera mode](#club-data-and-camera-mode). |
+| **Camera timing** | Seconds from the swing's impact to the shot's report, 0 to 5, which places the cameras' clips (beta). Blank uses the default, 0 s: a FlightScope reports the shot at impact. See [Setting the camera timing](cameras.md#setting-the-camera-timing). |
 
 ## Configuration
 

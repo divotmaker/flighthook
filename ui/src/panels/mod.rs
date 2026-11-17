@@ -5,6 +5,7 @@ pub(crate) mod card_row;
 pub(crate) mod cards;
 pub(crate) mod devices;
 pub(crate) mod dispersion;
+pub(crate) mod docs;
 pub(crate) mod flight;
 pub(crate) mod impact;
 pub(crate) mod last_shot;

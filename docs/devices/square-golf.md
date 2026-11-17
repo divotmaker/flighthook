@@ -4,6 +4,9 @@
 [allsquare](https://crates.io/crates/allsquare) over BLE (GATT). No pairing
 required.
 
+Driver: [allsquare](https://github.com/divotmaker/allsquare)
+([docs.rs](https://docs.rs/allsquare)).
+
 The original **Square / Square Home is not supported** — it uses a different
 club-code scheme.
 
@@ -77,7 +80,7 @@ DR = 15.0
 7i = 18.5
 ```
 
-Or in Settings > Devices: flip a Square Golf card to Settings; it has a
+Or in Settings > Devices: a Square Golf card's settings have a
 collapsible "Face impact calibration (beta)" section with one field per club. Leave a field
 blank to use the default for that club; a value overrides it. Changing a
 calibration restarts the card.
@@ -178,6 +181,22 @@ identity has been read, heartbeats and their acks, the status query and its
 reply, and any notification the driver does not recognize; those reach the
 log only, as hex lines at trace level. A discarded zero-spin shot clears what
 was captured for it. The device's BLE name and address are not in the file.
+
+## Settings
+
+Add the card from Settings > Devices: the **+** after Launch monitors,
+**Square Golf Omni**. Its page holds these fields:
+
+| Field | What it does |
+| --- | --- |
+| **Name** | The card's name in the UI and the logs. |
+| **BLE Address** | The Omni's advertised name, e.g. `SquareGolf(CD01)`, the same on every OS; a Bluetooth address (a UUID on macOS) also works. Blank (the default) connects to the first Omni found. Set it when more than one Omni is in range. |
+| **Discard zero-spin shots** | On by default: a shot that reads no spin at all is a failed read and is discarded, so you re-hit it. Putts are never discarded. See [Zero-spin rejection](#zero-spin-rejection). |
+| **Face impact calibration (beta)** | One field per club: the distance from the bottom edge of the club sticker's dot down to face center, in mm. Blank uses the built-in default for that club. See [Per-club calibration](#per-club-calibration). |
+| **Camera timing** | Seconds from the swing's impact to the shot's report, 0 to 5, which places the cameras' clips (beta). Blank uses the default, 1 s. See [Setting the camera timing](cameras.md#setting-the-camera-timing). |
+
+The club armed on connect (`club`) and the device's advanced spin
+measurement (`advanced_spin`) are set in the config file only.
 
 ## Configuration
 

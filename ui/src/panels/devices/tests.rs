@@ -3986,14 +3986,19 @@ fn reconnect_is_on_every_launch_monitor_and_output_telemetry_side_and_no_other()
         let shown = marks.contains_key(&format!("reconnect:{id}"));
         assert_eq!(shown, RECONNECTABLE.contains(&id), "{id}");
     }
-    // In the page's header, at its right.
+    // In the page's header, at its right, next to the Docs link.
     for id in RECONNECTABLE {
         let (button, enabled) = marks[&format!("reconnect:{id}")];
         let card = marks[&format!("card:{id}")].0;
+        let docs = marks[&format!("docs:{id}")].0;
         assert!(enabled, "{id}");
         assert!(card.contains_rect(button), "{id}");
         assert!(button.top() - card.top() < 40.0, "{id} at the top");
-        assert!(card.right() - button.right() < 60.0, "{id} at the right");
+        assert!(docs.left() - button.right() < 60.0, "{id} at the right");
+        assert!(
+            card.right() - docs.right() < 30.0,
+            "{id}: Docs furthest right"
+        );
     }
     // The ExPutt's Find mat sits beside it.
     let (find, _) = marks["find_mat:exputt.0"];

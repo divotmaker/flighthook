@@ -49,7 +49,7 @@ impl CardGroup {
 
 /// Every configurable actor type (its config section and actor ID prefix),
 /// in display order, with its group.
-const ACTOR_TYPES: &[(&str, CardGroup)] = &[
+pub(crate) const ACTOR_TYPES: &[(&str, CardGroup)] = &[
     ("webserver", CardGroup::General),
     ("mevo", CardGroup::LaunchMonitors),
     ("r10", CardGroup::LaunchMonitors),

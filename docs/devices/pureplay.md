@@ -3,6 +3,8 @@
 **Status: Beta.** Pureplay's Accessory API is early access: Pureplay can
 still change it, and a Pureplay update can need a flighthook update.
 
+Driver: built into flighthook.
+
 The Pureplay Accessory card follows a round in
 [Pureplay](https://github.com/PureplayGolf/Pureplay-Accessory) through
 Pureplay's Accessory API, a WebSocket on port 9770. While it is connected:
@@ -294,6 +296,18 @@ The token belongs to the card's address: changing the address pairs again.
 **Forget pairing** (the unplug icon) on the card's page deletes the token and
 reconnects: Pureplay asks to approve flighthook again. Pureplay keeps the
 old entry in its Settings > Accessories until you remove it there.
+
+## Settings
+
+Besides Reconnect and Remove, the card's header has **Forget pairing** (see
+[Pairing](#pairing)). Its page holds these fields:
+
+| Field | What it does |
+| --- | --- |
+| **Name** | The card's name in the UI and the logs. |
+| **Address** | Pureplay's address and Accessory port, `ip:port`, from Pureplay's Settings > Accessories. Blank (the default) is `127.0.0.1:9770`, Pureplay on this computer. Set it when Pureplay runs on another computer. Changing it pairs again. |
+| **Shots** | Which of Pureplay's shots the card takes: **Auto** (the default), **From Pureplay** or **From flighthook**. Pick From Pureplay when the launch monitor is connected to Pureplay, From flighthook when it is connected to flighthook, which sends its shots to Pureplay. See [Shots](#shots). |
+| **Camera timing** | Seconds from the swing's impact to the moment the card reports the shot, 0 to 5, which places the cameras' clips (beta). Blank uses the default, 0.9 s. See [Camera timing](#camera-timing-beta). |
 
 ## Config
 

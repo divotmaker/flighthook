@@ -7,6 +7,8 @@ simulator's player information (club and hand) back and makes it flighthook's.
 Launch monitor software that sends Open Connect to flighthook is the other
 direction, see [Open Connect Server](../devices/open-connect.md).
 
+Driver: built into flighthook.
+
 ## Setup
 
 1. Start the simulator.
@@ -72,6 +74,18 @@ wins.
 [Auto-chip](../../README.md#auto-chip-beta) sends its chip to every connected
 Open Connect client, whatever the routing says, and is offered while a client
 is connected.
+
+## Settings
+
+| Field | What it does |
+| --- | --- |
+| **Name** | The card's name in the UI and the logs. |
+| **Address** | The simulator's address and port, `ip:port`, where shots are sent. GSPro and Pureplay listen on `127.0.0.1:921` when they run on this computer, Muni Golf on `127.0.0.1:9210`. Change it for a simulator on another computer or port. |
+| **Full Monitor** | Which launch monitor's full swings the card sends. Default **Any**: every launch monitor's. See [Routing](#routing). |
+| **Chipping Monitor** | Which launch monitor's chips the card sends. Default **Any**. |
+| **Putting Monitor** | Which launch monitor's putts the card sends. Default **Any**. Pick a putting monitor here to send its putts and another monitor's full swings. |
+| **Chipping Clubs** | The simulator's clubs that set Chipping when the simulator selects them. Default GW, SW and LW. Click a club to add it or take it out. See [Modes and clubs](#modes-and-clubs). |
+| **Putting Clubs** | The simulator's clubs that set Putting. Default PT. With both lists empty the card sets no mode. |
 
 ## The card
 

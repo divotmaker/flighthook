@@ -153,6 +153,16 @@ const TELEMETRY_SHARE: f32 = 0.38;
 /// [`crate::topbar::TOUCH_TARGET`] (the glyph keeps its size).
 const HEADER_ICON: f32 = 24.0;
 
+/// How tall a page header's icon buttons are: [`HEADER_ICON`], on the
+/// phone [`crate::topbar::TOUCH_TARGET`].
+pub(crate) fn header_icon_size(ui: &egui::Ui) -> f32 {
+    if settings::narrow(ui) {
+        crate::topbar::TOUCH_TARGET
+    } else {
+        HEADER_ICON
+    }
+}
+
 /// A page header's icon button, `hover` naming it (also as a touch tip),
 /// marked `mark_name`.
 pub(crate) fn header_icon(
@@ -162,11 +172,7 @@ pub(crate) fn header_icon(
     mark_name: &str,
     enabled: bool,
 ) -> bool {
-    let size = if settings::narrow(ui) {
-        crate::topbar::TOUCH_TARGET
-    } else {
-        HEADER_ICON
-    };
+    let size = header_icon_size(ui);
     let response = ui
         .add_enabled_ui(enabled, |ui| {
             theme::icon(ui, icon, size, theme::ACCENT, enabled)
@@ -182,8 +188,8 @@ pub(crate) fn header_icon(
 /// One device page. Its header holds the name, the on/off switch
 /// (`view.switch`) and, on the right, the status chip, then the action
 /// icons: Find mat on an ExPutt's (enabled while it is connected), Forget pairing on a Pureplay Accessory's,
-/// Reconnect and Remove; Save and Cancel instead of the icons while its
-/// settings have unsaved edits. Under it, the telemetry (and a camera's live view) on the left
+/// Reconnect and Remove, then the Docs link ([`crate::panels::docs`]); Save and Cancel instead of the icons
+/// while its settings have unsaved edits. Under it, the telemetry (and a camera's live view) on the left
 /// in a block of fixed height that scrolls inside, the settings on the
 /// right, scrolling inside the page. A page the settings don't hold shows
 /// its telemetry only. Reconnect is disabled while one is in flight, while

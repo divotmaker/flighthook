@@ -9,6 +9,8 @@ Such software already sends its shots to a simulator as an Open Connect
 client; point it at flighthook's address instead, and flighthook listens on
 port 921 and accepts them.
 
+Driver: built into flighthook.
+
 ## What you get, and what you don't
 
 This is a bridge, not a driver: the launch monitor's own software has to be
@@ -52,9 +54,8 @@ name = "Open Connect Server"
 bind = "0.0.0.0:921"
 ```
 
-To listen on another port, flip the card to Settings and edit **Bind
-Address** (`ip:port`; blank means `0.0.0.0:921`). Saving restarts the server
-on the new address.
+To listen on another port, edit the card's **Bind Address** (`ip:port`;
+blank means `0.0.0.0:921`). Saving restarts the server on the new address.
 
 The card accepts one connection at a time: Open Connect is a single-peer
 protocol. A second launch monitor needs a second card on its own port.
@@ -67,6 +68,14 @@ first message (`Handed` is `RH` or `LH`, `Club` is GSPro's code, e.g. `W3`,
 changes. `Handed` is always sent: `RH` until a hand is chosen (by a golfer,
 the header or a simulator). Nothing is sent while the club is unknown. The 201 is written at least 50 ms after a
 `200`, so the two reach the software in separate reads.
+
+## Settings
+
+| Field | What it does |
+| --- | --- |
+| **Name** | The card's name in the UI and the logs. |
+| **Bind Address** | The address and port the server listens on, `ip:port`. Blank (the default) is `0.0.0.0:921`, which accepts connections from other computers too; `127.0.0.1` accepts them only from this one. Change the port for a second server card, or when another program on this computer already listens on 921 (to share the computer with GSPro, see [Sharing port 921 with GSPro](#sharing-port-921-with-gspro)). |
+| **Camera timing** | Seconds from the swing's impact to the shot's arrival, 0 to 5, which places the cameras' clips (beta). Blank uses the default, 2.5 s. Set it to the delay of the software that sends the shots. See [Setting the camera timing](cameras.md#setting-the-camera-timing). |
 
 ## Shot export
 

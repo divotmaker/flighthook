@@ -6,6 +6,9 @@ back, push it forward, and the swing becomes a full shot (club speed, path,
 face, ball speed, launch angle and direction, backspin and sidespin), the way
 an arcade-style trackball golf game reads a swing.
 
+Driver: [thumbswing](https://github.com/divotmaker/thumbswing)
+([docs.rs](https://docs.rs/thumbswing)).
+
 It is meant for testing and for practice without a launch monitor: every
 value is synthesized from the swing, nothing is measured from a real ball.
 The swing model and its defaults are a first fit, so expect to tune the feel
@@ -138,6 +141,7 @@ coil_timeout_s = 20            # how long the top of the swing waits (default 10
 
 | Key | Card field | Default | What it sets |
 |---|---|---|---|
+| `name` | Name | `Trackball` | the card's name in the UI and the logs |
 | `device` | Device | unset | the input; unset: the only trackball or mouse |
 | `club` | Starting club | `7I` | the club until the game names one (an FRP club code) |
 | `cpi` | CPI | 400 | counts per inch of ball travel |
@@ -154,7 +158,27 @@ coil_timeout_s = 20            # how long the top of the swing waits (default 10
 | `tuning.mirror_for_left_hand` | Mirror for left-handed players | false | mirror the strokes while the player is left-handed |
 | `tuning.face_max` | Max face angle | 20° | largest face angle |
 | `tuning.face_to_path_max` | Max face-to-path | 25° | largest face-to-path |
-| `thresholds.*` | Swing detection | | how swings are found in the movement: `speed_window_ms` (24), `gap_ms` (50), `v_start` (0.067), `v_stop` (0.033, below `v_start`), `v_min_swing` (0.133), `dwell_min_ms` (40), `back_min` (0.13), `full_cock` (0.67), `fwd_min` (0.17), `back_max_s` (2), `coil_timeout_s` (10), `fwd_window_ms` (300), `idle_settle_ms` (250), `cooldown_max_s` (2), `pull_cone_deg` (75) |
+| `thresholds.*` | Swing detection | | how swings are found in the movement; see below |
+
+The collapsible **Swing detection** section holds the thresholds:
+
+| Key | Card field | Default | What it sets |
+|---|---|---|---|
+| `thresholds.speed_window_ms` | Speed window | 24 ms | the time the ball's speed is measured over |
+| `thresholds.gap_ms` | Gap | 50 ms | the silence after which the ball's movement counts as a new one |
+| `thresholds.v_start` | Start speed | 0.067 | the speed that starts a backswing |
+| `thresholds.v_stop` | Stop speed | 0.033 | the speed below which the ball counts as stopped; below the start speed |
+| `thresholds.v_min_swing` | Swing speed | 0.133 | the speed a push must reach to be a swing |
+| `thresholds.dwell_min_ms` | Stop time | 40 ms | how long the ball must stay below the stop speed to count as stopped |
+| `thresholds.back_min` | Shortest backswing | 0.13 | the shortest backswing that counts |
+| `thresholds.full_cock` | Full backswing | 0.67 | the backswing length that counts as fully cocked |
+| `thresholds.fwd_min` | Shortest push | 0.17 | the forward travel that makes a push a swing |
+| `thresholds.back_max_s` | Longest backswing | 2 s | a backswing still moving after this long is dropped |
+| `thresholds.coil_timeout_s` | Wait at the top | 10 s | how long a finished backswing waits for the push |
+| `thresholds.fwd_window_ms` | Longest push | 300 ms | the most time the push is measured over |
+| `thresholds.idle_settle_ms` | Settle time | 250 ms | the quiet time after a shot before the next backswing can start |
+| `thresholds.cooldown_max_s` | Longest cooldown | 2 s | the longest wait after a shot while the ball still rolls |
+| `thresholds.pull_cone_deg` | Pull cone | 75° | the widest angle from straight back that still counts as a pull, 1 to 180 |
 
 Speeds in the thresholds are shares of the full power speed and lengths
 shares of a full stroke (the ball's travel in 100 ms at full power), so

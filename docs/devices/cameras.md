@@ -13,6 +13,9 @@ estimated impact to a moment after the report, saves it, and marks the shot
 with a replay button. Capture uses the
 [stance](https://github.com/divotmaker/stance) crate.
 
+Driver: [stance](https://github.com/divotmaker/stance)
+([docs.rs](https://docs.rs/stance)).
+
 ## What you need
 
 - A USB (UVC) camera with an MJPEG mode: most webcams (a Logitech C920 at
@@ -34,8 +37,7 @@ with a replay button. Capture uses the
    modes.
 3. **Save**. The card turns green once frames arrive; its telemetry shows
    the resolution, the frame rate achieved and dropped frames.
-4. **Still frame** (the camera icon) in the camera page's header shows the camera's current picture,
-   for aiming it.
+4. While the camera runs, its page shows the live view, for aiming it.
 5. For a camera on its side, set its **Rotation**; for one that doesn't face
    the golfer square on, its **Yaw** and **Pitch** (see
    [Rotation, yaw and pitch](#rotation-yaw-and-pitch)).
@@ -72,6 +74,44 @@ plugged into the same USB port, and across reboots. If the id is not
 connected, flighthook looks for a camera named `camera_name` and logs a
 warning when it uses one.
 
+## Settings
+
+Settings, Cameras holds one card per camera, then the **Replay** and
+**Body tracking** cards, which apply to every camera.
+
+### Camera card
+
+| Field | What it does |
+| --- | --- |
+| **Name** | The card's name in the UI, the logs and the replay. |
+| **Camera** | The USB camera to record from, picked from the cameras flighthook finds; the refresh icon beside it looks again. It is found again after a replug into the same port. **Test pattern** is a generated picture, for trying replay without a camera. |
+| **Rotation** | Turns the camera's picture clockwise, 0°, 90°, 180° or 270°, before it is shown and tracked, for a camera mounted on its side. Default 0°. Clips are stored as the camera sends them. See [Rotation, yaw and pitch](#rotation-yaw-and-pitch). |
+| **Position** | Where the camera stands: **Target Line**, **Golfer Front**, **Golfer Back** or **Overhead**. Default Golfer Front. See [Positions](#positions). |
+| **Video mode** | **Auto** (the default) picks the camera's highest frame rate, then its largest size at that rate; or pick one of the camera's modes. A faster mode shows more of the swing in slow motion and takes more disk space. |
+| **Latency** | Seconds a frame is old when it arrives, 0 to 10. Blank is 0. Set it for a camera that delivers its frames late, such as a buffered network stream. See [Camera latency](#camera-latency). |
+| **Yaw** | How far the camera points off square, -30 to 30 degrees; positive points to the right of the target line for a right-hander. Blank is 0. |
+| **Pitch** | How far the camera tilts down from level, -30 to 30 degrees. Blank is 0. |
+
+While the camera runs, its page shows the live view, for aiming it.
+
+### Replay card
+
+| Field | What it does |
+| --- | --- |
+| **Keep clips** | How many clips stay on disk, 1 to 1000. Default 20. Older clips are deleted. Each camera's clip of a 5.5 s window at 1280×720, 120 fps is about 55 MB. |
+| **Pre-roll** | Seconds recorded before the estimated impact, 0 to 10. Default 4. |
+| **Post-roll** | Seconds recorded after the launch monitor reports the shot, 0 to 10. Default 1.5. |
+| **Start before impact** | Where a replay starts, in seconds before the estimated impact, 0 to 10. Default 2: a backswing and downswing take 1.2 to 1.5 s, plus a buffer. See [Replay](#replay). |
+| **Show video on shot cards** | On by default: each camera gets a card beside the range bars in the Shots tab's Cards view. Off leaves those cards out; clips are still recorded. |
+| **Clip folder** | Where the clips are written, an AVI file and its index per camera in a folder per clip. Shown only; set `clip_dir` in the config file to move it. |
+
+The Replay and Body tracking cards are saved together with the Global and
+Simulation cards: **Save** on one saves them all.
+
+### Body tracking card
+
+See [Body tracking settings](#body-tracking-settings).
+
 ## Positions
 
 | Position | Where the camera stands |
@@ -94,8 +134,8 @@ is saved; the camera keeps recording.
   picture clockwise. A swing is taller than it is wide, so a face-on camera
   on its side fits the whole swing at about 2 m (6 ft) from the golfer, where
   an upright one needs about 3 m (10 ft). The picture is turned everywhere it
-  is shown: the live view, the replay, the Cameras tab, the shot cards and
-  the still frame. Body tracking works on the turned picture. Clips are
+  is shown: the live view, the replay, the Cameras tab and the shot cards.
+  Body tracking works on the turned picture. Clips are
   stored as the camera sends them; the rotation is applied when they are
   played and tracked.
 - **Yaw** (`yaw_deg`) is how far the camera points off square, in degrees,
@@ -180,7 +220,7 @@ the numbers don't fit under the clips.
 with its name and position, at up to 15 frames a second. With body tracking
 in Live mode, each picture also has the golfer's skeleton and posture (see
 [Live posture](#live-posture)) and a line under them reads out the
-settings (see [Settings](#settings)); in the other modes it shows the
+settings (see [Settings](#body-tracking-settings)); in the other modes it shows the
 pictures alone. Under the pictures, a **Last shot** strip shows the newest
 shot's swing once it is analyzed (in Live mode every clip is, a few seconds
 after the shot): its number and club, the tempo, colored (see
@@ -206,7 +246,7 @@ Body tracking finds the golfer's body in each camera's picture: 26 points
 joined into a skeleton. The golfer's lead side (the left of a right-hander)
 is drawn in teal, the trail side in orange, the head, neck and hips in
 white. The **Body tracking** card under Settings, Cameras holds its settings (see
-[Settings](#settings)).
+[Settings](#body-tracking-settings)).
 
 The mode decides when body tracking runs, and so what it costs:
 
@@ -495,7 +535,7 @@ the skeleton:
 They are measured as in the swing analysis, for the golfer's hand. A
 dash is a point not found.
 
-### Settings
+### Body tracking settings
 
 The **Body tracking** card under Settings, Cameras holds every body tracking setting,
 in this order, saved with its **Save** like the other cards:

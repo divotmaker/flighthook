@@ -211,9 +211,10 @@ pub(crate) enum TagPlace {
     Buttons,
 }
 
-/// A card's header row: the title on the left, `buttons` on the right, and
-/// an optional tag at `place`. `buttons` runs in a right-to-left layout: the
-/// first button added sits furthest right. The buttons keep their size;
+/// A card's header row: the title on the left, the card's Docs link
+/// furthest right with `buttons` left of it, and an optional tag at
+/// `place`. `buttons` runs in a right-to-left layout: the first button
+/// added sits nearest the Docs link. The buttons keep their size;
 /// the title is cut short first, down to [`TITLE_MIN_WIDTH`], then the
 /// tag, which is left out once it would be cut under [`TAG_MIN_TEXT`].
 /// `key` names the card for the tests.
@@ -261,6 +262,7 @@ pub(crate) fn card_header_with<R>(
     }
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            docs_link(ui, key);
             let result = buttons(ui);
             let gap = ui.spacing().item_spacing.x;
             let switch_room = switch
@@ -300,6 +302,13 @@ pub(crate) fn card_header_with<R>(
         .inner
     })
     .inner
+}
+
+/// The Docs link of the card `key` names ([`crate::panels::docs::link`]),
+/// as tall as the header's icon buttons.
+fn docs_link(ui: &mut egui::Ui, key: &str) {
+    let height = devices::header_icon_size(ui);
+    crate::panels::docs::link(ui, key, height);
 }
 
 /// [`card_header_with`] on the phone's open page: the back icon (locked
@@ -356,6 +365,7 @@ fn phone_page_header<R>(
         flipped
     };
     let trail = |ui: &mut egui::Ui| {
+        docs_link(ui, key);
         let result = buttons(ui);
         if let Some((text, TagPlace::Buttons)) = tag {
             let size = tag_size(ui, text);

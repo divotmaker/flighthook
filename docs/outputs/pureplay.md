@@ -28,3 +28,30 @@ back to the Pureplay Accessory card, which does not take it again. The
 Pureplay Accessory card never feeds an output: its own shots and readiness
 never go to Pureplay, GSPro or any other simulator, and an output's launch
 monitor pickers do not list it.
+
+## Pureplay Connect card (alpha)
+
+The **Pureplay Connect** card sends shots to Pureplay over Pureplay Connect,
+Pureplay's own protocol: Pureplay listens on TCP port 9760 and flighthook
+connects to it. It takes Pureplay's club and hand, and its `strict_mode`
+row reads `on` while a tournament round is in progress. The Software (+)
+menu does not offer it; add a `[pureplay.N]` section to the config file.
+
+Driver: built into flighthook.
+
+### Settings
+
+| Field | What it does |
+| --- | --- |
+| **Name** | The card's name in the UI and the logs. |
+| **Address** | Pureplay's address and port, `ip:port`, where shots are sent over Pureplay Connect. Default `127.0.0.1:9760`, Pureplay on this computer. Change it when Pureplay runs on another computer. |
+| **Full Monitor** | Which launch monitor's full swings the card sends. Default **Any**: every launch monitor's. Routing works as on the [Open Connect client](open-connect.md#routing). |
+| **Chipping Monitor** | Which launch monitor's chips the card sends. Default **Any**. |
+| **Putting Monitor** | Which launch monitor's putts the card sends. Default **Any**. |
+
+```toml
+[pureplay.0]
+name = "Pureplay Connect"
+address = "127.0.0.1:9760"   # default
+full_monitor = "mevo.0"      # optional routing, as on the Open Connect client
+```

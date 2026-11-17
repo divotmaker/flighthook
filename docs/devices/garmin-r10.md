@@ -3,6 +3,9 @@
 **Status: Supported** — decoded by [tenover](https://crates.io/crates/tenover) over
 BLE, using Garmin's GFDI framing and protobuf payloads.
 
+Driver: [tenover](https://github.com/divotmaker/10over)
+([docs.rs](https://docs.rs/tenover)).
+
 ## Pairing
 
 The R10 is auto-detected from the system's connected Bluetooth devices, so the
@@ -50,6 +53,18 @@ Never captured: anything before the handshake completes, which is where the
 device's unit ID travels; after it, any message carrying the device's
 identity or keys, or one that does not decode. Those reach the log only, as
 hex lines at trace level. The device's BLE address is not in the file.
+
+## Settings
+
+Add the card from Settings > Devices: the **+** after Launch monitors,
+**R10**. Its page holds these fields:
+
+| Field | What it does |
+| --- | --- |
+| **Name** | The card's name in the UI and the logs. |
+| **Monitor-to-Ball** | The distance from the R10 to the ball, sent to the device as its tee distance. Garmin recommends 6-8 ft behind the ball. Blank (the default) keeps whatever distance is already set on the device. See [`range`](#range). |
+| **Aim offset** | Degrees added to the launch direction (and to the face angle and path of a tracked club); + is right. Blank is 0. Set it when the unit is not aimed exactly at the target: hit a short straight chip and enter the negative of the launch direction it shows. See [`aim_offset_deg`](#aim_offset_deg-beta). |
+| **Camera timing** | Seconds from the swing's impact to the shot's report, 0 to 5, which places the cameras' clips (beta). Blank uses the default, 2 s. See [Setting the camera timing](cameras.md#setting-the-camera-timing). |
 
 ## Configuration
 

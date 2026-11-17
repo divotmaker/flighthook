@@ -776,6 +776,8 @@ pub(crate) enum Icon {
     Search,
     /// `debug-disconnect`.
     Disconnect,
+    /// `book`.
+    Book,
 }
 
 impl Icon {
@@ -795,6 +797,7 @@ impl Icon {
             Icon::Info => '\u{ea74}',
             Icon::Search => '\u{ea6d}',
             Icon::Disconnect => '\u{ead0}',
+            Icon::Book => '\u{eaa4}',
         }
     }
 }
@@ -862,6 +865,54 @@ pub(crate) fn icon(
     } else {
         response
     }
+}
+
+/// An [`icon`] with a word after it, `height` tall, clickable as one: muted
+/// at rest, `hover` on hover. For an action whose icon alone would not say
+/// what it does.
+pub(crate) fn icon_text(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    text: &str,
+    height: f32,
+    hover: Color32,
+) -> egui::Response {
+    let family = icon_family();
+    if !ui.fonts(|f| f.definitions().families.contains_key(&family)) {
+        add_icon_font(ui.ctx());
+    }
+    let words =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), FontId::proportional(13.0), TEXT_MUTED);
+    let gap = 4.0;
+    let width = ICON_SIZE + gap + words.size().x;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let color = if response.hovered() {
+            hover
+        } else {
+            TEXT_MUTED
+        };
+        let painter = ui.painter();
+        if ui.fonts(|f| f.definitions().families.contains_key(&family)) {
+            let glyph = painter.layout_no_wrap(
+                icon.codepoint().to_string(),
+                FontId::new(ICON_SIZE, family),
+                color,
+            );
+            let at = egui::pos2(
+                rect.left() + (ICON_SIZE - glyph.size().x) / 2.0,
+                rect.center().y,
+            );
+            painter.galley(at - egui::vec2(0.0, glyph.size().y / 2.0), glyph, color);
+        }
+        let at = egui::pos2(
+            rect.left() + ICON_SIZE + gap,
+            rect.center().y - words.size().y / 2.0,
+        );
+        painter.galley(at, words, color);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// A filled primary button (accent fill, dark label).
@@ -954,7 +1005,7 @@ mod tests {
         // Codepoints from Codicons' mapping.json: play 60204, debug-pause
         // 60113, chevron-left 60085, chevron-right 60086,
         // device-camera-video 60121, refresh 60215, download 60532, export
-        // 60332, search 60013, debug-disconnect 60112.
+        // 60332, search 60013, debug-disconnect 60112, book 60068.
         let icons = [
             (Icon::Play, '\u{eb2c}'),
             (Icon::Pause, '\u{ead1}'),
@@ -966,6 +1017,7 @@ mod tests {
             (Icon::Export, '\u{ebac}'),
             (Icon::Search, '\u{ea6d}'),
             (Icon::Disconnect, '\u{ead0}'),
+            (Icon::Book, '\u{eaa4}'),
         ];
         let ctx = egui::Context::default();
         install(&ctx);
