@@ -343,7 +343,7 @@ enum End {
 
 /// What the card does after a connection ended.
 #[derive(Debug, Clone, PartialEq)]
-enum Next {
+enum After {
     /// The actor was stopped: the card ends.
     Shutdown,
     /// Show `status`, then connect again after `wait`.
@@ -358,26 +358,26 @@ enum Next {
 /// What follows `end` at `now`, for a connection that was up since
 /// `since`. One that held for [`STABLE`] starts the backoff over before a
 /// lost connection takes its next wait.
-fn next(end: End, since: Option<Instant>, backoff: &mut Backoff, now: Instant) -> Next {
+fn next(end: End, since: Option<Instant>, backoff: &mut Backoff, now: Instant) -> After {
     if since.is_some_and(|t| now.saturating_duration_since(t) >= STABLE) {
         backoff.reset();
     }
     match end {
-        End::Shutdown => Next::Shutdown,
-        End::Lost | End::Backoff => Next::Connect {
+        End::Shutdown => After::Shutdown,
+        End::Lost | End::Backoff => After::Connect {
             status: ActorStatus::Reconnecting,
             wait: backoff.delay(),
         },
-        End::RetryAfter { delay, status } => Next::Connect {
+        End::RetryAfter { delay, status } => After::Connect {
             status,
             wait: delay,
         },
-        End::Again => Next::Connect {
+        End::Again => After::Connect {
             status: ActorStatus::Starting,
             wait: Duration::ZERO,
         },
-        End::Stopped => Next::Idle,
-        End::Cooldown { until, retry } => Next::Cooldown { until, retry },
+        End::Stopped => After::Idle,
+        End::Cooldown { until, retry } => After::Cooldown { until, retry },
     }
 }
 
@@ -740,17 +740,17 @@ fn run_with(
         }
         let since = card.connected_since.take();
         let wait = match next(end, since, &mut card.backoff, Instant::now()) {
-            Next::Shutdown => return,
-            Next::Connect { status, wait } => {
+            After::Shutdown => return,
+            After::Connect { status, wait } => {
                 card.publish(sender, status);
                 wait
             }
-            Next::Idle => {
+            After::Idle => {
                 card.publish(sender, ActorStatus::Disconnected);
                 card.idle(&mut receiver, sender, None);
                 return;
             }
-            Next::Cooldown { until, retry } => {
+            After::Cooldown { until, retry } => {
                 card.rows
                     .set(PAIRING, cooldown_text(secs_left(until, Instant::now())));
                 card.publish(sender, ActorStatus::Disconnected);

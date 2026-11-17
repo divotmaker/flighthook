@@ -48,7 +48,7 @@ mod tests {
     use flighthook::{ActorStatus, SquareConfig};
     use flightrelay::config::ConfigError;
     use flightrelay::driver::{
-        Backoff, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
+        Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
         NoAction, SessionEnd, TurnHints,
     };
     use flightrelay::{
@@ -84,7 +84,7 @@ mod tests {
         steps: VecDeque<Step>,
         /// The second copy of the last notification.
         repeat: Option<Vec<u8>>,
-        /// The card's session passes so far (polls).
+        /// The card's session passes so far (steps).
         passes: u64,
         /// Quiet until this pass.
         quiet_until: Option<u64>,
@@ -316,7 +316,7 @@ mod tests {
         devices: VecDeque<EqLink>,
     }
 
-    impl DeviceDriver for ScriptedOmni {
+    impl FrpDriver for ScriptedOmni {
         type Config = SquareConfig;
         type Error = allsquare::driver::Error;
         type Action = NoAction;
@@ -378,16 +378,16 @@ mod tests {
     /// link.
     struct ScriptedSession(OmniSession, EqLink);
 
-    impl DeviceSession for ScriptedSession {
+    impl FrpSession for ScriptedSession {
         type Driver = ScriptedOmni;
 
-        fn poll(
+        fn step(
             &mut self,
-            timeout: Duration,
+            now: Instant,
             out: &mut Events<'_>,
-        ) -> Result<(), allsquare::driver::Error> {
+        ) -> Result<Activity, allsquare::driver::Error> {
             self.1.wire().passes += 1;
-            self.0.poll(timeout, out)
+            self.0.step(now, out)
         }
 
         fn hints(&mut self, hints: &TurnHints) -> Result<(), allsquare::driver::Error> {

@@ -36,7 +36,7 @@ mod tests {
     use flightrelay::FrpBody;
     use flightrelay::config::ConfigError;
     use flightrelay::driver::{
-        Backoff, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
+        Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
         NoAction, SessionEnd,
     };
     use tenover::driver::R10Session;
@@ -184,7 +184,7 @@ mod tests {
 
     struct ScriptedSession(R10Session<EqFake>);
 
-    impl DeviceDriver for ScriptedR10 {
+    impl FrpDriver for ScriptedR10 {
         type Config = R10Config;
         type Error = tenover::driver::Error;
         type Action = NoAction;
@@ -235,15 +235,15 @@ mod tests {
         }
     }
 
-    impl DeviceSession for ScriptedSession {
+    impl FrpSession for ScriptedSession {
         type Driver = ScriptedR10;
 
-        fn poll(
+        fn step(
             &mut self,
-            timeout: Duration,
+            now: Instant,
             out: &mut Events<'_>,
-        ) -> Result<(), tenover::driver::Error> {
-            self.0.poll(timeout, out)
+        ) -> Result<Activity, tenover::driver::Error> {
+            self.0.step(now, out)
         }
 
         fn identity(&self) -> &DeviceIdentity {

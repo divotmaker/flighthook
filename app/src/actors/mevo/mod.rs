@@ -133,7 +133,7 @@ mod tests {
     use flighthook::{ActorStatus, Distance, Launch, MevoConfig, ShotKey, SpinSource};
     use flightrelay::config::{ConfigError, DriverConfig};
     use flightrelay::driver::{
-        ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events, NoAction,
+        Activity, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession, NoAction,
     };
     use flightrelay::{FrpMessage, GolferSelect, ShotFinished, ShotLaunch, ShotTrigger};
     use ironsight::protocol::shot::{FlightResult as D4, FlightResultV1};
@@ -152,7 +152,7 @@ mod tests {
 
     /// What a replayed device does next.
     enum Step {
-        /// These messages, in one poll.
+        /// These messages, in one step.
         Emit(Vec<FrpBody>),
         /// Nothing, until the flag is set.
         Hold(Arc<AtomicBool>),
@@ -175,7 +175,7 @@ mod tests {
         steps: VecDeque<Step>,
     }
 
-    impl DeviceDriver for ReplayMevo {
+    impl FrpDriver for ReplayMevo {
         type Config = MevoConfig;
         type Error = ironsight::driver::Error;
         type Action = NoAction;
@@ -216,14 +216,14 @@ mod tests {
         }
     }
 
-    impl DeviceSession for ReplaySession {
+    impl FrpSession for ReplaySession {
         type Driver = ReplayMevo;
 
-        fn poll(
+        fn step(
             &mut self,
-            timeout: Duration,
+            _: Instant,
             out: &mut Events<'_>,
-        ) -> Result<(), ironsight::driver::Error> {
+        ) -> Result<Activity, ironsight::driver::Error> {
             match self.steps.front() {
                 Some(Step::Emit(_)) => {
                     if let Some(Step::Emit(bodies)) = self.steps.pop_front() {
@@ -231,13 +231,14 @@ mod tests {
                             out.frp(body);
                         }
                     }
+                    Ok(Activity::Active)
                 }
                 Some(Step::Hold(flag)) if flag.load(Ordering::SeqCst) => {
                     self.steps.pop_front();
+                    Ok(Activity::Active)
                 }
-                _ => std::thread::sleep(timeout.min(Duration::from_millis(5))),
+                _ => Ok(Activity::Idle),
             }
-            Ok(())
         }
 
         fn identity(&self) -> &DeviceIdentity {

@@ -1,14 +1,14 @@
 //! [`DriverActor`]: a launch monitor card that runs on a flightrelay device
-//! driver ([`DeviceDriver`]) as an FRP launch monitor actor.
+//! driver ([`FrpDriver`]) as an FRP launch monitor actor.
 //!
 //! The driver owns the device: connect, session, shots, status, raw frames.
 //! The actor is the host around it, one thread per card:
 //!
 //! - **The run loop.** It builds the driver from the card's section
-//!   ([`DeviceDriver::new`]; a refused config shows on the card and the
-//!   actor waits for its stop), connects, polls the session until it fails
+//!   ([`FrpDriver::new`]; a refused config shows on the card and the
+//!   actor waits for its stop), connects, steps the session until it fails
 //!   or the actor is stopped, and reconnects after the delay the driver
-//!   asks for ([`DeviceDriver::retry_delay`], slept so that a stop cuts it
+//!   asks for ([`FrpDriver::retry_delay`], slept so that a stop cuts it
 //!   short). The card reads Starting before the first attempt, Connected
 //!   with each session, Reconnecting from the end of the first session on,
 //!   and Disconnected once stopped or given up. A connect that fails puts
@@ -45,8 +45,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flightrelay::driver::{
-    Backoff, ConnectCtx, ConnectHost, DeviceDriver, DeviceEvent, DeviceIdentity, DeviceSession,
-    DeviceStatus, DriverInfo, Events, HostFlags, Level, SessionEnd, Stop, TurnHints,
+    Activity, Backoff, ConnectCtx, ConnectHost, DeviceEvent, DeviceIdentity, DeviceStatus,
+    DriverInfo, Events, FrpDriver, FrpSession, HostFlags, IDLE, Level, SessionEnd, Stop, TurnHints,
 };
 use flightrelay::types::roles;
 use flightrelay::{
@@ -65,9 +65,6 @@ use flighthook::{
     Severity, ShotKey, ShotRaw,
 };
 
-/// How long one session poll may take.
-const POLL_TIMEOUT: Duration = Duration::from_millis(50);
-
 /// How often the bus is drained while the actor waits (a retry delay, or
 /// for its stop).
 const IDLE_SLICE: Duration = Duration::from_millis(100);
@@ -85,7 +82,7 @@ const SESSION_PHASE: &str = "measuring";
 // ---------------------------------------------------------------------------
 
 /// What a card adds to its device driver `D`.
-pub trait Hooks<D: DeviceDriver>: Default + Send + 'static {
+pub trait Hooks<D: FrpDriver>: Default + Send + 'static {
     /// The card's config section: host fields with `D`'s config flattened
     /// next to them.
     type Section: DeviceSection<Driver = D::Config>;
@@ -143,7 +140,7 @@ pub struct ShotSoFar {
 
 /// A launch monitor card running device driver `D` with the card's hooks
 /// `H`. See the [module docs](self).
-pub struct DriverActor<D: DeviceDriver, H: Hooks<D>> {
+pub struct DriverActor<D: FrpDriver, H: Hooks<D>> {
     /// The section the actor runs with, as last applied.
     section: Mutex<H::Section>,
     stop: Stop,
@@ -156,7 +153,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-impl<D: DeviceDriver, H: Hooks<D>> DriverActor<D, H> {
+impl<D: FrpDriver, H: Hooks<D>> DriverActor<D, H> {
     /// An actor for the card with config section `section`.
     pub fn new(section: H::Section) -> Self {
         Self {
@@ -171,7 +168,7 @@ impl<D: DeviceDriver, H: Hooks<D>> DriverActor<D, H> {
     /// section was removed). Applied when only host fields changed, or
     /// driver fields the driver takes live
     /// ([`DriverConfig::restart_needed`]); the running thread then hands the
-    /// new driver config to [`DeviceDriver::apply_config`]. A removed
+    /// new driver config to [`FrpDriver::apply_config`]. A removed
     /// section, a restart-needing change, a config the driver refuses, or a
     /// change while the current config is refused is RestartRequired.
     fn apply_section(&self, new: Option<H::Section>) -> ReconfigureOutcome {
@@ -196,7 +193,7 @@ impl<D: DeviceDriver, H: Hooks<D>> DriverActor<D, H> {
     }
 }
 
-impl<D: DeviceDriver, H: Hooks<D>> Actor for DriverActor<D, H> {
+impl<D: FrpDriver, H: Hooks<D>> Actor for DriverActor<D, H> {
     fn start(
         &self,
         state: Arc<SystemState>,
@@ -248,7 +245,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Actor for DriverActor<D, H> {
 // ---------------------------------------------------------------------------
 
 /// What the actor's thread starts with.
-struct Run<D: DeviceDriver, H: Hooks<D>> {
+struct Run<D: FrpDriver, H: Hooks<D>> {
     section: H::Section,
     stop: Stop,
     updates: Arc<Mutex<Option<H::Section>>>,
@@ -276,7 +273,7 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("no message")
 }
 
-impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
+impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
     /// The actor's thread: [`run_with`](Self::run_with), and if the driver
     /// panics, `not_armed` and Disconnected with [`DRIVER_FAILED`], then
     /// the thread ends (Reconnect starts a new one).
@@ -452,9 +449,10 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
         }
     }
 
-    /// Poll `session` until it fails (`Err`) or the actor is stopped
+    /// Step `session` until it fails (`Err`) or the actor is stopped
     /// (`Ok`), handing it new turn hints and the bus's actions, live config
-    /// and the round policy between polls.
+    /// and the round policy between steps. A step with nothing to do
+    /// ([`Activity::Idle`]) is followed by the driver contract's [`IDLE`] wait.
     fn drive(
         &self,
         session: &mut D::Session,
@@ -481,11 +479,14 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
             take_update(&self.updates, sink, Some(driver));
             flags.set_shots_allowed(sink.shots_allowed());
             sink.session_mode = given.mode;
-            {
+            let activity = {
                 let mut emit = |e| sink.handle(e);
-                session.poll(POLL_TIMEOUT, &mut Events::new(&mut emit, flags))?;
-            }
+                session.step(Instant::now(), &mut Events::new(&mut emit, flags))?
+            };
             sink.prune_shots();
+            if activity == Activity::Idle {
+                std::thread::sleep(IDLE);
+            }
         }
     }
 }
@@ -493,7 +494,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Run<D, H> {
 /// Take a section applied live, if one waits in `updates`: the sink's (and
 /// so the hooks') section, and the driver's config when its part changed
 /// and there is a driver.
-fn take_update<D: DeviceDriver, H: Hooks<D>>(
+fn take_update<D: FrpDriver, H: Hooks<D>>(
     updates: &Mutex<Option<H::Section>>,
     sink: &mut Sink<D, H>,
     driver: Option<&mut D>,
@@ -518,7 +519,7 @@ fn take_update<D: DeviceDriver, H: Hooks<D>>(
 
 /// The actor's inputs: the bus, the turn hints, queued actions and the stop
 /// token. It is the driver's [`ConnectHost`].
-struct Host<D: DeviceDriver, H> {
+struct Host<D: FrpDriver, H> {
     receiver: BusReceiver,
     /// The hints of flighthook's latest turn.
     hints: TurnHints,
@@ -544,7 +545,7 @@ struct Synced {
 }
 
 impl Synced {
-    fn new<D: DeviceDriver, H: Hooks<D>>(sink: &Sink<D, H>) -> Self {
+    fn new<D: FrpDriver, H: Hooks<D>>(sink: &Sink<D, H>) -> Self {
         Self {
             sender: sink.sender.clone(),
             published: Arc::clone(&sink.published),
@@ -560,7 +561,7 @@ impl Synced {
     }
 }
 
-impl<D: DeviceDriver, H: Hooks<D>> Host<D, H> {
+impl<D: FrpDriver, H: Hooks<D>> Host<D, H> {
     /// Inputs over `receiver`, with the hints of the session's turn now.
     fn new(
         receiver: BusReceiver,
@@ -635,7 +636,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Host<D, H> {
     }
 }
 
-impl<D: DeviceDriver, H: Hooks<D>> ConnectHost for Host<D, H> {
+impl<D: FrpDriver, H: Hooks<D>> ConnectHost for Host<D, H> {
     fn tick(&mut self) {
         self.drain();
     }
@@ -645,7 +646,7 @@ impl<D: DeviceDriver, H: Hooks<D>> ConnectHost for Host<D, H> {
     }
 }
 
-impl<D: DeviceDriver, H: Hooks<D>> Host<D, H> {
+impl<D: FrpDriver, H: Hooks<D>> Host<D, H> {
     /// Note the hints a connect starts with, so the session gets only a
     /// later change.
     fn begin_connect(&mut self) {
@@ -659,7 +660,7 @@ impl<D: DeviceDriver, H: Hooks<D>> Host<D, H> {
 
 /// Where the driver's events go: the bus, the shot's raw capture and the
 /// log. See the [module docs](self).
-struct Sink<D: DeviceDriver, H: Hooks<D>> {
+struct Sink<D: FrpDriver, H: Hooks<D>> {
     state: Arc<SystemState>,
     sender: BusSender,
     actor: String,
@@ -780,7 +781,7 @@ fn audit_line(actor: &str, frame: &RawFrame) -> String {
     )
 }
 
-impl<D: DeviceDriver, H: Hooks<D>> Sink<D, H> {
+impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
     fn new(
         state: Arc<SystemState>,
         sender: BusSender,
@@ -1329,7 +1330,7 @@ pub(crate) mod tests {
         Phase(&'static str, Box<Connect>),
     }
 
-    /// What one session poll does; an empty list idles.
+    /// What one session step does; an empty list idles.
     enum Step {
         Emit(Vec<DeviceEvent>),
         Fail(&'static str),
@@ -1396,7 +1397,7 @@ pub(crate) mod tests {
         frame.label.as_deref() == Some("bulk")
     }
 
-    impl DeviceDriver for FakeDriver {
+    impl FrpDriver for FakeDriver {
         type Config = FakeConfig;
         type Error = FakeError;
         type Action = flightrelay::driver::NoAction;
@@ -1470,23 +1471,20 @@ pub(crate) mod tests {
         }
     }
 
-    impl DeviceSession for FakeSession {
+    impl FrpSession for FakeSession {
         type Driver = FakeDriver;
 
-        fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), FakeError> {
+        fn step(&mut self, _: Instant, out: &mut Events<'_>) -> Result<Activity, FakeError> {
             match self.steps.pop_front() {
                 Some(Step::Emit(events)) => {
                     for event in events {
                         out.emit(event);
                     }
-                    Ok(())
+                    Ok(Activity::Active)
                 }
                 Some(Step::Fail(why)) => Err(FakeError(why.into())),
                 Some(Step::Panic) => panic!("a decoder bug"),
-                None => {
-                    std::thread::sleep(timeout.min(Duration::from_millis(10)));
-                    Ok(())
-                }
+                None => Ok(Activity::Idle),
             }
         }
 
@@ -2772,7 +2770,7 @@ pub(crate) mod tests {
     /// A card's shot source has the class its driver declares, so a driver
     /// that changes its source fails here instead of being classed
     /// differently.
-    fn source_matches<D: DeviceDriver, H: Hooks<D>>() {
+    fn source_matches<D: FrpDriver, H: Hooks<D>>() {
         assert_eq!(
             Some(H::SOURCE.provenance()),
             provenance_of(D::info(&D::Config::default()).source),

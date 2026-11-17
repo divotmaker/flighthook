@@ -53,7 +53,7 @@ mod tests {
     };
     use flightrelay::config::ConfigError;
     use flightrelay::driver::{
-        Backoff, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
+        Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
         NoAction, SessionEnd, TurnHints,
     };
     use flightrelay::{BusActor, FrpBody, FrpMessage, GolferSelect};
@@ -261,7 +261,7 @@ mod tests {
     /// its `device` setting instead of evdev devices.
     struct ScriptedTrackball(Thumbswing);
 
-    impl DeviceDriver for ScriptedTrackball {
+    impl FrpDriver for ScriptedTrackball {
         type Config = TrackballConfig;
         type Error = Error;
         type Action = NoAction;
@@ -304,11 +304,11 @@ mod tests {
 
     struct ScriptedSession(Session);
 
-    impl DeviceSession for ScriptedSession {
+    impl FrpSession for ScriptedSession {
         type Driver = ScriptedTrackball;
 
-        fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Error> {
-            self.0.poll(timeout, out)
+        fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
+            self.0.step(now, out)
         }
 
         fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {

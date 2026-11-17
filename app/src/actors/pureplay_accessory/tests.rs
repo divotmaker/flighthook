@@ -1163,13 +1163,16 @@ fn another_app_waiting_closes_and_asks_again_later() {
 fn a_stopped_card_waits_for_reconnect() {
     let now = Instant::now();
     let mut backoff = Backoff::new();
-    assert_eq!(next(End::Stopped, None, &mut backoff, now), Next::Idle);
+    assert_eq!(next(End::Stopped, None, &mut backoff, now), After::Idle);
     assert_eq!(
         next(End::Stopped, Some(now), &mut backoff, now + STABLE),
-        Next::Idle,
+        After::Idle,
         "after a long session too"
     );
-    assert_eq!(next(End::Shutdown, None, &mut backoff, now), Next::Shutdown);
+    assert_eq!(
+        next(End::Shutdown, None, &mut backoff, now),
+        After::Shutdown
+    );
 }
 
 /// Pureplay's cooldown counts down to its end; whether one more attempt
@@ -1182,7 +1185,7 @@ fn a_cooldown_waits_until_its_end_then_retries_only_when_it_says() {
     for retry in [true, false] {
         assert_eq!(
             next(End::Cooldown { until, retry }, None, &mut backoff, now),
-            Next::Cooldown { until, retry }
+            After::Cooldown { until, retry }
         );
     }
 }
@@ -1196,7 +1199,7 @@ fn a_lost_connection_reconnects_after_a_doubling_backoff() {
     let mut waits = Vec::new();
     for end in [End::Lost, End::Backoff].into_iter().cycle().take(8) {
         match next(end, None, &mut backoff, now) {
-            Next::Connect {
+            After::Connect {
                 status: ActorStatus::Reconnecting,
                 wait,
             } => waits.push(wait),
@@ -1217,7 +1220,7 @@ fn a_lost_connection_reconnects_after_a_doubling_backoff() {
 fn a_connection_that_held_for_stable_starts_the_backoff_over() {
     let up = Instant::now();
     let reconnect = |backoff: &mut Backoff, since, now| match next(End::Lost, since, backoff, now) {
-        Next::Connect { wait, .. } => wait,
+        After::Connect { wait, .. } => wait,
         other => panic!("{other:?}"),
     };
     let mut backoff = Backoff::new();
@@ -1248,21 +1251,21 @@ fn a_set_retry_keeps_its_wait_and_a_pair_without_the_token_goes_at_once() {
             &mut backoff,
             now
         ),
-        Next::Connect {
+        After::Connect {
             status: ActorStatus::Reconnecting,
             wait: delay
         }
     );
     assert_eq!(
         next(End::Again, None, &mut backoff, now),
-        Next::Connect {
+        After::Connect {
             status: ActorStatus::Starting,
             wait: Duration::ZERO
         }
     );
     assert_eq!(
         next(End::Lost, None, &mut backoff, now),
-        Next::Connect {
+        After::Connect {
             status: ActorStatus::Reconnecting,
             wait: MIN_BACKOFF
         },
@@ -2171,13 +2174,15 @@ fn only_an_address_change_restarts_the_card() {
 /// A mock simulator taking Open Connect: every message a client writes,
 /// as JSON, on any connection.
 struct OcHost {
+    /// The output that writes to it, for a wait's message.
+    name: &'static str,
     addr: SocketAddr,
     messages: mpsc::Receiver<Value>,
     accepted: mpsc::Receiver<()>,
 }
 
 impl OcHost {
-    fn new() -> Self {
+    fn new(name: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (tx, messages) = mpsc::channel();
@@ -2213,6 +2218,7 @@ impl OcHost {
             }
         });
         Self {
+            name,
             addr,
             messages,
             accepted,
@@ -2223,7 +2229,7 @@ impl OcHost {
     fn accepts(&self) {
         self.accepted
             .recv_timeout(WAIT)
-            .expect("the client connects");
+            .unwrap_or_else(|_| panic!("{}: the client connects", self.name));
     }
 
     /// Every message the clients wrote, up to the first `want` matches.
@@ -2234,7 +2240,12 @@ impl OcHost {
             let v = deadline
                 .checked_duration_since(Instant::now())
                 .and_then(|left| self.messages.recv_timeout(left).ok())
-                .unwrap_or_else(|| panic!("the message the test waits for, after {out:?}"));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: the message the test waits for, after {out:?}",
+                        self.name
+                    )
+                });
             let done = want(&v);
             out.push(v);
             if done {
@@ -2472,7 +2483,7 @@ fn an_echo_is_not_stored_and_gets_the_stroke() {
     let state = new_state();
     let (tx, _) = broadcast::channel(4096);
     let (mut card, mut peer) = connected_on(&mock, state.clone(), &tx);
-    let oc = OcHost::new();
+    let oc = OcHost::new("openconnect_client.0");
     let _stops = Stops(vec![oc_client(
         &state,
         &tx,
@@ -2540,8 +2551,8 @@ fn a_pureplay_shot_is_stored_and_reaches_no_output() {
     let state = new_state();
     let (tx, _) = broadcast::channel(4096);
     let (mut card, mut peer) = connected_on(&mock, state.clone(), &tx);
-    let any = OcHost::new();
-    let by_id = OcHost::new();
+    let any = OcHost::new("openconnect_client.0");
+    let by_id = OcHost::new("openconnect_client.1");
     let routed = crate::actors::gspro::GsProRouting {
         full_monitor: Some(ACTOR.into()),
         chipping_monitor: Some(ACTOR.into()),
@@ -2650,8 +2661,8 @@ fn the_cards_ready_never_reaches_an_output() {
                 && a.device.as_ref().and_then(|d| d.manufacturer.as_deref()) == Some("Pureplay")
                 && a.device.as_ref().and_then(|d| d.model.as_deref()) == Some("Accessory API"))
     });
-    let any = OcHost::new();
-    let by_id = OcHost::new();
+    let any = OcHost::new("openconnect_client.0");
+    let by_id = OcHost::new("openconnect_client.1");
     let routed = crate::actors::gspro::GsProRouting {
         full_monitor: Some(ACTOR.into()),
         ..Default::default()

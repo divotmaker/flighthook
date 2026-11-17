@@ -1,6 +1,6 @@
 //! Test support: scripted devices handed to a device driver under test.
 //!
-//! [`DeviceDriver::new`](flightrelay::driver::DeviceDriver::new) gets only
+//! [`FrpDriver::new`](flightrelay::driver::FrpDriver::new) gets only
 //! the card's config, so a test parks its scripted device here under a key
 //! taken from that config (an address, a range), and the test driver takes
 //! it out in `new`. Every test picks its own key; two tests that share one

@@ -54,8 +54,8 @@ use flighthook::{
 };
 use flightrelay::config::ConfigError;
 use flightrelay::driver::{
-    Backoff, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events, NoAction,
-    SessionEnd, TurnHints,
+    Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
+    NoAction, SessionEnd, TurnHints,
 };
 use flightrelay::{FrpBody, FrpMessage, GolferSelect};
 use ironsight::testing::{FakeDevice, Shot, fixtures};
@@ -328,7 +328,7 @@ struct GoldenR10 {
 
 struct GoldenR10Session(tenover::driver::R10Session<R10Link>);
 
-impl DeviceDriver for GoldenR10 {
+impl FrpDriver for GoldenR10 {
     type Config = R10Config;
     type Error = tenover::driver::Error;
     type Action = NoAction;
@@ -381,15 +381,15 @@ impl DeviceDriver for GoldenR10 {
     }
 }
 
-impl DeviceSession for GoldenR10Session {
+impl FrpSession for GoldenR10Session {
     type Driver = GoldenR10;
 
-    fn poll(
+    fn step(
         &mut self,
-        timeout: Duration,
+        now: Instant,
         out: &mut Events<'_>,
-    ) -> Result<(), tenover::driver::Error> {
-        self.0.poll(timeout, out)
+    ) -> Result<Activity, tenover::driver::Error> {
+        self.0.step(now, out)
     }
 
     fn identity(&self) -> &DeviceIdentity {
@@ -495,7 +495,7 @@ struct GoldenOmni {
 
 struct GoldenOmniSession(allsquare::driver::OmniSession);
 
-impl DeviceDriver for GoldenOmni {
+impl FrpDriver for GoldenOmni {
     type Config = SquareConfig;
     type Error = allsquare::driver::Error;
     type Action = NoAction;
@@ -544,15 +544,15 @@ impl DeviceDriver for GoldenOmni {
     }
 }
 
-impl DeviceSession for GoldenOmniSession {
+impl FrpSession for GoldenOmniSession {
     type Driver = GoldenOmni;
 
-    fn poll(
+    fn step(
         &mut self,
-        timeout: Duration,
+        now: Instant,
         out: &mut Events<'_>,
-    ) -> Result<(), allsquare::driver::Error> {
-        self.0.poll(timeout, out)
+    ) -> Result<Activity, allsquare::driver::Error> {
+        self.0.step(now, out)
     }
 
     fn hints(&mut self, hints: &TurnHints) -> Result<(), allsquare::driver::Error> {

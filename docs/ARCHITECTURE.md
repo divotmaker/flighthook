@@ -1241,15 +1241,15 @@ What a stop does, by actor:
 
 | Actor | Stops at once when | Bounded by |
 |---|---|---|
-| FlightScope (Mevo+, Gen2, Xi) | always: the TCP connect gives up at once on a stop, the handshake checks for one between polls, a session polls every 50 ms; closing sends nothing | the driver's `STOP_WAIT` (3 s); the driver is not exclusive, so an old instance still closing is replaced beside it (a second socket to the device can overlap the old one until it closes) |
+| FlightScope (Mevo+, Gen2, Xi) | always: the TCP connect gives up at once on a stop, the handshake checks for one between passes, the card between session steps (5 ms apart while the device is quiet); closing sends nothing | the driver's `STOP_WAIT` (3 s); the driver is not exclusive, so an old instance still closing is replaced beside it (a second socket to the device can overlap the old one until it closes) |
 | Open Connect client | always: 50 ms reads, 2s write timeout, the connect on its own thread; its local-client registration ends with the connection | a write in progress (2s) |
 | Pureplay | always: 50 ms reads, 2s write timeout, the connect on its own thread | a write in progress (2s) |
 | Open Connect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
 | Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
 | Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
-| ExPutt | discovering (250 ms slices), measuring (100 ms event wait, the session closes at once) or waiting to reconnect | the driver's `STOP_WAIT` (18 s: a session start of up to 17 s, which cannot be cut short: connect and greeting, two handshake replies, mat search; then the close) |
-| Trackball | always: opening the device is a few system calls, checked for a stop before and after; a session polls every 50 ms; closing drops the device | the driver's `STOP_WAIT` (1 s: closing joins the device's reader thread, which wakes every 100 ms); not exclusive (the card never grabs the device), so an old instance still closing is replaced beside it |
-| Mock monitor | always (50 ms polls; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
+| ExPutt | discovering (250 ms slices), measuring (checked between session steps, 5 ms apart while the device is quiet; the session closes at once) or waiting to reconnect | the driver's `STOP_WAIT` (18 s: a session start of up to 17 s, which cannot be cut short: connect and greeting, two handshake replies, mat search; then the close) |
+| Trackball | always: opening the device is a few system calls, checked for a stop before and after; the card checks between session steps (5 ms apart while the device is quiet); closing drops the device | the driver's `STOP_WAIT` (1 s: closing joins the device's reader thread, which wakes every 100 ms); not exclusive (the card never grabs the device), so an old instance still closing is replaced beside it |
+| Mock monitor | always (checked between session steps; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
 | Random club | always (100 ms loop) | -- |
 
 **FlightScope card**: ironsight's device driver (`ironsight::driver::Mevo`)
@@ -1293,7 +1293,7 @@ sidespin 0. The card publishes it as its own `shot.flight` holding only
 `assumed` spin, before `shot.finished` (see [Simulated values](#simulated-values)); `shot.launch` carries only what the device
 measured. A launch the Xi sends with its early result's total spin
 (`spin_source` `e8` or `auto`) keeps that. The mode at the trigger is the
-session's mode the host handed the driver before that `poll` pass, the mode the
+session's mode the host handed the driver before that `step`, the mode the
 driver itself takes for the shot, so a mode change between the trigger and the
 full result, seconds later, changes nothing.
 
@@ -2059,7 +2059,7 @@ already connected learns its state within one heartbeat.
 ## Device drivers
 
 A launch monitor card can run on a flightrelay device driver
-(`flightrelay::driver::DeviceDriver`): the FlightScope Mevo+, Gen2 and Xi
+(`flightrelay::driver::FrpDriver`): the FlightScope Mevo+, Gen2 and Xi
 (`ironsight::driver::Mevo`), the R10 (`tenover::driver::R10`), the Square
 Golf Omni (`allsquare::driver::Omni`), the ExPutt
 (`threeputt::driver::ExPutt`), the trackball
@@ -2126,7 +2126,9 @@ ran, and are dropped). A session: Connected with `device_info` (the identity's
 label) and `shot_count`, then a `bus.actor` carrying the identity and
 `device.source` before any shot; each pass drains the bus into the hints and
 the card's `action`s, hands a live config to `apply_config`, sets `wants_raw`
-(always) and `shots_allowed` (the round policy), and polls for 50 ms. A
+(always) and `shots_allowed` (the round policy), and steps the session once
+(`step`), waiting the driver contract's `IDLE` (5 ms) after a step with nothing
+to do. A
 session error sends `not_armed` and then Reconnecting;
 the driver's `retry_delay` (its own alerts, an SDK `Backoff`) is slept with
 the bus drained; `None` gives up with Disconnected and the error. A stop
@@ -2157,7 +2159,7 @@ host field only is Applied; a driver change that `restart_needed` calls
 live (and that validates) is Applied and handed to the running driver;
 anything else, a refused config or a removed section is RestartRequired.
 The actor's thread takes an Applied section at its next pass whatever it is
-doing: between session polls, before each connect, every 100 ms of a retry
+doing: between session steps, before each connect, every 100 ms of a retry
 delay and while it waits for its stop, so a change takes effect at the next
 shot or connect (the hooks see the new section at once).
 

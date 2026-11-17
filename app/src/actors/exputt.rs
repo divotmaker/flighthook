@@ -84,11 +84,11 @@ mod tests {
     };
     use flightrelay::config::{ConfigError, DriverConfig};
     use flightrelay::driver::{
-        Backoff, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
+        Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
         SessionEnd, TurnHints,
     };
-    use flightrelay::{BusActor, FrpMessage, GolferSelect, GolferTurn};
-    use threeputt::driver::{ExPuttSession, NOT_ANSWERING, Tuning};
+    use flightrelay::{BusActor, FrpMessage, GolferSelect};
+    use threeputt::driver::{ExPuttSession, Tuning};
     use threeputt::testing::{
         BALL_STRUCK, MockConfig, MockDevice, PUTT_READY, PUTT_RESULT_BALL_ONLY, PUTT_RESULT_FULL,
         PUTT_RESULT_PULLED, device_event,
@@ -120,9 +120,8 @@ mod tests {
             .port()
     }
 
-    /// The driver's timings scaled down (one second of silence standing
-    /// for 90), its device on `port` (read at every connect), no mat search
-    /// spacing, stall wait or "not answering" alert unless a test sets them.
+    /// The driver's session timeouts shortened, its device on `port` (read
+    /// at every connect) and discovery on a port nothing answers.
     fn tuning(port: &Arc<AtomicU16>) -> Tuning {
         let mut t = Tuning::default();
         t.port = Arc::clone(port);
@@ -131,13 +130,6 @@ mod tests {
         t.reply_timeout = Duration::from_secs(2);
         t.mat_timeout = Duration::from_secs(2);
         t.keepalive_interval = Duration::from_millis(100);
-        t.discovery_hint_after = Duration::from_secs(3600);
-        t.silence_baseline = Duration::from_millis(1000);
-        t.silence_after_strike = Duration::from_millis(2000);
-        t.silence_warn_after = Duration::from_millis(333);
-        t.stall_wait = Duration::ZERO;
-        t.resync_gap = Duration::ZERO;
-        t.not_answering_after = Duration::from_secs(3600);
         t
     }
 
@@ -150,7 +142,7 @@ mod tests {
         config: ExPuttConfig,
     }
 
-    impl DeviceDriver for ScriptedExPutt {
+    impl FrpDriver for ScriptedExPutt {
         type Config = ExPuttConfig;
         type Error = threeputt::driver::Error;
         type Action = Action;
@@ -199,15 +191,15 @@ mod tests {
 
     struct ScriptedSession(ExPuttSession);
 
-    impl DeviceSession for ScriptedSession {
+    impl FrpSession for ScriptedSession {
         type Driver = ScriptedExPutt;
 
-        fn poll(
+        fn step(
             &mut self,
-            timeout: Duration,
+            now: Instant,
             out: &mut Events<'_>,
-        ) -> Result<(), threeputt::driver::Error> {
-            self.0.poll(timeout, out)
+        ) -> Result<Activity, threeputt::driver::Error> {
+            self.0.step(now, out)
         }
 
         fn hints(&mut self, hints: &TurnHints) -> Result<(), threeputt::driver::Error> {
@@ -352,16 +344,6 @@ mod tests {
             });
         }
 
-        /// Put the session's turn with `hand` on the bus, as the system
-        /// actor publishes it.
-        fn turn(&self, hand: Handedness) {
-            let turn = GolferTurn::new(None, None, hand, Mode::Full);
-            let _ = self.tx.send(BusMsg::frp(FrpMessage::new(
-                self.state.flighthook_id(),
-                turn,
-            )));
-        }
-
         /// A `golfer.select` of `hand` from the web layer.
         fn select_hand(&self, hand: Handedness) {
             let mut select = GolferSelect::new("web");
@@ -395,6 +377,25 @@ mod tests {
                 }
             }
             panic!("{what} not seen; got {seen:?}");
+        }
+
+        /// Any `golfer.turn` on the bus with `hand`.
+        fn until_turn(&mut self, hand: Handedness) {
+            let deadline = Instant::now() + WAIT;
+            while Instant::now() < deadline {
+                match self.rx.try_recv() {
+                    Ok(m) => {
+                        if let Some(FrpBody::GolferTurn(turn)) = body(&m)
+                            && turn.handedness == Some(hand)
+                        {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+            panic!("no golfer.turn with {hand:?}");
         }
 
         fn until_status(&mut self, status: ActorStatus) -> Vec<BusMsg> {
@@ -502,11 +503,6 @@ mod tests {
             .collect()
     }
 
-    /// The `device_state` values in `seen`, in order.
-    fn device_states(seen: &[BusMsg]) -> Vec<&str> {
-        seen.iter().filter_map(device_state).collect()
-    }
-
     /// Readiness as the card last published it in `seen`.
     fn last_ready(seen: &[BusMsg]) -> bool {
         seen.iter().rev().find_map(is_ready).unwrap_or(false)
@@ -559,37 +555,6 @@ mod tests {
     fn sent(mock: &MockDevice, request: Request) -> bool {
         let json = request.to_json();
         mock.wait_until(WAIT, |packets| packets.iter().any(|p| p.json == json))
-    }
-
-    /// Whether `packets`, keepalives aside, are exactly a new round with
-    /// `hand`: match end, mat resync, hand, match begin.
-    fn round_sent(packets: &[threeputt::testing::ReceivedPacket], hand: Hand) -> bool {
-        let want: Vec<String> = [
-            Request::MatchEnded,
-            Request::StartCamera,
-            Request::ResyncToMat,
-            Request::StopCamera,
-            Request::SetHand(hand),
-            Request::MatchBegin,
-        ]
-        .iter()
-        .map(|r| r.to_json())
-        .collect();
-        let alive = Request::Alive.to_json();
-        let sent: Vec<&String> = packets
-            .iter()
-            .map(|p| &p.json)
-            .filter(|j| **j != alive)
-            .collect();
-        sent == want.iter().collect::<Vec<_>>()
-    }
-
-    fn quiet_mock() -> MockDevice {
-        MockDevice::spawn(MockConfig {
-            heartbeat: None,
-            ..MockConfig::default()
-        })
-        .expect("mock")
     }
 
     /// A port nothing listens on: connection attempts are refused.
@@ -814,106 +779,32 @@ mod tests {
 
     // -- Hand and Find mat -------------------------------------------------------
 
-    /// A hand change starts a new round, which finds the mat first: not
-    /// ready through "finding mat" and "mat found" until the device is ready
-    /// again, as after a Find mat, and no reconnect.
+    /// The session starts with the player's hand from the session's turn.
+    /// A change during the session is threeputt's (one round per mat-search
+    /// gap) and the host's (hints handed on when they change).
     #[test]
-    fn the_hand_follows_the_player() {
+    fn a_session_starts_with_the_players_hand() {
         let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
         let mut card = Card::on("10.77.0.8", &Arc::new(AtomicU16::new(mock.port())));
         card.select(|s| s.handedness = Some(Handedness::Left));
         card.start();
         card.until_status(ActorStatus::Connected);
-        mock.push_event(PUTT_READY);
-        card.until_ready(true, Some("ready"));
         assert!(sent(&mock, Request::SetHand(Hand::Left)), "starts left");
-        let before = mock.received().len();
-
-        // The session's turn: the player is right-handed.
-        card.turn(Handedness::Right);
-        let mut seen = card.until_ready(false, Some("ready"));
-        seen.extend(card.until("mat found", |m| device_state(m) == Some("mat found")));
-        mock.push_event(PUTT_READY);
-        seen.extend(card.until_ready(true, Some("ready")));
-        let mut states = device_states(&seen);
-        states.dedup();
-        assert_eq!(states, ["ready", "finding mat", "mat found", "ready"]);
-        assert!(
-            !seen.iter().any(|m| is_status(m, ActorStatus::Reconnecting)),
-            "no reconnect"
-        );
-        assert!(
-            mock.wait_until(WAIT, |p| round_sent(&p[before..], Hand::Right)),
-            "{:?}",
-            mock.received()
-        );
     }
 
-    /// A hand set in the UI (a `golfer.select` from `web`) reaches the
-    /// ExPutt through the session's turn: a new round with the new hand,
-    /// and a repeat of the same hand starts no other.
+    /// A hand set in the UI (a `golfer.select` from `web`) becomes the
+    /// session's turn, which the next session starts with.
     #[test]
     fn a_hand_set_in_the_ui_reaches_the_device() {
         let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
         let mut card = Card::on("10.77.0.9", &Arc::new(AtomicU16::new(mock.port())));
         card.start_system_actor();
+        card.select_hand(Handedness::Left);
+        card.until_turn(Handedness::Left);
         card.start();
         card.until_status(ActorStatus::Connected);
         assert!(sent(&mock, Request::MatchBegin));
-        assert!(sent(&mock, Request::SetHand(Hand::Right)), "starts right");
-        let before = mock.received().len();
-
-        card.select_hand(Handedness::Left);
-        assert!(
-            mock.wait_until(WAIT, |p| round_sent(&p[before..], Hand::Left)),
-            "{:?}",
-            mock.received()
-        );
-        let after = mock.received().len();
-        // A repeat of the same hand, then the other hand as a sentinel: the
-        // bus is in order, so the round for the sentinel is the only one
-        // since `after` unless the repeat started one of its own.
-        card.select_hand(Handedness::Left);
-        card.select_hand(Handedness::Right);
-        assert!(
-            mock.wait_until(WAIT, |p| round_sent(&p[after..], Hand::Right)),
-            "{:?}",
-            mock.received()
-        );
-    }
-
-    #[test]
-    fn find_mat_resyncs_the_device_and_is_ready_again() {
-        let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
-        let mut card = Card::started("10.77.0.10", &mock);
-        card.until_status(ActorStatus::Connected);
-        mock.push_event(PUTT_READY);
-        card.until_ready(true, Some("ready"));
-        let before = mock.received().len();
-
-        // A Find mat for another ExPutt is not for this one.
-        card.web(LocalEvent::FindMat {
-            target: "exputt.1".into(),
-        });
-        card.web(LocalEvent::FindMat {
-            target: "exputt.0".into(),
-        });
-        let mut seen = card.until_ready(false, Some("ready"));
-        seen.extend(card.until("mat found", |m| device_state(m) == Some("mat found")));
-        mock.push_event(PUTT_READY);
-        seen.extend(card.until_ready(true, Some("ready")));
-        let mut states = device_states(&seen);
-        states.dedup();
-        assert_eq!(states, ["ready", "finding mat", "mat found", "ready"]);
-        assert!(
-            !seen.iter().any(|m| is_status(m, ActorStatus::Reconnecting)),
-            "no reconnect"
-        );
-        assert!(
-            mock.wait_until(WAIT, |p| round_sent(&p[before..], Hand::Right)),
-            "{:?}",
-            mock.received()
-        );
+        assert!(sent(&mock, Request::SetHand(Hand::Left)), "starts left");
     }
 
     // -- Readiness ---------------------------------------------------------------
@@ -966,31 +857,6 @@ mod tests {
         assert!(!last_ready(&seen));
     }
 
-    #[test]
-    fn a_silent_device_is_not_ready_until_it_sends_again() {
-        // No heartbeat: ready from the device's own report, then silence past
-        // the warning threshold (a third of the baseline limit).
-        let mock = quiet_mock();
-        let mut card = Card::started("10.77.0.14", &mock);
-        mock.push_event(PUTT_READY);
-        let mut seen = card.until_ready(true, Some("ready"));
-        seen.extend(card.until_ready(false, None));
-        assert!(!last_ready(&seen), "not ready during silence");
-
-        // It sends again before the limit: ready as the device last said,
-        // and the session stands.
-        mock.push_event("Test,yy");
-        seen.extend(card.until_ready(true, None));
-        assert!(last_ready(&seen), "ready again");
-        // A putt after it is taken on the same session.
-        mock.push_event(PUTT_RESULT_FULL);
-        seen.extend(card.next_shot());
-        assert!(
-            !seen.iter().any(|m| is_status(m, ActorStatus::Reconnecting)),
-            "no reconnect"
-        );
-    }
-
     // -- Reconnects and the stall policy ------------------------------------------
 
     #[test]
@@ -1021,36 +887,6 @@ mod tests {
             unreachable!()
         };
         trigger.key.shot_number
-    }
-
-    /// The driver's stall wait: after a session lost to silence the next
-    /// attempt waits at least the stall wait, longer than the host's
-    /// backoff would.
-    #[test]
-    fn a_silent_device_gets_time_before_the_reconnect() {
-        let stall_wait = Duration::from_millis(2500);
-        let mock = quiet_mock();
-        let second = MockDevice::spawn(MockConfig::default()).expect("mock");
-        let port = Arc::new(AtomicU16::new(mock.port()));
-        let mut t = tuning(&port);
-        t.stall_wait = stall_wait;
-        let mut card = Card::new(section("10.77.0.17"), t);
-        card.start();
-        card.until_status(ActorStatus::Connected);
-        port.store(second.port(), Ordering::SeqCst);
-
-        let seen = card.until("silence", |m| {
-            alert(m).is_some_and(|(_, message)| message.contains("no data from the device"))
-        });
-        let lost = Instant::now();
-        assert!(seen.iter().any(|m| is_status(m, ActorStatus::Reconnecting)));
-        card.until_status(ActorStatus::Connected);
-        let waited = lost.elapsed();
-        assert!(
-            waited >= stall_wait - Duration::from_millis(100),
-            "reconnected after {waited:?}"
-        );
-        assert!(sent(&second, Request::MatchBegin));
     }
 
     /// A device whose app has stalled: it accepts every connection and
@@ -1105,42 +941,6 @@ mod tests {
         }
     }
 
-    /// The driver's alert policy through the host: an "ExPutt error" per
-    /// failed attempt, then once the device has not answered for a while one
-    /// "not answering" alert, and then quiet; the host adds no alert of its
-    /// own.
-    #[test]
-    fn a_device_that_never_answers_is_reported_once() {
-        let wedged = Wedged::spawn();
-        let port = Arc::new(AtomicU16::new(wedged.port));
-        let mut t = tuning(&port);
-        t.not_answering_after = Duration::from_millis(600);
-        t.reply_timeout = Duration::from_millis(200);
-        let mut card = Card::new(section("10.77.0.18"), t);
-        card.start();
-
-        let seen = card.until("not answering", |m| {
-            alert(m).is_some_and(|(_, message)| message == NOT_ANSWERING)
-        });
-        let got = alerts(&seen);
-        let (told, errors) = got.split_last().expect("alerts");
-        assert_eq!(told, NOT_ANSWERING);
-        assert!(!errors.is_empty(), "failed attempts first: {got:?}");
-        assert!(
-            errors.iter().all(|a| a.starts_with("ExPutt error")),
-            "{got:?}"
-        );
-        let (severity, _) = alert(seen.last().unwrap()).unwrap();
-        assert_eq!(severity, Severity::Warn);
-
-        // Attempts go on (the next after the host's 2 s), silently: nothing
-        // is alerted up to the next attempt.
-        let next = card.until("the next attempt", |m| {
-            phases(std::slice::from_ref(m)) == ["connecting"]
-        });
-        assert_eq!(alerts(&next), Vec::<String>::new());
-    }
-
     #[test]
     fn a_device_that_is_not_there_is_retried() {
         let port = Arc::new(AtomicU16::new(closed_port()));
@@ -1161,7 +961,7 @@ mod tests {
         let mut card = Card::started("10.77.0.20", &mock);
         card.until_status(ActorStatus::Connected);
         card.stop();
-        assert!(sent(&mock, Request::MatchEnded), "the session was closed");
+        assert!(mock.wait_closed(WAIT), "the session was closed");
     }
 
     /// Starting a session cannot be interrupted: a stop during a handshake
@@ -1185,24 +985,21 @@ mod tests {
     // -- Discovery -------------------------------------------------------------
 
     #[test]
-    fn discovery_without_a_device_hints_once_and_a_stop_ends_it() {
+    fn a_stop_ends_discovery() {
         let port = Arc::new(AtomicU16::new(closed_port()));
-        let mut t = tuning(&port);
-        t.discovery_hint_after = Duration::from_millis(300);
         let mut card = Card::new(
             ExPuttSection {
                 name: "ExPutt".into(),
                 ..ExPuttSection::default()
             },
-            t,
+            tuning(&port),
         );
         card.start();
-        let mut seen = card.until("alert", |m| alert(m).is_some());
-        assert_eq!(phases(&seen), ["discovering"]);
+        card.until("discovering", |m| {
+            phases(std::slice::from_ref(m)) == ["discovering"]
+        });
         card.stop();
-        seen.extend(card.until_status(ActorStatus::Disconnected));
-        // In the card's words. That the driver hints once is threeputt's.
-        assert_eq!(alerts(&seen), [DISCOVERY_HINT]);
+        let seen = card.until_status(ActorStatus::Disconnected);
         assert!(!seen.iter().any(|m| is_status(m, ActorStatus::Connected)));
     }
 

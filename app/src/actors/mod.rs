@@ -56,27 +56,27 @@ pub const STOP_WAIT: Duration = Duration::from_secs(3);
 /// command stops the actors it restarts or removes together, so this bounds
 /// how long it waits for them.
 pub const MAX_STOP_WAIT: Duration =
-    <threeputt::driver::ExPutt as flightrelay::driver::DeviceDriver>::STOP_WAIT;
+    <threeputt::driver::ExPutt as flightrelay::driver::FrpDriver>::STOP_WAIT;
 
 const _: () = assert!(STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
 const _: () = assert!(
-    <allsquare::driver::Omni as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+    <allsquare::driver::Omni as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
 const _: () = assert!(
-    <ironsight::driver::Mevo as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+    <ironsight::driver::Mevo as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
 const _: () = assert!(
-    <tenover::driver::R10 as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+    <tenover::driver::R10 as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
 const _: () = assert!(
-    <flightrelay::mock::MockDriver as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+    <flightrelay::mock::MockDriver as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
 const _: () = assert!(
-    <thumbswing::driver::Thumbswing as flightrelay::driver::DeviceDriver>::STOP_WAIT.as_millis()
+    <thumbswing::driver::Thumbswing as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
 
