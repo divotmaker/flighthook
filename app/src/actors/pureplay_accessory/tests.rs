@@ -32,6 +32,12 @@ const QUIET: Duration = Duration::from_millis(600);
 
 const ACTOR: &str = "pureplay_accessory.0";
 
+/// The card key of the test's bus markers ([`Card::caught_up`]); the session
+/// answers each with the same event from [`MARKER_ECHO`]. Nobody else acts on
+/// them and the bus record leaves them out.
+const MARKER: &str = "test-marker";
+const MARKER_ECHO: &str = "test-marker-echo";
+
 mod club;
 mod game;
 
@@ -49,6 +55,8 @@ struct Peer {
     ws: WebSocket<TcpStream>,
     /// The frame type of every message the card sent on it.
     kinds: Vec<FrameType>,
+    /// Messages read while waiting for a pong, not yet taken.
+    pending: std::collections::VecDeque<(Value, FrameType)>,
 }
 
 impl Peer {
@@ -66,6 +74,10 @@ impl Peer {
 
     /// The next message from the card.
     fn recv(&mut self) -> Value {
+        if let Some((v, kind)) = self.pending.pop_front() {
+            self.kinds.push(kind);
+            return v;
+        }
         let deadline = Instant::now() + WAIT;
         loop {
             assert!(Instant::now() < deadline, "nothing from the card");
@@ -86,6 +98,39 @@ impl Peer {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) => {}
                 Err(e) => panic!("read: {e}"),
+            }
+        }
+    }
+
+    /// Send a WebSocket ping and wait for its pong, keeping what the card
+    /// sent before it for [`Peer::recv`]. The card reads one frame per pass
+    /// and writes its pong at its next write or read, so everything it did
+    /// for the frames before the ping is done when the pong comes.
+    fn pong(&mut self) {
+        let payload = uuid::Uuid::new_v4().simple().to_string().into_bytes();
+        self.ws
+            .send(Message::Ping(payload.clone().into()))
+            .expect("ping");
+        let deadline = Instant::now() + WAIT;
+        loop {
+            assert!(Instant::now() < deadline, "no pong");
+            match self.ws.read() {
+                Ok(Message::Text(t)) => self.pending.push_back((
+                    serde_json::from_str(t.as_str()).expect("json"),
+                    FrameType::Text,
+                )),
+                Ok(Message::Binary(b)) => self
+                    .pending
+                    .push_back((serde_json::from_slice(&b).expect("json"), FrameType::Binary)),
+                Ok(Message::Pong(p)) if p.as_ref() == payload.as_slice() => return,
+                Ok(Message::Close(_)) => panic!("the card closed"),
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => panic!("the link closed: {e}"),
             }
         }
     }
@@ -303,6 +348,7 @@ impl Mock {
                     .send(Peer {
                         ws,
                         kinds: Vec::new(),
+                        pending: std::collections::VecDeque::new(),
                     })
                     .is_err()
                 {
@@ -470,6 +516,11 @@ struct Card {
     raw: Vec<BusMsg>,
     /// Unpacked messages not yet returned by `step`.
     queued: std::collections::VecDeque<FlighthookMessage>,
+    /// The card's bus, for the test's markers.
+    tx: broadcast::Sender<BusMsg>,
+    /// Markers sent, and the last one the session answered.
+    markers: u64,
+    echoed: u64,
 }
 
 /// Removes a test's folder (or file) when dropped, so a failing
@@ -546,10 +597,17 @@ impl SessionActor {
         let mut receiver = sender.subscribe();
         let writer = Arc::clone(&state.writer);
         let system = Arc::clone(&state.state);
+        let tx = tx.clone();
         let thread = std::thread::spawn(move || {
             publish_session(&writer, &sender);
             loop {
                 match receiver.poll() {
+                    Ok(Some(BusMsg::Local { card, event })) if card == MARKER => {
+                        let _ = tx.send(BusMsg::Local {
+                            card: MARKER_ECHO.into(),
+                            event,
+                        });
+                    }
                     Ok(Some(msg)) => {
                         handle_session(&msg, &writer, &sender);
                         follow_game_golfers(&msg, &system, &writer, &sender);
@@ -633,6 +691,9 @@ impl Card {
             sent: Vec::new(),
             raw: Vec::new(),
             queued: std::collections::VecDeque::new(),
+            tx: tx.clone(),
+            markers: 0,
+            echoed: 0,
         }
     }
 
@@ -649,44 +710,57 @@ impl Card {
         if let Some(msg) = self.queued.pop_front() {
             return Some(msg);
         }
-        match self.rx.try_recv() {
-            Ok(msg) => {
-                self.raw.push(msg.clone());
-                // The card's `bus.actor` as the web layer shows it: its
-                // device telemetry keys (`ready`) on the card; an empty
-                // value removes the key.
-                if let Some(flightrelay::FrpMessage {
-                    from,
-                    body: FrpBody::BusActor(actor),
-                }) = msg.as_frp()
-                    && from == ACTOR
-                {
-                    for (k, v) in flighthook::bus_actor_rows(actor) {
-                        if v.is_empty() {
-                            self.view.telemetry.remove(&k);
-                        } else {
-                            self.view.telemetry.insert(k, v);
-                        }
-                    }
-                }
-                for m in unpack(&msg) {
-                    if let FlighthookEvent::ActorStatus { status, telemetry } = &m.event {
-                        self.view.apply_status(*status, telemetry, 0);
-                    }
-                    self.sent.push(m.clone());
-                    self.queued.push_back(m);
-                }
-                self.queued.pop_front().or_else(|| {
-                    Some(FlighthookMessage {
-                        actor: String::new(),
-                        event: FlighthookEvent::Other,
-                    })
+        if let Ok(msg) = self.rx.try_recv() {
+            self.record(msg);
+            self.queued.pop_front().or_else(|| {
+                Some(FlighthookMessage {
+                    actor: String::new(),
+                    event: FlighthookEvent::Other,
                 })
+            })
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+            None
+        }
+    }
+
+    /// Keep `msg` in the record (a marker's echo only counts), fold the
+    /// card's statuses into the view and queue it for `step`.
+    fn record(&mut self, msg: BusMsg) {
+        if let BusMsg::Local { card, event } = &msg
+            && (card == MARKER || card == MARKER_ECHO)
+        {
+            if let LocalEvent::FindMat { target } = event
+                && card == MARKER_ECHO
+            {
+                self.echoed = target.parse().expect("a marker number");
             }
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(5));
-                None
+            return;
+        }
+        self.raw.push(msg.clone());
+        // The card's `bus.actor` as the web layer shows it: its device
+        // telemetry keys (`ready`) on the card; an empty value removes the
+        // key.
+        if let Some(flightrelay::FrpMessage {
+            from,
+            body: FrpBody::BusActor(actor),
+        }) = msg.as_frp()
+            && from == ACTOR
+        {
+            for (k, v) in flighthook::bus_actor_rows(actor) {
+                if v.is_empty() {
+                    self.view.telemetry.remove(&k);
+                } else {
+                    self.view.telemetry.insert(k, v);
+                }
             }
+        }
+        for m in unpack(&msg) {
+            if let FlighthookEvent::ActorStatus { status, telemetry } = &m.event {
+                self.view.apply_status(*status, telemetry, 0);
+            }
+            self.sent.push(m.clone());
+            self.queued.push_back(m);
         }
     }
 
@@ -726,10 +800,50 @@ impl Card {
     }
 
     /// Take what the bus holds now.
-    fn settle(&mut self) {
-        let until = Instant::now() + Duration::from_millis(100);
-        while Instant::now() < until {
+    fn take_all(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.record(msg);
+        }
+        self.queued.clear();
+    }
+
+    /// Wait until the session has taken everything on the bus before now:
+    /// it answers a marker, and handles the bus in order.
+    fn session_caught_up(&mut self) {
+        self.markers += 1;
+        let _ = self.tx.send(BusMsg::Local {
+            card: MARKER.into(),
+            event: LocalEvent::FindMat {
+                target: self.markers.to_string(),
+            },
+        });
+        let deadline = Instant::now() + WAIT;
+        while self.echoed < self.markers {
+            assert!(Instant::now() < deadline, "the session never answered");
             self.step();
+        }
+    }
+
+    /// Wait until the card and the session have acted on everything the
+    /// test did before this call: Pureplay's frames, the test's bus messages
+    /// and what each of them said to the other. Not what a timer sends
+    /// later.
+    ///
+    /// Three pings in a row: the card reads one frame per pass, so the
+    /// third is read a whole pass after the one that drained the test's bus
+    /// messages. Then the session answers a marker. A round in which
+    /// nothing new reaches the bus ends it.
+    fn caught_up(&mut self, peer: &mut Peer) {
+        loop {
+            let before = self.raw.len();
+            for _ in 0..3 {
+                peer.pong();
+            }
+            self.session_caught_up();
+            self.take_all();
+            if self.raw.len() == before {
+                return;
+            }
         }
     }
 
@@ -738,7 +852,7 @@ impl Card {
         if let Some(t) = self.thread.take() {
             t.join().expect("the card's thread ends");
         }
-        self.settle();
+        self.take_all();
         self.session.stop();
     }
 
@@ -852,7 +966,7 @@ fn a_new_card_pairs_with_a_prompt_and_follows_the_round() {
         card.tokens().get(&Card::token_key(mock.addr)),
         Some(Token::new("PPA-NEW-TOKEN"))
     );
-    card.settle();
+    card.caught_up(&mut peer);
     // The snapshot's hand and club, together in one `golfer.select`.
     let from_snapshot: Vec<&FlighthookMessage> = card
         .sent
@@ -1166,14 +1280,14 @@ fn a_removal_in_pureplay_deletes_the_token_and_waits_for_reconnect() {
 fn club_and_hand_follow_the_active_local_player() {
     let mock = Mock::new();
     let (mut card, mut peer) = connected(&mock, new_state(), "PPA-CLUB");
-    card.settle();
+    card.caught_up(&mut peer);
     let before = card.sent.len();
     peer.event(
         "player.club_changed",
         2,
         &json!({ "playerId": 1, "current": "Iron7", "currentClubId": "b-7i", "reason": "auto" }),
     );
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(clubs(&card.sent[before..]), [], "the club flighthook holds");
 
     peer.event(
@@ -1204,7 +1318,7 @@ fn club_and_hand_follow_the_active_local_player() {
         &json!({ "playerId": 3, "current": "Wood3", "reason": "user_selected" }),
     );
     card.shows(ActorStatus::Connected, |t| !t.contains_key("name"));
-    card.settle();
+    card.caught_up(&mut peer);
     let given: Vec<&FlighthookEvent> = card.sent[before..]
         .iter()
         .map(|m| &m.event)
@@ -1304,8 +1418,8 @@ fn the_token_appears_only_in_the_token_file() {
     // While paired, only the token file had it.
     let mock = Mock::new();
     let state = new_state();
-    let (mut card, _peer) = connected(&mock, state.clone(), &token);
-    card.settle();
+    let (mut card, mut peer) = connected(&mock, state.clone(), &token);
+    card.caught_up(&mut peer);
     let (status, _) = web_bodies(&state, &card.raw);
     assert!(status.contains("\"club\":\"7I\""), "{status}");
     assert!(!status.contains(&token), "/api/status while connected");
@@ -1844,7 +1958,7 @@ fn answered_pings_keep_the_link() {
     }
     assert!(pings >= 2, "pinged while quiet: {pings}");
     assert!(mock.conns.try_recv().is_err(), "no reconnect");
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.view.status, ActorStatus::Connected);
     card.stop();
 }
@@ -2281,7 +2395,7 @@ fn an_echo_is_not_stored_and_gets_the_stroke() {
         "shots",
         "auto: last from flighthook",
     );
-    card.settle();
+    card.caught_up(&mut peer);
     assert!(card.triggers().is_empty(), "the echo is not taken");
 
     let shots = stored(&state, &card.raw);
@@ -2356,7 +2470,7 @@ fn a_pureplay_shot_is_stored_and_reaches_no_output() {
         let wrote = host.within(Duration::from_millis(400));
         assert!(wrote.iter().all(|v| !is_shot(v)), "{wrote:?}");
     }
-    card.settle();
+    card.caught_up(&mut peer);
     let shots = stored(&state, &card.raw);
     assert_eq!(shots.len(), 1, "{shots:?}");
     assert_eq!(shots[0].card_key(), ACTOR);
@@ -2477,7 +2591,7 @@ fn a_remote_players_shot_is_ignored() {
     // A local shot after it is taken, so the card read the two above.
     peer.event("shot.launched", 4, &launched("pp-l", 1));
     card.bus(|e| matches!(e, FlighthookEvent::ShotTrigger { .. }));
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.triggers().len(), 1);
     let strokes = card.strokes();
     assert_eq!(strokes.len(), 1, "{strokes:?}");
@@ -2514,7 +2628,7 @@ fn launchless_outcomes_store_nothing() {
             }
         )
     });
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.triggers().len(), 1);
     let strokes: Vec<_> = card
         .strokes()
@@ -2568,7 +2682,7 @@ fn the_echo_window_cases() {
     peer.event("shot.launched", 4, &launched("pp-3", 1));
     peer.event("shot.completed", 5, &completed("pp-2", 1, "Green"));
     card.bus(|e| stroke_for(e, &sent));
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.triggers().len(), 2, "pp-1 and pp-3");
 
     // Scramble shots the team did not pick: pp-3 discarded before its
@@ -2584,7 +2698,7 @@ fn the_echo_window_cases() {
     // A local shot after them, so the card read the discard of pp-1.
     peer.event("shot.launched", 10, &launched("pp-4", 1));
     card.bus(|e| matches!(e, FlighthookEvent::ShotTrigger { key } if key.shot_number == 3));
-    card.settle();
+    card.caught_up(&mut peer);
     let kinds: Vec<_> = card.strokes().iter().map(|(_, o)| o.outcome).collect();
     assert_eq!(
         kinds,
@@ -2656,7 +2770,7 @@ fn a_result_after_a_reconnect_to_the_same_pureplay_attaches() {
         unreachable!()
     };
     assert_eq!(key.shot_number, 3, "the count goes on across reconnects");
-    card.settle();
+    card.caught_up(&mut peer);
     let ids: Vec<_> = card.strokes().into_iter().map(|(id, _)| id).collect();
     assert_eq!(
         ids,
@@ -2685,7 +2799,7 @@ fn from_flighthook_never_takes_and_from_pureplay_never_matches() {
     peer.event("shot.launched", 3, &launched("pp-2", 1));
     peer.event("shot.completed", 4, &completed("pp-1", 1, "Green"));
     card.bus(|e| stroke_for(e, &sent));
-    card.settle();
+    card.caught_up(&mut peer);
     assert!(card.triggers().is_empty(), "nothing taken");
 
     set_shots(&state, PureplayShots::FromPureplay);
@@ -2754,7 +2868,7 @@ fn a_shot_two_outputs_sent_is_echoed_once() {
         "shot b's result on shot b"
     );
     assert_eq!(state.sent_shots.len(), 0);
-    card.settle();
+    card.caught_up(&mut peer);
     assert!(card.triggers().is_empty(), "both were echoes");
     card.stop();
 }
@@ -2765,8 +2879,8 @@ fn a_shot_two_outputs_sent_is_echoed_once() {
 fn the_shots_row_follows_the_setting_while_pureplay_is_quiet() {
     let mock = Mock::new();
     let state = new_state();
-    let (mut card, _peer) = connected(&mock, state.clone(), "PPA-QUIET");
-    card.settle();
+    let (mut card, mut peer) = connected(&mock, state.clone(), "PPA-QUIET");
+    card.caught_up(&mut peer);
     set_shots(&state, PureplayShots::FromPureplay);
     card.shows_row(ActorStatus::Connected, "shots", "from Pureplay");
     set_shots(&state, PureplayShots::FromFlighthook);
@@ -2794,7 +2908,7 @@ fn a_repeated_launch_is_not_taken_again() {
     peer.event("shot.launched", 4, &launched("pp-2", 1));
     peer.event("shot.completed", 5, &completed("pp-2", 1, "Green"));
     card.bus(|e| stroke_for(e, &sent));
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.triggers().len(), 1, "pp-1 once; pp-2 the echo");
     card.stop();
 }

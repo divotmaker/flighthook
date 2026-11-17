@@ -129,7 +129,7 @@ fn a_round_with_two_local_players_switches_the_golfer_with_no_club_flip() {
     let ann = card.turn_until(|t| golfer(t) == Some("pureplay.Ann"));
     assert_eq!(ann.club, Some(Club::Driver));
     assert_eq!(ann.handedness, Some(Handedness::Left));
-    card.settle();
+    card.caught_up(&mut peer);
     let after: Vec<_> = card.turns()[before..].to_vec();
     assert_eq!(after, [ann], "one turn change");
     card.stop();
@@ -209,7 +209,7 @@ fn a_simulator_cards_turn_is_not_reasserted() {
     send_select(&tx, "openconnect_client.0", gspro);
     card.turn_until(|t| t.club == Some(Club::Iron8));
     let before = card.turns().len();
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.turns().len(), before, "no answer to a simulator card");
     peer.event(
         "player.club_changed",
@@ -293,7 +293,7 @@ fn the_card_publishes_profiles_the_round_the_ball_and_the_scores() {
         ("pureplay.Joe", 7, 1)
     );
     assert_eq!(ball.allowed_commands, None, "never game.aim");
-    card.settle();
+    card.caught_up(&mut peer);
     let profiles: Vec<_> = card
         .own_bodies()
         .into_iter()
@@ -418,7 +418,7 @@ fn a_linked_profiles_shots_land_under_the_golfer() {
     card.bus_from(ACTOR, |e| matches!(e, FlighthookEvent::ShotFinished { .. }));
     peer.event("shot.completed", 3, &completed("pp-1", 1, "InPlay"));
     card.bus_from(ACTOR, |e| matches!(e, FlighthookEvent::Stroke { .. }));
-    card.settle();
+    card.caught_up(&mut peer);
     let shots = stored(&state, &card.raw);
     assert_eq!(shots.len(), 1);
     let turn = shots[0].turn.as_ref().expect("turn");
@@ -475,9 +475,9 @@ impl Card {
 /// nothing more.
 #[test]
 fn a_reconnect_with_an_unchanged_round_sends_no_select() {
-    let (mut card, peer, _tx, mock) = rig_linked();
+    let (mut card, mut peer, _tx, mock) = rig_linked();
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     let before = card.selects();
     assert_eq!(before, 1, "one select for the snapshot");
     drop(peer);
@@ -488,8 +488,7 @@ fn a_reconnect_with_an_unchanged_round_sends_no_select() {
     peer.paired("PPA-SHOTS");
     peer.subscribe(&round(), 1);
     card.shows_row(ActorStatus::Connected, "club", "7I");
-    card.settle();
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.selects(), before, "the turn already matches");
     card.stop();
 }
@@ -497,9 +496,9 @@ fn a_reconnect_with_an_unchanged_round_sends_no_select() {
 /// A restarted card finds the session's turn already matching Pureplay's.
 #[test]
 fn a_card_restart_with_a_matching_turn_sends_no_select() {
-    let (mut card, peer, tx, mock) = rig_linked();
+    let (mut card, mut peer, tx, mock) = rig_linked();
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     let before = card.selects();
     drop(peer);
     card.restart_on(&mock, &tx);
@@ -509,8 +508,7 @@ fn a_card_restart_with_a_matching_turn_sends_no_select() {
     peer.paired("PPA-SHOTS");
     peer.subscribe(&round(), 1);
     card.shows_row(ActorStatus::Connected, "club", "7I");
-    card.settle();
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.selects(), before, "the turn already matches");
     card.stop();
 }
@@ -519,9 +517,9 @@ fn a_card_restart_with_a_matching_turn_sends_no_select() {
 /// reconnect, and no more.
 #[test]
 fn a_reconnect_after_the_turn_went_back_sends_one_select() {
-    let (mut card, peer, _tx, mock) = rig();
+    let (mut card, mut peer, _tx, mock) = rig();
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     let before = card.selects();
     drop(peer);
     card.shows(ActorStatus::Reconnecting, |_| true);
@@ -531,8 +529,7 @@ fn a_reconnect_after_the_turn_went_back_sends_one_select() {
     peer.paired("PPA-SHOTS");
     peer.subscribe(&round(), 1);
     card.shows_row(ActorStatus::Connected, "club", "7I");
-    card.settle();
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.selects(), before + 1, "one, not a stream");
     card.stop();
 }
@@ -556,7 +553,7 @@ impl Card {
 fn a_gimme_then_the_next_tee_changes_the_turn_once() {
     let (mut card, mut peer, _tx, _mock) = rig();
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     let before = card.turns().len();
     peer.event(
         "shot.completed",
@@ -583,7 +580,7 @@ fn a_gimme_then_the_next_tee_changes_the_turn_once() {
                  "clubId": "b-dr", "distanceToHoleM": 375.0 }),
     );
     card.turn_until(|t| t.club == Some(Club::Driver) && t.mode == Some(Mode::Full));
-    card.settle();
+    card.caught_up(&mut peer);
     let turns: Vec<_> = card.turns()[before..]
         .iter()
         .map(|t| (t.club, t.mode))
@@ -618,7 +615,7 @@ fn the_ball_carries_only_the_lie_of_its_own_shot() {
                  "clubId": "b-7i", "distanceToHoleM": 137.0 }),
     );
     card.frp_until(|m| m.from == ACTOR && matches!(&m.body, FrpBody::GameBall(b) if b.hole == 8));
-    card.settle();
+    card.caught_up(&mut peer);
     let tee = card
         .balls()
         .into_iter()
@@ -640,7 +637,7 @@ fn the_ball_carries_only_the_lie_of_its_own_shot() {
     card.frp_until(|m| {
         m.from == ACTOR && matches!(&m.body, FrpBody::GameBall(b) if lie(b).is_some())
     });
-    card.settle();
+    card.caught_up(&mut peer);
     let with = card
         .balls()
         .into_iter()
@@ -674,7 +671,7 @@ fn a_mulligan_stroke_names_the_stroke_it_replaces() {
     );
     peer.event("shot.launched", 5, &launched("shot-51", 1));
     peer.event("shot.completed", 6, &completed("shot-51", 1, "Green"));
-    card.settle();
+    card.caught_up(&mut peer);
     let strokes = card.strokes();
     let named: Vec<_> = strokes
         .iter()
@@ -692,8 +689,8 @@ fn a_mulligan_stroke_names_the_stroke_it_replaces() {
 /// its namespace.
 #[test]
 fn the_bus_actor_comes_before_the_first_profile() {
-    let (mut card, _peer, _tx, _mock) = rig();
-    card.settle();
+    let (mut card, mut peer, _tx, _mock) = rig();
+    card.caught_up(&mut peer);
     let kinds: Vec<_> = card
         .own_bodies()
         .into_iter()
@@ -723,7 +720,7 @@ fn a_discard_is_remembered_for_a_shot_the_card_never_mapped() {
     // A later shot's stroke proves the card read all of it.
     peer.event("shot.launched", 5, &launched("pp-10", 1));
     peer.event("shot.completed", 6, &completed("pp-10", 1, "InPlay"));
-    card.settle();
+    card.caught_up(&mut peer);
     let ids: Vec<_> = card
         .strokes()
         .into_iter()
@@ -746,7 +743,7 @@ fn a_stroke_joins_its_shot_only_from_the_actor_holding_game() {
     card.bus_from(ACTOR, |e| matches!(e, FlighthookEvent::ShotFinished { .. }));
     peer.event("shot.completed", 3, &completed("pp-1", 1, "InPlay"));
     card.bus_from(ACTOR, |e| matches!(e, FlighthookEvent::Stroke { .. }));
-    card.settle();
+    card.caught_up(&mut peer);
     let shots = stored(&state, &card.raw);
     assert_eq!(shots.len(), 1);
     assert!(shots[0].stroke.is_some(), "from the game");
@@ -816,7 +813,7 @@ fn the_end_of_the_round_returns_the_turn_to_the_start_golfer() {
                  "club": "Iron7", "distanceToHoleM": 20.0 }),
     );
     card.turn_until(|t| t.mode == Some(Mode::Chipping));
-    card.settle();
+    card.caught_up(&mut peer);
     let before = card.turns().len();
     peer.event(
         "match.ended",
@@ -824,7 +821,7 @@ fn the_end_of_the_round_returns_the_turn_to_the_start_golfer() {
         &json!({ "matchId": "m-1", "reason": "completed", "standings": [] }),
     );
     card.turn_after(before);
-    card.settle();
+    card.caught_up(&mut peer);
     let after = card.turns()[before..].to_vec();
     assert_eq!(after.len(), 1, "one turn change, which stays");
     assert_eq!(golfer(&after[0]), None);
@@ -840,16 +837,20 @@ fn a_closed_connection_returns_the_turn_to_the_start_golfer() {
     let state = new_state();
     with_eric(&state);
     let (tx, _) = broadcast::channel(4096);
-    let (mut card, peer) = connected_on(&mock, state, &tx);
+    let (mut card, mut peer) = connected_on(&mock, state, &tx);
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     let before = card.turns().len();
     drop(peer);
     let back = card.turn_after(before);
     assert_eq!(golfer(&back), Some("flighthook.eric"));
     assert_eq!(back.handedness, Some(Handedness::Left));
     assert_eq!(back.mode, Some(Mode::Full));
-    card.settle();
+    // The card shows Reconnecting once it has let go of the round; then it
+    // only drains the bus until it connects again.
+    card.shows(ActorStatus::Reconnecting, |_| true);
+    card.session_caught_up();
+    card.take_all();
     assert_eq!(
         card.turns().len(),
         before + 1,
@@ -909,7 +910,7 @@ fn first_match_with_a_shot(card: &mut Card, peer: &mut Peer) {
     card.frp_until(|m| {
         m.from == ACTOR && matches!(&m.body, FrpBody::Removed(r) if r.kind == StateKind::GameRound)
     });
-    card.settle();
+    card.caught_up(peer);
 }
 
 /// The events of a second match with Joe up, as Pureplay sends them (no
@@ -957,7 +958,7 @@ fn a_second_match_announced_by_events_is_taken_once_the_state_answers() {
     card.turn_until(is_joe);
     peer.event("shot.launched", 10, &launched("pp-2", 1));
     card.bus_from(ACTOR, |e| matches!(e, FlighthookEvent::ShotFinished { .. }));
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.triggers().len(), triggers + 1, "the shot is taken");
     assert_eq!(card.selects(), selects + 1, "one select for the new match");
     card.stop();
@@ -974,8 +975,7 @@ fn a_second_match_with_no_state_answer_stays_quiet() {
     let _ = peer.state_get();
     peer.event("shot.launched", 9, &launched("pp-2", 1));
     peer.event("shot.completed", 10, &completed("pp-2", 1, "InPlay"));
-    card.settle();
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.triggers().len(), triggers, "no shot is taken");
     assert_eq!(card.selects(), selects, "no select is sent");
     assert_eq!(card.turns().len(), turns, "the turn stays");
@@ -1006,7 +1006,7 @@ fn answer_and_take_the_shot(card: &mut Card, peer: &mut Peer, get: &Value, seq: 
     card.turn_until(is_joe);
     peer.event("shot.launched", seq + 1, &launched("pp-2", 1));
     card.bus_from(ACTOR, |e| matches!(e, FlighthookEvent::ShotFinished { .. }));
-    card.settle();
+    card.caught_up(peer);
     assert_eq!(card.triggers().len(), triggers + 1, "the shot is taken");
 }
 
@@ -1129,9 +1129,9 @@ fn an_event_naming_an_unknown_player_asks_for_the_state() {
 /// connection ends: Sam's own id, right-handed, not Eric.
 #[test]
 fn a_closed_connection_returns_a_linked_golfer_to_that_golfer() {
-    let (mut card, peer, _tx, _mock) = rig_linked();
+    let (mut card, mut peer, _tx, _mock) = rig_linked();
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     let before = card.turns().len();
     drop(peer);
     let back = card.turn_after(before);
@@ -1160,8 +1160,7 @@ fn a_shot_completed_after_the_round_ended_sends_no_stroke() {
     first_match_with_a_shot(&mut card, &mut peer);
     let from = card.raw.len();
     peer.event("shot.completed", 5, &completed("pp-late", 1, "InPlay"));
-    card.settle();
-    card.settle();
+    card.caught_up(&mut peer);
     let own = published_since(&card, from);
     assert!(
         own.iter().all(|b| !matches!(
@@ -1179,7 +1178,7 @@ fn a_shot_completed_after_the_round_ended_sends_no_stroke() {
 fn a_late_club_set_reply_for_a_player_who_left_publishes_no_golfer() {
     let (mut card, mut peer, tx, _mock) = rig();
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     send_select(&tx, &card.state.flighthook_id(), {
         let mut pick = flightrelay::GolferSelect::new("ui-1");
         pick.club = Some(Some(Club::Iron8));
@@ -1197,7 +1196,7 @@ fn a_late_club_set_reply_for_a_player_who_left_publishes_no_golfer() {
             && matches!(&m.body, FrpBody::Removed(r)
                 if r.kind == StateKind::GolferProfile && r.id.as_deref() == Some("pureplay.Joe"))
     });
-    card.settle();
+    card.caught_up(&mut peer);
     let from = card.raw.len();
     peer.send(&json!({ "type": "response", "id": cmd["id"], "ok": true,
                        "data": { "playerId": 1, "club": "Iron8", "clubId": "b-8i" } }));
@@ -1208,8 +1207,7 @@ fn a_late_club_set_reply_for_a_player_who_left_publishes_no_golfer() {
         3,
         &json!({ "matchId": "m-1", "holeNumber": 8, "par": 4, "playerIds": [2, 3] }),
     );
-    card.settle();
-    card.settle();
+    card.caught_up(&mut peer);
     let own = published_since(&card, from);
     assert!(
         own.iter().all(|b| !matches!(b, FrpBody::GolferProfile(_))),
@@ -1224,7 +1222,7 @@ fn a_late_club_set_reply_for_a_player_who_left_publishes_no_golfer() {
 fn a_late_club_set_reply_after_the_round_ended_publishes_no_golfer() {
     let (mut card, mut peer, tx, _mock) = rig();
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     send_select(&tx, &card.state.flighthook_id(), {
         let mut pick = flightrelay::GolferSelect::new("ui-1");
         pick.club = Some(Some(Club::Iron8));
@@ -1244,7 +1242,7 @@ fn a_late_club_set_reply_after_the_round_ended_publishes_no_golfer() {
     card.frp_until(|m| {
         m.from == ACTOR && matches!(&m.body, FrpBody::Removed(r) if r.kind == StateKind::GameRound)
     });
-    card.settle();
+    card.caught_up(&mut peer);
     let from = card.raw.len();
     peer.send(&json!({ "type": "response", "id": cmd["id"], "ok": true,
                        "data": { "playerId": 1, "club": "Iron8", "clubId": "b-8i" } }));
@@ -1253,8 +1251,7 @@ fn a_late_club_set_reply_after_the_round_ended_publishes_no_golfer() {
         3,
         &json!({ "matchId": "m-1", "holeNumber": 8, "par": 4, "playerIds": [] }),
     );
-    card.settle();
-    card.settle();
+    card.caught_up(&mut peer);
     let own = published_since(&card, from);
     assert!(
         own.iter().all(|b| !matches!(b, FrpBody::GolferProfile(_))),
@@ -1291,7 +1288,7 @@ fn a_hand_change_with_null_club_fields_keeps_the_club_and_the_mode() {
     let turn = card.turn_until(|t| t.handedness == Some(Handedness::Left));
     assert_eq!(turn.club, Some(Club::SandWedge));
     assert_eq!(turn.mode, Some(Mode::Chipping));
-    card.settle();
+    card.caught_up(&mut peer);
     let joe = card
         .own_bodies()
         .into_iter()
@@ -1329,8 +1326,7 @@ fn the_results_screen_puts_no_game_golfer_back_on_the_turn() {
         &json!({ "type": "event", "event": "state.snapshot", "seq": 6,
                        "requestId": get["id"], "data": results }),
     );
-    card.settle();
-    card.settle();
+    card.caught_up(&mut peer);
     let own = published_since(&card, from);
     assert!(
         own.iter().all(|b| !matches!(b, FrpBody::GolferProfile(_))),
@@ -1353,9 +1349,9 @@ fn the_results_screen_puts_no_game_golfer_back_on_the_turn() {
 /// game's player.
 #[test]
 fn a_reconnect_into_the_results_screen_leaves_the_turn_alone() {
-    let (mut card, peer, _tx, mock) = rig();
+    let (mut card, mut peer, _tx, mock) = rig();
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     let selects = card.selects();
     drop(peer);
     card.shows(ActorStatus::Reconnecting, |_| true);
@@ -1368,8 +1364,7 @@ fn a_reconnect_into_the_results_screen_leaves_the_turn_alone() {
     results["session"]["matchActive"] = json!(false);
     peer.subscribe(&results, 1);
     card.shows(ActorStatus::Connected, |_| true);
-    card.settle();
-    card.settle();
+    card.caught_up(&mut peer);
     assert_eq!(card.selects(), selects, "no select");
     assert!(
         card.turns()[turns..]
@@ -1388,7 +1383,7 @@ fn a_reconnect_into_the_results_screen_leaves_the_turn_alone() {
 fn a_player_the_snapshot_did_not_bring_is_asked_for_once() {
     let (mut card, mut peer, _tx, _mock) = rig();
     card.turn_until(is_joe);
-    card.settle();
+    card.caught_up(&mut peer);
     let names_nine = |peer: &mut Peer, seq: u64| {
         peer.event(
             "player.club_changed",

@@ -74,35 +74,14 @@ impl Peer {
     }
 
     /// The commands the card sends before it answers a WebSocket ping sent
-    /// now. The card takes the bus and Pureplay's frames in order and its
-    /// pong goes out after what it wrote before, so a command for anything
-    /// the test did before this call comes first.
+    /// now ([`Peer::pong`]), taken; other frames stay for [`Peer::recv`].
     fn commands_before_pong(&mut self) -> Vec<Value> {
-        let payload = uuid::Uuid::new_v4().simple().to_string().into_bytes();
-        self.ws
-            .send(Message::Ping(payload.clone().into()))
-            .expect("ping");
-        let deadline = Instant::now() + WAIT;
-        let mut out = Vec::new();
-        loop {
-            assert!(Instant::now() < deadline, "no pong");
-            match self.ws.read() {
-                Ok(Message::Text(t)) => {
-                    let v: Value = serde_json::from_str(t.as_str()).expect("json");
-                    if v["type"] == "command" {
-                        out.push(v);
-                    }
-                }
-                Ok(Message::Pong(p)) if p.as_ref() == payload.as_slice() => return out,
-                Ok(_) => {}
-                Err(tungstenite::Error::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(e) => panic!("the link closed: {e}"),
-            }
-        }
+        self.pong();
+        let (commands, rest) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|(v, _)| v["type"] == "command");
+        self.pending = rest;
+        commands.into_iter().map(|(v, _)| v).collect()
     }
 }
 
@@ -164,7 +143,7 @@ impl Rig {
         peer.paired_with(TOKEN, scopes);
         peer.subscribe(round, 1);
         card.shows(ActorStatus::Connected, |t| t.contains_key("club_out"));
-        card.settle();
+        card.caught_up(&mut peer);
         Self {
             mock,
             card,
@@ -225,7 +204,7 @@ impl Rig {
 
     /// The clubs the card put on the bus from message `from` on.
     fn clubs_since(&mut self, from: usize) -> Vec<Club> {
-        self.card.settle();
+        self.card.caught_up(&mut self.peer);
         let own: Vec<FlighthookMessage> = self.card.sent[from..]
             .iter()
             .filter(|m| m.actor == ACTOR)
@@ -247,7 +226,7 @@ impl Rig {
             assert!(Instant::now() < deadline, "the session never held {club:?}");
             self.card.step();
         }
-        self.card.settle();
+        self.card.caught_up(&mut self.peer);
     }
 }
 
@@ -533,7 +512,7 @@ fn one_command_in_flight_and_the_latest_pick_wins() {
     rig.pick(Club::Iron8);
     let cmd = rig.peer.command();
     rig.pick(Club::Driver);
-    rig.card.settle();
+    rig.card.caught_up(&mut rig.peer);
     rig.pick(Club::Iron7);
     rig.no_command("one in flight");
     rig.ok(&cmd, "Iron8", "b-8i");
@@ -584,7 +563,7 @@ fn a_pick_waits_for_a_readiness_naming_the_player() {
         &json!({ "shotId": null, "playerId": null, "ready": false, "controllable": true,
                        "allowedCommands": ["club.set"], "blockers": [] }),
     );
-    rig.card.settle();
+    rig.card.caught_up(&mut rig.peer);
     rig.pick(Club::Iron8);
     rig.no_command("no player named");
     rig.ready(&readiness("shot-2", true, &["aim.set", "club.set"], &[]));
@@ -601,7 +580,7 @@ fn a_pick_waits_for_a_readiness_naming_the_player() {
 fn a_pick_pureplay_does_not_take_here_is_dropped_at_once() {
     let mut rig = Rig::new();
     rig.ready(&readiness("shot-2", true, &["aim.set"], &[]));
-    rig.card.settle();
+    rig.card.caught_up(&mut rig.peer);
     rig.pick(Club::Iron8);
     rig.snaps_back_to(Club::Iron7);
     rig.no_command("club.set not allowed");
@@ -697,7 +676,7 @@ fn a_pick_of_the_held_type_waits_and_wins_over_a_suggestion() {
     let mut rig = Rig::in_the_air();
     let from = rig.card.sent.len();
     rig.pick(Club::Iron8);
-    rig.card.settle();
+    rig.card.caught_up(&mut rig.peer);
     rig.pick(Club::Iron7);
     rig.no_command("the ball is in the air");
     rig.auto("Driver", "b-dr");
@@ -856,7 +835,7 @@ fn a_snapshot_after_a_gap_keeps_or_drops_the_pending_pick() {
                            "requestId": get["id"], "data": snap }),
         );
         if same {
-            rig.card.settle();
+            rig.card.caught_up(&mut rig.peer);
             assert_eq!(rig.clubs_since(from), [], "Joe's driver stays off the bus");
             rig.ready(&readiness("shot-2", true, &["club.set"], &[]));
             assert_eq!(rig.peer.command()["data"]["clubId"], "b-8i");
