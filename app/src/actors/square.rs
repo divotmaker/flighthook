@@ -28,7 +28,7 @@ pub struct SquareHooks;
 
 impl Hooks<Omni> for SquareHooks {
     type Section = SquareSection;
-    const SOURCE: ShotSource = ShotSource::Square;
+    const SOURCE: Option<ShotSource> = Some(ShotSource::Square);
 }
 
 /// The Square Golf actor (`square.N`).
@@ -405,7 +405,7 @@ mod tests {
 
     impl Hooks<ScriptedOmni> for SquareHooks {
         type Section = SquareSection;
-        const SOURCE: ShotSource = ShotSource::Square;
+        const SOURCE: Option<ShotSource> = Some(ShotSource::Square);
     }
 
     /// A running Square card (`square.0`) on a scripted device, and the bus.

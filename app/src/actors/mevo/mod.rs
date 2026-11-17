@@ -41,7 +41,7 @@ pub struct MevoHooks;
 
 impl Hooks<Mevo> for MevoHooks {
     type Section = MevoSection;
-    const SOURCE: ShotSource = ShotSource::Mevo;
+    const SOURCE: Option<ShotSource> = Some(ShotSource::Mevo);
 
     fn before_finished(
         &mut self,
@@ -253,7 +253,7 @@ mod tests {
 
     impl Hooks<ReplayMevo> for MevoHooks {
         type Section = MevoSection;
-        const SOURCE: ShotSource = ShotSource::Mevo;
+        const SOURCE: Option<ShotSource> = Some(ShotSource::Mevo);
 
         fn before_finished(
             &mut self,

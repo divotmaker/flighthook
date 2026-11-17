@@ -31,7 +31,7 @@ pub struct TrackballHooks;
 
 impl Hooks<Thumbswing> for TrackballHooks {
     type Section = TrackballSection;
-    const SOURCE: ShotSource = ShotSource::Trackball;
+    const SOURCE: Option<ShotSource> = Some(ShotSource::Trackball);
 }
 
 /// The Trackball actor (`trackball.N`).
@@ -323,7 +323,7 @@ mod tests {
 
     impl Hooks<ScriptedTrackball> for TrackballHooks {
         type Section = TrackballSection;
-        const SOURCE: ShotSource = ShotSource::Trackball;
+        const SOURCE: Option<ShotSource> = Some(ShotSource::Trackball);
     }
 
     /// A new card's section reaching the test's inputs by `device`.

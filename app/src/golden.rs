@@ -403,7 +403,7 @@ impl FrpSession for GoldenR10Session {
 
 impl Hooks<GoldenR10> for R10Hooks {
     type Section = R10Section;
-    const SOURCE: ShotSource = ShotSource::R10;
+    const SOURCE: Option<ShotSource> = Some(ShotSource::R10);
 }
 
 // ===========================================================================
@@ -570,7 +570,7 @@ impl FrpSession for GoldenOmniSession {
 
 impl Hooks<GoldenOmni> for SquareHooks {
     type Section = SquareSection;
-    const SOURCE: ShotSource = ShotSource::Square;
+    const SOURCE: Option<ShotSource> = Some(ShotSource::Square);
 }
 
 fn omni_ack(state: allsquare::DeviceState) -> Vec<u8> {

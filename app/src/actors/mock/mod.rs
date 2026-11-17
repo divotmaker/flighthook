@@ -18,7 +18,7 @@ pub struct MockHooks;
 
 impl Hooks<MockDriver> for MockHooks {
     type Section = flighthook::MockMonitorSection;
-    const SOURCE: ShotSource = ShotSource::MockMonitor;
+    const SOURCE: Option<ShotSource> = Some(ShotSource::MockMonitor);
 }
 
 /// The mock launch monitor actor (`mock_monitor.N`).

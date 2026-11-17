@@ -23,7 +23,7 @@ use flighthook::ExPuttSection;
 use flightrelay::FrpBody;
 use threeputt::driver::{Action, ExPutt};
 
-use crate::actors::driver::{DriverActor, HookCtx, Hooks};
+use crate::actors::driver::{DriverActor, HookCtx, Hooks, Pass};
 use crate::actors::provenance::ShotSource;
 use crate::bus::{BusMsg, LocalEvent};
 
@@ -38,10 +38,11 @@ pub struct ExPuttHooks;
 
 impl Hooks<ExPutt> for ExPuttHooks {
     type Section = ExPuttSection;
-    const SOURCE: ShotSource = ShotSource::ExPutt;
+    const SOURCE: Option<ShotSource> = Some(ShotSource::ExPutt);
 
-    fn on_frp(&mut self, body: &mut FrpBody, _ctx: &mut HookCtx<'_, ExPuttSection>) {
+    fn on_frp(&mut self, body: &mut FrpBody, _ctx: &mut HookCtx<'_, ExPuttSection>) -> Pass {
         card_words(body);
+        Pass::Send
     }
 
     fn action(msg: &BusMsg, card: &str) -> Option<Action> {
@@ -240,10 +241,11 @@ mod tests {
 
     impl Hooks<ScriptedExPutt> for ExPuttHooks {
         type Section = ExPuttSection;
-        const SOURCE: ShotSource = ShotSource::ExPutt;
+        const SOURCE: Option<ShotSource> = Some(ShotSource::ExPutt);
 
-        fn on_frp(&mut self, body: &mut FrpBody, _ctx: &mut HookCtx<'_, ExPuttSection>) {
+        fn on_frp(&mut self, body: &mut FrpBody, _ctx: &mut HookCtx<'_, ExPuttSection>) -> Pass {
             card_words(body);
+            Pass::Send
         }
 
         fn action(msg: &BusMsg, card: &str) -> Option<Action> {

@@ -20,7 +20,7 @@ pub struct R10Hooks;
 
 impl Hooks<R10> for R10Hooks {
     type Section = R10Section;
-    const SOURCE: ShotSource = ShotSource::R10;
+    const SOURCE: Option<ShotSource> = Some(ShotSource::R10);
 }
 
 /// The R10 actor (`r10.N`).
@@ -257,7 +257,7 @@ mod tests {
 
     impl Hooks<ScriptedR10> for R10Hooks {
         type Section = R10Section;
-        const SOURCE: ShotSource = ShotSource::R10;
+        const SOURCE: Option<ShotSource> = Some(ShotSource::R10);
     }
 
     /// A running R10 card (`r10.0`) on a scripted device, and the bus.

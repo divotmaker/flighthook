@@ -975,8 +975,10 @@ async fn store_bus_event(state: &WebState, msg: &BusMsg, accumulators: &mut Pend
         },
         BusMsg::Frp { msg: frp, .. } if !accumulators.owners.admits(frp, now) => {}
         BusMsg::Frp { msg: frp, peer, .. } => match &frp.body {
+            // A hosted card's `bus.actor` carries its device.
             FrpBody::BusActor(actor)
-                if actor.has_role(flightrelay::types::roles::LAUNCH_MONITOR) =>
+                if actor.has_role(flightrelay::types::roles::LAUNCH_MONITOR)
+                    || actor.device.is_some() =>
             {
                 accumulators.data.feed(frp);
                 apply_device(state, &frp.from, actor).await;
@@ -1251,8 +1253,9 @@ async fn finish_shot(
     ui_socket::send_shot(state, data);
 }
 
-/// Keep the web state current from a launch monitor's `bus.actor`: its
-/// rows (`ready`, battery, the actor's own telemetry) on its card.
+/// Keep the web state current from a launch monitor's or a hosted card's
+/// `bus.actor`: its rows (`ready`, battery, the actor's own telemetry) on
+/// its card.
 async fn apply_device(state: &WebState, from: &str, actor: &flightrelay::BusActor) {
     let card = stored::card_of(&state.root, from);
     let rows = flighthook::bus_actor_rows(actor);

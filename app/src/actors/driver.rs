@@ -1,8 +1,9 @@
-//! [`DriverActor`]: a launch monitor card that runs on a flightrelay device
-//! driver ([`FrpDriver`]) as an FRP launch monitor actor.
+//! [`DriverActor`]: a card that runs on a flightrelay driver
+//! ([`FrpDriver`]) as an FRP actor with the driver's roles: a launch
+//! monitor device, or a software driver (a game, a simulator output).
 //!
-//! The driver owns the device: connect, session, shots, status, raw frames.
-//! The actor is the host around it, one thread per card:
+//! The driver owns the device or program: connect, session, shots, status,
+//! raw frames. The actor is the host around it, one thread per card:
 //!
 //! - **The run loop.** It builds the driver from the card's section
 //!   ([`FrpDriver::new`]; a refused config shows on the card and the
@@ -19,15 +20,22 @@
 //!   connect through [`ConnectHost::hints`]. The card's [`Hooks::action`]
 //!   matches become session actions (one asked while no session runs is
 //!   dropped when the next connect starts; one asked during a connect
-//!   reaches the session it opens).
-//! - **The bus out** ([`Sink`]): every shot message and alert goes on the
-//!   bus under the card's actor id as soon as the driver gives it. The
-//!   device's status and identity make the card's `bus.actor` (role
-//!   `launch_monitor`, `device.source` from the card's shot source),
-//!   published when it changes; while no session is up it is blocked by
-//!   `not_armed` and carries no battery, attitude or telemetry. Raw frames
-//!   go to the shot's capture, which goes out as the local `ShotCapture`
-//!   just before the shot's `shot.finished`, never as FRP.
+//!   reaches the session it opens). Every message goes through the card's
+//!   [`Hooks::route`], which picks what the session sees; before each step
+//!   the session gets that ([`FrpSession::bus`], in order), then the hints
+//!   and actions. A new session sees what [`Hooks::session_started`] gives
+//!   it first.
+//! - **The bus out** ([`Sink`]): every message of a kind the driver's roles
+//!   send goes on the bus under the card's actor id as soon as the driver
+//!   gives it, through [`Hooks::on_frp`]. The device's status and identity
+//!   make the card's `bus.actor` (the driver's roles and namespaces,
+//!   `device.source` from the card's shot source, if it is one), published
+//!   when it changes; while no session is up it carries no battery,
+//!   attitude or telemetry, and a launch monitor's is blocked by
+//!   `not_armed`. Telemetry the driver sends during a connect shows on the
+//!   card as rows. Raw frames go to the shot's capture, which goes out as
+//!   the local `ShotCapture` just before the shot's `shot.finished`, never
+//!   as FRP.
 //! - **Live config** ([`DriverActor::reconfigure`]): host fields and the
 //!   driver fields the driver applies live take effect without a restart,
 //!   at the loop's next pass whatever it is doing (in a session, before a
@@ -36,9 +44,11 @@
 //!   `not_armed`), never stuck Connected; Reconnect starts it again.
 //!
 //! What a card adds to its driver is its [`Hooks`]: its config section, its
-//! shot source and any host-side processing of the device's messages.
+//! shot source, host-side processing of the driver's messages and
+//! flighthook's policy for what its session sees.
 
-use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -48,10 +58,10 @@ use flightrelay::driver::{
     Activity, Backoff, ConnectCtx, ConnectHost, DeviceEvent, DeviceIdentity, DeviceStatus,
     DriverInfo, Events, FrpDriver, FrpSession, HostFlags, IDLE, Level, SessionEnd, Stop, TurnHints,
 };
-use flightrelay::types::roles;
+use flightrelay::types::{blockers, roles};
 use flightrelay::{
-    BusActor, DEFAULT_HEARTBEAT, DeviceInfo, FrpBody, RawFrame, Removal, ShotFinished, ShotTrigger,
-    StateKind,
+    BusActor, DEFAULT_HEARTBEAT, DeviceInfo, FrpBody, FrpMessage, RawFrame, Removal, ShotFinished,
+    ShotTrigger, StateKind,
 };
 use tracing::{debug, error, info, warn};
 
@@ -81,20 +91,25 @@ const SESSION_PHASE: &str = "measuring";
 // Hooks
 // ---------------------------------------------------------------------------
 
-/// What a card adds to its device driver `D`.
+/// What a card adds to its driver `D`.
 pub trait Hooks<D: FrpDriver>: Default + Send + 'static {
     /// The card's config section: host fields with `D`'s config flattened
     /// next to them.
     type Section: DeviceSection<Driver = D::Config>;
 
-    /// The shot source the card is. Its class must be the source `D`
+    /// The shot source the card is, `None` for a card that is no shot
+    /// source (an output). A source's class must be the source `D`
     /// declares ([`DriverInfo::source`]).
-    const SOURCE: ShotSource;
+    const SOURCE: Option<ShotSource>;
 
-    /// Host-side processing of one of the device's messages (a `shot.*`
-    /// message or a `bus.alert`) before it goes on the bus. A hook keeps the
-    /// message's kind. Raw frames do not reach it. Default: none.
-    fn on_frp(&mut self, _body: &mut FrpBody, _ctx: &mut HookCtx<'_, Self::Section>) {}
+    /// Host-side processing of one of the driver's messages before it goes
+    /// on the bus: a shot message, a raw frame (before it reaches the shot's
+    /// capture), or another kind the driver's roles send. A hook keeps the
+    /// message's kind. [`Pass::Drop`] on a `shot.trigger` drops the whole
+    /// shot; on anything else, that message. Default: send it as it is.
+    fn on_frp(&mut self, _body: &mut FrpBody, _ctx: &mut HookCtx<'_, Self::Section>) -> Pass {
+        Pass::Send
+    }
 
     /// Messages the card adds to `shot`, its own, just before the shot's
     /// `shot.finished` goes on the bus (e.g. the Mevo card's launch-only
@@ -112,14 +127,103 @@ pub trait Hooks<D: FrpDriver>: Default + Send + 'static {
     fn action(_msg: &BusMsg, _card: &str) -> Option<D::Action> {
         None
     }
+
+    /// flighthook's policy for one bus message: what of it the session
+    /// sees goes into [`HookCtx::to_session`]. Runs on every message the
+    /// card takes off the bus, also while no session is up (what it pushes
+    /// then is dropped). Default: the session sees nothing.
+    fn route(&mut self, _msg: &BusMsg, _ctx: &mut HookCtx<'_, Self::Section>) {}
+
+    /// A session connected: push what it must know first into
+    /// [`HookCtx::to_session`] (the current view, the current turn). It
+    /// sees this before anything else. Default: nothing.
+    fn session_started(&mut self, _ctx: &mut HookCtx<'_, Self::Section>) {}
+
+    /// The session ended, any way: drop what was held for it. Default:
+    /// nothing.
+    fn session_ended(&mut self, _ctx: &mut HookCtx<'_, Self::Section>) {}
 }
 
-/// What [`Hooks::on_frp`] and [`Hooks::before_finished`] see besides the
-/// message.
-#[derive(Debug)]
+/// What a hook does with one of the driver's messages ([`Hooks::on_frp`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    /// On the bus.
+    Send,
+    /// Not on the bus.
+    Drop,
+}
+
+/// What a hook sees besides the message.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only the software drivers' hooks read state, sender and to_session"
+    )
+)]
 pub struct HookCtx<'a, S> {
     /// The card's section as it is in effect.
     pub section: &'a S,
+    /// flighthook's state.
+    pub state: &'a SystemState,
+    /// The card's own sender.
+    pub sender: &'a BusSender,
+    /// Bus messages for the session: handed to [`FrpSession::bus`] in this
+    /// order before its next step.
+    pub to_session: &'a mut Vec<FrpMessage>,
+}
+
+/// The card's hooks with what they keep: lent to the bus in
+/// ([`Hooks::route`]) and the bus out ([`Hooks::on_frp`]), which a connect
+/// runs side by side.
+struct Hooked<D: FrpDriver, H: Hooks<D>> {
+    hooks: H,
+    /// The card's section as it is in effect.
+    section: H::Section,
+    /// What the hooks pushed for the session, not handed yet.
+    to_session: Vec<FrpMessage>,
+    _driver: PhantomData<fn() -> D>,
+}
+
+impl<D: FrpDriver, H: Hooks<D>> Hooked<D, H> {
+    fn new(section: H::Section) -> Self {
+        Self {
+            hooks: H::default(),
+            section,
+            to_session: Vec::new(),
+            _driver: PhantomData,
+        }
+    }
+
+    /// Run `f` on the hooks with their context.
+    fn with<R>(
+        &mut self,
+        state: &SystemState,
+        sender: &BusSender,
+        f: impl FnOnce(&mut H, &mut HookCtx<'_, H::Section>) -> R,
+    ) -> R {
+        let mut ctx = HookCtx {
+            section: &self.section,
+            state,
+            sender,
+            to_session: &mut self.to_session,
+        };
+        f(&mut self.hooks, &mut ctx)
+    }
+}
+
+/// Whether a message `body` of a driver with `info` goes on the bus: a
+/// kind its roles send. Any driver sends `bus.alert`, `golfer.select` and
+/// `bus.reply`; a game or a driver that issues golfer ids sends `game.*`
+/// and `golfer.profile` (and their removals); a launch monitor sends
+/// `shot.*`. The host owns everything else (`bus.actor`, `golfer.turn`,
+/// `practice.*`, `bus.sync`).
+fn role_sends(info: &DriverInfo, body: &FrpBody) -> bool {
+    let kind = body.kind();
+    matches!(kind, "bus.alert" | "golfer.select" | "bus.reply")
+        || ((info.roles.contains(&roles::GAME) || !info.namespaces.is_empty())
+            && (kind.starts_with("game.") || kind == "golfer.profile"))
+        || (info.roles.contains(&roles::LAUNCH_MONITOR) && kind.starts_with("shot."))
 }
 
 /// What the card sent of one of its shots so far.
@@ -138,8 +242,8 @@ pub struct ShotSoFar {
 // The actor
 // ---------------------------------------------------------------------------
 
-/// A launch monitor card running device driver `D` with the card's hooks
-/// `H`. See the [module docs](self).
+/// A card running driver `D` with the card's hooks `H`. See the
+/// [module docs](self).
 pub struct DriverActor<D: FrpDriver, H: Hooks<D>> {
     /// The section the actor runs with, as last applied.
     section: Mutex<H::Section>,
@@ -201,7 +305,7 @@ impl<D: FrpDriver, H: Hooks<D>> Actor for DriverActor<D, H> {
         receiver: BusReceiver,
     ) -> JoinHandle<()> {
         let run = Run::<D, H> {
-            section: lock(&self.section).clone(),
+            hooked: RefCell::new(Hooked::new(lock(&self.section).clone())),
             stop: self.stop.clone(),
             updates: Arc::clone(&self.updates),
             _types: PhantomData,
@@ -228,7 +332,7 @@ impl<D: FrpDriver, H: Hooks<D>> Actor for DriverActor<D, H> {
     }
 
     fn source(&self) -> Option<ShotSource> {
-        Some(H::SOURCE)
+        H::SOURCE
     }
 
     fn reconfigure(&self, state: &Arc<SystemState>, sender: &BusSender) -> ReconfigureOutcome {
@@ -244,9 +348,10 @@ impl<D: FrpDriver, H: Hooks<D>> Actor for DriverActor<D, H> {
 // The run loop
 // ---------------------------------------------------------------------------
 
-/// What the actor's thread starts with.
+/// What the actor's thread starts with, and the card's hooks, which it
+/// lends to the bus in and out.
 struct Run<D: FrpDriver, H: Hooks<D>> {
-    section: H::Section,
+    hooked: RefCell<Hooked<D, H>>,
     stop: Stop,
     updates: Arc<Mutex<Option<H::Section>>>,
     _types: PhantomData<fn() -> (D, H)>,
@@ -279,7 +384,8 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
     /// the thread ends (Reconnect starts a new one).
     fn run(self, state: Arc<SystemState>, sender: BusSender, receiver: BusReceiver) {
         let actor = sender.actor_id().to_owned();
-        let info = D::info(&self.section.driver_settings());
+        let section = self.hooked.borrow().section.clone();
+        let info = D::info(&section.driver_settings());
         // The fixed mode is forgotten when this thread ends.
         let _fixed_mode = match (info.fixed_mode, sender.frp_id()) {
             (Some(mode), Some(id)) => Some(state.set_fixed_mode(id, mode)),
@@ -288,12 +394,12 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
         let flags = HostFlags::new();
         flags.set_wants_raw(true);
         flags.set_min_level(min_level());
-        let mut sink = Sink::<D, H>::new(state, sender, info, self.section.clone());
+        let mut sink = Sink::<D, H>::new(state, sender, info);
         let mut host = Host::<D, H>::new(
             receiver,
             self.stop.clone(),
             actor.clone(),
-            &sink.state,
+            Arc::clone(&sink.state),
             Synced::new(&sink),
         );
         sink.publish_actor();
@@ -315,7 +421,8 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
     /// retry delays until the actor is stopped or the driver gives up.
     fn run_with(&self, host: &mut Host<D, H>, sink: &mut Sink<D, H>, flags: &HostFlags) {
         let actor = sink.actor.clone();
-        let mut driver = match D::new(sink.section.driver_settings()) {
+        let settings = self.hooked.borrow().section.driver_settings();
+        let mut driver = match D::new(settings) {
             Ok(driver) => driver,
             Err(e) => {
                 warn!("{actor}: settings not usable, not started: {e}");
@@ -335,15 +442,19 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
             if host.stopped() {
                 break;
             }
-            take_update(&self.updates, sink, Some(&mut driver));
+            self.take_update(sink, Some(&mut driver));
             // Device actions asked while no session ran were for no device.
             host.actions.clear();
             sink.begin_session();
             host.begin_connect();
             let connected = {
-                let mut emit = |e| sink.handle(e);
+                let mut emit = |e| sink.handle(e, &mut self.hooked.borrow_mut());
                 let out = Events::new(&mut emit, flags);
-                let mut ctx = ConnectCtx::new(&self.stop, out, host);
+                let mut connecting = Connecting {
+                    host: &mut *host,
+                    hooked: &self.hooked,
+                };
+                let mut ctx = ConnectCtx::new(&self.stop, out, &mut connecting);
                 driver.connect(&mut ctx)
             };
             let (error, connected_for) = match connected {
@@ -360,8 +471,11 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                 Ok(mut session) => {
                     attempts = 0;
                     let since = Instant::now();
-                    sink.connected(session.identity());
+                    start_session(sink, &mut self.hooked.borrow_mut(), session.identity());
                     let ended = self.drive(&mut session, &mut driver, host, sink, flags);
+                    self.hooked
+                        .borrow_mut()
+                        .with(&sink.state, &sink.sender, |h, ctx| h.session_ended(ctx));
                     match ended {
                         Err(e) if !host.stopped() => {
                             drop(session);
@@ -369,7 +483,7 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                             (e, Some(since.elapsed()))
                         }
                         _ => {
-                            let mut emit = |e| sink.handle(e);
+                            let mut emit = |e| sink.handle(e, &mut self.hooked.borrow_mut());
                             if let Err(e) = session.close(&mut Events::new(&mut emit, flags)) {
                                 warn!("{actor}: the device was not released cleanly: {e}");
                             }
@@ -384,7 +498,7 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                 attempts,
             };
             let delay = {
-                let mut emit = |e| sink.handle(e);
+                let mut emit = |e| sink.handle(e, &mut self.hooked.borrow_mut());
                 driver.retry_delay(&ended, &mut backoff, &mut Events::new(&mut emit, flags))
             };
             match delay {
@@ -425,10 +539,10 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
         let end = Instant::now() + duration;
         loop {
             let left = end.saturating_duration_since(Instant::now());
-            if !host.idle(left.min(IDLE_SLICE)) {
+            if !host.idle(left.min(IDLE_SLICE), &self.hooked) {
                 return false;
             }
-            take_update(&self.updates, sink, Some(driver));
+            self.take_update(sink, Some(driver));
             if left <= IDLE_SLICE {
                 return true;
             }
@@ -443,14 +557,14 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
         sink: &mut Sink<D, H>,
         mut driver: Option<&mut D>,
     ) {
-        while host.idle(IDLE_SLICE) {
-            take_update(&self.updates, sink, driver.as_deref_mut());
+        while host.idle(IDLE_SLICE, &self.hooked) {
+            self.take_update(sink, driver.as_deref_mut());
         }
     }
 
     /// Step `session` until it fails (`Err`) or the actor is stopped
-    /// (`Ok`), handing it new turn hints, the bus's actions and live config
-    /// between steps. A step with nothing to do
+    /// (`Ok`), taking live config and then, between steps, handing it what
+    /// [`step_session`] hands it. A step with nothing to do
     /// ([`Activity::Idle`]) is followed by the driver contract's [`IDLE`] wait.
     fn drive(
         &self,
@@ -464,51 +578,108 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
         // since reaches the session now.
         let mut given = host.connect_hints.take().unwrap_or_default();
         loop {
-            host.drain();
+            host.drain(&mut self.hooked.borrow_mut());
             if host.stopped() {
                 return Ok(());
             }
-            if host.hints != given {
-                given = host.hints;
-                session.hints(&given)?;
-            }
-            while let Some(action) = host.actions.pop_front() {
-                session.action(&action)?;
-            }
-            take_update(&self.updates, sink, Some(driver));
-            sink.session_mode = given.mode;
-            let activity = {
-                let mut emit = |e| sink.handle(e);
-                session.step(Instant::now(), &mut Events::new(&mut emit, flags))?
-            };
-            sink.prune_shots();
+            self.take_update(sink, Some(driver));
+            let activity = step_session(
+                session,
+                host,
+                sink,
+                &self.hooked,
+                &mut given,
+                flags,
+                Instant::now(),
+            )?;
             if activity == Activity::Idle {
                 std::thread::sleep(IDLE);
             }
         }
     }
+
+    /// Take a section applied live, if one waits in `updates`: the hooks'
+    /// section, and the driver's config when its part changed and there is
+    /// a driver.
+    fn take_update(&self, sink: &mut Sink<D, H>, driver: Option<&mut D>) {
+        let Some(new) = lock(&self.updates).take() else {
+            return;
+        };
+        let mut hooked = self.hooked.borrow_mut();
+        if let Some(driver) = driver {
+            let settings = new.driver_settings();
+            if settings != hooked.section.driver_settings() {
+                driver.apply_config(&settings);
+            }
+        }
+        hooked.section = new;
+        // A renamed card is a renamed actor.
+        sink.publish_actor();
+    }
 }
 
-/// Take a section applied live, if one waits in `updates`: the sink's (and
-/// so the hooks') section, and the driver's config when its part changed
-/// and there is a driver.
-fn take_update<D: FrpDriver, H: Hooks<D>>(
-    updates: &Mutex<Option<H::Section>>,
+/// A session connected as `identity`: the card shows it, and the hooks'
+/// [`Hooks::session_started`] fills what the session sees first (what they
+/// pushed before is dropped).
+fn start_session<D: FrpDriver, H: Hooks<D>>(
     sink: &mut Sink<D, H>,
-    driver: Option<&mut D>,
+    hooked: &mut Hooked<D, H>,
+    identity: &DeviceIdentity,
 ) {
-    let Some(new) = lock(updates).take() else {
-        return;
-    };
-    if let Some(driver) = driver {
-        let settings = new.driver_settings();
-        if settings != sink.section.driver_settings() {
-            driver.apply_config(&settings);
-        }
+    sink.connected(identity);
+    hooked.to_session.clear();
+    hooked.with(&sink.state, &sink.sender, |h, ctx| h.session_started(ctx));
+}
+
+/// One pass of a session after the bus was drained: what the hooks pushed
+/// for it ([`FrpSession::bus`], in order), new turn hints, the bus's
+/// actions, then one step at `now`.
+fn step_session<D: FrpDriver, H: Hooks<D>>(
+    session: &mut D::Session,
+    host: &mut Host<D, H>,
+    sink: &mut Sink<D, H>,
+    hooked: &RefCell<Hooked<D, H>>,
+    given: &mut TurnHints,
+    flags: &HostFlags,
+    now: Instant,
+) -> Result<Activity, D::Error> {
+    let to_session = std::mem::take(&mut hooked.borrow_mut().to_session);
+    for msg in &to_session {
+        session.bus(msg)?;
     }
-    sink.section = new;
-    // A renamed card is a renamed actor.
-    sink.publish_actor();
+    if host.hints != *given {
+        *given = host.hints;
+        session.hints(given)?;
+    }
+    while let Some(action) = host.actions.pop_front() {
+        session.action(&action)?;
+    }
+    sink.session_mode = given.mode;
+    let activity = {
+        let mut emit = |e| sink.handle(e, &mut hooked.borrow_mut());
+        session.step(now, &mut Events::new(&mut emit, flags))?
+    };
+    sink.prune_shots();
+    Ok(activity)
+}
+
+/// The driver's [`ConnectHost`] during a connect: the bus is drained (and
+/// routed, with nothing kept for the session) on every tick.
+struct Connecting<'a, D: FrpDriver, H: Hooks<D>> {
+    host: &'a mut Host<D, H>,
+    hooked: &'a RefCell<Hooked<D, H>>,
+}
+
+impl<D: FrpDriver, H: Hooks<D>> ConnectHost for Connecting<'_, D, H> {
+    fn tick(&mut self) {
+        let mut hooked = self.hooked.borrow_mut();
+        self.host.drain(&mut hooked);
+        hooked.to_session.clear();
+    }
+
+    fn hints(&self) -> &TurnHints {
+        &self.host.hints
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,9 +687,10 @@ fn take_update<D: FrpDriver, H: Hooks<D>>(
 // ---------------------------------------------------------------------------
 
 /// The actor's inputs: the bus, the turn hints, queued actions and the stop
-/// token. It is the driver's [`ConnectHost`].
+/// token.
 struct Host<D: FrpDriver, H> {
     receiver: BusReceiver,
+    state: Arc<SystemState>,
     /// The hints of flighthook's latest turn.
     hints: TurnHints,
     /// The hints a connect read last ([`ConnectHost::hints`]).
@@ -565,7 +737,7 @@ impl<D: FrpDriver, H: Hooks<D>> Host<D, H> {
         receiver: BusReceiver,
         stop: Stop,
         actor: String,
-        state: &SystemState,
+        state: Arc<SystemState>,
         synced: Synced,
     ) -> Self {
         Self {
@@ -576,15 +748,16 @@ impl<D: FrpDriver, H: Hooks<D>> Host<D, H> {
             stop,
             actor,
             session: state.flighthook_id(),
+            state,
             synced,
             _hooks: PhantomData,
         }
     }
 
     /// Take what is on the bus: flighthook's turn into the hints, the card's
-    /// actions into their queue. A closed bus or a shutdown flag stops the
-    /// actor.
-    fn drain(&mut self) {
+    /// actions into their queue, and every message through the hooks'
+    /// [`Hooks::route`]. A closed bus or a shutdown flag stops the actor.
+    fn drain(&mut self, hooked: &mut Hooked<D, H>) {
         loop {
             let msg = match self.receiver.poll() {
                 Ok(Some(msg)) => msg,
@@ -606,6 +779,9 @@ impl<D: FrpDriver, H: Hooks<D>> Host<D, H> {
             if let Some(action) = H::action(&msg, &self.actor) {
                 self.actions.push_back(action);
             }
+            hooked.with(&self.state, &self.synced.sender, |h, ctx| {
+                h.route(&msg, ctx);
+            });
         }
     }
 
@@ -617,11 +793,16 @@ impl<D: FrpDriver, H: Hooks<D>> Host<D, H> {
         self.stop.is_stopped()
     }
 
-    /// Wait `duration`, draining the bus; `false` when a stop cut it short.
-    fn idle(&mut self, duration: Duration) -> bool {
+    /// Wait `duration`, draining the bus (no session sees what the hooks
+    /// push meanwhile); `false` when a stop cut it short.
+    fn idle(&mut self, duration: Duration, hooked: &RefCell<Hooked<D, H>>) -> bool {
         let end = Instant::now() + duration;
         loop {
-            self.drain();
+            {
+                let mut hooked = hooked.borrow_mut();
+                self.drain(&mut hooked);
+                hooked.to_session.clear();
+            }
             if self.stopped() {
                 return false;
             }
@@ -631,16 +812,6 @@ impl<D: FrpDriver, H: Hooks<D>> Host<D, H> {
             }
             std::thread::sleep(left.min(IDLE_SLICE));
         }
-    }
-}
-
-impl<D: FrpDriver, H: Hooks<D>> ConnectHost for Host<D, H> {
-    fn tick(&mut self) {
-        self.drain();
-    }
-
-    fn hints(&self) -> &TurnHints {
-        &self.hints
     }
 }
 
@@ -663,9 +834,8 @@ struct Sink<D: FrpDriver, H: Hooks<D>> {
     sender: BusSender,
     actor: String,
     info: DriverInfo,
-    source: Source,
-    section: H::Section,
-    hooks: H,
+    /// The card's shot source, for its `bus.actor`.
+    source: Option<Source>,
     /// The session's device id (for raw frame numbers), once connected.
     device: Option<String>,
     /// The device's identity, while a session is up.
@@ -697,13 +867,15 @@ struct Sink<D: FrpDriver, H: Hooks<D>> {
     /// What went out of each shot not finished yet, by shot id, with when
     /// it started.
     shots: HashMap<String, (ShotSoFar, Instant)>,
+    /// Shots the hooks dropped at their trigger, by shot id, with when.
+    dropped: HashMap<String, Instant>,
     /// Shots finished over the actor's life.
     shot_count: u32,
     /// Puts the driver's timestamps on the host clock.
     clock: UtcClock,
     /// The mode the session runs in ([`HookCtx::session_mode`]).
     session_mode: Option<Mode>,
-    _driver: PhantomData<fn() -> D>,
+    _types: PhantomData<fn() -> (D, H)>,
 }
 
 /// How far the host's wall clock may drift from the monotonic clock before
@@ -762,32 +934,47 @@ impl UtcClock {
 }
 
 /// The audit log line of raw frame `frame` of actor `actor`: direction,
-/// number, label, then the bytes as hex.
-fn audit_line(actor: &str, frame: &RawFrame) -> String {
+/// number, label, then the bytes as hex, or as text for a text protocol
+/// (`text`).
+fn audit_line(actor: &str, frame: &RawFrame, text: bool) -> String {
+    let data = if text {
+        String::from_utf8_lossy(&frame.data).into_owned()
+    } else {
+        flighthook::hex_lower(&frame.data)
+    };
     format!(
-        "{actor} {} #{} {} {}",
+        "{actor} {} #{} {} {data}",
         frame.dir,
         frame.seq,
         frame.label.as_deref().unwrap_or(""),
-        flighthook::hex_lower(&frame.data)
     )
 }
 
+/// The card rows of a telemetry change from `old` to `new`: each changed
+/// or new key with its value, each removed key empty.
+fn telemetry_rows(
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
+) -> HashMap<String, String> {
+    let mut rows: HashMap<String, String> = new
+        .iter()
+        .filter(|(k, v)| old.get(*k) != Some(*v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for key in old.keys().filter(|k| !new.contains_key(*k)) {
+        rows.insert(key.clone(), String::new());
+    }
+    rows
+}
+
 impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
-    fn new(
-        state: Arc<SystemState>,
-        sender: BusSender,
-        info: DriverInfo,
-        section: H::Section,
-    ) -> Self {
+    fn new(state: Arc<SystemState>, sender: BusSender, info: DriverInfo) -> Self {
         Self {
             actor: sender.actor_id().to_owned(),
             state,
             sender,
             info,
-            source: H::SOURCE.provenance(),
-            section,
-            hooks: H::default(),
+            source: H::SOURCE.map(ShotSource::provenance),
             device: None,
             identity: None,
             status: ActorStatus::Starting,
@@ -800,16 +987,18 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             capture: None,
             seqs: HashMap::new(),
             shots: HashMap::new(),
+            dropped: HashMap::new(),
             shot_count: 0,
             clock: UtcClock::default(),
             session_mode: None,
-            _driver: PhantomData,
+            _types: PhantomData,
         }
     }
 
-    /// The card's `bus.actor` as it is now: the card's name, role
-    /// `launch_monitor`, the device's identity and status, and the card's
-    /// shot source.
+    /// The card's `bus.actor` as it is now: the card's name, the driver's
+    /// roles and namespaces, the device's identity and status, and the
+    /// card's shot source, if it is one. `not_armed` is a launch monitor's
+    /// only.
     fn bus_actor(&self) -> BusActor {
         let name = crate::actors::actor_names(&self.state.system.snapshot())
             .remove(&self.actor)
@@ -817,20 +1006,28 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             .unwrap_or_else(|| self.info.name.to_owned());
         let identity = self.identity.as_ref();
         let status = &self.device_status;
-        let mut actor = BusActor::new(name, DEFAULT_HEARTBEAT.as_secs_f64())
-            .with_role(roles::LAUNCH_MONITOR)
-            .with_device(DeviceInfo {
-                manufacturer: identity
-                    .and_then(|i| i.manufacturer.clone())
-                    .or_else(|| self.info.manufacturer.map(str::to_owned)),
-                model: identity.and_then(|i| i.model.clone()),
-                firmware: identity.and_then(|i| i.firmware.clone()),
-                source: Some(self.source),
-                battery_pct: status.battery_pct,
-                tilt: status.tilt,
-                roll: status.roll,
-            });
+        let mut actor = BusActor::new(name, DEFAULT_HEARTBEAT.as_secs_f64());
+        for role in self.info.roles {
+            actor = actor.with_role(*role);
+        }
+        for namespace in self.info.namespaces {
+            actor = actor.with_namespace(*namespace);
+        }
+        let mut actor = actor.with_device(DeviceInfo {
+            manufacturer: identity
+                .and_then(|i| i.manufacturer.clone())
+                .or_else(|| self.info.manufacturer.map(str::to_owned)),
+            model: identity.and_then(|i| i.model.clone()),
+            firmware: identity.and_then(|i| i.firmware.clone()),
+            source: self.source,
+            battery_pct: status.battery_pct,
+            tilt: status.tilt,
+            roll: status.roll,
+        });
         actor.blockers.clone_from(&status.blockers);
+        if !self.info.roles.contains(&roles::LAUNCH_MONITOR) {
+            actor.blockers.retain(|b| b != blockers::NOT_ARMED);
+        }
         actor.telemetry = (!status.telemetry.is_empty()).then(|| status.telemetry.clone());
         actor
     }
@@ -981,6 +1178,7 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         self.device_status = DeviceStatus::not_armed();
         self.identity = None;
         self.shots.clear();
+        self.dropped.clear();
         self.publish_actor();
     }
 
@@ -990,21 +1188,18 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         self.info.fixed_mode.or(self.session_mode)
     }
 
-    /// Put one driver event where it goes.
-    fn handle(&mut self, event: DeviceEvent) {
+    /// Put one driver event where it goes, through the card's hooks.
+    fn handle(&mut self, event: DeviceEvent, hooked: &mut Hooked<D, H>) {
         match event {
-            DeviceEvent::Frp(body) => self.frp(body),
+            DeviceEvent::Frp(body) => self.frp(body, hooked),
             DeviceEvent::Status(status) => {
-                self.device_status = status;
-                if !self.connecting {
-                    self.publish_actor();
-                }
+                let old = std::mem::replace(&mut self.device_status, status);
+                self.status_changed(&old.telemetry);
             }
             DeviceEvent::StatusChange(change) => {
+                let old = self.device_status.telemetry.clone();
                 self.device_status.apply(change);
-                if !self.connecting {
-                    self.publish_actor();
-                }
+                self.status_changed(&old);
             }
             DeviceEvent::Phase(phase) => {
                 if self.connecting {
@@ -1035,18 +1230,54 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         }
     }
 
-    fn frp(&mut self, mut body: FrpBody) {
+    /// The device's status changed from telemetry `old`: in the card's
+    /// `bus.actor` while a session is up; during a connect, the telemetry
+    /// change goes to the card as rows (the `bus.actor` waits for the
+    /// identity).
+    fn status_changed(&mut self, old: &BTreeMap<String, String>) {
+        if !self.connecting {
+            self.publish_actor();
+            return;
+        }
+        let mut telemetry = telemetry_rows(old, &self.device_status.telemetry);
+        if !telemetry.is_empty() {
+            self.hold_connect_error(&mut telemetry);
+            self.sender.local(LocalEvent::CardStatus {
+                status: self.status,
+                telemetry,
+            });
+        }
+    }
+
+    /// One of the driver's messages: through the hooks, then a raw frame to
+    /// the capture, a kind its roles send on the bus. The rest of a shot
+    /// the hooks dropped at its trigger is dropped too.
+    fn frp(&mut self, mut body: FrpBody, hooked: &mut Hooked<D, H>) {
+        if let Some(key) = body.shot_key()
+            && self.dropped.contains_key(&key.shot_id)
+        {
+            if matches!(body, FrpBody::ShotFinished(_)) {
+                self.dropped.remove(&key.shot_id);
+            }
+            return;
+        }
+        let pass = hooked.with(&self.state, &self.sender, |h, ctx| h.on_frp(&mut body, ctx));
+        if pass == Pass::Drop {
+            if let FrpBody::ShotTrigger(trigger) = body {
+                self.dropped.insert(trigger.key.shot_id, Instant::now());
+            }
+            return;
+        }
         if let FrpBody::ShotRaw(frame) = body {
             self.raw(frame);
             return;
         }
-        let mut ctx = HookCtx {
-            section: &self.section,
-        };
-        self.hooks.on_frp(&mut body, &mut ctx);
+        if !role_sends(&self.info, &body) {
+            return;
+        }
         match body {
             FrpBody::ShotTrigger(trigger) => self.trigger(trigger),
-            FrpBody::ShotFinished(finished) => self.finished(finished.key),
+            FrpBody::ShotFinished(finished) => self.finished(finished.key, hooked),
             FrpBody::ShotLaunch(ref m) => {
                 if let Some((shot, _)) = self.shots.get_mut(&m.key.shot_id) {
                     shot.launch.get_or_insert_with(|| m.launch.clone());
@@ -1071,8 +1302,7 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
                 }
                 self.sender.frp(alert);
             }
-            // Not the driver's to send.
-            _ => {}
+            _ => self.sender.frp(body),
         }
     }
 
@@ -1105,7 +1335,7 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
 
     /// A shot's end: what the hooks add to it, the shot's raw frames
     /// (local), then `shot.finished`, and the shot count.
-    fn finished(&mut self, key: ShotKey) {
+    fn finished(&mut self, key: ShotKey, hooked: &mut Hooked<D, H>) {
         let shot = self.shots.remove(&key.shot_id).map_or_else(
             || ShotSoFar {
                 key: key.clone(),
@@ -1115,10 +1345,9 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             },
             |(shot, _)| shot,
         );
-        let mut ctx = HookCtx {
-            section: &self.section,
-        };
-        let extra = self.hooks.before_finished(&shot, &mut ctx);
+        let extra = hooked.with(&self.state, &self.sender, |h, ctx| {
+            h.before_finished(&shot, ctx)
+        });
         for body in extra {
             self.sender.frp(body);
         }
@@ -1143,8 +1372,11 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         });
     }
 
-    /// Forget shots that never finished within flighthook's shot timeout.
+    /// Forget shots that never finished within flighthook's shot timeout,
+    /// and dropped shots after the same time.
     fn prune_shots(&mut self) {
+        self.dropped
+            .retain(|_, at| at.elapsed() < flighthook::SHOT_TIMEOUT);
         let actor = &self.actor;
         self.shots.retain(|_, (shot, since)| {
             let keep = since.elapsed() < flighthook::SHOT_TIMEOUT;
@@ -1166,7 +1398,7 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         let next = self.seqs.entry(device).or_insert(0);
         frame.seq = *next;
         *next += 1;
-        tracing::debug!(target: "audit", "{}", audit_line(&self.actor, &frame));
+        tracing::debug!(target: "audit", "{}", audit_line(&self.actor, &frame, profile.text));
         let Some(capture) = &mut self.capture else {
             return;
         };
@@ -1460,15 +1692,16 @@ pub(crate) mod tests {
 
     impl Hooks<FakeDriver> for FakeHooks {
         type Section = FakeSection;
-        const SOURCE: ShotSource = ShotSource::Mevo;
+        const SOURCE: Option<ShotSource> = Some(ShotSource::Mevo);
 
-        fn on_frp(&mut self, body: &mut FrpBody, ctx: &mut HookCtx<'_, FakeSection>) {
+        fn on_frp(&mut self, body: &mut FrpBody, ctx: &mut HookCtx<'_, FakeSection>) -> Pass {
             if let FrpBody::ShotLaunch(m) = body
                 && ctx.section.name == "estimate"
                 && m.launch.backspin_rpm.is_none()
             {
                 m.launch.backspin_rpm = Some(1234);
             }
+            Pass::Send
         }
     }
 
@@ -1535,12 +1768,37 @@ pub(crate) mod tests {
         frp(FrpBody::ShotRaw(frame))
     }
 
+    /// A sink with the card's hooks, which it hands to [`Sink::handle`].
+    struct TestSink<D: FrpDriver, H: Hooks<D>> {
+        sink: Sink<D, H>,
+        hooked: Hooked<D, H>,
+    }
+
+    impl<D: FrpDriver, H: Hooks<D>> TestSink<D, H> {
+        fn handle(&mut self, event: DeviceEvent) {
+            self.sink.handle(event, &mut self.hooked);
+        }
+    }
+
+    impl<D: FrpDriver, H: Hooks<D>> std::ops::Deref for TestSink<D, H> {
+        type Target = Sink<D, H>;
+        fn deref(&self) -> &Sink<D, H> {
+            &self.sink
+        }
+    }
+
+    impl<D: FrpDriver, H: Hooks<D>> std::ops::DerefMut for TestSink<D, H> {
+        fn deref_mut(&mut self) -> &mut Sink<D, H> {
+            &mut self.sink
+        }
+    }
+
     /// A connected sink of card `H` named `name`, and the bus behind it.
     fn sink<H: Hooks<FakeDriver, Section = FakeSection>>(
         name: &str,
     ) -> (
         TempDir,
-        Sink<FakeDriver, H>,
+        TestSink<FakeDriver, H>,
         broadcast::Receiver<BusMsg>,
         GameStateWriter,
     ) {
@@ -1554,7 +1812,7 @@ pub(crate) mod tests {
         name: &str,
     ) -> (
         TempDir,
-        Sink<FakeDriver, H>,
+        TestSink<FakeDriver, H>,
         broadcast::Receiver<BusMsg>,
         GameStateWriter,
     ) {
@@ -1566,7 +1824,10 @@ pub(crate) mod tests {
             name: name.into(),
             driver: FakeConfig::default(),
         };
-        let mut sink = Sink::new(state, sender, FakeDriver::info(&section.driver), section);
+        let mut sink = TestSink {
+            sink: Sink::new(state, sender, FakeDriver::info(&section.driver)),
+            hooked: Hooked::new(section),
+        };
         sink.begin_session();
         (dir, sink, rx, writer)
     }
@@ -1878,9 +2139,10 @@ pub(crate) mod tests {
     }
 
     /// The status a driver sends while it connects goes out in the card's
-    /// `bus.actor` with the identity once the session connects, and the
-    /// connect's `phase` leaves the card then; a connect without a phase
-    /// sends no `phase` key.
+    /// `bus.actor` with the identity once the session connects (its
+    /// telemetry shows on the card as rows meanwhile), and the connect's
+    /// `phase` leaves the card then; a connect without a phase sends no
+    /// `phase` key.
     #[test]
     fn a_connects_telemetry_goes_out_with_the_identity() {
         let ready = |pct: u8| {
@@ -1893,8 +2155,11 @@ pub(crate) mod tests {
         let (_dir, mut sink, mut rx, _w) = connecting_sink::<FakeHooks>("");
         sink.handle(DeviceEvent::Phase("handshaking"));
         sink.handle(ready(50));
+        sink.handle(ready(48));
         let seen = drain(&mut rx);
-        assert_eq!(kinds(&seen), ["status"], "the phase only");
+        assert_eq!(kinds(&seen), ["status", "status"], "no bus.actor yet");
+        let (_, rows) = card_status(&seen[1]).expect("a card status");
+        assert_eq!(rows, &HashMap::from([("ready".into(), "false".into())]));
         sink.connected(&DeviceIdentity::new("FAKE-1").with_model("Eagle"));
         let seen = drain(&mut rx);
         assert_eq!(kinds(&seen), ["status", "actor"]);
@@ -2007,7 +2272,15 @@ pub(crate) mod tests {
     fn trace_lines_and_frames_go_to_the_audit_log() {
         let mut beef = RawFrame::new(flightrelay::RawDir::Rx, 7, vec![0xbe, 0xef]);
         beef.label = Some("D4 DSP>APP".into());
-        assert_eq!(audit_line("fake.0", &beef), "fake.0 rx #7 D4 DSP>APP beef");
+        assert_eq!(
+            audit_line("fake.0", &beef, false),
+            "fake.0 rx #7 D4 DSP>APP beef"
+        );
+        let json = RawFrame::new(flightrelay::RawDir::Tx, 8, br#"{"a":1}"#.to_vec());
+        assert_eq!(
+            audit_line("fake.0", &json, true),
+            r#"fake.0 tx #8  {"a":1}"#
+        );
 
         let (buf, subscriber) = log_capture(tracing::Level::TRACE);
         let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
@@ -2627,6 +2900,441 @@ pub(crate) mod tests {
         rig.state.stop_and_wait("fake.0");
     }
 
+    // -- Software drivers ----------------------------------------------------
+
+    use crate::actors::scripted::{
+        SOFTWARE, Script as SoftScript, Seen, Software, SoftwareConfig, SoftwareSession,
+    };
+
+    fn game_round() -> flightrelay::GameRound {
+        flightrelay::GameRound {
+            id: "round-1".into(),
+            status: flightrelay::RoundStatus::Playing,
+            end_reason: None,
+            course: None,
+            scoring: None,
+            players: Vec::new(),
+            up: None,
+            hole: None,
+        }
+    }
+
+    fn game_aim() -> flightrelay::FrpMessage {
+        flightrelay::FrpMessage::new(
+            "sim",
+            flightrelay::GameAim {
+                r#ref: "a".into(),
+                action: flightrelay::AimAction::Reset,
+                degrees: None,
+                target: None,
+            },
+        )
+    }
+
+    /// A scripted software driver's config: its key and its roles.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
+    struct SoftConfig {
+        key: String,
+        /// `"game"` (with the `soft` namespace), `"launch_monitor"`, or no
+        /// role (an output).
+        role: String,
+    }
+
+    impl DriverConfig for SoftConfig {}
+
+    impl SoftwareConfig for SoftConfig {
+        fn info(&self) -> DriverInfo {
+            let info = DriverInfo::new("soft", "Soft", Source::Virtual);
+            match self.role.as_str() {
+                "game" => info.with_roles(&[roles::GAME]).with_namespaces(&["soft"]),
+                "launch_monitor" => info,
+                _ => info.with_roles(&[]),
+            }
+        }
+
+        fn key(&self) -> String {
+            self.key.clone()
+        }
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    struct SoftSection {
+        #[serde(default)]
+        name: String,
+        #[serde(flatten)]
+        driver: SoftConfig,
+    }
+
+    impl DeviceSection for SoftSection {
+        type Driver = SoftConfig;
+        const KIND: &'static str = "soft";
+
+        fn driver(&self) -> &SoftConfig {
+            &self.driver
+        }
+
+        fn sections(_: &flighthook::FlighthookConfig) -> &HashMap<String, Self> {
+            static NONE: LazyLock<HashMap<String, SoftSection>> = LazyLock::new(HashMap::new);
+            &NONE
+        }
+    }
+
+    type Soft = Software<SoftConfig>;
+
+    /// A software card that is no shot source. It hands its session every
+    /// FRP message of another actor, starts each session with the current
+    /// turn, asks the session for `aim` on a `game.aim`, and drops shot #13.
+    #[derive(Default)]
+    struct SoftHooks;
+
+    impl Hooks<Soft> for SoftHooks {
+        type Section = SoftSection;
+        const SOURCE: Option<ShotSource> = None;
+
+        fn on_frp(&mut self, body: &mut FrpBody, _: &mut HookCtx<'_, SoftSection>) -> Pass {
+            match body {
+                FrpBody::ShotTrigger(t) if t.key.shot_number == 13 => Pass::Drop,
+                _ => Pass::Send,
+            }
+        }
+
+        fn action(msg: &BusMsg, _: &str) -> Option<String> {
+            matches!(msg.as_frp().map(|m| &m.body), Some(FrpBody::GameAim(_))).then(|| "aim".into())
+        }
+
+        fn route(&mut self, msg: &BusMsg, ctx: &mut HookCtx<'_, SoftSection>) {
+            if let Some(m) = msg.as_frp()
+                && ctx.sender.frp_id() != Some(m.from.as_str())
+            {
+                ctx.to_session.push(m.clone());
+            }
+        }
+
+        fn session_started(&mut self, ctx: &mut HookCtx<'_, SoftSection>) {
+            ctx.to_session.push(flightrelay::FrpMessage::new(
+                ctx.state.flighthook_id(),
+                ctx.state.session.turn(),
+            ));
+        }
+    }
+
+    /// The same card as a virtual shot source.
+    #[derive(Default)]
+    struct SoftSourceHooks;
+
+    impl Hooks<Soft> for SoftSourceHooks {
+        type Section = SoftSection;
+        const SOURCE: Option<ShotSource> = Some(ShotSource::MockMonitor);
+    }
+
+    /// A software card `H` with `role`, its sink not connected yet, and the
+    /// bus behind it.
+    fn soft_sink<H: Hooks<Soft, Section = SoftSection>>(
+        role: &str,
+    ) -> (TempDir, TestSink<Soft, H>, broadcast::Receiver<BusMsg>) {
+        let (dir, state, _writer) = temp_state();
+        let (tx, rx) = broadcast::channel(256);
+        let sender =
+            BusSender::new("soft.0".into(), tx, Arc::default()).with_frp_id(Some("soft.0".into()));
+        let section = SoftSection {
+            name: "Soft".into(),
+            driver: SoftConfig {
+                key: "soft".into(),
+                role: role.into(),
+            },
+        };
+        let sink = TestSink {
+            sink: Sink::new(state, sender, Soft::info(&section.driver)),
+            hooked: Hooked::new(section),
+        };
+        (dir, sink, rx)
+    }
+
+    /// The kinds a driver's messages may have, by its roles and namespaces:
+    /// any driver sends alerts, selects and replies; a game, or a driver
+    /// that issues golfer ids, `game.*` and `golfer.profile` with their
+    /// removals; a launch monitor `shot.*`. The host's own kinds never
+    /// pass.
+    #[test]
+    fn a_drivers_roles_decide_the_kinds_it_sends() {
+        use flightrelay::{GolferId, GolferProfile, GolferSelect, GolferTurn, PracticeBlock};
+        let output = DriverInfo::new("o", "O", Source::Virtual).with_roles(&[]);
+        let game = DriverInfo::new("g", "G", Source::Virtual).with_roles(&[roles::GAME]);
+        let issuer = DriverInfo::new("i", "I", Source::Virtual)
+            .with_roles(&[])
+            .with_namespaces(&["soft"]);
+        let monitor = DriverInfo::new("m", "M", Source::Measured);
+        let bodies: Vec<(FrpBody, [bool; 4])> = vec![
+            (
+                flightrelay::BusAlert::new(Severity::Warn, "w").into(),
+                [true; 4],
+            ),
+            (GolferSelect::new("r").into(), [true; 4]),
+            (
+                flightrelay::BusReply::ok("fake.0", "golfer.select", "r").into(),
+                [true; 4],
+            ),
+            (game_round().into(), [false, true, true, false]),
+            (
+                Removal::of(StateKind::GameRound).into(),
+                [false, true, true, false],
+            ),
+            (
+                GolferProfile::new(GolferId::new("soft", "1").expect("an id"), "Ann").into(),
+                [false, true, true, false],
+            ),
+            (trigger(key(1)), [false, false, false, true]),
+            (finished(key(1)), [false, false, false, true]),
+            (BusActor::new("x", 2.0).into(), [false; 4]),
+            (Removal::of(StateKind::BusActor).into(), [false; 4]),
+            (
+                GolferTurn::new(None, None, flightrelay::Handedness::Right, Mode::Full).into(),
+                [false; 4],
+            ),
+            (
+                PracticeBlock {
+                    id: "b".into(),
+                    golfer: None,
+                    club: None,
+                    number: 1,
+                    session: 1,
+                    started_at: 0,
+                }
+                .into(),
+                [false; 4],
+            ),
+            (flightrelay::BusSync::new().into(), [false; 4]),
+        ];
+        for (body, want) in bodies {
+            let got = [&output, &game, &issuer, &monitor].map(|info| role_sends(info, &body));
+            assert_eq!(got, want, "{}", body.kind());
+        }
+    }
+
+    /// Through the sink: a game card's `game.round` and `golfer.select` go
+    /// on the bus under its id; its `shot.*` and `bus.actor` do not.
+    #[test]
+    fn a_game_cards_messages_go_out_by_its_roles() {
+        let (_dir, mut sink, mut rx) = soft_sink::<SoftHooks>("game");
+        sink.connected(&DeviceIdentity::new("soft"));
+        drain(&mut rx);
+        for body in [
+            game_round().into(),
+            flightrelay::GolferSelect::new("r").into(),
+            trigger(key(1)),
+            BusActor::new("x", 2.0).into(),
+        ] {
+            sink.handle(DeviceEvent::Frp(body));
+        }
+        let sent: Vec<_> = drain(&mut rx)
+            .iter()
+            .filter_map(|m| {
+                m.as_frp()
+                    .map(|f| (f.from.clone(), f.body.kind().to_owned()))
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                ("soft.0".to_owned(), "game.round".to_owned()),
+                ("soft.0".to_owned(), "golfer.select".to_owned()),
+            ]
+        );
+    }
+
+    /// A hook's `Pass::Drop` on a trigger drops the whole shot (until its
+    /// `shot.finished`, or the shot timeout); other shots go on.
+    #[test]
+    fn a_hook_drops_a_whole_shot_at_its_trigger() {
+        let (_dir, mut sink, mut rx) = soft_sink::<SoftHooks>("launch_monitor");
+        sink.connected(&DeviceIdentity::new("soft"));
+        drain(&mut rx);
+        for body in [
+            trigger(key(13)),
+            launch_of(key(13), launch()),
+            finished(key(13)),
+            trigger(key(1)),
+            trigger(key(13)),
+        ] {
+            sink.handle(DeviceEvent::Frp(body));
+        }
+        assert_eq!(kinds(&drain(&mut rx)), ["trigger"]);
+        assert_eq!(sink.dropped.len(), 1, "a dropped shot that never finishes");
+        let old = Instant::now()
+            .checked_sub(flighthook::SHOT_TIMEOUT + Duration::from_secs(1))
+            .expect("an old instant");
+        *sink.dropped.get_mut("shot-13").expect("dropped") = old;
+        sink.prune_shots();
+        assert!(sink.dropped.is_empty(), "forgotten after the shot timeout");
+    }
+
+    /// A card's `bus.actor` has its driver's roles and namespaces, the
+    /// `device.source` only for a shot source, and `not_armed` (no session)
+    /// only for a launch monitor.
+    #[test]
+    fn a_cards_actor_comes_from_its_drivers_roles_and_namespaces() {
+        let (_d1, game, _r1) = soft_sink::<SoftHooks>("game");
+        let actor = game.bus_actor();
+        assert_eq!(actor.roles, [roles::GAME]);
+        assert_eq!(actor.namespaces, ["soft"]);
+        assert_eq!(actor.device.and_then(|d| d.source), None);
+        assert!(actor.blockers.is_empty(), "{:?}", actor.blockers);
+
+        let (_d2, output, _r2) = soft_sink::<SoftHooks>("");
+        let actor = output.bus_actor();
+        assert!(actor.roles.is_empty() && actor.namespaces.is_empty());
+
+        let (_d3, monitor, _r3) = soft_sink::<SoftSourceHooks>("launch_monitor");
+        let actor = monitor.bus_actor();
+        assert_eq!(actor.roles, [roles::LAUNCH_MONITOR]);
+        assert!(actor.namespaces.is_empty());
+        assert_eq!(actor.device.and_then(|d| d.source), Some(Source::Virtual));
+        assert_eq!(actor.blockers, [blockers::NOT_ARMED]);
+    }
+
+    /// A connected session sees what `session_started` pushed first (what
+    /// the hooks pushed before the connect is dropped), then each pass hands
+    /// it what the hooks routed off the bus, in order, then the new turn
+    /// hints and the bus's actions, then one step at the given `now`.
+    #[test]
+    fn a_session_sees_its_start_then_the_routed_bus_then_hints_actions_and_the_step() {
+        let (_dir, sink, _rx) = soft_sink::<SoftHooks>("game");
+        let TestSink { mut sink, hooked } = sink;
+        let hooked = RefCell::new(hooked);
+        let state = Arc::clone(&sink.state);
+        let mut host = Host::<Soft, SoftHooks>::new(
+            sink.sender.subscribe(),
+            Stop::new(),
+            "soft.0".into(),
+            Arc::clone(&state),
+            Synced::new(&sink),
+        );
+        let script = SoftScript::default();
+        let seen = Arc::clone(&script.seen);
+        let mut session = SoftwareSession::<SoftConfig>::new("soft", script);
+
+        let early = flightrelay::FrpMessage::new("early", flightrelay::BusSync::new());
+        hooked.borrow_mut().to_session.push(early);
+        start_session(&mut sink, &mut hooked.borrow_mut(), session.identity());
+
+        let turn = flightrelay::FrpMessage::new(
+            state.flighthook_id(),
+            flightrelay::GolferTurn::new(
+                None,
+                Some(flightrelay::Club::SandWedge),
+                flightrelay::Handedness::Left,
+                Mode::Chipping,
+            ),
+        );
+        let aim = game_aim();
+        sink.sender.send(BusMsg::frp(turn.clone()));
+        sink.sender.send(BusMsg::frp(aim.clone()));
+        host.drain(&mut hooked.borrow_mut());
+        let now = Instant::now();
+        let mut given = TurnHints::default();
+        let flags = HostFlags::new();
+        let activity = step_session(
+            &mut session,
+            &mut host,
+            &mut sink,
+            &hooked,
+            &mut given,
+            &flags,
+            now,
+        )
+        .expect("a pass");
+        assert_eq!(activity, Activity::Idle);
+        let started = flightrelay::FrpMessage::new(state.flighthook_id(), state.session.turn());
+        assert_eq!(
+            *lock(&seen),
+            [
+                Seen::Bus(Box::new(started)),
+                Seen::Bus(Box::new(turn)),
+                Seen::Bus(Box::new(aim)),
+                Seen::Hints(given),
+                Seen::Action("aim".into()),
+                Seen::Step(now),
+            ]
+        );
+        assert_eq!(given.mode, Some(Mode::Chipping));
+        assert!(hooked.borrow().to_session.is_empty(), "handed once");
+    }
+
+    /// A software card runs on the host: its session gets the hooks'
+    /// start and the routed bus, its game messages go on the bus, its shot
+    /// messages (not a launch monitor) do not, and its `bus.actor` has its
+    /// roles and no shot source.
+    #[test]
+    fn a_software_card_runs_on_the_host() {
+        let mut steps = VecDeque::new();
+        steps.push_back(vec![frp(game_round()), frp(trigger(key(1)))]);
+        let script = SoftScript {
+            steps,
+            ..SoftScript::default()
+        };
+        let seen = Arc::clone(&script.seen);
+        SOFTWARE.put("soft-smoke".into(), script);
+        let mut rig = rig();
+        crate::actors::start_actor_as(
+            "fake.0".into(),
+            Some("fake.0".into()),
+            Box::new(DriverActor::<Soft, SoftHooks>::new(SoftSection {
+                name: "Soft".into(),
+                driver: SoftConfig {
+                    key: "soft-smoke".into(),
+                    role: "game".into(),
+                },
+            })),
+            &rig.state,
+            &rig.tx,
+        );
+        let seen_on_bus =
+            rig.until(|m| matches!(m.as_frp().map(|f| &f.body), Some(FrpBody::GameRound(_))));
+        let actor = seen_on_bus
+            .iter()
+            .rev()
+            .find_map(|m| match m.as_frp().map(|f| &f.body) {
+                Some(FrpBody::BusActor(a)) => Some(a.clone()),
+                _ => None,
+            })
+            .expect("the card's bus.actor");
+        assert_eq!(actor.roles, [roles::GAME]);
+        assert_eq!(actor.device.and_then(|d| d.source), None);
+        let aim = game_aim();
+        rig.tx.send(BusMsg::frp(aim.clone())).expect("sent");
+        let deadline = Instant::now() + crate::actors::GIVE_UP;
+        while !lock(&seen).contains(&Seen::Action("aim".into())) {
+            assert!(Instant::now() < deadline, "{:?}", lock(&seen));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let buses: Vec<_> = lock(&seen)
+            .iter()
+            .filter_map(|s| match s {
+                Seen::Bus(m) => Some((**m).clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(buses[0].body, FrpBody::GolferTurn(_)),
+            "the turn first: {buses:?}"
+        );
+        assert!(buses.contains(&aim), "{buses:?}");
+        assert_eq!(
+            rig.state.stop_and_wait("fake.0"),
+            crate::state::Stopped::Exited
+        );
+        let rest = drain(&mut rig.rx);
+        assert!(
+            !rest
+                .iter()
+                .chain(&seen_on_bus)
+                .filter(|m| of_fake(m))
+                .any(|m| kind(m) == "trigger"),
+            "no shot from a game"
+        );
+    }
+
     // -- Every hooked driver -------------------------------------------------
 
     fn provenance_of(source: Source) -> Option<Source> {
@@ -2642,7 +3350,7 @@ pub(crate) mod tests {
     /// differently.
     fn source_matches<D: FrpDriver, H: Hooks<D>>() {
         assert_eq!(
-            Some(H::SOURCE.provenance()),
+            H::SOURCE.map(ShotSource::provenance),
             provenance_of(D::info(&D::Config::default()).source),
             "{:?}",
             H::SOURCE
