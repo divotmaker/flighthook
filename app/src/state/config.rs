@@ -1421,6 +1421,25 @@ bind = "0.0.0.0:5880"
         }
     }
 
+    /// A file that still holds `[simulation] tournament` loads with the
+    /// rest of its section, and the next save leaves the key out.
+    #[test]
+    fn a_file_with_the_tournament_key_loads() {
+        for value in ["true", "false"] {
+            let dir = std::env::temp_dir().join(format!("flighthook-tournament-{}", generate_id()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let path = dir.join("config.toml");
+            let contents = format!("[simulation]\nauto_chip = true\ntournament = {value}\n");
+            std::fs::write(&path, contents).expect("write");
+            let cfg = SystemConfig::new(path);
+            assert_eq!(cfg.load_error(), None, "{value}");
+            assert!(cfg.simulation().auto_chip, "{value}");
+            let out = toml::to_string_pretty(&cfg.snapshot()).expect("ser");
+            assert!(!out.contains("tournament"), "{value}: {out}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[test]
     fn a_file_with_an_invalid_impact_lead_loads_and_uses_the_default() {
         let dir = std::env::temp_dir().join(format!("flighthook-lead-{}", generate_id()));

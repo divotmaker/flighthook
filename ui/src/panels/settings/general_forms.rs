@@ -123,7 +123,6 @@ impl SimulationForm {
             temperature_c: self.temperature_c()?,
             surface: self.surface,
             auto_chip: self.auto_chip,
-            tournament: self.loaded.tournament,
             actor_id: self.loaded.actor_id.clone(),
         };
         s.environment_error().is_none().then_some(s)

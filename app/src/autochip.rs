@@ -35,10 +35,6 @@ use crate::bus::{BusMsg, LocalEvent};
 use crate::sim;
 use crate::state::SystemState;
 
-/// Why Auto-Chip does not fire during a tournament round, whoever holds it
-/// (a simulator or tournament mode).
-pub(crate) const ROUND_ACTIVE: &str = "Auto-Chip is off during a tournament round";
-
 /// Launch angle of every Auto-chip, degrees.
 pub(crate) const LAUNCH_ELEVATION_DEG: f64 = 45.0;
 
@@ -55,13 +51,9 @@ const MAX_SPEED_MPH: f64 = 60.0;
 /// The solver stops once the speed bracket is this narrow, mph.
 const SPEED_TOLERANCE_MPH: f64 = 1e-4;
 
-/// Why no chip could be sent: Auto-chip is off for a tournament round, or
-/// no speed could be solved for the distance.
+/// Why no chip could be sent: no speed could be solved for the distance.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SolveError {
-    /// A tournament round is active, which takes measured shots only: the
-    /// round policy turns virtual producers off ([`SystemState::round`]).
-    RoundActive,
     /// The `[simulation]` environment is invalid (the reason).
     Environment(String),
     /// The target is not positive and finite.
@@ -73,7 +65,6 @@ pub(crate) enum SolveError {
 impl std::fmt::Display for SolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::RoundActive => write!(f, "{ROUND_ACTIVE}"),
             Self::Environment(e) => write!(f, "simulation environment invalid: {e}"),
             Self::Distance => write!(f, "distance must be positive"),
             Self::Unreachable => write!(f, "no ball speed gives that distance"),
@@ -157,12 +148,8 @@ pub(crate) fn solve_speed(yards: f64, cfg: &SimulationSection) -> Result<f64, So
 /// settings, as the next shot of [`AUTO_CHIP_ACTOR`]: `shots` counts the
 /// Auto-chip shots sent, and is advanced only once the solve has succeeded,
 /// so a chip that is not sent takes no number. Blocks for the solve (some
-/// tens of simulations). Returns the shot's key and ball. Auto-chip is a
-/// virtual producer: it registers as one and sends nothing while a round is
-/// active. It asks before the solve, and takes the number and sends the
-/// trigger in one step with the policy after it
-/// ([`RoundPolicy::send_if_allowed`](crate::state::round::RoundPolicy::send_if_allowed)),
-/// so a round that begins during the solve stops the chip.
+/// tens of simulations). Returns the shot's key and ball. Auto-chip
+/// registers as a shot source.
 pub(crate) fn send(
     state: &SystemState,
     bus: &broadcast::Sender<BusMsg>,
@@ -171,10 +158,7 @@ pub(crate) fn send(
 ) -> Result<(ShotKey, Launch), SolveError> {
     let source = ShotSource::AutoChip;
     let id = state.auto_chip_id();
-    state.round.register_source(&id, source);
-    if !state.round.allows(source.provenance()) {
-        return Err(SolveError::RoundActive);
-    }
+    state.sources.register_source(&id, source);
     let cfg = state.system.simulation();
     let speed = solve_speed(f64::from(yards), &cfg)?;
     let ball = ball(speed);
@@ -184,23 +168,20 @@ pub(crate) fn send(
     let local = |event: LocalEvent| {
         let _ = bus.send(BusMsg::local(AUTO_CHIP_ACTOR, event));
     };
-    let key = state
-        .round
-        .send_if_allowed(source.provenance(), || {
-            let shot_number = shots.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-            let key = ShotKey {
-                shot_id: uuid::Uuid::new_v4().to_string(),
-                shot_number,
-            };
-            info!(
-                "auto-chip shot #{shot_number}: {yards}yd ball={speed:.2}mph VLA={LAUNCH_ELEVATION_DEG:.1} backspin={}rpm",
-                backspin_rpm(speed),
-            );
-            frp(actor().into());
-            frp(ShotTrigger::new(key.clone()).into());
-            key
-        })
-        .ok_or(SolveError::RoundActive)?;
+    let key = {
+        let shot_number = shots.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let key = ShotKey {
+            shot_id: uuid::Uuid::new_v4().to_string(),
+            shot_number,
+        };
+        info!(
+            "auto-chip shot #{shot_number}: {yards}yd ball={speed:.2}mph VLA={LAUNCH_ELEVATION_DEG:.1} backspin={}rpm",
+            backspin_rpm(speed),
+        );
+        frp(actor().into());
+        frp(ShotTrigger::new(key.clone()).into());
+        key
+    };
     frp(ShotLaunch {
         key: key.clone(),
         launch: ball.clone(),
@@ -373,7 +354,7 @@ mod tests {
             Some(ShotSource::AutoChip.provenance()),
             "the actor declares the chip virtual"
         );
-        assert_eq!(state.round.source(&id), Some(ShotSource::AutoChip));
+        assert_eq!(state.sources.source(&id), Some(ShotSource::AutoChip));
         assert!(matches!(&bodies[0], FrpBody::ShotTrigger(t) if t.key == key));
         let FrpBody::ShotLaunch(launch) = &bodies[1] else {
             panic!("not a launch: {:?}", bodies[1]);

@@ -2,8 +2,8 @@
 //!
 //! Only values on the bus's measured blocks (`ball`, `club`, `impact`) are
 //! sent, each with its ValidMask bit; nothing is computed here, and
-//! flighthook's simulated values (`derived`) are never sent. During a
-//! tournament round the shot holds only what the launch monitor sent. A
+//! flighthook's simulated values (`derived`) are never sent. In strict mode
+//! the shot holds only what the launch monitor sent. A
 //! field the device did not report, or whose value is not finite, is sent
 //! as 0.0 with its bit clear.
 //!

@@ -213,9 +213,7 @@ A shot's values are the ones the game flew the ball with: after Pureplay's
 lie penalty or power adjustment, not the launch monitor's own reading. Its
 speed, launch angle, direction and spin are all a shot has; the carry,
 total and apex the Shots tab shows are flighthook's simulation of those
-values, as for every launch monitor. The card's shots are virtual: a
-tournament round never takes them, and they are never switched off during
-one. A shot only counts from Pureplay's live messages: nothing from before
+values, as for every launch monitor. The card's shots are virtual. A shot only counts from Pureplay's live messages: nothing from before
 the card connected, or missed while it was away, is taken later.
 
 ### Pureplay's result

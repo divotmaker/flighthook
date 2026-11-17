@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorStatus, ConnectionState, RoundState, ShotGrouping, StatusHistory};
+use crate::{ActorStatus, ConnectionState, ShotGrouping, StatusHistory};
 
 /// GET /api/status response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,10 +34,6 @@ pub struct StatusResponse {
     /// read, or after a save has replaced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_error: Option<ConfigLoadError>,
-    /// The tournament round: whether one is active, and which output holds
-    /// it. Omitted when no round is active.
-    #[serde(default, skip_serializing_if = "RoundState::is_inactive")]
-    pub round: RoundState,
 }
 
 /// One FRP actor in [`StatusResponse::actors`].
@@ -255,12 +251,6 @@ pub struct AutoChipResponse {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GroupingRequest {
     pub mode: ShotGrouping,
-}
-
-/// POST /api/tournament request body: switch tournament mode on or off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub struct TournamentRequest {
-    pub on: bool,
 }
 
 /// One practice block in `GET /api/blocks`: the `practice.block` as last

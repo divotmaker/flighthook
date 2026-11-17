@@ -49,10 +49,8 @@ pub(crate) fn outbound(msg: &BusMsg, to: PeerId) -> Option<&FrpMessage> {
 }
 
 /// What a hub link's text frame puts on the bus. A frame that is no FRP
-/// message, or a `shot.raw`, puts nothing; nor does a shot the round
-/// policy holds ([`crate::state::round::RoundPolicy::admits_remote`]: a
-/// virtual remote launch monitor's shot in tournament mode). A message from
-/// one of this process's own actors is [`Inbound::OwnBack`].
+/// message, or a `shot.raw`, puts nothing. A message from one of this
+/// process's own actors is [`Inbound::OwnBack`].
 pub(crate) enum Inbound {
     Bus(Box<BusMsg>),
     OwnBack(String),
@@ -72,9 +70,6 @@ pub(crate) fn inbound(root: &crate::state::SystemState, text: &str, peer: PeerId
     }
     if root.card_of_actor(&msg.from).is_some() || root.is_card_key(&msg.from) {
         return Inbound::OwnBack(msg.from);
-    }
-    if !root.round.admits_remote(&msg.from, &msg.body) {
-        return Inbound::Nothing;
     }
     Inbound::Bus(Box::new(BusMsg::from_peer(msg, peer)))
 }
@@ -491,65 +486,6 @@ mod tests {
             inbound(&state.root, sync, PeerId(9)),
             Inbound::Bus(m) if matches!(*m, BusMsg::Frp { peer: Some(PeerId(9)), .. })
         ));
-    }
-
-    /// Tournament mode holds a remote virtual launch monitor's shots (a
-    /// Trackball served over FRP) at the hub, the whole shot from its
-    /// trigger through its `shot.finished`; a measured remote monitor's
-    /// shots, a shot begun before the switch, and any shot once it is off
-    /// go through. A simulator's round alone holds nothing here.
-    #[test]
-    fn tournament_mode_holds_a_remote_virtual_monitors_shots() {
-        let (state, _writer, _dir) = test_state();
-        let root = &state.root;
-        root.round
-            .set_remote("tb00000000000001", Some(flighthook::Source::Virtual));
-        root.round
-            .set_remote("rd00000000000001", Some(flighthook::Source::Measured));
-        let shot = |from: &str, id: &str| -> Vec<String> {
-            let key = format!(r#""key":{{"shot_id":"{id}","shot_number":1}}"#);
-            vec![
-                format!(r#"{{"kind":"shot.trigger","from":"{from}",{key}}}"#),
-                format!(
-                    r#"{{"kind":"shot.launch","from":"{from}",{key},"launch":{{"launch_speed":"60.0mps"}}}}"#
-                ),
-                format!(r#"{{"kind":"shot.finished","from":"{from}",{key}}}"#),
-            ]
-        };
-        let passed = |text: &str| matches!(inbound(root, text, PeerId(9)), Inbound::Bus(_));
-        let all_pass = |texts: &[String]| texts.iter().all(|t| passed(t));
-        let none_pass = |texts: &[String]| texts.iter().all(|t| !passed(t));
-
-        // Off: everything goes through.
-        assert!(all_pass(&shot("tb00000000000001", "a")));
-        // A shot that began before tournament mode went on finishes.
-        let early = shot("tb00000000000001", "b");
-        assert!(passed(&early[0]));
-        root.round.set_manual(true);
-        assert!(all_pass(&early[1..]));
-        // On: the virtual monitor's shot is held whole, the measured one's
-        // and the virtual monitor's other messages go through.
-        assert!(none_pass(&shot("tb00000000000001", "c")));
-        assert!(all_pass(&shot("rd00000000000001", "d")));
-        assert!(passed(r#"{"kind":"bus.sync","from":"tb00000000000001"}"#));
-        // Off again: shots go through.
-        root.round.set_manual(false);
-        assert!(all_pass(&shot("tb00000000000001", "e")));
-
-        // A simulator's round alone holds the virtual monitor's shot too,
-        // and the measured one's still goes through.
-        let round = root
-            .round
-            .begin_round(&crate::state::round::RoundRequest {
-                holder: "Pureplay Connect",
-                feeds: &[],
-            })
-            .expect("a round");
-        assert!(none_pass(&shot("tb00000000000001", "f")));
-        assert!(all_pass(&shot("rd00000000000001", "g")));
-        // No round: it goes through again.
-        drop(round);
-        assert!(all_pass(&shot("tb00000000000001", "h")));
     }
 
     /// A peer message whose `from` is a local card key (here a mock

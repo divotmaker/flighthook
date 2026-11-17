@@ -624,119 +624,6 @@ fn the_running_actor_publishes_a_hand_change_once() {
     assert_eq!(state.session.turn().handedness, Some(Handedness::Left));
 }
 
-/// The tournament toggle writes `[simulation] tournament` (absent from
-/// the file while off), applies it before the outcome, and a restart
-/// with it on starts in tournament mode.
-#[test]
-fn set_tournament_persists_the_key_and_a_restart_starts_in_tournament_mode() {
-    let dir = TempDir(std::env::temp_dir().join(format!(
-        "flighthook-system-test-{}",
-        crate::state::config::generate_id()
-    )));
-    let path = dir.0.join("config.toml");
-    let (state, _writer) = SystemState::new(path.clone());
-    let state = Arc::new(state);
-    assert!(!state.round.active());
-    let (bus_tx, mut rx) = broadcast::channel(16);
-    let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
-    let set = |on: bool| {
-        run_config_command(
-            &LocalEvent::ConfigCommand {
-                request_id: Some("req-t".into()),
-                action: Box::new(ConfigAction::SetTournament { on }),
-            },
-            &state,
-            &bus_tx,
-            &sender,
-        );
-    };
-
-    set(true);
-    assert!(state.system.simulation().tournament);
-    let toml = std::fs::read_to_string(&path).expect("written");
-    assert!(toml.contains("tournament = true"), "{toml}");
-    assert!(state.round.state().manual && state.round.active());
-    let outcome = std::iter::from_fn(|| rx.try_recv().ok())
-            .filter_map(local_of)
-            .any(|m| matches!(m.event, LocalEvent::ConfigOutcome { ref request_id, .. } if request_id.as_deref() == Some("req-t")));
-    assert!(outcome, "the outcome goes out");
-
-    // A restart reads it: tournament mode from the start.
-    let (again, _w) = SystemState::new(path.clone());
-    assert_eq!(
-        again.round.state(),
-        flighthook::RoundState {
-            active: true,
-            holder: Some(crate::state::round::MANUAL_HOLDER.into()),
-            manual: true,
-            held: false,
-        }
-    );
-
-    set(false);
-    assert!(!state.round.active());
-    let toml = std::fs::read_to_string(&path).expect("written");
-    assert!(!toml.contains("tournament"), "absent while off: {toml}");
-    let (off, _w) = SystemState::new(path);
-    assert!(!off.round.active(), "a restart with it off starts off");
-}
-
-/// Only the toggle writes tournament mode: a `scope=global` save
-/// (`ReplaceGlobal`) or a whole-config save (`ReplaceAll`) keeps the live
-/// value whatever its body carries, in both directions.
-#[test]
-fn a_settings_save_never_changes_tournament_mode() {
-    let dir = TempDir(std::env::temp_dir().join(format!(
-        "flighthook-system-test-{}",
-        crate::state::config::generate_id()
-    )));
-    let path = dir.0.join("config.toml");
-    let (state, _writer) = SystemState::new(path.clone());
-    let state = Arc::new(state);
-    let (bus_tx, _rx) = broadcast::channel(64);
-    let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
-    let run = |action: ConfigAction| {
-        run_config_command(
-            &LocalEvent::ConfigCommand {
-                request_id: None,
-                action: Box::new(action),
-            },
-            &state,
-            &bus_tx,
-            &sender,
-        );
-    };
-    let saves = |body_says: bool| {
-        let mut config = state.system.snapshot();
-        config.simulation.tournament = body_says;
-        // Something else in the save changes, as a real one does.
-        config.simulation.temperature_c = if body_says { 10.0 } else { 20.0 };
-        [
-            ConfigAction::ReplaceGlobal {
-                config: Box::new(config.clone()),
-            },
-            ConfigAction::ReplaceAll {
-                config: Box::new(config),
-            },
-        ]
-    };
-    for live in [true, false] {
-        run(ConfigAction::SetTournament { on: live });
-        for action in saves(!live) {
-            run(action);
-            assert_eq!(state.system.simulation().tournament, live, "live {live}");
-            assert_eq!(state.round.state().manual, live, "live {live}");
-            let toml = std::fs::read_to_string(&path).expect("written");
-            assert_eq!(toml.contains("tournament = true"), live, "{toml}");
-        }
-        let temperature = if live { 20.0 } else { 10.0 };
-        assert!(
-            (state.system.simulation().temperature_c - temperature).abs() < 1e-9,
-            "the rest of the save is applied"
-        );
-    }
-}
-
 #[test]
 fn set_shot_grouping_persists_and_emits_the_outcome() {
     let dir = TempDir(std::env::temp_dir().join(format!(
@@ -2359,7 +2246,7 @@ fn a_removal_releases_an_actor_by_the_reconnect_rules() {
     let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
     for n in ["0", "1"] {
         let card = format!("mock_monitor.{n}");
-        state.round.register_card_source(
+        state.sources.register_card_source(
             &card,
             &card,
             crate::actors::provenance::ShotSource::MockMonitor,
@@ -2385,7 +2272,7 @@ fn a_removal_releases_an_actor_by_the_reconnect_rules() {
     assert_eq!(outcome_of(&seen, "remove-1").1, ["mock_monitor.1"]);
     assert!(state.actor_ids().is_empty(), "both unregistered");
     for id in ["mock_monitor.0", "mock_monitor.1"] {
-        assert_eq!(state.round.source(id), None, "{id} is not a source");
+        assert_eq!(state.sources.source(id), None, "{id} is not a source");
     }
     assert!(
         state.is_closing("mock_monitor.0"),
@@ -2492,7 +2379,7 @@ fn turning_a_card_off_stops_it_and_on_starts_it_again() {
 }
 
 /// A launch monitor turned off is forgotten by its actor ID: its host
-/// sends its `bus.actor` removal and the round stops counting it as a
+/// sends its `bus.actor` removal and the registry stops counting it as a
 /// source; the other card stays one.
 #[test]
 fn turning_a_card_off_forgets_it_by_actor_id() {
@@ -2506,7 +2393,7 @@ fn turning_a_card_off_forgets_it_by_actor_id() {
         c.mock_monitor.insert("0".into(), with_id("Mock", OFF));
         c.mock_monitor.insert("1".into(), with_id("Other", ON));
     });
-    assert!(state.round.source(OFF).is_some());
+    assert!(state.sources.source(OFF).is_some());
     let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
     run_config_command(
         &LocalEvent::ConfigCommand {
@@ -2536,8 +2423,8 @@ fn turning_a_card_off_forgets_it_by_actor_id() {
         }
     }
     assert!(removed, "its bus.actor is removed");
-    assert_eq!(state.round.source(OFF), None, "not a source");
-    assert!(state.round.source(ON).is_some(), "the other stays one");
+    assert_eq!(state.sources.source(OFF), None, "not a source");
+    assert!(state.sources.source(ON).is_some(), "the other stays one");
     stop_all(&state);
 }
 
@@ -2584,7 +2471,7 @@ fn a_lingering_card_turned_off_has_its_bus_actor_removed() {
     });
     state.stop_and_wait("mock_monitor.0");
     start_actor("mock_monitor.0".into(), Box::new(Lingers), &state, &bus_tx);
-    assert!(state.round.source(OFF).is_some());
+    assert!(state.sources.source(OFF).is_some());
     while rx.try_recv().is_ok() {}
     let sender = BusSender::new("system".into(), bus_tx.clone(), Arc::default());
     run_config_command(
@@ -2612,7 +2499,7 @@ fn a_lingering_card_turned_off_has_its_bus_actor_removed() {
         }
     }
     assert_eq!(removed, 1, "its bus.actor is removed once");
-    assert_eq!(state.round.source(OFF), None, "not a source");
+    assert_eq!(state.sources.source(OFF), None, "not a source");
     stop_all(&state);
 }
 
@@ -2623,13 +2510,13 @@ fn a_new_actor_id_replaces_the_cards_old_source() {
     let (_dir, state, _bus_tx, _rx) = running(|_| {});
     let source = crate::actors::provenance::ShotSource::MockMonitor;
     state
-        .round
+        .sources
         .register_card_source("mock_monitor.0", "old-id", source);
     state
-        .round
+        .sources
         .register_card_source("mock_monitor.0", "new-id", source);
-    assert_eq!(state.round.source("old-id"), None);
-    assert_eq!(state.round.source("new-id"), Some(source));
+    assert_eq!(state.sources.source("old-id"), None);
+    assert_eq!(state.sources.source("new-id"), Some(source));
     stop_all(&state);
 }
 
@@ -3126,7 +3013,7 @@ fn a_removal_during_a_long_reconnect_starts_nothing() {
     assert!(restarted.is_empty() && stopped.is_empty() && started.is_empty());
     assert!(state.actor_ids().iter().all(|a| a != id));
     assert_eq!(fresh_starts(&seen, id), 0);
-    assert_eq!(state.round.source(id), None, "not a shot source");
+    assert_eq!(state.sources.source(id), None, "not a shot source");
     shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     stop_all(&state);
 }

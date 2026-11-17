@@ -205,30 +205,22 @@ pub(crate) fn assert_outputs_pinned(
     assert_eq!(got, &PINS[start..end], "{case}");
 }
 
-/// The frames Pureplay Connect sends in a tournament round (strict mode)
-/// for the first shot that finishes in `messages`: the launch monitor's
-/// values as the round takes them ([`measured_shot`]), from a source the
-/// round counts (the launch monitor's `bus.actor` in `messages`), through
-/// the Pureplay mapper. `None` when the round withholds the shot.
+/// The frames Pureplay Connect sends in strict mode for the first shot
+/// that finishes in `messages`: the launch monitor's values as strict mode
+/// takes them ([`measured_shot`]), from a source it sends (the launch
+/// monitor's `bus.actor` in `messages`), through the Pureplay mapper.
+/// `None` when strict mode withholds the shot.
 ///
 /// [`measured_shot`]: crate::actors::simout::measured_shot
 pub(crate) fn strict_frames(
     card: &str,
     messages: &[crate::bus::BusMsg],
 ) -> Option<crate::actors::pureplay::mapper::ShotFrames> {
-    use crate::state::round::{RoundPolicy, RoundRequest};
-    let round = RoundPolicy::default();
-    let guard = round
-        .begin_round(&RoundRequest {
-            holder: "Pureplay",
-            feeds: &[],
-        })
-        .expect("a round");
     let mut agg = flightrelay::ShotAggregator::new();
     for msg in messages.iter().filter_map(crate::bus::BusMsg::as_frp) {
         if let Some(flightrelay::ShotEvent::Finished(shot)) = agg.feed(msg) {
             let shot = crate::actors::simout::measured_shot(&shot, card);
-            if !guard.counts(shot.source) {
+            if !crate::actors::pureplay::sends(true, shot.source) {
                 return None;
             }
             return crate::actors::pureplay::mapper::map_shot(&shot, 1);

@@ -370,18 +370,7 @@ impl SettingsForm {
         if let Some(saved) = &self.original_config {
             config.keep_actor_ids_from(saved);
         }
-        config.simulation.tournament = self.live_tournament();
         config
-    }
-
-    /// Tournament mode as the server last reported it. Only the toggle
-    /// writes it, so a save carries this value, never the form's copy.
-    pub(super) fn live_tournament(&self) -> bool {
-        self.original_config
-            .as_ref()
-            .map_or(self.simulation.loaded.tournament, |c| {
-                c.simulation.tournament
-            })
     }
 
     /// Append a new, unsaved entry from (+) menu `preset` at the lowest
@@ -598,12 +587,7 @@ impl SettingsForm {
                     self.actors.remove(idx);
                 }
             }
-            SaveTarget::Full => {
-                // The server keeps tournament mode on a whole-config save.
-                let tournament = saved.simulation.tournament;
-                saved = posted;
-                saved.simulation.tournament = tournament;
-            }
+            SaveTarget::Full => saved = posted,
         }
         self.load_from(&saved);
         match target {
@@ -721,7 +705,6 @@ impl SettingsForm {
         config.default_units = self.default_units;
         config.shot_grouping = self.shot_grouping;
         config.simulation = self.simulation.to_section_or_loaded();
-        config.simulation.tournament = self.live_tournament();
         config.replay = self.replay.to_section_or_loaded();
         config.body_tracking = self.body_tracking.to_section_or_loaded();
         config
@@ -823,27 +806,19 @@ pub(crate) fn switchable(type_key: &str) -> bool {
 }
 
 /// Whether `a` and `b` hold the same global settings.
-/// Tournament mode is left out: the General cards never write it.
 pub(super) fn global_matches(a: &FlighthookConfig, b: &FlighthookConfig) -> bool {
     a.default_units == b.default_units
         && a.shot_grouping == b.shot_grouping
-        && SimulationSection {
-            tournament: b.simulation.tournament,
-            ..a.simulation.clone()
-        } == b.simulation
+        && a.simulation == b.simulation
         && a.replay == b.replay
         && a.body_tracking == b.body_tracking
 }
 
-/// Copy `from`'s global settings into `to`, all but tournament mode (the
-/// server keeps it on a General save).
+/// Copy `from`'s global settings into `to`.
 pub(super) fn copy_global(to: &mut FlighthookConfig, from: &FlighthookConfig) {
     to.default_units = from.default_units;
     to.shot_grouping = from.shot_grouping;
-    to.simulation = SimulationSection {
-        tournament: to.simulation.tournament,
-        ..from.simulation.clone()
-    };
+    to.simulation = from.simulation.clone();
     to.replay = from.replay.clone();
     to.body_tracking = from.body_tracking.clone();
 }

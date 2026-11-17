@@ -14,8 +14,8 @@ use crate::panels::{Tab, flight};
 use crate::scale::{self, UiScale};
 use crate::theme;
 use crate::types::{
-    ActorStatus, ActorStatusResponse, CameraListResponse, Club, Handedness, LogEntry, RoundState,
-    ShotRow, UnitSystem,
+    ActorStatus, ActorStatusResponse, CameraListResponse, Club, Handedness, LogEntry, ShotRow,
+    UnitSystem,
 };
 
 const API_DOCS_MD: &str = include_str!("../../docs/API.md");
@@ -63,22 +63,14 @@ pub struct FlighthookApp {
     pub(crate) follow_turns: bool,
     /// The toast showing: its text and when it was set (input time, s).
     pub(crate) toast: Option<(String, f64)>,
-    /// Each tournament mode switch the header sent, in order (tests only).
-    #[cfg(test)]
-    pub(crate) tournament_sent: Vec<bool>,
     /// The Auto-chip distance (yards) sent and not answered yet.
     pub(crate) auto_chip_in_flight: Option<u32>,
     /// Why the last Auto-chip was not sent, shown in the error banner until
     /// the next one.
     pub(crate) auto_chip_error: Option<String>,
-    /// Why the last tournament mode switch failed, shown in the error
-    /// banner until the next switch.
-    pub(crate) tournament_error: Option<String>,
     /// The turn's handedness (`None` until the server reports one).
     /// Stamped on shots as they trigger, like the club.
     pub(crate) handed: Option<Handedness>,
-    /// The tournament round, as the server's round policy reports it.
-    pub(crate) round: RoundState,
 
     // Shot groups of the webserver the UI talks to
     pub(crate) groups: ShotGroups,
@@ -320,13 +312,9 @@ impl FlighthookApp {
             toast: None,
             #[cfg(test)]
             sent_selects: Vec::new(),
-            #[cfg(test)]
-            tournament_sent: Vec::new(),
             auto_chip_in_flight: None,
             auto_chip_error: None,
-            tournament_error: None,
             handed: None,
-            round: RoundState::default(),
             groups: ShotGroups::default(),
             settings: SettingsForm::default(),
             pending,
@@ -441,11 +429,9 @@ impl FlighthookApp {
             ) {
                 self.selected_club = club;
             }
-            // With the WebSocket up, its turn and `round_state` are the
-            // live source.
+            // With the WebSocket up, its turn is the live source.
             if !self.ws_connected {
                 self.handed = turn.and_then(|t| t.handedness);
-                self.round = status.round;
             }
             self.cameras_supported = status.cameras_supported;
             self.trackball_supported = status.trackball_supported;
@@ -495,10 +481,6 @@ impl FlighthookApp {
         if let Some(reply) = p.auto_chip.take() {
             self.auto_chip_in_flight = None;
             self.auto_chip_error = reply.err();
-        }
-
-        if let Some(reply) = p.tournament.take() {
-            self.tournament_error = reply.err();
         }
 
         if let Some(reply) = p.cameras.take() {
@@ -665,8 +647,7 @@ impl FlighthookApp {
 
     /// Handle one WebSocket event. Returns whether the socket is gone: then
     /// the server's state it carried is dropped with it (the actors on a
-    /// close, and the tournament round either way, so no banner outlives
-    /// the server that held the round).
+    /// close).
     pub(crate) fn handle_ws_event(&mut self, event: WsPollEvent) -> bool {
         match event {
             WsPollEvent::Opened => false,
@@ -674,13 +655,9 @@ impl FlighthookApp {
                 self.handle_ui_message(*msg);
                 false
             }
-            WsPollEvent::Error(_) => {
-                self.round = RoundState::default();
-                true
-            }
+            WsPollEvent::Error(_) => true,
             WsPollEvent::Disconnected => {
                 self.actors.clear();
-                self.round = RoundState::default();
                 true
             }
         }
@@ -1350,7 +1327,6 @@ mod tests {
             trackball_supported: false,
             clip_dir: None,
             config_error,
-            round: Default::default(),
         };
         let error = crate::types::ConfigLoadError {
             path: "/home/golfer/.config/flighthook/config.toml".into(),
@@ -1550,7 +1526,6 @@ mod tests {
             trackball_supported: false,
             clip_dir: None,
             config_error: None,
-            round: Default::default(),
         };
         let mut app = FlighthookApp::with_pending(net::new_pending());
         app.pending.lock().expect("lock").status = Some(status(Some(Handedness::Left)));
@@ -1601,7 +1576,6 @@ mod tests {
             trackball_supported: false,
             clip_dir: None,
             config_error: None,
-            round: Default::default(),
         };
         let mut app = FlighthookApp::with_pending(net::new_pending());
         app.now_ms = 10_000;
@@ -2261,7 +2235,6 @@ mod tests {
                 trackball_supported: false,
                 clip_dir: Some("/clips".into()),
                 config_error: None,
-                round: Default::default(),
             });
         }
         app.apply_pending();
@@ -2273,43 +2246,7 @@ mod tests {
         assert_eq!(metric.video.len(), 1);
     }
 
-    // -- Tournament banner ---------------------------------------------------
-
-    fn flatten_shapes(shape: &egui::Shape, out: &mut Vec<String>) {
-        match shape {
-            egui::Shape::Vec(inner) => inner.iter().for_each(|s| flatten_shapes(s, out)),
-            egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
-            _ => {}
-        }
-    }
-
-    /// One pass of the header in a window of `size` at `time`: its marked
-    /// controls and every text drawn.
-    fn header_pass(
-        ctx: &egui::Context,
-        app: &mut FlighthookApp,
-        size: egui::Vec2,
-        time: f64,
-        events: Vec<egui::Event>,
-    ) -> (crate::panels::devices::Marks, Vec<String>) {
-        use crate::panels::devices::Marks;
-        ctx.data_mut(|d| d.remove_temp::<Marks>(egui::Id::NULL));
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            time: Some(time),
-            events,
-            ..Default::default()
-        };
-        let output = ctx.run(input, |ctx| app.render_header_in_test(ctx));
-        let mut texts = Vec::new();
-        for clipped in &output.shapes {
-            flatten_shapes(&clipped.shape, &mut texts);
-        }
-        let marks = ctx
-            .data(|d| d.get_temp::<Marks>(egui::Id::NULL))
-            .unwrap_or_default();
-        (marks, texts)
-    }
+    // -- Header ----------------------------------------------------------------
 
     /// An app with Auto-chip on, GSPro and a Pureplay output connected and
     /// an Omni at 74 %: the fullest header.
@@ -2330,15 +2267,6 @@ mod tests {
         omni.telemetry.insert("battery_pct".into(), "74".into());
         app.actors.insert("square.0".into(), omni);
         app
-    }
-
-    fn round(holder: &str) -> RoundState {
-        RoundState {
-            active: true,
-            holder: Some(holder.into()),
-            held: true,
-            manual: false,
-        }
     }
 
     /// Two golfers, Eric (bag DR and PW, profile published) up.
@@ -2435,75 +2363,6 @@ mod tests {
         );
     }
 
-    /// The round comes from the server: its `round_state` events set it,
-    /// and a status reply does while the WebSocket is down.
-    #[test]
-    fn the_round_follows_the_server() {
-        let mut app = FlighthookApp::with_pending(crate::net::new_pending());
-        app.handle_ui_message(crate::socket::feed::local_msg(
-            "system",
-            flighthook::UiLocalEvent::RoundState {
-                round: round("Pureplay"),
-            },
-        ));
-        assert_eq!(app.round, round("Pureplay"));
-        app.handle_ui_message(crate::socket::feed::local_msg(
-            "system",
-            flighthook::UiLocalEvent::RoundState {
-                round: RoundState::default(),
-            },
-        ));
-        assert!(!app.round.active);
-
-        app.ws_connected = false;
-        app.pending.lock().expect("pending").status = Some(crate::types::StatusResponse {
-            cards: HashMap::new(),
-            actors: HashMap::new(),
-            turn: None,
-            cameras_supported: false,
-            trackball_supported: false,
-            clip_dir: None,
-            config_error: None,
-            round: round("Pureplay 2"),
-        });
-        app.apply_pending();
-        assert_eq!(app.round, round("Pureplay 2"));
-    }
-
-    /// A WebSocket that closes or fails takes the round with it: the
-    /// banner does not outlive the server that held the round.
-    #[test]
-    fn a_dropped_websocket_ends_the_round_on_screen() {
-        let size = egui::vec2(1600.0, 900.0);
-        for event in [
-            WsPollEvent::Disconnected,
-            WsPollEvent::Error("connection reset".into()),
-        ] {
-            let ctx = egui::Context::default();
-            theme::install(&ctx);
-            let mut app = full_header_app();
-            app.handle_ui_message(crate::socket::feed::local_msg(
-                "system",
-                flighthook::UiLocalEvent::RoundState {
-                    round: round("Pureplay"),
-                },
-            ));
-            header_pass(&ctx, &mut app, size, 0.0, Vec::new());
-            let (marks, _) = header_pass(&ctx, &mut app, size, 0.0, Vec::new());
-            assert!(marks.contains_key("title"));
-            assert!(marks.contains_key("tournament"));
-
-            assert!(app.handle_ws_event(event), "the socket is gone");
-            assert_eq!(app.round, RoundState::default());
-            header_pass(&ctx, &mut app, size, 0.0, Vec::new());
-            let (_, texts) = header_pass(&ctx, &mut app, size, 0.0, Vec::new());
-            assert!(
-                !texts.iter().any(|t| t.starts_with("TOURNAMENT")),
-                "{texts:?}"
-            );
-        }
-    }
-
     /// A status reply that says whether the server reads a trackball.
     fn welcome_status(trackball: bool) -> crate::types::StatusResponse {
         crate::types::StatusResponse {
@@ -2514,7 +2373,6 @@ mod tests {
             trackball_supported: trackball,
             clip_dir: None,
             config_error: None,
-            round: RoundState::default(),
         }
     }
 

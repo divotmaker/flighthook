@@ -303,7 +303,7 @@ pub(super) fn finish(
     let snap = state.system.snapshot();
     for id in stopped.iter().filter(|id| !configured.contains(id)) {
         let actor = state
-            .round
+            .sources
             .forget_card(id)
             .or_else(|| snap.actor_of_card(id))
             .or_else(|| state.beats.actor_of_card(id));

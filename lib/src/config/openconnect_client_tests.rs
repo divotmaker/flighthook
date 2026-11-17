@@ -63,7 +63,6 @@ fn every_field() -> FlighthookConfig {
             temperature_c: 12.5,
             surface: SimSurface::FirmGreen,
             auto_chip: true,
-            tournament: true,
         },
         replay: ReplaySection {
             keep_shots: 7,

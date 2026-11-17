@@ -198,8 +198,7 @@ Comprehensive system state: each local card's status, every FRP actor on the bus
   "config_error": {
     "path": "C:\\Users\\me\\AppData\\Roaming\\flighthook\\config.toml",
     "error": "line 4, column 8: unknown variant `liv`, expected one of `off`, `historical`, `live`"
-  },
-  "round": { "active": true, "holder": "Pureplay", "held": true }
+  }
 }
 ```
 
@@ -231,11 +230,6 @@ Comprehensive system state: each local card's status, every FRP actor on the bus
   and `{"error": "..."}` when the copy can't be made; the file and the field
   stay. The dashboard reads it with the rest of the status at startup and
   again after every settings change.
-- `round`: present only while a tournament round is active. A round is active while a simulator holds one (`held`:
-  an output such as Pureplay in strict mode, or the Pureplay Accessory's match), while tournament mode is switched on
-  (`manual`, see [`POST /api/tournament`](#post-apitournament)), or both. `holder` is the display name of the first
-  simulator holding it, else `"Manual"`. `manual` and `held` are omitted when false. The same object arrives on
-  [`/api/ws`](#websocket-apiws) as `round_state`.
 - Each entry of `cards` has: `name`, the card's configured name, as the config holds it at the request (a rename
   shows here at once; it restarts nothing; an Open Connect server with a blank name reads `Open Connect`, and Open
   Connect servers that share a name are numbered in index order, `Open Connect 1`, `Open Connect 2`); `status`:
@@ -287,8 +281,14 @@ reported by one source only:
   `127.0.0.1:9760`), `last_shot` (the ShotId Pureplay got last and the local
   time it was sent, `#4 at 16:41:07`), and for the current link only
   `shots_sent` (`4`), `ready_state` (the ready state last sent, `ready` |
-  `not ready` | `processing`) and `strict_mode` (`on` | `off`; `on` while a
-  tournament round is in progress, when Auto-chip does not fire). `club` and
+  `not ready` | `processing`) and `strict_mode` (`on` | `off`). Strict mode is
+  `on` while Pureplay records a tournament round: Pureplay asks for it on the
+  link and the output always accepts; it is off again when Pureplay ends it
+  or the link ends. While it is on, the output sends only shots whose launch
+  monitor declares `device.source` `measured` (see [Source](#source)), with
+  the values the launch monitor sent, and its ready state counts only those
+  launch monitors; the dashboard's header shows a Tournament icon while any
+  Pureplay Connect output reports `on`. `club` and
   `handed` are the club and hand Pureplay set. `error` says why the handshake
   failed (no reply to Hello, an unsupported protocol version); a refused or
   closed connection sets none. When the link ends, `shots_sent`,
@@ -445,8 +445,7 @@ offset and height inches; angles, spin and `path` (always meters and seconds) ar
 - `source`: where the shot comes from, from the launch monitor's `bus.actor` `device.source` (see
   [Source](#source)): `"measured"` (a physical launch monitor measured it: one flighthook reads, one whose app sends
   its shots to the Open Connect input, or a remote launch monitor that declares it) or `"virtual"` (the Trackball, the
-  mock launch monitor, Auto-chip, a Pureplay Accessory card). Absent on a shot stored without it; a tournament round
-  counts such a shot as not measured.
+  mock launch monitor, Auto-chip, a Pureplay Accessory card). Absent on a shot stored without it.
 - `stroke` (beta): a game's view of the stroke, the `game.stroke` joined to the shot by `shot_id`; it arrives
   seconds after the shot, from a Pureplay Accessory card or any FRP game. The fields are the spec's: `stroke_id`,
   `golfer`, `hole`, `stroke_number`, `outcome` (`in_play`, `green`, `holed`, `out_of_bounds`, `water`, `lost`,
@@ -1251,9 +1250,7 @@ Pureplay Connect card is connected.
 `400 Bad Request` with a JSON `{"error": "yards must be one of 1, 3, 5"}`
 body for any other distance. `409 Conflict` with a JSON `{"error"}` body when
 Auto-chip is turned off (`[simulation]` `auto_chip` is `false`, the default; the error is
-`"Auto-Chip is disabled in settings"`, and no shot is sent or numbered), while
-a tournament round is active, whoever holds it (nothing sent or numbered either; see
-`round` under [`GET /api/status`](#get-apistatus)), or
+`"Auto-Chip is disabled in settings"`, and no shot is sent or numbered), or
 when the `[simulation]` altitude or temperature is out of range. A body that is not
 `{"yards": <non-negative integer>}` is `422 Unprocessable Entity`, and a
 missing `Content-Type: application/json` `415 Unsupported Media Type`.
@@ -1283,39 +1280,6 @@ An Auto-chip joins the set in play like any shot, and counts in that set's
 `shots`. The dashboard lists it under that set but leaves it out of the
 set's shot count and of every set or club statistic (range bars, dispersion,
 the flight chart's set), and it is not a device of the device filter.
-
----
-
-### POST /api/tournament
-
-Switch tournament mode on or off. While it is on, Auto-chip is off and the
-mock launch monitor, the trackball and every remote launch monitor that
-declares itself virtual on `/frp` (e.g. a trackball served over FRP) hold
-their shots (a swing then is dropped and takes no shot number); no output's payload changes. It is never
-refused: a virtual launch monitor feeding an output just holds its shots. A
-simulator's round is untouched either way, and while one holds the round the
-setting stays underneath it: when the round ends, tournament mode is on again
-if it was on, and while one holds the round `{"on": false}` clears the setting but the round stays active (`held`) until the
-simulator ends it; tournament mode is on afterward only if the setting is still on. The dashboard disables its
-toggle while `held`. The setting is saved as
-`[simulation] tournament` (absent while
-off) and read at start-up. This route is its only writer: a
-[`POST /api/settings`](#post-apisettings) save, scoped to `global` or of the
-whole config, keeps the live value whatever its body carries.
-
-```json
-{ "on": true }
-```
-
-Answers `200` with the round as it is then, the same object as `round` in
-[`GET /api/status`](#get-apistatus):
-
-```json
-{ "active": true, "holder": "Manual", "manual": true }
-```
-
-`504 Gateway Timeout` when the change is not applied in time. A body that is
-not `{"on": <boolean>}` is `422 Unprocessable Entity`.
 
 ---
 
@@ -1850,10 +1814,7 @@ Full persisted config (mirrors `config.toml`).
   while `false`): whether the dashboard offers [Auto-chip](#post-apiauto-chip)
   and `POST /api/auto-chip` accepts a chip. Off by default; turn it on in
   Settings → General → Simulation (useful with radar launch monitors that miss short chips).
-  `tournament` (boolean, default `false`, omitted while `false`): whether
-  tournament mode is on (see [`POST /api/tournament`](#post-apitournament)); read
-  at start-up and written only by that route (a settings save keeps the live
-  value). With `"mode": "force"`, every simulated shot's results
+  With `"mode": "force"`, every simulated shot's results
   (carry, apex, flight time, descent, offline, roll, total) come from the
   simulation for every device, carried in the flight model's flight; the device's own results stay in the launch
   monitor's own flight.
@@ -2225,8 +2186,7 @@ is applied and writes that section `enabled = false`, so it is listed in
 the first (by numeric index) as it is and the later ones off, with a warning
 in the log; `enabled = false` is written by the next save.
 
-An actor that is off is not a shot source: it sends no shots, and is
-neither counted nor refused as a feed by a tournament round. It has no
+An actor that is off is not a shot source: it sends no shots. It has no
 battery in the header and adds nothing to readiness: an output routed to a
 monitor that is off is not ready, as with a monitor that is not configured.
 
@@ -2324,8 +2284,8 @@ card's id is the `actor_id` in its settings section, generated once and kept.
   peers' messages are relayed to every other peer, so two programs connected to flighthook see each other.
 - **In:** a peer's messages go onto flighthook's bus and are treated like any actor's:
   - `shot.*` from a launch monitor: stored, shown, sent to outputs routed to it, and counted for the golfer up and the
-    open [block](#get-apiblocks). A peer whose `bus.actor` `device.source` is `virtual` has its shots held
-    while a tournament round is active, as the mock and Trackball cards do.
+    open [block](#get-apiblocks). While Pureplay records a tournament round, a Pureplay Connect output sends a
+    peer's shots only when its `bus.actor` `device.source` is `measured`.
   - `golfer.select`: answered with a `bus.reply` by flighthook's session, so the golfer, club, hand and mode can be
     driven from another program. While a simulator card is connected it sends its own values back (the turn follows
     the simulator).
@@ -2407,7 +2367,6 @@ Sent once, first.
     "card_keys": { "5b80e2f7d14c9a63": "mevo.0" },
     "states": [ { "kind": "golfer.turn", "from": "c19e04b7a2d5f318", "golfer": null, "club": "7I", "handedness": "rh", "mode": "full" } ],
     "cards": { "mevo.0": { "name": "Mevo WiFi", "status": "connected", "telemetry": {}, "state": "connected", "red_for_ms": 0 } },
-    "round": { "active": false },
     "config_generation": 3
   }
 }
@@ -2417,7 +2376,6 @@ Sent once, first.
 - `card_keys`: the local card key of each flighthook actor on the bus, by actor id.
 - `states`: every FRP state on the bus (local and remote actors), as FRP messages.
 - `cards`: each local card's status, as in [`GET /api/status`](#get-apistatus).
-- `round`: the tournament round (the `round` object of `GET /api/status`; `{"active": false}` when none).
 - `config_generation`: counts up with every applied configuration change.
 
 #### frp
@@ -2438,8 +2396,6 @@ that is not an FRP message. `kind` is one of:
 
 - `card_status`: `status` and `telemetry` (the card's rows) of the card.
 - `alert`: `severity` (`warn`, `error`, `critical`) and `message`, from a card that is no FRP actor.
-- `round_state`: `round`, the tournament round started or ended (the same object as `round` in
-  [`GET /api/status`](#get-apistatus)).
 - `config_outcome`: a configuration change was applied: `request_id` (omitted for a change the dashboard did not
   make), `restarted`, `stopped`, `started` (card keys) and `config_generation`.
 - `card_keys`: `card_keys`, the card key of every local actor by actor id, sent after every configuration change.

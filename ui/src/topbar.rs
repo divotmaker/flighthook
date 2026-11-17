@@ -1,6 +1,7 @@
 //! The top bar: nav icons on the left (Shots, Cameras, Settings, Log), a
 //! title in the center while it fits, and on the right, by role: status and
-//! mode (energy, Tournament, Follow turns), actions (Auto-Chip, Shot Type)
+//! mode (energy, Tournament while a Pureplay game is in a tournament round,
+//! Follow turns), actions (Auto-Chip, Shot Type)
 //! and selections (Club, then Golfer at the far right edge). Every button is
 //! 40 px with a 6 px gap and no dividers; the groups are only an order.
 //! The dropdowns open under their button. In the portrait layout the nav
@@ -19,7 +20,6 @@ use crate::panels::cameras::ShotsPane;
 use crate::panels::devices::mark;
 use crate::panels::{Tab, settings_alert};
 use crate::theme;
-use crate::types::RoundState;
 
 /// Height of the bar.
 pub(crate) const BAR_HEIGHT: f32 = 52.0;
@@ -63,7 +63,6 @@ const SHOT_TYPE_TIP: &str =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeaderMenu {
     Energy,
-    Tournament,
     AutoChip,
     ShotType,
     Club,
@@ -82,82 +81,9 @@ enum Slot {
     Golfer,
 }
 
-/// The tournament control's state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Tournament {
-    /// No round.
-    Off,
-    /// The toggle alone holds a round.
-    Manual,
-    /// A simulator's round, held by the output named.
-    Held(Option<String>),
-}
-
-impl Tournament {
-    /// The state the server's round gives: held while a simulator holds
-    /// it, else on while tournament mode is.
-    pub(crate) fn of(round: &RoundState) -> Self {
-        if round.held {
-            Tournament::Held(round.holder.clone())
-        } else if round.manual {
-            Tournament::Manual
-        } else {
-            Tournament::Off
-        }
-    }
-
-    /// Text beside `TOURNAMENT` in the center title, if any.
-    fn holder(&self) -> Option<&str> {
-        match self {
-            Tournament::Off => None,
-            Tournament::Manual => Some("Manual"),
-            Tournament::Held(holder) => holder.as_deref(),
-        }
-    }
-
-    /// The icon's hover text.
-    fn button_tip(&self) -> String {
-        match self {
-            Tournament::Off => {
-                "Tournament mode: off. Click to turn on.\nWhile it is on, virtual devices are not \
-                 allowed."
-                    .to_owned()
-            }
-            Tournament::Manual => {
-                "Tournament mode: on. Click to turn off.\nVirtual devices are not allowed."
-                    .to_owned()
-            }
-            Tournament::Held(holder) => format!(
-                "Tournament round held by {}.\nIt can't be turned off here. Click for details.",
-                holder.as_deref().unwrap_or("a simulator")
-            ),
-        }
-    }
-
-    /// The message a switch to this state shows (no "click" wording: a
-    /// finger taps).
-    fn switch_text(&self) -> String {
-        match self {
-            Tournament::Off => "Tournament mode: off.".to_owned(),
-            _ => "Tournament mode: on.".to_owned(),
-        }
-    }
-
-    /// The center title's hover text: why things are off.
-    fn title_tip(&self) -> Option<String> {
-        match self {
-            Tournament::Off => None,
-            Tournament::Manual => {
-                Some("Tournament mode is on. Virtual devices are not allowed.".to_owned())
-            }
-            Tournament::Held(holder) => Some(format!(
-                "{} tournament round: only shots a launch monitor measured are sent. \
-                 Auto-Chip is off until the round ends.",
-                holder.as_deref().unwrap_or("A")
-            )),
-        }
-    }
-}
+/// The Tournament icon's hover text.
+pub(crate) const TOURNAMENT_TIP: &str =
+    "A Pureplay game is in a tournament round: only shots a launch monitor measured are sent.";
 
 /// A golfer the Golfer card lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -630,7 +556,9 @@ impl FlighthookApp {
         if !batteries.is_empty() {
             slots.push(Slot::Energy);
         }
-        slots.push(Slot::Tournament);
+        if self.strict_round() {
+            slots.push(Slot::Tournament);
+        }
         if self.known_golfers().len() >= 2 {
             slots.push(Slot::Follow);
         }
@@ -952,81 +880,23 @@ impl FlighthookApp {
         });
     }
 
-    /// The Tournament button: a click toggles tournament mode (one
-    /// request); a held round's click opens its card and sends nothing.
-    /// The toggle waits while Settings has unsaved edits, so the two never
-    /// write the file together.
+    /// Whether any Pureplay Connect link reports strict mode on (its
+    /// card's `strict_mode` row): the game is in a tournament round.
+    pub(crate) fn strict_round(&self) -> bool {
+        self.actors.iter().any(|(card, actor)| {
+            card.starts_with("pureplay.")
+                && actor
+                    .telemetry
+                    .get("strict_mode")
+                    .is_some_and(|v| v == "on")
+        })
+    }
+
+    /// The Tournament icon: a status with its hover text, no click action.
     fn tournament_button(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let state = Tournament::of(&self.round);
-        let held = matches!(state, Tournament::Held(_));
-        let locked = !held && self.settings.locked();
-        let selected = self.open(HeaderMenu::Tournament);
-        let response = hit(ui, rect, "tournament", !locked);
-        background(ui, rect, &response, selected);
-        let (icon, on) = match &state {
-            Tournament::Off => (&icons::TOURNAMENT_OFF, false),
-            Tournament::Manual => (&icons::TOURNAMENT_ON, true),
-            Tournament::Held(_) => (&icons::TOURNAMENT_HELD, true),
-        };
-        button_icon(ui, rect, &response, selected, on, icon);
-        let text = if locked {
-            LOCKED_REASON.to_owned()
-        } else {
-            state.button_tip()
-        };
-        let response = tip(response, text);
-        if response.clicked() {
-            if held {
-                self.toggle_menu(HeaderMenu::Tournament);
-            } else {
-                let on = state == Tournament::Off;
-                self.set_tournament(ui.ctx(), on);
-                let asked = if on {
-                    Tournament::Manual
-                } else {
-                    Tournament::Off
-                };
-                self.toast(ui.ctx(), asked.switch_text());
-            }
-        }
-        if !held && self.open(HeaderMenu::Tournament) {
-            self.header_menu = None;
-        }
-        if held {
-            let manual = self.round.manual;
-            let holder = state.holder().unwrap_or("a simulator").to_owned();
-            self.dropdown(HeaderMenu::Tournament, &response, |ui| {
-                ui.set_width(380.0);
-                ui.label(theme::caps("Tournament round", 11.0, theme::TEXT_MUTED));
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 4.0, theme::GOLD);
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.label(egui::RichText::new("Held by").color(theme::TEXT));
-                    ui.label(egui::RichText::new(&holder).strong().color(theme::GOLD));
-                });
-                ui.separator();
-                ui.label(theme::caps("While it lasts", 11.0, theme::TEXT_MUTED));
-                for line in [
-                    "Auto-Chip is off".to_owned(),
-                    "Trackball and Mock hold their shots".to_owned(),
-                    format!("{holder} gets only measured shots"),
-                ] {
-                    ui.label(format!("\u{2022} {line}"));
-                }
-                ui.label(
-                    egui::RichText::new(format!("It ends when {holder} ends it."))
-                        .color(theme::TEXT_DIM),
-                );
-                if manual {
-                    ui.label(
-                        egui::RichText::new("Tournament mode is also on and stays on afterward.")
-                            .color(theme::TEXT_DIM),
-                    );
-                }
-            });
-        }
+        let response = hit(ui, rect, "tournament", true);
+        button_icon(ui, rect, &response, false, true, &icons::TOURNAMENT_ON);
+        tip(response, TOURNAMENT_TIP);
     }
 
     /// The Follow turns button: the session's state, drawn on or slashed.
@@ -1120,7 +990,7 @@ impl FlighthookApp {
 
     /// The Auto-Chip button and its dropdown.
     fn auto_chip_button(&mut self, ui: &mut egui::Ui, rect: Rect, picks: &mut Picks) {
-        let blocked = auto_chip_blocked(&self.round, &self.actors, self.auto_chip_in_flight);
+        let blocked = auto_chip_blocked(&self.actors, self.auto_chip_in_flight);
         let selected = self.open(HeaderMenu::AutoChip);
         let response = hit(ui, rect, "auto-chip", blocked.is_none());
         background(ui, rect, &response, selected);
@@ -1387,37 +1257,30 @@ impl FlighthookApp {
 
     /// The center title, drawn only while it fits.
     fn render_title(&mut self, ui: &mut egui::Ui, bar: Rect, left_end: f32, right_start: f32) {
-        let state = Tournament::of(&self.round);
-        let candidates = title_candidates(&state);
-        for candidate in candidates {
-            let galley = ui.painter().layout_job(candidate.job());
-            let dot = 10.0;
-            let gap = 6.0;
-            let width = dot + gap + galley.size().x;
-            if !title_fits(bar, left_end, right_start, width) {
-                continue;
-            }
-            let rect = Rect::from_center_size(bar.center(), vec2(width, galley.size().y.max(dot)));
-            ui.painter().circle_filled(
-                pos2(rect.left() + dot / 2.0, rect.center().y),
-                4.0,
-                candidate.dot,
-            );
-            ui.painter().galley(
-                pos2(
-                    rect.left() + dot + gap,
-                    rect.center().y - galley.size().y / 2.0,
-                ),
-                galley,
-                Color32::PLACEHOLDER,
-            );
-            let response = ui.interact(rect, ui.id().with("title"), Sense::hover());
-            mark(ui, || "title".to_owned(), &response);
-            if let Some(text) = state.title_tip() {
-                response.on_hover_text(text);
-            }
+        let title = brand_title();
+        let galley = ui.painter().layout_job(title.job());
+        let dot = 10.0;
+        let gap = 6.0;
+        let width = dot + gap + galley.size().x;
+        if !title_fits(bar, left_end, right_start, width) {
             return;
         }
+        let rect = Rect::from_center_size(bar.center(), vec2(width, galley.size().y.max(dot)));
+        ui.painter().circle_filled(
+            pos2(rect.left() + dot / 2.0, rect.center().y),
+            4.0,
+            title.dot,
+        );
+        ui.painter().galley(
+            pos2(
+                rect.left() + dot + gap,
+                rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            Color32::PLACEHOLDER,
+        );
+        let response = ui.interact(rect, ui.id().with("title"), Sense::hover());
+        mark(ui, || "title".to_owned(), &response);
     }
 
     /// Carry out what the bar picked.
@@ -1671,40 +1534,19 @@ impl TitleText {
     }
 }
 
-/// The titles for `state`, the fullest first: the brand mark, or
-/// `TOURNAMENT · holder` and then `TOURNAMENT` during a round.
-fn title_candidates(state: &Tournament) -> Vec<TitleText> {
-    let tournament = |holder: Option<&str>| {
-        let mut parts = vec![("TOURNAMENT".to_owned(), 15.0, theme::GOLD, 2.5)];
-        if let Some(holder) = holder {
-            parts.push((format!("  \u{b7} {holder}"), 15.0, theme::TEXT_MUTED, 0.0));
-        }
-        TitleText {
-            dot: theme::GOLD,
-            parts,
-        }
-    };
-    match state {
-        Tournament::Off => vec![TitleText {
-            dot: theme::ACCENT,
-            parts: vec![
-                ("FLIGHTHOOK".to_owned(), 15.0, theme::ACCENT, 2.5),
-                (
-                    concat!("  v", env!("CARGO_PKG_VERSION")).to_owned(),
-                    11.0,
-                    theme::TEXT_DIM,
-                    0.0,
-                ),
-            ],
-        }],
-        other => {
-            let mut out = Vec::new();
-            if let Some(holder) = other.holder() {
-                out.push(tournament(Some(holder)));
-            }
-            out.push(tournament(None));
-            out
-        }
+/// The center title: the brand mark and the version.
+fn brand_title() -> TitleText {
+    TitleText {
+        dot: theme::ACCENT,
+        parts: vec![
+            ("FLIGHTHOOK".to_owned(), 15.0, theme::ACCENT, 2.5),
+            (
+                concat!("  v", env!("CARGO_PKG_VERSION")).to_owned(),
+                11.0,
+                theme::TEXT_DIM,
+                0.0,
+            ),
+        ],
     }
 }
 
@@ -1905,7 +1747,7 @@ mod tests {
         pass_at(&ctx, app, width, 0.0, Vec::new())
     }
 
-    const ICON_FLAGS: [&str; 4] = ["energy", "follow", "auto-chip", "shot-type"];
+    const ICON_FLAGS: [&str; 5] = ["energy", "follow", "auto-chip", "shot-type", "tournament"];
 
     /// An app whose bar shows the icons in `flags` (`ICON_FLAGS` bits).
     fn bar_app(flags: u8) -> FlighthookApp {
@@ -1929,7 +1771,18 @@ mod tests {
         if on(0) {
             charge(&mut app, "square.0", "Square Omni", 74);
         }
+        if on(4) {
+            strict(&mut app, true);
+        }
         app
+    }
+
+    /// A Pureplay Connect card whose link reports strict mode `on` or off.
+    fn strict(app: &mut FlighthookApp, on: bool) {
+        let mut card = ActorStatusResponse::new("Pureplay", ActorStatus::Connected);
+        card.telemetry
+            .insert("strict_mode".into(), if on { "on" } else { "off" }.into());
+        app.actors.insert("pureplay.0".into(), card);
     }
 
     fn charge(app: &mut FlighthookApp, id: &str, name: &str, pct: u8) {
@@ -1953,10 +1806,10 @@ mod tests {
     /// Every button's rect, at three widths and for every combination of
     /// the icons that come and go: the right group in role order,
     /// anchored to the right edge, 40 px buttons 6 px apart, no divider,
-    /// widths 178 / 224 / 270 / 316; the nav the same on the left.
+    /// widths 86 to 316; the nav the same on the left.
     #[test]
     fn every_button_has_its_place_at_every_width_and_icon_combination() {
-        for flags in 0..16u8 {
+        for flags in 0..32u8 {
             for width in [1600.0, 1024.0, 720.0] {
                 let mut app = bar_app(flags);
                 let p = pass(&mut app, width);
@@ -1988,7 +1841,7 @@ mod tests {
                 assert_eq!(rects.last().unwrap().right(), width - SIDE_MARGIN, "{at}");
                 let group = rects.last().unwrap().right() - rects[0].left();
                 assert_eq!(group, group_width(expected.len(), BUTTON, GAP), "{at}");
-                let widths = [132.0, 178.0, 224.0, 270.0, 316.0];
+                let widths = [86.0, 132.0, 178.0, 224.0, 270.0, 316.0];
                 assert!(widths.contains(&group), "{at}: {group}");
                 let nav: Vec<Rect> = ["shots", "cameras", "settings", "log"]
                     .iter()
@@ -2013,7 +1866,7 @@ mod tests {
     #[test]
     fn the_portrait_header_is_one_row_over_a_bottom_tab_bar() {
         for width in [360.0, 390.0, 430.0] {
-            let mut app = bar_app(0b1111);
+            let mut app = bar_app(0b1_1111);
             app.portrait = true;
             let p = pass(&mut app, width);
             let at = format!("at {width}");
@@ -2124,7 +1977,7 @@ mod tests {
     /// the groups never overlap.
     #[test]
     fn a_window_too_narrow_for_both_groups_clips_the_right_group() {
-        let mut app = bar_app(0b1111);
+        let mut app = bar_app(0b1_1111);
         let p = pass(&mut app, 400.0);
         let nav_end = p.rect("nav:log").right();
         for name in RIGHT_ORDER {
@@ -2150,7 +2003,7 @@ mod tests {
             if pass_at(&ctx, &mut app, width, 0.0, Vec::new())
                 .texts
                 .iter()
-                .any(|(t, _)| t == want || (want != "TOURNAMENT" && t.contains(want)))
+                .any(|(t, _)| t.contains(want))
             {
                 return width;
             }
@@ -2159,35 +2012,13 @@ mod tests {
         }
     }
 
-    fn held(holder: &str) -> impl Fn(&mut FlighthookApp) {
-        let holder = holder.to_owned();
-        move |app: &mut FlighthookApp| {
-            app.round = RoundState {
-                active: true,
-                holder: Some(holder.clone()),
-                held: true,
-                manual: false,
-            };
-        }
-    }
-
-    /// Tournament mode on, as the server reports it.
-    fn manual(app: &mut FlighthookApp) {
-        app.round = RoundState {
-            active: true,
-            holder: Some("Manual".into()),
-            held: false,
-            manual: true,
-        };
-    }
-
     /// Widths here are logical px (the window at zoom 1; the app zooms out
     /// below a 1024 px window, so a narrower window has more logical px).
     /// The title is there at 1024 and gone at 720 for all but the narrowest
     /// right group.
     #[test]
     fn the_title_shows_at_1024_not_at_720_logical_px() {
-        for flags in [0b1100u8, 0b1110, 0b1101, 0b1111] {
+        for flags in [0b1_1100u8, 0b1_1110, 0b1_1101, 0b1_1111] {
             let mut app = bar_app(flags);
             assert!(
                 pass(&mut app, 1024.0).marks.contains_key("title"),
@@ -2195,7 +2026,7 @@ mod tests {
             );
             // At 720 only the narrower groups leave room for it.
             let at_720 = pass(&mut app, 720.0).marks.contains_key("title");
-            assert_eq!(at_720, flags == 0b1100, "{flags:04b} at 720");
+            assert_eq!(at_720, flags == 0b1_1100, "{flags:05b} at 720");
         }
     }
 
@@ -2203,8 +2034,8 @@ mod tests {
     /// the right group on the half of the bar it sits on.
     #[test]
     fn the_narrowest_window_follows_the_clearance_rule() {
-        for flags in [0b1100u8, 0b1111] {
-            let n = 3 + flags.count_ones() as usize;
+        for flags in [0b1_1100u8, 0b1_1111] {
+            let n = 2 + flags.count_ones() as usize;
             let mut app = bar_app(flags);
             let wide = pass(&mut app, 1600.0);
             let title = wide.rect("title").width();
@@ -2222,7 +2053,7 @@ mod tests {
     /// center of the bar.
     #[test]
     fn the_title_is_centered_and_keeps_clear_of_the_groups() {
-        let mut app = bar_app(0b1111);
+        let mut app = bar_app(0b1_1111);
         for width in [900.0, 1024.0, 1600.0] {
             let p = pass(&mut app, width);
             let title = p.rect("title");
@@ -2238,246 +2069,13 @@ mod tests {
         }
     }
 
-    /// A round shows in the title: `TOURNAMENT · holder`, `· Manual` for
-    /// the toggle alone, and no banner strip under the bar.
-    #[test]
-    fn a_round_shows_in_the_title_with_no_banner() {
-        let mut app = bar_app(0);
-        let p = pass(&mut app, 1600.0);
-        assert!(p.texts.iter().any(|(t, _)| t.starts_with("FLIGHTHOOK")));
-        let idle_below = p.below;
-
-        held("Pureplay Connect")(&mut app);
-        let p = pass(&mut app, 1600.0);
-        assert!(
-            p.has_text("TOURNAMENT  \u{b7} Pureplay Connect"),
-            "{:?}",
-            p.texts
-        );
-        assert_eq!(
-            p.color_of("TOURNAMENT  \u{b7} Pureplay Connect"),
-            theme::GOLD
-        );
-        assert!(!p.texts.iter().any(|(t, _)| t.starts_with("FLIGHTHOOK")));
-        assert_eq!(p.below, idle_below, "no banner strip");
-
-        manual(&mut app);
-        let p = pass(&mut app, 1600.0);
-        assert!(p.has_text("TOURNAMENT  \u{b7} Manual"), "{:?}", p.texts);
-
-        // Out of room, the holder goes first, then the title.
-        let mut app = bar_app(0b1111);
-        held("Pureplay Connect")(&mut app);
-        let narrow = threshold(0b1111, "TOURNAMENT", held("Pureplay Connect"));
-        let p = pass(&mut app, narrow + 1.0);
-        assert!(p.has_text("TOURNAMENT"), "{:?}", p.texts);
-        assert!(!p.has_text("TOURNAMENT  \u{b7} Pureplay Connect"));
-        let p = pass(&mut app, 720.0);
-        assert!(!p.marks.contains_key("title"));
-        assert!(p.marks.contains_key("tournament"), "the icon carries it");
-    }
-
-    /// The Tournament button's three states, read from the round: its
-    /// glyph and color, and the hover text.
-    #[test]
-    fn the_tournament_button_shows_off_manual_and_held() {
-        let mut app = bar_app(0);
-        let p = pass(&mut app, 1600.0);
-        assert_eq!(
-            p.icon_in("tournament"),
-            ("tournament-off-normal@1x".to_owned(), theme::TEXT_MUTED)
-        );
-
-        // On is drawn in the hover style, untinted.
-        manual(&mut app);
-        let p = pass(&mut app, 1600.0);
-        assert_eq!(
-            p.icon_in("tournament"),
-            ("tournament-on-hover@1x".to_owned(), Color32::WHITE)
-        );
-
-        // Held: the trophy with the lock badge.
-        held("Pureplay Connect")(&mut app);
-        app.round.manual = true;
-        let p = pass(&mut app, 1600.0);
-        assert_eq!(
-            p.icon_in("tournament"),
-            ("tournament-held-hover@1x".to_owned(), Color32::WHITE)
-        );
-        // A click opens the card naming the holder and the effects.
-        let p = open(&mut app, HeaderMenu::Tournament, 1600.0);
-        // Only the holder's name is gold.
-        assert_eq!(p.color_of("Held by"), theme::TEXT);
-        assert_eq!(p.color_of("Pureplay Connect"), theme::GOLD);
-        for text in [
-            "\u{2022} Auto-Chip is off",
-            "\u{2022} Trackball and Mock hold their shots",
-            "\u{2022} Pureplay Connect gets only measured shots",
-            "It ends when Pureplay Connect ends it.",
-        ] {
-            assert!(p.has_text(text), "{text}: {:?}", p.texts);
-        }
-        assert!(p.has_text("Tournament mode is also on and stays on afterward."));
-    }
-
-    #[test]
-    fn the_tournament_states_have_their_hover_texts() {
-        let off = Tournament::of(&RoundState::default());
-        assert_eq!(
-            off.button_tip(),
-            "Tournament mode: off. Click to turn on.\nWhile it is on, virtual devices are not \
-             allowed."
-        );
-        assert_eq!(off.title_tip(), None);
-        let mut app = bar_app(0);
-        manual(&mut app);
-        let manual = Tournament::of(&app.round);
-        assert_eq!(
-            manual.button_tip(),
-            "Tournament mode: on. Click to turn off.\nVirtual devices are not allowed."
-        );
-        assert_eq!(
-            manual.title_tip().as_deref(),
-            Some("Tournament mode is on. Virtual devices are not allowed.")
-        );
-        let round = RoundState {
-            active: true,
-            holder: Some("Pureplay Connect".into()),
-            held: true,
-            manual: true,
-        };
-        // A simulator's round wins over the toggle.
-        let held = Tournament::of(&round);
-        assert_eq!(held, Tournament::Held(Some("Pureplay Connect".into())));
-        assert_eq!(
-            held.button_tip(),
-            "Tournament round held by Pureplay Connect.\nIt can't be turned off here. Click \
-             for details."
-        );
-        assert_eq!(
-            held.title_tip().as_deref(),
-            Some(
-                "Pureplay Connect tournament round: only shots a launch monitor measured are \
-                 sent. Auto-Chip is off until the round ends."
-            )
-        );
-    }
-
-    /// Off and on (manual), one click switches tournament mode with one
-    /// request; the icon follows the server's round, not the click.
-    #[test]
-    fn one_click_toggles_tournament_mode_with_one_request() {
-        let mut app = bar_app(0);
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let at = pass_at(&ctx, &mut app, 1600.0, 0.0, Vec::new())
-            .rect("tournament")
-            .center();
-        click(&ctx, &mut app, at);
-        assert_eq!(app.tournament_sent, [true], "one request to turn it on");
-        assert_eq!(app.header_menu, None, "no popup");
-        assert!(!app.round.active, "the server's round decides the state");
-        manual(&mut app);
-        click(&ctx, &mut app, at);
-        assert_eq!(
-            app.tournament_sent,
-            [true, false],
-            "one request to turn it off"
-        );
-        assert_eq!(app.header_menu, None, "no popup");
-    }
-
-    /// While a simulator holds the round, a click opens the locked card
-    /// and sends nothing; a second click closes it.
-    #[test]
-    fn a_click_on_a_held_round_opens_the_card_and_sends_nothing() {
-        let mut app = bar_app(0);
-        held("Pureplay Connect")(&mut app);
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let at = pass_at(&ctx, &mut app, 1600.0, 0.0, Vec::new())
-            .rect("tournament")
-            .center();
-        click(&ctx, &mut app, at);
-        assert_eq!(app.header_menu, Some(HeaderMenu::Tournament));
-        let p = pass_at(&ctx, &mut app, 1600.0, 0.0, Vec::new());
-        assert!(p.has_text("Held by"), "{:?}", p.texts);
-        assert!(
-            !p.has_text("Tournament mode is also on and stays on afterward."),
-            "the extra line only with tournament mode on too"
-        );
-        assert!(app.tournament_sent.is_empty(), "nothing sent");
-        click(&ctx, &mut app, at);
-        assert_eq!(app.header_menu, None);
-        assert!(app.tournament_sent.is_empty(), "still nothing sent");
-    }
-
     /// The toast's text, if one shows.
     fn toast_text(app: &FlighthookApp) -> Option<&str> {
         app.toast.as_ref().map(|(text, _)| text.as_str())
     }
 
-    /// A tournament switch shows a toast saying the state it asked for,
-    /// drawn near the bottom of the content.
-    #[test]
-    fn a_tournament_switch_shows_a_toast_of_the_state_asked_for() {
-        let mut app = bar_app(0);
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let at = pass_at(&ctx, &mut app, 1600.0, 0.0, Vec::new())
-            .rect("tournament")
-            .center();
-        click(&ctx, &mut app, at);
-        let on = Tournament::Manual.switch_text();
-        assert_eq!(toast_text(&app), Some(on.as_str()));
-        manual(&mut app);
-        click(&ctx, &mut app, at);
-        let off = Tournament::Off.switch_text();
-        assert_eq!(
-            toast_text(&app),
-            Some(off.as_str()),
-            "the new toast replaces the old"
-        );
-        let p = pass_at(&ctx, &mut app, 1600.0, 1.0, Vec::new());
-        assert!(p.has_text(&off) && !p.has_text(&on), "{:?}", p.texts);
-        let rect = p.text_rect(&off);
-        assert!(
-            rect.bottom() > 700.0 && rect.width() <= TOAST_WIDTH,
-            "{rect:?}"
-        );
-        assert!((rect.center().x - 800.0).abs() < 8.0, "centered: {rect:?}");
-    }
-
-    /// A held round's click (it opens the card) and a locked click show no
-    /// toast, and neither does the round changing on its own.
-    #[test]
-    fn a_held_or_locked_tournament_click_shows_no_toast() {
-        let mut app = bar_app(0);
-        held("Pureplay Connect")(&mut app);
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let at = pass_at(&ctx, &mut app, 1600.0, 0.0, Vec::new())
-            .rect("tournament")
-            .center();
-        click(&ctx, &mut app, at);
-        assert_eq!(app.header_menu, Some(HeaderMenu::Tournament));
-        assert_eq!(toast_text(&app), None, "held");
-        manual(&mut app);
-        pass_at(&ctx, &mut app, 1600.0, 0.0, Vec::new());
-        assert_eq!(toast_text(&app), None, "the round changed on its own");
-
-        let mut app = bar_app(0b1000);
-        app.settings.actors[0].set_dirty(true);
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let at = pass_at(&ctx, &mut app, 1600.0, 0.0, Vec::new())
-            .rect("tournament")
-            .center();
-        click(&ctx, &mut app, at);
-        assert_eq!(toast_text(&app), None, "locked");
-    }
-
-    /// A Follow turns switch shows a toast naming the new state.
+    /// A Follow turns switch shows a toast naming the new state, drawn
+    /// near the bottom of the content.
     #[test]
     fn a_follow_switch_shows_a_toast_of_the_new_state() {
         let mut app = golfers_app();
@@ -2487,7 +2085,51 @@ mod tests {
         assert!(!app.follow_turns);
         assert_eq!(toast_text(&app), Some("Following turns: off."));
         click(&ctx, &mut app, at);
-        assert_eq!(toast_text(&app), Some("Following turns: on."));
+        let on = "Following turns: on.";
+        assert_eq!(toast_text(&app), Some(on), "the new toast replaces the old");
+        let p = pass_at(&ctx, &mut app, 1600.0, 1.0, Vec::new());
+        assert!(!p.has_text("Following turns: off."), "{:?}", p.texts);
+        let rect = p.text_rect(on);
+        assert!(
+            rect.bottom() > 700.0 && rect.width() <= TOAST_WIDTH,
+            "{rect:?}"
+        );
+        assert!((rect.center().x - 800.0).abs() < 8.0, "centered: {rect:?}");
+    }
+
+    /// The Tournament icon shows only while a Pureplay Connect link reports
+    /// strict mode on, gold, with its hover text; a click opens nothing and
+    /// shows no toast.
+    #[test]
+    fn the_tournament_icon_shows_only_during_a_pureplay_strict_round() {
+        let mut app = bar_app(0);
+        assert!(!pass(&mut app, 1600.0).marks.contains_key("tournament"));
+        strict(&mut app, false);
+        assert!(!pass(&mut app, 1600.0).marks.contains_key("tournament"));
+        let mut accessory = ActorStatusResponse::new("Pureplay", ActorStatus::Connected);
+        accessory
+            .telemetry
+            .insert("strict_mode".into(), "on".into());
+        app.actors.insert("pureplay_accessory.0".into(), accessory);
+        assert!(
+            !pass(&mut app, 1600.0).marks.contains_key("tournament"),
+            "only Pureplay Connect's row counts"
+        );
+
+        strict(&mut app, true);
+        let (ctx, p) = settled(&mut app, 1600.0);
+        assert_eq!(
+            p.icon_in("tournament"),
+            ("tournament-on-hover@1x".to_owned(), Color32::WHITE)
+        );
+        let texts = hover_texts(&mut app, "tournament");
+        assert!(texts.iter().any(|t| t == TOURNAMENT_TIP), "{texts:?}");
+        click(&ctx, &mut app, p.rect("tournament").center());
+        assert_eq!(app.header_menu, None);
+        assert_eq!(toast_text(&app), None);
+
+        app.actors.remove("pureplay.0");
+        assert!(!pass(&mut app, 1600.0).marks.contains_key("tournament"));
     }
 
     /// The toast shows for its time and the fade, then is gone. On a phone
@@ -2512,34 +2154,6 @@ mod tests {
         assert_eq!(toast_text(&app), None);
     }
 
-    /// The Auto-Chip icon is disabled in both on states, with the reason
-    /// as its hover text.
-    #[test]
-    fn auto_chip_is_disabled_in_both_on_states_with_its_reason() {
-        let mut app = bar_app(0b0100);
-        app.actors.insert(
-            "openconnect_client.0".into(),
-            ActorStatusResponse::new("GSPro", ActorStatus::Connected),
-        );
-        assert!(pass(&mut app, 1600.0).enabled("auto-chip"));
-        manual(&mut app);
-        assert!(!pass(&mut app, 1600.0).enabled("auto-chip"));
-        let texts = hover_texts(&mut app, "auto-chip");
-        assert!(
-            texts.iter().any(|t| t.starts_with("Tournament mode is on")),
-            "{texts:?}"
-        );
-        held("Pureplay Connect")(&mut app);
-        assert!(!pass(&mut app, 1600.0).enabled("auto-chip"));
-        let texts = hover_texts(&mut app, "auto-chip");
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.starts_with("Pureplay Connect tournament round")),
-            "{texts:?}"
-        );
-    }
-
     /// On a touch screen a tap on the disabled Auto-Chip shows its reason
     /// under it until the next tap anywhere; without a touch it does not.
     #[test]
@@ -2547,7 +2161,7 @@ mod tests {
         let reason = |p: &Pass| {
             p.texts
                 .iter()
-                .any(|(t, _)| t.starts_with("Tournament mode is on"))
+                .any(|(t, _)| t.starts_with("Sending the chip"))
         };
         for touch in [true, false] {
             let mut app = bar_app(0b0100);
@@ -2555,7 +2169,7 @@ mod tests {
                 "openconnect_client.0".into(),
                 ActorStatusResponse::new("GSPro", ActorStatus::Connected),
             );
-            manual(&mut app);
+            app.auto_chip_in_flight = Some(3);
             let (ctx, p) = settled(&mut app, 390.0);
             let at = p.rect("auto-chip").center();
             let press = |pos: Pos2, pressed: bool| Event::PointerButton {
@@ -2607,28 +2221,6 @@ mod tests {
         }
     }
 
-    /// Unsaved Settings edits disable the toggle with the nav lock's
-    /// reason, in both off and on; a click sends nothing.
-    #[test]
-    fn unsaved_settings_edits_disable_the_tournament_toggle() {
-        let mut app = bar_app(0b1000);
-        app.settings.actors[0].set_dirty(true);
-        assert!(app.settings.locked());
-        for on in [false, true] {
-            if on {
-                manual(&mut app);
-            }
-            let ctx = egui::Context::default();
-            theme::install(&ctx);
-            let p = pass_at(&ctx, &mut app, 1600.0, 0.0, Vec::new());
-            assert!(!p.enabled("tournament"), "on: {on}");
-            click(&ctx, &mut app, p.rect("tournament").center());
-            assert!(app.tournament_sent.is_empty(), "on: {on}");
-            let texts = hover_texts(&mut app, "tournament");
-            assert!(texts.iter().any(|t| t == LOCKED_REASON), "{texts:?}");
-        }
-    }
-
     /// Auto-Chip: a titled dropdown of 1, 3 and 5 Yard; a pick sends the
     /// chip as before.
     #[test]
@@ -2646,8 +2238,8 @@ mod tests {
             .collect();
         assert!(ys.windows(2).all(|w| w[0] < w[1]), "{ys:?}");
         assert!(p.rect("auto-chip:1 Yard").top() > p.rect("auto-chip").bottom());
-        // It is blocked, with its reason, during a round: no dropdown.
-        held("Pureplay Connect")(&mut app);
+        // It is blocked while a chip is on its way: no dropdown.
+        app.auto_chip_in_flight = Some(3);
         let p = open(&mut app, HeaderMenu::AutoChip, 1600.0);
         assert!(!p.enabled("auto-chip"));
         assert!(!p.marks.contains_key("auto-chip:1 Yard"));
@@ -3293,7 +2885,6 @@ mod tests {
             ("shot-type", "shot-type-full"),
             ("club", "club-none"),
             ("golfer", "golfer-none"),
-            ("tournament", "tournament-off"),
         ] {
             assert_eq!(
                 hovering(&mut app, name, 1.0).icon_in(name),
@@ -3513,10 +3104,10 @@ mod tests {
         app.settings.load_from(&config);
         app.turn_golfer = Some("flighthook.e".into());
         app.current_mode = "full".into();
-        let off = Tournament::Off.button_tip();
+        strict(&mut app, true);
         let cases: [(&str, &str); 9] = [
             ("energy", "Square Omni 74%"),
-            ("tournament", off.as_str()),
+            ("tournament", TOURNAMENT_TIP),
             (
                 "follow",
                 "Following turns: on. The view moves to the golfer up.",

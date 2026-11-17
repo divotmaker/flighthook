@@ -604,7 +604,6 @@ async fn run(
         .route("/api/shots/grouping", post(routes::post_shot_grouping))
         .route("/api/select", post(routes::post_select))
         .route("/api/auto-chip", post(routes::post_auto_chip))
-        .route("/api/tournament", post(routes::post_tournament))
         .route("/api/find-mat", post(routes::post_find_mat))
         .route("/api/actors/{id}/reconnect", post(routes::post_reconnect))
         .route(
@@ -4113,9 +4112,9 @@ pub(crate) mod tests {
             {
                 remotes.hear(msg, heard);
             }
-            let _ = crate::actors::system::follow_remote(root, &mut remotes, m);
+            let _ = crate::actors::system::follow_remote(&mut remotes, m);
         }
-        crate::actors::system::expire_remotes(root, &mut remotes, &sender, now, now);
+        crate::actors::system::expire_remotes(&mut remotes, &sender, now, now);
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 

@@ -56,7 +56,6 @@ pub use flighthook::{
     RECONNECT_ALERT_MS,
     RandomClubSection,
     ReplaySection,
-    RoundState,
     Severity,
     ShotData,
     ShotGrouping,

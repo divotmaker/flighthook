@@ -103,8 +103,7 @@ pub async fn post_find_mat(
 /// surface ([`crate::autochip`]); the shot goes on the bus as actor
 /// [`flighthook::AUTO_CHIP_ACTOR`], so every output forwards it and it is
 /// stored like a device's shot. 409 when Auto-chip is disabled in the
-/// settings (`[simulation] auto_chip`), a tournament round is active (the
-/// round policy turns Auto-chip off) or the simulation environment is
+/// settings (`[simulation] auto_chip`) or the simulation environment is
 /// invalid, 400 for any other distance; all with a JSON `{"error"}` body.
 pub async fn post_auto_chip(
     State(state): State<Arc<WebState>>,

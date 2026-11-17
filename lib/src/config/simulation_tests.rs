@@ -194,26 +194,6 @@ fn auto_chip_defaults_off_and_round_trips_when_on() {
     assert_eq!(back, on);
 }
 
-/// `tournament` is off by default and absent while off; on, it
-/// round-trips.
-#[test]
-fn tournament_defaults_off_and_round_trips_when_on() {
-    let off = FlighthookConfig::default();
-    assert!(!off.simulation.tournament);
-    let text = serde_json::to_string(&off).expect("ser");
-    assert!(!text.contains("tournament"), "{text}");
-    let s: SimulationSection = serde_json::from_str("{}").expect("parses");
-    assert!(!s.tournament, "an absent key is off");
-
-    let mut on = FlighthookConfig::default();
-    on.simulation.tournament = true;
-    assert!(!on.simulation.is_default());
-    let text = serde_json::to_string(&on).expect("ser");
-    assert!(text.contains(r#""tournament":true"#), "{text}");
-    let back: FlighthookConfig = serde_json::from_str(&text).expect("parses");
-    assert!(back.simulation.tournament);
-}
-
 #[test]
 fn environment_bounds() {
     let ok = |altitude, temperature_c| {

@@ -192,7 +192,7 @@ impl Feed {
             .as_deref()
             .is_some_and(|c| c.starts_with("pureplay_accessory."))
             || state
-                .round
+                .sources
                 .source(actor)
                 .is_some_and(ShotSource::is_simulator))
     }
@@ -215,11 +215,10 @@ impl Feed {
 
     /// Whether the simulator is told a launch monitor is ready in the
     /// current mode: the routed one has no blockers; under "Any", any
-    /// launch monitor that may feed a simulator has none. `counts` limits
-    /// which monitors count (a tournament round counts only measured ones).
-    pub(crate) fn ready(&self, counts: impl Fn(&BusActor) -> bool) -> bool {
+    /// launch monitor that may feed a simulator has none.
+    pub(crate) fn ready(&self) -> bool {
         let usable = |id: &str, a: &BusActor| {
-            id != self.auto_chip && self.feeds_simulators(id) && counts(a) && a.is_clear()
+            id != self.auto_chip && self.feeds_simulators(id) && a.is_clear()
         };
         match self.routed(self.mode()) {
             Some(id) => self.monitors.get(id).is_some_and(|a| usable(id, a)),
@@ -318,7 +317,7 @@ impl OutputShot {
     }
 }
 
-/// The shot a simulator output sends outside a tournament round: the
+/// The shot a simulator output sends outside strict mode: the
 /// launch for a receiver that flies the ball itself (measured values,
 /// filled from the launch monitor's own flight's `assumed`), the launch
 /// monitor's own flight (not Auto-chip's, `auto_chip`; never a flight
@@ -343,7 +342,8 @@ pub(crate) fn output_shot(shot: &CompletedShot, card: &str, auto_chip: &str) -> 
     }
 }
 
-/// The shot as a measured-only receiver takes it (a tournament round): the
+/// The shot as a measured-only receiver takes it (Pureplay Connect's strict
+/// mode): the
 /// launch, club and impact as the launch monitor sent them, no flight, and
 /// the launch monitor's declared source.
 pub(crate) fn measured_shot(shot: &CompletedShot, card: &str) -> OutputShot {
@@ -500,7 +500,7 @@ mod tests {
             remotes.hear(frp, t0);
         }
         feed.handle(&msg);
-        assert!(feed.ready(|_| true));
+        assert!(feed.ready());
         // Its program died: no removal, only silence.
         let gone = remotes.expire(t0 + std::time::Duration::from_secs(7));
         assert_eq!(gone, ["aaaa000000000001"]);
@@ -512,7 +512,7 @@ mod tests {
             ));
         }
         assert!(feed.readiness_changed);
-        assert!(!feed.ready(|_| true));
+        assert!(!feed.ready());
         assert!(feed.monitor("aaaa000000000001").is_none());
     }
 

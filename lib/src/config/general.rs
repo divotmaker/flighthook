@@ -59,13 +59,6 @@ pub struct SimulationSection {
     /// conditions above whatever `mode` is.
     #[serde(default, skip_serializing_if = "is_false")]
     pub auto_chip: bool,
-    /// Whether tournament mode is switched on: Auto-chip is off and the
-    /// virtual launch monitors hold their shots. Read at start-up and
-    /// written only by `POST /api/tournament`: a settings save keeps the
-    /// live value whatever its body carries. Defaults to `false`; omitted
-    /// from the file and the API while off.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub tournament: bool,
     /// The flight model's FRP actor id (the Simulation card), generated once
     /// and kept. Absent until flighthook first runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,7 +145,6 @@ impl Default for SimulationSection {
             temperature_c: default_sim_temperature_c(),
             surface: SimSurface::default(),
             auto_chip: false,
-            tournament: false,
         }
     }
 }
@@ -177,7 +169,6 @@ impl SimulationSection {
             && is_default_sim_temperature_c(&self.temperature_c)
             && self.surface.is_default()
             && !self.auto_chip
-            && !self.tournament
             && self.actor_id.is_none()
     }
 

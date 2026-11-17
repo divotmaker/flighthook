@@ -65,7 +65,7 @@ address = "127.0.0.1:921"
 - `[[golfers]]` (beta) -- the golfers, in display order (see
   [Golfers](#golfers-beta)); omitted while empty
 - `[simulation]` -- the flight model (the Simulation card): `mode`, `altitude`,
-  `temperature_c`, `surface`, `auto_chip`, `tournament` and the flight model's
+  `temperature_c`, `surface`, `auto_chip` and the flight model's
   `actor_id`; each field omitted at its default
 - `actor_id` -- every launch monitor, output and Pureplay Accessory section
   carries the card's FRP actor id, generated once and kept (a card's id goes
@@ -318,7 +318,7 @@ pub struct FlighthookConfig {
 pub struct ReplaySection { pub keep_shots: u32, pub pre_roll_s: f64, pub post_roll_s: f64, pub start_before_impact_s: f64, pub clip_dir: Option<String>, pub shot_cards: bool }  // 20, 4.0, 1.5, 2.0, None, true (written only when false)
 pub struct CameraSection { pub name: String, pub camera: String, pub camera_name: Option<String>, pub position: CameraPosition, pub mode: String }  // mode "auto" | "WxH@fps"
 pub enum CameraPosition { TargetLine, GolferFront, GolferBack, Overhead }  // default GolferFront
-pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface, pub auto_chip: bool, pub tournament: bool, pub actor_id: Option<String> }  // auto_chip and tournament default false; tournament is written only by POST /api/tournament
+pub struct SimulationSection { pub mode: SimMode, pub altitude: Distance, pub temperature_c: f64, pub surface: SimSurface, pub auto_chip: bool, pub actor_id: Option<String> }  // auto_chip defaults to false
 pub struct GolferRecord { pub identifiers: Vec<String>, pub name: String, pub handed: Option<Handedness>, pub bag: Vec<Club>, pub sex: Option<Sex>, pub height: Option<f64> }  // identifiers: own `flighthook.<uuid>` first, then game ids
 pub enum SimMode { Off, On, Force }                 // default On
 pub enum SimSurface { Fairway, Green, FirmGreen }
@@ -340,7 +340,7 @@ pub struct RandomClubSection { pub name: String }
 **lib/src/api.rs** (shared REST API types, used by both app and UI):
 
 ```rust
-pub struct StatusResponse { pub cards: HashMap<String, ActorStatusResponse>, pub actors: HashMap<String, StatusActor>, pub turn: Option<GolferTurn>, pub cameras_supported: bool, pub trackball_supported: bool, pub clip_dir: Option<String>, pub config_error: Option<ConfigLoadError>, pub round: RoundState }  // cards by card key, actors by FRP actor id
+pub struct StatusResponse { pub cards: HashMap<String, ActorStatusResponse>, pub actors: HashMap<String, StatusActor>, pub turn: Option<GolferTurn>, pub cameras_supported: bool, pub trackball_supported: bool, pub clip_dir: Option<String>, pub config_error: Option<ConfigLoadError> }  // cards by card key, actors by FRP actor id
 pub struct ActorStatusResponse {
     pub name: String, pub status: ActorStatus, pub telemetry: HashMap<String, String>,
     pub state: ConnectionState, pub red_for_ms: u64,  // derived, see "Connection state" below
@@ -427,7 +427,6 @@ dashboard's state sees it; local cards never expire.
 | `ConfigCommand` / `ConfigOutcome` | Configuration changes and their result (see below) |
 | `CardStatus` | A card's lifecycle (`Starting`, `Connected`, ...) and its display rows (error, address, device label) |
 | `Alert` | An alert of something that is no FRP actor (a camera, the web server) |
-| `RoundState` | The tournament round started or ended |
 | `ClearShotHistory` | Delete the shot history |
 | `FindMat` | The ExPutt card locates its mat again |
 | `ShotVideo`, `ShotVideoRemoved`, `ShotPose`, `ShotSwing` | Camera clips and their analysis (beta, alpha) |
@@ -552,8 +551,8 @@ Putting, the card publishes one `shot.flight` of its own before its
 `shot.finished`, holding only `assumed { backspin_rpm, sidespin_rpm: 0 }`. The
 flight model flies the shot with it, the Open Connect client and Pureplay
 Connect output send it as the spin, and the dashboard shows the spin as
-simulated. It does not depend on `[simulation] mode`. Strict (tournament) mode
-ignores every flight, so it never sends the estimate.
+simulated. It does not depend on `[simulation] mode`. Pureplay Connect's
+strict mode ignores every flight, so it never sends the estimate.
 
 A value a device does not measure is left out rather than sent as a
 placeholder: the ExPutt sends no launch elevation, and an Xi shot under the
@@ -881,7 +880,6 @@ pub enum ConfigAction {
     Remove { id: String },                          // "mevo.0", "openconnect_client.1", "webserver.0", etc.; "gspro.N" = "openconnect_client.N"
     SetShotGrouping { mode: ShotGrouping },         // POST /api/shots/grouping, UI `grouping`
     SetBodyTracking { section: BodyTrackingSection },  // POST /api/settings?scope=body_tracking
-    SetTournament { on: bool },                     // POST /api/tournament
     SetGolfers { golfers: Vec<GolferRecord> },      // POST /api/settings?scope=golfers
     Reconnect { id: String },                       // POST /api/actors/{id}/reconnect
 }
@@ -1181,12 +1179,10 @@ of a card that is off starts nothing, and a reconnect of it is refused
 
 An actor that is off is no shot source: it is not running, so it sends no
 shots, has no battery in the header and adds no readiness; an output routed
-to it is not ready, as with a monitor that is not configured. A tournament
-round never counts it: turning it off forgets it as a shot source, as a
-removal does (`RoundPolicy::forget_source` in `system::finish`), the Pureplay
-output's `monitor_names` leaves it out, and a mode routed to it by ID counts
-for nothing (`Relay::feeds` keeps a routed ID only when it is a known
-monitor), so a mock that is off does not refuse a round. The Cameras tab's live view and its per-camera
+to it is not ready, as with a monitor that is not configured. Turning it
+off forgets it as a shot source, as a removal does (`Sources::forget_card`
+in the config reload), and the Pureplay output's `monitor_names` leaves it
+out. The Cameras tab's live view and its per-camera
 clip status show only the cameras that are on (`SettingsForm::cameras_on`).
 
 ### One card per address
@@ -1423,9 +1419,8 @@ push), `shot.launch` (speed, launch angle and direction, both spin pairs),
 `shot.club` (club speed, path, face angle, attack angle, dynamic loft,
 smash factor, swing plane), `shot.finished`. There is
 no flight result (the flight model flies it) and no raw frames. Everything is
-synthesized, so the source is virtual: during a tournament round the driver
-is told to hold shots, and a swing then is dropped with an info log line and takes no shot
-number. When the input goes away the session stays up: `ready` turns false,
+synthesized, so the source is virtual: Pureplay Connect does not send its
+shots in strict mode. When the input goes away the session stays up: `ready` turns false,
 the driver reopens the device by itself (with no `device` named it chooses
 again, so a device back under another node is found) and `ready` turns true.
 A device that cannot be opened is a `warn` alert saying what to do (name
@@ -1530,16 +1525,16 @@ that names an actor no card holds shows "Missing monitor" and routes nothing
 for that shot type until another is picked.
 
 **Simulator sources feed no simulator output.** A simulator output (the Open
-Connect client, the Pureplay Connect output) never takes shots, readiness or
-a place among a round's feeds from a simulator source, under "Any" and by ID,
+Connect client, the Pureplay Connect output) never takes shots or readiness
+from a simulator source, under "Any" and by ID,
 with no address comparison: `Feed::feeds_simulators(actor)` (`simout.rs`) is false
 for an actor whose registered `ShotSource::is_simulator()` (the Pureplay
 card) or whose ID starts `pureplay_accessory.` (before it registers). It is
 the one predicate behind `Feed::passes`, the outputs' readiness (`Feed::ready`)
-and the monitors they report (ready, connection state, battery), `monitor_names`
-and `Relay::feeds`. The
-Open Connect client's `Relay` holds a `gspro::Registry` (the `RoundPolicy`
-clone, for the source types, and the send registry) for it. A save that
+and the monitors they report (ready, connection state, battery) and
+`monitor_names`. The
+Open Connect client's `Relay` holds a `gspro::Registry` (the app state, for
+the source types, and the send registry) for it. A save that
 routes an output to a `pureplay_accessory.N` ID is refused with `400` ("An
 output can't take shots from Pureplay", `FlighthookConfig::simulator_routes`
 in `invalid_setting`); a config file with one loads with a warning, and the
@@ -1660,43 +1655,33 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   (an `error` key while not connected) or Disconnected. The monitor read is
   the one routed for the current mode; with Any, the best state of every
   monitor, and the battery and name of the only configured monitor, if there
-  is one. During a round only the monitors the policy counts (measured ones)
-  make the ReadyState and ConnectionState.
+  is one. In strict mode only measured launch monitors make the ReadyState
+  and ConnectionState.
 - Host commands: Ping → Heartbeat (ConnectionState, ReadyState, battery
   0-100 or 0xFF). SetClubInfo → one complete `golfer.select` (club and hand) on the bus, as a
   simulator's player information (unknown values logged and ignored), which the
   card re-asserts when flighthook's turn differs; the card shows the values as
   `club`/`handed`. SetShotContext: the putter selects putting, a distance under
   30 yards chipping, anything else full, sent as the mode in the select.
-  SetDetect and SetBallType are logged only. SetStrictMode
-  asks the round policy for a tournament round, below. Strict mode starts
-  off on every link.
+  SetDetect and SetBallType are logged only. SetStrictMode sets strict
+  mode, below. Strict mode starts off on every link.
   Error from the host → a Warn alert, one per burst of Errors less than 30 s
-  apart across links (not the StrictModeRequired that follows a refusal on
-  the same link). Any
+  apart across links. Any
   other type, including a device-to-host one, or a payload too short for its
   type → Error code 0, and the link carries on.
 - Audit log (`audit` target): every frame sent and received as its type and
   full frame hex, then the decoded message; bytes skipped while
   resynchronizing, as hex.
 
-Strict mode on the link. SetStrictMode(1) asks the round policy for a
-round (`RoundPolicy::begin_round`) with the holder's card name ("Pureplay
-Connect" when the card has none, so the round never reads as the Pureplay
-Accessory card's) and the launch monitors routed to the output
-(`GsProRouting::feeds`: each mode's monitor; "Any" = every configured one
-from the live config plus every one seen on the bus; a simulator source
-never) and acks the answer: StrictModeAck(1, "") with the
-`RoundGuard` held by the link, or StrictModeAck(0, reason) with strict mode
-off and a Warn alert ("Pureplay strict mode refused: `<reason>`. Tournament
-rounds take only shots a launch monitor measured."), one
-per 30 s burst (Pureplay closes the link and every reconnect asks again).
-SetStrictMode(0) → StrictModeAck(1), off. The guard drops with
-SetStrictMode(0), a refusal, the end of the link or the actor's stop. While
-it is held, a shot of a launch monitor that is not measured is not sent and
-takes no ShotId (an info log line once per source per link), and every
+Strict mode on the link (a tournament round in Pureplay).
+SetStrictMode(1) → StrictModeAck(1, ""), always: strict mode is on for the
+link. SetStrictMode(0) → StrictModeAck(1, ""), off; the end of the link or
+the actor's stop ends it too. While it is on, `pureplay::sends(strict,
+source)` lets out only a shot whose launch monitor declares `measured` in
+its `bus.actor` (a shot with no declared source is not sent); a shot held
+back takes no ShotId (an info log line once per source per link), and every
 `shot.flight` is ignored, so an estimated spin is never sent and nothing
-waits for it.
+waits for it. The card shows it as `strict_mode`.
 
 #### Pureplay Accessory card (beta)
 
@@ -1851,8 +1836,7 @@ needs no driver crate. The user guide is
   select.
 - Shots (`shots.rs`): the card is a virtual launch monitor and a game
   (`ShotSource::PureplayAccessory`, declared through `Actor::source()`, source
-  `virtual`). It never joins a round, never blocks one (it feeds no simulator
-  output) and does not ask `allows`/`send_if_allowed`. A `shot.launched` (live
+  `virtual`). It feeds no simulator output. A `shot.launched` (live
   only, never from a snapshot) is a candidate when its `playerId` is a local
   player. The Shots setting, read from the config at each shot
   (`shots::decide`): Auto takes the candidate unless `sent_shots.take_echo`
@@ -1950,10 +1934,9 @@ needs no driver crate. The user guide is
 
 ### Tournament rounds
 
-A tournament round is system-wide policy, not an output's: `state::round`
-(`SystemState::round`, a `RoundPolicy`). Pureplay Connect's strict mode asks
-for one, the Tournament toggle in the header sets one by hand, and nothing in
-the policy is Pureplay's.
+A tournament round is Pureplay's, and it lives in the Pureplay Connect output:
+its strict mode (see [Pureplay output](#pureplay-output-alpha)). flighthook has
+no round of its own, and nothing else changes during one.
 
 - **Source.** A launch monitor's `source` (FRP's `device.source`) says where a
   shot comes from, nothing more: `measured` (a launch monitor measured it: a
@@ -1966,78 +1949,26 @@ the policy is Pureplay's.
   `is_simulator()` (the Pureplay Accessory card) keeps a source out of every
   simulator output. An actor type declares its source (`Actor::source()`;
   `None` for actors that put no shots on the bus), and `start_actor` registers
-  it in the policy by actor ID. A remote launch monitor's source is read from
-  its `bus.actor` (unknown counts as not measured).
-- **Simulator sources.** The Pureplay Accessory card is `virtual`, so it never joins a
-  round; it never blocks one either, because no simulator output counts it
-  among its feeds (see the Open Connect client's routing rule), which is a
-  routing fact, not a round special case; and it is not switched off
-  during a round, since a simulator's own shots are not flighthook's to
-  switch off.
-- **Acceptance.** `begin_round(&RoundRequest { holder, feeds })` accepts
-  when every launch monitor in `feeds` is measured by its registered
-  source; otherwise `Refusal` names the first, in actor ID order: "`<name>`
-  is a virtual launch monitor", or "`<name>` is not a launch monitor
-  flighthook reads" (no registered source); a blank name gives the actor
-  ID. A source removed from the config or turned off is forgotten
-  (`RoundPolicy::forget_source`, from the system actor once the removal is
-  done), so a monitor that is gone or off feeds no output: Pureplay drops a
-  seen monitor that is not a known source, and counts a mode routed by ID
-  only to a known monitor. No launch monitor at all is accepted: nothing
-  unmeasured can reach the output.
-- **The guard.** `RoundGuard` ends the round when it drops. Several holders
-  may hold rounds at once; the round is active while any does, and the
-  first still held names it.
-- **Tournament mode.** `RoundPolicy::set_manual(on)` is the manual holder,
-  named `"Manual"` (`round::MANUAL_HOLDER`). It feeds no output, so there is
-  no acceptance check and no refusal: it only turns the virtual producers
-  off. A simulator's round on top of it is named by the simulator, and its
-  end falls back to the setting. The setting is `[simulation] tournament`:
-  `SystemState::new` applies it at start-up, `POST /api/tournament` writes
-  it through `ConfigAction::SetTournament` (applied before the outcome goes
-  out), and the system actor applies the saved value again after every
-  config command.
-- **Which shots count.** In a Pureplay Connect strict-mode round the output
-  sends only the shots of measured launch monitors and ignores every
+  it by actor ID in the shot source registry (`state::sources::Sources`,
+  `SystemState::sources`); a card turned off or removed is forgotten
+  (`Sources::forget_card`). Each actor's `bus.actor` carries its source, and a
+  finished shot carries the source its launch monitor declared
+  (`CompletedShot::source`); unknown counts as not measured.
+- **Which shots go out.** In strict mode Pureplay Connect sends only the
+  shots of measured launch monitors (`pureplay::sends`) and ignores every
   `shot.flight`, so it never sends a simulated or estimated value. It sends
   `launch`, `club` and `impact` as the launch monitor sent them, so the
   values a real launch monitor reports (the R10's back and side spin, the Xi's
   spin from its early result, the Omni's vertical impact, the Open Connect
   input's completed spin pair) go out.
-- **Readiness.** `RoundGuard::counts(source)`: only a measured launch
-  monitor counts for the holder's ready state and heartbeat, remote ones
-  included.
-- **Virtual producers.** Auto-Chip (`autochip::send`, the single firing
-  point) and the mock monitor send a shot's trigger through
-  `RoundPolicy::send_if_allowed(Source::Virtual, ..)`, which runs the
-  send only while no round is active (tournament mode on counts as active) and holds the policy while it runs, so
-  no round can begin between the check and the trigger. A remote launch monitor
-  that declares itself virtual is held the same way
-  (`RoundPolicy::admits_remote`): while any round is active, its
-  `shot.trigger` and the rest of that shot are not put on the bus. Auto-Chip also asks
-  `RoundPolicy::allows` before its solve, to answer at once. Refused, it
-  returns `SolveError::RoundActive`, which `POST /api/auto-chip` answers
-  with `409 {"error":"Auto-Chip is off during a tournament round"}`; nothing is put on the bus and no number is taken. A device
-  driver of a virtual source (the mock, the trackball) asks
-  `Events::shots_allowed()`, which its `DriverActor` sets from
-  `RoundPolicy::allows` before every poll, before it numbers a shot: a held
-  shot takes no number; the mock's fires once the round ends, a swing on
-  the trackball during the round is dropped. The actor logs "<id>: no shots during the
-  tournament round" once per round, and sends each trigger through
-  `send_if_allowed` as the backstop: a shot that starts anyway is dropped
-  whole.
-- **State.** `RoundPolicy::state()` is a `flighthook::RoundState { active,
-  holder, manual, held }` (`manual`: tournament mode is on; `held`: a
-  simulator holds the round). `main` attaches the bus, and every change goes out as a
-  local `RoundState` event; `GET /api/status` carries it as `round` (omitted
-  while inactive) and `/api/ws` sends it in the snapshot and on every change.
-  The UI keeps it in `FlighthookApp::round`: the header's
-  Tournament icon (off, on, or held with a lock) and center title show it,
-  and the Auto-Chip icon is disabled from it. A click on the icon sends
-  `POST /api/tournament` while off or on, and opens the held round's card
-  (no request) while a simulator holds it; the icon waits while Settings has
-  unsaved edits. A dashboard connection that closes or fails resets the round, so it does
-  not outlive the server.
+- **Readiness.** In strict mode only a measured launch monitor counts for the
+  output's ready state and heartbeat, remote ones included.
+- **Everything else.** Auto-Chip, the mock and the trackball keep making
+  shots during a round, and every other output still gets them.
+- **The header.** The dashboard shows the Tournament icon while any
+  Pureplay Connect card (`pureplay.N`) reports `strict_mode` `on` in its
+  telemetry (`FlighthookApp::strict_round`): a read-only status with its hover
+  text, no click action.
 
 Pureplay card rows (each key only when it changes):
 
@@ -2126,7 +2057,7 @@ ran, and are dropped). A session: Connected with `device_info` (the identity's
 label) and `shot_count`, then a `bus.actor` carrying the identity and
 `device.source` before any shot; each pass drains the bus into the hints and
 the card's `action`s, hands a live config to `apply_config`, sets `wants_raw`
-(always) and `shots_allowed` (the round policy), and steps the session once
+(always; `shots_allowed` stays at its default, on), and steps the session once
 (`step`), waiting the driver contract's `IDLE` (5 ms) after a step with nothing
 to do. A
 session error sends `not_armed` and then Reconnecting;
@@ -2144,7 +2075,7 @@ as the driver gives it; nothing is held:
 
 | Driver event | Bus |
 |---|---|
-| `shot.trigger` | `shot.trigger` (with the driver's timestamp) through `RoundPolicy::send_if_allowed`; opens the raw capture window at the trigger's time; refused, the whole shot is dropped |
+| `shot.trigger` | `shot.trigger` (with the driver's timestamp); opens the raw capture window at the trigger's time |
 | `shot.launch`, `shot.flight`, `shot.club`, `shot.impact` | the same messages, after the card's `on_frp` hook (the FlightScope hook may add its own `assumed` flight) |
 | `shot.finished` | the shot's raw frames as the local `ShotCapture` (`"<kind> device has no wire protocol"` without a raw profile), then `shot.finished`, then the card's `shot_count` |
 | `alert` | `bus.alert` |
@@ -2905,7 +2836,7 @@ session and practice roles). It handles:
   `practice.new_block`, and publishes the `practice.block`s (see
   [Sets](#sets)).
 - **Remote actors**: announces an actor that missed its heartbeats as
-  `ActorGone` (once a second it looks), and tells the round policy.
+  `ActorGone` (once a second it looks).
 - **Config mutations**: subscribes to `ConfigCommand` events (from the REST
   API). Applies the mutation to `SystemConfig`, calls `apply_config_reload()` to
   reconcile actors, and emits a `ConfigOutcome` once the actors it stopped have
@@ -2954,7 +2885,7 @@ pub struct SystemState {
     pub beats: Beats,             // the newest bus.actor of every local actor, re-sent each heartbeat
     pub local_clients: Arc<LocalClients>,  // this process's Open Connect clients
     pub sent_shots: Arc<SentShots>,        // the shots the simulator outputs wrote (5 s)
-    pub round: RoundPolicy,       // tournament rounds (strict mode, manual tournament mode)
+    pub sources: Arc<Sources>,    // every local shot source's type, by actor id
     pub clips: ClipStore,         // replay clips on disk (beta)
     pub cameras: Cameras,         // camera actors' latest frames + the camera list (beta)
     pub pose: BodyTracking,       // body tracking models + the recorded-clip queue (alpha)
@@ -3002,9 +2933,7 @@ actors](#hub-and-remote-actors)); there is no handshake and no version
 negotiation. The binding's greeting (every actor's `bus.actor` and state, then
 a `bus.sync`) is the first thing a peer receives; every later bus message goes
 to it unless it sent it or it is `shot.raw`. What a peer sends is checked
-against the own-id guard and put on the bus. A message from a remote virtual
-launch monitor during a tournament round is held (see [Tournament
-rounds](#tournament-rounds)). External programs use the flightrelay SDK
+against the own-id guard and put on the bus. External programs use the flightrelay SDK
 (`FrpEndpoint`) to connect.
 
 **`/api/ws`** is the dashboard's private socket (the dashboard is part of the
@@ -3199,19 +3128,15 @@ has unsaved edits.
 
 **Center title.** `FLIGHTHOOK v<version>` is drawn at the true center of the bar
 only while it keeps 24 px clear of both icon groups; otherwise it is not drawn.
-While a tournament round is on, the title reads `TOURNAMENT · <holder>`
-(`Manual` when the toggle alone holds it; the simulator's card name when a
-simulator holds it), shortening to `TOURNAMENT` and then to nothing as room
-shrinks; the Tournament icon carries the signal then.
 
 **Right, by role,** left to right:
 
 | Icon | Shown when | What it does |
 |---|---|---|
 | Energy | a device reports a battery charge | Opens the "Batteries" list: one row per device with its charge. The icon turns yellow when any device is below 20 % and red below 10 % |
-| Tournament | always | A toggle for tournament mode (`POST /api/tournament`). On, it applies the narrow policy: Auto-Chip is off and the virtual launch monitors (Trackball, Mock, and remote ones that declare themselves virtual) hold their shots. A simulator's round (Pureplay strict mode) shows the icon locked in gold: it can't be toggled off, and clicking it opens a card naming the holder |
+| Tournament | a Pureplay Connect card reports `strict_mode` `on` | A read-only status in gold: a Pureplay game is in a tournament round, and Pureplay Connect sends only measured shots (its hover text). No click action |
 | Follow turns | two or more golfers are known | A toggle (on by default, for the session only). On, the view follows every change of the golfer up; off, the view stays put and a pick in the Golfer card changes only the view |
-| Auto-Chip | `[simulation] auto_chip` is on | Opens the "Auto-Chip" menu (`1 Yard`, `3 Yard`, `5 Yard`); disabled, with the reason as hover text, during a round, while no simulator is connected and while a chip is in flight |
+| Auto-Chip | `[simulation] auto_chip` is on | Opens the "Auto-Chip" menu (`1 Yard`, `3 Yard`, `5 Yard`); disabled, with the reason as hover text, while no simulator is connected and while a chip is in flight |
 | Shot Type | an enabled launch monitor uses the hint, or an output routes Chipping or Putting to a specific monitor (see [Shot Type visibility](#games-and-simulators-re-assert)) | Opens "Shot Type": Full, Chip, Putt, sent as a `golfer.select` carrying `mode`. A tip says some launch monitors use it as a hint for the shot to expect |
 | Club | always | Shows the club in play (the club's shape with its code; an iron with "-" when none). Opens the club picker filtered to the golfer up's bag, the club in play always shown; a pick sends the club only |
 | Golfer | always | Shows the viewed golfer's initial in an avatar circle (an outline when there is no golfer). Opens the Golfer card |
@@ -3231,8 +3156,8 @@ golfer up. Club, Shot Type and Auto-Chip act on the golfer up and the devices,
 not the view. Export is unchanged: every golfer's shots, with `golfer_id`.
 Clear history clears every golfer's shots.
 
-An error banner above the tabs shows a card's `error` (and a failed Auto-Chip or
-tournament request) until the card's next status or the next press.
+An error banner above the tabs shows a card's `error` (and a failed Auto-Chip
+request) until the card's next status or the next press.
 
 ## Settings
 
@@ -3892,9 +3817,7 @@ Simulation (useful with radar launch monitors that miss short chips). With it
 off the icon is not drawn and `POST /api/auto-chip` answers `409`. Its menu,
 titled "Auto-Chip", lists `1 Yard`, `3 Yard`, `5 Yard`
 (`flighthook::AUTO_CHIP_YARDS`); a pick sends `POST /api/auto-chip`
-(`net::post_auto_chip`). The icon is disabled, with the reason on hover, while
-a round is active (tournament mode on, or a simulator's round: the server's
-`RoundState`, `FlighthookApp::round`; the server fires no chip then), while no
+(`net::post_auto_chip`). The icon is disabled, with the reason on hover, while no
 simulator card is connected (an Open Connect client or a Pureplay Connect
 output) and while a chip is waiting for its reply (`auto_chip_in_flight`). A
 failed reply shows in the error banner above the tabs (`Auto-Chip: <status>

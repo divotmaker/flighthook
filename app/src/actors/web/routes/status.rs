@@ -20,7 +20,6 @@ pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusRespon
         trackball_supported: thumbswing::device::SUPPORTED,
         clip_dir: Some(clip_dir.display().to_string()),
         config_error: state.root.system.load_error(),
-        round: state.root.round.state(),
     })
 }
 

@@ -64,11 +64,10 @@ pub fn build_export_line(
         settings: ExportSettings {
             device: ctx.device_section.clone(),
             // The conditions the shot was simulated under; whether the
-            // dashboard offers Auto-chip, tournament mode and the flight
-            // model's actor id are no part of them.
+            // dashboard offers Auto-chip and the flight model's actor id
+            // are no part of them.
             simulation: flighthook::SimulationSection {
                 auto_chip: false,
-                tournament: false,
                 actor_id: None,
                 ..ctx.simulation.clone()
             },
@@ -788,7 +787,6 @@ mod tests {
     fn the_auto_chip_setting_is_not_exported_with_a_shots_simulation() {
         let mut shot = private_shot();
         shot.context.simulation.auto_chip = true;
-        shot.context.simulation.tournament = true;
         let line: serde_json::Value = serde_json::from_str(&jsonl_line(
             &shot,
             "t",
@@ -800,10 +798,6 @@ mod tests {
         assert!(
             line["settings"]["simulation"].get("auto_chip").is_none(),
             "{line}"
-        );
-        assert!(
-            line["settings"]["simulation"].get("tournament").is_none(),
-            "tournament mode is no shot condition: {line}"
         );
     }
 

@@ -28,7 +28,7 @@ pub use flightrelay::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorStatus, ActorStatusResponse, CameraPosition, RoundState, ShotData, ShotGrouping};
+use crate::{ActorStatus, ActorStatusResponse, CameraPosition, ShotData, ShotGrouping};
 
 /// The path of the UI socket.
 pub const UI_WS_PATH: &str = "/api/ws";
@@ -60,8 +60,6 @@ pub struct UiSnapshot {
     pub states: Vec<FrpMessage>,
     /// Each local card's status, by card key.
     pub cards: HashMap<String, ActorStatusResponse>,
-    /// The tournament round.
-    pub round: RoundState,
     /// Counts up with every applied configuration change.
     pub config_generation: u64,
 }
@@ -85,8 +83,6 @@ pub enum UiLocalEvent {
     },
     /// An alert of a card that is no FRP actor.
     Alert { severity: Severity, message: String },
-    /// The tournament round started or ended.
-    RoundState { round: RoundState },
     /// A configuration change was applied.
     ConfigOutcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]

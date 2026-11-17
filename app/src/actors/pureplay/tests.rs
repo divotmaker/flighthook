@@ -132,10 +132,10 @@ fn estimated_spin_shot() -> OutputShot {
     }
 }
 
-/// A round policy that knows the shot sources these tests use, as the
-/// registry records them when the actors start.
-fn sources() -> RoundPolicy {
-    let round = RoundPolicy::default();
+/// A shot source registry that knows the shot sources these tests use, as
+/// it records them when the actors start.
+fn sources() -> Arc<Sources> {
+    let sources = Arc::new(Sources::default());
     for (id, source) in [
         ("mevo.0", ShotSource::Mevo),
         ("r10.0", ShotSource::R10),
@@ -147,9 +147,9 @@ fn sources() -> RoundPolicy {
         (flighthook::AUTO_CHIP_ACTOR, ShotSource::AutoChip),
         ("pureplay_accessory.0", ShotSource::PureplayAccessory),
     ] {
-        round.register_source(id, source);
+        sources.register_source(id, source);
     }
-    round
+    sources
 }
 
 /// A bus sender for the card `actor`, its FRP actor id the card key. What
@@ -211,23 +211,10 @@ fn test_state() -> Arc<SystemState> {
         "pureplay_accessory.0",
     ] {
         if let Some(source) = sources().source(id) {
-            state.round.register_source(id, source);
+            state.sources.register_source(id, source);
         }
     }
     Arc::new(state)
-}
-
-/// Why `relay` would be refused a round, `None` when it would be accepted.
-fn refusal(relay: &Relay, names: &HashMap<String, String>) -> Option<String> {
-    let request = RoundRequest {
-        holder: "Pureplay",
-        feeds: &relay.feeds(names),
-    };
-    relay
-        .round
-        .begin_round(&request)
-        .err()
-        .map(|r| r.reason().to_owned())
 }
 
 /// What the `pureplay.0` card put on the bus, as these tests read it.
@@ -284,47 +271,47 @@ fn ready_state_follows_the_monitor_through_a_shot() {
     let (monitor, mut rx) = relay_bus();
     let mut relay = new_relay(GsProRouting::default());
     let now = Instant::now();
-    assert_eq!(relay.ready_state(now, None), ReadyState::NotReady);
-    assert_eq!(relay.connection_state(None), ConnectionState::Disconnected);
+    assert_eq!(relay.ready_state(now, false), ReadyState::NotReady);
+    assert_eq!(relay.connection_state(false), ConnectionState::Disconnected);
 
     status(&monitor, ActorStatus::Starting);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.connection_state(None), ConnectionState::Connecting);
+    assert_eq!(relay.connection_state(false), ConnectionState::Connecting);
 
     status(&monitor, ActorStatus::Connected);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.connection_state(None), ConnectionState::Connected);
+    assert_eq!(relay.connection_state(false), ConnectionState::Connected);
     assert_eq!(
-        relay.ready_state(now, None),
+        relay.ready_state(now, false),
         ReadyState::NotReady,
         "not armed yet"
     );
 
     device_telemetry(&monitor, &[("ready", "true")]);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.ready_state(Instant::now(), None), ReadyState::Ready);
+    assert_eq!(relay.ready_state(Instant::now(), false), ReadyState::Ready);
 
     monitor.frp(flightrelay::ShotTrigger::new(key(1)));
     relay.drain(&mut rx).expect("bus");
     let triggered = Instant::now();
-    assert_eq!(relay.ready_state(triggered, None), ReadyState::Processing);
+    assert_eq!(relay.ready_state(triggered, false), ReadyState::Processing);
     // A shot that never finishes stops counting as processing.
     assert_eq!(
-        relay.ready_state(triggered + PROCESSING_LIMIT, None),
+        relay.ready_state(triggered + PROCESSING_LIMIT, false),
         ReadyState::Ready
     );
 
     monitor.frp(flightrelay::ShotFinished { key: key(1) });
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.ready_state(Instant::now(), None), ReadyState::Ready);
+    assert_eq!(relay.ready_state(Instant::now(), false), ReadyState::Ready);
 
     status(&monitor, ActorStatus::Reconnecting);
     relay.drain(&mut rx).expect("bus");
     assert_eq!(
-        relay.ready_state(Instant::now(), None),
+        relay.ready_state(Instant::now(), false),
         ReadyState::NotReady
     );
-    assert_eq!(relay.connection_state(None), ConnectionState::Reconnecting);
+    assert_eq!(relay.connection_state(false), ConnectionState::Reconnecting);
 }
 
 /// A monitor that reports `ready=true` before this actor saw any status
@@ -336,24 +323,24 @@ fn ready_before_any_status_counts_as_ready_and_connected() {
     let mut relay = new_relay(GsProRouting::default());
     device_telemetry(&monitor, &[("ready", "true"), ("battery_pct", "70")]);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.ready_state(Instant::now(), None), ReadyState::Ready);
-    assert_eq!(relay.connection_state(None), ConnectionState::Connected);
+    assert_eq!(relay.ready_state(Instant::now(), false), ReadyState::Ready);
+    assert_eq!(relay.connection_state(false), ConnectionState::Connected);
     assert_eq!(relay.battery(&names(&[("square.0", "Omni")])), Some(70));
 
     status(&monitor, ActorStatus::Reconnecting);
     relay.drain(&mut rx).expect("bus");
     assert_eq!(
-        relay.ready_state(Instant::now(), None),
+        relay.ready_state(Instant::now(), false),
         ReadyState::NotReady
     );
-    assert_eq!(relay.connection_state(None), ConnectionState::Reconnecting);
+    assert_eq!(relay.connection_state(false), ConnectionState::Reconnecting);
 
     // `ready=false` with no status seen says nothing about the connection.
     let (monitor, mut rx) = relay_bus();
     let mut relay = new_relay(GsProRouting::default());
     device_telemetry(&monitor, &[("ready", "false")]);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.connection_state(None), ConnectionState::Disconnected);
+    assert_eq!(relay.connection_state(false), ConnectionState::Disconnected);
 }
 
 /// An `error` a monitor reported holds until a status that ends its
@@ -372,17 +359,17 @@ fn a_monitor_error_ends_with_the_session_that_had_it() {
     // A repeat without the key changes nothing.
     status(&monitor, ActorStatus::Reconnecting);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.connection_state(None), ConnectionState::Error);
+    assert_eq!(relay.connection_state(false), ConnectionState::Error);
 
     status(&monitor, ActorStatus::Connected);
     status(&monitor, ActorStatus::Reconnecting);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.connection_state(None), ConnectionState::Reconnecting);
+    assert_eq!(relay.connection_state(false), ConnectionState::Reconnecting);
 
     error_status(ActorStatus::Reconnecting);
     status(&monitor, ActorStatus::Starting);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.connection_state(None), ConnectionState::Connecting);
+    assert_eq!(relay.connection_state(false), ConnectionState::Connecting);
 }
 
 #[test]
@@ -481,10 +468,10 @@ fn a_monitor_error_reads_as_the_error_state_until_it_connects() {
         telemetry: HashMap::from([("error".into(), "no adapter".into())]),
     });
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.connection_state(None), ConnectionState::Error);
+    assert_eq!(relay.connection_state(false), ConnectionState::Error);
     status(&monitor, ActorStatus::Connected);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.connection_state(None), ConnectionState::Connected);
+    assert_eq!(relay.connection_state(false), ConnectionState::Connected);
 }
 
 /// Routed to the Omni, the device's state is the Omni's alone; outputs
@@ -506,10 +493,10 @@ fn the_routed_monitor_alone_sets_the_state() {
     status(&omni, ActorStatus::Starting);
     relay.drain(&mut rx).expect("bus");
     assert_eq!(
-        relay.ready_state(Instant::now(), None),
+        relay.ready_state(Instant::now(), false),
         ReadyState::NotReady
     );
-    assert_eq!(relay.connection_state(None), ConnectionState::Connecting);
+    assert_eq!(relay.connection_state(false), ConnectionState::Connecting);
     let n = names(&[("square.0", "Omni"), ("mevo.0", "Mevo")]);
     assert_eq!(relay.battery(&n), None);
     assert!(!relay.monitors.contains_key("openconnect_client.0"));
@@ -517,7 +504,7 @@ fn the_routed_monitor_alone_sets_the_state() {
     status(&omni, ActorStatus::Connected);
     device_telemetry(&omni, &[("ready", "true"), ("battery_pct", "64")]);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(relay.ready_state(Instant::now(), None), ReadyState::Ready);
+    assert_eq!(relay.ready_state(Instant::now(), false), ReadyState::Ready);
     assert_eq!(relay.battery(&n), Some(64));
 }
 
@@ -559,7 +546,7 @@ fn any_routing_takes_the_best_monitor_and_names_a_lone_one() {
     assert_eq!(device_caps, 0);
     assert_eq!(device_name, "flighthook");
     assert_eq!(relay.battery(&two), None);
-    assert_eq!(relay.ready_state(Instant::now(), None), ReadyState::Ready);
+    assert_eq!(relay.ready_state(Instant::now(), false), ReadyState::Ready);
 }
 
 /// A monitor that never reported a battery gives no battery capability.
@@ -623,112 +610,24 @@ fn a_no_read_is_not_sent() {
     assert!(relay.next_shot(Instant::now()).is_none());
 }
 
-/// Strict mode is accepted only when every launch monitor routed to the
-/// output, in any detection mode, is measured; the reason names the first
-/// one that is not, and its class.
+/// In strict mode the ready state and the connection state count only
+/// measured launch monitors: a virtual monitor that is ready under "Any"
+/// makes the device Ready outside strict mode only.
 #[test]
-fn strict_mode_needs_every_routed_monitor_measured() {
-    let any = new_relay(GsProRouting::default());
-    assert_eq!(refusal(&any, &names(&[])), None, "no monitor at all");
-    let measured = names(&[
-        ("square.0", "Omni"),
-        ("mevo.0", "Mevo+"),
-        ("r10.0", "R10"),
-        ("exputt.0", "ExPutt"),
-    ]);
-    assert_eq!(refusal(&any, &measured), None);
-
-    let with_mock = names(&[("square.0", "Omni"), ("mock_monitor.0", "Mock")]);
-    assert_eq!(
-        refusal(&any, &with_mock).as_deref(),
-        Some("Mock is a virtual launch monitor"),
-        "Any routing takes the mock's shots"
-    );
-    let omni_only = new_relay(GsProRouting {
-        full_monitor: Some("square.0".into()),
-        chipping_monitor: Some("square.0".into()),
-        putting_monitor: Some("square.0".into()),
-    });
-    assert_eq!(
-        refusal(&omni_only, &with_mock),
-        None,
-        "a configured mock routed nowhere does not count"
-    );
-
-    let with_input = new_relay(GsProRouting {
-        full_monitor: Some("square.0".into()),
-        chipping_monitor: Some("mock_monitor.0".into()),
-        putting_monitor: Some("openconnect_server.0".into()),
-    });
-    let input_and_mock = names(&[
-        ("square.0", "Omni"),
-        ("mock_monitor.0", "Mock"),
-        ("openconnect_server.0", "Open Connect input"),
-    ]);
-    assert_eq!(
-        refusal(&with_input, &input_and_mock).as_deref(),
-        Some("Mock is a virtual launch monitor"),
-        "routed in one mode is enough"
-    );
-    let with_input = new_relay(GsProRouting {
-        putting_monitor: Some("openconnect_server.0".into()),
-        ..GsProRouting::default()
-    });
-    assert_eq!(
-        refusal(
-            &with_input,
-            &names(&[
-                ("square.0", "Omni"),
-                ("openconnect_server.0", "Open Connect input"),
-            ])
-        ),
-        None,
-        "the Open Connect input is measured"
-    );
-
-    // A launch monitor seen on the bus counts for Any too, named by its ID
-    // when it has no name.
-    let (tx, _) = broadcast::channel(16);
-    let mock = BusSender::new("mock_monitor.1".into(), tx.clone(), Arc::default());
-    let mut rx = BusSender::new("pureplay.0".into(), tx, Arc::default()).subscribe();
-    let mut seen = new_relay(GsProRouting::default());
-    status(&mock, ActorStatus::Connected);
-    seen.drain(&mut rx).expect("bus");
-    assert_eq!(
-        refusal(&seen, &names(&[("square.0", "Omni")])).as_deref(),
-        Some("mock_monitor.1 is a virtual launch monitor")
-    );
-    assert_eq!(
-        refusal(&any, &names(&[("mock_monitor.0", " ")])).as_deref(),
-        Some("mock_monitor.0 is a virtual launch monitor")
-    );
-}
-
-/// During a round the ready state and the connection state count only the
-/// launch monitors the policy counts: a virtual monitor that is ready
-/// under "Any" makes the device Ready outside a round only.
-#[test]
-fn readiness_counts_only_measured_monitors_during_a_round() {
+fn readiness_counts_only_measured_monitors_in_strict_mode() {
     let (tx, _) = broadcast::channel(64);
-    let round = sources();
     let omni = source_sender("square.0", &tx);
     let mock = source_sender("mock_monitor.0", &tx);
     let mut rx = BusSender::new("pureplay.0".into(), tx, Arc::default()).subscribe();
-    let mut relay = Relay::new(GsProRouting::default(), round.clone(), Some(test_state()));
+    let mut relay = new_relay(GsProRouting::default());
     status(&mock, ActorStatus::Connected);
     device_telemetry(&mock, &[("ready", "true")]);
     relay.drain(&mut rx).expect("bus");
-    let guard = round
-        .begin_round(&RoundRequest {
-            holder: "Pureplay",
-            feeds: &[],
-        })
-        .expect("a round");
     let now = Instant::now();
-    assert_eq!(relay.ready_state(now, None), ReadyState::Ready);
-    assert_eq!(relay.ready_state(now, Some(&guard)), ReadyState::NotReady);
+    assert_eq!(relay.ready_state(now, false), ReadyState::Ready);
+    assert_eq!(relay.ready_state(now, true), ReadyState::NotReady);
     assert_eq!(
-        relay.connection_state(Some(&guard)),
+        relay.connection_state(true),
         ConnectionState::Disconnected,
         "no measured monitor seen"
     );
@@ -736,84 +635,72 @@ fn readiness_counts_only_measured_monitors_during_a_round() {
     status(&omni, ActorStatus::Connected);
     relay.drain(&mut rx).expect("bus");
     assert_eq!(
-        relay.ready_state(Instant::now(), Some(&guard)),
+        relay.ready_state(Instant::now(), true),
         ReadyState::NotReady,
         "the Omni is not ready"
     );
-    assert_eq!(
-        relay.connection_state(Some(&guard)),
-        ConnectionState::Connected
-    );
+    assert_eq!(relay.connection_state(true), ConnectionState::Connected);
     device_telemetry(&omni, &[("ready", "true")]);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(
-        relay.ready_state(Instant::now(), Some(&guard)),
-        ReadyState::Ready
-    );
+    assert_eq!(relay.ready_state(Instant::now(), true), ReadyState::Ready);
 }
 
 /// A launch monitor seen on the bus and then removed from the config (so
-/// not a known source) does not feed the output, and does not refuse a
-/// round.
+/// not a known source) is forgotten: it does not feed the output.
 #[test]
-fn a_removed_monitor_does_not_refuse_a_round() {
+fn a_removed_monitor_is_forgotten() {
     let (tx, _) = broadcast::channel(16);
-    let round = sources();
+    let sources = sources();
     let mock = source_sender("mock_monitor.1", &tx);
     let mut rx = BusSender::new("pureplay.0".into(), tx, Arc::default()).subscribe();
-    let mut relay = Relay::new(GsProRouting::default(), round.clone(), Some(test_state()));
+    let mut relay = Relay::new(
+        GsProRouting::default(),
+        Arc::clone(&sources),
+        Some(test_state()),
+    );
     status(&mock, ActorStatus::Connected);
     relay.drain(&mut rx).expect("bus");
-    let configured = names(&[("square.0", "Omni")]);
-    assert_eq!(
-        refusal(&relay, &configured).as_deref(),
-        Some("mock_monitor.1 is a virtual launch monitor")
-    );
-    round.forget_source("mock_monitor.1");
+    assert!(relay.monitors.contains_key("mock_monitor.1"));
+    sources.forget_source("mock_monitor.1");
     status(&mock, ActorStatus::Disconnected);
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(refusal(&relay, &configured), None);
     assert!(!relay.monitors.contains_key("mock_monitor.1"));
 }
 
-/// Routed to "Any", a virtual card refuses strict mode until it is turned
-/// off: its `bus.actor` removal and the round forgetting its card (by its
-/// actor ID) leave the Mevo alone, and the round starts.
+/// A card turned off is forgotten: its `bus.actor` removal and the
+/// registry forgetting its card (by its actor ID) leave the Mevo alone.
 #[test]
-fn a_virtual_card_turned_off_lets_a_strict_round_start() {
+fn a_virtual_card_turned_off_is_forgotten() {
     const MEVO: &str = "7d2f9a41c03be856";
     const MOCK: &str = "c19e04b7a2d5f318";
     let (tx, _) = broadcast::channel(64);
-    let round = RoundPolicy::default();
-    round.register_card_source("mevo.0", MEVO, ShotSource::Mevo);
-    round.register_card_source("mock_monitor.0", MOCK, ShotSource::MockMonitor);
+    let sources = Arc::new(Sources::default());
+    sources.register_card_source("mevo.0", MEVO, ShotSource::Mevo);
+    sources.register_card_source("mock_monitor.0", MOCK, ShotSource::MockMonitor);
     let mevo = source_sender(MEVO, &tx);
     let mock = source_sender(MOCK, &tx);
     let mut rx = BusSender::new("pureplay.0".into(), tx, Arc::default()).subscribe();
-    let mut relay = Relay::new(GsProRouting::default(), round.clone(), Some(test_state()));
+    let mut relay = Relay::new(
+        GsProRouting::default(),
+        Arc::clone(&sources),
+        Some(test_state()),
+    );
     announce(&mevo);
     announce(&mock);
     relay.drain(&mut rx).expect("bus");
-    let configured = names(&[(MEVO, "Mevo"), (MOCK, "Mock")]);
-    assert_eq!(
-        refusal(&relay, &configured).as_deref(),
-        Some("Mock is a virtual launch monitor")
-    );
+    assert!(relay.monitors.contains_key(MOCK));
 
-    round.forget_card("mock_monitor.0");
+    sources.forget_card("mock_monitor.0");
     mock.frp(flightrelay::Removal::of(flightrelay::StateKind::BusActor));
     relay.drain(&mut rx).expect("bus");
-    let configured = names(&[(MEVO, "Mevo")]);
-    assert_eq!(refusal(&relay, &configured), None);
     assert!(!relay.monitors.contains_key(MOCK));
+    assert!(relay.monitors.contains_key(MEVO));
 }
 
-/// A launch monitor turned off is no feed: it is left out of the
-/// configured names and forgotten as a source when the system stops it, and
-/// a mode routed to it by ID counts for nothing. So a mock that is off does
-/// not refuse a round.
+/// A launch monitor turned off is left out of the configured names, also
+/// while it is still registered as a source.
 #[test]
-fn a_monitor_turned_off_does_not_refuse_a_round() {
+fn a_monitor_turned_off_is_left_out_of_the_names() {
     let dir = crate::actors::web::tests::TempDir(std::env::temp_dir().join(format!(
         "flighthook-pureplay-disabled-{}",
         crate::state::config::generate_id()
@@ -840,26 +727,27 @@ fn a_monitor_turned_off_does_not_refuse_a_round() {
         );
     });
     // Still registered (its stop not finished yet): left out all the same.
-    state.round.register_source("square.0", ShotSource::Square);
     state
-        .round
+        .sources
+        .register_source("square.0", ShotSource::Square);
+    state
+        .sources
         .register_source("mock_monitor.0", ShotSource::MockMonitor);
     let names = monitor_names(&state);
     assert_eq!(names.keys().collect::<Vec<_>>(), ["square.0"]);
+}
 
-    let round = sources();
-    round.forget_source("mock_monitor.0");
-    let any = Relay::new(GsProRouting::default(), round.clone(), Some(test_state()));
-    assert_eq!(refusal(&any, &names), None);
-    let to_the_mock = Relay::new(
-        GsProRouting {
-            putting_monitor: Some("mock_monitor.0".into()),
-            ..GsProRouting::default()
-        },
-        round,
-        Some(test_state()),
-    );
-    assert_eq!(refusal(&to_the_mock, &names), None, "routed by ID");
+/// Strict mode sends a measured shot and holds back any other (virtual, or
+/// a source that declares none); outside strict mode every shot is sent.
+#[test]
+fn strict_mode_sends_only_measured_shots() {
+    use flighthook::Source;
+    assert!(sends(true, Some(Source::Measured)));
+    assert!(!sends(true, Some(Source::Virtual)));
+    assert!(!sends(true, None));
+    for source in [Some(Source::Measured), Some(Source::Virtual), None] {
+        assert!(sends(false, source), "{source:?}");
+    }
 }
 
 // -- Against a mock Pureplay host -------------------------------------------
@@ -868,7 +756,6 @@ fn a_monitor_turned_off_does_not_refuse_a_round() {
 struct Bridge {
     host: TcpListener,
     tx: broadcast::Sender<BusMsg>,
-    round: RoundPolicy,
     monitor: BusSender,
     chip: BusSender,
     mock: BusSender,
@@ -902,7 +789,6 @@ impl Bridge {
         before: impl FnOnce(&BusSender),
     ) -> Self {
         let configured = names(monitors);
-        let round = sources();
         let host = TcpListener::bind("127.0.0.1:0").expect("bind mock host");
         host.set_nonblocking(true).expect("nonblocking");
         let addr = host.local_addr().expect("addr");
@@ -918,12 +804,10 @@ impl Bridge {
         before(&monitor);
         let mut synced = tx.subscribe();
         let (done_tx, done) = mpsc::channel();
-        let shared_round = round.clone();
         let sent = Arc::new(SentShots::default());
         let shared_sent = Arc::clone(&sent);
         std::thread::spawn(move || {
             let names = move || configured.clone();
-            let holder = || "Pureplay".to_owned();
             run_with(
                 addr,
                 routing,
@@ -931,8 +815,7 @@ impl Bridge {
                 Backoff::new(Duration::from_millis(20), Duration::from_millis(20)),
                 Shared {
                     names: &names,
-                    holder: &holder,
-                    round: shared_round,
+                    sources: sources(),
                     sent: Some(shared_sent),
                     state: Some(test_state()),
                 },
@@ -965,7 +848,6 @@ impl Bridge {
         Self {
             host,
             tx,
-            round,
             monitor,
             chip,
             mock,
@@ -1487,36 +1369,6 @@ fn strict_mode_clears_estimated_spin_and_suppresses_auto_chip() {
     bridge.stop();
 }
 
-/// Tournament mode alone makes no output measured-only: an estimated spin
-/// still goes out with its spin bits. Strict mode on top keeps its own
-/// rule (spin bits clear), and its end leaves tournament mode on.
-#[test]
-fn tournament_mode_is_not_strict_mode() {
-    let mut bridge = Bridge::start(|_| {});
-    let (_, mut host) = bridge.connect();
-    host.next();
-    bridge.round.set_manual(true);
-
-    emit(&bridge.monitor, 1, &estimated_spin_shot());
-    let ball = host.ball();
-    assert_eq!(ball.valid & BallData::BACK_SPIN, BallData::BACK_SPIN);
-    assert_eq!(ball.back_spin_rpm, 2000.0, "the estimate goes out");
-
-    host.strict(true);
-    bridge.telemetry_is(STRICT_MODE, "on");
-    emit(&bridge.monitor, 2, &estimated_spin_shot());
-    let ball = host.ball();
-    assert_eq!(
-        ball.valid,
-        BallData::BALL_SPEED | BallData::VLA | BallData::HLA,
-        "the simulator's measured-only rule"
-    );
-    host.strict(false);
-    assert!(bridge.round.state().manual && bridge.round.active());
-    bridge.round.set_manual(false);
-    bridge.stop();
-}
-
 /// A new link starts with strict mode off and ShotId 1, and repeats the
 /// handshake.
 #[test]
@@ -1637,8 +1489,8 @@ fn a_stop_during_the_handshake_returns_promptly() {
 
 /// A virtual launch monitor that turns up after strict mode was accepted
 /// (here under "Any" routing) has its shots kept back while the Omni's go;
-/// once the round ends they go out again, and the next request is refused
-/// because of it.
+/// once strict mode ends they go out again, and the next request is
+/// accepted all the same.
 #[test]
 fn a_virtual_monitor_that_turns_up_during_strict_mode_is_not_sent() {
     let bridge = Bridge::start(|_| {});
@@ -1658,13 +1510,7 @@ fn a_virtual_monitor_that_turns_up_during_strict_mode_is_not_sent() {
     host.strict(false);
     emit(&bridge.mock, 3, &mapper::tests::ball_only_shot());
     assert_eq!(host.ball().shot_id, 2, "sent with strict mode off");
-    assert_eq!(
-        host.strict_ack(true),
-        Message::StrictModeAck {
-            accepted: false,
-            reason: "mock_monitor.0 is a virtual launch monitor".into(),
-        }
-    );
+    host.strict(true);
     bridge.stop();
 }
 
@@ -1801,11 +1647,11 @@ fn a_ping_before_the_hello_ack_is_answered() {
     bridge.stop();
 }
 
-/// A virtual launch monitor routed to the output: strict mode is refused
-/// with the reason, nothing is held for Auto-chip, one alert says why, and
-/// Pureplay's StrictModeRequired error that follows raises no second one.
+/// A virtual launch monitor routed to the output: strict mode is accepted
+/// all the same, with no alert, and the mock's shots stay off the link
+/// while it is on.
 #[test]
-fn strict_mode_is_refused_when_a_routed_monitor_is_virtual() {
+fn strict_mode_is_accepted_with_a_virtual_monitor_routed() {
     let mut bridge = Bridge::start_configured(
         GsProRouting::default(),
         Mode::Full,
@@ -1814,79 +1660,16 @@ fn strict_mode_is_refused_when_a_routed_monitor_is_virtual() {
     );
     let (_, mut host) = bridge.connect();
     host.next();
-    assert_eq!(
-        host.strict_ack(true),
-        Message::StrictModeAck {
-            accepted: false,
-            reason: "Mock is a virtual launch monitor".into(),
-        }
-    );
-    assert!(!bridge.round.active(), "no strict round held");
-    host.send(&Message::Error {
-        code: codec::ERROR_STRICT_MODE_REQUIRED,
-        message: "Strict mode required".into(),
-    });
-    host.send(&Message::Ping);
-    assert!(matches!(host.next_not_ready(), Message::Heartbeat { .. }));
-    assert_eq!(
-        bridge.alerts(),
-        [
-            "Pureplay strict mode refused: Mock is a virtual launch monitor. Tournament rounds \
-          take only shots a launch monitor measured."
-        ]
-    );
-
-    // Strict mode stays off: the mock's shots go out as usual.
+    host.strict(true);
+    bridge.telemetry_is(STRICT_MODE, "on");
     emit(&bridge.mock, 1, &mapper::tests::ball_only_shot());
-    assert_eq!(host.ball().shot_id, 1);
-
-    // Pureplay closes the link; the next one asks again and is refused
-    // again, without another alert in the same burst.
-    drop(host);
-    let (_, mut host) = bridge.connect();
-    host.next();
-    assert!(matches!(
-        host.strict_ack(true),
-        Message::StrictModeAck {
-            accepted: false,
-            ..
-        }
-    ));
+    emit(&bridge.monitor, 1, &mapper::tests::full_shot());
+    let ball = host.ball();
+    assert_eq!((ball.shot_id, ball.ball_speed_ms), (1, 64.0), "the Omni's");
+    host.club();
     host.send(&Message::Ping);
     assert!(matches!(host.next_not_ready(), Message::Heartbeat { .. }));
     assert!(bridge.alerts().is_empty());
-    bridge.stop();
-}
-
-/// The Open Connect input routed in one mode is measured, so strict mode
-/// is accepted; so it is with no launch monitor at all.
-#[test]
-fn strict_mode_is_accepted_with_the_open_connect_input_routed() {
-    let routing = GsProRouting {
-        full_monitor: Some("square.0".into()),
-        chipping_monitor: Some("square.0".into()),
-        putting_monitor: Some("openconnect_server.0".into()),
-    };
-    let bridge = Bridge::start_configured(
-        routing,
-        Mode::Full,
-        &[
-            ("square.0", "Square Golf Omni"),
-            ("openconnect_server.0", "Open Connect input"),
-        ],
-        |_| {},
-    );
-    let (_, mut host) = bridge.connect();
-    host.next();
-    host.strict(true);
-    assert!(bridge.round.active());
-    bridge.stop();
-
-    let bridge = Bridge::start_configured(GsProRouting::default(), Mode::Full, &[], |_| {});
-    let (_, mut host) = bridge.connect();
-    host.next();
-    host.strict(true);
-    assert!(bridge.round.active());
     bridge.stop();
 }
 
@@ -1918,7 +1701,7 @@ fn strict_mode_sends_measured_sources_only() {
     bridge.stop();
 }
 
-/// In a strict round, another actor's `shot.launch` that comes
+/// In strict mode, another actor's `shot.launch` that comes
 /// between the launch monitor's trigger and its own launch is dropped, so
 /// Pureplay gets the launch monitor's values as the measured shot.
 #[test]
@@ -1979,44 +1762,6 @@ fn a_card_added_after_the_omni_connected_sends_its_first_shot_in_strict_mode() {
     bridge.stop();
 }
 
-/// The strict round is held for Auto-chip from the accepted ack until
-/// strict mode ends, the link drops (the new link starts without it) or the
-/// actor stops.
-#[test]
-fn strict_mode_holds_auto_chip_off_until_it_ends_or_the_link_drops() {
-    let mut bridge = Bridge::start(|_| {});
-    let (_, mut host) = bridge.connect();
-    host.next();
-    assert!(!bridge.round.active());
-    host.strict(true);
-    assert!(bridge.round.active(), "held once acked");
-    host.strict(false);
-    assert!(!bridge.round.active(), "released when the round ends");
-    host.strict(true);
-    assert!(bridge.round.active());
-
-    drop(host);
-    bridge.wait_for("Reconnecting", |e| {
-        matches!(
-            e,
-            Ev::Status {
-                status: ActorStatus::Reconnecting,
-                ..
-            }
-        )
-    });
-    assert!(!bridge.round.active(), "released when the link drops");
-    let (_, mut host) = bridge.connect();
-    host.next();
-    bridge.telemetry_is(STRICT_MODE, "off");
-    assert!(!bridge.round.active(), "a new link starts without it");
-
-    host.strict(true);
-    assert!(bridge.round.active());
-    bridge.stop();
-    assert!(!bridge.round.active(), "released when the actor stops");
-}
-
 /// On the wire: a shot whose back and side spin are a model's (assumed in
 /// the launch monitor's flight result) goes out with total and axis only in
 /// strict mode, the measured-only receiver, and with all four outside it.
@@ -2059,11 +1804,11 @@ fn strict_mode_withholds_assumed_spin_on_the_wire() {
     bridge.stop();
 }
 
-/// On the wire: a virtual monitor that turns up ready during a round under
+/// On the wire: a virtual monitor that turns up ready in strict mode under
 /// "Any" routing leaves the ready state and the heartbeat at the Omni's
-/// (not ready); once the round ends it counts again.
+/// (not ready); once strict mode ends it counts again.
 #[test]
-fn a_round_reports_readiness_from_measured_monitors_only() {
+fn strict_mode_reports_readiness_from_measured_monitors_only() {
     let bridge = Bridge::start(|omni| status(omni, ActorStatus::Connected));
     let (_, mut host) = bridge.connect();
     assert_eq!(
@@ -2110,8 +1855,7 @@ fn a_round_reports_readiness_from_measured_monitors_only() {
 // -- The Pureplay Accessory card (a simulator source) --------------------------------------
 
 /// The Pureplay Accessory card's shot, readiness, connection and battery never reach
-/// the output, under "Any" and routed to it by ID, registered or not yet;
-/// and it is never a feed a round names.
+/// the output, under "Any" and routed to it by ID, registered or not yet.
 #[test]
 fn a_pureplay_card_feeds_no_pureplay_connect_output() {
     let by_id = GsProRouting {
@@ -2119,16 +1863,16 @@ fn a_pureplay_card_feeds_no_pureplay_connect_output() {
         chipping_monitor: Some("pureplay_accessory.0".into()),
         putting_monitor: Some("pureplay_accessory.0".into()),
     };
-    for (routing, round) in [
+    for (routing, sources) in [
         (GsProRouting::default(), sources()),
         (by_id.clone(), sources()),
-        (GsProRouting::default(), RoundPolicy::default()),
-        (by_id, RoundPolicy::default()),
+        (GsProRouting::default(), Arc::default()),
+        (by_id, Arc::default()),
     ] {
         let (tx, _) = broadcast::channel(64);
         let card = source_sender("pureplay_accessory.0", &tx);
         let mut rx = BusSender::new("pureplay.0".into(), tx, Arc::default()).subscribe();
-        let mut relay = Relay::new(routing.clone(), round.clone(), Some(test_state()));
+        let mut relay = Relay::new(routing.clone(), sources, Some(test_state()));
         relay.connect(Instant::now());
         status(&card, ActorStatus::Connected);
         device_telemetry(&card, &[("ready", "true"), ("battery_pct", "90")]);
@@ -2136,12 +1880,9 @@ fn a_pureplay_card_feeds_no_pureplay_connect_output() {
         relay.drain(&mut rx).expect("bus");
         let now = Instant::now();
         assert!(relay.next_shot(now).is_none(), "{routing:?}");
-        assert_eq!(relay.ready_state(now, None), ReadyState::NotReady);
-        assert_eq!(relay.connection_state(None), ConnectionState::Disconnected);
+        assert_eq!(relay.ready_state(now, false), ReadyState::NotReady);
+        assert_eq!(relay.connection_state(false), ConnectionState::Disconnected);
         assert!(relay.monitors.is_empty());
-        let configured = names(&[("pureplay_accessory.0", "Pureplay")]);
-        assert!(relay.feeds(&configured).is_empty(), "{routing:?}");
-        assert_eq!(refusal(&relay, &configured), None);
     }
 }
 
@@ -2170,7 +1911,6 @@ fn strict_mode_is_accepted_with_the_pureplay_card_connected() {
             Message::ReadyState(ReadyState::NotReady.byte())
         );
         host.strict(true);
-        assert!(bridge.round.active());
         emit(&card, 1, &mapper::tests::ball_only_shot());
         // A shot from the Omni after it on the bus is the first shot out.
         emit(&bridge.monitor, 1, &mapper::tests::full_shot());
@@ -2257,7 +1997,9 @@ fn the_started_actor_records_its_shots_in_the_apps_registry() {
         protocol_version: 1,
         host_caps: 0,
     });
-    state.round.register_source("square.0", ShotSource::Square);
+    state
+        .sources
+        .register_source("square.0", ShotSource::Square);
     let monitor = source_sender("square.0", &tx);
     // The link counts from the handshake: shots before it are not sent.
     let deadline = Instant::now() + WAIT;
@@ -2283,36 +2025,6 @@ fn the_started_actor_records_its_shots_in_the_apps_registry() {
         state.stop_and_wait("pureplay.0"),
         crate::state::Stopped::Lingering
     ));
-}
-
-/// The output's holder name without a card name is "Pureplay Connect", so
-/// the Tournament strip never reads as the Pureplay Accessory card's.
-#[test]
-fn the_holder_name_defaults_to_pureplay_connect() {
-    let dir = std::env::temp_dir().join(format!(
-        "flighthook-pureplay-holder-{}",
-        crate::state::config::generate_id()
-    ));
-    let (state, _writer) = SystemState::new(dir.join("config.toml"));
-    state.system.update(|c| {
-        c.pureplay.insert(
-            "0".into(),
-            flighthook::PureplaySection {
-                name: String::new(),
-                ..flighthook::PureplaySection::default()
-            },
-        );
-        c.pureplay.insert(
-            "1".into(),
-            flighthook::PureplaySection {
-                name: "Bay 2".into(),
-                ..flighthook::PureplaySection::default()
-            },
-        );
-    });
-    assert_eq!(holder_name(&state, "pureplay.0"), "Pureplay Connect");
-    assert_eq!(holder_name(&state, "pureplay.1"), "Bay 2");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// While linked, the card sends its held select again (club, hand and
@@ -2426,34 +2138,25 @@ fn remote_monitor(id: &str, name: &str, source: flighthook::Source) -> BusMsg {
     )
 }
 
-/// A remote virtual launch monitor refuses a strict round under
-/// "Any", named by its `bus.actor` name; once it went silent (the system
-/// actor forgets its source and announces it gone) the round is accepted.
+/// A remote virtual launch monitor seen under "Any" is forgotten once it
+/// went silent (the system actor announces it gone).
 #[test]
-fn a_gone_remote_monitor_no_longer_refuses_a_round() {
+fn a_gone_remote_monitor_is_forgotten() {
     const REMOTE: &str = "aaaa000000000001";
     let (tx, _) = broadcast::channel(64);
     let mut rx = BusSender::new("pureplay.0".into(), tx.clone(), Arc::default()).subscribe();
-    let mut relay = Relay::new(
-        GsProRouting::default(),
-        RoundPolicy::default(),
-        Some(test_state()),
-    );
+    let mut relay = Relay::new(GsProRouting::default(), Arc::default(), Some(test_state()));
     tx.send(remote_monitor(
         REMOTE,
         "Trackball",
         flighthook::Source::Virtual,
     ))
     .unwrap();
-    relay
-        .round
-        .set_remote(REMOTE, Some(flighthook::Source::Virtual));
     relay.drain(&mut rx).expect("bus");
     assert_eq!(
-        refusal(&relay, &names(&[])).as_deref(),
-        Some("Trackball is a virtual launch monitor")
+        relay.monitors.get(REMOTE).and_then(|m| m.provenance),
+        Some(flighthook::Source::Virtual)
     );
-    relay.round.forget_remote(REMOTE);
     tx.send(BusMsg::local(
         "system",
         LocalEvent::ActorGone {
@@ -2462,6 +2165,5 @@ fn a_gone_remote_monitor_no_longer_refuses_a_round() {
     ))
     .unwrap();
     relay.drain(&mut rx).expect("bus");
-    assert_eq!(refusal(&relay, &names(&[])), None);
     assert!(relay.monitors.is_empty());
 }

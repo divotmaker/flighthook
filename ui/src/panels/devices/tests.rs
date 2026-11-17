@@ -2170,7 +2170,6 @@ fn a_rename_shows_on_the_telemetry_side_and_in_another_window_without_a_reload()
             trackball_supported: false,
             clip_dir: None,
             config_error: None,
-            round: Default::default(),
         });
         app.apply_pending();
     }

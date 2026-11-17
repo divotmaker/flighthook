@@ -8,8 +8,8 @@
 //!   actor whose `golfer.select` produced it. It is internal and never goes
 //!   on the wire.
 //! - [`BusMsg::Local`] carries flighthook's own events ([`LocalEvent`]):
-//!   configuration, card status, cameras, the tournament round, a shot's raw
-//!   frames and the flight model's path. They never leave flighthook.
+//!   configuration, card status, cameras, a shot's raw frames and the
+//!   flight model's path. They never leave flighthook.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,9 +18,7 @@ use std::sync::{Arc, Mutex};
 use flightrelay::{FrpBody, FrpMessage, GolferTurn, Severity, StateKind};
 use tokio::sync::broadcast;
 
-use flighthook::{
-    ActorStatus, CameraPosition, ConfigAction, FlightPath, RoundState, ShotKey, ShotRaw,
-};
+use flighthook::{ActorStatus, CameraPosition, ConfigAction, FlightPath, ShotKey, ShotRaw};
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -153,8 +151,6 @@ pub enum LocalEvent {
     /// An alert of a card that is no FRP actor (a camera, the web server,
     /// the system).
     Alert { severity: Severity, message: String },
-    /// The tournament round started or ended.
-    RoundState { round: RoundState },
     /// Delete the shot history (a store action); every set and the shot
     /// list are cleared.
     ClearShotHistory,

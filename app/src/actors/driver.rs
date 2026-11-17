@@ -340,7 +340,6 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
             host.actions.clear();
             sink.begin_session();
             host.begin_connect();
-            flags.set_shots_allowed(sink.shots_allowed());
             let connected = {
                 let mut emit = |e| sink.handle(e);
                 let out = Events::new(&mut emit, flags);
@@ -450,8 +449,8 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
     }
 
     /// Step `session` until it fails (`Err`) or the actor is stopped
-    /// (`Ok`), handing it new turn hints and the bus's actions, live config
-    /// and the round policy between steps. A step with nothing to do
+    /// (`Ok`), handing it new turn hints, the bus's actions and live config
+    /// between steps. A step with nothing to do
     /// ([`Activity::Idle`]) is followed by the driver contract's [`IDLE`] wait.
     fn drive(
         &self,
@@ -477,7 +476,6 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                 session.action(&action)?;
             }
             take_update(&self.updates, sink, Some(driver));
-            flags.set_shots_allowed(sink.shots_allowed());
             sink.session_mode = given.mode;
             let activity = {
                 let mut emit = |e| sink.handle(e);
@@ -699,12 +697,6 @@ struct Sink<D: FrpDriver, H: Hooks<D>> {
     /// What went out of each shot not finished yet, by shot id, with when
     /// it started.
     shots: HashMap<String, (ShotSoFar, Instant)>,
-    /// Shots the round policy refused at their trigger, by shot id, with
-    /// when.
-    refused: HashMap<String, Instant>,
-    /// A shot has been held back for the tournament round since the last
-    /// one went out (one log line per round).
-    holding: bool,
     /// Shots finished over the actor's life.
     shot_count: u32,
     /// Puts the driver's timestamps on the host clock.
@@ -808,8 +800,6 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             capture: None,
             seqs: HashMap::new(),
             shots: HashMap::new(),
-            refused: HashMap::new(),
-            holding: false,
             shot_count: 0,
             clock: UtcClock::default(),
             session_mode: None,
@@ -994,19 +984,6 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         self.publish_actor();
     }
 
-    /// Whether the driver may start a shot now, by the round policy; logs
-    /// once per round when a virtual source's shots are held back.
-    fn shots_allowed(&mut self) -> bool {
-        let allowed = self.state.round.allows(self.source);
-        if allowed {
-            self.holding = false;
-        } else if !self.holding {
-            self.holding = true;
-            info!("{}: no shots during the tournament round", self.actor);
-        }
-        allowed
-    }
-
     /// The mode the session runs in: the driver's fixed mode, else the turn
     /// hints' mode.
     fn mode(&self) -> Option<Mode> {
@@ -1063,15 +1040,6 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             self.raw(frame);
             return;
         }
-        if let Some(key) = body.shot_key() {
-            let id = key.shot_id.clone();
-            if self.refused.contains_key(&id) {
-                if matches!(body, FrpBody::ShotFinished(_)) {
-                    self.refused.remove(&id);
-                }
-                return;
-            }
-        }
         let mut ctx = HookCtx {
             section: &self.section,
         };
@@ -1108,45 +1076,30 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         }
     }
 
-    /// A shot's trigger: on the bus when the round policy lets it start
-    /// (the atomic check, a backstop to the driver's own `shots_allowed`),
-    /// which opens its raw capture window; else the rest of the shot is
-    /// dropped.
+    /// A shot's trigger: on the bus, which opens its raw capture window.
     fn trigger(&mut self, trigger: ShotTrigger) {
         let key = trigger.key.clone();
         let timestamp = trigger.timestamp;
-        let sender = &self.sender;
-        let sent = self
-            .state
-            .round
-            .send_if_allowed(self.source, || sender.frp(trigger));
-        if sent.is_some() {
-            self.holding = false;
-            let mode = self.mode();
-            self.shots.insert(
-                key.shot_id.clone(),
-                (
-                    ShotSoFar {
-                        key,
-                        launch: None,
-                        flight: None,
-                        mode,
-                    },
-                    Instant::now(),
-                ),
-            );
-            if let Some(capture) = &mut self.capture {
-                let at = match timestamp {
-                    Some(ms) => self.clock.instant_of(ms),
-                    None => Instant::now(),
-                };
-                capture.mark_trigger_at(at);
-            }
-        } else {
-            self.refused.insert(key.shot_id, Instant::now());
-            if !std::mem::replace(&mut self.holding, true) {
-                info!("{}: no shots during the tournament round", self.actor);
-            }
+        self.sender.frp(trigger);
+        let mode = self.mode();
+        self.shots.insert(
+            key.shot_id.clone(),
+            (
+                ShotSoFar {
+                    key,
+                    launch: None,
+                    flight: None,
+                    mode,
+                },
+                Instant::now(),
+            ),
+        );
+        if let Some(capture) = &mut self.capture {
+            let at = match timestamp {
+                Some(ms) => self.clock.instant_of(ms),
+                None => Instant::now(),
+            };
+            capture.mark_trigger_at(at);
         }
     }
 
@@ -1190,11 +1143,8 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         });
     }
 
-    /// Forget shots that never finished within flighthook's shot timeout,
-    /// and refused shots after the same time.
+    /// Forget shots that never finished within flighthook's shot timeout.
     fn prune_shots(&mut self) {
-        self.refused
-            .retain(|_, at| at.elapsed() < flighthook::SHOT_TIMEOUT);
         let actor = &self.actor;
         self.shots.retain(|_, (shot, since)| {
             let keep = since.elapsed() < flighthook::SHOT_TIMEOUT;
@@ -1256,7 +1206,6 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::actors::web::tests::TempDir;
-    use crate::state::round::RoundRequest;
     use crate::state::session::SessionWriter as GameStateWriter;
 
     // -- A scripted fake driver ---------------------------------------------
@@ -1523,15 +1472,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A virtual card on the same driver.
-    #[derive(Default)]
-    struct VirtualHooks;
-
-    impl Hooks<FakeDriver> for VirtualHooks {
-        type Section = FakeSection;
-        const SOURCE: ShotSource = ShotSource::MockMonitor;
-    }
-
     // -- Helpers -------------------------------------------------------------
 
     fn temp_state() -> (TempDir, Arc<SystemState>, GameStateWriter) {
@@ -1583,10 +1523,6 @@ pub(crate) mod tests {
 
     fn flight_of(key: ShotKey, flight: FlightResult) -> FrpBody {
         flightrelay::ShotFlight { key, flight }.into()
-    }
-
-    fn club_of(key: ShotKey, club: ClubData) -> FrpBody {
-        flightrelay::ShotClub { key, club }.into()
     }
 
     fn finished(key: ShotKey) -> FrpBody {
@@ -2083,72 +2019,6 @@ pub(crate) mod tests {
         assert!(
             log.contains("TRACE audit: fake.0 rx handshake 01ab"),
             "{log}"
-        );
-    }
-
-    /// Tournament mode holds a virtual card's shots (the trackball and the
-    /// mock run on this driver), and they are taken again once it is off.
-    #[test]
-    fn tournament_mode_holds_a_virtual_cards_shots() {
-        let (_dir, mut sink, mut rx, _w) = sink::<VirtualHooks>("");
-        drain(&mut rx);
-        sink.state.round.set_manual(true);
-        assert!(!sink.shots_allowed());
-        for event in [
-            trigger(key(1)),
-            launch_of(key(1), launch()),
-            finished(key(1)),
-        ] {
-            sink.handle(frp(event));
-        }
-        assert!(drain(&mut rx).is_empty(), "nothing of the shot");
-        assert!(sink.shots.is_empty());
-        sink.state.round.set_manual(false);
-        assert!(sink.shots_allowed());
-    }
-
-    /// During a round a virtual card's driver is told to hold its shots;
-    /// a shot that starts anyway is dropped whole by the round policy.
-    #[test]
-    fn a_round_holds_a_virtual_cards_shots() {
-        let (_dir, mut sink, mut rx, _w) = sink::<VirtualHooks>("");
-        drain(&mut rx);
-        assert!(sink.shots_allowed());
-        let guard = sink
-            .state
-            .round
-            .begin_round(&RoundRequest {
-                holder: "Pureplay",
-                feeds: &[],
-            })
-            .expect("a round");
-        assert!(!sink.shots_allowed());
-        for event in [
-            trigger(key(1)),
-            launch_of(key(1), launch()),
-            club_of(key(1), ClubData::default()),
-            finished(key(1)),
-        ] {
-            sink.handle(frp(event));
-        }
-        assert!(drain(&mut rx).is_empty(), "nothing of the shot");
-        assert!(sink.refused.is_empty() && sink.shots.is_empty());
-        sink.handle(frp(trigger(key(9))));
-        assert_eq!(sink.refused.len(), 1, "a shot that never finishes");
-        let old = Instant::now()
-            .checked_sub(flighthook::SHOT_TIMEOUT + Duration::from_secs(1))
-            .expect("an old instant");
-        *sink.refused.get_mut("shot-9").expect("refused") = old;
-        sink.prune_shots();
-        assert!(sink.refused.is_empty(), "forgotten after the shot timeout");
-        drop(guard);
-        assert!(sink.shots_allowed());
-        sink.handle(frp(trigger(key(2))));
-        let seen = drain(&mut rx);
-        assert_eq!(kinds(&seen), ["trigger"]);
-        assert_eq!(
-            sink.bus_actor().device.and_then(|d| d.source),
-            Some(Source::Virtual)
         );
     }
 

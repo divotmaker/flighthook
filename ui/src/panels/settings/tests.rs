@@ -291,35 +291,6 @@ fn cancel_restores_a_saved_entry_and_drops_a_new_one() {
     assert_eq!(form.actors.len(), saved_count + 1);
 }
 
-/// Tournament mode switched by another client while the General cards
-/// hold an unsaved edit: the save (scoped and whole) carries the live
-/// value from the reload, not the form's copy, in both directions.
-#[test]
-fn a_general_save_carries_the_live_tournament_mode() {
-    for live in [true, false] {
-        let mut before = FlighthookConfig::default();
-        before.simulation.tournament = !live;
-        let mut form = SettingsForm::default();
-        form.load_from(&before);
-        form.replay.keep_shots = "7".into();
-        form.mark_general(GeneralCard::Replay);
-        // Switched elsewhere: the ConfigOutcome reloads the settings.
-        let mut after = before.clone();
-        after.simulation.tournament = live;
-        form.load_from(&after);
-        assert!(form.global_dirty, "the edit stays");
-        assert_eq!(form.build_global_request().simulation.tournament, live);
-        assert_eq!(form.to_request().simulation.tournament, live);
-        assert_eq!(form.build_global_request().replay.keep_shots, 7);
-
-        // The save lands; the saved config keeps the live value.
-        let _ = form.begin_save(super::SaveTarget::Global);
-        assert_eq!(form.finish_save(Ok(())), None);
-        assert!(!form.global_dirty);
-        assert_eq!(form.saved_config_ref().unwrap().simulation.tournament, live);
-    }
-}
-
 #[test]
 fn general_edits_mark_the_card_they_were_made_on() {
     let mut form = SettingsForm::default();

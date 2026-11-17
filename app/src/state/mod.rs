@@ -4,9 +4,9 @@ pub mod config;
 pub mod local_clients;
 pub mod practice;
 pub mod remotes;
-pub mod round;
 pub mod sent_shots;
 pub mod session;
+pub mod sources;
 
 pub use session::{Session, SessionWriter};
 
@@ -23,8 +23,8 @@ use cameras::Cameras;
 use clips::ClipStore;
 use config::SystemConfig;
 use local_clients::LocalClients;
-use round::RoundPolicy;
 use sent_shots::SentShots;
+use sources::Sources;
 
 /// Root entry point for all managed application state.
 ///
@@ -41,8 +41,8 @@ pub struct SystemState {
     /// The shots the simulator outputs sent, which the Pureplay Accessory card tells
     /// the simulator's echoes by.
     pub sent_shots: Arc<SentShots>,
-    /// The tournament round policy, and every shot source's type.
-    pub round: RoundPolicy,
+    /// Every local shot source's type.
+    pub sources: Arc<Sources>,
     /// The replay clips on disk, shared by the camera actors (beta).
     pub clips: ClipStore,
     /// The camera actors' latest frames and the camera list (beta).
@@ -182,16 +182,13 @@ impl SystemState {
     pub fn new(config_path: PathBuf) -> (Self, SessionWriter) {
         let system = SystemConfig::new(config_path);
         let (session, writer) = Session::with_config(system.view());
-        // Tournament mode starts as the file says.
-        let round = RoundPolicy::default();
-        round.set_manual(system.simulation().tournament);
         (
             Self {
                 system,
                 session,
                 local_clients: Arc::default(),
                 sent_shots: Arc::default(),
-                round,
+                sources: Arc::default(),
                 clips: ClipStore::default(),
                 cameras: Cameras::default(),
                 pose: body_tracking(),

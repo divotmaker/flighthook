@@ -3,8 +3,7 @@
 //! The mock launch monitor is flightrelay's [`MockDriver`]: a virtual device
 //! that arms, reports a ball ready and makes a shot at a fixed interval, with
 //! values for the detection mode in play. It runs as a [`DriverActor`] like
-//! any device driver; the round policy holds its shots during a tournament
-//! round without using up shot numbers.
+//! any device driver.
 
 pub mod randomclub;
 
@@ -38,7 +37,6 @@ mod tests {
     use crate::actors::web::tests::TempDir;
     use crate::bus::{BusMsg, LocalEvent};
     use crate::state::SystemState;
-    use crate::state::round::RoundRequest;
     use crate::state::session::SessionWriter;
 
     /// A mock that makes a shot as fast as it polls.
@@ -262,56 +260,5 @@ mod tests {
             raw.unavailable.as_deref(),
             Some("mock device has no wire protocol")
         );
-    }
-
-    /// During a tournament round the mock makes no shot and takes no shot
-    /// number; its first shot after the round is number 1.
-    #[test]
-    fn a_round_holds_the_mocks_shots_without_taking_numbers() {
-        let mut rig = rig();
-        let guard = rig
-            .state
-            .round
-            .begin_round(&RoundRequest {
-                holder: "Pureplay",
-                feeds: &[],
-            })
-            .expect("a round");
-        rig.start(fast());
-        rig.until(Duration::from_secs(5), |m| {
-            actor(m).is_some_and(|a| a.device.is_some() && a.blockers.is_empty())
-        });
-        // Two bus.sync answers: the card answers while it drains, before
-        // each step, so at least one step (a shot each step when allowed)
-        // ran between them.
-        let mut held = Vec::new();
-        for _ in 0..2 {
-            let _ = rig.tx.send(BusMsg::frp(flightrelay::FrpMessage::new(
-                rig.state.flighthook_id(),
-                flightrelay::BusSync::new(),
-            )));
-            held.extend(rig.until(crate::actors::GIVE_UP, |m| actor(m).is_some()));
-        }
-        assert!(
-            !held
-                .iter()
-                .any(|m| matches!(body(m), Some(FrpBody::ShotTrigger(_)))),
-            "no shot during the round"
-        );
-        drop(guard);
-        let seen = rig.until(Duration::from_secs(5), |m| {
-            matches!(body(m), Some(FrpBody::ShotTrigger(_)))
-        });
-        let Some(FrpBody::ShotTrigger(trigger)) = seen.last().and_then(body) else {
-            unreachable!()
-        };
-        assert_eq!(trigger.key.shot_number, 1, "no number taken while held");
-        let source = seen
-            .iter()
-            .filter_map(actor)
-            .filter_map(|a| a.device.as_ref().and_then(|d| d.source))
-            .next_back();
-        assert_eq!(source, Some(Source::Virtual));
-        rig.state.stop_and_wait("mock_monitor.0");
     }
 }

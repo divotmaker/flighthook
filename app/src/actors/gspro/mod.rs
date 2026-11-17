@@ -42,7 +42,7 @@ pub(crate) mod proto;
 
 use proto::*;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -85,28 +85,6 @@ pub struct GsProRouting {
     pub full_monitor: Option<String>,
     pub chipping_monitor: Option<String>,
     pub putting_monitor: Option<String>,
-}
-
-impl GsProRouting {
-    /// The launch monitors whose shots this routing passes in any detection
-    /// mode, by actor ID: each mode's routed monitor, and for a mode routed
-    /// to "Any" every monitor in `any`.
-    pub fn feeds<'a>(&'a self, any: BTreeSet<&'a str>) -> BTreeSet<&'a str> {
-        let mut feeds = BTreeSet::new();
-        for routed in [
-            &self.full_monitor,
-            &self.chipping_monitor,
-            &self.putting_monitor,
-        ] {
-            match routed {
-                Some(id) => {
-                    feeds.insert(id.as_str());
-                }
-                None => feeds.extend(any.iter().copied()),
-            }
-        }
-        feeds
-    }
 }
 
 /// Open Connect client actor (`openconnect_client.N`). Connects to a
@@ -745,7 +723,7 @@ impl Relay {
 
     /// Whether the simulator is told a launch monitor is ready.
     fn ready(&self) -> bool {
-        self.feed.ready(|_| true)
+        self.feed.ready()
     }
 }
 
@@ -1236,71 +1214,6 @@ mod tests {
             assert_eq!(msg.club_data.speed, 0.0);
             assert_eq!(msg.club_data.loft, 0.0);
         }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// Tournament mode changes nothing GSPro receives: a launch-only chip
-    /// (speed and angles measured, its spin the card's estimate) still goes
-    /// out with the estimated spin, byte for byte as with the mode off.
-    #[test]
-    fn tournament_mode_leaves_a_launch_only_chips_estimated_spin_to_gspro() {
-        use crate::actors::provenance::ShotSource;
-        use flightrelay::types::{AssumedLaunch, Basis, FlightResult};
-        let dir = std::env::temp_dir().join(format!(
-            "flighthook-gspro-test-{}",
-            crate::state::config::generate_id()
-        ));
-        let (state, _writer) = SystemState::new(dir.join("config.toml"));
-        let state = Arc::new(state);
-        state.round.register_source("mevo.0", ShotSource::Mevo);
-        let sent = |n: u32| {
-            let (tx, _) = broadcast::channel(64);
-            let mevo = actor("mevo.0", &tx);
-            let mut receiver =
-                BusSender::new("openconnect_client.0".into(), tx.clone(), Arc::default())
-                    .subscribe();
-            let mut relay = Relay::new(
-                GsProRouting::default(),
-                Registry {
-                    state: Some(Arc::clone(&state)),
-                    sent: None,
-                },
-                "openconnect_client.0",
-            );
-            relay.connect(Instant::now());
-            let mut launch = mapper::tests::square_like_shot().launch.expect("ball data");
-            launch.backspin_rpm = None;
-            launch.sidespin_rpm = None;
-            launch.total_spin_rpm = None;
-            launch.spin_axis = None;
-            let key = key(n);
-            mevo.frp(flightrelay::ShotTrigger::new(key.clone()));
-            mevo.frp(flightrelay::ShotLaunch {
-                key: key.clone(),
-                launch,
-            });
-            mevo.frp(flightrelay::ShotFlight {
-                key: key.clone(),
-                flight: FlightResult {
-                    assumed: Some(AssumedLaunch {
-                        backspin_rpm: Some(2000),
-                        sidespin_rpm: Some(0),
-                        ..AssumedLaunch::default()
-                    }),
-                    ..FlightResult::new(Basis::Modeled)
-                },
-            });
-            mevo.frp(flightrelay::ShotFinished { key });
-            relay.drain(&mut receiver).expect("bus open");
-            let shot = relay.next_shot(Instant::now()).expect("sent to GSPro");
-            serde_json::to_value(mapper::map_shot(&shot)).expect("json")
-        };
-        let off = sent(1);
-        state.round.set_manual(true);
-        assert!(state.round.active());
-        let on = sent(1);
-        assert_eq!(on["BallData"]["BackSpin"], 2000.0, "{on}");
-        assert_eq!(on, off, "the payload does not change with tournament mode");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2557,7 +2470,7 @@ mod tests {
                 c.frp.auto_chip_actor_id = Some(flighthook::AUTO_CHIP_ACTOR.into());
             });
             for (actor, source) in sources {
-                state.round.register_source(actor, *source);
+                state.sources.register_source(actor, *source);
             }
             (Arc::new(state), dir)
         }

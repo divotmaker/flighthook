@@ -36,8 +36,6 @@ pub struct Pending {
     pub groups_posted: bool,
     /// The reply to a `POST /api/auto-chip`: sent, or why not.
     pub auto_chip: Option<Result<(), String>>,
-    /// The reply to a `POST /api/tournament`: applied, or why not.
-    pub tournament: Option<Result<(), String>>,
     /// The reply to `GET /api/cameras`: the camera list, or why not.
     pub cameras: Option<Result<CameraListResponse, String>>,
     /// Still frames by camera actor: the JPEG, or why there is none.
@@ -402,7 +400,7 @@ fn error_reason(resp: &ehttp::Response) -> String {
     }
 }
 
-/// A `POST /api/auto-chip` or `POST /api/tournament` reply as applied
+/// A `POST /api/auto-chip` reply as applied
 /// (`Ok`) or not (`Err` with a short reason: a network error or a non-2xx
 /// status).
 pub(crate) fn auto_chip_reply(result: Result<ehttp::Response, String>) -> Result<(), String> {
@@ -975,33 +973,6 @@ pub fn post_clear_history(ctx: &egui::Context) {
 pub fn post_grouping(ctx: &egui::Context, mode: ShotGrouping) {
     let body = serde_json::json!({ "mode": mode }).to_string();
     post_json(ctx, "/api/shots/grouping", body);
-}
-
-/// The `POST /api/tournament` request switching tournament mode to `on`.
-/// The server answers once the config command is applied, so it gets the
-/// config requests' timeout.
-pub(crate) fn tournament_request(on: bool) -> ehttp::Request {
-    let url = format!("{}/api/tournament", api_base());
-    let body = serde_json::json!({ "on": on }).to_string().into_bytes();
-    ehttp::Request {
-        headers: ehttp::Headers::new(&[("Accept", "*/*"), ("Content-Type", "application/json")]),
-        timeout: Some(CONFIG_REQUEST_TIMEOUT),
-        ..ehttp::Request::post(&url, body)
-    }
-}
-
-/// Switch tournament mode on or off (`POST /api/tournament`); the reply
-/// lands in `tournament` (a failure shows in the error banner, like
-/// Auto-chip's). The server's `round_state` event redraws the header.
-pub fn post_tournament(ctx: &egui::Context, pending: &PendingHandle, on: bool) {
-    let ctx = ctx.clone();
-    let pending = Arc::clone(pending);
-    ehttp::fetch(tournament_request(on), move |result| {
-        if let Ok(mut p) = pending.lock() {
-            p.tournament = Some(auto_chip_reply(result));
-        }
-        ctx.request_repaint();
-    });
 }
 
 /// Fire-and-forget POST of a JSON body (`body` may be empty) to `path`.

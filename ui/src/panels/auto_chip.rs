@@ -1,15 +1,14 @@
 //! Auto-Chip (beta): a menu chip in the header, right of the club picker,
 //! that sends a short straight chip to the sim (`POST /api/auto-chip`). It
 //! shows while the `[simulation] auto_chip` setting enables it and is
-//! disabled, with the reason as its hover text, while a tournament round is
-//! active (the server's round policy says so), no simulator is connected or
-//! a chip is on its way. A refused chip shows in the error banner
+//! disabled, with the reason as its hover text, while no simulator is
+//! connected or a chip is on its way. A refused chip shows in the error banner
 //! ([`super::monitoring`]).
 
 use std::collections::HashMap;
 
 use crate::app::FlighthookApp;
-use crate::types::{ActorStatusResponse, RoundState};
+use crate::types::ActorStatusResponse;
 
 /// Hover text on the Auto-chip button.
 pub(crate) const AUTO_CHIP_HINT: &str =
@@ -21,23 +20,13 @@ pub(crate) fn auto_chip_items() -> [(String, u32); 3] {
 }
 
 /// Why the Auto-Chip button is disabled, or `None` when it is enabled: a
-/// tournament round is active (the server fires no Auto-Chip during one;
-/// the reason names the simulator holding it, or tournament mode), a chip
-/// is on its way, or no output that forwards shots (an Open Connect client
+/// chip is on its way, or no output that forwards shots (an Open Connect client
 /// or Pureplay) is connected.
 pub(crate) fn auto_chip_blocked(
-    round: &RoundState,
     actors: &HashMap<String, ActorStatusResponse>,
     in_flight: Option<u32>,
 ) -> Option<String> {
-    if round.held {
-        Some(format!(
-            "{} tournament round",
-            round.holder.as_deref().unwrap_or("Simulator")
-        ))
-    } else if round.active {
-        Some("Tournament mode is on".to_owned())
-    } else if in_flight.is_some() {
+    if in_flight.is_some() {
         Some("Sending the chip\u{2026}".to_owned())
     } else if !crate::app::simulator_connected(actors) {
         Some("Auto-Chip: no simulator connected. Connect an Open Connect Client first.".to_owned())
@@ -47,19 +36,6 @@ pub(crate) fn auto_chip_blocked(
 }
 
 impl FlighthookApp {
-    /// Switch tournament mode to `on`: one request; the server's round
-    /// redraws the header, and a failed reply shows in the error banner.
-    pub(crate) fn set_tournament(&mut self, ctx: &egui::Context, on: bool) {
-        self.tournament_error = None;
-        #[cfg(not(test))]
-        crate::net::post_tournament(ctx, &self.pending, on);
-        #[cfg(test)]
-        {
-            let _ = ctx;
-            self.tournament_sent.push(on);
-        }
-    }
-
     /// Send an Auto-chip of `yards`: the button waits for the reply, and a
     /// failure shows in the error banner.
     pub(crate) fn send_auto_chip(&mut self, ctx: &egui::Context, yards: u32) {
@@ -182,98 +158,25 @@ mod tests {
 
     #[test]
     fn auto_chip_hover_says_why_it_is_disabled() {
-        let none = RoundState::default();
         let mut actors = HashMap::new();
-        assert!(
-            auto_chip_blocked(&none, &actors, None).is_some_and(|w| w.contains("no simulator"))
-        );
+        assert!(auto_chip_blocked(&actors, None).is_some_and(|w| w.contains("no simulator")));
         actors.insert(
             "openconnect_client.0".into(),
             ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Reconnecting),
         );
-        assert!(auto_chip_blocked(&none, &actors, None).is_some());
+        assert!(auto_chip_blocked(&actors, None).is_some());
         actors.insert(
             "openconnect_client.1".into(),
             ActorStatusResponse::new("Muni Golf", crate::types::ActorStatus::Connected),
         );
-        assert_eq!(auto_chip_blocked(&none, &actors, None), None);
-        assert!(
-            auto_chip_blocked(&none, &actors, Some(5)).is_some_and(|w| w.starts_with("Sending"))
-        );
-    }
-
-    /// The round the server reports while a Pureplay output holds one.
-    fn active() -> RoundState {
-        RoundState {
-            active: true,
-            holder: Some("Pureplay".into()),
-            held: true,
-            manual: false,
-        }
-    }
-
-    /// The round the server reports while only tournament mode is on.
-    fn manual() -> RoundState {
-        RoundState {
-            active: true,
-            holder: Some("Manual".into()),
-            held: false,
-            manual: true,
-        }
-    }
-
-    /// Both on states turn the chip off with their own reason: tournament
-    /// mode says so, a held round names the simulator holding it (also
-    /// with tournament mode on underneath).
-    #[test]
-    fn auto_chip_is_off_in_both_tournament_states_with_its_reason() {
-        let mut actors = HashMap::new();
-        actors.insert(
-            "openconnect_client.0".into(),
-            ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Connected),
-        );
-        assert_eq!(
-            auto_chip_blocked(&manual(), &actors, None).as_deref(),
-            Some("Tournament mode is on")
-        );
-        let held = RoundState {
-            holder: Some("Pureplay Connect".into()),
-            manual: true,
-            ..active()
-        };
-        assert_eq!(
-            auto_chip_blocked(&held, &actors, None).as_deref(),
-            Some("Pureplay Connect tournament round")
-        );
-    }
-
-    /// An active round turns the chip off, whatever else is connected,
-    /// until the server reports it ended. The cards' telemetry plays no
-    /// part.
-    #[test]
-    fn a_strict_round_turns_auto_chip_off_until_it_ends() {
-        let strict = Some("Pureplay tournament round".to_owned());
-        let mut actors = HashMap::new();
-        actors.insert(
-            "openconnect_client.0".into(),
-            ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Connected),
-        );
-        let mut card = ActorStatusResponse::new("Pureplay", crate::types::ActorStatus::Connected);
-        card.telemetry.insert("strict_mode".into(), "on".into());
-        actors.insert("pureplay.0".into(), card);
-        assert_eq!(
-            auto_chip_blocked(&RoundState::default(), &actors, None),
-            None,
-            "no round reported"
-        );
-        assert_eq!(auto_chip_blocked(&active(), &actors, None), strict);
-        assert_eq!(auto_chip_blocked(&active(), &actors, Some(3)), strict);
+        assert_eq!(auto_chip_blocked(&actors, None), None);
+        assert!(auto_chip_blocked(&actors, Some(5)).is_some_and(|w| w.starts_with("Sending")));
     }
 
     /// In the header the chip stays where it is, disabled: a click opens no
-    /// menu while the round holds, and the menu opens again after it.
+    /// menu while a chip is on its way, and the menu opens again after it.
     #[test]
-    fn the_header_chip_is_read_only_during_a_strict_round() {
+    fn the_header_chip_is_read_only_while_a_chip_is_on_its_way() {
         use egui::{Event, Modifiers, PointerButton};
 
         let ctx = egui::Context::default();
@@ -283,7 +186,7 @@ mod tests {
             "openconnect_client.0".into(),
             ActorStatusResponse::new("GSPro", crate::types::ActorStatus::Connected),
         );
-        app.round = active();
+        app.auto_chip_in_flight = Some(3);
         let click = |app: &mut FlighthookApp, at: egui::Pos2| -> Marks {
             let button = |pressed| Event::PointerButton {
                 pos: at,
@@ -314,12 +217,12 @@ mod tests {
         header_marks(&ctx, &mut app, 1600.0);
         let chip = header_marks(&ctx, &mut app, 1600.0)["auto-chip"].0;
         assert!(!menu(&click(&mut app, chip.center())), "read-only");
-        assert_eq!(app.auto_chip_in_flight, None);
+        assert_eq!(app.auto_chip_in_flight, Some(3));
 
-        app.round = RoundState::default();
+        app.auto_chip_in_flight = None;
         let marks = click(&mut app, chip.center());
         assert_eq!(marks["auto-chip"].0, chip, "same place");
-        assert!(menu(&marks), "the menu opens once the round ends");
+        assert!(menu(&marks), "the menu opens once the chip is answered");
     }
 
     /// One pass of the header on a 1600×900 screen; its marked controls.

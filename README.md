@@ -48,7 +48,8 @@ Each device links to its setup notes, quirks, and config reference.
 The Trackball turns a trackball or mouse into a launch monitor for testing and
 practice: pull the ball back, push it forward, and the swing becomes a full
 shot. Every value is synthesized from the swing, so it is a virtual launch
-monitor (no tournament rounds). Add it from the Launch monitors (+) menu
+monitor: Pureplay Connect does not send its shots during a Pureplay tournament
+round. Add it from the Launch monitors (+) menu
 (Linux only).
 
 The Pureplay Accessory card (beta) follows a round in Pureplay through
@@ -74,8 +75,8 @@ telemetry, its battery in the header's energy menu, and its shots in the
 Shots tab and the exports; it can be picked in an output's routing like a
 card flighthook runs itself. The card goes after about six seconds without
 its heartbeat. The program connects to flighthook; flighthook does not dial
-out to it. A remote launch monitor that says its shots are virtual
-is held during a tournament round like the Trackball and the Mock.
+out to it. During a Pureplay tournament round, Pureplay Connect sends a remote
+launch monitor's shots only when it says its shots are measured.
 
 Other launch monitor software reaches flighthook through the **Open Connect
 Server** card, which accepts shots from any software that sends GSPro Open
@@ -201,8 +202,8 @@ Terminal. Allow it.
 - A header with custom icons (beta): Shots, Cameras, Settings and Log on the
   left; on the right the batteries, Tournament, Follow turns, Auto-Chip, Shot
   Type, Club and Golfer — see [The header](#the-header-beta)
-- Tournament mode as a switch in the header: while it is on, Auto-Chip is off
-  and the virtual launch monitors (Trackball, Mock) hold their shots
+- Pureplay tournament rounds: while a Pureplay game is in one, Pureplay Connect
+  sends only measured shots and the header shows a Tournament icon
 - Battery icons in the header's energy menu for connected devices that report a charge
   (Mevo+, Square Golf Omni, and remote launch monitors that send one): yellow
   under 20 %, red under 10 %
@@ -323,7 +324,6 @@ altitude = "0ft"          # any distance unit, 0 to 5000 m
 temperature_c = 25.0      # -30 to 50
 surface = "fairway"       # fairway | green | firm_green
 auto_chip = false         # true shows the header's Auto-Chip button
-tournament = false       # written by the header's Tournament switch
 ```
 
 The mode applies per shot: changing it affects new shots only. An altitude or
@@ -524,8 +524,7 @@ total distance to the simulator, so the ball gets onto the green and the
 simulator's auto-putt can finish the hole. It is off by default; turn it on
 in Settings → General (**Auto-Chip Helper** on the Global card set to **Show**, or
 `auto_chip = true` under `[simulation]`). It is useful with radar launch
-monitors that miss short chips. It is off while tournament mode is on or a
-simulator's tournament round is held.
+monitors that miss short chips.
 
 - The chip is launched straight at 45° with 300 rpm of backspin per mph of
   ball speed, no sidespin and no club data, so it carries about 90% of the
@@ -553,7 +552,8 @@ tab: **Shots**, **Cameras** (hover text points to Settings while no camera is ad
 
 - **Energy**: the batteries of the devices that report one. It shows only
   when there is one to show.
-- **Tournament**: a switch for tournament mode (see below).
+- **Tournament**: shown while a Pureplay game is in a tournament round (see
+  below).
 - **Follow turns**: with two or more golfers known, on (the default) makes the
   Shots tab follow the golfer up; off keeps the view on the golfer you picked
   in the Golfer card. It is not saved: it is on again after a reload.
@@ -566,20 +566,21 @@ tab: **Shots**, **Cameras** (hover text points to Settings while no camera is ad
 - **Golfer**: the golfer up, shown as an initial. Its card picks who is up
   and opens Settings, Golfers.
 
-Switching Tournament or Follow turns shows a short message near the bottom of
-the window saying whether it is now on or off.
+Switching Follow turns shows a short message near the bottom of the window
+saying whether it is now on or off.
 
 The Club, Shot Type and Golfer pickers are always editable. While a simulator
 card (Open Connect client or Pureplay Accessory) is
 connected, a pick that differs from the simulator's is set back to the
 simulator's.
 
-**Tournament mode** is a switch while nothing else has set it: on, Auto-Chip is
-off and the virtual launch monitors (Trackball, Mock, and remote ones that say
-they are virtual) hold their shots, so only measured shots count. When a
-simulator holds a tournament round the switch shows it locked on, and it
-cannot be turned off from flighthook until the simulator ends the round. The
-manual switch is saved in `[simulation] tournament`.
+**Tournament** is a gold trophy that shows while a Pureplay game connected
+through the Pureplay Connect output (alpha) is in a tournament round. Its hover text says so; it
+has no click action. During the round Pureplay Connect sends Pureplay only the
+shots of launch monitors that measured them: shots from the Trackball, the
+Mock, Auto-Chip and remote launch monitors that do not say their shots are
+measured are not sent. They still reach the other outputs, and Auto-Chip and
+the Mock keep running.
 
 ### Golfers (beta)
 

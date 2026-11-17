@@ -102,9 +102,8 @@ saturated: lower **Full power speed**, or set **Report limit** to the
 device's real limit. In the Shots tab its shots look like any other launch
 monitor's.
 
-The Trackball is a **virtual** launch monitor: during a tournament round it
-sends no shots (a swing then is dropped and takes no shot number), and a
-round that a Trackball feeds is refused. Its shots cut no camera clip.
+The Trackball is a **virtual** launch monitor: Pureplay Connect does not send
+its shots during a Pureplay tournament round. Its shots cut no camera clip.
 
 ## Shot export
 

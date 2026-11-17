@@ -30,7 +30,6 @@ pub(crate) fn handle_config_command(
 ) {
     apply_config_command(event, state, bus_tx, sender, waits);
     state.pose.follow(&state.system.body_tracking());
-    state.round.set_manual(state.system.simulation().tournament);
 }
 
 /// [`handle_config_command`] but for body tracking.
@@ -59,22 +58,14 @@ pub(super) fn apply_config_command(
 
     match action.as_ref() {
         ConfigAction::ReplaceAll { config } => {
-            // Only `SetTournament` writes tournament mode: a whole-config
-            // save keeps the live value whatever its body carries.
-            let mut config = (**config).clone();
-            config.simulation.tournament = before.simulation.tournament;
-            state.system.replace(config);
+            state.system.replace((**config).clone());
             scope = None;
         }
         ConfigAction::ReplaceGlobal { config } => {
             state.system.update(|p| {
                 p.default_units = config.default_units;
                 p.shot_grouping = config.shot_grouping;
-                // Tournament mode stays as it is (only `SetTournament`
-                // writes it).
-                let tournament = p.simulation.tournament;
                 p.simulation = config.simulation.clone();
-                p.simulation.tournament = tournament;
                 p.replay = config.replay.clone();
                 p.body_tracking = config.body_tracking.clone();
             });
@@ -240,20 +231,6 @@ pub(super) fn apply_config_command(
             // Body tracking is read live everywhere: persist it and
             // reconcile nothing.
             state.system.update(|p| p.body_tracking = section.clone());
-            sender.local(LocalEvent::ConfigOutcome {
-                request_id: request_id.clone(),
-                restarted: Vec::new(),
-                stopped: Vec::new(),
-                started: Vec::new(),
-            });
-            return;
-        }
-        ConfigAction::SetTournament { on } => {
-            // Persisted, then applied before the outcome goes out, so the
-            // caller reads the new round when it hears the outcome.
-            let on = *on;
-            state.system.update(|p| p.simulation.tournament = on);
-            state.round.set_manual(on);
             sender.local(LocalEvent::ConfigOutcome {
                 request_id: request_id.clone(),
                 restarted: Vec::new(),

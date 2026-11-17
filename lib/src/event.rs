@@ -109,40 +109,6 @@ pub struct DerivedFlight {
 /// monitor that measured it, or no device at all.
 pub use flightrelay::Source;
 
-/// A tournament round: while one is active, virtual shot sources
-/// (Auto-chip, the mock launch monitor, the trackball) are off, and an
-/// output holding the round takes only measured shots and values.
-///
-/// A round is active while a simulator holds one (`held`), or while
-/// tournament mode is switched on by hand (`manual`), or both.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoundState {
-    /// A round is active.
-    #[serde(default)]
-    pub active: bool,
-    /// The display name of the round's holder: the first simulator holding
-    /// it (its card name), else `"Manual"` while only tournament mode holds
-    /// it. Absent when no round is active.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub holder: Option<String>,
-    /// Tournament mode is switched on (`[simulation] tournament`). It stays
-    /// on underneath a simulator's round. Omitted when false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub manual: bool,
-    /// A simulator holds the round, so it cannot be switched off here.
-    /// Omitted when false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub held: bool,
-}
-
-impl RoundState {
-    /// Whether no round is active.
-    #[must_use]
-    pub fn is_inactive(&self) -> bool {
-        !self.active
-    }
-}
-
 /// A simulated ball path from the tee to rest.
 ///
 /// Points are `[t, x, y, z]`: seconds since launch, meters downrange, meters
@@ -420,8 +386,7 @@ pub struct ShotData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golfer_name: Option<String>,
     /// What stands behind the shot, from the launch monitor's `bus.actor`.
-    /// Absent on shots stored without it; a tournament round counts those
-    /// as not measured.
+    /// Absent on shots stored without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
     /// Every `shot.flight` of the shot, with its sender, in arrival order.
@@ -1107,57 +1072,6 @@ mod tests {
             serde_json::to_value(Source::Measured).expect("ser"),
             "measured"
         );
-    }
-
-    #[test]
-    fn round_state_is_omitted_from_the_status_while_inactive() {
-        let inactive = RoundState::default();
-        assert!(inactive.is_inactive());
-        assert_eq!(
-            serde_json::to_value(&inactive).expect("ser"),
-            serde_json::json!({"active": false})
-        );
-        let round = RoundState {
-            active: true,
-            holder: Some("Pureplay".into()),
-            held: true,
-            manual: false,
-        };
-        assert_eq!(
-            serde_json::to_value(&round).expect("ser"),
-            serde_json::json!({"active": true, "holder": "Pureplay", "held": true})
-        );
-        let status: crate::StatusResponse = serde_json::from_str(
-            r#"{"actors":{},"round":{"active":true,"holder":"Pureplay","held":true}}"#,
-        )
-        .expect("de");
-        assert_eq!(status.round, round);
-    }
-
-    /// Tournament mode alone and under a simulator's round: `manual` and
-    /// `held` go out only when true.
-    #[test]
-    fn round_state_carries_the_manual_and_held_flags() {
-        let manual = RoundState {
-            active: true,
-            holder: Some("Manual".into()),
-            held: false,
-            manual: true,
-        };
-        let json = serde_json::to_value(&manual).expect("ser");
-        assert_eq!(
-            json,
-            serde_json::json!({"active": true, "holder": "Manual", "manual": true})
-        );
-        assert_eq!(
-            serde_json::from_value::<RoundState>(json).expect("de"),
-            manual
-        );
-        let both: RoundState = serde_json::from_str(
-            r#"{"active":true,"holder":"Pureplay Connect","held":true,"manual":true}"#,
-        )
-        .expect("de");
-        assert!(both.held && both.manual);
     }
 
     #[test]

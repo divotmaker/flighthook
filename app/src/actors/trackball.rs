@@ -6,9 +6,7 @@
 //! swing (pull the ball back, push it forward) into a full shot (launch with
 //! both spin pairs, then club data), follows the club, the hand and the
 //! putting mode the game names, and reports readiness. Every value is
-//! synthesized from the swing, so the card is a virtual launch monitor: a
-//! tournament round holds its shots, and a swing made while shots are held
-//! is dropped and takes no shot number. When the device is unplugged the
+//! synthesized from the swing, so the card is a virtual launch monitor. When the device is unplugged the
 //! session stays up, reports `ready=false` and reopens the device by
 //! itself. Off Linux the driver reports that the trackball is not supported
 //! there and gives up, so a section copied to another computer shows that
@@ -43,7 +41,7 @@ pub type TrackballActor = DriverActor<Thumbswing, TrackballHooks>;
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
@@ -67,7 +65,6 @@ mod tests {
     use crate::actors::scripted::Handoff;
     use crate::actors::{Actor, ReconfigureOutcome};
     use crate::bus::{BusMsg, BusSender, LocalEvent};
-    use crate::state::round::RoundRequest;
     use crate::state::{SessionWriter, SystemState};
 
     /// Longest any test waits for one thing.
@@ -84,9 +81,6 @@ mod tests {
     struct Feed {
         swings: Mutex<VecDeque<Vec<Sample>>>,
         unplugged: AtomicBool,
-        /// Times the input's clock stopped after running: a swing played
-        /// out, its timers run out.
-        played: AtomicUsize,
     }
 
     impl Feed {
@@ -95,15 +89,6 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push_back(samples);
-        }
-
-        /// Wait until `n` swings have played out.
-        fn until_played(&self, n: usize) {
-            let deadline = Instant::now() + WAIT;
-            while self.played.load(Ordering::SeqCst) < n {
-                assert!(Instant::now() < deadline, "the swing did not play out");
-                std::thread::sleep(Duration::from_millis(2));
-            }
         }
     }
 
@@ -122,8 +107,6 @@ mod tests {
         now: u64,
         running_until: u64,
         gone: bool,
-        /// Whether the clock ran at the last read of it.
-        was_running: bool,
         info: DeviceInfo,
     }
 
@@ -135,7 +118,6 @@ mod tests {
                 now: 1_000_000,
                 running_until: 0,
                 gone: false,
-                was_running: false,
                 info,
             }
         }
@@ -183,11 +165,6 @@ mod tests {
             if self.running() {
                 self.now += 1000;
             }
-            let running = self.running();
-            if self.was_running && !running {
-                self.feed.played.fetch_add(1, Ordering::SeqCst);
-            }
-            self.was_running = running;
             self.now
         }
 
@@ -518,19 +495,6 @@ mod tests {
             seen
         }
 
-        /// Messages until the card answers a `bus.sync` sent now: it answers
-        /// while it drains the bus, between steps, so every step before has
-        /// put its messages on the bus.
-        fn synced(&mut self) -> Vec<BusMsg> {
-            let _ = self.tx.send(BusMsg::frp(FrpMessage::new(
-                self.state.flighthook_id(),
-                flightrelay::BusSync::new(),
-            )));
-            self.until("bus.sync answered", |m| {
-                matches!(body(m), Some(FrpBody::BusActor(_)))
-            })
-        }
-
         /// Take `section` live, as a save does.
         fn reconfigure(&self, section: &TrackballSection) -> ReconfigureOutcome {
             self.state.system.update(|c| {
@@ -825,39 +789,6 @@ mod tests {
         let launch = putt.launch.as_ref().expect("launch");
         assert_eq!(launch.launch_elevation, Some(0.3));
         assert_eq!(launch.backspin_rpm, Some(0));
-        card.stop();
-    }
-
-    /// During a round the card's swings are dropped and take no shot
-    /// number; after it the next swing is shot 1.
-    #[test]
-    fn a_round_holds_the_trackball() {
-        let feed = Arc::new(Feed::default());
-        let mut card = Card::fed("fed-round", &feed);
-        card.until_ready(true);
-        let guard = card
-            .state
-            .round
-            .begin_round(&RoundRequest {
-                holder: "Pureplay",
-                feeds: &[],
-            })
-            .expect("a round");
-        // The card has drained the bus since the round began, so its next
-        // step sees the round.
-        let mut held = card.synced();
-        feed.swing(swing(0.0, 0.0, 1200.0));
-        feed.until_played(1);
-        held.extend(card.synced());
-        assert!(
-            held.iter()
-                .all(|m| !matches!(body(m), Some(FrpBody::ShotTrigger(_)))),
-            "{held:?}"
-        );
-        drop(guard);
-        card.synced();
-        feed.swing(swing(0.0, 0.0, 1200.0));
-        assert_eq!(shot_number(&card.next_shot()), 1, "no number taken");
         card.stop();
     }
 

@@ -17,7 +17,6 @@ wrote {"Code":200,"Message":"Shot received"}
 == 11 Mevo+ full swing, sim force (Full, Any)
 == 12 R10 full shot, sim force (Full, Any)
 # [simulation] mode = On
-# auto-chip not sent: Auto-Chip is off during a tournament round
 == 13 Auto-chip 3 yd (Full)
 == 14 simulator: RH, SW (Chipping)
 wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"RH","Club":"SW"}}
@@ -31,7 +30,6 @@ wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"RH","
 == 19 Xi full swing (Chipping, routed Xi; spin source auto = D4)
 == 20 Mevo+ full swing (Chipping: not routed)
 == 21 R10 full shot (Chipping: not routed)
-# auto-chip not sent: Auto-Chip is off during a tournament round
 == 22 Auto-chip 1 yd (Chipping)
 == 23 header picks Full (club stays SW)
 == 24 Mevo+ full swing (hand-picked Full, Any)
@@ -43,7 +41,6 @@ wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"LH","
 == 29 Open Connect monitor putt (Putting, routed server)
 wrote {"Code":200,"Message":"Shot received"}
 == 30 Omni putt (Putting: not routed)
-# auto-chip not sent: Auto-Chip is off during a tournament round
 == 31 Auto-chip 5 yd (Putting)
 == 32 simulator: LH, 7I (Full)
 wrote {"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"LH","Club":"I7"}}

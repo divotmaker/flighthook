@@ -166,12 +166,12 @@ fn run(
                 // ones.
                 let now = Instant::now();
                 if now >= next_expiry {
-                    expire_remotes(&state, &mut remotes, &sender, now, next_expiry);
+                    expire_remotes(&mut remotes, &sender, now, next_expiry);
                     next_expiry = now + EXPIRY_TICK;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Ok(Some(msg)) => match follow_remote(&state, &mut remotes, &msg) {
+            Ok(Some(msg)) => match follow_remote(&mut remotes, &msg) {
                 Some((_, event @ LocalEvent::ConfigCommand { .. })) => {
                     handle_config_command(event, &state, &bus_tx, &sender, &mut waits);
                     after_config_command(&state, &writer, &mut profiles, &mut practice, &sender);
@@ -209,11 +209,9 @@ pub(crate) fn resend_output_actors(state: &SystemState, bus_tx: &broadcast::Send
     });
 }
 
-/// Keep the remote actors' heartbeat clocks and the round policy's record
-/// of each remote launch monitor's declared source from a message
-/// that came in on a hub link. Returns the message's local event, if any.
+/// Keep the remote actors' heartbeat clocks from a message that came in on
+/// a hub link. Returns the message's local event, if any.
 pub(crate) fn follow_remote<'a>(
-    state: &SystemState,
     remotes: &mut Remotes,
     msg: &'a BusMsg,
 ) -> Option<(&'a str, &'a LocalEvent)> {
@@ -224,16 +222,6 @@ pub(crate) fn follow_remote<'a>(
     } = msg
     {
         remotes.hear(frp, Instant::now());
-        match &frp.body {
-            FrpBody::BusActor(actor) if actor.has_role(roles::LAUNCH_MONITOR) => {
-                let source = actor.device.as_ref().and_then(|d| d.source);
-                state.round.set_remote(&frp.from, source);
-            }
-            FrpBody::Removed(r) if r.kind == flightrelay::StateKind::BusActor => {
-                state.round.forget_remote(&frp.from);
-            }
-            _ => {}
-        }
     }
     msg.as_local()
 }
@@ -242,7 +230,6 @@ pub(crate) fn follow_remote<'a>(
 /// past its heartbeat ([`Remotes::check`]) and announce each on the bus as
 /// [`LocalEvent::ActorGone`].
 pub(crate) fn expire_remotes(
-    state: &SystemState,
     remotes: &mut Remotes,
     sender: &BusSender,
     now: Instant,
@@ -250,7 +237,6 @@ pub(crate) fn expire_remotes(
 ) {
     for actor in remotes.check(now, due) {
         tracing::info!("bus: actor {actor} went silent, forgotten");
-        state.round.forget_remote(&actor);
         sender.local(LocalEvent::ActorGone { actor });
     }
 }

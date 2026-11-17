@@ -121,8 +121,8 @@ pub trait Actor: Send + Sync {
     }
 
     /// The shot source this actor is, `None` for an actor that puts no shots
-    /// on the bus. [`start_actor`] records it in the round policy, by the
-    /// card's actor id.
+    /// on the bus. [`start_actor`] records it in the shot source registry,
+    /// by the card's actor id.
     fn source(&self) -> Option<provenance::ShotSource> {
         None
     }
@@ -373,7 +373,7 @@ pub(crate) fn start_actor_as(
     let shutdown = Arc::new(AtomicBool::new(false));
     if let Some(source) = actor.source() {
         state
-            .round
+            .sources
             .register_card_source(&id, frp_id.as_deref().unwrap_or(&id), source);
     }
     let sender = BusSender::new(id.clone(), bus_tx.clone(), Arc::clone(&shutdown))
@@ -592,7 +592,7 @@ mod tests {
             .collect::<Vec<_>>();
         for (id, source) in &started {
             let key = state.actor_of_card(id).unwrap_or_else(|| id.clone());
-            assert_eq!(state.round.source(&key), *source, "{id}");
+            assert_eq!(state.sources.source(&key), *source, "{id}");
         }
         assert_eq!(
             state.stop_all_and_wait(Duration::from_secs(2)),

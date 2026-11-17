@@ -110,11 +110,6 @@ pub enum ConfigAction {
     SetBodyTracking {
         section: BodyTrackingSection,
     },
-    /// Switch tournament mode on or off (`[simulation] tournament`,
-    /// persisted). Used by POST /api/tournament; never refused.
-    SetTournament {
-        on: bool,
-    },
     /// Replace the golfers alone (`[[golfers]]`, persisted). Used by
     /// POST /api/settings?scope=golfers.
     SetGolfers {

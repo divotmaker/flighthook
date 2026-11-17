@@ -39,7 +39,6 @@ pub(crate) const MESSAGE_TYPES: &[&str] = &[
     "bus.reply",
     "config_outcome",
     "card_keys",
-    "round_state",
 ];
 
 /// Filter groups for the dropdown.
@@ -90,7 +89,6 @@ const FILTER_GROUPS: &[(&str, &[&str])] = &[
             "bus.reply",
             "config_outcome",
             "card_keys",
-            "round_state",
         ],
     ),
     ("Alert", &["alert_error", "alert_warn", "alert_critical"]),
@@ -202,34 +200,10 @@ fn frp_debug(body: &FrpBody) -> String {
     }
 }
 
-/// The Log line of the round `after`, which follows `before`: tournament
-/// mode switched on or off reads as such; a simulator's round names its
-/// holder, with tournament mode underneath when it is on.
-pub(crate) fn round_line(
-    before: &flighthook::RoundState,
-    after: &flighthook::RoundState,
-) -> String {
-    let simulator = after.held.then_some(after.holder.as_deref()).flatten();
-    match (before.manual != after.manual, after.manual, simulator) {
-        (true, on, held) => {
-            let word = if on { "on" } else { "off" };
-            match held {
-                Some(holder) => format!("tournament mode turned {word} (round held by {holder})"),
-                None => format!("tournament mode turned {word}"),
-            }
-        }
-        (false, true, Some(holder)) => format!("round held by {holder} (tournament mode on)"),
-        (false, false, Some(holder)) => format!("round held by {holder}"),
-        (false, true, None) => "tournament mode on".into(),
-        (false, false, None) => "no round".into(),
-    }
-}
-
 fn local_debug(event: &UiLocalEvent) -> String {
     match event {
         UiLocalEvent::CardStatus { status, .. } => format!("{status:?}"),
         UiLocalEvent::Alert { severity, message } => format!("[{severity}] {message}"),
-        UiLocalEvent::RoundState { round } => round_line(round, round),
         UiLocalEvent::ConfigOutcome { request_id, .. } => match request_id {
             Some(rid) => format!("outcome({rid})"),
             None => "outcome".into(),
@@ -463,58 +437,6 @@ mod tests {
             card: "camera.0".into(),
             event,
         }))
-    }
-
-    /// The manual holder reads as tournament mode switched on or off, never
-    /// "round held by Manual"; a simulator's round names its holder.
-    #[test]
-    fn the_round_line_reads_plainly() {
-        use flighthook::RoundState;
-        let off = RoundState::default();
-        let manual = RoundState {
-            active: true,
-            holder: Some("Manual".into()),
-            manual: true,
-            held: false,
-        };
-        let held = |manual: bool| RoundState {
-            active: true,
-            holder: Some("Pureplay Connect".into()),
-            manual,
-            held: true,
-        };
-        assert_eq!(round_line(&off, &manual), "tournament mode turned on");
-        assert_eq!(round_line(&manual, &off), "tournament mode turned off");
-        assert_eq!(round_line(&manual, &manual), "tournament mode on");
-        assert_eq!(
-            round_line(&off, &held(false)),
-            "round held by Pureplay Connect"
-        );
-        assert_eq!(
-            round_line(&manual, &held(true)),
-            "round held by Pureplay Connect (tournament mode on)"
-        );
-        assert_eq!(
-            round_line(&held(false), &held(true)),
-            "tournament mode turned on (round held by Pureplay Connect)"
-        );
-        assert_eq!(round_line(&held(false), &off), "no round");
-
-        // Through the app: the line follows the round it held before.
-        let mut app = FlighthookApp::with_pending(crate::net::new_pending());
-        app.handle_ui_message(local(UiLocalEvent::RoundState {
-            round: manual.clone(),
-        }));
-        app.handle_ui_message(local(UiLocalEvent::RoundState { round: off }));
-        let lines: Vec<&str> = app
-            .log_entries
-            .iter()
-            .map(|e| e.event_debug.as_str())
-            .collect();
-        assert_eq!(
-            lines,
-            ["tournament mode turned on", "tournament mode turned off"]
-        );
     }
 
     #[test]

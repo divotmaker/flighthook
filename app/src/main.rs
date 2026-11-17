@@ -76,7 +76,6 @@ fn main() -> anyhow::Result<()> {
     // Build shared state root
     let (system_state, session_writer) = SystemState::new(config_path);
     let state = Arc::new(system_state);
-    state.round.attach(bus_tx.clone());
 
     // Auto-enable web server for native GUI (the GUI connects via HTTP/WS).
     // Persists to config so the file reflects the running state.

@@ -45,7 +45,6 @@ mod shots;
 mod status;
 #[cfg(test)]
 mod tests;
-mod tournament;
 mod ui_assets;
 mod video;
 
@@ -57,7 +56,6 @@ pub use reconnect::*;
 pub use settings::*;
 pub use shots::*;
 pub use status::*;
-pub use tournament::*;
 pub use ui_assets::*;
 pub use video::*;
 

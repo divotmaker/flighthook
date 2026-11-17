@@ -53,7 +53,6 @@ impl FlighthookApp {
         for actor in self.actors.values_mut() {
             actor.received(self.now_ms);
         }
-        self.round = snap.round;
         for msg in snap.states {
             self.apply_frp(msg);
         }
@@ -150,7 +149,6 @@ impl FlighthookApp {
             UiLocalEvent::CardStatus { status, telemetry } => {
                 self.apply_card_status(card, status, &telemetry);
             }
-            UiLocalEvent::RoundState { round } => self.round = round,
             UiLocalEvent::ConfigOutcome {
                 restarted, stopped, ..
             } => self.apply_config_outcome(&restarted, &stopped),
@@ -423,16 +421,7 @@ impl FlighthookApp {
             actor_name,
             actor_id,
             message_type: message_type(msg),
-            event_debug: match msg {
-                // A round line says what changed from the round held now.
-                UiMessage::Local(local) => match &local.event {
-                    UiLocalEvent::RoundState { round } => {
-                        crate::panels::log::round_line(&self.round, round)
-                    }
-                    _ => event_debug(msg),
-                },
-                _ => event_debug(msg),
-            },
+            event_debug: event_debug(msg),
             raw: serde_json::to_string(msg).unwrap_or_default(),
             alert_severity: alert_severity(msg),
         });

@@ -5,8 +5,8 @@
 //! source has a [`Source`]. [`ShotSource::provenance`] is the single
 //! exhaustive match, so a new source type does not compile until it is given
 //! a class. An actor declares its source ([`Actor::source`](super::Actor)):
-//! when it starts, the round policy records the source by actor ID
-//! ([`RoundPolicy`](crate::state::round::RoundPolicy)), and a launch
+//! when it starts, the shot source registry records the source by actor ID
+//! ([`Sources`](crate::state::sources::Sources)), and a launch
 //! monitor's `bus.actor` carries the class in its `device` block.
 
 pub use flighthook::Source;

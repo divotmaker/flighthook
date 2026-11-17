@@ -853,10 +853,10 @@ mod tests {
     }
 
     /// The impact height with the per-club offset to the face center is a
-    /// calibrated reading, not a model's value: a tournament round keeps
-    /// it, and the launch's four spin values.
+    /// calibrated reading, not a model's value: Pureplay Connect's strict
+    /// mode keeps it, and the launch's four spin values.
     #[test]
-    fn a_round_keeps_the_calibrated_impact_height() {
+    fn strict_mode_keeps_the_calibrated_impact_height() {
         let messages = first_shot("round", chip());
         let impact = messages
             .iter()
@@ -877,13 +877,6 @@ mod tests {
             impact.vertical,
             Some(flighthook::Distance::Millimeters(2.25))
         );
-        let round = crate::state::round::RoundPolicy::default();
-        let guard = round
-            .begin_round(&crate::state::round::RoundRequest {
-                holder: "Pureplay",
-                feeds: &[],
-            })
-            .expect("accepted");
         let shot = crate::actors::simout::OutputShot {
             launch: Some(launch.clone()),
             impact: Some(impact.clone()),
@@ -891,8 +884,8 @@ mod tests {
             ..crate::actors::simout::OutputShot::default()
         };
         assert!(
-            guard.counts(shot.source),
-            "a measured source counts in a round"
+            crate::actors::pureplay::sends(true, shot.source),
+            "strict mode sends a measured source's shot"
         );
         assert_eq!(shot.impact.as_ref(), Some(&impact));
         assert_eq!(shot.launch.as_ref(), Some(&launch));

@@ -685,7 +685,7 @@ impl Card {
         let session = SessionActor::start(&state, tx);
         let shutdown = Arc::new(AtomicBool::new(false));
         let source = ShotSource::PureplayAccessory;
-        state.round.register_source(ACTOR, source);
+        state.sources.register_source(ACTOR, source);
         let sender = BusSender::new(ACTOR.into(), tx.clone(), Arc::clone(&shutdown))
             .with_frp_id(Some(ACTOR.into()));
         let receiver = sender.subscribe();
@@ -2648,7 +2648,7 @@ fn a_pureplay_shot_is_stored_and_reaches_no_output() {
     assert_eq!(key.shot_number, 1, "the card's own count");
     assert_ne!(key.shot_id, "pp-2", "flighthook's own id");
     assert_eq!(
-        state.round.source(ACTOR).map(ShotSource::provenance),
+        state.sources.source(ACTOR).map(ShotSource::provenance),
         Some(flighthook::Source::Virtual)
     );
     let key = key.clone();
@@ -3028,7 +3028,12 @@ fn the_connected_card_is_no_feed_of_a_pureplay_connect_output() {
     });
     let (mut card, _peer) = connected(&mock, state.clone(), "PPA-STRICT");
     card.bus(|e| matches!(e, FlighthookEvent::BusActor(_)));
-    assert!(state.round.is_launch_monitor(ACTOR));
+    assert!(
+        state
+            .sources
+            .source(ACTOR)
+            .is_some_and(ShotSource::is_launch_monitor)
+    );
     let names = crate::actors::pureplay::monitor_names(&state);
     assert!(!names.contains_key(ACTOR), "{names:?}");
     card.stop();

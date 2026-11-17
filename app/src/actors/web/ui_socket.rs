@@ -111,9 +111,6 @@ fn ui_event(state: &WebState, event: &LocalEvent) -> Option<UiLocalEvent> {
             severity: *severity,
             message: message.clone(),
         },
-        LocalEvent::RoundState { round } => UiLocalEvent::RoundState {
-            round: round.clone(),
-        },
         LocalEvent::ConfigOutcome {
             request_id,
             restarted,
@@ -173,7 +170,6 @@ pub(super) async fn snapshot(state: &WebState) -> UiSnapshot {
         card_keys,
         states,
         cards,
-        round: state.root.round.state(),
         config_generation: state.config_generation.load(Ordering::Relaxed),
     }
 }
@@ -497,7 +493,6 @@ mod tests {
         assert_eq!(snap.states, vec![select]);
         assert_eq!(snap.actor_id, state.root.flighthook_id());
         assert_eq!(snap.config_generation, 1);
-        assert!(!snap.round.active);
     }
 
     /// A connection that fell behind gets a fresh snapshot, then the

@@ -422,10 +422,10 @@ mod tests {
 
     /// The R10 measures total spin and axis; the back and side spin tenover
     /// hands back are the same spin in the other pair, not a model's: the
-    /// bus launch carries all four, they agree, and a tournament round
-    /// keeps them as measured.
+    /// bus launch carries all four, they agree, and Pureplay Connect's
+    /// strict mode sends them as measured.
     #[test]
-    fn a_round_keeps_all_four_r10_spin_values() {
+    fn strict_mode_keeps_all_four_r10_spin_values() {
         let messages = first_shot(5.0, one_shot(EQ_SHOT_FULL));
         let launch = messages
             .iter()
@@ -446,21 +446,14 @@ mod tests {
         assert_eq!(components.total_spin_rpm, launch.total_spin_rpm);
         assert!((components.spin_axis.expect("axis") + 5.0).abs() < 0.05);
 
-        let round = crate::state::round::RoundPolicy::default();
-        let guard = round
-            .begin_round(&crate::state::round::RoundRequest {
-                holder: "Pureplay",
-                feeds: &[],
-            })
-            .expect("accepted");
         let shot = crate::actors::simout::OutputShot {
             launch: Some(launch.clone()),
             source: Some(ShotSource::R10.provenance()),
             ..crate::actors::simout::OutputShot::default()
         };
         assert!(
-            guard.counts(shot.source),
-            "a measured source counts in a round"
+            crate::actors::pureplay::sends(true, shot.source),
+            "strict mode sends a measured source's shot"
         );
         assert_eq!(shot.launch.as_ref(), Some(&launch));
     }

@@ -15,17 +15,15 @@
 //!   flighthook's turn differs from them unless the change came from
 //!   another game or simulator card ([`Held`]).
 //! - SetDetect and SetBallType are logged and otherwise left alone.
-//! - SetStrictMode(1) (a recorded tournament round) asks the round policy
-//!   for a round ([`RoundPolicy::begin_round`]), naming the launch monitors
-//!   routed to this output, and acks its answer: accepted, or refused with
-//!   the policy's reason. The link holds the [`RoundGuard`] while strict
-//!   mode is on; SetStrictMode(0) or the end of the link drops it. During
-//!   the round the card is a measured-only receiver: each shot goes out as
-//!   its launch monitor sent it (launch, club and impact; no flight result,
-//!   no value filled from an `assumed`), and a shot whose source is not
-//!   measured ([`RoundGuard::counts`]) is not sent (logged once per
-//!   source); the ready state and heartbeat count only the launch monitors
-//!   the policy counts. Every new link starts with strict mode off.
+//! - SetStrictMode(1) (a recorded tournament round in Pureplay) is always
+//!   accepted and turns strict mode on for the link; SetStrictMode(0) or the
+//!   end of the link turns it off. In strict mode the card is a
+//!   measured-only receiver: each shot goes out as its launch monitor sent
+//!   it (launch, club and impact; no flight result, no value filled from an
+//!   `assumed`), a shot whose launch monitor does not declare its source
+//!   measured ([`sends`]) is not sent (logged once per source), and the
+//!   ready state and heartbeat count only measured launch monitors. Every
+//!   new link starts with strict mode off.
 //! - An Error from the host raises a Warn alert, one per burst of errors
 //!   less than [`HOST_ERROR_BURST_GAP`] apart.
 //! - Any other message type is answered with Error (code 0).
@@ -39,8 +37,8 @@
 //!
 //! A simulator source (the Pureplay Accessory card) feeds no simulator output: its
 //! shots, readiness, connection state and battery never reach Pureplay
-//! through this output, and a round never names it, under "Any" routing or
-//! routed by ID ([`Feed::feeds_simulators`]). Each shot is recorded in the send
+//! through this output, under "Any" routing or routed by ID
+//! ([`Feed::feeds_simulators`]). Each shot is recorded in the send
 //! registry ([`SentShots`]) just before it is written, so the Pureplay Accessory card
 //! can tell the shot Pureplay then reports from one of its own; a shot
 //! whose ball data fails to write takes its record back.
@@ -61,7 +59,7 @@
 pub mod codec;
 pub mod mapper;
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -76,8 +74,8 @@ use super::{Actor, ReconfigureOutcome};
 use crate::actors::simout::OutputShot;
 use crate::bus::{BusMsg, BusReceiver, BusSender, LocalEvent, PollError};
 use crate::state::SystemState;
-use crate::state::round::{RoundGuard, RoundPolicy, RoundRequest, not_measured_reason};
 use crate::state::sent_shots::{SentShots, SimAddr};
+use crate::state::sources::Sources;
 use codec::{ConnectionState, FrameReader, Message, ReadyState};
 use flighthook::{ActorStatus, Severity, ShotKey};
 use flightrelay::{CompletedShot, FrpBody, GolferTurn};
@@ -91,9 +89,6 @@ const DEVICE_NAME: &str = "flighthook";
 /// Launch monitor display names by actor ID, read when a link starts.
 pub(crate) type MonitorNames = dyn Fn() -> HashMap<String, String> + Send + Sync;
 
-/// The output's display name, read when it asks for a round.
-pub(crate) type HolderName = dyn Fn() -> String + Send + Sync;
-
 /// The configured launch monitors' display names by actor id, those turned
 /// off and simulator sources (the Pureplay Accessory cards) left out.
 pub(crate) fn monitor_names(state: &SystemState) -> HashMap<String, String> {
@@ -104,22 +99,11 @@ pub(crate) fn monitor_names(state: &SystemState) -> HashMap<String, String> {
         .filter_map(|(card, name)| Some((config.actor_of_card(&card)?, name)))
         .filter(|(id, _)| {
             state
-                .round
+                .sources
                 .source(id)
                 .is_some_and(|s| s.is_launch_monitor() && !s.is_simulator())
         })
         .collect()
-}
-
-/// The display name of output `actor`: its card name, or "Pureplay
-/// Connect" when it has none.
-fn holder_name(state: &SystemState, actor: &str) -> String {
-    super::actor_names(&state.system.snapshot())
-        .get(actor)
-        .map(|n| n.trim())
-        .filter(|n| !n.is_empty())
-        .unwrap_or("Pureplay Connect")
-        .to_owned()
 }
 
 /// Actor error type.
@@ -157,12 +141,9 @@ impl Actor for PureplayActor {
         let addr = self.addr;
         let routing = self.routing.clone();
         let turn = state.session.turn();
-        let round = state.round.clone();
+        let sources = Arc::clone(&state.sources);
         let sent = Some(Arc::clone(&state.sent_shots));
-        let actor = sender.actor_id().to_owned();
-        let holder_state = Arc::clone(&state);
-        let holder_state_for_feed = Arc::clone(&state);
-        let holder: Box<HolderName> = Box::new(move || holder_name(&holder_state, &actor));
+        let feed_state = Arc::clone(&state);
         let names: Box<MonitorNames> = Box::new(move || monitor_names(&state));
         std::thread::Builder::new()
             .name(format!("pureplay:{}", sender.actor_id()))
@@ -174,10 +155,9 @@ impl Actor for PureplayActor {
                     Backoff::new(MIN_BACKOFF, MAX_BACKOFF),
                     Shared {
                         names: &*names,
-                        holder: &*holder,
-                        round,
+                        sources,
                         sent,
-                        state: Some(holder_state_for_feed),
+                        state: Some(feed_state),
                     },
                     &sender,
                     receiver,
@@ -348,10 +328,8 @@ fn last_shot_text(shot_id: u32) -> String {
 pub(crate) struct Shared<'a> {
     /// The configured launch monitors' names, read fresh when needed.
     pub names: &'a MonitorNames,
-    /// The output's display name, read fresh when it asks for a round.
-    pub holder: &'a HolderName,
-    /// The round policy: tournament rounds, and every shot source's type.
-    pub round: RoundPolicy,
+    /// Every local shot source's type.
+    pub sources: Arc<Sources>,
     /// Where each shot is recorded before it is written; `None` records
     /// nothing.
     pub sent: Option<Arc<SentShots>>,
@@ -370,7 +348,7 @@ pub(crate) fn run_with(
     sender: &BusSender,
     mut receiver: BusReceiver,
 ) {
-    let mut relay = Relay::new(routing, shared.round.clone(), shared.state.clone());
+    let mut relay = Relay::new(routing, Arc::clone(&shared.sources), shared.state.clone());
     relay.sent.clone_from(&shared.sent);
     relay.feed.turn = Some((turn, None));
     relay.card = sender.actor_id().to_owned();
@@ -455,7 +433,7 @@ struct PendingShot {
 /// What flighthook knows about one launch monitor.
 #[derive(Debug, Default)]
 struct Monitor {
-    /// Its class, from the round policy.
+    /// Its class, from the shot source registry or its `bus.actor`.
     provenance: Option<Source>,
     status: Option<ActorStatus>,
     /// The actor reports an `error`.
@@ -498,8 +476,8 @@ impl Monitor {
 struct Relay {
     /// Shots, routing and flighthook's turn from the bus.
     feed: Feed,
-    /// Which actors are launch monitors, and of what class.
-    round: RoundPolicy,
+    /// Which local actors are launch monitors, and of what class.
+    sources: Arc<Sources>,
     /// The app's state, `None` in tests that run without one.
     state: Option<Arc<SystemState>>,
     /// The card key (`pureplay.N`).
@@ -516,8 +494,6 @@ struct Relay {
     connected_at: Option<Instant>,
     /// When Pureplay last sent an Error, on any link.
     last_host_error: Option<Instant>,
-    /// When strict mode was last refused, on any link.
-    last_refusal: Option<Instant>,
     /// What Pureplay's SetClubInfo and SetShotContext gave on this link.
     held: Held,
     /// The distance to the target of Pureplay's last SetShotContext, m.
@@ -535,10 +511,10 @@ fn new_burst(last: &mut Option<Instant>, now: Instant) -> bool {
 }
 
 impl Relay {
-    fn new(routing: GsProRouting, round: RoundPolicy, state: Option<Arc<SystemState>>) -> Self {
+    fn new(routing: GsProRouting, sources: Arc<Sources>, state: Option<Arc<SystemState>>) -> Self {
         Self {
             feed: Feed::new(routing, state.clone()),
-            round,
+            sources,
             state,
             card: String::new(),
             sent: None,
@@ -547,7 +523,6 @@ impl Relay {
             outbox: VecDeque::new(),
             connected_at: None,
             last_host_error: None,
-            last_refusal: None,
             held: Held::default(),
             distance_m: None,
             reassert: false,
@@ -590,42 +565,6 @@ impl Relay {
         new_burst(&mut self.last_host_error, now)
     }
 
-    /// Record a strict-mode refusal at `now`. Returns whether it starts a
-    /// new burst (and so is alerted): Pureplay closes the link after a
-    /// refusal, and every reconnect asks again.
-    fn refusal(&mut self, now: Instant) -> bool {
-        new_burst(&mut self.last_refusal, now)
-    }
-
-    /// The launch monitors whose shots reach this output, in any mode, with
-    /// their display names (a remote one's `bus.actor` name; blank when
-    /// they have none), for a round request:
-    /// "Any" routing stands for every configured launch monitor that is on
-    /// (`names`) and every one seen on the bus, and a monitor routed by ID
-    /// counts when it is one of those. One turned off or removed feeds
-    /// nothing, nor does a simulator source ([`Feed::feeds_simulators`]).
-    fn feeds<'a>(&'a self, names: &'a HashMap<String, String>) -> Vec<(&'a str, &'a str)> {
-        let known: BTreeSet<&str> = names
-            .keys()
-            .chain(self.monitors.keys())
-            .map(String::as_str)
-            .filter(|id| self.feed.feeds_simulators(id))
-            .collect();
-        self.feed
-            .routing
-            .feeds(known.clone())
-            .into_iter()
-            .filter(|id| known.contains(id))
-            .map(|id| {
-                let name = names
-                    .get(id)
-                    .map(String::as_str)
-                    .or_else(|| self.feed.monitor(id).map(|a| a.name.as_str()));
-                (id, name.unwrap_or(""))
-            })
-            .collect()
-    }
-
     fn connect(&mut self, now: Instant) {
         self.connected_at = Some(now);
     }
@@ -664,9 +603,9 @@ impl Relay {
         }
         // A monitor removed from the config is not a known source any more,
         // so it does not feed this output.
-        let (round, feed) = (&self.round, &self.feed);
+        let (sources, feed) = (&self.sources, &self.feed);
         self.monitors
-            .retain(|id, _| round.source(id).is_some() || feed.monitor(id).is_some());
+            .retain(|id, _| sources.source(id).is_some() || feed.monitor(id).is_some());
         Ok(())
     }
 
@@ -676,7 +615,7 @@ impl Relay {
         if !self.feed.feeds_simulators(actor) {
             return None;
         }
-        let provenance = match self.round.source(actor) {
+        let provenance = match self.sources.source(actor) {
             Some(source) if source.is_launch_monitor() => Some(source.provenance()),
             Some(_) => return None,
             None => self
@@ -832,10 +771,9 @@ impl Relay {
     }
 
     /// The monitors the device's state is read from: the routed one, or
-    /// every launch monitor for Any; during a round (`round`) only those it
-    /// counts.
-    fn subjects(&self, round: Option<&RoundGuard>) -> Vec<&Monitor> {
-        let counted = |m: &&Monitor| round.is_none_or(|r| r.counts(m.provenance));
+    /// every launch monitor for Any; in strict mode only measured ones.
+    fn subjects(&self, strict: bool) -> Vec<&Monitor> {
+        let counted = |m: &&Monitor| sends(strict, m.provenance);
         match self.routed() {
             Some(id) => self.monitors.get(id).into_iter().filter(counted).collect(),
             None => self.monitors.values().filter(counted).collect(),
@@ -844,9 +782,9 @@ impl Relay {
 
     /// The ready state: the routed monitor's, or for Any, Processing when
     /// any monitor is, else Ready when any is.
-    fn ready_state(&self, now: Instant, round: Option<&RoundGuard>) -> ReadyState {
+    fn ready_state(&self, now: Instant, strict: bool) -> ReadyState {
         let states: Vec<ReadyState> = self
-            .subjects(round)
+            .subjects(strict)
             .iter()
             .map(|m| m.ready_state(now))
             .collect();
@@ -858,9 +796,9 @@ impl Relay {
 
     /// The connection state: the routed monitor's, or for Any the best of
     /// every monitor's.
-    fn connection_state(&self, round: Option<&RoundGuard>) -> ConnectionState {
+    fn connection_state(&self, strict: bool) -> ConnectionState {
         let states: Vec<ConnectionState> = self
-            .subjects(round)
+            .subjects(strict)
             .iter()
             .map(|m| m.connection_state())
             .collect();
@@ -923,7 +861,7 @@ impl Relay {
     }
 
     /// [`next_shot`](Self::next_shot), with the shot's key, as it goes out
-    /// outside a round.
+    /// outside strict mode.
     #[cfg(test)]
     fn next_send(&mut self, now: Instant) -> Option<(ShotKey, OutputShot)> {
         self.next_pending(now).map(|(key, shot, name)| {
@@ -960,8 +898,8 @@ struct Link<'a, S> {
     reader: FrameReader,
     /// HelloAck received.
     handshaken: bool,
-    /// The tournament round, held while strict mode is on.
-    round: Option<RoundGuard>,
+    /// Strict mode is on.
+    strict: bool,
     /// The ShotId given out last on this link.
     last_shot_id: u32,
     shots_sent: u32,
@@ -969,9 +907,6 @@ struct Link<'a, S> {
     ready: Option<ReadyState>,
     /// A frame with its reserved byte set was logged.
     reserved_seen: bool,
-    /// This link refused strict mode: Pureplay's StrictModeRequired error
-    /// that follows is expected, and not alerted again.
-    refused: bool,
     /// Sources whose shots strict mode kept back on this link (logged once
     /// each).
     withheld: HashSet<String>,
@@ -986,12 +921,11 @@ impl<'a, S: Read + Write> Link<'a, S> {
             name,
             reader: FrameReader::new(),
             handshaken: false,
-            round: None,
+            strict: false,
             last_shot_id: 0,
             shots_sent: 0,
             ready: None,
             reserved_seen: false,
-            refused: false,
             withheld: HashSet::new(),
             selects: 0,
         }
@@ -1053,7 +987,6 @@ impl<'a, S: Read + Write> Link<'a, S> {
         &mut self,
         relay: &mut Relay,
         names: &HashMap<String, String>,
-        shared: &Shared<'_>,
         telemetry: &mut Telemetry,
         sender: &BusSender,
     ) -> Result<(), LinkError> {
@@ -1080,7 +1013,7 @@ impl<'a, S: Read + Write> Link<'a, S> {
                 },
             );
             match decoded {
-                Ok(msg) => self.handle(msg, relay, names, shared, telemetry, sender)?,
+                Ok(msg) => self.handle(msg, relay, names, telemetry, sender)?,
                 Err(e) => {
                     tracing::warn!("pureplay <- {e}");
                     self.send(&Message::Error {
@@ -1100,7 +1033,6 @@ impl<'a, S: Read + Write> Link<'a, S> {
         msg: Message,
         relay: &mut Relay,
         names: &HashMap<String, String>,
-        shared: &Shared<'_>,
         telemetry: &mut Telemetry,
         sender: &BusSender,
     ) -> Result<(), LinkError> {
@@ -1121,10 +1053,9 @@ impl<'a, S: Read + Write> Link<'a, S> {
                 }
             }
             Message::Ping => {
-                let round = self.round.as_ref();
                 let heartbeat = Message::Heartbeat {
-                    connection_state: relay.connection_state(round).byte(),
-                    ready_state: relay.ready_state(Instant::now(), round).byte(),
+                    connection_state: relay.connection_state(self.strict).byte(),
+                    ready_state: relay.ready_state(Instant::now(), self.strict).byte(),
                     battery: relay.battery(names).unwrap_or(codec::BATTERY_UNKNOWN),
                 };
                 self.send(&heartbeat)?;
@@ -1164,53 +1095,16 @@ impl<'a, S: Read + Write> Link<'a, S> {
                 }
             }
             Message::SetStrictMode { strict } => {
-                // A new guard replaces the one held before it lets go, so a
-                // repeated request does not end the round in between.
-                let refusal = if strict == 0 {
-                    self.round = None;
-                    None
-                } else {
-                    let names = (shared.names)();
-                    let holder = (shared.holder)();
-                    let request = RoundRequest {
-                        holder: &holder,
-                        feeds: &relay.feeds(&names),
-                    };
-                    match shared.round.begin_round(&request) {
-                        Ok(guard) => {
-                            self.round = Some(guard);
-                            None
-                        }
-                        Err(refusal) => {
-                            self.round = None;
-                            Some(refusal.reason().to_owned())
-                        }
-                    }
-                };
+                self.strict = strict != 0;
                 self.send(&Message::StrictModeAck {
-                    accepted: refusal.is_none(),
-                    reason: refusal.clone().unwrap_or_default(),
+                    accepted: true,
+                    reason: String::new(),
                 })?;
-                match refusal {
-                    Some(reason) => {
-                        self.refused = true;
-                        tracing::warn!("pureplay <- SetStrictMode {strict}: refused, {reason}");
-                        if relay.refusal(Instant::now()) {
-                            sender.alert(
-                                Severity::Warn,
-                                format!(
-                                    "Pureplay strict mode refused: {reason}. Tournament rounds \
-                                     take only shots a launch monitor measured."
-                                ),
-                            );
-                        }
-                    }
-                    None => tracing::info!(
-                        "pureplay <- SetStrictMode {strict}: strict mode {}",
-                        if self.round.is_some() { "on" } else { "off" }
-                    ),
-                }
-                telemetry.set(STRICT_MODE, on_off(self.round.is_some()));
+                tracing::info!(
+                    "pureplay <- SetStrictMode {strict}: strict mode {}",
+                    on_off(self.strict)
+                );
+                telemetry.set(STRICT_MODE, on_off(self.strict));
             }
             Message::Error { code, message } => {
                 let what = match code {
@@ -1218,10 +1112,7 @@ impl<'a, S: Read + Write> Link<'a, S> {
                     _ => "",
                 };
                 tracing::warn!("pureplay <- error {code}{what}: {message}");
-                // After a refusal the StrictModeRequired error is expected,
-                // and the refusal has its own alert.
-                let expected = self.refused && code == codec::ERROR_STRICT_MODE_REQUIRED;
-                if relay.host_error(Instant::now()) && !expected {
+                if relay.host_error(Instant::now()) {
                     sender.alert(
                         Severity::Warn,
                         format!("Pureplay error {code}{what}: {message}"),
@@ -1264,7 +1155,7 @@ impl<'a, S: Read + Write> Link<'a, S> {
         now: Instant,
         telemetry: &mut Telemetry,
     ) -> Result<(), LinkError> {
-        let state = relay.ready_state(now, self.round.as_ref());
+        let state = relay.ready_state(now, self.strict);
         if self.ready != Some(state) {
             self.send(&Message::ReadyState(state.byte()))?;
             self.ready = Some(state);
@@ -1273,14 +1164,13 @@ impl<'a, S: Read + Write> Link<'a, S> {
         Ok(())
     }
 
-    /// Log a shot the round does not count: once per source at info, then
+    /// Log a shot strict mode does not send: once per source at info, then
     /// at debug.
     fn withhold(&mut self, shot: &OutputShot) {
         if self.withheld.insert(shot.actor.clone()) {
             tracing::info!(
-                "pureplay: strict mode, shots from '{}' are not sent: {}",
+                "pureplay: strict mode, shots from '{}' are not sent: its source is not measured",
                 shot.actor,
-                not_measured_reason(shot.source, &shot.actor).unwrap_or_default(),
             );
         } else {
             tracing::debug!(
@@ -1300,28 +1190,22 @@ impl<'a, S: Read + Write> Link<'a, S> {
     ) -> Result<(), LinkError> {
         while let Some((key, done, name)) = relay.next_pending(now) {
             let shot_id = self.last_shot_id + 1;
-            let (shot, frames) = match &self.round {
-                None => {
-                    let auto_chip = relay
-                        .state
-                        .as_ref()
-                        .map_or_else(|| "autochip".to_owned(), |s| s.auto_chip_id());
-                    let shot = output_shot(&done, &name, &auto_chip);
-                    let frames = mapper::map_shot(&shot, shot_id);
-                    (shot, frames)
-                }
-                Some(round) => {
-                    // The measured-only receiver: the launch monitor's own
-                    // launch, club and impact, from a measured source only.
-                    let shot = measured_shot(&done, &name);
-                    if !round.counts(shot.source) {
-                        self.withhold(&shot);
-                        continue;
-                    }
-                    let frames = mapper::map_shot(&shot, shot_id);
-                    (shot, frames)
-                }
+            let shot = if self.strict {
+                // The measured-only receiver: the launch monitor's own
+                // launch, club and impact.
+                measured_shot(&done, &name)
+            } else {
+                let auto_chip = relay
+                    .state
+                    .as_ref()
+                    .map_or_else(|| "autochip".to_owned(), |s| s.auto_chip_id());
+                output_shot(&done, &name, &auto_chip)
             };
+            if !sends(self.strict, shot.source) {
+                self.withhold(&shot);
+                continue;
+            }
+            let frames = mapper::map_shot(&shot, shot_id);
             let Some(frames) = frames else {
                 tracing::debug!(
                     "pureplay: shot #{} from '{}' has no ball data, not sent",
@@ -1341,7 +1225,7 @@ impl<'a, S: Read + Write> Link<'a, S> {
                 } else {
                     ""
                 },
-                if self.round.is_some() { ", strict" } else { "" },
+                if self.strict { ", strict" } else { "" },
             );
             if let Err(e) = self.send(&Message::BallData(frames.ball)) {
                 relay.forget_send(&key);
@@ -1356,6 +1240,12 @@ impl<'a, S: Read + Write> Link<'a, S> {
         }
         Ok(())
     }
+}
+
+/// Whether a shot whose launch monitor declares `source` is sent: every
+/// shot outside strict mode, in strict mode only a measured one.
+pub(crate) fn sends(strict: bool, source: Option<Source>) -> bool {
+    !strict || source == Some(Source::Measured)
 }
 
 fn on_off(on: bool) -> String {
@@ -1442,7 +1332,7 @@ fn session(
             )));
         }
         link.read()?;
-        link.handle_frames(relay, &names, shared, telemetry, sender)?;
+        link.handle_frames(relay, &names, telemetry, sender)?;
         relay.drain(receiver)?;
     }
 
@@ -1468,7 +1358,7 @@ fn session(
         // The read waits up to IDLE_POLL when nothing comes in, which paces
         // the loop.
         link.read()?;
-        link.handle_frames(relay, &names, shared, telemetry, sender)?;
+        link.handle_frames(relay, &names, telemetry, sender)?;
         relay.drain(receiver)?;
         if std::mem::take(&mut relay.reassert) {
             link.select(relay, sender);
