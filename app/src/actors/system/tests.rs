@@ -1583,13 +1583,18 @@ fn statuses(seen: &[Seen], actor: &str) -> Vec<ActorStatus> {
         .collect()
 }
 
-/// Messages until `want` matches one, waiting up to 8 s.
+/// How long a wait on an event may take before the test fails. Only a
+/// failure waits this long: every wait returns at its event.
+const GIVE_UP: Duration = Duration::from_secs(60);
+
+/// Messages until `want` matches one, waiting up to [`GIVE_UP`]. A receiver
+/// that fell behind fails the test: the message it waits for may be lost.
 fn until(
     rx: &mut broadcast::Receiver<BusMsg>,
     what: &str,
     mut want: impl FnMut(&Seen) -> bool,
 ) -> Vec<Seen> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + GIVE_UP;
     let mut seen = Vec::new();
     while std::time::Instant::now() < deadline {
         match rx.try_recv() {
@@ -1603,21 +1608,23 @@ fn until(
                     return seen;
                 }
             }
-            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                panic!("{what}: {n} messages lost, the test fell behind")
+            }
             Err(_) => std::thread::sleep(Duration::from_millis(5)),
         }
     }
     panic!("{what} not seen");
 }
 
-/// Every message (FRP ones included) until `want` matches one,
-/// waiting up to 8 s.
+/// Every message (FRP ones included) until `want` matches one, waiting up
+/// to [`GIVE_UP`]; a receiver that fell behind fails the test.
 fn until_msg(
     rx: &mut broadcast::Receiver<BusMsg>,
     what: &str,
     mut want: impl FnMut(&BusMsg) -> bool,
 ) -> Vec<BusMsg> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + GIVE_UP;
     let mut seen = Vec::new();
     while std::time::Instant::now() < deadline {
         match rx.try_recv() {
@@ -1628,7 +1635,9 @@ fn until_msg(
                     return seen;
                 }
             }
-            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                panic!("{what}: {n} messages lost, the test fell behind")
+            }
             Err(_) => std::thread::sleep(Duration::from_millis(5)),
         }
     }
@@ -3133,7 +3142,7 @@ fn stop_exits(state: &SystemState, id: &str) {
 }
 
 fn wait_until(what: &str, done: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + GIVE_UP;
     while !done() {
         assert!(std::time::Instant::now() < deadline, "{what}");
         std::thread::sleep(Duration::from_millis(10));
