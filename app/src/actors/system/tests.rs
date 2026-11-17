@@ -2867,6 +2867,7 @@ impl Actor for Slow {
 /// lets go of its device on the way out gets to; the wait is capped.
 #[test]
 fn exit_waits_for_the_actors_to_let_go() {
+    // Waited for: the call returns once they have ended, well inside the cap.
     let (_dir, state, bus_tx, _rx) = running(|_| {});
     let slow: Vec<Arc<AtomicBool>> = (0..3).map(|_| Arc::default()).collect();
     for (n, ended) in slow.iter().enumerate() {
@@ -2880,7 +2881,17 @@ fn exit_waits_for_the_actors_to_let_go() {
             &bus_tx,
         );
     }
-    // One whose thread outlives the cap, and one still closing.
+    let running_after = state.stop_all_and_wait(Duration::from_secs(10));
+    assert!(running_after.is_empty(), "{running_after:?}");
+    for ended in &slow {
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "waited for"
+        );
+    }
+
+    // Capped: one whose thread outlives the cap, and one still closing.
+    let (_dir, state, bus_tx, _rx) = running(|_| {});
     let (stuck, _hold) = stubborn(false);
     for n in 0..2 {
         start_actor(
@@ -2892,14 +2903,7 @@ fn exit_waits_for_the_actors_to_let_go() {
     }
     state.close_in_background("mock_monitor.1");
 
-    let cap = Duration::from_millis(800);
-    let running = state.stop_all_and_wait(cap);
-    for ended in &slow {
-        assert!(
-            ended.load(std::sync::atomic::Ordering::SeqCst),
-            "waited for"
-        );
-    }
+    let running = state.stop_all_and_wait(Duration::from_millis(50));
     assert_eq!(running, ["mock_monitor.0", "mock_monitor.1"]);
 }
 
@@ -2910,7 +2914,7 @@ fn exit_waits_for_the_actors_to_let_go() {
 #[test]
 fn a_reconnect_during_another_of_the_same_actor_starts_nothing_more() {
     let id = "mock_monitor.0";
-    let (_dir, state, mut rx, web, shutdown) = slow_to_close(Duration::from_millis(800));
+    let (_dir, state, mut rx, web, shutdown, hold) = slow_to_close();
     let old = state.actor_thread(id);
     web.local(LocalEvent::ConfigCommand {
         request_id: Some("first".into()),
@@ -2931,10 +2935,10 @@ fn a_reconnect_during_another_of_the_same_actor_starts_nothing_more() {
     assert!(state.is_settling(id), "the first still waits");
     assert_eq!(state.actor_thread(id), old, "nothing started beside it");
 
+    hold.release();
     seen.extend(until(&mut rx, "the first", |m| outcome_for(m, "first")));
     assert_eq!(outcome_of(&seen, "first").0, [id]);
-    std::thread::sleep(Duration::from_millis(200));
-    seen.extend(std::iter::from_fn(|| rx.try_recv().ok()).filter_map(local_of));
+    seen.extend(sentinel(&web, &mut rx));
     shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     let card = statuses(&seen, id);
     assert_eq!(fresh_starts(&seen, id), 1, "{card:?}");
@@ -2943,10 +2947,10 @@ fn a_reconnect_during_another_of_the_same_actor_starts_nothing_more() {
     stop_all(&state);
 }
 
-/// An actor that ends `holds` after its stop and may be waited for as
-/// long as an ExPutt.
+/// An actor that, once stopped, ends only when the test releases its
+/// [`Hold`], and may be waited for as long as an ExPutt.
 struct SlowToClose {
-    holds: Duration,
+    gate: Gate,
 }
 
 impl Actor for SlowToClose {
@@ -2956,12 +2960,18 @@ impl Actor for SlowToClose {
         _sender: BusSender,
         receiver: BusReceiver,
     ) -> std::thread::JoinHandle<()> {
-        let holds = self.holds;
+        let gate = Arc::clone(&self.gate);
         std::thread::spawn(move || {
             while !receiver.is_shutdown() {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            std::thread::sleep(holds);
+            let (lock, cv) = &*gate;
+            let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut held = cv
+                .wait_while(held, |g| !g.open)
+                .unwrap_or_else(|e| e.into_inner());
+            held.spoke = true;
+            cv.notify_all();
         })
     }
 
@@ -2974,24 +2984,26 @@ impl Actor for SlowToClose {
     }
 }
 
-/// The running system actor with `mock_monitor.0` a [`SlowToClose`]
-/// holding for `holds`, and a sender for commands and game events.
-fn slow_to_close(
-    holds: Duration,
-) -> (
+/// The running system actor with `mock_monitor.0` a [`SlowToClose`], the
+/// test's hold on it, and a sender for commands and game events.
+fn slow_to_close() -> (
     TempDir,
     Arc<SystemState>,
     broadcast::Receiver<BusMsg>,
     BusSender,
     Arc<AtomicBool>,
+    Hold,
 ) {
     let (dir, state, bus_tx, rx) = running(|c| {
         c.mock_monitor.insert("0".into(), mock("Mock"));
     });
     state.stop_and_wait("mock_monitor.0");
+    let gate = Gate::default();
     start_actor(
         "mock_monitor.0".into(),
-        Box::new(SlowToClose { holds }),
+        Box::new(SlowToClose {
+            gate: Arc::clone(&gate),
+        }),
         &state,
         &bus_tx,
     );
@@ -2999,7 +3011,7 @@ fn slow_to_close(
     let shutdown = Arc::new(AtomicBool::new(false));
     start_for_test(writer, &state, &bus_tx, Arc::clone(&shutdown));
     let web = BusSender::new("web".into(), bus_tx, Arc::default()).with_frp_id(Some("web".into()));
-    (dir, state, rx, web, shutdown)
+    (dir, state, rx, web, shutdown, Hold(gate))
 }
 
 fn outcome_for(m: &Seen, request: &str) -> bool {
@@ -3012,9 +3024,7 @@ fn outcome_for(m: &Seen, request: &str) -> bool {
 #[test]
 fn a_club_change_during_a_long_reconnect_is_applied_at_once() {
     let id = "mock_monitor.0";
-    let holds = Duration::from_millis(1500);
-    let (_dir, state, mut rx, web, shutdown) = slow_to_close(holds);
-    let at = std::time::Instant::now();
+    let (_dir, state, mut rx, web, shutdown, hold) = slow_to_close();
     web.local(LocalEvent::ConfigCommand {
         request_id: Some("reconnect".into()),
         action: Box::new(ConfigAction::Reconnect { id: id.into() }),
@@ -3033,10 +3043,10 @@ fn a_club_change_during_a_long_reconnect_is_applied_at_once() {
             .any(|m| outcome_for(&m, "reconnect")),
         "before the reconnect finished"
     );
-    assert!(state.is_settling(id));
+    assert!(state.is_settling(id), "it waits for the old instance");
 
+    hold.release();
     let done = until(&mut rx, "the reconnect", |m| outcome_for(m, "reconnect"));
-    assert!(at.elapsed() >= holds, "it waited for the old instance");
     assert_eq!(outcome_of(&done, "reconnect").0, [id]);
     assert!(!state.is_settling(id));
     assert!(state.actor_thread(id).is_some(), "the new instance runs");
@@ -3050,8 +3060,7 @@ fn a_club_change_during_a_long_reconnect_is_applied_at_once() {
 #[test]
 fn a_save_during_a_long_reconnect_follows_the_closing_rules() {
     let id = "mock_monitor.0";
-    let holds = Duration::from_millis(1200);
-    let (_dir, state, mut rx, web, shutdown) = slow_to_close(holds);
+    let (_dir, state, mut rx, web, shutdown, hold) = slow_to_close();
     web.local(LocalEvent::ConfigCommand {
         request_id: Some("reconnect".into()),
         action: Box::new(ConfigAction::Reconnect { id: id.into() }),
@@ -3071,12 +3080,12 @@ fn a_save_during_a_long_reconnect_follows_the_closing_rules() {
     assert_eq!(state.actor_thread(id), old, "nothing started beside it");
     assert_eq!(state.system.snapshot().mock_monitor["0"].name, "Renamed");
 
+    hold.release();
     seen.extend(until(&mut rx, "the reconnect", |m| {
         outcome_for(m, "reconnect")
     }));
     assert_eq!(outcome_of(&seen, "reconnect").0, [id]);
-    std::thread::sleep(Duration::from_millis(200));
-    seen.extend(std::iter::from_fn(|| rx.try_recv().ok()).filter_map(local_of));
+    seen.extend(sentinel(&web, &mut rx));
     let starts = fresh_starts(&seen, id);
     assert_eq!(starts, 1, "one new instance");
     assert_ne!(state.actor_thread(id), old);
@@ -3090,7 +3099,7 @@ fn a_save_during_a_long_reconnect_follows_the_closing_rules() {
 #[test]
 fn a_removal_during_a_long_reconnect_starts_nothing() {
     let id = "mock_monitor.0";
-    let (_dir, state, mut rx, web, shutdown) = slow_to_close(Duration::from_millis(800));
+    let (_dir, state, mut rx, web, shutdown, hold) = slow_to_close();
     web.local(LocalEvent::ConfigCommand {
         request_id: Some("reconnect".into()),
         action: Box::new(ConfigAction::Reconnect { id: id.into() }),
@@ -3102,6 +3111,7 @@ fn a_removal_during_a_long_reconnect_starts_nothing() {
     });
     let mut seen = until(&mut rx, "the removal", |m| outcome_for(m, "remove"));
     assert_eq!(outcome_of(&seen, "remove").1, [id]);
+    hold.release();
     seen.extend(until(&mut rx, "the reconnect", |m| {
         outcome_for(m, "reconnect")
     }));
@@ -3260,14 +3270,15 @@ fn an_open_connect_server_waiting_to_bind_stops_at_once() {
 const HELD_PORT_WAIT: Duration = Duration::from_millis(100);
 
 /// A stand-in for an Open Connect server on `bind` whose thread still
-/// owns the listener: it lets go of the port `port_held` after its stop,
-/// and ends `thread_lingers` after that. Its replaceable probe is the
-/// real server's.
+/// owns the listener after its stop. With `holds_port` it lets go of the
+/// port when the test releases its [`Hold`], else at once; either way its
+/// thread ends, after a last word, only once released. Its replaceable
+/// probe is the real server's.
 struct HeldPort {
     bind: std::net::SocketAddr,
     listener: Mutex<Option<std::net::TcpListener>>,
-    port_held: Duration,
-    thread_lingers: Duration,
+    holds_port: bool,
+    gate: Gate,
 }
 
 impl Actor for HeldPort {
@@ -3278,18 +3289,25 @@ impl Actor for HeldPort {
         receiver: BusReceiver,
     ) -> std::thread::JoinHandle<()> {
         let listener = self.listener.lock().expect("listener").take();
-        let (held, lingers) = (self.port_held, self.thread_lingers);
+        let (holds_port, gate) = (self.holds_port, Arc::clone(&self.gate));
         std::thread::spawn(move || {
             while !receiver.is_shutdown() {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            std::thread::sleep(held);
+            // Without `holds_port`, the port is let go of at once.
+            let listener = listener.filter(|_| holds_port);
+            let (lock, cv) = &*gate;
+            let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut held = cv
+                .wait_while(held, |g| !g.open)
+                .unwrap_or_else(|e| e.into_inner());
             drop(listener);
-            std::thread::sleep(lingers);
             sender.local(LocalEvent::Alert {
                 severity: Severity::Warn,
                 message: "late".into(),
             });
+            held.spoke = true;
+            cv.notify_all();
         })
     }
 
@@ -3310,14 +3328,14 @@ impl Actor for HeldPort {
 /// Running `openconnect_server.0` configured on a free port, with a
 /// [`HeldPort`] in place of the server.
 fn with_held_port(
-    port_held: Duration,
-    thread_lingers: Duration,
+    holds_port: bool,
 ) -> (
     TempDir,
     Arc<SystemState>,
     broadcast::Sender<BusMsg>,
     broadcast::Receiver<BusMsg>,
     std::net::SocketAddr,
+    Hold,
 ) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let bind = listener.local_addr().expect("addr");
@@ -3336,18 +3354,19 @@ fn with_held_port(
     // `running` started the real server, which found the port taken:
     // put the stand-in in its place.
     state.stop_and_wait("openconnect_server.0");
+    let gate = Gate::default();
     start_actor(
         "openconnect_server.0".into(),
         Box::new(HeldPort {
             bind,
             listener: Mutex::new(Some(listener)),
-            port_held,
-            thread_lingers,
+            holds_port,
+            gate: Arc::clone(&gate),
         }),
         &state,
         &bus_tx,
     );
-    (dir, state, bus_tx, rx, bind)
+    (dir, state, bus_tx, rx, bind, Hold(gate))
 }
 
 /// An Open Connect server whose old thread still holds the listen port
@@ -3357,8 +3376,7 @@ fn with_held_port(
 #[test]
 fn an_open_connect_server_holding_its_port_is_restarted_when_it_lets_go() {
     let id = "openconnect_server.0";
-    let (dir, state, bus_tx, mut rx, bind) =
-        with_held_port(Duration::from_millis(600), Duration::ZERO);
+    let (dir, state, bus_tx, mut rx, bind, hold) = with_held_port(true);
     let (_, writer) = SystemState::new(dir.0.join("unused.toml"));
     let shutdown = Arc::new(AtomicBool::new(false));
     start_for_test(writer, &state, &bus_tx, Arc::clone(&shutdown));
@@ -3377,6 +3395,7 @@ fn an_open_connect_server_holding_its_port_is_restarted_when_it_lets_go() {
         "the old thread still owns the port"
     );
 
+    hold.release();
     let done = until(&mut rx, "the restart", |m| {
         matches!(&m.event, LocalEvent::ConfigOutcome { request_id: None, restarted, .. }
                 if restarted == &[id.to_owned()])
@@ -3396,8 +3415,7 @@ fn an_open_connect_server_holding_its_port_is_restarted_when_it_lets_go() {
 #[test]
 fn an_open_connect_server_that_freed_its_port_is_replaced_at_once() {
     let id = "openconnect_server.0";
-    let (_dir, state, bus_tx, mut rx, bind) =
-        with_held_port(Duration::ZERO, Duration::from_millis(600));
+    let (_dir, state, bus_tx, mut rx, bind, hold) = with_held_port(false);
     let old = state.actor_thread(id);
 
     let (restarted, seen) = reconnect_through_command(&state, &bus_tx, &mut rx, id);
@@ -3409,7 +3427,7 @@ fn an_open_connect_server_that_freed_its_port_is_replaced_at_once() {
         std::net::TcpStream::connect(bind).is_ok()
     });
 
-    std::thread::sleep(Duration::from_millis(700));
+    hold.release();
     let after: Vec<Seen> = std::iter::from_fn(|| rx.try_recv().ok())
         .filter_map(local_of)
         .collect();
