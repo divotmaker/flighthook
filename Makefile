@@ -73,9 +73,11 @@ buildtools:
 stop:
 	@pkill -x flighthook 2>/dev/null && echo "stopped" || echo "nothing running"
 
-# Publish schemas + lib to crates.io. Dry-runs both first to catch errors
-# before committing any real publish.
+# Publish the integration crate and lib to crates.io, the crate first (lib
+# depends on it). Dry-runs first to catch errors before any real publish.
 publish:
+	cargo publish -p flighthook-pureplay --dry-run
+	cargo publish -p flighthook-pureplay
 	cargo publish -p flighthook --dry-run
 	cargo publish -p flighthook
 

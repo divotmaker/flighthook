@@ -33,7 +33,7 @@ threeputt = { version = "0.2.0", default-features = false, features = ["config"]
 thumbswing = { version = "0.0.3", default-features = false, features = ["config"] }
 # Pureplay Connect's settings (`connect::Config`, the `config` feature:
 # no network code, so the WASM UI builds it too).
-flighthook-pureplay = { path = "../pureplay", default-features = false, features = ["config"] }
+flighthook-pureplay = { version = "0.2.2", path = "../pureplay", default-features = false, features = ["config"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"], optional = true }
