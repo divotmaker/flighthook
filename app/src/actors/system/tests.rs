@@ -2022,7 +2022,7 @@ fn error_cleared(seen: &[Seen], actor: &str) -> bool {
     seen.iter().any(|m| {
             m.actor == actor
                 && matches!(&m.event, LocalEvent::CardStatus { status: ActorStatus::Starting, telemetry }
-                    if telemetry.get("error").is_some_and(String::is_empty))
+                    if telemetry.get("error").is_some_and(|e| e == "none"))
         })
 }
 

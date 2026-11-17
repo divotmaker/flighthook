@@ -320,43 +320,57 @@ fn an_empty_status_telemetry_value_removes_the_key() {
 }
 
 #[test]
-fn a_lost_connection_or_a_new_instance_clears_the_cards_telemetry() {
+fn a_cards_rows_stay_through_a_lost_connection_and_flags_follow_its_bus_actor() {
     let mut app = FlighthookApp::with_pending(net::new_pending());
     let status = |status, telemetry: &[(&str, &str)]| {
         crate::socket::feed::card_msg("mevo.0", status, telemetry)
     };
     let device = |pairs: &[(&str, &str)]| crate::socket::feed::bus_actor_msg("lm", pairs);
     let held = |app: &FlighthookApp| {
-        let mut keys: Vec<String> = app.actors["mevo.0"].telemetry.keys().cloned().collect();
-        keys.sort();
-        keys
+        let mut rows: Vec<(String, String)> = app.actors["mevo.0"]
+            .telemetry
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        rows.sort();
+        rows
     };
+    let row = |k: &str, v: &str| (k.to_owned(), v.to_owned());
 
     app.card_keys.insert("lm".into(), "mevo.0".into());
     app.handle_ui_message(status(ActorStatus::Connected, &[("device_info", "Xi")]));
-    app.handle_ui_message(device(&[("gain", "1")]));
-    app.handle_ui_message(device(&[("club", "DR")]));
-    assert_eq!(held(&app), ["club", "device_info", "gain", "ready"]);
+    app.handle_ui_message(device(&[("tilt", "6.5°")]));
+    let flighthook::UiMessage::Frp(mut flagged) = device(&[("tilt", "7.0°")]) else {
+        unreachable!()
+    };
+    if let flighthook::FrpBody::BusActor(actor) = &mut flagged.body {
+        actor.flagged = vec!["tilt".into()];
+    }
+    app.handle_ui_message(flighthook::UiMessage::Frp(flagged));
+    assert_eq!(app.actors["mevo.0"].flagged, ["tilt"]);
 
-    // Connected, Connected: merges.
-    app.handle_ui_message(status(ActorStatus::Connected, &[("shot_count", "1")]));
-    assert_eq!(held(&app).len(), 5);
-
-    // Lost: only the message's own keys remain.
+    // Lost: every row stays, each at its latest value.
     app.handle_ui_message(status(ActorStatus::Reconnecting, &[("error", "gone")]));
-    assert_eq!(held(&app), ["error"]);
-    // Repeated non-Connected statuses merge.
-    app.handle_ui_message(status(ActorStatus::Disconnected, &[("phase", "x")]));
-    assert_eq!(held(&app), ["error", "phase"]);
-    app.handle_ui_message(device(&[]));
-    assert_eq!(held(&app), ["error", "phase", "ready"]);
+    app.handle_ui_message(device(&[("tilt", "unknown")]));
+    app.handle_ui_message(status(
+        ActorStatus::Reconnecting,
+        &[("device_info", "none")],
+    ));
+    assert_eq!(
+        held(&app),
+        [
+            row("device_info", "none"),
+            row("error", "gone"),
+            row("ready", "true"),
+            row("tilt", "unknown"),
+        ]
+    );
+    assert!(app.actors["mevo.0"].flagged.is_empty(), "replaced whole");
 
-    // A new instance starts over.
-    app.handle_ui_message(status(ActorStatus::Starting, &[("bind", "b")]));
-    assert_eq!(held(&app), ["bind"]);
-    app.handle_ui_message(status(ActorStatus::Connected, &[]));
-    app.handle_ui_message(status(ActorStatus::Disconnected, &[]));
-    assert!(held(&app).is_empty());
+    // A new instance keeps them too, until each is sent again.
+    app.handle_ui_message(status(ActorStatus::Starting, &[("error", "none")]));
+    assert_eq!(held(&app).len(), 4);
+    assert_eq!(app.actors["mevo.0"].error(), None);
 }
 
 #[test]

@@ -113,7 +113,8 @@ pub(super) fn start_released(
 }
 
 /// Start `fresh` as a new instance of its actor. Its card starts over:
-/// `Starting`, without an error an earlier instance left.
+/// `Starting`, its `error` row `none` (an earlier instance's error is
+/// over).
 pub(super) fn start_fresh(
     state: &Arc<SystemState>,
     bus_tx: &broadcast::Sender<BusMsg>,
@@ -122,7 +123,7 @@ pub(super) fn start_fresh(
     let card = BusSender::new(fresh.id.clone(), bus_tx.clone(), Arc::default());
     card.local(LocalEvent::CardStatus {
         status: ActorStatus::Starting,
-        telemetry: HashMap::from([("error".into(), String::new())]),
+        telemetry: HashMap::from([("error".into(), "none".into())]),
     });
     start_actor(fresh.id, fresh.actor, state, bus_tx);
 }

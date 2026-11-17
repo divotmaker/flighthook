@@ -74,6 +74,11 @@ pub struct ActorStatusResponse {
     pub status: ActorStatus,
     #[serde(default)]
     pub telemetry: HashMap<String, String>,
+    /// The rows whose value needs the user's attention now, from the
+    /// actor's `bus.actor` (`flagged`): telemetry keys and `battery_pct`.
+    /// Absent when none is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flagged: Vec<String>,
     /// The state to show, as of the reply: `status` plus the actor's history
     /// since it last started.
     #[serde(default)]
@@ -96,6 +101,7 @@ impl ActorStatusResponse {
             name: name.into(),
             status,
             telemetry: HashMap::new(),
+            flagged: Vec::new(),
             state: ConnectionState::default(),
             red_for_ms: 0,
             history: StatusHistory::default(),
@@ -114,6 +120,7 @@ impl ActorStatusResponse {
             name: name.into(),
             status,
             telemetry: HashMap::new(),
+            flagged: Vec::new(),
             state: ConnectionState::Disabled,
             red_for_ms: 0,
             history: StatusHistory::off(status),
@@ -137,26 +144,27 @@ impl ActorStatusResponse {
     }
 
     /// Apply an `actor_status` event: record `status` at `now_ms`, then fold
-    /// in the keys it carries. What the actor held (device-reported values,
-    /// `club`, `handed`, `name`, status keys) is dropped first when a
-    /// connection is lost (Connected, then Disconnected or Reconnecting) and
-    /// when a new instance starts (Starting); a card never shows a lost
-    /// connection's values. Any other status merges: each key replaces the one
-    /// held, and an empty value removes it. Returns whether the held telemetry
-    /// was dropped.
+    /// in the keys it carries: each key replaces the one held, and an empty
+    /// value removes it. A key held stays through every status: its
+    /// reporter sends an explicit value (`none`) for what it no longer
+    /// knows.
     pub fn apply_status(
         &mut self,
         status: ActorStatus,
         telemetry: &HashMap<String, String>,
         now_ms: u64,
-    ) -> bool {
-        let cleared = clears_telemetry(self.status, status);
-        if cleared {
-            self.telemetry.clear();
-        }
+    ) {
         self.observe(status, now_ms);
         merge_telemetry(&mut self.telemetry, telemetry);
-        cleared
+    }
+
+    /// The `error` row, unless it reads `none` (or is empty).
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.telemetry
+            .get("error")
+            .map(String::as_str)
+            .filter(|e| !e.is_empty() && *e != "none")
     }
 
     /// The actor was stopped and started again: a new history, keeping only
@@ -289,14 +297,6 @@ pub struct NewBlockRequest {
     pub new_session: bool,
 }
 
-/// Whether a status change from `from` to `to` ends the telemetry the actor
-/// held: a lost connection, or a new instance starting.
-fn clears_telemetry(from: ActorStatus, to: ActorStatus) -> bool {
-    to == ActorStatus::Starting
-        || (from == ActorStatus::Connected
-            && matches!(to, ActorStatus::Disconnected | ActorStatus::Reconnecting))
-}
-
 /// Merge an `actor_status` event's telemetry into an actor's: each key
 /// replaces the one held, and an empty value removes the key.
 fn merge_telemetry(held: &mut HashMap<String, String>, update: &HashMap<String, String>) {
@@ -387,40 +387,30 @@ mod tests {
     }
 
     #[test]
-    fn losing_a_connection_drops_the_held_telemetry_but_keeps_the_messages_own_keys() {
-        for lost in [ActorStatus::Disconnected, ActorStatus::Reconnecting] {
-            let mut a = connected_with(&[
-                ("battery_pct", "80"),
-                ("ready", "true"),
-                ("club", "DR"),
-                ("handed", "rh"),
-                ("name", "Eric"),
-                ("detection_mode", "full"),
-            ]);
-            a.apply_status(lost, &tel(&[("error", "refused")]), 10);
-            assert_eq!(a.status, lost);
-            assert_eq!(a.telemetry, tel(&[("error", "refused")]), "{lost:?}");
-        }
-    }
-
-    #[test]
-    fn a_new_instance_starts_without_the_old_telemetry() {
-        for from in [
-            ActorStatus::Connected,
+    fn every_status_merges_and_a_key_held_stays() {
+        for to in [
             ActorStatus::Disconnected,
             ActorStatus::Reconnecting,
             ActorStatus::Starting,
         ] {
-            let mut a = ActorStatusResponse::new("Mevo", from);
-            a.telemetry = tel(&[("ready", "true"), ("error", "old")]);
-            a.apply_status(ActorStatus::Starting, &tel(&[("address", "1.2.3.4:5")]), 10);
-            assert_eq!(a.telemetry, tel(&[("address", "1.2.3.4:5")]), "{from:?}");
+            let mut a = connected_with(&[("ready", "true"), ("device_state", "waiting")]);
+            a.apply_status(to, &tel(&[("error", "refused")]), 10);
+            assert_eq!(a.status, to);
+            assert_eq!(
+                a.telemetry,
+                tel(&[
+                    ("ready", "true"),
+                    ("device_state", "waiting"),
+                    ("error", "refused")
+                ]),
+                "{to:?}"
+            );
+            assert_eq!(a.error(), Some("refused"));
+            a.apply_status(to, &tel(&[("error", "none")]), 11);
+            assert_eq!(a.error(), None, "none is no error");
         }
-    }
 
-    #[test]
-    fn statuses_that_do_not_end_a_connection_merge() {
-        // Not Connected before: keys reported bit by bit while connecting stay.
+        // Keys reported bit by bit while connecting stay.
         let mut a = ActorStatusResponse::new("Mevo", ActorStatus::Disconnected);
         a.apply_status(ActorStatus::Disconnected, &tel(&[("error", "refused")]), 1);
         a.apply_status(ActorStatus::Reconnecting, &tel(&[("attempt", "2")]), 2);

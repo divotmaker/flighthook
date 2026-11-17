@@ -727,11 +727,7 @@ pub(super) fn status_over(
     now_ms: u64,
 ) -> egui::Response {
     let color = monitoring::status_color(status, now_ms);
-    let error = status
-        .telemetry
-        .get("error")
-        .filter(|e| !e.is_empty())
-        .cloned();
+    let error = status.error().map(str::to_owned);
     let inner = rect.shrink(16.0);
     let mut child = ui.new_child(
         egui::UiBuilder::new()

@@ -174,13 +174,13 @@ fn emit_status(status: ActorStatus, state: &WebState, bus_tx: &broadcast::Sender
             state.request_count.load(Ordering::Relaxed).to_string(),
         ),
     ]);
-    // An empty value removes the key, so a successful bind clears the error.
+    // A successful bind says there is no error.
     let error = if status == ActorStatus::Disconnected {
         "bind failed"
     } else if state.looped() {
         ws::OWN_MESSAGES_BACK
     } else {
-        ""
+        "none"
     };
     telemetry.insert("error".into(), error.into());
     let _ = bus_tx.send(BusMsg::local(

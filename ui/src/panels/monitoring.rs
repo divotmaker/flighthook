@@ -25,12 +25,13 @@ const TELEMETRY_GAP: f32 = 18.0;
 /// key, one per row. The rows keep to the card's width: the key column is as
 /// wide as the longest key (at most [`TELEMETRY_KEY_SHARE`] of the card), and
 /// a key or value too long for its column is cut short with "…", the full
-/// text on hover. An empty value is not shown.
+/// text on hover. An empty value is not shown, nor an `error` that reads
+/// `none` (no error). A flagged row's value is red.
 pub(crate) fn telemetry_body(ui: &mut egui::Ui, id: &str, actor: &ActorStatusResponse) {
     let mut keys: Vec<&String> = actor
         .telemetry
         .iter()
-        .filter(|(_, v)| !v.is_empty())
+        .filter(|(k, v)| shown_row(k, v))
         .map(|(k, _)| k)
         .collect();
     if keys.is_empty() {
@@ -74,10 +75,15 @@ pub(crate) fn telemetry_body(ui: &mut egui::Ui, id: &str, actor: &ActorStatusRes
                     key_width,
                     egui::RichText::new(key.as_str()).color(theme::TEXT_MUTED),
                 );
+                let color = if actor.flagged.contains(key) {
+                    theme::DANGER
+                } else {
+                    theme::TEXT
+                };
                 let value = cell(
                     ui,
                     value_width,
-                    egui::RichText::new(&actor.telemetry[key]).color(theme::TEXT),
+                    egui::RichText::new(&actor.telemetry[key]).color(color),
                 );
                 devices::mark(ui, || format!("telemetry:{id}:{key}"), &value);
             });
@@ -85,9 +91,14 @@ pub(crate) fn telemetry_body(ui: &mut egui::Ui, id: &str, actor: &ActorStatusRes
     });
 }
 
+/// Whether [`telemetry_body`] shows row `key` with `value`.
+fn shown_row(key: &str, value: &str) -> bool {
+    !(value.is_empty() || (key == "error" && value == "none"))
+}
+
 /// Whether [`telemetry_body`] has a row to show for `actor`.
 pub(crate) fn has_telemetry(actor: &ActorStatusResponse) -> bool {
-    actor.telemetry.values().any(|v| !v.is_empty())
+    actor.telemetry.iter().any(|(k, v)| shown_row(k, v))
 }
 
 /// The body of a card with no telemetry to show, centered in it: a check in
@@ -141,7 +152,8 @@ impl FlighthookApp {
             if let Some(err) = self
                 .reconnect_errors
                 .get(id)
-                .or_else(|| actor.telemetry.get("error"))
+                .map(String::as_str)
+                .or_else(|| actor.error())
                 .filter(|e| !e.is_empty())
             {
                 error_banner(ui, &format!("{}: {err}", actor.name));

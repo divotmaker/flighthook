@@ -294,13 +294,9 @@ impl FlighthookApp {
                 .get(&card.id)
                 .cloned()
                 .unwrap_or_else(|| crate::app::new_actor(String::new()));
-            let own = reconnect_error.cloned().or_else(|| {
-                shown
-                    .telemetry
-                    .get("error")
-                    .filter(|e| !e.is_empty())
-                    .cloned()
-            });
+            let own = reconnect_error
+                .cloned()
+                .or_else(|| shown.error().map(str::to_owned));
             shown
                 .telemetry
                 .insert("error".into(), error_row(own.as_deref(), conflict));

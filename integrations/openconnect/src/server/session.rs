@@ -173,6 +173,7 @@ impl FrpDriver for Server {
     fn info(_: &Config) -> DriverInfo {
         DriverInfo::new("openconnect_server", "Open Connect", Source::Measured)
             .exclusive()
+            .with_telemetry(&[("ball_detected", "unknown")])
             .with_raw(RawProfile::new(
                 "openconnect-json",
                 0,
@@ -259,7 +260,6 @@ impl Server {
                 Ok((stream, peer)) => {
                     ctx.out.phase("handshaking");
                     let greeted = self.greet(stream, peer, &reason, ctx)?;
-                    ctx.out.phase("listening");
                     if let Some((stream, buf, first)) = greeted {
                         let identity = DeviceIdentity::new(peer.to_string())
                             .with_model(first.device_id.clone())
@@ -274,8 +274,10 @@ impl Server {
                             self.ids.clone(),
                         );
                         session.hints = *ctx.hints();
+                        ctx.out.phase("measuring");
                         return Ok(session);
                     }
+                    ctx.out.phase("listening");
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => ctx.wait(IDLE)?,
                 Err(e) => return Err(Error::Io(e)),

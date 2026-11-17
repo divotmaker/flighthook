@@ -51,6 +51,8 @@ const SHOT_TIMEOUT: Duration = Duration::from_secs(45);
 const MONITOR_READY: &str = "monitor_ready";
 /// The simulator's last response on this connection: code and message.
 const RESPONSE: &str = "response";
+/// A telemetry value with nothing to report.
+const NONE: &str = "none";
 
 /// What a connect or a session failed with.
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +96,12 @@ impl FrpDriver for Client {
     fn info(_: &Config) -> DriverInfo {
         DriverInfo::new("openconnect_client", "Open Connect", Source::Virtual)
             .with_roles(&[])
+            .with_telemetry(&[
+                (MONITOR_READY, "unknown"),
+                (RESPONSE, NONE),
+                ("club", NONE),
+                ("handed", NONE),
+            ])
             .with_raw(RawProfile::new("openconnect-tcp", 0, 0, 0, |_| false, true))
     }
 
@@ -113,6 +121,7 @@ impl FrpDriver for Client {
     /// The TCP connect, the connection registered as this process's own,
     /// then 1 s for this process's own server to refuse it.
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Session<TcpStream>, Error> {
+        ctx.out.phase("connecting");
         let addr = self
             .config
             .addr()
@@ -130,6 +139,7 @@ impl FrpDriver for Client {
         let identity = DeviceIdentity::new(addr.to_string())
             .with_model("Open Connect")
             .with_label(addr.to_string());
+        ctx.out.phase("connected");
         Ok(Session {
             _registration: Some(registration),
             ..Session::new(stream, identity, self.last_number.clone(), ctx.now())
@@ -358,10 +368,13 @@ impl<S: Read + Write> Session<S> {
         }
         if heard.player || heard.info.is_some() {
             out.telemetry([
-                ("club", self.club.map(|c| c.to_string()).unwrap_or_default()),
+                (
+                    "club",
+                    self.club.map_or_else(|| NONE.into(), |c| c.to_string()),
+                ),
                 (
                     "handed",
-                    self.hand.map(|h| h.to_string()).unwrap_or_default(),
+                    self.hand.map_or_else(|| NONE.into(), |h| h.to_string()),
                 ),
             ]);
         }

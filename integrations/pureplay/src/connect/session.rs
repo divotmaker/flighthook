@@ -57,6 +57,8 @@ const ERROR: &str = "error";
 const READY_STATE: &str = "ready_state";
 /// Whether strict mode is on for this link.
 const STRICT_MODE: &str = "strict_mode";
+/// A telemetry value with nothing to report.
+const NONE: &str = "none";
 
 /// What a connect or a session failed with.
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +114,13 @@ impl FrpDriver for Connect {
     fn info(_: &Config) -> DriverInfo {
         DriverInfo::new("pureplay", "Pureplay Connect", Source::Virtual)
             .with_roles(&[])
+            .with_telemetry(&[
+                (ERROR, NONE),
+                (READY_STATE, "unknown"),
+                (STRICT_MODE, "off"),
+                ("club", NONE),
+                ("handed", NONE),
+            ])
             .with_raw(RawProfile::new("pureplay-tcp", 0, 0, 0, |_| false, false))
     }
 
@@ -131,6 +140,7 @@ impl FrpDriver for Connect {
     /// The TCP connect. The handshake runs in the session, after the host
     /// has handed it what it sees.
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Session<TcpStream>, Error> {
+        ctx.out.phase("connecting");
         let addr = self
             .config
             .addr()
@@ -144,6 +154,7 @@ impl FrpDriver for Connect {
         let identity = DeviceIdentity::new(addr.to_string())
             .with_model("Pureplay")
             .with_label(addr.to_string());
+        ctx.out.phase("handshaking");
         Ok(Session::new(
             stream,
             identity,
@@ -498,10 +509,8 @@ impl<S: Read + Write> Session<S> {
                     out.log(Level::Debug, "HelloAck again, ignored");
                 } else if protocol_version == codec::VERSION {
                     self.handshaken = true;
-                    // An empty value takes the row off the card, then the
-                    // key leaves the actor.
-                    out.telemetry([(ERROR, ""), (STRICT_MODE, on_off(false))]);
-                    out.clear_telemetry([ERROR]);
+                    out.phase("connected");
+                    out.telemetry([(ERROR, NONE), (STRICT_MODE, on_off(false))]);
                 } else {
                     return Err(Error::Handshake(format!(
                         "Pureplay chose protocol version {protocol_version}; flighthook speaks \
@@ -522,10 +531,13 @@ impl<S: Read + Write> Session<S> {
                 self.set_club_info(handedness, club, out);
                 self.select(out);
                 out.telemetry([
-                    ("club", self.club.map(|c| c.to_string()).unwrap_or_default()),
+                    (
+                        "club",
+                        self.club.map_or_else(|| NONE.into(), |c| c.to_string()),
+                    ),
                     (
                         "handed",
-                        self.hand.map(|h| h.to_string()).unwrap_or_default(),
+                        self.hand.map_or_else(|| NONE.into(), |h| h.to_string()),
                     ),
                 ]);
             }

@@ -22,7 +22,7 @@ pub(crate) struct RemoteCard {
     pub id: String,
     pub group: CardGroup,
     /// Name, connected state and rows: device, `ready` (or the blockers),
-    /// battery, attitude, the actor's telemetry and a conflict `error`.
+    /// battery, the actor's telemetry and a conflict `error`.
     pub status: ActorStatusResponse,
 }
 
@@ -59,6 +59,7 @@ pub(crate) fn remote_cards(
             };
             let mut status = ActorStatusResponse::new(actor.name.clone(), ActorStatus::Connected);
             status.telemetry = rows(actor);
+            status.flagged.clone_from(&actor.flagged);
             if let Some(error) = conflicts.get(id) {
                 status.telemetry.insert("error".into(), error.clone());
             }
@@ -72,8 +73,8 @@ pub(crate) fn remote_cards(
 }
 
 /// A remote actor's rows: the device (maker, model, firmware), `ready` as
-/// "true" with no blockers or the blockers as the value, battery, attitude
-/// and its telemetry.
+/// "true" with no blockers or the blockers as the value, battery and its
+/// telemetry.
 fn rows(actor: &BusActor) -> HashMap<String, String> {
     let mut rows: HashMap<String, String> = flighthook::bus_actor_rows(actor)
         .into_iter()

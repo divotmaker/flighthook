@@ -742,8 +742,7 @@ impl Run<'_> {
                         SessionEnd::Shutdown => break,
                         SessionEnd::Lost(error) => {
                             warn!("{actor}: camera lost: {error}");
-                            let telemetry = HashMap::from([("error".to_owned(), error)]);
-                            self.status(ActorStatus::Reconnecting, telemetry);
+                            self.status(ActorStatus::Reconnecting, idle_rows(error));
                         }
                     }
                     Some(started.elapsed())
@@ -769,7 +768,7 @@ impl Run<'_> {
                     } else {
                         ActorStatus::Starting
                     };
-                    self.status(s, HashMap::from([("error".to_owned(), error)]));
+                    self.status(s, idle_rows(error));
                     None
                 }
             };
@@ -793,7 +792,7 @@ impl Run<'_> {
             self.finished(event);
         }
         self.cameras.frames.remove(actor);
-        self.status(ActorStatus::Disconnected, HashMap::new());
+        self.status(ActorStatus::Disconnected, idle_rows("none".to_owned()));
     }
 
     /// Start capturing from the camera `section` names. Blocks while it opens.
@@ -809,6 +808,18 @@ impl Run<'_> {
             Err(e) => Err(OpenError::Failed(e.to_string())),
         }
     }
+}
+
+/// The rows of a camera with no capture open: what a capture reports reads
+/// `none` (`fps` 0), and `error`.
+fn idle_rows(error: String) -> HashMap<String, String> {
+    HashMap::from([
+        ("camera".to_owned(), "none".to_owned()),
+        ("resolution".to_owned(), "none".to_owned()),
+        ("mode_fps".to_owned(), "none".to_owned()),
+        ("fps".to_owned(), "0".to_owned()),
+        ("error".to_owned(), error),
+    ])
 }
 
 enum SessionEnd {
@@ -987,7 +998,7 @@ impl Run<'_> {
                     format!("{}x{}", format.width, format.height),
                 ),
                 ("mode_fps".to_owned(), format!("{nominal:.0}")),
-                ("error".to_owned(), String::new()),
+                ("error".to_owned(), "none".to_owned()),
             ]),
         );
 

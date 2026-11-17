@@ -823,12 +823,18 @@ each key through one of them only.
   `blockers` (what keeps it from taking a shot; `ready` means none) and
   `telemetry` (standard keys `ready`, `battery_pct`, `tilt`, `roll`, `temp_c`,
   `external_power`; a driver may add its own, such as the mock's `radar_mode`
-  and `tracking_mode`). A launch monitor with no session publishes `not_armed`
-  and clears battery, attitude and telemetry.
+  and `tracking_mode`) and `flagged` (the values that need attention now, such
+  as `tilt` and `roll` while a device is not level; a flagged row shows red).
+  Each driver declares its telemetry keys with the value they have while not
+  reported (`DriverInfo::telemetry`), and every `bus.actor` carries every one.
+  A launch monitor with no session publishes `not_armed`, no battery, and each
+  key at that value.
 - **`CardStatus`** (local) is what flighthook knows about the card and its
   connection: a status enum and the card's display rows. Standard keys:
-  `device_info`; launch monitors on a device driver add `shot_count` and, while
-  a driver reports one, `phase`; a card whose connect fails adds `error`.
+  `device_info` (`none` once the session ends); launch monitors on a device
+  driver add `shot_count`; every card on a driver shows `phase`, the last
+  phase its driver set; a card whose connect fails adds `error`, which reads
+  `none` once a session connects.
   The simulator outputs add `last_shot` and `shots_sent` (see
   [Open Connect client telemetry](#open-connect-client-telemetry) and
   [Pureplay output](#pureplay-output-alpha)); the Pureplay Accessory adds
@@ -843,23 +849,18 @@ pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
 `ActorStatusResponse` (in `lib/src/api.rs`) adds a `name` field and is the
 cached per-card state in both the web layer and the dashboard. Both merge a
 card's `bus.actor` telemetry and its status rows into one map per card. A key
-in a status replaces the one held; an empty value removes it (how a card on a
-driver and the web server clear `error`, and how the host removes a key its
-driver dropped during a session, since the `bus.actor` lists only the keys
-the driver has). A web server sets `error` to
-`bind failed` while it cannot bind its address, and clears it with every other
-status.
+in a status replaces the one held; an empty value removes it (only a battery
+with no reading leaves that way). A web server sets `error` to
+`bind failed` while it cannot bind its address, and to `none` with every other
+status. An `error` that reads `none` is no error: no banner, and no row on the
+card.
 
-A card never shows a lost connection's values. When a card's status goes from
-`Connected` to `Disconnected` or `Reconnecting`, and on every `Starting` (a new
-instance), the web layer and the dashboard drop all the telemetry held for the
-card (device-reported keys, `club`, `handed`, `name`, status keys) and then
-merge the keys that status carries, so `error` and the keys a card sends with a
-status stay. Later statuses that do not end a connection merge as above. Both
-sides call `ActorStatusResponse::apply_status`. The cards send their keys
-again with each connection. The card then shows its empty state until the
-actor reports: the spinner while not Connected, the connected mark when
-Connected with no rows.
+A card's rows stay through every status, each at the last value sent: a
+lost connection, a reconnect and a new instance show the values the card and
+its driver send for "not known" (`none`, `unknown`, `idle`, `0`), never a
+blank. Both sides call `ActorStatusResponse::apply_status`. Before its first
+row the card shows its empty state: the spinner while not Connected, the
+connected mark when Connected with no rows.
 
 ### ConfigCommand / ConfigOutcome -- event-sourced config mutations
 
@@ -1311,12 +1312,13 @@ closes.
 `DriverActor` (`actors::r10::R10Hooks`: section `R10Section`, source `R10`, no
 processing of its own). The driver finds a paired R10 over BLE (`phase:
 discovering`), runs the handshake (`phase: handshaking`, at most 10 s from its
-start), then the card is `Connected` (`device_info` "Garmin R10 (<address>)")
+start), then the card is `Connected` (`phase: measuring`, `device_info` "Garmin R10 (<address>)")
 with `bus.actor` device `manufacturer: "Garmin"`, `model: "R10"`. It sends the
 card's `range` as the tee distance once the device wakes (a changed range
-restarts the card). Telemetry keys: `ready`, `tilt`, `roll`, `device_state`
-(`waiting` | `recording` | `processing`); a device error is an alert with its
-tilt as `tilt`/`roll`. A shot is trigger, `shot.launch` (total spin and axis plus
+restarts the card). Telemetry keys: `ready`, `tilt`, `roll` (`unknown` until a
+device error carries a reading, flagged while the device reports it is not
+level), `device_state` (`waiting` | `recording` | `processing`, `unknown`
+before the first); a device error is an alert. A shot is trigger, `shot.launch` (total spin and axis plus
 back/side spin, all measured; a total of 0 has no axis), `shot.club` when the
 club was tracked, `shot.finished`, then `ready=false`; the R10 has no wall
 clock, so the trigger carries no timestamp. Commands are ignored (no mode,
@@ -1330,7 +1332,7 @@ source `Square`, no processing of its own). The driver scans for the Omni (or
 the one `address` pins: advertised name, BLE address, or the macOS peripheral
 UUID; blank or the all-zero placeholder discovers), `phase: discovering`,
 connects without pairing and reads its identity, then the card is
-`Connected` (`device_info` "Square Golf <model> <name> (<address>)", so the
+`Connected` (`phase: measuring`, `device_info` "Square Golf <model> <name> (<address>)", so the
 address can be copied into the config) with a `bus.actor` device
 `manufacturer: "Invant"`, the model the device reports and its `lm`
 firmware. It arms on its first poll (`ready=false`) with the club and hand
@@ -1360,8 +1362,7 @@ the card is exclusive: a new instance waits for the old one to close.
 `Action::FindMat`). With no address the driver waits for the device to
 announce itself on the network (`phase: discovering`, polled every 5 ms), then
 connects (`phase: connecting`) and starts measuring with the turn's hand
-(the session's, right-handed when unknown; `phase: measuring`, which the
-`Connected` status keeps). The card is then `Connected` (`device_info`
+(the session's, right-handed when unknown; `phase: measuring`). The card is then `Connected` (`device_info`
 "ExPutt RG (<ip>)", which is also the FRP device id) with a `bus.actor` device
 `model: "ExPutt RG"` (and the device software version as `firmware` when it
 was discovered). The device page's Find mat icon (`POST /api/find-mat`, a
@@ -1417,7 +1418,7 @@ grab: the card runs the driver with its `grab` off
 the ball, and a `grab` key in the section is read without an error, ignored
 and left out of the next save (the config load does not count it as a
 difference, so it alone never rewrites the file). The card is then `Connected`
-(`device_info` "thumbswing (<the name the device reports>)"; the FRP
+(`phase: measuring`, `device_info` "thumbswing (<the name the device reports>)"; the FRP
 device id is the input's `/dev/input/by-id` link name, else the reported
 name) with a `bus.actor` device `manufacturer: "divotmaker"`, `model:
 "thumbswing trackball"`, the crate version as `firmware` and `source:
@@ -1981,19 +1982,19 @@ new one.
   `unauthorised` while connected → the removal. A `pair` without a token is
   sent by itself at most once per actor start; after that only a Reconnect
   (a new start) sends another.
-- Telemetry (card rows, each key only while it has a value): connected,
+- Telemetry (card rows; a key with no value reads `none`, `missed_events`
+  `0`, `pureplay` `unknown`): connected,
   `device_info` and `shot_count` (the host's), `name`, `club`, `handed` (the
   active local player), `hole`, `blockers` (while the readiness is not
   ready: its blockers, `controls_disabled` not one), `club_out` (`on`, `read
   only`, `off in Pureplay`, `not supported`; see Club out above),
-  `missed_events`, `pureplay` (`gameVersion`); otherwise `pairing`. The
+  `missed_events`, `pureplay` (`gameVersion`); not connected, `pairing`. The
   driver's rows ride the card's `bus.actor` telemetry, so `/frp` shows them
   too. `error` is the host's: a failed connect's or opening's reason until a
-  link connects. The hooks add `shots` (`auto`, `auto: last from Pureplay`,
+  link connects, then `none`. The hooks add `shots` (`auto`, `auto: last from Pureplay`,
   `auto: last from flighthook`, `from Pureplay`, `from flighthook`; sent
   when it changes, so it follows a Shots setting change while Pureplay is
-  quiet) and `last_shot` (`#12 at 16:41:07`, the shot the card took last),
-  which the next Reconnecting clears.
+  quiet) and `last_shot` (`#12 at 16:41:07`, the shot the card took last).
 - Forget pairing: `POST /api/actors/{id}/forget-pairing` deletes the card's
   token (on a blocking worker), then reconnects it through the reconnect
   path; a reconnect of the card already in flight answers 409 first and
@@ -2228,9 +2229,9 @@ as the driver gives it; nothing is held:
 | `shot.launch`, `shot.flight`, `shot.club`, `shot.impact` | the same messages, after the card's `on_frp` hook |
 | `shot.finished` | what the card's `before_finished` hook adds (the FlightScope's own `assumed` flight), the shot's raw frames as the local `ShotCapture` (`"<kind> device has no wire protocol"` without a raw profile), then `shot.finished`, then the card's `shot_count` |
 | `alert` | `bus.alert` |
-| status and identity | the card's `bus.actor` (blockers, battery, attitude, telemetry, device), published when it changes |
+| status and identity | the card's `bus.actor` (blockers, battery, every declared telemetry key, flagged values, device), published when it changes; during a connect, changed telemetry goes to the card as rows |
 | `raw_frame` | numbered per device id across sessions (frames of the first connect, before the id is known, number on into it), a hex line at the `audit` target, recorded for the export ([raw capture](#raw-capture-and-shot-export)); never on the bus |
-| `Phase` | the card's `phase`; the Connected status removes a phase set during the connect (`phase: ""`), unless the connect's last phase was `measuring` (the session's own phase in the driver contract's list), which it keeps. A connect that fails removes its phase before the retry delay, and a stop during a connect leaves the card Disconnected without it |
+| `Phase` | the card's `phase`, kept until the driver sets another: a driver sets one at the start of every connect and once its session is up (`measuring`, or `connected` for an output) |
 | `Log` | tracing; trace lines at the `audit` target |
 | `ShotDiscarded` | the pre-roll is cleared |
 
@@ -3473,7 +3474,8 @@ which is left out once it would be cut to a stub.
   [Connection state](#connection-state)), then its
   telemetry key/value
   pairs one per row, sorted by key. Detection mode, battery, tilt, roll,
-  temperature, club, handed and the rest come from the actor's telemetry map.
+  temperature, club, handed and the rest come from the actor's telemetry map;
+  a row the actor flags shows its value in red.
   The key column is as wide as the longest key, up to 45 % of the card; a key
   or value too long for its column is cut short with "…" and shown in full
   on hover (a Square Golf Omni's `device_info`, for one). With no row to

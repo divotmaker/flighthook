@@ -140,98 +140,53 @@ async fn held(state: &WebState) -> HashMap<String, String> {
 }
 
 #[tokio::test]
-async fn a_lost_connection_clears_the_actors_telemetry() {
-    for lost in [ActorStatus::Disconnected, ActorStatus::Reconnecting] {
-        let (state, _writer, _dir) = test_state();
-        let mut up = Updater::new(&state);
-        connected_mevo(&mut up).await;
-        // device_info, club, handed and the bus.actor's rows: ready,
-        // battery_pct, tilt_state (no tilt or roll: empty rows are
-        // left out).
-        assert_eq!(held(&state).await.len(), 6, "{:?}", held(&state).await);
-
-        up.send(
-            "mevo.0",
-            Ev::Local(LocalEvent::CardStatus {
-                status: lost,
-                telemetry: kv(&[("error", "gone")]),
-            }),
-        )
-        .await;
-        assert_eq!(held(&state).await, kv(&[("error", "gone")]), "{lost:?}");
-        assert_eq!(state.actors.read().await["mevo.0"].status, lost);
-        // The export keeps the device's identity: its `bus.actor`.
-        let model = state.bus_state.lock().ok().and_then(|bus| {
-            bus.actors()
-                .find(|(id, _)| *id == "mevo.0")
-                .and_then(|(_, a)| a.device.clone()?.model)
-        });
-        assert_eq!(model.as_deref(), Some("Mevo+"));
-    }
-}
-
-#[tokio::test]
-async fn a_new_instance_starts_without_the_old_telemetry() {
+async fn a_cards_rows_stay_through_a_lost_connection_and_flags_follow_its_bus_actor() {
     let (state, _writer, _dir) = test_state();
     let mut up = Updater::new(&state);
     connected_mevo(&mut up).await;
-    up.status("mevo.0", ActorStatus::Disconnected).await;
-    // Values reported after the loss are held until the next start.
-    up.send(
-        "mevo.0",
-        Ev::Local(LocalEvent::CardStatus {
-            status: ActorStatus::Disconnected,
-            telemetry: kv(&[("club", "DR")]),
-        }),
-    )
-    .await;
-    up.send(
-        "mevo.0",
-        Ev::Local(LocalEvent::CardStatus {
-            status: ActorStatus::Starting,
-            telemetry: kv(&[("address", "1.2.3.4:5")]),
-        }),
-    )
-    .await;
-    assert_eq!(held(&state).await, kv(&[("address", "1.2.3.4:5")]));
-}
+    // device_info, club, handed and the bus.actor's rows: ready,
+    // battery_pct, tilt_state.
+    assert_eq!(held(&state).await.len(), 6, "{:?}", held(&state).await);
+    let device = || flightrelay::DeviceInfo {
+        manufacturer: Some("FlightScope".into()),
+        model: Some("Mevo+".into()),
+        ..flightrelay::DeviceInfo::default()
+    };
+    let Ev::Frp(FrpBody::BusActor(mut flagged)) = Ev::device(device(), &[("tilt", "6.5°")]) else {
+        unreachable!()
+    };
+    flagged.flagged = vec!["tilt".into()];
+    up.send("mevo.0", Ev::frp(flagged)).await;
+    assert_eq!(state.actors.read().await["mevo.0"].flagged, ["tilt"]);
 
-#[tokio::test]
-async fn repeated_statuses_that_are_not_a_loss_merge() {
-    let (state, _writer, _dir) = test_state();
-    let mut up = Updater::new(&state);
-    connected_mevo(&mut up).await;
     up.send(
         "mevo.0",
         Ev::Local(LocalEvent::CardStatus {
-            status: ActorStatus::Connected,
-            telemetry: kv(&[("shot_count", "1")]),
+            status: ActorStatus::Reconnecting,
+            telemetry: kv(&[("error", "gone"), ("device_info", "none")]),
         }),
     )
     .await;
-    assert_eq!(held(&state).await.len(), 7);
-    up.send(
-        "mevo.0",
-        Ev::Local(LocalEvent::CardStatus {
-            status: ActorStatus::Disconnected,
-            telemetry: kv(&[("error", "a")]),
-        }),
-    )
-    .await;
-    for status in [ActorStatus::Reconnecting, ActorStatus::Disconnected] {
-        up.send(
-            "mevo.0",
-            Ev::Local(LocalEvent::CardStatus {
-                status,
-                telemetry: kv(&[("phase", "connecting")]),
-            }),
-        )
+    up.send("mevo.0", Ev::device(device(), &[("tilt", "unknown")]))
         .await;
-    }
+    let rows = held(&state).await;
     assert_eq!(
-        held(&state).await,
-        kv(&[("error", "a"), ("phase", "connecting")])
+        state.actors.read().await["mevo.0"].status,
+        ActorStatus::Reconnecting
     );
+    assert_eq!(rows["error"], "gone");
+    assert_eq!(rows["device_info"], "none");
+    assert_eq!(rows["tilt"], "unknown");
+    assert_eq!(rows["club"], "7I", "a row stays at its last value");
+    assert!(!rows.contains_key("battery_pct"), "no battery reading");
+    assert!(state.actors.read().await["mevo.0"].flagged.is_empty());
+    // The export keeps the device's identity: its `bus.actor`.
+    let model = state.bus_state.lock().ok().and_then(|bus| {
+        bus.actors()
+            .find(|(id, _)| *id == "mevo.0")
+            .and_then(|(_, a)| a.device.clone()?.model)
+    });
+    assert_eq!(model.as_deref(), Some("Mevo+"));
 }
 
 #[tokio::test]
@@ -252,7 +207,8 @@ async fn a_successful_bind_clears_the_bind_error() {
     let actors = state.actors.read().await;
     let web = actors.get("webserver.0").expect("webserver status");
     assert_eq!(web.status, ActorStatus::Connected);
-    assert!(!web.telemetry.contains_key("error"), "{:?}", web.telemetry);
+    assert_eq!(web.telemetry["error"], "none");
+    assert_eq!(web.error(), None);
     assert_eq!(web.telemetry["bind"], "127.0.0.1:0");
 }
 

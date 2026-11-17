@@ -30,10 +30,12 @@
 //!   gives it, through [`Hooks::on_frp`]. The device's status and identity
 //!   make the card's `bus.actor` (the driver's roles and namespaces,
 //!   `device.source` from the card's shot source, if it is one), published
-//!   when it changes; while no session is up it carries no battery,
-//!   attitude or telemetry, and a launch monitor's is blocked by
-//!   `not_armed`. Telemetry the driver sends during a connect shows on the
-//!   card as rows. Raw frames go to the shot's capture, which goes out as
+//!   when it changes; while no session is up it carries no battery, each
+//!   telemetry key the driver declares at its not-reported value, and a
+//!   launch monitor's is blocked by `not_armed`. Telemetry the driver sends
+//!   during a connect shows on the card as rows. The card's `phase` row is
+//!   the last phase the driver set; its `error` row reads `none` once the
+//!   outage it described is over, and `device_info` once the session ends. Raw frames go to the shot's capture, which goes out as
 //!   the local `ShotCapture` just before the shot's `shot.finished`, never
 //!   as FRP.
 //! - **Live config** ([`DriverActor::reconfigure`]): host fields and the
@@ -81,10 +83,8 @@ const IDLE_SLICE: Duration = Duration::from_millis(100);
 /// The card's error after the device driver panicked.
 const DRIVER_FAILED: &str = "the device driver failed; press Reconnect";
 
-/// The phase of a running session in the device driver contract's list
-/// (`DeviceEvent::Phase`). A driver that sets it as the last step of its
-/// connect keeps it on the card while Connected.
-const SESSION_PHASE: &str = "measuring";
+/// A card row with nothing to report.
+const NONE: &str = "none";
 
 // ---------------------------------------------------------------------------
 // Hooks
@@ -405,9 +405,9 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
         }));
         if let Err(panic) = ran {
             error!("{actor}: the device driver failed: {}", panic_text(&*panic));
+            let mut telemetry = sink.ended_rows();
+            telemetry.insert("error".into(), DRIVER_FAILED.into());
             sink.session_ended(&mut self.hooked.borrow_mut());
-            let mut telemetry = HashMap::from([("error".into(), DRIVER_FAILED.into())]);
-            sink.end_phase(&mut telemetry);
             sink.status(ActorStatus::Disconnected, telemetry);
         } else if host.stopped() {
             sink.remove_actor();
@@ -459,8 +459,8 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                     if host.stopped() {
                         break;
                     }
-                    // The failed connect's phase is not shown through the
-                    // retry delay; its error is.
+                    // The failed connect's error shows through the retry
+                    // delay.
                     sink.connect_failed(&e.to_string());
                     attempts += 1;
                     (e, None)
@@ -513,11 +513,9 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                 }
             }
         }
-        // A stop that ended a connect leaves no phase and no connect error
-        // on the card.
+        // A stop that ended a connect ends its outage too.
+        let mut telemetry = sink.ended_rows();
         sink.session_ended(&mut self.hooked.borrow_mut());
-        let mut telemetry = HashMap::new();
-        sink.end_phase(&mut telemetry);
         sink.end_connect_error(&mut telemetry);
         sink.status(ActorStatus::Disconnected, telemetry);
     }
@@ -856,12 +854,14 @@ struct Sink<D: FrpDriver, H: Hooks<D>> {
     /// A connect is running: the device's status goes out with the
     /// session's identity once it connects.
     connecting: bool,
-    /// The `phase` last set during this connect, if any (cleared when the
-    /// session connects).
-    phase_shown: Option<&'static str>,
     /// The error of the last failed connect of the current outage: the card's
     /// `error` row, on every status sent until a session connects.
     connect_error: Option<String>,
+    /// The error the card's `error` row shows from the host (a failed
+    /// connect, giving up, a driver panic), until it reads `none`. A driver
+    /// that reports an `error` key of its own shares that row, so its
+    /// `bus.actor` carries this one while it is set.
+    host_error: Option<String>,
     /// The driver alert last logged, until a session connects: the same
     /// alert again (a driver may raise it on every retry) is not logged
     /// again.
@@ -948,21 +948,16 @@ fn audit_line(actor: &str, frame: &RawFrame, text: bool) -> String {
     )
 }
 
-/// The card rows of a telemetry change from `old` to `new`: each changed
-/// or new key with its value, each removed key empty.
+/// The card rows of a telemetry change from `old` to `new` (both with
+/// every declared key): each key whose value changed.
 fn telemetry_rows(
     old: &BTreeMap<String, String>,
     new: &BTreeMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut rows: HashMap<String, String> = new
-        .iter()
+    new.iter()
         .filter(|(k, v)| old.get(*k) != Some(*v))
         .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for key in old.keys().filter(|k| !new.contains_key(*k)) {
-        rows.insert(key.clone(), String::new());
-    }
-    rows
+        .collect()
 }
 
 impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
@@ -980,7 +975,7 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             device_status: DeviceStatus::not_armed(),
             published: Arc::new(Mutex::new(None)),
             connecting: false,
-            phase_shown: None,
+            host_error: None,
             connect_error: None,
             last_alert: None,
             capture: None,
@@ -1012,6 +1007,11 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         if let Some(device) = actor.device.as_mut() {
             device.source = self.source;
         }
+        if let (Some(error), Some(rows)) = (&self.host_error, actor.telemetry.as_mut())
+            && let Some(row) = rows.get_mut("error")
+        {
+            row.clone_from(error);
+        }
         actor
     }
 
@@ -1035,11 +1035,22 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
 
     /// Send status `status` with card telemetry `telemetry`, and the
     /// connect error still held unless the status is Connected or carries
-    /// an `error` of its own (a Starting status drops what the card held).
+    /// an `error` of its own. An `error` it sends becomes the host's error
+    /// (`none` ends it), republished in the `bus.actor` of a driver with an
+    /// `error` key.
     fn status(&mut self, status: ActorStatus, mut telemetry: HashMap<String, String>) {
         self.status = status;
         *lock(&self.shown) = status;
         self.hold_connect_error(&mut telemetry);
+        if let Some(error) = telemetry.get("error") {
+            let error = (error != NONE).then(|| error.clone());
+            if error != self.host_error {
+                self.host_error = error;
+                if self.info.telemetry.iter().any(|(k, _)| *k == "error") {
+                    self.publish_actor();
+                }
+            }
+        }
         self.sender
             .local(LocalEvent::CardStatus { status, telemetry });
     }
@@ -1058,27 +1069,21 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
 
     /// A connect failed with `error`: the card shows it as its `error` row
     /// through the retry delay, and the log gets one warning when it is the
-    /// first of the outage or the text changed. The connect's `phase` leaves
-    /// the card.
+    /// first of the outage or the text changed.
     fn connect_failed(&mut self, error: &str) {
-        let changed = self.connect_error.as_deref() != Some(error);
-        if changed {
+        if self.connect_error.as_deref() != Some(error) {
             warn!("{}: cannot connect: {error}", self.actor);
             self.connect_error = Some(error.to_owned());
-        }
-        let mut telemetry = HashMap::new();
-        self.end_phase(&mut telemetry);
-        if changed || !telemetry.is_empty() {
-            self.status(self.status, telemetry);
+            self.status(self.status, HashMap::new());
         }
     }
 
     /// The outage is over (a session connected, or the actor stopped): takes
-    /// the held connect error back, removing the card's `error` row through
-    /// `telemetry` (an empty value removes the key).
+    /// the held connect error back, the card's `error` row reading `none`
+    /// through `telemetry`.
     fn end_connect_error(&mut self, telemetry: &mut HashMap<String, String>) {
         if self.connect_error.take().is_some() {
-            telemetry.insert("error".into(), String::new());
+            telemetry.insert("error".into(), NONE.into());
         }
     }
 
@@ -1097,11 +1102,9 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
     }
 
     /// A session connected as `identity`: Connected, with the card text and,
-    /// for a launch monitor, the shot count (and the connect's `phase`
-    /// removed, unless the driver ended its connect on [`SESSION_PHASE`],
-    /// which describes the session), then the card's `bus.actor` with the
-    /// device's identity and the status the driver sent while connecting,
-    /// before any shot.
+    /// for a launch monitor, the shot count, then the card's `bus.actor`
+    /// with the device's identity and the status the driver sent while
+    /// connecting, before any shot.
     fn connected(&mut self, identity: &DeviceIdentity) {
         self.connecting = false;
         self.last_alert = None;
@@ -1128,38 +1131,32 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             telemetry.insert("shot_count".into(), self.shot_count.to_string());
         }
         self.end_connect_error(&mut telemetry);
-        // An empty value removes the key: the phases were the connect's.
-        match self.phase_shown.take() {
-            Some(SESSION_PHASE) => {
-                telemetry.insert("phase".into(), SESSION_PHASE.into());
-            }
-            Some(_) => {
-                telemetry.insert("phase".into(), String::new());
-            }
-            None => {}
-        }
         self.status(ActorStatus::Connected, telemetry);
         self.publish_actor();
     }
 
-    /// A connect ended without a session: removes the `phase` it set, if
-    /// any, through `telemetry` (an empty value removes the key).
-    fn end_phase(&mut self, telemetry: &mut HashMap<String, String>) {
-        if self.phase_shown.take().is_some() {
-            telemetry.insert("phase".into(), String::new());
-        }
+    /// The session failed: Reconnecting, then its open shots finished and
+    /// `not_armed`, so the card shows the not-reported values, not the lost
+    /// connection's.
+    fn session_lost(&mut self, hooked: &mut Hooked<D, H>) {
+        let rows = self.ended_rows();
+        self.status(ActorStatus::Reconnecting, rows);
+        self.session_ended(hooked);
     }
 
-    /// The session failed: its open shots finished, `not_armed`, then
-    /// Reconnecting, so a card never shows a lost connection's values.
-    fn session_lost(&mut self, hooked: &mut Hooked<D, H>) {
-        self.session_ended(hooked);
-        self.status(ActorStatus::Reconnecting, HashMap::new());
+    /// The card rows of a session that ends: `device_info` reads `none`
+    /// (nothing while no session is up).
+    fn ended_rows(&self) -> HashMap<String, String> {
+        self.identity
+            .as_ref()
+            .map(|_| ("device_info".into(), NONE.into()))
+            .into_iter()
+            .collect()
     }
 
     /// No session: every shot it left open is finished, so outputs get it
-    /// at once; the card's `bus.actor` is `not_armed`, with no battery,
-    /// attitude or telemetry.
+    /// at once; the card's `bus.actor` is `not_armed`, with no battery and
+    /// each declared telemetry key at its not-reported value.
     fn session_ended(&mut self, hooked: &mut Hooked<D, H>) {
         let mut open: Vec<(Instant, ShotKey)> = self
             .shots
@@ -1181,6 +1178,15 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         self.publish_actor();
     }
 
+    /// The telemetry the card's `bus.actor` carries for the status held:
+    /// every declared key.
+    fn telemetry_shown(&self) -> BTreeMap<String, String> {
+        self.info
+            .bus_actor(String::new(), DEFAULT_HEARTBEAT, None, &self.device_status)
+            .telemetry
+            .unwrap_or_default()
+    }
+
     /// The mode the session runs in: the driver's fixed mode, else the turn
     /// hints' mode.
     fn mode(&self) -> Option<Mode> {
@@ -1192,18 +1198,16 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         match event {
             DeviceEvent::Frp(body) => self.frp(body, hooked),
             DeviceEvent::Status(status) => {
-                let old = std::mem::replace(&mut self.device_status, status);
-                self.status_changed(&old.telemetry);
+                let old = self.telemetry_shown();
+                self.device_status = status;
+                self.status_changed(&old);
             }
             DeviceEvent::StatusChange(change) => {
-                let old = self.device_status.telemetry.clone();
+                let old = self.telemetry_shown();
                 self.device_status.apply(change);
                 self.status_changed(&old);
             }
             DeviceEvent::Phase(phase) => {
-                if self.connecting {
-                    self.phase_shown = Some(phase);
-                }
                 let mut telemetry = HashMap::from([("phase".into(), phase.to_owned())]);
                 self.hold_connect_error(&mut telemetry);
                 self.sender.local(LocalEvent::CardStatus {
@@ -1231,23 +1235,15 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
     }
 
     /// The device's status changed from telemetry `old`: in the card's
-    /// `bus.actor` while a session is up, with each key that left sent to
-    /// the card as an empty row (the `bus.actor` lists only the keys the
-    /// device has); during a connect, the telemetry change goes to the card
-    /// as rows (the `bus.actor` waits for the identity).
+    /// `bus.actor` while a session is up; during a connect, the telemetry
+    /// change goes to the card as rows (the `bus.actor` waits for the
+    /// identity).
     fn status_changed(&mut self, old: &BTreeMap<String, String>) {
-        let mut telemetry = telemetry_rows(old, &self.device_status.telemetry);
         if !self.connecting {
             self.publish_actor();
-            telemetry.retain(|k, _| !self.device_status.telemetry.contains_key(k));
-            if !telemetry.is_empty() {
-                self.sender.local(LocalEvent::CardStatus {
-                    status: self.status,
-                    telemetry,
-                });
-            }
             return;
         }
+        let mut telemetry = telemetry_rows(old, &self.telemetry_shown());
         if !telemetry.is_empty() {
             self.hold_connect_error(&mut telemetry);
             self.sender.local(LocalEvent::CardStatus {

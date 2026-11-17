@@ -40,8 +40,8 @@ historical data. Angles are degrees, spin is RPM.
 
 Other messages on the same connection:
 
-- `bus.actor`: who an actor is, its roles, blockers (`blockers` empty: ready), device info (battery, tilt) and
-  telemetry; also its heartbeat
+- `bus.actor`: who an actor is, its roles, blockers (`blockers` empty: ready), device info (battery), telemetry
+  and `flagged` values; also its heartbeat
 - `golfer.turn`: the golfer up, club, hand and mode
 - `golfer.profile`: a golfer known to an actor (flighthook's saved golfers, a game's players)
 - `practice.block`: the open [sets](#get-apiblocks)
@@ -161,8 +161,8 @@ Comprehensive system state: each local card's status, every FRP actor on the bus
       "telemetry": {
         "ready": "true",
         "battery_pct": "85",
-        "tilt": "0.5",
-        "roll": "-0.2",
+        "tilt": "0.5°",
+        "roll": "-0.2°",
         "phase": "measuring",
         "shot_count": "12",
         "device_info": "FlightScope Mevo+"
@@ -202,10 +202,12 @@ Comprehensive system state: each local card's status, every FRP actor on the bus
 }
 ```
 
-- `cards`: each local card's status, by card key (`mevo.0`, `openconnect_client.0`, ...; see below).
+- `cards`: each local card's status, by card key (`mevo.0`, `openconnect_client.0`, ...; see below). `flagged`
+  lists the rows whose value needs attention now (from the card's `bus.actor`, such as `tilt` and `roll` while a
+  device is not level); omitted when none is.
 - `actors`: every FRP actor on the bus, local and remote, by actor id. `name`, `roles` and `blockers` are from its
   latest `bus.actor` (`blockers` empty means ready); `device` is the `bus.actor` device object (manufacturer, model,
-  firmware, battery, attitude, `source`); `card` names the local card key when the actor is a flighthook card. Other
+  firmware, battery, `source`); `card` names the local card key when the actor is a flighthook card. Other
   FRP programs connected to `/frp` appear here with no `card`.
 - `turn`: the current `golfer.turn` (flighthook's own): `golfer` (a golfer id or `null`), `club` (a
   [club code](#club) or `null`), `handedness` and `mode`. Omitted before the session has published one.
@@ -255,17 +257,24 @@ config change, removing the card (then adding it again) and turning it off then 
 client of [`/api/ws`](#websocket-apiws) applies the same rules to the `card_status` events to keep `state` and the
 red time current.
 
-A card's `telemetry` holds its rows as key/value strings. A key is
-reported by one source only:
-- **Device-reported** (reported by the device): `ready`, `battery_pct`, `tilt`,
-  `roll`, `temp_c`, `external_power` (a Mevo+), `zero_spin_discards` (a Square Golf), and a device driver's own state keys
+A card's `telemetry` holds its rows as key/value strings. A row, once
+shown, always has a value: what its source does not know reads `none`
+(or `unknown`, `idle`, `0`), and the rows stay while the card is
+reconnecting or disconnected. Only `battery_pct` leaves when there is no
+reading. A key is reported by one source only:
+- **Device-reported** (reported by the device): `ready`, `battery_pct`, `tilt`
+  and `roll` (degrees, `0.4°`; a Mevo+ and an R10, which flags both while it
+  reports it is not level), `temp_c`, `external_power` (a Mevo+), `zero_spin_discards` (a Square Golf), and a device driver's own state keys
   (the mock's `radar_mode`, `tracking_mode`; the Square Golf's
   `device_state`; the Trackball's `synthetic`
   (`true`), `input` (the name the device reports), `cpi`, `profile` (the
   club in play) and `handed` (`rh` | `lh`))
-- **Every card**: `device_info`, `shot_count` (a launch monitor's),
-  `phase`; `error` on a card on a device driver whose connects keep failing:
-  the latest connect error, removed when a session connects
+- **Every card**: `device_info` (`none` once the session ends),
+  `shot_count` (a launch monitor's), `phase` (what the driver is doing:
+  `discovering`, `listening`, `connecting`, `handshaking`, `configuring`,
+  then `measuring`, or `connected` for an output; the last one set);
+  `error` on a card on a device driver whose connects keep failing: the
+  latest connect error, `none` when a session connects
 - **Software cards**: `club`, `handed`, `name`, `error`
 - **Open Connect clients** (GSPro, Pureplay, Muni Golf, generic):
   `device_info` (the simulator's address, `127.0.0.1:921`, while
@@ -275,7 +284,10 @@ reported by one source only:
   last sent to the simulator, `true` | `false`), `response` (the
   simulator's last response code and message, `201 GSPro Player
   Information`), `club` and `handed` (the simulator's player
-  information) and `ready` (`true`, from the card's `bus.actor`). `error`
+  information) and `ready` (`true`, from the card's `bus.actor`). Between
+  connections `monitor_ready` reads `unknown`, `response`, `club` and
+  `handed` read `none`, and `last_shot` and `shots_sent` keep the last
+  connection's. `error`
   holds why the last connect failed (the simulator not
   listening, or this flighthook's own Open Connect Server refusing the
   connection) until a connection succeeds
@@ -295,7 +307,8 @@ reported by one source only:
   failed (no reply to Hello, an unsupported protocol version) until a
   handshake succeeds; a connect that fails (Pureplay not running) shows its
   error until a connection is made, as on every card on a driver. When the
-  link ends, every row of the link is removed
+  link ends, the link's rows read `none` (`ready_state` `unknown`,
+  `strict_mode` `off`)
 - **Pureplay Accessory cards** (beta): while connected, `name`,
   `club` and `handed` (the active local player: the player who is up when
   that player sits at the Pureplay computer), `hole` (`7, par 4`),
@@ -307,8 +320,9 @@ reported by one source only:
   `off in Pureplay` when Pureplay's "Let Apps Change Aim and Club" is off;
   `not supported` when Pureplay offers no club command, or the player who
   is up has no bag), `missed_events` (gaps in Pureplay's event numbers,
-  only above 0; each one asks Pureplay for its state again) and `pureplay`
-  (the game's version); each only while it has a value; these ride the
+  above 0; each one asks Pureplay for its state again) and `pureplay`
+  (the game's version); each `none` while it has no value (`missed_events`
+  `0`, `pureplay` `unknown`); these ride the
   card's `bus.actor` telemetry. `device_info` is Pureplay's address,
   `shot_count` the shots the card put on the bus, `shots` the Shots setting
   (`auto`, `auto: last from Pureplay`, `auto: last from flighthook`, `from
@@ -331,13 +345,14 @@ reported by one source only:
   not running, another protocol or version, none of the events the card
   follows) until a connection is made, as on every card on a driver;
   `Press Reconnect to pair again.` once the card waits for Reconnect; or
-  that the pairing could not be saved. When the link ends, every row of
-  the link is removed. See [Pureplay Accessory](devices/pureplay.md)
+  that the pairing could not be saved. When the link ends, the link's rows
+  read `none`. See [Pureplay Accessory](devices/pureplay.md)
 - **Cameras**: `camera` (the camera's own name),
   `position`, `resolution` (`1280x720`), `mode_fps` (the frame rate asked
   for), `fps` (achieved over the last second), `dropped` (frames missing
   since it connected), `error`. `fps`, `dropped` and `position` are sent at
-  most every 2 s, and only when they change
+  most every 2 s, and only when they change. With no capture open,
+  `camera`, `resolution` and `mode_fps` read `none` and `fps` `0`
 
 ---
 ---
@@ -2277,7 +2292,7 @@ A peer that falls too far behind gets the greeting again and carries on from the
 | Actor | Roles | Publishes |
 |---|---|---|
 | flighthook (its id is `[frp] actor_id`) | `session`, `practice`, `collector` | `golfer.turn`, `golfer.profile` for each saved golfer (namespace `flighthook`), `practice.block` |
-| each launch monitor card (Mevo, R10, Square Golf, ExPutt, Trackball, mock, Open Connect server input) | `launch_monitor` | `shot.*`; its `bus.actor` carries `device` (maker, model, battery, attitude, `source`) and `blockers` |
+| each launch monitor card (Mevo, R10, Square Golf, ExPutt, Trackball, mock, Open Connect server input) | `launch_monitor` | `shot.*`; its `bus.actor` carries `device` (maker, model, battery, `source`), `blockers`, `telemetry` and `flagged` |
 | Auto-chip | `launch_monitor` (`source` `virtual`) | `shot.*` for each chip |
 | flight model (the Simulation card) | `flight_model` | `shot.flight` with `basis` `modeled`, after the monitor's own |
 | Pureplay Accessory card (beta) | `game`, `launch_monitor` | `game.round`, `game.scores`, `game.ball`, `game.stroke`, `golfer.profile` for its players (namespace `pureplay`), `shot.*` |

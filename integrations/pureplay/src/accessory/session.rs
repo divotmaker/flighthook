@@ -90,6 +90,8 @@ pub(super) const BLOCKERS: &str = "blockers";
 pub(super) const CLUB_OUT: &str = "club_out";
 pub(super) const MISSED: &str = "missed_events";
 pub(super) const PUREPLAY: &str = "pureplay";
+/// A row with nothing to report.
+const NONE: &str = "none";
 /// The keys that hold for one link.
 pub(super) const PER_LINK: [&str; 8] = [
     NAME, CLUB, HANDED, HOLE, BLOCKERS, CLUB_OUT, MISSED, PUREPLAY,
@@ -383,9 +385,11 @@ impl Accessory {
     ) -> Result<Session<L>, Error> {
         let addr = self.addr();
         let mut session = Session::new(link, Arc::clone(&self.card), addr);
+        ctx.out.phase("handshaking");
         loop {
             let activity = session.step(ctx.now(), &mut ctx.out)?;
             if session.following() {
+                ctx.out.phase("measuring");
                 return Ok(session);
             }
             match activity {
@@ -430,6 +434,18 @@ impl FrpDriver for Accessory {
             .with_manufacturer(MANUFACTURER)
             .with_roles(&[roles::GAME, roles::LAUNCH_MONITOR])
             .with_namespaces(&[model::NAMESPACE])
+            .with_telemetry(&[
+                (PAIRING, NONE),
+                (ERROR, NONE),
+                (NAME, NONE),
+                (CLUB, NONE),
+                (HANDED, NONE),
+                (HOLE, NONE),
+                (BLOCKERS, NONE),
+                (CLUB_OUT, NONE),
+                (MISSED, "0"),
+                (PUREPLAY, "unknown"),
+            ])
             .with_raw(RawProfile::new("pureplay-ws", 0, 0, 0, |_| false, true))
     }
 
@@ -448,6 +464,7 @@ impl FrpDriver for Accessory {
     }
 
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Session<WsLink>, Error> {
+        ctx.out.phase("connecting");
         self.before_open(ctx)?;
         let addr = self.addr();
         let stream = match ctx.connect_tcp(addr, CONNECT_TIMEOUT)? {

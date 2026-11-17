@@ -109,6 +109,8 @@ impl Card {
         }
     }
 
+    /// Set row `key`; an empty value takes it out of the status, so its
+    /// actor shows the row's declared value (`DriverInfo::telemetry`).
     pub(super) fn set(&mut self, key: &'static str, value: impl Into<String>) {
         let value = value.into();
         if value.is_empty() {
@@ -142,8 +144,8 @@ impl Card {
     }
 
     /// A connect starts: the host holds no status, while the card still
-    /// shows the rows the last connect left. They are put back first, so
-    /// that one the card no longer has leaves the card.
+    /// shows the rows the last connect left. They are put back first, so the
+    /// host holds what the card last sent and the next change is seen.
     pub(super) fn restore(&mut self, out: &mut Events<'_>) {
         if !self.shown.telemetry.is_empty() {
             out.status(self.shown.clone());

@@ -118,8 +118,9 @@ pub enum UiLocalEvent {
 }
 
 /// A `bus.actor`'s values as card rows: `ready` (no blockers),
-/// `battery_pct`, `tilt`, `roll` and the actor's own telemetry. A value
-/// the actor does not report is empty, which removes the row.
+/// `battery_pct` and the actor's own telemetry. A battery the actor does
+/// not report is empty, which removes the row; telemetry always carries
+/// every key the actor uses.
 #[must_use]
 pub fn bus_actor_rows(actor: &flightrelay::BusActor) -> HashMap<String, String> {
     let device = actor.device.clone().unwrap_or_default();
@@ -130,13 +131,13 @@ pub fn bus_actor_rows(actor: &flightrelay::BusActor) -> HashMap<String, String> 
         .into_iter()
         .collect();
     rows.insert("ready".into(), actor.is_clear().to_string());
-    for (key, value) in [
-        ("battery_pct", device.battery_pct.map(|v| v.to_string())),
-        ("tilt", device.tilt.map(|v| v.to_string())),
-        ("roll", device.roll.map(|v| v.to_string())),
-    ] {
-        rows.insert(key.into(), value.unwrap_or_default());
-    }
+    rows.insert(
+        "battery_pct".into(),
+        device
+            .battery_pct
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    );
     rows
 }
 

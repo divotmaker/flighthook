@@ -784,14 +784,15 @@ async fn finish_shot(
 }
 
 /// Keep the web state current from a launch monitor's or a hosted card's
-/// `bus.actor`: its rows (`ready`, battery, the actor's own telemetry) on
-/// its card.
+/// `bus.actor`: its rows (`ready`, battery, the actor's own telemetry) and
+/// flagged values on its card.
 async fn apply_device(state: &WebState, from: &str, actor: &flightrelay::BusActor) {
     let card = stored::card_of(&state.root, from);
     let rows = flighthook::bus_actor_rows(actor);
     let mut actors = state.actors.write().await;
     if let Some(entry) = actors.get_mut(&card) {
-        // An empty row is one the actor no longer has.
+        entry.flagged.clone_from(&actor.flagged);
+        // An empty row is a battery the actor no longer reports.
         for (k, v) in rows {
             if v.is_empty() {
                 entry.telemetry.remove(&k);

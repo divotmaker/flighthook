@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use flightrelay::driver::{
     Activity, Backoff, DeviceEvent, DeviceIdentity, FrpDriver, FrpSession, Live, SessionEnd,
 };
-use flightrelay::testing::{TestHost, alerts, status};
+use flightrelay::testing::{TestHost, alerts, status, statuses};
 use flightrelay::{
     AssumedLaunch, Basis, BusActor, Club, DeviceInfo, FlightResult, FrpBody, FrpMessage,
     GolferSelect, Handedness, Launch, Mode, RawDir, Removal, ShotClub, ShotFinished, ShotFlight,
@@ -508,9 +508,26 @@ fn a_host_that_never_answers_hello_is_an_error_until_one_does() {
     assert!(reason.contains("no reply to Hello"), "{reason}");
 
     let mut next = Link::linked();
-    let rows = status(&next.events()).telemetry;
-    assert!(!rows.contains_key("error"), "the reason leaves the card");
+    let events = next.events();
+    let rows = status(&events).telemetry;
+    assert_eq!(rows["error"], "none", "the reason leaves the card");
     assert_eq!(rows[STRICT_MODE_KEY], "off");
+    assert_same_keys(&events);
+}
+
+/// Every status in `events` gives an actor with the same, declared
+/// telemetry keys.
+fn assert_same_keys(events: &[DeviceEvent]) {
+    let info = Connect::info(&Config::default());
+    let declared: Vec<&str> = info.telemetry.iter().map(|(k, _)| *k).collect();
+    for status in statuses(events) {
+        let actor = info.bus_actor("x", Duration::from_secs(2), None, &status);
+        let mut keys: Vec<String> = actor.telemetry.unwrap().into_keys().collect();
+        keys.sort();
+        let mut want: Vec<String> = declared.iter().map(|k| (*k).to_owned()).collect();
+        want.sort();
+        assert_eq!(keys, want);
+    }
 }
 
 /// A HelloAck choosing a version flighthook does not speak ends the link
@@ -945,6 +962,7 @@ fn set_club_info_sets_the_hand_and_club() {
     let rows = status(&events).telemetry;
     assert_eq!(rows["club"], Club::Iron7.to_string());
     assert_eq!(rows["handed"], Handedness::Left.to_string());
+    assert_same_keys(&events);
 
     link.send(&Message::SetClubInfo {
         handedness: 0,

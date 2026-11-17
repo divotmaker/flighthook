@@ -598,11 +598,7 @@ impl FlighthookApp {
             .collect();
         for id in expired {
             self.reconnect_done(&id);
-            let explained = self
-                .actors
-                .get(&id)
-                .and_then(|a| a.telemetry.get("error"))
-                .is_some_and(|e| !e.is_empty());
+            let explained = self.actors.get(&id).and_then(|a| a.error()).is_some();
             if !explained {
                 self.reconnect_errors
                     .insert(id, RECONNECT_UNFINISHED.into());

@@ -433,7 +433,7 @@ fn readiness_and_ball_detection_follow_every_message() {
     assert!(events.iter().any(|e| matches!(
         e,
         DeviceEvent::StatusChange(StatusChange::Telemetry(p))
-            if p.get("ball_detected") == Some(&Some("true".into()))
+            if p.get("ball_detected") == Some(&"true".into())
     )));
     assert_eq!(link.exchange(READY), [OK_HEARTBEAT]);
     assert!(

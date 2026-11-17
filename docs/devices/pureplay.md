@@ -129,7 +129,8 @@ shots have no game golfer.
 
 ## The card
 
-Connected, the card shows (each row only while it has a value):
+Connected, the card shows (a row with no value reads `none`; `missed_events`
+`0`, `pureplay` `unknown`):
 
 | Row | What it is |
 |---|---|
