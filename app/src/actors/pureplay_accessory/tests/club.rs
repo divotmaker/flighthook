@@ -454,40 +454,21 @@ fn not_ready_puts_the_pick_back_until_pureplay_is_ready() {
     rig.card.stop();
 }
 
-/// Every refusal drops the pick and puts Pureplay's club back on the bus;
-/// so does a club not in the bag and a command left unanswered.
-/// `forbidden_scope` also turns club out off.
+/// A refusal puts Pureplay's club back on the bus, and `forbidden_scope`
+/// shows club out off until a readiness lets apps steer again; a command
+/// left unanswered puts it back too. (Which refusals drop a pick is
+/// `club_out`'s.)
 #[test]
-fn every_failure_puts_pureplays_club_back() {
-    for code in [
-        "forbidden_scope",
-        "not_allowed",
-        "bad_request",
-        "unknown_command",
-    ] {
-        let mut rig = Rig::new();
-        rig.pick(Club::Iron8);
-        let cmd = rig.peer.command();
-        rig.refuse(&cmd, code, &json!({}));
-        rig.snaps_back_to(Club::Iron7);
-        if code == "forbidden_scope" {
-            rig.card
-                .shows_row(ActorStatus::Connected, "club_out", "off in Pureplay");
-            rig.pick(Club::Driver);
-            rig.snaps_back_to(Club::Iron7);
-            rig.no_command("club out is off");
-            // The switch on again: a readiness that lets apps steer.
-            rig.ready(&readiness("shot-2", true, &["club.set"], &[]));
-            rig.card.shows_row(ActorStatus::Connected, "club_out", "on");
-            rig.pick(Club::Driver);
-            assert_eq!(rig.peer.command()["data"]["clubId"], "b-dr");
-        }
-        rig.card.stop();
-    }
+fn a_refusal_and_an_unanswered_command_put_pureplays_club_back() {
     let mut rig = Rig::new();
-    rig.pick(Club::PitchingWedge);
+    rig.pick(Club::Iron8);
+    let cmd = rig.peer.command();
+    rig.refuse(&cmd, "forbidden_scope", &json!({}));
     rig.snaps_back_to(Club::Iron7);
-    rig.no_command("not in the bag");
+    rig.card
+        .shows_row(ActorStatus::Connected, "club_out", "off in Pureplay");
+    rig.ready(&readiness("shot-2", true, &["club.set"], &[]));
+    rig.card.shows_row(ActorStatus::Connected, "club_out", "on");
     rig.pick(Club::Iron8);
     let started = Instant::now();
     let _unanswered = rig.peer.command();

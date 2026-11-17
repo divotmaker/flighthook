@@ -1194,4 +1194,40 @@ mod tests {
             assert!(!out.holds_club(), "{case}");
         }
     }
+
+    /// Every refusal but `not_ready` and `rate_limited` drops the pick, and
+    /// so does a type the bag does not hold. `forbidden_scope` also turns
+    /// club out off, until a readiness lets apps steer the shot again.
+    #[test]
+    fn every_failure_drops_the_pick_and_forbidden_scope_turns_club_out_off() {
+        for code in [
+            "forbidden_scope",
+            "not_allowed",
+            "bad_request",
+            "unknown_command",
+        ] {
+            let mut model = model_with(bag(), "Iron7", ready());
+            let mut out = linked(&["club.set"]);
+            let now = Instant::now();
+            assert_eq!(sent(&out.pick(Club::SandWedge, &model, now)).len(), 1);
+            let acts = out
+                .reply(&refused(1, json!({ "code": code })), &mut model, now)
+                .expect("ours");
+            assert_eq!(acts, [Action::SnapBack], "{code}");
+            assert!(!out.holds_club(), "{code}");
+            if code == "forbidden_scope" {
+                assert_eq!(out.state(&model), State::Off);
+                assert_eq!(out.pick(Club::Driver, &model, now), [Action::SnapBack]);
+                ready_changed(&mut out, &mut model, ready());
+                assert_eq!(out.state(&model), State::On);
+                assert_eq!(sent(&out.pick(Club::Driver, &model, now)).len(), 1);
+            } else {
+                assert_eq!(out.state(&model), State::On, "{code}");
+            }
+        }
+        let model = model_with(bag(), "Iron7", ready());
+        let mut out = linked(&["club.set"]);
+        let acts = out.pick(Club::PitchingWedge, &model, Instant::now());
+        assert_eq!(acts, [Action::SnapBack], "not in the bag");
+    }
 }
