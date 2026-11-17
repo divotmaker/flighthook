@@ -877,11 +877,11 @@ mod tests {
             impact.vertical,
             Some(flighthook::Distance::Millimeters(2.25))
         );
-        let shot = crate::actors::simout::OutputShot {
+        let shot = flighthook_openconnect::client::OutputShot {
             launch: Some(launch.clone()),
             impact: Some(impact.clone()),
             source: Some(ShotSource::Square.provenance()),
-            ..crate::actors::simout::OutputShot::default()
+            ..flighthook_openconnect::client::OutputShot::default()
         };
         assert!(
             flighthook_pureplay::connect::sends(true, shot.source),

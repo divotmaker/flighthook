@@ -10,7 +10,7 @@ fn gspro_sections_read_as_openconnect_client() {
     .expect("parse");
     let s = &c.openconnect_client["1"];
     assert_eq!(s.name, "Bay");
-    assert_eq!(s.address.as_deref(), Some("10.0.0.5:921"));
+    assert_eq!(s.driver.address.as_deref(), Some("10.0.0.5:921"));
     assert_eq!(s.full_monitor.as_deref(), Some("mevo.0"));
     assert!(c.has_user_actors());
 }
@@ -146,7 +146,10 @@ fn every_field() -> FlighthookConfig {
         }),
         openconnect_client: one(OpenConnectClientSection {
             name: "Muni Golf".into(),
-            address: Some("127.0.0.1:9210".into()),
+            driver: crate::OpenConnectClientConfig {
+                address: Some("127.0.0.1:9210".into()),
+                ..Default::default()
+            },
             full_monitor: Some("openconnect_server.3".into()),
             ..OpenConnectClientSection::default()
         }),
@@ -209,7 +212,10 @@ fn gspro_sections_join_every_other_field() {
             putting_clubs: crate::default_putting_clubs(),
             name: "Bay".into(),
             enabled: true,
-            address: Some("10.0.0.5:921".into()),
+            driver: crate::OpenConnectClientConfig {
+                address: Some("10.0.0.5:921".into()),
+                ..Default::default()
+            },
             full_monitor: None,
             chipping_monitor: None,
             putting_monitor: None,

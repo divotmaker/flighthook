@@ -79,10 +79,10 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use crate::actors::simout::OutputShot;
     use flighthook::{
         ActorStatus, ClubData, ExPuttConfig, Handedness, Launch, Mode, Severity, ShotRaw, Velocity,
     };
+    use flighthook_openconnect::client::OutputShot;
     use flightrelay::config::{ConfigError, DriverConfig};
     use flightrelay::driver::{
         Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
@@ -98,11 +98,11 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
-    use crate::actors::gspro::mapper::map_shot;
     use crate::actors::scripted::Handoff;
     use crate::actors::{Actor, ReconfigureOutcome};
     use crate::bus::BusSender;
     use crate::state::{SessionWriter, SystemState};
+    use flighthook_openconnect::client::mapper::map_shot;
 
     /// Longest any test waits for one thing.
     const WAIT: Duration = crate::actors::GIVE_UP;

@@ -842,7 +842,7 @@ fn both_921_entries_add_one_open_connect_card() {
         let config = app.settings.to_request();
         assert_eq!(config.openconnect_client["0"].name, "Open Connect");
         assert_eq!(
-            config.openconnect_client["0"].address.as_deref(),
+            config.openconnect_client["0"].driver.address.as_deref(),
             Some("127.0.0.1:921")
         );
         assert!(config.pureplay.is_empty());
@@ -860,7 +860,10 @@ fn app_with_open_connect() -> FlighthookApp {
             name: "Open Connect".into(),
             enabled: true,
             actor_id: None,
-            address: Some("127.0.0.1:921".into()),
+            driver: flighthook::OpenConnectClientConfig {
+                address: Some("127.0.0.1:921".into()),
+                ..Default::default()
+            },
             full_monitor: None,
             chipping_monitor: None,
             putting_monitor: None,
@@ -1023,7 +1026,7 @@ fn a_duplicate_can_be_turned_on_after_moving_to_a_free_address() {
     let _ = screen.click_mark(&mut app, &marks, &format!("save:{id}"));
     let posted = app.settings.posted().expect("a save is out").1.clone();
     assert_eq!(
-        posted.openconnect_client["1"].address.as_deref(),
+        posted.openconnect_client["1"].driver.address.as_deref(),
         Some("127.0.0.1:9210")
     );
     assert!(!posted.openconnect_client["1"].enabled, "still off");
@@ -1059,7 +1062,7 @@ fn editing_an_address_onto_a_held_one_saves_the_card_off() {
     assert_eq!(*target, SaveTarget::Actor(id.into()));
     assert!(!posted.openconnect_client["1"].enabled, "saved off");
     assert_eq!(
-        posted.openconnect_client["1"].address.as_deref(),
+        posted.openconnect_client["1"].driver.address.as_deref(),
         Some("127.0.0.1:921")
     );
     assert!(posted.openconnect_client["0"].enabled, "the holder is on");
@@ -3662,7 +3665,10 @@ fn app_with_every_card() -> FlighthookApp {
         "0".into(),
         flighthook::OpenConnectClientSection {
             name: "GSPro".into(),
-            address: Some("127.0.0.1:921".into()),
+            driver: flighthook::OpenConnectClientConfig {
+                address: Some("127.0.0.1:921".into()),
+                ..Default::default()
+            },
             ..Default::default()
         },
     );

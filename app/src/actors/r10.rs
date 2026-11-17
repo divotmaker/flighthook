@@ -446,10 +446,10 @@ mod tests {
         assert_eq!(components.total_spin_rpm, launch.total_spin_rpm);
         assert!((components.spin_axis.expect("axis") + 5.0).abs() < 0.05);
 
-        let shot = crate::actors::simout::OutputShot {
+        let shot = flighthook_openconnect::client::OutputShot {
             launch: Some(launch.clone()),
             source: Some(ShotSource::R10.provenance()),
-            ..crate::actors::simout::OutputShot::default()
+            ..flighthook_openconnect::client::OutputShot::default()
         };
         assert!(
             flighthook_pureplay::connect::sends(true, shot.source),

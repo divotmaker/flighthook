@@ -734,16 +734,17 @@ mod tests {
     /// which a simulator output never writes.
     #[test]
     fn a_missed_read_reaches_no_output() {
-        use crate::actors::gspro::GsProRouting;
-        use crate::actors::simout::{Feed, FeedEvent};
         let seen = first_wire_shot(Model::Xi, section(Model::Xi), Shot::xi_no_read());
-        let mut feed = Feed::new(GsProRouting::default(), None);
-        let events: Vec<FeedEvent> = seen.iter().filter_map(|m| feed.handle(m)).collect();
-        assert!(
-            matches!(events.last(), Some(FeedEvent::NoData(_))),
-            "{events:?}"
-        );
-        assert!(!events.iter().any(|e| matches!(e, FeedEvent::Shot(_))));
+        let mut shots = flightrelay::ShotAggregator::new();
+        let shot = seen
+            .iter()
+            .filter_map(crate::bus::BusMsg::as_frp)
+            .find_map(|m| match shots.feed(m) {
+                Some(flightrelay::ShotEvent::Finished(shot)) => Some(shot),
+                _ => None,
+            })
+            .expect("the shot finishes");
+        assert!(!flighthook_openconnect::client::output_shot(&shot, "mevo.0").has_data());
     }
 
     /// Every output's numbers for a Mevo+ and an Xi full swing (through the

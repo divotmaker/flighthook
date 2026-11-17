@@ -2,14 +2,13 @@
 //! Connect output) share: the shots and readiness they take from the bus,
 //! and the turn they hold for the simulator.
 //!
-//! - [`Feed`] composes each shot with the SDK's [`ShotAggregator`] (fed
-//!   only flighthook's own `golfer.turn`) and lets a finished shot through
-//!   when its launch monitor is the one routed for the mode of flighthook's
-//!   turn as the shot finishes. Routing names launch monitors by actor id;
-//!   Auto-chip always passes; a game's launch monitor (the Pureplay
-//!   Accessory card, any actor holding `game`) never does. Readiness is the
-//!   routed launch monitor's `bus.actor` with no blockers (under "Any": any
-//!   launch monitor that may feed a simulator).
+//! - [`Feed`] follows flighthook's turn (its own `golfer.turn` only) and
+//!   the launch monitors' `bus.actor`s, and lets a shot's `shot.finished`
+//!   through when its launch monitor is the one routed ([`Routing`]) for
+//!   the mode of flighthook's turn as the shot finishes. Routing names
+//!   launch monitors by actor id; Auto-chip always passes; a game's launch
+//!   monitor (the Pureplay Accessory card, any actor holding `game`) never
+//!   does.
 //! - [`RoutedView`] is what a software output's session sees of the launch
 //!   monitors: the `bus.actor` of each one the [`Feed`] stands for in the
 //!   current mode, and its removal when it leaves that view.
@@ -25,35 +24,29 @@ use std::sync::Arc;
 
 use flightrelay::types::roles;
 use flightrelay::{
-    BusActor, CompletedShot, FrpBody, FrpMessage, GolferSelect, GolferTurn, Handedness, Removal,
-    ShotAggregator, ShotEvent, StateKind,
+    BusActor, FrpBody, FrpMessage, GolferSelect, GolferTurn, Handedness, Removal, StateKind,
 };
 
-use super::gspro::GsProRouting;
 use super::provenance::ShotSource;
 use crate::bus::BusMsg;
 use crate::state::SystemState;
 use flighthook::{Club, Mode, SHOT_TIMEOUT};
-use flighthook::{ClubData, FaceImpact, FlightResult, Launch, Source};
 
-/// A finished shot an output takes.
-#[derive(Debug, Clone)]
-pub(crate) struct FinishedShot {
-    pub shot: CompletedShot,
+/// A simulator output's launch monitor for each mode, by actor id; `None`
+/// takes any.
+#[derive(Debug, Clone, Default)]
+pub struct Routing {
+    pub full_monitor: Option<String>,
+    pub chipping_monitor: Option<String>,
+    pub putting_monitor: Option<String>,
 }
 
 /// What a message on the bus meant for an output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeedEvent {
-    /// A shot finished whose launch monitor the routing passes in the
-    /// current mode.
-    Shot(FinishedShot),
-    /// A shot finished that the routing does not pass (for the log).
-    Skipped(CompletedShot),
-    /// A routed shot finished with no data an output sends: no launch,
-    /// club or impact, and no flight of its own launch monitor (a missed
-    /// read). Outputs never write it.
-    NoData(CompletedShot),
+    /// A shot's `shot.finished` from its launch monitor, which the routing
+    /// passes in the current mode.
+    Finished,
     /// flighthook's turn changed, with its cause.
     Turn,
     /// A part of a shot before its finish (trigger, launch, club, impact, or
@@ -128,29 +121,26 @@ impl ShotOwners {
     }
 }
 
-/// Shots and readiness from the bus for one simulator output.
+/// Shots and launch monitors from the bus for one simulator output.
 pub(crate) struct Feed {
-    pub routing: GsProRouting,
+    pub routing: Routing,
     state: Option<Arc<SystemState>>,
     /// flighthook's actor id: only its turn counts.
     session: String,
     /// Auto-chip's actor id.
     auto_chip: String,
-    shots: ShotAggregator,
     owners: ShotOwners,
     /// flighthook's turn and the actor that caused it.
     pub turn: Option<(GolferTurn, Option<String>)>,
     /// Every launch monitor's `bus.actor`, by actor id.
     monitors: HashMap<String, BusActor>,
-    /// Readiness may have changed since it was last taken.
-    pub readiness_changed: bool,
 }
 
 impl Feed {
     /// A feed with `routing`, reading the app's state (`None` in tests that
     /// run without one: flighthook's actor is `flighthook`, Auto-chip's
     /// `autochip`).
-    pub(crate) fn new(routing: GsProRouting, state: Option<Arc<SystemState>>) -> Self {
+    pub(crate) fn new(routing: Routing, state: Option<Arc<SystemState>>) -> Self {
         let (session, auto_chip) = match &state {
             Some(s) => (s.flighthook_id(), s.auto_chip_id()),
             None => ("flighthook".into(), "autochip".into()),
@@ -160,11 +150,9 @@ impl Feed {
             state,
             session,
             auto_chip,
-            shots: ShotAggregator::new().with_timeout(SHOT_TIMEOUT),
             owners: ShotOwners::default(),
             turn: None,
             monitors: HashMap::new(),
-            readiness_changed: false,
         }
     }
 
@@ -226,13 +214,6 @@ impl Feed {
         self.monitors.get(actor)
     }
 
-    /// Whether the simulator is told a launch monitor is ready in the
-    /// current mode: one in view ([`in_view`](Self::in_view)) has no
-    /// blockers.
-    pub(crate) fn ready(&self) -> bool {
-        self.in_view().values().any(BusActor::is_clear)
-    }
-
     /// The launch monitors the output stands for in the current mode, by
     /// actor id: the routed one, or under "Any" every one that may feed a
     /// simulator; never Auto-chip, which is no readiness.
@@ -265,13 +246,10 @@ impl Feed {
         }
     }
 
-    /// The remote actor `actor` is gone: its `bus.actor` and its open
-    /// shots are forgotten, as on its `bus.actor` removal.
+    /// The remote actor `actor` is gone: its `bus.actor` is forgotten, as
+    /// on its `bus.actor` removal.
     fn forget_actor(&mut self, actor: &str) {
-        if self.monitors.remove(actor).is_some() {
-            self.readiness_changed = true;
-        }
-        self.shots.forget_actor(actor);
+        self.monitors.remove(actor);
         self.owners.forget_actor(actor);
     }
 
@@ -291,41 +269,28 @@ impl Feed {
                 if msg.from != self.session {
                     return None;
                 }
-                self.shots.feed(msg);
                 self.turn = Some((turn.clone(), cause.clone()));
-                self.readiness_changed = true;
                 return Some(FeedEvent::Turn);
             }
-            FrpBody::PracticeBlock(_) if msg.from != self.session => return None,
             FrpBody::BusActor(actor) => {
                 if actor.has_role(roles::LAUNCH_MONITOR) {
                     self.monitors.insert(msg.from.clone(), actor.clone());
-                    self.readiness_changed = true;
                 }
             }
             FrpBody::Removed(Removal {
                 kind: StateKind::BusActor,
                 ..
             }) => {
-                if self.monitors.remove(&msg.from).is_some() {
-                    self.readiness_changed = true;
-                }
+                self.monitors.remove(&msg.from);
+            }
+            FrpBody::ShotFinished(_) => {
+                return self
+                    .passes(&msg.from, self.mode())
+                    .then_some(FeedEvent::Finished);
             }
             _ => {}
         }
-        let part = self.is_part(msg);
-        match self.shots.feed(msg) {
-            Some(ShotEvent::Finished(shot)) => {
-                if !self.passes(&shot.from, self.mode()) {
-                    Some(FeedEvent::Skipped(shot))
-                } else if output_shot(&shot, "", &self.auto_chip).has_data() {
-                    Some(FeedEvent::Shot(FinishedShot { shot }))
-                } else {
-                    Some(FeedEvent::NoData(shot))
-                }
-            }
-            _ => part.then_some(FeedEvent::Part),
-        }
+        self.is_part(msg).then_some(FeedEvent::Part)
     }
 }
 
@@ -360,59 +325,6 @@ impl RoutedView {
     /// A new session: it has been handed nothing yet.
     pub(crate) fn clear(&mut self) {
         self.shown.clear();
-    }
-}
-
-/// A shot as a simulator output sends it: the launch, the launch
-/// monitor's own flight, club and impact, numbered by the launch monitor.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct OutputShot {
-    /// The launch monitor's card name, for the log.
-    pub actor: String,
-    pub shot_number: u32,
-    pub shot_id: Option<String>,
-    pub launch: Option<Launch>,
-    /// The launch monitor's own flight result.
-    pub flight: Option<FlightResult>,
-    pub club: Option<ClubData>,
-    pub impact: Option<FaceImpact>,
-    /// What stands behind the shot, from the launch monitor's `bus.actor`.
-    pub source: Option<Source>,
-}
-
-impl OutputShot {
-    /// True when the shot carries launch, flight, club or impact data.
-    #[must_use]
-    pub fn has_data(&self) -> bool {
-        self.launch.is_some()
-            || self.flight.is_some()
-            || self.club.is_some()
-            || self.impact.is_some()
-    }
-}
-
-/// The shot a simulator output sends outside strict mode: the
-/// launch for a receiver that flies the ball itself (measured values,
-/// filled from the launch monitor's own flight's `assumed`), the launch
-/// monitor's own flight (not Auto-chip's, `auto_chip`; never a flight
-/// model's), club and impact. `card` names the launch monitor in the log.
-pub(crate) fn output_shot(shot: &CompletedShot, card: &str, auto_chip: &str) -> OutputShot {
-    OutputShot {
-        actor: card.to_owned(),
-        shot_number: shot.key.shot_number,
-        shot_id: Some(shot.key.shot_id.clone()),
-        launch: shot.launch_for_flight(),
-        flight: (shot.from != auto_chip)
-            .then(|| {
-                shot.flights
-                    .iter()
-                    .find(|f| f.from == shot.from)
-                    .map(|f| f.flight.clone())
-            })
-            .flatten(),
-        club: shot.club.clone(),
-        impact: shot.impact.clone(),
-        source: shot.source,
     }
 }
 
@@ -513,7 +425,7 @@ mod tests {
     /// silent is gone (the system actor's tracker announces it).
     #[test]
     fn readiness_drops_when_a_silent_remote_monitor_is_gone() {
-        let mut feed = Feed::new(GsProRouting::default(), None);
+        let mut feed = Feed::new(Routing::default(), None);
         let mut remotes = crate::state::remotes::Remotes::new();
         let t0 = std::time::Instant::now();
         let msg = remote(ready_monitor(), "aaaa000000000001");
@@ -521,28 +433,28 @@ mod tests {
             remotes.hear(frp, t0);
         }
         feed.handle(&msg);
-        assert!(feed.ready());
+        assert!(feed.in_view().values().any(BusActor::is_clear));
         // Its program died: no removal, only silence.
         let gone = remotes.expire(t0 + std::time::Duration::from_secs(7));
         assert_eq!(gone, ["aaaa000000000001"]);
-        feed.readiness_changed = false;
         for actor in gone {
             feed.handle(&BusMsg::local(
                 "system",
                 crate::bus::LocalEvent::ActorGone { actor },
             ));
         }
-        assert!(feed.readiness_changed);
-        assert!(!feed.ready());
+        assert!(feed.in_view().is_empty());
         assert!(feed.monitor("aaaa000000000001").is_none());
     }
 
     /// A shot's launch, club, impact and finish come from its launch
-    /// monitor alone; another actor's are dropped, its flight is kept.
+    /// monitor alone: another actor's are dropped, and so is a flight
+    /// model's flight; the launch monitor's own flight is a part.
     #[test]
     fn only_the_shots_launch_monitor_sends_its_parts() {
+        use flighthook::{FlightResult, Launch};
         use flightrelay::{ShotFinished, ShotFlight, ShotKey, ShotLaunch, ShotTrigger};
-        let mut feed = Feed::new(GsProRouting::default(), None);
+        let mut feed = Feed::new(Routing::default(), None);
         let key = ShotKey::new("s1", 1);
         let launch = |mps: f64| ShotLaunch {
             key: key.clone(),
@@ -552,29 +464,39 @@ mod tests {
             },
         };
         feed.handle(&remote(ready_monitor(), "lm"));
-        feed.handle(&remote(ShotTrigger::new(key.clone()), "lm"));
-        feed.handle(&remote(launch(99.0), "intruder"));
-        feed.handle(&remote(ShotTrigger::new(key.clone()), "intruder"));
+        assert_eq!(
+            feed.handle(&remote(ShotTrigger::new(key.clone()), "lm")),
+            Some(FeedEvent::Part)
+        );
+        assert_eq!(feed.handle(&remote(launch(99.0), "intruder")), None);
+        assert_eq!(
+            feed.handle(&remote(ShotTrigger::new(key.clone()), "intruder")),
+            None
+        );
         assert!(
             feed.handle(&remote(ShotFinished { key: key.clone() }, "intruder"))
                 .is_none(),
             "only the launch monitor finishes its shot"
         );
-        feed.handle(&remote(launch(50.0), "lm"));
-        feed.handle(&remote(
-            ShotFlight {
-                key: key.clone(),
-                flight: FlightResult::new(flightrelay::Basis::Modeled),
-            },
-            "model",
-        ));
-        let Some(FeedEvent::Shot(done)) = feed.handle(&remote(ShotFinished { key }, "lm")) else {
-            panic!("the launch monitor's finish lets the shot through");
-        };
         assert_eq!(
-            done.shot.launch.as_ref().and_then(|l| l.launch_speed),
-            Some(flighthook::Velocity::MetersPerSecond(50.0))
+            feed.handle(&remote(launch(50.0), "lm")),
+            Some(FeedEvent::Part)
         );
-        assert!(done.shot.flights.iter().any(|f| f.from == "model"));
+        let flight = |from: &str| {
+            remote(
+                ShotFlight {
+                    key: key.clone(),
+                    flight: FlightResult::new(flightrelay::Basis::Modeled),
+                },
+                from,
+            )
+        };
+        assert_eq!(feed.handle(&flight("model")), None);
+        assert_eq!(feed.handle(&flight("lm")), Some(FeedEvent::Part));
+        assert_eq!(
+            feed.handle(&remote(ShotFinished { key }, "lm")),
+            Some(FeedEvent::Finished),
+            "the launch monitor's finish lets the shot through"
+        );
     }
 }

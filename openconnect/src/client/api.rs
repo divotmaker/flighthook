@@ -1,17 +1,16 @@
 //! GSPro Open Connect V1 JSON types.
 //!
-//! These types are used in both directions. The `openconnect_client` actor
-//! is a *client*: it sends [`GsProMessage`] and receives [`GsProResponse`].
-//! The `openconnect_server` actor is a *server*: it receives [`GsProMessage`]
-//! from a launch monitor and sends [`GsProResponse`] back. Every type therefore
+//! These types are used in both directions. An Open Connect *client* (the
+//! [client driver](super)) sends [`GsProMessage`] and receives
+//! [`GsProResponse`]; an Open Connect *server* receives [`GsProMessage`] from
+//! a launch monitor and sends [`GsProResponse`] back. Every type therefore
 //! derives both `Serialize` and `Deserialize`.
 //!
 //! Inbound messages come from third-party launch monitors that populate the
 //! schema unevenly, so the optional sub-objects default rather than failing
 //! the parse. Only `DeviceID` and `ShotNumber` are treated as required.
 
-use flighthook::ClubExt;
-use flighthook::{Club, Handedness};
+use flightrelay::{Club, Handedness};
 use serde::{Deserialize, Serialize};
 
 /// Top-level Open Connect message: flighthook -> GSPro, or launch monitor ->
@@ -136,10 +135,66 @@ impl GsProResponse {
             message: "GSPro Player Information".into(),
             player: Some(PlayerInfo {
                 handed: handed.map(|h| hand_code(h).to_string()),
-                club: club.map(|c| c.gspro_code().to_string()),
+                club: club.map(|c| club_code(c).to_string()),
             }),
         }
     }
+}
+
+/// GSPro's letter-first code for `club` (`DR`, `W3`, `H4`, `I7`, `PW`,
+/// `PT`). GSPro has no mini driver, so the mini driver is `DR`.
+#[must_use]
+pub fn club_code(club: Club) -> &'static str {
+    match club {
+        Club::Driver | Club::MiniDriver => "DR",
+        Club::Wood2 => "W2",
+        Club::Wood3 => "W3",
+        Club::Wood4 => "W4",
+        Club::Wood5 => "W5",
+        Club::Wood6 => "W6",
+        Club::Wood7 => "W7",
+        Club::Wood8 => "W8",
+        Club::Wood9 => "W9",
+        Club::Hybrid1 => "H1",
+        Club::Hybrid2 => "H2",
+        Club::Hybrid3 => "H3",
+        Club::Hybrid4 => "H4",
+        Club::Hybrid5 => "H5",
+        Club::Hybrid6 => "H6",
+        Club::Hybrid7 => "H7",
+        Club::Hybrid8 => "H8",
+        Club::Hybrid9 => "H9",
+        Club::Iron1 => "I1",
+        Club::Iron2 => "I2",
+        Club::Iron3 => "I3",
+        Club::Iron4 => "I4",
+        Club::Iron5 => "I5",
+        Club::Iron6 => "I6",
+        Club::Iron7 => "I7",
+        Club::Iron8 => "I8",
+        Club::Iron9 => "I9",
+        Club::PitchingWedge => "PW",
+        Club::GapWedge => "GW",
+        Club::SandWedge => "SW",
+        Club::LobWedge => "LW",
+        Club::Putter => "PT",
+        // A club code newer than this table: the driver, as for the mini
+        // driver.
+        _ => "DR",
+    }
+}
+
+/// The club for a GSPro club code, case-insensitively and ignoring
+/// surrounding whitespace: GSPro's letter-first code ([`club_code`]) or the
+/// FRP code (`7I`). `None` for any other.
+#[must_use]
+pub fn club_from_code(code: &str) -> Option<Club> {
+    let code = code.trim().to_ascii_uppercase();
+    Club::ALL
+        .iter()
+        .copied()
+        .find(|&c| c != Club::MiniDriver && club_code(c) == code)
+        .or_else(|| code.parse().ok())
 }
 
 /// GSPro's code for a hand: `RH` or `LH`.

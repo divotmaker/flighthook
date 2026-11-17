@@ -2180,7 +2180,7 @@ full_monitor = "mevo.0"
         let c = cfg.snapshot();
         let client = &c.openconnect_client["0"];
         assert_eq!(client.name, "Bay GSPro");
-        assert_eq!(client.address.as_deref(), Some("192.168.1.20:921"));
+        assert_eq!(client.driver.address.as_deref(), Some("192.168.1.20:921"));
         let routed = client.full_monitor.as_deref().expect("routed");
         assert_eq!(c.card_of_actor(routed).as_deref(), Some("mevo.0"));
         assert_eq!(c.mevo["0"].name, "Mevo+");
@@ -3175,7 +3175,7 @@ name = "new 1"
         names.sort_unstable();
         assert_eq!(names, [("0", "new 0"), ("1", "new 1"), ("2", "old 2")]);
         assert_eq!(
-            c.openconnect_client["2"].address.as_deref(),
+            c.openconnect_client["2"].driver.address.as_deref(),
             Some("127.0.0.1:9210")
         );
         // The collision is what `load` warns about.

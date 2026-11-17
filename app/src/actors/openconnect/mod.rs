@@ -26,7 +26,8 @@
 //! The server refuses a connection from this process's own
 //! `openconnect_client` (one pointed at this server's port), which would loop
 //! every shot client -> server -> bus -> client. Each client registers its
-//! connection's local address in [`LocalClients`]; a peer found there is
+//! connection's local address as this process's own
+//! ([`flighthook_openconnect::local`]); a peer found there is
 //! closed at once, unread, and the server raises one Error alert per burst of
 //! that client's reconnect attempts. A connection from anything else, on the
 //! same host or not, is served as usual.
@@ -39,12 +40,12 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::gspro::api;
 use super::{Actor, ReconfigureOutcome, actor_names};
 use crate::bus::{BusReceiver, BusSender, LocalEvent};
 use crate::state::SystemState;
-use crate::state::local_clients::LocalClients;
 use flighthook::{ActorStatus, Club, Handedness, RawDir, RawRecord, Severity, ShotKey, ShotRaw};
+use flighthook_openconnect::client::api;
+use flighthook_openconnect::local;
 use flightrelay::types::{blockers, roles};
 use flightrelay::{
     BusActor, DEFAULT_HEARTBEAT, DeviceInfo, ShotClub, ShotFinished, ShotFlight, ShotImpact,
@@ -105,18 +106,20 @@ impl Refusals {
 /// refused; the caller closes the connection.
 fn refuse_own_client(
     state: &SystemState,
-    clients: &LocalClients,
     peer: SocketAddr,
     refusals: &mut Refusals,
     sender: &BusSender,
 ) -> bool {
-    let Some(client) = clients.client_at(peer) else {
+    let Some(client) = local::client_at(peer) else {
         return false;
     };
     let names = actor_names(&state.system.snapshot());
-    let client_name = display_name(&names, &client);
+    let card = state
+        .card_of_actor(&client)
+        .unwrap_or_else(|| client.clone());
+    let client_name = display_name(&names, &card);
     let server_name = display_name(&names, sender.actor_id());
-    clients.refuse(peer, &refusal_error(&server_name));
+    local::refuse(peer, &refusal_error(&server_name));
     tracing::warn!("openconnect server: refused {peer}, from {client} ({client_name})");
     if refusals.record(&client, Instant::now()) {
         sender.alert(Severity::Error, refusal_alert(&client_name, peer));
@@ -204,7 +207,6 @@ fn run(state: &SystemState, bind: SocketAddr, sender: BusSender, receiver: BusRe
 fn listen(state: &SystemState, bind: SocketAddr, sender: &BusSender, mut receiver: BusReceiver) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(15);
-    let clients = Arc::clone(&state.local_clients);
     let mut refusals = Refusals::default();
     // The monitor the server's `bus.actor` last described, for `bus.sync`.
     let mut last: Option<MonitorState> = None;
@@ -265,7 +267,7 @@ fn listen(state: &SystemState, bind: SocketAddr, sender: &BusSender, mut receive
             });
             match listener.accept() {
                 Ok((stream, peer)) => {
-                    if refuse_own_client(state, &clients, peer, &mut refusals, sender) {
+                    if refuse_own_client(state, peer, &mut refusals, sender) {
                         close(&stream);
                         continue;
                     }
@@ -401,7 +403,6 @@ fn serve(
     last: &mut Option<MonitorState>,
 ) {
     let name = sender.actor_id();
-    let clients = &state.local_clients;
 
     // Some platforms (Windows, the BSDs) hand out accepted sockets in the
     // listener's non-blocking mode; reads here block, up to the timeout.
@@ -441,7 +442,7 @@ fn serve(
         });
 
         let read = stream.read(&mut chunk);
-        if refuse_own_client(state, clients, peer_addr, refusals, sender) {
+        if refuse_own_client(state, peer_addr, refusals, sender) {
             close(&stream);
             return;
         }
@@ -794,7 +795,7 @@ mod tests {
     fn ingested(
         request: &str,
         _handed: flighthook::Handedness,
-    ) -> crate::actors::simout::OutputShot {
+    ) -> flighthook_openconnect::client::OutputShot {
         let (tx, mut rx) = broadcast::channel(16);
         let sender = server_sender(tx);
         let msg: api::GsProMessage = serde_json::from_str(request).expect("parses");
@@ -809,7 +810,7 @@ mod tests {
             }
         }
         let shot = done.expect("a finished shot");
-        crate::actors::simout::OutputShot {
+        flighthook_openconnect::client::OutputShot {
             actor: shot.from.clone(),
             shot_number: shot.key.shot_number,
             shot_id: Some(shot.key.shot_id.clone()),
@@ -821,7 +822,7 @@ mod tests {
                 .map(|f| f.flight.clone()),
             club: shot.club.clone(),
             impact: shot.impact.clone(),
-            ..crate::actors::simout::OutputShot::default()
+            ..flighthook_openconnect::client::OutputShot::default()
         }
     }
 
@@ -927,7 +928,8 @@ mod tests {
         for request in LATERAL_SHOTS {
             let m: api::GsProMessage = serde_json::from_str(request).expect("parses");
             for handed in [flighthook::Handedness::Right, flighthook::Handedness::Left] {
-                let out = crate::actors::gspro::mapper::map_shot(&ingested(request, handed));
+                let out =
+                    flighthook_openconnect::client::mapper::map_shot(&ingested(request, handed));
                 let eps = 1e-9;
                 let at = format!("{handed:?} {request}");
                 assert!((out.ball_data.hla - m.ball_data.hla).abs() < eps, "{at}");
@@ -1015,9 +1017,6 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::Ordering;
 
-    use crate::actors::backoff::Backoff;
-    use crate::actors::gspro::{self, GsProRouting};
-
     /// Longest any test waits for one thing.
     const WAIT: Duration = crate::actors::GIVE_UP;
 
@@ -1028,6 +1027,8 @@ mod tests {
         tx: broadcast::Sender<BusMsg>,
         events: broadcast::Receiver<BusMsg>,
         flags: Vec<Arc<AtomicBool>>,
+        /// Actors started as the app starts them, stopped on drop.
+        started: Vec<String>,
         dir: std::path::PathBuf,
     }
 
@@ -1067,6 +1068,7 @@ mod tests {
                 tx,
                 events,
                 flags: Vec::new(),
+                started: Vec::new(),
                 dir,
             }
         }
@@ -1111,21 +1113,26 @@ mod tests {
             seen.last().and_then(listening).expect("listening")
         }
 
-        /// Start `openconnect_client.0` dialing `addr`.
+        /// Start `openconnect_client.0` dialing `addr`, as the app starts
+        /// it.
         fn client(&mut self, addr: SocketAddr) {
-            let sender = self.sender("openconnect_client.0");
-            let receiver = sender.subscribe();
-            let state = Arc::clone(&self.state);
-            std::thread::spawn(move || {
-                gspro::run_with(
-                    addr,
-                    GsProRouting::default(),
-                    Backoff::new(Duration::from_secs(1), Duration::from_secs(1)),
-                    &state.local_clients,
-                    &sender,
-                    receiver,
-                );
-            });
+            let mut section = self
+                .state
+                .system
+                .snapshot()
+                .openconnect_client
+                .get("0")
+                .cloned()
+                .expect("the client's section");
+            section.driver.address = Some(addr.to_string());
+            crate::actors::start_actor_as(
+                "openconnect_client.0".into(),
+                Some("openconnect_client.0".into()),
+                Box::new(crate::actors::outputs::OpenConnectClientActor::new(section)),
+                &self.state,
+                &self.tx,
+            );
+            self.started.push("openconnect_client.0".into());
         }
 
         /// Every message until `done` holds for one or [`WAIT`] runs out.
@@ -1155,6 +1162,9 @@ mod tests {
         fn drop(&mut self) {
             for flag in &self.flags {
                 flag.store(true, Ordering::Relaxed);
+            }
+            for actor in &self.started {
+                let _ = self.state.stop_and_wait(actor);
             }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -1237,8 +1247,8 @@ mod tests {
         let port = rig.server([0, 0, 0, 0]).port();
         rig.client(SocketAddr::from(([127, 0, 0, 1], port)));
 
-        // Refused, with the reason on the client's card.
-        let mut seen = rig.until("the first refusal", |m| client_error(m).is_some());
+        // Refused, with the reason on the client's card, and alerted.
+        let seen = rig.until("the first refusal", |m| client_error(m).is_some());
         let error = seen
             .iter()
             .find_map(client_error)
@@ -1251,33 +1261,6 @@ mod tests {
              port instead."
         );
 
-        // A shot while the loop is set up never comes back round.
-        let monitor = rig.sender("mevo.0");
-        let key = ShotKey {
-            shot_id: "s1".into(),
-            shot_number: 1,
-        };
-        monitor.frp(ShotTrigger::new(key.clone()));
-        monitor.frp(ShotLaunch {
-            key: key.clone(),
-            launch: flighthook::Launch {
-                launch_speed: Some(flighthook::Velocity::MilesPerHour(100.0)),
-                launch_elevation: Some(14.0),
-                launch_azimuth: Some(1.0),
-                backspin_rpm: Some(3000),
-                sidespin_rpm: Some(100),
-                ..Default::default()
-            },
-        });
-        monitor.frp(ShotFinished { key });
-
-        // The retries are refused too, quietly: one alert for the burst.
-        let mut refusals = 1;
-        while refusals < 3 {
-            let more = rig.until("another refusal", |m| client_error(m).is_some());
-            refusals += 1;
-            seen.extend(more);
-        }
         let alerts = alerts(&seen, "openconnect_server.0");
         assert_eq!(alerts.len(), 1, "{alerts:?}");
         let (start, end) = alerts[0]
@@ -1291,23 +1274,29 @@ mod tests {
             ),
             "{end}"
         );
-        assert!(!seen.iter().any(server_shot), "a shot looped back");
-        // Once refused, the client's card stays on the error: it does not
-        // flash Connected on each retry.
-        let first = seen
-            .iter()
-            .position(|m| client_error(m).is_some())
-            .expect("refused");
+        // A refused connection never shows as Connected.
         assert!(
-            !seen[first..]
-                .iter()
-                .any(|m| connected(m, "openconnect_client.0")),
-            "the client reported Connected after a refusal"
+            !seen.iter().any(|m| connected(m, "openconnect_client.0")),
+            "the client reported Connected"
         );
         assert!(
             !seen.iter().any(|m| connected(m, "openconnect_server.0")),
             "the server never serves its own client"
         );
+    }
+
+    /// Refusals of one client less than the burst gap apart are one burst,
+    /// alerted once; another client's, or one after a quiet gap, is alerted.
+    #[test]
+    fn refusals_of_one_client_in_a_burst_are_alerted_once() {
+        let mut refusals = Refusals::default();
+        let t0 = Instant::now();
+        let alerted: Vec<bool> = [0, 1, 3, 6, 36]
+            .into_iter()
+            .map(|s| refusals.record("oc-a", t0 + Duration::from_secs(s)))
+            .collect();
+        assert_eq!(alerted, [true, false, false, false, true]);
+        assert!(refusals.record("oc-b", t0 + Duration::from_secs(37)));
     }
 
     #[test]

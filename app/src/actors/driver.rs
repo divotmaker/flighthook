@@ -1126,11 +1126,12 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         });
     }
 
-    /// A session connected as `identity`: Connected, with the card text and
-    /// the shot count (and the connect's `phase` removed, unless the driver
-    /// ended its connect on [`SESSION_PHASE`], which describes the session),
-    /// then the card's `bus.actor` with the device's identity and the status
-    /// the driver sent while connecting, before any shot.
+    /// A session connected as `identity`: Connected, with the card text and,
+    /// for a launch monitor, the shot count (and the connect's `phase`
+    /// removed, unless the driver ended its connect on [`SESSION_PHASE`],
+    /// which describes the session), then the card's `bus.actor` with the
+    /// device's identity and the status the driver sent while connecting,
+    /// before any shot.
     fn connected(&mut self, identity: &DeviceIdentity) {
         self.connecting = false;
         self.last_alert = None;
@@ -1152,10 +1153,10 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         } else {
             info!("{}: connected to {}", self.actor, identity.label());
         }
-        let mut telemetry = HashMap::from([
-            ("device_info".into(), identity.label()),
-            ("shot_count".into(), self.shot_count.to_string()),
-        ]);
+        let mut telemetry = HashMap::from([("device_info".into(), identity.label())]);
+        if self.info.roles.contains(&roles::LAUNCH_MONITOR) {
+            telemetry.insert("shot_count".into(), self.shot_count.to_string());
+        }
         self.end_connect_error(&mut telemetry);
         // An empty value removes the key: the phases were the connect's.
         match self.phase_shown.take() {
@@ -3614,6 +3615,30 @@ pub(crate) mod tests {
         keys_apart(&pureplay, &full);
         assert_eq!(
             driver_keys::<flighthook::PureplayConfig>(),
+            BTreeSet::from(["address".to_owned()])
+        );
+
+        let client = flighthook::OpenConnectClientSection {
+            name: "GSPro".into(),
+            actor_id: Some("out-2".into()),
+            enabled: false,
+            driver: flighthook::OpenConnectClientConfig::default(),
+            full_monitor: Some("lm-1".into()),
+            chipping_monitor: Some("lm-2".into()),
+            putting_monitor: Some("lm-3".into()),
+            chipping_clubs: vec![flighthook::Club::SandWedge],
+            putting_clubs: vec![flighthook::Club::Putter],
+        };
+        let full = flighthook::OpenConnectClientSection {
+            driver: flighthook::OpenConnectClientConfig {
+                address: Some("192.168.1.20:921".into()),
+                ..flighthook::OpenConnectClientConfig::default()
+            },
+            ..client.clone()
+        };
+        keys_apart(&client, &full);
+        assert_eq!(
+            driver_keys::<flighthook::OpenConnectClientConfig>(),
             BTreeSet::from(["address".to_owned()])
         );
 

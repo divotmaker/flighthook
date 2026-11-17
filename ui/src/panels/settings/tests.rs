@@ -591,7 +591,10 @@ fn an_open_connect_card_drops_clubs_its_pickers_do_not_offer() {
         "0".into(),
         flighthook::OpenConnectClientSection {
             name: "GSPro".into(),
-            address: Some("127.0.0.1:921".into()),
+            driver: flighthook::OpenConnectClientConfig {
+                address: Some("127.0.0.1:921".into()),
+                ..Default::default()
+            },
             chipping_clubs: vec![Club::SandWedge, Club::Iron9],
             putting_clubs: vec![Club::Putter, Club::Driver],
             ..flighthook::OpenConnectClientSection::default()

@@ -83,9 +83,10 @@ impl FlighthookApp {
                     self.remote_names
                         .insert(msg.from.clone(), actor.name.trim().to_owned());
                 }
-                // An output card's `bus.actor` only names it: no rows.
+                // An output card's own `bus.actor` only names it: no rows.
+                // Its driver's carries `device` and the session's rows.
                 if let Some(card) = self.card_keys.get(&msg.from)
-                    && !is_output_card(card)
+                    && (!is_output_card(card) || actor.device.is_some())
                     && let Some(status) = self.actors.get_mut(card)
                 {
                     for (k, v) in flighthook::bus_actor_rows(actor) {
@@ -785,7 +786,8 @@ mod tests {
         assert_eq!(app.log_entries[0].message_type, "card_status");
     }
 
-    /// An output card's `bus.actor` (no role) adds no rows to its card.
+    /// An output card's own `bus.actor` (no role, no device) adds no rows
+    /// to its card; its driver's (with `device`) adds the session's rows.
     #[test]
     fn an_output_cards_bus_actor_adds_no_rows() {
         let mut app = app();
@@ -800,6 +802,16 @@ mod tests {
             BusActor::new("GSPro", 2.0),
         ))));
         assert!(app.actors["openconnect_client.0"].telemetry.is_empty());
+        let mut hosted = BusActor::new("Open Connect", 2.0).with_device(Default::default());
+        hosted.telemetry = Some(std::collections::BTreeMap::from([(
+            "monitor_ready".to_owned(),
+            "true".to_owned(),
+        )]));
+        app.handle_ui_message(UiMessage::Frp(Box::new(FrpMessage::new("gs1", hosted))));
+        assert_eq!(
+            app.actors["openconnect_client.0"].telemetry["monitor_ready"],
+            "true"
+        );
     }
 }
 

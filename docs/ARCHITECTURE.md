@@ -819,8 +819,8 @@ each key through one of them only.
   connection: a status enum and the card's display rows. Standard keys:
   `device_info`; launch monitors on a device driver add `shot_count` and, while
   a driver reports one, `phase`; integration cards add `club`, `handed`,
-  `name`, `error`. Open Connect clients add `address`, `last_shot`,
-  `shots_sent`, `monitor_ready`, `response` (see
+  `name`, `error`. Open Connect clients add `last_shot`, `shots_sent`,
+  `monitor_ready`, `response` (see
   [Open Connect client telemetry](#open-connect-client-telemetry)); Pureplay
   outputs add `last_shot`, `shots_sent`, `ready_state`, `strict_mode` (see
   [Pureplay output](#pureplay-output-alpha)).
@@ -1089,22 +1089,22 @@ receipt on its own clock), then applies live card status events and
 `ConfigOutcome.restarted` to it the same way the server does.
 
 All actors use linear backoff on connection failure: starts at 1s, adds 1s per
-failed attempt, capped at 15s (3s for the Open Connect client, a loopback/LAN
-TCP connect). The Open Connect client actor restarts at 1s after a connection
-that lasted at least 10s; one that drops sooner counts as a failed attempt, so
-a link that keeps connecting and dropping still backs off to the cap. The
-Open Connect server restarts at 1s after a successful bind. A card on a
-device driver (the FlightScope, the R10, the Square Golf, the ExPutt, the
-trackball, the mock) waits the delay its driver asks for: the FlightScope,
-the R10, the Square Golf and the trackball use the SDK's `Backoff`, 1 s per
-failed attempt up to 15 s, back to 1 s after a session of at least 10 s; the
-ExPutt adjusts the same backoff (below). The trackball's driver gives up off
+failed attempt, capped at 15s (3s for the Open Connect client and Pureplay
+Connect, a loopback/LAN TCP connect). The Open Connect client restarts at 1s
+after a connection that lasted at least 10s; one that drops sooner counts as
+a failed attempt, so a link that keeps connecting and dropping still backs
+off to the cap. The Open Connect server restarts at 1s after a successful
+bind. A card on a driver (the FlightScope, the R10, the Square Golf, the
+ExPutt, the trackball, the mock, the Open Connect client, Pureplay Connect)
+waits the delay its driver asks for: the FlightScope, the R10, the Square
+Golf and the trackball use the SDK's `Backoff`, 1 s per failed attempt up to
+15 s, back to 1 s after a session of at least 10 s; the ExPutt adjusts the
+same backoff (below). The trackball's driver gives up off
 Linux (the card ends Disconnected with the error). Every actor polls its shutdown flag during the backoff wait
 (the Open Connect server during its bind retry delay too), so stopping one
-never waits out the delay. The Open Connect client's TCP connect (up to 5s)
-runs on a thread of its own: a stop ends the actor at once, and a connect
-that completes afterward closes again; the FlightScope driver's (up to 5 s,
-the SDK's `connect_tcp`) gives up at once on a stop. The ExPutt's
+never waits out the delay. The TCP connect of the FlightScope driver, the
+Open Connect client and Pureplay Connect (up to 5 s, the SDK's
+`connect_tcp`) gives up at once on a stop. The ExPutt's
 session start cannot be cut short: the TCP connect and the device's greeting
 (up to 3s each), its two handshake replies (up to 3s each) and its mat search
 (up to 5s).
@@ -1237,7 +1237,7 @@ What a stop does, by actor:
 | Actor | Stops at once when | Bounded by |
 |---|---|---|
 | FlightScope (Mevo+, Gen2, Xi) | always: the TCP connect gives up at once on a stop, the handshake checks for one between passes, the card between session steps (5 ms apart while the device is quiet); closing sends nothing | the driver's `STOP_WAIT` (3 s); the driver is not exclusive, so an old instance still closing is replaced beside it (a second socket to the device can overlap the old one until it closes) |
-| Open Connect client | always: 50 ms reads, 2s write timeout, the connect on its own thread; its local-client registration ends with the connection | a write in progress (2s) |
+| Open Connect client | always: the TCP connect and the 1 s refusal wait give up at once on a stop, the card between session steps (5 ms apart while the connection is quiet; reads and writes do not block); its local-client registration ends with the session | the driver's `STOP_WAIT` (3 s) |
 | Pureplay | always: the TCP connect gives up at once on a stop, the card between session steps (5 ms apart while the link is quiet; reads and writes do not block); closing sends nothing | the driver's `STOP_WAIT` (3 s) |
 | Open Connect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
 | Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
@@ -1389,8 +1389,9 @@ suggests turning it off and on again, and the per-attempt alerts stop until
 a session succeeds (attempts that fail another way do not restart the
 clock). The reconnect delays are in [Connection state](#connection-state) above.
 
-An Open Connect client logs a warning at start when an ExPutt is configured
-and its Putting Monitor is unset (Any).
+An Open Connect client logs a warning when it starts taking the bus (its
+first bus message) when an ExPutt is configured and its Putting Monitor is
+unset (Any).
 
 **Trackball card** (alpha): thumbswing's device driver
 (`thumbswing::driver::Thumbswing`) on `DriverActor`
@@ -1436,12 +1437,13 @@ card is not exclusive: a new instance does not wait for the old one to let
 the device go. Its shots cut no camera clip: the type has no
 impact lead (`impact_lead_default_s("trackball")` is `None`).
 
-**Open Connect client actor** (GSPro, Pureplay, Muni Golf, ...): emits `Starting` before
-first TCP connect attempt, `Connected` on success. Connection loss after a
-successful session emits `Reconnecting`; failure before ever connecting stays
-at `Starting`. A refused, failed or closed connection is shown only through
-this status and the log, with no alert: a simulator not running is normal when
-another one is in use.
+**Open Connect client** (GSPro, Pureplay, Muni Golf, ...): a card on the
+driver host, so its status is the host's: `Starting` before the first
+connection, `Connected` for each one, `Reconnecting` after one ends. A
+refused, failed or closed connection is shown only through the status, the
+card's `error` row (the host shows a failed connect's reason until a
+connection succeeds) and the log, with no alert: a simulator not running is
+normal when another one is in use.
 
 **Open Connect server (input)** is a launch monitor actor with source `measured`
 (another vendor's companion software counts as measured). It publishes
@@ -1454,74 +1456,88 @@ not re-assert.
 **Open Connect self-loop guard**: an Open Connect client pointed at this
 process's own Open Connect server (e.g. client `127.0.0.1:921`, server bind
 `0.0.0.0:921`, GSPro closed) would send every shot client -> server -> bus ->
-client, forever. `SystemState.local_clients` (`state/local_clients.rs`) holds
-the local socket address of every connected Open Connect client, registered
-right after `connect` and before anything is sent, and removed when the
-connection ends. The server looks up each peer it accepts, comparing IP and
-port with IPv4-mapped IPv6 read as IPv4 and every loopback address as
-`127.0.0.1`. It looks the peer up again after each read, before handling it,
-so the connection's data never reaches the bus even if the client registered
-a moment after the accept. The server reports `Connected` only once the first
-read (up to 100 ms) has passed that look-up too. A match is closed at once,
-unread, and refused:
+client, forever. The crate's `flighthook_openconnect::local` holds the local
+socket address of every connected Open Connect client of the process (one
+static registry), registered by the client's connect right after the TCP
+connect and before anything is sent, under the card's actor id, and removed
+when the session ends. The server looks up each peer it accepts
+(`local::client_at`), comparing IP and port with IPv4-mapped IPv6 read as IPv4
+and every loopback address as `127.0.0.1`. It looks the peer up again after
+each read, before handling it, so the connection's data never reaches the bus
+even if the client registered a moment after the accept. The server reports
+`Connected` only once the first read (up to 100 ms) has passed that look-up
+too. A match is closed at once, unread, and refused (`local::refuse`):
 
 - the server raises one `Error` alert per burst of that client's reconnect
   attempts (refusals less than 30 s apart are one burst), shown in the Log
   after the server's name: "Refused Open Connect Client "<client name>" from
   <peer>: it is this flighthook's own client, which would loop shots back.
   Point it at the simulator's port.";
-- the client sets its telemetry `error` key, shown after the client's name in
-  the banner: "Refused by this flighthook's own Open Connect Server "<server
-  name>": this address points at it, which would loop shots back. Use the
-  simulator's port instead." It keeps retrying with its usual backoff.
+- the client's connect waits 1 s after the TCP connect before it succeeds
+  (`client::REFUSAL_VERDICT`) and fails with the server's reason when it was
+  refused, so a refused connection never shows as connected. The card shows
+  the reason as its `error` row, after the client's name in the banner:
+  "Refused by this flighthook's own Open Connect Server "<server name>": this
+  address points at it, which would loop shots back. Use the simulator's port
+  instead." It keeps retrying with its usual backoff; the row goes when a
+  connection succeeds.
 
-The names are the ones the cards show (the actor ID when blank). A client
-reports `Connected` only once a connection has lasted 1 s, so a refused
-connection never shows as connected. The `error` key is cleared (an empty
-value) when a connection outlasts that, when an attempt fails any other way,
-and when the actor starts.
+The names are the ones the cards show (the actor ID when blank). A shot that
+finishes in the second the connect waits is not sent.
 
 A connection from anything else, on the same host or not, is served as usual:
 a monitor's connector on 921 feeding a server whose client sends on to GSPro
 on 922 is unaffected. A stopped or unreachable simulator is unaffected too:
 still no alert and no dot.
 
-**Open Connect client shot delivery**: the bridge drains the bus the whole time
-it runs, connected or not, so nothing queues up while the simulator is away.
-Every shot that finishes while the simulator is connected is sent, in order,
-including several that finish together. A shot that finishes while it is not
-connected (stopped,
-starting up, or between reconnects) is dropped. A shot is also dropped if it
-is more than 5s old when the bridge can send it, its age counted from when the
-bridge took the finished shot off the bus. A connected bridge sends a shot in
-the same loop pass that takes it off the bus, so in practice this only drops
-shots left queued behind a failed write when the reconnect takes longer than
-5s. Dropped shots are logged at debug level only, with no alert: a simulator
-not running is normal when another one is in use. A shot whose write fails
-is not retried. A write to the simulator that blocks for more than 2s fails like any
-other, ending the connection and starting a reconnect, with no alert. The JSON
-sent for a shot is the same whatever happened to the connection before it.
+**Open Connect client.** The protocol lives in the workspace crate
+`flighthook-openconnect` (`openconnect/`), module `client`: a flightrelay
+driver (`client::Client`, feature `driver`) whose settings (`client::Config`:
+`address`, feature `config`, which `lib` and the WASM UI build, with the Open
+Connect JSON types in `client::api`) `OpenConnectClientSection` flattens next
+to its own fields, so the config keys are unchanged. The card is a
+`DriverActor` with the hooks in `actors/outputs.rs` (`OpenConnectClientHooks`,
+the same `OutputHooks` as Pureplay Connect's); its `bus.actor` has no roles.
 
-**Integration readiness**: the Open Connect client tracks the routed launch
-monitor's readiness from its `bus.actor` (no blockers means ready; under "Any",
-any launch monitor that may feed a simulator) and uses it to set both
-`launch_monitor_is_ready` and `launch_monitor_ball_detected` in heartbeats
-and shot messages.
-
-**Open Connect client on FRP.** The client composes each shot with an SDK
-aggregator fed only flighthook's own turn and sends a finished shot when its
-launch monitor is the one routed for the mode of flighthook's turn as the shot
-finishes (routing names launch monitors by actor id; Auto-Chip always passes; a
-game's launch monitor, the Pureplay Accessory card, never does). The launch it
-sends is the measured launch with a missing value filled from the launch
-monitor's own flight's `assumed` (the FlightScope launch-only spin); the carry
-and other results come from the launch monitor's own flight only, never the
-flight model's, and an Auto-Chip's launch goes alone. Whenever the simulator's
-player information arrives, the card sends one complete `golfer.select` (club,
-hand and, with club lists set, the mode) and re-asserts it by the rule in
-[Games and simulators re-assert](#games-and-simulators-re-assert). A routing
-that names an actor no card holds shows "Missing monitor" and routes nothing
-for that shot type until another is picked.
+- The driver's connect is the TCP connect (5 s), the registration as this
+  process's own client and the 1 s refusal wait (above); the card shows
+  Connected from there, with the simulator's address as its `device_info`.
+  Its session (`client::Session`, generic over a `Read + Write` transport,
+  non-blocking over TCP) sends each finished shot as one shot message, in
+  order, several that finish together included; a heartbeat about a second
+  after the session starts, every 10 s after it, and at once when the
+  readiness changes; and reads the simulator's responses (a code outside
+  2xx, an unknown club code or text that is not a response raises a Warn
+  alert). A write that fails ends the connection with no alert; the shots
+  behind it go with the session. Reconnects back off 1 s, +1 s, cap 3 s
+  (reset after a 10 s connection), with no alert.
+- `ShotNumber` is the shot's own number, or one more than the last one sent
+  when that is higher (the driver keeps the last one across connections), so
+  device and Auto-Chip numbers never repeat and a device whose count starts
+  again still goes up. A shot with no launch, flight, club or impact (a
+  missed read) is not sent and takes no number. The launch it sends is the
+  measured launch with a missing value filled from the launch monitor's own
+  flight's `assumed` (the FlightScope launch-only spin); the carry and other
+  results come from the launch monitor's own flight only, never the flight
+  model's, and an Auto-Chip's launch goes alone.
+- What the session sees is chosen by the hooks, as for Pureplay Connect: the
+  `RoutedView`, each shot's parts and its `shot.finished` only when the
+  routing passes it (below). The readiness in heartbeats
+  (`LaunchMonitorIsReady` and `LaunchMonitorBallDetected`) is whether any
+  launch monitor in view has no blockers. A routing that names an actor no
+  card holds shows "Missing monitor" and routes nothing for that shot type
+  until another is picked.
+- Whenever the simulator's player information arrives, the session sends one
+  complete `golfer.select` (club and hand as it holds them); the hooks add
+  the mode the card's club lists give for the club (with both lists empty,
+  none), keep it (`Held`) and re-assert it by the rule in
+  [Games and simulators re-assert](#games-and-simulators-re-assert),
+  recomputing the mode from the live club lists on each turn.
+- Every object written (`shot`, `heartbeat`) and every read (`response`)
+  goes to the host as a text raw frame: an `audit` debug line with the JSON.
+  Each shot's frame comes back with the shot's key once written: the hooks
+  record it in the send registry (below) under the configured address and set
+  `shots_sent` and `last_shot` on the card.
 
 **Simulator sources feed no simulator output.** A simulator output (the Open
 Connect client, the Pureplay Connect output) never takes shots or readiness
@@ -1529,10 +1545,9 @@ from a simulator source, under "Any" and by ID,
 with no address comparison: `Feed::feeds_simulators(actor)` (`simout.rs`) is false
 for an actor whose registered `ShotSource::is_simulator()` (the Pureplay
 card) or whose ID starts `pureplay_accessory.` (before it registers). It is
-the one predicate behind `Feed::passes`, the outputs' readiness (`Feed::ready`)
-and the monitors they report (ready, connection state, battery). The
-Open Connect client's `Relay` holds a `gspro::Registry` (the app state, for
-the source types, and the send registry) for it. A save that
+the one predicate behind `Feed::passes` and the view the outputs' sessions
+are handed (`Feed::in_view`), which their readiness and the monitors they
+report (ready, connection state, battery) come from. A save that
 routes an output to a `pureplay_accessory.N` ID is refused with `400` ("An
 output can't take shots from Pureplay", `FlighthookConfig::simulator_routes`
 in `invalid_setting`); a config file with one loads with a warning, and the
@@ -1544,12 +1559,11 @@ exports, `/frp`) takes the card's shots like any shot.
 `SentShots`) is how the Pureplay Accessory card tells Pureplay's return of a shot an
 output sent from a shot of its own. Each simulator output records
 `(ShotKey, SimAddr, Instant)` for each shot it writes (only shots it
-writes: not one strict mode keeps back or one dropped as stale), with the
-key the bus carried (the shot's own number, before the Open Connect client
-raises it). The Open Connect client records just before the write and takes
-the record back when the write fails (`SentShots::forget`); Pureplay Connect
-records once the BallData is written, under its configured address
-(`SimAddr::of(None, address)`). `SimAddr::of(local, peer)`
+writes: not one strict mode keeps back), with the key the bus carried (the
+shot's own number, before the Open Connect client raises it), once the shot
+(Open Connect) or its BallData (Pureplay Connect) is written, under the
+output's configured address (`SimAddr::of(None, address)`). A write that
+fails records nothing. `SimAddr::of(local, peer)`
 is fixed per connection: the simulator's address and whether it is this
 computer (loopback, unspecified, or the connection's two ends share an
 address); the card makes one for its own connection the same way. At most
@@ -1568,28 +1582,21 @@ Pureplay never plays (it was not ready) stays until it expires.
 #### Open Connect client telemetry
 
 The Open Connect client (GSPro, Pureplay, Muni Golf or a generic simulator;
-one actor)
-reports what it knows as `ActorStatus` telemetry (`gspro::Telemetry`), each
-key only when its value changes:
+one actor) shows, besides the host's rows (`device_info`, the simulator's
+address while connected; `error`):
 
-| Key | Value | Example | Holds for |
+| Key | Value | Example | From |
 |---|---|---|---|
-| `address` | the simulator's address it dials | `127.0.0.1:921` | the actor |
-| `last_shot` | the `ShotNumber` the simulator got last and the local time it was written | `#12 at 16:41:07` | the actor |
-| `shots_sent` | shots written on this connection (`0` from the connect) | `3` | the connection |
-| `monitor_ready` | the readiness last sent in a heartbeat (`true`/`false`) | `true` | the connection |
-| `response` | the simulator's last response, code and message | `201 GSPro Player Information` | the connection |
+| `last_shot` | the `ShotNumber` the simulator got last and the local time it was written | `#12 at 16:41:07` | the hooks |
+| `shots_sent` | shots written on this connection (`0` from the connect) | `3` | the hooks |
+| `monitor_ready` | the readiness last sent in a heartbeat (`true`/`false`) | `true` | the session |
+| `response` | the simulator's last response, code and message | `201 GSPro Player Information` | the session |
+| `club`, `handed` | the simulator's player information | `7I`, `rh` | the session |
 
-`club` and `handed` on the card are the simulator's player information: the
-client sends them as a `golfer.select` and shows them on its card. Until the 1 s refusal verdict the keys wait
-and go out with `Connected`; after it, with a `Connected` status as they
-change. When the connection ends, the status that says so removes the
-connection's keys and `club` and `handed` (empty values). The first status of
-a new instance sets `address` and removes every other key an earlier
-instance left. Because a `Starting` or a lost connection drops the card's
-telemetry, every `Starting` and `Reconnecting` status carries `address`,
-`last_shot` and a held refusal `error` again, so a reconnecting card still
-shows where it dials. Nothing here adds traffic to the simulator.
+Every key holds for the connection: the session's keys are its actor's
+telemetry, which the host takes off the card when the session ends, and the
+hooks' rows go with the status that says so. Nothing here adds traffic to the
+simulator.
 
 #### Pureplay output (alpha)
 
@@ -1649,12 +1656,11 @@ hooks in `actors/outputs.rs` (`PureplayHooks`); its `bus.actor` has no roles.
   a handshake succeeds. A HelloAck choosing any version but 1 fails it too.
   Then the ReadyState is pushed and every change after it, and each shot goes
   out as BallData (+ ClubData), ShotId counting from 1 on every link. A shot
-  that finished before the handshake, or more than 5 s before it could be
-  sent, is dropped. Reconnects back off 1 s, +1 s, cap 3 s (reset after a
+  that finished before the handshake is dropped. Reconnects back off 1 s, +1 s, cap 3 s (reset after a
   10 s link), with no alert.
 - What the session sees is chosen by the hooks, through the card's `Feed`
   (`simout.rs`): the mode is flighthook's turn mode when a shot finishes, the
-  per-mode routing is by launch monitor actor id (`GsProRouting`,
+  per-mode routing is by launch monitor actor id (`simout::Routing`,
   `Feed::passes`, Auto-Chip always accepted), and a simulator source never
   feeds it. The session is handed the `RoutedView` (the `bus.actor` of each
   launch monitor in `Feed::in_view`: the routed one, or with Any every one
@@ -2076,7 +2082,7 @@ is the actor: flighthook's own `golfer.turn` becomes the driver's `TurnHints`
 whenever the turn changes (each turn is complete), and the card's actions are
 queued (actions still queued when a connect starts were asked while no session
 ran, and are dropped). A session: Connected with `device_info` (the identity's
-label) and `shot_count`, then a `bus.actor` carrying the identity and
+label) and, for a launch monitor, `shot_count`, then a `bus.actor` carrying the identity and
 `device.source` before any shot; each pass drains the bus into the hints and
 the card's `action`s, hands a live config to `apply_config`, sets `wants_raw`
 (always; `shots_allowed` stays at its default, on), and steps the session once
@@ -2905,7 +2911,6 @@ pub struct SystemState {
     pub system: SystemConfig,     // cached config (RwLock + disk persistence + reload lock)
     pub session: Session,         // read side of the turn (golfer, club, hand, mode)
     pub beats: Beats,             // the newest bus.actor of every local actor, re-sent each heartbeat
-    pub local_clients: Arc<LocalClients>,  // this process's Open Connect clients
     pub sent_shots: Arc<SentShots>,        // the shots the simulator outputs wrote (5 s)
     pub sources: Arc<Sources>,    // every local shot source's type, by actor id
     pub clips: ClipStore,         // replay clips on disk (beta)
@@ -3018,10 +3023,10 @@ config-driven). Then each config section constructs an actor struct and calls
 `actor.start(state, sender, receiver)`. Each actor gets a per-actor
 `Arc<AtomicBool>` shutdown flag shared between the `BusReceiver` and the
 registry. Launch monitor actors (the `DriverActor` cards) run event loops
-polling the bus. Output actors (the Open Connect client in `actors::gspro`, the
-Pureplay output in `actors::pureplay`, the Accessory card, random club)
-subscribe to the bus and send `golfer.select` (for club and hand changes) and
-card status (for connection status).
+polling the bus, and so do the simulator outputs (the Open Connect client and
+Pureplay Connect, `DriverActor`s with the hooks in `actors::outputs`). The
+Accessory card and random club subscribe to the bus and send `golfer.select`
+(for club and hand changes) and card status (for connection status).
 
 **Drain subscriber**: a tokio task that consumes all bus messages to keep the
 broadcast channel healthy when no other subscriber is active.
@@ -3861,8 +3866,8 @@ actor `Auto-Chip` (`chart::device_label`); it has no config section, so it gets
 no Settings card. The Open Connect client's routing check
 (`Feed::passes`) takes Auto-Chip shots in every mode whatever monitor is
 routed, and sends its launch alone: the chip stands in for a read the routed
-monitor missed. The client's `Relay::next_shot` sends `max(shot_number, last
-sent + 1)` as the `ShotNumber`, so device and Auto-Chip numbers never repeat.
+monitor missed. The client's session sends `max(shot_number, last sent + 1)`
+as the `ShotNumber`, so device and Auto-Chip numbers never repeat.
 Auto-Chip is enabled while an Open Connect client or Pureplay Connect card is
 connected.
 

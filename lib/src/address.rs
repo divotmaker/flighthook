@@ -179,7 +179,7 @@ impl FlighthookConfig {
             &mut out,
             "openconnect_client",
             &self.openconnect_client,
-            |s| (s.enabled, s.address.as_deref()),
+            |s| (s.enabled, s.driver.address.as_deref()),
         );
         push(&mut out, "pureplay", &self.pureplay, |s| {
             (s.enabled, s.driver.address.as_deref())
@@ -318,7 +318,10 @@ mod tests {
             putting_clubs: crate::default_putting_clubs(),
             name: "Open Connect".into(),
             enabled,
-            address: address.map(str::to_owned),
+            driver: crate::OpenConnectClientConfig {
+                address: address.map(str::to_owned),
+                ..Default::default()
+            },
             full_monitor: None,
             chipping_monitor: None,
             putting_monitor: None,
@@ -465,7 +468,12 @@ mod tests {
             .insert("2".into(), client(None, true));
         assert_eq!(added.enable_clashes(&live).len(), 1);
         // The same card on a free address is no clash.
-        added.openconnect_client.get_mut("2").unwrap().address = Some("127.0.0.1:9210".into());
+        added
+            .openconnect_client
+            .get_mut("2")
+            .unwrap()
+            .driver
+            .address = Some("127.0.0.1:9210".into());
         assert!(added.enable_clashes(&live).is_empty());
     }
 
@@ -478,7 +486,8 @@ mod tests {
         // The first card moves onto the second's address: it loses, though
         // it is first in order.
         let mut save = live.clone();
-        save.openconnect_client.get_mut("0").unwrap().address = Some("127.0.0.1:9210".into());
+        save.openconnect_client.get_mut("0").unwrap().driver.address =
+            Some("127.0.0.1:9210".into());
         let clashes = save.demote_clashing(Some(&live));
         assert_eq!(clashes.len(), 1);
         assert_eq!(clashes[0].id, "openconnect_client.0");

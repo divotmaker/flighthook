@@ -1,7 +1,6 @@
 pub mod cameras;
 pub mod clips;
 pub mod config;
-pub mod local_clients;
 pub mod practice;
 pub mod remotes;
 pub mod sent_shots;
@@ -22,7 +21,6 @@ use crate::bus::BusSender;
 use cameras::Cameras;
 use clips::ClipStore;
 use config::SystemConfig;
-use local_clients::LocalClients;
 use sent_shots::SentShots;
 use sources::Sources;
 
@@ -35,9 +33,6 @@ pub struct SystemState {
     pub session: Session,
     /// The newest `bus.actor` of every local actor, for the heartbeat timer.
     pub beats: crate::bus::Beats,
-    /// This process's connected Open Connect clients, which its Open Connect
-    /// servers refuse.
-    pub local_clients: Arc<LocalClients>,
     /// The shots the simulator outputs sent, which the Pureplay Accessory card tells
     /// the simulator's echoes by.
     pub sent_shots: Arc<SentShots>,
@@ -186,7 +181,6 @@ impl SystemState {
             Self {
                 system,
                 session,
-                local_clients: Arc::default(),
                 sent_shots: Arc::default(),
                 sources: Arc::default(),
                 clips: ClipStore::default(),

@@ -696,7 +696,10 @@ fn replace_global_keeps_every_actor_section() {
     let live_client = flighthook::OpenConnectClientSection {
         name: "Saved elsewhere".into(),
         enabled: true,
-        address: Some("not an address".into()),
+        driver: flighthook::OpenConnectClientConfig {
+            address: Some("not an address".into()),
+            ..Default::default()
+        },
         full_monitor: None,
         chipping_monitor: None,
         putting_monitor: None,
@@ -1803,7 +1806,10 @@ fn an_open_connect_client_reconnects_and_is_not_refused_as_its_old_self() {
             "0".into(),
             flighthook::OpenConnectClientSection {
                 name: "GSPro".into(),
-                address: Some(sim.addr.to_string()),
+                driver: flighthook::OpenConnectClientConfig {
+                    address: Some(sim.addr.to_string()),
+                    ..Default::default()
+                },
                 ..flighthook::OpenConnectClientSection::default()
             },
         );
@@ -1821,17 +1827,18 @@ fn an_open_connect_client_reconnects_and_is_not_refused_as_its_old_self() {
     });
     let id = "openconnect_client.0";
     until(&mut rx, "connected", |m| connected(m, id));
+    let actor = state.actor_of_card(id).expect("an actor id");
     let first = sim.peers()[0];
     assert_eq!(
-        state.local_clients.client_at(first).as_deref(),
-        Some(id),
+        flighthook_openconnect::local::client_at(first).as_deref(),
+        Some(actor.as_str()),
         "registered as this process's client"
     );
 
     let (restarted, _) = reconnect_through_command(&state, &bus_tx, &mut rx, id);
     assert_eq!(restarted, [id]);
     assert_eq!(
-        state.local_clients.client_at(first),
+        flighthook_openconnect::local::client_at(first),
         None,
         "the old connection's registration is released"
     );
@@ -1845,7 +1852,10 @@ fn an_open_connect_client_reconnects_and_is_not_refused_as_its_old_self() {
     assert!(!refused, "no refusal");
     let peers = sim.peers();
     assert_eq!(peers.len(), 2, "{peers:?}");
-    assert_eq!(state.local_clients.client_at(peers[1]).as_deref(), Some(id));
+    assert_eq!(
+        flighthook_openconnect::local::client_at(peers[1]).as_deref(),
+        Some(actor.as_str())
+    );
     stop_all(&state);
 }
 
@@ -2196,7 +2206,7 @@ fn a_muted_instance_leaves_no_bus_actor_in_the_feeds() {
     let (_dir, state, bus_tx, mut rx) =
         with_stubborn(&[("0", Some(&actor0)), ("1", Some(&actor1))]);
     let mut feed = crate::actors::simout::Feed::new(
-        crate::actors::gspro::GsProRouting::default(),
+        crate::actors::simout::Routing::default(),
         Some(Arc::clone(&state)),
     );
     let ids: Vec<String> = ["mock_monitor.0", "mock_monitor.1"]
@@ -2541,7 +2551,10 @@ fn open_connect(address: &str, enabled: bool) -> flighthook::OpenConnectClientSe
     flighthook::OpenConnectClientSection {
         name: "Open Connect".into(),
         enabled,
-        address: Some(address.into()),
+        driver: flighthook::OpenConnectClientConfig {
+            address: Some(address.into()),
+            ..Default::default()
+        },
         full_monitor: None,
         chipping_monitor: None,
         putting_monitor: None,
@@ -2619,7 +2632,7 @@ fn editing_a_card_onto_a_held_address_saves_it_off() {
     let config = state.system.snapshot();
     assert!(!config.openconnect_client["1"].enabled);
     assert_eq!(
-        config.openconnect_client["1"].address.as_deref(),
+        config.openconnect_client["1"].driver.address.as_deref(),
         Some("localhost:1"),
         "the edit is kept"
     );
@@ -3057,7 +3070,10 @@ fn an_open_connect_client_on_a_silent_simulator_stops_at_once_and_unregisters() 
             "0".into(),
             flighthook::OpenConnectClientSection {
                 name: "GSPro".into(),
-                address: Some(sim.addr.to_string()),
+                driver: flighthook::OpenConnectClientConfig {
+                    address: Some(sim.addr.to_string()),
+                    ..Default::default()
+                },
                 ..flighthook::OpenConnectClientSection::default()
             },
         );
@@ -3066,7 +3082,7 @@ fn an_open_connect_client_on_a_silent_simulator_stops_at_once_and_unregisters() 
     until(&mut rx, "connected", |m| connected(m, id));
     let peer = sim.peers()[0];
     stop_exits(&state, id);
-    assert_eq!(state.local_clients.client_at(peer), None);
+    assert_eq!(flighthook_openconnect::local::client_at(peer), None);
 }
 
 #[test]
@@ -3077,7 +3093,10 @@ fn an_open_connect_client_before_its_verdict_stops_at_once() {
             "0".into(),
             flighthook::OpenConnectClientSection {
                 name: "GSPro".into(),
-                address: Some(sim.addr.to_string()),
+                driver: flighthook::OpenConnectClientConfig {
+                    address: Some(sim.addr.to_string()),
+                    ..Default::default()
+                },
                 ..flighthook::OpenConnectClientSection::default()
             },
         );

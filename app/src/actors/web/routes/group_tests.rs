@@ -560,7 +560,10 @@ async fn settings_save_that_enables_a_duplicate_address_is_409() {
     let client = |address: &str, enabled| flighthook::OpenConnectClientSection {
         name: "Open Connect".into(),
         enabled,
-        address: Some(address.into()),
+        driver: flighthook::OpenConnectClientConfig {
+            address: Some(address.into()),
+            ..Default::default()
+        },
         full_monitor: None,
         chipping_monitor: None,
         putting_monitor: None,
@@ -601,7 +604,7 @@ async fn settings_save_that_enables_a_duplicate_address_is_409() {
     // A card that stays off, and one turned on at a free address, save
     // (here the command times out: no system actor runs).
     let mut free = live.clone();
-    free.openconnect_client.get_mut("1").unwrap().address = Some("127.0.0.1:9210".into());
+    free.openconnect_client.get_mut("1").unwrap().driver.address = Some("127.0.0.1:9210".into());
     free.openconnect_client.get_mut("1").unwrap().enabled = true;
     for (scope, body) in [
         (Some("openconnect_client.1"), live.clone()),

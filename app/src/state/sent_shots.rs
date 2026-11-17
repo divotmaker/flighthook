@@ -5,16 +5,14 @@
 //! the shot it then plays: Pureplay's Accessory API reports every shot,
 //! the ones flighthook sent included. Every simulator output (the Open
 //! Connect client and the Pureplay Connect output) records each shot here
-//! with the simulator's address: the Open Connect client just before it
-//! writes the shot, Pureplay Connect once its write succeeded. So the
+//! with the simulator's configured address once its write succeeded. So the
 //! Pureplay card can tell a shot flighthook sent (an echo) from one
 //! Pureplay had from elsewhere: [`SentShots::take_echo`].
 //!
 //! A record is consumed by the echo it matches, together with any other
 //! record of the same shot (the same shot sent by a second output), and is
-//! forgotten once it is older than [`ECHO_WINDOW`]. The Open Connect
-//! client takes the record of a write that fails back
-//! ([`SentShots::forget`]). At most [`CAPACITY`] are kept.
+//! forgotten once it is older than [`ECHO_WINDOW`]. At most [`CAPACITY`]
+//! are kept.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
@@ -75,8 +73,8 @@ pub struct SentShots {
 }
 
 impl SentShots {
-    /// Record that an output is about to write shot `key` to the simulator
-    /// at `peer`, at `at`.
+    /// Record that an output wrote shot `key` to the simulator at `peer`,
+    /// at `at`.
     pub fn record(&self, key: ShotKey, peer: SimAddr, at: Instant) {
         let mut sent = self.sent.lock().unwrap_or_else(PoisonError::into_inner);
         expire(&mut sent, at);
@@ -84,15 +82,6 @@ impl SentShots {
             sent.pop_front();
         }
         sent.push_back(Sent { key, peer, at });
-    }
-
-    /// Take back the newest record of shot `key` to the simulator at
-    /// `peer`: the write it was made for failed, so the shot was not sent.
-    pub fn forget(&self, key: &ShotKey, peer: SimAddr) {
-        let mut sent = self.sent.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(index) = sent.iter().rposition(|s| s.key == *key && s.peer == peer) {
-            sent.remove(index);
-        }
     }
 
     /// The send a shot the simulator at `from` reported at `now` echoes,
@@ -213,25 +202,6 @@ mod tests {
         sent.record(key(2), oc, t0);
         sent.record(key(2), ppc, t0);
         assert_eq!(sent.take_echo(loopback(), t0), Some(key(2)));
-        assert_eq!(sent.take_echo(loopback(), t0), None);
-    }
-
-    /// A write that failed takes its own record back, and only that one.
-    #[test]
-    fn a_failed_write_takes_its_record_back() {
-        let sent = SentShots::default();
-        let t0 = Instant::now();
-        let oc = at([127, 0, 0, 1], 921);
-        let ppc = at([127, 0, 0, 1], 9760);
-        sent.record(key(1), oc, t0);
-        sent.record(key(2), oc, t0);
-        sent.record(key(2), ppc, t0);
-        sent.forget(&key(2), oc);
-        assert_eq!(sent.len(), 2);
-        sent.forget(&key(3), oc);
-        assert_eq!(sent.len(), 2, "no such record");
-        assert_eq!(sent.take_echo(loopback(), t0), Some(key(1)));
-        sent.forget(&key(2), ppc);
         assert_eq!(sent.take_echo(loopback(), t0), None);
     }
 

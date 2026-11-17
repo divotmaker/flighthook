@@ -7,7 +7,6 @@ pub mod clip_source;
 pub mod driver;
 pub mod exputt;
 pub mod flight_model;
-pub mod gspro;
 pub mod mevo;
 pub mod mock;
 pub mod openconnect;
@@ -254,25 +253,11 @@ pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor> {
 
     // Open Connect clients (GSPro, Pureplay, Muni Golf, ...)
     for (index, section) in &config.openconnect_client {
-        let id = global_id("openconnect_client", index);
-        let addr_str = section.address.as_deref().unwrap_or("127.0.0.1:921");
-        match addr_str.parse::<SocketAddr>() {
-            Ok(addr) => {
-                let routing = gspro::GsProRouting {
-                    full_monitor: section.full_monitor.clone(),
-                    chipping_monitor: section.chipping_monitor.clone(),
-                    putting_monitor: section.putting_monitor.clone(),
-                };
-                actors.push(ResolvedActor {
-                    id,
-                    name: section.name.clone(),
-                    actor: Box::new(gspro::GsProActor { addr, routing }),
-                });
-            }
-            Err(e) => {
-                tracing::warn!("integration '{id}': invalid address '{addr_str}': {e}");
-            }
-        }
+        actors.push(ResolvedActor {
+            id: global_id("openconnect_client", index),
+            name: section.name.clone(),
+            actor: Box::new(outputs::OpenConnectClientActor::new(section.clone())),
+        });
     }
 
     // Pureplay Connect outputs

@@ -263,20 +263,22 @@ reported by one source only:
   `device_state`; the Trackball's `synthetic`
   (`true`), `input` (the name the device reports), `cpi`, `profile` (the
   club in play) and `handed` (`rh` | `lh`))
-- **Every card**: `device_info`, `shot_count`,
+- **Every card**: `device_info`, `shot_count` (a launch monitor's),
   `phase`; `error` on a card on a device driver whose connects keep failing:
   the latest connect error, removed when a session connects
 - **Software cards**: `club`, `handed`, `name`, `error`
 - **Open Connect clients** (GSPro, Pureplay, Muni Golf, generic):
-  `address` (the simulator's, `127.0.0.1:921`), `last_shot` (the
+  `device_info` (the simulator's address, `127.0.0.1:921`, while
+  connected), and for the current connection only `last_shot` (the
   `ShotNumber` the simulator got last and the local time it was sent,
-  `#12 at 16:41:07`), and for the current connection only `shots_sent`
-  (`3`), `monitor_ready` (the readiness last sent to the simulator, `true` |
-  `false`) and `response` (the simulator's last response code and message,
-  `201 GSPro Player Information`). `club` and `handed` are the simulator's
-  player information. When the connection ends, `shots_sent`,
-  `monitor_ready`, `response`, `club` and `handed` are removed; `address`
-  and `last_shot` stay
+  `#12 at 16:41:07`), `shots_sent` (`3`), `monitor_ready` (the readiness
+  last sent to the simulator, `true` | `false`), `response` (the
+  simulator's last response code and message, `201 GSPro Player
+  Information`), `club` and `handed` (the simulator's player
+  information) and `ready` (`true`, from the card's `bus.actor`). `error`
+  holds why the last connect failed (the simulator not
+  listening, or this flighthook's own Open Connect Server refusing the
+  connection) until a connection succeeds
 - **Pureplay Connect outputs** (alpha): `device_info` (Pureplay's address,
   `127.0.0.1:9760`, while connected), and for the current link only
   `last_shot` (the ShotId Pureplay got last and the local time it was sent,

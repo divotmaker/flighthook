@@ -2557,7 +2557,7 @@ mod tests {
         assert!(exputt.enabled);
         let muni = &posted.openconnect_client["0"];
         assert_eq!(muni.name, "Muni Golf");
-        assert_eq!(muni.address.as_deref(), Some("127.0.0.1:9210"));
+        assert_eq!(muni.driver.address.as_deref(), Some("127.0.0.1:9210"));
         assert!(muni.enabled);
         assert_eq!(posted.exputt.len(), 1);
         assert_eq!(posted.openconnect_client.len(), 1);

@@ -90,44 +90,7 @@ impl ClubExt for Club {
     }
 
     fn gspro_code(self) -> &'static str {
-        match self {
-            Club::Driver => "DR",
-            Club::MiniDriver => "DR",
-            Club::Wood2 => "W2",
-            Club::Wood3 => "W3",
-            Club::Wood4 => "W4",
-            Club::Wood5 => "W5",
-            Club::Wood6 => "W6",
-            Club::Wood7 => "W7",
-            Club::Wood8 => "W8",
-            Club::Wood9 => "W9",
-            Club::Hybrid1 => "H1",
-            Club::Hybrid2 => "H2",
-            Club::Hybrid3 => "H3",
-            Club::Hybrid4 => "H4",
-            Club::Hybrid5 => "H5",
-            Club::Hybrid6 => "H6",
-            Club::Hybrid7 => "H7",
-            Club::Hybrid8 => "H8",
-            Club::Hybrid9 => "H9",
-            Club::Iron1 => "I1",
-            Club::Iron2 => "I2",
-            Club::Iron3 => "I3",
-            Club::Iron4 => "I4",
-            Club::Iron5 => "I5",
-            Club::Iron6 => "I6",
-            Club::Iron7 => "I7",
-            Club::Iron8 => "I8",
-            Club::Iron9 => "I9",
-            Club::PitchingWedge => "PW",
-            Club::GapWedge => "GW",
-            Club::SandWedge => "SW",
-            Club::LobWedge => "LW",
-            Club::Putter => "PT",
-            // A club code newer than this table: the driver, as for the
-            // mini driver.
-            _ => "DR",
-        }
+        flighthook_openconnect::client::api::club_code(self)
     }
 
     fn class(&self) -> Option<ClubClass> {

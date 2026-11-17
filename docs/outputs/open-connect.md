@@ -75,8 +75,9 @@ is connected.
 
 ## The card
 
-Connected, the card shows `address`, the simulator's `club` and `handed`,
-`last_shot` (the shot number the simulator got last and when), `shots_sent`
-and `monitor_ready` for this connection, and `response` (the simulator's last
-code and message). A shot that finishes while the simulator is not connected
-is dropped.
+Connected, the card shows the simulator's address (`device_info`), the
+simulator's `club` and `handed`, and for this connection `last_shot` (the
+shot number the simulator got last and when), `shots_sent`, `monitor_ready`
+and `response` (the simulator's last code and message). A shot that finishes
+while the simulator is not connected is dropped. While the card cannot
+connect, `error` says why.

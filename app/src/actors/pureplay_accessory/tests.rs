@@ -2347,48 +2347,49 @@ fn is_shot(v: &Value) -> bool {
     v["ShotDataOptions"]["ContainsBallData"] == true
 }
 
-/// An Open Connect client `actor` with `routing` dialing `addr`, on the bus
-/// `tx`, recording its sends in the state's registry as the app's does.
-/// Stops when the returned flag is set.
+/// An Open Connect client card `actor` with `routing` dialing `addr`, on
+/// the bus `tx`, started as the app starts it (it records its sends in the
+/// state's registry). Stopped when the returned [`Stop`] is dropped.
 fn oc_client(
     state: &TestState,
     tx: &broadcast::Sender<BusMsg>,
     actor: &str,
     addr: SocketAddr,
-    routing: crate::actors::gspro::GsProRouting,
-) -> Arc<AtomicBool> {
-    use crate::actors::backoff::Backoff;
-    use crate::actors::gspro::{Registry, run_shared};
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let sender = BusSender::new(actor.into(), tx.clone(), Arc::clone(&shutdown));
-    let receiver = sender.subscribe();
-    let registry = Registry {
-        state: Some(Arc::clone(&state.state)),
-        sent: Some(Arc::clone(&state.sent_shots)),
+    routing: crate::actors::simout::Routing,
+) -> Stop {
+    let section = flighthook::OpenConnectClientSection {
+        actor_id: Some(actor.into()),
+        driver: flighthook::OpenConnectClientConfig {
+            address: Some(addr.to_string()),
+            ..Default::default()
+        },
+        full_monitor: routing.full_monitor,
+        chipping_monitor: routing.chipping_monitor,
+        putting_monitor: routing.putting_monitor,
+        ..flighthook::OpenConnectClientSection::default()
     };
-    let clients = Arc::clone(&state.local_clients);
-    std::thread::spawn(move || {
-        run_shared(
-            addr,
-            routing,
-            registry,
-            Backoff::new(Duration::from_millis(20), Duration::from_millis(20)),
-            &clients,
-            &sender,
-            receiver,
-        );
-    });
-    shutdown
+    crate::actors::start_actor_as(
+        actor.into(),
+        Some(actor.into()),
+        Box::new(crate::actors::outputs::OpenConnectClientActor::new(section)),
+        state,
+        tx,
+    );
+    Stop {
+        state: Arc::clone(state),
+        actor: actor.into(),
+    }
 }
 
-/// Stops the flags it holds when dropped.
-struct Stops(Vec<Arc<AtomicBool>>);
+/// Stops an actor started for a test when dropped.
+struct Stop {
+    state: Arc<SystemState>,
+    actor: String,
+}
 
-impl Drop for Stops {
+impl Drop for Stop {
     fn drop(&mut self) {
-        for s in &self.0 {
-            s.store(true, Ordering::SeqCst);
-        }
+        let _ = self.state.stop_and_wait(&self.actor);
     }
 }
 
@@ -2552,13 +2553,13 @@ fn an_echo_is_not_stored_and_gets_the_stroke() {
     let (tx, _) = broadcast::channel(4096);
     let (mut card, mut peer) = connected_on(&mock, state.clone(), &tx);
     let oc = OcHost::new("openconnect_client.0");
-    let _stops = Stops(vec![oc_client(
+    let _stops = [oc_client(
         &state,
         &tx,
         "openconnect_client.0",
         oc.addr,
         Default::default(),
-    )]);
+    )];
     oc.accepts();
     until_connected(&mut card, &["openconnect_client.0"]);
 
@@ -2621,12 +2622,12 @@ fn a_pureplay_shot_is_stored_and_reaches_no_output() {
     let (mut card, mut peer) = connected_on(&mock, state.clone(), &tx);
     let any = OcHost::new("openconnect_client.0");
     let by_id = OcHost::new("openconnect_client.1");
-    let routed = crate::actors::gspro::GsProRouting {
+    let routed = crate::actors::simout::Routing {
         full_monitor: Some(ACTOR.into()),
         chipping_monitor: Some(ACTOR.into()),
         putting_monitor: Some(ACTOR.into()),
     };
-    let _stops = Stops(vec![
+    let _stops = [
         oc_client(
             &state,
             &tx,
@@ -2635,7 +2636,7 @@ fn a_pureplay_shot_is_stored_and_reaches_no_output() {
             Default::default(),
         ),
         oc_client(&state, &tx, "openconnect_client.1", by_id.addr, routed),
-    ]);
+    ];
     any.accepts();
     by_id.accepts();
     until_connected(&mut card, &["openconnect_client.0", "openconnect_client.1"]);
@@ -2731,11 +2732,11 @@ fn the_cards_ready_never_reaches_an_output() {
     });
     let any = OcHost::new("openconnect_client.0");
     let by_id = OcHost::new("openconnect_client.1");
-    let routed = crate::actors::gspro::GsProRouting {
+    let routed = crate::actors::simout::Routing {
         full_monitor: Some(ACTOR.into()),
         ..Default::default()
     };
-    let _stops = Stops(vec![
+    let _stops = [
         oc_client(
             &state,
             &tx,
@@ -2744,9 +2745,10 @@ fn the_cards_ready_never_reaches_an_output() {
             Default::default(),
         ),
         oc_client(&state, &tx, "openconnect_client.1", by_id.addr, routed),
-    ]);
+    ];
     any.accepts();
     by_id.accepts();
+    until_connected(&mut card, &["openconnect_client.0", "openconnect_client.1"]);
     // The card says it is ready again while both outputs run.
     let card_sender =
         BusSender::new(ACTOR.into(), tx.clone(), Arc::default()).with_frp_id(Some(ACTOR.into()));
@@ -3034,7 +3036,7 @@ fn the_connected_card_is_no_feed_of_a_pureplay_connect_output() {
             .is_some_and(ShotSource::is_launch_monitor)
     );
     let feed = crate::actors::simout::Feed::new(
-        crate::actors::gspro::GsProRouting::default(),
+        crate::actors::simout::Routing::default(),
         Some(Arc::clone(&state.state)),
     );
     assert!(!feed.feeds_simulators(ACTOR));

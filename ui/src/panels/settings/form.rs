@@ -104,7 +104,7 @@ pub(super) fn actor_entries(s: &FlighthookConfig) -> Vec<ActorFormEntry> {
             integration_type: "openconnect_client".into(),
             name: section.name.clone(),
             enabled: section.enabled,
-            address: section.address.clone().unwrap_or_default(),
+            address: section.driver.address.clone().unwrap_or_default(),
             full_monitor: section.full_monitor.clone().unwrap_or_default(),
             chipping_monitor: section.chipping_monitor.clone().unwrap_or_default(),
             putting_monitor: section.putting_monitor.clone().unwrap_or_default(),
@@ -1133,10 +1133,13 @@ pub(super) fn apply_actor_to_config(
                         OpenConnectClientSection {
                             name: entry.name.clone(),
                             enabled: entry.enabled,
-                            address: if entry.address.is_empty() {
-                                None
-                            } else {
-                                Some(entry.address.clone())
+                            driver: flighthook::OpenConnectClientConfig {
+                                address: if entry.address.is_empty() {
+                                    None
+                                } else {
+                                    Some(entry.address.clone())
+                                },
+                                ..Default::default()
                             },
                             full_monitor: if entry.full_monitor.is_empty() {
                                 None

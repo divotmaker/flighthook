@@ -1,0 +1,29 @@
+[package]
+name = "flighthook-openconnect"
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.94"
+description = "Open Connect integrations for flighthook: the Open Connect client"
+license = "MIT OR Apache-2.0"
+keywords = ["golf", "launch-monitor", "gspro"]
+repository = "https://github.com/divotmaker/flighthook"
+readme = false
+
+[features]
+default = ["driver"]
+# The settings and the Open Connect JSON types only (serde), so the WASM UI
+# builds them.
+config = ["dep:flightrelay", "flightrelay/config", "dep:serde"]
+# The flightrelay drivers, their sessions and transports (`controller`: the
+# shot aggregator a session composes shots with).
+driver = ["config", "flightrelay/driver", "flightrelay/controller", "dep:serde_json", "dep:thiserror"]
+
+[dependencies]
+flightrelay = { version = "0.6.0", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+thiserror = { version = "2", optional = true }
+
+[dev-dependencies]
+# The driver test host (`testing`): one thread, virtual time.
+flightrelay = { version = "0.6.0", features = ["testing"] }

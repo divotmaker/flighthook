@@ -1,13 +1,14 @@
 //! Open Connect V1 -> flighthook bus types.
 //!
-//! The inverse of `gspro::mapper`. Open Connect always reports speeds in mph
-//! and angles in degrees; distances follow the message's `Units` field, and
-//! face impact is millimeters. Open Connect lateral signs are absolute
+//! The inverse of the Open Connect client's mapper
+//! ([`flighthook_openconnect::client::mapper`]). Open Connect always reports
+//! speeds in mph and angles in degrees; distances follow the message's
+//! `Units` field, and face impact is millimeters. Open Connect lateral signs are absolute
 //! (positive = right of the target line, for either hand), the same as FRP's,
 //! so HLA, SideSpin, SpinAxis, FaceToTarget and Path are taken as they are.
 
-use super::super::gspro::api;
 use flighthook::{Basis, ClubData, Distance, FaceImpact, FlightResult, Launch, Velocity};
+use flighthook_openconnect::client::api;
 
 /// Distance unit selected by the message's `Units` field.
 ///
@@ -259,12 +260,12 @@ mod tests {
         assert_eq!(ball.total_spin_rpm, Some(3251));
         assert_eq!(ball.spin_axis, Some(10.0));
 
-        let shot = crate::actors::simout::OutputShot {
+        let shot = flighthook_openconnect::client::OutputShot {
             actor: "openconnect_server.0".into(),
             launch: Some(ball),
-            ..crate::actors::simout::OutputShot::default()
+            ..flighthook_openconnect::client::OutputShot::default()
         };
-        let out = super::super::super::gspro::mapper::map_shot(&shot);
+        let out = flighthook_openconnect::client::mapper::map_shot(&shot);
         let (bs, ss) = (3201.0_f64, 564.0_f64);
         assert_eq!(out.ball_data.back_spin, bs);
         assert_eq!(out.ball_data.side_spin, ss);
@@ -296,21 +297,21 @@ mod tests {
     }
 
     /// Ingest (`map_launch`/`map_club`) is the exact inverse of
-    /// `gspro::mapper::map_shot`: running a message through both reproduces
+    /// `flighthook_openconnect::client::mapper::map_shot`: running a message through both reproduces
     /// its lateral values. The actor-level tests in `openconnect::tests`
     /// check the same for both hands.
     #[test]
     fn ingest_then_gspro_map_shot_round_trips() {
         let m = lateral_msg();
-        let shot = crate::actors::simout::OutputShot {
+        let shot = flighthook_openconnect::client::OutputShot {
             actor: "openconnect_server.0".into(),
             shot_number: m.shot_number,
             launch: Some(map_launch(&m)),
             club: Some(map_club(&m)),
             impact: None,
-            ..crate::actors::simout::OutputShot::default()
+            ..flighthook_openconnect::client::OutputShot::default()
         };
-        let out = super::super::super::gspro::mapper::map_shot(&shot);
+        let out = flighthook_openconnect::client::mapper::map_shot(&shot);
         let eps = 1e-9;
         assert!((out.ball_data.hla - m.ball_data.hla).abs() < eps, "hla");
         assert!(

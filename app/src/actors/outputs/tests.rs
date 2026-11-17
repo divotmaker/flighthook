@@ -1,6 +1,7 @@
-//! The Pureplay Connect card's policy, as pure tests of its hooks (one
+//! The simulator output cards' policy, as pure tests of their hooks (one
 //! thread, the hooks called as the host calls them), and one smoke test of
-//! the card on the driver host with a scripted driver.
+//! each card on the driver host with a scripted driver. Pureplay Connect
+//! here, the Open Connect client in [`openconnect`].
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -21,11 +22,24 @@ use crate::actors::web::tests::TempDir;
 use crate::bus::{BusReceiver, BusSender, PeerId};
 use crate::state::SystemState;
 
+/// A simulator output's section, with its driver for the hooks' calls.
+trait Card: OutputSection {
+    type D: FrpDriver<Config = <Self as flighthook::DeviceSection>::Driver>;
+}
+
+impl Card for PureplaySection {
+    type D = Connect;
+}
+
+impl Card for flighthook::OpenConnectClientSection {
+    type D = flighthook_openconnect::client::Client;
+}
+
 /// The card's hooks with what the host lends them: the card's section,
 /// flighthook's state and the card's sender, on a bus the test reads.
-struct Rig {
-    hooks: PureplayHooks,
-    section: PureplaySection,
+struct Rig<S: Card> {
+    hooks: OutputHooks<S>,
+    section: S,
     state: Arc<SystemState>,
     card: BusSender,
     /// The status the host lends the hooks.
@@ -33,7 +47,7 @@ struct Rig {
     tx: broadcast::Sender<BusMsg>,
     /// What the hooks put on the bus.
     seen: BusReceiver,
-    _dir: TempDir,
+    _dir: Option<TempDir>,
 }
 
 /// The actors these tests use, with their shot sources.
@@ -47,43 +61,71 @@ const SOURCES: [(&str, ShotSource); 7] = [
     ("pureplay_accessory.0", ShotSource::PureplayAccessory),
 ];
 
-impl Rig {
+/// The app's state for these tests, with flighthook's turn in `mode`, and
+/// its session writer.
+fn rig_state(mode: Mode) -> (SystemState, crate::state::SessionWriter, TempDir) {
+    let dir = TempDir(std::env::temp_dir().join(format!(
+        "flighthook-output-hooks-{}",
+        crate::state::config::generate_id()
+    )));
+    let (state, writer) = SystemState::new(dir.0.join("config.toml"));
+    state.system.update(|c| {
+        c.webserver.clear();
+        c.frp.actor_id = Some("flighthook".into());
+        c.frp.auto_chip_actor_id = Some(flighthook::AUTO_CHIP_ACTOR.into());
+        c.pureplay_accessory.insert(
+            "0".into(),
+            flighthook::PureplayAccessorySection {
+                actor_id: Some("pureplay_accessory.0".into()),
+                ..flighthook::PureplayAccessorySection::default()
+            },
+        );
+    });
+    for (id, source) in SOURCES {
+        state.sources.register_source(id, source);
+    }
+    writer.apply(&GolferSelect {
+        mode: Some(mode),
+        ..GolferSelect::new("start")
+    });
+    (state, writer, dir)
+}
+
+impl<S: Card> Rig<S> {
+    /// Card `key` (its FRP actor id too) with `section`, on `state` and the
+    /// bus `tx`.
+    fn on(section: S, key: &str, state: Arc<SystemState>, tx: broadcast::Sender<BusMsg>) -> Self {
+        let card =
+            BusSender::new(key.into(), tx.clone(), Arc::default()).with_frp_id(Some(key.into()));
+        let seen = card.subscribe();
+        Self {
+            hooks: OutputHooks::default(),
+            section,
+            state,
+            card,
+            status: ActorStatus::Connected,
+            tx,
+            seen,
+            _dir: None,
+        }
+    }
+
+    /// Card `key` with `section`, flighthook's turn in `mode`.
+    fn with(section: S, key: &str, mode: Mode) -> Self {
+        let (state, _writer, dir) = rig_state(mode);
+        let mut rig = Self::on(section, key, Arc::new(state), broadcast::channel(1024).0);
+        rig._dir = Some(dir);
+        rig
+    }
+}
+
+impl Rig<PureplaySection> {
     /// A card with `routing` (full, chipping, putting), flighthook's turn
     /// in `mode`.
     fn new(routing: [Option<&str>; 3], mode: Mode) -> Self {
-        let dir = TempDir(std::env::temp_dir().join(format!(
-            "flighthook-pureplay-hooks-{}",
-            crate::state::config::generate_id()
-        )));
-        let (state, writer) = SystemState::new(dir.0.join("config.toml"));
-        state.system.update(|c| {
-            c.webserver.clear();
-            c.frp.actor_id = Some("flighthook".into());
-            c.frp.auto_chip_actor_id = Some(flighthook::AUTO_CHIP_ACTOR.into());
-            c.pureplay_accessory.insert(
-                "0".into(),
-                flighthook::PureplayAccessorySection {
-                    actor_id: Some("pureplay_accessory.0".into()),
-                    ..flighthook::PureplayAccessorySection::default()
-                },
-            );
-        });
-        for (id, source) in SOURCES {
-            state.sources.register_source(id, source);
-        }
-        writer.apply(&GolferSelect {
-            mode: Some(mode),
-            ..GolferSelect::new("start")
-        });
-        let state = Arc::new(state);
-        let (tx, _) = broadcast::channel(1024);
-        let card = BusSender::new("pureplay.0".into(), tx.clone(), Arc::default())
-            .with_frp_id(Some("pureplay.0".into()));
-        let seen = card.subscribe();
         let [full, chipping, putting] = routing.map(|r| r.map(str::to_owned));
-        Self {
-            hooks: PureplayHooks::default(),
-            section: PureplaySection {
+        Self::with(
+            PureplaySection {
                 driver: Config {
                     address: Some("127.0.0.1:9760".into()),
                 },
@@ -92,25 +134,23 @@ impl Rig {
                 putting_monitor: putting,
                 ..PureplaySection::default()
             },
-            state,
-            card,
-            status: ActorStatus::Connected,
-            tx,
-            seen,
-            _dir: dir,
-        }
+            "pureplay.0",
+            mode,
+        )
     }
 
     /// A card that routes every mode to "Any", in Full.
     fn any() -> Self {
         Self::new([None, None, None], Mode::Full)
     }
+}
 
+impl<S: Card> Rig<S> {
     /// Run `f` on the hooks as the host does; returns what they pushed for
     /// the session.
-    fn with(
+    fn call(
         &mut self,
-        f: impl FnOnce(&mut PureplayHooks, &mut HookCtx<'_, PureplaySection>),
+        f: impl FnOnce(&mut OutputHooks<S>, &mut HookCtx<'_, S>),
     ) -> Vec<FrpMessage> {
         let mut to_session = Vec::new();
         let mut ctx = HookCtx {
@@ -126,7 +166,7 @@ impl Rig {
 
     /// The host routes `msg`.
     fn route(&mut self, msg: BusMsg) -> Vec<FrpMessage> {
-        self.with(|h, ctx| Hooks::<Connect>::route(h, &msg, ctx))
+        self.call(|h, ctx| Hooks::<S::D>::route(h, &msg, ctx))
     }
 
     /// The host routes a message of local actor `from`.
@@ -136,19 +176,24 @@ impl Rig {
 
     /// A session connected.
     fn start(&mut self) -> Vec<FrpMessage> {
-        self.with(Hooks::<Connect>::session_started)
+        self.call(Hooks::<S::D>::session_started)
     }
 
     /// The session ended.
     fn end(&mut self) {
-        self.with(Hooks::<Connect>::session_ended);
+        self.call(Hooks::<S::D>::session_ended);
     }
 
     /// The driver sent `body`.
-    fn driver_sent(&mut self, mut body: FrpBody) -> Pass {
+    fn driver_sent(&mut self, body: FrpBody) -> Pass {
+        self.driver_sends(body).0
+    }
+
+    /// The driver sent `body`: what the hooks made of it.
+    fn driver_sends(&mut self, mut body: FrpBody) -> (Pass, FrpBody) {
         let mut pass = Pass::Drop;
-        self.with(|h, ctx| pass = Hooks::<Connect>::on_frp(h, &mut body, ctx));
-        pass
+        self.call(|h, ctx| pass = Hooks::<S::D>::on_frp(h, &mut body, ctx));
+        (pass, body)
     }
 
     /// flighthook's turn, caused by `cause`.
@@ -223,7 +268,7 @@ fn pair(from: &str, kind: &str) -> (String, String) {
 
 /// Put shot `n` of `actor` through the hooks (trigger, launch, finished);
 /// returns what the session was handed.
-fn shot(rig: &mut Rig, actor: &str, n: u32) -> Vec<FrpMessage> {
+fn shot<S: Card>(rig: &mut Rig<S>, actor: &str, n: u32) -> Vec<FrpMessage> {
     let key = key_of(actor, n);
     let mut handed = rig.from(actor, ShotTrigger::new(key.clone()));
     handed.extend(rig.from(actor, launch(&key)));
@@ -476,7 +521,7 @@ fn each_written_shot_is_recorded_as_sent() {
 #[test]
 fn the_card_reasserts_its_held_select_with_the_mode() {
     let mut rig = Rig::any();
-    let selects = |rig: &mut Rig| -> Vec<GolferSelect> {
+    let selects = |rig: &mut Rig<PureplaySection>| -> Vec<GolferSelect> {
         rig.sent()
             .into_iter()
             .filter_map(|m| match m.as_frp().map(|f| f.body.clone()) {
@@ -588,3 +633,5 @@ fn the_started_actor_records_its_shots_in_the_apps_registry() {
         crate::state::Stopped::Lingering
     ));
 }
+
+mod openconnect;

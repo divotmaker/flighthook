@@ -91,10 +91,9 @@ pub(crate) fn put_derived(shot: &mut ShotData, derived: Option<flighthook::Deriv
 /// shot, its GSPro / Open Connect message, its Pureplay frames and its CSV
 /// row in both unit systems, one line each.
 ///
-/// Each shot is built as production builds it. The outputs take it through
-/// [`output_shot`](crate::actors::simout::output_shot) with Auto-chip's
-/// actor id (the shot's own when `card` is Auto-chip's card), so Auto-chip's
-/// flight never reaches them. The CSV row is the stored shot's: the flight
+/// Each shot is built as production builds it. The outputs are handed no
+/// Auto-chip flight (the shot is Auto-chip's when `card` is Auto-chip's
+/// card), and take it through their `output_shot`. The CSV row is the stored shot's: the flight
 /// model's addendum is added as the flight model actor computes it
 /// (default `[simulation]`, the shot's turn mode, else `mode`, the mode the
 /// card arms in), then the web store's composition names the shot by its
@@ -115,14 +114,15 @@ pub(crate) fn outputs(card: &str, mode: Option<Mode>, messages: &[crate::bus::Bu
         } else {
             flighthook::AUTO_CHIP_ACTOR.to_owned()
         };
-        let data = crate::actors::simout::output_shot(&shot, card, &auto_chip);
-        let gspro = serde_json::to_string(&crate::actors::gspro::mapper::map_shot(&data))
-            .expect("gspro json");
-        // Pureplay Connect is handed no Auto-chip flight.
+        // The outputs are handed no Auto-chip flight.
         let mut handed = shot.clone();
         if shot.from == auto_chip {
             handed.flights.clear();
         }
+        let gspro = serde_json::to_string(&flighthook_openconnect::client::mapper::map_shot(
+            &flighthook_openconnect::client::output_shot(&handed, card),
+        ))
+        .expect("gspro json");
         let pureplay = format!(
             "{:?}",
             flighthook_pureplay::connect::mapper::map_shot(

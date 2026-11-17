@@ -139,7 +139,10 @@ impl Default for OpenConnectClientSection {
             putting_clubs: crate::default_putting_clubs(),
             name: "GSPro".into(),
             enabled: true,
-            address: Some("127.0.0.1:921".into()),
+            driver: OpenConnectClientConfig {
+                address: Some(crate::OPENCONNECT_DEFAULT_ADDRESS.into()),
+                ..OpenConnectClientConfig::default()
+            },
             full_monitor: None,
             chipping_monitor: None,
             putting_monitor: None,

@@ -55,8 +55,10 @@ pub struct OpenConnectClientSection {
     /// with the card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
-    /// Simulator address. Defaults to `127.0.0.1:921`.
-    pub address: Option<String>,
+    /// The Open Connect client's settings: `address`, the simulator's
+    /// (`ip:port`, default `127.0.0.1:921`).
+    #[serde(flatten)]
+    pub driver: OpenConnectClientConfig,
     /// The FRP actor id of the launch monitor for full-swing shots. A card
     /// key (`mevo.0`) in the file names that card's actor id from the
     /// first load on. None = accept from any monitor.
@@ -128,6 +130,28 @@ impl OpenConnectClientSection {
         ]
         .into_iter()
         .any(|m| routed_to_simulator(config, m.as_deref()))
+    }
+}
+
+impl DeviceSection for OpenConnectClientSection {
+    type Driver = OpenConnectClientConfig;
+    const KIND: &'static str = "openconnect_client";
+
+    fn driver(&self) -> &OpenConnectClientConfig {
+        &self.driver
+    }
+
+    /// The driver's settings with the card's actor id, which the
+    /// connection is registered under as this process's own.
+    fn driver_settings(&self) -> OpenConnectClientConfig {
+        OpenConnectClientConfig {
+            actor: self.actor_id.clone().unwrap_or_default(),
+            ..self.driver.clone()
+        }
+    }
+
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
+        &config.openconnect_client
     }
 }
 
