@@ -784,22 +784,13 @@ async fn finish_shot(
 }
 
 /// Keep the web state current from a launch monitor's or a hosted card's
-/// `bus.actor`: its rows (`ready`, battery, the actor's own telemetry) and
-/// flagged values on its card.
+/// `bus.actor`: its rows and flagged values on its card
+/// ([`ActorStatusResponse::apply_actor`](flighthook::ActorStatusResponse::apply_actor)).
 async fn apply_device(state: &WebState, from: &str, actor: &flightrelay::BusActor) {
     let card = stored::card_of(&state.root, from);
-    let rows = flighthook::bus_actor_rows(actor);
     let mut actors = state.actors.write().await;
     if let Some(entry) = actors.get_mut(&card) {
-        entry.flagged.clone_from(&actor.flagged);
-        // An empty row is a battery the actor no longer reports.
-        for (k, v) in rows {
-            if v.is_empty() {
-                entry.telemetry.remove(&k);
-            } else {
-                entry.telemetry.insert(k, v);
-            }
-        }
+        entry.apply_actor(actor);
     }
 }
 
@@ -820,8 +811,6 @@ async fn apply_local(
                 let name = names.get(card).cloned().unwrap_or_default();
                 new_actor(name)
             });
-            // A lost connection or a new instance drops the telemetry held
-            // for the actor.
             actor.apply_status(*status, telemetry, state.now_ms());
             drop(actors);
             // Out of session, the device finishes none of its pending shots.

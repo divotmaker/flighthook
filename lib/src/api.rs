@@ -147,7 +147,7 @@ impl ActorStatusResponse {
     /// in the keys it carries: each key replaces the one held, and an empty
     /// value removes it. A key held stays through every status: its
     /// reporter sends an explicit value (`none`) for what it no longer
-    /// knows.
+    /// knows. A card that is not Connected reads `ready` false.
     pub fn apply_status(
         &mut self,
         status: ActorStatus,
@@ -156,6 +156,29 @@ impl ActorStatusResponse {
     ) {
         self.observe(status, now_ms);
         merge_telemetry(&mut self.telemetry, telemetry);
+        if status != ActorStatus::Connected
+            && let Some(ready) = self.telemetry.get_mut("ready")
+        {
+            *ready = false.to_string();
+        }
+    }
+
+    /// Fold in a local card's `bus.actor`: its rows
+    /// ([`bus_actor_rows`](crate::bus_actor_rows)) and flagged values, with
+    /// `ready` true only while the card is Connected and the actor has no
+    /// blockers. An empty row (a battery the actor no longer reports) is
+    /// removed.
+    pub fn apply_actor(&mut self, actor: &flightrelay::BusActor) {
+        self.flagged.clone_from(&actor.flagged);
+        for (k, v) in crate::bus_actor_rows(actor) {
+            if v.is_empty() {
+                self.telemetry.remove(&k);
+            } else {
+                self.telemetry.insert(k, v);
+            }
+        }
+        let ready = self.status == ActorStatus::Connected && actor.is_clear();
+        self.telemetry.insert("ready".into(), ready.to_string());
     }
 
     /// The `error` row, unless it reads `none` (or is empty).
@@ -399,11 +422,11 @@ mod tests {
             assert_eq!(
                 a.telemetry,
                 tel(&[
-                    ("ready", "true"),
+                    ("ready", "false"),
                     ("device_state", "waiting"),
                     ("error", "refused")
                 ]),
-                "{to:?}"
+                "{to:?}: not connected, not ready"
             );
             assert_eq!(a.error(), Some("refused"));
             a.apply_status(to, &tel(&[("error", "none")]), 11);
@@ -430,6 +453,29 @@ mod tests {
         a.telemetry = tel(&[("address", "x")]);
         a.apply_status(ActorStatus::Connected, &tel(&[("ready", "true")]), 5);
         assert_eq!(a.telemetry, tel(&[("address", "x"), ("ready", "true")]));
+    }
+
+    /// A local card's `ready` is true only while it is Connected and its
+    /// `bus.actor` has no blockers: an output with no session reads false,
+    /// and its heartbeat (the same `bus.actor` again) leaves it false.
+    #[test]
+    fn a_cards_ready_needs_a_connection_and_no_blockers() {
+        let output = flightrelay::BusActor::new("GSPro", 2.0);
+        let mut a = ActorStatusResponse::new("GSPro", ActorStatus::Starting);
+        a.apply_actor(&output);
+        assert_eq!(a.telemetry["ready"], "false", "no session");
+        a.apply_status(ActorStatus::Connected, &HashMap::new(), 1);
+        a.apply_actor(&output);
+        assert_eq!(a.telemetry["ready"], "true");
+        a.apply_status(ActorStatus::Reconnecting, &HashMap::new(), 2);
+        assert_eq!(a.telemetry["ready"], "false", "the connection is lost");
+        a.apply_actor(&output);
+        assert_eq!(a.telemetry["ready"], "false", "the heartbeat keeps it");
+        a.apply_status(ActorStatus::Connected, &HashMap::new(), 3);
+        let mut blocked = output.clone();
+        blocked.blockers = vec![flightrelay::blockers::NOT_ARMED.into()];
+        a.apply_actor(&blocked);
+        assert_eq!(a.telemetry["ready"], "false", "blocked");
     }
 
     #[test]

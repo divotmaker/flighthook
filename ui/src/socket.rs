@@ -80,14 +80,7 @@ impl FlighthookApp {
                     && (!flighthook::is_output_card(card) || actor.device.is_some())
                     && let Some(status) = self.actors.get_mut(card)
                 {
-                    status.flagged.clone_from(&actor.flagged);
-                    for (k, v) in flighthook::bus_actor_rows(actor) {
-                        if v.is_empty() {
-                            status.telemetry.remove(&k);
-                        } else {
-                            status.telemetry.insert(k, v);
-                        }
-                    }
+                    status.apply_actor(actor);
                 }
             }
             FrpBody::GolferTurn(turn) if msg.from == self.flighthook_id => {

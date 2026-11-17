@@ -262,17 +262,20 @@ shown, always has a value: what its source does not know reads `none`
 (or `unknown`, `idle`, `0`), and the rows stay while the card is
 reconnecting or disconnected. Only `battery_pct` leaves when there is no
 reading. A key is reported by one source only:
-- **Device-reported** (reported by the device): `ready`, `battery_pct`, `tilt`
+- **Device-reported** (reported by the device): `battery_pct`, `tilt`
   and `roll` (degrees, `0.4°`; a Mevo+ and an R10, which flags both while it
   reports it is not level), `temp_c`, `external_power` (a Mevo+), `zero_spin_discards` (a Square Golf), and a device driver's own state keys
   (the mock's `radar_mode`, `tracking_mode`; the Square Golf's
   `device_state`; the Trackball's `synthetic`
   (`true`), `input` (the name the device reports), `cpi`, `profile` (the
   club in play) and `handed` (`rh` | `lh`))
-- **Every card**: `device_info` (`none` once the session ends),
-  `shot_count` (a launch monitor's), `phase` (what the driver is doing:
-  `discovering`, `listening`, `connecting`, `handshaking`, `configuring`,
-  then `measuring`, or `connected` for an output; the last one set);
+- **Every card**: `ready` (`true` while the card is connected and its
+  `bus.actor` has no blockers, else `false`), `device_info` (`none` once the
+  session ends), `shot_count` (a launch monitor's), `phase` (what the driver
+  is doing: `discovering`, `listening`, `connecting`, `handshaking`,
+  `configuring`, then `measuring`, or `connected` for an output; the last one
+  set while connecting or connected, `connecting` while the card starts or
+  reconnects, `idle` once it is disconnected);
   `error` on a card on a device driver whose connects keep failing: the
   latest connect error, `none` when a session connects
 - **Software cards**: `club`, `handed`, `name`, `error`
@@ -284,7 +287,7 @@ reading. A key is reported by one source only:
   last sent to the simulator, `true` | `false`), `response` (the
   simulator's last response code and message, `201 GSPro Player
   Information`), `club` and `handed` (the simulator's player
-  information) and `ready` (`true`, from the card's `bus.actor`). Between
+  information). Between
   connections `monitor_ready` reads `unknown`, `response`, `club` and
   `handed` read `none`, and `last_shot` and `shots_sent` keep the last
   connection's. `error`
@@ -295,8 +298,8 @@ reading. A key is reported by one source only:
   `127.0.0.1:9760`, while connected), and for the current link only
   `last_shot` (the ShotId Pureplay got last and the local time it was sent,
   `#4 at 16:41:07`), `shots_sent` (`4`), `ready_state` (the ready state last
-  sent, `ready` | `not ready` | `processing`), `strict_mode` (`on` | `off`)
-  and `ready` (`true`, from the card's `bus.actor`). Strict mode is
+  sent, `ready` | `not ready` | `processing`) and `strict_mode` (`on` |
+  `off`). Strict mode is
   `on` while Pureplay records a tournament round: Pureplay asks for it on the
   link and the output always accepts; it is off again when Pureplay ends it
   or the link ends. While it is on, the output sends only shots whose launch

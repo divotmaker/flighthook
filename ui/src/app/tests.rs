@@ -349,7 +349,8 @@ fn a_cards_rows_stay_through_a_lost_connection_and_flags_follow_its_bus_actor() 
     app.handle_ui_message(flighthook::UiMessage::Frp(flagged));
     assert_eq!(app.actors["mevo.0"].flagged, ["tilt"]);
 
-    // Lost: every row stays, each at its latest value.
+    // Lost: every row stays, each at its latest value; not connected, so
+    // not ready.
     app.handle_ui_message(status(ActorStatus::Reconnecting, &[("error", "gone")]));
     app.handle_ui_message(device(&[("tilt", "unknown")]));
     app.handle_ui_message(status(
@@ -361,7 +362,7 @@ fn a_cards_rows_stay_through_a_lost_connection_and_flags_follow_its_bus_actor() 
         [
             row("device_info", "none"),
             row("error", "gone"),
-            row("ready", "true"),
+            row("ready", "false"),
             row("tilt", "unknown"),
         ]
     );

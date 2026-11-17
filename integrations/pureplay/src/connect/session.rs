@@ -100,6 +100,9 @@ pub struct Connect {
     backoff: Backoff,
     /// When Pureplay last sent an Error, on any link.
     host_errors: Live<Option<Instant>>,
+    /// Why the last link's handshake failed, if it did: the next link's
+    /// `error` until its HelloAck.
+    handshake_error: Option<String>,
 }
 
 impl FrpDriver for Connect {
@@ -130,6 +133,7 @@ impl FrpDriver for Connect {
             config,
             backoff: Backoff::new(MIN_BACKOFF, MAX_BACKOFF),
             host_errors: Live::new(None),
+            handshake_error: None,
         })
     }
 
@@ -138,7 +142,8 @@ impl FrpDriver for Connect {
     }
 
     /// The TCP connect. The handshake runs in the session, after the host
-    /// has handed it what it sees.
+    /// has handed it what it sees; the last link's handshake failure stays
+    /// in `error` meanwhile.
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Session<TcpStream>, Error> {
         ctx.out.phase("connecting");
         let addr = self
@@ -148,6 +153,9 @@ impl FrpDriver for Connect {
         let stream = ctx.connect_tcp(addr, CONNECT_TIMEOUT)??;
         stream.set_nodelay(true)?;
         stream.set_nonblocking(true)?;
+        if let Some(reason) = &self.handshake_error {
+            ctx.out.telemetry([(ERROR, reason.clone())]);
+        }
         // The host takes what is on the bus now, so the first step's Hello
         // names what is in view.
         ctx.tick()?;
@@ -164,14 +172,19 @@ impl FrpDriver for Connect {
     }
 
     /// The backoff (1-3 s), with no alert: Pureplay not running is normal.
-    /// A failed handshake puts its reason in `error`.
+    /// A failed handshake puts its reason in `error`, and the next link
+    /// sends it again.
     fn retry_delay(
         &mut self,
         ended: &SessionEnd<'_, Error>,
         _backoff: &mut Backoff,
         out: &mut Events<'_>,
     ) -> Option<Duration> {
-        if let Error::Handshake(reason) = ended.error {
+        self.handshake_error = match ended.error {
+            Error::Handshake(reason) => Some(reason.clone()),
+            _ => None,
+        };
+        if let Some(reason) = &self.handshake_error {
             out.telemetry([(ERROR, reason.clone())]);
         }
         Some(self.backoff.delay(ended.connected_for))

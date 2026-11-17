@@ -414,6 +414,14 @@ fn retries_back_off_one_to_three_seconds_and_a_handshake_failure_shows() {
     let events = host.take();
     assert_eq!(status(&events).telemetry["error"], "no reply");
     assert!(alerts(&events).is_empty());
+    host.with(|now, out| {
+        driver.retry_delay(
+            &SessionEnd::new(&refused, now, None, 1),
+            &mut Backoff::default(),
+            out,
+        )
+    });
+    assert_eq!(driver.handshake_error, None, "only the last link's failure");
 }
 
 // -- The handshake -------------------------------------------------------------
@@ -1169,8 +1177,9 @@ fn host_errors_are_alerted_once_per_burst() {
 
 // -- A real socket ---------------------------------------------------------------
 
-/// Over TCP: the driver connects, the session says Hello, takes HelloAck,
-/// pushes its ready state and writes a shot it is handed.
+/// Over TCP: the driver connects with the last link's handshake failure
+/// still in `error`, the session says Hello, takes HelloAck (`error` reads
+/// `none`), pushes its ready state and writes a shot it is handed.
 #[test]
 fn a_real_link_shakes_hands_and_sends_a_shot() {
     use std::net::TcpListener;
@@ -1181,7 +1190,21 @@ fn a_real_link_shakes_hands_and_sends_a_shot() {
     })
     .expect("driver");
     let mut host = TestHost::new();
+    let failed = Error::Handshake("no reply to Hello".into());
+    host.with(|now, out| {
+        driver.retry_delay(
+            &SessionEnd::new(&failed, now, Some(HELLO_TIMEOUT), 0),
+            &mut Backoff::default(),
+            out,
+        )
+    });
+    host.take();
     let mut session = host.connect(&mut driver).expect("connects");
+    assert_eq!(
+        status(&host.take()).telemetry["error"],
+        "no reply to Hello",
+        "the reason stays through the next handshake"
+    );
     let (mut peer, _) = listener.accept().expect("the driver connects");
     peer.set_read_timeout(Some(Duration::from_secs(60)))
         .expect("timeout");
@@ -1210,6 +1233,7 @@ fn a_real_link_shakes_hands_and_sends_a_shot() {
     while !session.handshaken {
         host.with(|now, out| session.step(now, out)).expect("steps");
     }
+    assert_eq!(status(&host.take()).telemetry["error"], "none");
     assert_eq!(
         next(&mut peer),
         Message::ReadyState(ReadyState::NotReady.byte())

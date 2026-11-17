@@ -833,8 +833,11 @@ each key through one of them only.
   connection: a status enum and the card's display rows. Standard keys:
   `device_info` (`none` once the session ends); launch monitors on a device
   driver add `shot_count`; every card on a driver shows `phase`, the last
-  phase its driver set; a card whose connect fails adds `error`, which reads
-  `none` once a session connects.
+  phase its driver set while a connect or session runs, `connecting` while
+  the card starts or reconnects and `idle` once it is disconnected; a card
+  whose connect fails adds `error`, which reads `none` once a session
+  connects. A card's `ready` row is `true` while the card is connected and
+  its `bus.actor` has no blockers.
   The simulator outputs add `last_shot` and `shots_sent` (see
   [Open Connect client telemetry](#open-connect-client-telemetry) and
   [Pureplay output](#pureplay-output-alpha)); the Pureplay Accessory adds
@@ -2229,9 +2232,9 @@ as the driver gives it; nothing is held:
 | `shot.launch`, `shot.flight`, `shot.club`, `shot.impact` | the same messages, after the card's `on_frp` hook |
 | `shot.finished` | what the card's `before_finished` hook adds (the FlightScope's own `assumed` flight), the shot's raw frames as the local `ShotCapture` (`"<kind> device has no wire protocol"` without a raw profile), then `shot.finished`, then the card's `shot_count` |
 | `alert` | `bus.alert` |
-| status and identity | the card's `bus.actor` (blockers, battery, every declared telemetry key, flagged values, device), published when it changes; during a connect, changed telemetry goes to the card as rows |
+| status and identity | the card's `bus.actor` (blockers, battery, every declared telemetry key, flagged values, device), published when it changes; during a connect it carries the telemetry and flags the driver sent, on a `not_armed` status (battery and blockers wait for the session) |
 | `raw_frame` | numbered per device id across sessions (frames of the first connect, before the id is known, number on into it), a hex line at the `audit` target, recorded for the export ([raw capture](#raw-capture-and-shot-export)); never on the bus |
-| `Phase` | the card's `phase`, kept until the driver sets another: a driver sets one at the start of every connect and once its session is up (`measuring`, or `connected` for an output) |
+| `Phase` | the card's `phase`, kept until the driver sets another or the card leaves Connected without a connect running (`connecting` while it reconnects, `idle` once disconnected): a driver sets one at the start of every connect and once its session is up (`measuring`, or `connected` for an output) |
 | `Log` | tracing; trace lines at the `audit` target |
 | `ShotDiscarded` | the pre-roll is cleared |
 

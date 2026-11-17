@@ -104,6 +104,10 @@ struct Script {
     retry: Option<Duration>,
     /// Told when a connect begins.
     entered: Option<std::sync::mpsc::Sender<()>>,
+    /// When set, a connect waits for it after `entered`, then ticks.
+    hold: Option<std::sync::mpsc::Receiver<()>>,
+    /// The driver gives up after a failed connect.
+    give_up: bool,
 }
 
 static SCRIPTS: LazyLock<Mutex<HashMap<u64, Arc<Mutex<Script>>>>> = LazyLock::new(Mutex::default);
@@ -179,14 +183,18 @@ impl FrpDriver for FakeDriver {
 
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<FakeSession, FakeError> {
         ctx.tick()?;
-        let mut next = {
+        let (mut next, hold) = {
             let mut script = lock(&self.script);
             script.latched.push(*ctx.hints());
             if let Some(entered) = &script.entered {
                 let _ = entered.send(());
             }
-            script.connects.pop_front()
+            (script.connects.pop_front(), script.hold.take())
         };
+        if let Some(hold) = hold {
+            let _ = hold.recv();
+            ctx.tick()?;
+        }
         while let Some(Connect::Phase(phase, inner)) = next {
             ctx.out.phase(phase);
             next = Some(*inner);
@@ -214,11 +222,8 @@ impl FrpDriver for FakeDriver {
         out: &mut Events<'_>,
     ) -> Option<Duration> {
         out.alert(Severity::Warn, ended.error.to_string());
-        Some(
-            lock(&self.script)
-                .retry
-                .unwrap_or(Duration::from_millis(10)),
-        )
+        let script = lock(&self.script);
+        (!script.give_up).then(|| script.retry.unwrap_or(Duration::from_millis(10)))
     }
 
     fn apply_config(&mut self, new: &FakeConfig) {
@@ -783,26 +788,44 @@ fn frames_before_the_first_session_are_numbered_on() {
 }
 
 /// The status a driver sends while it connects goes out in the card's
-/// `bus.actor` with the identity once the session connects (its
-/// telemetry shows on the card as rows meanwhile); the Connected status
-/// leaves the card's `phase` as the driver set it.
+/// `bus.actor` at once: its telemetry and flags on a `not_armed` actor
+/// (battery and blockers wait for the session), so the heartbeat, which
+/// resends that `bus.actor`, keeps the card's rows. The identity and the
+/// rest go out once the session connects; the Connected status leaves the
+/// card's `phase` as the driver set it.
 #[test]
-fn a_connects_telemetry_goes_out_with_the_identity() {
-    let ready = |pct: u8| {
+fn a_connects_telemetry_goes_out_at_once_and_the_heartbeat_keeps_it() {
+    let warming = |pct: u8| {
         DeviceEvent::Status(
             DeviceStatus::new()
-                .with_telemetry("ready", "false")
+                .with_telemetry("blockers", "warming up")
+                .with_flag("blockers", true)
                 .with_battery(pct),
         )
     };
     let (_dir, mut sink, mut rx, _w) = connecting_sink::<FakeHooks>("");
     sink.handle(DeviceEvent::Phase("handshaking"));
-    sink.handle(ready(50));
-    sink.handle(ready(48));
+    sink.handle(warming(50));
+    sink.handle(warming(48));
     let seen = drain(&mut rx);
-    assert_eq!(kinds(&seen), ["status", "status"], "no bus.actor yet");
-    let (_, rows) = card_status(&seen[1]).expect("a card status");
-    assert_eq!(rows, &HashMap::from([("ready".into(), "false".into())]));
+    assert_eq!(kinds(&seen), ["status", "actor"], "the battery waits");
+    let FrpBody::BusActor(actor) = body(&seen[1]) else {
+        unreachable!()
+    };
+    assert_eq!(actor.blockers, [flightrelay::blockers::NOT_ARMED]);
+    assert_eq!(actor.device.as_ref().and_then(|d| d.battery_pct), None);
+    assert_eq!(actor.flagged, ["blockers"]);
+    let mut card = flighthook::ActorStatusResponse::new("Fake", ActorStatus::Starting);
+    for m in &seen {
+        if let Some((status, telemetry)) = card_status(m) {
+            card.apply_status(status, telemetry, 0);
+        }
+    }
+    // The heartbeat: the `bus.actor` last published, again.
+    card.apply_actor(lock(&sink.published).as_ref().expect("published"));
+    assert_eq!(card.telemetry["blockers"], "warming up");
+    assert_eq!(card.flagged, ["blockers"]);
+
     sink.connected(&DeviceIdentity::new("FAKE-1").with_model("Eagle"));
     let seen = drain(&mut rx);
     assert_eq!(kinds(&seen), ["status", "actor"]);
@@ -812,15 +835,15 @@ fn a_connects_telemetry_goes_out_with_the_identity() {
     let FrpBody::BusActor(actor) = body(&seen[1]) else {
         unreachable!()
     };
+    let device = actor.device.as_ref().expect("device");
+    assert_eq!(device.model.as_deref(), Some("Eagle"));
+    assert_eq!(device.battery_pct, Some(48));
+    assert!(actor.blockers.is_empty());
     assert_eq!(
-        actor.device.as_ref().and_then(|d| d.model.as_deref()),
-        Some("Eagle")
+        actor.telemetry.as_ref().expect("telemetry")["blockers"],
+        "warming up"
     );
-    assert_eq!(
-        actor.telemetry.as_ref().expect("telemetry")["ready"],
-        "false"
-    );
-    sink.handle(ready(49));
+    sink.handle(warming(49));
     assert_eq!(kinds(&drain(&mut rx)), ["actor"], "connected: at once");
 }
 
@@ -1146,10 +1169,10 @@ fn a_stop_ends_a_blocked_connect_within_the_stop_wait() {
     rig.until(|m| is_status(m, ActorStatus::Disconnected));
 }
 
-/// The `phase` of a connect that fails stays on the card through the
-/// retry delay, until the next attempt sets its own.
+/// The card reads `phase` `connecting` while it starts and through the
+/// retry delay after a failed connect, until the next attempt sets its own.
 #[test]
-fn a_failed_connects_phase_stays_until_the_next_one() {
+fn a_failed_connect_reads_connecting_until_the_next_one_sets_its_phase() {
     let (id, _script) = script(vec![
         Connect::Phase("handshaking", Box::new(Connect::Fail("no answer"))),
         Connect::Phase("discovering", Box::new(Connect::Block)),
@@ -1172,9 +1195,35 @@ fn a_failed_connects_phase_stays_until_the_next_one() {
     use ActorStatus::Starting;
     assert_eq!(
         phases,
-        [(Starting, "handshaking"), (Starting, "discovering")]
+        [
+            (Starting, "connecting"),
+            (Starting, "handshaking"),
+            (Starting, "connecting"),
+            (Starting, "discovering")
+        ]
     );
     rig.state.stop_and_wait("fake.0");
+}
+
+/// A driver that gives up after a failed connect leaves the card
+/// Disconnected with the error and `phase` `idle`.
+#[test]
+fn a_driver_that_gives_up_reads_idle() {
+    let (id, script) = script(vec![Connect::Phase(
+        "handshaking",
+        Box::new(Connect::Fail("refused")),
+    )]);
+    lock(&script).give_up = true;
+    let mut rig = rig();
+    rig.start(section(id));
+    let seen = rig.until(|m| is_status(m, ActorStatus::Disconnected));
+    let (_, rows) = card_status(&seen[seen.len() - 1]).expect("Disconnected");
+    assert_eq!(rows["phase"], "idle");
+    assert_eq!(rows["error"], "refused");
+    assert_eq!(
+        rig.state.stop_and_wait("fake.0"),
+        crate::state::Stopped::Exited
+    );
 }
 
 /// The error row of the card after each of `seen`'s statuses, as the web
@@ -1339,23 +1388,24 @@ fn a_drivers_alerts_are_logged() {
     );
 }
 
-/// A stop that ends a connect leaves the card Disconnected with the
-/// connect's last `phase`: the host never clears one.
+/// A stop that ends a connect leaves the card Disconnected with `phase`
+/// `idle`.
 #[test]
-fn a_stop_during_a_connect_keeps_the_last_phase() {
+fn a_stop_during_a_connect_reads_idle() {
     let (id, _script) = script(vec![Connect::Phase(
         "handshaking",
         Box::new(Connect::Block),
     )]);
     let mut rig = rig();
     rig.start(section(id));
-    let seen = rig.until(|m| card_status(m).is_some_and(|(_, t)| t.contains_key("phase")));
+    let seen = rig.until(|m| {
+        card_status(m).is_some_and(|(_, t)| t.get("phase").is_some_and(|p| p == "handshaking"))
+    });
     assert_eq!(
         rig.state.stop_and_wait("fake.0"),
         crate::state::Stopped::Exited
     );
     let end = rig.until(|m| is_status(m, ActorStatus::Disconnected));
-    // The card's view of every status: the phase stays once Disconnected.
     let mut card = flighthook::ActorStatusResponse::new("Fake", ActorStatus::Starting);
     for m in seen.iter().chain(&end) {
         if let Some((status, telemetry)) = card_status(m) {
@@ -1363,7 +1413,7 @@ fn a_stop_during_a_connect_keeps_the_last_phase() {
         }
     }
     assert_eq!(card.status, ActorStatus::Disconnected);
-    assert_eq!(card.telemetry["phase"], "handshaking");
+    assert_eq!(card.telemetry["phase"], "idle");
 }
 
 /// Another actor's `bus.sync` gets the card's current `bus.actor` again,
@@ -1407,8 +1457,9 @@ fn refused_settings_show_on_the_card() {
     );
 }
 
-/// A driver that panics ends the card Disconnected with the error and
-/// `ready=false`, never stuck Connected; the thread has ended.
+/// A driver that panics ends the card Disconnected with the error,
+/// `ready=false` and `phase` `idle`, never stuck Connected; the thread has
+/// ended.
 #[test]
 fn a_driver_panic_ends_disconnected_with_the_error() {
     let ready = DeviceEvent::Status(DeviceStatus::new());
@@ -1422,7 +1473,9 @@ fn a_driver_panic_ends_disconnected_with_the_error() {
     use ActorStatus::{Connected, Disconnected, Starting};
     assert_eq!(statuses(&seen), [Starting, Connected, Disconnected]);
     let last = seen.len() - 1;
-    assert!(card_status(&seen[last]).is_some_and(|(_, t)| t["error"] == DRIVER_FAILED));
+    let (_, rows) = card_status(&seen[last]).expect("Disconnected");
+    assert_eq!(rows["error"], DRIVER_FAILED);
+    assert_eq!(rows["phase"], "idle");
     assert!(is_not_armed(&seen[last - 1]), "{:?}", kinds(&seen));
     assert_eq!(
         rig.state.stop_and_wait("fake.0"),
@@ -1553,6 +1606,48 @@ fn commands_reach_the_latched_command_and_the_session() {
     assert_eq!(hints.mode, Some(Mode::Chipping));
     assert_eq!(hints.handedness, Some(flightrelay::Handedness::Left));
     assert_eq!(hints.club, Some(flightrelay::Club::SandWedge));
+    rig.state.stop_and_wait("fake.0");
+}
+
+/// A turn that arrives while a connect runs, after the connect read the
+/// hints, reaches the session before its first step.
+#[test]
+fn a_turn_during_the_connect_reaches_the_session_before_its_first_step() {
+    let stepped = DeviceEvent::Status(DeviceStatus::new().with_telemetry("blockers", "stepped"));
+    let (id, script) = script(vec![Connect::Session(vec![Step::Emit(vec![stepped])])]);
+    let (entered, connect) = std::sync::mpsc::channel();
+    let (release, hold) = std::sync::mpsc::channel();
+    lock(&script).entered = Some(entered);
+    lock(&script).hold = Some(hold);
+    let mut rig = rig();
+    rig.start(section(id));
+    connect
+        .recv_timeout(crate::actors::GIVE_UP)
+        .expect("the connect begins");
+    rig.tx
+        .send(BusMsg::frp(flightrelay::FrpMessage::new(
+            rig.state.flighthook_id(),
+            flightrelay::GolferTurn::new(
+                None,
+                Some(flightrelay::Club::Putter),
+                flightrelay::Handedness::Right,
+                Mode::Putting,
+            ),
+        )))
+        .expect("sent");
+    release.send(()).expect("the connect waits");
+    rig.until(|m| {
+        matches!(m.as_frp().map(|f| &f.body), Some(FrpBody::BusActor(a))
+            if a.telemetry.as_ref().is_some_and(|t| t["blockers"] == "stepped"))
+    });
+    let script = lock(&script);
+    assert_ne!(script.latched[0].mode, Some(Mode::Putting), "read before");
+    assert_eq!(
+        script.commands.first().map(|h| h.mode),
+        Some(Some(Mode::Putting)),
+        "handed to the session"
+    );
+    drop(script);
     rig.state.stop_and_wait("fake.0");
 }
 
@@ -1825,7 +1920,8 @@ fn a_hook_drops_a_whole_shot_at_its_trigger() {
     assert!(sink.dropped.is_empty(), "forgotten after the shot timeout");
 }
 
-/// A session that ends with a shot open: the card is Reconnecting, then
+/// A session that ends with a shot open: the card is Reconnecting (`phase`
+/// `connecting`), then
 /// the shot finishes at once, as a finished shot goes out (its raw
 /// capture, `shot.finished`, the shot count), then the card's `bus.actor`
 /// is `not_armed`.
@@ -1846,6 +1942,7 @@ fn a_lost_sessions_open_shot_is_finished() {
     let (status, rows) = card_status(&seen[0]).expect("Reconnecting");
     assert_eq!(status, ActorStatus::Reconnecting);
     assert_eq!(rows["device_info"], "none");
+    assert_eq!(rows["phase"], "connecting");
     let FrpBody::ShotFinished(finished) = body(&seen[2]) else {
         unreachable!()
     };
