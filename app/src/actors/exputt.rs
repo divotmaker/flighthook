@@ -340,6 +340,18 @@ mod tests {
             let _ = self.tx.send(BusMsg::local("web", event));
         }
 
+        /// Wait until the card has drained the bus up to now: it answers
+        /// `bus.sync` with its `bus.actor` while it drains, in bus order.
+        fn synced(&mut self) {
+            let _ = self.tx.send(BusMsg::frp(FrpMessage::new(
+                self.state.flighthook_id(),
+                flightrelay::BusSync::new(),
+            )));
+            self.until("bus.sync answered", |m| {
+                matches!(body(m), Some(FrpBody::BusActor(_)))
+            });
+        }
+
         /// Put the session's turn with `hand` on the bus, as the system
         /// actor publishes it.
         fn turn(&self, hand: Handedness) {
@@ -408,18 +420,6 @@ mod tests {
                 .expect("shot.trigger");
             seen.drain(..start);
             seen
-        }
-
-        /// Every message from the card waiting on the bus, without waiting.
-        fn drain(&mut self) -> Vec<BusMsg> {
-            let mut seen = Vec::new();
-            loop {
-                match self.rx.try_recv() {
-                    Ok(m) if self.mine(&m) => seen.push(m),
-                    Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                    Err(_) => return seen,
-                }
-            }
         }
 
         /// Stop the card and wait for its thread.
@@ -979,8 +979,9 @@ mod tests {
         mock.push_event("Test,yy");
         seen.extend(card.until_ready(true, None));
         assert!(last_ready(&seen), "ready again");
-        std::thread::sleep(Duration::from_millis(100));
-        seen.extend(card.drain());
+        // A putt after it is taken on the same session.
+        mock.push_event(PUTT_RESULT_FULL);
+        seen.extend(card.next_shot());
         assert!(
             !seen.iter().any(|m| is_status(m, ActorStatus::Reconnecting)),
             "no reconnect"
@@ -1189,15 +1190,11 @@ mod tests {
         card.start();
         let mut seen = card.until("alert", |m| alert(m).is_some());
         assert_eq!(phases(&seen), ["discovering"]);
-        // Many more slices, no second hint.
-        std::thread::sleep(Duration::from_millis(800));
-        seen.extend(card.drain());
-        // In the card's words.
+        card.stop();
+        seen.extend(card.until_status(ActorStatus::Disconnected));
+        // In the card's words. That the driver hints once is threeputt's.
         assert_eq!(alerts(&seen), [DISCOVERY_HINT]);
         assert!(!seen.iter().any(|m| is_status(m, ActorStatus::Connected)));
-
-        card.stop();
-        card.until_status(ActorStatus::Disconnected);
     }
 
     /// A Find mat pressed while the card has no session is for no device:
@@ -1211,11 +1208,15 @@ mod tests {
         card.web(LocalEvent::FindMat {
             target: "exputt.0".into(),
         });
-        std::thread::sleep(Duration::from_millis(200));
+        // Taken while the attempt in progress still reaches no device.
+        card.synced();
         let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
         port.store(mock.port(), Ordering::SeqCst);
         card.until_status(ActorStatus::Connected);
-        std::thread::sleep(Duration::from_millis(500));
+        // The session's first pass carries out the queued actions before it
+        // reads the device, so a putt taken shows they are done.
+        mock.push_event(PUTT_RESULT_FULL);
+        card.next_shot();
         let searches = mock
             .received()
             .iter()
