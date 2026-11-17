@@ -33,11 +33,11 @@ threeputt = { version = "0.2.0", default-features = false, features = ["config"]
 thumbswing = { version = "0.0.3", default-features = false, features = ["config"] }
 # Pureplay Connect's settings (`connect::Config`, the `config` feature:
 # no network code, so the WASM UI builds it too).
-flighthook-pureplay = { version = "0.2.2", path = "../pureplay", default-features = false, features = ["config"] }
+flighthook-pureplay = { version = "0.2.2", path = "../integrations/pureplay", default-features = false, features = ["config"] }
 # The Open Connect client's settings (`client::Config`) and the Open
 # Connect JSON types (`client::api`), the `config` feature: no network
 # code, so the WASM UI builds it too.
-flighthook-openconnect = { version = "0.2.2", path = "../openconnect", default-features = false, features = ["config"] }
+flighthook-openconnect = { version = "0.2.2", path = "../integrations/openconnect", default-features = false, features = ["config"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"], optional = true }

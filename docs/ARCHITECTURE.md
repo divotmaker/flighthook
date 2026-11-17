@@ -1491,13 +1491,14 @@ on 922 is unaffected. A stopped or unreachable simulator is unaffected too:
 still no alert and no dot.
 
 **Open Connect client.** The protocol lives in the workspace crate
-`flighthook-openconnect` (`openconnect/`), module `client`: a flightrelay
-driver (`client::Client`, feature `driver`) whose settings (`client::Config`:
-`address`, feature `config`, which `lib` and the WASM UI build, with the Open
-Connect JSON types in `client::api`) `OpenConnectClientSection` flattens next
-to its own fields, so the config keys are unchanged. The card is a
-`DriverActor` with the hooks in `actors/outputs.rs` (`OpenConnectClientHooks`,
-the same `OutputHooks` as Pureplay Connect's); its `bus.actor` has no roles.
+`flighthook-openconnect` (`integrations/openconnect/`), module `client`: a
+flightrelay driver (`client::Client`, feature `driver`) whose settings
+(`client::Config`: `address`, feature `config`, which `lib` and the WASM UI
+build, with the Open Connect JSON types in `client::api`)
+`OpenConnectClientSection` flattens next to its own fields, so the config keys
+are unchanged. The card is a `DriverActor` with the hooks in
+`actors/outputs.rs` (`OpenConnectClientHooks`, the same `OutputHooks` as
+Pureplay Connect's); its `bus.actor` has no roles.
 
 - The driver's connect is the TCP connect (5 s), the registration as this
   process's own client and the 1 s refusal wait (above); the card shows
@@ -1607,13 +1608,14 @@ and listens on TCP 9760, flighthook is the device and connects. The user
 guide is [outputs/pureplay.md](outputs/pureplay.md), which also covers the
 Pureplay (Open Connect) preset, the Open Connect client card on 921.
 
-The protocol lives in the workspace crate `flighthook-pureplay` (`pureplay/`),
-module `connect`: a flightrelay driver (`connect::Connect`, feature `driver`)
-whose settings (`connect::Config`: `address`, feature `config`, which `lib` and
-the WASM UI build) `PureplaySection` flattens next to its own fields, so the
-config keys are `name`, `enabled`, `actor_id`, `address`, `full_monitor`,
-`chipping_monitor`, `putting_monitor`. The card is a `DriverActor` with the
-hooks in `actors/outputs.rs` (`PureplayHooks`); its `bus.actor` has no roles.
+The protocol lives in the workspace crate `flighthook-pureplay`
+(`integrations/pureplay/`), module `connect`: a flightrelay driver
+(`connect::Connect`, feature `driver`) whose settings (`connect::Config`:
+`address`, feature `config`, which `lib` and the WASM UI build)
+`PureplaySection` flattens next to its own fields, so the config keys are
+`name`, `enabled`, `actor_id`, `address`, `full_monitor`, `chipping_monitor`,
+`putting_monitor`. The card is a `DriverActor` with the hooks in
+`actors/outputs.rs` (`PureplayHooks`); its `bus.actor` has no roles.
 
 - `codec.rs` is the wire format, pure and unit-tested: frames (`"PL"`,
   version 1, reserved 0, type, u16 LE length, payload, CRC32C LE over header
