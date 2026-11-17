@@ -112,6 +112,12 @@ mod tests {
     /// (see [`Handoff`]).
     static TUNINGS: Handoff<String, Tuning> = Handoff::new();
 
+    /// The actions a card's sessions were handed, by the card's `address`.
+    static ACTIONS: Handoff<String, Actions> = Handoff::new();
+
+    /// Every action a card's sessions were handed, in order.
+    type Actions = Arc<std::sync::Mutex<Vec<Action>>>;
+
     /// A UDP port nothing sends beacons to.
     fn quiet_udp_port() -> u16 {
         std::net::UdpSocket::bind("127.0.0.1:0")
@@ -140,6 +146,7 @@ mod tests {
     struct ScriptedExPutt {
         inner: ExPutt,
         config: ExPuttConfig,
+        actions: Actions,
     }
 
     impl FrpDriver for ScriptedExPutt {
@@ -155,15 +162,16 @@ mod tests {
 
         fn new(config: ExPuttConfig) -> Result<Self, ConfigError> {
             config.validate()?;
-            let tuning = TUNINGS
-                .take(&config.address.clone().unwrap_or_default())
-                .unwrap_or_default();
+            let key = config.address.clone().unwrap_or_default();
+            let tuning = TUNINGS.take(&key).unwrap_or_default();
+            let actions = ACTIONS.take(&key).unwrap_or_default();
             let local = ExPuttConfig {
                 address: config.ip()?.map(|_| "127.0.0.1".into()),
             };
             Ok(Self {
                 inner: ExPutt::with_tuning(local, tuning)?,
                 config,
+                actions,
             })
         }
 
@@ -172,7 +180,10 @@ mod tests {
         }
 
         fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ScriptedSession, Self::Error> {
-            self.inner.connect(ctx).map(ScriptedSession)
+            let actions = Arc::clone(&self.actions);
+            self.inner
+                .connect(ctx)
+                .map(|session| ScriptedSession { session, actions })
         }
 
         fn retry_delay(
@@ -189,7 +200,11 @@ mod tests {
         }
     }
 
-    struct ScriptedSession(ExPuttSession);
+    /// threeputt's session, recording the actions it is handed.
+    struct ScriptedSession {
+        session: ExPuttSession,
+        actions: Actions,
+    }
 
     impl FrpSession for ScriptedSession {
         type Driver = ScriptedExPutt;
@@ -199,23 +214,27 @@ mod tests {
             now: Instant,
             out: &mut Events<'_>,
         ) -> Result<Activity, threeputt::driver::Error> {
-            self.0.step(now, out)
+            self.session.step(now, out)
         }
 
         fn hints(&mut self, hints: &TurnHints) -> Result<(), threeputt::driver::Error> {
-            self.0.hints(hints)
+            self.session.hints(hints)
         }
 
         fn action(&mut self, action: &Action) -> Result<(), threeputt::driver::Error> {
-            self.0.action(action)
+            self.actions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(*action);
+            self.session.action(action)
         }
 
         fn identity(&self) -> &DeviceIdentity {
-            self.0.identity()
+            self.session.identity()
         }
 
         fn close(self, out: &mut Events<'_>) -> Result<(), threeputt::driver::Error> {
-            self.0.close(out)
+            self.session.close(out)
         }
     }
 
@@ -255,6 +274,8 @@ mod tests {
         section: ExPuttSection,
         /// The card's FRP actor id.
         frp: String,
+        /// What the card's sessions were handed.
+        actions: Actions,
     }
 
     impl Card {
@@ -270,7 +291,10 @@ mod tests {
                 c.exputt.insert("0".into(), section.clone());
             });
             let frp = state.actor_of_card("exputt.0").expect("frp id");
-            TUNINGS.put(section.driver.address.clone().unwrap_or_default(), tuning);
+            let key = section.driver.address.clone().unwrap_or_default();
+            TUNINGS.put(key.clone(), tuning);
+            let actions = Actions::default();
+            ACTIONS.put(key, Arc::clone(&actions));
             let (tx, rx) = broadcast::channel(4096);
             Self {
                 dir,
@@ -281,6 +305,7 @@ mod tests {
                 shutdown: Arc::default(),
                 section,
                 frp,
+                actions,
             }
         }
 
@@ -1029,6 +1054,27 @@ mod tests {
             .filter(|p| p.json == Request::ResyncToMat.to_json())
             .count();
         assert_eq!(searches, 1, "{:?}", mock.received());
+    }
+
+    /// A Find mat pressed during a session reaches that session, once, and
+    /// one for another card does not.
+    #[test]
+    fn a_find_mat_reaches_the_running_session() {
+        let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
+        let mut card = Card::started("10.77.0.24", &mock);
+        card.until_status(ActorStatus::Connected);
+        card.web(LocalEvent::FindMat {
+            target: "exputt.1".into(),
+        });
+        card.web(LocalEvent::FindMat {
+            target: "exputt.0".into(),
+        });
+        // The host drains the bus before every step, so a putt read after
+        // the two messages shows both were drained.
+        mock.push_event(PUTT_RESULT_FULL);
+        card.next_shot();
+        let actions = card.actions.lock().expect("actions").clone();
+        assert_eq!(actions, [Action::FindMat]);
     }
 
     // -- Config ----------------------------------------------------------------
