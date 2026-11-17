@@ -422,12 +422,22 @@ fn turn(job: &ClipJob, mode: BodyTrackingMode, now: Instant) -> Turn {
 /// Sleep until `job`'s [`turn`]. True when it runs; false when it is
 /// skipped, or pruned or cleared meanwhile.
 fn wait_turn(state: &SystemState, job: &ClipJob) -> bool {
+    wait_turn_on(state, job, Instant::now, std::thread::sleep)
+}
+
+/// [`wait_turn`] on the clock `now`, sleeping with `sleep`.
+fn wait_turn_on(
+    state: &SystemState,
+    job: &ClipJob,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> bool {
     loop {
         if !state.clips.is_current(&job.slot) {
             return false;
         }
-        match turn(job, state.system.body_tracking().mode, Instant::now()) {
-            Turn::Wait(left) => std::thread::sleep(left.min(MODEL_POLL)),
+        match turn(job, state.system.body_tracking().mode, now()) {
+            Turn::Wait(left) => sleep(left.min(MODEL_POLL)),
             Turn::Run => return true,
             Turn::Skip => return false,
         }
@@ -1086,6 +1096,32 @@ mod tests {
             job.on_demand = true;
             assert_eq!(run(&state, &job), viewed, "{mode:?} viewed");
         }
+    }
+
+    /// The wait carries out the turn: a recorded clip is tracked once the
+    /// clock reaches `CLIP_DELAY` after it was written, and one cleared
+    /// while it waits is not tracked.
+    #[test]
+    fn a_recorded_clip_waits_clip_delay_on_the_clock() {
+        let (dir, state) = state();
+        set_mode(&state, BodyTrackingMode::Live);
+        let written = Instant::now();
+        let mut job = clip(&state, &dir, 1);
+        job.written = written;
+        let clock = std::cell::Cell::new(written);
+        let wait = |d: Duration| clock.set(clock.get() + d);
+        assert!(wait_turn_on(&state, &job, || clock.get(), wait));
+        assert_eq!(clock.get(), written + CLIP_DELAY);
+
+        let mut job = clip(&state, &dir, 2);
+        job.written = written;
+        clock.set(written);
+        let cleared = |d: Duration| {
+            state.clips.clear();
+            clock.set(clock.get() + d);
+        };
+        assert!(!wait_turn_on(&state, &job, || clock.get(), cleared));
+        assert!(clock.get() < written + CLIP_DELAY);
     }
 
     #[test]
