@@ -2224,8 +2224,7 @@ fn a_muted_instance_leaves_no_bus_actor_in_the_feeds() {
     for id in &ids {
         feed.handle(&BusMsg::frp(flightrelay::FrpMessage::new(
             id.clone(),
-            flightrelay::BusActor::new("Mock", 2.0)
-                .with_role(flightrelay::types::roles::LAUNCH_MONITOR),
+            flightrelay::BusActor::new("Mock", 2.0).with_role(flightrelay::roles::LAUNCH_MONITOR),
         )));
     }
     let removed = |msgs: &[BusMsg], id: &str| {

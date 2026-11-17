@@ -265,7 +265,7 @@ fn game_aim_is_answered_unsupported() {
 fn the_card_publishes_profiles_the_round_the_ball_and_the_scores() {
     let info = Accessory::info(&Config::default());
     assert_eq!(info.namespaces, [model::NAMESPACE]);
-    assert!(info.roles.contains(&flightrelay::types::roles::GAME));
+    assert!(info.roles.contains(&flightrelay::roles::GAME));
     let mut rig = rig();
     let round = rig
         .frps()

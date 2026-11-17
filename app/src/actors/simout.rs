@@ -22,9 +22,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use flightrelay::types::roles;
 use flightrelay::{
-    BusActor, FrpBody, FrpMessage, GolferSelect, GolferTurn, Handedness, Removal, StateKind,
+    BusActor, FrpBody, FrpMessage, GolferSelect, GolferTurn, Handedness, Removal, StateKind, roles,
 };
 
 use super::provenance::ShotSource;

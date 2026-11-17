@@ -1890,7 +1890,7 @@ fn a_cards_actor_comes_from_its_drivers_roles_and_namespaces() {
     assert_eq!(actor.roles, [roles::LAUNCH_MONITOR]);
     assert!(actor.namespaces.is_empty());
     assert_eq!(actor.device.and_then(|d| d.source), Some(Source::Virtual));
-    assert_eq!(actor.blockers, [flightrelay::types::blockers::NOT_ARMED]);
+    assert_eq!(actor.blockers, [flightrelay::blockers::NOT_ARMED]);
 }
 
 /// A connected session sees what `session_started` pushed first (what

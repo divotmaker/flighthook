@@ -206,7 +206,7 @@ pub fn club_from_pureplay(n: u8) -> Option<Club> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use flightrelay::types::{Basis, ClubData as FhClubData, FaceImpact, FlightResult, Launch};
+    use flightrelay::{Basis, ClubData as FhClubData, FaceImpact, FlightResult, Launch};
     use flightrelay::{Distance, Velocity};
 
     /// A full shot: ball with both spin pairs, club, face impact.

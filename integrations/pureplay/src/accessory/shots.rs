@@ -8,11 +8,10 @@
 
 use std::collections::VecDeque;
 
-use flightrelay::types::Launch;
 use flightrelay::{
-    Basis, FlightResult, GameStroke, GolferId, Lie, Position, ShotKey, StrokeOutcome,
+    Basis, Distance, FlightResult, GameStroke, GolferId, Launch, Lie, Position, ShotKey,
+    StrokeOutcome, Velocity,
 };
-use flightrelay::{Distance, Velocity};
 
 use super::protocol::{ShotCompleted, ShotLaunched};
 

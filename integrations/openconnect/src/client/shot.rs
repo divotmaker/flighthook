@@ -1,7 +1,6 @@
 //! A shot as the Open Connect client sends it.
 
-use flightrelay::types::{ClubData, FaceImpact, FlightResult, Launch};
-use flightrelay::{CompletedShot, Source};
+use flightrelay::{ClubData, CompletedShot, FaceImpact, FlightResult, Launch, Source};
 
 /// A shot as the session sends it: the launch, the launch monitor's own
 /// flight, club and impact, numbered by the launch monitor.

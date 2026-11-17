@@ -20,8 +20,7 @@ use flightrelay::driver::{
     Activity, Backoff as HostBackoff, ConnectCtx, DeviceIdentity, DeviceStatus, DriverInfo, Events,
     FrpDriver, FrpSession, IDLE, Level, NoAction, RawProfile, SessionEnd, Stopped,
 };
-use flightrelay::types::roles;
-use flightrelay::{FrpMessage, RawDir, Source};
+use flightrelay::{FrpMessage, RawDir, Source, roles};
 use serde_json::Value;
 
 use super::Config;

@@ -1,4 +1,4 @@
-use allsquare::driver::{club_data, face_impact, launch};
+use allsquare::driver::convert::{club_data, face_impact, launch};
 use allsquare::testing;
 use allsquare::{BallMetrics, ClubMetrics};
 use flighthook::ShotKey;

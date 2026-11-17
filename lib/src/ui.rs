@@ -21,10 +21,9 @@ use flightrelay::{FrpMessage, Severity, ShotKey};
 pub use flightrelay::FrpMessage as BusMessage;
 /// The FRP types the UI reads from the socket and sends on it.
 pub use flightrelay::KINDS as FRP_KINDS;
-pub use flightrelay::types::roles;
 pub use flightrelay::{
     BusActor, BusAlert, DeviceInfo, FrpBody, GolferId, GolferProfile, GolferSelect, PracticeBlock,
-    PracticeNewBlock, Removal, ShotFinished, ShotTrigger, StateKey, StateKind,
+    PracticeNewBlock, Removal, ShotFinished, ShotTrigger, StateKey, StateKind, roles,
 };
 use serde::{Deserialize, Serialize};
 

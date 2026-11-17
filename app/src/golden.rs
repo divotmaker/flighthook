@@ -1025,9 +1025,7 @@ impl Heard {
             BusMsg::Frp { msg, .. } => {
                 let card = crate::actors::web::stored::card_of(root, &msg.from);
                 match &msg.body {
-                    FrpBody::BusActor(a)
-                        if a.has_role(flightrelay::types::roles::LAUNCH_MONITOR) =>
-                    {
+                    FrpBody::BusActor(a) if a.has_role(flightrelay::roles::LAUNCH_MONITOR) => {
                         let ready = flighthook::bus_actor_rows(a)
                             .get("ready")
                             .map(|r| r == "true");

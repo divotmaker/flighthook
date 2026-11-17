@@ -67,20 +67,16 @@ stance = { version = "0.0.5", features = ["pose", "pose-download"] }
 # It reads Linux evdev; on other platforms it builds and its connect reports
 # that the trackball is not supported there.
 thumbswing = { version = "0.0.3", features = ["driver"] }
+# The Square Golf device driver (`driver`: `allsquare::driver::Omni`). It
+# implies `ble`, whose backend allsquare picks by target: BlueZ on Linux,
+# btleplug elsewhere.
+allsquare = { version = "0.5.0", features = ["driver"] }
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.
 flighthook-ui = { path = "../ui", optional = true }
 egui = { version = "0.33", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
-
-# The Square Golf device driver (`driver`: `allsquare::driver::Omni`). Its
-# BLE backend is platform-specific: BlueZ on Linux, btleplug elsewhere.
-[target.'cfg(target_os = "linux")'.dependencies]
-allsquare = { version = "0.5.0", features = ["driver", "bluez"] }
-
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-allsquare = { version = "0.5.0", features = ["driver", "btleplug"] }
 
 # eframe backend is platform-specific: x11+wayland on Linux, Win32 on Windows.
 [target.'cfg(not(target_os = "windows"))'.dependencies]

@@ -20,10 +20,9 @@ use dimple::aero::BallModel;
 use dimple::ground::Termination;
 use dimple::trajectory::{ShotInput, simulate_shot};
 use flighthook::{AUTO_CHIP_ACTOR, Launch, Mode, ShotKey, ShotRaw, SimulationSection, Velocity};
-use flightrelay::types::roles;
 use flightrelay::{
     BusActor, DEFAULT_HEARTBEAT, DeviceInfo, FrpBody, FrpMessage, ShotFinished, ShotFlight,
-    ShotLaunch, ShotTrigger,
+    ShotLaunch, ShotTrigger, roles,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 

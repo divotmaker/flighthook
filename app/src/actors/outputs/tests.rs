@@ -9,10 +9,9 @@ use std::net::SocketAddr;
 use flighthook::{ActorStatus, Club, Handedness, Mode};
 use flighthook_pureplay::connect::Config;
 use flightrelay::driver::{DeviceEvent, DriverInfo};
-use flightrelay::types::roles;
 use flightrelay::{
     BusActor, DeviceInfo, FlightResult, FrpMessage, GolferSelect, GolferTurn, RawFrame, Removal,
-    ShotFinished, ShotFlight, ShotKey, ShotLaunch, ShotTrigger, Source, StateKind,
+    ShotFinished, ShotFlight, ShotKey, ShotLaunch, ShotTrigger, Source, StateKind, roles,
 };
 use tokio::sync::broadcast;
 

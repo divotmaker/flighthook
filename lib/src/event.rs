@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use flightrelay::types::{Basis, ClubData, FaceImpact, FlightResult, Launch};
-use flightrelay::{Distance, Velocity};
+use flightrelay::{Basis, ClubData, Distance, FaceImpact, FlightResult, Launch, Velocity};
 
 use crate::{Club, Handedness, ShotMetrics, ShotVideo, UnitSystem};
 

@@ -30,10 +30,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use flightrelay::types::roles;
 use flightrelay::{
     BusActor, CompletedShot, DEFAULT_HEARTBEAT, FrpBody, FrpMessage, Removal, ShotAccumulator,
-    ShotEvent, ShotFlight, StateKind,
+    ShotEvent, ShotFlight, StateKind, roles,
 };
 use tracing::info;
 

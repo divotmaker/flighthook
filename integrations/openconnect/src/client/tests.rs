@@ -12,10 +12,9 @@ use flightrelay::driver::{
     Activity, Backoff, DeviceEvent, FrpDriver, FrpSession, Live, SessionEnd,
 };
 use flightrelay::testing::{TestHost, status};
-use flightrelay::types::roles;
 use flightrelay::{
     BusActor, Club, FrpBody, FrpMessage, GolferSelect, Handedness, RawDir, Removal, ShotFinished,
-    ShotKey, ShotLaunch, ShotTrigger, StateKind,
+    ShotKey, ShotLaunch, ShotTrigger, StateKind, roles,
 };
 
 use super::*;

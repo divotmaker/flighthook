@@ -32,8 +32,7 @@ use crate::state::practice::{BlockChange, Practice, now_ms};
 use crate::state::remotes::{EXPIRY_TICK, Remotes};
 use crate::state::{SessionWriter, Stopped, SystemState};
 use flighthook::{ActorStatus, Severity};
-use flightrelay::types::roles;
-use flightrelay::{BusActor, BusReply, DEFAULT_HEARTBEAT, FrpBody, GolferProfile};
+use flightrelay::{BusActor, BusReply, DEFAULT_HEARTBEAT, FrpBody, GolferProfile, roles};
 
 mod config_commands;
 mod practice;

@@ -11,10 +11,9 @@ use flightrelay::driver::{
     Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
     Level, Live, NoAction, RawProfile, SessionEnd, Stopped,
 };
-use flightrelay::types::roles;
 use flightrelay::{
     BusActor, Club, CompletedShot, FrpBody, FrpMessage, GolferSelect, Handedness, RawDir, RawFrame,
-    Removal, ShotAccumulator, ShotEvent, Source, StateKind,
+    Removal, ShotAccumulator, ShotEvent, Source, StateKind, roles,
 };
 
 use super::api::GsProMessage;

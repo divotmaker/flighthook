@@ -11,10 +11,10 @@ use flightrelay::driver::{
     Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
     Level, Live, NoAction, RawProfile, SessionEnd, Stopped,
 };
-use flightrelay::types::{blockers, roles};
 use flightrelay::{
     BusActor, Club, CompletedShot, FrpBody, FrpMessage, GolferSelect, Handedness, Mode, RawDir,
-    RawFrame, Removal, Severity, ShotAccumulator, ShotEvent, ShotKey, Source, StateKind,
+    RawFrame, Removal, Severity, ShotAccumulator, ShotEvent, ShotKey, Source, StateKind, blockers,
+    roles,
 };
 
 use super::codec::{self, BallData, ConnectionState, FrameReader, Message, ReadyState};

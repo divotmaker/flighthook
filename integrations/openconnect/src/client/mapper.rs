@@ -106,7 +106,7 @@ pub fn map_shot(shot: &OutputShot) -> GsProMessage {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use flightrelay::types::{Basis, ClubData as FhClubData, FaceImpact, FlightResult, Launch};
+    use flightrelay::{Basis, ClubData as FhClubData, FaceImpact, FlightResult, Launch};
     use flightrelay::{Distance, Velocity};
 
     fn shot_with_impact(lateral_mm: f64, vertical_mm: f64) -> OutputShot {

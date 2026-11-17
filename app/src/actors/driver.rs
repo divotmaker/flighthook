@@ -58,10 +58,9 @@ use flightrelay::driver::{
     Activity, Backoff, ConnectCtx, ConnectHost, DeviceEvent, DeviceIdentity, DeviceStatus,
     DriverInfo, Events, FrpDriver, FrpSession, HostFlags, IDLE, Level, SessionEnd, Stop, TurnHints,
 };
-use flightrelay::types::roles;
 use flightrelay::{
     BusActor, DEFAULT_HEARTBEAT, FrpBody, FrpMessage, RawFrame, Removal, ShotFinished, ShotTrigger,
-    StateKind,
+    StateKind, roles,
 };
 use tracing::{debug, error, info, warn};
 

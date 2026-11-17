@@ -53,10 +53,11 @@ pub use flighthook_pureplay::connect::{
 };
 pub use flightrelay::config::{ConfigError, DriverConfig};
 pub use flightrelay::mock::MockConfig;
-pub use flightrelay::types::{AssumedLaunch, Basis, ClubData, FaceImpact, FlightResult, Launch};
-pub use flightrelay::{DEFAULT_PATH as FRP_PATH, DEFAULT_PORT as FRP_PORT, DEFAULT_URL as FRP_URL};
-pub use flightrelay::{Distance, Velocity};
-pub use flightrelay::{GolferTurn, Handedness, SPEC_VERSION as FRP_VERSION, Severity};
+pub use flightrelay::{
+    AssumedLaunch, Basis, ClubData, DEFAULT_PATH as FRP_PATH, DEFAULT_PORT as FRP_PORT,
+    DEFAULT_URL as FRP_URL, Distance, FaceImpact, FlightResult, GolferTurn, Handedness, Launch,
+    SPEC_VERSION as FRP_VERSION, Severity, Velocity,
+};
 pub use ironsight::config::Config as MevoConfig;
 /// What the FlightScope driver uses for a setting left unset.
 pub use ironsight::config::{

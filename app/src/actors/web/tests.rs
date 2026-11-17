@@ -44,8 +44,8 @@ impl Ev {
     /// The card's launch monitor `bus.actor` with `device` and
     /// `telemetry`, ready (no blockers).
     pub(crate) fn device(device: flightrelay::DeviceInfo, telemetry: &[(&str, &str)]) -> Self {
-        let mut actor = flightrelay::BusActor::new("test", 5.0)
-            .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+        let mut actor =
+            flightrelay::BusActor::new("test", 5.0).with_role(flightrelay::roles::LAUNCH_MONITOR);
         actor.device = Some(device);
         actor.telemetry = (!telemetry.is_empty()).then(|| {
             telemetry
@@ -732,8 +732,8 @@ async fn a_stored_shot_keeps_its_provenance() {
             shot_id: format!("uuid-{n}"),
             shot_number: n,
         };
-        let mut declared = flightrelay::BusActor::new(actor, 5.0)
-            .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+        let mut declared =
+            flightrelay::BusActor::new(actor, 5.0).with_role(flightrelay::roles::LAUNCH_MONITOR);
         declared.device = Some(flightrelay::DeviceInfo {
             source: provenance,
             ..flightrelay::DeviceInfo::default()
@@ -1163,8 +1163,8 @@ async fn trigger_snapshots_context_and_finish_stores_raw() {
         &mut acc,
     )
     .await;
-    let mut declared = flightrelay::BusActor::new("mevo.0", 5.0)
-        .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+    let mut declared =
+        flightrelay::BusActor::new("mevo.0", 5.0).with_role(flightrelay::roles::LAUNCH_MONITOR);
     declared.device = Some(flightrelay::DeviceInfo {
         manufacturer: Some("FlightScope".into()),
         model: Some("Xi".into()),
@@ -2719,8 +2719,8 @@ async fn a_stall_past_the_expiry_keeps_the_local_turn_and_set() {
         Ev::device(flightrelay::DeviceInfo::default(), &[]),
     )
     .await;
-    let lm = flightrelay::BusActor::new("Trackball", 2.0)
-        .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+    let lm =
+        flightrelay::BusActor::new("Trackball", 2.0).with_role(flightrelay::roles::LAUNCH_MONITOR);
     up.bus(&from_peer("aaaa000000000001", lm)).await;
     let mut msgs: Vec<BusMsg> = std::iter::from_fn(|| seen.try_recv().ok()).collect();
     msgs.push(from_peer(
@@ -2778,8 +2778,8 @@ async fn the_first_set_stays_set_1_after_a_remote_monitor_died_mid_shot() {
     let (state, writer, _dir) = test_state();
     let mut up = Updater::new(&state);
     up.club(&writer, Club::Iron7).await;
-    let lm = flightrelay::BusActor::new("Trackball", 2.0)
-        .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+    let lm =
+        flightrelay::BusActor::new("Trackball", 2.0).with_role(flightrelay::roles::LAUNCH_MONITOR);
     let msgs = [
         from_peer("aaaa000000000001", lm),
         from_peer("aaaa000000000001", flightrelay::ShotTrigger::new(key(1))),
@@ -2811,8 +2811,8 @@ async fn a_club_change_before_a_remote_monitor_dies_leaves_set_1() {
     let (state, writer, _dir) = test_state();
     let mut up = Updater::new(&state);
     up.club(&writer, Club::Iron7).await;
-    let lm = flightrelay::BusActor::new("Trackball", 2.0)
-        .with_role(flightrelay::types::roles::LAUNCH_MONITOR);
+    let lm =
+        flightrelay::BusActor::new("Trackball", 2.0).with_role(flightrelay::roles::LAUNCH_MONITOR);
     let msgs = [
         from_peer("aaaa000000000001", lm),
         from_peer("aaaa000000000001", flightrelay::ShotTrigger::new(key(1))),
@@ -2963,8 +2963,7 @@ async fn a_remote_shot_exports_device_kind_frp() {
     let remote = "aaaa000000000001";
     let lm = from_peer(
         remote,
-        flightrelay::BusActor::new("Trackball", 2.0)
-            .with_role(flightrelay::types::roles::LAUNCH_MONITOR),
+        flightrelay::BusActor::new("Trackball", 2.0).with_role(flightrelay::roles::LAUNCH_MONITOR),
     );
     super::ui_socket::follow(&state, &lm);
     up.bus(&lm).await;

@@ -6,8 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use flightrelay::Distance;
-use flightrelay::types::{ClubData, FlightResult, Launch};
+use flightrelay::{ClubData, Distance, FlightResult, Launch};
 
 /// Values flighthook computes from the measured [`Launch`], the device's
 /// [`FlightResult`] and the [`ClubData`] of a shot.
@@ -168,7 +167,7 @@ mod tests {
         (a - b).abs() < 1e-9
     }
 
-    use flightrelay::types::Basis;
+    use flightrelay::Basis;
 
     fn components(back: Option<i32>, side: Option<i32>) -> Launch {
         Launch {

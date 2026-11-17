@@ -9,10 +9,9 @@ use std::time::Duration;
 
 use flighthook::{ActorStatus, Club, Handedness, Mode};
 use flightrelay::driver::{DeviceEvent, DriverInfo};
-use flightrelay::types::roles;
 use flightrelay::{
     BusReply, BusSync, GameAim, GameStroke, GolferSelect, GolferTurn, ShotFinished, ShotLaunch,
-    ShotTrigger,
+    ShotTrigger, roles,
 };
 use tokio::sync::broadcast;
 

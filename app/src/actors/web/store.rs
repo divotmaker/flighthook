@@ -476,7 +476,7 @@ async fn store_bus_event(state: &WebState, msg: &BusMsg, accumulators: &mut Pend
     if let Some(m) = msg.as_frp()
         && let FrpBody::BusActor(actor) = &m.body
     {
-        if actor.has_role(flightrelay::types::roles::GAME) {
+        if actor.has_role(flightrelay::roles::GAME) {
             accumulators.games.insert(m.from.clone());
         } else {
             accumulators.games.remove(&m.from);
@@ -508,8 +508,7 @@ async fn store_bus_event(state: &WebState, msg: &BusMsg, accumulators: &mut Pend
         BusMsg::Frp { msg: frp, peer, .. } => match &frp.body {
             // A hosted card's `bus.actor` carries its device.
             FrpBody::BusActor(actor)
-                if actor.has_role(flightrelay::types::roles::LAUNCH_MONITOR)
-                    || actor.device.is_some() =>
+                if actor.has_role(flightrelay::roles::LAUNCH_MONITOR) || actor.device.is_some() =>
             {
                 accumulators.data.feed(frp);
                 apply_device(state, &frp.from, actor).await;

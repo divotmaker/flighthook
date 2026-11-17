@@ -8,8 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flightrelay::driver::{DeviceStatus, Events, Level, ShotIds};
-use flightrelay::types::blockers;
-use flightrelay::{BusReply, Club, FrpBody, FrpMessage, RawDir, ReplyError};
+use flightrelay::{BusReply, Club, FrpBody, FrpMessage, RawDir, ReplyError, blockers};
 
 use super::club_out::{Action, ClubOut};
 use super::link::{Link, SEND_BINARY};
