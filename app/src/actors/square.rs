@@ -146,7 +146,7 @@ mod tests {
 
         /// Wait until `count` club selects have been written.
         fn wait_for_selects(&self, count: usize) {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::actors::GIVE_UP;
             while self.selects().len() < count && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -610,10 +610,18 @@ mod tests {
             false,
         );
         card.link.wait_for_selects(1);
-        std::thread::sleep(Duration::from_millis(200));
+        // A club change as the sentinel: anything more the turns before it
+        // wrote would come ahead of its select.
+        card.turn(turn(Some(Club::Driver), Handedness::Left, Mode::Full));
+        card.link.wait_for_selects(2);
         card.stop();
         let selects = card.link.selects();
-        assert_eq!(selects.len(), 1);
+        assert_eq!(selects.len(), 2, "{selects:?}");
+        assert!(select_is(
+            &selects[1],
+            allsquare::Club::Driver,
+            allsquare::Handed::Left
+        ));
         assert!(select_is(
             &selects[0],
             allsquare::Club::PitchingWedge,
@@ -635,10 +643,18 @@ mod tests {
         card.turn(turn(None, Handedness::Left, Mode::Full));
         card.turn(turn(Some(Club::Iron8), Handedness::Left, Mode::Full));
         card.link.wait_for_selects(3);
-        std::thread::sleep(Duration::from_millis(200));
+        // A club change as the sentinel: anything more the turns before it
+        // wrote would come ahead of its select.
+        card.turn(turn(Some(Club::Driver), Handedness::Left, Mode::Full));
+        card.link.wait_for_selects(4);
         card.stop();
         let selects = card.link.selects();
-        assert_eq!(selects.len(), 3);
+        assert_eq!(selects.len(), 4, "{selects:?}");
+        assert!(select_is(
+            &selects[3],
+            allsquare::Club::Driver,
+            allsquare::Handed::Left
+        ));
         assert!(select_is(&selects[0], Iron7, Right));
         assert!(select_is(&selects[1], Iron7, Left));
         assert!(select_is(&selects[2], Iron8, Left));
@@ -663,10 +679,18 @@ mod tests {
         // The next select is the next frame: nothing else was written.
         card.turn(turn(Some(Club::Iron7), Handedness::Left, Mode::Full));
         card.link.wait_for_selects(3);
-        std::thread::sleep(Duration::from_millis(200));
+        // A club change as the sentinel: anything more the turns before it
+        // wrote would come ahead of its select.
+        card.turn(turn(Some(Club::Driver), Handedness::Left, Mode::Full));
+        card.link.wait_for_selects(4);
         card.stop();
         let selects = card.link.selects();
-        assert_eq!(selects.len(), 3);
+        assert_eq!(selects.len(), 4, "{selects:?}");
+        assert!(select_is(
+            &selects[3],
+            allsquare::Club::Driver,
+            allsquare::Handed::Left
+        ));
         assert!(select_is(&selects[0], Iron7, Right));
         assert!(select_is(&selects[1], Iron8, Left));
         assert!(select_is(&selects[2], Iron7, Left));
@@ -687,10 +711,18 @@ mod tests {
         card.select(left);
         card.select(|s| s.club = Some(Some(Club::Iron8)));
         card.link.wait_for_selects(3);
-        std::thread::sleep(Duration::from_millis(200));
+        // A club change as the sentinel: anything more the turns before it
+        // wrote would come ahead of its select.
+        card.select(|s| s.club = Some(Some(Club::Driver)));
+        card.link.wait_for_selects(4);
         card.stop();
         let selects = card.link.selects();
-        assert_eq!(selects.len(), 3);
+        assert_eq!(selects.len(), 4, "{selects:?}");
+        assert!(select_is(
+            &selects[3],
+            allsquare::Club::Driver,
+            allsquare::Handed::Left
+        ));
         assert!(select_is(&selects[0], Iron7, Right));
         assert!(select_is(&selects[1], Iron7, Left));
         assert!(select_is(&selects[2], Iron8, Left));
