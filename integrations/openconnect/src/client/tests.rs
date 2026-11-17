@@ -32,9 +32,8 @@ struct Pipe {
     closed: bool,
     /// Every write fails.
     broken: bool,
-    /// The client ended its side with a close (a FIN), after reading what
-    /// the simulator had sent.
-    finished: bool,
+    /// The session called its stream's close.
+    close_called: bool,
 }
 
 /// The client's end: reads what the simulator sent (would block when there
@@ -62,9 +61,7 @@ impl Read for Wire {
 
 impl Close for Wire {
     fn close(&mut self) {
-        let mut pipe = self.0.borrow_mut();
-        pipe.to_client.clear();
-        pipe.finished = true;
+        self.0.borrow_mut().close_called = true;
     }
 }
 
@@ -515,20 +512,17 @@ fn an_answered_shot_sets_no_error() {
     assert!(!status(&link.events()).telemetry.contains_key("error"));
 }
 
-/// A session that ends normally closes its end after reading what the
-/// simulator still had to say.
+/// A session that ends normally closes its stream (the real-socket test
+/// shows that close ends with a FIN).
 #[test]
-fn a_normal_close_reads_what_is_left_and_ends_with_a_fin() {
+fn closing_a_session_closes_its_stream() {
     let Link {
         mut host,
         session,
         wire,
     } = Link::new();
-    wire.0.borrow_mut().to_client.extend(b"{\"Code\":200}");
     host.with(|_, out| session.close(out));
-    let pipe = wire.0.borrow();
-    assert!(pipe.finished);
-    assert!(pipe.to_client.is_empty());
+    assert!(wire.0.borrow().close_called);
 }
 
 /// The session's telemetry: the readiness sent, the simulator's last
