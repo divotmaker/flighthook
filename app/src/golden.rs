@@ -39,7 +39,7 @@
 
 #![allow(clippy::too_many_lines, clippy::missing_panics_doc)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -75,6 +75,14 @@ use flighthook_pureplay::connect::codec::{self, FrameReader, Message};
 const SETTLE: Duration = Duration::from_millis(700);
 /// Longest wait for any one thing.
 const WAIT: Duration = Duration::from_secs(30);
+/// The launch monitors every output stands for under "Any".
+const MONITORS: [&str; 5] = [
+    "mevo.0",
+    "mevo.1",
+    "r10.0",
+    "square.0",
+    "openconnect_server.0",
+];
 
 // ===========================================================================
 // FlightScope devices: ironsight's FakeDevice served over TCP
@@ -1050,6 +1058,10 @@ enum Event {
     ShotFinished,
     /// The session's `golfer.turn`.
     Turn,
+    /// A launch monitor's `bus.actor`.
+    Actor,
+    /// A `bus.sync`.
+    Sync,
     Other,
 }
 
@@ -1077,8 +1089,9 @@ impl Heard {
                         let ready = flighthook::bus_actor_rows(a)
                             .get("ready")
                             .map(|r| r == "true");
-                        (card, Event::Other, ready)
+                        (card, Event::Actor, ready)
                     }
+                    FrpBody::BusSync(_) => (card, Event::Sync, None),
                     FrpBody::ShotFinished(_) => (card, Event::ShotFinished, None),
                     FrpBody::GolferTurn(_) if msg.from == root.flighthook_id() => {
                         (card, Event::Turn, None)
@@ -1141,13 +1154,15 @@ impl Rig {
         let (state, writer) = SystemState::new(dir.join("config.toml"));
         let mevo = FsDevice::serve(false);
         let xi = FsDevice::serve(true);
-        let gspro = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let gspro_addr = gspro.local_addr().expect("addr");
-        // The Open Connect server's address: a free port, found before it
-        // binds.
-        let oc_addr = TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .expect("a free port");
+        // The simulator's and the Open Connect server's addresses: free
+        // ports, found before they bind.
+        let free_port = || {
+            TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("a free port")
+        };
+        let gspro_addr = free_port();
+        let oc_addr = free_port();
         let range = match output {
             Output::GsPro => "7ft",
             Output::Pureplay => "8ft",
@@ -1293,6 +1308,10 @@ impl Rig {
         monitor.send(OC_HEARTBEAT);
 
         // The output, last.
+        let out_id = match output {
+            Output::GsPro => "openconnect_client.0",
+            Output::Pureplay | Output::PureplayStrict => "pureplay.0",
+        };
         for resolved in crate::actors::resolve_actors(&state.system.snapshot()) {
             if resolved.id.starts_with("openconnect_client.")
                 || resolved.id.starts_with("pureplay.")
@@ -1300,6 +1319,21 @@ impl Rig {
                 crate::actors::start_actor(resolved.id, resolved.actor, &state, &tx);
             }
         }
+        // The simulator listens only once every launch monitor has answered
+        // the output's `bus.sync`: the output's first connect is refused, and
+        // its retry starts the session with every monitor in view.
+        let (mut synced, mut answered) = (false, HashSet::new());
+        rig_seen.until(|m| {
+            match m.event {
+                Event::Sync if m.actor == out_id => synced = true,
+                Event::Actor if synced && MONITORS.contains(&m.actor.as_str()) => {
+                    answered.insert(m.actor.clone());
+                }
+                _ => {}
+            }
+            (answered.len() == MONITORS.len()).then_some(())
+        });
+        let gspro = TcpListener::bind(gspro_addr).expect("bind the simulator");
         let sim: Box<dyn Sim> = match output {
             Output::GsPro => Box::new(FakeGsPro::accept(&gspro)),
             Output::Pureplay | Output::PureplayStrict => {
@@ -1309,10 +1343,6 @@ impl Rig {
                 }
                 Box::new(host)
             }
-        };
-        let out_id = match output {
-            Output::GsPro => "openconnect_client.0",
-            Output::Pureplay | Output::PureplayStrict => "pureplay.0",
         };
         rig_seen.until(|m| {
             (m.actor == out_id

@@ -70,11 +70,11 @@ use super::protocol::{self, Readiness, Response};
 pub const PICKS_WAIT: bool = true;
 
 /// Longest a command waits for its reply before the pick is dropped.
-pub const COMMAND_TIMEOUT: Duration = super::timing(5_000, 1_000);
+pub const COMMAND_TIMEOUT: Duration = Duration::from_millis(5_000);
 
 /// After `not_ready`, the pick is sent again this much later, or at
 /// Pureplay's next readiness if that comes first.
-pub const NOT_READY_RETRY: Duration = super::timing(1_000, 400);
+pub const NOT_READY_RETRY: Duration = Duration::from_millis(1_000);
 
 /// How often a pick answered `not_ready` is sent again; the next
 /// `not_ready` drops it.

@@ -208,12 +208,6 @@ impl Feed {
         self.routed(mode).is_none_or(|id| id == actor)
     }
 
-    /// The launch monitor `actor`'s `bus.actor`, if it has published one.
-    #[cfg(test)]
-    pub(crate) fn monitor(&self, actor: &str) -> Option<&BusActor> {
-        self.monitors.get(actor)
-    }
-
     /// The launch monitors the output stands for in the current mode, by
     /// actor id: the routed one, or under "Any" every one that may feed a
     /// simulator; never Auto-chip, which is no readiness.
@@ -444,7 +438,6 @@ mod tests {
             ));
         }
         assert!(feed.in_view().is_empty());
-        assert!(feed.monitor("aaaa000000000001").is_none());
     }
 
     /// A shot's launch, club, impact and finish come from its launch

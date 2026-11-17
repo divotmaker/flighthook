@@ -41,8 +41,6 @@ pub use session::{Accessory, Error, Session};
 pub use shots::MAP_CAPACITY as SHOTS_KEPT;
 
 use std::net::SocketAddr;
-#[cfg(feature = "driver")]
-use std::time::Duration;
 
 use flightrelay::config::{ConfigError, DriverConfig};
 use serde::{Deserialize, Serialize};
@@ -93,15 +91,5 @@ impl DriverConfig for Config {
             address: Some(String::new()),
             token_file: None,
         }
-    }
-}
-
-/// `ms` in a build, `test_ms` in this crate's tests.
-#[cfg(feature = "driver")]
-pub(crate) const fn timing(ms: u64, test_ms: u64) -> Duration {
-    if cfg!(test) {
-        Duration::from_millis(test_ms)
-    } else {
-        Duration::from_millis(ms)
     }
 }

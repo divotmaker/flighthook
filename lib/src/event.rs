@@ -20,7 +20,7 @@ use crate::{Club, Handedness, ShotMetrics, ShotVideo, UnitSystem};
 /// Values flighthook simulated from the measured launch (beta).
 ///
 /// By default present only for fields the device did not report: a value in
-/// the device's flight result ([`ShotData::flight`]) is the device's and a
+/// the device's flight result (its own entry in [`ShotData::flights`]) is the device's and a
 /// value here is simulated. A field set in both is shown with the value here: on a shot that flies, a
 /// measured carry or flight time of exactly 0 is not a reading, so it is
 /// simulated next to the untouched 0. A ground ball (a measured apex of 0,
@@ -39,7 +39,7 @@ use crate::{Club, Handedness, ShotMetrics, ShotVideo, UnitSystem};
 /// When [`replaces_measured`](Self::replaces_measured) is set (the
 /// `[simulation] mode = "force"` setting), every result field is the
 /// simulation's, whether or not the device measured it, and these values
-/// take precedence over the device's in [`ShotData::flight`], which are kept
+/// take precedence over the device's in [`ShotData::flights`], which are kept
 /// unchanged.
 ///
 /// [`spin_estimated`](Self::spin_estimated) marks a spin in the shot's
@@ -88,7 +88,7 @@ pub struct DerivedFlight {
     pub path: Option<FlightPath>,
     /// True when these values replace the device's results: every result
     /// field above is simulated and takes precedence over the device's
-    /// value in [`ShotData::flight`]. Set per shot when the `[simulation] mode`
+    /// value in [`ShotData::flights`]. Set per shot when the `[simulation] mode`
     /// in effect when the shot was simulated is `force`.
     /// Omitted on the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

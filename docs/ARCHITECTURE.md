@@ -400,7 +400,7 @@ consumers subscribe and filter.
 | Each launch monitor card | the card's name | the card's section | `launch_monitor`, with `device.source` |
 | Auto-Chip | `Auto-Chip` | `[frp] auto_chip_actor_id` | `launch_monitor`, source `virtual` |
 | Each output card (Open Connect client, Pureplay Connect, Random Club) | the card's name | the card's section | none: they send `golfer.select` |
-| Pureplay Accessory card | the card's name | the card's section | `game` (and `launch_monitor` when its Shots setting ingests), namespace `pureplay`, source `virtual` |
+| Pureplay Accessory card | the card's name | the card's section | `game` and `launch_monitor`, namespace `pureplay`, source `virtual` |
 
 Cameras are not FRP actors. Every local actor publishes its `bus.actor` every
 2 s on the internal bus (one timer), so the hub forwards it to peers and the
@@ -1730,18 +1730,27 @@ waits for it. The card shows it as `strict_mode`.
 
 #### Pureplay Accessory card (beta)
 
-`actors/pureplay_accessory/` (actor `pureplay_accessory.N`, config
+The Pureplay Accessory card (actor `pureplay_accessory.N`, config
 `[pureplay_accessory.N]`, `PureplayAccessorySection` = `name`, `enabled`,
 `address`, `shots`, `impact_lead_s`; UI type label and card name
 "Pureplay Accessory", under Software, (+) entry "Pureplay Accessory", on the
 welcome screen among the launch monitors, not offered by the outputs'
-routing dropdowns) follows a round in
-Pureplay
-through its Accessory API, Pureplay's published WebSocket API (version 1,
-early access): `ws://<address>/` (default `127.0.0.1:9770`), subprotocol
-`binary`. It is a public, documented API, like Pureplay Connect, so the card
-needs no driver crate. The user guide is
-[devices/pureplay.md](devices/pureplay.md).
+routing dropdowns) follows a round in Pureplay through its Accessory API,
+Pureplay's published WebSocket API (version 1, early access):
+`ws://<address>/` (default `127.0.0.1:9770`), subprotocol `binary`. The user
+guide is [devices/pureplay.md](devices/pureplay.md).
+
+The protocol lives in the workspace crate `flighthook-pureplay`, module
+`accessory`: a flightrelay driver (`accessory::Accessory`, feature `driver`;
+kind `pureplay_accessory`, roles `game` and `launch_monitor`, namespace
+`pureplay`, source `virtual`) whose settings (`accessory::Config`:
+`address`, feature `config`) `PureplayAccessorySection` flattens next to its
+own fields, so the config keys are unchanged. The card is a `DriverActor`
+with the hooks in `actors/pureplay_accessory.rs` (`PureplayAccessoryHooks`).
+What the card keeps across links (the pairing token, the round model, the
+shot map, club out) lives in the driver, which lives as long as the actor:
+the card's Reconnect, an address change or turning it off and on starts a
+new one.
 
 - `protocol.rs` reads the messages (`hello`, `pairing.pending`, `paired`,
   `response`, `event` and the payloads the card uses; unknown fields,
@@ -1752,22 +1761,22 @@ needs no driver crate. The user guide is
   and 1H have none), `RH`/`LH` to the hand (`Unknown` to none). Every JSON
   example of Pureplay's document is a parser fixture (`fixtures.rs`).
 - `token.rs`: the pairing token is kept in `pureplay-tokens.json` in
-  flighthook's data folder (`SystemState::pureplay_tokens`, a `TokenStore`;
-  tests use a fresh temporary file per state), never in the config file.
-  Entries `{ token, clientId, paired_at }` are keyed by the card's address
-  normalized (`flighthook::address_key`), so changing the address pairs
-  again. Written whole and atomically (a temporary file, then a rename),
-  readable by its owner only (0600 on Unix). A file that is not a token file
-  reads as empty (warned once) and is copied to `pureplay-tokens.json.bad`
-  before the next write replaces it. `Token`'s `Debug` prints `<redacted>`,
-  and every frame's text has each token seen (as written and JSON-escaped)
-  replaced by `<redacted>` before it is logged or put on the bus (`redact`),
-  the rest byte for byte the wire text. A `paired` frame's token is learned
-  from the frame's JSON before the typed parse, so a `paired` that does not
-  parse is still logged redacted; a frame that is not JSON is logged by its
-  length only. Parse errors and response texts are redacted too. The app's
-  log filter holds tungstenite at `warn` (its trace lines print whole
-  frames).
+  flighthook's data folder (`TokenStore::shared()`, one store per process,
+  which the app's forget-pairing route uses too; tests use a fresh temporary
+  file), never in the config file. Entries `{ token, clientId, paired_at }`
+  are keyed by the card's address as it compares equal for the same host and
+  port (`token::key`), so changing the address pairs again. Written whole and
+  atomically (a temporary file, then a rename), readable by its owner only
+  (0600 on Unix). A file that is not a token file reads as empty (warned
+  once) and is copied to `pureplay-tokens.json.bad` before the next write
+  replaces it. `Token`'s `Debug` prints `<redacted>`, and every frame's text
+  has each token seen (as written and JSON-escaped) replaced by `<redacted>`
+  before it is logged, the rest byte for byte the wire text. A `paired`
+  frame's token is learned from the frame's JSON before the typed parse, so a
+  `paired` that does not parse is still logged redacted; a frame that is not
+  JSON is logged by its length only. Parse errors and response texts are
+  redacted too. The app's log filter holds tungstenite at `warn` (its trace
+  lines print whole frames).
 - `model.rs` keeps the round: per player `isLocal`, the profile slot, name,
   handedness, held club, bag, ball and distance to the hole, the active player
   (`turn.activeShooterId`), the hole and the readiness, from the snapshot and
@@ -1775,20 +1784,17 @@ needs no driver crate. The user guide is
   `context.invalidated` events. For the **active local player** only (a
   remote player's club, hand and turn give nothing) it holds the turn the card
   wants: the player's golfer id, club, hand and mode, sent whole in one
-  `golfer.select` when Pureplay reports a change (snapshot, `turn.changed`,
-  `player.changed`, the player's `player.club_changed` whatever its `reason`, a
-  `shot.initialized` distance that changes the mode) and flighthook's turn
-  differs from it, and again whenever flighthook's turn differs from it, unless
-  a game or simulator card caused that turn. The golfer differs when the turn's
-  golfer and the player's id do not resolve to the same golfer (the lookup
-  rule). The mode is the shared club + distance rule: the putter putts, a
+  `golfer.select` whenever flighthook's turn, as the card is handed it,
+  differs from it. The golfer differs when the turn's golfer id is not the
+  player's. The mode is the shared club + distance rule: the putter putts, a
   distance to the hole under 30 yards chips, anything else is a full swing.
   `player.changed` clears, on an explicit `null`, only the identity fields it
   reports (profile, name, hand, team, handicap). A snapshot of the results
   screen (`matchActive` false for the match that just ended) brings no players
   and no shooter. While a club pick is outstanding (`Model::hold_club`) the
   card neither sends nor compares the club; while a `golfer.select` awaits its
-  reply the turn on the bus is not final and nothing is compared with it. A new
+  reply the turn on the bus is not final and nothing is compared with it, and
+  a select unanswered for 5 s (`SELECT_FORGOTTEN`) is forgotten. A new
   `serverInstanceId` (Pureplay restarted) drops the model.
 - `game.rs` publishes the round on the bus as the `game` actor: every player as
   `golfer.profile` `pureplay.<name>` (a player without a name as
@@ -1796,17 +1802,18 @@ needs no driver crate. The user guide is
   the ball about to be played as `game.ball` and the scores as `game.scores`.
   A player who leaves, `match.ended` and `context.invalidated` remove what they
   published. `game.aim` is answered `unsupported`.
-- `mod.rs` runs the connection on the actor's thread with tungstenite's
-  blocking client over `connect_tcp` (5 s), a 100 ms read timeout so the
-  bus is drained throughout, the WebSocket handshake included (resumed
-  after each poll, 2.5 s at most). It waits for `hello` (5 s), checks
-  `protocol` = `ppaccessory` and `version` = 1, sends `pair` (`client`
-  "flighthook", `version` the app version, the saved token or `null`) as its
-  first message, then `subscribe` (the events of its list that
+- `session.rs`: the driver's connect is the TCP connect (5 s) and the
+  WebSocket handshake (tungstenite, resumed between the host's ticks, 2.5 s
+  at most), then the link's opening, run to its end: it waits for `hello`
+  (5 s), checks `protocol` = `ppaccessory` and `version` = 1, sends `pair`
+  (`client` "flighthook", `version` the app version, the saved token or
+  `null`) as its first message, then `subscribe` (the events of its list that
   `hello.capabilities.events` names, all of them when it names none; a list
   naming none of them is an `error`, "Pureplay offers none of the events
-  flighthook follows", retried every 30 s) with `snapshot: true`, and is
-  Connected once the snapshot is applied. A gap in the events' `seq` is
+  flighthook follows", retried every 30 s) with `snapshot: true`, and the card
+  is Connected once the snapshot is applied, with Pureplay's address as its
+  `device_info`. The opening and the round are one step function over a
+  `Link` (`link.rs`; `WsLink` over TCP). A gap in the events' `seq` is
   counted (`missed_events`) and, like `context.invalidated`,
   `match.started` or an event naming a player the card does not hold
   (`turn.changed`, `shot.initialized`, `shot.launched`,
@@ -1820,17 +1827,20 @@ needs no driver crate. The user guide is
   a snapshot comes, asking for its players and any named meanwhile; a player
   named while a request is out is asked for by the next one. A `seq` lower than
   the last is logged. With nothing received for 20 s the card sends a
-  WebSocket ping; after two unanswered (60 s quiet) the link is lost (`PING`
-  switches this off). It keeps `hello.capabilities.commands` and the
-  pairing's scopes (both logged). It sends text frames and reads binary and
-  text (`SEND_BINARY` switches what it sends). Its only commands are club
-  out's.
-- Club out (`club_out.rs`, `ClubOut`): a `golfer.select` carrying a club that
-  the card drains while following the round is a pick when its sender is
-  neither the card nor another game or simulator card (the header, the API,
-  random club, a launch monitor or a third-party tool; a simulator's club is
-  Pureplay's own coming back; `SystemState::is_game_card`); the latest pick
-  of a drain is taken. Usable (`club_out` `on`) with `control` in the
+  WebSocket ping; after two unanswered (60 s quiet) the link is lost. It keeps
+  `hello.capabilities.commands` and the pairing's scopes (both logged). It
+  sends text frames and reads binary and text (`SEND_BINARY` switches what it
+  sends). Its only commands are club out's.
+- What the driver is handed is the hooks' choice (`route`): flighthook's
+  `golfer.turn`, except one another game or simulator card caused (the
+  card's own turns pass); the `bus.reply` to each `golfer.select`; a
+  `golfer.select` carrying a club from an actor that is neither the card nor
+  a game or simulator card (a pick; `SystemState::is_game_card`); `bus.sync`;
+  `game.aim` from any other actor. A new link is handed flighthook's current
+  turn first.
+- Club out (`club_out.rs`, `ClubOut`): of the picks the card is handed
+  while following the round, the latest of a pass is taken. Usable
+  (`club_out` `on`) with `control` in the
   pairing's scopes (Pureplay's prompt grants `read` for **Read Only** and
   `read` + `control` for **Aim and Club**; `scopes: null` grants nothing),
   `club.set`, `club.next` or `club.prev` in `hello.capabilities.commands`,
@@ -1880,97 +1890,104 @@ needs no driver crate. The user guide is
   bus when flighthook holds another (`Model::sync`) as the card's complete
   select.
 - Shots (`shots.rs`): the card is a virtual launch monitor and a game
-  (`ShotSource::PureplayAccessory`, declared through `Actor::source()`, source
-  `virtual`). It feeds no simulator output. A `shot.launched` (live
-  only, never from a snapshot) is a candidate when its `playerId` is a local
-  player. The Shots setting, read from the config at each shot
-  (`shots::decide`): Auto takes the candidate unless `sent_shots.take_echo`
-  finds the send it echoes; "From Pureplay" takes every candidate and matches
-  nothing (`shots::matches_echoes`, the one switch); "From flighthook" takes
-  none and still matches. A taken shot gets a fresh UUID and goes on the bus as
-  `shot.trigger` (no timestamp: Pureplay's clock is not flighthook's; the
-  camera dates it on arrival and the impact lead, default 0.9 s, covers the
-  delay), `shot.launch` (`ballSpeedMs` m/s, `launchAngleDeg`, `directionDeg` +
-  right, spins rounded, `sideSpinRpm` times `shots::SIDE_SPIN_SIGN`; no flight,
-  club or impact) and `shot.finished`. A matched echo puts nothing on the bus.
-  A `shot.launched` whose `shotId` the card already holds is logged and not
-  taken again. `ShotMap` keeps Pureplay's `shotId` against the `shot_id` of the
-  shot it stands for (a taken shot or a matched echo; the newest 256), kept
-  across a reconnect to the same `serverInstanceId` and cleared on a new one.
-  `shot.completed` finds its shot there (never by time) and goes on the bus as
-  `game.stroke` (stroke id, shot id, golfer, hole, stroke number, the launch
-  values flown, a modeled flight with Pureplay's carry, total and apex, the
-  outcome `in_play`, `green`, `holed`, `out_of_bounds`, `water`, `lost`,
+  (`ShotSource::PureplayAccessory`, the hooks' `SOURCE`). It feeds no
+  simulator output. Every live `shot.launched` (never from a snapshot) of a
+  local player that carries a ball speed is reported as the card's shot,
+  numbered by the host: `shot.trigger` (no timestamp: Pureplay's clock is
+  not flighthook's; the camera dates it on arrival and the impact lead,
+  default 0.9 s, covers the delay), `shot.launch` (`ballSpeedMs` m/s,
+  `launchAngleDeg`, `directionDeg` + right, spins rounded, `sideSpinRpm`
+  times `shots::SIDE_SPIN_SIGN`; no flight, club or impact) and
+  `shot.finished`. The hooks apply the Shots setting, read from the section,
+  at each shot's `shot.trigger` (`decide`): Auto takes the shot unless
+  `sent_shots.take_echo` finds the send it echoes (matched against the
+  card's configured address); "From Pureplay" takes every shot and matches
+  nothing; "From flighthook" takes none and still matches. A shot not taken
+  is dropped whole (`Pass::Drop`): nothing of it reaches the bus, and since
+  the host numbers every shot reported, the numbers a user sees can skip. A
+  `shot.launched` whose `shotId` the card already holds is logged and not
+  reported again. `ShotMap` keeps Pureplay's `shotId` against the card's
+  shot (the newest 256), kept across a reconnect to the same
+  `serverInstanceId` and cleared on a new one. `shot.completed` finds its
+  shot there (never by time) and goes on the bus as `game.stroke` (stroke
+  id, shot id, golfer, hole, stroke number, the launch values flown, a
+  modeled flight with Pureplay's carry, total and apex, the outcome
+  `in_play`, `green`, `holed`, `out_of_bounds`, `water`, `lost`,
   `unplayable`, `gimme`, `auto_putt` or `penalty_only`, the putt and penalty
-  strokes, lie and distances to the hole); a Gimme, AutoPutt or PenaltyOnly has
-  no shot id. `shot.cancelled` `discarded` (a scramble shot the team did not
-  pick) sends no stroke and retracts none. `score.updated` is `game.scores`. A
-  remote player's shot is logged and stored nowhere. The `ShotMap` and the
-  card's shot count belong to the actor: the card's Reconnect, an address
-  change or turning it off and on starts a new one, which forgets them.
+  strokes, lie and distances to the hole); the hooks give a dropped shot's
+  stroke the `shot_id` of the flighthook shot it echoes, or none. A Gimme,
+  AutoPutt or PenaltyOnly has no shot id. `shot.cancelled` `discarded` (a
+  scramble shot the team did not pick) sends no stroke and retracts none.
+  `score.updated` is `game.scores`. A remote player's shot is logged and
+  stored nowhere. Each shot carries the host's `ShotCapture` (transport
+  `pureplay-ws`, no frames).
 - Readiness: the card's `bus.actor` `blockers` are Pureplay's readiness
   blockers (empty when `readiness.ready`; from the snapshot and
-  `shot.ready_changed`); the first carries the device identity (manufacturer
-  "Pureplay", model "Accessory API", firmware `gameVersion`). A connection that
-  said ready and ends publishes a blocker again.
-- Connection and pairing: refused or dropped without a close frame →
-  Reconnecting, backoff 1, 2, 4 ... 30 s (reset once a connection has held
-  30 s), the token kept, an `error` from Pureplay (version, events) cleared.
-  `4429` before `hello` → Reconnecting, `pairing` "Pureplay has too
-  many apps connected", backoff. A `hello` of another protocol or version →
-  Reconnecting, `error`, retried every 30 s. Waiting in Pureplay's queue,
-  then `pairing.pending` → Starting, `pairing` "Waiting for Pureplay", then
+  `shot.ready_changed`), and its device identity is manufacturer "Pureplay",
+  model "Accessory API", firmware `gameVersion`. A link that ends leaves the
+  card `not_armed`.
+- Connection and pairing (each wait is the driver's `retry_delay`; the card's
+  status is the host's: Starting before the first link, Reconnecting after a
+  link or a failed connect, Disconnected when the driver gives up): refused
+  or dropped without a close frame → backoff 1, 2, 4 ... 30 s (reset once a
+  link has held 30 s), the token kept. `4429` before `hello` → `pairing`
+  "Pureplay has too many apps connected", backoff. A `hello` of another
+  protocol or version → `error`, retried every 30 s. Waiting in Pureplay's
+  queue, then `pairing.pending` → `pairing` "Waiting for Pureplay", then
   "Approve flighthook in Pureplay (42 s)" counted down once a second from
   `expiresInSec`; only a `pair` without a token waits without limit, one
-  with a token gives up after 5 s (Reconnecting). `bad_request` to a `pair`
-  without a token (another app on the address is waiting) → the card
-  closes, Reconnecting, retried in 10 s; the sixth in a row → Disconnected
-  with Pureplay's `message` in `pairing`.
+  with a token gives up after 5 s. `bad_request` to a `pair` without a token
+  (another app on the address is waiting) → the card closes, retried in
+  10 s; the sixth in a row → Disconnected with Pureplay's `message` in
+  `pairing`.
   A refusal, told apart by the response before the close and the close code:
   `forbidden_scope` + `4403` ("Turn on Ask about new apps in Pureplay's
   Settings > Accessories"), `unauthorised` + `4403` ("Pureplay turned the
   request down"), `unauthorised` + `4408` ("The request timed out in
-  Pureplay") → Disconnected, no retry. `rate_limited` + `4429` (the cooldown)
-  → Disconnected, "Pureplay asks to wait (1:42)" counted down from
-  `retryAfterMs`, then the same attempt once more; a second cooldown answer
-  counts down to "Press Reconnect to pair again.". `unauthorised` echoing the
-  `pair` + `4401` with a saved token → the token is deleted and the card pairs
-  once without one, when this actor start has not sent its one `pair`
-  without a token yet (else "Removed in Pureplay. Press Reconnect to pair
-  again."). After a removal in Pureplay that `pair` meets Pureplay's
-  cooldown, so the card counts the wait down and then asks once more, which
-  shows the prompt. An unprompted `unauthorised` (`id: null`) then `4401`
-  while connected (removed in Pureplay) → the token deleted, Disconnected,
-  "Removed in Pureplay. Press Reconnect to pair again.", no retry. When the
-  socket ends without a close frame (or none comes within 1 s), the refused
-  response decides: `unauthorised` to a `pair` without a token → "Pureplay
-  turned the request down", with a token → the dead-token rule,
-  `forbidden_scope` → the Ask-about-new-apps text, `rate_limited` → the
-  cooldown, an unprompted `unauthorised` while connected → the removal. A
-  `pair` without a token is sent by itself at most once per actor start;
-  after that only a Reconnect (a new start) sends another.
-- Telemetry (card status rows, each key only while it has a value): connected,
-  `name`, `club`, `handed` (the active local player), `hole`, `blockers`
-  (while the readiness is not ready: its blockers, `controls_disabled` not
-  one), `club_out` (`on`, `read only`, `off in Pureplay`, `not supported`;
-  see Club out above),
-  `shots` (`auto`, `auto: last from Pureplay`, `auto: last from
-  flighthook`, `from Pureplay`, `from flighthook`), `missed_events`,
-  `pureplay` (`gameVersion`); `last_shot` (`#12 at 16:41:07`, the shot the
-  card took last) for the actor; otherwise `pairing` and `error`. Every
-  status change carries every row; between changes only what changed. The
-  rows are checked on every pass of the follow loop (100 ms), so `shots`
-  follows a Shots setting change while Pureplay is quiet.
+  Pureplay") → Disconnected, no retry, with `error` "Press Reconnect to pair
+  again." beside the `pairing` row. `rate_limited` + `4429` (the cooldown)
+  → the next connect first counts "Pureplay asks to wait (1:42)" down from
+  `retryAfterMs` in `pairing`, then makes the same attempt once more; a
+  second cooldown answer counts down to "Press Reconnect to pair again.".
+  `unauthorised` echoing the `pair` + `4401` with a saved token → the token
+  is deleted and the card pairs again at once without one, when this actor
+  start has not sent its one `pair` without a token yet (else "Removed in
+  Pureplay. Press Reconnect to pair again."). After a removal in Pureplay
+  that `pair` meets Pureplay's cooldown, so the card counts the wait down
+  and then asks once more, which shows the prompt. An unprompted
+  `unauthorised` (`id: null`) then `4401` while connected (removed in
+  Pureplay) → the token deleted, Disconnected, "Removed in Pureplay. Press
+  Reconnect to pair again.", no retry. When the socket ends without a close
+  frame (or none comes within 1 s), the refused response decides:
+  `unauthorised` to a `pair` without a token → "Pureplay turned the request
+  down", with a token → the dead-token rule, `forbidden_scope` → the
+  Ask-about-new-apps text, `rate_limited` → the cooldown, an unprompted
+  `unauthorised` while connected → the removal. A `pair` without a token is
+  sent by itself at most once per actor start; after that only a Reconnect
+  (a new start) sends another.
+- Telemetry (card rows, each key only while it has a value): connected,
+  `device_info` and `shot_count` (the host's), `name`, `club`, `handed` (the
+  active local player), `hole`, `blockers` (while the readiness is not
+  ready: its blockers, `controls_disabled` not one), `club_out` (`on`, `read
+  only`, `off in Pureplay`, `not supported`; see Club out above),
+  `missed_events`, `pureplay` (`gameVersion`); otherwise `pairing`. The
+  driver's rows ride the card's `bus.actor` telemetry, so `/frp` shows them
+  too. `error` is the host's: a failed connect's or opening's reason until a
+  link connects. The hooks add `shots` (`auto`, `auto: last from Pureplay`,
+  `auto: last from flighthook`, `from Pureplay`, `from flighthook`; sent
+  when it changes, so it follows a Shots setting change while Pureplay is
+  quiet) and `last_shot` (`#12 at 16:41:07`, the shot the card took last),
+  which the next Reconnecting clears.
 - Forget pairing: `POST /api/actors/{id}/forget-pairing` deletes the card's
   token (on a blocking worker), then reconnects it through the reconnect
   path; a reconnect of the card already in flight answers 409 first and
   keeps the token.
-- Audit log (`audit` target): every frame sent and received as its frame
-  type and its JSON text, tokens redacted; close frames with their code.
-  The messages a frame produces carry that text as their raw payload. Each
-  shot decision is logged: taken (with the card's shot number), the echo of
-  which flighthook shot, or not taken and why. Each club pick is logged: sent,
-  waiting, set, refused (with the code) or dropped and why.
+- Audit log: every frame sent and received is the host's raw-frame line at
+  the `audit` target (debug), text frames as their text, tokens redacted;
+  close frames with their code. Each shot decision is logged: taken (with
+  the card's shot number), the echo of which flighthook shot, or not taken
+  and why. Each club pick is logged: sent, waiting, set, refused (with the
+  code) or dropped and why.
 - The game's view of a shot attaches in the collector: a `game.stroke` joins
   the stored shot with the same `shot_id` whenever it arrives (a shot the
   history no longer holds is skipped). The Shots tab does not show it; the JSONL
@@ -2030,6 +2047,64 @@ ends. The state of a launch monitor is learned from its `bus.actor` (every local
 actor publishes it each heartbeat), so an output that starts while a monitor is
 already connected learns its state within one heartbeat.
 
+## Integration crates
+
+The simulator and game integrations are flightrelay drivers
+(`flightrelay::driver::FrpDriver`) in two workspace crates under
+`integrations/`. The app runs them on the same driver host as the launch
+monitors ([Device drivers](#device-drivers)).
+
+| Crate | Module | Driver | What it is |
+|---|---|---|---|
+| `flighthook-pureplay` | `connect` | `connect::Connect` | Pureplay Connect v1, the output that sends Pureplay the shots of the launch monitors it stands for ([Pureplay output](#pureplay-output-alpha)) |
+| | `accessory` | `accessory::Accessory` | Pureplay's Accessory API: Pureplay's round as a game and a virtual launch monitor, and the club picked in flighthook sent to Pureplay ([Pureplay Accessory card](#pureplay-accessory-card-beta)) |
+| `flighthook-openconnect` | `client` | `client::Client` | the Open Connect client, the output to GSPro, Pureplay, Muni Golf and other simulators |
+| | `server` | `server::Server` | the Open Connect server, a launch monitor fed by another program's Open Connect client |
+
+Each crate has two features. `config` builds the settings types only
+(serde), which `lib` and the WASM UI use; for Open Connect it also builds
+the JSON types in `client::api`. `driver` builds the drivers, their sessions
+and transports, which the app uses.
+
+A driver owns its protocol: the connect, the session and its wire format,
+its own shot composition, its telemetry rows, alerts and raw frames, and its
+retry delays. Each session is generic over its transport: `Read + Write` for
+the TCP ones, a `Link` for the Accessory's WebSocket. The crates' tests drive
+the sessions over in-memory transports on the SDK's test host, in virtual
+time, with one test each on a real socket. The crates know nothing of
+flighthook's config, cards or state. The app's section for each card
+flattens the crate's `Config` next to its own fields, so the TOML keys and
+the REST JSON are flat. What is flighthook policy stays in the app, in the
+card's hooks.
+
+**How the app hooks in.** Each card is a `DriverActor<D, H>`. A software
+driver's hooks use more of `Hooks` than a device's:
+
+- `route` sees every message the host takes off the bus and chooses what the
+  session is handed. It pushes those messages into `to_session`, which the
+  host gives the session's `FrpSession::bus` in order before its next step.
+  What it pushes while no session is up is dropped.
+- `session_started` fills what a new session sees first, such as the current
+  view or turn. `session_ended` drops what was held for the session.
+- `on_frp` sees each message the driver emits before it goes on the bus,
+  raw frames included (a shot's frame carries its shot key). `Pass::Drop` on
+  a `shot.trigger` drops the whole shot.
+- `SOURCE` is the card's shot source, `None` for an output.
+
+During a connect, the host keeps taking the bus through `route` at each
+`ConnectCtx::tick`, with nothing kept for the session. The TCP drivers tick
+once right after the TCP connect, so the session's first step sees what is on
+the bus. A driver sends only the kinds its roles allow. Any driver sends
+`bus.alert`, `golfer.select` and `bus.reply`. A game, or a driver that
+issues golfer ids, sends `game.*` and `golfer.profile`. A launch monitor
+sends `shot.*`. The host owns `bus.actor`, `golfer.turn` and the rest.
+
+| Hooks | Card | What they add |
+|---|---|---|
+| `actors/outputs.rs`: `OutputHooks` (`PureplayHooks`, `OpenConnectClientHooks`) | Pureplay Connect, Open Connect client | the routing and the routed view (`simout.rs`: `Feed`, `RoutedView`); the held select and its re-assert; the send registry record of each shot written; `shots_sent` and `last_shot` |
+| `actors/openconnect_server.rs`: `OpenConnectServerHooks` | Open Connect server | the shot source `measured`; the refused client's card name |
+| `actors/pureplay_accessory.rs`: `PureplayAccessoryHooks` | Pureplay Accessory | what the driver is handed (turns, picks, select replies, `bus.sync`, `game.aim`); the Shots setting and echo matching; `shots` and `last_shot` |
+
 ## Device drivers
 
 A launch monitor card can run on a flightrelay device driver
@@ -2042,7 +2117,9 @@ Golf Omni (`allsquare::driver::Omni`), the ExPutt
 session, shots, telemetry, raw frames); `actors::driver::DriverActor<D, H>`
 is the host around it, one thread per card. What a card adds is its
 `Hooks<D>`: its config section (`H::Section`, a lib `DeviceSection`), its
-shot source (`H::SOURCE`) and optional processing (`on_frp`, `action`).
+shot source (`H::SOURCE`) and optional processing (`on_frp`, `action`;
+a software driver's hooks also `route`, see
+[Integration crates](#integration-crates)).
 The FlightScope's are `actors::mevo::MevoHooks` (its `on_frp` estimates a
 launch-only chip's spin and publishes it as the card's own `assumed` flight),
 the R10's `actors::r10::R10Hooks`, the Square Golf's

@@ -13,7 +13,7 @@
 //! (lateral positive toward the toe, vertical positive above center), so
 //! ImpactPointX/Y take it as it is for either hand. Pureplay Connect v1 does
 //! not define SideSpin's sign: it goes out with flighthook's (positive =
-//! curves right) through [`side_spin`], the one place that sets it.
+//! curves right), set in one place in this module.
 
 use flightrelay::Club;
 use flightrelay::types::Launch;

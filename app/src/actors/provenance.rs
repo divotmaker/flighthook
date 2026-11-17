@@ -71,24 +71,6 @@ impl ShotSource {
         }
     }
 
-    /// Whether the source is a launch monitor card (configured, with a
-    /// status and readiness of its own); Auto-chip is not.
-    #[cfg(test)]
-    #[must_use]
-    pub fn is_launch_monitor(self) -> bool {
-        match self {
-            Self::Mevo
-            | Self::R10
-            | Self::Square
-            | Self::ExPutt
-            | Self::Trackball
-            | Self::MockMonitor
-            | Self::OpenConnectServer
-            | Self::PureplayAccessory => true,
-            Self::AutoChip => false,
-        }
-    }
-
     /// Whether the source is a simulator: its shots are the simulator's
     /// own, so no simulator output takes them, nor its readiness
     /// ([`Feed::feeds_simulators`](super::simout::Feed::feeds_simulators)).
@@ -174,22 +156,22 @@ mod tests {
     #[test]
     fn every_source_has_a_class() {
         use Source::{Measured, Virtual};
-        let classes: Vec<(ShotSource, Source, bool, bool)> = ShotSource::ALL
+        let classes: Vec<(ShotSource, Source, bool)> = ShotSource::ALL
             .into_iter()
-            .map(|s| (s, s.provenance(), s.is_launch_monitor(), s.is_simulator()))
+            .map(|s| (s, s.provenance(), s.is_simulator()))
             .collect();
         assert_eq!(
             classes,
             [
-                (ShotSource::Mevo, Measured, true, false),
-                (ShotSource::R10, Measured, true, false),
-                (ShotSource::Square, Measured, true, false),
-                (ShotSource::ExPutt, Measured, true, false),
-                (ShotSource::Trackball, Virtual, true, false),
-                (ShotSource::MockMonitor, Virtual, true, false),
-                (ShotSource::OpenConnectServer, Measured, true, false),
-                (ShotSource::AutoChip, Virtual, false, false),
-                (ShotSource::PureplayAccessory, Virtual, true, true),
+                (ShotSource::Mevo, Measured, false),
+                (ShotSource::R10, Measured, false),
+                (ShotSource::Square, Measured, false),
+                (ShotSource::ExPutt, Measured, false),
+                (ShotSource::Trackball, Virtual, false),
+                (ShotSource::MockMonitor, Virtual, false),
+                (ShotSource::OpenConnectServer, Measured, false),
+                (ShotSource::AutoChip, Virtual, false),
+                (ShotSource::PureplayAccessory, Virtual, true),
             ]
         );
     }
@@ -237,12 +219,6 @@ mod tests {
                 ("pureplay_accessory", ShotSource::PureplayAccessory),
             ]
         );
-        for source in ShotSource::ALL {
-            assert!(
-                !source.is_launch_monitor() || sources.iter().any(|(_, s)| *s == source),
-                "{source:?} has a config section"
-            );
-        }
         let mut config = super::every_actor_config();
         let mut n = 0;
         config.fill_actor_ids(|| {

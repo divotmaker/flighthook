@@ -2240,8 +2240,8 @@ fn a_muted_instance_leaves_no_bus_actor_in_the_feeds() {
     for msg in &msgs {
         feed.handle(msg);
     }
-    assert!(feed.monitor(&ids[0]).is_none());
-    assert!(feed.monitor(&ids[1]).is_some(), "the other stays");
+    assert!(!feed.in_view().contains_key(&ids[0]));
+    assert!(feed.in_view().contains_key(&ids[1]), "the other stays");
     // Replaced beside: the removal goes out before the new instance.
     save_mock(&state, &bus_tx, &mut rx, "1");
     let msgs: Vec<BusMsg> = std::iter::from_fn(|| raw.try_recv().ok()).collect();

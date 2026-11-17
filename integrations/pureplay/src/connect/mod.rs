@@ -26,7 +26,7 @@
 //!   than [`HOST_ERROR_BURST_GAP`] apart, on any link.
 //! - Any other message type is answered with Error (code 0).
 //!
-//! **What the session is handed** ([`FrpSession::bus`]) is its view of the
+//! **What the session is handed** ([`FrpSession::bus`](flightrelay::driver::FrpSession::bus)) is its view of the
 //! bus, chosen by the host: the `bus.actor` of each launch monitor it stands
 //! for (and that actor's removal when it leaves the view), and the messages of
 //! the shots it may send. It composes each shot from those messages itself.

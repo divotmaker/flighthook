@@ -30,17 +30,17 @@ use super::model::{self, Model, Want};
 use super::protocol::{self, Capabilities, Hello, Incoming, Paired, ResponseError};
 use super::shots::{self, Discarded, Flown, ShotMap};
 use super::token::{self, Token, TokenStore};
-use super::{Config, game, timing};
+use super::{Config, game};
 
 /// Reconnect backoff: 1, 2, 4 ... seconds, capped.
-pub(crate) const MIN_BACKOFF: Duration = timing(1_000, 40);
-pub(crate) const MAX_BACKOFF: Duration = timing(30_000, 320);
+pub(crate) const MIN_BACKOFF: Duration = Duration::from_millis(1_000);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_millis(30_000);
 /// A link that held this long resets the backoff.
-pub(crate) const STABLE: Duration = timing(30_000, 320);
+pub(crate) const STABLE: Duration = Duration::from_millis(30_000);
 /// A `hello` from another protocol or version is retried this often.
-pub(crate) const VERSION_RETRY: Duration = timing(30_000, 150);
+pub(crate) const VERSION_RETRY: Duration = Duration::from_millis(30_000);
 /// After `bad_request` to `pair` the card tries again this much later.
-pub(crate) const BAD_REQUEST_RETRY: Duration = timing(10_000, 150);
+pub(crate) const BAD_REQUEST_RETRY: Duration = Duration::from_millis(10_000);
 /// `bad_request` answers in a row after which the card stops asking.
 const BAD_REQUEST_TRIES: u32 = 6;
 /// Longest a TCP connect may take.
@@ -48,22 +48,25 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest the WebSocket handshake may take.
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(2_500);
 /// Longest `hello` may take after the handshake.
-pub(crate) const HELLO_TIMEOUT: Duration = timing(5_000, 1_000);
+pub(crate) const HELLO_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// Longest a `pair` with a token may wait for its answer.
-pub(crate) const PAIR_TIMEOUT: Duration = timing(5_000, 1_000);
+pub(crate) const PAIR_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// How long a refused `pair` waits for its close frame before the response
 /// decides by itself.
-pub(crate) const CLOSE_GRACE: Duration = timing(1_000, 200);
+pub(crate) const CLOSE_GRACE: Duration = Duration::from_millis(1_000);
 /// Longest the snapshot may take after `subscribe`, and a `state.get`'s
 /// answer.
-pub(crate) const SNAPSHOT_TIMEOUT: Duration = timing(5_000, 1_000);
+pub(crate) const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// Least time between two `state.get`.
-pub(crate) const STATE_GET_GAP: Duration = timing(1_000, 100);
+pub(crate) const STATE_GET_GAP: Duration = Duration::from_millis(1_000);
 /// The waits before a `state.get` that got no snapshot (no answer in
 /// [`SNAPSHOT_TIMEOUT`], or refused) is sent again: one per failure in a
 /// row, the last one repeating until a snapshot comes.
-pub(crate) const STATE_GET_RETRY: [Duration; 3] =
-    [timing(5_000, 200), timing(10_000, 400), timing(30_000, 800)];
+pub(crate) const STATE_GET_RETRY: [Duration; 3] = [
+    Duration::from_millis(5_000),
+    Duration::from_millis(10_000),
+    Duration::from_millis(30_000),
+];
 /// A link that has sent nothing this long is pinged.
 pub(crate) const PING_EVERY: Duration = Duration::from_secs(20);
 /// Pings without an answer after which the link counts as lost.
@@ -944,7 +947,7 @@ impl Card {
 }
 
 /// The Accessory driver: one link to Pureplay at a time, over a WebSocket.
-/// See the [module docs](self).
+/// See the [module docs](crate::accessory).
 #[derive(Debug)]
 pub struct Accessory {
     config: Config,

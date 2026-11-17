@@ -37,8 +37,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// within this, so a refused connection never shows as connected.
 pub const REFUSAL_VERDICT: Duration = Duration::from_secs(1);
 
-/// How often the session sends a heartbeat. The first goes out
-/// [`FIRST_HEARTBEAT`] after the session starts.
+/// How often the session sends a heartbeat. The first goes out 1 s after
+/// the session starts.
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
 
 /// When the first heartbeat goes out, after the session starts.

@@ -126,8 +126,9 @@ enum Read {
 }
 
 impl TokenStore {
-    /// The process-wide store of the token file at [`default_path`]: every
-    /// card of the process pairs through it.
+    /// The process-wide store of the token file in the user's local data
+    /// folder (`flighthook/pureplay-tokens.json`): every card of the process
+    /// pairs through it.
     #[must_use]
     pub fn shared() -> Arc<Self> {
         static SHARED: OnceLock<Arc<TokenStore>> = OnceLock::new();

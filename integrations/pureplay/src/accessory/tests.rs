@@ -890,8 +890,8 @@ fn joe() -> GolferId {
 }
 
 /// The one real-socket test: [`WsLink`] against a WebSocket server on
-/// loopback, asking for the `binary` subprotocol, sending text, reading
-/// binary, a ping answered, and the server's close code.
+/// loopback, asking for the `binary` subprotocol, sending commands in text
+/// frames, reading binary, a ping answered, and the server's close code.
 #[test]
 fn the_websocket_link_talks_to_a_real_server() {
     use std::net::TcpListener;
@@ -920,9 +920,12 @@ fn the_websocket_link_talks_to_a_real_server() {
             Ok(resp)
         })
         .expect("handshake");
+        // The first data frame, as text or as the bytes of a binary frame.
         let got = loop {
-            if let Message::Text(t) = ws.read().expect("read") {
-                break t.as_str().to_owned();
+            match ws.read().expect("read") {
+                Message::Text(t) => break Ok(t.as_str().to_owned()),
+                Message::Binary(b) => break Err(b.to_vec()),
+                _ => {}
             }
         };
         ws.send(Message::binary(br#"{"type":"hello"}"#.to_vec()))
@@ -963,5 +966,9 @@ fn the_websocket_link_talks_to_a_real_server() {
         ]
     );
     link.close();
-    assert_eq!(server.join().expect("server"), r#"{"type":"pair"}"#);
+    assert_eq!(
+        server.join().expect("server"),
+        Ok(r#"{"type":"pair"}"#.to_owned()),
+        "a command goes in a text frame"
+    );
 }

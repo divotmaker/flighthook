@@ -496,11 +496,9 @@ fn the_cards_ready_never_reaches_an_output() {
 #[test]
 fn the_connected_card_is_no_feed_of_a_pureplay_connect_output() {
     let rig = Rig::new();
-    assert!(
-        rig.state
-            .sources
-            .source(ACTOR)
-            .is_some_and(ShotSource::is_launch_monitor)
+    assert_eq!(
+        rig.state.sources.source(ACTOR),
+        Some(ShotSource::PureplayAccessory)
     );
     let feed = Feed::new(Routing::default(), Some(Arc::clone(&rig.state)));
     assert!(!feed.feeds_simulators(ACTOR));
