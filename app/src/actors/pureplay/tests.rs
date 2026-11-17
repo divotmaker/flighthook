@@ -1177,6 +1177,18 @@ impl Host {
         }
     }
 
+    /// Nothing but ReadyState frames comes before the answer to a Ping sent
+    /// now: the bridge reads the host's bytes in order and answers each in
+    /// turn, so whatever the host sent before got its answer (if any) first.
+    fn no_answer_before_a_ping(&mut self) {
+        self.send(&Message::Ping);
+        let answer = self.next_not_ready();
+        assert!(
+            matches!(answer, Message::Heartbeat { .. }),
+            "unexpected {answer:?}"
+        );
+    }
+
     /// Nothing but ReadyState frames arrives for `quiet`.
     fn assert_quiet(&mut self, quiet: Duration) {
         let until = Instant::now() + quiet;
@@ -1431,7 +1443,7 @@ fn advisory_commands_are_quiet_and_unknown_types_get_an_error() {
     });
     host.send(&Message::SetDetect { mode: 1 });
     host.send(&Message::SetBallType { ball_type: 1 });
-    host.assert_quiet(Duration::from_millis(200));
+    host.no_answer_before_a_ping();
 
     host.stream
         .write_all(&codec::encode_frame(0xA5, &[1, 2]).expect("frame"))
@@ -1681,7 +1693,7 @@ fn garbage_from_the_host_is_skipped() {
     let (_, mut host) = bridge.connect();
     host.next();
     host.stream.write_all(&[0x13; 5000]).expect("write");
-    host.assert_quiet(Duration::from_millis(150));
+    host.no_answer_before_a_ping();
     let mut garbage_then_ping = vec![0x00, 0x50, 0x4C, 0x00, 0x99];
     garbage_then_ping.extend(Message::Ping.to_frame());
     host.stream.write_all(&garbage_then_ping).expect("write");
@@ -2198,7 +2210,15 @@ fn each_written_shot_is_recorded_as_sent() {
     );
     host.strict(true);
     emit(&bridge.mock, 8, &mapper::tests::ball_only_shot());
-    host.assert_quiet(Duration::from_millis(200));
+    // A shot the bridge writes after it, on the same bus: the held one,
+    // had it gone out, would come first.
+    emit(&bridge.monitor, 9, &mapper::tests::full_shot());
+    assert_eq!(host.ball().shot_id, 2);
+    assert_eq!(host.club().shot_id, 2);
+    assert_eq!(
+        bridge.sent.take_echo(loopback, Instant::now()),
+        Some(key_of("square.0", 9))
+    );
     assert_eq!(bridge.sent.take_echo(loopback, Instant::now()), None);
     bridge.stop();
 }
