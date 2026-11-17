@@ -2427,11 +2427,14 @@ mod tests {
         assert_eq!(video["position"], "golfer_front");
         assert!(video["complete"].is_boolean());
         assert!(video["fps"].as_f64().unwrap() > 20.0, "{video}");
-        // 0.4 s pre-roll + 0.6 s post-roll, the trigger 0.4 s in.
-        let duration = video["duration_ms"].as_u64().unwrap();
-        assert!((850..=1100).contains(&duration), "{video}");
+        // The trigger 0.4 s in (the pre-roll), some post-roll after it. How
+        // much post-roll a paced camera delivers before the cut depends on
+        // the machine's load; the window itself is
+        // `a_clip_with_latency_covers_the_real_window`.
         let trigger = video["trigger_offset_ms"].as_i64().unwrap();
         assert!((300..=500).contains(&trigger), "{video}");
+        let duration = video["duration_ms"].as_i64().unwrap();
+        assert!(duration > trigger, "{video}");
         assert_eq!(video["impact_offset_ms"], video["trigger_offset_ms"]);
 
         // The clip list and its files.
@@ -2591,16 +2594,12 @@ mod tests {
         let b = rig.shot("mock_monitor.1", 1);
         let (keys, _) = rig.next_video().expect("shot_video");
         assert_eq!(keys, [a.clone(), b.clone()]);
-        assert!(
-            rig.wait_for(Duration::from_millis(800), |m| matches!(
-                m.event,
-                LocalEvent::ShotVideo { .. }
-            ))
-            .is_none(),
-            "one clip"
-        );
-        assert_eq!(rig.folders(), 1);
-        assert_eq!(rig.shots(2).len(), 2);
+        // One clip: the next one is a later shot's.
+        let c = rig.shot("mock_monitor.0", 2);
+        let (keys, _) = rig.next_video().expect("shot_video");
+        assert_eq!(keys, [c], "one clip for the swing");
+        assert_eq!(rig.folders(), 2);
+        assert_eq!(rig.shots(3).len(), 3);
         for key in [&a, &b] {
             assert_eq!(rig.row(key, 1)["video"][0]["camera"], "camera.0");
         }
