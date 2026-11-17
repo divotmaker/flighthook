@@ -182,7 +182,9 @@ address = "127.0.0.1:921"
   offset outside -10 to 10, is refused (the card shows why and Save stays
   off; a save is `400`; from the file, the card does not start)
 - ExPutt sections show name and an optional IP Address (blank finds the
-  device on the network); the putting hand follows the game's handedness.
+  device on the network; setting the ExPutt's IP address makes reconnects
+  dependable, so give it a fixed IP in your router); the putting hand follows
+  the game's handedness.
   `address` is the ExPutt driver's setting (threeputt's `Config`, flattened
   into the section); one that is not an IP address is refused (the card
   shows why and Save stays off; a save is `400`; from the file, the card

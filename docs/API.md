@@ -1929,7 +1929,8 @@ Full persisted config (mirrors `config.toml`).
   the actor
 - ExPutt sections have `name` and an optional `address`, the ExPutt
   driver's setting: the device's IP address (no port). When absent or blank
-  the device is found on the local network. Omitted while unset. A save that
+  the device is found on the local network; setting the ExPutt's IP address
+  makes reconnects dependable (give it a fixed IP in your router). Omitted while unset. A save that
   changes it into anything else (a host name, an address with a port) is
   rejected with `400` (`"exputt.0: address: \"exputt.local\" is not an IP
   address; leave it blank to find the device on the network"`); a config

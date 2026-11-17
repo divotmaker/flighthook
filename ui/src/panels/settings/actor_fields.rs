@@ -178,7 +178,9 @@ pub(crate) fn actor_fields(
                 ui.horizontal(|ui| {
                     field_label(ui, "IP Address:").on_hover_text(
                         "IP address of the device on your network. Leave blank to \
-                         find it automatically.",
+                         find it automatically. Setting the ExPutt's IP address \
+                         here makes reconnects dependable (give it a fixed IP in \
+                         your router).",
                     );
                     let field = ui
                         .add(
