@@ -16,22 +16,22 @@ clap = ["dep:clap"]
 [dependencies]
 # `mock`: the mock launch monitor's settings (`MockConfig`), with the
 # driver settings contract (`DriverConfig`); adds no dependencies.
-flightrelay = { version = "0.6.0", features = ["mock"] }
+flightrelay = { version = "0.7.0", features = ["mock"] }
 # The FlightScope driver's settings (`ironsight::config::Config`, the
 # `config` feature: no device stack, so the WASM UI builds it too).
-ironsight = { version = "0.8.0", default-features = false, features = ["config"] }
+ironsight = { version = "0.9.0", default-features = false, features = ["config"] }
 # The R10 driver's settings (`tenover::config::Config`, the `config`
 # feature: no BLE stack, so the WASM UI builds it too).
-tenover = { version = "0.6.0", default-features = false, features = ["config"] }
+tenover = { version = "0.7.0", default-features = false, features = ["config"] }
 # The Square Golf driver's settings (`allsquare::config::Config`, the
 # `config` feature: no BLE stack, so the WASM UI builds it too).
-allsquare = { version = "0.5.0", default-features = false, features = ["config"] }
+allsquare = { version = "0.6.0", default-features = false, features = ["config"] }
 # The ExPutt driver's settings (`threeputt::config::Config`, the `config`
 # feature: no network code, so the WASM UI builds it too).
-threeputt = { version = "0.2.0", default-features = false, features = ["config"] }
+threeputt = { version = "0.3.0", default-features = false, features = ["config"] }
 # The Trackball driver's settings (`thumbswing::Config`, the `config`
 # feature: no device stack, so the WASM UI builds it too).
-thumbswing = { version = "0.0.3", default-features = false, features = ["config"] }
+thumbswing = { version = "0.0.4", default-features = false, features = ["config"] }
 # The Pureplay cards' settings (`connect::Config`, `accessory::Config`, the
 # `config` feature: no network code, so the WASM UI builds it too).
 flighthook-pureplay = { version = "0.2.2", path = "../integrations/pureplay", default-features = false, features = ["config"] }

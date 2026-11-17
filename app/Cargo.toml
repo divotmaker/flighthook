@@ -20,9 +20,9 @@ gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
 # The FlightScope device driver (`driver`: `ironsight::driver::Mevo`).
-ironsight = { version = "0.8.0", features = ["driver"] }
+ironsight = { version = "0.9.0", features = ["driver"] }
 # The R10's device driver (`driver`: `tenover::driver::R10`).
-tenover = { version = "0.6.0", features = ["driver"] }
+tenover = { version = "0.7.0", features = ["driver"] }
 flighthook = { path = "../lib", features = ["clap"] }
 # The Pureplay drivers (`driver`: `connect::Connect`, `accessory::Accessory`).
 flighthook-pureplay = { path = "../integrations/pureplay", features = ["driver"] }
@@ -35,7 +35,7 @@ flighthook-cameras = { path = "../cameras" }
 # device driver contract the launch monitor actors run on (`driver`) and the
 # mock launch monitor (`mock`); the same crate the lib re-exports its types
 # from. Neither feature adds a dependency.
-flightrelay = { version = "0.6.0", features = ["collector", "driver", "mock"] }
+flightrelay = { version = "0.7.0", features = ["collector", "driver", "mock"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -56,18 +56,18 @@ uuid = { version = "1", features = ["v4"] }
 # Ball-flight physics for simulated (derived) shot values.
 dimple = "0.0.8"
 # The ExPutt RG's device driver (`driver`: `threeputt::driver::ExPutt`).
-threeputt = { version = "0.2.0", features = ["driver"] }
+threeputt = { version = "0.3.0", features = ["driver"] }
 # A camera's video mode (`stance::FormatRequest`) is checked when the config
 # resolves; the cameras themselves are `flighthook-cameras`.
-stance = { version = "0.0.5", features = ["pose", "pose-download"] }
+stance = { version = "0.0.6", features = ["pose", "pose-download"] }
 # The Trackball's device driver (`driver`: `thumbswing::driver::Thumbswing`).
 # It reads Linux evdev; on other platforms it builds and its connect reports
 # that the trackball is not supported there.
-thumbswing = { version = "0.0.3", features = ["driver"] }
+thumbswing = { version = "0.0.4", features = ["driver"] }
 # The Square Golf device driver (`driver`: `allsquare::driver::Omni`). It
 # implies `ble`, whose backend allsquare picks by target: BlueZ on Linux,
 # btleplug elsewhere.
-allsquare = { version = "0.5.0", features = ["driver"] }
+allsquare = { version = "0.6.0", features = ["driver"] }
 
 # Native GUI — optional, included by default `gui` feature.
 # Excluded in headless builds via --no-default-features.
@@ -90,19 +90,19 @@ tungstenite = "0.29"
 # process's own clients.
 flighthook-openconnect = { path = "../integrations/openconnect", features = ["driver", "testing"] }
 # ironsight's test support: a scripted device and recorded result frames.
-ironsight = { version = "0.8.0", features = ["driver", "testing"] }
+ironsight = { version = "0.9.0", features = ["driver", "testing"] }
 # tenover's test support: GFDI frame builders with synthetic identity.
-tenover = { version = "0.6.0", features = ["driver", "testing"] }
+tenover = { version = "0.7.0", features = ["driver", "testing"] }
 # allsquare's test support: notification fixtures and encoders, and the
 # driver's connect over a scripted link.
-allsquare = { version = "0.5.0", features = ["driver", "testing"] }
+allsquare = { version = "0.6.0", features = ["driver", "testing"] }
 # threeputt's test support: an in-memory device and sample putts.
-threeputt = { version = "0.2.0", features = ["driver", "testing"] }
+threeputt = { version = "0.3.0", features = ["driver", "testing"] }
 # The cameras' test support: the fake model source and the body tracking test
 # helpers.
 flighthook-cameras = { path = "../cameras", features = ["testing"] }
 # thumbswing's test support: synthetic swing streams and recordings.
-thumbswing = { version = "0.0.3", features = ["driver", "testing"] }
+thumbswing = { version = "0.0.4", features = ["driver", "testing"] }
 
 [build-dependencies]
 winresource = "0.1"

@@ -23,11 +23,11 @@ driver = ["config", "flightrelay/driver", "flightrelay/collector", "dep:serde_js
 testing = ["driver"]
 
 [dependencies]
-flightrelay = { version = "0.6.0", optional = true }
+flightrelay = { version = "0.7.0", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 thiserror = { version = "2", optional = true }
 
 [dev-dependencies]
 # The driver test host (`testing`): one thread, virtual time.
-flightrelay = { version = "0.6.0", features = ["testing"] }
+flightrelay = { version = "0.7.0", features = ["testing"] }
