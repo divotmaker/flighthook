@@ -192,7 +192,7 @@ pub(crate) fn reconnect_target(
 ) -> Result<String, ReconnectRefusal> {
     let id = canonical_id(id);
     let type_key = id.split_once('.').map_or(id.as_str(), |(t, _)| t);
-    if !reconnectable(type_key) {
+    if !flighthook::reconnectable(type_key) {
         return Err(ReconnectRefusal::NotReconnectable(format!(
             "'{id}' is not a launch monitor or output"
         )));

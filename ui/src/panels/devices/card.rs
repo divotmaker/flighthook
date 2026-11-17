@@ -219,7 +219,7 @@ pub(super) fn device_card(
     let has_form = form.is_some();
     let removable = has_form && !view.remote && cards::removable(entry_type(id));
     let forget = has_form && entry_type(id) == "pureplay_accessory";
-    let reconnect = !view.remote && cards::reconnectable(entry_type(id));
+    let reconnect = !view.remote && flighthook::reconnectable(entry_type(id));
     let find_mat = !view.remote && entry_type(id) == "exputt";
     let off = view.telemetry.is_some_and(ActorStatusResponse::is_disabled);
     let connected = view

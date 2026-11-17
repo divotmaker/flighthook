@@ -17,6 +17,9 @@ testing = []
 
 [dependencies]
 flighthook = { path = "../lib" }
+# The camera's reconnect backoff (`driver::Backoff`); the same crate the lib
+# re-exports its types from. The feature adds no dependency.
+flightrelay = { version = "0.6.0", features = ["driver"] }
 # Swing cameras: capture, pre-roll and trigger-cut MJPEG clips; `pose` is
 # body tracking (RTMPose on the CPU), `pose-download` fetches its models.
 stance = { version = "0.0.5", features = ["pose", "pose-download"] }

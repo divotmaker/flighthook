@@ -7,6 +7,8 @@
 // Re-exports from the lib crate — shared with the app crate
 // ---------------------------------------------------------------------------
 
+use flighthook::ShotVideos as _;
+
 pub use flighthook::{
     // Domain types
     ActorStatus,
@@ -207,18 +209,22 @@ impl From<ShotData> for ShotRow {
     }
 }
 
-/// Stamp `video`, one camera's clip, on every row whose shot is in `keys`
-/// (by shot id, whatever device the row is from), replacing that camera's
-/// earlier clip. Returns whether a row changed.
+/// The rows whose shot is in `keys` (by shot id, whatever device the row is
+/// from).
+fn rows_of<'a>(
+    rows: &'a mut [ShotRow],
+    keys: &'a [ShotKey],
+) -> impl Iterator<Item = &'a mut ShotRow> {
+    rows.iter_mut()
+        .filter(|r| !r.shot_id.is_empty() && keys.iter().any(|k| k.shot_id == r.shot_id))
+}
+
+/// Stamp `video`, one camera's clip, on every row whose shot is in `keys`,
+/// replacing that camera's earlier clip. Returns whether a row changed.
 pub fn stamp_video(rows: &mut [ShotRow], keys: &[ShotKey], video: &ShotVideo) -> bool {
     let mut changed = false;
-    for row in rows
-        .iter_mut()
-        .filter(|r| !r.shot_id.is_empty() && keys.iter().any(|k| k.shot_id == r.shot_id))
-    {
-        row.video.retain(|v| v.camera != video.camera);
-        row.video.push(video.clone());
-        row.video.sort_by(|a, b| a.camera.cmp(&b.camera));
+    for row in rows_of(rows, keys) {
+        row.video.stamp_video(video);
         changed = true;
     }
     changed
@@ -228,17 +234,10 @@ pub fn stamp_video(rows: &mut [ShotRow], keys: &[ShotKey], video: &ShotVideo) ->
 /// tracked with the camera turned by `rotation` degrees: its keypoints can
 /// be fetched. Returns whether a row changed.
 pub fn mark_pose(rows: &mut [ShotRow], keys: &[ShotKey], camera: &str, rotation: u16) -> bool {
-    let mut changed = mark_video(rows, keys, camera, |v| &mut v.pose);
-    for row in rows
-        .iter_mut()
-        .filter(|r| !r.shot_id.is_empty() && keys.iter().any(|k| k.shot_id == r.shot_id))
-    {
-        for video in row.video.iter_mut().filter(|v| v.camera == camera) {
-            changed |= video.rotation != rotation;
-            video.rotation = rotation;
-        }
-    }
-    changed
+    mark_video(rows, keys, camera, |v| {
+        v.pose = true;
+        v.rotation = rotation;
+    })
 }
 
 /// Forget camera `camera`'s body tracking and swing analysis of shot
@@ -250,11 +249,7 @@ pub fn forget_analysis(rows: &mut [ShotRow], shot_id: &str, camera: &str) -> boo
         .iter_mut()
         .filter(|r| !r.shot_id.is_empty() && r.shot_id == shot_id)
     {
-        for video in row.video.iter_mut().filter(|v| v.camera == camera) {
-            changed |= video.pose || video.swing;
-            video.pose = false;
-            video.swing = false;
-        }
+        changed |= row.video.forget_analysis(camera);
     }
     changed
 }
@@ -262,27 +257,20 @@ pub fn forget_analysis(rows: &mut [ShotRow], shot_id: &str, camera: &str) -> boo
 /// Mark camera `camera`'s clip of the rows whose shot is in `keys` as swing
 /// analyzed: its report can be fetched. Returns whether a row changed.
 pub fn mark_swing(rows: &mut [ShotRow], keys: &[ShotKey], camera: &str) -> bool {
-    mark_video(rows, keys, camera, |v| &mut v.swing)
+    mark_video(rows, keys, camera, |v| v.swing = true)
 }
 
-/// Set the flag `flag` picks on camera `camera`'s clip of the rows whose
-/// shot is in `keys`. Returns whether a row changed.
+/// Apply `set` to camera `camera`'s clip of the rows whose shot is in
+/// `keys`. Returns whether a row changed.
 fn mark_video(
     rows: &mut [ShotRow],
     keys: &[ShotKey],
     camera: &str,
-    flag: fn(&mut ShotVideo) -> &mut bool,
+    set: impl Fn(&mut ShotVideo),
 ) -> bool {
     let mut changed = false;
-    for row in rows
-        .iter_mut()
-        .filter(|r| !r.shot_id.is_empty() && keys.iter().any(|k| k.shot_id == r.shot_id))
-    {
-        for video in row.video.iter_mut().filter(|v| v.camera == camera) {
-            let f = flag(video);
-            changed |= !*f;
-            *f = true;
-        }
+    for row in rows_of(rows, keys) {
+        changed |= row.video.mark_video(camera, &set);
     }
     changed
 }

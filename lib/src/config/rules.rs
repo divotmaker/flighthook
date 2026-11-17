@@ -3,6 +3,24 @@
 
 use super::*;
 
+/// Whether card `card` (`pureplay.0`) is an output card (an Open Connect
+/// client, a Pureplay Connect output, random club): an actor with a name and
+/// no role, whose `bus.actor` carries nothing for its card.
+#[must_use]
+pub fn is_output_card(card: &str) -> bool {
+    matches!(
+        card.split_once('.').map(|(kind, _)| kind),
+        Some("openconnect_client" | "pureplay" | "random_club")
+    )
+}
+
+/// Whether actors of type `type_key` can be reconnected: every launch
+/// monitor and output, not a camera, the web server or the system actor.
+#[must_use]
+pub fn reconnectable(type_key: &str) -> bool {
+    !matches!(type_key, "camera" | "webserver" | "system")
+}
+
 impl FlighthookConfig {
     /// The golfer `id` means (the lookup rule): the golfer whose
     /// identifiers contain it. `None` when no golfer lists it; the id then
@@ -623,5 +641,32 @@ impl FlighthookConfig {
             || !self.pureplay_accessory.is_empty()
             || !self.random_club.is_empty()
             || !self.camera.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_launch_monitors_and_outputs_are_reconnectable() {
+        for t in [
+            "mevo",
+            "r10",
+            "square",
+            "exputt",
+            "trackball",
+            "mock_monitor",
+            "openconnect_server",
+            "openconnect_client",
+            "pureplay",
+            "pureplay_accessory",
+            "random_club",
+        ] {
+            assert!(reconnectable(t), "{t}");
+        }
+        for t in ["camera", "webserver", "system"] {
+            assert!(!reconnectable(t), "{t}");
+        }
     }
 }

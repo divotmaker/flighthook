@@ -56,6 +56,51 @@ pub struct ShotVideo {
     pub analyzed_with: Option<String>,
 }
 
+/// The clip flags of one shot's clips (a shot's `video`): one clip per
+/// camera, in camera order, each marked as its body tracking and swing
+/// analysis are done.
+pub trait ShotVideos {
+    /// Put `video`, one camera's clip, in the list, replacing that camera's
+    /// earlier one.
+    fn stamp_video(&mut self, video: &ShotVideo);
+
+    /// Apply `set` (body tracked, swing analyzed) to camera `camera`'s clip.
+    /// Returns whether the clip changed.
+    fn mark_video(&mut self, camera: &str, set: impl Fn(&mut ShotVideo)) -> bool;
+
+    /// Forget what camera `camera`'s clip says about its body tracking and
+    /// swing analysis (its clip is being tracked again). Returns whether the
+    /// clip changed.
+    fn forget_analysis(&mut self, camera: &str) -> bool;
+}
+
+impl ShotVideos for Vec<ShotVideo> {
+    fn stamp_video(&mut self, video: &ShotVideo) {
+        self.retain(|old| old.camera != video.camera);
+        self.push(video.clone());
+        self.sort_by(|a, b| a.camera.cmp(&b.camera));
+    }
+
+    fn mark_video(&mut self, camera: &str, set: impl Fn(&mut ShotVideo)) -> bool {
+        let mut changed = false;
+        for video in self.iter_mut().filter(|v| v.camera == camera) {
+            let before = video.clone();
+            set(video);
+            changed |= *video != before;
+        }
+        changed
+    }
+
+    fn forget_analysis(&mut self, camera: &str) -> bool {
+        self.mark_video(camera, |video| {
+            video.pose = false;
+            video.swing = false;
+            video.rotation = 0;
+            video.analyzed_with = None;
+        })
+    }
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
 fn is_zero(v: &u16) -> bool {
     *v == 0

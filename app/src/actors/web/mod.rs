@@ -27,7 +27,7 @@ use crate::state::SystemState;
 use blocks::BlockStore;
 use flighthook::{
     ActorStatus, ActorStatusResponse, ExportDevice, FlightPath, FlighthookConfig, Mode,
-    SHOT_TIMEOUT, ShotData, ShotKey, ShotRaw, ShotVideo, SimulationSection,
+    SHOT_TIMEOUT, ShotData, ShotKey, ShotRaw, ShotVideo, ShotVideos as _, SimulationSection,
 };
 use flightrelay::{CompletedShot, FrpBody, ShotAggregator, ShotEvent};
 
@@ -859,11 +859,7 @@ fn stamp_video(
     video: Option<&ShotVideo>,
 ) {
     let apply = |list: &mut Vec<ShotVideo>| match video {
-        Some(v) => {
-            list.retain(|old| old.camera != v.camera);
-            list.push(v.clone());
-            list.sort_by(|a, b| a.camera.cmp(&b.camera));
-        }
+        Some(v) => list.stamp_video(v),
         None => list.clear(),
     };
     for (id, p) in pending.iter_mut() {
@@ -886,12 +882,7 @@ pub(crate) async fn forget_analysis(state: &WebState, keys: &[ShotKey], camera: 
         .iter_mut()
         .filter(|s| keys.iter().any(|k| k.shot_id == s.key.shot_id))
     {
-        for video in stored.data.video.iter_mut().filter(|v| v.camera == camera) {
-            video.pose = false;
-            video.swing = false;
-            video.rotation = 0;
-            video.analyzed_with = None;
-        }
+        stored.data.video.forget_analysis(camera);
     }
 }
 
@@ -903,9 +894,7 @@ fn mark_video(
     set: impl Fn(&mut ShotVideo),
 ) {
     let apply = |list: &mut Vec<ShotVideo>| {
-        for video in list.iter_mut().filter(|v| v.camera == camera) {
-            set(video);
-        }
+        list.mark_video(camera, &set);
     };
     for (id, p) in pending.iter_mut() {
         if id == shot_id {

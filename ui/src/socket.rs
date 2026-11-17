@@ -17,15 +17,6 @@ use crate::types::{LogEntry, ShotRow};
 /// Log rows kept for the Log tab.
 const MAX_LOG_ENTRIES: usize = 500;
 
-/// Whether card `card` is an output card (Open Connect client, Pureplay
-/// Connect, random club), whose `bus.actor` carries nothing for its card.
-fn is_output_card(card: &str) -> bool {
-    matches!(
-        card.split_once('.').map(|(kind, _)| kind),
-        Some("openconnect_client" | "pureplay" | "random_club")
-    )
-}
-
 impl FlighthookApp {
     /// Handle one message of the UI socket.
     pub(crate) fn handle_ui_message(&mut self, msg: UiMessage) {
@@ -86,7 +77,7 @@ impl FlighthookApp {
                 // An output card's own `bus.actor` only names it: no rows.
                 // Its driver's carries `device` and the session's rows.
                 if let Some(card) = self.card_keys.get(&msg.from)
-                    && (!is_output_card(card) || actor.device.is_some())
+                    && (!flighthook::is_output_card(card) || actor.device.is_some())
                     && let Some(status) = self.actors.get_mut(card)
                 {
                     for (k, v) in flighthook::bus_actor_rows(actor) {

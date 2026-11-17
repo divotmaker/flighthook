@@ -14,7 +14,6 @@
 //!   swing numbers and grades computed from them.
 //! - [`settings`]: what the cameras read from the live config.
 
-mod backoff;
 mod camera;
 #[cfg(debug_assertions)]
 mod clip_source;

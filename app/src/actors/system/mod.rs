@@ -24,8 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 use crate::actors::{
-    Actor, ReconfigureOutcome, ResolvedActor, actor_names, reconnectable, resolve_actors,
-    start_actor,
+    Actor, ReconfigureOutcome, ResolvedActor, actor_names, resolve_actors, start_actor,
 };
 use crate::bus::{BusMsg, BusReceiver, BusSender, LocalEvent, PollError};
 use crate::state::config::{FlighthookConfig, canonical_id};
@@ -205,7 +204,7 @@ pub(crate) fn resend_output_actors(state: &SystemState, bus_tx: &broadcast::Send
     state.beats.send_again(bus_tx, |from| {
         state
             .card_of_actor(from)
-            .is_some_and(|card| crate::actors::is_output_card(&card) && state.is_live_local(from))
+            .is_some_and(|card| flighthook::is_output_card(&card) && state.is_live_local(from))
     });
 }
 

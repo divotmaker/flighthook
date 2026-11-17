@@ -57,7 +57,6 @@ use stance::{
 };
 use tracing::{debug, info, warn};
 
-use crate::backoff::Backoff;
 use crate::clips::{self, ClipShot, clip_impact};
 use crate::pose::clips::{ClipJob, ClipTiming};
 use crate::pose::live::{self, LIVE_FPS, LiveWorker};
@@ -68,6 +67,7 @@ use flighthook::{
     ActorStatus, BodyTrackingMode, CameraSection, FlighthookConfig, GolferTurn, MAX_IMPACT_LEAD_S,
     MAX_TRIGGER_DELAY_S, ReplaySection, ShotKey, ShotVideo,
 };
+use flightrelay::driver::Backoff;
 
 /// Recorder history beyond the pre-roll and the longest reach.
 const BUFFER_MARGIN: Duration = Duration::from_millis(500);

@@ -67,6 +67,7 @@ pub use general::*;
 pub use golfers::*;
 pub use impact_lead::*;
 pub use outputs::*;
+pub use rules::{is_output_card, reconnectable};
 
 /// The kind of stroke the golfer is about to play (FRP's `mode`).
 pub use flightrelay::Mode;

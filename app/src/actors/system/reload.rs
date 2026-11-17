@@ -307,7 +307,7 @@ pub(super) fn finish(
             .forget_card(id)
             .or_else(|| snap.actor_of_card(id))
             .or_else(|| state.beats.actor_of_card(id));
-        if (silenced.contains(id) || crate::actors::is_output_card(id))
+        if (silenced.contains(id) || flighthook::is_output_card(id))
             && let Some(actor) = actor
         {
             let _ = bus_tx.send(BusMsg::frp(flightrelay::FrpMessage::new(

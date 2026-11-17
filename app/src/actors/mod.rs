@@ -331,7 +331,7 @@ pub(crate) fn start_actor_as(
         .with_beats(state.beats.clone());
     let muted = sender.muted();
     let receiver = sender.subscribe();
-    if is_output_card(&id) {
+    if flighthook::is_output_card(&id) {
         sender.frp(output_bus_actor(state, &id));
     }
     let thread = actor.start(Arc::clone(state), sender, receiver);
@@ -346,18 +346,6 @@ pub(crate) fn start_actor_as(
     );
 }
 
-/// Whether card `card` is an output card (an Open Connect client, a
-/// Pureplay Connect output, random club): an actor with a name and no role.
-/// Its `bus.actor` goes out as it starts and is heartbeat
-/// like every local actor's; the system actor sends it again on `bus.sync`
-/// and its removal when the card is removed or turned off.
-pub(crate) fn is_output_card(card: &str) -> bool {
-    matches!(
-        card.split_once('.').map(|(kind, _)| kind),
-        Some("openconnect_client" | "pureplay" | "random_club")
-    )
-}
-
 /// The `bus.actor` of output card `card`: the card's name (its key when it
 /// has none), no role.
 pub(crate) fn output_bus_actor(state: &SystemState, card: &str) -> flightrelay::BusActor {
@@ -367,12 +355,6 @@ pub(crate) fn output_bus_actor(state: &SystemState, card: &str) -> flightrelay::
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| card.to_owned());
     flightrelay::BusActor::new(name, flightrelay::DEFAULT_HEARTBEAT.as_secs_f64())
-}
-
-/// Whether actors of this type can be reconnected: every launch monitor and
-/// output, not a camera, the web server or the system actor.
-pub(crate) fn reconnectable(type_key: &str) -> bool {
-    !matches!(type_key, "camera" | "webserver" | "system")
 }
 
 /// Build a map of actor IDs to display names from config (for UI display).
@@ -513,28 +495,6 @@ mod tests {
             state.stop_all_and_wait(Duration::from_secs(2)),
             Vec::<String>::new()
         );
-    }
-
-    #[test]
-    fn only_launch_monitors_and_outputs_are_reconnectable() {
-        for t in [
-            "mevo",
-            "r10",
-            "square",
-            "exputt",
-            "trackball",
-            "mock_monitor",
-            "openconnect_server",
-            "openconnect_client",
-            "pureplay",
-            "pureplay_accessory",
-            "random_club",
-        ] {
-            assert!(reconnectable(t), "{t}");
-        }
-        for t in ["camera", "webserver", "system"] {
-            assert!(!reconnectable(t), "{t}");
-        }
     }
 
     #[test]
