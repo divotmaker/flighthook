@@ -83,3 +83,13 @@ while the simulator is not connected is dropped. While the card cannot
 connect, `error` says why. Connected, `error` also says so when a shot gets no
 `200` reply within a second ("the simulator isn't reading shots; restart its
 Open Connect window"), until a reply comes.
+
+## GSPro takes one connection per launch
+
+GSPro's Open Connect window accepts one connection each time it starts. Once
+flighthook disconnects from it, for any reason (the card's **Reconnect**,
+turning the card off and on, changing its address, or closing flighthook),
+GSPro stops taking shots until you restart its Open Connect window. The card
+may still connect and show **CONNECTED**; the first shot that goes unanswered
+sets `error` as described above. After you restart GSPro's Open Connect window,
+the card connects to the new window. Pureplay and Muni Golf aren't affected.
