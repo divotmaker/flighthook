@@ -1402,12 +1402,11 @@ connection, or no event for 90 s (120 s while a ball is detected, until the putt
 result or the device is ready again), ends the session; a quiet spell past
 10 s logs one warning and makes `ready` false until the device sends again
 (then it is what the device last reported). Each failed attempt is an
-`alert` (`warn`, "ExPutt error: ..."); when attempts get no answer from a
-device that accepts them and the first such attempt of an outage is 2
-minutes old, one `alert` (`warn`) says the ExPutt is not answering and
-suggests turning it off and on again, and the per-attempt alerts stop until
-a session succeeds (attempts that fail another way do not restart the
-clock). The reconnect delays are in [Connection state](#connection-state) above.
+`alert` (`warn`, "ExPutt error: ..."); when the first failed attempt of an
+outage is 2 minutes old (the device turned off, out of reach or not
+answering), one `alert` (`warn`) says the ExPutt is not answering and asks
+to check that it is on, and the per-attempt alerts stop until a session
+succeeds. The reconnect delays are in [Connection state](#connection-state) above.
 
 An Open Connect client logs a warning when it starts taking the bus (its
 first bus message) when an ExPutt is configured and its Putting Monitor is
