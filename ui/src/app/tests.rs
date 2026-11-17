@@ -196,49 +196,8 @@ fn a_practice_block_fetches_the_sets_again() {
     assert!(app.needs_groups_refresh);
 }
 
-#[test]
-fn status_reply_never_clobbers_a_live_or_pending_club() {
-    let mut pick = None;
-    // The WebSocket is the live source while it is up.
-    assert_eq!(status_pick(true, &mut pick, 0, Some(Club::Driver)), None);
-    // Without it, the reply is the source...
-    assert_eq!(
-        status_pick(false, &mut pick, 0, Some(Club::Driver)),
-        Some(Some(Club::Driver))
-    );
-    assert_eq!(status_pick(false, &mut pick, 0, None), Some(None));
-    // ...except a reply that predates a REST pick.
-    pick = Some(Club::Iron7);
-    assert_eq!(status_pick(false, &mut pick, 0, Some(Club::Driver)), None);
-    assert_eq!(pick, Some(Club::Iron7));
-    assert_eq!(
-        status_pick(false, &mut pick, 0, Some(Club::Iron7)),
-        Some(Some(Club::Iron7))
-    );
-    assert_eq!(pick, None, "confirmed");
-    assert_eq!(
-        status_pick(false, &mut pick, 0, Some(Club::Driver)),
-        Some(Some(Club::Driver))
-    );
-    // A pick the server took back (Pureplay holds another club): the
-    // reply is taken as it is once the pick is older than the hold.
-    pick = Some(Club::Iron8);
-    assert_eq!(
-        status_pick(false, &mut pick, REST_PICK_HOLD_MS - 1, Some(Club::Iron7)),
-        None,
-        "still within the hold"
-    );
-    assert_eq!(
-        status_pick(false, &mut pick, REST_PICK_HOLD_MS, Some(Club::Iron7)),
-        Some(Some(Club::Iron7)),
-        "the pick expired"
-    );
-    assert_eq!(pick, None);
-}
-
-/// Without the WebSocket, the hand picked over REST shows until a status
-/// reply carries it; with it, `hand_info` is the source and the reply's
-/// hand is ignored.
+/// Without the WebSocket, the hand follows the status replies; with it,
+/// the session's turn is the source and the reply's hand is ignored.
 #[test]
 fn the_hand_follows_status_replies_and_hand_info() {
     let status = |handed: Option<flighthook::Handedness>| crate::types::StatusResponse {
@@ -279,45 +238,6 @@ fn hand_codes_are_rh_and_lh() {
         [Handedness::Right, Handedness::Left].map(hand_code),
         ["RH", "LH"]
     );
-}
-
-/// Without the WebSocket, a club picked over REST that the server takes
-/// back (Pureplay holds another club) leaves the header once the pick
-/// is older than the hold: the next status reply sets Pureplay's club.
-#[test]
-fn a_rest_pick_the_server_takes_back_leaves_the_header() {
-    let status = |club| crate::types::StatusResponse {
-        cards: HashMap::new(),
-        actors: HashMap::new(),
-        turn: Some(flighthook::GolferTurn::new(
-            None,
-            club,
-            flighthook::Handedness::Right,
-            flighthook::Mode::Full,
-        )),
-        cameras_supported: false,
-        trackball_supported: false,
-        clip_dir: None,
-        config_error: None,
-    };
-    let mut app = FlighthookApp::with_pending(net::new_pending());
-    app.now_ms = 10_000;
-    app.selected_club = Some(Club::Iron8);
-    app.club_pick = Some(Club::Iron8);
-    app.club_picked_ms = app.now_ms;
-    app.now_ms += 500;
-    app.pending.lock().expect("lock").status = Some(status(Some(Club::Iron7)));
-    app.apply_pending();
-    assert_eq!(
-        app.selected_club,
-        Some(Club::Iron8),
-        "a reply that predates it"
-    );
-    app.now_ms += REST_PICK_HOLD_MS;
-    app.pending.lock().expect("lock").status = Some(status(Some(Club::Iron7)));
-    app.apply_pending();
-    assert_eq!(app.selected_club, Some(Club::Iron7), "Pureplay's club");
-    assert_eq!(app.club_pick, None);
 }
 
 #[test]
@@ -616,36 +536,6 @@ fn clear_history_on_the_bus_empties_the_shots_tab() {
         },
     ));
     assert_eq!(app.shots.len(), 1);
-}
-
-#[test]
-fn group_commands_over_rest_update_the_sending_ui() {
-    use crate::panels::shots::GroupCommand;
-    let mut app = FlighthookApp::with_pending(net::new_pending());
-    for n in 1..=3 {
-        app.handle_ui_message(crate::socket::feed::shot_msg(
-            "mevo.0",
-            flighthook::ShotKey {
-                shot_id: format!("s{n}"),
-                shot_number: n,
-            },
-        ));
-    }
-    app.needs_groups_refresh = false;
-    app.confirm_clear = true;
-
-    // A New set or New session answered: the sets are fetched again.
-    app.pending.lock().expect("lock").groups_posted = true;
-    app.apply_pending();
-    assert!(app.needs_groups_refresh);
-    assert!(!app.pending.lock().expect("lock").groups_posted, "taken");
-
-    // Clear history over REST: the tab empties as for the socket's event.
-    let ctx = egui::Context::default();
-    app.send_group_command(&ctx, GroupCommand::ClearHistory);
-    assert!(app.shots.is_empty());
-    assert!(app.groups.is_empty());
-    assert!(!app.confirm_clear);
 }
 
 #[test]

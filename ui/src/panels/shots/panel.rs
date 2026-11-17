@@ -491,7 +491,7 @@ impl FlighthookApp {
             });
         let (delete, cancel) = modal.inner;
         if delete {
-            self.send_group_command(ctx, GroupCommand::ClearHistory);
+            self.send_group_command(GroupCommand::ClearHistory);
             self.confirm_clear = false;
         } else if cancel || modal.should_close() {
             self.confirm_clear = false;
@@ -823,12 +823,11 @@ impl FlighthookApp {
             });
         });
 
-        let ctx = ui.ctx().clone();
         if new_group {
-            self.send_group_command(&ctx, GroupCommand::NewGroup);
+            self.send_group_command(GroupCommand::NewGroup);
         }
         if new_session {
-            self.send_group_command(&ctx, GroupCommand::NewSession);
+            self.send_group_command(GroupCommand::NewSession);
         }
     }
 
@@ -847,11 +846,10 @@ impl FlighthookApp {
         }
     }
 
-    /// Send `command` over the WebSocket when it is up, else over REST.
-    /// Without the socket this UI hears none of the bus events that follow,
-    /// so it applies the command itself (see `apply_posted`).
-    /// New set rolls the viewed golfer's set ([`Self::new_set_golfer`]).
-    pub(crate) fn send_group_command(&mut self, ctx: &egui::Context, command: GroupCommand) {
+    /// Send `command` over the WebSocket; this UI follows the bus events
+    /// that come back. New set rolls the viewed golfer's set
+    /// ([`Self::new_set_golfer`]).
+    pub(crate) fn send_group_command(&mut self, command: GroupCommand) {
         let viewed = self.new_set_golfer();
         if command == GroupCommand::NewGroup && self.viewing_view_only() {
             return;
@@ -868,19 +866,6 @@ impl FlighthookApp {
                 }
             };
             net::send_command(tx, &command);
-            return;
-        }
-        match command {
-            GroupCommand::NewGroup => {
-                self.groups.asked_new_set();
-                net::post_new_block(ctx, &self.pending, viewed, false);
-            }
-            GroupCommand::NewSession => net::post_new_block(ctx, &self.pending, None, true),
-            GroupCommand::ClearHistory => {
-                net::post_clear_history(ctx);
-                // Over REST no socket tells this UI: empty the Shots tab now.
-                self.clear_shot_history();
-            }
         }
     }
 

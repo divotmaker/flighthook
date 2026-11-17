@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::replay::Window;
 use crate::types::{
-    self, AutoChipRequest, CameraListResponse, Club, FindMatRequest, FlighthookConfig, LivePose,
+    self, AutoChipRequest, CameraListResponse, FindMatRequest, FlighthookConfig, LivePose,
     PostSettingsResponse, ShotData, ShotGrouping, StatusResponse,
 };
 
@@ -31,9 +31,6 @@ pub struct Pending {
     /// The reply to a `POST /api/settings`: the response, or why the save
     /// cannot be taken as applied.
     pub settings_save: Option<Result<PostSettingsResponse, String>>,
-    /// A New set or New session sent over REST has been answered: the sets
-    /// are fetched again.
-    pub groups_posted: bool,
     /// The reply to a `POST /api/auto-chip`: sent, or why not.
     pub auto_chip: Option<Result<(), String>>,
     /// The reply to `GET /api/cameras`: the camera list, or why not.
@@ -910,21 +907,6 @@ pub(crate) fn fetch_frames(
     });
 }
 
-/// Select the mode (`POST /api/select`).
-pub fn post_mode(ctx: &egui::Context, mode: &str) {
-    post_json(ctx, "/api/select", select_body("mode", mode));
-}
-
-/// Select the club in play (`POST /api/select`).
-pub fn post_club(ctx: &egui::Context, club: Club) {
-    post_json(ctx, "/api/select", select_body("club", &club.to_string()));
-}
-
-/// The `POST /api/select` body selecting `value` for `field`.
-pub(crate) fn select_body(field: &str, value: &str) -> String {
-    serde_json::json!({ field: value }).to_string()
-}
-
 /// Have ExPutt `actor` locate its mat again (`POST /api/find-mat`).
 pub fn post_find_mat(ctx: &egui::Context, actor: &str) {
     let body = serde_json::to_string(&FindMatRequest {
@@ -932,41 +914,6 @@ pub fn post_find_mat(ctx: &egui::Context, actor: &str) {
     })
     .unwrap_or_default();
     post_json(ctx, "/api/find-mat", body);
-}
-
-/// Start a new set, or with `new_session` a new session (`POST
-/// /api/blocks`); sets `groups_posted` once answered.
-pub fn post_new_block(
-    ctx: &egui::Context,
-    pending: &PendingHandle,
-    golfer: Option<flighthook::GolferId>,
-    new_session: bool,
-) {
-    let ctx = ctx.clone();
-    let pending = pending.clone();
-    let url = format!("{}/api/blocks", api_base());
-    let body = serde_json::to_vec(&flighthook::NewBlockRequest {
-        golfer,
-        new_session,
-    })
-    .unwrap_or_default();
-    let mut req = ehttp::Request::post(&url, body);
-    req.headers
-        .insert("Content-Type".to_string(), "application/json".to_string());
-    ehttp::fetch(req, move |result| {
-        if result.is_ok_and(|r| r.ok)
-            && let Ok(mut p) = pending.lock()
-        {
-            p.groups_posted = true;
-        }
-        ctx.request_repaint();
-    });
-}
-
-/// Delete the shot history and every set, and start a new session
-/// (`POST /api/shots/clear`).
-pub fn post_clear_history(ctx: &egui::Context) {
-    post_json(ctx, "/api/shots/clear", String::new());
 }
 
 /// Set the shot grouping mode (`POST /api/shots/grouping`).
@@ -1086,7 +1033,7 @@ pub fn poll_ws(rx: &mut ewebsock::WsReceiver) -> (Vec<WsPollEvent>, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Handedness;
+    use crate::types::{Club, Handedness};
 
     /// The UI socket's commands: a select and a new block go as FRP
     /// messages with a fresh `ref`; the server stamps `from`.
@@ -1125,11 +1072,6 @@ mod tests {
         assert_eq!(
             status.turn.and_then(|t| t.handedness),
             Some(Handedness::Right)
-        );
-
-        assert_eq!(
-            select_body("club", &Club::Iron7.to_string()),
-            r#"{"club":"7I"}"#
         );
     }
 

@@ -51,10 +51,6 @@ pub struct FlighthookApp {
     /// Club in play: game state's club, or the user's own pick until the
     /// server echoes it.
     pub(crate) selected_club: Option<Club>,
-    /// A club picked over REST that no `/api/status` reply has carried yet.
-    pub(crate) club_pick: Option<Club>,
-    /// When [`Self::club_pick`] was made ([`Self::now_ms`]).
-    pub(crate) club_picked_ms: u64,
     /// The golfer up: the raw id flighthook's `golfer.turn` names.
     pub(crate) turn_golfer: Option<String>,
     /// The top bar's open dropdown.
@@ -304,8 +300,6 @@ impl FlighthookApp {
             shots: Vec::new(),
             current_mode: "full".into(),
             selected_club: None,
-            club_pick: None,
-            club_picked_ms: 0,
             turn_golfer: None,
             header_menu: None,
             follow_turns: true,
@@ -420,17 +414,9 @@ impl FlighthookApp {
             if let Some(mode) = turn.and_then(|t| t.mode) {
                 self.current_mode = mode.to_string();
             }
-            let club_age = self.now_ms.saturating_sub(self.club_picked_ms);
-            if let Some(club) = status_pick(
-                self.ws_connected,
-                &mut self.club_pick,
-                club_age,
-                turn.and_then(|t| t.club),
-            ) {
-                self.selected_club = club;
-            }
             // With the WebSocket up, its turn is the live source.
             if !self.ws_connected {
+                self.selected_club = turn.and_then(|t| t.club);
                 self.handed = turn.and_then(|t| t.handedness);
             }
             self.cameras_supported = status.cameras_supported;
@@ -472,10 +458,6 @@ impl FlighthookApp {
             && p.groups_generation >= self.cleared_generation
         {
             self.groups.replace(groups);
-        }
-
-        if std::mem::take(&mut p.groups_posted) {
-            self.needs_groups_refresh = true;
         }
 
         if let Some(reply) = p.auto_chip.take() {
@@ -669,7 +651,6 @@ impl FlighthookApp {
         self.view_hold = None;
         self.turn_golfer = turn.golfer.as_ref().map(|g| g.as_str().to_owned());
         self.selected_club = turn.club;
-        self.club_pick = None;
         self.handed = turn.handedness;
         if let Some(mode) = turn.mode {
             self.current_mode = mode.to_string();
@@ -1084,46 +1065,13 @@ impl FlighthookApp {
 }
 
 impl FlighthookApp {
-    /// Select `club` as the club in play: over the WebSocket when it is up,
-    /// else over REST.
-    pub(crate) fn pick_club(&mut self, ctx: &egui::Context, club: Club) {
+    /// Select `club` as the club in play, over the WebSocket.
+    pub(crate) fn pick_club(&mut self, club: Club) {
         self.selected_club = Some(club);
         if let Some(tx) = &mut self.ws_sender {
             net::send_command(tx, &net::select_command(|s| s.club = Some(Some(club))));
-        } else {
-            self.club_pick = Some(club);
-            self.club_picked_ms = self.now_ms;
-            net::post_club(ctx, club);
         }
     }
-}
-
-/// How long a club picked over REST holds against `/api/status`
-/// replies that do not carry it, milliseconds. The server can take a pick
-/// back (a Pureplay Accessory card puts Pureplay's club back), and then no
-/// reply ever carries it.
-const REST_PICK_HOLD_MS: u64 = 2_000;
-
-/// The club a `/api/status` reply sets, if it sets one. With the
-/// WebSocket up, its `init` and `club_info` are the live source
-/// and the reply is ignored. Without it, a reply that does not carry the
-/// value picked over REST (`pick`, made `age_ms` ago) is ignored too, for
-/// [`REST_PICK_HOLD_MS`]; the first reply that carries it, or any reply
-/// after that, clears `pick`.
-fn status_pick<T: Copy + PartialEq>(
-    ws_connected: bool,
-    pick: &mut Option<T>,
-    age_ms: u64,
-    reply: Option<T>,
-) -> Option<Option<T>> {
-    if ws_connected {
-        return None;
-    }
-    if pick.is_some_and(|p| reply != Some(p)) && age_ms < REST_PICK_HOLD_MS {
-        return None;
-    }
-    *pick = None;
-    Some(reply)
 }
 
 /// The frame's input time in whole milliseconds.

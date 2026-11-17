@@ -5824,7 +5824,6 @@ fn by_club_ignores_the_golfer_ups_club_while_viewing_someone_else() {
 /// empty set shows as the gold "next" header for that golfer.
 #[test]
 fn new_set_over_the_socket_shows_the_viewed_golfers_next_set() {
-    let ctx = egui::Context::default();
     let mut app = golfers_cards_app();
     app.refresh_shot_caches();
     app.follow_turns = false;
@@ -5835,7 +5834,7 @@ fn new_set_over_the_socket_shows_the_viewed_golfers_next_set() {
     let (tx, _rx) =
         ewebsock::connect("ws://127.0.0.1:9/", ewebsock::Options::default()).expect("a sender");
     app.ws_sender = Some(tx);
-    app.send_group_command(&ctx, GroupCommand::NewGroup);
+    app.send_group_command(GroupCommand::NewGroup);
     app.ws_sender = None;
     // The practice actor's reply: Eric's set c closed, an empty set d.
     let block = |set: SetInfo| flighthook::BlockInfo {

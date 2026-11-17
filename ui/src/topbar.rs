@@ -1260,12 +1260,10 @@ impl FlighthookApp {
             self.current_mode = mode.to_string();
             if let Some(tx) = &mut self.ws_sender {
                 net::send_command(tx, &net::select_command(|s| s.mode = Some(mode)));
-            } else {
-                net::post_mode(ctx, &mode.to_string());
             }
         }
         if let Some(club) = picks.club {
-            self.pick_club(ctx, club);
+            self.pick_club(club);
         }
         if let Some(id) = picks.golfer {
             self.pick_golfer(&id);
