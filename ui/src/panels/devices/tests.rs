@@ -2388,7 +2388,7 @@ const MONITOR_TIMINGS: [(&str, &str); 6] = [
     ("mevo", "0"),
     ("r10", "2"),
     ("square", "1"),
-    ("exputt", "1.5"),
+    ("exputt", "0.5"),
     ("mock_monitor", "0"),
     ("openconnect_server", "2.5"),
 ];

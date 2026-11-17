@@ -21,6 +21,7 @@ pub fn impact_lead_default_s(prefix: &str) -> Option<f64> {
         crate::api::AUTO_CHIP_ACTOR | "trackball" => None,
         // Reports at impact.
         "mevo" | "mock_monitor" => Some(0.0),
+        "exputt" => Some(0.5),
         "square" => Some(1.0),
         "r10" => Some(2.0),
         "openconnect_server" => Some(2.5),

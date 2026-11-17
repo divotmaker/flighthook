@@ -737,7 +737,7 @@ are **beta estimates**, to be measured with a camera:
 | Launch monitor | Default camera timing |
 | --- | --- |
 | FlightScope Mevo+ / Gen2 / Xi | 0 s |
-| ExPutt | 1.5 s |
+| ExPutt | 0.5 s |
 | Square Golf Omni | 1 s |
 | Garmin R10 | 2 s |
 | Pureplay Accessory card | 0.9 s |

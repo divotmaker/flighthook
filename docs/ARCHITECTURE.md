@@ -2643,10 +2643,11 @@ applies to the next shot; neither the camera nor the monitor restarts
 | Source | Default impact lead |
 | --- | --- |
 | `mevo`, `mock_monitor` | 0 |
+| `exputt` | 500 ms |
 | `square` | 1000 ms |
 | `r10` | 2000 ms |
 | `openconnect_server` | 2500 ms |
-| any other launch monitor, `exputt` included (`DEFAULT_IMPACT_LEAD_S`) | 1500 ms |
+| any other launch monitor (`DEFAULT_IMPACT_LEAD_S`) | 1500 ms |
 | `autochip`, `trackball` | not recorded (no swing a camera films) |
 
 Pre- and post-roll come from the live `[replay]` section at every trigger;

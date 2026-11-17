@@ -45,7 +45,7 @@ fn impact_leads_default_by_device_kind() {
     assert_eq!(ms(&config, "mevo.0"), Some(0));
     assert_eq!(ms(&config, "mock_monitor.3"), Some(0));
     assert_eq!(ms(&config, "square.0"), Some(1000));
-    assert_eq!(ms(&config, "exputt.0"), Some(1500));
+    assert_eq!(ms(&config, "exputt.0"), Some(500));
     assert_eq!(ms(&config, "r10.1"), Some(2000));
     assert_eq!(ms(&config, "openconnect_server.0"), Some(2500));
     assert_eq!(ms(&config, "pureplay_accessory.0"), Some(900));

@@ -11,8 +11,8 @@ fn defaults_by_launch_monitor_kind() {
         ("square", 1.0),
         ("r10", 2.0),
         ("openconnect_server", 2.5),
+        ("exputt", 0.5),
         // A kind added later, or one without a better-known value.
-        ("exputt", 1.5),
         ("someday", 1.5),
     ] {
         assert_eq!(impact_lead_default_s(prefix), Some(s), "{prefix}");
