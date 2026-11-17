@@ -42,7 +42,18 @@ async fn a_newer_frame_is_answered_at_once_with_its_number_and_time() {
         .root
         .cameras
         .set_live("camera.0", 123_456, jpeg(), None);
-    let resp = get_camera_live_with(&state, "camera.0", 0, Duration::from_secs(5)).await;
+    // At once: answered on its first poll, without waiting.
+    let first = std::pin::pin!(get_camera_live_with(
+        &state,
+        "camera.0",
+        0,
+        Duration::from_secs(5)
+    ));
+    let waker = std::task::Waker::noop();
+    let std::task::Poll::Ready(resp) = first.poll(&mut std::task::Context::from_waker(waker))
+    else {
+        panic!("the request waited");
+    };
     assert_eq!(resp.status(), StatusCode::OK);
     let headers = resp.headers().clone();
     assert_eq!(headers[header::CONTENT_TYPE], "image/jpeg");

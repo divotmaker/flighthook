@@ -402,8 +402,13 @@ mod tests {
     async fn a_live_request_gets_a_newer_frame_at_once_or_waits_for_one() {
         let cams = Arc::new(Cameras::default());
         let seq = cams.set_live("camera.0", 42, jpeg(1), None);
-        match cams.next_live("camera.0", 0, Duration::from_secs(5)).await {
-            LiveWait::Frame(f) => assert_eq!((f.seq, f.time_ns, f.jpeg[2]), (seq, 42, 1)),
+        // At once: answered on its first poll, without waiting.
+        let first = std::pin::pin!(cams.next_live("camera.0", 0, Duration::from_secs(5)));
+        let waker = std::task::Waker::noop();
+        match first.poll(&mut std::task::Context::from_waker(waker)) {
+            std::task::Poll::Ready(LiveWait::Frame(f)) => {
+                assert_eq!((f.seq, f.time_ns, f.jpeg[2]), (seq, 42, 1));
+            }
             other => panic!("{other:?}"),
         }
         // Nothing newer: the time runs out.
