@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "allsquare",
  "clap",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-app"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "allsquare",
  "anyhow",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-cameras"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-openconnect"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "flightrelay",
  "serde",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-pureplay"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "flighthook-ui"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
