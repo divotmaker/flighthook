@@ -764,7 +764,10 @@ mod tests {
         mock.push_event(BALL_STRUCK);
         card.until_ready(false, Some("ball struck"));
         let to = now_ms();
-        std::thread::sleep(Duration::from_millis(300));
+        // The result arrives in a later millisecond than any strike time.
+        while now_ms() <= to {
+            std::thread::yield_now();
+        }
         mock.push_event(PUTT_RESULT_FULL);
         let messages = card.next_shot();
         let Some(FrpBody::ShotTrigger(trigger)) = body(&messages[0]) else {
@@ -1054,6 +1057,8 @@ mod tests {
     /// greets, and never answers anything.
     struct Wedged {
         port: u16,
+        /// One message per connection accepted and greeted.
+        accepted: std::sync::mpsc::Receiver<()>,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
     }
@@ -1066,6 +1071,7 @@ mod tests {
             let port = listener.local_addr().expect("addr").port();
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
+            let (greeted, accepted) = std::sync::mpsc::channel();
             let thread = std::thread::spawn(move || {
                 let mut held = Vec::new();
                 while !flag.load(Ordering::SeqCst) {
@@ -1075,6 +1081,7 @@ mod tests {
                                 threeputt::zmtp::SOCKET_ROUTER,
                             ));
                             held.push(stream);
+                            let _ = greeted.send(());
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(5)),
                     }
@@ -1082,6 +1089,7 @@ mod tests {
             });
             Self {
                 port,
+                accepted,
                 stop,
                 thread: Some(thread),
             }
@@ -1166,10 +1174,11 @@ mod tests {
         t.reply_timeout = Duration::from_millis(1500);
         let mut card = Card::new(section("10.77.0.21"), t);
         card.start();
-        card.until("connecting", |m| {
-            phases(std::slice::from_ref(m)) == ["connecting"]
-        });
-        std::thread::sleep(Duration::from_millis(200));
+        // The device took the connection: the card is in the handshake.
+        wedged
+            .accepted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the card connects");
         card.stop();
     }
 
