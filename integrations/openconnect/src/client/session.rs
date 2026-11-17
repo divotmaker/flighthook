@@ -67,6 +67,9 @@ const CLOSE_WAIT: Duration = Duration::from_millis(250);
 const MONITOR_READY: &str = "monitor_ready";
 /// The simulator's last response on this connection: code and message.
 const RESPONSE: &str = "response";
+/// The card's error row: the host's (a failed connect) and this session's
+/// (shots the simulator is not reading) share it.
+const ERROR: &str = "error";
 /// A telemetry value with nothing to report.
 const NONE: &str = "none";
 
@@ -142,6 +145,7 @@ impl FrpDriver for Client {
                 (RESPONSE, NONE),
                 ("club", NONE),
                 ("handed", NONE),
+                (ERROR, NONE),
             ])
             .with_raw(RawProfile::new("openconnect-tcp", 0, 0, 0, |_| false, true))
     }
@@ -398,7 +402,7 @@ impl<S: Close> Session<S> {
         {
             self.not_reading = true;
             out.log(Level::Warn, NOT_READING.to_owned());
-            out.telemetry([("error", NOT_READING.to_owned())]);
+            out.telemetry([(ERROR, NOT_READING.to_owned())]);
         }
     }
 
@@ -437,7 +441,7 @@ impl<S: Close> Session<S> {
         if heard.ok {
             self.unanswered = None;
             if std::mem::take(&mut self.not_reading) {
-                out.telemetry([("error", NONE.to_owned())]);
+                out.telemetry([(ERROR, NONE.to_owned())]);
             }
         }
         if let Some((hand, club)) = heard.info {

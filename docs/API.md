@@ -264,7 +264,7 @@ reconnecting or disconnected. A card on a driver has `device_info`
 (`none`), a launch monitor's `shot_count` (`0`) and, for a device that reports
 a battery, `battery_pct` (`unknown` until a level is reported and while there
 is none) from the moment it starts. A key is reported by one source only, except `error` on the
-Pureplay Connect and Pureplay Accessory cards: their driver reports it,
+Pureplay Connect, Pureplay Accessory and Open Connect client cards: their driver reports it,
 and the card's own error (a failed connect, giving up) takes its place
 while it lasts:
 - **Device-reported** (reported by the device): `battery_pct`, `tilt`

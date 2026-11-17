@@ -455,6 +455,8 @@ fn queued_shots_go_out_250_ms_apart() {
 /// warning; a later `200` clears the row.
 #[test]
 fn a_shot_the_simulator_does_not_answer_sets_the_error_until_a_200() {
+    let declared = Client::info(&Config::default()).telemetry;
+    assert!(declared.iter().any(|(key, _)| *key == "error"));
     let mut link = Link::new();
     link.shot("mevo.0", key(1));
     link.settle();

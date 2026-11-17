@@ -43,7 +43,8 @@
 //!
 //! **Telemetry** (the actor's, for the connection): `monitor_ready` (the
 //! readiness last sent), `response` (the simulator's last response code and
-//! message), and `club` and `handed`, what the simulator set.
+//! message), `club` and `handed`, what the simulator set, and `error`
+//! (`none`, or that the simulator is not reading shots).
 //!
 //! **Raw frames:** every object written (`shot`, `readiness`, `heartbeat`) and every read
 //! (`response`) goes to the host as a text `shot.raw`. The frame of a shot
