@@ -117,25 +117,6 @@ fn spin(launch: &Launch) -> (Option<i32>, Option<f64>) {
     (spin.total_spin_rpm, finite(spin.spin_axis))
 }
 
-/// The ball's back and side spin, for a consumer that reads the spin as
-/// components: the ones the device reported, else its total split by its
-/// spin axis. A total with no axis is all backspin and gives no sidespin;
-/// a consumer that needs one fills its own default.
-#[must_use]
-pub fn spin_components(launch: &Launch) -> (Option<i32>, Option<i32>) {
-    launch.spin_components()
-}
-
-/// The backspin for an output with a backspin field of its own: the
-/// device's, or, for a total spin reported with no axis and no components
-/// (the Xi's E8 total on a shot without club data), the total, all of it
-/// backspin. No sidespin or axis is made up for such a total; an output
-/// that must send a number for them sends 0.
-#[must_use]
-pub fn output_backspin(launch: &Launch) -> Option<i32> {
-    launch.output_backspin()
-}
-
 /// `face_angle − path`.
 fn face_to_path(club: &ClubData) -> Option<f64> {
     Some(finite(club.face_angle)? - finite(club.path)?)

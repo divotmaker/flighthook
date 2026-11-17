@@ -7,10 +7,9 @@ use super::*;
 
 /// Body tracking's settings in Live mode, the rest at their defaults.
 pub fn live_section() -> BodyTrackingSection {
-    BodyTrackingSection {
-        mode: flighthook::BodyTrackingMode::Live,
-        ..BodyTrackingSection::default()
-    }
+    let mut section = BodyTrackingSection::default();
+    section.mode = flighthook::BodyTrackingMode::Live;
+    section
 }
 
 /// A frame's JPEG with its number in the first pixel row's brightness:
@@ -218,10 +217,8 @@ fn each_frame_goes_out_with_the_pose_found_on_it() {
     let build: Build =
         Box::new(move |s, _| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
     let (publish, published) = publisher();
-    let section = BodyTrackingSection {
-        smoothing: 0.0,
-        ..live_section()
-    };
+    let mut section = live_section();
+    section.smoothing = 0.0;
     let worker = LiveWorker::start("camera.0", settings(section), build, publish).unwrap();
     for n in [40u8, 120, 200] {
         worker.offer(u64::from(n), numbered_jpeg(n));
@@ -442,11 +439,10 @@ fn top_bright_jpeg() -> Arc<[u8]> {
 fn live_frames_are_turned_by_the_cameras_rotation_before_tracking() {
     let rotation = Arc::new(Mutex::new(Rotation::None));
     let read = Arc::clone(&rotation);
+    let mut body = live_section();
+    body.smoothing = 0.0;
     let settings: Settings = Box::new(move || LiveSettings {
-        body: BodyTrackingSection {
-            smoothing: 0.0,
-            ..live_section()
-        },
+        body: body.clone(),
         posture: None,
         rotation: *read.lock().unwrap(),
     });
@@ -565,10 +561,8 @@ fn a_frame_dated_earlier_than_the_last_starts_the_smoothing_afresh() {
         Box::new(move |s, _| Some(fake_tracker(Duration::ZERO, &built, true, s.detect_every)));
     let (publish, published) = publisher();
     // Heavy smoothing: a jump would barely move the nose.
-    let section = BodyTrackingSection {
-        smoothing: 0.1,
-        ..live_section()
-    };
+    let mut section = live_section();
+    section.smoothing = 0.1;
     let worker = LiveWorker::start("camera.0", settings(section), build, publish).unwrap();
     let second = 1_000_000_000;
     worker.offer(10 * second, numbered_jpeg(40));
@@ -715,10 +709,8 @@ fn the_real_models_find_the_golfer_on_a_live_frame() {
         Some(Box::new(tracker) as Box<dyn Estimate>)
     });
     let (publish, published) = publisher();
-    let section = BodyTrackingSection {
-        model,
-        ..live_section()
-    };
+    let mut section = live_section();
+    section.model = model;
     let worker = LiveWorker::start("camera.0", settings(section), build, publish).unwrap();
     worker.offer(7, Arc::from(jpeg));
     for _ in 0..12_000 {

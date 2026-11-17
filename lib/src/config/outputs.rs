@@ -211,10 +211,6 @@ impl DeviceSection for PureplayAccessorySection {
     }
 }
 
-/// Deprecated alias of [`OpenConnectClientSection`].
-#[deprecated(note = "use OpenConnectClientSection")]
-pub type GsProSection = OpenConnectClientSection;
-
 /// A Pureplay output instance (alpha).
 ///
 /// Dials Pureplay (port 9760) and sends it every routed shot over the

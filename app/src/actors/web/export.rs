@@ -335,7 +335,7 @@ pub fn to_csv_row(
         speed(b.launch_speed),
         f(b.launch_elevation),
         f(b.launch_azimuth),
-        i(flighthook::output_backspin(&b)),
+        i(b.output_backspin()),
         i(b.sidespin_rpm),
         i(b.total_spin_rpm),
         f(b.spin_axis),

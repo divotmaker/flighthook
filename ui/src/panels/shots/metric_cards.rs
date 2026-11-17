@@ -126,7 +126,7 @@ pub(super) fn card_metrics(
     let f: &FlightResult = shot.flight.as_ref().unwrap_or(&no_flight);
     let club: &ClubData = shot.club.as_ref().unwrap_or(&no_club);
     let d: &DerivedFlight = shot.derived.as_ref().unwrap_or(&no_derived);
-    let (backspin, sidespin) = flighthook::spin_components(ball);
+    let (backspin, sidespin) = ball.spin_components();
     let v = |x: Option<Distance>| x.map(|x| x.value());
     let measured = |x: Option<f64>| x.map(|x| (x, false));
 

@@ -232,7 +232,7 @@ pub(super) fn table_cells(
         (l, f) => cells.extend({
             let l = l.unwrap_or(&no_launch);
             let f = f.unwrap_or(&no_flight);
-            let (backspin, sidespin) = flighthook::spin_components(l);
+            let (backspin, sidespin) = l.spin_components();
             [
                 Text(opt_f(l.launch_speed.map(|v| v.value()), 1)),
                 Text(opt_f(l.launch_elevation, 1)),

@@ -116,7 +116,7 @@ fn ground_surface(configured: SimSurface, mode: Option<Mode>) -> Surface {
 /// monitor that sends no `BackSpin`/`SideSpin`) reports exactly this. A
 /// total spin with no axis is flown as backspin with no sidespin.
 fn shot_input(ball: &Launch) -> Result<ShotInput, &'static str> {
-    let (back, side) = match flighthook::spin_components(ball) {
+    let (back, side) = match ball.spin_components() {
         (Some(back), None) if ball.total_spin_rpm.is_some() => (Some(back), Some(0)),
         pair => pair,
     };

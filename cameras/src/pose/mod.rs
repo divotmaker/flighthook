@@ -148,10 +148,8 @@ mod tests {
             std::env::temp_dir().join("flighthook-no-models-here"),
             models::fake::Fake::new(1, std::time::Duration::ZERO),
         );
-        let mut s = BodyTrackingSection {
-            mode: BodyTrackingMode::Live,
-            ..BodyTrackingSection::default()
-        };
+        let mut s = BodyTrackingSection::default();
+        s.mode = BodyTrackingMode::Live;
         assert_eq!(
             pose.live_state(&s, "camera.0"),
             ("loading", None),
@@ -188,10 +186,8 @@ mod tests {
             dir.clone(),
             models::fake::Fake::new(1000, std::time::Duration::from_millis(5)),
         );
-        let s = BodyTrackingSection {
-            mode: BodyTrackingMode::Live,
-            ..BodyTrackingSection::default()
-        };
+        let mut s = BodyTrackingSection::default();
+        s.mode = BodyTrackingMode::Live;
         pose.models.download(s.model);
         assert_eq!(pose.live_state(&s, "camera.0"), ("downloading", None));
         pose.models.cancel_download();
@@ -210,9 +206,10 @@ mod tests {
             dir.clone(),
             models::fake::Fake::new(1000, std::time::Duration::from_millis(5)),
         );
-        let at = |mode| BodyTrackingSection {
-            mode,
-            ..BodyTrackingSection::default()
+        let at = |mode| {
+            let mut s = BodyTrackingSection::default();
+            s.mode = mode;
+            s
         };
         let m = flighthook::PoseModel::RtmposeM;
         pose.follow(&at(BodyTrackingMode::Live));
@@ -248,20 +245,16 @@ mod tests {
             std::env::temp_dir().join("flighthook-no-models-here"),
             models::fake::Fake::new(1, std::time::Duration::ZERO),
         );
-        let s = BodyTrackingSection {
-            mode: BodyTrackingMode::Live,
-            ..BodyTrackingSection::default()
-        };
+        let mut s = BodyTrackingSection::default();
+        s.mode = BodyTrackingMode::Live;
         pose.set_live_failed("camera.1", Some("stopped".into()));
         assert_eq!(
             pose.live_state(&s, "camera.1"),
             ("failed", Some("stopped".into()))
         );
         assert_eq!(pose.live_state(&s, "camera.0"), ("loading", None));
-        let off = BodyTrackingSection {
-            mode: BodyTrackingMode::Off,
-            ..s.clone()
-        };
+        let mut off = s.clone();
+        off.mode = BodyTrackingMode::Off;
         assert_eq!(pose.live_state(&off, "camera.1"), ("off", None));
         pose.set_live_failed("camera.1", None);
         assert_eq!(pose.live_state(&s, "camera.1"), ("loading", None));

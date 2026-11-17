@@ -3193,14 +3193,12 @@ fn the_body_tracking_card_saves_the_skeleton_and_the_tuning_values() {
     let marks = screen.frame(&mut app, Vec::new());
     assert!(enabled(&marks, "save:body_tracking"));
     assert!(!marks.contains_key("save:global"));
-    let wanted = BodyTrackingSection {
-        mode: BodyTrackingMode::Historical,
-        min_score: 0.45,
-        smoothing: 0.5,
-        detect_every: 30,
-        show_skeleton: false,
-        ..BodyTrackingSection::default()
-    };
+    let mut wanted = BodyTrackingSection::default();
+    wanted.mode = BodyTrackingMode::Historical;
+    wanted.min_score = 0.45;
+    wanted.smoothing = 0.5;
+    wanted.detect_every = 30;
+    wanted.show_skeleton = false;
     assert_eq!(app.settings.build_global_request().body_tracking, wanted);
     // Out of range, at the ranges the server holds: the range under the
     // field and no Save.

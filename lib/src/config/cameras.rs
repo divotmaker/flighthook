@@ -263,8 +263,7 @@ pub struct BodyTrackingSection {
     /// config moves it to [`PlayerSection::height`]. Never written, never
     /// compared.
     #[serde(skip)]
-    #[doc(hidden)]
-    pub legacy_golfer_height: Option<f64>,
+    pub(crate) legacy_golfer_height: Option<f64>,
 }
 
 impl PartialEq for BodyTrackingSection {

@@ -954,14 +954,12 @@ fn the_readout_names_every_value_and_each_cameras_rate() {
             pose_ms: None,
         },
     ];
-    let tuned = BodyTrackingSection {
-        model: flighthook::PoseModel::RtmposeS,
-        min_score: 0.45,
-        smoothing: 0.0,
-        detect_every: 30,
-        show_skeleton: false,
-        ..s.clone()
-    };
+    let mut tuned = s.clone();
+    tuned.model = flighthook::PoseModel::RtmposeS;
+    tuned.min_score = 0.45;
+    tuned.smoothing = 0.0;
+    tuned.detect_every = 30;
+    tuned.show_skeleton = false;
     assert_eq!(
         readout(&tuned, &two),
         "RTMPose-s · min score 0.45 · smoothing off · detect every 30 · skeleton off · \

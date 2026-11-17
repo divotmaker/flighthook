@@ -280,15 +280,13 @@ impl BodyTrackingForm {
     /// The section to save, or `None` while a field is unparsable or out
     /// of range.
     pub(crate) fn to_section(&self) -> Option<BodyTrackingSection> {
-        let s = BodyTrackingSection {
-            mode: self.mode,
-            model: self.model,
-            min_score: self.min_score_value()?,
-            smoothing: self.smoothing_value()?,
-            detect_every: self.detect_every_value()?,
-            show_skeleton: self.show_skeleton,
-            legacy_golfer_height: None,
-        };
+        let mut s = BodyTrackingSection::default();
+        s.mode = self.mode;
+        s.model = self.model;
+        s.min_score = self.min_score_value()?;
+        s.smoothing = self.smoothing_value()?;
+        s.detect_every = self.detect_every_value()?;
+        s.show_skeleton = self.show_skeleton;
         s.error().is_none().then_some(s)
     }
 
