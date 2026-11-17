@@ -1099,4 +1099,99 @@ mod tests {
         let held = model.player(1).and_then(|p| p.club.as_deref());
         assert_eq!(held, Some("Iron7"), "the late reply changes nothing");
     }
+
+    /// Pureplay sends event `name` with `data`: club out sees it first,
+    /// then the model, as the card does. Returns club out's actions.
+    fn event(
+        out: &mut ClubOut,
+        model: &mut Model,
+        name: &str,
+        data: serde_json::Value,
+    ) -> Vec<Action> {
+        let event = protocol::Event {
+            name: name.into(),
+            data,
+            ..protocol::Event::default()
+        };
+        let actions = out.before_event(&event);
+        model.apply_event(&event).expect("event");
+        actions
+    }
+
+    /// A pending pick is dropped by a turn passing to another player, a
+    /// context reset, and the player's own choice; once Pureplay is ready,
+    /// nothing is sent.
+    #[test]
+    fn a_pending_pick_is_dropped_by_a_turn_a_reset_and_the_players_choice() {
+        let waiting = json!({ "shotId": "shot-1", "playerId": 1, "ready": false,
+                              "controllable": false, "allowedCommands": [],
+                              "blockers": ["shot_in_progress"] });
+        let drops = [
+            (
+                "turn.changed",
+                json!({ "previousPlayerId": 1, "currentPlayerId": 2, "reason": "next_player" }),
+            ),
+            (
+                "context.invalidated",
+                json!({ "reason": "reset", "matchId": null }),
+            ),
+            (
+                "player.club_changed",
+                json!({ "playerId": 1, "current": "Iron9", "reason": "user_selected" }),
+            ),
+        ];
+        for (name, data) in drops {
+            let mut model = model_with(bag(), "Iron7", waiting.clone());
+            let mut out = linked(&["club.set"]);
+            let now = Instant::now();
+            assert!(
+                out.pick(Club::SandWedge, &model, now).is_empty(),
+                "{name}: waits"
+            );
+            assert!(out.holds_club(), "{name}: pending");
+            assert_eq!(
+                event(&mut out, &mut model, name, data),
+                [Action::SnapBack],
+                "{name}"
+            );
+            assert!(!out.holds_club(), "{name}");
+            ready_changed(&mut out, &mut model, ready());
+            assert!(
+                out.drive(&model, now).is_empty(),
+                "{name}: nothing once ready"
+            );
+        }
+    }
+
+    /// A command in flight when the turn passes to another player: a late
+    /// success, a late `not_ready` or no reply at all sends nothing more.
+    #[test]
+    fn a_command_in_flight_across_a_turn_sends_nothing_more() {
+        let turn = json!({ "previousPlayerId": 1, "currentPlayerId": 2, "reason": "next_player" });
+        for case in ["success", "not_ready", "no reply"] {
+            let mut model = model_with(bag(), "Iron7", ready());
+            let mut out = linked(&["club.set"]);
+            let now = Instant::now();
+            assert_eq!(sent(&out.pick(Club::SandWedge, &model, now)).len(), 1);
+            let acts = event(&mut out, &mut model, "turn.changed", turn.clone());
+            assert_eq!(acts, [Action::SnapBack], "{case}");
+            assert!(!out.holds_club(), "{case}");
+            let later = now + COMMAND_TIMEOUT;
+            let acts = match case {
+                "success" => out
+                    .reply(&step_reply(1, "SandWedge", "sw-1"), &mut model, now)
+                    .expect("ours"),
+                "not_ready" => out
+                    .reply(&refused(1, json!({ "code": "not_ready" })), &mut model, now)
+                    .expect("ours"),
+                _ => out.drive(&model, later),
+            };
+            assert!(sent(&acts).is_empty(), "{case}: {acts:?}");
+            assert!(
+                out.drive(&model, later + NOT_READY_RETRY).is_empty(),
+                "{case}"
+            );
+            assert!(!out.holds_club(), "{case}");
+        }
+    }
 }

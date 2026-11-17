@@ -356,59 +356,29 @@ fn a_pick_waits_through_the_shot_and_wins_over_pureplays_suggestion() {
     rig.card.stop();
 }
 
-/// A pending pick is dropped by a turn change, a context reset, and the
-/// player's own choice in Pureplay; Pureplay's club goes on the bus, and
-/// nothing is sent once Pureplay is ready.
+/// A pending pick dropped by a turn change: the card puts each player's
+/// club in Pureplay on the bus. (What drops a pick is `club_out`'s.)
 #[test]
-fn a_pending_pick_is_dropped_by_a_turn_a_reset_and_the_players_choice() {
+fn a_pick_dropped_by_a_turn_puts_each_players_club_back() {
     let waiting = readiness("shot-1", false, &[], &["shot_in_progress"]);
-    for case in ["turn.changed", "context.invalidated", "user_selected"] {
-        let mut rig = Rig::new();
-        rig.ready(&waiting);
-        rig.card
-            .shows_row(ActorStatus::Connected, "blockers", "shot in progress");
-        rig.pick(Club::Iron8);
-        rig.no_command(case);
-        match case {
-            "turn.changed" => {
-                rig.event(
-                    "turn.changed",
-                    &json!({ "previousPlayerId": 1, "currentPlayerId": 2, "holeNumber": 7,
-                             "reason": "next_player" }),
-                );
-                rig.snaps_back_to(Club::Driver);
-                rig.event(
-                    "turn.changed",
-                    &json!({ "previousPlayerId": 2, "currentPlayerId": 1, "holeNumber": 7,
-                             "reason": "next_player" }),
-                );
-                rig.snaps_back_to(Club::Iron7);
-            }
-            "context.invalidated" => {
-                rig.event(
-                    "context.invalidated",
-                    &json!({ "reason": "reset", "matchId": null }),
-                );
-                let get = rig.peer.recv();
-                assert_eq!(get["type"], "state.get", "{get}");
-                rig.peer
-                    .send(&json!({ "type": "event", "event": "state.snapshot",
-                    "seq": rig.seq + 1, "requestId": get["id"], "data": round() }));
-                rig.seq += 1;
-                rig.snaps_back_to(Club::Iron7);
-            }
-            _ => {
-                rig.event(
-                    "player.club_changed",
-                    &json!({ "playerId": 1, "current": "Iron9", "reason": "user_selected" }),
-                );
-                rig.snaps_back_to(Club::Iron9);
-            }
-        }
-        rig.ready(&readiness("shot-2", true, &["club.set"], &[]));
-        rig.no_command(case);
-        rig.card.stop();
-    }
+    let mut rig = Rig::new();
+    rig.ready(&waiting);
+    rig.card
+        .shows_row(ActorStatus::Connected, "blockers", "shot in progress");
+    rig.pick(Club::Iron8);
+    rig.event(
+        "turn.changed",
+        &json!({ "previousPlayerId": 1, "currentPlayerId": 2, "holeNumber": 7,
+                 "reason": "next_player" }),
+    );
+    rig.snaps_back_to(Club::Driver);
+    rig.event(
+        "turn.changed",
+        &json!({ "previousPlayerId": 2, "currentPlayerId": 1, "holeNumber": 7,
+                 "reason": "next_player" }),
+    );
+    rig.snaps_back_to(Club::Iron7);
+    rig.card.stop();
 }
 
 /// A pending pick goes with the connection: after a reconnect to the same
@@ -821,32 +791,25 @@ fn a_player_without_a_bag_has_no_club_out() {
     }
 }
 
-/// A command in flight when the turn passes to another player: a late
-/// success, a late `not_ready` or no reply at all sends nothing more, and
-/// the new player's club stays on the bus.
+/// A late success for a command sent before the turn passed to another
+/// player leaves the new player's club on the bus. (That nothing more is
+/// sent is `club_out`'s.)
 #[test]
-fn a_command_in_flight_across_a_turn_sends_nothing_more() {
-    for case in ["success", "not_ready", "no reply"] {
-        let mut rig = Rig::new();
-        rig.pick(Club::Iron8);
-        let cmd = rig.peer.command();
-        rig.event(
-            "turn.changed",
-            &json!({ "previousPlayerId": 1, "currentPlayerId": 2, "reason": "next_player" }),
-        );
-        rig.snaps_back_to(Club::Driver);
-        rig.session_holds(Club::Driver);
-        let from = rig.card.sent.len();
-        match case {
-            "success" => rig.ok(&cmd, "Iron8", "b-8i"),
-            "not_ready" => rig.refuse(&cmd, "not_ready", &json!({})),
-            _ => std::thread::sleep(club_out::COMMAND_TIMEOUT),
-        }
-        rig.no_command(case);
-        assert_eq!(rig.clubs_since(from), [], "{case}: Ann's driver stays");
-        rig.card.shows_row(ActorStatus::Connected, "club", "DR");
-        rig.card.stop();
-    }
+fn a_late_success_after_a_turn_leaves_the_new_players_club() {
+    let mut rig = Rig::new();
+    rig.pick(Club::Iron8);
+    let cmd = rig.peer.command();
+    rig.event(
+        "turn.changed",
+        &json!({ "previousPlayerId": 1, "currentPlayerId": 2, "reason": "next_player" }),
+    );
+    rig.snaps_back_to(Club::Driver);
+    rig.session_holds(Club::Driver);
+    let from = rig.card.sent.len();
+    rig.ok(&cmd, "Iron8", "b-8i");
+    assert_eq!(rig.clubs_since(from), [], "Ann's driver stays");
+    rig.card.shows_row(ActorStatus::Connected, "club", "DR");
+    rig.card.stop();
 }
 
 /// A pick while a player at another computer is up is not sent and puts
