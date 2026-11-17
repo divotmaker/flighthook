@@ -1,0 +1,46 @@
+[package]
+name = "flighthook-cameras"
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.94"
+description = "Swing cameras for flighthook: the clip store, the camera frame slots and body tracking"
+license = "MIT OR Apache-2.0"
+keywords = ["golf", "launch-monitor", "camera"]
+repository = "https://github.com/divotmaker/flighthook"
+readme = false
+
+[features]
+# Test support for the host's tests: the fake model sources and the test
+# helpers of the body tracking tests.
+testing = ["dep:jpeg-encoder"]
+
+[dependencies]
+flighthook = { path = "../lib" }
+# Swing cameras: capture, pre-roll and trigger-cut MJPEG clips; `pose` is
+# body tracking (RTMPose on the CPU), `pose-download` fetches its models.
+stance = { version = "0.0.5", features = ["pose", "pose-download"] }
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+dirs = "6"
+# The frame slots' watch channel and its timed wait; no runtime is started here.
+tokio = { version = "1", features = ["sync", "time"] }
+# Encodes the numbered test frames of the body tracking tests (`testing`).
+jpeg-encoder = { version = "0.7", optional = true }
+
+# The body tracking clip pass runs at a higher nice value (setpriority).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# The body tracking clip pass runs at below-normal priority (thread priority
+# calls).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+# Encodes the numbered test frames of the body tracking tests (already in the
+# tree through stance).
+jpeg-encoder = "0.7"

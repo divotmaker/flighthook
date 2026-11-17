@@ -33,7 +33,10 @@ use stance::pose::{
 use tracing::warn;
 
 use super::swing::{LivePostureFilter, LiveSetup};
-use crate::actors::camera::LIVE_FPS;
+
+/// Most frames a second put in a camera's live slot while it is watched;
+/// the frames in between are left out.
+pub const LIVE_FPS: u32 = 15;
 
 /// Least time from the start of one pose to the start of the next.
 const LIVE_EVERY: Duration = Duration::from_nanos(1_000_000_000 / LIVE_FPS as u64);
@@ -392,8 +395,9 @@ impl Smoother {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "testing"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
@@ -402,7 +406,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// Body tracking's settings in Live mode, the rest at their defaults.
-    pub(crate) fn live_section() -> BodyTrackingSection {
+    pub fn live_section() -> BodyTrackingSection {
         BodyTrackingSection {
             mode: flighthook::BodyTrackingMode::Live,
             ..BodyTrackingSection::default()
@@ -412,7 +416,7 @@ pub(crate) mod tests {
     /// A frame's JPEG with its number in the first pixel row's brightness:
     /// the fake pose puts the number in the nose's x, so a pose names the
     /// frame it was found on.
-    pub(crate) fn numbered_jpeg(n: u8) -> Arc<[u8]> {
+    pub fn numbered_jpeg(n: u8) -> Arc<[u8]> {
         let (w, h) = (32u16, 24u16);
         let pixels = vec![n; usize::from(w) * usize::from(h) * 3];
         let mut out = Vec::new();
@@ -424,18 +428,18 @@ pub(crate) mod tests {
 
     /// A pose engine whose nose sits at x = the frame's brightness, taking
     /// `delay` per frame; it counts its calls.
-    pub(crate) struct FakePose {
-        pub(crate) delay: Duration,
-        pub(crate) calls: Arc<AtomicUsize>,
-        pub(crate) scores: VecDeque<f32>,
+    pub struct FakePose {
+        pub delay: Duration,
+        pub calls: Arc<AtomicUsize>,
+        pub scores: VecDeque<f32>,
         /// When given, each estimate waits for its pass.
-        pub(crate) gate: Option<Arc<Gate>>,
+        pub gate: Option<Arc<Gate>>,
     }
 
     /// Holds each estimate until the test lets one through, and tells how
     /// many have started.
     #[derive(Default)]
-    pub(crate) struct Gate {
+    pub struct Gate {
         /// Estimates started, then passes left.
         inner: Mutex<(usize, usize)>,
         changed: Condvar,
@@ -450,7 +454,7 @@ pub(crate) mod tests {
 
         /// Wait until `n` estimates have started.
         fn started(&self, n: usize) {
-            let deadline = Instant::now() + crate::actors::GIVE_UP;
+            let deadline = Instant::now() + crate::GIVE_UP;
             let mut inner = self.inner.lock().unwrap();
             while inner.0 < n {
                 assert!(Instant::now() < deadline, "{} of {n} estimates", inner.0);
@@ -505,8 +509,8 @@ pub(crate) mod tests {
     }
 
     /// A detector that finds one person filling the frame, or nobody.
-    pub(crate) struct FakeDetector {
-        pub(crate) found: bool,
+    pub struct FakeDetector {
+        pub found: bool,
     }
 
     impl PersonDetector for FakeDetector {
@@ -531,7 +535,7 @@ pub(crate) mod tests {
     }
 
     /// A fake tracker.
-    pub(crate) fn fake_tracker(
+    pub fn fake_tracker(
         delay: Duration,
         calls: &Arc<AtomicUsize>,
         found: bool,
@@ -591,7 +595,7 @@ pub(crate) mod tests {
     }
 
     fn wait_for(published: &Published, n: usize) {
-        let deadline = Instant::now() + crate::actors::GIVE_UP;
+        let deadline = Instant::now() + crate::GIVE_UP;
         while Instant::now() < deadline {
             if published.lock().unwrap().len() >= n {
                 return;
@@ -1018,7 +1022,7 @@ pub(crate) mod tests {
         gate.open(1);
         // It ends by itself, dropping its publisher, and publishes nothing
         // after being dropped.
-        let deadline = Instant::now() + crate::actors::GIVE_UP;
+        let deadline = Instant::now() + crate::GIVE_UP;
         while Arc::strong_count(&published) > 1 {
             assert!(Instant::now() < deadline, "the worker did not end");
             std::thread::sleep(Duration::from_millis(5));

@@ -20,7 +20,7 @@ pub(crate) fn after_config_command(
 /// Apply config command `event`. The actors it stops are waited for on a
 /// helper thread (`waits`); its `ConfigOutcome` goes out once they have
 /// ended and what it starts has started, at once when it stops nothing.
-/// Body tracking then follows its mode ([`crate::pose::BodyTracking::follow`]).
+/// Body tracking then follows its mode ([`flighthook_cameras::pose::BodyTracking::follow`]).
 pub(crate) fn handle_config_command(
     event: &LocalEvent,
     state: &Arc<SystemState>,
@@ -50,7 +50,7 @@ pub(super) fn apply_config_command(
         return;
     };
 
-    let clip_dir = crate::state::clips::clip_dir(&state.system.replay());
+    let clip_dir = flighthook_cameras::clips::clip_dir(&state.system.replay());
 
     // Determine scope for actor reconciliation
     let scope: Option<String>;

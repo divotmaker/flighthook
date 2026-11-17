@@ -741,7 +741,7 @@ fn mb(bytes: u64) -> f64 {
 /// A stand-in for the official sources (tests): a file counts as verified
 /// when it holds [`Fake::CONTENT`]; a download writes it in steps into a
 /// `<file>.part-fake` file, honoring the cancel flag, or fails.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod fake {
     use super::*;
 
@@ -1109,7 +1109,7 @@ mod tests {
         assert!(default_dir().ends_with("flighthook/models"));
         assert_eq!(
             default_dir().parent(),
-            crate::state::clips::default_dir().parent(),
+            crate::clips::default_dir().parent(),
             "beside the clips"
         );
     }

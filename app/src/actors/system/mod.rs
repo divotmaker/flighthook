@@ -259,13 +259,13 @@ pub(crate) fn clear_clips(state: &SystemState) {
 /// in one `shot_video_removed`.
 fn follow_clip_dir(state: &SystemState, sender: &BusSender, before: &std::path::Path) {
     let replay = state.system.replay();
-    let dir = crate::state::clips::clip_dir(&replay);
+    let dir = flighthook_cameras::clips::clip_dir(&replay);
     if dir == before {
         return;
     }
     let removed = state
         .clips
-        .reindex(&dir, crate::state::clips::keep(&replay));
+        .reindex(&dir, flighthook_cameras::clips::keep(&replay));
     tracing::info!(
         "clips: now in {} ({} shot(s) no longer have clips; {} is left as it is)",
         dir.display(),

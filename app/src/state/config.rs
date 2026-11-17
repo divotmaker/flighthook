@@ -1373,7 +1373,7 @@ bind = "0.0.0.0:5880"
         let c = load(&path).0;
         assert_eq!(c.replay.keep_shots, 0, "the file is not rewritten");
         assert!(c.replay.error().is_some());
-        assert_eq!(crate::state::clips::keep(&c.replay), 1);
+        assert_eq!(flighthook_cameras::clips::keep(&c.replay), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

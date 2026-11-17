@@ -1881,13 +1881,16 @@ async fn get_status_says_where_clips_go_and_whether_cameras_work() {
     assert_eq!(
         status.clip_dir.as_deref(),
         Some(
-            crate::state::clips::default_dir()
+            flighthook_cameras::clips::default_dir()
                 .display()
                 .to_string()
                 .as_str()
         )
     );
-    assert_eq!(status.cameras_supported, crate::state::cameras::supported());
+    assert_eq!(
+        status.cameras_supported,
+        flighthook_cameras::frames::supported()
+    );
     assert_eq!(status.trackball_supported, cfg!(target_os = "linux"));
     state
         .root

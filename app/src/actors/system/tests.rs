@@ -1214,7 +1214,7 @@ fn a_new_clip_folder_is_followed_and_the_old_clips_are_no_longer_served() {
         shot_id: "a".into(),
         shot_number: 1,
     };
-    let shot = crate::state::clips::ClipShot {
+    let shot = flighthook_cameras::clips::ClipShot {
         key: key.clone(),
         device: "mock".into(),
         impact_lead_ms: 0,
@@ -1270,7 +1270,7 @@ fn a_new_clip_folder_is_followed_and_the_old_clips_are_no_longer_served() {
 fn clear_history_deletes_the_clips() {
     let (dir, state, _writer, _sender, _rx) = game();
     let clips = dir.0.join("clips");
-    let shot = crate::state::clips::ClipShot {
+    let shot = flighthook_cameras::clips::ClipShot {
         key: flighthook::ShotKey {
             shot_id: "a".into(),
             shot_number: 1,

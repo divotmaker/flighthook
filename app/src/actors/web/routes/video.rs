@@ -63,7 +63,7 @@ pub async fn get_shot_grades(
     State(state): State<Arc<WebState>>,
     Path((shot_id, camera)): Path<(String, String)>,
 ) -> Response {
-    use crate::pose::grades::{GradeInput, grade_file};
+    use flighthook_cameras::pose::grades::{GradeInput, grade_file};
     let missing = || {
         (
             StatusCode::NOT_FOUND,

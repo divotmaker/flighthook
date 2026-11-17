@@ -2,7 +2,7 @@
 //! (`pose:clips`) finds the golfer's keypoints on every frame of a clip and
 //! stores them beside it as `<camera>.pose.json`, then analyzes the swing
 //! in them and stores `<camera>.swing.json` (a face-on or down-the-line
-//! camera only; see [`super::swing`]).
+//! camera only; see [`flighthook_cameras::pose::swing`]).
 //!
 //! Which clips are tracked follows `[body_tracking] mode`:
 //!
@@ -20,7 +20,7 @@
 //! ago is dropped with a warning. A clip pruned or cleared before its turn
 //! is skipped, and so is a recorded clip whose turn comes after the mode
 //! left Live. Each clip runs on a quarter of the computer's logical CPUs
-//! ([`clip_threads`]), at below-normal priority ([`super::priority`]), so a
+//! ([`clip_threads`]), at below-normal priority ([`flighthook_cameras::pose::priority`]), so a
 //! simulator on the same computer keeps the CPU it needs. A clip whose pass
 //! fails unexpectedly (a panic) is logged and the queue goes on. When its
 //! pose file is written the clip store marks it and one `shot_pose` event
@@ -37,11 +37,11 @@ use stance::pose::{PoseConfig, PoseTrack, Rotation};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use super::models::{ModelState, pose_config};
-use super::swing::{SwingInput, SwingWritten, write_report};
 use crate::bus::{BusMsg, LocalEvent};
 use crate::state::SystemState;
-use crate::state::clips::ClipSlot;
+use flighthook_cameras::clips::ClipSlot;
+use flighthook_cameras::pose::models::{ModelState, pose_config};
+use flighthook_cameras::pose::swing::{SwingInput, SwingWritten, write_report};
 
 /// How often a clip waiting for the models or its turn looks again.
 const MODEL_POLL: Duration = Duration::from_millis(250);
@@ -149,6 +149,12 @@ pub struct ClipQueue {
 #[cfg(test)]
 pub type FakePass = fn(&std::path::Path, &PoseConfig) -> stance::Result<PoseTrack>;
 
+impl flighthook_cameras::pose::Waiting for ClipQueue {
+    fn clear(&self) -> usize {
+        ClipQueue::clear(self)
+    }
+}
+
 /// Worker threads for one clip: a quarter of the logical CPUs, at least 1.
 pub fn clip_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| (n.get() / 4).max(1))
@@ -156,12 +162,12 @@ pub fn clip_threads() -> usize {
 
 /// The clip pass's settings for `model` on a camera turned by `rotation`:
 /// [`clip_threads`] workers, each lowering its own priority first
-/// ([`super::priority::worker_hook`]), detecting every 10 frames, every
+/// ([`flighthook_cameras::pose::priority::worker_hook`]), detecting every 10 frames, every
 /// frame turned upright before detection.
 pub fn clip_config(model: PoseModel, rotation: Rotation) -> PoseConfig {
     PoseConfig {
         threads: clip_threads(),
-        on_worker_start: Some(super::priority::worker_hook()),
+        on_worker_start: Some(flighthook_cameras::pose::priority::worker_hook()),
         rotation,
         ..pose_config(model, PoseConfig::default().detect_every)
     }
@@ -169,7 +175,8 @@ pub fn clip_config(model: PoseModel, rotation: Rotation) -> PoseConfig {
 
 /// Most clips waiting: one per clip the store keeps.
 pub fn bound(state: &SystemState) -> usize {
-    let keep = usize::try_from(crate::state::clips::keep(&state.system.replay())).unwrap_or(1);
+    let keep =
+        usize::try_from(flighthook_cameras::clips::keep(&state.system.replay())).unwrap_or(1);
     keep.saturating_mul(state.system.camera_count().max(1))
 }
 
@@ -287,7 +294,7 @@ pub enum Requested {
 /// `shot_pose` and `shot_swing` go out on `bus` with the camera as their
 /// actor.
 ///
-/// [`ClipStore::clear_analysis`]: crate::state::clips::ClipStore::clear_analysis
+/// [`ClipStore::clear_analysis`]: flighthook_cameras::clips::ClipStore::clear_analysis
 pub fn request(
     state: &Arc<SystemState>,
     shot_id: &str,
@@ -345,7 +352,7 @@ pub fn request(
 /// Take the jobs one at a time until none is left, at below-normal
 /// priority. A job that panics is logged and the next one taken.
 fn work(state: &SystemState, queue: &Mutex<Inner>) {
-    super::priority::lower_this_thread();
+    flighthook_cameras::pose::priority::lower_this_thread();
     // Should the thread unwind anyway, the next push starts a new worker.
     let _unwinding = Idle(queue);
     loop {
@@ -610,7 +617,7 @@ fn swing(state: &SystemState, job: &ClipJob, track: &PoseTrack) -> bool {
         hand: job.hand,
         impact_ns: job.impact_ns,
         height_cm: clip_golfer_facts(state, job.golfer.as_deref()).height,
-        mirrored: super::swing::mirrored(camera),
+        mirrored: flighthook_cameras::pose::swing::mirrored(camera),
     };
     let written = match write_report(camera, track, &job.avi, &input) {
         Ok(Some(written)) => written,
@@ -679,8 +686,8 @@ fn impact_line(job: &ClipJob, written: &SwingWritten) -> Option<String> {
 mod tests {
     use super::*;
     use crate::actors::web::tests::TempDir;
-    use crate::state::clips::ClipShot;
     use flighthook::{CameraPosition, ShotVideo};
+    use flighthook_cameras::clips::ClipShot;
 
     fn state() -> (TempDir, Arc<SystemState>) {
         state_with("")
@@ -1004,7 +1011,7 @@ mod tests {
         job.hand = Some(Handedness::Left);
         job.impact_ns = Some(93 * 16_666_667);
         let kept = process(&state, &job, PoseModel::RtmposeM, &|_, _| {
-            Ok(crate::pose::swing::tests::swing_track())
+            Ok(flighthook_cameras::pose::swing::tests::swing_track())
         });
         assert!(kept);
         // shot_pose first, then shot_swing, one each.
@@ -1035,7 +1042,7 @@ mod tests {
         let mut behind = clip(&state, &dir, 2);
         behind.position = CameraPosition::GolferBack;
         assert!(process(&state, &behind, PoseModel::RtmposeM, &|_, _| {
-            Ok(crate::pose::swing::tests::swing_track())
+            Ok(flighthook_cameras::pose::swing::tests::swing_track())
         }));
         assert!(behind.slot.dir.join("camera.0.pose.json").exists());
         assert!(!behind.slot.dir.join("camera.0.swing.json").exists());
@@ -1308,7 +1315,7 @@ mod tests {
         let job = clip(&state, &dir, 1);
         let (tx, _rx) = broadcast::channel(16);
         assert!(process(&state, &job, PoseModel::RtmposeM, &|_, _| Ok(
-            crate::pose::swing::tests::swing_track()
+            flighthook_cameras::pose::swing::tests::swing_track()
         )));
         let pose = job.slot.dir.join("camera.0.pose.json");
         assert!(pose.exists());
@@ -1415,7 +1422,7 @@ mod tests {
             self.0
                 .lock()
                 .unwrap()
-                .push(super::super::priority::current());
+                .push(flighthook_cameras::pose::priority::current());
             #[allow(clippy::cast_precision_loss)]
             let (w, h) = (image.width() as f32, image.height() as f32);
             Ok(vec![stance::pose::Detection {
@@ -1433,8 +1440,8 @@ mod tests {
     #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn the_clip_pass_workers_run_below_normal() {
-        use super::super::live::tests::{FakePose, numbered_jpeg};
-        use super::super::priority::{current, lowered_from};
+        use flighthook_cameras::pose::live::tests::{FakePose, numbered_jpeg};
+        use flighthook_cameras::pose::priority::{current, lowered_from};
         let base = current();
         let seen: Arc<Mutex<Vec<i32>>> = Arc::default();
         let models = stance::pose::PoseModels::new(
@@ -1472,7 +1479,7 @@ mod tests {
     /// them.
     #[test]
     fn the_real_pass_tracks_a_clip_when_there_is_one() {
-        use crate::pose::models::{Models, Official};
+        use flighthook_cameras::pose::models::{Models, Official};
         let (Some(models), Some(avi)) = (
             std::env::var_os("STANCE_MODEL_DIR"),
             std::env::var_os("STANCE_TEST_CLIP"),
@@ -1497,7 +1504,7 @@ mod tests {
         let forked = shared.fork().expect("fork");
         let config = clip_config(model, Rotation::None);
         let (took, frames) = std::thread::spawn(move || {
-            super::super::priority::lower_this_thread();
+            flighthook_cameras::pose::priority::lower_this_thread();
             let started = Instant::now();
             let track = stance::pose::analyze_clip(&forked, &avi, &config).expect("pass");
             (started.elapsed(), track.frames.len())

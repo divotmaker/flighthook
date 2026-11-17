@@ -488,7 +488,7 @@ impl ClipStore {
 
     /// Number of clip folders held.
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.lock().clips.len()
     }
 }
@@ -598,7 +598,7 @@ fn write_shot_file(dir: &Path, file: &ShotFile) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actors::web::tests::TempDir;
+    use crate::TempDir;
     use flighthook::CameraPosition;
 
     fn temp() -> TempDir {

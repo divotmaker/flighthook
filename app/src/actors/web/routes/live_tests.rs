@@ -182,7 +182,7 @@ async fn a_request_keeps_the_live_slot_updated_only_for_a_while() {
     let resp = get_camera_live_with(&state, "camera.0", 0, Duration::from_millis(1)).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(cams.live_wanted("camera.0", Instant::now()));
-    let lapsed = asked + crate::state::cameras::LIVE_WATCH + Duration::from_millis(50);
+    let lapsed = asked + flighthook_cameras::frames::LIVE_WATCH + Duration::from_millis(50);
     assert!(!cams.live_wanted("camera.0", lapsed));
 }
 
@@ -190,7 +190,7 @@ async fn a_request_keeps_the_live_slot_updated_only_for_a_while() {
 async fn too_many_waiting_requests_are_refused() {
     let (state, _dir) = with_camera();
     let state = Arc::new(state);
-    let waits: Vec<_> = (0..crate::state::cameras::LIVE_WAITERS)
+    let waits: Vec<_> = (0..flighthook_cameras::frames::LIVE_WAITERS)
         .map(|_| {
             let state = Arc::clone(&state);
             tokio::spawn(async move {
@@ -202,7 +202,7 @@ async fn too_many_waiting_requests_are_refused() {
         .collect();
     let cams = &state.root.cameras;
     for _ in 0..400 {
-        if cams.live_waiters("camera.0") == crate::state::cameras::LIVE_WAITERS {
+        if cams.live_waiters("camera.0") == flighthook_cameras::frames::LIVE_WAITERS {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;

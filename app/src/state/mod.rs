@@ -1,5 +1,3 @@
-pub mod cameras;
-pub mod clips;
 pub mod config;
 pub mod practice;
 pub mod remotes;
@@ -18,9 +16,9 @@ use std::time::{Duration, Instant};
 
 use crate::actors::{Actor, ReconfigureOutcome};
 use crate::bus::BusSender;
-use cameras::Cameras;
-use clips::ClipStore;
 use config::SystemConfig;
+use flighthook_cameras::clips::ClipStore;
+use flighthook_cameras::frames::Frames;
 use sent_shots::SentShots;
 use sources::Sources;
 
@@ -41,9 +39,9 @@ pub struct SystemState {
     /// The replay clips on disk, shared by the camera actors (beta).
     pub clips: ClipStore,
     /// The camera actors' latest frames and the camera list (beta).
-    pub cameras: Cameras,
+    pub cameras: Frames,
     /// Body tracking's models and recorded-clip queue (alpha).
-    pub pose: crate::pose::BodyTracking,
+    pub pose: flighthook_cameras::pose::BodyTracking<crate::pose::clips::ClipQueue>,
     /// The Pureplay Accessory cards' pairing tokens (beta), kept out of the config.
     pub pureplay_tokens: Arc<flighthook_pureplay::accessory::token::TokenStore>,
     /// The mode each running local launch monitor with a fixed mode arms
@@ -101,22 +99,22 @@ pub enum Stopped {
 /// sources. Tests never download: each state has an empty folder of its own
 /// and a stand-in source (`models::fake`, a "download" of about 0.4 s per
 /// file).
-fn body_tracking() -> crate::pose::BodyTracking {
+fn body_tracking() -> flighthook_cameras::pose::BodyTracking<crate::pose::clips::ClipQueue> {
     #[cfg(test)]
     {
-        crate::pose::BodyTracking::new(
+        flighthook_cameras::pose::BodyTracking::new(
             std::env::temp_dir().join(format!(
                 "flighthook-test-models-{}",
                 uuid::Uuid::new_v4().simple()
             )),
-            crate::pose::models::fake::Fake::new(40, Duration::from_millis(10)),
+            flighthook_cameras::pose::models::fake::Fake::new(40, Duration::from_millis(10)),
         )
     }
     #[cfg(not(test))]
     {
-        crate::pose::BodyTracking::new(
-            crate::pose::models::default_dir(),
-            std::sync::Arc::new(crate::pose::models::Official::default()),
+        flighthook_cameras::pose::BodyTracking::new(
+            flighthook_cameras::pose::models::default_dir(),
+            std::sync::Arc::new(flighthook_cameras::pose::models::Official::default()),
         )
     }
 }
@@ -184,7 +182,7 @@ impl SystemState {
                 sent_shots: Arc::default(),
                 sources: Arc::default(),
                 clips: ClipStore::default(),
-                cameras: Cameras::default(),
+                cameras: Frames::default(),
                 pose: body_tracking(),
                 pureplay_tokens: pureplay_tokens(),
                 fixed_modes: FixedModes::default(),

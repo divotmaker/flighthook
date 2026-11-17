@@ -11,12 +11,12 @@ pub async fn get_status(State(state): State<Arc<WebState>>) -> Json<StatusRespon
     let actors = status_actors(&state);
 
     let turn = state.root.session.turn();
-    let clip_dir = crate::state::clips::clip_dir(&state.root.system.replay());
+    let clip_dir = flighthook_cameras::clips::clip_dir(&state.root.system.replay());
     Json(StatusResponse {
         cards,
         actors,
         turn: Some(turn),
-        cameras_supported: crate::state::cameras::supported(),
+        cameras_supported: flighthook_cameras::frames::supported(),
         trackball_supported: thumbswing::device::SUPPORTED,
         clip_dir: Some(clip_dir.display().to_string()),
         config_error: state.root.system.load_error(),

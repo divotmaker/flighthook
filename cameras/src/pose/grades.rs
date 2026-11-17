@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn a_file_is_read_and_graded() {
-        let dir = crate::actors::web::tests::TempDir(std::env::temp_dir().join(format!(
+        let dir = crate::TempDir(std::env::temp_dir().join(format!(
             "fh-grades-{}-{:?}",
             std::process::id(),
             std::thread::current().id()

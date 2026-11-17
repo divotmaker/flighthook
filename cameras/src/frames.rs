@@ -117,14 +117,14 @@ type Listing = (Instant, Vec<CameraInfo>, Option<String>);
 
 /// The camera actors' slots and the cached camera list.
 #[derive(Debug, Default)]
-pub struct Cameras {
+pub struct Frames {
     slots: RwLock<HashMap<String, Slot>>,
     list: Mutex<Option<Listing>>,
     /// The last live frame's sequence number.
     live_seq: AtomicU64,
 }
 
-impl Cameras {
+impl Frames {
     /// Record that actor `actor` has camera `camera` open, or none. With
     /// none its live frame goes: the camera has stopped.
     pub fn set_open(&self, actor: &str, camera: Option<&str>) {
@@ -189,14 +189,14 @@ impl Cameras {
     }
 
     /// Actor `actor`'s live frame, if it has one.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn live(&self, actor: &str) -> Option<Arc<LiveFrame>> {
         let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
         slots.get(actor).and_then(|s| s.live.borrow().clone())
     }
 
     /// Live requests waiting on actor `actor`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn live_waiters(&self, actor: &str) -> usize {
         let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
         slots
@@ -276,7 +276,7 @@ impl Cameras {
         self.list_with(stance::list)
     }
 
-    /// [`Cameras::list`] with `enumerate` in place of the platform's.
+    /// [`Frames::list`] with `enumerate` in place of the platform's.
     pub fn list_with(
         &self,
         enumerate: impl FnOnce() -> stance::Result<Vec<CameraInfo>>,
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn slots_hold_the_still_and_the_camera() {
-        let cams = Cameras::default();
+        let cams = Frames::default();
         assert!(cams.still("camera.0").is_none());
         cams.set_open("camera.0", Some("usb-1"));
         cams.set_still("camera.0", Arc::from(vec![0xFF, 0xD8].as_slice()));
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn the_live_slot_is_wanted_for_a_few_seconds_after_each_request() {
-        let cams = Cameras::default();
+        let cams = Frames::default();
         let t0 = Instant::now();
         assert!(!cams.live_wanted("camera.0", t0), "nobody asked");
         cams.watch_live("camera.0", t0);
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn a_new_viewing_never_gets_the_last_viewings_frame() {
-        let cams = Cameras::default();
+        let cams = Frames::default();
         let t0 = Instant::now();
         cams.watch_live("camera.0", t0);
         let first = cams.set_live("camera.0", 5, jpeg(1), None);
@@ -400,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_live_request_gets_a_newer_frame_at_once_or_waits_for_one() {
-        let cams = Arc::new(Cameras::default());
+        let cams = Arc::new(Frames::default());
         let seq = cams.set_live("camera.0", 42, jpeg(1), None);
         // At once: answered on its first poll, without waiting.
         let first = std::pin::pin!(cams.next_live("camera.0", 0, Duration::from_secs(5)));
@@ -437,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn a_viewer_from_before_a_restart_gets_the_new_frames() {
         // A fresh process: its numbers start again at 1.
-        let cams = Arc::new(Cameras::default());
+        let cams = Arc::new(Frames::default());
         let seq = cams.set_live("camera.0", 42, jpeg(1), None);
         match cams
             .next_live("camera.0", 18_234, Duration::from_secs(5))
@@ -471,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_requests_waiting_on_a_camera_are_bounded() {
-        let cams = Arc::new(Cameras::default());
+        let cams = Arc::new(Frames::default());
         let waits: Vec<_> = (0..LIVE_WAITERS)
             .map(|_| {
                 let cams = Arc::clone(&cams);
@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn the_list_names_modes_fastest_first_marks_held_cameras_and_ends_with_the_test_pattern() {
         use stance::Format;
-        let cams = Cameras::default();
+        let cams = Frames::default();
         cams.set_open("camera.1", Some("usb-1"));
         let yuyv = Format {
             fourcc: "YUY2".into(),

@@ -54,14 +54,16 @@ use tracing::{debug, info, warn};
 use crate::actors::backoff::Backoff;
 use crate::actors::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, LocalEvent, PollError};
-use crate::pose::live::{self, LiveWorker};
-use crate::pose::{clips::ClipJob, models};
+use crate::pose::clips::ClipJob;
 use crate::state::SystemState;
-use crate::state::clips::{self, ClipShot};
 use flighthook::{
     ActorStatus, BodyTrackingMode, CameraSection, MAX_IMPACT_LEAD_S, MAX_LATENCY_S,
     MAX_TRIGGER_DELAY_S, ReplaySection, Severity, ShotKey, ShotVideo,
 };
+use flighthook_cameras::clips::{self, ClipShot};
+use flighthook_cameras::pose::live::LIVE_FPS;
+use flighthook_cameras::pose::live::{self, LiveWorker};
+use flighthook_cameras::pose::models;
 
 /// Recorder history beyond the pre-roll and the longest reach.
 const BUFFER_MARGIN: Duration = Duration::from_millis(500);
@@ -75,10 +77,6 @@ const TELEMETRY_EVERY: Duration = Duration::from_secs(2);
 
 /// How often the newest frame is put in the actor's still slot.
 const STILL_EVERY: Duration = Duration::from_millis(500);
-
-/// Most frames a second put in the actor's live slot while it is watched;
-/// the frames in between are left out.
-pub(crate) const LIVE_FPS: u32 = 15;
 
 /// Least time between two live frames.
 const LIVE_EVERY: Duration = Duration::from_nanos(1_000_000_000 / LIVE_FPS as u64);
@@ -338,10 +336,10 @@ fn live_settings(state: &SystemState, actor: &str) -> live::LiveSettings {
         .unwrap_or_default();
     live::LiveSettings {
         body: state.system.body_tracking(),
-        posture: crate::pose::swing::live_setup(
+        posture: flighthook_cameras::pose::swing::live_setup(
             position,
             state.session.turn().handedness,
-            crate::pose::swing::mirrored(actor),
+            flighthook_cameras::pose::swing::mirrored(actor),
         ),
         rotation: stance::pose::Rotation::from_degrees(state.system.camera_rotation(actor))
             .unwrap_or_default(),
@@ -2711,7 +2709,7 @@ mod tests {
     }
 
     /// The live slot's frame once it is newer than `after`.
-    fn live_after(state: &SystemState, after: u64) -> Arc<crate::state::cameras::LiveFrame> {
+    fn live_after(state: &SystemState, after: u64) -> Arc<flighthook_cameras::frames::LiveFrame> {
         for _ in 0..400 {
             if let Some(f) = state.cameras.live("camera.0").filter(|f| f.seq > after) {
                 return f;
@@ -2723,7 +2721,7 @@ mod tests {
 
     #[test]
     fn a_watched_camera_goes_live_with_poses_and_a_lapsed_watch_resets_the_tracker() {
-        use crate::pose::live::tests::numbered_jpeg;
+        use flighthook_cameras::pose::live::tests::numbered_jpeg;
         let (_dir, state) = state_with(LIVE);
         let state = Arc::new(state);
         let mut route = LiveRoute {
@@ -2789,7 +2787,7 @@ mod tests {
 
     #[test]
     fn a_dead_live_worker_is_restarted_then_reported_as_failed() {
-        use crate::pose::live::tests::numbered_jpeg;
+        use flighthook_cameras::pose::live::tests::numbered_jpeg;
         use std::sync::atomic::Ordering;
         let (_dir, state) = state_with(LIVE);
         let state = Arc::new(state);
@@ -2889,7 +2887,7 @@ mod tests {
         use stance::pose::{PoseFrame, PoseTrack, Skeleton};
         let name = avi.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
         let (_, sidecar) = stance::open_clip(avi.parent().expect("folder"), name)?;
-        let pose = crate::pose::swing::tests::golfer((300.0, 260.0));
+        let pose = flighthook_cameras::pose::swing::tests::golfer((300.0, 260.0));
         Ok(PoseTrack {
             version: stance::pose::POSE_TRACK_VERSION,
             skeleton: Skeleton::Halpe26,
@@ -3145,7 +3143,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             while !matches!(
                 rig.state.pose.models.state(model),
-                Some(crate::pose::models::ModelState::Missing)
+                Some(flighthook_cameras::pose::models::ModelState::Missing)
             ) {
                 assert!(
                     Instant::now() < deadline,

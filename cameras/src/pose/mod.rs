@@ -6,8 +6,9 @@
 //!   the user confirms it, loaded once and shared.
 //! - [`live`]: a camera's live view worker, which puts each live frame in
 //!   its slot together with the pose found on it.
-//! - [`clips`]: the queue that tracks every recorded swing and writes its
-//!   keypoints, then its swing analysis, beside the clip.
+//! - `clips`: the queue that tracks every recorded swing and writes its
+//!   keypoints, then its swing analysis, beside the clip. The host provides
+//!   it ([`Waiting`]).
 //! - [`swing`]: swing events, tempo and body metrics of a recorded swing,
 //!   and the live posture (stance's golf analysis).
 //! - [`priority`]: below-normal CPU priority for the clip pass.
@@ -17,7 +18,7 @@
 //!
 //! - Off (the default): nothing. No model is loaded or downloaded.
 //! - Historical: a clip is tracked the first time it is viewed
-//!   ([`clips::request`]); the models load with the first one.
+//!   (`clips::request`); the models load with the first one.
 //! - Live: the live views while watched, and every clip as it is recorded;
 //!   the models load when a camera starts.
 //!
@@ -30,7 +31,6 @@
 //! ([`models::ModelState::Missing`]) until the user confirms the download
 //! in the UI ([`models::Models::download`]).
 
-pub mod clips;
 pub mod grades;
 pub mod live;
 pub mod models;
@@ -44,24 +44,32 @@ use std::sync::{Arc, Mutex};
 use flighthook::{BodyTrackingMode, BodyTrackingSection};
 use tracing::info;
 
+/// The recorded clips waiting for body tracking, as [`BodyTracking`] sees
+/// them: it only drops them all when body tracking turns off.
+pub trait Waiting: Default {
+    /// Drop every clip waiting, a pass already running finishes. Returns how
+    /// many were dropped.
+    fn clear(&self) -> usize;
+}
+
 /// Everything body tracking holds for the app: the models, the queue of
-/// recorded clips, and the cameras whose live tracking has failed.
-pub struct BodyTracking {
+/// recorded clips `Q`, and the cameras whose live tracking has failed.
+pub struct BodyTracking<Q> {
     pub models: models::Models,
-    pub clips: clips::ClipQueue,
+    pub clips: Q,
     /// Why each camera's live tracking stopped, by camera actor.
     live_failed: Mutex<HashMap<String, String>>,
     /// The mode [`BodyTracking::follow`] last saw.
     mode: Mutex<Option<BodyTrackingMode>>,
 }
 
-impl BodyTracking {
+impl<Q: Waiting> BodyTracking<Q> {
     /// Body tracking with its models in `dir`, checked and downloaded
     /// through `source`.
     pub fn new(dir: PathBuf, source: Arc<dyn models::Source>) -> Self {
         Self {
             models: models::Models::new(dir, source),
-            clips: clips::ClipQueue::default(),
+            clips: Q::default(),
             live_failed: Mutex::default(),
             mode: Mutex::default(),
         }
@@ -140,6 +148,18 @@ impl BodyTracking {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A queue that holds nothing.
+    #[derive(Default)]
+    struct NoClips;
+
+    impl Waiting for NoClips {
+        fn clear(&self) -> usize {
+            0
+        }
+    }
+
+    type BodyTracking = super::BodyTracking<NoClips>;
 
     #[test]
     fn the_live_state_names_off_and_where_the_model_is() {

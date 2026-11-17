@@ -264,14 +264,15 @@ impl LivePostureFilter {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+#[cfg(any(test, feature = "testing"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod tests {
     use super::*;
     use stance::pose::{BBox, Keypoint, PoseFrame, Skeleton};
 
     /// A right-handed golfer face-on at address, about 300 px tall: the
     /// Halpe-26 keypoints, all scoring 0.9, with the hands at `hands`.
-    pub(crate) fn golfer(hands: (f32, f32)) -> Pose {
+    pub fn golfer(hands: (f32, f32)) -> Pose {
         let at = |x: f32, y: f32| Keypoint { x, y, score: 0.9 };
         let mut k = vec![at(0.0, 0.0); 26];
         k[0] = at(300.0, 110.0); // nose
@@ -305,7 +306,7 @@ pub(crate) mod tests {
     /// A face-on swing at 60 fps: still hands at address, a backswing to
     /// the trail side and up, a downswing through the address point, and a
     /// follow-through.
-    pub(crate) fn swing_track() -> PoseTrack {
+    pub fn swing_track() -> PoseTrack {
         let dt = 16_666_667u64;
         let mut frames = Vec::new();
         let mut hands = Vec::new();
@@ -357,8 +358,8 @@ pub(crate) mod tests {
         assert_eq!(handed(Some(Handedness::Right)), Handed::Right);
     }
 
-    fn dir() -> crate::actors::web::tests::TempDir {
-        let dir = crate::actors::web::tests::TempDir(std::env::temp_dir().join(format!(
+    fn dir() -> crate::TempDir {
+        let dir = crate::TempDir(std::env::temp_dir().join(format!(
             "flighthook-swing-{}",
             uuid::Uuid::new_v4().simple()
         )));

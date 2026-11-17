@@ -29,6 +29,8 @@ flighthook-pureplay = { path = "../integrations/pureplay", features = ["driver"]
 # The Open Connect drivers (`driver`: `client::Client`, `server::Server`),
 # which share the registry of this process's own client connections.
 flighthook-openconnect = { path = "../integrations/openconnect", features = ["driver"] }
+# Swing cameras: the clip store, the frame slots and body tracking.
+flighthook-cameras = { path = "../cameras" }
 # FRP's forwarding rules for the `/frp` endpoint (`ForwardFilter`), the
 # device driver contract the launch monitor actors run on (`driver`) and the
 # mock launch monitor (`mock`); the same crate the lib re-exports its types
@@ -76,9 +78,6 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 # BLE backend is platform-specific: BlueZ on Linux, btleplug elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
 allsquare = { version = "0.5.0", features = ["driver", "bluez"] }
-# The body tracking clip pass runs at a higher nice value (setpriority);
-# already in the tree (tokio, ...).
-libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 allsquare = { version = "0.5.0", features = ["driver", "btleplug"] }
@@ -89,9 +88,6 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 
 [target.'cfg(target_os = "windows")'.dependencies]
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"], optional = true }
-# The body tracking clip pass runs at below-normal priority (thread priority
-# calls); already in the tree (tokio, dirs, ...).
-windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 # A WebSocket client for the tests, the version axum's `ws` feature already
@@ -110,11 +106,11 @@ allsquare = { version = "0.5.0", features = ["driver", "testing"] }
 # threeputt's test support: an in-process mock device, sample putts and the
 # driver's test timings.
 threeputt = { version = "0.2.0", features = ["driver", "testing"] }
+# The cameras' test support: the fake model source and the body tracking test
+# helpers.
+flighthook-cameras = { path = "../cameras", features = ["testing"] }
 # thumbswing's test support: synthetic swing streams and recordings.
 thumbswing = { version = "0.0.3", features = ["driver", "testing"] }
-# Encodes the numbered test frames of the body tracking tests (already in the
-# tree through stance).
-jpeg-encoder = "0.7"
 
 [build-dependencies]
 winresource = "0.1"

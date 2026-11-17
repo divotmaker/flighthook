@@ -67,16 +67,16 @@ pub struct LiveQuery {
 /// GET /api/cameras/{actor}/live?after=<seq> — the camera's live frame
 /// newer than `after`, a JPEG as the camera sent it, with its sequence
 /// number (`X-Frame-Seq`) and time (`X-Frame-Time-Ns`, see
-/// [`LiveFrame::time_ns`](crate::state::cameras::LiveFrame)), and the
+/// [`LiveFrame::time_ns`](flighthook_cameras::frames::LiveFrame)), and the
 /// golfer's keypoints on that frame (`X-Pose`, compact JSON) when body
 /// tracking ran on it. Waits up to
-/// [`LIVE_WAIT`](crate::state::cameras::LIVE_WAIT) for one, then `204`.
+/// [`LIVE_WAIT`](flighthook_cameras::frames::LIVE_WAIT) for one, then `204`.
 /// Both carry body tracking's state (`X-Pose-State`: `off`, `loading`,
 /// `downloading`, `ready` or `failed`, the failure in `X-Pose-Error`).
 /// Each request keeps the camera's live slot updated for the next
-/// [`LIVE_WATCH`](crate::state::cameras::LIVE_WATCH). `404` when `actor` is
+/// [`LIVE_WATCH`](flighthook_cameras::frames::LIVE_WATCH). `404` when `actor` is
 /// not a configured camera; `503` when the camera already has
-/// [`LIVE_WAITERS`](crate::state::cameras::LIVE_WAITERS) requests waiting.
+/// [`LIVE_WAITERS`](flighthook_cameras::frames::LIVE_WAITERS) requests waiting.
 pub async fn get_camera_live(
     State(state): State<Arc<WebState>>,
     Path(actor): Path<String>,
@@ -86,7 +86,7 @@ pub async fn get_camera_live(
         &state,
         &actor,
         query.after,
-        crate::state::cameras::LIVE_WAIT,
+        flighthook_cameras::frames::LIVE_WAIT,
     )
     .await
 }
@@ -98,7 +98,7 @@ pub(super) async fn get_camera_live_with(
     after: u64,
     wait: Duration,
 ) -> Response {
-    use crate::state::cameras::LiveWait;
+    use flighthook_cameras::frames::LiveWait;
     let configured = actor
         .strip_prefix("camera.")
         .is_some_and(|index| state.root.system.camera(index).is_some());

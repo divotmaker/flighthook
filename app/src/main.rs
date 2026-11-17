@@ -16,7 +16,11 @@ mod autochip;
 mod bus;
 #[cfg(test)]
 mod golden;
-mod pose;
+/// Body tracking's clip queue; the rest of body tracking is in the cameras
+/// crate.
+mod pose {
+    pub mod clips;
+}
 mod raw_capture;
 #[cfg(debug_assertions)]
 mod screens;
@@ -122,8 +126,10 @@ fn main() -> anyhow::Result<()> {
     // the newest `keep_shots`.
     {
         let replay = state.system.replay();
-        let dir = state::clips::clip_dir(&replay);
-        let removed = state.clips.load(&dir, state::clips::keep(&replay));
+        let dir = flighthook_cameras::clips::clip_dir(&replay);
+        let removed = state
+            .clips
+            .load(&dir, flighthook_cameras::clips::keep(&replay));
         if !removed.is_empty() {
             tracing::info!(
                 "clips: deleted the clips of {} older shot(s) in {}",

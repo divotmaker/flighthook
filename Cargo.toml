@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "ui", "lib", "integrations/pureplay", "integrations/openconnect"]
+members = ["app", "ui", "lib", "cameras", "integrations/pureplay", "integrations/openconnect"]
 resolver = "2"
 
 # `make screens`: an optimized build with debug assertions, which carries the

@@ -29,7 +29,7 @@ pub async fn get_body_tracking_models(State(state): State<Arc<WebState>>) -> Res
 /// asking again starts nothing), `200` with the state when every file is
 /// there already. The only way flighthook downloads a model.
 pub async fn post_body_tracking_models_download(State(state): State<Arc<WebState>>) -> Response {
-    use crate::pose::models::DownloadStart;
+    use flighthook_cameras::pose::models::DownloadStart;
     let root = Arc::clone(&state.root);
     let answered = tokio::task::spawn_blocking(move || {
         let model = root.system.body_tracking().model;
