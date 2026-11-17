@@ -441,6 +441,20 @@ struct Picks {
     settings: bool,
 }
 
+/// `name` as the Golfer card names it: an unknown golfer reads "Unknown
+/// golfer N", N being the key's place in `unknown` (the keys shown so far,
+/// the key joining at the end) plus one; any other name stays.
+fn numbered_name(name: String, key: &str, unknown: &mut Vec<String>) -> String {
+    if name != crate::app::UNKNOWN_GOLFER {
+        return name;
+    }
+    let at = unknown.iter().position(|k| k == key).unwrap_or_else(|| {
+        unknown.push(key.to_owned());
+        unknown.len() - 1
+    });
+    format!("{name} {}", at + 1)
+}
+
 impl FlighthookApp {
     /// The known golfers ([`Self::compute_known_golfers`]) as worked out
     /// this frame.
@@ -466,16 +480,11 @@ impl FlighthookApp {
                     if !known.iter().any(|g| g.id == key)
                         && !past.iter().any(|p| p.key.as_deref() == Some(key))
                     {
-                        let mut name =
-                            golfer_name(config, &self.bus_states, &self.golfer_names, key);
-                        if name == crate::app::UNKNOWN_GOLFER {
-                            let at = self.unknown_golfers.iter().position(|k| k == key);
-                            let n = at.unwrap_or_else(|| {
-                                self.unknown_golfers.push(key.to_owned());
-                                self.unknown_golfers.len() - 1
-                            });
-                            name = format!("{name} {}", n + 1);
-                        }
+                        let name = numbered_name(
+                            golfer_name(config, &self.bus_states, &self.golfer_names, key),
+                            key,
+                            &mut self.unknown_golfers,
+                        );
                         past.push(PastGolfer {
                             key: Some(key.to_owned()),
                             name,
@@ -1169,7 +1178,13 @@ impl FlighthookApp {
         } else {
             self.viewed_golfer.as_deref()
         };
-        let name = shown.map(|id| golfer_name(config, &self.bus_states, &self.golfer_names, id));
+        let name = shown.map(|id| {
+            numbered_name(
+                golfer_name(config, &self.bus_states, &self.golfer_names, id),
+                id,
+                &mut self.unknown_golfers,
+            )
+        });
         let selected = self.open(HeaderMenu::Golfer);
         let response = hit(ui, rect, "golfer", true);
         background(ui, rect, &response, selected);

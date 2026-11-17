@@ -1799,3 +1799,27 @@ fn view_only_rows_follow_the_known_golfers_and_send_nothing() {
         }
     }
 }
+
+/// The Golfer card's header and its rows name an unknown golfer by the same
+/// number; a named golfer keeps its name and takes no number.
+#[test]
+fn an_unknown_golfer_is_numbered_the_same_wherever_it_is_named() {
+    let mut unknown = Vec::new();
+    let unnamed = || crate::app::UNKNOWN_GOLFER.to_owned();
+    assert_eq!(
+        numbered_name(unnamed(), "flighthook.a", &mut unknown),
+        "Unknown golfer 1"
+    );
+    assert_eq!(
+        numbered_name("Eric".to_owned(), "flighthook.e", &mut unknown),
+        "Eric"
+    );
+    assert_eq!(
+        numbered_name(unnamed(), "flighthook.b", &mut unknown),
+        "Unknown golfer 2"
+    );
+    assert_eq!(
+        numbered_name(unnamed(), "flighthook.a", &mut unknown),
+        "Unknown golfer 1"
+    );
+}
