@@ -96,8 +96,8 @@ tenover = { version = "0.6.0", features = ["driver", "testing"] }
 # allsquare's test support: notification fixtures and encoders, and the
 # driver's connect over a scripted link.
 allsquare = { version = "0.5.0", features = ["driver", "testing"] }
-# threeputt's test support: an in-process mock device, sample putts and the
-# driver's test timings.
+# threeputt's test support: an in-memory device, sample putts and the driver's
+# test ports.
 threeputt = { version = "0.2.0", features = ["driver", "testing"] }
 # The cameras' test support: the fake model source and the body tracking test
 # helpers.

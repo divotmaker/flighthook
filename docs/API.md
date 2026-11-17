@@ -1218,7 +1218,7 @@ this changes no set.
 - `mode`: [`ShotGrouping`](#shotgrouping): `"by_set"` | `"by_club"` | `"none"`
 
 **Response** `200 OK` once the system actor has applied it, echoing the body
-(`{"mode":"by_club"}`). `504 Gateway Timeout` when it has not within 22 s
+(`{"mode":"by_club"}`). `504 Gateway Timeout` when it has not within 10 s
 (see [config timeout](#config-timeout)); the command is already on the bus then, so it may still apply later. A
 `mode` outside the three is
 `422 Unprocessable Entity`, a malformed body `400 Bad Request` and a missing
@@ -1629,8 +1629,7 @@ restarted. A `409` of that kind is settled by the actor's status. The
 dashboard cannot hit it: it disables Reconnect while a save is out.
 
 How long the old connection is given to close depends on the device: up to
-3 s, 6 s for a Garmin R10 or a Square Golf, 18 s for an ExPutt (a session start in progress
-cannot be cut short), 1 s for a Trackball. A Mevo/Xi, an Open Connect client,
+3 s, 6 s for a Garmin R10 or a Square Golf, 1 s for a Trackball. A Mevo/Xi, an Open Connect client,
 a mock or a Trackball still
 closing after that is replaced anyway (it holds nothing the new one needs and
 closes itself). A Garmin R10, a Square Golf, an ExPutt or an Open Connect
@@ -2218,7 +2217,7 @@ as applied.
 | `400 Bad Request` | a whole-config or output-scoped save routes an Open Connect or Pureplay Connect output to a Pureplay Accessory card (`"An output can't take shots from Pureplay"`) |
 | `409 Conflict` | the save turns on a section, or adds one that is on, at an address an enabled section of the same type has (`"An Open Connect card already uses 127.0.0.1:921"`); nothing is saved |
 | `500 Internal Server Error` | the config file is unusable and cannot be backed up before the first save |
-| `504 Gateway Timeout` | SystemActor did not answer within 22 s (see below) |
+| `504 Gateway Timeout` | SystemActor did not answer within 10 s (see below) |
 
 A body that is not a valid `FlighthookConfig` is rejected by the JSON
 extractor with a `4xx` and a plain-text reason.
@@ -2228,7 +2227,7 @@ extractor with a `4xx` and a plain-text reason.
 A save that restarts or removes actors stops them together and waits for
 each to let go of its device or connection, as a
 [reconnect](#post-apiactorsidreconnect) does: up to 3 s, 6 s for a Garmin
-R10 or a Square Golf, 18 s for an ExPutt, 1 s for a Trackball. One still closing after that is handled the same way
+R10 or a Square Golf, 1 s for a Trackball. One still closing after that is handled the same way
 as for a reconnect: replaced beside it when it holds nothing the new one
 needs, otherwise its card says the previous connection has not closed yet,
 it is listed in neither `restarted` nor `started`, and it starts by itself
@@ -2237,8 +2236,8 @@ own thread, so a save sent while a reconnect or another save waits is
 handled at once. A save of an actor another command is still waiting for
 follows the same rule as one whose old connection is still closing: it is
 not started by the save (removed, it is listed in `stopped`), and it starts
-from the saved settings when that wait is over. The server waits up to 22 s
-for SystemActor (the longest stop wait, 18 s, plus 4 s), so a save is
+from the saved settings when that wait is over. The server waits up to 10 s
+for SystemActor (the longest stop wait, 6 s, plus 4 s), so a save is
 answered with its outcome, not a `504`.
 
 A save that changes the Web Server's own `bind` restarts the server that is

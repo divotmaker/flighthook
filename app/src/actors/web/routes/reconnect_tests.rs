@@ -265,9 +265,9 @@ async fn a_reconnect_that_completes_by_itself_is_accepted() {
 fn the_config_timeout_outlasts_the_longest_stop_wait() {
     use crate::actors::{MAX_STOP_WAIT, STOP_WAIT};
     let exputt = crate::actors::exputt::ExPuttActor::new(flighthook::ExPuttSection::default());
-    assert_eq!(exputt.stop_wait(), MAX_STOP_WAIT);
     let square = crate::actors::square::SquareActor::new(flighthook::SquareSection::default());
-    for wait in [STOP_WAIT, square.stop_wait()] {
+    assert_eq!(square.stop_wait(), MAX_STOP_WAIT);
+    for wait in [STOP_WAIT, exputt.stop_wait()] {
         assert!(wait <= MAX_STOP_WAIT, "{wait:?}");
     }
     assert!(CONFIG_TIMEOUT >= MAX_STOP_WAIT + START_ROOM);

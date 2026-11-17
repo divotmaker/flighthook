@@ -53,15 +53,15 @@ pub enum ReconfigureOutcome {
 /// ([`Actor::stop_wait`]).
 pub const STOP_WAIT: Duration = Duration::from_secs(3);
 
-/// The longest [`Actor::stop_wait`] of any actor: the ExPutt's. A config
+/// The longest [`Actor::stop_wait`] of any actor: the Omni's. A config
 /// command stops the actors it restarts or removes together, so this bounds
 /// how long it waits for them.
 pub const MAX_STOP_WAIT: Duration =
-    <threeputt::driver::ExPutt as flightrelay::driver::FrpDriver>::STOP_WAIT;
+    <allsquare::driver::Omni as flightrelay::driver::FrpDriver>::STOP_WAIT;
 
 const _: () = assert!(STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
 const _: () = assert!(
-    <allsquare::driver::Omni as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
+    <threeputt::driver::ExPutt as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
         <= MAX_STOP_WAIT.as_millis()
 );
 const _: () = assert!(

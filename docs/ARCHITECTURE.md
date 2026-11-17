@@ -912,7 +912,7 @@ view and reconciles no actor; no set changes. `SetBodyTracking` persists the
 `[body_tracking]` section alone and reconciles no actor (it is read live). `/api/settings` answers `400`
 for an unknown scope and `504` when no `ConfigOutcome` arrives within
 `CONFIG_TIMEOUT` (`web/routes/settings.rs`): the longest stop wait of any actor
-(`actors::MAX_STOP_WAIT`, the ExPutt's 18s) plus 4s, so 22s. A command stops
+(`actors::MAX_STOP_WAIT`, the Square Golf's 6s) plus 4s, so 10s. A command stops
 the actors it restarts or removes together, so it waits at most one longest
 stop wait, and it never waits behind another command's (see below). The UI's
 save and reconnect requests wait 60s (`net::CONFIG_REQUEST_TIMEOUT`, asserted
@@ -1119,10 +1119,9 @@ same backoff (below). The trackball's driver gives up off
 Linux (the card ends Disconnected with the error). Every actor polls its shutdown flag during the backoff wait,
 so stopping one never waits out the delay. The TCP connect of the FlightScope driver, the
 Open Connect client and Pureplay Connect (up to 5 s, the SDK's
-`connect_tcp`) gives up at once on a stop. The ExPutt's
-session start cannot be cut short: the TCP connect and the device's greeting
-(up to 3s each), its two handshake replies (up to 3s each) and its mat search
-(up to 5s).
+`connect_tcp`) gives up at once on a stop, as does the ExPutt's whole
+session start: its discovery, TCP connect, greeting and handshake check for a
+stop on every pass.
 The ExPutt driver caps its first 3 reconnect delays at 1s after a session
 that was measuring, then uses the backoff. After a session lost to silence
 it waits 15s before the first attempt and leaves at least 15s between
@@ -1150,8 +1149,7 @@ actor and the command waits for it on a helper thread (see
    then wait up to `Actor::stop_wait()` for the actor's thread to end
    (`SystemState::wait_for_exit`): 3s by default; a card on a device driver
    waits its driver's `STOP_WAIT` (6s for an R10, and for a Square Golf,
-   which disarms and disconnects; 1s for a trackball); 18s for an ExPutt, whose session start
-   cannot be cut short; none for the web server (the save that moves it is
+   which disarms and disconnects; 1s for a trackball); none for the web server (the save that moves it is
    answered by the server being stopped, and its successor retries the bind).
 2. If the thread is still running, the actor's `replaceable_while_stopping()`
    decides: a Mevo/Xi, an Open Connect client, the mock actors and the web
@@ -1256,7 +1254,7 @@ What a stop does, by actor:
 | Open Connect server | always: the accept loop, the wait for a peer's first message and the card between session steps (5 ms apart while the monitor is quiet; reads and writes do not block); the listen port is free once it ends | the driver's `STOP_WAIT` (3 s); the driver is exclusive, so a new instance waits for the old one to let go of the port |
 | Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
 | Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
-| ExPutt | discovering (250 ms slices), measuring (checked between session steps, 5 ms apart while the device is quiet; the session closes at once) or waiting to reconnect | the driver's `STOP_WAIT` (18 s: a session start of up to 17 s, which cannot be cut short: connect and greeting, two handshake replies, mat search; then the close) |
+| ExPutt | discovering (250 ms slices), measuring (checked between session steps, 5 ms apart while the device is quiet; the session closes at once) or waiting to reconnect | the driver's `STOP_WAIT` (3 s: discovery, the connect and the handshake each check for a stop on every pass; the close says goodbye and waits at most half a second for the device to hang up) |
 | Trackball | always: opening the device is a few system calls, checked for a stop before and after; the card checks between session steps (5 ms apart while the device is quiet); closing drops the device | the driver's `STOP_WAIT` (1 s: closing joins the device's reader thread, which wakes every 100 ms); not exclusive (the card never grabs the device), so an old instance still closing is replaced beside it |
 | Mock monitor | always (checked between session steps; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
 | Random club | always (100 ms loop) | -- |
