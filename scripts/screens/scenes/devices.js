@@ -3,8 +3,8 @@
 // launch monitor's page (an Open Connect launch monitor beside it in the
 // list); then the camera's page, its telemetry beside its settings, its live
 // view under the telemetry and its Rotation in sight. The camera plays one
-// color-bars frame over and over (`still.avi` in the scene's folder), so the
-// live view holds still.
+// frame of the face-on swing clip (impact, see lib/footage.js) over and over
+// (`swing.avi` in the scene's folder), so the live view holds still.
 // GSPro is configured too (Settings, Software).
 //
 // The cards show ports, so this scene uses fixed ones. The Open Connect
@@ -21,6 +21,8 @@ const { run, sleep } = require('../lib/util');
 const { Monitor, Simulator } = require('../lib/openconnect');
 
 const MOCK_FIRST_SHOT_MS = 33000;
+// The face-on clip's frame just after impact (its source frames 1540..2000, impact 1839.5).
+const IMPACT_FRAME = 300;
 
 function shot(n) {
   const v = Math.sin(n * 1.3);
@@ -45,7 +47,7 @@ function shot(n) {
 
 module.exports = {
   name: 'devices',
-  needs: ['cameras'],
+  needs: ['footage', 'cameras'],
   ports: { web: 5971, monitor: 5972, gspro: 5973, peer: 5974 },
   env: { FLIGHTHOOK_SCREENS_CLOCK: '18:24:08' },
   config: ({ ports }) => `default_units = "imperial"
@@ -71,10 +73,10 @@ bind = "127.0.0.1:${ports.monitor}"
 
 [camera.0]
 name = "Golfer Back"
-camera = "clip:still.avi"
+camera = "clip:swing.avi"
 position = "golfer_back"
 mode = "auto"
-rotation_deg = 90
+rotation_deg = 0
 
 [openconnect_client.0]
 name = "GSPro"
@@ -82,13 +84,13 @@ address = "127.0.0.1:${ports.gspro}"
 `,
 
   async before(ctx) {
-    // One frame of ffmpeg's color bars, as a clip of its own.
-    const jpeg = path.join(ctx.dir, 'still.jpg');
+    // The face-on clip's impact frame, as a clip of its own.
+    const jpeg = path.join(ctx.dir, 'swing.jpg');
     await run(process.env.FFMPEG || 'ffmpeg', ['-nostdin', '-hide_banner', '-loglevel', 'error',
-      '-f', 'lavfi', '-i', 'smptebars=size=1280x720:rate=1', '-frames:v', '1',
+      '-i', ctx.footage['golfer-front'], '-vf', `select=eq(n\\,${IMPACT_FRAME})`, '-frames:v', '1',
       '-c:v', 'mjpeg', '-q:v', '2', '-pix_fmt', 'yuvj420p', jpeg]);
-    writeClip(path.join(ctx.dir, 'still'), [fs.readFileSync(jpeg)], {
-      width: 1280, height: 720, fps: 30, tNs: [0], impactNs: 0,
+    writeClip(path.join(ctx.dir, 'swing'), [fs.readFileSync(jpeg)], {
+      width: 1080, height: 900, fps: 30, tNs: [0], impactNs: 0,
     });
     ctx.gspro = new Simulator(ctx.ports.gspro);
     ctx.cleanup.push(() => ctx.gspro.close());

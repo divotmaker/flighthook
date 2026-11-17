@@ -69,7 +69,7 @@ the repository mounted at the same path.
 | --- | --- | --- |
 | `shots.js` | `shots.png` | Shots tab, Cards view: a 12-shot 7-iron session from one Open Connect monitor, GSPro connected, a camera recording with video off on the shot cards |
 | `cameras.js` | `cameras.png` | Cameras tab: two cameras playing the swing clips, body tracking Live, shot #2 paused on the impact mark |
-| `devices.js` | `devices.png`, `devices-settings.png` | Settings on the Mock launch monitor's page (an Open Connect monitor, a camera and GSPro are in the list too); then the camera's page, its telemetry beside its settings, its live view under the telemetry (the camera plays one color-bars frame, so the picture holds still) |
+| `devices.js` | `devices.png`, `devices-settings.png` | Settings on the Mock launch monitor's page (an Open Connect monitor, a camera and GSPro are in the list too); then the camera's page, its telemetry beside its settings, its live view under the telemetry (the camera plays one frame of the face-on swing clip, so the picture holds still) |
 | `multi-monitor-routing.js` | `multi-monitor-routing.png` | A GSPro output's page, its settings routing full swings and chips to different monitors, putts to any |
 
 ## What keeps the pictures the same
