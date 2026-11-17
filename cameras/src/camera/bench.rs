@@ -1,45 +1,25 @@
 //! The camera's core on one thread: a [`Recording`] and a [`Pass`] fed by
 //! the unpaced test pattern at explicit times, every finished clip saved
 //! at once into [`Cameras`] over a scratch folder, and the events kept in
-//! order. No capture thread, no bus, no sleeps.
+//! order. No capture thread, no host, no sleeps.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use flighthook::{
-    BodyTrackingMode, CameraPosition, CameraSection, FlighthookConfig, GolferTurn, ShotKey,
-};
-use flighthook_cameras::pose::BodyTracking;
-use flighthook_cameras::pose::models::fake::Fake;
-use flighthook_cameras::{Cameras, Event, Host, Out, settings};
+use flighthook::{BodyTrackingMode, CameraPosition, CameraSection, FlighthookConfig, ShotKey};
 use stance::{RecorderEvent, Source, TestPattern, TestPatternConfig};
 
-use super::{Pass, Recording, ShotTrigger, Tag, save};
-use crate::actors::web::tests::TempDir;
+use super::{Pass, Recording, Tag, Trigger, save};
+use crate::{Cameras, Event, Out, settings};
 
 const MS: u64 = 1_000_000;
 
 const CAMERA: &str = "camera.0";
 
-/// A host whose turn is always the start turn.
-struct FakeHost;
-
-impl Host for FakeHost {
-    fn turn(&self) -> GolferTurn {
-        GolferTurn::new(
-            None,
-            None,
-            flighthook::Handedness::Right,
-            flighthook::Mode::Full,
-        )
-    }
-}
-
 /// One test-pattern camera at 100 fps, its frames dated from 0, read one
 /// at a time at their own host time.
 struct Bench {
-    dir: TempDir,
-    config: Arc<RwLock<FlighthookConfig>>,
+    base: crate::bench::Bench,
     cameras: Arc<Cameras>,
     /// Every event, in order.
     events: Arc<Mutex<Vec<Event>>>,
@@ -59,16 +39,10 @@ impl Bench {
     /// A 0.4 s pre-roll and a 0.6 s post-roll, keeping `keep` shots, body
     /// tracking in `mode`.
     fn new(keep: u32, mode: BodyTrackingMode) -> Self {
-        let dir = TempDir(std::env::temp_dir().join(format!(
-            "flighthook-camera-bench-{}",
-            uuid::Uuid::new_v4().simple()
-        )));
-        std::fs::create_dir_all(&dir.0).expect("dir");
         let mut config = FlighthookConfig::default();
         config.replay.keep_shots = keep;
         config.replay.pre_roll_s = 0.4;
         config.replay.post_roll_s = 0.6;
-        config.replay.clip_dir = Some(dir.0.join("clips").display().to_string());
         config.camera.insert(
             "0".into(),
             CameraSection {
@@ -81,12 +55,11 @@ impl Bench {
         config.body_tracking.mode = mode;
         let mut recording = Recording::new(&config);
         recording.set_fps(100.0);
-        let config = Arc::new(RwLock::new(config));
-        let pose = BodyTracking::new(
-            dir.0.join("models"),
-            Fake::new(40, Duration::from_millis(10)),
-        );
-        let cameras = Cameras::new(Arc::clone(&config), Arc::new(FakeHost), pose);
+        let base = crate::bench::bench(config);
+        base.update(|c| {
+            c.replay.clip_dir = Some(base.dir.0.join("clips").display().to_string());
+        });
+        let cameras = Arc::clone(&base.cameras);
         let events: Arc<Mutex<Vec<Event>>> = Arc::default();
         let sink = Arc::clone(&events);
         let out: Out = Arc::new(move |e| sink.lock().unwrap().push(e));
@@ -101,8 +74,7 @@ impl Bench {
         .expect("pattern");
         let t0 = Instant::now();
         Self {
-            dir,
-            config,
+            base,
             cameras,
             events,
             out,
@@ -126,7 +98,7 @@ impl Bench {
             .expect("frame")
             .expect("frame");
         self.now_ns = frame.host_ns;
-        let lag = settings::latency(&self.config.read().unwrap(), CAMERA);
+        let lag = settings::latency(&self.cameras.settings().read(), CAMERA);
         let now = self.t0 + Duration::from_nanos(self.now_ns);
         let (_, frame) = self.pass.frame(frame, lag, now);
         let recorded = frame.map(|frame| {
@@ -166,16 +138,16 @@ impl Bench {
             shot_number: n,
         };
         let prefix = card.split_once('.').map_or(card, |(p, _)| p);
-        let shot = ShotTrigger {
+        let shot = Trigger {
             card: card.to_owned(),
-            device: crate::actors::web::device_kind(prefix).to_owned(),
+            device: prefix.to_owned(),
             key: key.clone(),
             timestamp: None,
         };
         let turn = self.cameras.turn();
         let generation = self.cameras.clips.generation();
         self.recording.trigger(
-            &self.config.read().unwrap(),
+            &self.cameras.settings().read(),
             &shot,
             self.now_ns,
             &turn,
@@ -206,7 +178,7 @@ impl Bench {
 
     /// Clip folders on disk.
     fn folders(&self) -> usize {
-        std::fs::read_dir(self.dir.0.join("clips"))
+        std::fs::read_dir(self.base.dir.0.join("clips"))
             .map(|d| d.flatten().filter(|e| e.path().is_dir()).count())
             .unwrap_or(0)
     }
@@ -229,13 +201,8 @@ fn a_latency_raised_between_two_frames_dates_the_next_frames_earlier() {
     bench.run_to(500);
     assert_eq!(bench.frame(), Some(510 * MS), "dated as it arrived");
     bench
-        .config
-        .write()
-        .unwrap()
-        .camera
-        .get_mut("0")
-        .unwrap()
-        .latency_s = Some(0.3);
+        .base
+        .update(|c| c.camera.get_mut("0").unwrap().latency_s = Some(0.3));
     // Dated 300 ms earlier: the frames that arrive by 810 ms are not after
     // the one recorded at 510 ms, so they are dropped.
     while bench.now_ns < 810 * MS {

@@ -47,6 +47,8 @@ mod status;
 mod tests;
 mod ui_assets;
 mod video;
+#[cfg(test)]
+mod video_tests;
 
 pub use blocks::*;
 pub use body_tracking::*;

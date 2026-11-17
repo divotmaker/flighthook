@@ -107,7 +107,7 @@ impl LoopingClip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actors::web::tests::TempDir;
+    use crate::TempDir;
     use stance::{ClipRecorder, RecorderConfig, RecorderEvent, TestPattern, TestPatternConfig};
 
     /// A 10-frame, 100 fps test-pattern clip written by stance.

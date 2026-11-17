@@ -1,4 +1,4 @@
-//! Linear reconnect backoff shared by the reconnecting actors.
+//! Linear reconnect backoff of a camera that is lost or won't open.
 
 use std::time::Duration;
 
@@ -6,16 +6,14 @@ use std::time::Duration;
 const STEP: Duration = Duration::from_secs(1);
 
 /// Shortest session that restarts the backoff at `min`. Longer than any
-/// connect-time setup (GSPro's first heartbeat goes out ~1 s after connect,
-/// a Square Golf identity exchange and arm take a few seconds), so a link
-/// that is accepted and then drops during setup counts as a failed attempt
-/// and keeps growing toward the cap.
+/// connect-time setup, so a camera that opens and then drops during setup
+/// counts as a failed attempt and keeps growing toward the cap.
 pub(crate) const STABLE_SESSION: Duration = Duration::from_secs(10);
 
 /// Linear reconnect backoff: starts at `min`, grows by 1 s per failed
 /// attempt, capped at `max`. A session that lasted at least
 /// [`STABLE_SESSION`] restarts the sequence at `min`, so one long outage does
-/// not slow every later reconnect, while a link that keeps connecting and
+/// not slow every later reconnect, while a camera that keeps opening and
 /// dropping at once still backs off to `max`.
 #[derive(Debug, Clone)]
 pub(crate) struct Backoff {

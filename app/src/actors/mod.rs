@@ -1,9 +1,6 @@
 //! Actor infrastructure — shared trait, bus helpers, and actor resolution.
 
-pub(crate) mod backoff;
 pub mod camera;
-#[cfg(debug_assertions)]
-pub mod clip_source;
 pub mod driver;
 pub mod exputt;
 pub mod flight_model;

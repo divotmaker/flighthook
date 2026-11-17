@@ -5,6 +5,8 @@
 //! builds it over its live config and its [`Host`], and hears from it
 //! through an [`Out`].
 //!
+//! - [`Camera`]: one `[camera.N]`'s loop, which records a clip of every swing
+//!   the host triggers it with.
 //! - [`clips`]: the replay clip store, one folder per recorded swing.
 //! - [`frames`]: what the cameras share with the web layer, the newest
 //!   still and live frames and the camera list.
@@ -12,10 +14,20 @@
 //!   swing numbers and grades computed from them.
 //! - [`settings`]: what the cameras read from the live config.
 
+mod backoff;
+mod camera;
+#[cfg(debug_assertions)]
+mod clip_source;
 pub mod clips;
 pub mod frames;
 pub mod pose;
+#[cfg(debug_assertions)]
+mod screens;
 pub mod settings;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
+pub use camera::{Camera, Input, Trigger, UNSUPPORTED, restart_needed};
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -63,7 +75,7 @@ impl Cameras {
     }
 
     /// The live config the cameras read.
-    pub fn settings(&self) -> &Settings {
+    pub(crate) fn settings(&self) -> &Settings {
         &self.settings
     }
 }

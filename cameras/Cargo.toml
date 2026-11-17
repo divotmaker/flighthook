@@ -40,6 +40,8 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+# Builds the configs of the tests from their TOML text.
+toml = "0.8"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 # Encodes the numbered test frames of the body tracking tests (already in the
 # tree through stance).
