@@ -118,8 +118,8 @@ pub enum UiLocalEvent {
 }
 
 /// A `bus.actor`'s values as card rows: `battery_pct` and the actor's own
-/// telemetry. A battery the actor does not report is empty, which removes
-/// the row; telemetry always carries every key the actor uses. A card's
+/// telemetry. A battery the actor does not report is empty (a card that
+/// shows a battery row reads it `unknown`); telemetry always carries every key the actor uses. A card's
 /// `ready` row is its own rule
 /// ([`ActorStatusResponse::apply_actor`](crate::ActorStatusResponse::apply_actor)).
 #[must_use]

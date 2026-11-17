@@ -42,6 +42,7 @@ pub struct MevoHooks;
 impl Hooks<Mevo> for MevoHooks {
     type Section = MevoSection;
     const SOURCE: Option<ShotSource> = Some(ShotSource::Mevo);
+    const BATTERY: bool = true;
 
     fn before_finished(
         &mut self,

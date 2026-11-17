@@ -37,7 +37,10 @@
 //!   row is the last phase the driver set while a connect or session runs,
 //!   `connecting` while it starts or reconnects and `idle` once
 //!   disconnected; its `error` row reads `none` once the outage it
-//!   described is over, and `device_info` once the session ends. Raw frames
+//!   described is over, and `device_info` once the session ends. The card
+//!   has its host rows from its start (`device_info` `none`, a launch
+//!   monitor's `shot_count` `0`, `battery_pct` `unknown` for a driver that
+//!   reports a battery), so its row list does not grow on connect. Raw frames
 //!   go to the shot's capture, which goes out as the local `ShotCapture`
 //!   just before the shot's `shot.finished`, never as FRP.
 //! - **Live config** ([`DriverActor::reconfigure`]): host fields and the
@@ -102,6 +105,10 @@ pub trait Hooks<D: FrpDriver>: Default + Send + 'static {
     /// source (an output). A source's class must be the source `D`
     /// declares ([`DriverInfo::source`]).
     const SOURCE: Option<ShotSource>;
+
+    /// The card's driver reports a battery: the card shows a `battery_pct`
+    /// row from its start, `unknown` until a level is reported.
+    const BATTERY: bool = false;
 
     /// Host-side processing of one of the driver's messages before it goes
     /// on the bus: a shot message, a raw frame (before it reaches the shot's
@@ -412,10 +419,9 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
             Ok(driver) => driver,
             Err(e) => {
                 warn!("{actor}: settings not usable, not started: {e}");
-                sink.status(
-                    ActorStatus::Disconnected,
-                    HashMap::from([("error".into(), e.to_string())]),
-                );
+                let mut rows = sink.start_rows();
+                rows.insert("error".into(), e.to_string());
+                sink.status(ActorStatus::Disconnected, rows);
                 self.wait_for_stop(host, sink, None);
                 return;
             }
@@ -423,7 +429,8 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
 
         let mut backoff = Backoff::default();
         let mut attempts = 0u32;
-        sink.status(ActorStatus::Starting, HashMap::new());
+        let rows = sink.start_rows();
+        sink.status(ActorStatus::Starting, rows);
         loop {
             if host.stopped() {
                 break;
@@ -1123,6 +1130,20 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
         let rows = self.ended_rows();
         self.status(ActorStatus::Reconnecting, rows);
         self.session_ended(hooked);
+    }
+
+    /// The card's host rows from its start, so its row list never grows:
+    /// `device_info` `none`, a launch monitor's `shot_count`, and a battery
+    /// the driver reports (`unknown` until a level comes).
+    fn start_rows(&self) -> HashMap<String, String> {
+        let mut rows = HashMap::from([("device_info".into(), NONE.into())]);
+        if self.info.roles.contains(&roles::LAUNCH_MONITOR) {
+            rows.insert("shot_count".into(), self.shot_count.to_string());
+        }
+        if H::BATTERY {
+            rows.insert("battery_pct".into(), "unknown".into());
+        }
+        rows
     }
 
     /// The card rows of a session that ends: `device_info` reads `none`

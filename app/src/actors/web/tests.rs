@@ -178,7 +178,7 @@ async fn a_cards_rows_stay_through_a_lost_connection_and_flags_follow_its_bus_ac
     assert_eq!(rows["device_info"], "none");
     assert_eq!(rows["tilt"], "unknown");
     assert_eq!(rows["club"], "7I", "a row stays at its last value");
-    assert!(!rows.contains_key("battery_pct"), "no battery reading");
+    assert_eq!(rows["battery_pct"], "unknown", "no battery reading");
     assert!(state.actors.read().await["mevo.0"].flagged.is_empty());
     // The export keeps the device's identity: its `bus.actor`.
     let model = state.bus_state.lock().ok().and_then(|bus| {

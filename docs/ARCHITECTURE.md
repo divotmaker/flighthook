@@ -831,8 +831,10 @@ each key through one of them only.
   key at that value.
 - **`CardStatus`** (local) is what flighthook knows about the card and its
   connection: a status enum and the card's display rows. Standard keys:
-  `device_info` (`none` once the session ends); launch monitors on a device
-  driver add `shot_count`; every card on a driver shows `phase`, the last
+  `device_info` (`none` before a session and once it ends); launch monitors
+  on a device driver add `shot_count`, and a device that reports a battery
+  `battery_pct` (`unknown` until a level is reported); all three are there
+  from the card's start; every card on a driver shows `phase`, the last
   phase its driver set while a connect or session runs, `connecting` while
   the card starts or reconnects and `idle` once it is disconnected; a card
   whose connect fails adds `error`, which reads `none` once a session
@@ -853,7 +855,7 @@ pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
 cached per-card state in both the web layer and the dashboard. Both merge a
 card's `bus.actor` telemetry and its status rows into one map per card. A key
 in a status replaces the one held. A `bus.actor` that reports no battery
-takes the `battery_pct` row away; no other row leaves. A web server sets
+sets a `battery_pct` row the card has to `unknown`; no row leaves. A web server sets
 `error` to `bind failed` while it cannot bind its address, and to `none` with
 every other status. An `error` that reads `none` is no error: no banner, and no row on the
 card.

@@ -260,8 +260,10 @@ red time current.
 A card's `telemetry` holds its rows as key/value strings. A row, once
 shown, always has a value: what its source does not know reads `none`
 (or `unknown`, `idle`, `0`), and the rows stay while the card is
-reconnecting or disconnected. Only `battery_pct` leaves when there is no
-reading. A key is reported by one source only, except `error` on the
+reconnecting or disconnected. A card on a driver has `device_info`
+(`none`), a launch monitor's `shot_count` (`0`) and, for a device that reports
+a battery, `battery_pct` (`unknown` until a level is reported and while there
+is none) from the moment it starts. A key is reported by one source only, except `error` on the
 Pureplay Connect and Pureplay Accessory cards: their driver reports it,
 and the card's own error (a failed connect, giving up) takes its place
 while it lasts:
@@ -273,8 +275,8 @@ while it lasts:
   (`true`), `input` (the name the device reports), `cpi`, `profile` (the
   club in play) and `handed` (`rh` | `lh`))
 - **Every card**: `ready` (`true` while the card is connected and its
-  `bus.actor` has no blockers, else `false`), `device_info` (`none` once the
-  session ends), `shot_count` (a launch monitor's), `phase` (what the driver
+  `bus.actor` has no blockers, else `false`), `device_info` (`none` until a
+  session connects and once it ends), `shot_count` (a launch monitor's), `phase` (what the driver
   is doing: `discovering`, `listening`, `connecting`, `handshaking`,
   `configuring`, then `measuring`, or `connected` for an output; the last one
   set while connecting or connected, `connecting` while the card starts or

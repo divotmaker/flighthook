@@ -29,6 +29,7 @@ pub struct SquareHooks;
 impl Hooks<Omni> for SquareHooks {
     type Section = SquareSection;
     const SOURCE: Option<ShotSource> = Some(ShotSource::Square);
+    const BATTERY: bool = true;
 }
 
 /// The Square Golf actor (`square.N`).

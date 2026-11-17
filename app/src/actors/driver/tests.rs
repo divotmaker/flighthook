@@ -273,6 +273,7 @@ struct FakeHooks;
 impl Hooks<FakeDriver> for FakeHooks {
     type Section = FakeSection;
     const SOURCE: Option<ShotSource> = Some(ShotSource::Mevo);
+    const BATTERY: bool = true;
 
     fn on_frp(&mut self, body: &mut FrpBody, ctx: &mut HookCtx<'_, FakeSection>) -> Pass {
         if let FrpBody::ShotLaunch(m) = body
@@ -1925,6 +1926,63 @@ fn a_lost_sessions_open_shot_is_finished() {
     assert_eq!(finished.key, key(7));
     assert_eq!(card_status(&seen[3]).expect("count").1["shot_count"], "1");
     assert!(is_not_armed(&seen[4]));
+}
+
+/// A card has the same row keys before it connects, connected (a battery
+/// reported or not), reconnecting and off: `device_info` `none`,
+/// `shot_count` `0` and `battery_pct` `unknown` from the start.
+#[test]
+fn a_cards_row_keys_are_the_same_in_every_state() {
+    let (_dir, mut sink, mut rx, _w) = connecting_sink::<FakeHooks>("");
+    let mut card = flighthook::ActorStatusResponse::new("Fake", ActorStatus::Starting);
+    let mut fold = |rx: &mut broadcast::Receiver<BusMsg>| {
+        for m in drain(rx) {
+            if let Some((status, telemetry)) = card_status(&m) {
+                card.apply_status(status, telemetry, 0);
+            } else if let FrpBody::BusActor(actor) = body(&m) {
+                card.apply_actor(actor);
+            }
+        }
+        let mut keys: Vec<String> = card.telemetry.keys().cloned().collect();
+        keys.sort();
+        (keys, card.telemetry.clone())
+    };
+    sink.publish_actor();
+    let rows = sink.start_rows();
+    sink.status(ActorStatus::Starting, rows);
+    let (start, rows) = fold(&mut rx);
+    assert_eq!(rows["device_info"], "none");
+    assert_eq!(rows["shot_count"], "0");
+    assert_eq!(rows["battery_pct"], "unknown");
+
+    sink.connected(&DeviceIdentity::new("FAKE-1").with_model("Eagle"));
+    let (connected, rows) = fold(&mut rx);
+    assert_eq!(connected, start);
+    assert_eq!(rows["battery_pct"], "unknown", "no level reported yet");
+    sink.handle(DeviceEvent::Status(DeviceStatus::new().with_battery(80)));
+    let (reported, rows) = fold(&mut rx);
+    assert_eq!(reported, start);
+    assert_eq!(rows["battery_pct"], "80");
+
+    let TestSink {
+        sink: inner,
+        hooked,
+    } = &mut sink;
+    inner.session_lost(hooked);
+    let (reconnecting, rows) = fold(&mut rx);
+    assert_eq!(reconnecting, start);
+    assert_eq!(rows["device_info"], "none");
+    assert_eq!(rows["battery_pct"], "unknown");
+
+    sink.status(ActorStatus::Disconnected, HashMap::new());
+    assert_eq!(fold(&mut rx).0, start);
+}
+
+/// A card whose driver reports no battery has no `battery_pct` row.
+#[test]
+fn a_card_without_a_battery_has_no_battery_row() {
+    let (_dir, sink, _rx, _w) = connecting_sink::<ShotHooks>("");
+    assert!(!sink.start_rows().contains_key("battery_pct"));
 }
 
 /// A card's `bus.actor` has its driver's roles and namespaces, the

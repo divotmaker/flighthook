@@ -167,15 +167,16 @@ impl ActorStatusResponse {
     /// Fold in a local card's `bus.actor`: its rows
     /// ([`bus_actor_rows`](crate::bus_actor_rows)) and flagged values, with
     /// `ready` true only while the card is Connected and the actor has no
-    /// blockers. An empty row (a battery the actor no longer reports) is
-    /// removed.
+    /// blockers. An empty row (a battery the actor does not report) reads
+    /// `unknown` on a card that has the row, and adds none to one that has
+    /// not.
     pub fn apply_actor(&mut self, actor: &flightrelay::BusActor) {
         self.flagged.clone_from(&actor.flagged);
         for (k, v) in crate::bus_actor_rows(actor) {
-            if v.is_empty() {
-                self.telemetry.remove(&k);
-            } else {
+            if !v.is_empty() {
                 self.telemetry.insert(k, v);
+            } else if let Some(row) = self.telemetry.get_mut(&k) {
+                *row = "unknown".into();
             }
         }
         let ready = self.status == ActorStatus::Connected && actor.is_clear();
