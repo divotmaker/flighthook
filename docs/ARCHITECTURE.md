@@ -1380,11 +1380,11 @@ locates the mat the same way; the detection mode and the club do not apply.
 Mat searches are at least 10 s apart (the one at session start counts):
 requests inside that time are folded into one search with the latest hand,
 run when it ends, and a hand changed back to the one in effect needs none;
-`ready` is false while one waits. Telemetry keys: `ready` (true when the
-device is ready for a putt, false from a ball being detected until it is ready again, and
-false when the connection is lost, before `reconnecting`), `device_state`
-(`finding mat` | `mat found` | `ready` | `ball detected`; a putt result
-changes neither key). After 30 s of discovery without finding the device,
+`ready` is false while one waits. Telemetry keys: `ready` (false while there
+is no mat: none found yet, or a mat search is running or waiting; false while the
+device is silent; and false when the connection is lost, before `reconnecting`),
+`device_state` (`finding mat` | `mat found` | `ready` | `ball detected`;
+`ball detected` from a ball being set down until the putt's result, then `ready`). After 30 s of discovery without finding the device,
 one `alert` (`warn`) suggests entering its IP address on the device card
 (the driver's hint, worded for the card by the card's `on_frp`). Each putt
 is a shot:
