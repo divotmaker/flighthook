@@ -282,8 +282,6 @@ impl FlighthookApp {
             .map(|c| c.message());
         let form = card.form.and_then(|idx| self.settings.actors.get_mut(idx));
         let dirty = form.as_ref().is_some_and(|f| f.dirty());
-        let still = (entry_type(&card.id) == "camera")
-            .then(|| self.stills.entry(card.id.clone()).or_default());
         // A failed reconnect request shows as the card's `error`, like an
         // error the actor reports. An ownership conflict is added to
         // the card's own error in the same row.
@@ -334,7 +332,16 @@ impl FlighthookApp {
             cameras: &self.camera_list,
             remote: false,
         };
-        device_card(ui, &card.id, &view, form, still)
+        let mut live = (entry_type(&card.id) == "camera").then(|| CardLive {
+            view: self.live.get_mut(&card.id),
+            on_screen: false,
+        });
+        let action = device_card(ui, &card.id, &view, form, live.as_mut());
+        if live.is_some_and(|l| l.on_screen) {
+            self.card_live.insert(card.id.clone());
+            self.fetch_live_frames(ui.ctx());
+        }
+        action
     }
 
     /// The ownership conflict row of local card `card`: the Web
@@ -395,10 +402,6 @@ impl FlighthookApp {
             (CardAction::Reconnect, _) => self.reconnect(ctx, id),
             (CardAction::ForgetPairing, _) => self.forget_pairing(ctx, id),
             (CardAction::Enable(on), _) => self.set_enabled(ctx, id, on),
-            (CardAction::Still, _) => {
-                #[cfg(not(test))]
-                net::fetch_still(ctx, &self.pending, id);
-            }
             (CardAction::RefreshCameras, _) => self.refresh_cameras(ctx),
             (CardAction::Save, Some(_)) => self.post_save(ctx, SaveTarget::Actor(id.to_string())),
             (CardAction::Cancel, Some(idx)) => self.cancel_device(idx),

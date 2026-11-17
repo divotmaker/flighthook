@@ -2939,7 +2939,8 @@ fn cameras_are_not_routing_monitors() {
 }
 
 #[test]
-fn a_running_cameras_card_fetches_and_shows_a_still_frame() {
+fn a_running_cameras_card_shows_its_live_view_while_it_is_on_screen() {
+    use crate::net::{LiveReply, PoseState};
     use stance::{Source, TestPattern, TestPatternConfig};
 
     let screen = Screen::one_section(1600.0, 1000.0);
@@ -2950,24 +2951,32 @@ fn a_running_cameras_card_fetches_and_shows_a_still_frame() {
     );
     let _ = app.settings.add_actor("camera");
     let mut config = app.settings.to_request();
-    config.camera.get_mut("0").unwrap().camera = "test-pattern".into();
+    let camera = config.camera.get_mut("0").unwrap();
+    camera.camera = "test-pattern".into();
+    camera.rotation_deg = 90;
     app.settings = SettingsForm::default();
     app.settings.load_from(&config);
     let id = "camera.0";
-    let marks = screen.frame(&mut app, Vec::new());
-    assert!(!enabled(&marks, &format!("still:{id}")), "not running");
+    // Two screen updates, each starting as the app's does.
+    let frames = |app: &mut FlighthookApp| {
+        app.sync_live_views(&screen.0);
+        screen.frame(app, Vec::new());
+        app.sync_live_views(&screen.0);
+        screen.frame(app, Vec::new())
+    };
+    let marks = frames(&mut app);
+    assert!(app.live.is_empty(), "not running: no live view");
+    assert!(
+        !marks.contains_key(&format!("still:{id}")),
+        "no Still button"
+    );
 
     app.actors.insert(
         id.into(),
         ActorStatusResponse::new("Camera", ActorStatus::Connected),
     );
-    let marks = screen.frame(&mut app, Vec::new());
-    let marks = screen.click_mark(&mut app, &marks, &format!("still:{id}"));
-    assert!(
-        !enabled(&marks, &format!("still:{id}")),
-        "waiting for the frame"
-    );
-    assert!(app.stills[id].loading);
+    frames(&mut app);
+    let view = app.live.get(id).expect("a live view while the card shows");
 
     let mut config = TestPatternConfig::default();
     config.width = 160;
@@ -2978,27 +2987,46 @@ fn a_running_cameras_card_fetches_and_shows_a_still_frame() {
         .next_frame(std::time::Duration::ZERO)
         .unwrap()
         .unwrap();
-    app.pending
-        .lock()
-        .unwrap()
-        .stills
-        .push((id.into(), Ok(frame.jpeg.to_vec())));
-    app.apply_pending();
+    let view_id = view.id;
+    app.live_replies(
+        vec![(
+            view_id,
+            LiveReply::Frame {
+                seq: 1,
+                jpeg: frame.jpeg.to_vec(),
+                pose: None,
+                state: PoseState::default(),
+            },
+        )],
+        0.0,
+    );
     let marks = screen.frame(&mut app, Vec::new());
-    assert!(enabled(&marks, &format!("still:{id}")));
-    let (image, _) = marks[&format!("still_image:{id}")];
+    let (image, _) = marks[&format!("card_live:{id}")];
     let (card, _) = marks[&format!("card:{id}")];
     assert!(card.contains_rect(image), "in its page");
-    assert!((image.height() / image.width() - 90.0 / 160.0).abs() < 0.02);
-    // Under the telemetry block, at its width; the block keeps its
-    // height.
+    // Turned a quarter by the card's rotation, and no taller than the page.
+    assert!((image.height() / image.width() - 160.0 / 90.0).abs() < 0.02);
     let (telemetry, _, _) = screen.bodies()[&format!("{id}.telemetry")];
     assert!(image.top() >= telemetry.bottom());
+    assert!((telemetry.height() - TELEMETRY_HEIGHT).abs() < 0.5);
+
+    // Upright: at the telemetry block's width, under it.
+    let mut config = app.settings.to_request();
+    config.camera.get_mut("0").unwrap().rotation_deg = 0;
+    app.settings = SettingsForm::default();
+    app.settings.load_from(&config);
+    let marks = frames(&mut app);
+    let (image, _) = marks[&format!("card_live:{id}")];
+    assert!((image.height() / image.width() - 90.0 / 160.0).abs() < 0.02);
     assert!(
         image.width() > telemetry.width() * 0.8,
         "at the block's width"
     );
-    assert!((telemetry.height() - TELEMETRY_HEIGHT).abs() < 0.5);
+
+    // Another page: the view goes.
+    app.select_item(SettingsSection::Cameras, SettingsItem::BodyTracking);
+    frames(&mut app);
+    assert!(app.live.is_empty(), "the card is off screen");
 }
 
 #[test]

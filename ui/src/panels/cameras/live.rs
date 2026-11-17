@@ -137,7 +137,7 @@ impl Tuning {
 /// One camera's live view: its fetch loop and the picture on screen.
 pub(crate) struct LiveView {
     /// The number its replies carry.
-    pub(super) id: u64,
+    pub(crate) id: u64,
     /// A request is out.
     pub(super) in_flight: bool,
     /// The sequence number of the frame received last.
@@ -256,10 +256,33 @@ impl LiveView {
         self.texture.as_ref()
     }
 
+    /// Whether a picture is shown.
+    pub(crate) fn has_picture(&self) -> bool {
+        self.texture.is_some()
+    }
+
     /// Height over width of the picture, once one is shown.
     pub(super) fn aspect(&self) -> Option<f32> {
         let [w, h] = self.texture.as_ref()?.size();
         (w > 0).then(|| h as f32 / w as f32)
+    }
+}
+
+/// A camera card's live picture: `view`'s newest frame turned clockwise by
+/// `rotation` degrees, as large as the space left in `ui` holds; nothing
+/// before the first frame.
+pub(crate) fn card_picture(ui: &mut egui::Ui, actor: &str, view: &mut LiveView, rotation: u16) {
+    let ctx = ui.ctx().clone();
+    if let Some(tex) = view.texture(&ctx, actor).cloned() {
+        let size = crate::pose::turned_size(tex.size_vec2(), rotation);
+        let width = if size.y > 0.0 {
+            ui.available_width()
+                .min(ui.available_height() * size.x / size.y)
+        } else {
+            ui.available_width()
+        };
+        let shown = replay::picture(ui, &tex, width, rotation);
+        devices::mark(ui, || format!("card_live:{actor}"), &shown);
     }
 }
 
@@ -406,20 +429,29 @@ impl FlighthookApp {
         }
     }
 
-    /// Keep one live view per saved camera while Live is on screen, and
-    /// none otherwise. Live is deselected once no camera is left.
+    /// Keep one live view per saved camera while Live is on screen, and per
+    /// saved camera whose card showed its live picture in the last screen
+    /// update ([`card_picture`]); none otherwise. Live is deselected once no
+    /// camera is left.
     pub(crate) fn sync_live_views(&mut self, ctx: &egui::Context) {
         if self.settings.loaded && !self.cameras_shown() {
             self.live_selected = false;
         }
-        if !self.live_shown() || !page_visible(ctx) {
+        let on_cards = std::mem::take(&mut self.card_live);
+        if !page_visible(ctx) {
             self.live.clear();
             return;
         }
-        let cameras = self.settings.cameras_on();
-        self.live
-            .retain(|actor, _| cameras.iter().any(|(id, _)| id == actor));
-        for (actor, _) in cameras {
+        let live = self.live_shown();
+        let wanted: Vec<String> = self
+            .settings
+            .cameras_on()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| live || on_cards.contains(id))
+            .collect();
+        self.live.retain(|actor, _| wanted.contains(actor));
+        for actor in wanted {
             if !self.live.contains_key(&actor) {
                 self.live_seq += 1;
                 self.live.insert(actor, LiveView::new(self.live_seq));
@@ -438,7 +470,7 @@ impl FlighthookApp {
     }
 
     /// Send each live view's next request, when it is due.
-    pub(super) fn fetch_live_frames(&mut self, ctx: &egui::Context) {
+    pub(crate) fn fetch_live_frames(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
         for (actor, view) in &mut self.live {
             if let Some(after) = view.due(now) {

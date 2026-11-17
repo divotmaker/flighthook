@@ -1,9 +1,11 @@
 'use strict';
 // screens/devices.png and screens/devices-settings.png: Settings, the Mock
 // launch monitor's page (an Open Connect launch monitor beside it in the
-// list); then the test-pattern camera's page, its telemetry beside its
-// settings, its Rotation in sight under the camera. GSPro is configured too
-// (Settings, Software).
+// list); then the camera's page, its telemetry beside its settings, its live
+// view under the telemetry and its Rotation in sight. The camera plays one
+// color-bars frame over and over (`still.avi` in the scene's folder), so the
+// live view holds still.
+// GSPro is configured too (Settings, Software).
 //
 // The cards show ports, so this scene uses fixed ones. The Open Connect
 // monitor sends six 7-iron shots; the Mock's first shot comes 33 s after it
@@ -12,7 +14,10 @@
 // browser's (a status check) and settles across a telemetry update (every
 // 5 s).
 
-const { sleep } = require('../lib/util');
+const fs = require('node:fs');
+const path = require('node:path');
+const { writeClip } = require('../lib/avi');
+const { run, sleep } = require('../lib/util');
 const { Monitor, Simulator } = require('../lib/openconnect');
 
 const MOCK_FIRST_SHOT_MS = 33000;
@@ -66,7 +71,7 @@ bind = "127.0.0.1:${ports.monitor}"
 
 [camera.0]
 name = "Golfer Back"
-camera = "test-pattern"
+camera = "clip:still.avi"
 position = "golfer_back"
 mode = "auto"
 rotation_deg = 90
@@ -77,6 +82,14 @@ address = "127.0.0.1:${ports.gspro}"
 `,
 
   async before(ctx) {
+    // One frame of ffmpeg's color bars, as a clip of its own.
+    const jpeg = path.join(ctx.dir, 'still.jpg');
+    await run(process.env.FFMPEG || 'ffmpeg', ['-nostdin', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'smptebars=size=1280x720:rate=1', '-frames:v', '1',
+      '-c:v', 'mjpeg', '-q:v', '2', '-pix_fmt', 'yuvj420p', jpeg]);
+    writeClip(path.join(ctx.dir, 'still'), [fs.readFileSync(jpeg)], {
+      width: 1280, height: 720, fps: 30, tNs: [0], impactNs: 0,
+    });
     ctx.gspro = new Simulator(ctx.ports.gspro);
     ctx.cleanup.push(() => ctx.gspro.close());
     await ctx.gspro.listen();

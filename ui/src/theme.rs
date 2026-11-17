@@ -774,8 +774,6 @@ pub(crate) enum Icon {
     Info,
     /// `search`.
     Search,
-    /// `device-camera`.
-    Camera,
     /// `debug-disconnect`.
     Disconnect,
 }
@@ -796,7 +794,6 @@ impl Icon {
             Icon::Export => '\u{ebac}',
             Icon::Info => '\u{ea74}',
             Icon::Search => '\u{ea6d}',
-            Icon::Camera => '\u{eada}',
             Icon::Disconnect => '\u{ead0}',
         }
     }
@@ -957,7 +954,7 @@ mod tests {
         // Codepoints from Codicons' mapping.json: play 60204, debug-pause
         // 60113, chevron-left 60085, chevron-right 60086,
         // device-camera-video 60121, refresh 60215, download 60532, export
-        // 60332, search 60013, device-camera 60122, debug-disconnect 60112.
+        // 60332, search 60013, debug-disconnect 60112.
         let icons = [
             (Icon::Play, '\u{eb2c}'),
             (Icon::Pause, '\u{ead1}'),
@@ -968,7 +965,6 @@ mod tests {
             (Icon::Download, '\u{ec74}'),
             (Icon::Export, '\u{ebac}'),
             (Icon::Search, '\u{ea6d}'),
-            (Icon::Camera, '\u{eada}'),
             (Icon::Disconnect, '\u{ead0}'),
         ];
         let ctx = egui::Context::default();

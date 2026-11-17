@@ -1,4 +1,4 @@
-//! Camera pictures: a camera card's still frame, the replay view, a modal
+//! Camera pictures: the replay view, a modal
 //! over the Shots tab that plays a shot's clips side by side, the same
 //! player inline in the Cameras tab (with each clip's swing
 //! analysis), and the camera cards in the Cards view's row beside the range
@@ -60,7 +60,7 @@ pub(crate) fn texture(
 
 /// A picture turned clockwise by `rotation` degrees and scaled to `width`,
 /// keeping its aspect.
-fn picture(
+pub(crate) fn picture(
     ui: &mut egui::Ui,
     tex: &egui::TextureHandle,
     width: f32,
@@ -71,93 +71,6 @@ fn picture(
     let (rect, response) = ui.allocate_exact_size(size * scale, egui::Sense::hover());
     crate::pose::paint_turned(ui, tex.id(), rect, rotation, egui::CornerRadius::ZERO);
     response
-}
-
-// ---------------------------------------------------------------------------
-// Still frame
-// ---------------------------------------------------------------------------
-
-/// A camera card's still frame.
-#[derive(Default)]
-pub(crate) struct Still {
-    /// A request is out.
-    pub(crate) loading: bool,
-    /// The last frame received, not decoded yet.
-    jpeg: Option<Vec<u8>>,
-    texture: Option<egui::TextureHandle>,
-    /// Why there is no frame.
-    pub(crate) error: Option<String>,
-}
-
-impl Still {
-    /// Take the server's reply.
-    pub(crate) fn reply(&mut self, reply: Result<Vec<u8>, String>) {
-        self.loading = false;
-        match reply {
-            Ok(jpeg) => {
-                self.jpeg = Some(jpeg);
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e),
-        }
-    }
-
-    /// Whether [`still_picture`] shows a frame or why there is none.
-    pub(crate) fn shown(&self) -> bool {
-        self.jpeg.is_some() || self.texture.is_some() || self.error.is_some()
-    }
-
-    /// The frame as a texture, decoding a newly received one.
-    fn texture(&mut self, ctx: &egui::Context, actor: &str) -> Option<&egui::TextureHandle> {
-        if let Some(jpeg) = self.jpeg.take() {
-            match texture(ctx, format!("still:{actor}"), &jpeg) {
-                Some(tex) => self.texture = Some(tex),
-                None => self.error = Some("the frame did not decode".to_owned()),
-            }
-        }
-        self.texture.as_ref()
-    }
-}
-
-/// A camera page's Still frame icon, for its header. It needs a
-/// running camera and no request out. Returns whether it was clicked: the
-/// caller fetches the frame.
-pub(crate) fn still_button(
-    ui: &mut egui::Ui,
-    actor: &str,
-    still: &mut Still,
-    running: bool,
-) -> bool {
-    let clicked = devices::header_icon(
-        ui,
-        theme::Icon::Camera,
-        "Still frame",
-        &format!("still:{actor}"),
-        running && !still.loading,
-    );
-    if clicked {
-        still.loading = true;
-        still.error = None;
-    }
-    clicked
-}
-
-/// A camera card's still frame, once fetched, turned clockwise by
-/// `rotation` degrees at the card's width, or why there is none.
-pub(crate) fn still_picture(ui: &mut egui::Ui, actor: &str, still: &mut Still, rotation: u16) {
-    let ctx = ui.ctx().clone();
-    if let Some(tex) = still.texture(&ctx, actor) {
-        ui.add_space(4.0);
-        let shown = picture(ui, tex, ui.available_width(), rotation);
-        devices::mark(ui, || format!("still_image:{actor}"), &shown);
-    }
-    if let Some(error) = &still.error {
-        ui.label(
-            egui::RichText::new(error)
-                .size(11.0)
-                .color(theme::TEXT_MUTED),
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------

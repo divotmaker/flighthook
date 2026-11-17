@@ -18,9 +18,10 @@
 //!   a repaint; it is decoded on the next screen update into the view's
 //!   texture, and the keypoints and posture that came with it (`X-Pose`) are
 //!   drawn with that picture, so they always match it. The loops run only
-//!   while Live is on screen: elsewhere, or with the window minimized or
-//!   the browser tab hidden, the views are dropped, and the server stops
-//!   updating the live frames a few seconds later.
+//!   while Live is on screen, or a camera's card shows its live picture on
+//!   the Devices tab ([`card_picture`]): elsewhere, or with the window
+//!   minimized or the browser tab hidden, the views are dropped, and the
+//!   server stops updating the live frames a few seconds later.
 //!
 //! Body tracking's settings are on the Devices tab's Body tracking card; a
 //! single line under the live views reads out the values and each camera's

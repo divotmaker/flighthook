@@ -35,8 +35,6 @@ pub struct Pending {
     pub auto_chip: Option<Result<(), String>>,
     /// The reply to `GET /api/cameras`: the camera list, or why not.
     pub cameras: Option<Result<CameraListResponse, String>>,
-    /// Still frames by camera actor: the JPEG, or why there is none.
-    pub stills: Vec<(String, Result<Vec<u8>, String>)>,
     /// Answered reconnects, by actor: how, or why not.
     pub reconnects: Vec<(String, Result<Reconnected, String>)>,
     /// Replies for the replay view.
@@ -524,30 +522,6 @@ pub fn fetch_cameras(ctx: &egui::Context, pending: &PendingHandle) {
         });
         if let Ok(mut p) = pending.lock() {
             p.cameras = Some(reply);
-        }
-        ctx.request_repaint();
-    });
-}
-
-/// Fetch camera `actor`'s latest frame (`GET /api/cameras/{actor}/still`)
-/// into `stills`.
-pub fn fetch_still(ctx: &egui::Context, pending: &PendingHandle, actor: &str) {
-    let ctx = ctx.clone();
-    let pending = Arc::clone(pending);
-    let actor = actor.to_owned();
-    let url = format!("{}/api/cameras/{actor}/still", api_base());
-    ehttp::fetch(ehttp::Request::get(&url), move |result| {
-        let reply = result.and_then(|resp| {
-            if resp.ok {
-                Ok(resp.bytes)
-            } else if resp.status == 404 {
-                Err("no frame yet".to_owned())
-            } else {
-                Err(error_reason(&resp))
-            }
-        });
-        if let Ok(mut p) = pending.lock() {
-            p.stills.push((actor, reply));
         }
         ctx.request_repaint();
     });

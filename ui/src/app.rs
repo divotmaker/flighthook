@@ -220,8 +220,9 @@ pub struct FlighthookApp {
     pub(crate) config_error: Option<crate::types::ConfigLoadError>,
     /// The camera list for the camera cards' pickers.
     pub(crate) camera_list: CameraList,
-    /// Each camera card's still frame, by actor ID.
-    pub(crate) stills: HashMap<String, crate::panels::replay::Still>,
+    /// The camera cards whose live picture was on screen in the last
+    /// screen update, by actor ID: the next one keeps their live views.
+    pub(crate) card_live: HashSet<String>,
     /// The open replay view.
     pub(crate) replay: Option<crate::panels::replay::ReplayView>,
     /// Number of the last replay or camera card clip opened: replies for
@@ -377,7 +378,7 @@ impl FlighthookApp {
             clip_dir: None,
             config_error: None,
             camera_list: CameraList::default(),
-            stills: HashMap::new(),
+            card_live: HashSet::new(),
             replay: None,
             replay_seq: 0,
             card_row: crate::panels::card_row::CardRow::default(),
@@ -476,7 +477,6 @@ impl FlighthookApp {
             }
         }
         let reconnects = std::mem::take(&mut p.reconnects);
-        let stills = std::mem::take(&mut p.stills);
         let replies = std::mem::take(&mut p.replay);
         let live = std::mem::take(&mut p.live);
         let tuning = p.tuning.take();
@@ -518,9 +518,6 @@ impl FlighthookApp {
             self.reconnect_reply(actor, reply);
         }
         self.expire_reconnects();
-        for (actor, reply) in stills {
-            self.stills.entry(actor).or_default().reply(reply);
-        }
         self.live_replies(live, self.now_ms as f64 / 1000.0);
         if let Some(reply) = tuning {
             self.tuning.reply(reply);

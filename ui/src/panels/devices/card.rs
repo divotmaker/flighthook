@@ -2,6 +2,7 @@
 //! regions, painting the page, and what a click on it asks for.
 
 use super::*;
+use crate::panels::cameras::{self, LiveView};
 
 /// A device card: an actor ID, and its entry in the settings form (an index
 /// into its actors) when the actor is configured.
@@ -81,8 +82,6 @@ pub(super) enum CardAction {
     Cancel,
     Remove,
     FindMat,
-    /// Fetch the camera's still frame.
-    Still,
     /// Look for cameras again.
     RefreshCameras,
     /// Stop the actor and start it again.
@@ -91,6 +90,14 @@ pub(super) enum CardAction {
     ForgetPairing,
     /// Turn the card on (`true`) or off, saved at once.
     Enable(bool),
+}
+
+/// A camera card's live view.
+pub(super) struct CardLive<'a> {
+    /// The picture's fetch loop, once the app has started one.
+    pub(super) view: Option<&'a mut LiveView>,
+    /// The picture's place was on screen in this update.
+    pub(super) on_screen: bool,
 }
 
 /// How a device card is drawn.
@@ -174,10 +181,9 @@ pub(crate) fn header_icon(
 
 /// One device page. Its header holds the name, the on/off switch
 /// (`view.switch`) and, on the right, the status chip, then the action
-/// icons: Find mat on an ExPutt's (enabled while it is connected), Still
-/// frame on a camera's (`still`), Forget pairing on a Pureplay Accessory's,
+/// icons: Find mat on an ExPutt's (enabled while it is connected), Forget pairing on a Pureplay Accessory's,
 /// Reconnect and Remove; Save and Cancel instead of the icons while its
-/// settings have unsaved edits. Under it, the telemetry (and a camera's still frame) on the left
+/// settings have unsaved edits. Under it, the telemetry (and a camera's live view) on the left
 /// in a block of fixed height that scrolls inside, the settings on the
 /// right, scrolling inside the page. A page the settings don't hold shows
 /// its telemetry only. Reconnect is disabled while one is in flight, while
@@ -188,7 +194,7 @@ pub(super) fn device_card(
     id: &str,
     view: &CardView<'_>,
     form: Option<&mut ActorFormEntry>,
-    mut still: Option<&mut crate::panels::replay::Still>,
+    live: Option<&mut CardLive<'_>>,
 ) -> Option<CardAction> {
     let accent = view.telemetry.map_or(theme::TEXT_DIM, |a| {
         monitoring::status_color(a, view.now_ms)
@@ -292,11 +298,6 @@ pub(super) fn device_card(
                 {
                     action = Some(CardAction::FindMat);
                 }
-                if let Some(still) = still.as_deref_mut().filter(|_| !dirty)
-                    && crate::panels::replay::still_button(ui, id, still, connected)
-                {
-                    action = Some(CardAction::Still);
-                }
                 if let Some(actor) = view.telemetry {
                     let badge = theme::badge(ui, actor.state().label(), accent);
                     mark(ui, || format!("badge:{id}"), &badge);
@@ -337,20 +338,32 @@ pub(super) fn device_card(
         if stacked {
             height = height.min(area.height() * STACKED_TELEMETRY_SHARE);
         }
+        let live_shown = live
+            .as_deref()
+            .and_then(|l| l.view.as_deref())
+            .is_some_and(LiveView::has_picture);
         let telemetry_key = format!("{id}.telemetry");
         scrolled_region(&mut column, &telemetry_key, height, |ui| {
             // With nothing to show, the actor's state instead.
             if let Some(actor) = view.telemetry {
-                if monitoring::has_telemetry(actor) || still.as_deref().is_some_and(|s| s.shown()) {
+                if monitoring::has_telemetry(actor) || live_shown {
                     monitoring::telemetry_body(ui, id, actor);
                 } else {
                     monitoring::no_telemetry(ui, id, actor, accent);
                 }
             }
         });
-        if let Some(still) = still {
+        if let Some(live) = live {
             column.add_space(8.0);
-            crate::panels::replay::still_picture(&mut column, id, still, view.rotation);
+            live.on_screen =
+                connected && column.is_rect_visible(column.available_rect_before_wrap());
+            if live.on_screen {
+                match live.view.as_deref_mut() {
+                    Some(view_) => cameras::card_picture(&mut column, id, view_, view.rotation),
+                    // The app starts the view in its next update.
+                    None => column.ctx().request_repaint(),
+                }
+            }
         }
         let settings_top = if stacked {
             column.min_rect().bottom() + 12.0

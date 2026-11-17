@@ -3428,7 +3428,7 @@ naming the other actor.
 Each web server, launch monitor, camera and output has a page: its header,
 then its telemetry beside its settings, both visible. The telemetry sits on
 the left in a block of fixed height (240 points) that scrolls inside, so
-nothing beside or under it moves as rows come and go; a camera's still frame
+nothing beside or under it moves as rows come and go; a camera's live view
 shows under it. The settings fill the rest of the page and scroll inside it.
 On the phone the telemetry block goes over the settings. A remote actor's
 page, or a running actor's the settings don't list, shows its telemetry only.
@@ -3489,7 +3489,7 @@ which is left out once it would be cut to a stub.
   status color while the actor is starting, connecting or reconnecting, and
   a check in a ring in the connected green once it is connected
   (`monitoring::no_telemetry`, `theme::loading_ring` / `connected_ring`). It
-  goes as soon as a row arrives; a camera's still frame takes its place too.
+  goes as soon as a row arrives; a camera's live view takes its place too.
   Only a spinner on screen asks for repaints (about 30 a second). Every launch
   monitor and output card (Mevo/Xi, R10, Square Golf, ExPutt, Trackball, the
   Open Connect server, the mock monitor, the Open Connect clients, Random club
@@ -3508,8 +3508,7 @@ which is left out once it would be cut to a stub.
   why), shows its reason as the card's `error` row and in the error banner,
   as an error the actor reports does, until the actor's next status or the
   next press. An ExPutt's **Find mat** icon (Codicons `search`) sits left of it (enabled while the ExPutt is
-  connected), and a camera has the **Still frame** icon (Codicons `device-camera`) instead, its frame shown under
-  the telemetry. Each header icon shows its name as its hover (or touch) tip. The plain forms and the
+  connected); a camera's page shows its live view under the telemetry instead. Each header icon shows its name as its hover (or touch) tip. The plain forms and the
   cameras have no Reconnect.
 - **Settings**: the instance's fields in a label column. The **Remove**
   icon (Codicons `trash`; every card but the web server's) asks for
@@ -3523,7 +3522,7 @@ which is left out once it would be cut to a stub.
 #### Page height
 
 Every page is as tall as Settings. Telemetry that arrives, an edit, a
-validation message, an error line or a still frame never changes its
+validation message, an error line or a live view never changes its
 height. Inside a page the header stays at the top, with the "Save or cancel
 your changes" hint and a failed save's line under it; the settings (or a
 plain form's rows) scroll inside the page when they do not fit, with egui's
@@ -3641,11 +3640,13 @@ displayed).
   sign in words under it) and Pitch (`camera_pitch:<id>`), the angles' range
   under them while out of range. The body scrolls to Yaw and Pitch. Save needs a camera, a mode
   and every value in range. They are left out of the
-  Open Connect clients' routing dropdowns. Its page's header holds
-  the **Still frame** icon, enabled while the camera is connected: it fetches
-  [`GET /api/cameras/{actor}/still`](API.md#get-apicamerasactorstill) and
-  shows the frame under the telemetry, at its width (decoded like the replay's frames),
-  turned by the card's rotation
+  Open Connect clients' routing dropdowns. While the camera is
+  connected and its page is on screen (not scrolled away, not another page,
+  the window not minimized or the browser tab hidden), the page shows the
+  camera's live view under the telemetry: the Shots tab's live picture
+  (`GET /api/cameras/{actor}/live`), turned by the card's rotation and as
+  large as the space under the telemetry holds. Its fetch loop stops when
+  the page leaves the screen
 - The Body tracking card (alpha, Cameras, after Replay) holds every
   `[body_tracking]` field, in this order: Mode (`mode`, Off | Historical |
   Live, pills like Model's), Model (`model`, RTMPose-m | RTMPose-s), Show
