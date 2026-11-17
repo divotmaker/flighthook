@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 
 use flighthook::{OpenConnectClientConfig, OpenConnectClientSection};
 use flighthook_openconnect::client::{Client, mapper, output_shot};
-use flightrelay::{ShotAggregator, ShotEvent};
+use flightrelay::{ShotAccumulator, ShotEvent};
 
 use super::*;
 
@@ -388,7 +388,7 @@ fn an_auto_chip_is_sent_whatever_the_routing() {
                 .any(|m| matches!(m.body, FrpBody::ShotFlight(_))),
             "{mode:?}: no Auto-chip flight"
         );
-        let mut shots = ShotAggregator::new();
+        let mut shots = ShotAccumulator::new();
         let done = handed
             .iter()
             .find_map(|m| match shots.feed(m) {

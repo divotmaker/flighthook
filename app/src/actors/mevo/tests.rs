@@ -1,6 +1,6 @@
 use flighthook::{DeviceSection, Launch, ShotKey, SpinSource};
 use flightrelay::ShotLaunch;
-use flightrelay::driver::{DeviceEvent, DeviceIdentity, FrpDriver, TurnHints};
+use flightrelay::driver::{DeviceEvent, DeviceIdentity, FrpDriver, FrpSession, TurnHints};
 use ironsight::protocol::shot::{FlightResult as D4, FlightResultV1};
 use ironsight::protocol::{TYPE_CLUB_RESULT, TYPE_FLIGHT_RESULT, TYPE_FLIGHT_RESULT_V1};
 use ironsight::testing::{FakeDevice, Shot, fixtures};

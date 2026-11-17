@@ -31,11 +31,7 @@ pub fn output_shot(shot: &CompletedShot, actor: &str) -> OutputShot {
         shot_number: shot.key.shot_number,
         shot_id: Some(shot.key.shot_id.clone()),
         launch: shot.launch_for_flight(),
-        flight: shot
-            .flights
-            .iter()
-            .find(|f| f.from == shot.from)
-            .map(|f| f.flight.clone()),
+        flight: shot.own_flight().cloned(),
         club: shot.club.clone(),
         impact: shot.impact.clone(),
         source: shot.source,

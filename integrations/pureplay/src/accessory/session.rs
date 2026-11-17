@@ -4,7 +4,7 @@
 //! [`FrpDriver::connect`] opens the WebSocket and runs the link's opening
 //! (`hello`, pairing, `subscribe` and the snapshot) to its end; the session
 //! then follows the round. The opening and the round are one step function
-//! ([`Session::step_at`]), so a test drives both over a fake [`Link`] in
+//! ([`FrpSession::step`]), so a test drives both over a fake [`Link`] in
 //! virtual time.
 //!
 //! What the card keeps across links (the token, the round model, the shot
@@ -385,7 +385,7 @@ impl Accessory {
         let addr = self.addr();
         let mut session = Session::new(link, Arc::clone(&self.card), addr);
         loop {
-            let activity = session.step_at(ctx.now(), &mut ctx.out)?;
+            let activity = session.step(ctx.now(), &mut ctx.out)?;
             if session.following() {
                 return Ok(session);
             }
@@ -548,9 +548,8 @@ enum Read {
     Closed(Option<u16>),
 }
 
-/// One link to Pureplay over `L`, from `hello` to its end. Over a WebSocket
-/// it is the driver's [`FrpSession`]; over any other `L` a test steps it
-/// with [`step_at`](Self::step_at).
+/// One link to Pureplay over `L`, from `hello` to its end: the driver's
+/// [`FrpSession`], over a WebSocket, or over any other `L` in a test.
 #[derive(Debug)]
 pub struct Session<L = WsLink> {
     link: L,
@@ -574,15 +573,31 @@ pub struct Session<L = WsLink> {
     saved: Option<Token>,
 }
 
-impl FrpSession for Session<WsLink> {
-    type Driver = Accessory;
+impl<L: Link> FrpSession for Session<L> {
+    type Error = Error;
+    type Action = NoAction;
 
+    /// One pass at `now`: what the bus handed, then at most one frame and
+    /// what is due. An `Err` ends the link; the card's game state leaves
+    /// the bus first.
+    ///
+    /// # Errors
+    ///
+    /// Returns how the link ended.
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        self.step_at(now, out)
+        let card = Arc::clone(&self.card);
+        let mut card = lock(&card);
+        let stepped = self.step_with(&mut card, now, out);
+        if stepped.is_err() {
+            card.end_link(out);
+        }
+        card.show(out);
+        stepped
     }
 
-    fn bus(&mut self, msg: &FrpMessage) -> Result<(), Error> {
-        self.hand(msg);
+    /// A bus message for the link, taken at the next step.
+    fn bus(&mut self, msg: &FrpMessage, _: &mut Events<'_>) -> Result<(), Error> {
+        self.inbox.push(msg.clone());
         Ok(())
     }
 
@@ -590,8 +605,10 @@ impl FrpSession for Session<WsLink> {
         &self.identity
     }
 
+    /// The card's game state leaves the bus and the link closes.
     fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
-        self.close_link(out);
+        lock(&self.card).end_link(out);
+        self.link.close();
         Ok(())
     }
 }
@@ -619,35 +636,6 @@ impl<L: Link> Session<L> {
     /// Whether the link follows the round (its opening is done).
     pub(crate) fn following(&self) -> bool {
         matches!(self.phase, Phase::Following)
-    }
-
-    /// A bus message for the link, taken at the next step.
-    pub(crate) fn hand(&mut self, msg: &FrpMessage) {
-        self.inbox.push(msg.clone());
-    }
-
-    /// The card's game state leaves the bus and the link closes.
-    pub(crate) fn close_link(&mut self, out: &mut Events<'_>) {
-        lock(&self.card).end_link(out);
-        self.link.close();
-    }
-
-    /// One pass at `now`: what the bus handed, then at most one frame and
-    /// what is due. An `Err` ends the link; the card's game state leaves
-    /// the bus first.
-    ///
-    /// # Errors
-    ///
-    /// Returns how the link ended.
-    pub fn step_at(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        let card = Arc::clone(&self.card);
-        let mut card = lock(&card);
-        let stepped = self.step_with(&mut card, now, out);
-        if stepped.is_err() {
-            card.end_link(out);
-        }
-        card.show(out);
-        stepped
     }
 
     fn step_with(
@@ -703,7 +691,13 @@ impl<L: Link> Session<L> {
                     code.map_or_else(|| "(no code)".to_owned(), |c| c.to_string()),
                     card.redact(&reason)
                 );
-                out.raw(RawDir::Rx, "close", line.as_bytes());
+                out.wire(
+                    RawDir::Rx,
+                    "close",
+                    line.as_bytes().to_vec(),
+                    flightrelay::utc_ms(),
+                    false,
+                );
                 return Read::Closed(code);
             }
             Frame::Control => return Read::Nothing,
@@ -729,7 +723,13 @@ impl<L: Link> Session<L> {
             card.learn(t);
         }
         let shown = card.redact(&text);
-        out.raw(RawDir::Rx, kind, shown.as_bytes());
+        out.wire(
+            RawDir::Rx,
+            kind,
+            shown.as_bytes().to_vec(),
+            flightrelay::utc_ms(),
+            false,
+        );
         match protocol::parse(&text) {
             Ok(msg) => Read::Msg(msg, shown),
             Err(e) => {
@@ -1162,7 +1162,7 @@ impl<L: Link> Session<L> {
                 self.link.close();
                 return Err(Error::Lost("no answer to pings".into()));
             }
-            out.raw(RawDir::Tx, "ping", &[]);
+            out.wire(RawDir::Tx, "ping", Vec::new(), flightrelay::utc_ms(), false);
             if let Err(e) = self.link.ping() {
                 out.log(Level::Info, format!("ping failed: {e}"));
                 return Err(Error::Lost(format!("ping failed: {e}")));

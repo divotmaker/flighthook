@@ -28,7 +28,7 @@ allsquare = { version = "0.5.0", default-features = false, features = ["config"]
 # The ExPutt driver's settings (`threeputt::config::Config`, the `config`
 # feature: no network code, so the WASM UI builds it too).
 threeputt = { version = "0.2.0", default-features = false, features = ["config"] }
-# The Trackball driver's settings (`thumbswing::Settings`, the `config`
+# The Trackball driver's settings (`thumbswing::Config`, the `config`
 # feature: no device stack, so the WASM UI builds it too).
 thumbswing = { version = "0.0.3", default-features = false, features = ["config"] }
 # The Pureplay cards' settings (`connect::Config`, `accessory::Config`, the

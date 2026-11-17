@@ -14,7 +14,7 @@ use flightrelay::driver::{
 use flightrelay::types::roles;
 use flightrelay::{
     BusActor, Club, CompletedShot, FrpBody, FrpMessage, GolferSelect, Handedness, RawDir, RawFrame,
-    Removal, ShotAggregator, ShotEvent, Source, StateKind,
+    Removal, ShotAccumulator, ShotEvent, Source, StateKind,
 };
 
 use super::api::GsProMessage;
@@ -154,8 +154,8 @@ impl FrpDriver for Client {
 }
 
 /// One connection to the simulator over transport `S`, from the connect to
-/// its end. Over TCP it is the driver's [`FrpSession`]; over any other `S`
-/// a test steps it with [`step_at`](Self::step_at).
+/// its end: the driver's [`FrpSession`], over TCP, or over any other `S`
+/// in a test.
 #[derive(Debug)]
 pub struct Session<S = TcpStream> {
     stream: S,
@@ -176,22 +176,63 @@ pub struct Session<S = TcpStream> {
     hand: Option<Handedness>,
     /// The launch monitors in view: their `bus.actor`, by actor id.
     monitors: BTreeMap<String, BusActor>,
-    shots: ShotAggregator,
+    shots: ShotAccumulator,
     /// Finished shots not sent yet.
     outbox: VecDeque<CompletedShot>,
     /// The time of the last step, which stamps what the session is handed.
     now: Instant,
 }
 
-impl FrpSession for Session<TcpStream> {
-    type Driver = Client;
+impl<S: Read + Write> FrpSession for Session<S> {
+    type Error = Error;
+    type Action = NoAction;
 
+    /// One pass at `now`: what the simulator sent, the shots waiting, then
+    /// the heartbeat when the readiness changed or one is due.
+    ///
+    /// # Errors
+    ///
+    /// Returns what ended the connection: a read or write that failed, or
+    /// the simulator closing it.
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        self.step_at(now, out)
+        self.now = now;
+        let read = self.read(out)?;
+        let sent = self.send_shots(out)?;
+        let ready = self.ready();
+        let beat = if ready != self.ready
+            || now.saturating_duration_since(self.last_heartbeat) >= HEARTBEAT_EVERY
+        {
+            self.heartbeat(ready, out)?;
+            true
+        } else {
+            false
+        };
+        Ok(if read || sent || beat {
+            Activity::Active
+        } else {
+            Activity::Idle
+        })
     }
 
-    fn bus(&mut self, msg: &FrpMessage) -> Result<(), Error> {
-        self.hand(msg);
+    /// Take one message of the session's view of the bus (see the
+    /// [module docs](super)). Reads no clock: it is stamped with the last
+    /// step's time.
+    fn bus(&mut self, msg: &FrpMessage, _: &mut Events<'_>) -> Result<(), Error> {
+        match &msg.body {
+            FrpBody::BusActor(actor) if actor.has_role(roles::LAUNCH_MONITOR) => {
+                self.monitors.insert(msg.from.clone(), actor.clone());
+            }
+            FrpBody::Removed(Removal {
+                kind: StateKind::BusActor,
+                ..
+            }) => {
+                self.monitors.remove(&msg.from);
+            }
+            _ => {}
+        }
+        if let Some(ShotEvent::Finished(shot)) = self.shots.feed_at(msg, self.now) {
+            self.outbox.push_back(shot);
+        }
         Ok(())
     }
 
@@ -227,58 +268,10 @@ impl<S: Read + Write> Session<S> {
             club: None,
             hand: None,
             monitors: BTreeMap::new(),
-            shots: ShotAggregator::new().with_timeout(SHOT_TIMEOUT),
+            shots: ShotAccumulator::new().with_timeout(SHOT_TIMEOUT),
             outbox: VecDeque::new(),
             now,
         }
-    }
-
-    /// Take one message of the session's view of the bus (see the
-    /// [module docs](super)). Reads no clock: it is stamped with the last
-    /// step's time.
-    pub fn hand(&mut self, msg: &FrpMessage) {
-        match &msg.body {
-            FrpBody::BusActor(actor) if actor.has_role(roles::LAUNCH_MONITOR) => {
-                self.monitors.insert(msg.from.clone(), actor.clone());
-            }
-            FrpBody::Removed(Removal {
-                kind: StateKind::BusActor,
-                ..
-            }) => {
-                self.monitors.remove(&msg.from);
-            }
-            _ => {}
-        }
-        if let Some(ShotEvent::Finished(shot)) = self.shots.feed_at(msg, self.now) {
-            self.outbox.push_back(shot);
-        }
-    }
-
-    /// One pass at `now`: what the simulator sent, the shots waiting, then
-    /// the heartbeat when the readiness changed or one is due.
-    ///
-    /// # Errors
-    ///
-    /// Returns what ended the connection: a read or write that failed, or
-    /// the simulator closing it.
-    pub fn step_at(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        self.now = now;
-        let read = self.read(out)?;
-        let sent = self.send_shots(out)?;
-        let ready = self.ready();
-        let beat = if ready != self.ready
-            || now.saturating_duration_since(self.last_heartbeat) >= HEARTBEAT_EVERY
-        {
-            self.heartbeat(ready, out)?;
-            true
-        } else {
-            false
-        };
-        Ok(if read || sent || beat {
-            Activity::Active
-        } else {
-            Activity::Idle
-        })
     }
 
     /// Whether the simulator is told a launch monitor is ready: one in view
@@ -306,7 +299,7 @@ impl<S: Read + Write> Session<S> {
                 label: Some(label.to_owned()),
                 ..RawFrame::new(RawDir::Tx, 0, json)
             })),
-            None => out.raw(RawDir::Tx, label, &json),
+            None => out.wire(RawDir::Tx, label, json, flightrelay::utc_ms(), false),
         }
         Ok(())
     }
@@ -345,7 +338,13 @@ impl<S: Read + Write> Session<S> {
             }
             Err(e) => return Err(Error::Io(e)),
         };
-        out.raw(RawDir::Rx, "response", &buf[..n]);
+        out.wire(
+            RawDir::Rx,
+            "response",
+            buf[..n].to_vec(),
+            flightrelay::utc_ms(),
+            false,
+        );
         let heard = proto::handle_response(&buf[..n], out);
         if let Some((hand, club)) = heard.info {
             if hand.is_some() {

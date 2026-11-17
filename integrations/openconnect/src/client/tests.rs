@@ -9,9 +9,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use flightrelay::driver::{
-    Activity, Backoff, DeviceEvent, FrpDriver, FrpSession, Live, SessionEnd, StatusChange,
+    Activity, Backoff, DeviceEvent, FrpDriver, FrpSession, Live, SessionEnd,
 };
-use flightrelay::testing::TestHost;
+use flightrelay::testing::{TestHost, status};
 use flightrelay::types::roles;
 use flightrelay::{
     BusActor, Club, FrpBody, FrpMessage, GolferSelect, Handedness, RawDir, Removal, ShotFinished,
@@ -106,7 +106,7 @@ impl Link {
 
     fn try_step(&mut self) -> Result<Activity, Error> {
         let Self { host, session, .. } = self;
-        host.with(|now, out| session.step_at(now, out))
+        host.with(|now, out| session.step(now, out))
     }
 
     /// Step until the session idles.
@@ -116,7 +116,9 @@ impl Link {
 
     /// Hand the session a message from actor `from`.
     fn hand(&mut self, from: &str, body: impl Into<FrpBody>) {
-        self.session.hand(&FrpMessage::new(from, body));
+        let Self { host, session, .. } = self;
+        host.bus(session, &FrpMessage::new(from, body))
+            .expect("handed");
     }
 
     /// Hand the session shot `key` of `from`: trigger, the golden ball,
@@ -206,20 +208,6 @@ fn monitor(ready: bool) -> BusActor {
         actor.blockers.push("not_ready".into());
     }
     actor
-}
-
-/// The telemetry set in `events`, the last value of each key (an empty
-/// value for a cleared key).
-fn telemetry(events: &[DeviceEvent]) -> std::collections::HashMap<String, String> {
-    let mut rows = std::collections::HashMap::new();
-    for e in events {
-        if let DeviceEvent::StatusChange(StatusChange::Telemetry(pairs)) = e {
-            for (k, v) in pairs {
-                rows.insert(k.clone(), v.clone().unwrap_or_default());
-            }
-        }
-    }
-    rows
 }
 
 /// The `golfer.select`s in `events`.
@@ -405,7 +393,7 @@ fn the_card_shows_the_connection_and_its_shots() {
         r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"RH","Club":"DR"}}"#,
     );
     link.settle();
-    let rows = telemetry(&link.events());
+    let rows = status(&link.events()).telemetry;
     assert_eq!(rows["response"], "201 GSPro Player Information");
     assert_eq!(rows["monitor_ready"], "true");
     assert_eq!(rows["club"], Club::Driver.to_string());
@@ -454,11 +442,7 @@ fn a_lost_connection_is_a_status_not_an_alert() {
     let error = Error::Io(io::ErrorKind::ConnectionRefused.into());
     let mut delays = Vec::new();
     for connected_for in [None, None, None, None, Some(Duration::from_secs(60))] {
-        let ended = SessionEnd {
-            error: Some(&error),
-            connected_for,
-            attempts: 1,
-        };
+        let ended = SessionEnd::new(Some(&error), connected_for, 1);
         let delay = host.with(|_, out| driver.retry_delay(&ended, &mut Backoff::default(), out));
         delays.push(delay.expect("retries").as_secs());
     }

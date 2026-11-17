@@ -11,19 +11,12 @@ fn a_new_trackball_card_writes_its_name() {
         serde_json::to_string(&section).unwrap(),
         r#"{"name":"Trackball"}"#
     );
-    assert!(!section.driver.config.grab);
-    assert!(!section.driver_settings().config.grab);
+    assert!(!section.driver.detector.grab);
+    assert!(!section.driver_settings().detector.grab);
     assert!(section.enabled);
-    assert_eq!(
-        section.driver,
-        TrackballConfig {
-            config: thumbswing::Config {
-                grab: false,
-                ..thumbswing::Config::default()
-            },
-            ..TrackballConfig::default()
-        }
-    );
+    let mut driver = TrackballConfig::default();
+    driver.detector.grab = false;
+    assert_eq!(section.driver, driver);
 }
 
 /// Every key reads into the driver's settings and writes back the same
@@ -52,9 +45,9 @@ fn a_trackball_section_reads_and_writes_its_keys() {
     assert_eq!(d.club, thumbswing::Club::Driver);
     assert_eq!(d.hand, thumbswing::Hand::default(), "a hand key is ignored");
     assert!(!serde_json::to_string(&section).unwrap().contains("hand"));
-    assert!((d.config.cpi - 800.0).abs() < f64::EPSILON, "an integer");
-    assert!(!d.config.grab);
-    assert!((d.config.thresholds.v_start - 0.08).abs() < f64::EPSILON);
+    assert!((d.detector.cpi - 800.0).abs() < f64::EPSILON, "an integer");
+    assert!(!d.detector.grab);
+    assert!((d.detector.thresholds.v_start - 0.08).abs() < f64::EPSILON);
     assert_eq!(d.tuning.curve_sense, thumbswing::CurveSense::Physical);
 }
 
@@ -65,8 +58,8 @@ fn a_grab_key_is_ignored_and_dropped() {
     for grab in ["true", "false"] {
         let json = format!(r#"{{"name":"Trackball","cpi":800.0,"grab":{grab}}}"#);
         let section: TrackballSection = serde_json::from_str(&json).unwrap();
-        assert!(!section.driver.config.grab, "{json}");
-        assert!(!section.driver_settings().config.grab, "{json}");
+        assert!(!section.driver.detector.grab, "{json}");
+        assert!(!section.driver_settings().detector.grab, "{json}");
         assert_eq!(
             serde_json::to_string(&section).unwrap(),
             r#"{"name":"Trackball","cpi":800.0}"#
@@ -75,8 +68,8 @@ fn a_grab_key_is_ignored_and_dropped() {
     // A section built in code with the grab on still hands the driver
     // the grab off, and writes no key.
     let mut section = TrackballSection::default();
-    section.driver.config.grab = true;
-    assert!(!section.driver_settings().config.grab);
+    section.driver.detector.grab = true;
+    assert!(!section.driver_settings().detector.grab);
     assert_eq!(
         serde_json::to_string(&section).unwrap(),
         r#"{"name":"Trackball"}"#
@@ -95,10 +88,13 @@ fn values_the_driver_refuses_name_the_card_and_field() {
     assert_eq!(config.device_error(), None);
     type Refuse = fn(&mut TrackballConfig);
     let cases: [(Refuse, &str); 5] = [
-        (|d| d.config.cpi = 0.0, "trackball.0: cpi: "),
-        (|d| d.config.report_limit = 0, "trackball.0: report_limit: "),
+        (|d| d.detector.cpi = 0.0, "trackball.0: cpi: "),
         (
-            |d| d.config.thresholds.v_stop = 0.5,
+            |d| d.detector.report_limit = 0,
+            "trackball.0: report_limit: ",
+        ),
+        (
+            |d| d.detector.thresholds.v_stop = 0.5,
             "trackball.0: thresholds.v_stop: ",
         ),
         (
@@ -121,7 +117,7 @@ fn values_the_driver_refuses_name_the_card_and_field() {
         config.trackball.get_mut("0").unwrap().name = "Renamed".into();
         config.trackball.get_mut("0").unwrap().enabled = false;
         assert_eq!(config.changed_device_error(&saved), None, "{prefix}");
-        config.trackball.get_mut("0").unwrap().driver.config.cpi = -1.0;
+        config.trackball.get_mut("0").unwrap().driver.detector.cpi = -1.0;
         assert!(config.changed_device_error(&saved).is_some(), "{prefix}");
     }
 }

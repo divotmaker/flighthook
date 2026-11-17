@@ -4,7 +4,7 @@
 //!
 //! [`BlockStore`] is pure bookkeeping with no I/O. The web layer feeds it the
 //! practice actor's `practice.block` messages and their removals in bus
-//! order, counts a stored shot for the block the SDK aggregator stamped on it
+//! order, counts a stored shot for the block the SDK accumulator stamped on it
 //! at its trigger, and releases it again when the shot leaves the history.
 //! Clear history forgets everything.
 

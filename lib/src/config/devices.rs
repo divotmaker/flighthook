@@ -286,7 +286,7 @@ impl From<TrackballTable> for TrackballSection {
     /// and the hand comes from the turn.
     fn from(table: TrackballTable) -> Self {
         let mut driver = table.driver;
-        driver.config.grab = false;
+        driver.detector.grab = false;
         driver.hand = thumbswing::Hand::default();
         Self {
             name: table.name,
@@ -303,7 +303,7 @@ impl From<TrackballSection> for TrackballTable {
     /// out.
     fn from(section: TrackballSection) -> Self {
         let mut driver = section.driver;
-        driver.config.grab = thumbswing::Config::default().grab;
+        driver.detector.grab = thumbswing::DetectorConfig::default().grab;
         driver.hand = thumbswing::Hand::default();
         Self {
             name: section.name,
@@ -325,7 +325,7 @@ impl DeviceSection for TrackballSection {
     /// The driver's settings with the grab off.
     fn driver_settings(&self) -> TrackballConfig {
         let mut settings = self.driver.clone();
-        settings.config.grab = false;
+        settings.detector.grab = false;
         settings
     }
 

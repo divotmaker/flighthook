@@ -265,11 +265,11 @@ mod tests {
     }
 
     /// A plain FRP 0.3.0 collector, read the way cyberflight's intake reads
-    /// the bus (an SDK `ShotAggregator` over the raw WebSocket), gets the
+    /// the bus (an SDK `ShotAccumulator` over the raw WebSocket), gets the
     /// greeting and then each local shot, without `shot.raw`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_frp_collector_gets_the_greeting_and_each_shot() {
-        use flightrelay::{Launch, ShotAggregator, ShotEvent, ShotFinished, ShotLaunch, Velocity};
+        use flightrelay::{Launch, ShotAccumulator, ShotEvent, ShotFinished, ShotLaunch, Velocity};
         let (state, _writer, _dir) = test_state();
         let state = Arc::new(state);
         if let Ok(mut bus) = state.bus_state.lock() {
@@ -291,7 +291,7 @@ mod tests {
         let (greeted_tx, greeted_rx) = std::sync::mpsc::channel();
         let collector = std::thread::spawn(move || {
             let (mut ws, _) = tungstenite::connect(url).expect("connect");
-            let mut shots = ShotAggregator::default();
+            let mut shots = ShotAccumulator::default();
             let mut kinds = Vec::new();
             loop {
                 let tungstenite::Message::Text(text) = ws.read().expect("read") else {

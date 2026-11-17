@@ -1079,9 +1079,9 @@ async fn settings_save_with_a_refused_trackball_setting_is_400() {
     let live = state.root.system.snapshot();
     type Refuse = fn(&mut flighthook::TrackballConfig);
     let refusals: [(Refuse, &str); 3] = [
-        (|d| d.config.cpi = 0.0, "trackball.0: cpi: "),
+        (|d| d.detector.cpi = 0.0, "trackball.0: cpi: "),
         (
-            |d| d.config.thresholds.v_stop = 1.0,
+            |d| d.detector.thresholds.v_stop = 1.0,
             "trackball.0: thresholds.v_stop: ",
         ),
         (

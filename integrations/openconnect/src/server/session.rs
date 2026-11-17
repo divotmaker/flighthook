@@ -274,7 +274,7 @@ impl Server {
                             reason,
                             self.ids.clone(),
                         );
-                        session.set_hints(ctx.hints());
+                        session.hints = *ctx.hints();
                         return Ok(session);
                     }
                 }
@@ -331,8 +331,8 @@ impl Server {
 }
 
 /// One monitor's connection over transport `S`, from its first message to
-/// its end. Over TCP it is the driver's [`FrpSession`]; over any other `S` a
-/// test steps it with [`step_at`](Self::step_at).
+/// its end: the driver's [`FrpSession`], over TCP, or over any other `S` in
+/// a test.
 #[derive(Debug)]
 pub struct Session<S = TcpStream> {
     stream: S,
@@ -359,15 +359,36 @@ pub struct Session<S = TcpStream> {
     replied_at: Option<Instant>,
 }
 
-impl FrpSession for Session<TcpStream> {
-    type Driver = Server;
+impl<S: Read + Write> FrpSession for Session<S> {
+    type Error = Error;
+    type Action = NoAction;
 
+    /// One pass at `now`: a look at who the peer is, a read of what the
+    /// peer sent, the messages waiting, then the player information when it
+    /// is due.
+    ///
+    /// # Errors
+    ///
+    /// Returns what ended the connection: the monitor leaving, a client of
+    /// this process, a read or write that failed, or garbage.
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        self.step_at(now, out)
+        if let Some(client) = local::client_at(self.peer) {
+            refuse(&self.refusals, &client, self.peer, &self.reason, now, out);
+            return Err(Error::OwnClient);
+        }
+        let read = read_into(&mut self.stream, &mut self.buf)?.is_some();
+        let handled = self.drain(now, out)?;
+        let told = self.send_player_info(now, out)?;
+        Ok(if handled || read || told {
+            Activity::Active
+        } else {
+            Activity::Idle
+        })
     }
 
-    fn hints(&mut self, hints: &TurnHints) -> Result<(), Error> {
-        self.set_hints(hints);
+    /// Take the turn's hints: the hand and club the monitor is told.
+    fn hints(&mut self, hints: &TurnHints, _: &mut Events<'_>) -> Result<(), Error> {
+        self.hints = *hints;
         Ok(())
     }
 
@@ -409,34 +430,6 @@ impl<S: Read + Write> Session<S> {
             player_sent: (None, None),
             replied_at: None,
         }
-    }
-
-    /// Take the turn's hints: the hand and club the monitor is told.
-    pub fn set_hints(&mut self, hints: &TurnHints) {
-        self.hints = *hints;
-    }
-
-    /// One pass at `now`: a look at who the peer is, a read of what the
-    /// peer sent, the messages waiting, then the player information when it
-    /// is due.
-    ///
-    /// # Errors
-    ///
-    /// Returns what ended the connection: the monitor leaving, a client of
-    /// this process, a read or write that failed, or garbage.
-    pub fn step_at(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        if let Some(client) = local::client_at(self.peer) {
-            refuse(&self.refusals, &client, self.peer, &self.reason, now, out);
-            return Err(Error::OwnClient);
-        }
-        let read = read_into(&mut self.stream, &mut self.buf)?.is_some();
-        let handled = self.drain(now, out)?;
-        let told = self.send_player_info(now, out)?;
-        Ok(if handled || read || told {
-            Activity::Active
-        } else {
-            Activity::Idle
-        })
     }
 
     /// Handle every complete message buffered. Returns whether there was
@@ -490,8 +483,20 @@ impl<S: Read + Write> Session<S> {
         }))
         .map_err(io::Error::from)?;
         let key = shot.then(|| self.emit_shot(msg, out));
-        out.raw(RawDir::Rx, if shot { "request" } else { "heartbeat" }, raw);
-        out.raw(RawDir::Tx, "reply", &reply);
+        out.wire(
+            RawDir::Rx,
+            if shot { "request" } else { "heartbeat" },
+            raw.to_vec(),
+            flightrelay::utc_ms(),
+            false,
+        );
+        out.wire(
+            RawDir::Tx,
+            "reply",
+            reply.to_vec(),
+            flightrelay::utc_ms(),
+            false,
+        );
         if let Some(key) = key {
             out.shot_finished(key);
         }
@@ -558,7 +563,13 @@ impl<S: Read + Write> Session<S> {
         }
         let player =
             serde_json::to_vec(&GsProResponse::player(held.0, held.1)).map_err(io::Error::from)?;
-        out.raw(RawDir::Tx, "player", &player);
+        out.wire(
+            RawDir::Tx,
+            "player",
+            player.to_vec(),
+            flightrelay::utc_ms(),
+            false,
+        );
         self.stream.write_all(&player)?;
         self.stream.flush()?;
         self.player_sent = held;

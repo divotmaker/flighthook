@@ -1,7 +1,5 @@
 //! Shot data -> GSPro message conversion.
 
-use flightrelay::types::Launch;
-
 use super::OutputShot;
 use super::api::{BallData, ClubData, GsProMessage, ShotDataOptions};
 
@@ -18,7 +16,7 @@ pub fn map_shot(shot: &OutputShot) -> GsProMessage {
     // carry. A total spin with no axis goes out as backspin with no
     // sidespin.
     let (speed, vla, hla, carry_distance, bs, ss) = if let Some(ref b) = shot.launch {
-        let (back, side) = spin_components(b);
+        let (back, side) = b.spin_components();
         (
             b.launch_speed.map(|v| v.as_mph()).unwrap_or(0.0),
             b.launch_elevation.unwrap_or(0.0),
@@ -105,32 +103,10 @@ pub fn map_shot(shot: &OutputShot) -> GsProMessage {
     }
 }
 
-/// The backspin and sidespin of `launch`, rpm: the device's components, or
-/// those of its total spin and axis; a total spin with no axis is all
-/// backspin, with no sidespin.
-fn spin_components(launch: &Launch) -> (Option<i32>, Option<i32>) {
-    if launch.backspin_rpm.is_some() || launch.sidespin_rpm.is_some() {
-        return (launch.backspin_rpm, launch.sidespin_rpm);
-    }
-    let Some(total) = launch.total_spin_rpm else {
-        return (None, None);
-    };
-    let Some(axis) = launch.spin_axis.filter(|a| a.is_finite()) else {
-        return (Some(total), None);
-    };
-    let mut spin = Launch {
-        total_spin_rpm: Some(total),
-        spin_axis: Some(axis),
-        ..Launch::default()
-    };
-    spin.complete_spin();
-    (spin.backspin_rpm, spin.sidespin_rpm)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use flightrelay::types::{Basis, ClubData as FhClubData, FaceImpact, FlightResult};
+    use flightrelay::types::{Basis, ClubData as FhClubData, FaceImpact, FlightResult, Launch};
     use flightrelay::{Distance, Velocity};
 
     fn shot_with_impact(lateral_mm: f64, vertical_mm: f64) -> OutputShot {
@@ -187,7 +163,7 @@ pub(crate) mod tests {
     }
 
     /// GSPro output for a launch-only shot: no `CarryDistance` appears.
-    pub(crate) const GOLDEN_RH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89998400000002,"SpinAxis":-2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":-300.0,"HLA":-1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Lie":0.0,"Loft":0.0,"Path":0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
+    pub(crate) const GOLDEN_RH: &str = r#"{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":12,"APIversion":"1","BallData":{"Speed":119.89978525411597,"SpinAxis":-2.642545294064724,"TotalSpin":6506.9193939989755,"BackSpin":6500.0,"SideSpin":-300.0,"HLA":-1.2,"VLA":17.0},"ClubData":{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Lie":0.0,"Loft":0.0,"Path":0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":false}}"#;
 
     #[test]
     fn a_launch_only_shot_sends_no_carry() {

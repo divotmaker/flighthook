@@ -35,7 +35,7 @@ flighthook-cameras = { path = "../cameras" }
 # device driver contract the launch monitor actors run on (`driver`) and the
 # mock launch monitor (`mock`); the same crate the lib re-exports its types
 # from. Neither feature adds a dependency.
-flightrelay = { version = "0.6.0", features = ["controller", "driver", "mock"] }
+flightrelay = { version = "0.6.0", features = ["collector", "driver", "mock"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

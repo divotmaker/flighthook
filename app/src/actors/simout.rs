@@ -170,6 +170,7 @@ impl Feed {
             Mode::Full => self.routing.full_monitor.as_deref(),
             Mode::Chipping => self.routing.chipping_monitor.as_deref(),
             Mode::Putting => self.routing.putting_monitor.as_deref(),
+            _ => None,
         }
     }
 

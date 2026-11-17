@@ -101,7 +101,7 @@ pub(crate) fn profile_of(golfer: &flighthook::GolferRecord) -> Option<GolferProf
     profile.height = golfer
         .facts()
         .height
-        .map(flightrelay::units::Distance::Centimeters);
+        .map(flightrelay::Distance::Centimeters);
     Some(profile)
 }
 

@@ -47,7 +47,7 @@ pub(crate) fn stored_data(
 #[cfg(test)]
 mod tests {
     use flightrelay::{
-        AssumedLaunch, Basis, FrpMessage, Launch, ShotAggregator, ShotEvent, ShotFinished,
+        AssumedLaunch, Basis, FrpMessage, Launch, ShotAccumulator, ShotEvent, ShotFinished,
         ShotFlight, ShotKey, ShotLaunch, ShotTrigger, Velocity,
     };
 
@@ -87,7 +87,7 @@ mod tests {
         own: Option<FlightResult>,
         addenda: &[(&str, FlightResult)],
     ) -> CompletedShot {
-        let mut agg = ShotAggregator::new();
+        let mut agg = ShotAccumulator::new();
         agg.feed(&FrpMessage::new(from, ShotTrigger::new(key())));
         agg.feed(&FrpMessage::new(from, ShotLaunch { key: key(), launch }));
         if let Some(flight) = own {

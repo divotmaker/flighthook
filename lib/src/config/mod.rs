@@ -10,13 +10,13 @@ use flighthook_pureplay::accessory::Config as PureplayAccessoryConfig;
 use flighthook_pureplay::connect::Config as PureplayConfig;
 use flightrelay::config::DriverConfig;
 use flightrelay::mock::MockConfig;
-use flightrelay::units::{Distance, Velocity};
+use flightrelay::{Distance, Velocity};
 use ironsight::config::Config as MevoConfig;
 pub use ironsight::config::{CameraMode, FlightScopeEnvironment, SpinSource};
 use serde::{Deserialize, Serialize};
 use tenover::config::Config as R10Config;
 use threeputt::config::Config as ExPuttConfig;
-use thumbswing::Settings as TrackballConfig;
+use thumbswing::Config as TrackballConfig;
 
 use crate::group::ShotGrouping;
 use crate::{Club, Handedness};
@@ -92,6 +92,8 @@ impl DistanceExt for Distance {
             Self::Centimeters(_) => "centimeters",
             Self::Yards(_) => "yards",
             Self::Millimeters(_) => "millimeters",
+            // A unit flighthook does not offer yet.
+            _ => "meters",
         }
     }
 

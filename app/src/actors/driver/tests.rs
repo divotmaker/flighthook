@@ -229,7 +229,8 @@ impl FrpDriver for FakeDriver {
 }
 
 impl FrpSession for FakeSession {
-    type Driver = FakeDriver;
+    type Error = FakeError;
+    type Action = flightrelay::driver::NoAction;
 
     fn step(&mut self, _: Instant, out: &mut Events<'_>) -> Result<Activity, FakeError> {
         match self.steps.pop_front() {
@@ -245,7 +246,7 @@ impl FrpSession for FakeSession {
         }
     }
 
-    fn hints(&mut self, hints: &TurnHints) -> Result<(), FakeError> {
+    fn hints(&mut self, hints: &TurnHints, _: &mut Events<'_>) -> Result<(), FakeError> {
         lock(&self.script).commands.push(*hints);
         Ok(())
     }
@@ -711,7 +712,7 @@ fn the_capture_carries_the_device_id_for_the_scrub() {
 #[test]
 fn one_millisecond_is_one_instant() {
     let mut clock = UtcClock::default();
-    let ms = utc_ms().expect("clock");
+    let ms = flightrelay::utc_ms().expect("clock");
     let first = clock.instant_of(ms);
     for _ in 0..5 {
         std::thread::sleep(Duration::from_micros(700));
@@ -728,7 +729,7 @@ fn frames_of_one_millisecond_keep_their_order() {
     use flightrelay::RawDir::Rx;
     let (_dir, mut sink, mut rx, _w) = sink::<FakeHooks>("");
     drain(&mut rx);
-    let ms = utc_ms().expect("clock");
+    let ms = flightrelay::utc_ms().expect("clock");
     let stamped = |n: u8| {
         let mut frame = RawFrame::new(Rx, 0, vec![n]);
         frame.label = Some(n.to_string());
@@ -1863,7 +1864,7 @@ fn a_cards_actor_comes_from_its_drivers_roles_and_namespaces() {
     assert_eq!(actor.roles, [roles::LAUNCH_MONITOR]);
     assert!(actor.namespaces.is_empty());
     assert_eq!(actor.device.and_then(|d| d.source), Some(Source::Virtual));
-    assert_eq!(actor.blockers, [blockers::NOT_ARMED]);
+    assert_eq!(actor.blockers, [flightrelay::types::blockers::NOT_ARMED]);
 }
 
 /// A connected session sees what `session_started` pushed first (what
@@ -2137,12 +2138,14 @@ fn host_keys_never_collide_with_driver_keys() {
         driver: flighthook::MockConfig::default(),
     };
     let full = flighthook::MockMonitorSection {
-        driver: flighthook::MockConfig {
-            shot_interval_s: 5.0,
-            arm_delay_s: 3.0,
-            ball_ready_delay_s: 2.0,
-            post_shot_delay_s: 4.0,
-            serial: Some("7".into()),
+        driver: {
+            let mut config = flighthook::MockConfig::default();
+            config.shot_interval_s = 5.0;
+            config.arm_delay_s = 3.0;
+            config.ball_ready_delay_s = 2.0;
+            config.post_shot_delay_s = 4.0;
+            config.serial = Some("7".into());
+            config
         },
         ..mock.clone()
     };
@@ -2170,10 +2173,11 @@ fn host_keys_never_collide_with_driver_keys() {
         driver: flighthook::MevoConfig::default(),
     };
     let full = flighthook::MevoSection {
-        driver: flighthook::MevoConfig {
-            address: Some("10.0.0.5:5100".into()),
-            spin_source: flighthook::SpinSource::Auto,
-            ..flighthook::MevoConfig::example()
+        driver: {
+            let mut config = flighthook::MevoConfig::example();
+            config.address = Some("10.0.0.5:5100".into());
+            config.spin_source = flighthook::SpinSource::Auto;
+            config
         },
         ..mevo.clone()
     };
@@ -2205,9 +2209,11 @@ fn host_keys_never_collide_with_driver_keys() {
         driver: flighthook::R10Config::default(),
     };
     let full = flighthook::R10Section {
-        driver: flighthook::R10Config {
-            range: Some(flighthook::Distance::Feet(7.0)),
-            aim_offset_deg: Some(1.5),
+        driver: {
+            let mut config = flighthook::R10Config::default();
+            config.range = Some(flighthook::Distance::Feet(7.0));
+            config.aim_offset_deg = Some(1.5);
+            config
         },
         ..r10.clone()
     };
@@ -2225,12 +2231,15 @@ fn host_keys_never_collide_with_driver_keys() {
         driver: flighthook::SquareConfig::default(),
     };
     let full = flighthook::SquareSection {
-        driver: flighthook::SquareConfig {
-            address: Some("SquareGolf(CD01)".into()),
-            club: "PW".into(),
-            advanced_spin: false,
-            discard_non_putting_zero_spin: false,
-            dot_bottom_to_face_center_mm: std::collections::BTreeMap::from([("7I".into(), 21.5)]),
+        driver: {
+            let mut config = flighthook::SquareConfig::default();
+            config.address = Some("SquareGolf(CD01)".into());
+            config.club = "PW".into();
+            config.advanced_spin = false;
+            config.discard_non_putting_zero_spin = false;
+            config.dot_bottom_to_face_center_mm =
+                std::collections::BTreeMap::from([("7I".into(), 21.5)]);
+            config
         },
         ..square.clone()
     };
@@ -2304,8 +2313,10 @@ fn host_keys_never_collide_with_driver_keys() {
         driver: flighthook::ExPuttConfig::default(),
     };
     let full = flighthook::ExPuttSection {
-        driver: flighthook::ExPuttConfig {
-            address: Some("192.168.1.50".into()),
+        driver: {
+            let mut config = flighthook::ExPuttConfig::default();
+            config.address = Some("192.168.1.50".into());
+            config
         },
         ..exputt.clone()
     };
@@ -2330,10 +2341,10 @@ fn host_keys_never_collide_with_driver_keys() {
     d.device = Some("usb-Example_Trackball-event-mouse".into());
     d.club = flighthook::TrackballClub::Driver;
     d.hand = flighthook::TrackballHand::Left;
-    d.config.cpi = 800.0;
-    d.config.report_limit = 2047;
-    d.config.grab = false;
-    d.config.thresholds.v_start = 0.08;
+    d.detector.cpi = 800.0;
+    d.detector.report_limit = 2047;
+    d.detector.grab = false;
+    d.detector.thresholds.v_start = 0.08;
     d.tuning.curve_sense = flighthook::TrackballCurveSense::Physical;
     let serde_json::Value::Object(driver) = serde_json::to_value(&full.driver).expect("json")
     else {

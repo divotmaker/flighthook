@@ -29,7 +29,7 @@ id). A shot is a sequence of messages that share a `key` (`shot_id` and `shot_nu
 
 The messages between a shot's trigger and its finish may arrive in any order. flighthook's flight model sends its
 `shot.flight` under its own `from`, after the launch monitor's `shot.finished`, and any other actor's `shot.flight` can
-arrive after it too. The `ShotAggregator` in the
+arrive after it too. The `ShotAccumulator` in the
 [FRP Rust SDK](https://github.com/flightrelay/sdk-rust) assembles them; other languages collect by `key`. All
 `launch`, `flight` and `club` fields are optional, except a flight's `basis`.
 
@@ -532,7 +532,7 @@ first, else `metrics.total_spin_rpm` and `metrics.spin_axis`; likewise
 `club.spin_loft`, else `metrics.spin_loft`. Lateral values are
 absolute: + is right of the target line for every golfer. `metrics` is on
 `/api/shots`, on [`/api/ws`](#websocket-apiws) and in the [export](#get-apishotsexport). `/frp` carries
-the launch monitor's messages, which hold no `metrics`: the SDK's `ShotAggregator` computes them when it assembles a
+the launch monitor's messages, which hold no `metrics`: the SDK's `ShotAccumulator` computes them when it assembles a
 shot, and other `/frp` consumers can use the formulas above or read the shot from `/api/shots`.
 
 ---
@@ -2329,7 +2329,7 @@ card's id is the `actor_id` in its settings section, generated once and kept.
 ### Messages
 
 The message kinds, their fields, units and signs are defined by the [spec](https://github.com/flightrelay/spec); the
-[Rust SDK](https://github.com/flightrelay/sdk-rust) implements them (`ShotAggregator` collects a shot's messages by
+[Rust SDK](https://github.com/flightrelay/sdk-rust) implements them (`ShotAccumulator` collects a shot's messages by
 `key`). flighthook adds no kinds and no fields to what it sends on `/frp`. The kinds on a flighthook bus:
 
 | Kind | Class | Sent by |

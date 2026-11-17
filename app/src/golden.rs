@@ -54,8 +54,7 @@ use flighthook::{
 };
 use flightrelay::config::ConfigError;
 use flightrelay::driver::{
-    Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
-    NoAction, SessionEnd, TurnHints,
+    Backoff, ConnectCtx, DriverInfo, Events, FrpDriver, NoAction, SessionEnd,
 };
 use flightrelay::{FrpBody, FrpMessage, GolferSelect};
 use ironsight::testing::{FakeDevice, Shot, fixtures};
@@ -213,7 +212,7 @@ fn launch_only_chip() -> Shot {
 /// MultiLink handle the scripted R10 grants.
 const R10_HANDLE: u8 = 0x05;
 /// The scripted R10's BLE address (synthetic).
-const R10_ADDRESS: &str = "F5:D1:00:00:00:01";
+pub(crate) const R10_ADDRESS: &str = "F5:D1:00:00:00:01";
 /// Empty reads between two batches.
 const R10_GAP_READS: u32 = 4;
 
@@ -226,10 +225,10 @@ struct R10Wire {
 /// A scripted R10: batches of chunks the harness queues, a few empty reads
 /// between batches; quiet (not gone) when nothing is queued.
 #[derive(Clone, Default)]
-struct R10Link(Arc<Mutex<R10Wire>>);
+pub(crate) struct R10Link(Arc<Mutex<R10Wire>>);
 
 impl R10Link {
-    fn queue(&self, batches: Vec<Vec<Vec<u8>>>) {
+    pub(crate) fn queue(&self, batches: Vec<Vec<Vec<u8>>>) {
         let mut w = self.0.lock().unwrap();
         w.batches.extend(batches.into_iter().map(Into::into));
     }
@@ -268,12 +267,12 @@ fn r10_msg(frame: &[u8]) -> Vec<Vec<u8>> {
     tenover::testing::chunks(R10_HANDLE, frame, 20)
 }
 
-fn r10_envelope(envelope: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn r10_envelope(envelope: &[u8]) -> Vec<Vec<u8>> {
     r10_msg(&tenover::testing::protobuf_frame(envelope))
 }
 
 /// Handshake, subscribe, wake (the tee distance goes out), armed.
-fn r10_session_start() -> Vec<Vec<Vec<u8>>> {
+pub(crate) fn r10_session_start() -> Vec<Vec<Vec<u8>>> {
     use tenover::testing as t;
     let handshake = [
         vec![t::register_response(R10_HANDLE)],
@@ -312,7 +311,7 @@ fn r10_full_shot(n: u32) -> Vec<Vec<Vec<u8>>> {
 
 /// tenover's golden regular shot message (its `wire_golden` fixture): every
 /// ball, club and swing value.
-const R10_SHOT_FULL: &[u8] = &[
+pub(crate) const R10_SHOT_FULL: &[u8] = &[
     0xf2, 0x01, 0x53, 0x1a, 0x51, 0x08, 0x08, 0xca, 0x3e, 0x4c, 0x12, 0x4a, 0x08, 0x2a, 0x10, 0x01,
     0x1a, 0x1d, 0x0d, 0x00, 0x00, 0x48, 0x41, 0x15, 0x9a, 0x99, 0x99, 0xbf, 0x1d, 0x00, 0x00, 0x86,
     0x42, 0x25, 0x00, 0x00, 0xa0, 0x40, 0x2d, 0x00, 0x00, 0x2f, 0x45, 0x30, 0x00, 0x38, 0x01, 0x22,
@@ -334,13 +333,11 @@ struct GoldenR10 {
     link: Option<R10Link>,
 }
 
-struct GoldenR10Session(tenover::driver::R10Session<R10Link>);
-
 impl FrpDriver for GoldenR10 {
     type Config = R10Config;
     type Error = tenover::driver::Error;
     type Action = NoAction;
-    type Session = GoldenR10Session;
+    type Session = tenover::driver::R10Session<R10Link>;
     const STOP_WAIT: Duration = tenover::driver::R10::STOP_WAIT;
 
     fn info(config: &R10Config) -> DriverInfo {
@@ -359,15 +356,11 @@ impl FrpDriver for GoldenR10 {
         self.inner.config()
     }
 
-    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<GoldenR10Session, Self::Error> {
+    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Self::Session, Self::Error> {
         ctx.tick()?;
         ctx.out.phase("discovering");
         match self.link.take() {
-            Some(link) => Ok(GoldenR10Session(self.inner.connect_with(
-                ctx,
-                link,
-                R10_ADDRESS,
-            )?)),
+            Some(link) => self.inner.connect_with(ctx, link, R10_ADDRESS),
             None => loop {
                 ctx.tick()?;
                 std::thread::sleep(Duration::from_millis(20));
@@ -386,26 +379,6 @@ impl FrpDriver for GoldenR10 {
 
     fn apply_config(&mut self, new: &R10Config) {
         self.inner.apply_config(new);
-    }
-}
-
-impl FrpSession for GoldenR10Session {
-    type Driver = GoldenR10;
-
-    fn step(
-        &mut self,
-        now: Instant,
-        out: &mut Events<'_>,
-    ) -> Result<Activity, tenover::driver::Error> {
-        self.0.step(now, out)
-    }
-
-    fn identity(&self) -> &DeviceIdentity {
-        self.0.identity()
-    }
-
-    fn close(self, out: &mut Events<'_>) -> Result<(), tenover::driver::Error> {
-        self.0.close(out)
     }
 }
 
@@ -501,13 +474,11 @@ struct GoldenOmni {
     link: Option<OmniLink>,
 }
 
-struct GoldenOmniSession(allsquare::driver::OmniSession);
-
 impl FrpDriver for GoldenOmni {
     type Config = SquareConfig;
     type Error = allsquare::driver::Error;
     type Action = NoAction;
-    type Session = GoldenOmniSession;
+    type Session = allsquare::driver::OmniSession;
     const STOP_WAIT: Duration = allsquare::driver::Omni::STOP_WAIT;
 
     fn info(config: &SquareConfig) -> DriverInfo {
@@ -526,11 +497,11 @@ impl FrpDriver for GoldenOmni {
         self.inner.config()
     }
 
-    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<GoldenOmniSession, Self::Error> {
+    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Self::Session, Self::Error> {
         ctx.tick()?;
         ctx.out.phase("discovering");
         match self.link.take() {
-            Some(link) => Ok(GoldenOmniSession(self.inner.connect_with(ctx, link)?)),
+            Some(link) => self.inner.connect_with(ctx, link),
             None => loop {
                 ctx.tick()?;
                 std::thread::sleep(Duration::from_millis(20));
@@ -552,30 +523,6 @@ impl FrpDriver for GoldenOmni {
     }
 }
 
-impl FrpSession for GoldenOmniSession {
-    type Driver = GoldenOmni;
-
-    fn step(
-        &mut self,
-        now: Instant,
-        out: &mut Events<'_>,
-    ) -> Result<Activity, allsquare::driver::Error> {
-        self.0.step(now, out)
-    }
-
-    fn hints(&mut self, hints: &TurnHints) -> Result<(), allsquare::driver::Error> {
-        self.0.hints(hints)
-    }
-
-    fn identity(&self) -> &DeviceIdentity {
-        self.0.identity()
-    }
-
-    fn close(self, out: &mut Events<'_>) -> Result<(), allsquare::driver::Error> {
-        self.0.close(out)
-    }
-}
-
 impl Hooks<GoldenOmni> for SquareHooks {
     type Section = SquareSection;
     const SOURCE: Option<ShotSource> = Some(ShotSource::Square);
@@ -587,28 +534,25 @@ fn omni_ack(state: allsquare::DeviceState) -> Vec<u8> {
 
 /// A full 7-iron swing with every club value (allsquare's full-swing pin).
 fn omni_full_swing() -> Vec<Vec<u8>> {
-    use allsquare::{BallMetrics, ClubMetrics, DeviceState, testing};
-    let ball = BallMetrics {
-        speed: 60.0,
-        launch_angle: 14.0,
-        direction: -1.2,
-        total_spin: 3059,
-        spin_axis: -11.31,
-        back_spin: 3000,
-        side_spin: -600,
-        ..testing::ball_metrics()
-    };
-    let club = ClubMetrics {
-        mask: 0xff,
-        path: Some(-2.4),
-        face_angle: Some(-0.8),
-        attack_angle: Some(-1.6),
-        dynamic_loft: Some(17.9),
-        impact_horizontal: Some(3.5),
-        impact_vertical: Some(-4.0),
-        club_speed: Some(41.4),
-        smash_factor: Some(1.45),
-    };
+    use allsquare::{ClubMetrics, DeviceState, testing};
+    let mut ball = testing::ball_metrics();
+    ball.speed = 60.0;
+    ball.launch_angle = 14.0;
+    ball.direction = -1.2;
+    ball.total_spin = 3059;
+    ball.spin_axis = -11.31;
+    ball.back_spin = 3000;
+    ball.side_spin = -600;
+    let mut club = ClubMetrics::default();
+    club.mask = 0xff;
+    club.path = Some(-2.4);
+    club.face_angle = Some(-0.8);
+    club.attack_angle = Some(-1.6);
+    club.dynamic_loft = Some(17.9);
+    club.impact_horizontal = Some(3.5);
+    club.impact_vertical = Some(-4.0);
+    club.club_speed = Some(41.4);
+    club.smash_factor = Some(1.45);
     vec![
         testing::ball_notification(&ball).to_vec(),
         testing::club_notification(&club).to_vec(),
@@ -620,17 +564,15 @@ fn omni_full_swing() -> Vec<Vec<u8>> {
 
 /// A putt without club data.
 fn omni_putt() -> Vec<Vec<u8>> {
-    use allsquare::{BallMetrics, ClubMetrics, DeviceState, testing};
-    let ball = BallMetrics {
-        speed: 2.5,
-        launch_angle: 1.2,
-        direction: -0.8,
-        total_spin: 0,
-        spin_axis: 0.0,
-        back_spin: 0,
-        side_spin: 0,
-        ..testing::ball_metrics()
-    };
+    use allsquare::{ClubMetrics, DeviceState, testing};
+    let mut ball = testing::ball_metrics();
+    ball.speed = 2.5;
+    ball.launch_angle = 1.2;
+    ball.direction = -0.8;
+    ball.total_spin = 0;
+    ball.spin_axis = 0.0;
+    ball.back_spin = 0;
+    ball.side_spin = 0;
     vec![
         testing::ball_notification(&ball).to_vec(),
         testing::club_notification(&ClubMetrics::default()).to_vec(),

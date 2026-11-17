@@ -103,7 +103,7 @@ pub(crate) fn outputs(card: &str, mode: Option<Mode>, messages: &[crate::bus::Bu
     use crate::actors::web::{ExportContext, StoredShot};
     use flighthook::{SimulationSection, UnitSystem};
     const FLIGHT_MODEL: &str = "simulation";
-    let mut agg = flightrelay::ShotAggregator::new();
+    let mut agg = flightrelay::ShotAccumulator::new();
     let mut text = String::new();
     for msg in messages.iter().filter_map(crate::bus::BusMsg::as_frp) {
         let Some(flightrelay::ShotEvent::Finished(mut shot)) = agg.feed(msg) else {
@@ -227,7 +227,7 @@ pub(crate) fn strict_frames(
     card: &str,
     messages: &[crate::bus::BusMsg],
 ) -> Option<flighthook_pureplay::connect::mapper::ShotFrames> {
-    let mut agg = flightrelay::ShotAggregator::new();
+    let mut agg = flightrelay::ShotAccumulator::new();
     for msg in messages.iter().filter_map(crate::bus::BusMsg::as_frp) {
         if let Some(flightrelay::ShotEvent::Finished(shot)) = agg.feed(msg) {
             let shot = flighthook_pureplay::connect::measured_shot(&shot, card);

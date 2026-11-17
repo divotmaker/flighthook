@@ -47,6 +47,7 @@ pub(super) fn environment_label(env: FlightScopeEnvironment) -> &'static str {
     match env {
         FlightScopeEnvironment::LimitedFlight => "Limited flight (sim/indoor)",
         FlightScopeEnvironment::Outdoor => "Outdoor (full flight)",
+        _ => "Other",
     }
 }
 
@@ -55,6 +56,7 @@ pub(super) fn spin_source_label(src: SpinSource) -> &'static str {
         SpinSource::D4 => "D4 (matches FS Golf)",
         SpinSource::E8 => "E8",
         SpinSource::Auto => "Auto (E8 on full swings)",
+        _ => "Other",
     }
 }
 
@@ -78,6 +80,7 @@ pub(super) fn camera_mode_label(mode: CameraMode) -> &'static str {
         CameraMode::Standard => "Standard (radar only)",
         CameraMode::Fusion => "Fusion — older firmware",
         CameraMode::RawFusion => "Raw Fusion — BM17.04+",
+        _ => "Other",
     }
 }
 
@@ -774,72 +777,72 @@ impl DeviceFormEntry {
                 Some(shown)
             }
         };
-        MevoConfig {
-            address: if address == m.address.as_deref().unwrap_or_default().trim() {
-                m.address.clone()
-            } else {
-                (!address.is_empty()).then(|| address.to_owned())
-            },
-            ball_type: if self.ball_type == m.ball_type.unwrap_or(MEVO_BALL_TYPE) {
-                m.ball_type
-            } else {
-                Some(self.ball_type)
-            },
-            tee_height: form_distance(
-                m.tee_height,
-                MEVO_TEE_HEIGHT,
-                &self.tee_height_val,
-                &self.tee_height_unit,
-            ),
-            range: form_distance(m.range, MEVO_RANGE, &self.range_val, &self.range_unit),
-            surface_height: form_distance(
-                m.surface_height,
-                MEVO_SURFACE_HEIGHT,
-                &self.surface_height_val,
-                &self.surface_height_unit,
-            ),
-            track_pct: if self.track_pct.trim() == track_pct_text(m.track_pct) {
-                m.track_pct
-            } else {
-                self.track_pct.trim().parse().ok()
-            },
-            use_estimated: pick(m.use_estimated, false, self.use_estimated),
-            camera_mode: if self.camera_mode == m.camera_mode() {
-                m.camera_mode
-            } else {
-                Some(self.camera_mode)
-            },
-            environment: if self.environment == m.environment() {
-                m.environment
-            } else {
-                Some(self.environment)
-            },
-            spin_source: self.spin_source,
-        }
+        let mut config = m.clone();
+        config.address = if address == m.address.as_deref().unwrap_or_default().trim() {
+            m.address.clone()
+        } else {
+            (!address.is_empty()).then(|| address.to_owned())
+        };
+        config.ball_type = if self.ball_type == m.ball_type.unwrap_or(MEVO_BALL_TYPE) {
+            m.ball_type
+        } else {
+            Some(self.ball_type)
+        };
+        config.tee_height = form_distance(
+            m.tee_height,
+            MEVO_TEE_HEIGHT,
+            &self.tee_height_val,
+            &self.tee_height_unit,
+        );
+        config.range = form_distance(m.range, MEVO_RANGE, &self.range_val, &self.range_unit);
+        config.surface_height = form_distance(
+            m.surface_height,
+            MEVO_SURFACE_HEIGHT,
+            &self.surface_height_val,
+            &self.surface_height_unit,
+        );
+        config.track_pct = if self.track_pct.trim() == track_pct_text(m.track_pct) {
+            m.track_pct
+        } else {
+            self.track_pct.trim().parse().ok()
+        };
+        config.use_estimated = pick(m.use_estimated, false, self.use_estimated);
+        config.camera_mode = if self.camera_mode == m.camera_mode() {
+            m.camera_mode
+        } else {
+            Some(self.camera_mode)
+        };
+        config.environment = if self.environment == m.environment() {
+            m.environment
+        } else {
+            Some(self.environment)
+        };
+        config.spin_source = self.spin_source;
+        config
     }
 
     /// The R10 driver's settings from the form: the range and the aim offset
     /// as typed, blank (or not a number, which
     /// [`driver_error`](Self::driver_error) refuses) for none.
     pub(crate) fn r10_config(&self) -> flighthook::R10Config {
-        flighthook::R10Config {
-            range: self
-                .range_val
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .map(|v| Distance::from_value_and_unit(v, &self.range_unit)),
-            aim_offset_deg: self.aim_offset.trim().parse::<f64>().ok(),
-        }
+        let mut config = flighthook::R10Config::default();
+        config.range = self
+            .range_val
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|v| Distance::from_value_and_unit(v, &self.range_unit));
+        config.aim_offset_deg = self.aim_offset.trim().parse::<f64>().ok();
+        config
     }
 
     /// The ExPutt driver's settings from the form: the IP address as typed
     /// (trimmed), blank for none (the device is found on the network).
     pub(crate) fn exputt_config(&self) -> flighthook::ExPuttConfig {
         let address = self.address.trim();
-        flighthook::ExPuttConfig {
-            address: (!address.is_empty()).then(|| address.to_owned()),
-        }
+        let mut config = flighthook::ExPuttConfig::default();
+        config.address = (!address.is_empty()).then(|| address.to_owned());
+        config
     }
 
     /// The Square Golf driver's settings from the form: the address
@@ -857,12 +860,11 @@ impl DeviceFormEntry {
             .map(|(key, &mm)| (key.clone(), mm))
             .collect();
         calibration.extend(impact_mm_to_config(&self.square_impact_mm));
-        SquareConfig {
-            address: (!address.is_empty()).then(|| address.to_owned()),
-            discard_non_putting_zero_spin: self.discard_zero_spin,
-            dot_bottom_to_face_center_mm: calibration,
-            ..self.square.clone()
-        }
+        let mut config = self.square.clone();
+        config.address = (!address.is_empty()).then(|| address.to_owned());
+        config.discard_non_putting_zero_spin = self.discard_zero_spin;
+        config.dot_bottom_to_face_center_mm = calibration;
+        config
     }
 
     /// Whether the driver settings keep the card from saving: refused

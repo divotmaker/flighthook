@@ -30,7 +30,7 @@ use flighthook::{
     ActorStatus, ActorStatusResponse, ExportDevice, FlightPath, FlighthookConfig, Mode,
     SHOT_TIMEOUT, ShotData, ShotKey, ShotRaw, ShotVideo, ShotVideos as _, SimulationSection,
 };
-use flightrelay::{CompletedShot, FrpBody, ShotAggregator, ShotEvent};
+use flightrelay::{CompletedShot, FrpBody, ShotAccumulator, ShotEvent};
 pub use store::*;
 
 fn new_actor(name: String) -> ActorStatusResponse {

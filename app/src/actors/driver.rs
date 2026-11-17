@@ -52,16 +52,16 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use flightrelay::driver::{
     Activity, Backoff, ConnectCtx, ConnectHost, DeviceEvent, DeviceIdentity, DeviceStatus,
     DriverInfo, Events, FrpDriver, FrpSession, HostFlags, IDLE, Level, SessionEnd, Stop, TurnHints,
 };
-use flightrelay::types::{blockers, roles};
+use flightrelay::types::roles;
 use flightrelay::{
-    BusActor, DEFAULT_HEARTBEAT, DeviceInfo, FrpBody, FrpMessage, RawFrame, Removal, ShotFinished,
-    ShotTrigger, StateKind,
+    BusActor, DEFAULT_HEARTBEAT, FrpBody, FrpMessage, RawFrame, Removal, ShotFinished, ShotTrigger,
+    StateKind,
 };
 use tracing::{debug, error, info, warn};
 
@@ -495,11 +495,7 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                     }
                 }
             };
-            let ended = SessionEnd {
-                error: Some(&error),
-                connected_for,
-                attempts,
-            };
+            let ended = SessionEnd::new(Some(&error), connected_for, attempts);
             let delay = {
                 let mut emit = |e| sink.handle(e, &mut self.hooked.borrow_mut());
                 driver.retry_delay(&ended, &mut backoff, &mut Events::new(&mut emit, flags))
@@ -649,20 +645,22 @@ fn step_session<D: FrpDriver, H: Hooks<D>>(
     now: Instant,
 ) -> Result<Activity, D::Error> {
     let to_session = std::mem::take(&mut hooked.borrow_mut().to_session);
-    for msg in &to_session {
-        session.bus(msg)?;
-    }
-    if host.hints != *given {
-        *given = host.hints;
-        session.hints(given)?;
-    }
-    while let Some(action) = host.actions.pop_front() {
-        session.action(&action)?;
-    }
+    let turned = host.hints != *given;
+    *given = host.hints;
     sink.session_mode = given.mode;
     let activity = {
         let mut emit = |e| sink.handle(e, &mut hooked.borrow_mut());
-        session.step(now, &mut Events::new(&mut emit, flags))?
+        let mut out = Events::new(&mut emit, flags);
+        for msg in &to_session {
+            session.bus(msg, &mut out)?;
+        }
+        if turned {
+            session.hints(given, &mut out)?;
+        }
+        while let Some(action) = host.actions.pop_front() {
+            session.action(&action, &mut out)?;
+        }
+        session.step(now, &mut out)?
     };
     sink.prune_shots();
     Ok(activity)
@@ -906,14 +904,6 @@ struct UtcClock {
     anchor: Option<(Instant, u64)>,
 }
 
-/// The current UTC time, milliseconds since the Unix epoch.
-fn utc_ms() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-}
-
 /// `at` moved by `ms` milliseconds (back for a negative `ms`), or `at` when
 /// that is out of range.
 fn shifted(at: Instant, ms: i128) -> Instant {
@@ -930,7 +920,7 @@ impl UtcClock {
     /// The instant of `ms` on this host's monotonic clock.
     fn instant_of(&mut self, ms: u64) -> Instant {
         let now = Instant::now();
-        let Some(now_ms) = utc_ms() else {
+        let Some(now_ms) = flightrelay::utc_ms() else {
             return now;
         };
         let fresh = self.anchor.is_some_and(|(mono, utc)| {
@@ -1017,31 +1007,15 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             .remove(&self.actor)
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| self.info.name.to_owned());
-        let identity = self.identity.as_ref();
-        let status = &self.device_status;
-        let mut actor = BusActor::new(name, DEFAULT_HEARTBEAT.as_secs_f64());
-        for role in self.info.roles {
-            actor = actor.with_role(*role);
+        let mut actor = self.info.bus_actor(
+            name,
+            DEFAULT_HEARTBEAT,
+            self.identity.as_ref(),
+            &self.device_status,
+        );
+        if let Some(device) = actor.device.as_mut() {
+            device.source = self.source;
         }
-        for namespace in self.info.namespaces {
-            actor = actor.with_namespace(*namespace);
-        }
-        let mut actor = actor.with_device(DeviceInfo {
-            manufacturer: identity
-                .and_then(|i| i.manufacturer.clone())
-                .or_else(|| self.info.manufacturer.map(str::to_owned)),
-            model: identity.and_then(|i| i.model.clone()),
-            firmware: identity.and_then(|i| i.firmware.clone()),
-            source: self.source,
-            battery_pct: status.battery_pct,
-            tilt: status.tilt,
-            roll: status.roll,
-        });
-        actor.blockers.clone_from(&status.blockers);
-        if !self.info.roles.contains(&roles::LAUNCH_MONITOR) {
-            actor.blockers.retain(|b| b != blockers::NOT_ARMED);
-        }
-        actor.telemetry = (!status.telemetry.is_empty()).then(|| status.telemetry.clone());
         actor
     }
 
@@ -1234,6 +1208,7 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
                     Level::Debug => debug!("{actor}: {line}"),
                     Level::Info => info!("{actor}: {line}"),
                     Level::Warn => warn!("{actor}: {line}"),
+                    _ => info!("{actor}: {line}"),
                 }
             }
             DeviceEvent::ShotDiscarded => {

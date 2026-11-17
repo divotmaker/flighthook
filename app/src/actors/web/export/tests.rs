@@ -45,10 +45,11 @@ fn mevo_config() -> FlighthookConfig {
         "0".into(),
         MevoSection {
             name: "My Mevo".into(),
-            driver: flighthook::MevoConfig {
-                address: Some(ADDR.into()),
-                ball_type: Some(1),
-                ..flighthook::MevoConfig::default()
+            driver: {
+                let mut config = flighthook::MevoConfig::default();
+                config.address = Some(ADDR.into());
+                config.ball_type = Some(1);
+                config
             },
             ..MevoSection::default()
         },

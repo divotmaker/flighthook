@@ -991,7 +991,7 @@ fn ball() -> Launch {
 /// warning; a flight model's addendum does not.
 #[test]
 fn only_the_launch_monitors_own_late_message_warns() {
-    let mut agg = flightrelay::ShotAggregator::new();
+    let mut agg = flightrelay::ShotAccumulator::new();
     let from = "monitor-id";
     agg.feed(&flightrelay::FrpMessage::new(
         from,
@@ -1137,11 +1137,12 @@ async fn trigger_snapshots_context_and_finish_stores_raw() {
             "0".into(),
             MevoSection {
                 name: "Range Mevo".into(),
-                driver: flighthook::MevoConfig {
-                    address: Some("10.0.0.7:5100".into()),
-                    ball_type: Some(1),
-                    track_pct: Some(80.0),
-                    ..flighthook::MevoConfig::default()
+                driver: {
+                    let mut config = flighthook::MevoConfig::default();
+                    config.address = Some("10.0.0.7:5100".into());
+                    config.ball_type = Some(1);
+                    config.track_pct = Some(80.0);
+                    config
                 },
                 ..MevoSection::default()
             },

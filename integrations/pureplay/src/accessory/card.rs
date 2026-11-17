@@ -348,7 +348,13 @@ impl Card {
         out: &mut Events<'_>,
     ) -> Result<(), ()> {
         let kind = if SEND_BINARY { "binary" } else { "text" };
-        out.raw(RawDir::Tx, kind, self.redact(text).as_bytes());
+        out.wire(
+            RawDir::Tx,
+            kind,
+            self.redact(text).as_bytes().to_vec(),
+            flightrelay::utc_ms(),
+            false,
+        );
         link.send(text).map_err(|e| {
             out.log(Level::Info, format!("send failed: {e}"));
         })

@@ -206,16 +206,17 @@ pub(super) fn new_actor_entry(preset: &AddPreset, id: String) -> Option<ActorFor
             square: SquareConfig::default(),
             square_impact_mm: std::collections::HashMap::new(),
             // A new FlightScope card states the values it shows.
-            mevo: MevoConfig {
-                ball_type: Some(ball_type),
-                tee_height: Some(MEVO_TEE_HEIGHT),
-                range: Some(MEVO_RANGE),
-                surface_height: Some(MEVO_SURFACE_HEIGHT),
-                track_pct: Some(flighthook::MEVO_DEFAULT_TRACK_PCT),
-                use_estimated: Some(false),
-                camera_mode: Some(CameraMode::Standard),
-                environment: Some(FlightScopeEnvironment::LimitedFlight),
-                ..MevoConfig::default()
+            mevo: {
+                let mut mevo = MevoConfig::default();
+                mevo.ball_type = Some(ball_type);
+                mevo.tee_height = Some(MEVO_TEE_HEIGHT);
+                mevo.range = Some(MEVO_RANGE);
+                mevo.surface_height = Some(MEVO_SURFACE_HEIGHT);
+                mevo.track_pct = Some(flighthook::MEVO_DEFAULT_TRACK_PCT);
+                mevo.use_estimated = Some(false);
+                mevo.camera_mode = Some(CameraMode::Standard);
+                mevo.environment = Some(FlightScopeEnvironment::LimitedFlight);
+                mevo
             },
             mock: MockConfig::default(),
             trackball: (type_key == "trackball").then(Box::default),

@@ -4,10 +4,7 @@ use std::time::Duration;
 
 use flighthook::{ActorStatus, ExPuttConfig, Mode, Severity};
 use flightrelay::config::{ConfigError, DriverConfig};
-use flightrelay::driver::{
-    Activity, Backoff, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
-    SessionEnd, TurnHints,
-};
+use flightrelay::driver::{Backoff, ConnectCtx, DriverInfo, Events, FrpDriver, SessionEnd};
 use threeputt::driver::{ExPuttSession, Tuning};
 use threeputt::testing::{MockConfig, MockDevice, PUTT_RESULT_FULL, PUTT_RESULT_PULLED};
 use tokio::sync::broadcast;
@@ -33,7 +30,7 @@ impl FrpDriver for ScriptedExPutt {
     type Config = ExPuttConfig;
     type Error = threeputt::driver::Error;
     type Action = Action;
-    type Session = ScriptedSession;
+    type Session = ExPuttSession;
     const STOP_WAIT: Duration = ExPutt::STOP_WAIT;
 
     fn info(config: &ExPuttConfig) -> DriverInfo {
@@ -47,9 +44,8 @@ impl FrpDriver for ScriptedExPutt {
             .expect("a mock device");
         let mut tuning = Tuning::default();
         tuning.port = Arc::new(AtomicU16::new(port));
-        let local = ExPuttConfig {
-            address: Some("127.0.0.1".into()),
-        };
+        let mut local = ExPuttConfig::default();
+        local.address = Some("127.0.0.1".into());
         Ok(Self {
             inner: ExPutt::with_tuning(local, tuning)?,
             config,
@@ -60,8 +56,8 @@ impl FrpDriver for ScriptedExPutt {
         &self.config
     }
 
-    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ScriptedSession, Self::Error> {
-        self.inner.connect(ctx).map(ScriptedSession)
+    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<ExPuttSession, Self::Error> {
+        self.inner.connect(ctx)
     }
 
     fn retry_delay(
@@ -75,37 +71,6 @@ impl FrpDriver for ScriptedExPutt {
 
     fn apply_config(&mut self, new: &ExPuttConfig) {
         self.config = new.clone();
-    }
-}
-
-/// threeputt's session.
-struct ScriptedSession(ExPuttSession);
-
-impl FrpSession for ScriptedSession {
-    type Driver = ScriptedExPutt;
-
-    fn step(
-        &mut self,
-        now: std::time::Instant,
-        out: &mut Events<'_>,
-    ) -> Result<Activity, threeputt::driver::Error> {
-        self.0.step(now, out)
-    }
-
-    fn hints(&mut self, hints: &TurnHints) -> Result<(), threeputt::driver::Error> {
-        self.0.hints(hints)
-    }
-
-    fn action(&mut self, action: &Action) -> Result<(), threeputt::driver::Error> {
-        self.0.action(action)
-    }
-
-    fn identity(&self) -> &DeviceIdentity {
-        self.0.identity()
-    }
-
-    fn close(self, out: &mut Events<'_>) -> Result<(), threeputt::driver::Error> {
-        self.0.close(out)
     }
 }
 
@@ -165,8 +130,10 @@ fn outputs_keep_their_numbers() {
         let mock = MockDevice::spawn(MockConfig::default()).expect("mock");
         PORTS.put(address.into(), mock.port());
         let section = ExPuttSection {
-            driver: ExPuttConfig {
-                address: Some(address.into()),
+            driver: {
+                let mut config = ExPuttConfig::default();
+                config.address = Some(address.into());
+                config
             },
             ..ExPuttSection::default()
         };

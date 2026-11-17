@@ -42,21 +42,20 @@ impl Default for FlighthookConfig {
 
 impl Default for MevoSection {
     fn default() -> Self {
+        let mut driver = MevoConfig::default();
+        driver.address = Some("192.168.2.1:5100".into());
+        driver.ball_type = Some(1);
+        driver.tee_height = Some(Distance::Inches(1.5));
+        driver.range = Some(Distance::Feet(8.0));
+        driver.surface_height = Some(Distance::Inches(0.0));
+        driver.track_pct = Some(80.0);
         Self {
             actor_id: None,
             name: "Mevo WiFi".into(),
             enabled: true,
             launch_only_spin: Self::DEFAULT_LAUNCH_ONLY_SPIN,
             impact_lead_s: None,
-            driver: MevoConfig {
-                address: Some("192.168.2.1:5100".into()),
-                ball_type: Some(1),
-                tee_height: Some(Distance::Inches(1.5)),
-                range: Some(Distance::Feet(8.0)),
-                surface_height: Some(Distance::Inches(0.0)),
-                track_pct: Some(80.0),
-                ..MevoConfig::default()
-            },
+            driver,
         }
     }
 }
@@ -91,17 +90,13 @@ impl Default for SquareSection {
 impl Default for TrackballSection {
     /// What a new Trackball card writes: its name.
     fn default() -> Self {
+        let mut driver = TrackballConfig::default();
+        driver.detector.grab = false;
         Self {
             name: "Trackball".into(),
             enabled: true,
             actor_id: None,
-            driver: TrackballConfig {
-                config: thumbswing::Config {
-                    grab: false,
-                    ..thumbswing::Config::default()
-                },
-                ..TrackballConfig::default()
-            },
+            driver,
         }
     }
 }

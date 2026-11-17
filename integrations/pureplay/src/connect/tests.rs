@@ -9,9 +9,8 @@ use std::time::{Duration, Instant};
 
 use flightrelay::driver::{
     Activity, Backoff, DeviceEvent, DeviceIdentity, FrpDriver, FrpSession, Live, SessionEnd,
-    StatusChange,
 };
-use flightrelay::testing::TestHost;
+use flightrelay::testing::{TestHost, alerts, status};
 use flightrelay::types::{AssumedLaunch, Basis, FlightResult, Launch, roles};
 use flightrelay::{
     BusActor, Club, DeviceInfo, FrpBody, FrpMessage, GolferSelect, Handedness, Mode, RawDir,
@@ -119,7 +118,7 @@ impl Link {
     /// One step of the session.
     fn try_step(&mut self) -> Result<Activity, Error> {
         let Self { host, session, .. } = self;
-        host.with(|now, out| session.step_at(now, out))
+        host.with(|now, out| session.step(now, out))
     }
 
     fn step(&mut self) {
@@ -133,7 +132,9 @@ impl Link {
 
     /// Hand the session a message from actor `from`.
     fn hand(&mut self, from: &str, body: impl Into<FrpBody>) {
-        self.session.hand(&FrpMessage::new(from, body));
+        let Self { host, session, .. } = self;
+        host.bus(session, &FrpMessage::new(from, body))
+            .expect("handed");
     }
 
     /// Pureplay sends `msg`.
@@ -292,37 +293,12 @@ fn not_armed(name: &str, source: Source) -> BusActor {
     actor
 }
 
-/// The telemetry set in `events`, the last value of each key (an empty
-/// value for a cleared key).
-fn telemetry(events: &[DeviceEvent]) -> std::collections::HashMap<String, String> {
-    let mut rows = std::collections::HashMap::new();
-    for e in events {
-        if let DeviceEvent::StatusChange(StatusChange::Telemetry(pairs)) = e {
-            for (k, v) in pairs {
-                rows.insert(k.clone(), v.clone().unwrap_or_default());
-            }
-        }
-    }
-    rows
-}
-
 /// The `golfer.select`s in `events`.
 fn selects(events: &[DeviceEvent]) -> Vec<GolferSelect> {
     events
         .iter()
         .filter_map(|e| match e {
             DeviceEvent::Frp(FrpBody::GolferSelect(s)) => Some(s.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The alerts in `events`.
-fn alerts(events: &[DeviceEvent]) -> Vec<String> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            DeviceEvent::Frp(FrpBody::BusAlert(a)) => Some(a.message.clone()),
             _ => None,
         })
         .collect()
@@ -414,11 +390,7 @@ fn retries_back_off_one_to_three_seconds_and_a_handshake_failure_shows() {
         .map(|_| {
             host.with(|_, out| {
                 driver.retry_delay(
-                    &SessionEnd {
-                        error: Some(&refused),
-                        connected_for: None,
-                        attempts: 1,
-                    },
+                    &SessionEnd::new(Some(&refused), None, 1),
                     &mut Backoff::default(),
                     out,
                 )
@@ -435,17 +407,13 @@ fn retries_back_off_one_to_three_seconds_and_a_handshake_failure_shows() {
     let failed = Error::Handshake("no reply".into());
     host.with(|_, out| {
         driver.retry_delay(
-            &SessionEnd {
-                error: Some(&failed),
-                connected_for: Some(Duration::ZERO),
-                attempts: 0,
-            },
+            &SessionEnd::new(Some(&failed), Some(Duration::ZERO), 0),
             &mut Backoff::default(),
             out,
         )
     });
     let events = host.take();
-    assert_eq!(telemetry(&events)["error"], "no reply");
+    assert_eq!(status(&events).telemetry["error"], "no reply");
     assert!(alerts(&events).is_empty());
 }
 
@@ -541,8 +509,8 @@ fn a_host_that_never_answers_hello_is_an_error_until_one_does() {
     assert!(reason.contains("no reply to Hello"), "{reason}");
 
     let mut next = Link::linked();
-    let rows = telemetry(&next.events());
-    assert_eq!(rows["error"], "", "the reason leaves the card");
+    let rows = status(&next.events()).telemetry;
+    assert!(!rows.contains_key("error"), "the reason leaves the card");
     assert_eq!(rows[STRICT_MODE_KEY], "off");
 }
 
@@ -566,7 +534,7 @@ fn an_unsupported_version_ends_the_link() {
 #[test]
 fn the_card_shows_the_address_and_the_link() {
     let mut link = Link::linked();
-    let rows = telemetry(&link.events());
+    let rows = status(&link.events()).telemetry;
     assert_eq!(rows[STRICT_MODE_KEY], "off");
     assert_eq!(rows["ready_state"], "not ready");
     assert_eq!(link.session.identity.label(), "127.0.0.1:9760");
@@ -828,7 +796,7 @@ fn strict_mode_clears_estimated_spin_and_suppresses_auto_chip() {
     link.hand("omni", monitor("Omni", Source::Measured, true, None));
     link.hand("chip", monitor("Auto-chip", Source::Virtual, true, None));
     link.strict(true);
-    assert_eq!(telemetry(&link.events())[STRICT_MODE_KEY], "on");
+    assert_eq!(status(&link.events()).telemetry[STRICT_MODE_KEY], "on");
 
     link.shot("omni", 1, &estimated_spin_shot());
     let ball = link.balls().remove(0);
@@ -975,7 +943,7 @@ fn set_club_info_sets_the_hand_and_club() {
     assert_eq!(select.handedness, Some(Handedness::Left));
     assert_eq!(select.club, Some(Some(Club::Iron7)));
     assert_eq!(select.mode, Some(Mode::Full));
-    let rows = telemetry(&events);
+    let rows = status(&events).telemetry;
     assert_eq!(rows["club"], Club::Iron7.to_string());
     assert_eq!(rows["handed"], Handedness::Left.to_string());
 
@@ -1148,8 +1116,10 @@ fn host_errors_in_a_burst_raise_one_alert() {
         });
     }
     link.settle();
+    let events = link.events();
+    let alerts: Vec<_> = alerts(&events).iter().map(|a| a.message.as_str()).collect();
     assert_eq!(
-        alerts(&link.events()),
+        alerts,
         ["Pureplay error 2 (strict mode required): Strict mode required"]
     );
 }

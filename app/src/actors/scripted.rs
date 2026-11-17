@@ -356,7 +356,8 @@ impl<C: SoftwareConfig> FrpDriver for Software<C> {
 }
 
 impl<C: SoftwareConfig> FrpSession for SoftwareSession<C> {
-    type Driver = Software<C>;
+    type Error = SoftwareError;
+    type Action = String;
 
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, SoftwareError> {
         self.see(Seen::Step(now));
@@ -371,17 +372,17 @@ impl<C: SoftwareConfig> FrpSession for SoftwareSession<C> {
         }
     }
 
-    fn hints(&mut self, hints: &TurnHints) -> Result<(), SoftwareError> {
+    fn hints(&mut self, hints: &TurnHints, _: &mut Events<'_>) -> Result<(), SoftwareError> {
         self.see(Seen::Hints(*hints));
         Ok(())
     }
 
-    fn bus(&mut self, msg: &FrpMessage) -> Result<(), SoftwareError> {
+    fn bus(&mut self, msg: &FrpMessage, _: &mut Events<'_>) -> Result<(), SoftwareError> {
         self.see(Seen::Bus(Box::new(msg.clone())));
         Ok(())
     }
 
-    fn action(&mut self, action: &String) -> Result<(), SoftwareError> {
+    fn action(&mut self, action: &String, _: &mut Events<'_>) -> Result<(), SoftwareError> {
         self.see(Seen::Action(action.clone()));
         Ok(())
     }

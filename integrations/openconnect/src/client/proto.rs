@@ -73,9 +73,7 @@ pub(crate) fn handle_response(buf: &[u8], out: &mut Events<'_>) -> Heard {
 
 #[cfg(test)]
 mod tests {
-    use flightrelay::FrpBody;
-    use flightrelay::driver::DeviceEvent;
-    use flightrelay::testing::TestHost;
+    use flightrelay::testing::{TestHost, alerts};
 
     use super::*;
 
@@ -83,10 +81,7 @@ mod tests {
     fn heard(buf: &str) -> (Heard, bool) {
         let mut host = TestHost::new();
         let heard = host.with(|_, out| handle_response(buf.as_bytes(), out));
-        let alerted = host
-            .take_frp()
-            .iter()
-            .any(|e| matches!(e, DeviceEvent::Frp(FrpBody::BusAlert(_))));
+        let alerted = !alerts(&host.take()).is_empty();
         (heard, alerted)
     }
 

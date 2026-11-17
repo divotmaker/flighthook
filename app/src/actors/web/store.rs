@@ -83,7 +83,7 @@ pub(crate) struct PendingShot {
     /// The launch monitor's card key (its actor id for a remote one).
     actor: String,
     context: ExportContext,
-    /// The session's turn at the trigger, for a shot the aggregator stamped
+    /// The session's turn at the trigger, for a shot the accumulator stamped
     /// no turn on.
     turn: Option<flightrelay::GolferTurn>,
     /// The launch monitor arms only for putts (its driver's fixed mode at
@@ -102,11 +102,11 @@ pub(crate) struct PendingShot {
 }
 
 /// The shots between `shot.trigger` and `shot.finished`: their messages,
-/// composed by the SDK's [`ShotAggregator`] (flighthook's
+/// composed by the SDK's [`ShotAccumulator`] (flighthook's
 /// [`SHOT_TIMEOUT`], fed only flighthook's own turn), and the web layer's
 /// own per-shot state, by shot id.
 pub(crate) struct PendingShots {
-    data: ShotAggregator,
+    data: ShotAccumulator,
     /// Each shot's launch monitor: only it sends the shot's parts.
     owners: crate::actors::simout::ShotOwners,
     /// The actors whose last `bus.actor` holds the `game` role: only a
@@ -118,7 +118,7 @@ pub(crate) struct PendingShots {
 impl Default for PendingShots {
     fn default() -> Self {
         Self {
-            data: ShotAggregator::new().with_timeout(SHOT_TIMEOUT),
+            data: ShotAccumulator::new().with_timeout(SHOT_TIMEOUT),
             owners: crate::actors::simout::ShotOwners::default(),
             games: std::collections::HashSet::new(),
             shots: HashMap::new(),
@@ -137,7 +137,7 @@ impl PendingShots {
     }
 
     /// End `actor`'s pending shots (a card key), except the shot `keep` (a
-    /// shot id). The aggregator discards each of them as on a timeout, so
+    /// shot id). The accumulator discards each of them as on a timeout, so
     /// their later messages and finish are ignored.
     fn discard_actor(&mut self, actor: &str, keep: Option<&str>) {
         let ended: Vec<String> = self
@@ -523,7 +523,7 @@ async fn store_bus_event(state: &WebState, msg: &BusMsg, accumulators: &mut Pend
                 // A device runs one shot at a time: a new trigger ends its
                 // earlier unfinished shots uncounted.
                 drop_pending(accumulators, &card, Some(&id));
-                // The aggregator stamps the turn and the golfer's open block
+                // The accumulator stamps the turn and the golfer's open block
                 // now, so commands and club changes during the flight apply
                 // to the next shot.
                 accumulators.data.feed(frp);
@@ -886,7 +886,7 @@ async fn apply_local(
             // Shots in flight belong to the history being cleared: they end
             // here, so a late `shot.finished` finds nothing to store. The
             // store forgets its shots and blocks, then asks for a new
-            // session. The aggregator keeps the turn and the open blocks it
+            // session. The accumulator keeps the turn and the open blocks it
             // follows.
             for (id, _) in accumulators.shots.drain() {
                 accumulators.data.discard(&id);

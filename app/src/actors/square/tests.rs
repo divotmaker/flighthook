@@ -11,56 +11,48 @@ use crate::actors::scripted::shot_events;
 use crate::bus::BusMsg;
 
 fn full_swing() -> (BallMetrics, ClubMetrics) {
-    (
-        BallMetrics {
-            speed: 60.0,
-            launch_angle: 14.0,
-            direction: -1.2,
-            total_spin: 3059,
-            spin_axis: -11.31,
-            back_spin: 3000,
-            side_spin: -600,
-            ..testing::ball_metrics()
-        },
-        ClubMetrics {
-            mask: 0xff,
-            path: Some(-2.4),
-            face_angle: Some(-0.8),
-            attack_angle: Some(-1.6),
-            dynamic_loft: Some(17.9),
-            impact_horizontal: Some(3.5),
-            impact_vertical: Some(-4.0),
-            club_speed: Some(41.4),
-            smash_factor: Some(1.45),
-        },
-    )
+    let mut ball = testing::ball_metrics();
+    ball.speed = 60.0;
+    ball.launch_angle = 14.0;
+    ball.direction = -1.2;
+    ball.total_spin = 3059;
+    ball.spin_axis = -11.31;
+    ball.back_spin = 3000;
+    ball.side_spin = -600;
+    let mut club = ClubMetrics::default();
+    club.mask = 0xff;
+    club.path = Some(-2.4);
+    club.face_angle = Some(-0.8);
+    club.attack_angle = Some(-1.6);
+    club.dynamic_loft = Some(17.9);
+    club.impact_horizontal = Some(3.5);
+    club.impact_vertical = Some(-4.0);
+    club.club_speed = Some(41.4);
+    club.smash_factor = Some(1.45);
+    (ball, club)
 }
 
 /// A tracked fade chip (the chip pin's).
 fn chip() -> (BallMetrics, ClubMetrics) {
-    (
-        BallMetrics {
-            speed: 3.30,
-            launch_angle: 32.51,
-            direction: 7.39,
-            total_spin: 627,
-            spin_axis: -8.00,
-            back_spin: 621,
-            side_spin: -87,
-            ..testing::ball_metrics()
-        },
-        ClubMetrics {
-            mask: 0xff,
-            path: Some(2.15),
-            face_angle: Some(4.62),
-            attack_angle: Some(-3.18),
-            dynamic_loft: Some(38.4),
-            impact_horizontal: Some(-6.5),
-            impact_vertical: Some(2.25),
-            club_speed: Some(3.02),
-            smash_factor: Some(1.09),
-        },
-    )
+    let mut ball = testing::ball_metrics();
+    ball.speed = 3.30;
+    ball.launch_angle = 32.51;
+    ball.direction = 7.39;
+    ball.total_spin = 627;
+    ball.spin_axis = -8.00;
+    ball.back_spin = 621;
+    ball.side_spin = -87;
+    let mut club = ClubMetrics::default();
+    club.mask = 0xff;
+    club.path = Some(2.15);
+    club.face_angle = Some(4.62);
+    club.attack_angle = Some(-3.18);
+    club.dynamic_loft = Some(38.4);
+    club.impact_horizontal = Some(-6.5);
+    club.impact_vertical = Some(2.25);
+    club.club_speed = Some(3.02);
+    club.smash_factor = Some(1.09);
+    (ball, club)
 }
 
 /// What the card puts on the bus for the shot `(ball, club)` as

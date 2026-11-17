@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use flightrelay::types::roles;
 use flightrelay::{
-    BusActor, CompletedShot, DEFAULT_HEARTBEAT, FrpBody, FrpMessage, Removal, ShotAggregator,
+    BusActor, CompletedShot, DEFAULT_HEARTBEAT, FrpBody, FrpMessage, Removal, ShotAccumulator,
     ShotEvent, ShotFlight, StateKind,
 };
 use tracing::info;
@@ -90,7 +90,7 @@ struct FlightModel<'a> {
     session: String,
     /// The flight model's own actor id.
     own: String,
-    shots: ShotAggregator,
+    shots: ShotAccumulator,
     /// Each shot's launch monitor: only it sends the launch it flies.
     owners: super::simout::ShotOwners,
     /// Its `bus.actor` is published (the mode is not `off`).
@@ -104,7 +104,7 @@ impl<'a> FlightModel<'a> {
             sender,
             session: state.flighthook_id(),
             own: sender.frp_id().unwrap_or_default().to_owned(),
-            shots: ShotAggregator::new().with_timeout(SHOT_TIMEOUT),
+            shots: ShotAccumulator::new().with_timeout(SHOT_TIMEOUT),
             owners: super::simout::ShotOwners::default(),
             on_bus: false,
         }

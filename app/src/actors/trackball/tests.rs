@@ -126,9 +126,10 @@ fn the_card_is_a_virtual_source() {
 async fn the_export_names_no_device() {
     let section = TrackballSection {
         name: "Trackball".into(),
-        driver: TrackballConfig {
-            device: Some("usb-Example_Trackball_SN0042-event-mouse".into()),
-            ..TrackballConfig::default()
+        driver: {
+            let mut config = TrackballConfig::default();
+            config.device = Some("usb-Example_Trackball_SN0042-event-mouse".into());
+            config
         },
         ..TrackballSection::default()
     };

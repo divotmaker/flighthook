@@ -47,8 +47,8 @@ pub(crate) const DEVICE: [Number; 2] = [
         unit: "counts/in",
         hover: "Counts per inch of ball travel the device reports.",
         whole: None,
-        get: |d| d.config.cpi,
-        set: |d, v| d.config.cpi = v,
+        get: |d| d.detector.cpi,
+        set: |d, v| d.detector.cpi = v,
     },
     Number {
         key: "report_limit",
@@ -58,8 +58,8 @@ pub(crate) const DEVICE: [Number; 2] = [
                 2047 for 12-bit, 32767 for 16-bit. A swing that hits it is \
                 logged as saturated.",
         whole: I32,
-        get: |d| f64::from(d.config.report_limit),
-        set: |d, v| d.config.report_limit = v as i32,
+        get: |d| f64::from(d.detector.report_limit),
+        set: |d, v| d.detector.report_limit = v as i32,
     },
 ];
 
@@ -169,8 +169,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         unit: "ms",
         hover: "Time the ball's speed is measured over.",
         whole: U32,
-        get: |d| f64::from(d.config.thresholds.speed_window_ms),
-        set: |d, v| d.config.thresholds.speed_window_ms = v as u32,
+        get: |d| f64::from(d.detector.thresholds.speed_window_ms),
+        set: |d, v| d.detector.thresholds.speed_window_ms = v as u32,
     },
     Number {
         key: "thresholds.gap_ms",
@@ -178,8 +178,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         unit: "ms",
         hover: "Silence after which the ball's movement counts as a new one.",
         whole: U32,
-        get: |d| f64::from(d.config.thresholds.gap_ms),
-        set: |d, v| d.config.thresholds.gap_ms = v as u32,
+        get: |d| f64::from(d.detector.thresholds.gap_ms),
+        set: |d, v| d.detector.thresholds.gap_ms = v as u32,
     },
     Number {
         key: "thresholds.v_start",
@@ -187,8 +187,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         unit: SHARE_OF_FULL,
         hover: "Speed that starts a backswing, as a share of the full power speed.",
         whole: None,
-        get: |d| d.config.thresholds.v_start,
-        set: |d, v| d.config.thresholds.v_start = v,
+        get: |d| d.detector.thresholds.v_start,
+        set: |d, v| d.detector.thresholds.v_start = v,
     },
     Number {
         key: "thresholds.v_stop",
@@ -197,8 +197,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         hover: "Speed below which the ball counts as stopped, as a share of the \
                 full power speed. Below the start speed.",
         whole: None,
-        get: |d| d.config.thresholds.v_stop,
-        set: |d, v| d.config.thresholds.v_stop = v,
+        get: |d| d.detector.thresholds.v_stop,
+        set: |d, v| d.detector.thresholds.v_stop = v,
     },
     Number {
         key: "thresholds.v_min_swing",
@@ -207,8 +207,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         hover: "Speed a push must reach to be a swing, as a share of the full \
                 power speed.",
         whole: None,
-        get: |d| d.config.thresholds.v_min_swing,
-        set: |d, v| d.config.thresholds.v_min_swing = v,
+        get: |d| d.detector.thresholds.v_min_swing,
+        set: |d, v| d.detector.thresholds.v_min_swing = v,
     },
     Number {
         key: "thresholds.dwell_min_ms",
@@ -217,8 +217,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         hover: "How long the ball must stay below the stop speed to count as \
                 stopped.",
         whole: U32,
-        get: |d| f64::from(d.config.thresholds.dwell_min_ms),
-        set: |d, v| d.config.thresholds.dwell_min_ms = v as u32,
+        get: |d| f64::from(d.detector.thresholds.dwell_min_ms),
+        set: |d, v| d.detector.thresholds.dwell_min_ms = v as u32,
     },
     Number {
         key: "thresholds.back_min",
@@ -227,8 +227,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         hover: "As a share of a full stroke, the distance the ball travels in \
                 100 ms at full power.",
         whole: None,
-        get: |d| d.config.thresholds.back_min,
-        set: |d, v| d.config.thresholds.back_min = v,
+        get: |d| d.detector.thresholds.back_min,
+        set: |d, v| d.detector.thresholds.back_min = v,
     },
     Number {
         key: "thresholds.full_cock",
@@ -237,8 +237,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         hover: "Backswing length that counts as fully cocked, as a share of a \
                 full stroke.",
         whole: None,
-        get: |d| d.config.thresholds.full_cock,
-        set: |d, v| d.config.thresholds.full_cock = v,
+        get: |d| d.detector.thresholds.full_cock,
+        set: |d, v| d.detector.thresholds.full_cock = v,
     },
     Number {
         key: "thresholds.fwd_min",
@@ -247,8 +247,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         hover: "Forward travel that makes a push a swing, as a share of a full \
                 stroke.",
         whole: None,
-        get: |d| d.config.thresholds.fwd_min,
-        set: |d, v| d.config.thresholds.fwd_min = v,
+        get: |d| d.detector.thresholds.fwd_min,
+        set: |d, v| d.detector.thresholds.fwd_min = v,
     },
     Number {
         key: "thresholds.back_max_s",
@@ -256,8 +256,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         unit: "s",
         hover: "A backswing still moving after this long is dropped.",
         whole: None,
-        get: |d| d.config.thresholds.back_max_s,
-        set: |d, v| d.config.thresholds.back_max_s = v,
+        get: |d| d.detector.thresholds.back_max_s,
+        set: |d, v| d.detector.thresholds.back_max_s = v,
     },
     Number {
         key: "thresholds.coil_timeout_s",
@@ -265,8 +265,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         unit: "s",
         hover: "How long a finished backswing waits for the push.",
         whole: None,
-        get: |d| d.config.thresholds.coil_timeout_s,
-        set: |d, v| d.config.thresholds.coil_timeout_s = v,
+        get: |d| d.detector.thresholds.coil_timeout_s,
+        set: |d, v| d.detector.thresholds.coil_timeout_s = v,
     },
     Number {
         key: "thresholds.fwd_window_ms",
@@ -274,8 +274,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         unit: "ms",
         hover: "Time the push is measured over at most.",
         whole: U32,
-        get: |d| f64::from(d.config.thresholds.fwd_window_ms),
-        set: |d, v| d.config.thresholds.fwd_window_ms = v as u32,
+        get: |d| f64::from(d.detector.thresholds.fwd_window_ms),
+        set: |d, v| d.detector.thresholds.fwd_window_ms = v as u32,
     },
     Number {
         key: "thresholds.idle_settle_ms",
@@ -283,8 +283,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         unit: "ms",
         hover: "Quiet time after a shot before the next backswing can start.",
         whole: U32,
-        get: |d| f64::from(d.config.thresholds.idle_settle_ms),
-        set: |d, v| d.config.thresholds.idle_settle_ms = v as u32,
+        get: |d| f64::from(d.detector.thresholds.idle_settle_ms),
+        set: |d, v| d.detector.thresholds.idle_settle_ms = v as u32,
     },
     Number {
         key: "thresholds.cooldown_max_s",
@@ -292,8 +292,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         unit: "s",
         hover: "Longest wait after a shot while the ball still rolls.",
         whole: None,
-        get: |d| d.config.thresholds.cooldown_max_s,
-        set: |d, v| d.config.thresholds.cooldown_max_s = v,
+        get: |d| d.detector.thresholds.cooldown_max_s,
+        set: |d, v| d.detector.thresholds.cooldown_max_s = v,
     },
     Number {
         key: "thresholds.pull_cone_deg",
@@ -302,8 +302,8 @@ pub(crate) const THRESHOLDS: [Number; 15] = [
         hover: "Widest angle from straight back that still counts as a pull, \
                 1 to 180.",
         whole: None,
-        get: |d| d.config.thresholds.pull_cone_deg,
-        set: |d, v| d.config.thresholds.pull_cone_deg = v,
+        get: |d| d.detector.thresholds.pull_cone_deg,
+        set: |d, v| d.detector.thresholds.pull_cone_deg = v,
     },
 ];
 

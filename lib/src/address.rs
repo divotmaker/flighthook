@@ -396,9 +396,10 @@ mod tests {
         c.mevo.insert(
             "0".into(),
             MevoSection {
-                driver: MevoConfig {
-                    address: Some("127.0.0.1:921".into()),
-                    ..MevoConfig::default()
+                driver: {
+                    let mut driver = MevoConfig::default();
+                    driver.address = Some("127.0.0.1:921".into());
+                    driver
                 },
                 ..MevoSection::default()
             },

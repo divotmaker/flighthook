@@ -322,7 +322,7 @@ impl Rig {
     fn hand_from(&mut self, from: &str, body: impl Into<FrpBody>) {
         let msg = FrpMessage::new(from, body);
         if let Some(session) = &mut self.session {
-            session.hand(&msg);
+            self.host.bus(session, &msg).expect("handed");
         }
     }
 
@@ -341,11 +341,7 @@ impl Rig {
             self.connect_error = true;
             self.view.insert("error".into(), error.to_string());
         }
-        let ended = SessionEnd {
-            error: Some(&error),
-            connected_for,
-            attempts: self.attempts,
-        };
+        let ended = SessionEnd::new(Some(&error), connected_for, self.attempts);
         let mut backoff = HostBackoff::default();
         let driver = &mut self.driver;
         self.delay = self
@@ -417,7 +413,7 @@ impl Rig {
     /// link or it ended.
     fn step(&mut self) -> Option<Activity> {
         let session = self.session.as_mut()?;
-        let stepped = self.host.with(|now, out| session.step_at(now, out));
+        let stepped = self.host.with(|now, out| session.step(now, out));
         let following = session.following();
         self.take_events();
         match stepped {

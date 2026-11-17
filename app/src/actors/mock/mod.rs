@@ -43,12 +43,14 @@ mod tests {
     fn fast() -> MockMonitorSection {
         MockMonitorSection {
             name: "Mock".into(),
-            driver: MockConfig {
-                shot_interval_s: 0.0,
-                arm_delay_s: 0.0,
-                ball_ready_delay_s: 0.0,
-                post_shot_delay_s: 0.0,
-                serial: None,
+            driver: {
+                let mut config = MockConfig::default();
+                config.shot_interval_s = 0.0;
+                config.arm_delay_s = 0.0;
+                config.ball_ready_delay_s = 0.0;
+                config.post_shot_delay_s = 0.0;
+                config.serial = None;
+                config
             },
             ..MockMonitorSection::default()
         }

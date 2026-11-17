@@ -1452,7 +1452,7 @@ fn the_trackball_is_added_where_the_server_can_read_one() {
     assert!(enabled(&marks, &format!("save:{id}")));
     let section = app.settings.build_actor_request(id).trackball["0"].clone();
     assert!((section.driver.tuning.full_power_speed - 40.0).abs() < f64::EPSILON);
-    assert!(!section.driver.config.grab);
+    assert!(!section.driver.detector.grab);
 }
 
 #[test]

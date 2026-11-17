@@ -99,7 +99,7 @@ fn alert_type(severity: Severity) -> &'static str {
     match severity {
         Severity::Critical => "alert_critical",
         Severity::Error => "alert_error",
-        Severity::Warn => "alert_warn",
+        _ => "alert_warn",
     }
 }
 
@@ -409,7 +409,7 @@ fn log_cells(entry: &LogEntry) -> [egui::RichText; 6] {
     let debug = mono(&entry.event_debug);
     let debug = match entry.alert_severity {
         Some(Severity::Error | Severity::Critical) => debug.color(theme::DANGER),
-        Some(Severity::Warn) => debug.color(theme::GOLD),
+        Some(_) => debug.color(theme::GOLD),
         None => debug,
     };
     let raw = if entry.raw.is_empty() {

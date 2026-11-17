@@ -551,11 +551,9 @@ fn launch_only_spin_survives_a_settings_save() {
 #[test]
 fn mock_driver_settings_survive_a_save_and_are_validated() {
     let mut cfg = FlighthookConfig::default();
-    let driver = MockConfig {
-        shot_interval_s: 5.0,
-        serial: Some("7".into()),
-        ..MockConfig::default()
-    };
+    let mut driver = MockConfig::default();
+    driver.shot_interval_s = 5.0;
+    driver.serial = Some("7".into());
     cfg.mock_monitor.insert(
         "0".into(),
         MockMonitorSection {
@@ -677,7 +675,7 @@ fn trackball_settings_are_saved_as_loaded_unless_changed() {
         form.load_from(&cfg);
         let saved = form.build_actor_request("trackball.0");
         assert_eq!(json(&saved.trackball["0"]), r#"{"name":"Trackball"}"#);
-        assert!(!saved.trackball["0"].driver.config.grab, "{loaded}");
+        assert!(!saved.trackball["0"].driver.detector.grab, "{loaded}");
     }
 
     let mut cfg = FlighthookConfig::default();
@@ -798,7 +796,7 @@ fn the_trackball_settings_are_validated_by_its_driver() {
 
     let mut cfg = FlighthookConfig::default();
     let mut refused = flighthook::TrackballSection::default();
-    refused.driver.config.cpi = 0.0;
+    refused.driver.detector.cpi = 0.0;
     cfg.trackball.insert("0".into(), refused);
     let mut form = SettingsForm::default();
     form.load_from(&cfg);
@@ -882,8 +880,10 @@ fn the_exputt_address_is_validated_by_its_driver() {
     cfg.exputt.insert(
         "0".into(),
         flighthook::ExPuttSection {
-            driver: flighthook::ExPuttConfig {
-                address: Some("exputt.local".into()),
+            driver: {
+                let mut config = flighthook::ExPuttConfig::default();
+                config.address = Some("exputt.local".into());
+                config
             },
             ..flighthook::ExPuttSection::default()
         },
@@ -948,15 +948,15 @@ fn square_driver_settings_survive_a_save() {
     cfg.square.insert(
         "0".into(),
         flighthook::SquareSection {
-            driver: flighthook::SquareConfig {
-                address: Some("SquareGolf(CD01)".into()),
-                club: "PW".into(),
-                advanced_spin: false,
-                discard_non_putting_zero_spin: true,
-                dot_bottom_to_face_center_mm: std::collections::BTreeMap::from([
-                    ("7i".into(), 21.5),
-                    ("PT".into(), 8.0),
-                ]),
+            driver: {
+                let mut config = flighthook::SquareConfig::default();
+                config.address = Some("SquareGolf(CD01)".into());
+                config.club = "PW".into();
+                config.advanced_spin = false;
+                config.discard_non_putting_zero_spin = true;
+                config.dot_bottom_to_face_center_mm =
+                    std::collections::BTreeMap::from([("7i".into(), 21.5), ("PT".into(), 8.0)]);
+                config
             },
             ..flighthook::SquareSection::default()
         },
@@ -994,19 +994,16 @@ fn square_driver_settings_survive_a_save() {
     assert_eq!(dev.driver_error(), None);
     assert!(super::actor_valid(&form.actors[0]));
     let saved = form.build_actor_request("square.0").square["0"].clone();
-    assert_eq!(
-        saved.driver,
-        flighthook::SquareConfig {
-            address: None,
-            club: "PW".into(),
-            advanced_spin: false,
-            discard_non_putting_zero_spin: false,
-            dot_bottom_to_face_center_mm: std::collections::BTreeMap::from([
-                ("DR".into(), 19.0),
-                ("PT".into(), 8.0),
-            ]),
-        }
-    );
+    assert_eq!(saved.driver, {
+        let mut config = flighthook::SquareConfig::default();
+        config.address = None;
+        config.club = "PW".into();
+        config.advanced_spin = false;
+        config.discard_non_putting_zero_spin = false;
+        config.dot_bottom_to_face_center_mm =
+            std::collections::BTreeMap::from([("DR".into(), 19.0), ("PT".into(), 8.0)]);
+        config
+    });
 }
 
 #[test]
@@ -1015,9 +1012,10 @@ fn the_r10_range_is_validated_by_its_driver() {
     cfg.r10.insert(
         "0".into(),
         R10Section {
-            driver: flighthook::R10Config {
-                range: Some(Distance::Feet(7.0)),
-                ..flighthook::R10Config::default()
+            driver: {
+                let mut config = flighthook::R10Config::default();
+                config.range = Some(Distance::Feet(7.0));
+                config
             },
             ..R10Section::default()
         },
@@ -1105,9 +1103,11 @@ fn the_r10_aim_offset_is_validated_by_its_driver() {
     cfg.r10.insert(
         "0".into(),
         R10Section {
-            driver: flighthook::R10Config {
-                range: Some(Distance::Feet(7.0)),
-                aim_offset_deg: Some(-1.5),
+            driver: {
+                let mut config = flighthook::R10Config::default();
+                config.range = Some(Distance::Feet(7.0));
+                config.aim_offset_deg = Some(-1.5);
+                config
             },
             ..R10Section::default()
         },

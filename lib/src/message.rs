@@ -138,8 +138,10 @@ mod tests {
                 name: "ExPutt".into(),
                 enabled: true,
                 impact_lead_s: None,
-                driver: ExPuttConfig {
-                    address: Some("192.168.1.50".into()),
+                driver: {
+                    let mut driver = ExPuttConfig::default();
+                    driver.address = Some("192.168.1.50".into());
+                    driver
                 },
             },
         };

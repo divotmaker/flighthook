@@ -230,11 +230,7 @@ fn another_app_waiting_closes_and_asks_again_later() {
 /// The driver's retry delay after a link ended with `error`, having held
 /// for `held` (`None`: a connect that failed).
 fn retry(rig: &mut Rig, error: &Error, held: Option<Duration>) -> Option<Duration> {
-    let ended = SessionEnd {
-        error: Some(error),
-        connected_for: held,
-        attempts: 1,
-    };
+    let ended = SessionEnd::new(Some(error), held, 1);
     let mut backoff = HostBackoff::default();
     let driver = &mut rig.driver;
     rig.host

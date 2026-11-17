@@ -49,6 +49,17 @@ fn every_field() -> FlighthookConfig {
     fn one<T>(section: T) -> std::collections::HashMap<String, T> {
         std::collections::HashMap::from([("3".to_string(), section)])
     }
+    let mut exputt = ExPuttConfig::default();
+    exputt.address = Some("192.168.1.50".into());
+    let mut trackball = TrackballConfig::default();
+    trackball.device = Some("usb-Example_Trackball-event-mouse".into());
+    trackball.club = thumbswing::Club::Driver;
+    trackball.detector.cpi = 800.0;
+    trackball.detector.report_limit = 2047;
+    trackball.detector.grab = false;
+    trackball.detector.thresholds.v_start = 0.08;
+    trackball.tuning.curve_sense = thumbswing::CurveSense::Physical;
+    trackball.tuning.full_power_speed = 40.0;
     FlighthookConfig {
         default_units: UnitSystem::Metric,
         frp: FrpSection {
@@ -102,33 +113,13 @@ fn every_field() -> FlighthookConfig {
             name: "Putting".into(),
             enabled: true,
             impact_lead_s: None,
-            driver: ExPuttConfig {
-                address: Some("192.168.1.50".into()),
-            },
+            driver: exputt,
         }),
         trackball: one(TrackballSection {
             actor_id: None,
             name: "Arcade".into(),
             enabled: false,
-            driver: TrackballConfig {
-                device: Some("usb-Example_Trackball-event-mouse".into()),
-                club: thumbswing::Club::Driver,
-                hand: thumbswing::Hand::default(),
-                config: thumbswing::Config {
-                    cpi: 800.0,
-                    report_limit: 2047,
-                    grab: false,
-                    thresholds: thumbswing::Thresholds {
-                        v_start: 0.08,
-                        ..thumbswing::Thresholds::default()
-                    },
-                },
-                tuning: thumbswing::Tuning {
-                    curve_sense: thumbswing::CurveSense::Physical,
-                    full_power_speed: 40.0,
-                    ..thumbswing::Tuning::default()
-                },
-            },
+            driver: trackball,
         }),
         mock_monitor: one(MockMonitorSection {
             actor_id: None,

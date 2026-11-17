@@ -842,13 +842,11 @@ fn a_square_section_file_from_0_1_24_loads_unchanged() {
     let second = &config.square["1"];
     assert!(!second.enabled);
     assert_eq!(second.driver.address.as_deref(), Some("02:00:00:AB:CD:01"));
-    assert_eq!(
-        second.driver,
-        flighthook::SquareConfig {
-            address: Some("02:00:00:AB:CD:01".into()),
-            ..flighthook::SquareConfig::default()
-        }
-    );
+    assert_eq!(second.driver, {
+        let mut config = flighthook::SquareConfig::default();
+        config.address = Some("02:00:00:AB:CD:01".into());
+        config
+    });
     assert_eq!(config.device_error(), None);
     assert_only_ids_added(&dir, &path, &config, &text, &expected);
     let saved = toml::to_string_pretty(&config).expect("toml");
@@ -1014,9 +1012,9 @@ fn a_trackball_section_file_loads_unchanged() {
     let d = &first.driver;
     assert_eq!(d.device(), Some("usb-Example_Trackball-event-mouse"));
     assert_eq!(d.club, flighthook::TrackballClub::Driver);
-    assert!((d.config.cpi - 800.0).abs() < f64::EPSILON);
-    assert!(!d.config.grab);
-    assert!((d.config.thresholds.coil_timeout_s - 20.0).abs() < f64::EPSILON);
+    assert!((d.detector.cpi - 800.0).abs() < f64::EPSILON);
+    assert!(!d.detector.grab);
+    assert!((d.detector.thresholds.coil_timeout_s - 20.0).abs() < f64::EPSILON);
     assert!((d.tuning.full_power_speed - 40.0).abs() < f64::EPSILON);
     assert_eq!(
         d.tuning.curve_sense,
@@ -1024,7 +1022,7 @@ fn a_trackball_section_file_loads_unchanged() {
     );
     let second = &config.trackball["1"];
     assert!(!second.enabled);
-    assert!(!second.driver_settings().config.grab);
+    assert!(!second.driver_settings().detector.grab);
     assert_eq!(config.device_error(), None);
     assert_eq!(
         std::fs::read_to_string(&path).expect("read"),
@@ -1061,8 +1059,8 @@ fn a_trackball_grab_key_loads_and_does_not_grab() {
     assert_eq!(error, None);
     assert_eq!(config.device_error(), None);
     for section in config.trackball.values() {
-        assert!(!section.driver.config.grab);
-        assert!(!section.driver_settings().config.grab);
+        assert!(!section.driver.detector.grab);
+        assert!(!section.driver_settings().detector.grab);
     }
     assert_eq!(
         std::fs::read_to_string(&path).expect("read"),

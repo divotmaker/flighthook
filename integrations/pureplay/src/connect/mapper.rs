@@ -16,7 +16,6 @@
 //! curves right), set in one place in this module.
 
 use flightrelay::Club;
-use flightrelay::types::Launch;
 
 use super::OutputShot;
 use super::codec::{BallData, ClubData};
@@ -36,21 +35,6 @@ const SIDE_SPIN_SIGN: f64 = 1.0;
 /// Pureplay's SideSpin for flighthook's `sidespin_rpm`.
 fn side_spin(rpm: i32) -> f64 {
     SIDE_SPIN_SIGN * f64::from(rpm)
-}
-
-/// The backspin to send for `launch`: its own, or a total spin that comes
-/// with no axis and no components, which is all backspin. No sidespin or
-/// axis is made up for such a total.
-fn output_backspin(launch: &Launch) -> Option<i32> {
-    match (
-        launch.backspin_rpm,
-        launch.sidespin_rpm,
-        launch.total_spin_rpm,
-        launch.spin_axis,
-    ) {
-        (None, None, Some(total), None) => Some(total),
-        (back, ..) => back,
-    }
 }
 
 /// Set `bit` in `mask` and return the value as `f32` when `value` is a
@@ -93,7 +77,7 @@ pub fn map_shot(shot: &OutputShot, shot_id: u32) -> Option<ShotFrames> {
         back_spin_rpm: field(
             &mut valid,
             BallData::BACK_SPIN,
-            output_backspin(b).map(f64::from),
+            b.output_backspin().map(f64::from),
         ),
         side_spin_rpm: field(
             &mut valid,
@@ -222,7 +206,7 @@ pub fn club_from_pureplay(n: u8) -> Option<Club> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use flightrelay::types::{Basis, ClubData as FhClubData, FaceImpact, FlightResult};
+    use flightrelay::types::{Basis, ClubData as FhClubData, FaceImpact, FlightResult, Launch};
     use flightrelay::{Distance, Velocity};
 
     /// A full shot: ball with both spin pairs, club, face impact.

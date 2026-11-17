@@ -14,9 +14,9 @@ default = ["driver"]
 # The settings and the Open Connect JSON types only (serde), so the WASM UI
 # builds them.
 config = ["dep:flightrelay", "flightrelay/config", "dep:serde"]
-# The flightrelay drivers, their sessions and transports (`controller`: the
-# shot aggregator a session composes shots with).
-driver = ["config", "flightrelay/driver", "flightrelay/controller", "dep:serde_json", "dep:thiserror"]
+# The flightrelay drivers, their sessions and transports (`collector`: the
+# shot accumulator a session composes shots with).
+driver = ["config", "flightrelay/driver", "flightrelay/collector", "dep:serde_json", "dep:thiserror"]
 # A read-only look at the registry of this process's own clients, for the
 # host's tests.
 testing = ["driver"]

@@ -302,6 +302,7 @@ fn mode_icon(mode: Mode) -> &'static Asset {
         Mode::Full => &icons::SHOT_FULL,
         Mode::Chipping => &icons::SHOT_CHIP,
         Mode::Putting => &icons::SHOT_PUTT,
+        _ => &icons::SHOT_FULL,
     }
 }
 
@@ -331,6 +332,7 @@ fn mode_label(mode: Mode) -> &'static str {
         Mode::Full => "Full",
         Mode::Chipping => "Chip",
         Mode::Putting => "Putt",
+        _ => "Other",
     }
 }
 

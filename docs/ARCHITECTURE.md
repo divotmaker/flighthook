@@ -474,12 +474,12 @@ Types that cross the app/UI boundary (REST, `/api/ws`, config) live in the
 
 ### Shot composing and the store
 
-The SDK's `ShotAggregator` composes each shot from its messages until
+The SDK's `ShotAccumulator` composes each shot from its messages until
 `shot.finished` and stamps flighthook's own `golfer.turn` and `practice.block`
 at the trigger. A shot not finished 45 s after its trigger (`SHOT_TIMEOUT`;
 longer than a driver's own shot deadline) is discarded, and the messages of a
 finished or discarded shot are ignored for another 45 s. The Open Connect
-client, the Pureplay Connect session and the collector each keep an aggregator.
+client, the Pureplay Connect session and the collector each keep an accumulator.
 
 The collector stores every finished shot (`ShotData`, `GET /api/shots`) with:
 the launch as the launch monitor sent it; every `shot.flight` with its sender
@@ -807,7 +807,7 @@ splits a block the same way when it has shots.
 
 The collector (`app/src/actors/web/blocks.rs`) keeps every block seen this run,
 open or closed, with its stored-shot count, for headers and history
-(`GET /api/blocks`). Membership is the block the aggregator stamped on the
+(`GET /api/blocks`). Membership is the block the accumulator stamped on the
 shot at its trigger. The `shot_grouping` setting (`none`, `by_club`, `by_set`)
 is the Shots navigation's default view; By club combines blocks with the same
 golfer, club and session. Every stored shot carries its block in every view,
@@ -1701,7 +1701,7 @@ The protocol lives in the workspace crate `flighthook-pureplay`
   flight), and the shot's `shot.finished` only when the routing passes it. A
   new session is handed the whole view first. The card sends `bus.sync` when
   it starts, so the launch monitors already up republish their `bus.actor`.
-  The session composes each shot with its own `ShotAggregator` (shots still
+  The session composes each shot with its own `ShotAccumulator` (shots still
   unfinished 45 s after their trigger are let go).
 - The device's state comes from the launch monitors in view: their
   `bus.actor` (blockers, battery, source) and `shot.trigger`/`shot.finished`.

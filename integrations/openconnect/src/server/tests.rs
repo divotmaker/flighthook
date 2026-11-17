@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use flightrelay::driver::{Activity, DeviceEvent, FrpDriver, FrpSession, StatusChange};
-use flightrelay::testing::TestHost;
-use flightrelay::{Club, FrpBody, FrpMessage, Handedness, ShotAggregator, ShotEvent};
+use flightrelay::testing::{TestHost, bodies};
+use flightrelay::{Club, FrpBody, FrpMessage, Handedness, ShotAccumulator, ShotEvent};
 
 use super::*;
 use crate::client::api::GsProMessage;
@@ -134,7 +134,7 @@ impl Link {
 
     fn try_step(&mut self) -> Result<Activity, Error> {
         let Self { host, session, .. } = self;
-        host.with(|now, out| session.step_at(now, out))
+        host.with(|now, out| session.step(now, out))
     }
 
     /// Step until the session idles.
@@ -166,7 +166,9 @@ impl Link {
         if let Some(club) = club {
             hints = hints.with_club(club);
         }
-        self.session.set_hints(&hints);
+        let Self { host, session, .. } = self;
+        host.with(|_, out| session.hints(&hints, out))
+            .expect("hints");
     }
 
     /// What the server wrote since the last call, one entry per write.
@@ -198,17 +200,6 @@ fn player_info(hand: Option<&str>, club: Option<&str>) -> String {
     )
 }
 
-/// The message bodies in `events`, as `FrpMessage`s from `from`.
-fn bodies(events: &[DeviceEvent]) -> Vec<FrpBody> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            DeviceEvent::Frp(body) => Some(body.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 /// The kinds of message in `events`, in order, raw frames as
 /// `rx:label`/`tx:label`.
 fn kinds(events: &[DeviceEvent]) -> Vec<String> {
@@ -234,10 +225,11 @@ fn ingested(request: &str) -> OutputShot {
     let mut link = Link::new();
     link.send(request);
     link.settle();
-    let mut shots = ShotAggregator::new();
+    let mut shots = ShotAccumulator::new();
     let mut done = None;
     for body in bodies(&link.events()) {
-        if let Some(ShotEvent::Finished(shot)) = shots.feed(&FrpMessage::new("range", body)) {
+        if let Some(ShotEvent::Finished(shot)) = shots.feed(&FrpMessage::new("range", body.clone()))
+        {
             done = Some(shot);
         }
     }
@@ -272,7 +264,7 @@ fn shot_finished_carries_request_and_reply() {
         .collect();
     assert_eq!(frames[0].data, request.as_bytes());
     assert_eq!(frames[1].data, OK_SHOT.as_bytes());
-    let FrpBody::ShotTrigger(trigger) = &bodies(&events)[0] else {
+    let FrpBody::ShotTrigger(trigger) = bodies(&events)[0] else {
         panic!("a trigger first");
     };
     assert_eq!(trigger.key.shot_number, 4, "the monitor's own number");
@@ -714,11 +706,7 @@ fn a_monitor_that_leaves_ends_the_session_and_the_next_connect_is_at_once() {
     let mut host = TestHost::new();
     let delay = host.with(|_, out| {
         server.retry_delay(
-            &SessionEnd {
-                error: Some(&ended),
-                connected_for: Some(Duration::from_secs(5)),
-                attempts: 0,
-            },
+            &SessionEnd::new(Some(&ended), Some(Duration::from_secs(5)), 0),
             &mut backoff,
             out,
         )
@@ -744,11 +732,7 @@ fn a_bind_that_fails_is_an_error_alert_and_backs_off() {
         .map(|attempts| {
             host.with(|_, out| {
                 server.retry_delay(
-                    &SessionEnd {
-                        error: Some(&error),
-                        connected_for: None,
-                        attempts,
-                    },
+                    &SessionEnd::new(Some(&error), None, attempts),
                     &mut backoff,
                     out,
                 )
@@ -976,7 +960,12 @@ fn a_chain_through_the_server_to_another_port_works() {
     // What the server put on the bus goes to the client, as a host would.
     for body in bodies(&events) {
         if !matches!(body, FrpBody::ShotRaw(_)) {
-            client_session.hand(&FrpMessage::new("range-bridge", body));
+            client_host
+                .bus(
+                    &mut client_session,
+                    &FrpMessage::new("range-bridge", body.clone()),
+                )
+                .expect("handed");
         }
     }
     client_host

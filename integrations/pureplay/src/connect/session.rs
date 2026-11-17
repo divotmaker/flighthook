@@ -14,7 +14,7 @@ use flightrelay::driver::{
 use flightrelay::types::{blockers, roles};
 use flightrelay::{
     BusActor, Club, CompletedShot, FrpBody, FrpMessage, GolferSelect, Handedness, Mode, RawDir,
-    RawFrame, Removal, Severity, ShotAggregator, ShotEvent, ShotKey, Source, StateKind,
+    RawFrame, Removal, Severity, ShotAccumulator, ShotEvent, ShotKey, Source, StateKind,
 };
 
 use super::codec::{self, BallData, ConnectionState, FrameReader, Message, ReadyState};
@@ -172,8 +172,8 @@ impl FrpDriver for Connect {
 }
 
 /// One link to Pureplay over transport `S`, from the TCP connect to its
-/// end. Over TCP it is the driver's [`FrpSession`]; over any other `S` a
-/// test steps it with [`step_at`](Self::step_at).
+/// end: the driver's [`FrpSession`], over TCP, or over any other `S` in a
+/// test.
 #[derive(Debug)]
 pub struct Session<S = TcpStream> {
     stream: S,
@@ -199,7 +199,7 @@ pub struct Session<S = TcpStream> {
     monitors: BTreeMap<String, BusActor>,
     /// When each launch monitor's shot in progress was triggered.
     processing: HashMap<String, Instant>,
-    shots: ShotAggregator,
+    shots: ShotAccumulator,
     /// Finished shots not sent yet.
     outbox: VecDeque<CompletedShot>,
     /// The time of the last step, which stamps what the session is handed.
@@ -212,15 +212,87 @@ pub struct Session<S = TcpStream> {
     host_errors: Live<Option<Instant>>,
 }
 
-impl FrpSession for Session<TcpStream> {
-    type Driver = Connect;
+impl<S: Read + Write> FrpSession for Session<S> {
+    type Error = Error;
+    type Action = NoAction;
 
+    /// One pass at `now`: Hello on the first; then what Pureplay sent, the
+    /// shots waiting and the ready state.
+    ///
+    /// # Errors
+    ///
+    /// Returns what ended the link: a read or write that failed, Pureplay
+    /// closing it, or a handshake that failed.
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        self.step_at(now, out)
+        self.now = now;
+        let Some(hello_at) = self.hello_at else {
+            let hello = self.hello();
+            self.send(&hello, out)?;
+            self.hello_at = Some(now);
+            return Ok(Activity::Active);
+        };
+        if !self.handshaken {
+            for shot in self.outbox.drain(..) {
+                out.log(
+                    Level::Debug,
+                    format!(
+                        "not linked yet, dropping shot #{} from '{}'",
+                        shot.key.shot_number, shot.from
+                    ),
+                );
+            }
+        }
+        let read = self.read()?;
+        self.handle_frames(out)?;
+        if !self.handshaken {
+            if now.saturating_duration_since(hello_at) >= HELLO_TIMEOUT {
+                return Err(Error::Handshake(format!(
+                    "no reply to Hello within {HELLO_TIMEOUT:?}; is Pureplay listening there?"
+                )));
+            }
+            return Ok(if read {
+                Activity::Active
+            } else {
+                Activity::Idle
+            });
+        }
+        let sent = self.send_shots(out)?;
+        let pushed = self.push_ready(now, out)?;
+        Ok(if read || sent || pushed {
+            Activity::Active
+        } else {
+            Activity::Idle
+        })
     }
 
-    fn bus(&mut self, msg: &FrpMessage) -> Result<(), Error> {
-        self.hand(msg);
+    /// Take one message of the session's view of the bus (see the
+    /// [module docs](super)). Reads no clock: it is stamped with the last
+    /// step's time.
+    fn bus(&mut self, msg: &FrpMessage, _: &mut Events<'_>) -> Result<(), Error> {
+        match &msg.body {
+            FrpBody::BusActor(actor) if actor.has_role(roles::LAUNCH_MONITOR) => {
+                self.monitors.insert(msg.from.clone(), actor.clone());
+            }
+            FrpBody::Removed(Removal {
+                kind: StateKind::BusActor,
+                ..
+            }) => {
+                self.monitors.remove(&msg.from);
+                self.processing.remove(&msg.from);
+            }
+            // A monitor out of view is not on the bus: its shot in progress
+            // does not count when it comes into view.
+            FrpBody::ShotTrigger(_) if self.monitors.contains_key(&msg.from) => {
+                self.processing.insert(msg.from.clone(), self.now);
+            }
+            FrpBody::ShotFinished(_) => {
+                self.processing.remove(&msg.from);
+            }
+            _ => {}
+        }
+        if let Some(ShotEvent::Finished(shot)) = self.shots.feed_at(msg, self.now) {
+            self.outbox.push_back(shot);
+        }
         Ok(())
     }
 
@@ -280,7 +352,7 @@ impl<S: Read + Write> Session<S> {
             selects: 0,
             monitors: BTreeMap::new(),
             processing: HashMap::new(),
-            shots: ShotAggregator::new().with_timeout(SHOT_TIMEOUT),
+            shots: ShotAccumulator::new().with_timeout(SHOT_TIMEOUT),
             outbox: VecDeque::new(),
             now,
             club: None,
@@ -290,90 +362,17 @@ impl<S: Read + Write> Session<S> {
         }
     }
 
-    /// Take one message of the session's view of the bus (see the
-    /// [module docs](super)). Reads no clock: it is stamped with the last
-    /// step's time.
-    pub fn hand(&mut self, msg: &FrpMessage) {
-        match &msg.body {
-            FrpBody::BusActor(actor) if actor.has_role(roles::LAUNCH_MONITOR) => {
-                self.monitors.insert(msg.from.clone(), actor.clone());
-            }
-            FrpBody::Removed(Removal {
-                kind: StateKind::BusActor,
-                ..
-            }) => {
-                self.monitors.remove(&msg.from);
-                self.processing.remove(&msg.from);
-            }
-            // A monitor out of view is not on the bus: its shot in progress
-            // does not count when it comes into view.
-            FrpBody::ShotTrigger(_) if self.monitors.contains_key(&msg.from) => {
-                self.processing.insert(msg.from.clone(), self.now);
-            }
-            FrpBody::ShotFinished(_) => {
-                self.processing.remove(&msg.from);
-            }
-            _ => {}
-        }
-        if let Some(ShotEvent::Finished(shot)) = self.shots.feed_at(msg, self.now) {
-            self.outbox.push_back(shot);
-        }
-    }
-
-    /// One pass at `now`: Hello on the first; then what Pureplay sent, the
-    /// shots waiting and the ready state.
-    ///
-    /// # Errors
-    ///
-    /// Returns what ended the link: a read or write that failed, Pureplay
-    /// closing it, or a handshake that failed.
-    pub fn step_at(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        self.now = now;
-        let Some(hello_at) = self.hello_at else {
-            let hello = self.hello();
-            self.send(&hello, out)?;
-            self.hello_at = Some(now);
-            return Ok(Activity::Active);
-        };
-        if !self.handshaken {
-            for shot in self.outbox.drain(..) {
-                out.log(
-                    Level::Debug,
-                    format!(
-                        "not linked yet, dropping shot #{} from '{}'",
-                        shot.key.shot_number, shot.from
-                    ),
-                );
-            }
-        }
-        let read = self.read()?;
-        self.handle_frames(out)?;
-        if !self.handshaken {
-            if now.saturating_duration_since(hello_at) >= HELLO_TIMEOUT {
-                return Err(Error::Handshake(format!(
-                    "no reply to Hello within {HELLO_TIMEOUT:?}; is Pureplay listening there?"
-                )));
-            }
-            return Ok(if read {
-                Activity::Active
-            } else {
-                Activity::Idle
-            });
-        }
-        let sent = self.send_shots(out)?;
-        let pushed = self.push_ready(now, out)?;
-        Ok(if read || sent || pushed {
-            Activity::Active
-        } else {
-            Activity::Idle
-        })
-    }
-
     /// Write `msg`, then hand its frame to the host.
     fn send(&mut self, msg: &Message, out: &mut Events<'_>) -> Result<(), Error> {
         let frame = msg.to_frame();
         self.write(&frame)?;
-        out.raw(RawDir::Tx, codec::kind_name(msg.kind()), &frame);
+        out.wire(
+            RawDir::Tx,
+            codec::kind_name(msg.kind()),
+            frame.to_vec(),
+            flightrelay::utc_ms(),
+            false,
+        );
         Ok(())
     }
 
@@ -448,7 +447,13 @@ impl<S: Read + Write> Session<S> {
     fn handle_frames(&mut self, out: &mut Events<'_>) -> Result<(), Error> {
         while let Some(frame) = self.reader.next_frame() {
             self.log_skipped(out);
-            out.raw(RawDir::Rx, codec::kind_name(frame.kind), &frame.bytes);
+            out.wire(
+                RawDir::Rx,
+                codec::kind_name(frame.kind),
+                frame.bytes.to_vec(),
+                flightrelay::utc_ms(),
+                false,
+            );
             if frame.reserved != 0 && !self.reserved_seen {
                 self.reserved_seen = true;
                 out.log(
