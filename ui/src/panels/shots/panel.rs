@@ -575,9 +575,18 @@ impl FlighthookApp {
         } else {
             TOOLBAR_HEIGHT
         };
-        ui.allocate_ui_with_layout(
+        // The row is the toolbar's height; its content is centered `HEADER_DROP` below the
+        // row's middle (the touch-sized row keeps its middle), so the label and icons center
+        // on the toolbar's pill.
+        let (row, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), toolbar),
-            egui::Layout::left_to_right(egui::Align::Center),
+            egui::Sense::hover(),
+        );
+        let drop = if self.portrait { 0.0 } else { HEADER_DROP };
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(row.with_min_y(row.min.y + 2.0 * drop))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
             |ui| {
                 ui.add_space(inset);
                 ui.label(theme::caps("Shots", 11.0, theme::TEXT_MUTED));

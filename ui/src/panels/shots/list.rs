@@ -19,6 +19,9 @@ pub(crate) const LIST_HEADER_HEIGHT: f32 = 30.0;
 /// Height of the Shots tab's toolbar row and of the shots navigation's
 /// header row beside it, so both center on one line.
 pub(crate) const TOOLBAR_HEIGHT: f32 = 38.0;
+/// How far the navigation header's label and icons sit below the middle of
+/// its row: text and icon glyphs draw above the middle of their boxes.
+pub(crate) const HEADER_DROP: f32 = 2.0;
 /// Height of the foot's New set / New session line.
 pub(super) const STRIP_BUTTONS_HEIGHT: f32 = 28.0;
 /// Height of the foot's hint line.
