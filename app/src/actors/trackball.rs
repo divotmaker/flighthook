@@ -43,7 +43,7 @@ pub type TrackballActor = DriverActor<Thumbswing, TrackballHooks>;
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
@@ -84,6 +84,9 @@ mod tests {
     struct Feed {
         swings: Mutex<VecDeque<Vec<Sample>>>,
         unplugged: AtomicBool,
+        /// Times the input's clock stopped after running: a swing played
+        /// out, its timers run out.
+        played: AtomicUsize,
     }
 
     impl Feed {
@@ -92,6 +95,15 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push_back(samples);
+        }
+
+        /// Wait until `n` swings have played out.
+        fn until_played(&self, n: usize) {
+            let deadline = Instant::now() + WAIT;
+            while self.played.load(Ordering::SeqCst) < n {
+                assert!(Instant::now() < deadline, "the swing did not play out");
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
     }
 
@@ -110,6 +122,8 @@ mod tests {
         now: u64,
         running_until: u64,
         gone: bool,
+        /// Whether the clock ran at the last read of it.
+        was_running: bool,
         info: DeviceInfo,
     }
 
@@ -121,6 +135,7 @@ mod tests {
                 now: 1_000_000,
                 running_until: 0,
                 gone: false,
+                was_running: false,
                 info,
             }
         }
@@ -168,6 +183,11 @@ mod tests {
             if self.running() {
                 self.now += 1000;
             }
+            let running = self.running();
+            if self.was_running && !running {
+                self.feed.played.fetch_add(1, Ordering::SeqCst);
+            }
+            self.was_running = running;
             self.now
         }
 
@@ -498,16 +518,17 @@ mod tests {
             seen
         }
 
-        /// Every message from the card waiting on the bus, without waiting.
-        fn drain(&mut self) -> Vec<BusMsg> {
-            let mut seen = Vec::new();
-            loop {
-                match self.rx.try_recv() {
-                    Ok(m) if self.mine(&m) => seen.push(m),
-                    Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                    Err(_) => return seen,
-                }
-            }
+        /// Messages until the card answers a `bus.sync` sent now: it answers
+        /// while it drains the bus, between steps, so every step before has
+        /// put its messages on the bus.
+        fn synced(&mut self) -> Vec<BusMsg> {
+            let _ = self.tx.send(BusMsg::frp(FrpMessage::new(
+                self.state.flighthook_id(),
+                flightrelay::BusSync::new(),
+            )));
+            self.until("bus.sync answered", |m| {
+                matches!(body(m), Some(FrpBody::BusActor(_)))
+            })
         }
 
         /// Take `section` live, as a save does.
@@ -822,20 +843,19 @@ mod tests {
                 feeds: &[],
             })
             .expect("a round");
-        // A swing at the input's own pace takes a few milliseconds here:
-        // give the card a few passes to see the round first, and after it.
-        let passes = Duration::from_millis(300);
-        std::thread::sleep(passes);
+        // The card has drained the bus since the round began, so its next
+        // step sees the round.
+        let mut held = card.synced();
         feed.swing(swing(0.0, 0.0, 1200.0));
-        std::thread::sleep(passes);
-        let held = card.drain();
+        feed.until_played(1);
+        held.extend(card.synced());
         assert!(
             held.iter()
                 .all(|m| !matches!(body(m), Some(FrpBody::ShotTrigger(_)))),
             "{held:?}"
         );
         drop(guard);
-        std::thread::sleep(passes);
+        card.synced();
         feed.swing(swing(0.0, 0.0, 1200.0));
         assert_eq!(shot_number(&card.next_shot()), 1, "no number taken");
         card.stop();
