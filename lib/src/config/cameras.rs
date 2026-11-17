@@ -526,8 +526,8 @@ pub struct CameraSection {
     /// Where the camera stands.
     #[serde(default)]
     pub position: CameraPosition,
-    /// Video mode: `auto` (the highest frame rate, then the largest size)
-    /// or `WIDTHxHEIGHT@FPS`, e.g. `1280x720@120`.
+    /// Video mode: `auto` (the highest frame rate up to 120 fps, then the
+    /// largest size) or `WIDTHxHEIGHT@FPS`, e.g. `1280x720@120`.
     #[serde(default = "default_video_mode")]
     pub mode: String,
     /// Seconds a frame is old when it arrives, 0 to [`MAX_LATENCY_S`]: a

@@ -29,8 +29,9 @@ with a replay button. Capture uses the
 1. Settings → Cameras → **Cameras (+)** → **Camera**.
 2. On the new camera's page, pick the **Camera** from the list
    (**Test pattern** is a generated picture for trying it out), its
-   **Position**, and the **Video mode**: **Auto** takes the highest frame
-   rate, then the largest size; or pick one of the camera's modes.
+   **Position**, and the **Video mode**: **Auto** picks the highest frame
+   rate up to 120 fps, then the largest size; or pick one of the camera's
+   modes.
 3. **Save**. The card turns green once frames arrive; its telemetry shows
    the resolution, the frame rate achieved and dropped frames.
 4. **Still frame** (the camera icon) in the camera page's header shows the camera's current picture,

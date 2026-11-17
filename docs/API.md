@@ -2124,7 +2124,7 @@ Full persisted config (mirrors `config.toml`).
   picture); `camera_name`, the camera's own name when it was picked, used
   when the id is not connected (a camera moved to another USB port);
   `position` ([`CameraPosition`](#cameraposition), default `golfer_front`); and
-  `mode`, `auto` (the highest frame rate, then the largest size) or
+  `mode`, `auto` (the highest frame rate up to 120 fps, then the largest size) or
   `WIDTHxHEIGHT@FPS` (`1280x720@120`). Changing the camera or the mode
   restarts the actor; a name or position change applies at once
 - `gspro` sections are also accepted when posting and read as

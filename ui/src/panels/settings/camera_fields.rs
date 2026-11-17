@@ -165,8 +165,8 @@ pub(super) fn camera_fields(
 
     ui.horizontal(|ui| {
         field_label(ui, "Video mode:").on_hover_text(
-            "Auto picks the camera's highest frame rate, then its largest size at that \
-             rate. A faster mode shows more of the swing in slow motion and takes more \
+            "Auto picks the camera's highest frame rate up to 120 fps, then its largest \
+             size at that rate. A faster mode shows more of the swing in slow motion and takes more \
              disk space.",
         );
         let auto = CameraSection::AUTO_MODE;
