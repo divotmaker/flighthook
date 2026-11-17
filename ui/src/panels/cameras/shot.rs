@@ -44,6 +44,7 @@ impl FlighthookApp {
                 let Some(layout) = self.render_shot_player(ui, max_picture) else {
                     return;
                 };
+                let (origin, available) = (ui.cursor().min.x, ui.available_width());
                 ui.add_space(12.0);
                 // Each camera's swing, at the frame it shows, graded
                 // against the picked reference.
@@ -63,14 +64,27 @@ impl FlighthookApp {
                 // In the portrait layout the cameras are stacked, each the
                 // full width.
                 let stacked = self.portrait;
+                let across = if stacked { 1 } else { layout.columns.len() };
+                let column_w = layout.columns.first().map_or(0.0, |c| c.width);
+                let n = across as f32;
+                let row = column_w * n + layout.gap * (n - 1.0);
+                // The Notes box of the tables, beside them when it fits (the
+                // tables narrow for it, keeping their positions), else under
+                // them.
+                let tables: Vec<(&SwingReportFile, Option<&ReferenceGrades>)> = layout
+                    .columns
+                    .iter()
+                    .filter_map(|c| {
+                        let report = c.swing.as_deref().filter(|r| r.swing_found())?;
+                        Some((report, grades(c)))
+                    })
+                    .collect();
+                let notes = swing_notes(&tables, imperial, table_positions(column_w));
+                let beside = notes.as_ref().and(notes_beside(
+                    available, layout.pad, column_w, across, layout.gap,
+                ));
+                let table_w = beside.unwrap_or(column_w);
                 if !swings.is_empty() {
-                    let n = if stacked {
-                        1.0
-                    } else {
-                        layout.columns.len() as f32
-                    };
-                    let row = layout.columns.first().map_or(0.0, |c| c.width) * n
-                        + layout.gap * (n - 1.0);
                     // One tempo for the shot, across its cameras' columns.
                     let tempo = tempo_values(&swings);
                     ui.horizontal_top(|ui| {
@@ -83,16 +97,6 @@ impl FlighthookApp {
                         ui.add_space(layout.pad);
                         frame_row(ui, &frame, row);
                     });
-                    let mut misses = miss_entries(&tempo);
-                    misses.extend(miss_entries(&frame));
-                    let graded = swings.iter().any(|s| {
-                        s.grades
-                            .is_some_and(|g| !g.grades.is_empty() || !g.tempo.is_empty())
-                    });
-                    ui.horizontal_top(|ui| {
-                        ui.add_space(layout.pad);
-                        miss_line(ui, &misses, row, graded);
-                    });
                 }
                 let body = |ui: &mut egui::Ui| {
                     // The same offset as the clips' row (`pad`, then the
@@ -101,14 +105,14 @@ impl FlighthookApp {
                     ui.spacing_mut().item_spacing.x = layout.gap;
                     for column in &layout.columns {
                         ui.allocate_ui_with_layout(
-                            egui::vec2(column.width, 0.0),
+                            egui::vec2(table_w, 0.0),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
-                                ui.set_width(column.width);
+                                ui.set_width(table_w);
                                 if let Some(report) = &column.swing {
                                     let panel = if report.swing_found() {
                                         if let Some(text) = self.yaw_warning(&column.camera) {
-                                            let line = muted_line(ui, &text, column.width);
+                                            let line = muted_line(ui, &text, table_w);
                                             devices::mark(
                                                 ui,
                                                 || format!("yaw_warning:{}", column.camera),
@@ -121,14 +125,14 @@ impl FlighthookApp {
                                                 &column.camera,
                                                 report,
                                                 imperial,
-                                                column.width,
+                                                table_w,
                                                 grades(column),
                                                 reference,
                                             );
                                         })
                                         .response
                                     } else {
-                                        no_swing_line(ui, column.width)
+                                        no_swing_line(ui, table_w)
                                     };
                                     devices::mark(
                                         ui,
@@ -140,10 +144,40 @@ impl FlighthookApp {
                         );
                     }
                 };
-                if stacked {
-                    ui.vertical(body);
-                } else {
-                    ui.horizontal_top(body);
+                // The Notes box after the last table, out to the clips'
+                // right edge, or into the pane's margin when that is too
+                // narrow.
+                let box_beside = |ui: &mut egui::Ui, notes: &[(SwingPosition, Vec<SwingNote>)]| {
+                    let left = ui.cursor().min.x;
+                    let width = (origin + layout.pad + row - left)
+                        .max(NOTES_MIN_W)
+                        .min(origin + available - left);
+                    notes_box(ui, notes, reference, width);
+                };
+                match (&notes, beside) {
+                    (Some(notes), Some(_)) => {
+                        ui.horizontal_top(|ui| {
+                            if stacked {
+                                ui.vertical(body);
+                            } else {
+                                body(ui);
+                            }
+                            box_beside(ui, notes);
+                        });
+                    }
+                    _ if stacked => {
+                        ui.vertical(body);
+                    }
+                    _ => {
+                        ui.horizontal_top(body);
+                    }
+                }
+                if let (Some(notes), None) = (&notes, beside) {
+                    ui.add_space(12.0);
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(layout.pad);
+                        notes_box(ui, notes, reference, row);
+                    });
                 }
                 ui.add_space(8.0);
             });

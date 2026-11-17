@@ -2408,8 +2408,8 @@ the tab as not shown, so a tab on screen turns Live on.
   is Off. `render_last_shot` (mark `live_last_shot`, `LAST_SHOT_H` reserved
   under the pictures before the column width is fitted): the title
   (`Last shot · #12 · DR`), the tempo tiles and the six body tiles from the
-  same `tempo_values` / `frame_tiles`, each camera at its own impact event
-  (so graded), and the miss line. No clip is fetched.
+  same `tempo_values` / `frame_tiles`, each camera at its own impact event.
+  No clip is fetched.
 - **A shot** (`render_shot_cameras`): the shot's header (number, LATEST /
   Back to latest, Replay), then the inline player (`FlighthookApp::
   shot_player`, a `replay::ReplayView` made `with_swing`, kept while the
@@ -2448,8 +2448,7 @@ the tab as not shown, so a tab on screen turns Live on.
   its last); `SwingReportFile::sample(id, t_ns)` takes the nearest series
   frame (none outside the series) and the centimeters from `scale`. Several
   reports of one view average; a tile with no value is a dash. Formatting is
-  the metrics table's (`metric_shown`). A line under the tiles names the
-  tiles off their band (see **Grades** below). Then under each column that
+  the metrics table's (`metric_shown`), plain at every frame. Then under each column that
   camera's metrics at address, top, impact and finish, and lead arm back and
   lead arm down too in a column 560 points or wider (`table_positions`; a
   heading that doesn't fit its column takes two lines)
@@ -2480,27 +2479,38 @@ the tab as not shown, so a tab on screen turns Live on.
   (120, 170, 255, apart from `HEADING`), `GRADE_DRAW` green = `ACCENT`,
   `GRADE_NEAR` yellow = `GOLD`, `GRADE_FAR` red = `DANGER`; ungraded stays
   `TEXT`; `worded_value` lays text out uncolored and the painter gives the
-  color). Tiles (`Swing { report, t_ns, grades }`, `frame_tiles`,
-  `tempo_values`): a frame tile is graded only when its camera's frame is a
-  key event's frame of that report or one frame either side
-  (`key_position`, by series frame), with that position's grade; several
-  cameras' tile takes the grade they share (`shared_grade`: all graded, same
-  fit), else none; the tempo tiles take the face-on cameras' shared grade,
-  else the first camera's in column order (Backswing is never graded).
-  `graded_shown`: a graded turn's word is `signs::turn` (Open/Closed) of the
-  signed value, a shift keeps its own word, any other value off its band
-  takes `signs::direction` of the grade's `direction`. The miss line
-  (`miss_entries`, `miss_job`, `miss_line`, mark `frame_misses`; 13 pt, at
-  most two lines) lists the tempo and frame tiles off their band (not
-  `Both`): the tile's name muted, then the grade's `word` in its fit's
-  color, joined by ` · `; while the shot has grades a line's height is kept
-  even when it is empty, so the tables hold still as the playhead crosses a
-  key frame. Table cells (`metric_rows` -> `Cell { shown, grade, worded }`)
+  color). The frame tiles are never graded, so nothing on the pane changes
+  as the playhead crosses a key frame. The tempo tiles (`Swing { report,
+  t_ns, grades }`, `tempo_values`) take the face-on cameras' shared grade
+  (`shared_grade`: all graded, same fit), else the first camera's in column
+  order (Backswing is never graded).
+  `graded_shown` (a table cell's value as its hover reads it): a graded
+  turn's word is `signs::turn` (Open/Closed) of the signed value, a shift
+  keeps its own word, any other value off its band takes `signs::direction`
+  of the grade's `direction`. Table cells (`metric_rows` -> `Cell { shown, grade, worded }`)
   are colored by their position's grade; a graded cell's hover text
   (`band_tip`, `band_text`; marks `cell:<camera>:<row>:<col>`) is the
   reference and its band (fade and draw bands for the shape-linked rows,
   inches in the Units system, rounded after the conversion), the value as a
   tile reads it, and the words.
+  The **Notes** box (`swing_notes`, `notes_box`; mark `swing_notes`, a
+  bullet `swing_note:<metric>:<position>`) lists the table cells off their
+  band (`off_band`: `Near` or `Far`, the yellow and red cells) at the
+  positions the tables show, grouped under each position's name in small
+  capitals in table order (positions without notes left out), each bullet
+  the metric's name muted, ` — `, and the grade's `word` in its fit's color
+  (13 pt, lines hanging after the bullet; the cell's `worded` value when the
+  grade has no words). A metric graded the same at the same position by two
+  cameras is one bullet. With no graded cell there is no box; with graded
+  cells all inside, the box is the muted line `All measurements within the
+  tour range` (`amateur range` for the Amateur reference). It depends only
+  on the shot, the reference and the pane's width, never on the playhead.
+  It sits right of the tables, level with their top, when `notes_beside`
+  finds room: each table narrowed from its column's width as far as a box of
+  `NOTES_MIN_W` (280) needs, but no narrower than `TABLE_MIN_W` (440, or its
+  column when narrower) and keeping the positions its column shows (the box
+  runs to the clips' right edge, or into the pane's margin when that is too
+  narrow); otherwise it is under the tables, across the clips' row.
   The table has Hip turn and Shoulder turn and leaves out
   `hip_width_proxy` and `loss_of_posture` (the Forward bend row's change
   from address), which stay in the file. The UI reads the file through

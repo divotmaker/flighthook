@@ -1,8 +1,7 @@
 //! The Cameras pane's **Last shot** strip (alpha): while Live is on, the
 //! newest shot's swing under the live pictures, as the shot's own page
-//! shows it at impact: the tempo tiles, the six body tiles at each
-//! camera's impact, colored against the picked reference, and the line
-//! naming the tiles off their band.
+//! shows it at impact: the tempo tiles, colored against the picked
+//! reference, and the six body tiles at each camera's impact.
 //!
 //! The strip fetches only the newest shot's swing analyses and grades (no
 //! clip), once the server has analyzed them (`video[].swing`, which body
@@ -20,9 +19,8 @@ use crate::theme;
 use crate::types::{ShotRow, SwingReportFile, UnitSystem};
 use flighthook::{BodyGrades, ReferenceKind};
 
-/// Height of the strip: its title, the tempo tiles, the body tiles and two
-/// lines of misses.
-pub(crate) const LAST_SHOT_H: f32 = 182.0;
+/// Height of the strip: its title, the tempo tiles and the body tiles.
+pub(crate) const LAST_SHOT_H: f32 = 136.0;
 
 /// One camera's swing and grades of the shot.
 #[derive(Default)]
@@ -246,8 +244,8 @@ impl FlighthookApp {
     }
 
     /// The strip, `width` wide (mark `live_last_shot`), when one is shown:
-    /// its title, the tempo tiles, the body tiles at impact and the misses,
-    /// in [`LAST_SHOT_H`].
+    /// its title, the tempo tiles and the body tiles at impact, in
+    /// [`LAST_SHOT_H`].
     pub(crate) fn render_last_shot(&self, ui: &mut egui::Ui, width: f32) {
         let Some(strip) = self.live_strip.shown() else {
             return;
@@ -268,9 +266,6 @@ impl FlighthookApp {
                     );
                     cameras::value_tiles(ui, &tempo, width);
                     cameras::value_tiles(ui, &frame, width);
-                    let mut misses = cameras::miss_entries(&tempo);
-                    misses.extend(cameras::miss_entries(&frame));
-                    cameras::miss_line(ui, &misses, width, true);
                 },
             )
             .response;

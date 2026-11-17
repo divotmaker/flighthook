@@ -183,9 +183,9 @@ in Live mode, each picture also has the golfer's skeleton and posture (see
 settings (see [Settings](#settings)); in the other modes it shows the
 pictures alone. Under the pictures, a **Last shot** strip shows the newest
 shot's swing once it is analyzed (in Live mode every clip is, a few seconds
-after the shot): its number and club, the tempo, the six body tiles at each
-camera's impact, colored, and the line naming the ones off their band (see
-[Bands and colors](#bands-and-colors)). It stays until the next shot's
+after the shot): its number and club, the tempo, colored (see
+[Bands and colors](#bands-and-colors)), and the six body tiles at each
+camera's impact. It stays until the next shot's
 swing is in. A new shot doesn't take you
 off Live; turn **Live** off (back to the shot the list shows), pick a shot,
 or go to another tab to leave it. A camera that is not connected shows its
@@ -322,7 +322,8 @@ shows it under the clip in the Cameras tab. A camera at **Golfer Back** or
   reads **Up** or **Down** (`2.1 in Down`). A distance that rounds to 0 has
   no word.
 - **Metrics tables:** under each clip, its camera's metrics, below the
-  tiles.
+  tiles, with the Notes box beside them (see
+  [Bands and colors](#bands-and-colors)).
 - **Swing events:** address, takeaway, lead arm back (the lead arm parallel
   to the ground in the backswing), top, lead arm down (the same in the
   downswing), impact and finish. They are
@@ -449,28 +450,27 @@ studies, not a measured band). The color says which band a number is in:
 Every other number has one band and reads aqua, yellow or red. A number
 without a band stays white.
 
-**The words.** A color never stands alone:
+**What is colored.** The metrics tables and the tempo tiles. A band
+belongs to a key position (address, lead arm back, top, lead arm down,
+impact, finish), and each table has a column for each position it shows.
+The six tiles at the frame on screen stay white, so nothing changes as the
+clip plays through the key positions. The tempo takes the face-on camera's
+color, and none when two face-on cameras differ.
 
-- A tile keeps its number and its word in the color: a graded turn reads
-  **Open** or **Closed** (`39° Open`), a move from address keeps its own word
-  (`3.9 in Toward`), and any other number off its band gets the word for its
-  side (`29° Less`).
-- Under the tiles, one line names each tile off its band and why: blue and
-  green say which side (`Hip turn more open: fade side`), yellow and red what
-  that miss tends to produce (`Head sway further away from the target than
-  tour: head falls back, flip`). The line is empty when every tile is inside.
+**The words.**
+
 - In the metrics tables the number is colored; hover it for its band and
   words: `Tour · fade 36–46° · draw 30–40° · 44° Open · more open: fade side`.
   Bands in inches follow the Units switch (rounded after the conversion).
-
-**When.** A band belongs to a key position (address, lead arm back, top, lead
-arm down, impact, finish), so a tile is colored when the frame on screen is
-the frame of one of those events of that camera's swing, or one frame either
-side: pause on the impact tick, or step onto the top, and the tiles color;
-elsewhere they are white. The tables and the tempo are always colored, and
-so is the Live view's Last shot strip, which shows impact. A
-tile that averages two cameras takes the color they share, and none when
-they differ; the tempo takes the face-on camera's.
+- The **Notes** box, beside the tables (under them when the pane is too
+  narrow), lists each table number outside its band, yellow or red, with what
+  that miss tends to produce: `• Shoulder turn — less open than tour:
+  shoulders behind, push or hook`. The notes are grouped under the key
+  position they belong to, in the tables' order, and a number graded the same
+  by both cameras is listed once. The box follows the Tour | Amateur switch
+  and stays the same while the clip plays. With every number inside its band
+  it reads `All measurements within the tour range`; a shot without bands
+  (no club, or a putter) has no box.
 
 **What is not colored.** A turn measured by one camera is colored at impact
 only: at the top one camera reads it well short of its 3D value (see

@@ -2970,18 +2970,18 @@ fn a_graded_value_takes_its_color_and_its_word() {
 }
 
 #[test]
-fn a_tile_is_colored_only_on_a_key_positions_frame() {
+fn the_frame_tiles_carry_no_grade_at_a_key_frame() {
     let fo = face_on_series(true);
-    // The one-camera turn has a grade at impact only; hip sway at the top.
+    // Grades at impact and at the top, off their bands.
     let tour = reference_grades(
         ReferenceKind::Tour,
         vec![
             grade_of(
                 "hip_turn",
                 "impact",
-                Fit::Fade,
+                Fit::Far,
                 18.0,
-                Some("more open: fade side"),
+                Some("more open than tour"),
             ),
             grade_of(
                 "hip_sway",
@@ -2993,56 +2993,28 @@ fn a_tile_is_colored_only_on_a_key_positions_frame() {
         ],
         Vec::new(),
     );
-    let tiles_at = |frame: u64| {
-        frame_tiles(
+    // On the address, the top, around impact and between them: the tiles
+    // read as the ungraded ones, plain.
+    for frame in [60, 100, 150, 179, 180, 181] {
+        let at = Some(frame * FRAME_NS);
+        let graded = frame_tiles(
             &[Swing {
                 report: &fo,
-                t_ns: Some(frame * FRAME_NS),
+                t_ns: at,
                 grades: Some(&tour),
             }],
             false,
-        )
-    };
-    // On the impact frame and one frame either side: the turn is
-    // colored with its word; the hip sway (no impact grade) is plain.
-    for frame in [179, 180, 181] {
-        let tiles = tiles_at(frame);
-        assert_eq!(tiles[0].color, theme::GRADE_FADE, "{frame}");
-        assert_eq!(tiles[0].word, Some("Open"), "{frame}");
-        assert!(tiles[0].grade.is_some());
-        assert_eq!(tiles[2].color, theme::TEXT, "{frame}");
-        assert!(tiles[2].grade.is_none());
-    }
-    // Two frames off: plain, no word.
-    for frame in [178, 182, 250] {
-        let tiles = tiles_at(frame);
-        assert!(
-            tiles
-                .iter()
-                .all(|t| t.color == theme::TEXT && t.grade.is_none()),
-            "{frame}"
         );
-        assert_eq!(tiles[0].word, None, "{frame}");
+        let ungraded = frame_tiles(&plain(&[(&fo, at)]), false);
+        assert!(graded.iter().all(|t| t.color == theme::TEXT), "{frame}");
+        assert_eq!(frame_texts(&graded), frame_texts(&ungraded), "{frame}");
+        assert_eq!(graded[0].word, None, "a one-camera turn has no word");
     }
-    // On the top: the one-camera turn is not graded there, the hip sway
-    // is.
-    let tiles = tiles_at(150);
-    assert_eq!((tiles[0].color, tiles[0].word), (theme::TEXT, None));
-    assert_eq!(tiles[2].color, theme::GRADE_NEAR);
-    assert_eq!(key_position(&fo, 150 * FRAME_NS), Some(SwingPosition::Top));
-    assert_eq!(
-        key_position(&fo, 60 * FRAME_NS),
-        Some(SwingPosition::Address)
-    );
-    assert_eq!(key_position(&fo, 100 * FRAME_NS), None);
-    // Without grades nothing is colored.
-    let plain_tiles = frame_tiles(&plain(&[(&fo, Some(180 * FRAME_NS))]), false);
-    assert!(plain_tiles.iter().all(|t| t.color == theme::TEXT));
 }
 
 #[test]
-fn averaged_tiles_take_the_grade_the_cameras_share() {
-    let (a, b) = (face_on_series(true), face_on_series(true));
+fn the_tempo_takes_the_grade_the_face_on_cameras_share() {
+    let a = face_on_series(true);
     let fade = |fit| {
         reference_grades(
             ReferenceKind::Tour,
@@ -3050,32 +3022,13 @@ fn averaged_tiles_take_the_grade_the_cameras_share() {
             vec![grade_of("tempo_ratio", "swing", fit, 3.0, Some("words"))],
         )
     };
-    let (g1, g2, g3) = (fade(Fit::Fade), fade(Fit::Fade), fade(Fit::Near));
+    let (g1, g3) = (fade(Fit::Fade), fade(Fit::Near));
     let at = Some(180 * FRAME_NS);
     let swing = |report, grades| Swing {
         report,
         t_ns: at,
         grades: Some(grades),
     };
-    // Two face-on cameras that agree: the color; that disagree: none.
-    let agree = frame_tiles(&[swing(&a, &g1), swing(&b, &g2)], false);
-    assert_eq!(agree[0].color, theme::GRADE_FADE);
-    let differ = frame_tiles(&[swing(&a, &g1), swing(&b, &g3)], false);
-    assert_eq!(differ[0].color, theme::TEXT);
-    assert!(differ[0].grade.is_none());
-    // One of them without grades: none either.
-    let half = frame_tiles(
-        &[
-            swing(&a, &g1),
-            Swing {
-                report: &b,
-                t_ns: at,
-                grades: None,
-            },
-        ],
-        false,
-    );
-    assert_eq!(half[0].color, theme::TEXT);
     // The tempo: the face-on camera's grade over another view's; the
     // first camera's when no face-on camera has one.
     let dtl = down_the_line_series();
@@ -3094,81 +3047,220 @@ fn averaged_tiles_take_the_grade_the_cameras_share() {
         },
     ]);
     assert_eq!(tempo[0].color, theme::GRADE_NEAR);
+    let b = face_on_series(true);
     let tempo = tempo_values(&[swing(&a, &g1), swing(&b, &g3)]);
     assert_eq!(tempo[0].color, theme::TEXT, "two face-on cameras disagree");
 }
 
+/// A note of metric `id` named `label` with `words` and `fit`.
+fn note(id: &str, label: &str, words: &str, fit: Fit) -> SwingNote {
+    SwingNote {
+        id: id.into(),
+        label: label.into(),
+        words: words.into(),
+        fit,
+    }
+}
+
 #[test]
-fn the_miss_line_lists_the_tiles_off_their_band() {
-    let tile = |label, grade: Option<MetricGrade>| FrameValue {
-        id: "x",
-        label,
-        text: "1".into(),
-        word: None,
-        color: theme::TEXT,
-        grade,
-    };
-    let tiles = [
-        tile(
-            "Hip turn",
-            Some(grade_of(
-                "hip_turn",
-                "impact",
-                Fit::Fade,
-                44.0,
-                Some("more open: fade side"),
-            )),
-        ),
-        tile(
-            "Shoulder turn",
-            Some(grade_of("shoulder_turn", "impact", Fit::Both, 31.0, None)),
-        ),
-        tile("Head sway", None),
-        tile(
-            "Forward bend",
-            Some(grade_of(
-                "spine_forward_bend",
+fn the_notes_list_the_cells_off_their_band_by_position_once() {
+    use SwingPosition::{Address, Finish, Impact, Top};
+    let positions = [Address, Top, Impact, Finish];
+    let (a, b) = (report(false), report(false));
+    let first = reference_grades(
+        ReferenceKind::Tour,
+        vec![
+            grade_of(
+                "lateral_spine_tilt",
+                "address",
+                Fit::Near,
+                8.0,
+                Some("less than tour: X"),
+            ),
+            grade_of("hip_sway", "top", Fit::Both, -1.0, None),
+            grade_of(
+                "hip_sway",
                 "impact",
                 Fit::Far,
-                20.0,
-                Some("less than tour: stood up, early extension pattern"),
-            )),
-        ),
-    ];
-    let entries = miss_entries(&tiles);
-    assert_eq!(
-        entries,
-        [
-            ("Hip turn", "more open: fade side".to_owned(), Fit::Fade),
-            (
-                "Forward bend",
-                "less than tour: stood up, early extension pattern".to_owned(),
-                Fit::Far
+                4.0,
+                Some("further toward the target than tour: slide"),
             ),
-        ]
+            grade_of(
+                "lateral_spine_tilt",
+                "impact",
+                Fit::Near,
+                21.0,
+                Some("more than tour: Y"),
+            ),
+            // Inside the fade band: on a band, no note.
+            grade_of(
+                "lateral_spine_tilt",
+                "top",
+                Fit::Fade,
+                -4.0,
+                Some("fade side"),
+            ),
+            // No words of its own: the value as its tile reads it.
+            grade_of("shoulder_tilt", "finish", Fit::Far, 30.0, None),
+            // Not in the table, or at a position it doesn't show.
+            grade_of("hip_width_proxy", "top", Fit::Far, 0.8, Some("hidden")),
+            grade_of(
+                "hip_sway",
+                "arm_parallel_back",
+                Fit::Far,
+                1.0,
+                Some("hidden"),
+            ),
+        ],
+        Vec::new(),
     );
-    let job = miss_job(&entries, 400.0);
+    let second = reference_grades(
+        ReferenceKind::Tour,
+        vec![
+            // The same grade as the first camera's: one note.
+            grade_of(
+                "hip_sway",
+                "impact",
+                Fit::Far,
+                4.0,
+                Some("further toward the target than tour: slide"),
+            ),
+            // Graded otherwise: its own note.
+            grade_of(
+                "lateral_spine_tilt",
+                "address",
+                Fit::Far,
+                8.0,
+                Some("less than tour: Z"),
+            ),
+        ],
+        Vec::new(),
+    );
+    let notes = swing_notes(&[(&a, Some(&first)), (&b, Some(&second))], true, &positions);
+    assert_eq!(
+        notes,
+        Some(vec![
+            (
+                Address,
+                vec![
+                    note(
+                        "lateral_spine_tilt",
+                        "Side bend",
+                        "less than tour: X",
+                        Fit::Near
+                    ),
+                    note(
+                        "lateral_spine_tilt",
+                        "Side bend",
+                        "less than tour: Z",
+                        Fit::Far
+                    ),
+                ]
+            ),
+            (
+                Impact,
+                vec![
+                    note(
+                        "hip_sway",
+                        "Hip sway",
+                        "further toward the target than tour: slide",
+                        Fit::Far
+                    ),
+                    note(
+                        "lateral_spine_tilt",
+                        "Side bend",
+                        "more than tour: Y",
+                        Fit::Near
+                    ),
+                ]
+            ),
+            (
+                Finish,
+                vec![note(
+                    "shoulder_tilt",
+                    "Shoulder tilt",
+                    "30\u{b0} Less",
+                    Fit::Far
+                )]
+            ),
+        ]),
+        "positions in table order, cameras in column order, the top left out"
+    );
+    // Graded, every cell inside a band: no notes.
+    let inside = reference_grades(
+        ReferenceKind::Tour,
+        vec![
+            grade_of("hip_sway", "impact", Fit::Both, 4.0, None),
+            grade_of(
+                "lateral_spine_tilt",
+                "impact",
+                Fit::Draw,
+                21.0,
+                Some("draw side"),
+            ),
+        ],
+        Vec::new(),
+    );
+    assert_eq!(
+        swing_notes(&[(&a, Some(&inside))], true, &positions),
+        Some(Vec::new())
+    );
+    // No grades, or none on a table cell: no box.
+    assert_eq!(swing_notes(&[(&a, None)], true, &positions), None);
+    let tempo_only = reference_grades(
+        ReferenceKind::Tour,
+        Vec::new(),
+        vec![grade_of(
+            "tempo_ratio",
+            "swing",
+            Fit::Far,
+            4.0,
+            Some("words"),
+        )],
+    );
+    assert_eq!(
+        swing_notes(&[(&a, Some(&tempo_only))], true, &positions),
+        None
+    );
+    assert_eq!(swing_notes(&[], true, &positions), None);
+    assert_eq!(
+        notes_all_inside(ReferenceKind::Amateur),
+        "All measurements within the amateur range"
+    );
+}
+
+#[test]
+fn a_notes_bullet_has_the_name_muted_and_the_words_in_their_color() {
+    let job = note_job(
+        &note(
+            "shoulder_turn",
+            "Shoulder turn",
+            "less open than tour: shoulders behind, push or hook",
+            Fit::Far,
+        ),
+        300.0,
+    );
     assert_eq!(
         job.text,
-        "Hip turn more open: fade side \u{b7} Forward bend less than tour: stood up, early extension pattern"
+        "Shoulder turn \u{2014} less open than tour: shoulders behind, push or hook"
     );
-    // Names muted, words in their fit's color.
     let colors: Vec<egui::Color32> = job.sections.iter().map(|s| s.format.color).collect();
-    assert_eq!(
-        colors,
-        [
-            theme::TEXT_MUTED,
-            theme::GRADE_FADE,
-            theme::TEXT_MUTED,
-            theme::TEXT_MUTED,
-            theme::GRADE_FAR
-        ]
-    );
-    assert_eq!(job.wrap.max_rows, 2, "two lines at most");
-    assert!(
-        miss_entries(&tiles[1..3]).is_empty(),
-        "all inside or ungraded"
-    );
+    assert_eq!(colors, [theme::TEXT_MUTED, theme::GRADE_FAR]);
+}
+
+#[test]
+fn the_notes_go_beside_the_tables_only_where_the_tables_keep_their_positions() {
+    // Two 514-wide columns filling a 1040-wide pane: the tables would
+    // narrow to 368, under the readable width, so the box goes under.
+    assert_eq!(notes_beside(1040.0, 0.0, 514.0, 2, 12.0), None);
+    // Two 654-wide columns in a 1670-wide pane: tables of 595, which keep
+    // the lead arm positions.
+    assert_eq!(notes_beside(1670.0, 175.0, 654.0, 2, 12.0), Some(595.5));
+    // Narrowing a table under the lead arm width would drop two positions.
+    assert_eq!(notes_beside(1500.0, 175.0, 654.0, 2, 12.0), None);
+    // A column already narrower than the readable width keeps its width.
+    assert_eq!(notes_beside(1300.0, 260.0, 380.0, 2, 12.0), None);
+    assert_eq!(notes_beside(1300.0, 100.0, 380.0, 2, 12.0), Some(380.0));
 }
 
 #[test]
@@ -3294,6 +3386,19 @@ fn hip_grades(camera: &str) -> flighthook::BodyGrades {
     }
 }
 
+/// The face-on test report ([`face_on_series`]) with the hip turn at
+/// impact in its metrics, so the table has a cell [`hip_grades`] grades.
+fn face_on_with_hips() -> SwingReportFile {
+    let mut r = face_on_series(true);
+    r.metrics.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "hip_turn", "unit": "degrees", "values": {"impact": 18.0}
+        }))
+        .expect("metric"),
+    );
+    r
+}
+
 /// A shot of a `hand` golfer in the Cameras pane with the face-on
 /// camera's report, clip and grades, paused on the impact frame.
 fn graded_shot(hand: Handedness) -> (Screen, FlighthookApp) {
@@ -3306,7 +3411,7 @@ fn graded_shot(hand: Handedness) -> (Screen, FlighthookApp) {
     app.shots_rev += 1;
     app.set_shots_pane(ShotsPane::Cameras);
     screen.frame(&mut app, Vec::new());
-    give_report(&mut app, "camera.0", face_on_series(true));
+    give_report(&mut app, "camera.0", face_on_with_hips());
     give_sidecar(&mut app, "camera.0");
     give_grades(&mut app, "camera.0", hip_grades("camera.0"));
     screen.frame(&mut app, Vec::new());
@@ -3329,20 +3434,26 @@ fn the_reference_picker_switches_the_colors_and_is_kept() {
         !screen.texts().iter().any(|t| t == "Mine"),
         "not before personal bands"
     );
-    // Tour: the hips in the fade band, blue, with the turn's word and the
-    // miss line.
-    assert_eq!(screen.color_of("18°"), Some(theme::GRADE_FADE));
-    assert_eq!(screen.color_of("Open"), Some(theme::GRADE_FADE));
-    assert!(marks.contains_key("frame_misses"));
+    // Tour: the hips in the fade band: the table's cell blue, the tile
+    // plain, and the Notes box says every number is inside a band.
+    let colors = |screen: &Screen, text: &str| -> Vec<egui::Color32> {
+        screen
+            .4
+            .borrow()
+            .iter()
+            .filter(|(t, _)| t == text)
+            .map(|(_, c)| *c)
+            .collect()
+    };
+    assert_eq!(colors(&screen, "18°"), [theme::TEXT, theme::GRADE_FADE]);
+    assert!(marks.contains_key("swing_notes"));
     assert!(
         screen
             .texts()
             .iter()
-            .any(|t| t.contains("Hip turn more open: fade side")),
-        "{:?}",
-        screen.texts()
+            .any(|t| t == "All measurements within the tour range")
     );
-    // Amateur: yellow, its own words.
+    // Amateur: yellow, and its words in the box.
     let at = marks["body_reference:amateur"].0.center();
     screen.click(&mut app, at);
     assert_eq!(app.body_reference, ReferenceKind::Amateur);
@@ -3351,14 +3462,24 @@ fn the_reference_picker_switches_the_colors_and_is_kept() {
         ReferenceKind::Amateur,
         "kept on this device"
     );
-    screen.frame(&mut app, Vec::new());
-    assert_eq!(screen.color_of("18°"), Some(theme::GRADE_NEAR));
-    assert!(screen.texts().iter().any(|t| t.contains("than amateurs")));
-    // Off the key position: plain, and the miss line's words go.
+    let marks = screen.frame(&mut app, Vec::new());
+    assert_eq!(colors(&screen, "18°"), [theme::TEXT, theme::GRADE_NEAR]);
+    assert!(marks.contains_key("swing_note:hip_turn:impact"));
+    assert!(
+        screen
+            .texts()
+            .iter()
+            .any(|t| t == "Hip turn \u{2014} more open than amateurs: fade or slice pattern"),
+        "{:?}",
+        screen.texts()
+    );
+    // Off the key position the box stays as it is.
+    let notes = marks["swing_notes"].0;
     seek_to_frame(&mut app, 120);
-    screen.frame(&mut app, Vec::new());
+    let marks = screen.frame(&mut app, Vec::new());
     assert_eq!(screen.color_of("12°"), Some(theme::TEXT));
-    assert!(!screen.texts().iter().any(|t| t.contains("than amateurs")));
+    assert_eq!(marks["swing_notes"].0, notes, "the box holds still");
+    assert!(screen.texts().iter().any(|t| t.contains("than amateurs")));
     app.set_body_reference(ReferenceKind::Tour);
     // Not in the Data pane.
     app.set_shots_pane(ShotsPane::Data);
@@ -3373,9 +3494,54 @@ fn a_left_handed_golfers_tiles_read_the_same() {
     right.frame(&mut rh, Vec::new());
     left.frame(&mut lh, Vec::new());
     assert_eq!(row_values(&right), row_values(&left));
-    for text in ["18°", "Open"] {
-        assert_eq!(right.color_of(text), left.color_of(text), "{text}");
+    assert_eq!(right.color_of("18°"), left.color_of("18°"));
+}
+
+/// Two cameras' graded shot on a `w` × `h` screen, paused on the impact
+/// frame: the marks.
+fn two_camera_notes(w: f32, h: f32) -> Marks {
+    let screen = Screen::sized(w, h);
+    let mut app = app(&[0, 1], true);
+    app.set_body_reference(ReferenceKind::Amateur);
+    app.shots = vec![shot_row(1, &["camera.0", "camera.1"])];
+    app.shots_rev += 1;
+    app.set_shots_pane(ShotsPane::Cameras);
+    screen.frame(&mut app, Vec::new());
+    for camera in ["camera.0", "camera.1"] {
+        give_report(&mut app, camera, face_on_with_hips());
+        give_sidecar(&mut app, camera);
+        give_grades(&mut app, camera, hip_grades(camera));
     }
+    screen.frame(&mut app, Vec::new());
+    seek_to_frame(&mut app, 180);
+    screen.frame(&mut app, Vec::new());
+    screen.frame(&mut app, Vec::new())
+}
+
+#[test]
+fn the_notes_box_sits_beside_the_tables_when_wide_and_under_them_when_narrow() {
+    // Narrow: under both tables, across them.
+    for (w, h) in [(1024.0, 768.0), (1280.0, 944.0)] {
+        let marks = two_camera_notes(w, h);
+        let (a, b) = (marks["swing:camera.0"].0, marks["swing:camera.1"].0);
+        let notes = marks["swing_notes"].0;
+        assert!(notes.top() > a.bottom().max(b.bottom()), "under at {w}x{h}");
+        assert!((notes.left() - a.left()).abs() < 0.5 && (notes.right() - b.right()).abs() < 0.5);
+    }
+    // Wide: right of the tables, level with them.
+    let marks = two_camera_notes(2400.0, 1300.0);
+    let (a, b) = (marks["swing:camera.0"].0, marks["swing:camera.1"].0);
+    let notes = marks["swing_notes"].0;
+    assert!(notes.left() > b.right() && (notes.top() - a.top()).abs() < 0.5);
+    assert!(notes.width() >= NOTES_MIN_W - 0.5 && notes.right() <= 2400.0);
+    // The same grade from both cameras is one note.
+    assert_eq!(
+        marks
+            .keys()
+            .filter(|k| k.starts_with("swing_note:"))
+            .count(),
+        1
+    );
 }
 
 /// Answer the Last shot strip being fetched: camera `camera`'s swing
@@ -3428,14 +3594,8 @@ fn live_shows_the_last_shots_swing_under_the_pictures_until_the_next_one_is_in()
         let readout = marks["pose_readout"].0;
         assert!(readout.top() >= strip.bottom() && readout.bottom() <= h);
         assert!(screen.texts().iter().any(|t| t == "Last shot \u{b7} #1"));
-        // The body at impact (frame 180), colored, with the misses.
-        assert_eq!(screen.color_of("18°"), Some(theme::GRADE_FADE));
-        assert!(
-            screen
-                .texts()
-                .iter()
-                .any(|t| t.contains("Hip turn more open: fade side"))
-        );
+        // The body at impact (frame 180), plain.
+        assert_eq!(screen.color_of("18°"), Some(theme::TEXT));
         // The next shot: the strip stays until its swing is in.
         app.shots.push(shot_row(2, &["camera.0"]));
         app.shots_rev += 1;

@@ -1,5 +1,5 @@
 //! Swing analysis shown under a clip: tiles, tempo, metric labels and values, the metrics table,
-//! frame tiles, grade colors and the miss line.
+//! frame tiles, grade colors and the Notes box.
 
 use super::*;
 
@@ -29,21 +29,6 @@ pub(crate) struct Swing<'a> {
     pub(crate) report: &'a SwingReportFile,
     pub(crate) t_ns: Option<u64>,
     pub(crate) grades: Option<&'a ReferenceGrades>,
-}
-
-/// The key position whose event is at the frame of `report` at `t_ns`, or
-/// one frame either side of it; `None` elsewhere.
-pub(crate) fn key_position(report: &SwingReportFile, t_ns: u64) -> Option<SwingPosition> {
-    let at = report.series.frame_at(t_ns)?;
-    SwingPosition::ALL
-        .into_iter()
-        .filter_map(|p| {
-            let frame = report.series.frame_at(report.events.at(p)?.t_ns)?;
-            let apart = frame.abs_diff(at);
-            (apart <= 1).then_some((apart, p))
-        })
-        .min_by_key(|(apart, _)| *apart)
-        .map(|(_, p)| p)
 }
 
 /// The one grade a tile shows for several cameras' `grades` of it: theirs
@@ -147,7 +132,6 @@ pub(crate) fn tempo_values<'a>(swings: &[Swing<'a>]) -> Vec<FrameValue> {
                 color: grade.as_ref().map_or(theme::TEXT, |g| grade_color(g.fit)),
                 text,
                 word: None,
-                grade,
             }
         })
         .collect()
@@ -412,6 +396,225 @@ pub(crate) fn band_tip(
     parts.join(" \u{b7} ")
 }
 
+/// Whether a cell graded `fit` is off its band: near it or far from it, the
+/// cells the table colors yellow or red.
+pub(crate) fn off_band(fit: Fit) -> bool {
+    matches!(fit, Fit::Near | Fit::Far)
+}
+
+/// A bullet of the Notes box: a metrics table cell off its band, with its
+/// metric's id and name, its words and its fit.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SwingNote {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) words: String,
+    pub(crate) fit: Fit,
+}
+
+/// The Notes box of the metrics tables of `tables` (each camera's report
+/// and its grades against the picked reference, in column order) at
+/// `positions`: per key position, in table order, each cell off its band
+/// ([`off_band`]) with its grade's words, the words its hover text ends with
+/// ([`band_tip`]; the value as its tile reads it when the grade has none).
+/// A metric graded the same at the same position by two cameras is one
+/// note, and a position without notes is left out. Empty when every graded
+/// cell is inside its band; `None` when no cell is graded.
+pub(crate) fn swing_notes(
+    tables: &[(&SwingReportFile, Option<&ReferenceGrades>)],
+    imperial: bool,
+    positions: &[SwingPosition],
+) -> Option<Vec<(SwingPosition, Vec<SwingNote>)>> {
+    let rows: Vec<(String, Vec<Cell>)> = tables
+        .iter()
+        .flat_map(|(report, grades)| metric_rows(report, imperial, positions, *grades))
+        .collect();
+    if !rows
+        .iter()
+        .any(|(_, cells)| cells.iter().any(|c| c.grade.is_some()))
+    {
+        return None;
+    }
+    let notes = positions.iter().enumerate().filter_map(|(k, &position)| {
+        let mut notes: Vec<SwingNote> = Vec::new();
+        for (label, cells) in &rows {
+            let Some(cell) = cells.get(k) else {
+                continue;
+            };
+            let Some(grade) = cell.grade.as_ref().filter(|g| off_band(g.fit)) else {
+                continue;
+            };
+            let words = grade
+                .word
+                .clone()
+                .unwrap_or_else(|| match cell.worded.word {
+                    Some(word) => format!("{} {word}", cell.worded.text),
+                    None => cell.worded.text.clone(),
+                });
+            let note = SwingNote {
+                id: grade.id.clone(),
+                label: label.clone(),
+                words,
+                fit: grade.fit,
+            };
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
+        (!notes.is_empty()).then_some((position, notes))
+    });
+    Some(notes.collect())
+}
+
+/// Size of the Notes box's text.
+pub(super) const NOTE_SIZE: f32 = 13.0;
+
+/// Narrowest the Notes box gets beside the metrics tables.
+pub(crate) const NOTES_MIN_W: f32 = 280.0;
+
+/// Narrowest a metrics table gets to make room for the Notes box beside it.
+pub(crate) const TABLE_MIN_W: f32 = 440.0;
+
+/// The width of each of `across` metrics tables, side by side and `gap`
+/// apart, starting `pad` into a pane `available` wide, when the Notes box
+/// fits beside them: each table narrowed from its column's width (`column`)
+/// as far as the box needs, but no narrower than [`TABLE_MIN_W`] (or its
+/// column) and keeping the positions its column shows ([`table_positions`]).
+/// `None` when the box goes under the tables.
+pub(crate) fn notes_beside(
+    available: f32,
+    pad: f32,
+    column: f32,
+    across: usize,
+    gap: f32,
+) -> Option<f32> {
+    let n = across.max(1) as f32;
+    let table = column.min((available - pad - NOTES_MIN_W - gap * n) / n);
+    let readable = table >= column.min(TABLE_MIN_W);
+    let same = table_positions(table).len() == table_positions(column).len();
+    (readable && same).then_some(table)
+}
+
+/// A note's text, after its bullet: the metric's name muted, then its words
+/// in its fit's color, `width` wide.
+pub(crate) fn note_job(note: &SwingNote, width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let format = |color| egui::TextFormat {
+        font_id: egui::FontId::proportional(NOTE_SIZE),
+        color,
+        ..Default::default()
+    };
+    job.append(
+        &format!("{} \u{2014} ", note.label),
+        0.0,
+        format(theme::TEXT_MUTED),
+    );
+    job.append(&note.words, 0.0, format(grade_color(note.fit)));
+    job.wrap.max_width = width;
+    job
+}
+
+/// The line the Notes box shows when every graded cell is inside its band
+/// of `reference`.
+pub(crate) fn notes_all_inside(reference: ReferenceKind) -> String {
+    format!(
+        "All measurements within the {} range",
+        reference.label().to_lowercase()
+    )
+}
+
+/// The Notes box, `width` wide (mark `swing_notes`): per key position with
+/// notes, its name in small capitals, then a bullet per note
+/// (`swing_note:<metric>:<position>`), its lines hanging after the bullet;
+/// with no notes, the muted [`notes_all_inside`] line.
+pub(super) fn notes_box(
+    ui: &mut egui::Ui,
+    notes: &[(SwingPosition, Vec<SwingNote>)],
+    reference: ReferenceKind,
+    width: f32,
+) {
+    const PAD: f32 = 10.0;
+    const HEADING_H: f32 = 18.0;
+    const NOTE_GAP: f32 = 3.0;
+    enum Item {
+        Heading(std::sync::Arc<egui::Galley>),
+        Note(String, std::sync::Arc<egui::Galley>),
+        Line(std::sync::Arc<egui::Galley>),
+    }
+    let inner = (width - 2.0 * PAD).max(1.0);
+    let font = egui::FontId::proportional(NOTE_SIZE);
+    let bullet =
+        ui.fonts_mut(|f| f.layout_no_wrap("\u{2022}".to_owned(), font.clone(), theme::TEXT_MUTED));
+    let indent = bullet.size().x + 6.0;
+    let mut items = Vec::new();
+    if notes.is_empty() {
+        let line = egui::text::LayoutJob::simple(
+            notes_all_inside(reference),
+            font.clone(),
+            theme::TEXT_MUTED,
+            inner,
+        );
+        items.push(Item::Line(ui.fonts_mut(|f| f.layout_job(line))));
+    }
+    for (position, group) in notes {
+        let heading = ui.fonts_mut(|f| {
+            f.layout_no_wrap(
+                position.label().to_uppercase(),
+                egui::FontId::proportional(10.0),
+                theme::TEXT_MUTED,
+            )
+        });
+        items.push(Item::Heading(heading));
+        for note in group {
+            let galley = ui.fonts_mut(|f| f.layout_job(note_job(note, inner - indent)));
+            let key = format!("swing_note:{}:{}", note.id, position.key());
+            items.push(Item::Note(key, galley));
+        }
+    }
+    let height = items
+        .iter()
+        .map(|item| match item {
+            Item::Heading(_) => HEADING_H,
+            Item::Note(_, g) => g.size().y + NOTE_GAP,
+            Item::Line(g) => g.size().y,
+        })
+        .sum::<f32>()
+        + 2.0 * PAD;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 6.0, theme::SURFACE);
+    let left = rect.left() + PAD;
+    let mut y = rect.top() + PAD;
+    for item in items {
+        match item {
+            Item::Heading(galley) => {
+                let at = egui::pos2(left, y + HEADING_H - galley.size().y - 3.0);
+                ui.painter().galley(at, galley, theme::TEXT_MUTED);
+                y += HEADING_H;
+            }
+            Item::Note(key, galley) => {
+                let h = galley.size().y;
+                ui.painter()
+                    .galley(egui::pos2(left, y), bullet.clone(), theme::TEXT_MUTED);
+                ui.painter()
+                    .galley(egui::pos2(left + indent, y), galley, theme::TEXT);
+                if cfg!(test) {
+                    let area = egui::Rect::from_min_size(egui::pos2(left, y), egui::vec2(inner, h));
+                    let shown = ui.interact(area, ui.id().with(&key), egui::Sense::hover());
+                    devices::mark(ui, || key.clone(), &shown);
+                }
+                y += h + NOTE_GAP;
+            }
+            Item::Line(galley) => {
+                let h = galley.size().y;
+                ui.painter()
+                    .galley(egui::pos2(left, y), galley, theme::TEXT_MUTED);
+                y += h;
+            }
+        }
+    }
+    devices::mark(ui, || "swing_notes".to_owned(), &response);
+}
+
 /// Height of a row of the swing tables.
 pub(super) const TABLE_ROW_H: f32 = 22.0;
 
@@ -471,26 +674,22 @@ pub(super) const SPINE_FACE_ON: FrameTile = FrameTile {
     id: "lateral_spine_tilt",
 };
 
-/// One tile's content: the metric's id, its name, its value on screen
-/// (with a direction word) in its grade's color, and its grade.
+/// One tile's content: the metric's id, its name, and its value on screen
+/// (with a direction word) in its color.
 pub(crate) struct FrameValue {
     pub(crate) id: &'static str,
     pub(crate) label: &'static str,
     pub(crate) text: String,
     pub(crate) word: Option<&'static str>,
     pub(crate) color: egui::Color32,
-    pub(crate) grade: Option<MetricGrade>,
 }
 
 /// The body at the replay's position: per tile, the metric from each
 /// camera whose report is of the tile's view, at the frame that camera
 /// shows, the mean when several have a value. A dash where none has. The
 /// spine is the down-the-line forward bend, or the face-on side bend when
-/// no report is down the line. Values read as in the metrics table.
-///
-/// A tile is graded only where the frame shown is a key position's (or
-/// next to it, [`key_position`]): with that position's grade, the grade the
-/// cameras showing it share ([`shared_grade`]). Elsewhere it is plain.
+/// no report is down the line. Values read as in the metrics table, plain
+/// at every frame.
 pub(crate) fn frame_tiles(swings: &[Swing], imperial: bool) -> Vec<FrameValue> {
     let down_the_line = swings
         .iter()
@@ -506,28 +705,19 @@ pub(crate) fn frame_tiles(swings: &[Swing], imperial: bool) -> Vec<FrameValue> {
             let samples: Vec<_> = swings
                 .iter()
                 .filter(|s| s.report.view == Some(tile.view))
-                .filter_map(|s| {
-                    let t = s.t_ns?;
-                    let sample = s.report.sample(tile.id, t)?;
-                    let grade =
-                        key_position(s.report, t).and_then(|p| s.grades?.grade(tile.id, p.key()));
-                    Some((sample, grade))
-                })
+                .filter_map(|s| s.report.sample(tile.id, s.t_ns?))
                 .collect();
-            let (shown, grade) = match samples.as_slice() {
-                [] => (Shown::none(), None),
-                [(first, _), ..] => {
+            let shown = match samples.as_slice() {
+                [] => Shown::none(),
+                [first, ..] => {
                     let n = samples.len() as f64;
-                    let value = samples.iter().map(|(s, _)| s.value).sum::<f64>() / n;
+                    let value = samples.iter().map(|s| s.value).sum::<f64>() / n;
                     let cm = samples
                         .iter()
-                        .map(|(s, _)| s.cm)
+                        .map(|s| s.cm)
                         .sum::<Option<f64>>()
                         .map(|sum| sum / n);
-                    let grade = shared_grade(samples.iter().map(|(_, g)| *g));
-                    let shown =
-                        graded_shown(tile.id, &first.unit, value, cm, imperial, grade.as_ref());
-                    (shown, grade)
+                    metric_shown(tile.id, &first.unit, value, cm, imperial)
                 }
             };
             FrameValue {
@@ -536,7 +726,6 @@ pub(crate) fn frame_tiles(swings: &[Swing], imperial: bool) -> Vec<FrameValue> {
                 text: shown.text,
                 word: shown.word,
                 color: shown.color,
-                grade,
             }
         })
         .collect()
@@ -562,66 +751,6 @@ pub(crate) fn value_tiles(ui: &mut egui::Ui, tiles: &[FrameValue], width: f32) -
         .map(|t| (t.label, t.text.as_str(), t.word, t.color))
         .collect();
     worded_tiles(ui, &shown, width)
-}
-
-/// The miss line's entries: each tile off its band (graded, not
-/// [`Fit::Both`]) with its name, its words and its fit.
-pub(crate) fn miss_entries(tiles: &[FrameValue]) -> Vec<(&'static str, String, Fit)> {
-    tiles
-        .iter()
-        .filter_map(|t| {
-            let grade = t.grade.as_ref().filter(|g| g.fit != Fit::Both)?;
-            Some((t.label, grade.word.clone()?, grade.fit))
-        })
-        .collect()
-}
-
-/// Size of the miss line's text.
-pub(super) const MISS_SIZE: f32 = 13.0;
-
-/// The miss line's text: each entry's name muted and its words in its fit's
-/// color, joined by middle dots.
-pub(crate) fn miss_job(entries: &[(&str, String, Fit)], width: f32) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    let format = |color| egui::TextFormat {
-        font_id: egui::FontId::proportional(MISS_SIZE),
-        color,
-        ..Default::default()
-    };
-    for (k, (label, words, fit)) in entries.iter().enumerate() {
-        if k > 0 {
-            job.append(" \u{b7} ", 0.0, format(theme::TEXT_MUTED));
-        }
-        job.append(label, 0.0, format(theme::TEXT_MUTED));
-        job.append(&format!(" {words}"), 0.0, format(grade_color(*fit)));
-    }
-    job.wrap.max_width = width;
-    job.wrap.max_rows = 2;
-    job
-}
-
-/// The miss line under the tiles, `width` wide: the tiles off their band
-/// ([`miss_entries`]), at most two lines. With none, a line's height is
-/// kept empty while the shot has grades (`reserve`), so the tables below
-/// hold still as the playhead passes a key position. Mark `frame_misses`.
-pub(crate) fn miss_line(
-    ui: &mut egui::Ui,
-    entries: &[(&str, String, Fit)],
-    width: f32,
-    reserve: bool,
-) {
-    if entries.is_empty() && !reserve {
-        return;
-    }
-    let galley = ui.fonts_mut(|f| f.layout_job(miss_job(entries, width)));
-    let line = ui.fonts_mut(|f| f.row_height(&egui::FontId::proportional(MISS_SIZE)));
-    let height = galley.size().y.max(line) + 6.0;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    if !entries.is_empty() {
-        ui.painter()
-            .galley(rect.left_top() + egui::vec2(0.0, 4.0), galley, theme::TEXT);
-    }
-    devices::mark(ui, || "frame_misses".to_owned(), &response);
 }
 
 /// One camera's swing metrics, `width` wide: its body measurements at the
