@@ -665,10 +665,8 @@ fn out_of_range_environment_is_not_simulated() {
 
 fn assert_matches_dimple(input: &ShotInput) -> DerivedFlight {
     let d = derive(&from_input(input), &cfg()).expect("simulated");
-    let env = Environment {
-        altitude_m: 0.0,
-        temperature_c: 25.0,
-    };
+    let mut env = Environment::SEA_LEVEL;
+    env.temperature_c = 25.0;
     let shot = simulate_shot(input, &BallModel::TOUR, &env, &Surface::FAIRWAY);
     assert_eq!(shot.ground.termination, Termination::Rest);
     let f = &shot.flight;
@@ -780,10 +778,9 @@ fn log_line_prints_present_fields_in_order_with_signs() {
 /// The raw simulated path for `b` under the default settings.
 fn raw_path(b: &Ball) -> FullPath {
     let c = cfg();
-    let env = Environment {
-        altitude_m: c.altitude.as_meters(),
-        temperature_c: c.temperature_c,
-    };
+    let mut env = Environment::SEA_LEVEL;
+    env.altitude_m = c.altitude.as_meters();
+    env.temperature_c = c.temperature_c;
     let input = shot_input(b).expect("simulatable");
     let shot = simulate_shot(&input, &BallModel::TOUR, &env, &surface(c.surface));
     let rest = shot.ground.termination == Termination::Rest;

@@ -39,6 +39,7 @@
 
 use std::sync::Mutex;
 
+use dimple::Vec3;
 use dimple::aero::BallModel;
 use dimple::environment::Environment;
 use dimple::ground::{BallState, GroundModel, GroundResult, Surface, Termination};
@@ -48,7 +49,6 @@ use flighthook::{
     Basis, DerivedFlight, Distance, FlightPath, FlightResult, Launch, Mode, SimMode, SimSurface,
     SimulationSection,
 };
-use glam::DVec3;
 #[cfg(test)]
 use tracing::info;
 use tracing::{debug, warn};
@@ -307,14 +307,15 @@ fn derive_with_error(
     (!d.is_empty()).then_some(d)
 }
 
-/// The `dimple` environment for `cfg`. Not `Environment::SEA_LEVEL` (15 C):
-/// the default is the ball model's 25 C calibration point, carried in the
-/// config default.
+/// The `dimple` environment for `cfg`: its altitude and temperature over
+/// `Environment::SEA_LEVEL`. The temperature default is the ball model's
+/// 25 C calibration point (not sea level's 15 C), carried in the config
+/// default.
 pub(crate) fn environment(cfg: &SimulationSection) -> Environment {
-    Environment {
-        altitude_m: cfg.altitude.as_meters(),
-        temperature_c: cfg.temperature_c,
-    }
+    let mut env = Environment::SEA_LEVEL;
+    env.altitude_m = cfg.altitude.as_meters();
+    env.temperature_c = cfg.temperature_c;
+    env
 }
 
 /// The anchored path when there is one and every point is finite; logs why
@@ -380,13 +381,17 @@ fn derive_ground_ball(
     let az = hla.to_radians();
     let start = BallState {
         time: 0.0,
-        pos: DVec3::ZERO,
-        vel: DVec3::new(speed * az.cos(), 0.0, speed * az.sin()),
-        spin: DVec3::ZERO,
+        pos: Vec3::ZERO,
+        vel: Vec3::new(speed * az.cos(), 0.0, speed * az.sin()),
+        spin: Vec3::ZERO,
     };
     let env = environment(cfg);
     let ground = surface.settle(&start, &BallModel::TOUR, env.air_density());
-    let rest = ground.termination == Termination::Rest && ground.rest.pos.is_finite();
+    let p = ground.rest.pos;
+    let rest = ground.termination == Termination::Rest
+        && p.x.is_finite()
+        && p.y.is_finite()
+        && p.z.is_finite();
     let raw = FullPath::new(vec![[0.0; 4]], &ground, rest);
     let force = cfg.mode == SimMode::Force;
     let measured = if force {
