@@ -1695,6 +1695,25 @@ mod tests {
     }
 
     #[test]
+    fn shots_finished_after_the_connection_dropped_are_not_sent_on_reconnect() {
+        let (mut relay, monitor, mut receiver) = relay_with_bus();
+        let start = Instant::now();
+        relay.connect(start);
+        emit_shot(&monitor, 1);
+        relay.drain(&mut receiver).expect("bus open");
+        assert_eq!(sent_numbers(&mut relay, start), [1]);
+        assert!(relay.disconnect().is_some());
+        emit_shot(&monitor, 2);
+        emit_shot(&monitor, 3);
+        relay.drain(&mut receiver).expect("bus open");
+        let later = start + MAX_BACKOFF;
+        relay.connect(later);
+        emit_shot(&monitor, 4);
+        relay.drain(&mut receiver).expect("bus open");
+        assert_eq!(sent_numbers(&mut relay, later), [4]);
+    }
+
+    #[test]
     fn a_shot_older_than_the_stale_limit_is_dropped() {
         let (mut relay, monitor, mut receiver) = relay_with_bus();
         relay.connect(Instant::now());
@@ -2152,6 +2171,22 @@ mod tests {
         );
         assert_eq!(gspro.shots(2), [golden(12), golden(13)]);
         bridge.stop().expect("bridge stops");
+    }
+
+    #[test]
+    fn a_lost_connection_is_a_status_not_an_alert() {
+        // No backoff: the bridge reconnects at once.
+        let mut bridge = Bridge::start(Backoff::new(Duration::ZERO, Duration::ZERO));
+        let first = bridge.accept();
+        let mut alerts = bridge.wait_for_status(ActorStatus::Connected);
+        drop(first);
+        alerts.extend(bridge.wait_for_status(ActorStatus::Reconnecting));
+        let mut second = bridge.accept();
+        alerts.extend(bridge.wait_for_status(ActorStatus::Connected));
+        emit_shot(&bridge.monitor, 1);
+        assert_eq!(second.shots(1), [golden(1)]);
+        bridge.stop().expect("bridge stops");
+        assert!(alerts.is_empty(), "{alerts:?}");
     }
 
     /// The client's card, built from its statuses as the web layer builds it
