@@ -371,14 +371,9 @@ fn at(host_ns: u64, device_ns: Option<u64>) -> Frame {
 
 /// The capture's stats at `fps`.
 fn stats(fps: f64) -> CaptureStats {
-    CaptureStats {
-        frames: 0,
-        dropped: 0,
-        fps,
-        last_frame_ns: None,
-        ring_frames: 0,
-        ring_bytes: 0,
-    }
+    let mut stats = CaptureStats::default();
+    stats.fps = fps;
+    stats
 }
 
 #[test]
@@ -541,15 +536,15 @@ fn dated_frames_stay_strictly_increasing_when_the_latency_changes() {
 /// Recorder settings of the simulations below: a 200 ms pre-roll and a
 /// 100 ms post-roll at 100 fps, finished 300 ms after the window.
 fn sim_config() -> RecorderConfig {
-    RecorderConfig {
-        pre_roll: millis(200),
-        post_roll: millis(100),
-        merge_window: millis(500),
-        buffer: millis(5000),
-        max_bytes: usize::MAX,
-        stall: millis(300),
-        fps: Some(100.0),
-    }
+    let mut config = RecorderConfig::default();
+    config.pre_roll = millis(200);
+    config.post_roll = millis(100);
+    config.merge_window = millis(500);
+    config.buffer = millis(5000);
+    config.max_bytes = usize::MAX;
+    config.stall = millis(300);
+    config.fps = Some(100.0);
+    config
 }
 
 /// A camera `latency_ms` behind real time, shooting 100 fps, and a launch
@@ -592,6 +587,7 @@ fn clip_of(events: Vec<RecorderEvent<&'static str>>) -> stance::Clip<&'static st
     let mut clips = events.into_iter().map(|e| match e {
         RecorderEvent::Finished(c) => c,
         RecorderEvent::Discarded(d) => panic!("discarded: {d:?}"),
+        _ => panic!("an unexpected recorder event"),
     });
     let clip = clips.next().expect("a clip");
     assert!(clips.next().is_none(), "one clip");
@@ -683,13 +679,12 @@ fn the_history_covers_the_pre_roll_whatever_the_latency() {
     );
     // A 10 s latency camera, impact lead 1.5 s, default pre-roll: the
     // window start is in the ring when the trigger arrives.
-    let mut recorder: ClipRecorder<&'static str> = ClipRecorder::new(RecorderConfig {
-        pre_roll: millis(500),
-        post_roll: millis(100),
-        buffer: millis(500) + millis(1500) + BUFFER_MARGIN,
-        fps: Some(100.0),
-        ..RecorderConfig::default()
-    });
+    let mut config = RecorderConfig::default();
+    config.pre_roll = millis(500);
+    config.post_roll = millis(100);
+    config.buffer = millis(500) + millis(1500) + BUFFER_MARGIN;
+    config.fps = Some(100.0);
+    let mut recorder: ClipRecorder<&'static str> = ClipRecorder::new(config);
     let mut restamp = Restamp::default();
     let lag = millis(10_000);
     let mut clips = Vec::new();

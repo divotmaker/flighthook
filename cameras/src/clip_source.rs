@@ -112,19 +112,16 @@ mod tests {
 
     /// A 10-frame, 100 fps test-pattern clip written by stance.
     fn clip(dir: &Path) -> PathBuf {
-        let mut pattern = TestPattern::new(TestPatternConfig {
-            width: 64,
-            height: 48,
-            fps: 100,
-            paced: false,
-            ..TestPatternConfig::default()
-        })
-        .expect("pattern");
-        let mut recorder: ClipRecorder<u32> = ClipRecorder::new(RecorderConfig {
-            pre_roll: Duration::from_millis(40),
-            post_roll: Duration::from_millis(50),
-            ..RecorderConfig::default()
-        });
+        let mut config = TestPatternConfig::default();
+        config.width = 64;
+        config.height = 48;
+        config.fps = 100;
+        config.paced = false;
+        let mut pattern = TestPattern::new(config).expect("pattern");
+        let mut config = RecorderConfig::default();
+        config.pre_roll = Duration::from_millis(40);
+        config.post_roll = Duration::from_millis(50);
+        let mut recorder: ClipRecorder<u32> = ClipRecorder::new(config);
         let mut clip = None;
         for i in 0..40u64 {
             let mut frame = pattern.next_frame(Duration::ZERO).unwrap().unwrap();

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use flighthook::{CameraPosition, Handedness, LivePosture, SwingView, round_deg};
 use stance::golf::{
-    Guess, Handed, ImpactSource, PostureFilter, SwingOptions, SwingReport, View, analyze_swing,
+    Guess, Handed, ImpactSource, PostureFilter, SwingConfig, SwingReport, View, analyze_swing,
     unmirror,
 };
 use stance::pose::{OneEuroParams, Pose, PoseTrack};
@@ -59,10 +59,11 @@ pub fn handed(hand: Option<Handedness>) -> Handed {
     }
 }
 
+/// flighthook picks only these two views (`view_for`).
 fn wire_view(view: View) -> SwingView {
     match view {
-        View::FaceOn => SwingView::FaceOn,
         View::DownTheLine => SwingView::DownTheLine,
+        _ => SwingView::FaceOn,
     }
 }
 
@@ -122,15 +123,13 @@ pub fn write_report(
         return Ok(None);
     };
     let handed = handed(input.hand);
-    let options = SwingOptions {
-        view: Some(view),
-        handed,
-        impact_ns: input.impact_ns,
-        height_cm: input.height_cm,
-        mirrored: input.mirrored,
-        ..SwingOptions::default()
-    };
-    let report = analyze_swing(track, &options).map_err(|e| e.to_string())?;
+    let mut config = SwingConfig::default();
+    config.view = Some(view);
+    config.handed = handed;
+    config.impact_ns = input.impact_ns;
+    config.height_cm = input.height_cm;
+    config.mirrored = input.mirrored;
+    let report = analyze_swing(track, &config).map_err(|e| e.to_string())?;
     if let Some(guess) = handed_mismatch(&report, handed) {
         warn!(
             "{camera}: the swing looks {} ({:.0} % sure) but the player is {}; is the camera picture mirrored?",
@@ -226,10 +225,8 @@ impl LivePostureFilter {
                 h.to_bits() == hz.to_bits() && *s == setup
             };
             if !self.filter.as_ref().is_some_and(same) {
-                let params = OneEuroParams {
-                    min_cutoff: hz,
-                    ..OneEuroParams::default()
-                };
+                let mut params = OneEuroParams::default();
+                params.min_cutoff = hz;
                 self.filter = Some((PostureFilter::new(params), hz, setup));
             }
             match &mut self.filter {
@@ -241,9 +238,10 @@ impl LivePostureFilter {
             raw
         };
         let deg = |v: Option<f64>| v.map(round_deg);
-        match setup.view {
-            View::FaceOn => LivePosture {
-                view: wire_view(setup.view),
+        let view = wire_view(setup.view);
+        match view {
+            SwingView::FaceOn => LivePosture {
+                view,
                 spine_angle: deg(smoothed.spine_angle),
                 shoulder_tilt: deg(smoothed.shoulder_tilt),
                 lead_arm_angle: deg(smoothed.lead_elbow_angle),
@@ -251,8 +249,8 @@ impl LivePostureFilter {
                 trail_knee_flex: None,
                 trail_elbow_angle: None,
             },
-            View::DownTheLine => LivePosture {
-                view: wire_view(setup.view),
+            SwingView::DownTheLine => LivePosture {
+                view,
                 spine_angle: deg(smoothed.spine_angle),
                 shoulder_tilt: None,
                 lead_arm_angle: None,
@@ -453,14 +451,9 @@ pub(crate) mod tests {
         let guess = handed_mismatch(&report, Handed::Left).expect("a confident disagreement");
         assert_eq!(guess.value, Handed::Right);
         // The right hand agrees with the swing: no warning.
-        let right = analyze_swing(
-            &track,
-            &SwingOptions {
-                view: Some(View::FaceOn),
-                ..SwingOptions::default()
-            },
-        )
-        .unwrap();
+        let mut config = SwingConfig::default();
+        config.view = Some(View::FaceOn);
+        let right = analyze_swing(&track, &config).unwrap();
         assert!(handed_mismatch(&right, Handed::Right).is_none());
     }
 

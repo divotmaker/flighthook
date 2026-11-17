@@ -946,13 +946,11 @@ pub(crate) mod tests {
     #[test]
     fn webcam_frames_decode_to_rgb() {
         use stance::{Source, TestPattern, TestPatternConfig};
-        let mut pattern = TestPattern::new(TestPatternConfig {
-            width: 64,
-            height: 48,
-            paced: false,
-            ..TestPatternConfig::default()
-        })
-        .unwrap();
+        let mut config = TestPatternConfig::default();
+        config.width = 64;
+        config.height = 48;
+        config.paced = false;
+        let mut pattern = TestPattern::new(config).unwrap();
         let frame = pattern
             .next_frame(std::time::Duration::ZERO)
             .unwrap()

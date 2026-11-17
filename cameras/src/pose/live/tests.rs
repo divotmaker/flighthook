@@ -172,14 +172,9 @@ fn gated_tracker(
 }
 
 fn tracker(pose: FakePose, found: bool, detect_every: u32) -> Box<dyn Estimate> {
-    Box::new(PoseTracker::new(
-        pose,
-        FakeDetector { found },
-        stance::pose::PoseConfig {
-            detect_every,
-            ..stance::pose::PoseConfig::default()
-        },
-    ))
+    let mut config = stance::pose::PoseConfig::default();
+    config.detect_every = detect_every;
+    Box::new(PoseTracker::new(pose, FakeDetector { found }, config))
 }
 
 type Published = Arc<Mutex<Vec<(u64, Option<LivePose>)>>>;
@@ -459,13 +454,12 @@ fn live_frames_are_turned_by_the_cameras_rotation_before_tracking() {
     let log = Arc::clone(&builds);
     let build: Build = Box::new(move |s, r| {
         log.lock().unwrap().push(r);
+        let mut config = crate::pose::models::pose_config(s.model, s.detect_every);
+        config.rotation = r;
         Some(Box::new(PoseTracker::new(
             SizePose,
             FakeDetector { found: true },
-            stance::pose::PoseConfig {
-                rotation: r,
-                ..crate::pose::models::pose_config(s.model, s.detect_every)
-            },
+            config,
         )) as Box<dyn Estimate>)
     });
     let (publish, published) = publisher();

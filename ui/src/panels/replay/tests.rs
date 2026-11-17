@@ -824,13 +824,11 @@ fn jpeg_clip(n: u64) -> (Track, Vec<u8>) {
 /// (impact half way), and the bytes of the file it indexes.
 fn jpeg_clip_at(n: u64, period: u64) -> (Track, Vec<u8>) {
     use stance::{Source, TestPattern, TestPatternConfig};
-    let mut pattern = TestPattern::new(TestPatternConfig {
-        width: 64,
-        height: 48,
-        paced: false,
-        ..TestPatternConfig::default()
-    })
-    .unwrap();
+    let mut config = TestPatternConfig::default();
+    config.width = 64;
+    config.height = 48;
+    config.paced = false;
+    let mut pattern = TestPattern::new(config).unwrap();
     let mut file = vec![0; 232];
     let mut t = track(1000, period, n, 1);
     for f in &mut t.frames {

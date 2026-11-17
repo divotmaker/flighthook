@@ -60,11 +60,10 @@ pub fn spec(model: PoseModel) -> ModelSpec {
 /// `detect_every` frames; everything else at stance's defaults (person
 /// detector YOLOX-Tiny, no smoothing: the live view smooths on its own).
 pub fn pose_config(model: PoseModel, detect_every: u32) -> PoseConfig {
-    PoseConfig {
-        pose_model: spec(model),
-        detect_every: detect_every.max(1),
-        ..PoseConfig::default()
-    }
+    let mut config = PoseConfig::default();
+    config.pose_model = spec(model);
+    config.detect_every = detect_every.max(1);
+    config
 }
 
 /// The files `model` needs: its pose model, then the person detector.

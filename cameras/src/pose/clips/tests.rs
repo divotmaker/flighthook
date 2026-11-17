@@ -765,10 +765,8 @@ fn the_clip_pass_workers_run_below_normal() {
     let frames: Vec<(u64, Arc<[u8]>)> = (0..30u8)
         .map(|n| (u64::from(n) * 1_000_000, numbered_jpeg(n)))
         .collect();
-    let config = PoseConfig {
-        threads: 2,
-        ..clip_config(PoseModel::RtmposeM, Rotation::None)
-    };
+    let mut config = clip_config(PoseModel::RtmposeM, Rotation::None);
+    config.threads = 2;
     let caller = std::thread::spawn(move || {
         stance::pose::analyze_frames(&models, &frames, &config).expect("pass");
         current()

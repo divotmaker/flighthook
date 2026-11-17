@@ -25,20 +25,17 @@ pub fn store_clip(cameras: &Arc<Cameras>, keys: &[ShotKey]) {
 /// A 100 fps clip of the shots `keys` from the unpaced test pattern, dated
 /// from 0: triggered at 500 ms, at generation `generation`.
 pub(crate) fn unpaced_clip(keys: &[ShotKey], generation: u64) -> stance::Clip<Tag> {
-    let mut pattern = TestPattern::new(TestPatternConfig {
-        width: 64,
-        height: 48,
-        fps: 100,
-        paced: false,
-        origin_ns: Some(0),
-        ..TestPatternConfig::default()
-    })
-    .expect("pattern");
-    let mut recorder = ClipRecorder::new(RecorderConfig {
-        pre_roll: Duration::from_millis(100),
-        post_roll: Duration::from_millis(100),
-        ..RecorderConfig::default()
-    });
+    let mut config = TestPatternConfig::default();
+    config.width = 64;
+    config.height = 48;
+    config.fps = 100;
+    config.paced = false;
+    config.origin_ns = Some(0);
+    let mut pattern = TestPattern::new(config).expect("pattern");
+    let mut config = RecorderConfig::default();
+    config.pre_roll = Duration::from_millis(100);
+    config.post_roll = Duration::from_millis(100);
+    let mut recorder = ClipRecorder::new(config);
     for seq in 0..100 {
         if seq == 50 {
             for (i, key) in keys.iter().enumerate() {

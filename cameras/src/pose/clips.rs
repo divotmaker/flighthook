@@ -158,12 +158,11 @@ pub fn clip_threads() -> usize {
 /// ([`super::priority::worker_hook`]), detecting every 10 frames, every
 /// frame turned upright before detection.
 pub fn clip_config(model: PoseModel, rotation: Rotation) -> PoseConfig {
-    PoseConfig {
-        threads: clip_threads(),
-        on_worker_start: Some(super::priority::worker_hook()),
-        rotation,
-        ..pose_config(model, PoseConfig::default().detect_every)
-    }
+    let mut config = pose_config(model, PoseConfig::default().detect_every);
+    config.threads = clip_threads();
+    config.on_worker_start = Some(super::priority::worker_hook());
+    config.rotation = rotation;
+    config
 }
 
 /// Most clips waiting: one per clip the store keeps.

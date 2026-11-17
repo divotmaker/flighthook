@@ -63,15 +63,13 @@ impl Bench {
         let events: Arc<Mutex<Vec<Event>>> = Arc::default();
         let sink = Arc::clone(&events);
         let out: Out = Arc::new(move |e| sink.lock().unwrap().push(e));
-        let pattern = TestPattern::new(TestPatternConfig {
-            width: 64,
-            height: 48,
-            fps: 100,
-            paced: false,
-            origin_ns: Some(0),
-            ..TestPatternConfig::default()
-        })
-        .expect("pattern");
+        let mut config = TestPatternConfig::default();
+        config.width = 64;
+        config.height = 48;
+        config.fps = 100;
+        config.paced = false;
+        config.origin_ns = Some(0);
+        let pattern = TestPattern::new(config).expect("pattern");
         let t0 = Instant::now();
         Self {
             base,
@@ -127,6 +125,7 @@ impl Bench {
                     save(&self.cameras, CAMERA, &self.out, &self.out, &clip);
                 }
                 RecorderEvent::Discarded(_) => self.discarded += 1,
+                _ => {}
             }
         }
     }

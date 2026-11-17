@@ -2969,13 +2969,11 @@ fn a_running_cameras_card_fetches_and_shows_a_still_frame() {
     );
     assert!(app.stills[id].loading);
 
-    let mut pattern = TestPattern::new(TestPatternConfig {
-        width: 160,
-        height: 90,
-        paced: false,
-        ..TestPatternConfig::default()
-    })
-    .unwrap();
+    let mut config = TestPatternConfig::default();
+    config.width = 160;
+    config.height = 90;
+    config.paced = false;
+    let mut pattern = TestPattern::new(config).unwrap();
     let frame = pattern
         .next_frame(std::time::Duration::ZERO)
         .unwrap()

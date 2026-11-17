@@ -294,10 +294,9 @@ fn start_live_worker(cameras: &Arc<Cameras>, actor: &str) -> Option<LiveWorker> 
     let build: live::Build = Box::new(move |s, rotation| {
         let shared = build_cameras.pose.models.want(s.model).ready()?;
         let made = shared.fork().and_then(|m| {
-            m.tracker(stance::pose::PoseConfig {
-                rotation,
-                ..models::pose_config(s.model, s.detect_every)
-            })
+            let mut config = models::pose_config(s.model, s.detect_every);
+            config.rotation = rotation;
+            m.tracker(config)
         });
         match made {
             Ok(tracker) => Some(Box::new(tracker) as Box<dyn live::Estimate>),
@@ -375,14 +374,12 @@ fn recorder_config(
     longest_reach: Duration,
     fps: Option<f64>,
 ) -> RecorderConfig {
-    let pre_roll = roll(replay.pre_roll_s);
-    RecorderConfig {
-        pre_roll,
-        post_roll: roll(replay.post_roll_s),
-        buffer: pre_roll + longest_reach + BUFFER_MARGIN,
-        fps,
-        ..RecorderConfig::default()
-    }
+    let mut config = RecorderConfig::default();
+    config.pre_roll = roll(replay.pre_roll_s);
+    config.post_roll = roll(replay.post_roll_s);
+    config.buffer = config.pre_roll + longest_reach + BUFFER_MARGIN;
+    config.fps = fps;
+    config
 }
 
 /// How far before a trigger's arrival its impact can lie, over the
@@ -801,10 +798,8 @@ impl Run<'_> {
 
     /// Start capturing from the camera `section` names. Blocks while it opens.
     fn open_capture(&self, section: &CameraSection) -> Result<Capture, OpenError> {
-        let config = CaptureConfig {
-            thread_name: format!("capture:{}", self.actor),
-            ..CaptureConfig::default()
-        };
+        let mut config = CaptureConfig::default();
+        config.thread_name = format!("capture:{}", self.actor);
         let source = section.clone();
         let cameras = Arc::clone(self.cameras);
         let actor = self.actor.to_owned();
@@ -1119,6 +1114,7 @@ impl Run<'_> {
                     warn!("camera: no thread to save a clip: {e}");
                 }
             }
+            _ => {}
         }
     }
 }

@@ -830,13 +830,11 @@ fn removing_the_cameras_leaves_live() {
 /// A 64×48 JPEG, as a camera sends one.
 fn frame_jpeg() -> Vec<u8> {
     use stance::{Source, TestPattern, TestPatternConfig};
-    let mut pattern = TestPattern::new(TestPatternConfig {
-        width: 64,
-        height: 48,
-        paced: false,
-        ..TestPatternConfig::default()
-    })
-    .unwrap();
+    let mut config = TestPatternConfig::default();
+    config.width = 64;
+    config.height = 48;
+    config.paced = false;
+    let mut pattern = TestPattern::new(config).unwrap();
     pattern
         .next_frame(std::time::Duration::ZERO)
         .unwrap()

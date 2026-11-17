@@ -375,10 +375,8 @@ impl Smoother {
             return;
         }
         if self.filters.len() != pose.keypoints.len() {
-            let params = OneEuroParams {
-                min_cutoff: hz,
-                ..OneEuroParams::default()
-            };
+            let mut params = OneEuroParams::default();
+            params.min_cutoff = hz;
             self.filters = vec![[OneEuro::new(params), OneEuro::new(params)]; pose.keypoints.len()];
         }
         // Host nanoseconds stay exact in f64 for months of uptime.
