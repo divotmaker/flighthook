@@ -515,8 +515,6 @@ mod tests {
                 pid: 0x082d,
             }),
             formats,
-            controls: Vec::new(),
-            exposure_unit: None,
             probe_error: None,
         }
     }
