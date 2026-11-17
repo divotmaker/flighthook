@@ -1965,10 +1965,8 @@ no round of its own, and nothing else changes during one.
   output's ready state and heartbeat, remote ones included.
 - **Everything else.** Auto-Chip, the mock and the trackball keep making
   shots during a round, and every other output still gets them.
-- **The header.** The dashboard shows the Tournament icon while any
-  Pureplay Connect card (`pureplay.N`) reports `strict_mode` `on` in its
-  telemetry (`FlighthookApp::strict_round`): a read-only status with its hover
-  text, no click action.
+- **The dashboard.** A round shows only on the Pureplay Connect card, as its
+  `strict_mode` row (`on` | `off`); the header has no icon for it.
 
 Pureplay card rows (each key only when it changes):
 
@@ -3115,7 +3113,7 @@ the title while it fits), and the tabs move to a 52 px bar of four equal tabs
 at the bottom of the window.
 
 ```
-  [Shots][Cameras][Settings][Log]    FLIGHTHOOK v0.2.1    [Energy][Tournament][Follow] [Auto-Chip][Shot Type] [Club][Golfer]
+  [Shots][Cameras][Settings][Log]    FLIGHTHOOK v0.2.1    [Energy][Follow] [Auto-Chip][Shot Type] [Club][Golfer]
    nav icons (the tabs)               title, when it fits  status/mode            actions              selections
 ```
 
@@ -3134,7 +3132,6 @@ only while it keeps 24 px clear of both icon groups; otherwise it is not drawn.
 | Icon | Shown when | What it does |
 |---|---|---|
 | Energy | a device reports a battery charge | Opens the "Batteries" list: one row per device with its charge. The icon turns yellow when any device is below 20 % and red below 10 % |
-| Tournament | a Pureplay Connect card reports `strict_mode` `on` | A read-only status in gold: a Pureplay game is in a tournament round, and Pureplay Connect sends only measured shots (its hover text). No click action |
 | Follow turns | two or more golfers are known | A toggle (on by default, for the session only). On, the view follows every change of the golfer up; off, the view stays put and a pick in the Golfer card changes only the view |
 | Auto-Chip | `[simulation] auto_chip` is on | Opens the "Auto-Chip" menu (`1 Yard`, `3 Yard`, `5 Yard`); disabled, with the reason as hover text, while no simulator is connected and while a chip is in flight |
 | Shot Type | an enabled launch monitor uses the hint, or an output routes Chipping or Putting to a specific monitor (see [Shot Type visibility](#games-and-simulators-re-assert)) | Opens "Shot Type": Full, Chip, Putt, sent as a `golfer.select` carrying `mode`. A tip says some launch monitors use it as a hint for the shot to expect |

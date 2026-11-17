@@ -68,7 +68,6 @@ pub(crate) const NAV_SHOTS: Asset = asset!("nav-shots", 24.0);
 pub(crate) const NAV_CAMERAS: Asset = asset!("nav-cameras", 24.0);
 pub(crate) const NAV_SETTINGS: Asset = asset!("nav-settings", 24.0);
 pub(crate) const NAV_LOG: Asset = asset!("nav-log", 24.0);
-pub(crate) const TOURNAMENT_ON: Asset = asset!("tournament-on", 24.0);
 pub(crate) const AUTO_CHIP_OFF: Asset = asset!("auto-chip-off", 24.0);
 pub(crate) const AUTO_CHIP_ON: Asset = asset!("auto-chip-on", 24.0);
 pub(crate) const ENERGY: Asset = asset!("energy", 24.0);
@@ -98,12 +97,11 @@ pub(crate) const GOLFER_NONE: Asset = asset!("golfer-none", 28.0);
 
 /// Every icon, for the test that decodes them all.
 #[cfg(test)]
-pub(crate) const ALL: [Asset; 23] = [
+pub(crate) const ALL: [Asset; 22] = [
     NAV_SHOTS,
     NAV_CAMERAS,
     NAV_SETTINGS,
     NAV_LOG,
-    TOURNAMENT_ON,
     AUTO_CHIP_OFF,
     AUTO_CHIP_ON,
     ENERGY,

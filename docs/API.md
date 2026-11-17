@@ -287,8 +287,7 @@ reported by one source only:
   or the link ends. While it is on, the output sends only shots whose launch
   monitor declares `device.source` `measured` (see [Source](#source)), with
   the values the launch monitor sent, and its ready state counts only those
-  launch monitors; the dashboard's header shows a Tournament icon while any
-  Pureplay Connect output reports `on`. `club` and
+  launch monitors; the output's card shows the round as `strict_mode` `on`. `club` and
   `handed` are the club and hand Pureplay set. `error` says why the handshake
   failed (no reply to Hello, an unsupported protocol version); a refused or
   closed connection sets none. When the link ends, `shots_sent`,

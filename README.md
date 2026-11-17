@@ -200,10 +200,11 @@ Terminal. Allow it.
   the one up from the header, and keep each golfer's shots, sets, grades
   and exports apart — see [Golfers](#golfers-beta)
 - A header with custom icons (beta): Shots, Cameras, Settings and Log on the
-  left; on the right the batteries, Tournament, Follow turns, Auto-Chip, Shot
+  left; on the right the batteries, Follow turns, Auto-Chip, Shot
   Type, Club and Golfer — see [The header](#the-header-beta)
 - Pureplay tournament rounds: while a Pureplay game is in one, Pureplay Connect
-  sends only measured shots and the header shows a Tournament icon
+  sends only measured shots and its card on the Settings page shows the round
+  as `strict_mode`
 - Battery icons in the header's energy menu for connected devices that report a charge
   (Mevo+, Square Golf Omni, and remote launch monitors that send one): yellow
   under 20 %, red under 10 %
@@ -552,8 +553,6 @@ tab: **Shots**, **Cameras** (hover text points to Settings while no camera is ad
 
 - **Energy**: the batteries of the devices that report one. It shows only
   when there is one to show.
-- **Tournament**: shown while a Pureplay game is in a tournament round (see
-  below).
 - **Follow turns**: with two or more golfers known, on (the default) makes the
   Shots tab follow the golfer up; off keeps the view on the golfer you picked
   in the Golfer card. It is not saved: it is on again after a reload.
@@ -574,9 +573,9 @@ card (Open Connect client or Pureplay Accessory) is
 connected, a pick that differs from the simulator's is set back to the
 simulator's.
 
-**Tournament** is a gold trophy that shows while a Pureplay game connected
-through the Pureplay Connect output (alpha) is in a tournament round. Its hover text says so; it
-has no click action. During the round Pureplay Connect sends Pureplay only the
+While a Pureplay game connected through the Pureplay Connect output (alpha) is in a
+tournament round, the output's card shows `strict_mode` `on`. During the round
+Pureplay Connect sends Pureplay only the
 shots of launch monitors that measured them: shots from the Trackball, the
 Mock, Auto-Chip and remote launch monitors that do not say their shots are
 measured are not sent. They still reach the other outputs, and Auto-Chip and

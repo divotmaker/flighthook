@@ -1,7 +1,6 @@
 //! The top bar: nav icons on the left (Shots, Cameras, Settings, Log), a
 //! title in the center while it fits, and on the right, by role: status and
-//! mode (energy, Tournament while a Pureplay game is in a tournament round,
-//! Follow turns), actions (Auto-Chip, Shot Type)
+//! mode (energy, Follow turns), actions (Auto-Chip, Shot Type)
 //! and selections (Club, then Golfer at the far right edge). Every button is
 //! 40 px with a 6 px gap and no dividers; the groups are only an order.
 //! The dropdowns open under their button. In the portrait layout the nav
@@ -73,17 +72,12 @@ pub(crate) enum HeaderMenu {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Slot {
     Energy,
-    Tournament,
     Follow,
     AutoChip,
     ShotType,
     Club,
     Golfer,
 }
-
-/// The Tournament icon's hover text.
-pub(crate) const TOURNAMENT_TIP: &str =
-    "A Pureplay game is in a tournament round: only shots a launch monitor measured are sent.";
 
 /// A golfer the Golfer card lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -556,9 +550,6 @@ impl FlighthookApp {
         if !batteries.is_empty() {
             slots.push(Slot::Energy);
         }
-        if self.strict_round() {
-            slots.push(Slot::Tournament);
-        }
         if self.known_golfers().len() >= 2 {
             slots.push(Slot::Follow);
         }
@@ -823,7 +814,6 @@ impl FlighthookApp {
             let rect = Rect::from_min_size(pos2(x, top), vec2(button, button));
             match slot {
                 Slot::Energy => self.energy_button(ui, rect, &batteries),
-                Slot::Tournament => self.tournament_button(ui, rect),
                 Slot::Follow => self.follow_button(ui, rect),
                 Slot::AutoChip => self.auto_chip_button(ui, rect, picks),
                 Slot::ShotType => self.shot_type_button(ui, rect, picks),
@@ -878,25 +868,6 @@ impl FlighthookApp {
                 );
             }
         });
-    }
-
-    /// Whether any Pureplay Connect link reports strict mode on (its
-    /// card's `strict_mode` row): the game is in a tournament round.
-    pub(crate) fn strict_round(&self) -> bool {
-        self.actors.iter().any(|(card, actor)| {
-            card.starts_with("pureplay.")
-                && actor
-                    .telemetry
-                    .get("strict_mode")
-                    .is_some_and(|v| v == "on")
-        })
-    }
-
-    /// The Tournament icon: a status with its hover text, no click action.
-    fn tournament_button(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let response = hit(ui, rect, "tournament", true);
-        button_icon(ui, rect, &response, false, true, &icons::TOURNAMENT_ON);
-        tip(response, TOURNAMENT_TIP);
     }
 
     /// The Follow turns button: the session's state, drawn on or slashed.
@@ -1747,7 +1718,7 @@ mod tests {
         pass_at(&ctx, app, width, 0.0, Vec::new())
     }
 
-    const ICON_FLAGS: [&str; 5] = ["energy", "follow", "auto-chip", "shot-type", "tournament"];
+    const ICON_FLAGS: [&str; 4] = ["energy", "follow", "auto-chip", "shot-type"];
 
     /// An app whose bar shows the icons in `flags` (`ICON_FLAGS` bits).
     fn bar_app(flags: u8) -> FlighthookApp {
@@ -1771,18 +1742,7 @@ mod tests {
         if on(0) {
             charge(&mut app, "square.0", "Square Omni", 74);
         }
-        if on(4) {
-            strict(&mut app, true);
-        }
         app
-    }
-
-    /// A Pureplay Connect card whose link reports strict mode `on` or off.
-    fn strict(app: &mut FlighthookApp, on: bool) {
-        let mut card = ActorStatusResponse::new("Pureplay", ActorStatus::Connected);
-        card.telemetry
-            .insert("strict_mode".into(), if on { "on" } else { "off" }.into());
-        app.actors.insert("pureplay.0".into(), card);
     }
 
     fn charge(app: &mut FlighthookApp, id: &str, name: &str, pct: u8) {
@@ -1793,9 +1753,8 @@ mod tests {
         app.actors.insert(id.into(), actor);
     }
 
-    const RIGHT_ORDER: [&str; 7] = [
+    const RIGHT_ORDER: [&str; 6] = [
         "energy",
-        "tournament",
         "follow",
         "auto-chip",
         "shot-type",
@@ -1806,10 +1765,10 @@ mod tests {
     /// Every button's rect, at three widths and for every combination of
     /// the icons that come and go: the right group in role order,
     /// anchored to the right edge, 40 px buttons 6 px apart, no divider,
-    /// widths 86 to 316; the nav the same on the left.
+    /// widths 86 to 270; the nav the same on the left.
     #[test]
     fn every_button_has_its_place_at_every_width_and_icon_combination() {
-        for flags in 0..32u8 {
+        for flags in 0..16u8 {
             for width in [1600.0, 1024.0, 720.0] {
                 let mut app = bar_app(flags);
                 let p = pass(&mut app, width);
@@ -1841,7 +1800,7 @@ mod tests {
                 assert_eq!(rects.last().unwrap().right(), width - SIDE_MARGIN, "{at}");
                 let group = rects.last().unwrap().right() - rects[0].left();
                 assert_eq!(group, group_width(expected.len(), BUTTON, GAP), "{at}");
-                let widths = [86.0, 132.0, 178.0, 224.0, 270.0, 316.0];
+                let widths = [86.0, 132.0, 178.0, 224.0, 270.0];
                 assert!(widths.contains(&group), "{at}: {group}");
                 let nav: Vec<Rect> = ["shots", "cameras", "settings", "log"]
                     .iter()
@@ -1866,7 +1825,7 @@ mod tests {
     #[test]
     fn the_portrait_header_is_one_row_over_a_bottom_tab_bar() {
         for width in [360.0, 390.0, 430.0] {
-            let mut app = bar_app(0b1_1111);
+            let mut app = bar_app(0b1111);
             app.portrait = true;
             let p = pass(&mut app, width);
             let at = format!("at {width}");
@@ -1882,7 +1841,7 @@ mod tests {
                 assert_eq!(pair[1].left() - pair[0].right(), GAP, "{at}");
             }
             let last = right.last().unwrap().right();
-            assert_eq!(last, (width - SIDE_MARGIN - 344.0).max(GAP) + 344.0, "{at}");
+            assert_eq!(last, (width - SIDE_MARGIN - 294.0).max(GAP) + 294.0, "{at}");
             let nav: Vec<Rect> = ["shots", "cameras", "settings", "log"]
                 .iter()
                 .map(|n| p.rect(&format!("nav:{n}")))
@@ -1977,7 +1936,7 @@ mod tests {
     /// the groups never overlap.
     #[test]
     fn a_window_too_narrow_for_both_groups_clips_the_right_group() {
-        let mut app = bar_app(0b1_1111);
+        let mut app = bar_app(0b1111);
         let p = pass(&mut app, 400.0);
         let nav_end = p.rect("nav:log").right();
         for name in RIGHT_ORDER {
@@ -2014,11 +1973,11 @@ mod tests {
 
     /// Widths here are logical px (the window at zoom 1; the app zooms out
     /// below a 1024 px window, so a narrower window has more logical px).
-    /// The title is there at 1024 and gone at 720 for all but the narrowest
-    /// right group.
+    /// The title is there at 1024, and at 720 unless the right group is the
+    /// widest.
     #[test]
     fn the_title_shows_at_1024_not_at_720_logical_px() {
-        for flags in [0b1_1100u8, 0b1_1110, 0b1_1101, 0b1_1111] {
+        for flags in [0b1100u8, 0b1110, 0b1101, 0b1111] {
             let mut app = bar_app(flags);
             assert!(
                 pass(&mut app, 1024.0).marks.contains_key("title"),
@@ -2026,7 +1985,7 @@ mod tests {
             );
             // At 720 only the narrower groups leave room for it.
             let at_720 = pass(&mut app, 720.0).marks.contains_key("title");
-            assert_eq!(at_720, flags == 0b1_1100, "{flags:05b} at 720");
+            assert_eq!(at_720, flags != 0b1111, "{flags:04b} at 720");
         }
     }
 
@@ -2034,7 +1993,7 @@ mod tests {
     /// the right group on the half of the bar it sits on.
     #[test]
     fn the_narrowest_window_follows_the_clearance_rule() {
-        for flags in [0b1_1100u8, 0b1_1111] {
+        for flags in [0b1100u8, 0b1111] {
             let n = 2 + flags.count_ones() as usize;
             let mut app = bar_app(flags);
             let wide = pass(&mut app, 1600.0);
@@ -2053,7 +2012,7 @@ mod tests {
     /// center of the bar.
     #[test]
     fn the_title_is_centered_and_keeps_clear_of_the_groups() {
-        let mut app = bar_app(0b1_1111);
+        let mut app = bar_app(0b1111);
         for width in [900.0, 1024.0, 1600.0] {
             let p = pass(&mut app, width);
             let title = p.rect("title");
@@ -2095,41 +2054,6 @@ mod tests {
             "{rect:?}"
         );
         assert!((rect.center().x - 800.0).abs() < 8.0, "centered: {rect:?}");
-    }
-
-    /// The Tournament icon shows only while a Pureplay Connect link reports
-    /// strict mode on, gold, with its hover text; a click opens nothing and
-    /// shows no toast.
-    #[test]
-    fn the_tournament_icon_shows_only_during_a_pureplay_strict_round() {
-        let mut app = bar_app(0);
-        assert!(!pass(&mut app, 1600.0).marks.contains_key("tournament"));
-        strict(&mut app, false);
-        assert!(!pass(&mut app, 1600.0).marks.contains_key("tournament"));
-        let mut accessory = ActorStatusResponse::new("Pureplay", ActorStatus::Connected);
-        accessory
-            .telemetry
-            .insert("strict_mode".into(), "on".into());
-        app.actors.insert("pureplay_accessory.0".into(), accessory);
-        assert!(
-            !pass(&mut app, 1600.0).marks.contains_key("tournament"),
-            "only Pureplay Connect's row counts"
-        );
-
-        strict(&mut app, true);
-        let (ctx, p) = settled(&mut app, 1600.0);
-        assert_eq!(
-            p.icon_in("tournament"),
-            ("tournament-on-hover@1x".to_owned(), Color32::WHITE)
-        );
-        let texts = hover_texts(&mut app, "tournament");
-        assert!(texts.iter().any(|t| t == TOURNAMENT_TIP), "{texts:?}");
-        click(&ctx, &mut app, p.rect("tournament").center());
-        assert_eq!(app.header_menu, None);
-        assert_eq!(toast_text(&app), None);
-
-        app.actors.remove("pureplay.0");
-        assert!(!pass(&mut app, 1600.0).marks.contains_key("tournament"));
     }
 
     /// The toast shows for its time and the fade, then is gone. On a phone
@@ -3104,10 +3028,8 @@ mod tests {
         app.settings.load_from(&config);
         app.turn_golfer = Some("flighthook.e".into());
         app.current_mode = "full".into();
-        strict(&mut app, true);
-        let cases: [(&str, &str); 9] = [
+        let cases: [(&str, &str); 8] = [
             ("energy", "Square Omni 74%"),
-            ("tournament", TOURNAMENT_TIP),
             (
                 "follow",
                 "Following turns: on. The view moves to the golfer up.",
