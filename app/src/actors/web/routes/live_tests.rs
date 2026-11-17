@@ -167,8 +167,11 @@ async fn a_frame_arriving_while_it_waits_is_answered() {
     let (state, _dir) = with_camera();
     let state = Arc::new(state);
     let root = Arc::clone(&state.root);
+    // The frame comes once the request waits for it.
     let put = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        while root.cameras.frames.live_waiters("camera.0") == 0 {
+            tokio::task::yield_now().await;
+        }
         root.cameras.frames.set_live("camera.0", 9, jpeg(), None)
     });
     let resp = get_camera_live(

@@ -123,8 +123,7 @@ mod tests {
     impl Rig {
         /// Start with `[replay] keep_shots = 20`, short rolls, and one
         /// 30 fps test-pattern camera, waiting until it captures and its
-        /// pre-roll has filled (the paced pattern keeps real time, skipping
-        /// frames when it falls behind, so a slow machine only waits longer).
+        /// pre-roll has filled.
         fn start() -> Self {
             let dir = TempDir(std::env::temp_dir().join(format!(
                 "flighthook-camera-test-{}",
@@ -187,8 +186,33 @@ mod tests {
                     )
             })
             .expect("camera connected");
-            std::thread::sleep(Duration::from_millis(600));
+            rig.until_pre_roll_filled();
             rig
+        }
+
+        /// Until the camera's frames span the pre-roll (0.4 s): watched
+        /// live, it puts every frame it captures in its live slot.
+        fn until_pre_roll_filled(&self) {
+            use flighthook_cameras::frames::LiveWait;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a runtime");
+            let frames = &self.state.cameras.frames;
+            let (mut first, mut seq) = (None, 0);
+            loop {
+                frames.watch_live("camera.0", Instant::now());
+                match runtime.block_on(frames.next_live("camera.0", seq, crate::actors::GIVE_UP)) {
+                    LiveWait::Frame(frame) => {
+                        seq = frame.seq;
+                        let first = *first.get_or_insert(frame.time_ns);
+                        if frame.time_ns - first >= 400_000_000 {
+                            return;
+                        }
+                    }
+                    other => panic!("no camera frame: {other:?}"),
+                }
+            }
         }
 
         fn clips_dir(&self) -> std::path::PathBuf {

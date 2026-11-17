@@ -3058,15 +3058,18 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
 #[test]
 fn a_mevo_waiting_on_a_silent_device_stops_at_once() {
     let device = Simulator::spawn();
-    let (_dir, state, _bus_tx, _rx) = running(|c| {
+    let (_dir, state, _bus_tx, mut rx) = running(|c| {
         let mut section: flighthook::MevoSection =
             serde_json::from_str("{}").expect("empty section");
         section.driver.address = Some(device.addr.to_string());
         c.mevo.insert("0".into(), section);
     });
-    // Connected, its handshake unanswered.
-    wait_until("connected", || !device.peers().is_empty());
-    std::thread::sleep(Duration::from_millis(200));
+    // Connected, in a handshake the device never answers.
+    until(&mut rx, "the handshake", |m| {
+        m.actor == "mevo.0"
+            && matches!(&m.event, LocalEvent::CardStatus { telemetry, .. }
+                if telemetry.get("phase").map(String::as_str) == Some("handshaking"))
+    });
     stop_exits(&state, "mevo.0");
 }
 

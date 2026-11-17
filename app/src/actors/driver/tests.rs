@@ -102,6 +102,8 @@ struct Script {
     closes: u32,
     /// The retry delay the driver asks for; 10 ms when `None`.
     retry: Option<Duration>,
+    /// Told when a connect begins.
+    entered: Option<std::sync::mpsc::Sender<()>>,
 }
 
 static SCRIPTS: LazyLock<Mutex<HashMap<u64, Arc<Mutex<Script>>>>> = LazyLock::new(Mutex::default);
@@ -179,6 +181,9 @@ impl FrpDriver for FakeDriver {
         let mut next = {
             let mut script = lock(&self.script);
             script.latched.push(*ctx.hints());
+            if let Some(entered) = &script.entered {
+                let _ = entered.send(());
+            }
             script.connects.pop_front()
         };
         while let Some(Connect::Phase(phase, inner)) = next {
@@ -1125,11 +1130,14 @@ fn the_card_reads_starting_connected_then_reconnecting() {
 /// `STOP_WAIT`.
 #[test]
 fn a_stop_ends_a_blocked_connect_within_the_stop_wait() {
-    let (id, _script) = script(vec![Connect::Block]);
+    let (id, script) = script(vec![Connect::Block]);
+    let (entered, connect) = std::sync::mpsc::channel();
+    lock(&script).entered = Some(entered);
     let mut rig = rig();
     rig.start(section(id));
-    rig.until(|m| is_status(m, ActorStatus::Starting));
-    std::thread::sleep(Duration::from_millis(100));
+    connect
+        .recv_timeout(crate::actors::GIVE_UP)
+        .expect("the connect begins");
     assert_eq!(
         rig.state.stop_and_wait("fake.0"),
         crate::state::Stopped::Exited

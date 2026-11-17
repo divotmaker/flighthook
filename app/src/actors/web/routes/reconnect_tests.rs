@@ -275,10 +275,11 @@ fn the_config_timeout_outlasts_the_longest_stop_wait() {
 }
 
 /// An actor that holds its device for `holds` after a stop, waited for
-/// `wait`.
+/// `wait`; it tells `stopped` when its stop arrives.
 struct Lingers {
     holds: Duration,
     wait: Duration,
+    stopped: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 impl crate::actors::Actor for Lingers {
@@ -289,10 +290,12 @@ impl crate::actors::Actor for Lingers {
         receiver: BusReceiver,
     ) -> std::thread::JoinHandle<()> {
         let holds = self.holds;
+        let stopped = self.stopped.clone();
         std::thread::spawn(move || {
             while !receiver.is_shutdown() {
                 std::thread::sleep(Duration::from_millis(5));
             }
+            let _ = stopped.send(());
             std::thread::sleep(holds);
         })
     }
@@ -317,11 +320,13 @@ async fn a_save_during_a_long_reconnect_is_answered_at_once() {
         Arc::clone(&shutdown),
     );
     let wait = Duration::from_millis(800);
+    let (stopped, mut stop_seen) = tokio::sync::mpsc::unbounded_channel();
     crate::actors::start_actor(
         "mock_monitor.0".into(),
         Box::new(Lingers {
             holds: Duration::from_secs(2),
             wait,
+            stopped,
         }),
         &state.root,
         &state.bus_tx,
@@ -331,7 +336,8 @@ async fn a_save_during_a_long_reconnect_is_answered_at_once() {
         let state = Arc::clone(&state);
         tokio::spawn(async move { reconnect(&state, "mock_monitor.0", CONFIG_TIMEOUT).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The reconnect stopped the actor and waits it out.
+    stop_seen.recv().await.expect("the stop");
     let saved = save_settings(
         &state,
         Some("mock_monitor.0"),
