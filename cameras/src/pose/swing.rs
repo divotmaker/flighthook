@@ -158,7 +158,7 @@ fn impact_shift_ns(report: &SwingReport, given: Option<u64>) -> Option<i64> {
 }
 
 /// The handedness `report`'s swing suggests, when it disagrees with
-/// `handed` and is at least [`HANDED_WARN_CONFIDENCE`] sure.
+/// `handed` and is at least 0.6 sure.
 pub fn handed_mismatch(report: &SwingReport, handed: Handed) -> Option<Guess<Handed>> {
     report
         .handed_guess

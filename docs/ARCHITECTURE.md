@@ -7,6 +7,16 @@ flighthook itself is one more actor: it plays the session (the turn), the
 practice (the Sets) and the collector (the shot store, the dashboard, the
 export) roles.
 
+## Workspace crates
+
+| Crate | Where | What it is |
+|---|---|---|
+| `flighthook` | `lib/` | the shared types and pure rules: config, shot events, the REST and WebSocket types |
+| `flighthook-app` | `app/` | the binary: actors, the bus, state and the web server |
+| `flighthook-ui` | `ui/` | the dashboard (egui, native and WASM) |
+| `flighthook-cameras` | `cameras/` | the swing cameras: the camera loop, the replay clip store, the frame slots and body tracking ([Cameras and replay](#cameras-and-replay)) |
+| `flighthook-pureplay`, `flighthook-openconnect` | `integrations/` | the simulator and game drivers ([Integration crates](#integration-crates)) |
+
 ## Config Model
 
 Type-prefixed config sections. The section prefix encodes the component type;
@@ -2240,10 +2250,30 @@ the shot. Capture, the pre-roll and clip cutting are the
 supplies the triggers, stores the clips and serves them. Frames never travel
 on the bus: only one local `ShotVideo` event per finished clip.
 
+The `flighthook-cameras` workspace crate does the camera work: the camera
+loop, the clip store, the frame slots and body tracking. It knows nothing of
+the bus, the actor registry or the app's state. The app hands it two things
+and hears from it through a third:
+
+- `Cameras`, everything the cameras share, one per process (`clips`, `frames`
+  and `pose`), built over the live config and a `Host`.
+- `Host`, what the cameras ask of the app: the turn now.
+- `Event` and `Out`: what a camera tells the app, as that camera's: status
+  and card rows, alerts, `Video` and `VideoRemoved` for the clips, `Pose` and
+  `Swing` for body tracking. The app turns each into its bus event.
+- `Camera::run` is the loop of one `[camera.N]`. It takes the camera's section
+  and an `Out`, and asks a `poll` closure for an `Input` (`Stop`, `Idle` or
+  `Trigger`) at least every 10 ms.
+
+The app's `CameraActor` (`app/src/actors/camera.rs`) is the thin wrapper: it
+runs `Camera::run` on the camera's thread and turns bus messages into `Input`s
+and `Event`s into bus events. In the crate, the tests drive the loop's pure
+step with explicit times; no test depends on the clock.
+
 ### Camera actor
 
 One `CameraActor` (`app/src/actors/camera.rs`) per `[camera.N]`, on its own
-thread. It opens its source with stance's `Capture::start` (which
+thread, runs `Camera::run` (`cameras/src/camera.rs`). It opens its source with stance's `Capture::start` (which
 blocks while the camera opens; the camera then runs on a capture thread of
 its own, frames going into a bounded ring) and loops:
 
@@ -2254,7 +2284,7 @@ its own, frames going into a bounded ring) and loops:
   the pre-roll;
 - `ClipRecorder::poll` runs every pass, so clips finish when frames stop;
 - every 500 ms the newest frame goes to the actor's slot in
-  `SystemState::cameras`, for the still;
+  `Cameras::frames`, for the still;
 - while the slot is watched (below), the newest frame of the pass goes to
   its live slot, at most `LIVE_FPS` (15) a second, or with body tracking
   in Live mode through the camera's body tracking worker, which puts it
@@ -2287,7 +2317,7 @@ platform has no camera backend (macOS) the actor reports `disconnected` with
 ### Live frames
 
 The Cameras tab's Live view shows each camera live through the actor's **live slot** in
-`SystemState::cameras` (`state/cameras.rs`): one frame, the JPEG as the
+`Cameras::frames` (`cameras/src/frames.rs`): one frame, the JPEG as the
 camera sent it, with a sequence number and its time. The number counts up
 over every camera's live frames and never repeats while the server runs;
 the time is the frame's host time less the camera's latency
@@ -2598,8 +2628,8 @@ monitors); a trigger from a source already in an open clip cuts that clip
 
 A finished clip is saved on a thread of its own (`clip:camera.N`). Shots
 whose trigger came before a Clear history are left out; a clip with none
-left is not written. `ClipStore::begin` (`app/src/state/clips.rs`, one store
-in `SystemState`) picks the clip folder: the folder of a clip that already holds one of the
+left is not written. `ClipStore::begin` (`cameras/src/clips.rs`, one store
+in `Cameras`) picks the clip folder: the folder of a clip that already holds one of the
 clip's shots (another camera's clip of the same swing), else a new one,
 named `YYYYMMDD-HHMMSS-mmm-xxxxxxxx` (UTC, so names sort by time) under the
 clip folder (`[replay] clip_dir`, default `dirs::data_local_dir()/flighthook/clips`).
@@ -2694,8 +2724,8 @@ YOLOX-Tiny person detector finds the golfer, RTMPose-m or -s finds 26 Halpe
 keypoints in that box (tract, pure Rust, no native libraries); and golf
 numbers measured on them by stance's golf analysis (`stance::golf`): each
 recorded swing's events, tempo and metrics, and the live posture. The code
-is `app/src/pose/` (`models.rs`, `live.rs`, `clips.rs`, `priority.rs`,
-`swing.rs` and `grades.rs`, the modules that call `stance::golf`), held in `SystemState::pose`. `[body_tracking]` is read live
+is `cameras/src/pose/` (`models.rs`, `live.rs`, `clips.rs`, `priority.rs`,
+`swing.rs` and `grades.rs`, the modules that call `stance::golf`), held in `Cameras::pose`. `[body_tracking]` is read live
 through `SystemConfig::body_tracking()` (out-of-range values at their
 defaults): no change restarts a camera.
 
@@ -2982,7 +3012,7 @@ session and practice roles). It handles:
   thread; the stop waits run on helper threads, so selects and further commands
   are handled meanwhile.
 - **Clear history**: on `ClearShotHistory` it deletes every replay clip
-  (`SystemState::clips`), once for the process, whichever web server sent it,
+  (`Cameras::clips`), once for the process, whichever web server sent it,
   and starts a new session.
 - **Clip folder**: after a config command that moves `[replay] clip_dir`, it
   reindexes the clip store (see [Clip store](#clip-store)).
@@ -3023,9 +3053,7 @@ pub struct SystemState {
     pub beats: Beats,             // the newest bus.actor of every local actor, re-sent each heartbeat
     pub sent_shots: Arc<SentShots>,        // the shots the simulator outputs wrote (5 s)
     pub sources: Arc<Sources>,    // every local shot source's type, by actor id
-    pub clips: ClipStore,         // replay clips on disk (beta)
-    pub cameras: Cameras,         // camera actors' latest frames + the camera list (beta)
-    pub pose: BodyTracking,       // body tracking models + the recorded-clip queue (alpha)
+    pub cameras: Arc<Cameras>,    // replay clips, camera frames and body tracking (beta; flighthook-cameras)
     pub pureplay_tokens: Arc<TokenStore>,  // Pureplay Accessory pairing tokens
     actors: RwLock<HashMap<String, Registered>>,  // the actor + its ActorHandle
 }

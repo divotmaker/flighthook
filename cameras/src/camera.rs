@@ -673,7 +673,7 @@ impl Camera {
     /// lost. `out` is the camera's own events (status, alerts, clips saved
     /// and removed), `raw` those of its clip jobs (body tracking of a clip is
     /// announced even when this camera has been restarted since). `poll` is
-    /// asked at least every [`FRAME_WAIT`] and returns what is waiting, one
+    /// asked at least every 10 ms and returns what is waiting, one
     /// input per call.
     pub fn run(
         cameras: &Arc<Cameras>,
