@@ -1,4 +1,5 @@
 use crate::app::{FlighthookApp, hand_code};
+use crate::panels::devices;
 use crate::theme;
 use crate::types::{LogEntry, Severity};
 use flighthook::{FrpBody, UiLocalEvent, UiMessage};
@@ -242,6 +243,12 @@ fn local_debug(event: &UiLocalEvent) -> String {
     }
 }
 
+/// Space kept between the Filters list's popup and the window's bottom edge.
+const FILTER_LIST_MARGIN: f32 = 8.0;
+/// The least height the Filters list gets, however little room is under the
+/// button.
+const FILTER_LIST_MIN_HEIGHT: f32 = 80.0;
+
 impl FlighthookApp {
     pub(crate) fn render_log_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -264,6 +271,7 @@ impl FlighthookApp {
             };
             let popup_id = ui.make_persistent_id("log_filter_popup");
             let filter_btn = ui.button(&filter_label);
+            devices::mark(ui, || "log_filter_button".to_owned(), &filter_btn);
             if filter_btn.clicked() {
                 self.log_filter_open = !self.log_filter_open;
             }
@@ -271,43 +279,58 @@ impl FlighthookApp {
                 let area = egui::Area::new(popup_id)
                     .order(egui::Order::Foreground)
                     .fixed_pos(filter_btn.rect.left_bottom())
+                    .default_height(ui.ctx().content_rect().bottom() - filter_btn.rect.bottom())
                     .show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            // Toggle all
+                            // Toggle all, above the list so it is always in sight
                             let all_checked = self.log_type_filters.iter().all(|(_, v)| *v);
                             let mut toggle_all = all_checked;
-                            if ui.checkbox(&mut toggle_all, "All").clicked() {
+                            let all = ui.checkbox(&mut toggle_all, "All");
+                            devices::mark(ui, || "log_filter_all".to_owned(), &all);
+                            if all.clicked() {
                                 for v in self.log_type_filters.values_mut() {
                                     *v = toggle_all;
                                 }
                             }
                             ui.separator();
 
-                            for &(group_name, keys) in FILTER_GROUPS {
-                                // Group heading with toggle-all checkbox
-                                let group_all = keys.iter().all(|k| {
-                                    self.log_type_filters.get(*k).copied().unwrap_or(true)
-                                });
-                                let mut group_toggle = group_all;
-                                let heading = egui::RichText::new(group_name).strong();
-                                if ui.checkbox(&mut group_toggle, heading).clicked() {
-                                    for &k in keys {
-                                        if let Some(v) = self.log_type_filters.get_mut(k) {
-                                            *v = group_toggle;
-                                        }
-                                    }
-                                }
-
-                                for &key in keys {
-                                    if let Some(checked) = self.log_type_filters.get_mut(key) {
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(16.0);
-                                            ui.checkbox(checked, key);
+                            // The list scrolls in the room under the button.
+                            let room = ui.ctx().content_rect().bottom()
+                                - ui.cursor().top()
+                                - f32::from(ui.spacing().menu_margin.bottom)
+                                - FILTER_LIST_MARGIN;
+                            egui::ScrollArea::vertical()
+                                .id_salt("log_filter_list")
+                                .max_height(room.max(FILTER_LIST_MIN_HEIGHT))
+                                .show(ui, |ui| {
+                                    for &(group_name, keys) in FILTER_GROUPS {
+                                        // Group heading with toggle-all checkbox
+                                        let group_all = keys.iter().all(|k| {
+                                            self.log_type_filters.get(*k).copied().unwrap_or(true)
                                         });
+                                        let mut group_toggle = group_all;
+                                        let heading = egui::RichText::new(group_name).strong();
+                                        if ui.checkbox(&mut group_toggle, heading).clicked() {
+                                            for &k in keys {
+                                                if let Some(v) = self.log_type_filters.get_mut(k) {
+                                                    *v = group_toggle;
+                                                }
+                                            }
+                                        }
+
+                                        for &key in keys {
+                                            if let Some(checked) =
+                                                self.log_type_filters.get_mut(key)
+                                            {
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(16.0);
+                                                    ui.checkbox(checked, key);
+                                                });
+                                            }
+                                        }
+                                        ui.add_space(4.0);
                                     }
-                                }
-                                ui.add_space(4.0);
-                            }
+                                });
                         });
                     });
 
@@ -431,6 +454,66 @@ fn log_cells(entry: &LogEntry) -> [egui::RichText; 6] {
 mod tests {
     use super::*;
     use flighthook::{BusMessage, ShotKey, UiLocal};
+
+    /// The Filters popup in a window `height` points tall: the popup's rect,
+    /// the "All" checkbox's and the button's.
+    fn filters_popup(height: f32) -> (egui::Rect, egui::Rect, egui::Rect) {
+        let ctx = egui::Context::default();
+        let mut app = FlighthookApp::with_pending(crate::net::new_pending());
+        app.log_type_filters = MESSAGE_TYPES
+            .iter()
+            .map(|k| ((*k).to_owned(), true))
+            .collect();
+        app.log_filter_open = true;
+        let mut frame = || {
+            ctx.data_mut(|d| d.remove_temp::<devices::Marks>(egui::Id::NULL));
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, height),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.render_log_panel(ui));
+            });
+        };
+        // The popup's place settles over a few passes.
+        for _ in 0..8 {
+            frame();
+        }
+        let popup = ctx.memory(|m| {
+            m.areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|l| l.order == egui::Order::Foreground)
+                .filter_map(|l| m.area_rect(l.id))
+                .next()
+                .expect("the popup")
+        });
+        let marks = ctx
+            .data(|d| d.get_temp::<devices::Marks>(egui::Id::NULL))
+            .expect("marks");
+        (
+            popup,
+            marks["log_filter_all"].0,
+            marks["log_filter_button"].0,
+        )
+    }
+
+    #[test]
+    fn the_filters_list_scrolls_in_the_room_under_the_button() {
+        let (popup, all, button) = filters_popup(300.0);
+        // Under the button and inside the window, not pushed up over it.
+        assert!((popup.top() - button.bottom()).abs() < 1.0, "{popup:?}");
+        assert!(popup.bottom() <= 300.0, "{popup:?}");
+        assert!(popup.contains_rect(all), "All stays in the popup");
+        let (tall, _, _) = filters_popup(2000.0);
+        assert!(
+            tall.height() > popup.height(),
+            "the list is cut, not shrunk"
+        );
+    }
 
     fn local(event: UiLocalEvent) -> UiMessage {
         UiMessage::Local(Box::new(UiLocal {
