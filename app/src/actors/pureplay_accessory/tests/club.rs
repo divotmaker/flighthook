@@ -73,11 +73,19 @@ impl Peer {
         }
     }
 
-    /// The commands the card sends within `quiet`.
-    fn commands_within(&mut self, quiet: Duration) -> Vec<Value> {
-        let until = Instant::now() + quiet;
+    /// The commands the card sends before it answers a WebSocket ping sent
+    /// now. The card takes the bus and Pureplay's frames in order and its
+    /// pong goes out after what it wrote before, so a command for anything
+    /// the test did before this call comes first.
+    fn commands_before_pong(&mut self) -> Vec<Value> {
+        let payload = uuid::Uuid::new_v4().simple().to_string().into_bytes();
+        self.ws
+            .send(Message::Ping(payload.clone().into()))
+            .expect("ping");
+        let deadline = Instant::now() + WAIT;
         let mut out = Vec::new();
-        while Instant::now() < until {
+        loop {
+            assert!(Instant::now() < deadline, "no pong");
             match self.ws.read() {
                 Ok(Message::Text(t)) => {
                     let v: Value = serde_json::from_str(t.as_str()).expect("json");
@@ -85,16 +93,16 @@ impl Peer {
                         out.push(v);
                     }
                 }
+                Ok(Message::Pong(p)) if p.as_ref() == payload.as_slice() => return out,
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(e))
                     if matches!(
                         e.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) => {}
-                Err(_) => break,
+                Err(e) => panic!("the link closed: {e}"),
             }
         }
-        out
     }
 }
 
@@ -209,9 +217,9 @@ impl Rig {
         self.peer.refuse(id.as_deref(), code, extra);
     }
 
-    /// No command within [`QUIET`].
+    /// No command for anything done so far.
     fn no_command(&mut self, why: &str) {
-        let sent = self.peer.commands_within(QUIET);
+        let sent = self.peer.commands_before_pong();
         assert!(sent.is_empty(), "{why}: {sent:?}");
     }
 
@@ -875,7 +883,7 @@ fn a_pick_between_connections_is_not_sent() {
     peer.paired_with(TOKEN, &["read", "control"]);
     peer.subscribe(&round(), 1);
     rig.card.shows_row(ActorStatus::Connected, "club", "7I");
-    let sent = peer.commands_within(QUIET);
+    let sent = peer.commands_before_pong();
     assert!(sent.is_empty(), "{sent:?}");
     rig.card.stop();
 }
@@ -939,7 +947,7 @@ fn scopes_null_is_read_only() {
     card.shows_row(ActorStatus::Connected, "club_out", "read only");
     send_club(&tx, "web", Club::Iron8);
     card.bus_from(ACTOR, |e| is_club(e, Club::Iron7));
-    let sent = peer.commands_within(QUIET);
+    let sent = peer.commands_before_pong();
     assert!(sent.is_empty(), "{sent:?}");
     card.stop();
 }
@@ -981,7 +989,7 @@ fn a_new_pairing_with_another_grant_updates_club_out() {
             vec![peer.command()]
         } else {
             rig.card.bus_from(ACTOR, |e| is_club(e, Club::Iron7));
-            peer.commands_within(QUIET)
+            peer.commands_before_pong()
         };
         assert_eq!(sent.len(), usize::from(row_after == "on"), "{row_after}");
         rig.card.stop();
