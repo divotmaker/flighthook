@@ -25,9 +25,9 @@
 //!
 //! Normalizations (the only ones):
 //! - GSPro heartbeats are not recorded one by one (their count and position
-//!   depend on 10 s timers and on how a device's ready flicker falls into
-//!   the bridge's 50 ms passes). At the end of each step the last heartbeat
-//!   written so far is recorded, when it differs from the one recorded last.
+//!   depend on 10 s timers): only the first is recorded. A change of
+//!   readiness is a message of its own (not a heartbeat) and is recorded
+//!   byte for byte, like a shot.
 //! - Pureplay `ReadyState` pushes: the same rule (the last one sent by the
 //!   end of each step, when it differs from the one recorded last).
 //! - Pureplay `Hello`: the firmware string (the crate version) is replaced
@@ -737,8 +737,8 @@ trait Sim {
 struct FakeGsPro {
     peer: Peer,
     json: JsonSplitter,
-    last_heartbeat: Option<String>,
-    recorded_heartbeat: Option<String>,
+    /// Whether the first heartbeat has been recorded.
+    heard_heartbeat: bool,
 }
 
 impl FakeGsPro {
@@ -748,8 +748,7 @@ impl FakeGsPro {
         Self {
             peer: Peer::new(stream),
             json: JsonSplitter::default(),
-            last_heartbeat: None,
-            recorded_heartbeat: None,
+            heard_heartbeat: false,
         }
     }
 }
@@ -779,16 +778,10 @@ impl Sim for FakeGsPro {
                 .ok()
                 .and_then(|v| v.pointer("/ShotDataOptions/IsHeartBeat").cloned())
                 .is_some_and(|v| v == serde_json::Value::Bool(true));
-            if heartbeat {
-                self.last_heartbeat = Some(obj);
-            } else {
+            if !heartbeat {
                 lines.push(format!("sent {obj}"));
-            }
-        }
-        if self.last_heartbeat != self.recorded_heartbeat {
-            self.recorded_heartbeat.clone_from(&self.last_heartbeat);
-            if let Some(hb) = &self.last_heartbeat {
-                lines.push(format!("heartbeat {hb}"));
+            } else if !std::mem::replace(&mut self.heard_heartbeat, true) {
+                lines.push(format!("heartbeat {obj}"));
             }
         }
         (lines.clone(), lines)

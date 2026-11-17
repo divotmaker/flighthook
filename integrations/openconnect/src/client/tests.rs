@@ -417,6 +417,23 @@ fn heartbeats_follow_the_clock_and_the_readiness_goes_out_by_itself() {
     assert!(!is_heartbeat(&gone[0]) && !readiness(&gone[0]));
 }
 
+/// The heartbeat and the readiness message, byte for byte.
+#[test]
+fn the_heartbeat_and_the_readiness_message_are_these_bytes() {
+    let heartbeat = |flag: bool| {
+        format!(
+            r#"{{"DeviceID":"Flighthook","Units":"Yards","ShotNumber":0,"APIversion":"1","BallData":{{"Speed":0.0,"SpinAxis":0.0,"TotalSpin":0.0,"BackSpin":0.0,"SideSpin":0.0,"HLA":0.0,"VLA":0.0}},"ClubData":{{"Speed":0.0,"AngleOfAttack":0.0,"FaceToTarget":0.0,"Lie":0.0,"Loft":0.0,"Path":0.0,"SpeedAtImpact":0.0,"VerticalFaceImpact":0.0,"HorizontalFaceImpact":0.0,"ClosureRate":0.0}},"ShotDataOptions":{{"ContainsBallData":false,"ContainsClubData":false,"LaunchMonitorIsReady":true,"LaunchMonitorBallDetected":true,"IsHeartBeat":{flag}}}}}"#
+        )
+    };
+    let mut link = Link::new();
+    link.hand("mevo.0", monitor(true));
+    link.settle();
+    assert_eq!(link.written(), [heartbeat(false)]);
+    link.host.advance(HEARTBEAT_EVERY);
+    link.settle();
+    assert_eq!(link.written(), [heartbeat(true)]);
+}
+
 /// A shot and a readiness change in the same step go out as two writes,
 /// the shot first and the readiness [`SHOT_GAP`] after it.
 #[test]
