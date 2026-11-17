@@ -45,7 +45,7 @@ pub struct SystemState {
     /// Body tracking's models and recorded-clip queue (alpha).
     pub pose: crate::pose::BodyTracking,
     /// The Pureplay Accessory cards' pairing tokens (beta), kept out of the config.
-    pub pureplay_tokens: Arc<crate::actors::pureplay_accessory::token::TokenStore>,
+    pub pureplay_tokens: Arc<flighthook_pureplay::accessory::token::TokenStore>,
     /// The mode each running local launch monitor with a fixed mode arms
     /// in (the ExPutt: putting), by actor id.
     fixed_modes: FixedModes,
@@ -123,19 +123,19 @@ fn body_tracking() -> crate::pose::BodyTracking {
 
 /// The Pureplay token file: the user's data folder; in tests a file of
 /// each state's own in a fresh temporary folder.
-fn pureplay_tokens() -> Arc<crate::actors::pureplay_accessory::token::TokenStore> {
-    use crate::actors::pureplay_accessory::token::{FILE_NAME, TokenStore, default_path};
-    let path = if cfg!(test) {
-        std::env::temp_dir()
+fn pureplay_tokens() -> Arc<flighthook_pureplay::accessory::token::TokenStore> {
+    use flighthook_pureplay::accessory::token::{FILE_NAME, TokenStore};
+    if cfg!(test) {
+        let path = std::env::temp_dir()
             .join(format!(
                 "flighthook-test-pp-tokens-{}",
                 uuid::Uuid::new_v4().simple()
             ))
-            .join(FILE_NAME)
+            .join(FILE_NAME);
+        Arc::new(TokenStore::new(path))
     } else {
-        default_path()
-    };
-    Arc::new(TokenStore::new(path))
+        TokenStore::shared()
+    }
 }
 
 /// A test state's token folder goes with the state.

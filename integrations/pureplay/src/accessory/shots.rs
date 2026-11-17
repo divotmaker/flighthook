@@ -1,19 +1,5 @@
-//! Pureplay's shots in flighthook: which ones the card takes, how a shot's
-//! values become flighthook's, and how Pureplay's later result finds the
-//! shot it belongs to.
-//!
-//! A shot of a player at this machine (`isLocal`) is a candidate. The
-//! card's Shots setting ([`PureplayShots`]) decides what becomes of it
-//! ([`decide`]):
-//!
-//! - **Auto**: a candidate that echoes a shot a simulator output sent
-//!   (the send registry, [`SentShots::take_echo`](crate::state::sent_shots::SentShots))
-//!   is not taken; Pureplay's result goes to the shot flighthook sent. Any
-//!   other candidate is taken.
-//! - **From Pureplay**: every candidate is taken, with no matching
-//!   ([`matches_echoes`]).
-//! - **From flighthook**: none is taken; echoes are still matched, so
-//!   their results reach flighthook's shots.
+//! Pureplay's shots in flighthook: how a shot's values become flighthook's,
+//! and how Pureplay's later result finds the shot it belongs to.
 //!
 //! A shot the card takes gets flighthook's own key (a fresh shot id, the
 //! card's own count). [`ShotMap`] keeps Pureplay's `shotId` against the key
@@ -22,8 +8,11 @@
 
 use std::collections::VecDeque;
 
-use flighthook::{Distance, Launch, PureplayShots, ShotKey, Velocity};
-use flightrelay::{Basis, FlightResult, GameStroke, GolferId, Lie, Position, StrokeOutcome};
+use flightrelay::types::Launch;
+use flightrelay::units::{Distance, Velocity};
+use flightrelay::{
+    Basis, FlightResult, GameStroke, GolferId, Lie, Position, ShotKey, StrokeOutcome,
+};
 
 use super::protocol::{ShotCompleted, ShotLaunched};
 
@@ -36,41 +25,6 @@ pub const MAP_CAPACITY: usize = 256;
 
 /// The flight model Pureplay's flight is named by.
 pub const SOURCE: &str = "Pureplay";
-
-/// Whether the card matches a candidate against the shots the simulator
-/// outputs sent, in mode `shots`. "From Pureplay" takes every local shot
-/// as its own, so it does not.
-#[must_use]
-pub fn matches_echoes(shots: PureplayShots) -> bool {
-    shots != PureplayShots::FromPureplay
-}
-
-/// What becomes of a candidate shot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Decision {
-    /// The card takes it: a flighthook shot of its own.
-    Take,
-    /// It echoes flighthook's shot `ShotKey`: not taken; its result goes
-    /// to that shot.
-    Echo(ShotKey),
-    /// Not taken, and no shot of flighthook's: "From flighthook" with no
-    /// matching send.
-    Ignore,
-}
-
-/// What becomes of a candidate shot in mode `shots`. `echo` finds (and
-/// consumes) the send the shot echoes; it is asked only when the mode
-/// matches echoes.
-pub fn decide(shots: PureplayShots, echo: impl FnOnce() -> Option<ShotKey>) -> Decision {
-    if !matches_echoes(shots) {
-        return Decision::Take;
-    }
-    match echo() {
-        Some(key) => Decision::Echo(key),
-        None if shots == PureplayShots::FromFlighthook => Decision::Ignore,
-        None => Decision::Take,
-    }
-}
 
 /// flighthook's launch for Pureplay's `shot`: ball speed, launch angle,
 /// direction (positive right, as FRP) and spin. `None` without a ball
@@ -277,7 +231,7 @@ impl ShotMap {
     }
 
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 }
@@ -406,29 +360,6 @@ mod tests {
         ] {
             assert_eq!(stroke(&d, None, golfer.clone(), None, None), None);
         }
-    }
-
-    /// Auto takes what is no echo; From Pureplay takes everything without
-    /// asking; From flighthook takes nothing but still matches echoes.
-    #[test]
-    fn the_shots_setting_decides() {
-        use PureplayShots::{Auto, FromFlighthook, FromPureplay};
-        assert_eq!(decide(Auto, || None), Decision::Take);
-        assert_eq!(decide(Auto, || Some(key(1))), Decision::Echo(key(1)));
-        assert_eq!(decide(FromFlighthook, || None), Decision::Ignore);
-        assert_eq!(
-            decide(FromFlighthook, || Some(key(2))),
-            Decision::Echo(key(2))
-        );
-        let asked = std::cell::Cell::new(false);
-        let d = decide(FromPureplay, || {
-            asked.set(true);
-            Some(key(3))
-        });
-        assert_eq!(d, Decision::Take);
-        assert!(!asked.get(), "From Pureplay does not match echoes");
-        assert!(matches_echoes(Auto) && matches_echoes(FromFlighthook));
-        assert!(!matches_echoes(FromPureplay));
     }
 
     /// The map keeps the newest shots, a repeat replacing the earlier.

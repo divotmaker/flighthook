@@ -102,46 +102,36 @@
 //! connection. `error` holds a version mismatch or a token file that could
 //! not be written.
 
-pub mod club_out;
-pub mod game;
-pub mod model;
-pub mod protocol;
-pub mod shots;
-pub mod token;
+mod echo;
 
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use serde_json::Value;
-use tungstenite::client::IntoClientRequest;
-use tungstenite::{HandshakeError, Message, WebSocket};
 
 use super::provenance::ShotSource;
 use super::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, LocalEvent, PollError};
 use crate::state::SystemState;
 use crate::state::sent_shots::SimAddr;
-use club_out::{Action, ClubOut};
+use echo::Decision;
 use flighthook::{ActorStatus, Club, PureplayShots, ShotKey};
+use flighthook_pureplay::accessory::club_out::{Action, ClubOut};
+use flighthook_pureplay::accessory::link::{Frame, Link, SEND_BINARY, WsLink};
+use flighthook_pureplay::accessory::model::{self, Model, Want};
+use flighthook_pureplay::accessory::protocol::{self, Hello, Incoming, Paired, ResponseError};
+use flighthook_pureplay::accessory::shots::{self, Flown, ShotMap};
+use flighthook_pureplay::accessory::token::{self, Token, TokenStore};
+use flighthook_pureplay::accessory::{game, link};
 use flightrelay::types::{blockers, roles};
 use flightrelay::{
     BusActor, BusReply, DEFAULT_HEARTBEAT, DeviceInfo, FrpBody, ReplyError, ShotFinished,
     ShotLaunch, ShotTrigger,
 };
-use model::{Model, Want};
-use protocol::{Hello, Incoming, Paired, ResponseError};
-use shots::{Decision, Flown, ShotMap};
-use token::{Token, TokenStore};
+use serde_json::Value;
 
-/// Pureplay's default Accessory address.
-pub const DEFAULT_ADDRESS: &str = "127.0.0.1:9770";
-
-/// Whether the card sends its JSON in binary frames rather than text ones.
-/// Pureplay's example clients send text.
-pub const SEND_BINARY: bool = false;
+pub use flighthook_pureplay::accessory::DEFAULT_ADDRESS;
 
 /// Whether the card pings a link that has gone quiet ([`PING_EVERY`]).
 pub const PING: bool = true;
@@ -792,76 +782,30 @@ enum Read {
     Closed(Option<u16>),
 }
 
-/// The card's TCP stream. A read that times out reads as `WouldBlock` on
-/// every platform (Windows reports `TimedOut`), so the WebSocket handshake
-/// can be resumed after each poll.
-struct Polled(TcpStream);
-
-impl std::io::Read for Polled {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                std::io::ErrorKind::WouldBlock.into()
-            } else {
-                e
-            }
-        })
-    }
-}
-
-impl std::io::Write for Polled {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-/// One WebSocket connection.
-struct Link {
-    ws: WebSocket<Polled>,
-    actor: String,
-}
-
-impl Link {
-    fn send(&mut self, text: &str, secrets: &[Token]) -> Result<(), ()> {
+impl Card<'_> {
+    /// Send `text` on the link, logged with every token replaced. A failed
+    /// send is logged and is the caller's to end the connection with.
+    fn send(&self, link: &mut dyn Link, text: &str) -> Result<(), ()> {
         tracing::info!(
             target: "audit",
             "{} sent {} {}",
             self.actor,
             if SEND_BINARY { "binary" } else { "text" },
-            token::redact(text, secrets),
+            self.redact(text),
         );
-        let msg = if SEND_BINARY {
-            Message::binary(text.as_bytes().to_vec())
-        } else {
-            Message::text(text.to_owned())
-        };
-        self.ws.send(msg).map_err(|e| {
+        link.send(text).map_err(|e| {
             tracing::info!("{}: send failed: {e}", self.actor);
         })
     }
 
     /// Send a WebSocket ping.
-    fn ping(&mut self) -> Result<(), ()> {
+    fn ping(&self, link: &mut dyn Link) -> Result<(), ()> {
         tracing::debug!(target: "audit", "{} sent ping", self.actor);
-        self.ws
-            .send(Message::Ping(tungstenite::Bytes::new()))
-            .map_err(|e| {
-                tracing::info!("{}: ping failed: {e}", self.actor);
-            })
+        link.ping().map_err(|e| {
+            tracing::info!("{}: ping failed: {e}", self.actor);
+        })
     }
 
-    /// Close the connection from this side.
-    fn close(&mut self) {
-        let _ = self.ws.close(None);
-        let _ = self.ws.flush();
-    }
-}
-
-impl Card<'_> {
     /// Send the card's status: every row on a change of status, else what
     /// changed (nothing when nothing did).
     fn publish(&mut self, sender: &BusSender, status: ActorStatus) {
@@ -1014,52 +958,43 @@ impl Card<'_> {
     }
 
     /// Read what has arrived, waiting up to [`READ_POLL`].
-    fn read(&mut self, link: &mut Link) -> Read {
-        let msg = match link.ws.read() {
-            Ok(msg) => {
+    fn read(&mut self, link: &mut dyn Link) -> Read {
+        let frame = match link.recv() {
+            Ok(Some(frame)) => {
                 self.heard = Instant::now();
-                msg
+                frame
             }
-            Err(tungstenite::Error::Io(e))
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Read::Nothing;
-            }
+            Ok(None) => return Read::Nothing,
             Err(e) => {
                 tracing::info!("{}: connection lost: {e}", self.actor);
                 return Read::Closed(None);
             }
         };
-        let (text, kind) = match msg {
-            Message::Text(t) => (t.as_str().to_owned(), "text"),
-            Message::Binary(b) => match String::from_utf8(b.to_vec()) {
+        let (text, kind) = match frame {
+            Frame::Text(t) => (t, "text"),
+            Frame::Binary(b) => match String::from_utf8(b) {
                 Ok(t) => (t, "binary"),
-                Err(_) => {
+                Err(e) => {
                     tracing::warn!(
                         target: "audit",
                         "{} received binary, not UTF-8: {}",
                         self.actor,
-                        flighthook::hex_lower(&b),
+                        flighthook::hex_lower(e.as_bytes()),
                     );
                     return Read::Nothing;
                 }
             },
-            Message::Close(frame) => {
-                let code = frame.as_ref().map(|f| u16::from(f.code));
+            Frame::Close { code, reason } => {
                 tracing::info!(
                     target: "audit",
                     "{} received close {} {}",
                     self.actor,
                     code.map_or_else(|| "(no code)".to_owned(), |c| c.to_string()),
-                    self.redact(frame.as_ref().map_or("", |f| f.reason.as_str())),
+                    self.redact(&reason),
                 );
-                let _ = link.ws.flush();
                 return Read::Closed(code);
             }
-            _ => return Read::Nothing,
+            Frame::Control => return Read::Nothing,
         };
         // A `paired` frame carries a token the card has not seen: learn it
         // before anything logs the frame, however the rest of it reads.
@@ -1115,43 +1050,17 @@ impl Card<'_> {
         {
             return End::Lost;
         }
-        let mut request = match format!("ws://{}/", self.addr).into_client_request() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("{}: {e}", self.actor);
-                return End::Lost;
-            }
-        };
-        request.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            tungstenite::http::HeaderValue::from_static("binary"),
-        );
         // Each read waits one poll, so a stop is seen while Pureplay is slow
         // to answer.
-        let deadline = Instant::now() + WS_HANDSHAKE_TIMEOUT;
-        let mut attempt = tungstenite::client(request, Polled(stream));
-        let ws = loop {
-            match attempt {
-                Ok((ws, _)) => break ws,
-                Err(HandshakeError::Failure(e)) => {
-                    tracing::info!("{}: WebSocket handshake failed: {e}", self.actor);
-                    return End::Lost;
-                }
-                Err(HandshakeError::Interrupted(mid)) => {
-                    if !self.drain(receiver) {
-                        return End::Shutdown;
-                    }
-                    if Instant::now() >= deadline {
-                        tracing::info!("{}: no WebSocket handshake reply", self.actor);
-                        return End::Lost;
-                    }
-                    attempt = mid.handshake();
-                }
+        let mut link = match WsLink::open(stream, self.addr, WS_HANDSHAKE_TIMEOUT, || {
+            self.drain(receiver)
+        }) {
+            Ok(link) => link,
+            Err(link::OpenError::Stopped) => return End::Shutdown,
+            Err(e) => {
+                tracing::info!("{}: {e}", self.actor);
+                return End::Lost;
             }
-        };
-        let mut link = Link {
-            ws,
-            actor: self.actor.clone(),
         };
         tracing::info!("{}: connected to {}", self.actor, self.addr);
         self.heard = Instant::now();
@@ -1163,7 +1072,12 @@ impl Card<'_> {
     }
 
     /// One connection: `hello`, pairing, subscription, then the round.
-    fn session(&mut self, link: &mut Link, sender: &BusSender, receiver: &mut BusReceiver) -> End {
+    fn session(
+        &mut self,
+        link: &mut dyn Link,
+        sender: &BusSender,
+        receiver: &mut BusReceiver,
+    ) -> End {
         let hello = match self.hello(link, receiver) {
             Ok(h) => h,
             Err(end) => return end,
@@ -1182,7 +1096,7 @@ impl Card<'_> {
     }
 
     /// Wait for `hello` and check it.
-    fn hello(&mut self, link: &mut Link, receiver: &mut BusReceiver) -> Result<Hello, End> {
+    fn hello(&mut self, link: &mut dyn Link, receiver: &mut BusReceiver) -> Result<Hello, End> {
         let started = Instant::now();
         let hello = loop {
             if !self.drain(receiver) {
@@ -1255,7 +1169,7 @@ impl Card<'_> {
     /// Pair, with the saved token or by asking the player.
     fn pair(
         &mut self,
-        link: &mut Link,
+        link: &mut dyn Link,
         sender: &BusSender,
         receiver: &mut BusReceiver,
         saved: Option<&Token>,
@@ -1266,8 +1180,8 @@ impl Card<'_> {
             self.rows.set(PAIRING, WAITING);
             self.publish(sender, ActorStatus::Starting);
         }
-        if link
-            .send(&protocol::pair(saved.map(Token::expose)), &self.secrets)
+        if self
+            .send(link, &protocol::pair(saved.map(Token::expose)))
             .is_err()
         {
             return Err(End::Lost);
@@ -1383,7 +1297,7 @@ impl Card<'_> {
     /// Subscribe and take the snapshot. Returns the snapshot's `seq`.
     fn subscribe(
         &mut self,
-        link: &mut Link,
+        link: &mut dyn Link,
         sender: &BusSender,
         receiver: &mut BusReceiver,
         hello: &Hello,
@@ -1399,10 +1313,7 @@ impl Card<'_> {
                 status: ActorStatus::Reconnecting,
             });
         }
-        if link
-            .send(&protocol::subscribe(&events), &self.secrets)
-            .is_err()
-        {
+        if self.send(link, &protocol::subscribe(&events)).is_err() {
             return Err(End::Lost);
         }
         let asked = Instant::now();
@@ -1454,7 +1365,7 @@ impl Card<'_> {
     /// Follow the round until the connection ends.
     fn follow(
         &mut self,
-        link: &mut Link,
+        link: &mut dyn Link,
         sender: &BusSender,
         receiver: &mut BusReceiver,
         mut last_seq: Option<u64>,
@@ -1581,7 +1492,7 @@ impl Card<'_> {
             let now = Instant::now();
             match gets.due(now) {
                 Ok(Some(id)) => {
-                    let _ = link.send(&protocol::state_get(&id), &self.secrets);
+                    let _ = self.send(link, &protocol::state_get(&id));
                 }
                 Ok(None) => {}
                 Err(id) => {
@@ -1604,7 +1515,7 @@ impl Card<'_> {
                         link.close();
                         return End::Lost;
                     }
-                    if link.ping().is_err() {
+                    if self.ping(link).is_err() {
                         return End::Lost;
                     }
                     pings += 1;
@@ -1642,7 +1553,7 @@ impl Card<'_> {
     fn club_actions(
         &mut self,
         actions: Vec<Action>,
-        link: &mut Link,
+        link: &mut dyn Link,
         sender: &BusSender,
         raw: Option<&str>,
     ) {
@@ -1650,7 +1561,7 @@ impl Card<'_> {
             match action {
                 // A failed send ends the connection, which drops the pick.
                 Action::Send(text) => {
-                    let _ = link.send(&text, &self.secrets);
+                    let _ = self.send(link, &text);
                 }
                 Action::SnapBack => {
                     if let Some(raw) = raw {
@@ -1849,7 +1760,7 @@ impl Card<'_> {
         let mode = self.shots_setting();
         let here = self.here;
         let sent = &self.state.sent_shots;
-        let decision = shots::decide(mode, || sent.take_echo(here, Instant::now()));
+        let decision = echo::decide(mode, || sent.take_echo(here, Instant::now()));
         match decision {
             Decision::Echo(key) => {
                 tracing::info!(

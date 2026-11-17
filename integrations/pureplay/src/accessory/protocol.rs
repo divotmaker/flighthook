@@ -8,7 +8,7 @@
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
-use flighthook::{Club, Handedness};
+use flightrelay::{Club, Handedness};
 
 /// `hello.protocol` of a Pureplay Accessory server.
 pub const PROTOCOL: &str = "ppaccessory";

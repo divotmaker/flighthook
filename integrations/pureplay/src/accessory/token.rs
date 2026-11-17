@@ -3,7 +3,7 @@
 //! never carry a token.
 //!
 //! The file (`pureplay-tokens.json`) maps a card's normalized address
-//! ([`flighthook::address_key`]) to its pairing: `{ token, clientId,
+//! (flighthook's `address_key`) to its pairing: `{ token, clientId,
 //! paired_at }`. Changing a card's address therefore pairs it again. The
 //! file is written atomically (a temporary file, then a rename) and is
 //! readable by its owner only (0600 on Unix; on Windows the per-user data
@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -112,6 +112,14 @@ enum Read {
 }
 
 impl TokenStore {
+    /// The process-wide store of the token file at [`default_path`]: every
+    /// card of the process pairs through it.
+    #[must_use]
+    pub fn shared() -> Arc<Self> {
+        static SHARED: OnceLock<Arc<TokenStore>> = OnceLock::new();
+        Arc::clone(SHARED.get_or_init(|| Arc::new(Self::new(default_path()))))
+    }
+
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self {

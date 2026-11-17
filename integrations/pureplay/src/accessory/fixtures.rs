@@ -488,11 +488,11 @@ fn the_envelope_and_snapshots_are_read() {
     assert_eq!(joe.is_local, Some(true));
     assert_eq!(
         joe.club.as_deref().and_then(club),
-        Some(flighthook::Club::Iron7)
+        Some(flightrelay::Club::Iron7)
     );
     assert_eq!(
         joe.handedness.as_deref().and_then(hand),
-        Some(flighthook::Handedness::Right)
+        Some(flightrelay::Handedness::Right)
     );
     assert_eq!(joe.bag.as_ref().map(Vec::len), Some(2));
     let r = snap.readiness.expect("readiness");

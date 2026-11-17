@@ -42,11 +42,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
-# The Pureplay card's WebSocket client (Pureplay's Accessory API), blocking
-# on the actor's thread. The version axum's `ws` feature already builds
-# through tokio-tungstenite, with its default `handshake` feature: no new
-# crate in the build.
-tungstenite = "0.29"
 # `fs`: clips and their sidecars are served with HTTP Range support.
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 # Runs tower-http's file service inside a handler (`ServiceExt::oneshot`).
@@ -99,6 +94,11 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+# A WebSocket client and a fake Pureplay for the tests, the version axum's
+# `ws` feature already builds through tokio-tungstenite.
+tungstenite = "0.29"
+# The Pureplay integration's short waits, for the tests of the Accessory card.
+flighthook-pureplay = { path = "../integrations/pureplay", features = ["driver", "testing"] }
 # The Open Connect integration's test support: a look at the registry of this
 # process's own clients.
 flighthook-openconnect = { path = "../integrations/openconnect", features = ["driver", "testing"] }

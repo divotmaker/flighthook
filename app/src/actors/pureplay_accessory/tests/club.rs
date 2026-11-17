@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::bus::BusMsg;
+use flighthook_pureplay::accessory::club_out;
 
 /// The token every rig pairs with.
 const TOKEN: &str = "PPA-CLUBOUT";

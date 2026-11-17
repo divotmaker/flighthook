@@ -6,15 +6,17 @@
 //! the snapshot then events with `seq`; the server sends binary frames and
 //! the card's text frames are read.
 
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
+use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::server::{Request, Response as HsResponse};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
+use tungstenite::{Message, WebSocket};
 
 use super::*;
 use crate::actors::provenance::ShotSource;

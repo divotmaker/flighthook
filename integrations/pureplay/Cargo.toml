@@ -3,7 +3,7 @@ name = "flighthook-pureplay"
 version = "0.2.2"
 edition = "2024"
 rust-version = "1.94"
-description = "Pureplay integrations for flighthook: Pureplay Connect"
+description = "Pureplay integrations for flighthook: Pureplay Connect and the Accessory API"
 license = "MIT OR Apache-2.0"
 keywords = ["golf", "launch-monitor"]
 repository = "https://github.com/divotmaker/flighthook"
@@ -15,12 +15,24 @@ default = ["driver"]
 config = ["dep:flightrelay", "flightrelay/config", "dep:serde"]
 # The flightrelay drivers, their sessions and transports (`controller`: the
 # shot aggregator a session composes shots with).
-driver = ["config", "flightrelay/driver", "flightrelay/controller", "dep:thiserror"]
+driver = [
+    "config", "flightrelay/driver", "flightrelay/controller", "dep:thiserror", "dep:serde_json",
+    "dep:tracing", "dep:tungstenite", "dep:dirs", "dep:chrono", "dep:uuid",
+]
+# Short waits, for the tests of a crate that depends on this one.
+testing = []
 
 [dependencies]
 flightrelay = { version = "0.6.0", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 thiserror = { version = "2", optional = true }
+serde_json = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+# The Accessory's WebSocket client, blocking on the caller's thread.
+tungstenite = { version = "0.29", optional = true }
+dirs = { version = "6", optional = true }
+chrono = { version = "0.4", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [dev-dependencies]
 # The driver test host (`testing`): one thread, virtual time.

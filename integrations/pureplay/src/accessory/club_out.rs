@@ -57,7 +57,7 @@
 
 use std::time::{Duration, Instant};
 
-use flighthook::Club;
+use flightrelay::Club;
 use serde::Deserialize;
 
 use super::model::Model;

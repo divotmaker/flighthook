@@ -88,7 +88,7 @@ fn error_of(result: Reply) -> serde_json::Value {
 /// other ID is `404` and touches no token.
 #[tokio::test]
 async fn forget_pairing_deletes_the_token_and_reconnects_the_card() {
-    use crate::actors::pureplay_accessory::token::Token;
+    use flighthook_pureplay::accessory::token::Token;
     let (state, _writer, _dir) = configured();
     // `localhost` is an address the card never runs with (it needs a
     // literal socket address); it is here to show the token key is the

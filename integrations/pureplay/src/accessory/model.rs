@@ -33,12 +33,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use flighthook::{Club, Handedness};
-use flightrelay::{GolferId, GolferSelect, GolferTurn, Mode};
+use flightrelay::{Club, GolferId, GolferSelect, GolferTurn, Handedness, Mode};
 
 use super::protocol::{self, BagEntry, Event, Player, Readiness};
 use super::shots::MAP_CAPACITY;
-use flighthook_pureplay::connect::mode_for_lie;
+use crate::connect::mode_for_lie;
 
 /// One player as the card knows them.
 #[derive(Debug, Clone, Default, PartialEq)]
