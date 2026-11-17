@@ -467,22 +467,24 @@ impl FlighthookApp {
             return;
         }
         self.camera_list.loading = true;
+        self.camera_list.stale = false;
         #[cfg(not(test))]
         net::fetch_cameras(ctx, &self.pending);
         #[cfg(test)]
         let _ = ctx;
     }
 
-    /// Fetch the camera list the first time a camera's page shows, or a
-    /// camera card has unsaved edits.
+    /// Fetch the camera list while a camera's page shows, or a camera card
+    /// has unsaved edits: the first time, and again once a camera card has
+    /// turned Connected since the last fetch went out.
     pub(super) fn camera_list_due(&self, shown: Option<&SettingsItem>) -> bool {
         // Tests drawing every page show every camera's.
         #[cfg(test)]
         let every = self.all_settings_sections;
         #[cfg(not(test))]
         let every = false;
-        self.camera_list.list.is_none()
-            && self.camera_list.error.is_none()
+        let first = self.camera_list.list.is_none() && self.camera_list.error.is_none();
+        (first || self.camera_list.stale)
             && !self.camera_list.loading
             && self.settings.actors.iter().any(|a| {
                 matches!(a, ActorFormEntry::Device(d) if d.is_camera())

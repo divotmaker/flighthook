@@ -276,6 +276,10 @@ pub(crate) struct CameraList {
     pub(crate) error: Option<String>,
     /// A fetch is out.
     pub(crate) loading: bool,
+    /// A camera card turned Connected since the last fetch went out (a camera
+    /// that dropped off USB and came back): the list is fetched again the
+    /// next time a camera card needs it.
+    pub(crate) stale: bool,
 }
 
 impl FlighthookApp {

@@ -2885,6 +2885,38 @@ fn the_camera_list_loads_with_a_camera_cards_settings_and_on_refresh() {
     );
 }
 
+/// A camera that dropped off USB came back: the list fetched while it was
+/// gone lacks it, so a camera card turning Connected makes the list due
+/// again. A status that stays Connected, or another card's, does not.
+#[test]
+fn a_camera_card_turning_connected_makes_the_camera_list_due_again() {
+    let screen = Screen::new();
+    let mut app = app();
+    let _ = app.settings.add_actor("camera");
+    let none = HashMap::new();
+    app.apply_card_status("camera.0".into(), ActorStatus::Reconnecting, &none);
+    // The list fetched mid-drop: no camera in it.
+    app.camera_list.list = Some(crate::types::CameraListResponse {
+        supported: true,
+        cameras: Vec::new(),
+    });
+    assert!(!app.camera_list_due(None), "a list is held");
+    app.apply_card_status("mevo.9".into(), ActorStatus::Connected, &none);
+    assert!(!app.camera_list_due(None), "not a camera card");
+
+    app.apply_card_status("camera.0".into(), ActorStatus::Connected, &none);
+    assert!(app.camera_list_due(None), "the camera is back");
+    screen.frame(&mut app, Vec::new());
+    assert!(app.camera_list.loading, "fetched again");
+    assert!(!app.camera_list_due(None), "one fetch at a time");
+    app.pending.lock().unwrap().cameras = Some(Ok(camera_list()));
+    app.apply_pending();
+    assert_eq!(app.camera_list.list, Some(camera_list()));
+
+    app.apply_card_status("camera.0".into(), ActorStatus::Connected, &none);
+    assert!(!app.camera_list_due(None), "still Connected: not due again");
+}
+
 /// The outputs' routing pickers offer the launch monitors: no camera
 /// and no Pureplay Accessory card.
 #[test]

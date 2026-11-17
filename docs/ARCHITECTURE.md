@@ -3636,7 +3636,9 @@ displayed).
   change restarts it
 - Camera cards (beta) show name, Camera (a dropdown of
   [`GET /api/cameras`](API.md#get-apicameras), fetched the first time a
-  camera card shows its settings, with a refresh icon; a camera another card
+  camera card shows its settings and again once a camera card has turned
+  Connected since the last fetch (a camera that dropped off USB and came
+  back), with a refresh icon; a camera another card
   uses reads "(in use by camera.N)", a saved camera that is not connected
   "(not connected)"), Position, Video mode (Auto or one of the picked
   camera's modes, `1280×720 @ 120`; a saved mode the list lacks stays

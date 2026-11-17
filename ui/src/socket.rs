@@ -277,11 +277,16 @@ impl FlighthookApp {
         if status == ActorStatus::Starting {
             self.reconnect_started(&card);
         }
+        let camera = crate::panels::cards::split_actor_id(&card).0 == "camera";
         let actor = self
             .actors
             .entry(card)
             .or_insert_with(|| new_actor(String::new()));
+        let connected = status == ActorStatus::Connected && actor.status != ActorStatus::Connected;
         actor.apply_status(status, telemetry, self.now_ms);
+        if camera && connected {
+            self.camera_list.stale = true;
+        }
     }
 
     /// A configuration change was applied: stopped actors go (or show
