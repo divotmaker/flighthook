@@ -3202,15 +3202,13 @@ mod tests {
             };
             assert!(restarted.is_empty(), "no camera restart");
         };
-        // A recorded clip waits its 3 s in Live; leaving Live before its
-        // turn leaves it untracked.
+        // A recorded clip waits its 3 s in Live; the mode in effect at its
+        // turn decides whether it runs (`pose::clips::turn`).
         rig.state.pose.clips.fake(fake_pass);
         rig.shot("mock_monitor.0", 1);
         rig.next_video().expect("shot_video");
         assert!(rig.state.pose.clips.working(), "queued for its pass");
         save(&mut rig, BodyTrackingMode::Historical);
-        rig.idle_clips();
-        assert!(!rig.saw_pose(), "no automatic pass out of Live");
         // Historical keeps the models for the clips viewed; Off lets them go
         // and drops what waits.
         assert!(rig.state.pose.models.state(model).is_some());
@@ -3222,11 +3220,12 @@ mod tests {
         assert!(rig.state.pose.clips.waiting().is_empty());
         // Back to Live: recorded clips are tracked again.
         save(&mut rig, BodyTrackingMode::Live);
-        rig.shot("mock_monitor.0", 3);
+        let third = rig.shot("mock_monitor.0", 3);
         rig.next_video().expect("shot_video");
-        rig.wait_for(Duration::from_secs(10), |m| {
-            matches!(m.event, LocalEvent::ShotPose { .. })
-        })
+        rig.wait_for(
+            Duration::from_secs(10),
+            |m| matches!(&m.event, LocalEvent::ShotPose { keys, .. } if keys.contains(&third)),
+        )
         .expect("Live tracks the clip");
     }
 }
