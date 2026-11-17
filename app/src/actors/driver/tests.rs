@@ -455,6 +455,32 @@ fn raw_of(messages: &[BusMsg]) -> ShotRaw {
         .expect("a finished shot")
 }
 
+/// What card `card` (hooks `H` on driver `D`, with `section`) puts on the
+/// bus for one session of device `identity` that emits `events`, the
+/// session in `mode`: through the host's own sink, with no thread, device
+/// or clock. Connected and the card's `bus.actor` (with `D`'s roles and the
+/// card's source) come first, then each event through the card's hooks.
+pub(crate) fn card_bus<D: FrpDriver, H: Hooks<D>>(
+    card: &str,
+    section: H::Section,
+    mode: Option<Mode>,
+    identity: &DeviceIdentity,
+    events: impl IntoIterator<Item = DeviceEvent>,
+) -> Vec<BusMsg> {
+    let (_dir, state, _writer) = temp_state();
+    let (tx, mut rx) = broadcast::channel(4096);
+    let sender = BusSender::new(card.into(), tx, Arc::default()).with_frp_id(Some(card.into()));
+    let mut sink = Sink::<D, H>::new(state, sender, D::info(&section.driver_settings()));
+    let mut hooked = Hooked::new(section);
+    sink.begin_session();
+    start_session(&mut sink, &mut hooked, identity);
+    sink.session_mode = mode;
+    for event in events {
+        sink.handle(event, &mut hooked);
+    }
+    drain(&mut rx)
+}
+
 // -- The sink ------------------------------------------------------------
 
 /// A session's start: Connected with the card text and the shot count,
@@ -580,6 +606,39 @@ fn a_hook_marks_an_estimated_spin() {
         panic!("{:?}", kinds(&seen))
     };
     assert_eq!(l.launch.backspin_rpm, Some(1234));
+}
+
+/// A card that keeps what it saw of each shot at its end.
+#[derive(Default)]
+struct ShotHooks(Vec<ShotSoFar>);
+
+impl Hooks<FakeDriver> for ShotHooks {
+    type Section = FakeSection;
+    const SOURCE: Option<ShotSource> = Some(ShotSource::Mevo);
+
+    fn before_finished(
+        &mut self,
+        shot: &ShotSoFar,
+        _: &mut HookCtx<'_, FakeSection>,
+    ) -> Vec<FrpBody> {
+        self.0.push(shot.clone());
+        Vec::new()
+    }
+}
+
+/// The hooks see a shot's mode as the session ran in at its trigger,
+/// whatever it runs in by the shot's end, with the measured launch.
+#[test]
+fn a_shots_mode_is_the_sessions_at_its_trigger() {
+    let (_dir, mut sink, _rx, _w) = sink::<ShotHooks>("");
+    sink.session_mode = Some(Mode::Putting);
+    sink.handle(frp(trigger(key(1))));
+    sink.session_mode = Some(Mode::Full);
+    sink.handle(frp(launch_of(key(1), launch())));
+    sink.handle(frp(finished(key(1))));
+    let shot = &sink.hooked.hooks.0[0];
+    assert_eq!(shot.mode, Some(Mode::Putting));
+    assert_eq!(shot.launch, Some(launch()));
 }
 
 /// Raw frames go to the shot's capture (pre-roll included) with their

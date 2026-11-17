@@ -1,5 +1,6 @@
 //! Test support: scripted devices handed to a device driver under test,
-//! and [`Software`], a scripted software driver.
+//! [`Stepped`], a host that runs a real driver's session on the test's
+//! thread, and [`Software`], a scripted software driver.
 //!
 //! [`FrpDriver::new`](flightrelay::driver::FrpDriver::new) gets only
 //! the card's config, so a test parks its scripted device here under a key
@@ -13,15 +14,18 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use flightrelay::FrpMessage;
+use flighthook::ShotKey;
 use flightrelay::config::{ConfigError, DriverConfig};
 use flightrelay::driver::{
-    Activity, ConnectCtx, DeviceEvent, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
-    Stopped, TurnHints,
+    Activity, ConnectCtx, ConnectHost, DeviceEvent, DeviceIdentity, DriverInfo, Events, FrpDriver,
+    FrpSession, HostFlags, IDLE, Stop, Stopped, TurnHints,
 };
+use flightrelay::{FrpBody, FrpMessage, ShotFinished, ShotTrigger};
 use tokio::sync::broadcast;
+
+use crate::bus::BusMsg;
 
 /// The next message on `rx`, blocking until one arrives; `None` when the
 /// bus closes or nothing arrives within [`GIVE_UP`](crate::actors::GIVE_UP)
@@ -74,6 +78,135 @@ impl<K: Eq + Hash + Debug, T> Handoff<K, T> {
             .as_mut()
             .and_then(|map| map.remove(key))
     }
+}
+
+// ---------------------------------------------------------------------------
+// A real driver's session on this thread
+// ---------------------------------------------------------------------------
+
+/// The body of `m`, when it is an FRP message.
+pub(crate) fn body(m: &BusMsg) -> Option<&FrpBody> {
+    m.as_frp().map(|f| &f.body)
+}
+
+/// A host for one session of a real driver on the test's thread: a clock
+/// that moves only when the driver waits or the session idles, and every
+/// event the driver emitted, for [`card_bus`](crate::actors::driver::tests::card_bus).
+pub(crate) struct Stepped {
+    clock: Clock,
+    flags: HostFlags,
+    stop: Stop,
+    /// What the driver emitted so far.
+    pub(crate) events: Vec<DeviceEvent>,
+}
+
+/// Active steps in a row after which [`Stepped::until`] gives up: a fast
+/// replay (whose clock is its input's) takes one step per millisecond of
+/// its input.
+const MAX_BUSY_STEPS: u32 = 1_000_000;
+
+struct Clock {
+    now: Instant,
+    hints: TurnHints,
+}
+
+impl ConnectHost for Clock {
+    fn tick(&mut self) {}
+
+    fn hints(&self) -> &TurnHints {
+        &self.hints
+    }
+
+    fn now(&self) -> Instant {
+        self.now
+    }
+
+    fn wait(&mut self, d: Duration) {
+        self.now += d;
+    }
+}
+
+impl Stepped {
+    /// A host whose connects see `hints`, raw frames wanted.
+    pub(crate) fn new(hints: TurnHints) -> Self {
+        let flags = HostFlags::new();
+        flags.set_wants_raw(true);
+        Self {
+            clock: Clock {
+                now: Instant::now(),
+                hints,
+            },
+            flags,
+            stop: Stop::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Any connect-shaped call against this host.
+    pub(crate) fn connect<T, E>(
+        &mut self,
+        f: impl FnOnce(&mut ConnectCtx<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let events = &mut self.events;
+        let mut sink = |e: DeviceEvent| events.push(e);
+        let mut ctx = ConnectCtx::new(
+            &self.stop,
+            Events::new(&mut sink, &self.flags),
+            &mut self.clock,
+        );
+        f(&mut ctx)
+    }
+
+    /// Step with `step` until an event matching `want` arrives: again at
+    /// the same instant after an active step, [`IDLE`] later after an idle
+    /// one.
+    ///
+    /// # Panics
+    ///
+    /// When a step fails, or nothing matches within
+    /// [`GIVE_UP`](crate::actors::GIVE_UP) of the host's clock or
+    /// [`MAX_BUSY_STEPS`] active steps in a row.
+    pub(crate) fn until<E: Debug>(
+        &mut self,
+        mut step: impl FnMut(Instant, &mut Events<'_>) -> Result<Activity, E>,
+        want: impl Fn(&DeviceEvent) -> bool,
+    ) {
+        let from = self.events.len();
+        let give_up = self.clock.now + crate::actors::GIVE_UP;
+        let mut busy = 0u32;
+        while !self.events[from..].iter().any(&want) {
+            assert!(
+                self.clock.now < give_up && busy < MAX_BUSY_STEPS,
+                "never seen: {:?}",
+                &self.events[from..]
+            );
+            let events = &mut self.events;
+            let mut sink = |e: DeviceEvent| events.push(e);
+            let activity =
+                step(self.clock.now, &mut Events::new(&mut sink, &self.flags)).expect("a step");
+            if activity == Activity::Idle {
+                busy = 0;
+                self.clock.now += IDLE;
+            } else {
+                busy += 1;
+            }
+        }
+    }
+}
+
+/// Whether `event` is a `shot.finished`.
+pub(crate) fn is_finished(event: &DeviceEvent) -> bool {
+    matches!(event, DeviceEvent::Frp(FrpBody::ShotFinished(_)))
+}
+
+/// The events of one shot `key` as a driver emits them: its trigger, then
+/// `parts` (the launch, flight, club, impact), then `shot.finished`.
+pub(crate) fn shot_events(key: &ShotKey, parts: Vec<FrpBody>) -> Vec<DeviceEvent> {
+    std::iter::once(ShotTrigger::new(key.clone()).into())
+        .chain(parts)
+        .chain(std::iter::once(ShotFinished { key: key.clone() }.into()))
+        .map(DeviceEvent::Frp)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

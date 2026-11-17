@@ -119,9 +119,4 @@ fn launch_only_spin(launch: &Launch, rpm_per_mph: f64, mode: Option<Mode>) -> Op
 pub type MevoActor = DriverActor<Mevo, MevoHooks>;
 
 #[cfg(test)]
-use ironsight as iron;
-#[cfg(test)]
-mod scenario;
-
-#[cfg(test)]
 mod tests;
