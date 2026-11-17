@@ -1008,7 +1008,7 @@ mod tests {
     use crate::bus::LocalEvent;
 
     /// Longest any test waits for one thing before failing.
-    const WAIT: Duration = Duration::from_secs(5);
+    const WAIT: Duration = crate::actors::GIVE_UP;
 
     fn key(n: u32) -> ShotKey {
         ShotKey {

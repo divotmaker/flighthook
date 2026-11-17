@@ -1583,9 +1583,7 @@ fn statuses(seen: &[Seen], actor: &str) -> Vec<ActorStatus> {
         .collect()
 }
 
-/// How long a wait on an event may take before the test fails. Only a
-/// failure waits this long: every wait returns at its event.
-const GIVE_UP: Duration = Duration::from_secs(60);
+use crate::actors::GIVE_UP;
 
 /// Messages until `want` matches one, waiting up to [`GIVE_UP`]. A receiver
 /// that fell behind fails the test: the message it waits for may be lost.

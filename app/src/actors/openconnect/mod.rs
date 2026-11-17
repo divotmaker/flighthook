@@ -1019,7 +1019,7 @@ mod tests {
     use crate::actors::gspro::{self, GsProRouting};
 
     /// Longest any test waits for one thing.
-    const WAIT: Duration = Duration::from_secs(8);
+    const WAIT: Duration = crate::actors::GIVE_UP;
 
     /// A process's worth of actors on one bus, sharing one `SystemState`.
     struct Rig {

@@ -104,7 +104,7 @@ mod tests {
     use crate::state::{SessionWriter, SystemState};
 
     /// Longest any test waits for one thing.
-    const WAIT: Duration = Duration::from_secs(8);
+    const WAIT: Duration = crate::actors::GIVE_UP;
 
     // -- The ExPutt on a mock device -----------------------------------------
 
@@ -397,7 +397,10 @@ mod tests {
                             return seen;
                         }
                     }
-                    Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                    Ok(_) => {}
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        panic!("{what}: the test fell {n} messages behind on the bus")
+                    }
                     Err(_) => std::thread::sleep(Duration::from_millis(2)),
                 }
             }
@@ -416,7 +419,9 @@ mod tests {
                             return;
                         }
                     }
-                    Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        panic!("the test fell {n} messages behind on the bus")
+                    }
                     Err(_) => std::thread::sleep(Duration::from_millis(2)),
                 }
             }

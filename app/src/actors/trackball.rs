@@ -71,7 +71,7 @@ mod tests {
     use crate::state::{SessionWriter, SystemState};
 
     /// Longest any test waits for one thing.
-    const WAIT: Duration = Duration::from_secs(8);
+    const WAIT: Duration = crate::actors::GIVE_UP;
 
     /// Opens the input a `device` setting names, with or without the grab.
     type Opener =

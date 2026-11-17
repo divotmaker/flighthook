@@ -25,7 +25,7 @@ use flighthook::{ActorStatusResponse, Club, Handedness};
 use flightrelay::FrpBody;
 
 /// Longest a test waits for one thing.
-const WAIT: Duration = Duration::from_secs(5);
+const WAIT: Duration = crate::actors::GIVE_UP;
 const ACTOR: &str = "pureplay_accessory.0";
 
 /// The card key of the test's bus markers ([`Card::caught_up`]); the session

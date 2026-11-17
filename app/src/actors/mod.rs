@@ -36,6 +36,11 @@ use crate::bus::{BusReceiver, BusSender};
 use crate::state::config::{FlighthookConfig, global_id};
 use crate::state::{ActorHandle, SystemState};
 
+/// How long a test waits on an event before it fails. Only a failure waits
+/// this long: every wait returns at its event.
+#[cfg(test)]
+pub(crate) const GIVE_UP: Duration = Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // Actor trait
 // ---------------------------------------------------------------------------
