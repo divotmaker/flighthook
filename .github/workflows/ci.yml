@@ -33,5 +33,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Docs
+        # The app's binary and the lib crate are both named flighthook, so the
+        # app is documented on its own to keep their doc pages apart.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --workspace --exclude flighthook-app --no-deps --document-private-items --locked
+          cargo doc -p flighthook-app --no-deps --document-private-items --locked
+
       - name: Run tests
         run: cargo test --workspace --locked

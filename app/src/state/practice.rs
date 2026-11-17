@@ -125,7 +125,9 @@ impl Practice {
         Self::open_with(None, turn, now_ms)
     }
 
-    /// [`Self::start`], keying golfers by the lookup rule on `config`.
+    /// A practice actor following `turn`, with its first block opened,
+    /// keying golfers by the lookup rule on `config`. Returns the actor and
+    /// the block to publish.
     #[must_use]
     pub fn with_config(
         config: ConfigView,

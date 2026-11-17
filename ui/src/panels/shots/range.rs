@@ -414,8 +414,8 @@ pub(in crate::panels) fn device_options(
     device_options_with(ids, actors, &HashMap::new())
 }
 
-/// [`device_options`] naming remote actors by their `bus.actor` names in
-/// `remote`.
+/// Labels of the device filter's options, as for `device_options`, naming
+/// remote actors by their `bus.actor` names in `remote`.
 pub(in crate::panels) fn device_options_with(
     ids: &[String],
     actors: &HashMap<String, ActorStatusResponse>,

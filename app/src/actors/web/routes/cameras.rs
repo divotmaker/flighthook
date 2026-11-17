@@ -64,7 +64,7 @@ pub struct LiveQuery {
     pub(super) after: u64,
 }
 
-/// GET /api/cameras/{actor}/live?after=<seq> — the camera's live frame
+/// `GET /api/cameras/{actor}/live?after=<seq>` — the camera's live frame
 /// newer than `after`, a JPEG as the camera sent it, with its sequence
 /// number (`X-Frame-Seq`) and time (`X-Frame-Time-Ns`, see
 /// [`LiveFrame::time_ns`](flighthook_cameras::frames::LiveFrame)), and the

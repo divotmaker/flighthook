@@ -78,7 +78,7 @@ impl Registered {
     }
 }
 
-/// How [`SystemState::stop_and_wait`] ended.
+/// How [`SystemState::wait_for_exit`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stopped {
     /// No actor is registered under that ID.

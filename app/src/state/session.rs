@@ -138,7 +138,7 @@ impl SessionWriter {
     }
 
     /// The `from` of the select that last changed the turn; `None` when the
-    /// session itself is the cause (the start turn, [`apply`](Self::apply)).
+    /// session itself is the cause (the start turn, or `apply` in tests).
     #[must_use]
     pub fn cause(&self) -> Option<String> {
         self.cause.read().unwrap_or_else(|e| e.into_inner()).clone()

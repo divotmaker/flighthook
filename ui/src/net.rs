@@ -1,6 +1,6 @@
 //! Networking — ehttp REST + ewebsock WebSocket.
 //!
-//! Async results are placed in a shared `Pending` queue (Arc<Mutex>)
+//! Async results are placed in a shared `Pending` queue (`Arc<Mutex>`)
 //! that the app drains each frame. This avoids touching egui's internal
 //! data store from async callbacks.
 

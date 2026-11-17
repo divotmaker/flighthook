@@ -414,7 +414,7 @@ impl FlighthookApp {
     }
 
     /// The navigation's device filter, `DEVICE [All ▾]`, while the shots
-    /// come from two or more devices ([`device_options`]).
+    /// come from two or more devices ([`device_options_with`]).
     pub(super) fn render_device_filter(&mut self, ui: &mut egui::Ui, inset: f32) {
         let ids = self.devices().into_owned();
         let Some(labels) = device_options_with(&ids, &self.actors, &self.remote_names) else {

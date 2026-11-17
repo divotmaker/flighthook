@@ -885,7 +885,7 @@ struct Sink<D: FrpDriver, H: Hooks<D>> {
     shot_count: u32,
     /// Puts the driver's timestamps on the host clock.
     clock: UtcClock,
-    /// The mode the session runs in ([`HookCtx::session_mode`]).
+    /// The mode the session runs in, from the hints last handed to it.
     session_mode: Option<Mode>,
     _types: PhantomData<fn() -> (D, H)>,
 }

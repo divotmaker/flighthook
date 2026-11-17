@@ -2,7 +2,7 @@
 //!
 //! It flies every shot a launch monitor finishes and publishes what it
 //! computed as a `shot.flight` addendum (`basis: modeled`, model
-//! "flighthook <version> (dimple <version>)"), with only the result fields
+//! `"flighthook <version> (dimple <version>)"`), with only the result fields
 //! it computed:
 //!
 //! - under `[simulation] mode = on`, the ones the launch monitor's own
