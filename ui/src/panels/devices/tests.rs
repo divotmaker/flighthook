@@ -1176,7 +1176,10 @@ fn the_pureplay_card_saves_its_address_and_forgets_its_pairing() {
             name: "Pureplay Accessory".into(),
             enabled: true,
             actor_id: None,
-            address: Some("127.0.0.1:9770".into()),
+            driver: flighthook::PureplayAccessoryConfig {
+                address: Some("127.0.0.1:9770".into()),
+                token_file: None,
+            },
             shots: flighthook::PureplayShots::Auto,
             impact_lead_s: None,
         }
@@ -1240,7 +1243,9 @@ fn the_pureplay_card_saves_its_address_and_forgets_its_pairing() {
         &app.settings.actors[idx]
     ));
     assert_eq!(
-        app.settings.to_request().pureplay_accessory["0"].address,
+        app.settings.to_request().pureplay_accessory["0"]
+            .driver
+            .address,
         None
     );
 

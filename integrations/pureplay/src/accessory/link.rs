@@ -10,7 +10,7 @@ use tungstenite::{HandshakeError, Message, WebSocket};
 
 /// Whether the card sends its JSON in binary frames rather than text ones.
 /// Pureplay's example clients send text.
-pub const SEND_BINARY: bool = false;
+pub(crate) const SEND_BINARY: bool = false;
 
 /// One frame received.
 #[derive(Debug, Clone, PartialEq, Eq)]

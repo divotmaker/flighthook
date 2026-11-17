@@ -426,7 +426,6 @@ impl BusSender {
         BusReceiver {
             inner: self.inner.subscribe(),
             shutdown: Arc::clone(&self.shutdown),
-            lagged: false,
         }
     }
 }
@@ -452,21 +451,12 @@ impl Clone for BusSender {
 pub struct BusReceiver {
     inner: broadcast::Receiver<BusMsg>,
     shutdown: Arc<AtomicBool>,
-    /// Messages were dropped because this receiver fell behind, since the
-    /// last [`take_lagged`](Self::take_lagged).
-    lagged: bool,
 }
 
 impl BusReceiver {
     /// Check whether this actor's shutdown flag has been set.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
-    }
-
-    /// Whether messages were dropped because this receiver fell behind,
-    /// since the last call.
-    pub fn take_lagged(&mut self) -> bool {
-        std::mem::take(&mut self.lagged)
     }
 
     /// Non-blocking drain: returns the next message, `Ok(None)` if empty,
@@ -482,7 +472,6 @@ impl BusReceiver {
                 Err(broadcast::error::TryRecvError::Closed) => return Err(PollError::Shutdown),
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
                     tracing::warn!("bus: lagged, dropped {n} events");
-                    self.lagged = true;
                 }
             }
         }
@@ -494,7 +483,6 @@ impl From<broadcast::Receiver<BusMsg>> for BusReceiver {
         Self {
             inner,
             shutdown: Arc::new(AtomicBool::new(false)),
-            lagged: false,
         }
     }
 }
@@ -502,21 +490,6 @@ impl From<broadcast::Receiver<BusMsg>> for BusReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A receiver that fell behind says so once.
-    #[test]
-    fn a_lagging_receiver_reports_it_once() {
-        let (tx, _) = broadcast::channel(2);
-        let sender = BusSender::new("web".into(), tx, Arc::default());
-        let mut rx = sender.subscribe();
-        for _ in 0..4 {
-            sender.local(LocalEvent::ClearShotHistory);
-        }
-        assert!(!rx.take_lagged(), "nothing read yet");
-        assert!(matches!(rx.poll(), Ok(Some(_))));
-        assert!(rx.take_lagged());
-        assert!(!rx.take_lagged());
-    }
 
     /// The heartbeat sends each live actor's newest `bus.actor` again, and
     /// forgets a removed or no longer live one.

@@ -97,7 +97,10 @@ async fn forget_pairing_deletes_the_token_and_reconnects_the_card() {
         c.pureplay_accessory.insert(
             "0".into(),
             flighthook::PureplayAccessorySection {
-                address: Some("localhost:9770".into()),
+                driver: flighthook::PureplayAccessoryConfig {
+                    address: Some("localhost:9770".into()),
+                    token_file: None,
+                },
                 ..flighthook::PureplayAccessorySection::default()
             },
         );

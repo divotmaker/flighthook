@@ -310,9 +310,12 @@ reported by one source only:
   from Pureplay`, `auto: last from flighthook`, `from Pureplay` or `from
   flighthook`), `missed_events` (gaps in Pureplay's event numbers, only
   above 0; each one asks Pureplay for its state again) and `pureplay` (the
-  game's version); each only while it has a value. `last_shot` (the shot
-  the card took last and the local time, `#12 at 16:41:07`) stays after
-  the connection. Pureplay's readiness is the card's
+  game's version); each only while it has a value; these ride the card's
+  `bus.actor` telemetry. `device_info` is Pureplay's address, `shot_count`
+  the shots the card put on the bus, and `last_shot` the shot the card took
+  last and the local time (`#12 at 16:41:07`; the card numbers every shot of
+  a local player, so a shot Pureplay echoes skips a number). Pureplay's
+  readiness is the card's
   `ready` (`true` | `false`), as
   for any launch monitor, with manufacturer `Pureplay`, model `Accessory
   API` and firmware the game's version. Not connected,
@@ -324,9 +327,12 @@ reported by one source only:
   in Pureplay`, `Pureplay asks to wait (1:42)` (counting down), `Removed in
   Pureplay. Press Reconnect to pair again.` or `Press Reconnect to pair
   again.`, or, after six `bad_request` answers in a row, Pureplay's own
-  message. `error` says Pureplay speaks another protocol or version, offers
-  none of the events the card follows, or that the pairing could not be
-  saved. See [Pureplay Accessory](devices/pureplay.md)
+  message. `error` says why the last connection attempt failed (Pureplay
+  not running, another protocol or version, none of the events the card
+  follows) until a connection is made, as on every card on a driver;
+  `Press Reconnect to pair again.` once the card waits for Reconnect; or
+  that the pairing could not be saved. When the link ends, every row of
+  the link is removed. See [Pureplay Accessory](devices/pureplay.md)
 - **Cameras**: `camera` (the camera's own name),
   `position`, `resolution` (`1280x720`), `mode_fps` (the frame rate asked
   for), `fps` (achieved over the last second), `dropped` (frames missing

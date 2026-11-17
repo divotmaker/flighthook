@@ -67,7 +67,6 @@ type LastClub = (Option<Club>, u64);
 /// The session's turn, read side.
 pub struct Session {
     inner: Arc<RwLock<GolferTurn>>,
-    cause: Arc<RwLock<Option<String>>>,
 }
 
 /// The session's turn, write side (the system actor). It also keeps the
@@ -104,7 +103,6 @@ impl Session {
         (
             Self {
                 inner: Arc::clone(&inner),
-                cause: Arc::clone(&cause),
             },
             SessionWriter {
                 inner,
@@ -121,13 +119,6 @@ impl Session {
     #[must_use]
     pub fn turn(&self) -> GolferTurn {
         self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    /// The `from` of the select that last changed the turn; `None` when
-    /// the session itself is the cause.
-    #[must_use]
-    pub fn cause(&self) -> Option<String> {
-        self.cause.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The current mode.

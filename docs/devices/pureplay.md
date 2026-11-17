@@ -141,7 +141,8 @@ Connected, the card shows (each row only while it has a value):
 | `blockers` | while it does not: why (`shot in progress`) |
 | `club_out` | whether a club picked in flighthook goes to Pureplay: `on` (Aim and Club), `read only` (Read Only), `off in Pureplay` (Pureplay's **Let Apps Change Aim and Club** is off), `not supported` (this Pureplay has no club command, or the player who is up has no bag) |
 | `shots` | the Shots setting; on Auto, where the last shot came from (`auto: last from Pureplay`, `auto: last from flighthook`) |
-| `last_shot` | the shot the card took last and when, `#12 at 16:41:07` (stays after the connection) |
+| `last_shot` | the shot the card took last and when, `#12 at 16:41:07`; the card numbers every shot of a player at this computer, so a shot Pureplay echoes back skips a number |
+| `device_info` | Pureplay's address |
 | `missed_events` | how many times the card missed some of Pureplay's messages; each time it reads Pureplay's state again |
 | `pureplay` | Pureplay's version |
 
@@ -269,11 +270,12 @@ Accessories settings change, the card reconnects by itself (after 1, 2, 4
 computer goes quiet (the computer sleeps or loses its network), the card
 notices within about a minute and reconnects.
 
-An `error` row says the program at the card's address is not a Pureplay
-Accessory server, speaks another version of it, or offers none of the
-events the card follows (the card tries again every 30 seconds), or that the
-pairing could not be saved (the card goes on; flighthook asks again on its
-next start).
+An `error` row says why the last connection attempt failed until a
+connection is made: Pureplay is not running, the program at the card's
+address is not a Pureplay Accessory server, speaks another version of it,
+or offers none of the events the card follows (the card tries again every
+30 seconds). It also says when the pairing could not be saved (the card
+goes on; flighthook asks again on its next start).
 
 ### Where the pairing is kept
 

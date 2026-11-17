@@ -37,24 +37,18 @@ fn snapshot_value(active: i64) -> serde_json::Value {
     })
 }
 
-/// The lookup rule with no golfers: every id is its own key.
-fn own(id: Option<&str>) -> Option<String> {
-    id.map(str::to_owned)
+/// The test's clock: one fixed instant.
+fn now() -> Instant {
+    static NOW: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *NOW.get_or_init(Instant::now)
 }
 
 /// A model that knows flighthook's start turn: no golfer, no club, right-
 /// handed, full.
 fn fresh() -> Model {
     let mut model = Model::default();
-    model.flighthook_holds(
-        &GolferTurn::new(None, None, Handedness::Right, Mode::Full),
-        None,
-    );
+    model.flighthook_holds(&GolferTurn::new(None, None, Handedness::Right, Mode::Full));
     model
-}
-
-fn no_cards(_: &str) -> bool {
-    false
 }
 
 fn id(s: &str) -> GolferId {
@@ -71,19 +65,18 @@ fn turn_for(want: &Want) -> GolferTurn {
     )
 }
 
-/// The card sent `want` and the session answered: flighthook holds it,
-/// caused by the card.
+/// The card sent `want` and the session answered: flighthook holds it.
 fn answered(model: &mut Model, want: &Want) {
-    model.select_sent("card", "c");
-    model.flighthook_holds(&turn_for(want), Some("card"));
-    assert!(model.select_answered("card", "c"));
+    model.select_sent("c", now());
+    model.flighthook_holds(&turn_for(want));
+    assert!(model.select_answered("c"));
 }
 
 #[test]
 fn the_snapshot_gives_the_local_player_ups_complete_turn() {
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
-    let want = model.sync(own, no_cards).expect("a select");
+    let want = model.sync(now()).expect("a select");
     assert_eq!(
         want,
         Want {
@@ -103,7 +96,7 @@ fn the_snapshot_gives_the_local_player_ups_complete_turn() {
     // Once flighthook holds it, the same snapshot sends nothing.
     answered(&mut model, &want);
     model.apply_snapshot(&snapshot(1));
-    assert_eq!(model.sync(own, no_cards), None);
+    assert_eq!(model.sync(now()), None);
 }
 
 /// Two local players: a turn to the second sends the golfer, club, hand and
@@ -112,23 +105,23 @@ fn the_snapshot_gives_the_local_player_ups_complete_turn() {
 fn a_turn_to_a_second_local_player_sends_one_complete_select() {
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
-    let joe = model.sync(own, no_cards).expect("joe");
+    let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
     let turn = event(
         "turn.changed",
         json!({ "previousPlayerId": 1, "currentPlayerId": 2, "reason": "next_player" }),
     );
     model.apply_event(&turn).expect("turn");
-    let ann = model.sync(own, no_cards).expect("ann");
+    let ann = model.sync(now()).expect("ann");
     assert_eq!(ann.golfer, id("pureplay.Ann"));
     assert_eq!(ann.club, Some(Club::Driver));
     assert_eq!(ann.hand, Some(Handedness::Left));
     // Nothing more until it is answered, and nothing after.
-    model.select_sent("card", "c2");
-    assert_eq!(model.sync(own, no_cards), None);
-    model.flighthook_holds(&turn_for(&ann), Some("card"));
-    model.select_answered("card", "c2");
-    assert_eq!(model.sync(own, no_cards), None);
+    model.select_sent("c2", now());
+    assert_eq!(model.sync(now()), None);
+    model.flighthook_holds(&turn_for(&ann));
+    model.select_answered("c2");
+    assert_eq!(model.sync(now()), None);
 }
 
 /// A remote player up sends nothing and re-asserts nothing: the turn keeps
@@ -137,53 +130,45 @@ fn a_turn_to_a_second_local_player_sends_one_complete_select() {
 fn a_remote_player_up_sends_nothing() {
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
-    let joe = model.sync(own, no_cards).expect("joe");
+    let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
     let turn = event(
         "turn.changed",
         json!({ "previousPlayerId": 1, "currentPlayerId": 3 }),
     );
     model.apply_event(&turn).expect("turn");
-    assert_eq!(model.sync(own, no_cards), None);
+    assert_eq!(model.sync(now()), None);
     let pick = GolferTurn::new(None, Some(Club::Wood5), Handedness::Right, Mode::Full);
-    model.flighthook_holds(&pick, Some("flighthook"));
-    assert_eq!(model.sync(own, no_cards), None);
+    model.flighthook_holds(&pick);
+    assert_eq!(model.sync(now()), None);
     assert_eq!(model.golfer(3), Some(id("pureplay.Remote")));
 }
 
-/// A header golfer or club pick (caused by flighthook) is re-asserted; a
-/// turn a game or simulator card caused is not; Pureplay reporting a
-/// change sends whatever caused the turn.
+/// A header golfer or club pick is re-asserted, and Pureplay reporting a
+/// change sends. (The host hands the card no turn a game or simulator card
+/// caused.)
 #[test]
 fn the_card_reasserts_against_changes_no_game_card_made() {
-    let gspro = |a: &str| a == "gspro";
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
-    let joe = model.sync(own, gspro).expect("joe");
+    let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
 
     let header_golfer = GolferTurn {
         golfer: Some(id("flighthook.abc")),
         ..turn_for(&joe)
     };
-    model.flighthook_holds(&header_golfer, Some("flighthook"));
-    assert_eq!(model.sync(own, gspro), Some(joe.clone()), "golfer pick");
+    model.flighthook_holds(&header_golfer);
+    assert_eq!(model.sync(now()), Some(joe.clone()), "golfer pick");
     answered(&mut model, &joe);
 
     let header_club = GolferTurn {
         club: Some(Club::Wood5),
         ..turn_for(&joe)
     };
-    model.flighthook_holds(&header_club, Some("flighthook"));
-    assert_eq!(model.sync(own, gspro), Some(joe.clone()), "club pick");
+    model.flighthook_holds(&header_club);
+    assert_eq!(model.sync(now()), Some(joe.clone()), "club pick");
     answered(&mut model, &joe);
-
-    let from_gspro = GolferTurn {
-        club: Some(Club::Iron8),
-        ..turn_for(&joe)
-    };
-    model.flighthook_holds(&from_gspro, Some("gspro"));
-    assert_eq!(model.sync(own, gspro), None, "last sender wins");
 
     // Pureplay reports Joe's club change: the card sends.
     let change = event(
@@ -191,44 +176,32 @@ fn the_card_reasserts_against_changes_no_game_card_made() {
         json!({ "playerId": 1, "current": "Iron9", "currentClubId": "x", "reason": "user_selected" }),
     );
     model.apply_event(&change).expect("club");
-    let want = model.sync(own, gspro).expect("reported");
+    let want = model.sync(now()).expect("reported");
     assert_eq!(want.club, Some(Club::Iron9));
 }
 
-/// The golfer compares by the lookup rule: a flighthook golfer listing the
-/// player's id is the same golfer.
+/// A1: the golfer compares by id. A flighthook golfer that lists the
+/// player's id is another golfer, so the card re-asserts the Pureplay id.
 #[test]
-fn a_linked_golfer_is_the_same_golfer() {
+fn a_linked_golfer_is_another_golfer_by_id() {
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
-    let joe = model.sync(own, no_cards).expect("joe");
+    let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
-    let linked = |id: Option<&str>| {
-        id.map(|id| {
-            if id == "pureplay.Joe" {
-                "flighthook.eric".to_owned()
-            } else {
-                id.to_owned()
-            }
-        })
-    };
     let picked = GolferTurn {
         golfer: Some(id("flighthook.eric")),
         ..turn_for(&joe)
     };
-    model.flighthook_holds(&picked, Some("flighthook"));
-    assert_eq!(model.sync(linked, no_cards), None, "same golfer");
-    assert_eq!(model.sync(own, no_cards), Some(joe), "another golfer");
+    model.flighthook_holds(&picked);
+    assert_eq!(model.sync(now()), Some(joe));
 }
 
-/// The mode: the putter putts; under 30 yd chips; otherwise, or with no
-/// distance, a full swing. A new distance that changes the mode sends.
 #[test]
 fn the_club_and_distance_give_the_mode() {
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
     assert_eq!(model.want().expect("joe").mode, Mode::Full, "unknown");
-    let joe = model.sync(own, no_cards).expect("joe");
+    let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
     for (distance, mode) in [(150.0, Mode::Full), (20.0, Mode::Chipping)] {
         let init = event(
@@ -238,7 +211,7 @@ fn the_club_and_distance_give_the_mode() {
         );
         model.apply_event(&init).expect("init");
         assert_eq!(model.want().expect("joe").mode, mode, "{distance} m");
-        if let Some(want) = model.sync(own, no_cards) {
+        if let Some(want) = model.sync(now()) {
             answered(&mut model, &want);
         }
     }
@@ -247,7 +220,7 @@ fn the_club_and_distance_give_the_mode() {
         json!({ "playerId": 1, "current": "Putter", "currentClubId": "p", "reason": "auto" }),
     );
     model.apply_event(&putter).expect("club");
-    let want = model.sync(own, no_cards).expect("putter");
+    let want = model.sync(now()).expect("putter");
     assert_eq!((want.club, want.mode), (Some(Club::Putter), Mode::Putting));
 }
 
@@ -257,41 +230,39 @@ fn the_club_and_distance_give_the_mode() {
 fn a_held_pick_keeps_the_club_out_of_the_select() {
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
-    let joe = model.sync(own, no_cards).expect("joe");
+    let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
     model.hold_club(true);
     let picked = GolferTurn {
         club: Some(Club::Wood5),
         ..turn_for(&joe)
     };
-    model.flighthook_holds(&picked, Some("flighthook"));
-    assert_eq!(model.sync(own, no_cards), None);
+    model.flighthook_holds(&picked);
+    assert_eq!(model.sync(now()), None);
     // The pick ended with Pureplay keeping the 7 iron: back it goes.
     model.hold_club(false);
-    assert_eq!(model.sync(own, no_cards), Some(joe));
+    assert_eq!(model.sync(now()), Some(joe));
 }
 
-/// Falling behind forgets the unanswered selects and compares the current
-/// turn at once.
+/// A10: a select unanswered for 5 s is forgotten, and the turn is compared
+/// again.
 #[test]
-fn falling_behind_compares_the_current_turn() {
+fn an_unanswered_select_is_forgotten_after_5_s() {
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
-    let joe = model.sync(own, no_cards).expect("joe");
+    let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
-    model.select_sent("web", "w-1");
-    assert_eq!(model.sync(own, no_cards), None, "unanswered");
-    let other = GolferTurn {
+    model.select_sent("w-1", now());
+    model.flighthook_holds(&GolferTurn {
         club: Some(Club::Driver),
         ..turn_for(&joe)
-    };
-    model.lagged(&other, None);
-    assert_eq!(model.sync(own, no_cards), Some(joe));
-    assert!(!model.select_answered("web", "w-1"));
+    });
+    let later = now() + SELECT_FORGOTTEN - Duration::from_millis(1);
+    assert_eq!(model.sync(later), None, "unanswered");
+    assert_eq!(model.sync(now() + SELECT_FORGOTTEN), Some(joe));
+    assert!(!model.select_answered("w-1"));
 }
 
-/// An unknown hand is not sent and not compared; a club type with no code
-/// is sent as `club: null`, and a turn that holds a club differs.
 #[test]
 fn an_unknown_hand_or_club_is_left_out() {
     let mut model = fresh();
@@ -299,7 +270,7 @@ fn an_unknown_hand_or_club_is_left_out() {
     snap.players[0].handedness = Some("Unknown".into());
     snap.players[0].club = Some("Chipper".into());
     model.apply_snapshot(&snap);
-    let want = model.sync(own, no_cards).expect("joe");
+    let want = model.sync(now()).expect("joe");
     assert_eq!((want.club, want.hand), (None, None));
     assert!(want.unmapped);
     let select = want.select("r".into());
@@ -307,51 +278,29 @@ fn an_unknown_hand_or_club_is_left_out() {
     // A turn that already holds no club is the same.
     let mut turn = turn_for(&want);
     turn.club = None;
-    model.select_sent("card", "c");
-    model.flighthook_holds(&turn, Some("card"));
-    model.select_answered("card", "c");
-    assert_eq!(model.sync(own, no_cards), None);
+    model.select_sent("c", now());
+    model.flighthook_holds(&turn);
+    model.select_answered("c");
+    assert_eq!(model.sync(now()), None);
     // The header's club on it is put back to none.
     turn.club = Some(Club::Driver);
-    model.flighthook_holds(&turn, Some("flighthook"));
-    assert!(model.sync(own, no_cards).is_some());
+    model.flighthook_holds(&turn);
+    assert!(model.sync(now()).is_some());
 }
 
-/// Falling behind seeds the cause too: a turn a simulator card caused is
-/// not answered.
-#[test]
-fn falling_behind_keeps_the_cause_of_the_turn() {
-    let gspro = |a: &str| a == "gspro";
-    let mut model = fresh();
-    model.apply_snapshot(&snapshot(1));
-    let joe = model.sync(own, gspro).expect("joe");
-    answered(&mut model, &joe);
-    let from_gspro = GolferTurn {
-        club: Some(Club::Iron8),
-        ..turn_for(&joe)
-    };
-    model.select_sent("web", "w-1");
-    model.lagged(&from_gspro, Some("gspro"));
-    assert_eq!(model.sync(own, gspro), None, "last sender wins");
-    model.lagged(&from_gspro, Some("flighthook"));
-    assert_eq!(model.sync(own, gspro), Some(joe));
-}
-
-/// No turn known is no difference: nothing is sent until the card holds
-/// flighthook's turn, and a turn kept across a reset still counts.
 #[test]
 fn no_known_turn_sends_nothing_and_a_reset_keeps_it() {
     let mut model = Model::default();
     model.apply_snapshot(&snapshot(1));
-    assert_eq!(model.sync(own, no_cards), None);
+    assert_eq!(model.sync(now()), None);
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
-    let joe = model.sync(own, no_cards).expect("joe");
+    let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
     model.forget_held();
     model.reset();
     model.apply_snapshot(&snapshot(1));
-    assert_eq!(model.sync(own, no_cards), None, "the turn is still held");
+    assert_eq!(model.sync(now()), None, "the turn is still held");
 }
 
 /// A stroke's end distance is not the next shot's: across a gimme, the
@@ -361,12 +310,12 @@ fn no_known_turn_sends_nothing_and_a_reset_keeps_it() {
 fn the_mode_takes_its_distance_only_from_the_shot_set_up() {
     let mut model = fresh();
     model.apply_snapshot(&snapshot(1));
-    let joe = model.sync(own, no_cards).expect("joe");
+    let joe = model.sync(now()).expect("joe");
     answered(&mut model, &joe);
     let mut modes = Vec::new();
     let mut step = |model: &mut Model, name: &str, data: serde_json::Value| {
         model.apply_event(&event(name, data)).expect(name);
-        if let Some(want) = model.sync(own, no_cards) {
+        if let Some(want) = model.sync(now()) {
             modes.push((want.club, want.mode));
             answered(model, &want);
         }
@@ -667,7 +616,7 @@ fn a_player_changed_null_keeps_the_club_bag_and_mode() {
                     "clubId": "bag-1-SandWedge", "distanceToHoleM": 15.0, "replacesShotId": null }),
         ))
         .expect("initialized");
-    let want = model.sync(own, no_cards).expect("a select");
+    let want = model.sync(now()).expect("a select");
     assert_eq!(
         (want.club, want.mode),
         (Some(Club::SandWedge), Mode::Chipping)
@@ -691,7 +640,7 @@ fn a_player_changed_null_keeps_the_club_bag_and_mode() {
     assert_eq!(joe.bag, bag);
     assert!(joe.distance.is_some());
     assert_eq!(joe.hand(), Some(Handedness::Left));
-    let want = model.sync(own, no_cards).expect("the new hand");
+    let want = model.sync(now()).expect("the new hand");
     assert_eq!(
         (want.club, want.hand, want.mode),
         (

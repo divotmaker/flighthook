@@ -174,7 +174,10 @@ impl Default for PureplayAccessorySection {
             actor_id: None,
             name: "Pureplay Accessory".into(),
             enabled: true,
-            address: Some("127.0.0.1:9770".into()),
+            driver: PureplayAccessoryConfig {
+                address: Some("127.0.0.1:9770".into()),
+                token_file: None,
+            },
             shots: PureplayShots::Auto,
             impact_lead_s: None,
         }

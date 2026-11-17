@@ -188,7 +188,7 @@ impl FlighthookConfig {
             &mut out,
             "pureplay_accessory",
             &self.pureplay_accessory,
-            |s| (s.enabled, s.address.as_deref()),
+            |s| (s.enabled, s.driver.address.as_deref()),
         );
         out
     }

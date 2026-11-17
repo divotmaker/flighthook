@@ -597,7 +597,7 @@ impl DeviceFormEntry {
         Self {
             name: s.name.clone(),
             enabled: s.enabled,
-            address: s.address.clone().unwrap_or_default(),
+            address: s.driver.address.clone().unwrap_or_default(),
             pureplay_shots: s.shots,
             impact_lead: impact_lead_text(s.impact_lead_s),
             ..Self::blank(id, "pureplay_accessory")

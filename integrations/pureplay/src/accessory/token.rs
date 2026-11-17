@@ -3,7 +3,7 @@
 //! never carry a token.
 //!
 //! The file (`pureplay-tokens.json`) maps a card's normalized address
-//! (flighthook's `address_key`) to its pairing: `{ token, clientId,
+//! ([`key`]) to its pairing: `{ token, clientId,
 //! paired_at }`. Changing a card's address therefore pairs it again. The
 //! file is written atomically (a temporary file, then a rename) and is
 //! readable by its owner only (0600 on Unix; on Windows the per-user data
@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,13 +25,13 @@ use serde::{Deserialize, Serialize};
 pub const FILE_NAME: &str = "pureplay-tokens.json";
 
 /// What replaces a token wherever a frame is logged or shown.
-pub const REDACTED: &str = "<redacted>";
+pub(crate) const REDACTED: &str = "<redacted>";
 
 /// The default token file: `flighthook/pureplay-tokens.json` in the user's
 /// local data folder (`%LOCALAPPDATA%\flighthook`,
 /// `~/.local/share/flighthook`).
 #[must_use]
-pub fn default_path() -> PathBuf {
+pub(crate) fn default_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("flighthook")
@@ -65,7 +66,7 @@ impl fmt::Debug for Token {
 /// text is unchanged, so a redacted frame is otherwise byte for byte the
 /// frame on the wire.
 #[must_use]
-pub fn redact<'a>(text: &str, tokens: impl IntoIterator<Item = &'a Token>) -> String {
+pub(crate) fn redact<'a>(text: &str, tokens: impl IntoIterator<Item = &'a Token>) -> String {
     let mut out = text.to_owned();
     for token in tokens {
         let raw = token.expose();
@@ -92,6 +93,19 @@ struct Entry {
     client_id: String,
     #[serde(default)]
     paired_at: String,
+}
+
+/// The token file key of the card at `addr`: the address as it compares
+/// equal for the same host and port (an IPv4-mapped IPv6 address as IPv4).
+#[must_use]
+pub fn key(addr: SocketAddr) -> String {
+    match addr {
+        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or_else(
+            || addr.to_string(),
+            |v4| SocketAddr::from((v4, v6.port())).to_string(),
+        ),
+        SocketAddr::V4(_) => addr.to_string(),
+    }
 }
 
 /// The token file, read and written whole under a lock.

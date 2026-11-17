@@ -9,18 +9,12 @@
 //!
 //! **The turn the card holds** ([`Want`]) is the active local player's
 //! golfer id, club, hand and mode, sent whole in one `golfer.select`
-//! ([`Model::sync`]):
+//! ([`Model::sync`]) whenever flighthook's turn, as the card is handed it,
+//! differs from it. The host hands the card no turn another game or
+//! simulator card caused, so between those the last sender wins.
 //!
-//! - when Pureplay reports a change of it (snapshot, `turn.changed`,
-//!   `player.changed`, the active local player's `player.club_changed`, a
-//!   `shot.initialized` distance that changes the mode) and flighthook's turn
-//!   differs from it;
-//! - again whenever flighthook's turn differs from it, unless the turn was
-//!   caused by a game or simulator card: between those the last sender wins.
-//!
-//! The golfer differs when the turn's golfer and the player's id do not
-//! resolve to the same golfer (the lookup rule). A remote player up gives
-//! nothing: the turn keeps the last local golfer. The mode is the shared
+//! The golfer differs when the turn's golfer id is not the player's. A
+//! remote player up gives nothing: the turn keeps the last local golfer. The mode is the shared
 //! club + distance rule ([`mode_for_lie`]): the putter putts; a distance to
 //! the hole under 30 yd chips; anything else, an unknown distance included,
 //! is a full swing.
@@ -29,9 +23,11 @@
 //! ([`Model::hold_club`], see [`club_out`](super::club_out)), the card
 //! neither sends nor compares the club. While a `golfer.select` (the card's
 //! own or a pick from outside) awaits its `bus.reply`, the turn on the bus
-//! is not final and nothing is compared with it.
+//! is not final and nothing is compared with it; a select unanswered for
+//! [`SELECT_FORGOTTEN`] is forgotten.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use flightrelay::{Club, GolferId, GolferSelect, GolferTurn, Handedness, Mode};
 
@@ -164,6 +160,10 @@ pub fn golfer_id(id: i64, name: Option<&str>) -> Option<GolferId> {
 /// The golfer namespace the card issues.
 pub const NAMESPACE: &str = "pureplay";
 
+/// How long a `golfer.select` may go unanswered before the card stops
+/// waiting for its `bus.reply`.
+pub const SELECT_FORGOTTEN: Duration = Duration::from_secs(5);
+
 /// The turn the card holds for the active local player.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Want {
@@ -192,10 +192,10 @@ impl Want {
         }
     }
 
-    /// Whether `turn` differs from what the card holds. `key` is the
-    /// lookup rule: the key a golfer id is counted under.
-    pub fn differs(&self, turn: &GolferTurn, key: impl Fn(Option<&str>) -> Option<String>) -> bool {
-        key(turn.golfer.as_ref().map(GolferId::as_str)) != key(Some(self.golfer.as_str()))
+    /// Whether `turn` differs from what the card holds.
+    #[must_use]
+    pub fn differs(&self, turn: &GolferTurn) -> bool {
+        turn.golfer.as_ref() != Some(&self.golfer)
             || self.club.is_some_and(|c| turn.club != Some(c))
             || (self.unmapped && turn.club.is_some())
             || self.hand.is_some_and(|h| turn.handedness != Some(h))
@@ -301,18 +301,15 @@ pub struct Model {
     replaces: Recent<String>,
     scores: BTreeMap<i64, ScoreState>,
     readiness: Option<Readiness>,
-    /// flighthook's turn as the bus last carried it, and what caused it.
-    turn: Option<(GolferTurn, Option<String>)>,
+    /// flighthook's turn as the card was last handed it.
+    turn: Option<GolferTurn>,
     /// A club pick is outstanding: the club is neither sent nor compared.
     club_held: bool,
-    /// Pureplay reported a change of the turn the card holds since the
-    /// last comparison.
-    reported: bool,
-    /// The `golfer.select`s awaiting their `bus.reply`, by sender and
-    /// `ref`: the card's own and the picks from outside. While any is
-    /// unanswered, the turn on the bus is not final and nothing is
+    /// The `golfer.select`s awaiting their `bus.reply`, by `ref`, with when
+    /// each went out: the card's own and the picks from outside. While any
+    /// is unanswered, the turn on the bus is not final and nothing is
     /// compared with it.
-    unanswered: BTreeSet<(String, String)>,
+    unanswered: BTreeMap<String, Instant>,
 }
 
 impl Model {
@@ -436,17 +433,11 @@ impl Model {
         };
         player.club = club;
         player.club_id = club_id;
-        if self.active_local_id() == Some(id) {
-            self.reported = true;
-        }
     }
 
     /// Neither send nor compare the club while `hold` (a club pick is
     /// outstanding). Letting go compares again.
     pub fn hold_club(&mut self, hold: bool) {
-        if self.club_held && !hold {
-            self.reported = true;
-        }
         self.club_held = hold;
     }
 
@@ -470,39 +461,30 @@ impl Model {
         };
     }
 
-    /// Note flighthook's turn and what caused it (also how the card seeds
-    /// itself with the session's turn when it starts).
-    pub fn flighthook_holds(&mut self, turn: &GolferTurn, cause: Option<&str>) {
-        self.turn = Some((turn.clone(), cause.map(str::to_owned)));
+    /// Note flighthook's turn (also how the card is seeded with the
+    /// session's turn when a link starts).
+    pub fn flighthook_holds(&mut self, turn: &GolferTurn) {
+        self.turn = Some(turn.clone());
     }
 
-    /// Note a `golfer.select` sent by `from` with `r#ref`: until its
-    /// `bus.reply`, nothing is compared with flighthook's turn.
-    pub fn select_sent(&mut self, from: &str, r#ref: &str) {
-        self.unanswered.insert((from.to_owned(), r#ref.to_owned()));
+    /// Note a `golfer.select` with `r#ref` that went out at `now` (the
+    /// card's own or a pick from outside): until its `bus.reply`, or for
+    /// [`SELECT_FORGOTTEN`], nothing is compared with flighthook's turn.
+    pub fn select_sent(&mut self, r#ref: &str, now: Instant) {
+        self.unanswered.insert(r#ref.to_owned(), now);
     }
 
-    /// Note the `bus.reply` to the select `r#ref` of `to`. Returns true when
-    /// it was the last one unanswered: the turn on the bus is final (the
-    /// session publishes a turn before its reply).
-    pub fn select_answered(&mut self, to: &str, r#ref: &str) -> bool {
-        self.unanswered.remove(&(to.to_owned(), r#ref.to_owned())) && self.unanswered.is_empty()
-    }
-
-    /// The card's bus receiver fell behind: replies may be lost, so the
-    /// selects awaiting one are forgotten and `turn` (the session's current
-    /// one, with its cause) is what flighthook holds.
-    pub fn lagged(&mut self, turn: &GolferTurn, cause: Option<&str>) {
-        self.unanswered.clear();
-        self.flighthook_holds(turn, cause);
+    /// Note the `bus.reply` to the select `r#ref`. Returns true when it was
+    /// the last one unanswered: the turn on the bus is final (the session
+    /// publishes a turn before its reply).
+    pub fn select_answered(&mut self, r#ref: &str) -> bool {
+        self.unanswered.remove(r#ref).is_some() && self.unanswered.is_empty()
     }
 
     /// Forget the selects awaiting a reply. Called when the connection
-    /// ends. The turn flighthook holds is kept: the card reads the bus the
-    /// whole time, so its copy stays current.
+    /// ends. The turn flighthook holds is kept.
     pub fn forget_held(&mut self) {
         self.unanswered.clear();
-        self.reported = false;
     }
 
     /// The turn the card holds: the active local player's golfer, club,
@@ -520,7 +502,7 @@ impl Model {
         let club = if self.club_held { None } else { held };
         // While a pick holds the club, the mode follows the club picked.
         let mode_club = if self.club_held {
-            self.turn.as_ref().and_then(|(t, _)| t.club)
+            self.turn.as_ref().and_then(|t| t.club)
         } else {
             held
         };
@@ -533,27 +515,19 @@ impl Model {
         })
     }
 
-    /// The `golfer.select` to send now, if any: once every select is
-    /// answered, the card's turn when flighthook's differs from it and
-    /// either Pureplay reported a change or the turn was not caused by a
-    /// game or simulator card (`is_game_card`). `key` is the lookup rule.
-    pub fn sync(
-        &mut self,
-        key: impl Fn(Option<&str>) -> Option<String>,
-        is_game_card: impl Fn(&str) -> bool,
-    ) -> Option<Want> {
+    /// The `golfer.select` to send at `now`, if any: once every select is
+    /// answered (or forgotten), the card's turn when flighthook's differs
+    /// from it.
+    pub fn sync(&mut self, now: Instant) -> Option<Want> {
+        self.unanswered
+            .retain(|_, sent| now.saturating_duration_since(*sent) < SELECT_FORGOTTEN);
         if !self.unanswered.is_empty() {
             return None;
         }
-        let reported = std::mem::take(&mut self.reported);
         let want = self.want()?;
         // No turn known is no difference: the card is seeded with the
-        // session's turn when it starts.
-        let (turn, cause) = self.turn.as_ref()?;
-        if !want.differs(turn, key) {
-            return None;
-        }
-        (reported || !cause.as_deref().is_some_and(is_game_card)).then_some(want)
+        // session's turn when a link starts.
+        want.differs(self.turn.as_ref()?).then_some(want)
     }
 
     /// The hole row: "7, par 4".
@@ -628,12 +602,10 @@ impl Model {
                 score.to_par = p.to_par;
             }
         }
-        self.reported = true;
     }
 
     /// Take a live event. An event the model does not use changes nothing.
     pub fn apply_event(&mut self, event: &Event) -> Result<(), protocol::ParseError> {
-        let before = self.want();
         match event.name.as_str() {
             "turn.changed" => {
                 let t: protocol::TurnChanged = protocol::payload(event)?;
@@ -833,9 +805,6 @@ impl Model {
                 self.scores.clear();
             }
             _ => {}
-        }
-        if self.want() != before {
-            self.reported = true;
         }
         Ok(())
     }

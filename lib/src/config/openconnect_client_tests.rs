@@ -167,7 +167,10 @@ fn every_field() -> FlighthookConfig {
             actor_id: None,
             name: "Pureplay bay".into(),
             enabled: false,
-            address: Some("192.168.1.20:9770".into()),
+            driver: crate::PureplayAccessoryConfig {
+                address: Some("192.168.1.20:9770".into()),
+                token_file: None,
+            },
             shots: PureplayShots::FromPureplay,
             impact_lead_s: Some(3.0),
         }),

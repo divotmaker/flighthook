@@ -909,24 +909,6 @@ impl SystemConfig {
             .in_effect()
     }
 
-    /// The Shots setting of Pureplay Accessory card `actor` (e.g.
-    /// `pureplay_accessory.0`), the default when it has no section. Read
-    /// for every shot and on every pass of the card's loop, so a change
-    /// applies at once.
-    pub fn pureplay_shots(&self, actor: &str) -> flighthook::PureplayShots {
-        actor
-            .strip_prefix("pureplay_accessory.")
-            .and_then(|index| {
-                self.inner
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .pureplay_accessory
-                    .get(index)
-                    .map(|s| s.shots)
-            })
-            .unwrap_or_default()
-    }
-
     /// Number of configured cameras.
     pub fn camera_count(&self) -> usize {
         self.inner

@@ -23,7 +23,7 @@ pub mod trackball;
 pub mod web;
 
 use std::collections::HashMap;
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
@@ -264,21 +264,13 @@ pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor> {
 
     // Pureplay Accessory cards (Pureplay's Accessory API)
     for (index, section) in &config.pureplay_accessory {
-        let id = global_id("pureplay_accessory", index);
-        let addr_str = section
-            .address
-            .as_deref()
-            .unwrap_or(pureplay_accessory::DEFAULT_ADDRESS);
-        match addr_str.parse::<SocketAddr>() {
-            Ok(addr) => actors.push(ResolvedActor {
-                id,
-                name: section.name.clone(),
-                actor: Box::new(pureplay_accessory::PureplayAccessoryActor { addr }),
-            }),
-            Err(e) => {
-                tracing::warn!("device '{id}': invalid address '{addr_str}': {e}");
-            }
-        }
+        actors.push(ResolvedActor {
+            id: global_id("pureplay_accessory", index),
+            name: section.name.clone(),
+            actor: Box::new(pureplay_accessory::PureplayAccessoryActor::new(
+                section.clone(),
+            )),
+        });
     }
 
     // Random club integrations
@@ -384,41 +376,6 @@ pub(crate) fn output_bus_actor(state: &SystemState, card: &str) -> flightrelay::
 /// output, not a camera, the web server or the system actor.
 pub(crate) fn reconnectable(type_key: &str) -> bool {
     !matches!(type_key, "camera" | "webserver" | "system")
-}
-
-/// How often [`connect_tcp`] looks at the shutdown flag.
-const CONNECT_POLL: Duration = Duration::from_millis(50);
-
-/// Connect actor `actor` to `addr` within `timeout`, giving up as soon as
-/// `receiver`'s actor is told to stop: `Ok(None)`. The connect runs on a
-/// thread of its own; one that completes after the actor gave up closes the
-/// connection at once.
-pub(crate) fn connect_tcp(
-    actor: &str,
-    addr: SocketAddr,
-    timeout: Duration,
-    receiver: &BusReceiver,
-) -> std::io::Result<Option<TcpStream>> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name(format!("connect:{actor}"))
-        .spawn(move || {
-            // Nobody waits for the result once the actor stopped: the
-            // stream is dropped, closing it.
-            let _ = tx.send(TcpStream::connect_timeout(&addr, timeout));
-        })?;
-    loop {
-        if receiver.is_shutdown() {
-            return Ok(None);
-        }
-        match rx.recv_timeout(CONNECT_POLL) {
-            Ok(result) => return result.map(Some),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(std::io::Error::other("connect thread ended"));
-            }
-        }
-    }
 }
 
 /// Build a map of actor IDs to display names from config (for UI display).
@@ -559,30 +516,6 @@ mod tests {
             state.stop_all_and_wait(Duration::from_secs(2)),
             Vec::<String>::new()
         );
-    }
-
-    #[test]
-    fn a_connect_returns_the_stream() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let receiver =
-            BusSender::new("mevo.0".into(), broadcast::channel(1).0, Arc::default()).subscribe();
-        let stream = connect_tcp("mevo.0", addr, Duration::from_secs(2), &receiver)
-            .expect("connect")
-            .expect("not stopped");
-        assert_eq!(stream.peer_addr().expect("peer"), addr);
-    }
-
-    #[test]
-    fn a_stopped_actor_gives_up_its_connect_at_once() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let shutdown = Arc::new(AtomicBool::new(true));
-        let receiver =
-            BusSender::new("mevo.0".into(), broadcast::channel(1).0, shutdown).subscribe();
-        let stream =
-            connect_tcp("mevo.0", addr, Duration::from_secs(5), &receiver).expect("no error");
-        assert!(stream.is_none());
     }
 
     #[test]

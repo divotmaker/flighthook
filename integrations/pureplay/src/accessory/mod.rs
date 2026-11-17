@@ -1,36 +1,44 @@
-//! Pureplay's Accessory API (beta): the parts of the Accessory card that are
-//! pure.
+//! Pureplay's Accessory API (beta): the Accessory driver, [`Accessory`].
 //!
 //! Pureplay listens on a WebSocket (`ws://<host>:9770/`, subprotocol
 //! `binary`), sends JSON in binary frames, and takes JSON in text frames.
-//!
-//! - [`protocol`]: the messages, both ways, and their parser.
-//! - [`model`]: the round as the card follows it (players, bags, the turn,
-//!   readiness) and the complete `golfer.select` it derives.
-//! - [`game`]: the model as the bus's `game.*` and `golfer.profile` messages.
-//! - [`club_out`]: a club picked in flighthook on its way to Pureplay.
-//! - [`shots`]: Pureplay's shots as flighthook's, and the map from a
-//!   Pureplay shot to the flighthook shot it stands for.
-//! - [`token`]: the pairing tokens, kept in a file of their own, and their
-//!   redaction.
-//! - [`link`]: [`Link`](link::Link), one connection, and its WebSocket form.
+//! The driver pairs (the token kept in a file of its own, [`token`]),
+//! follows the round, publishes it as the bus's `game` (the `pureplay`
+//! golfer namespace: `golfer.profile`, `game.round`, `game.ball`,
+//! `game.scores`), sends the turn of the local player up as one complete
+//! `golfer.select`, sends a club picked in flighthook to Pureplay, reports
+//! every shot of a local player as its own (`shot.trigger`, `shot.launch`,
+//! `shot.finished`) and Pureplay's result as `game.stroke`, and answers
+//! `game.aim` `unsupported`. Inside the crate: `protocol` (the messages and
+//! their parser), `model` (the round and the select it derives), `game` (the
+//! model as bus messages), `club_out`, `shots` (Pureplay's shots as
+//! flighthook's) and `session` (the driver). [`link`] is one connection,
+//! and its WebSocket form.
 //!
 //! Feature `config` builds [`Config`] only (serde), feature `driver` the rest.
 
 #[cfg(feature = "driver")]
-pub mod club_out;
+pub(crate) mod club_out;
 #[cfg(feature = "driver")]
-pub mod game;
+pub(crate) mod game;
 #[cfg(feature = "driver")]
 pub mod link;
 #[cfg(feature = "driver")]
-pub mod model;
+pub(crate) mod model;
 #[cfg(feature = "driver")]
-pub mod protocol;
+pub(crate) mod protocol;
 #[cfg(feature = "driver")]
-pub mod shots;
+mod session;
+#[cfg(feature = "driver")]
+pub(crate) mod shots;
 #[cfg(feature = "driver")]
 pub mod token;
+
+#[cfg(feature = "driver")]
+pub use session::{Accessory, Error, Session};
+/// How many of Pureplay's recent shots the driver maps to its own.
+#[cfg(feature = "driver")]
+pub use shots::MAP_CAPACITY as SHOTS_KEPT;
 
 use std::net::SocketAddr;
 #[cfg(feature = "driver")]
@@ -46,8 +54,8 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:9770";
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// Pureplay's Accessory address, `ip:port`. Defaults to
-    /// [`DEFAULT_ADDRESS`], and is left out while unset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// [`DEFAULT_ADDRESS`].
+    #[serde(default)]
     pub address: Option<String>,
     /// The token file, for tests; unset uses the user's data folder.
     #[serde(skip)]
@@ -74,6 +82,12 @@ impl DriverConfig for Config {
         self.addr().map(|_| ())
     }
 
+    /// Only another address (or token file) restarts the card: an unset
+    /// address is the default one.
+    fn restart_needed(old: &Self, new: &Self) -> bool {
+        old.addr().ok() != new.addr().ok() || old.token_file != new.token_file
+    }
+
     fn example() -> Self {
         Self {
             address: Some(String::new()),
@@ -82,11 +96,10 @@ impl DriverConfig for Config {
     }
 }
 
-/// `ms` in a build, `test_ms` in tests (this crate's, and a dependent's with
-/// feature `testing`).
+/// `ms` in a build, `test_ms` in this crate's tests.
 #[cfg(feature = "driver")]
 pub(crate) const fn timing(ms: u64, test_ms: u64) -> Duration {
-    if cfg!(any(test, feature = "testing")) {
+    if cfg!(test) {
         Duration::from_millis(test_ms)
     } else {
         Duration::from_millis(ms)

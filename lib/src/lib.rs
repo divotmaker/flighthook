@@ -43,6 +43,11 @@ pub use flighthook_openconnect::client::{
 pub use flighthook_openconnect::server::{
     Config as OpenConnectServerConfig, DEFAULT_BIND as OPENCONNECT_DEFAULT_BIND,
 };
+/// The Pureplay Accessory card's settings, and Pureplay's Accessory address
+/// when none is set.
+pub use flighthook_pureplay::accessory::{
+    Config as PureplayAccessoryConfig, DEFAULT_ADDRESS as PUREPLAY_ACCESSORY_DEFAULT_ADDRESS,
+};
 pub use flighthook_pureplay::connect::{
     Config as PureplayConfig, DEFAULT_ADDRESS as PUREPLAY_DEFAULT_ADDRESS,
 };

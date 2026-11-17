@@ -49,7 +49,7 @@ pub(super) async fn forget_pairing(
     id: &str,
     timeout: Duration,
 ) -> Result<(StatusCode, Json<PostSettingsResponse>), SettingsError> {
-    use crate::actors::pureplay_accessory::{DEFAULT_ADDRESS, token_key};
+    use flighthook_pureplay::accessory::{DEFAULT_ADDRESS, token};
     let id = crate::state::config::canonical_id(id);
     let config = state.root.system.snapshot();
     let section = id
@@ -62,10 +62,10 @@ pub(super) async fn forget_pairing(
             &format!("no Pureplay Accessory card '{id}'"),
         ));
     };
-    let address = section.address.as_deref().unwrap_or(DEFAULT_ADDRESS);
+    let address = section.driver.address.as_deref().unwrap_or(DEFAULT_ADDRESS);
     let key = address
         .parse()
-        .map_or_else(|_| flighthook::address_key(address), token_key);
+        .map_or_else(|_| flighthook::address_key(address), token::key);
     // The guard first: a reconnect already under way keeps the token.
     let (id, in_flight) = begin_reconnect(state, &id)?;
     let tokens = Arc::clone(&state.root.pureplay_tokens);

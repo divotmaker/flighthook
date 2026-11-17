@@ -198,6 +198,19 @@ impl DeviceSection for PureplaySection {
     }
 }
 
+impl DeviceSection for PureplayAccessorySection {
+    type Driver = PureplayAccessoryConfig;
+    const KIND: &'static str = "pureplay_accessory";
+
+    fn driver(&self) -> &PureplayAccessoryConfig {
+        &self.driver
+    }
+
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
+        &config.pureplay_accessory
+    }
+}
+
 /// Deprecated alias of [`OpenConnectClientSection`].
 #[deprecated(note = "use OpenConnectClientSection")]
 pub type GsProSection = OpenConnectClientSection;
@@ -262,8 +275,10 @@ pub struct PureplayAccessorySection {
     /// with the card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
-    /// Pureplay's address, `ip:port`. Defaults to `127.0.0.1:9770`.
-    pub address: Option<String>,
+    /// Pureplay's address (`address`, `ip:port`, defaults to
+    /// `127.0.0.1:9770`).
+    #[serde(flatten)]
+    pub driver: PureplayAccessoryConfig,
     /// Which shots the card takes from Pureplay. Defaults to
     /// [`PureplayShots::Auto`], and is left out of the config file then.
     #[serde(default, skip_serializing_if = "PureplayShots::is_default")]
