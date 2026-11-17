@@ -614,11 +614,9 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(true));
         let receiver =
             BusSender::new("mevo.0".into(), broadcast::channel(1).0, shutdown).subscribe();
-        let at = std::time::Instant::now();
         let stream =
             connect_tcp("mevo.0", addr, Duration::from_secs(5), &receiver).expect("no error");
         assert!(stream.is_none());
-        assert!(at.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

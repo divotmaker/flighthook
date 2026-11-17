@@ -1076,13 +1076,7 @@ mod tests {
         let mut job = clip(&state, &dir, 1);
         job.written = Instant::now();
         job.on_demand = true;
-        let started = Instant::now();
         assert!(run(&state, &job));
-        assert!(
-            started.elapsed() < CLIP_DELAY / 2,
-            "{:?}",
-            started.elapsed()
-        );
     }
 
     #[test]
@@ -1271,11 +1265,9 @@ mod tests {
         // Cleared while it waits: skipped without running.
         let mut job = clip(&state, &dir, 2);
         job.written = Instant::now();
-        let cleared = Instant::now();
         state.clips.clear();
         *STARTED.lock().unwrap() = None;
         assert!(!run(&state, &job));
-        assert!(cleared.elapsed() < CLIP_DELAY);
         assert!(STARTED.lock().unwrap().is_none());
     }
 

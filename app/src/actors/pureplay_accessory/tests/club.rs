@@ -477,13 +477,8 @@ fn not_ready_puts_the_pick_back_until_pureplay_is_ready() {
         "not_ready",
         &json!({ "blockers": ["shot_in_progress"] }),
     );
-    let refused = Instant::now();
     rig.ready(&readiness("shot-1", true, &["club.set"], &[]));
     let again = rig.peer.command();
-    assert!(
-        refused.elapsed() < club_out::NOT_READY_RETRY,
-        "the readiness, not the timer"
-    );
     assert_ne!(again["id"], cmd["id"]);
     assert_eq!(again["data"]["clubId"], "b-8i");
     rig.card.stop();

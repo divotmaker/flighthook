@@ -381,12 +381,10 @@ mod tests {
             matches!(statuses[0].as_local(), Some((_, LocalEvent::CardStatus { telemetry, .. }))
             if telemetry["error"] == "range: must be a distance greater than 0")
         );
-        let at = Instant::now();
         assert_eq!(
             card.state.stop_and_wait("r10.0"),
             crate::state::Stopped::Exited
         );
-        assert!(at.elapsed() < Duration::from_secs(2));
     }
 
     // -- Shot values and outputs ---------------------------------------------

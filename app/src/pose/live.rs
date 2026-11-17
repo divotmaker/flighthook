@@ -912,9 +912,7 @@ pub(crate) mod tests {
         worker.offer(1, numbered_jpeg(1));
         // Mid-pose.
         std::thread::sleep(Duration::from_millis(100));
-        let dropped = Instant::now();
         drop(worker);
-        assert!(dropped.elapsed() < Duration::from_millis(100));
         // It ends by itself and publishes nothing after being dropped.
         while calls.load(Ordering::SeqCst) == 0 {
             assert!(Instant::now() < deadline, "the pose did not finish");

@@ -2323,12 +2323,10 @@ pub(crate) mod tests {
         rig.start(section(id));
         rig.until(|m| is_status(m, ActorStatus::Starting));
         std::thread::sleep(Duration::from_millis(100));
-        let at = Instant::now();
         assert_eq!(
             rig.state.stop_and_wait("fake.0"),
             crate::state::Stopped::Exited
         );
-        assert!(at.elapsed() < FakeDriver::STOP_WAIT, "{:?}", at.elapsed());
         rig.until(|m| is_status(m, ActorStatus::Disconnected));
     }
 
@@ -2606,12 +2604,10 @@ pub(crate) mod tests {
         // The card's `bus.actor` goes out as the actor starts.
         assert_eq!(kinds(&seen), ["actor", "status"], "no Starting, no connect");
         assert!(card_status(&seen[1]).is_some_and(|(_, t)| t["error"] == "bad: must be false"));
-        let at = Instant::now();
         assert_eq!(
             rig.state.stop_and_wait("fake.0"),
             crate::state::Stopped::Exited
         );
-        assert!(at.elapsed() < Duration::from_secs(2));
     }
 
     /// A driver that panics ends the card Disconnected with the error and

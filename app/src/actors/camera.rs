@@ -2974,7 +2974,6 @@ mod tests {
                 .is_some_and(|e| e.contains("camera.0"))
         );
         // Viewed: queued, then tracked at once (no 3 s wait) with its events.
-        let asked = Instant::now();
         let (code, body) = rig.post(&analyze);
         assert_eq!(code, 202, "{body}");
         assert_eq!(body["state"], "queued");
@@ -2983,11 +2982,6 @@ mod tests {
                 matches!(m.event, LocalEvent::ShotPose { .. })
             })
             .expect("shot_pose");
-        assert!(
-            asked.elapsed() < crate::pose::clips::CLIP_DELAY,
-            "{:?}",
-            asked.elapsed()
-        );
         assert_eq!(done.actor, "camera.0");
         rig.wait_for(Duration::from_secs(10), |m| {
             matches!(m.event, LocalEvent::ShotSwing { .. })

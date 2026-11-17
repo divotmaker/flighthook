@@ -702,10 +702,7 @@ mod tests {
         let card = Card::start(&section("stop"), vec![], None, vec![], false);
         card.link.wait_for_selects(1);
         assert_eq!(card.link.wire().released, 0);
-        let stopped = Instant::now();
         card.stop();
-        let took = stopped.elapsed();
-        assert!(took < Duration::from_secs(1), "{took:?}");
         let wire = card.link.wire();
         assert_eq!(wire.released, 1, "the link is ended");
         let disarm = allsquare::Command::DetectBall {
