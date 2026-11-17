@@ -2942,3 +2942,98 @@ fn a_late_snapshot_that_brings_everyone_ends_the_retries() {
     assert_eq!(gets.due(much_later), Ok(None), "nothing asked again");
     assert_eq!((gets.failures, gets.not_before), (0, None));
 }
+
+const MS: Duration = Duration::from_millis(1);
+
+/// Nothing wanted, nothing asked; one request at a time, the next no sooner
+/// than [`STATE_GET_GAP`] after the last, and a want while one is out is
+/// answered by it.
+#[test]
+fn state_gets_go_one_at_a_time_at_least_the_gap_apart() {
+    let mut gets = StateGets::default();
+    let start = Instant::now();
+    assert_eq!(gets.due(start), Ok(None), "nothing wanted");
+    gets.want();
+    let id = gets.due(start).expect("no timeout").expect("a request");
+    gets.want();
+    assert_eq!(gets.due(start + STATE_GET_GAP * 2), Ok(None), "one is out");
+    gets.answered(Some(&id), |_| true);
+    assert_eq!(gets.due(start + STATE_GET_GAP * 3), Ok(None), "answered");
+    gets.want();
+    let early = start + STATE_GET_GAP - MS;
+    assert_eq!(gets.due(early), Ok(None), "within the gap");
+    let next = gets.due(start + STATE_GET_GAP).expect("no timeout");
+    assert!(next.is_some_and(|n| n != id), "a new request after the gap");
+}
+
+/// A request unanswered for [`SNAPSHOT_TIMEOUT`] is given up and sent again
+/// after the next [`STATE_GET_RETRY`] wait, the last one repeating, with
+/// the players it asked for.
+#[test]
+fn an_unanswered_state_get_is_retried_after_a_growing_wait() {
+    let mut gets = StateGets::default();
+    let mut now = Instant::now();
+    gets.want_player(1);
+    let mut id = gets.due(now).expect("no timeout").expect("a request");
+    let waits = [
+        STATE_GET_RETRY[0],
+        STATE_GET_RETRY[1],
+        STATE_GET_RETRY[2],
+        STATE_GET_RETRY[2],
+    ];
+    for wait in waits {
+        assert_eq!(gets.due(now + SNAPSHOT_TIMEOUT - MS), Ok(None), "waiting");
+        now += SNAPSHOT_TIMEOUT;
+        assert_eq!(gets.due(now), Err(id.clone()), "given up");
+        assert_eq!(gets.due(now + wait - MS), Ok(None), "the wait {wait:?}");
+        now += wait;
+        let again = gets.due(now).expect("no timeout").expect("sent again");
+        assert_ne!(again, id);
+        let asked = gets.pending.as_ref().map(|(_, _, p)| p.clone());
+        assert_eq!(asked, Some(BTreeSet::from([1])), "player 1 again");
+        id = again;
+    }
+}
+
+/// A refused request goes again after the next wait, or after
+/// `retryAfterMs` when that is longer.
+#[test]
+fn a_refused_state_get_waits_the_longer_of_the_retry_and_retry_after() {
+    for (retry_after, wait) in [
+        (None, STATE_GET_RETRY[0]),
+        (Some(MS), STATE_GET_RETRY[0]),
+        (Some(STATE_GET_RETRY[2] * 2), STATE_GET_RETRY[2] * 2),
+    ] {
+        let mut gets = StateGets::default();
+        let start = Instant::now();
+        gets.want();
+        let _ = gets.due(start);
+        gets.refused(start, retry_after);
+        assert_eq!(gets.due(start + wait - MS), Ok(None), "{retry_after:?}");
+        let again = gets.due(start + wait).expect("no timeout");
+        assert!(again.is_some(), "{retry_after:?}: sent after {wait:?}");
+    }
+}
+
+/// A player a real snapshot asked for and did not bring is not asked for
+/// again until [`StateGets::clear_not_brought`].
+#[test]
+fn a_player_the_snapshot_did_not_bring_is_asked_for_once_until_cleared() {
+    let mut gets = StateGets::default();
+    let mut now = Instant::now();
+    gets.want_player(9);
+    let id = gets.due(now).expect("no timeout").expect("a request");
+    gets.answered(Some(&id), |_| false);
+    for _ in 0..10 {
+        gets.want_player(9);
+        now += STATE_GET_GAP;
+        assert_eq!(gets.due(now), Ok(None), "player 9 again");
+    }
+    gets.clear_not_brought();
+    gets.want_player(9);
+    now += STATE_GET_GAP;
+    assert!(
+        gets.due(now).expect("no timeout").is_some(),
+        "after a clear"
+    );
+}

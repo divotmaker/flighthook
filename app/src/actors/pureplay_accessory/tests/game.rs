@@ -871,21 +871,6 @@ impl Peer {
             }
         }
     }
-
-    /// Whether the card sends a `state.get` within [`QUIET`].
-    fn asks_for_state(&mut self) -> bool {
-        let until = Instant::now() + QUIET;
-        while Instant::now() < until {
-            match self.ws.read() {
-                Ok(Message::Text(t)) if t.as_str().contains("state.get") => return true,
-                Ok(Message::Binary(b)) if String::from_utf8_lossy(&b).contains("state.get") => {
-                    return true;
-                }
-                _ => {}
-            }
-        }
-        false
-    }
 }
 
 /// [`round`] as match `id`.
@@ -1046,37 +1031,6 @@ fn a_refused_state_get_is_asked_again_after_a_wait() {
     card.stop();
 }
 
-/// Requests that get no snapshot are paced by a growing wait, never one
-/// per event.
-#[test]
-fn unanswered_state_gets_are_paced() {
-    let (mut card, mut peer, _tx, _mock) = rig();
-    first_match_with_a_shot(&mut card, &mut peer);
-    second_match_events(&mut peer, 5);
-    let _ = peer.state_get();
-    let mut at = vec![Instant::now()];
-    let deadline = Instant::now() + WAIT * 2;
-    let mut seq = 9;
-    while at.len() < 4 {
-        assert!(Instant::now() < deadline, "no request after {at:?}");
-        player_one_named(&mut peer, seq, 1);
-        seq += 1;
-        if peer.asks_for_state() {
-            at.push(Instant::now());
-        }
-    }
-    let gaps: Vec<Duration> = at.windows(2).map(|w| w[1] - w[0]).collect();
-    // The test sees a request up to [`QUIET`] late.
-    for (gap, retry) in gaps.iter().zip(STATE_GET_RETRY) {
-        assert!(
-            *gap + QUIET >= SNAPSHOT_TIMEOUT + retry,
-            "{gaps:?}: a request goes out only after the timeout and the wait"
-        );
-    }
-    assert!(gaps[2] > gaps[0], "{gaps:?}: the wait grows");
-    card.stop();
-}
-
 /// A player named while a request is out is asked for by the next request
 /// when the answer does not bring them, not marked.
 #[test]
@@ -1111,10 +1065,6 @@ fn a_player_named_while_a_request_is_out_is_asked_for_by_the_next() {
 fn an_event_naming_an_unknown_player_asks_for_the_state() {
     let (mut card, mut peer, _tx, _mock) = rig();
     first_match_with_a_shot(&mut card, &mut peer);
-    assert!(
-        !peer.asks_for_state(),
-        "nothing is asked while nothing is wanted"
-    );
     peer.event(
         "turn.changed",
         5,
@@ -1376,11 +1326,12 @@ fn a_reconnect_into_the_results_screen_leaves_the_turn_alone() {
     card.stop();
 }
 
-/// A player the last snapshot did not bring is asked for once: a stream of
-/// events naming them sends one `state.get` until a new match, a context
-/// change, a join or a reconnect.
+/// An event naming a player the card does not hold asks for them, and a
+/// context change lets the card ask for them again after a snapshot left
+/// them out. That nothing more is asked before it is
+/// `a_player_the_snapshot_did_not_bring_is_asked_for_once_until_cleared`.
 #[test]
-fn a_player_the_snapshot_did_not_bring_is_asked_for_once() {
+fn a_player_the_snapshot_did_not_bring_is_asked_for_again_after_a_context_change() {
     let (mut card, mut peer, _tx, _mock) = rig();
     card.turn_until(is_joe);
     card.caught_up(&mut peer);
@@ -1397,24 +1348,16 @@ fn a_player_the_snapshot_did_not_bring_is_asked_for_once() {
         &json!({ "type": "event", "event": "state.snapshot", "seq": 3,
                        "requestId": get["id"], "data": round() }),
     );
-    for seq in 4..14 {
-        names_nine(&mut peer, seq);
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    assert!(!peer.asks_for_state(), "asked for player 9 again");
-    // A context change clears it: once its own request is answered, the
-    // next event naming player 9 asks for them again.
-    peer.event("context.invalidated", 14, &json!({ "reason": "loading" }));
+    // Once the context change's own request is answered, the next event
+    // naming player 9 asks for them again.
+    peer.event("context.invalidated", 4, &json!({ "reason": "loading" }));
     let get = peer.state_get();
     peer.send(
-        &json!({ "type": "event", "event": "state.snapshot", "seq": 15,
+        &json!({ "type": "event", "event": "state.snapshot", "seq": 5,
                        "requestId": get["id"], "data": round() }),
     );
-    std::thread::sleep(Duration::from_millis(200));
-    names_nine(&mut peer, 16);
-    assert!(
-        peer.asks_for_state(),
-        "player 9 is asked for again after the context change"
-    );
+    names_nine(&mut peer, 6);
+    let again = peer.state_get();
+    assert_ne!(again["id"], get["id"], "player 9 asked for again");
     card.stop();
 }
