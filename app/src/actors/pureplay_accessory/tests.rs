@@ -359,6 +359,27 @@ impl Mock {
     fn next(&self) -> Peer {
         self.conns.recv_timeout(WAIT).expect("the card connects")
     }
+
+    /// How many connections the listener took that the test has not:
+    /// a sentinel client connects last, and the listener takes connections
+    /// in order, so every one handed over before the sentinel's came first.
+    fn untaken(&self) -> usize {
+        let mut request = format!("ws://{}/", self.addr)
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            tungstenite::http::HeaderValue::from_static("binary"),
+        );
+        let stream = std::net::TcpStream::connect(self.addr).expect("connect");
+        let sentinel = stream.local_addr().expect("addr");
+        let _client = tungstenite::client(request, stream).expect("handshake");
+        let mut before = 0;
+        while self.next().ws.get_ref().peer_addr().expect("peer") != sentinel {
+            before += 1;
+        }
+        before
+    }
 }
 
 // -- The bus as the tests read it ----------------------------------------------
@@ -786,6 +807,25 @@ impl Card {
                 && pred(&msg.event)
             {
                 return msg;
+            }
+        }
+    }
+
+    /// Send `bus.sync` and wait for the card's `bus.actor` answer: the card
+    /// has drained the bus since.
+    fn synced(&mut self) {
+        let _ = self.tx.send(BusMsg::frp(flightrelay::FrpMessage::new(
+            "test",
+            flightrelay::BusSync::new(),
+        )));
+        let deadline = Instant::now() + WAIT;
+        loop {
+            assert!(Instant::now() < deadline, "the card never answered");
+            if let Some(msg) = self.step()
+                && msg.actor == ACTOR
+                && matches!(msg.event, FlighthookEvent::BusActor(_))
+            {
+                return;
             }
         }
     }
@@ -1292,6 +1332,34 @@ fn a_refusal_is_disconnected_with_its_reason_and_not_retried() {
         card.shows_row(ActorStatus::Disconnected, "pairing", text);
         card.stop();
     }
+}
+
+/// A refused card carries out its wait for Reconnect: once stopped, it
+/// never connected again. Denied while it asks, and refused on a paired
+/// connection (the token kept, so only the wait keeps it from asking).
+#[test]
+fn a_refused_card_does_not_connect_again() {
+    let mock = Mock::new();
+    let mut card = Card::start(mock.addr, new_state());
+    let mut peer = mock.next();
+    peer.hello();
+    assert_eq!(peer.pair(), None);
+    peer.refuse(Some(protocol::PAIR_ID), "unauthorised", &json!({}));
+    peer.close(4403);
+    card.shows_row(ActorStatus::Disconnected, "pairing", DENIED);
+    card.stop_and_join();
+    assert_eq!(mock.untaken(), 0);
+
+    let mock = Mock::new();
+    let (mut card, peer) = connected(&mock, new_state(), "PPA-KEPT");
+    peer.close(4403);
+    card.shows_row(ActorStatus::Disconnected, "pairing", DENIED);
+    assert!(card.tokens().get(&token_key(mock.addr)).is_some());
+    // The card drains the bus only once it acted on the refusal: waiting,
+    // or (were it to ask again) with its next connection under way.
+    card.synced();
+    card.stop_and_join();
+    assert_eq!(mock.untaken(), 0);
 }
 
 /// Pureplay's cooldown: the wait counts down, then the card asks once
