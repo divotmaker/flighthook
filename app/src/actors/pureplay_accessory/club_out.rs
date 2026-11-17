@@ -971,4 +971,132 @@ mod tests {
             "from the 7 iron toward the wedge"
         );
     }
+
+    /// A refusal of command `n` with `error`.
+    fn refused(n: usize, error: serde_json::Value) -> Response {
+        Response {
+            id: Some(format!("c-{n}")),
+            ok: false,
+            data: json!(null),
+            error: Some(serde_json::from_value(error).expect("error")),
+        }
+    }
+
+    /// Pureplay's readiness changes to `readiness`: the model takes the
+    /// event after club out has seen it, as the card does.
+    fn ready_changed(out: &mut ClubOut, model: &mut Model, readiness: serde_json::Value) {
+        let event = protocol::Event {
+            name: "shot.ready_changed".into(),
+            data: readiness,
+            ..protocol::Event::default()
+        };
+        assert!(out.before_event(&event).is_empty());
+        model.apply_event(&event).expect("event");
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// With no new readiness, a pick answered `not_ready` goes again
+    /// [`NOT_READY_RETRY`] later, [`NOT_READY_RETRIES`] times; the next
+    /// `not_ready` drops it.
+    #[test]
+    fn not_ready_is_retried_on_the_timer_then_dropped() {
+        let mut model = model_with(bag(), "Iron7", ready());
+        let mut out = linked(&["club.set"]);
+        let mut now = Instant::now();
+        assert_eq!(sent(&out.pick(Club::SandWedge, &model, now)).len(), 1);
+        for n in 1..=NOT_READY_RETRIES as usize {
+            let acts = out
+                .reply(&refused(n, json!({ "code": "not_ready" })), &mut model, now)
+                .expect("ours");
+            assert!(acts.is_empty(), "retry {n} waits");
+            assert!(out.holds_club(), "retry {n} pending");
+            assert!(out.drive(&model, now + NOT_READY_RETRY - ms(1)).is_empty());
+            now += NOT_READY_RETRY;
+            let again = sent(&out.drive(&model, now));
+            assert_eq!(again.len(), 1, "retry {n}");
+            assert_eq!(again[0]["data"]["clubId"], "sw-1");
+        }
+        let n = NOT_READY_RETRIES as usize + 1;
+        let acts = out
+            .reply(&refused(n, json!({ "code": "not_ready" })), &mut model, now)
+            .expect("ours");
+        assert_eq!(acts, [Action::SnapBack]);
+        assert!(!out.holds_club());
+        assert!(out.drive(&model, now + NOT_READY_RETRY * 2).is_empty());
+    }
+
+    /// After `not_ready`, a new readiness sends the pick at once: the
+    /// readiness, not the timer.
+    #[test]
+    fn not_ready_goes_again_at_the_next_readiness_ahead_of_the_timer() {
+        let mut model = model_with(bag(), "Iron7", ready());
+        let mut out = linked(&["club.set"]);
+        let now = Instant::now();
+        assert_eq!(sent(&out.pick(Club::SandWedge, &model, now)).len(), 1);
+        let not_ready = json!({ "code": "not_ready", "blockers": ["shot_in_progress"] });
+        assert!(
+            out.reply(&refused(1, not_ready), &mut model, now)
+                .expect("ours")
+                .is_empty()
+        );
+        ready_changed(&mut out, &mut model, ready());
+        let again = sent(&out.drive(&model, now));
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0]["id"], "c-2");
+        assert_eq!(again[0]["data"]["clubId"], "sw-1");
+    }
+
+    /// `rate_limited` is retried once, after `retryAfterMs` or a short wait
+    /// when it names none; a second one drops the pick.
+    #[test]
+    fn rate_limited_is_retried_once_after_its_wait() {
+        for (error, wait) in [
+            (
+                json!({ "code": "rate_limited", "retryAfterMs": 300 }),
+                ms(300),
+            ),
+            (json!({ "code": "rate_limited" }), RATE_LIMIT_WAIT),
+        ] {
+            let mut model = model_with(bag(), "Iron7", ready());
+            let mut out = linked(&["club.set"]);
+            let now = Instant::now();
+            assert_eq!(sent(&out.pick(Club::SandWedge, &model, now)).len(), 1);
+            let acts = out
+                .reply(&refused(1, error.clone()), &mut model, now)
+                .expect("ours");
+            assert!(acts.is_empty(), "{error}");
+            assert!(out.drive(&model, now + wait - ms(1)).is_empty(), "{error}");
+            let again = sent(&out.drive(&model, now + wait));
+            assert_eq!(again.len(), 1, "{error}");
+            let acts = out
+                .reply(&refused(2, error.clone()), &mut model, now + wait)
+                .expect("ours");
+            assert_eq!(acts, [Action::SnapBack], "{error}: one retry");
+            assert!(out.drive(&model, now + wait * 3).is_empty(), "{error}");
+        }
+    }
+
+    /// A command unanswered for [`COMMAND_TIMEOUT`] drops the pick; a reply
+    /// after that answers nothing of the card's.
+    #[test]
+    fn an_unanswered_command_drops_the_pick_and_a_late_reply_is_ignored() {
+        let mut model = model_with(bag(), "Iron7", ready());
+        let mut out = linked(&["club.set"]);
+        let now = Instant::now();
+        assert_eq!(sent(&out.pick(Club::SandWedge, &model, now)).len(), 1);
+        assert!(out.drive(&model, now + COMMAND_TIMEOUT - ms(1)).is_empty());
+        assert!(out.holds_club());
+        let later = now + COMMAND_TIMEOUT;
+        assert_eq!(out.drive(&model, later), [Action::SnapBack]);
+        assert!(!out.holds_club());
+        assert_eq!(
+            out.reply(&step_reply(1, "SandWedge", "sw-1"), &mut model, later),
+            None
+        );
+        let held = model.player(1).and_then(|p| p.club.as_deref());
+        assert_eq!(held, Some("Iron7"), "the late reply changes nothing");
+    }
 }

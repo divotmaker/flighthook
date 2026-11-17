@@ -484,53 +484,6 @@ fn not_ready_puts_the_pick_back_until_pureplay_is_ready() {
     rig.card.stop();
 }
 
-/// With no new readiness, a pick answered `not_ready` is sent again on a
-/// timer, three times; the fourth `not_ready` drops it and Pureplay's club
-/// goes back on the bus.
-#[test]
-fn not_ready_is_retried_on_a_timer_three_times_then_dropped() {
-    let mut rig = Rig::new();
-    rig.pick(Club::Iron8);
-    let mut cmd = rig.peer.command();
-    for retry in 1..=club_out::NOT_READY_RETRIES {
-        rig.refuse(&cmd, "not_ready", &json!({}));
-        let refused = Instant::now();
-        let again = rig.peer.command();
-        assert!(
-            refused.elapsed() >= club_out::NOT_READY_RETRY - Duration::from_millis(50),
-            "retry {retry} waits for the timer"
-        );
-        assert_eq!(again["data"]["clubId"], "b-8i", "retry {retry}");
-        cmd = again;
-    }
-    rig.refuse(&cmd, "not_ready", &json!({}));
-    rig.snaps_back_to(Club::Iron7);
-    let sent = rig.peer.commands_within(club_out::NOT_READY_RETRY * 2);
-    assert!(sent.is_empty(), "dropped: {sent:?}");
-    rig.card.stop();
-}
-
-/// `rate_limited` is retried once after `retryAfterMs`; a second one drops
-/// the pick and puts Pureplay's club back.
-#[test]
-fn rate_limited_is_retried_once_after_its_wait() {
-    let mut rig = Rig::new();
-    rig.pick(Club::Iron8);
-    let cmd = rig.peer.command();
-    let refused = Instant::now();
-    rig.refuse(&cmd, "rate_limited", &json!({ "retryAfterMs": 300 }));
-    let again = rig.peer.command();
-    assert!(
-        refused.elapsed() >= Duration::from_millis(300),
-        "after the wait"
-    );
-    assert_eq!(again["data"]["clubId"], "b-8i");
-    rig.refuse(&again, "rate_limited", &json!({ "retryAfterMs": 50 }));
-    rig.snaps_back_to(Club::Iron7);
-    rig.no_command("one retry");
-    rig.card.stop();
-}
-
 /// Every refusal drops the pick and puts Pureplay's club back on the bus;
 /// so does a club not in the bag and a command left unanswered.
 /// `forbidden_scope` also turns club out off.
@@ -962,35 +915,6 @@ fn a_snapshot_after_a_gap_keeps_or_drops_the_pending_pick() {
         }
         rig.card.stop();
     }
-}
-
-/// A reply after the command timed out is ignored: nothing is sent and
-/// nothing goes on the bus for it.
-#[test]
-fn a_reply_after_the_timeout_is_ignored() {
-    let mut rig = Rig::new();
-    rig.pick(Club::Iron8);
-    let cmd = rig.peer.command();
-    rig.snaps_back_to(Club::Iron7);
-    let from = rig.card.sent.len();
-    rig.ok(&cmd, "Iron8", "b-8i");
-    rig.no_command("the late reply");
-    assert_eq!(rig.clubs_since(from), []);
-    rig.card.shows_row(ActorStatus::Connected, "club", "7I");
-    rig.card.stop();
-}
-
-/// `rate_limited` without `retryAfterMs` is retried after a short wait.
-#[test]
-fn rate_limited_without_a_wait_is_retried() {
-    let mut rig = Rig::new();
-    rig.pick(Club::Iron8);
-    let cmd = rig.peer.command();
-    rig.refuse(&cmd, "rate_limited", &json!({}));
-    let again = rig.peer.command();
-    assert_ne!(again["id"], cmd["id"]);
-    assert_eq!(again["data"]["clubId"], "b-8i");
-    rig.card.stop();
 }
 
 /// A club picked while the card is between connections is not sent at the
