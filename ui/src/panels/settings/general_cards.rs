@@ -534,7 +534,7 @@ impl FlighthookApp {
             }
             ui.horizontal(|ui| {
                 field_label(ui, "Temperature:").on_hover_text(
-                    "Air temperature, -30 to 50 °C (-22 to 122 °F). Defaults to 25 °C (77 °F).",
+                    "Air temperature, -30 to 50 °C (-22 to 122 °F). Defaults to 15 °C (59 °F).",
                 );
                 sim_changed |= ui
                     .add(

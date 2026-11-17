@@ -125,7 +125,7 @@ fn absent_section_parses_to_defaults() {
     assert_eq!(c.simulation, SimulationSection::default());
     assert_eq!(c.simulation.mode, SimMode::On);
     assert_eq!(c.simulation.altitude.as_meters(), 0.0);
-    assert_eq!(c.simulation.temperature_c, 25.0);
+    assert_eq!(c.simulation.temperature_c, 15.0);
     assert_eq!(c.simulation.surface, SimSurface::Fairway);
     assert_eq!(c, FlighthookConfig::default());
 }
@@ -134,7 +134,7 @@ fn absent_section_parses_to_defaults() {
 fn partial_section_fills_defaults() {
     let s: SimulationSection = serde_json::from_str(r#"{"mode":"off"}"#).expect("parses");
     assert_eq!(s.mode, SimMode::Off);
-    assert_eq!(s.temperature_c, 25.0);
+    assert_eq!(s.temperature_c, 15.0);
     let s: SimulationSection =
         serde_json::from_str(r#"{"altitude":"5280ft","surface":"firm_green"}"#).expect("parses");
     assert_eq!(s.mode, SimMode::On);

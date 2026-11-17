@@ -665,9 +665,7 @@ fn out_of_range_environment_is_not_simulated() {
 
 fn assert_matches_dimple(input: &ShotInput) -> DerivedFlight {
     let d = derive(&from_input(input), &cfg()).expect("simulated");
-    let mut env = Environment::SEA_LEVEL;
-    env.temperature_c = 25.0;
-    let shot = simulate_shot(input, &BallModel::TOUR, &env, &Surface::FAIRWAY);
+    let shot = simulate_shot(input, &aero(&cfg()), &Surface::FAIRWAY);
     assert_eq!(shot.ground.termination, Termination::Rest);
     let f = &shot.flight;
     let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
@@ -677,12 +675,15 @@ fn assert_matches_dimple(input: &ShotInput) -> DerivedFlight {
     assert!(close(d.flight_time.expect("time"), f.flight_time));
     assert!(close(
         d.descent_angle.expect("descent"),
-        ShotStats::from_shot(&shot).descent_angle_deg
+        f.descent_angle_deg
     ));
     assert!(close(m(d.roll_distance), shot.total_m - f.carry_m));
-    assert!(close(m(d.roll_offline), shot.final_pos.z - f.lateral_m));
+    assert!(close(
+        m(d.roll_offline),
+        shot.ground.rest.pos.z - f.lateral_m
+    ));
     assert!(close(m(d.total_distance), shot.total_m));
-    assert!(close(m(d.total_offline), shot.final_pos.z));
+    assert!(close(m(d.total_offline), shot.ground.rest.pos.z));
     d
 }
 
@@ -778,11 +779,8 @@ fn log_line_prints_present_fields_in_order_with_signs() {
 /// The raw simulated path for `b` under the default settings.
 fn raw_path(b: &Ball) -> FullPath {
     let c = cfg();
-    let mut env = Environment::SEA_LEVEL;
-    env.altitude_m = c.altitude.as_meters();
-    env.temperature_c = c.temperature_c;
     let input = shot_input(b).expect("simulatable");
-    let shot = simulate_shot(&input, &BallModel::TOUR, &env, &surface(c.surface));
+    let shot = simulate_shot(&input, &aero(&c), &surface(c.surface));
     let rest = shot.ground.termination == Termination::Rest;
     FullPath::from_shot(&shot, rest)
 }

@@ -165,7 +165,7 @@ fn fresh_config_simulation_holds_only_actor_id() {
 #[test]
 fn simulation_with_explicit_defaults_loads() {
     let file = format!(
-        "[simulation]\nmode = \"on\"\naltitude = \"0ft\"\ntemperature_c = 25.0\nsurface = \"fairway\"\nauto_chip = false\n{GOLDEN_DEFAULT_TOML}"
+        "[simulation]\nmode = \"on\"\naltitude = \"0ft\"\ntemperature_c = 15.0\nsurface = \"fairway\"\nauto_chip = false\n{GOLDEN_DEFAULT_TOML}"
     );
     let c: FlighthookConfig = toml::from_str(&file).expect("parses");
     assert_eq!(c.simulation, flighthook::SimulationSection::default());

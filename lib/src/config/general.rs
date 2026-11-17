@@ -42,7 +42,7 @@ pub struct SimulationSection {
         skip_serializing_if = "is_zero_altitude"
     )]
     pub altitude: Distance,
-    /// Air temperature, degrees Celsius. Defaults to 25; omitted from the
+    /// Air temperature, degrees Celsius. Defaults to 15; omitted from the
     /// file and the API while at the default. Valid range: -30 to 50.
     #[serde(
         default = "default_sim_temperature_c",
@@ -150,8 +150,8 @@ impl Default for SimulationSection {
 }
 
 impl SimulationSection {
-    /// Default air temperature (°C): the ball model's calibration point.
-    pub const DEFAULT_TEMPERATURE_C: f64 = 25.0;
+    /// Default air temperature (°C): standard air at sea level.
+    pub const DEFAULT_TEMPERATURE_C: f64 = 15.0;
     /// Highest accepted altitude (m).
     pub const MAX_ALTITUDE_M: f64 = 5000.0;
     /// Lowest accepted temperature (°C).

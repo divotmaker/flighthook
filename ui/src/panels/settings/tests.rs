@@ -358,7 +358,7 @@ fn simulation_form_round_trips_defaults_exactly() {
     }
     let imperial =
         SimulationForm::from_section(&SimulationSection::default(), UnitSystem::Imperial);
-    assert_eq!(imperial.temperature_val, "77");
+    assert_eq!(imperial.temperature_val, "59");
     assert_eq!(imperial.temperature_unit(), "°F");
 }
 

@@ -39,12 +39,9 @@
 
 use std::sync::Mutex;
 
-use dimple::Vec3;
-use dimple::aero::BallModel;
-use dimple::environment::Environment;
 use dimple::ground::{BallState, GroundModel, GroundResult, Surface, Termination};
-use dimple::stats::ShotStats;
 use dimple::trajectory::{ShotInput, ShotResult, simulate_shot};
+use dimple::{Tour, Vec3, Wind, standard_air_density};
 use flighthook::{
     Basis, DerivedFlight, Distance, FlightPath, FlightResult, Launch, Mode, SimMode, SimSurface,
     SimulationSection,
@@ -214,10 +211,9 @@ fn derive_with_error(
             return None;
         }
     };
-    let env = environment(cfg);
-    let shot = simulate_shot(&input, &BallModel::TOUR, &env, &surface(cfg.surface));
+    let shot = simulate_shot(&input, &aero(cfg), &surface(cfg.surface));
     let f = &shot.flight;
-    let descent = ShotStats::from_shot(&shot).descent_angle_deg;
+    let descent = f.descent_angle_deg;
     let flight_ok = f.flight_time > 0.0
         && f.points.len() >= 2
         && [f.flight_time, f.carry_m, f.apex_m, f.lateral_m, descent]
@@ -230,7 +226,7 @@ fn derive_with_error(
 
     let rest = shot.ground.termination == Termination::Rest
         && shot.total_m.is_finite()
-        && shot.final_pos.z.is_finite();
+        && shot.ground.rest.pos.z.is_finite();
     let raw = FullPath::from_shot(&shot, rest);
     let force = cfg.mode == SimMode::Force;
     let measured = if force {
@@ -289,7 +285,7 @@ fn derive_with_error(
         // a measured landing, so neither offline is shown.
         let total_offline = match anchored.as_ref().and_then(|p| p.ground.last()) {
             Some(r) => Some(r[3]),
-            None if measured.offline.is_none() => Some(shot.final_pos.z),
+            None if measured.offline.is_none() => Some(shot.ground.rest.pos.z),
             None => None,
         };
         if let Some(total_offline) = total_offline {
@@ -307,15 +303,13 @@ fn derive_with_error(
     (!d.is_empty()).then_some(d)
 }
 
-/// The `dimple` environment for `cfg`: its altitude and temperature over
-/// `Environment::SEA_LEVEL`. The temperature default is the ball model's
-/// 25 C calibration point (not sea level's 15 C), carried in the config
-/// default.
-pub(crate) fn environment(cfg: &SimulationSection) -> Environment {
-    let mut env = Environment::SEA_LEVEL;
-    env.altitude_m = cfg.altitude.as_meters();
-    env.temperature_c = cfg.temperature_c;
-    env
+/// The `dimple` aero model for `cfg`: still air at the standard density for
+/// its altitude and temperature.
+pub(crate) fn aero(cfg: &SimulationSection) -> Tour {
+    Tour::new(
+        standard_air_density(cfg.altitude.as_meters(), cfg.temperature_c),
+        Wind::None,
+    )
 }
 
 /// The anchored path when there is one and every point is finite; logs why
@@ -385,13 +379,11 @@ fn derive_ground_ball(
         vel: Vec3::new(speed * az.cos(), 0.0, speed * az.sin()),
         spin: Vec3::ZERO,
     };
-    let env = environment(cfg);
-    let ground = surface.settle(&start, &BallModel::TOUR, env.air_density());
-    let p = ground.rest.pos;
+    let ground = surface.settle(&start, &aero(cfg));
     let rest = ground.termination == Termination::Rest
-        && p.x.is_finite()
-        && p.y.is_finite()
-        && p.z.is_finite();
+        && [ground.rest.pos.x, ground.rest.pos.y, ground.rest.pos.z]
+            .iter()
+            .all(|v| v.is_finite());
     let raw = FullPath::new(vec![[0.0; 4]], &ground, rest);
     let force = cfg.mode == SimMode::Force;
     let measured = if force {

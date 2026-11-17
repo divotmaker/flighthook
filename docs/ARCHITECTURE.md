@@ -4031,10 +4031,10 @@ failed reply shows in the error banner above the tabs (`Auto-Chip: <status>
 before when the setting is turned off.
 
 On the server (`app/src/autochip.rs`), `solve_speed` bisects the ball speed
-(0.1-60 mph, to 1e-4 mph) at which dimple, with the `[simulation]`
-environment and surface and `BallModel::TOUR`, rests at the chosen total
-for a straight 45° launch with backspin `round(SPIN_PER_MPH (300) ×
-mph)` and no sidespin; the total rises with speed. `send` publishes the
+(0.1-60 mph, to 1e-4 mph) at which dimple, with its `Tour` model at the
+`[simulation]` altitude and temperature and the `[simulation]` surface, rests
+at the chosen total for a straight 45° launch with backspin
+`round(SPIN_PER_MPH (300) × mph)` and no sidespin; the total rises with speed. `send` publishes the
 Auto-Chip launch monitor's `bus.actor` (source `virtual`), `shot.trigger`,
 `shot.launch`, a modeled `shot.flight` (simulated whatever `[simulation]
 mode`, `off` included, in Chipping mode), a local `ShotCapture` and

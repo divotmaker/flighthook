@@ -16,7 +16,6 @@
 //! flighthook's, so its own flight (`basis: modeled`, model [`MODEL`])
 //! always carries the simulated values, whatever the `[simulation]` mode.
 
-use dimple::aero::BallModel;
 use dimple::ground::Termination;
 use dimple::trajectory::{ShotInput, simulate_shot};
 use flighthook::{AUTO_CHIP_ACTOR, Launch, Mode, ShotKey, ShotRaw, SimulationSection, Velocity};
@@ -101,12 +100,7 @@ fn simulated_total_m(speed_mph: f64, cfg: &SimulationSection) -> Option<f64> {
         backspin_rpm: f64::from(backspin_rpm(speed_mph)),
         sidespin_rpm: 0.0,
     };
-    let shot = simulate_shot(
-        &input,
-        &BallModel::TOUR,
-        &sim::environment(cfg),
-        &sim::surface(cfg.surface),
-    );
+    let shot = simulate_shot(&input, &sim::aero(cfg), &sim::surface(cfg.surface));
     (shot.ground.termination == Termination::Rest && shot.total_m.is_finite())
         .then_some(shot.total_m)
 }

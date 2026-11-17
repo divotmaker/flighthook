@@ -1840,7 +1840,7 @@ Full persisted config (mirrors `config.toml`).
 - `simulation` (beta) holds the settings for simulated values: `mode`
   ([`SimMode`](#simmode), default `"on"`, omitted while `"on"`), `altitude`
   (unit-tagged distance, default `"0ft"`, valid 0 to 5000 m), `temperature_c`
-  (default `25.0`, valid -30 to 50) and `surface` ([`SimSurface`](#simsurface),
+  (default `15.0`, valid -30 to 50) and `surface` ([`SimSurface`](#simsurface),
   default `"fairway"`) and `auto_chip` (boolean, default `false`, omitted
   while `false`): whether the dashboard offers [Auto-chip](#post-apiauto-chip)
   and `POST /api/auto-chip` accepts a chip. Off by default; turn it on in
