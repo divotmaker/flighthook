@@ -391,7 +391,7 @@ fn a_pending_pick_is_dropped_with_the_connection() {
         rig.card
             .shows_row(ActorStatus::Connected, "blockers", "shot in progress");
         rig.pick(Club::Iron8);
-        rig.no_command("not ready");
+        rig.session_holds(Club::Iron8);
         drop(rig.peer);
         rig.card.shows(ActorStatus::Reconnecting, |_| true);
         let mut peer = rig.mock.next();
@@ -400,8 +400,9 @@ fn a_pending_pick_is_dropped_with_the_connection() {
         peer.paired_with(TOKEN, &["read", "control"]);
         peer.subscribe(&round(), 1);
         rig.card.shows_row(ActorStatus::Connected, "club", "7I");
-        let sent = peer.commands_within(QUIET);
-        assert!(sent.is_empty(), "{instance}: {sent:?}");
+        // The first command is a later pick's, not the dropped one's.
+        send_club(&rig.tx, "web", Club::Driver);
+        assert_eq!(peer.command()["data"]["clubId"], "b-dr", "{instance}");
         rig.card.stop();
     }
 }
@@ -562,7 +563,6 @@ fn the_club_out_row_says_whether_picks_reach_pureplay() {
         rig.card.shows_row(ActorStatus::Connected, "club_out", row);
         rig.pick(Club::Iron8);
         rig.snaps_back_to(Club::Iron7);
-        rig.no_command(row);
         rig.card.stop();
     }
 }

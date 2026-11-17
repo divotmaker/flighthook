@@ -1230,4 +1230,48 @@ mod tests {
         let acts = out.pick(Club::PitchingWedge, &model, Instant::now());
         assert_eq!(acts, [Action::SnapBack], "not in the bag");
     }
+
+    /// While club out is not usable a pick sends nothing and puts
+    /// Pureplay's club back.
+    #[test]
+    fn a_pick_while_club_out_is_not_on_only_snaps_back() {
+        let model = model_with(bag(), "Iron7", ready());
+        let off = model_with(bag(), "Iron7", json!({ "blockers": ["controls_disabled"] }));
+        let read_only = {
+            let mut out = ClubOut::new("a");
+            out.link(&["read".into()], &["club.set".into()]);
+            out
+        };
+        for (mut out, model, state) in [
+            (read_only, &model, State::ReadOnly),
+            (linked(&["aim.set"]), &model, State::NotSupported),
+            (linked(&["club.set"]), &off, State::Off),
+        ] {
+            assert_eq!(out.state(model), state);
+            assert_eq!(
+                out.pick(Club::SandWedge, model, Instant::now()),
+                [Action::SnapBack]
+            );
+            assert!(!out.holds_club(), "{state:?}");
+        }
+    }
+
+    /// A pending pick goes with the connection: after the next connection
+    /// nothing is sent for it.
+    #[test]
+    fn a_pending_pick_is_dropped_with_the_connection() {
+        let waiting = json!({ "shotId": "shot-1", "playerId": 1, "ready": false,
+                              "controllable": false, "allowedCommands": [],
+                              "blockers": ["shot_in_progress"] });
+        let mut model = model_with(bag(), "Iron7", waiting);
+        let mut out = linked(&["club.set"]);
+        let now = Instant::now();
+        assert!(out.pick(Club::SandWedge, &model, now).is_empty());
+        assert!(out.holds_club());
+        out.clear();
+        assert!(!out.holds_club());
+        out.link(&["read".into(), "control".into()], &["club.set".into()]);
+        ready_changed(&mut out, &mut model, ready());
+        assert!(out.drive(&model, now).is_empty());
+    }
 }
