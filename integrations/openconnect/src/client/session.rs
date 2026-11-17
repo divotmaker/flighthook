@@ -248,7 +248,7 @@ impl<S: Close> FrpSession for Session<S> {
     type Action = NoAction;
 
     /// One pass at `now`: what the simulator sent, then at most one
-    /// message, and none until [`SHOT_GAP`] after a shot: the oldest shot
+    /// message, and none for 250 ms after a shot: the oldest shot
     /// waiting, else the readiness when it changed, else the heartbeat when
     /// one is due.
     ///
