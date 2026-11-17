@@ -5,7 +5,7 @@ use std::sync::mpsc;
 
 use tokio::sync::broadcast;
 
-use super::codec::{BallData, ClubData, Frame, kind};
+use super::codec::{BallData, ClubData, Frame};
 use super::*;
 use crate::actors::provenance::ShotSource;
 use crate::bus::{BusMsg, LocalEvent};
@@ -1189,23 +1189,6 @@ impl Host {
         );
     }
 
-    /// Nothing but ReadyState frames arrives for `quiet`.
-    fn assert_quiet(&mut self, quiet: Duration) {
-        let until = Instant::now() + quiet;
-        let mut buf = [0u8; 4096];
-        while Instant::now() < until {
-            while let Some(f) = self.reader.next_frame() {
-                assert_eq!(f.kind, kind::READY_STATE, "unexpected frame {f:?}");
-            }
-            match self.stream.read(&mut buf) {
-                Ok(0) => panic!("bridge closed the link"),
-                Ok(n) => self.reader.push(&buf[..n]),
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                Err(e) => panic!("read: {e}"),
-            }
-        }
-    }
-
     fn ball(&mut self) -> BallData {
         match self.next_not_ready() {
             Message::BallData(b) => b,
@@ -2090,7 +2073,19 @@ fn a_round_reports_readiness_from_measured_monitors_only() {
     host.strict(true);
     status(&bridge.mock, ActorStatus::Connected);
     device_telemetry(&bridge.mock, &[("ready", "true")]);
-    host.assert_quiet(Duration::from_millis(300));
+    // A shot from the Omni after them on the bus: once it is out, the
+    // bridge has taken the virtual monitor's state, and no ReadyState came.
+    emit(&bridge.monitor, 1, &mapper::tests::full_shot());
+    let ball = host.next();
+    assert!(
+        matches!(&ball, Message::BallData(b) if b.shot_id == 1),
+        "{ball:?}"
+    );
+    let club = host.next();
+    assert!(
+        matches!(&club, Message::ClubData(c) if c.shot_id == 1),
+        "{club:?}"
+    );
     host.send(&Message::Ping);
     assert_eq!(
         host.next(),
@@ -2177,7 +2172,10 @@ fn strict_mode_is_accepted_with_the_pureplay_card_connected() {
         host.strict(true);
         assert!(bridge.round.active());
         emit(&card, 1, &mapper::tests::ball_only_shot());
-        host.assert_quiet(Duration::from_millis(300));
+        // A shot from the Omni after it on the bus is the first shot out.
+        emit(&bridge.monitor, 1, &mapper::tests::full_shot());
+        assert_eq!(host.ball().shot_id, 1);
+        assert_eq!(host.club().shot_id, 1);
         host.send(&Message::Ping);
         assert_eq!(
             host.next_not_ready(),
