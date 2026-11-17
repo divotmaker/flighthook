@@ -1,6 +1,6 @@
 [package]
 name = "flighthook"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.94"
 description = "flighthook event bus types and schemas"
@@ -34,11 +34,11 @@ threeputt = { version = "0.3.0", default-features = false, features = ["config"]
 thumbswing = { version = "0.0.4", default-features = false, features = ["config"] }
 # The Pureplay cards' settings (`connect::Config`, `accessory::Config`, the
 # `config` feature: no network code, so the WASM UI builds it too).
-flighthook-pureplay = { version = "0.3.0", path = "../integrations/pureplay", default-features = false, features = ["config"] }
+flighthook-pureplay = { version = "0.3.1", path = "../integrations/pureplay", default-features = false, features = ["config"] }
 # The Open Connect cards' settings (`client::Config`, `server::Config`) and
 # the Open Connect JSON types (`client::api`), the `config` feature: no
 # network code, so the WASM UI builds it too.
-flighthook-openconnect = { version = "0.3.0", path = "../integrations/openconnect", default-features = false, features = ["config"] }
+flighthook-openconnect = { version = "0.3.1", path = "../integrations/openconnect", default-features = false, features = ["config"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"], optional = true }
