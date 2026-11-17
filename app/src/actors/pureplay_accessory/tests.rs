@@ -26,10 +26,6 @@ use flightrelay::FrpBody;
 
 /// Longest a test waits for one thing.
 const WAIT: Duration = Duration::from_secs(5);
-/// How long a test watches for a connection that must not come: many
-/// times the test backoff.
-const QUIET: Duration = Duration::from_millis(600);
-
 const ACTOR: &str = "pureplay_accessory.0";
 
 /// The card key of the test's bus markers ([`Card::caught_up`]); the session
@@ -362,11 +358,6 @@ impl Mock {
     /// The card's next connection.
     fn next(&self) -> Peer {
         self.conns.recv_timeout(WAIT).expect("the card connects")
-    }
-
-    /// Whether the card connects again within [`QUIET`].
-    fn reconnects(&self) -> bool {
-        self.conns.recv_timeout(QUIET).is_ok()
     }
 }
 
@@ -1162,6 +1153,123 @@ fn another_app_waiting_closes_and_asks_again_later() {
     card.stop();
 }
 
+// -- What follows a connection's end (`next`, stepped) ------------------------------
+
+/// A refusal, a removal or six `bad_request`s end in `End::Stopped`: the
+/// card is Disconnected until the user's Reconnect, and never connects by
+/// itself. The socket tests show the status and row only `End::Stopped`
+/// publishes (Disconnected with the reason); this is what keeps it there.
+#[test]
+fn a_stopped_card_waits_for_reconnect() {
+    let now = Instant::now();
+    let mut backoff = Backoff::new();
+    assert_eq!(next(End::Stopped, None, &mut backoff, now), Next::Idle);
+    assert_eq!(
+        next(End::Stopped, Some(now), &mut backoff, now + STABLE),
+        Next::Idle,
+        "after a long session too"
+    );
+    assert_eq!(next(End::Shutdown, None, &mut backoff, now), Next::Shutdown);
+}
+
+/// Pureplay's cooldown counts down to its end; whether one more attempt
+/// follows is the cooldown's own `retry`.
+#[test]
+fn a_cooldown_waits_until_its_end_then_retries_only_when_it_says() {
+    let now = Instant::now();
+    let until = now + Duration::from_secs(2);
+    let mut backoff = Backoff::new();
+    for retry in [true, false] {
+        assert_eq!(
+            next(End::Cooldown { until, retry }, None, &mut backoff, now),
+            Next::Cooldown { until, retry }
+        );
+    }
+}
+
+/// Lost or refused for a while: Reconnecting, after a wait that doubles
+/// from `MIN_BACKOFF` up to `MAX_BACKOFF`.
+#[test]
+fn a_lost_connection_reconnects_after_a_doubling_backoff() {
+    let now = Instant::now();
+    let mut backoff = Backoff::new();
+    let mut waits = Vec::new();
+    for end in [End::Lost, End::Backoff].into_iter().cycle().take(8) {
+        match next(end, None, &mut backoff, now) {
+            Next::Connect {
+                status: ActorStatus::Reconnecting,
+                wait,
+            } => waits.push(wait),
+            other => panic!("{other:?}"),
+        }
+    }
+    let mut want = MIN_BACKOFF;
+    for wait in waits {
+        assert_eq!(wait, want);
+        want = (want * 2).min(MAX_BACKOFF);
+    }
+    assert_eq!(want, MAX_BACKOFF, "the cap is reached");
+}
+
+/// A connection that held for `STABLE` starts the backoff over; one that
+/// ended sooner keeps doubling it.
+#[test]
+fn a_connection_that_held_for_stable_starts_the_backoff_over() {
+    let up = Instant::now();
+    let reconnect = |backoff: &mut Backoff, since, now| match next(End::Lost, since, backoff, now) {
+        Next::Connect { wait, .. } => wait,
+        other => panic!("{other:?}"),
+    };
+    let mut backoff = Backoff::new();
+    assert_eq!(reconnect(&mut backoff, None, up), MIN_BACKOFF);
+    let short = up + STABLE - Duration::from_millis(1);
+    assert_eq!(reconnect(&mut backoff, Some(up), short), MIN_BACKOFF * 2);
+    assert_eq!(
+        reconnect(&mut backoff, Some(up), up + STABLE),
+        MIN_BACKOFF,
+        "held for STABLE"
+    );
+}
+
+/// A retry the card set itself keeps its own wait and status; a dead
+/// token's one pair without it goes at once.
+#[test]
+fn a_set_retry_keeps_its_wait_and_a_pair_without_the_token_goes_at_once() {
+    let now = Instant::now();
+    let mut backoff = Backoff::new();
+    let delay = Duration::from_millis(1234);
+    assert_eq!(
+        next(
+            End::RetryAfter {
+                delay,
+                status: ActorStatus::Reconnecting
+            },
+            None,
+            &mut backoff,
+            now
+        ),
+        Next::Connect {
+            status: ActorStatus::Reconnecting,
+            wait: delay
+        }
+    );
+    assert_eq!(
+        next(End::Again, None, &mut backoff, now),
+        Next::Connect {
+            status: ActorStatus::Starting,
+            wait: Duration::ZERO
+        }
+    );
+    assert_eq!(
+        next(End::Lost, None, &mut backoff, now),
+        Next::Connect {
+            status: ActorStatus::Reconnecting,
+            wait: MIN_BACKOFF
+        },
+        "neither touched the backoff"
+    );
+}
+
 /// Each refusal of a `pair` that closes the socket: Disconnected, the
 /// reason in the `pairing` row, and no new attempt by itself.
 #[test]
@@ -1179,10 +1287,6 @@ fn a_refusal_is_disconnected_with_its_reason_and_not_retried() {
         peer.refuse(Some(protocol::PAIR_ID), code, &json!({}));
         peer.close(close);
         card.shows_row(ActorStatus::Disconnected, "pairing", text);
-        assert!(
-            !mock.reconnects(),
-            "{code} {close}: no retry until Reconnect"
-        );
         card.stop();
     }
 }
@@ -1230,7 +1334,6 @@ fn a_cooldown_counts_down_and_retries_once() {
         t.get("pairing")
             .is_some_and(|p| p.starts_with("Pureplay asks to wait"))
     });
-    assert!(!mock.reconnects(), "one retry only");
     card.shows_row(ActorStatus::Disconnected, "pairing", PRESS_RECONNECT);
     card.stop();
 }
@@ -1269,7 +1372,6 @@ fn a_removal_in_pureplay_deletes_the_token_and_waits_for_reconnect() {
     peer.close(4401);
     card.shows_row(ActorStatus::Disconnected, "pairing", REMOVED);
     assert_eq!(card.tokens().get(&token_key(mock.addr)), None);
-    assert!(!mock.reconnects(), "a removal starts Pureplay's cooldown");
     card.stop();
 }
 
@@ -1466,7 +1568,6 @@ fn a_denial_without_a_close_frame_is_not_asked_again() {
     peer.pong();
     drop(peer);
     card.shows_row(ActorStatus::Disconnected, "pairing", DENIED);
-    assert!(!mock.reconnects(), "denied: no new pair by itself");
     card.stop();
 }
 
@@ -1481,7 +1582,6 @@ fn a_removal_without_a_close_frame_is_not_asked_again() {
     drop(peer);
     card.shows_row(ActorStatus::Disconnected, "pairing", REMOVED);
     assert_eq!(card.tokens().get(&token_key(mock.addr)), None);
-    assert!(!mock.reconnects(), "removed: no reconnect by itself");
     card.stop();
 }
 
@@ -1503,7 +1603,6 @@ fn other_refusals_without_a_close_frame_decide_by_the_response() {
             drop(peer);
         }
         card.shows_row(ActorStatus::Disconnected, "pairing", ASK_OFF);
-        assert!(!mock.reconnects(), "forbidden_scope, open {keep_open}");
         card.stop();
 
         // rate_limited: the cooldown.
@@ -1742,7 +1841,6 @@ fn bad_request_six_times_stops_with_pureplays_message() {
         "pairing",
         "A request is already pending.",
     );
-    assert!(!mock.reconnects(), "no seventh try");
     card.stop();
 }
 
@@ -1789,7 +1887,6 @@ fn a_dead_token_after_the_automatic_pair_waits_for_reconnect() {
     peer.close(4401);
     card.shows_row(ActorStatus::Disconnected, "pairing", REMOVED);
     assert_eq!(card.tokens().get(&token_key(mock.addr)), None);
-    assert!(!mock.reconnects(), "no second prompt by itself");
     card.stop();
 }
 

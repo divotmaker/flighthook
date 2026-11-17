@@ -989,7 +989,6 @@ fn removed_then_reconnect_waits_out_the_cooldown_and_pairs_with_the_new_grant() 
     rig.peer.close(4401);
     rig.card
         .shows_row(ActorStatus::Disconnected, "pairing", REMOVED);
-    assert!(!mock.reconnects(), "no retry until Reconnect");
     rig.card.stop();
     // Reconnect: the actor starts again on the same state.
     let tokens = Arc::clone(&state.pureplay_tokens);

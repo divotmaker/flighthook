@@ -341,6 +341,46 @@ enum End {
     Cooldown { until: Instant, retry: bool },
 }
 
+/// What the card does after a connection ended.
+#[derive(Debug, Clone, PartialEq)]
+enum Next {
+    /// The actor was stopped: the card ends.
+    Shutdown,
+    /// Show `status`, then connect again after `wait`.
+    Connect { status: ActorStatus, wait: Duration },
+    /// Disconnected until the user's Reconnect.
+    Idle,
+    /// Disconnected, counting down to `until`; then one more attempt when
+    /// `retry`, else Disconnected until the user's Reconnect.
+    Cooldown { until: Instant, retry: bool },
+}
+
+/// What follows `end` at `now`, for a connection that was up since
+/// `since`. One that held for [`STABLE`] starts the backoff over before a
+/// lost connection takes its next wait.
+fn next(end: End, since: Option<Instant>, backoff: &mut Backoff, now: Instant) -> Next {
+    if since.is_some_and(|t| now.saturating_duration_since(t) >= STABLE) {
+        backoff.reset();
+    }
+    match end {
+        End::Shutdown => Next::Shutdown,
+        End::Lost | End::Backoff => Next::Connect {
+            status: ActorStatus::Reconnecting,
+            wait: backoff.delay(),
+        },
+        End::RetryAfter { delay, status } => Next::Connect {
+            status,
+            wait: delay,
+        },
+        End::Again => Next::Connect {
+            status: ActorStatus::Starting,
+            wait: Duration::ZERO,
+        },
+        End::Stopped => Next::Idle,
+        End::Cooldown { until, retry } => Next::Cooldown { until, retry },
+    }
+}
+
 /// Exponential reconnect backoff.
 #[derive(Debug)]
 struct Backoff {
@@ -692,40 +732,25 @@ fn run_with(
         let end = card.connect(sender, &mut receiver);
         card.end_ready(sender);
         card.clear_link(sender);
-        if card
-            .connected_since
-            .take()
-            .is_some_and(|t| t.elapsed() >= STABLE)
-        {
-            card.backoff.reset();
+        if end == End::Lost {
+            card.rows.clear(PAIRING);
         }
-        let wait = match end {
-            End::Shutdown => return,
-            End::Lost => {
-                card.rows.clear(PAIRING);
-                card.unreachable();
-                card.publish(sender, ActorStatus::Reconnecting);
-                card.backoff.delay()
-            }
-            End::Backoff => {
-                card.unreachable();
-                card.publish(sender, ActorStatus::Reconnecting);
-                card.backoff.delay()
-            }
-            End::RetryAfter { delay, status } => {
+        if matches!(end, End::Lost | End::Backoff) {
+            card.unreachable();
+        }
+        let since = card.connected_since.take();
+        let wait = match next(end, since, &mut card.backoff, Instant::now()) {
+            Next::Shutdown => return,
+            Next::Connect { status, wait } => {
                 card.publish(sender, status);
-                delay
+                wait
             }
-            End::Again => {
-                card.publish(sender, ActorStatus::Starting);
-                Duration::ZERO
-            }
-            End::Stopped => {
+            Next::Idle => {
                 card.publish(sender, ActorStatus::Disconnected);
                 card.idle(&mut receiver, sender, None);
                 return;
             }
-            End::Cooldown { until, retry } => {
+            Next::Cooldown { until, retry } => {
                 card.rows
                     .set(PAIRING, cooldown_text(secs_left(until, Instant::now())));
                 card.publish(sender, ActorStatus::Disconnected);
