@@ -9,19 +9,31 @@
 //! points at it, which would loop shots back) fails the connect with the
 //! server's reason. The session then:
 //!
+//! - writes one message at a time, and nothing for 250 ms after a shot: some
+//!   simulators read only one message per read, so a message written with
+//!   the shot would be lost. A shot gets a `200` reply; one that has none
+//!   after 1 s sets the card's `error` ("the simulator isn't reading shots;
+//!   restart its Open Connect window") and logs a warning once, until a `200`
+//!   comes;
 //! - sends each finished shot as one shot message. Its `ShotNumber` is the
 //!   shot's own number, or one more than the last one sent when that is
 //!   higher, so the numbers a simulator sees always increase, across
 //!   sources that count separately and across reconnects (the driver keeps
 //!   the last one). A shot with no launch, flight, club or impact (a missed
 //!   read) is not sent and takes no number;
-//! - sends a heartbeat with the readiness about a second after it starts,
-//!   then every 10 s, and at once whenever the readiness changes. The
-//!   readiness is whether any launch monitor in view has no blockers;
+//! - sends a heartbeat with the readiness about a second after it starts
+//!   and then every 10 s, and a readiness message (not a heartbeat, no ball
+//!   or club data) at once whenever the readiness changes. The readiness is
+//!   whether any launch monitor in view has no blockers;
 //! - reads the simulator's responses. A code outside 2xx, an unknown club
 //!   code or text that is not a response raises a Warn alert. Player
 //!   information (club and hand) becomes one `golfer.select` with the club
 //!   and hand the session holds (a hand or club left out stays).
+//!
+//! **Closing:** a session that ends (the card stopped, its address changed)
+//! stops writing, reads until the simulator ends its side (for at most a
+//! quarter second) and then drops the connection, so it ends with a close,
+//! not a reset.
 //!
 //! **What the session is handed** ([`FrpSession::bus`]) is its view of the
 //! bus, chosen by the host: the `bus.actor` of each launch monitor it stands
@@ -33,7 +45,7 @@
 //! readiness last sent), `response` (the simulator's last response code and
 //! message), and `club` and `handed`, what the simulator set.
 //!
-//! **Raw frames:** every object written (`shot`, `heartbeat`) and every read
+//! **Raw frames:** every object written (`shot`, `readiness`, `heartbeat`) and every read
 //! (`response`) goes to the host as a text `shot.raw`. The frame of a shot
 //! carries the key the shot had on the bus, after it was written, so a host
 //! can tell which of its shots the simulator was sent.
@@ -51,7 +63,7 @@ mod session;
 mod shot;
 
 #[cfg(feature = "driver")]
-pub use session::{Client, Error, Session};
+pub use session::{Client, Close, Error, Session};
 #[cfg(feature = "driver")]
 pub use shot::{OutputShot, output_shot};
 

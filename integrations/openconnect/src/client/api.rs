@@ -226,6 +226,17 @@ pub struct PlayerInfo {
 impl GsProMessage {
     /// Construct a heartbeat with explicit readiness flags.
     pub fn heartbeat_with_readiness(ready: bool, ball_detected: bool) -> Self {
+        Self::status(ready, ball_detected, true)
+    }
+
+    /// A readiness update: not a heartbeat, no ball data and no club data,
+    /// with the readiness flags set.
+    pub fn readiness(ready: bool, ball_detected: bool) -> Self {
+        Self::status(ready, ball_detected, false)
+    }
+
+    /// A message with no data that carries only the readiness flags.
+    fn status(ready: bool, ball_detected: bool, heartbeat: bool) -> Self {
         Self {
             device_id: "Flighthook".into(),
             units: "Yards".into(),
@@ -247,7 +258,7 @@ impl GsProMessage {
                 contains_club_data: false,
                 launch_monitor_is_ready: ready,
                 launch_monitor_ball_detected: ball_detected,
-                is_heart_beat: true,
+                is_heart_beat: heartbeat,
             },
         }
     }

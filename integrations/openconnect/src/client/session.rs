@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
 use flightrelay::config::{ConfigError, DriverConfig};
@@ -47,6 +47,22 @@ const FIRST_HEARTBEAT: Duration = Duration::from_secs(1);
 /// timeout.
 const SHOT_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// How long nothing goes out after a shot: some simulators read only one
+/// message per read, so the next message waits until they have taken the
+/// shot and answered it.
+pub(crate) const SHOT_GAP: Duration = Duration::from_millis(250);
+
+/// How long a shot may go unanswered before the card says the simulator is
+/// not reading shots.
+pub(crate) const REPLY_WITHIN: Duration = Duration::from_secs(1);
+
+/// The card's `error` while a shot has gone unanswered.
+pub(crate) const NOT_READING: &str =
+    "the simulator isn't reading shots; restart its Open Connect window";
+
+/// The longest a closing connection waits for the simulator to end its side.
+const CLOSE_WAIT: Duration = Duration::from_millis(250);
+
 /// The readiness last sent on this connection.
 const MONITOR_READY: &str = "monitor_ready";
 /// The simulator's last response on this connection: code and message.
@@ -70,6 +86,31 @@ pub enum Error {
 impl From<Stopped> for Error {
     fn from(_: Stopped) -> Self {
         Self::Stopped
+    }
+}
+
+/// A connection that can end gracefully: what the session needs of its
+/// stream besides reading and writing.
+pub trait Close: Read + Write {
+    /// End the connection with a close, not a reset: stop writing, then read
+    /// whatever the simulator still sends until it ends its side, for at
+    /// most a short while.
+    fn close(&mut self);
+}
+
+impl Close for TcpStream {
+    fn close(&mut self) {
+        let _ = self.shutdown(Shutdown::Write);
+        let end = Instant::now() + CLOSE_WAIT;
+        let mut buf = [0u8; 4096];
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            if self.set_read_timeout(Some(left)).is_err()
+                || self.set_nonblocking(false).is_err()
+                || !matches!(self.read(&mut buf), Ok(n) if n > 0)
+            {
+                break;
+            }
+        }
     }
 }
 
@@ -190,14 +231,22 @@ pub struct Session<S = TcpStream> {
     outbox: VecDeque<CompletedShot>,
     /// The time of the last step, which stamps what the session is handed.
     now: Instant,
+    /// Nothing is written before this time.
+    hold_until: Instant,
+    /// When the oldest shot the simulator has not answered was sent.
+    unanswered: Option<Instant>,
+    /// The card shows that the simulator is not reading shots.
+    not_reading: bool,
 }
 
-impl<S: Read + Write> FrpSession for Session<S> {
+impl<S: Close> FrpSession for Session<S> {
     type Error = Error;
     type Action = NoAction;
 
-    /// One pass at `now`: what the simulator sent, the shots waiting, then
-    /// the heartbeat when the readiness changed or one is due.
+    /// One pass at `now`: what the simulator sent, then at most one
+    /// message, and none until [`SHOT_GAP`] after a shot: the oldest shot
+    /// waiting, else the readiness when it changed, else the heartbeat when
+    /// one is due.
     ///
     /// # Errors
     ///
@@ -206,17 +255,9 @@ impl<S: Read + Write> FrpSession for Session<S> {
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
         self.now = now;
         let read = self.read(out)?;
-        let sent = self.send_shots(out)?;
-        let ready = self.ready();
-        let beat = if ready != self.ready
-            || now.saturating_duration_since(self.last_heartbeat) >= HEARTBEAT_EVERY
-        {
-            self.heartbeat(ready, out)?;
-            true
-        } else {
-            false
-        };
-        Ok(if read || sent || beat {
+        self.check_replies(out);
+        let wrote = now >= self.hold_until && self.write_next(out)?;
+        Ok(if read || wrote {
             Activity::Active
         } else {
             Activity::Idle
@@ -249,11 +290,13 @@ impl<S: Read + Write> FrpSession for Session<S> {
         &self.identity
     }
 
-    /// Dropping the stream closes the connection.
-    fn close(self, _: &mut Events<'_>) {}
+    /// Ends the connection with a close, not a reset ([`Close::close`]).
+    fn close(mut self, _: &mut Events<'_>) {
+        self.stream.close();
+    }
 }
 
-impl<S: Read + Write> Session<S> {
+impl<S: Close> Session<S> {
     /// A connection over `stream` to the simulator `identity`, at `now`,
     /// numbering shots after `last_number`.
     pub(crate) fn new(
@@ -278,6 +321,9 @@ impl<S: Read + Write> Session<S> {
             shots: ShotAccumulator::new().with_timeout(SHOT_TIMEOUT),
             outbox: VecDeque::new(),
             now,
+            hold_until: now,
+            unanswered: None,
+            not_reading: false,
         }
     }
 
@@ -311,14 +357,49 @@ impl<S: Read + Write> Session<S> {
         Ok(())
     }
 
-    /// Send the heartbeat with readiness `ready`.
-    fn heartbeat(&mut self, ready: bool, out: &mut Events<'_>) -> Result<(), Error> {
-        let msg = GsProMessage::heartbeat_with_readiness(ready, ready);
-        self.send(&msg, "heartbeat", None, out)?;
+    /// Write the next message that is due, if any: the oldest shot waiting
+    /// (holding every write for [`SHOT_GAP`]), else the readiness when it
+    /// changed, else the heartbeat when one is due. Returns whether one went
+    /// out.
+    fn write_next(&mut self, out: &mut Events<'_>) -> Result<bool, Error> {
+        if self.send_shot(out)? {
+            self.hold_until = self.now + SHOT_GAP;
+            return Ok(true);
+        }
+        let ready = self.ready();
+        if ready != self.ready {
+            let msg = GsProMessage::readiness(ready, ready);
+            self.send(&msg, "readiness", None, out)?;
+            self.set_ready(ready, out);
+        } else if self.now.saturating_duration_since(self.last_heartbeat) >= HEARTBEAT_EVERY {
+            let msg = GsProMessage::heartbeat_with_readiness(ready, ready);
+            self.send(&msg, "heartbeat", None, out)?;
+            self.last_heartbeat = self.now;
+            self.set_ready(ready, out);
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The readiness sent is `ready`.
+    fn set_ready(&mut self, ready: bool, out: &mut Events<'_>) {
         self.ready = ready;
-        self.last_heartbeat = self.now;
         out.telemetry([(MONITOR_READY, ready.to_string())]);
-        Ok(())
+    }
+
+    /// The card says so, once, when a shot has gone [`REPLY_WITHIN`]
+    /// without a reply.
+    fn check_replies(&mut self, out: &mut Events<'_>) {
+        if !self.not_reading
+            && self
+                .unanswered
+                .is_some_and(|sent| self.now.saturating_duration_since(sent) >= REPLY_WITHIN)
+        {
+            self.not_reading = true;
+            out.log(Level::Warn, NOT_READING.to_owned());
+            out.telemetry([("error", NOT_READING.to_owned())]);
+        }
     }
 
     /// Read what has arrived, without waiting, and handle it. Returns
@@ -353,6 +434,12 @@ impl<S: Read + Write> Session<S> {
             false,
         );
         let heard = proto::handle_response(&buf[..n], out);
+        if heard.ok {
+            self.unanswered = None;
+            if std::mem::take(&mut self.not_reading) {
+                out.telemetry([("error", NONE.to_owned())]);
+            }
+        }
         if let Some((hand, club)) = heard.info {
             if hand.is_some() {
                 self.hand = hand;
@@ -395,12 +482,12 @@ impl<S: Read + Write> Session<S> {
         });
     }
 
-    /// Send every shot waiting, oldest first. Returns whether one went out.
+    /// Send the oldest shot waiting (a shot with no data is dropped, and the
+    /// next one is looked at). Returns whether one went out.
     ///
     /// The shot's `shot_number` becomes its `ShotNumber`: its own number,
     /// or one more than the last one sent when that is higher.
-    fn send_shots(&mut self, out: &mut Events<'_>) -> Result<bool, Error> {
-        let mut sent = false;
+    fn send_shot(&mut self, out: &mut Events<'_>) -> Result<bool, Error> {
         while let Some(done) = self.outbox.pop_front() {
             let mut shot = output_shot(&done, &done.from);
             if !shot.has_data() {
@@ -429,9 +516,10 @@ impl<S: Read + Write> Session<S> {
             log_outbound(&msg, out);
             self.send(&msg, "shot", Some(done.key.clone()), out)?;
             self.last_number.set(number);
-            sent = true;
+            self.unanswered.get_or_insert(self.now);
+            return Ok(true);
         }
-        Ok(sent)
+        Ok(false)
     }
 }
 

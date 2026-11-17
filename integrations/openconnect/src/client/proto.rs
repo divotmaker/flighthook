@@ -12,6 +12,8 @@ pub(crate) struct Heard {
     pub last: Option<(i32, String)>,
     /// Whether a response carried player information.
     pub player: bool,
+    /// Whether a response was `200`, the reply to a message.
+    pub ok: bool,
     /// The simulator's player information, the last of the read: its hand
     /// and club, each when it named one flighthook knows.
     pub info: Option<(Option<Handedness>, Option<Club>)>,
@@ -30,6 +32,7 @@ pub(crate) fn handle_response(buf: &[u8], out: &mut Events<'_>) -> Heard {
                 parsed_any = true;
                 heard.last = Some((resp.code, resp.message.clone()));
                 heard.player |= resp.player.is_some();
+                heard.ok |= resp.code == 200;
                 if resp.code >= 200 && resp.code < 300 {
                     out.log(Level::Info, format!("<- {}: {}", resp.code, resp.message));
                 } else {

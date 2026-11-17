@@ -1558,8 +1558,17 @@ Pureplay Connect's); its `bus.actor` has no roles.
 - What the session sees is chosen by the hooks, as for Pureplay Connect: the
   `RoutedView`, each shot's parts and its `shot.finished` only when the
   routing passes it (below). The readiness in heartbeats
-  (`LaunchMonitorIsReady` and `LaunchMonitorBallDetected`) is whether any
-  launch monitor in view has no blockers. A routing that names an actor no
+  and readiness messages (`LaunchMonitorIsReady` and
+  `LaunchMonitorBallDetected`) is whether any launch monitor in view has no
+  blockers. A heartbeat goes out about a second after the connect and every
+  10 s; a change of readiness goes out at once as a message of its own (not a
+  heartbeat, no ball or club data). One message goes out per write, and none
+  for 250 ms after a shot, because some simulators read only one message per
+  read. A shot the simulator does not answer with a `200` within 1 s sets the
+  card's `error` ("the simulator isn't reading shots; restart its Open Connect
+  window") and logs one warning; the next `200` clears it. A connection that
+  ends (the card turned off, its address changed) ends with a close, not a
+  reset. A routing that names an actor no
   card holds shows "Missing monitor" and routes nothing for that shot type
   until another is picked.
 - Whenever the simulator's player information arrives, the session sends one
@@ -1623,7 +1632,7 @@ address while connected; `error`):
 |---|---|---|---|
 | `last_shot` | the `ShotNumber` the simulator got last and the local time it was written | `#12 at 16:41:07` | the hooks |
 | `shots_sent` | shots written on this connection (`0` from the connect) | `3` | the hooks |
-| `monitor_ready` | the readiness last sent in a heartbeat (`true`/`false`) | `true` | the session |
+| `monitor_ready` | the readiness last sent, in a heartbeat or a readiness message (`true`/`false`) | `true` | the session |
 | `response` | the simulator's last response, code and message | `201 GSPro Player Information` | the session |
 | `club`, `handed` | the simulator's player information | `7I`, `rh` | the session |
 

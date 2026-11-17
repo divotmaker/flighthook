@@ -80,4 +80,6 @@ simulator's `club` and `handed`, and for this connection `last_shot` (the
 shot number the simulator got last and when), `shots_sent`, `monitor_ready`
 and `response` (the simulator's last code and message). A shot that finishes
 while the simulator is not connected is dropped. While the card cannot
-connect, `error` says why.
+connect, `error` says why. Connected, `error` also says so when a shot gets no
+`200` reply within a second ("the simulator isn't reading shots; restart its
+Open Connect window"), until a reply comes.

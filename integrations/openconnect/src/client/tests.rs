@@ -32,6 +32,9 @@ struct Pipe {
     closed: bool,
     /// Every write fails.
     broken: bool,
+    /// The client ended its side with a close (a FIN), after reading what
+    /// the simulator had sent.
+    finished: bool,
 }
 
 /// The client's end: reads what the simulator sent (would block when there
@@ -54,6 +57,14 @@ impl Read for Wire {
             *slot = byte;
         }
         Ok(n)
+    }
+}
+
+impl Close for Wire {
+    fn close(&mut self) {
+        let mut pipe = self.0.borrow_mut();
+        pipe.to_client.clear();
+        pipe.finished = true;
     }
 }
 
@@ -154,12 +165,20 @@ impl Link {
         out
     }
 
-    /// The shot objects written since the last call (heartbeats left out).
+    /// Step and advance the clock by [`SHOT_GAP`], enough times for every
+    /// shot waiting to go out.
+    fn flush(&mut self) {
+        for _ in 0..8 {
+            self.settle();
+            self.host.advance(SHOT_GAP);
+        }
+        self.settle();
+    }
+
+    /// The shot objects written since the last call (heartbeats and
+    /// readiness messages left out).
     fn shots(&mut self) -> Vec<String> {
-        self.written()
-            .into_iter()
-            .filter(|o| !is_heartbeat(o))
-            .collect()
+        self.written().into_iter().filter(|o| is_shot(o)).collect()
     }
 
     /// The `ShotNumber`s written since the last call.
@@ -178,6 +197,11 @@ impl Link {
     fn events(&mut self) -> Vec<DeviceEvent> {
         self.host.take()
     }
+}
+
+fn is_shot(object: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(object).expect("JSON")["ShotDataOptions"]["ContainsBallData"]
+        == true
 }
 
 fn is_heartbeat(object: &str) -> bool {
@@ -239,7 +263,7 @@ fn shots_finished_in_one_drain_are_all_queued_in_order() {
     for n in 1..=3 {
         link.shot("mevo.0", key(n));
     }
-    link.settle();
+    link.flush();
     assert_eq!(link.shots(), [golden(1), golden(2), golden(3)]);
 }
 
@@ -250,7 +274,7 @@ fn an_increasing_sequence_keeps_its_shot_numbers() {
     for n in [1, 2, 5, 6, 40] {
         link.shot("mevo.0", key(n));
     }
-    link.settle();
+    link.flush();
     assert_eq!(link.numbers(), [1, 2, 5, 6, 40]);
 }
 
@@ -262,7 +286,7 @@ fn an_auto_chip_between_device_shots_never_repeats_a_shot_number() {
     link.shot("mevo.0", key(1));
     link.shot("autochip", ShotKey::new("chip-1", 1));
     link.shot("mevo.0", key(2));
-    link.settle();
+    link.flush();
     assert_eq!(link.numbers(), [1, 2, 3]);
 }
 
@@ -276,13 +300,13 @@ fn a_device_count_reset_after_a_reconnect_still_increases() {
     for n in 1..=3 {
         first.shot("mevo.0", key(n));
     }
-    first.settle();
+    first.flush();
     assert_eq!(first.numbers(), [1, 2, 3]);
     let mut second = Link::numbered(last);
     for n in 1..=4 {
         second.shot("mevo.0", ShotKey::new(format!("again-{n}"), n));
     }
-    second.settle();
+    second.flush();
     assert_eq!(second.numbers(), [4, 5, 6, 7]);
 }
 
@@ -307,7 +331,7 @@ fn a_no_read_writes_nothing_and_uses_no_shot_number() {
     link.hand("mevo.0", ShotTrigger::new(key(13)));
     link.hand("mevo.0", ShotFinished { key: key(13) });
     link.shot("mevo.0", ShotKey::new("shot-13b", 13));
-    link.settle();
+    link.flush();
     assert_eq!(link.shots(), [golden(12), golden(13)]);
 }
 
@@ -318,7 +342,7 @@ fn each_written_shot_is_handed_back_with_its_bus_key() {
     let mut link = Link::new();
     link.shot("mevo.0", key(3));
     link.shot("r10.0", ShotKey::new("r10-2", 2));
-    link.settle();
+    link.flush();
     assert_eq!(link.numbers(), [3, 4]);
     assert_eq!(
         sent_keys(&link.events()),
@@ -348,9 +372,14 @@ fn a_failed_write_takes_its_record_back() {
 // -- Heartbeats and readiness ----------------------------------------------------
 
 /// The first heartbeat goes out a second after the session starts, then
-/// every 10 s; a readiness change sends one at once.
+/// every 10 s. A readiness change goes out at once as a message of its own:
+/// not a heartbeat, no ball or club data, the readiness set; the heartbeats
+/// keep their own clock.
 #[test]
-fn heartbeats_follow_the_clock_and_the_readiness() {
+fn heartbeats_follow_the_clock_and_the_readiness_goes_out_by_itself() {
+    let options = |object: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(object).expect("JSON")["ShotDataOptions"].clone()
+    };
     let mut link = Link::new();
     link.settle();
     assert!(link.written().is_empty(), "nothing before the first second");
@@ -364,7 +393,11 @@ fn heartbeats_follow_the_clock_and_the_readiness() {
     link.settle();
     let ready = link.written();
     assert_eq!(ready.len(), 1, "at once");
-    assert!(readiness(&ready[0]));
+    let o = options(&ready[0]);
+    assert_eq!(o["IsHeartBeat"], false);
+    assert_eq!(o["ContainsBallData"], false);
+    assert_eq!(o["ContainsClubData"], false);
+    assert_eq!(o["LaunchMonitorIsReady"], true);
 
     link.host
         .advance(HEARTBEAT_EVERY - Duration::from_millis(1));
@@ -372,14 +405,111 @@ fn heartbeats_follow_the_clock_and_the_readiness() {
     assert!(link.written().is_empty());
     link.host.advance(Duration::from_millis(1));
     link.settle();
-    assert_eq!(link.written().len(), 1, "10 s after the last");
+    let beat = link.written();
+    assert_eq!(beat.len(), 1, "10 s after the last heartbeat");
+    assert!(is_heartbeat(&beat[0]) && readiness(&beat[0]));
 
     // Out of view: not ready.
     link.hand("mevo.0", Removal::of(StateKind::BusActor));
     link.settle();
     let gone = link.written();
     assert_eq!(gone.len(), 1);
-    assert!(!readiness(&gone[0]));
+    assert!(!is_heartbeat(&gone[0]) && !readiness(&gone[0]));
+}
+
+/// A shot and a readiness change in the same step go out as two writes,
+/// the shot first and the readiness [`SHOT_GAP`] after it.
+#[test]
+fn a_shot_and_a_readiness_change_in_one_step_go_out_250_ms_apart() {
+    let mut link = Link::new();
+    link.hand("mevo.0", monitor(true));
+    link.shot("mevo.0", key(1));
+    link.settle();
+    let first = link.written();
+    assert_eq!(first.len(), 1, "one message per write");
+    assert!(is_shot(&first[0]));
+    link.host.advance(SHOT_GAP - Duration::from_millis(1));
+    link.settle();
+    assert!(link.written().is_empty(), "held after a shot");
+    link.host.advance(Duration::from_millis(1));
+    link.settle();
+    let second = link.written();
+    assert_eq!(second.len(), 1);
+    assert!(!is_heartbeat(&second[0]) && !is_shot(&second[0]) && readiness(&second[0]));
+}
+
+/// Two shots queued go out [`SHOT_GAP`] apart, never in one write.
+#[test]
+fn queued_shots_go_out_250_ms_apart() {
+    let mut link = Link::new();
+    link.shot("mevo.0", key(1));
+    link.shot("mevo.0", key(2));
+    link.settle();
+    assert_eq!(link.numbers(), [1]);
+    link.host.advance(SHOT_GAP);
+    link.settle();
+    assert_eq!(link.numbers(), [2]);
+}
+
+/// A shot with no `200` after 1 s sets the card's `error` and logs one
+/// warning; a later `200` clears the row.
+#[test]
+fn a_shot_the_simulator_does_not_answer_sets_the_error_until_a_200() {
+    let mut link = Link::new();
+    link.shot("mevo.0", key(1));
+    link.settle();
+    link.events();
+    link.host.advance(REPLY_WITHIN - Duration::from_millis(1));
+    link.settle();
+    assert!(!status(&link.events()).telemetry.contains_key("error"));
+
+    link.host.advance(Duration::from_millis(1));
+    link.settle();
+    let events = link.events();
+    assert_eq!(status(&events).telemetry["error"], NOT_READING);
+    let warnings = |events: &[DeviceEvent]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, DeviceEvent::Log(Level::Warn, line) if line == NOT_READING))
+            .count()
+    };
+    assert_eq!(warnings(&events), 1);
+
+    link.host.advance(Duration::from_secs(5));
+    link.settle();
+    assert_eq!(warnings(&link.events()), 0, "logged once");
+
+    link.send(r#"{"Code":200,"Message":"Shot received"}"#);
+    link.settle();
+    assert_eq!(status(&link.events()).telemetry["error"], "none");
+}
+
+/// A shot answered in time never sets the error.
+#[test]
+fn an_answered_shot_sets_no_error() {
+    let mut link = Link::new();
+    link.shot("mevo.0", key(1));
+    link.settle();
+    link.send(r#"{"Code":200,"Message":"Shot received"}"#);
+    link.host.advance(REPLY_WITHIN * 2);
+    link.settle();
+    assert!(!status(&link.events()).telemetry.contains_key("error"));
+}
+
+/// A session that ends normally closes its end after reading what the
+/// simulator still had to say.
+#[test]
+fn a_normal_close_reads_what_is_left_and_ends_with_a_fin() {
+    let Link {
+        mut host,
+        session,
+        wire,
+    } = Link::new();
+    wire.0.borrow_mut().to_client.extend(b"{\"Code\":200}");
+    host.with(|_, out| session.close(out));
+    let pipe = wire.0.borrow();
+    assert!(pipe.finished);
+    assert!(pipe.to_client.is_empty());
 }
 
 /// The session's telemetry: the readiness sent, the simulator's last
@@ -494,7 +624,10 @@ fn shots_right_after_connect_are_all_sent_in_order_with_unchanged_json() {
                 .expect("takes it");
         }
     }
-    host.with(|now, out| session.step(now, out)).expect("steps");
+    for _ in 0..3 {
+        host.advance(SHOT_GAP);
+        host.with(|now, out| session.step(now, out)).expect("steps");
+    }
     let mut shots = Vec::new();
     let mut buf = Vec::new();
     while shots.len() < 3 {
@@ -516,4 +649,32 @@ fn shots_right_after_connect_are_all_sent_in_order_with_unchanged_json() {
     assert_eq!(shots, [golden(12), golden(13), golden(14)]);
     drop(session);
     assert_eq!(local::client_at(client), None, "released with the session");
+}
+
+/// Over TCP: closing a session whose simulator has said something the
+/// client has not read still ends with a FIN, which the simulator reads as
+/// the end of the stream. (Dropping the connection with that unread would
+/// reset it.)
+#[test]
+fn closing_a_real_connection_ends_it_with_a_fin_not_a_reset() {
+    use std::net::{Shutdown, TcpListener};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut driver = Client::new(Config {
+        address: Some(listener.local_addr().expect("addr").to_string()),
+        actor: "oc-close".into(),
+    })
+    .expect("driver");
+    let mut host = TestHost::new();
+    let session = host.connect(&mut driver).expect("connects");
+    let (mut peer, _) = listener.accept().expect("the driver connects");
+    peer.set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("timeout");
+    peer.write_all(br#"{"Code":200,"Message":"late"}"#)
+        .expect("the simulator speaks");
+    peer.shutdown(Shutdown::Write).expect("the simulator ends");
+    host.with(|_, out| session.close(out));
+    let mut rest = Vec::new();
+    peer.read_to_end(&mut rest)
+        .expect("the simulator reads the end of the stream");
+    assert!(rest.is_empty());
 }
