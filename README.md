@@ -3,8 +3,6 @@
 # flighthook
 
 [![CI](https://github.com/divotmaker/flighthook/actions/workflows/ci.yml/badge.svg)](https://github.com/divotmaker/flighthook/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/flighthook.svg)](https://crates.io/crates/flighthook)
-[![docs.rs](https://docs.rs/flighthook/badge.svg)](https://docs.rs/flighthook)
 
 Acts as a bridge between golf launch monitors and simulation software.
 Connects to launch monitors, decodes shot data, and forwards it to integrations like GSPro.
@@ -31,7 +29,8 @@ pose skeleton and swing data.*
 
 ### Launch Monitors
 
-Each device links to its setup notes, quirks, and config reference.
+Each device links to its setup notes, quirks, and config reference. Every
+card in Settings has its guide in the [docs index](docs/README.md).
 
 | Device                                               | Protocol                | Driver                                          | Status           |
 | ---------------------------------------------------- | ----------------------- | ----------------------------------------------- | ---------------- |
@@ -117,6 +116,11 @@ adds its card, but a card added at an address another card of its type is
 using starts off (Disabled), and its switch stays locked until you change its
 address to a free one, so you can set it up for a different port.
 
+GSPro's Open Connect window accepts one connection per launch. After
+flighthook disconnects from it (Reconnect, turning the card off and on,
+closing flighthook), restart GSPro's Open Connect window; details in
+[Open Connect](docs/outputs/open-connect.md#gspro-takes-one-connection-per-launch).
+
 ### Custom Integrations
 
 flighthook serves the [Flight Relay Protocol](https://github.com/flightrelay/spec)
@@ -147,7 +151,7 @@ not depend on flighthook itself.
 
 ## Status
 
-**Beta (0.2.x)** — The API, configuration format, and WebSocket protocol are usable but may still change. Breaking changes will be noted in release notes.
+**Beta (0.3.x)** — The API, configuration format, and WebSocket protocol are usable but may still change. Breaking changes will be noted in release notes.
 
 ## Install
 
@@ -227,9 +231,10 @@ Terminal. Allow it.
   see [Swing replay](#swing-replay)
 - Body tracking: the golfer's skeleton drawn over the replays, with each
   swing's tempo (averaged over the cameras), key moments and body angles,
-  and the hip turn, shoulder turn, hip sway and spine at the frame on screen,
-  colored against published tour (or amateur) averages, with a fade and a
-  draw band for the numbers that depend on the shot's shape,
+  and the hip turn, shoulder turn, hip sway and spine at the frame on screen;
+  the metrics are colored against published tour (or amateur) averages, with
+  a fade and a draw band for the numbers that depend on the shot's shape,
+  and a Notes box names each one off its band,
   found on this computer's CPU with RTMPose; Off (the default), Historical (a clip is
   tracked the first time it is viewed, which keeps the CPU free while you
   play) or Live (every camera live and every clip as it is recorded), set
@@ -251,7 +256,7 @@ When a launch monitor doesn't report carry, apex, flight time, descent angle,
 offline, roll or total, flighthook simulates them from the measured launch (ball
 speed, launch angle, launch direction, backspin, sidespin) with the
 [dimple](https://crates.io/crates/dimple) ball-flight model: modern tour ball,
-flat fairway, sea level and 25 °C by default.
+flat fairway, sea level and 15 °C by default.
 
 `[simulation] mode` (Settings → General → Simulation card) picks what is simulated:
 
@@ -322,7 +327,7 @@ Settings live under `[simulation]` (all keys optional) or in the Simulation card
 [simulation]
 mode = "on"               # off | on | force
 altitude = "0ft"          # any distance unit, 0 to 5000 m
-temperature_c = 25.0      # -30 to 50
+temperature_c = 15.0      # -30 to 50
 surface = "fairway"       # fairway | green | firm_green
 auto_chip = false         # true shows the header's Auto-Chip button
 ```
@@ -470,8 +475,7 @@ without an offline are left out.
 
 With a USB camera added under Settings, Cameras (Windows and Linux; not macOS
 yet), flighthook records a clip of every shot, from a few seconds before the
-impact to just after the launch monitor reports it (the ExPutt: just after
-the strike). A shot with clips gets a
+impact to just after the launch monitor reports it. A shot with clips gets a
 **Replay** button on its header in Cards and in a column of the Table, and the
 Cameras tab plays the shown shot's clips inline. Replay opens playing, with the
 cameras side by side and a scrubber that
@@ -480,10 +484,9 @@ impact by default). It loops until you turn **Loop** off; pause, step frame
 by frame, slow it to ½, ¼ or ⅛, or download a camera's clip as an AVI with
 the download icon next to its name.
 
-- FlightScope monitors report a shot at impact, and the ExPutt dates each
-  putt at its strike. For the others the impact is estimated a fixed time
-  before their report (beta); each monitor
-  has a default, and **Camera timing** in its settings changes it. See [Cameras](docs/devices/cameras.md#when-a-clip-starts-and-ends).
+- FlightScope monitors report a shot at impact. For the others the impact is
+  estimated a fixed time before their report (beta); each monitor
+  has a default (0.5 s for the ExPutt), and **Camera timing** in its settings changes it. See [Cameras](docs/devices/cameras.md#when-a-clip-starts-and-ends).
 - A camera mounted on its side gets a **Rotation** (90° or 270°) in its
   settings: the picture is turned upright everywhere it is shown and
   tracked, so a face-on camera fits the whole swing from about 2 m (6 ft).
@@ -507,9 +510,10 @@ distance toward the ball or back, e.g. `0.8 in Back`.
 The numbers are colored against published tour averages (**Tour | Amateur**
 in the Cameras tab's toolbar picks the bands): aqua inside the band, blue inside the fade
 band only and green inside the draw band only for the numbers that depend on
-the shot's shape, yellow near, red far, always with words; a line under the
-tiles names each one off its band. Tiles color on a key moment's frame, such
-as the impact tick, and with Live on a Last shot strip under the live
+the shot's shape, yellow near, red far. A Notes box beside the tables (under
+them in a narrow window) names the tempo and each number off its band and
+what that miss tends to produce. The tiles at the frame on screen stay plain
+as the clip plays. With Live on a Last shot strip under the live
 pictures shows the newest shot at impact. See
 [Bands and colors](docs/devices/cameras.md#bands-and-colors).
 
@@ -622,7 +626,9 @@ trash icon on a page removes it. There is one web server: it can be edited
 launch monitor or Software page closes its connection and starts it again
 from its saved settings, without restarting flighthook. The switch next to
 a page's title turns that device off or on at once, keeping its settings: a
-device that is off doesn't run, sends no shots and shows **DISABLED**.
+device that is off doesn't run, sends no shots and shows **DISABLED**. The
+**Docs** link in a page's header opens that card's guide
+([docs index](docs/README.md)).
 
 Each device's badge, left stripe and list dot show its connection:
 
@@ -679,7 +685,7 @@ TOML file auto-created on first run at the platform config directory:
 [simulation]
 mode = "on"
 altitude = "0ft"
-temperature_c = 25.0
+temperature_c = 15.0
 surface = "fairway"
 auto_chip = false
 
