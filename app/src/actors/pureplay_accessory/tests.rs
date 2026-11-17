@@ -2074,20 +2074,27 @@ fn the_card_stops_at_once() {
     card.shows_row(ActorStatus::Starting, "pairing", WAITING);
     card.stop_and_join();
 
-    // A server that accepts the connection and says nothing.
+    // A server that reads the card's upgrade request and says nothing.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let (tx, accepted) = mpsc::channel();
+    let (tx, asked) = mpsc::channel();
     std::thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
+        use std::io::Read as _;
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                request.push(byte[0]);
+            }
             let _ = tx.send(());
             std::thread::sleep(Duration::from_secs(10));
             drop(stream);
         }
     });
     let mut card = Card::start(addr, new_state());
-    accepted.recv_timeout(WAIT).expect("the card connects");
-    std::thread::sleep(Duration::from_millis(100));
+    asked
+        .recv_timeout(WAIT)
+        .expect("the card waits for the handshake's answer");
     card.stop_and_join();
 
     let mock = Mock::new();
@@ -2219,17 +2226,27 @@ impl OcHost {
             .expect("the client connects");
     }
 
-    /// Every message the clients wrote within `quiet`.
-    fn within(&self, quiet: Duration) -> Vec<Value> {
-        let until = Instant::now() + quiet;
+    /// Every message the clients wrote, up to the first `want` matches.
+    fn until(&self, mut want: impl FnMut(&Value) -> bool) -> Vec<Value> {
+        let deadline = Instant::now() + WAIT;
         let mut out = Vec::new();
-        while let Some(left) = until.checked_duration_since(Instant::now()) {
-            match self.messages.recv_timeout(left) {
-                Ok(v) => out.push(v),
-                Err(_) => break,
+        loop {
+            let v = deadline
+                .checked_duration_since(Instant::now())
+                .and_then(|left| self.messages.recv_timeout(left).ok())
+                .unwrap_or_else(|| panic!("the message the test waits for, after {out:?}"));
+            let done = want(&v);
+            out.push(v);
+            if done {
+                return out;
             }
         }
-        out
+    }
+
+    /// Every message the clients wrote, up to the shot sent as
+    /// `ShotNumber` `number`.
+    fn until_shot(&self, number: u32) -> Vec<Value> {
+        self.until(|v| is_shot(v) && v["ShotNumber"] == number)
     }
 
     /// The next shot a client wrote.
@@ -2503,10 +2520,13 @@ fn an_echo_is_not_stored_and_gets_the_stroke() {
         shots[0].stroke.as_ref().map(|s| s.outcome),
         Some(flightrelay::StrokeOutcome::Green)
     );
-    assert!(
-        oc.within(Duration::from_millis(200))
-            .iter()
-            .all(|v| !is_shot(v))
+    // The next shot the output writes is a later one of the launch monitor.
+    monitor_shot(&tx, "mevo.0", &ShotKey::new("mevo-shot-2", 42));
+    let wrote = oc.until(is_shot);
+    assert_eq!(
+        wrote.last().map(|v| v["ShotNumber"].clone()),
+        Some(json!(42)),
+        "{wrote:?}"
     );
     card.stop();
 }
@@ -2564,10 +2584,6 @@ fn a_pureplay_shot_is_stored_and_reaches_no_output() {
             && t.get("last_shot").is_some_and(|v| v.starts_with("#1 at "))
     });
 
-    for host in [&any, &by_id] {
-        let wrote = host.within(Duration::from_millis(400));
-        assert!(wrote.iter().all(|v| !is_shot(v)), "{wrote:?}");
-    }
     card.caught_up(&mut peer);
     let shots = stored(&state, &card.raw);
     assert_eq!(shots.len(), 1, "{shots:?}");
@@ -2603,6 +2619,19 @@ fn a_pureplay_shot_is_stored_and_reaches_no_output() {
     assert_eq!(line["data"]["stroke"]["outcome"], "out_of_bounds");
     assert!(!lines[0].contains("PPA-SHOTS"), "{}", lines[0]);
     assert!(!lines[0].contains(&mock.addr.to_string()), "{}", lines[0]);
+    // Neither output wrote the card's shot: Auto-chip's, which every
+    // routing takes, is the first shot each writes.
+    // Numbered past the card's shot, which is its own #1.
+    let chips = std::sync::atomic::AtomicU32::new(40);
+    let (chip, _) = crate::autochip::send(&state, &tx, 3, &chips).expect("chipped");
+    for host in [&any, &by_id] {
+        let wrote = host.until(is_shot);
+        assert_eq!(
+            wrote.last().map(|v| v["ShotNumber"].clone()),
+            Some(json!(chip.shot_number)),
+            "{wrote:?}"
+        );
+    }
     card.stop();
 }
 
@@ -2647,33 +2676,28 @@ fn the_cards_ready_never_reaches_an_output() {
             .with_role(roles::GAME)
             .with_role(roles::LAUNCH_MONITOR),
     );
-    let heartbeats = |host: &OcHost| -> Vec<Value> {
-        host.within(Duration::from_millis(1500))
-            .into_iter()
-            .filter(|v| v["ShotDataOptions"]["ContainsBallData"] == false)
-            .collect()
-    };
-    for host in [&any, &by_id] {
-        let beats = heartbeats(host);
-        assert!(!beats.is_empty(), "a heartbeat");
-        assert!(
-            beats
-                .iter()
-                .all(|v| v["ShotDataOptions"]["LaunchMonitorIsReady"] == false),
-            "{beats:?}"
-        );
+    // Two Auto-chip shots in turn: the second is drained only after the
+    // first was written, so anything the card's readiness made either
+    // output say is on the wire before it.
+    let chips = std::sync::atomic::AtomicU32::new(0);
+    for _ in 0..2 {
+        let (key, _) = crate::autochip::send(&state, &tx, 3, &chips).expect("chipped");
+        for host in [&any, &by_id] {
+            let wrote = host.until_shot(key.shot_number);
+            assert!(
+                wrote
+                    .iter()
+                    .filter(|v| !is_shot(v))
+                    .all(|v| v["ShotDataOptions"]["LaunchMonitorIsReady"] == false),
+                "{wrote:?}"
+            );
+        }
     }
     // A launch monitor's readiness reaches the output on "Any" as before.
     let monitor = BusSender::new("mevo.0".into(), tx.clone(), Arc::default())
         .with_frp_id(Some("mevo.0".into()));
     monitor.frp(flightrelay::BusActor::new("Mevo+", 1.0).with_role(roles::LAUNCH_MONITOR));
-    let beats = any.within(Duration::from_millis(500));
-    assert!(
-        beats
-            .iter()
-            .any(|v| v["ShotDataOptions"]["LaunchMonitorIsReady"] == true),
-        "{beats:?}"
-    );
+    any.until(|v| !is_shot(v) && v["ShotDataOptions"]["LaunchMonitorIsReady"] == true);
     card.stop();
 }
 
