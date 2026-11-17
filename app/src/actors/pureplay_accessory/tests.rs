@@ -3015,9 +3015,8 @@ fn from_flighthook_never_takes_and_from_pureplay_never_matches() {
 }
 
 /// A configured, connected card is a launch monitor, yet not one of the
-/// launch monitors a Pureplay Connect output names (in Hello, for its
-/// battery, in a round request). The output's own strict-mode test is in
-/// its module.
+/// launch monitors a simulator output stands for: no Pureplay Connect
+/// session is handed its `bus.actor` or its shots.
 #[test]
 fn the_connected_card_is_no_feed_of_a_pureplay_connect_output() {
     let mock = Mock::new();
@@ -3034,8 +3033,11 @@ fn the_connected_card_is_no_feed_of_a_pureplay_connect_output() {
             .source(ACTOR)
             .is_some_and(ShotSource::is_launch_monitor)
     );
-    let names = crate::actors::pureplay::monitor_names(&state);
-    assert!(!names.contains_key(ACTOR), "{names:?}");
+    let feed = crate::actors::simout::Feed::new(
+        crate::actors::gspro::GsProRouting::default(),
+        Some(Arc::clone(&state.state)),
+    );
+    assert!(!feed.feeds_simulators(ACTOR));
     card.stop();
 }
 

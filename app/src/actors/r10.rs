@@ -410,10 +410,10 @@ mod tests {
         // Its own range: the range keys the scripted device handoff.
         let messages = first_shot(7.0, one_shot(EQ_SHOT_FULL));
         let frames = crate::test_ball::strict_frames("r10.0", &messages).expect("sent");
-        let spin = crate::actors::pureplay::codec::BallData::TOTAL_SPIN
-            | crate::actors::pureplay::codec::BallData::BACK_SPIN
-            | crate::actors::pureplay::codec::BallData::SIDE_SPIN
-            | crate::actors::pureplay::codec::BallData::SPIN_AXIS;
+        let spin = flighthook_pureplay::connect::codec::BallData::TOTAL_SPIN
+            | flighthook_pureplay::connect::codec::BallData::BACK_SPIN
+            | flighthook_pureplay::connect::codec::BallData::SIDE_SPIN
+            | flighthook_pureplay::connect::codec::BallData::SPIN_AXIS;
         assert_eq!(frames.ball.valid & spin, spin);
         assert!(frames.ball.back_spin_rpm > 0.0);
         let unknown = crate::test_ball::without_bus_actor(&messages);
@@ -452,7 +452,7 @@ mod tests {
             ..crate::actors::simout::OutputShot::default()
         };
         assert!(
-            crate::actors::pureplay::sends(true, shot.source),
+            flighthook_pureplay::connect::sends(true, shot.source),
             "strict mode sends a measured source's shot"
         );
         assert_eq!(shot.launch.as_ref(), Some(&launch));

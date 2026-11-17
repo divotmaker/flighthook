@@ -10,6 +10,9 @@
 //!   Accessory card, any actor holding `game`) never does. Readiness is the
 //!   routed launch monitor's `bus.actor` with no blockers (under "Any": any
 //!   launch monitor that may feed a simulator).
+//! - [`RoutedView`] is what a software output's session sees of the launch
+//!   monitors: the `bus.actor` of each one the [`Feed`] stands for in the
+//!   current mode, and its removal when it leaves that view.
 //! - [`Held`] is what a game or simulator card holds for the turn (club,
 //!   hand and, when the card sets one, the mode). The card sends it whole in
 //!   one `golfer.select` ([`Held::select`]) whenever its simulator reports
@@ -17,12 +20,12 @@
 //!   turn's cause is a game or simulator card: between those the last
 //!   sender wins ([`Held::reasserts`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use flightrelay::types::roles;
 use flightrelay::{
-    BusActor, CompletedShot, FrpBody, GolferSelect, GolferTurn, Handedness, Removal,
+    BusActor, CompletedShot, FrpBody, FrpMessage, GolferSelect, GolferTurn, Handedness, Removal,
     ShotAggregator, ShotEvent, StateKind,
 };
 
@@ -53,6 +56,10 @@ pub(crate) enum FeedEvent {
     NoData(CompletedShot),
     /// flighthook's turn changed, with its cause.
     Turn,
+    /// A part of a shot before its finish (trigger, launch, club, impact, or
+    /// its launch monitor's own flight) from a launch monitor that may feed
+    /// a simulator; never Auto-chip's flight.
+    Part,
 }
 
 /// The launch monitor of each shot (the sender of its `shot.trigger`).
@@ -113,6 +120,11 @@ impl ShotOwners {
     /// The actor `actor` is gone: its warning may be logged again.
     pub(crate) fn forget_actor(&mut self, actor: &str) {
         self.warned.remove(actor);
+    }
+
+    /// The launch monitor of shot `shot_id`, while it is known.
+    fn owner(&self, shot_id: &str) -> Option<&str> {
+        self.owners.get(shot_id).map(|(owner, _)| owner.as_str())
     }
 }
 
@@ -209,20 +221,47 @@ impl Feed {
     }
 
     /// The launch monitor `actor`'s `bus.actor`, if it has published one.
+    #[cfg(test)]
     pub(crate) fn monitor(&self, actor: &str) -> Option<&BusActor> {
         self.monitors.get(actor)
     }
 
     /// Whether the simulator is told a launch monitor is ready in the
-    /// current mode: the routed one has no blockers; under "Any", any
-    /// launch monitor that may feed a simulator has none.
+    /// current mode: one in view ([`in_view`](Self::in_view)) has no
+    /// blockers.
     pub(crate) fn ready(&self) -> bool {
-        let usable = |id: &str, a: &BusActor| {
-            id != self.auto_chip && self.feeds_simulators(id) && a.is_clear()
-        };
-        match self.routed(self.mode()) {
-            Some(id) => self.monitors.get(id).is_some_and(|a| usable(id, a)),
-            None => self.monitors.iter().any(|(id, a)| usable(id, a)),
+        self.in_view().values().any(BusActor::is_clear)
+    }
+
+    /// The launch monitors the output stands for in the current mode, by
+    /// actor id: the routed one, or under "Any" every one that may feed a
+    /// simulator; never Auto-chip, which is no readiness.
+    pub(crate) fn in_view(&self) -> BTreeMap<String, BusActor> {
+        let routed = self.routed(self.mode());
+        self.monitors
+            .iter()
+            .filter(|(id, _)| {
+                **id != self.auto_chip
+                    && self.feeds_simulators(id)
+                    && routed.is_none_or(|r| r == id.as_str())
+            })
+            .map(|(id, a)| (id.clone(), a.clone()))
+            .collect()
+    }
+
+    /// Whether `msg` is a [`FeedEvent::Part`].
+    fn is_part(&self, msg: &FrpMessage) -> bool {
+        match &msg.body {
+            FrpBody::ShotTrigger(_)
+            | FrpBody::ShotLaunch(_)
+            | FrpBody::ShotClub(_)
+            | FrpBody::ShotImpact(_) => self.feeds_simulators(&msg.from),
+            FrpBody::ShotFlight(f) => {
+                msg.from != self.auto_chip
+                    && self.feeds_simulators(&msg.from)
+                    && self.owners.owner(&f.key.shot_id) == Some(msg.from.as_str())
+            }
+            _ => false,
         }
     }
 
@@ -274,8 +313,9 @@ impl Feed {
             }
             _ => {}
         }
-        match self.shots.feed(msg)? {
-            ShotEvent::Finished(shot) => {
+        let part = self.is_part(msg);
+        match self.shots.feed(msg) {
+            Some(ShotEvent::Finished(shot)) => {
                 if !self.passes(&shot.from, self.mode()) {
                     Some(FeedEvent::Skipped(shot))
                 } else if output_shot(&shot, "", &self.auto_chip).has_data() {
@@ -284,8 +324,42 @@ impl Feed {
                     Some(FeedEvent::NoData(shot))
                 }
             }
-            _ => None,
+            _ => part.then_some(FeedEvent::Part),
         }
+    }
+}
+
+/// What a software output's session sees of the launch monitors: the
+/// `bus.actor` of each one in the feed's view ([`Feed::in_view`]), handed
+/// again when it changes, and its removal once it leaves the view (to the
+/// session, a monitor out of view is not on the bus).
+#[derive(Debug, Default)]
+pub(crate) struct RoutedView {
+    /// What the session was handed last, by actor id.
+    shown: BTreeMap<String, BusActor>,
+}
+
+impl RoutedView {
+    /// Push into `to` what changed in `feed`'s view since the last update.
+    pub(crate) fn update(&mut self, feed: &Feed, to: &mut Vec<FrpMessage>) {
+        let view = feed.in_view();
+        for id in self.shown.keys().filter(|id| !view.contains_key(*id)) {
+            to.push(FrpMessage::new(
+                id.clone(),
+                Removal::of(StateKind::BusActor),
+            ));
+        }
+        for (id, actor) in &view {
+            if self.shown.get(id) != Some(actor) {
+                to.push(FrpMessage::new(id.clone(), actor.clone()));
+            }
+        }
+        self.shown = view;
+    }
+
+    /// A new session: it has been handed nothing yet.
+    pub(crate) fn clear(&mut self) {
+        self.shown.clear();
     }
 }
 
@@ -342,23 +416,6 @@ pub(crate) fn output_shot(shot: &CompletedShot, card: &str, auto_chip: &str) -> 
     }
 }
 
-/// The shot as a measured-only receiver takes it (Pureplay Connect's strict
-/// mode): the
-/// launch, club and impact as the launch monitor sent them, no flight, and
-/// the launch monitor's declared source.
-pub(crate) fn measured_shot(shot: &CompletedShot, card: &str) -> OutputShot {
-    OutputShot {
-        actor: card.to_owned(),
-        shot_number: shot.key.shot_number,
-        shot_id: Some(shot.key.shot_id.clone()),
-        launch: shot.launch.clone(),
-        club: shot.club.clone(),
-        impact: shot.impact.clone(),
-        source: shot.source,
-        ..OutputShot::default()
-    }
-}
-
 /// What a game or simulator card holds for the turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Held {
@@ -405,45 +462,9 @@ impl Held {
     }
 }
 
-/// The mode for a putt, a chip or a full swing from the club in play and the
-/// distance to the hole before the shot, for a game that gives both: the
-/// putter putts; a distance under [`CHIP_DISTANCE_M`] chips; anything else,
-/// an unknown distance included, is a full swing. A distance of 0 or less
-/// is unknown.
-#[must_use]
-pub(crate) fn mode_for_lie(club: Option<Club>, distance_m: Option<f64>) -> Mode {
-    if club == Some(Club::Putter) {
-        Mode::Putting
-    } else if distance_m.is_some_and(|d| d.is_finite() && d > 0.0 && d < CHIP_DISTANCE_M) {
-        Mode::Chipping
-    } else {
-        Mode::Full
-    }
-}
-
-/// The distance to the hole under which a shot is a chip: 30 yd.
-pub(crate) const CHIP_DISTANCE_M: f64 = 27.432;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_lie_gives_the_mode() {
-        assert_eq!(mode_for_lie(Some(Club::Putter), Some(150.0)), Mode::Putting);
-        assert_eq!(
-            mode_for_lie(Some(Club::SandWedge), Some(20.0)),
-            Mode::Chipping
-        );
-        assert_eq!(
-            mode_for_lie(Some(Club::SandWedge), Some(27.432)),
-            Mode::Full
-        );
-        assert_eq!(mode_for_lie(Some(Club::Driver), None), Mode::Full);
-        assert_eq!(mode_for_lie(Some(Club::SandWedge), Some(0.0)), Mode::Full);
-        assert_eq!(mode_for_lie(Some(Club::SandWedge), Some(-5.0)), Mode::Full);
-        assert_eq!(mode_for_lie(None, Some(5.0)), Mode::Chipping);
-    }
 
     fn turn(club: Option<Club>, hand: Handedness, mode: Mode) -> GolferTurn {
         GolferTurn::new(None, club, hand, mode)

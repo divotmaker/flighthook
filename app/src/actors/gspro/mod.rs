@@ -667,7 +667,7 @@ impl Relay {
                             .reasserts(turn, cause.as_deref(), |a| self.is_game_card(a))
                 });
             }
-            None => {}
+            Some(FeedEvent::Part) | None => {}
         }
     }
 

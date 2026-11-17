@@ -189,7 +189,7 @@ fn a_pureplay_scope_upserts_or_removes_its_section() {
     match scoped_action("pureplay.0", &c).expect("known scope") {
         ConfigAction::UpsertPureplay { index, section } => {
             assert_eq!(index, "0");
-            assert_eq!(section.address.as_deref(), Some("127.0.0.1:9760"));
+            assert_eq!(section.driver.address.as_deref(), Some("127.0.0.1:9760"));
         }
         other => panic!("expected UpsertPureplay, got {other:?}"),
     }

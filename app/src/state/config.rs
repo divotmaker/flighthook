@@ -3269,7 +3269,10 @@ name = "Clubs"
         assert_eq!(c.openconnect_client["0"].name, "GSPro");
         assert_eq!(c.openconnect_client["1"].name, "Muni Golf");
         assert_eq!(c.random_club["0"].name, "Clubs");
-        assert_eq!(c.pureplay["0"].address.as_deref(), Some("127.0.0.1:9760"));
+        assert_eq!(
+            c.pureplay["0"].driver.address.as_deref(),
+            Some("127.0.0.1:9760")
+        );
         assert_eq!(c.pureplay["0"].full_monitor.as_deref(), Some("mevo.0"));
         assert_eq!(c.golfers[0].sex, Some(flighthook::Sex::Female));
         assert_eq!(c.golfers[0].height, Some(170.0));

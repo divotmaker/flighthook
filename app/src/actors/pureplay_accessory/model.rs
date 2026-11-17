@@ -38,7 +38,7 @@ use flightrelay::{GolferId, GolferSelect, GolferTurn, Mode};
 
 use super::protocol::{self, BagEntry, Event, Player, Readiness};
 use super::shots::MAP_CAPACITY;
-use crate::actors::simout::mode_for_lie;
+use flighthook_pureplay::connect::mode_for_lie;
 
 /// One player as the card knows them.
 #[derive(Debug, Clone, Default, PartialEq)]

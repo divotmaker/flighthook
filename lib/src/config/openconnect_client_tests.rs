@@ -152,7 +152,9 @@ fn every_field() -> FlighthookConfig {
         }),
         pureplay: one(PureplaySection {
             name: "Pureplay".into(),
-            address: Some("192.168.1.20:9760".into()),
+            driver: crate::PureplayConfig {
+                address: Some("192.168.1.20:9760".into()),
+            },
             putting_monitor: Some("exputt.3".into()),
             ..PureplaySection::default()
         }),

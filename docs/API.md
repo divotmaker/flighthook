@@ -277,11 +277,12 @@ reported by one source only:
   player information. When the connection ends, `shots_sent`,
   `monitor_ready`, `response`, `club` and `handed` are removed; `address`
   and `last_shot` stay
-- **Pureplay Connect outputs** (alpha): `address` (Pureplay's,
-  `127.0.0.1:9760`), `last_shot` (the ShotId Pureplay got last and the local
-  time it was sent, `#4 at 16:41:07`), and for the current link only
-  `shots_sent` (`4`), `ready_state` (the ready state last sent, `ready` |
-  `not ready` | `processing`) and `strict_mode` (`on` | `off`). Strict mode is
+- **Pureplay Connect outputs** (alpha): `device_info` (Pureplay's address,
+  `127.0.0.1:9760`, while connected), and for the current link only
+  `last_shot` (the ShotId Pureplay got last and the local time it was sent,
+  `#4 at 16:41:07`), `shots_sent` (`4`), `ready_state` (the ready state last
+  sent, `ready` | `not ready` | `processing`), `strict_mode` (`on` | `off`)
+  and `ready` (`true`, from the card's `bus.actor`). Strict mode is
   `on` while Pureplay records a tournament round: Pureplay asks for it on the
   link and the output always accepts; it is off again when Pureplay ends it
   or the link ends. While it is on, the output sends only shots whose launch
@@ -289,9 +290,10 @@ reported by one source only:
   the values the launch monitor sent, and its ready state counts only those
   launch monitors; the output's card shows the round as `strict_mode` `on`. `club` and
   `handed` are the club and hand Pureplay set. `error` says why the handshake
-  failed (no reply to Hello, an unsupported protocol version); a refused or
-  closed connection sets none. When the link ends, `shots_sent`,
-  `ready_state`, `strict_mode`, `club` and `handed` are removed
+  failed (no reply to Hello, an unsupported protocol version) until a
+  handshake succeeds; a connect that fails (Pureplay not running) shows its
+  error until a connection is made, as on every card on a driver. When the
+  link ends, every row of the link is removed
 - **Pureplay Accessory cards** (beta): while connected, `name`,
   `club` and `handed` (the active local player: the player who is up when
   that player sits at the Pureplay computer), `hole` (`7, par 4`),

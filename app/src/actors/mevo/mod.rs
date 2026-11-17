@@ -854,8 +854,8 @@ mod tests {
             ),
         );
         let frames = crate::test_ball::strict_frames("mevo.0", &xi).expect("sent");
-        let pair = crate::actors::pureplay::codec::BallData::BACK_SPIN
-            | crate::actors::pureplay::codec::BallData::SIDE_SPIN;
+        let pair = flighthook_pureplay::connect::codec::BallData::BACK_SPIN
+            | flighthook_pureplay::connect::codec::BallData::SIDE_SPIN;
         assert_eq!(frames.ball.valid & pair, pair);
         assert!(frames.ball.back_spin_rpm > 0.0);
 
@@ -867,13 +867,13 @@ mod tests {
         );
         let frames =
             crate::test_ball::strict_frames("mevo.0", &chip.launch_only(&finish)).expect("sent");
-        let spin = crate::actors::pureplay::codec::BallData::TOTAL_SPIN
-            | crate::actors::pureplay::codec::BallData::BACK_SPIN
-            | crate::actors::pureplay::codec::BallData::SIDE_SPIN
-            | crate::actors::pureplay::codec::BallData::SPIN_AXIS;
+        let spin = flighthook_pureplay::connect::codec::BallData::TOTAL_SPIN
+            | flighthook_pureplay::connect::codec::BallData::BACK_SPIN
+            | flighthook_pureplay::connect::codec::BallData::SIDE_SPIN
+            | flighthook_pureplay::connect::codec::BallData::SPIN_AXIS;
         assert_eq!(frames.ball.valid & spin, 0, "no measured spin");
         assert_ne!(
-            frames.ball.valid & crate::actors::pureplay::codec::BallData::BALL_SPEED,
+            frames.ball.valid & flighthook_pureplay::connect::codec::BallData::BALL_SPEED,
             0
         );
     }

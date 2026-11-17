@@ -847,8 +847,8 @@ mod tests {
         let messages = first_shot("strict-full", full_swing());
         let frames = crate::test_ball::strict_frames("square.0", &messages).expect("sent");
         let club = frames.club.expect("club data");
-        let impact = crate::actors::pureplay::codec::ClubData::IMPACT_POINT_X
-            | crate::actors::pureplay::codec::ClubData::IMPACT_POINT_Y;
+        let impact = flighthook_pureplay::connect::codec::ClubData::IMPACT_POINT_X
+            | flighthook_pureplay::connect::codec::ClubData::IMPACT_POINT_Y;
         assert_eq!(club.valid & impact, impact);
     }
 
@@ -884,7 +884,7 @@ mod tests {
             ..crate::actors::simout::OutputShot::default()
         };
         assert!(
-            crate::actors::pureplay::sends(true, shot.source),
+            flighthook_pureplay::connect::sends(true, shot.source),
             "strict mode sends a measured source's shot"
         );
         assert_eq!(shot.impact.as_ref(), Some(&impact));

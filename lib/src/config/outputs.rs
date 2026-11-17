@@ -146,6 +146,19 @@ impl PureplaySection {
     }
 }
 
+impl DeviceSection for PureplaySection {
+    type Driver = PureplayConfig;
+    const KIND: &'static str = "pureplay";
+
+    fn driver(&self) -> &PureplayConfig {
+        &self.driver
+    }
+
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
+        &config.pureplay
+    }
+}
+
 /// Deprecated alias of [`OpenConnectClientSection`].
 #[deprecated(note = "use OpenConnectClientSection")]
 pub type GsProSection = OpenConnectClientSection;
@@ -169,8 +182,10 @@ pub struct PureplaySection {
     /// with the card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
-    /// Pureplay's address. Defaults to `127.0.0.1:9760`.
-    pub address: Option<String>,
+    /// Pureplay Connect's settings: `address`, Pureplay's (`ip:port`,
+    /// default `127.0.0.1:9760`).
+    #[serde(flatten)]
+    pub driver: PureplayConfig,
     /// The FRP actor id of the launch monitor for full-swing shots. A card
     /// key (`mevo.0`) in the file names that card's actor id from the
     /// first load on. None = accept from any monitor.

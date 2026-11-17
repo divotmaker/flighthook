@@ -42,12 +42,6 @@ impl Sources {
         registry.sources.insert(actor.to_owned(), source);
     }
 
-    /// Forget actor `actor`: it stopped for good.
-    #[cfg(test)]
-    pub fn forget_source(&self, actor: &str) {
-        self.lock().sources.remove(actor);
-    }
-
     /// Forget the source card `card` registered, by its actor ID: the card
     /// was turned off or removed. Returns that actor ID.
     pub fn forget_card(&self, card: &str) -> Option<String> {

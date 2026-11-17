@@ -469,7 +469,7 @@ The SDK's `ShotAggregator` composes each shot from its messages until
 at the trigger. A shot not finished 45 s after its trigger (`SHOT_TIMEOUT`;
 longer than a driver's own shot deadline) is discarded, and the messages of a
 finished or discarded shot are ignored for another 45 s. The Open Connect
-client, the Pureplay Connect output and the collector each keep an aggregator.
+client, the Pureplay Connect session and the collector each keep an aggregator.
 
 The collector stores every finished shot (`ShotData`, `GET /api/shots`) with:
 the launch as the launch monitor sent it; every `shot.flight` with its sender
@@ -822,8 +822,8 @@ each key through one of them only.
   `name`, `error`. Open Connect clients add `address`, `last_shot`,
   `shots_sent`, `monitor_ready`, `response` (see
   [Open Connect client telemetry](#open-connect-client-telemetry)); Pureplay
-  outputs add `address`, `last_shot`, `shots_sent`, `ready_state`,
-  `strict_mode` (see [Pureplay output](#pureplay-output-alpha)).
+  outputs add `last_shot`, `shots_sent`, `ready_state`, `strict_mode` (see
+  [Pureplay output](#pureplay-output-alpha)).
 
 ```rust
 pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
@@ -990,7 +990,7 @@ nothing yet re-asserts nothing.
 **Shot type.** The Open Connect client sets the mode from the simulator's club
 by its own lists, `chipping_clubs` and `putting_clubs` (a putting club:
 putting, a chipping club: chipping, any other: full); with both lists empty it
-sends no mode. Pureplay Connect applies one shared rule (`simout.rs`, `mode_for_lie`): the
+sends no mode. Pureplay Connect applies one shared rule (`flighthook_pureplay::connect::mode_for_lie`): the
 putter is putting; a `SetShotContext` distance under 30 yards is chipping; any
 other club or distance is full. The Pureplay Accessory sets the mode itself on
 each turn by the same rule. Shot Type in the header sends a select carrying
@@ -1181,8 +1181,7 @@ An actor that is off is no shot source: it is not running, so it sends no
 shots, has no battery in the header and adds no readiness; an output routed
 to it is not ready, as with a monitor that is not configured. Turning it
 off forgets it as a shot source, as a removal does (`Sources::forget_card`
-in the config reload), and the Pureplay output's `monitor_names` leaves it
-out. The Cameras tab's live view and its per-camera
+in the config reload), and the Pureplay output's view leaves it out. The Cameras tab's live view and its per-camera
 clip status show only the cameras that are on (`SettingsForm::cameras_on`).
 
 ### One card per address
@@ -1239,7 +1238,7 @@ What a stop does, by actor:
 |---|---|---|
 | FlightScope (Mevo+, Gen2, Xi) | always: the TCP connect gives up at once on a stop, the handshake checks for one between passes, the card between session steps (5 ms apart while the device is quiet); closing sends nothing | the driver's `STOP_WAIT` (3 s); the driver is not exclusive, so an old instance still closing is replaced beside it (a second socket to the device can overlap the old one until it closes) |
 | Open Connect client | always: 50 ms reads, 2s write timeout, the connect on its own thread; its local-client registration ends with the connection | a write in progress (2s) |
-| Pureplay | always: 50 ms reads, 2s write timeout, the connect on its own thread | a write in progress (2s) |
+| Pureplay | always: the TCP connect gives up at once on a stop, the card between session steps (5 ms apart while the link is quiet; reads and writes do not block); closing sends nothing | the driver's `STOP_WAIT` (3 s) |
 | Open Connect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
 | Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
 | Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
@@ -1545,11 +1544,13 @@ exports, `/frp`) takes the card's shots like any shot.
 **Send registry.** `SystemState.sent_shots` (`state/sent_shots.rs`,
 `SentShots`) is how the Pureplay Accessory card tells Pureplay's return of a shot an
 output sent from a shot of its own. Each simulator output records
-`(ShotKey, SimAddr, Instant)` just before it writes a shot (only shots it
+`(ShotKey, SimAddr, Instant)` for each shot it writes (only shots it
 writes: not one strict mode keeps back or one dropped as stale), with the
 key the bus carried (the shot's own number, before the Open Connect client
-raises it). A write that fails takes its record back (`SentShots::forget`;
-for Pureplay Connect, a failed BallData write). `SimAddr::of(local, peer)`
+raises it). The Open Connect client records just before the write and takes
+the record back when the write fails (`SentShots::forget`); Pureplay Connect
+records once the BallData is written, under its configured address
+(`SimAddr::of(None, address)`). `SimAddr::of(local, peer)`
 is fixed per connection: the simulator's address and whether it is this
 computer (loopback, unspecified, or the connection's two ends share an
 address); the card makes one for its own connection the same way. At most
@@ -1593,12 +1594,20 @@ shows where it dials. Nothing here adds traffic to the simulator.
 
 #### Pureplay output (alpha)
 
-`actors/pureplay/` (actor `pureplay.N`, config `[pureplay.N]`,
+The Pureplay Connect card (actor `pureplay.N`, config `[pureplay.N]`,
 `PureplaySection`, UI type label "Pureplay Connect") sends shots to Pureplay
 over Pureplay Connect v1, Pureplay's published protocol: Pureplay is the host
 and listens on TCP 9760, flighthook is the device and connects. The user
 guide is [outputs/pureplay.md](outputs/pureplay.md), which also covers the
 Pureplay (Open Connect) preset, the Open Connect client card on 921.
+
+The protocol lives in the workspace crate `flighthook-pureplay` (`pureplay/`),
+module `connect`: a flightrelay driver (`connect::Connect`, feature `driver`)
+whose settings (`connect::Config`: `address`, feature `config`, which `lib` and
+the WASM UI build) `PureplaySection` flattens next to its own fields, so the
+config keys are `name`, `enabled`, `actor_id`, `address`, `full_monitor`,
+`chipping_monitor`, `putting_monitor`. The card is a `DriverActor` with the
+hooks in `actors/outputs.rs` (`PureplayHooks`); its `bus.actor` has no roles.
 
 - `codec.rs` is the wire format, pure and unit-tested: frames (`"PL"`,
   version 1, reserved 0, type, u16 LE length, payload, CRC32C LE over header
@@ -1619,7 +1628,7 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   result is never read. In strict mode the values go out as the launch monitor
   sent them.
   A total spin with no axis and no components also goes out as BackSpin
-  (`flighthook::output_backspin`). Nothing is computed (no total/axis from
+  (as `flighthook::output_backspin` does). Nothing is computed (no total/axis from
   the components, no smash factor):
   Pureplay fills those gaps. Speeds in m/s, impact in mm via
   `Distance::as_millimeters()`. Signs pass through unchanged for both hands:
@@ -1630,53 +1639,69 @@ Pureplay (Open Connect) preset, the Open Connect client card on 921.
   place to change it, to be confirmed against Pureplay. Pureplay's club numbers map to flighthook's clubs in
   `club_from_pureplay` (0 driver, 1-8 woods 2-9, 9-16 hybrids 2-9, 17-25
   irons 1-9, 26-29 PW/GW/SW/LW, 30 putter).
-- `mod.rs` runs the link like the Open Connect client runs its connection:
-  the mode is flighthook's turn mode when a shot finishes, the bus is drained
-  the whole time (shots still unfinished 45 s after their trigger are let go,
-  the shared `ShotAggregator` rule), the same backoff (1 s, +1 s, cap 3 s,
-  reset after a 10 s link), the same per-mode routing by launch monitor actor
-  id (`GsProRouting`, `Feed::passes`, Auto-Chip always
-  accepted), shots queued
-  only while the link is up and dropped when older than 5 s. A link: TCP
-  connect (5 s), Hello (ProtocolVersion 1; DeviceCaps BatteryPowered when the
-  monitor that stands for the device has reported `battery_pct`;
-  DeviceName `flighthook (<monitor name>)` or `flighthook`; Firmware the app
-  version), then HelloAck within 5 s, else the handshake fails with `error`
-  telemetry. A HelloAck choosing any version but 1 fails it too. Then the
-  status goes `Connected`, the ReadyState is pushed and every change after
-  it, and each routed shot goes out as BallData (+ ClubData), ShotId
-  counting from 1 on every link.
-- The device's state comes from the routed launch monitors' `bus.actor`
-  (blockers, battery) and card status (connection, `error`), and
-  `shot.trigger`/`shot.finished`. ReadyState: NotReady while the monitor is
-  not Connected or has blockers, Processing from a trigger until its shot
-  finishes (at most 10 s), Ready otherwise; never BallDetected.
-  ConnectionState: Connected, Connecting (`Starting`), Reconnecting, Error
-  (an `error` key while not connected) or Disconnected. The monitor read is
-  the one routed for the current mode; with Any, the best state of every
-  monitor, and the battery and name of the only configured monitor, if there
-  is one. In strict mode only measured launch monitors make the ReadyState
-  and ConnectionState.
+- The driver's `connect` is the TCP connect (5 s); the card shows Connected
+  from there, with Pureplay's address as its `device_info`. Its session
+  (`connect::Session`, generic over a `Read + Write` transport, non-blocking
+  over TCP) runs the link in steps: Hello on the first step (ProtocolVersion
+  1; DeviceCaps BatteryPowered when the monitor that stands for the device
+  has reported a battery; DeviceName `flighthook (<monitor name>)` or
+  `flighthook`; Firmware the crate version), then HelloAck within 5 s, else
+  the session ends with the reason in `error`, which stays on the card until
+  a handshake succeeds. A HelloAck choosing any version but 1 fails it too.
+  Then the ReadyState is pushed and every change after it, and each shot goes
+  out as BallData (+ ClubData), ShotId counting from 1 on every link. A shot
+  that finished before the handshake, or more than 5 s before it could be
+  sent, is dropped. Reconnects back off 1 s, +1 s, cap 3 s (reset after a
+  10 s link), with no alert.
+- What the session sees is chosen by the hooks, through the card's `Feed`
+  (`simout.rs`): the mode is flighthook's turn mode when a shot finishes, the
+  per-mode routing is by launch monitor actor id (`GsProRouting`,
+  `Feed::passes`, Auto-Chip always accepted), and a simulator source never
+  feeds it. The session is handed the `RoutedView` (the `bus.actor` of each
+  launch monitor in `Feed::in_view`: the routed one, or with Any every one
+  that may feed a simulator, never Auto-chip; again when it changes; its
+  removal when it leaves the view), each shot's trigger, launch, club, impact
+  and its launch monitor's own flight (`FeedEvent::Part`; never Auto-chip's
+  flight), and the shot's `shot.finished` only when the routing passes it. A
+  new session is handed the whole view first. The card sends `bus.sync` when
+  it starts, so the launch monitors already up republish their `bus.actor`.
+  The session composes each shot with its own `ShotAggregator` (shots still
+  unfinished 45 s after their trigger are let go).
+- The device's state comes from the launch monitors in view: their
+  `bus.actor` (blockers, battery, source) and `shot.trigger`/`shot.finished`.
+  A monitor whose `bus.actor` is blocked by `not_armed` is connecting, any
+  other connected. ReadyState: NotReady while no monitor is connected and
+  clear, Processing from a trigger until its shot finishes (at most 10 s),
+  Ready otherwise; never BallDetected. ConnectionState: Connected, Connecting
+  or Disconnected (no monitor in view), the best of every monitor's. The
+  battery and the name in Hello are those of the only monitor in view, if
+  there is one. In strict mode only measured launch monitors make the
+  ReadyState and ConnectionState.
 - Host commands: Ping → Heartbeat (ConnectionState, ReadyState, battery
-  0-100 or 0xFF). SetClubInfo → one complete `golfer.select` (club and hand) on the bus, as a
-  simulator's player information (unknown values logged and ignored), which the
-  card re-asserts when flighthook's turn differs; the card shows the values as
-  `club`/`handed`. SetShotContext: the putter selects putting, a distance under
-  30 yards chipping, anything else full, sent as the mode in the select.
-  SetDetect and SetBallType are logged only. SetStrictMode sets strict
-  mode, below. Strict mode starts off on every link.
-  Error from the host → a Warn alert, one per burst of Errors less than 30 s
-  apart across links. Any
-  other type, including a device-to-host one, or a payload too short for its
-  type → Error code 0, and the link carries on.
-- Audit log (`audit` target): every frame sent and received as its type and
-  full frame hex, then the decoded message; bytes skipped while
-  resynchronizing, as hex.
+  0-100 or 0xFF). SetClubInfo → one complete `golfer.select` (club, hand and
+  mode) from the card, as a simulator's player information (unknown values
+  logged and ignored); the card shows the values as `club`/`handed`.
+  SetShotContext: the putter selects putting, a distance under 30 yards
+  chipping, anything else full (`connect::mode_for_lie`), sent again in the
+  select when it changes the mode. The hooks keep the last select
+  (`Held`) for the link and send it again when flighthook's turn differs
+  from it, unless a game or simulator card changed the turn. SetDetect and
+  SetBallType are logged only. SetStrictMode sets strict mode, below. Strict
+  mode starts off on every link. Error from the host → a Warn alert, one per
+  burst of Errors less than 30 s apart across links. Any other type,
+  including a device-to-host one, or a payload too short for its type →
+  Error code 0, and the link carries on.
+- Every frame sent and received goes to the host as a raw frame labeled with
+  its type: an `audit` debug line with the full frame hex. Bytes skipped
+  while resynchronizing are logged as hex. Each shot's BallData comes back
+  with the shot's key once written: the hooks record it in the send
+  registry (below) under the configured address and set `shots_sent` and
+  `last_shot` on the card.
 
 Strict mode on the link (a tournament round in Pureplay).
 SetStrictMode(1) → StrictModeAck(1, ""), always: strict mode is on for the
 link. SetStrictMode(0) → StrictModeAck(1, ""), off; the end of the link or
-the actor's stop ends it too. While it is on, `pureplay::sends(strict,
+the actor's stop ends it too. While it is on, `connect::sends(strict,
 source)` lets out only a shot whose launch monitor declares `measured` in
 its `bus.actor` (a shot with no declared source is not sent); a shot held
 back takes no ShotId (an info log line once per source per link), and every

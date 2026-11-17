@@ -1793,10 +1793,10 @@ mod tests {
         let messages: Vec<BusMsg> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         let frames =
             crate::test_ball::strict_frames("openconnect_server.0", &messages).expect("sent");
-        let spin = crate::actors::pureplay::codec::BallData::TOTAL_SPIN
-            | crate::actors::pureplay::codec::BallData::BACK_SPIN
-            | crate::actors::pureplay::codec::BallData::SIDE_SPIN
-            | crate::actors::pureplay::codec::BallData::SPIN_AXIS;
+        let spin = flighthook_pureplay::connect::codec::BallData::TOTAL_SPIN
+            | flighthook_pureplay::connect::codec::BallData::BACK_SPIN
+            | flighthook_pureplay::connect::codec::BallData::SIDE_SPIN
+            | flighthook_pureplay::connect::codec::BallData::SPIN_AXIS;
         assert_eq!(frames.ball.valid & spin, spin);
     }
 }

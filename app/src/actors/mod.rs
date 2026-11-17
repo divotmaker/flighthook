@@ -11,8 +11,8 @@ pub mod gspro;
 pub mod mevo;
 pub mod mock;
 pub mod openconnect;
+pub mod outputs;
 pub mod provenance;
-pub mod pureplay;
 pub mod pureplay_accessory;
 pub mod r10;
 #[cfg(test)]
@@ -275,30 +275,13 @@ pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor> {
         }
     }
 
-    // Pureplay outputs
+    // Pureplay Connect outputs
     for (index, section) in &config.pureplay {
-        let id = global_id("pureplay", index);
-        let addr_str = section
-            .address
-            .as_deref()
-            .unwrap_or(pureplay::DEFAULT_ADDRESS);
-        match addr_str.parse::<SocketAddr>() {
-            Ok(addr) => {
-                let routing = gspro::GsProRouting {
-                    full_monitor: section.full_monitor.clone(),
-                    chipping_monitor: section.chipping_monitor.clone(),
-                    putting_monitor: section.putting_monitor.clone(),
-                };
-                actors.push(ResolvedActor {
-                    id,
-                    name: section.name.clone(),
-                    actor: Box::new(pureplay::PureplayActor { addr, routing }),
-                });
-            }
-            Err(e) => {
-                tracing::warn!("integration '{id}': invalid address '{addr_str}': {e}");
-            }
-        }
+        actors.push(ResolvedActor {
+            id: global_id("pureplay", index),
+            name: section.name.clone(),
+            actor: Box::new(outputs::PureplayActor::new(section.clone())),
+        });
     }
 
     // Pureplay Accessory cards (Pureplay's Accessory API)
@@ -656,16 +639,21 @@ mod tests {
             "1".into(),
             flighthook::PureplaySection {
                 name: "Bad".into(),
-                address: Some("not an address".into()),
+                driver: flighthook::PureplayConfig {
+                    address: Some("not an address".into()),
+                },
                 ..flighthook::PureplaySection::default()
             },
         );
-        let ids: Vec<String> = resolve_actors(&config)
+        let mut ids: Vec<String> = resolve_actors(&config)
             .into_iter()
             .map(|a| a.id)
             .filter(|id| id.starts_with("pureplay."))
             .collect();
-        assert_eq!(ids, ["pureplay.0"], "an invalid address is skipped");
+        ids.sort();
+        // An invalid address is a card whose driver refuses its settings:
+        // it shows why.
+        assert_eq!(ids, ["pureplay.0", "pureplay.1"]);
         assert_eq!(actor_names(&config)["pureplay.0"], "Pureplay");
     }
 

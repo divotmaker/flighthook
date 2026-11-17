@@ -63,12 +63,12 @@ use tokio::sync::broadcast;
 
 use crate::actors::driver::{DriverActor, Hooks};
 use crate::actors::provenance::ShotSource;
-use crate::actors::pureplay::codec::{self, FrameReader, Message};
 use crate::actors::r10::R10Hooks;
 use crate::actors::scripted::Handoff;
 use crate::actors::square::SquareHooks;
 use crate::bus::{BusMsg, LocalEvent};
 use crate::state::SystemState;
+use flighthook_pureplay::connect::codec::{self, FrameReader, Message};
 
 /// How long each step waits after its own events, for every output to
 /// pass over them (bridges poll every 50 to 100 ms).
@@ -963,7 +963,7 @@ impl Sim for MockPureplay {
         };
         self.club = Some(club);
         let club = (0u8..=30)
-            .find(|n| crate::actors::pureplay::mapper::club_from_pureplay(*n) == Some(club))
+            .find(|n| flighthook_pureplay::connect::mapper::club_from_pureplay(*n) == Some(club))
             .expect("a Pureplay club");
         self.send(&Message::SetClubInfo { handedness, club });
     }

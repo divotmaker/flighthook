@@ -4,6 +4,7 @@
 use std::fmt;
 
 use allsquare::config::Config as SquareConfig;
+use flighthook_pureplay::connect::Config as PureplayConfig;
 use flightrelay::config::DriverConfig;
 use flightrelay::mock::MockConfig;
 use flightrelay::units::{Distance, Velocity};

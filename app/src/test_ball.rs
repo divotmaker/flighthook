@@ -118,7 +118,18 @@ pub(crate) fn outputs(card: &str, mode: Option<Mode>, messages: &[crate::bus::Bu
         let data = crate::actors::simout::output_shot(&shot, card, &auto_chip);
         let gspro = serde_json::to_string(&crate::actors::gspro::mapper::map_shot(&data))
             .expect("gspro json");
-        let pureplay = format!("{:?}", crate::actors::pureplay::mapper::map_shot(&data, 1));
+        // Pureplay Connect is handed no Auto-chip flight.
+        let mut handed = shot.clone();
+        if shot.from == auto_chip {
+            handed.flights.clear();
+        }
+        let pureplay = format!(
+            "{:?}",
+            flighthook_pureplay::connect::mapper::map_shot(
+                &flighthook_pureplay::connect::output_shot(&handed, card),
+                1
+            )
+        );
         let mut path = None;
         if let Some(launch) = shot.launch_for_flight() {
             let device = shot
@@ -211,19 +222,19 @@ pub(crate) fn assert_outputs_pinned(
 /// monitor's `bus.actor` in `messages`), through the Pureplay mapper.
 /// `None` when strict mode withholds the shot.
 ///
-/// [`measured_shot`]: crate::actors::simout::measured_shot
+/// [`measured_shot`]: flighthook_pureplay::connect::measured_shot
 pub(crate) fn strict_frames(
     card: &str,
     messages: &[crate::bus::BusMsg],
-) -> Option<crate::actors::pureplay::mapper::ShotFrames> {
+) -> Option<flighthook_pureplay::connect::mapper::ShotFrames> {
     let mut agg = flightrelay::ShotAggregator::new();
     for msg in messages.iter().filter_map(crate::bus::BusMsg::as_frp) {
         if let Some(flightrelay::ShotEvent::Finished(shot)) = agg.feed(msg) {
-            let shot = crate::actors::simout::measured_shot(&shot, card);
-            if !crate::actors::pureplay::sends(true, shot.source) {
+            let shot = flighthook_pureplay::connect::measured_shot(&shot, card);
+            if !flighthook_pureplay::connect::sends(true, shot.source) {
                 return None;
             }
-            return crate::actors::pureplay::mapper::map_shot(&shot, 1);
+            return flighthook_pureplay::connect::mapper::map_shot(&shot, 1);
         }
     }
     panic!("no shot finished in {} messages", messages.len());

@@ -153,7 +153,9 @@ impl Default for PureplaySection {
             actor_id: None,
             name: "Pureplay".into(),
             enabled: true,
-            address: Some("127.0.0.1:9760".into()),
+            driver: PureplayConfig {
+                address: Some(crate::PUREPLAY_DEFAULT_ADDRESS.into()),
+            },
             full_monitor: None,
             chipping_monitor: None,
             putting_monitor: None,

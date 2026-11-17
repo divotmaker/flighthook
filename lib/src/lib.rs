@@ -32,6 +32,10 @@ pub use video::*;
 
 // Re-export flightrelay types used throughout flighthook.
 pub use allsquare::config::Config as SquareConfig;
+/// Pureplay Connect's settings, and Pureplay's address when none is set.
+pub use flighthook_pureplay::connect::{
+    Config as PureplayConfig, DEFAULT_ADDRESS as PUREPLAY_DEFAULT_ADDRESS,
+};
 pub use flightrelay::config::{ConfigError, DriverConfig};
 pub use flightrelay::mock::MockConfig;
 pub use flightrelay::types::{AssumedLaunch, Basis, ClubData, FaceImpact, FlightResult, Launch};

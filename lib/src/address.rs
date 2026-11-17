@@ -182,7 +182,7 @@ impl FlighthookConfig {
             |s| (s.enabled, s.address.as_deref()),
         );
         push(&mut out, "pureplay", &self.pureplay, |s| {
-            (s.enabled, s.address.as_deref())
+            (s.enabled, s.driver.address.as_deref())
         });
         push(
             &mut out,

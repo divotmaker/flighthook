@@ -154,18 +154,11 @@ pub enum Pass {
 }
 
 /// What a hook sees besides the message.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the software drivers' hooks read state, sender and to_session"
-    )
-)]
 pub struct HookCtx<'a, S> {
     /// The card's section as it is in effect.
     pub section: &'a S,
     /// flighthook's state.
-    pub state: &'a SystemState,
+    pub state: &'a Arc<SystemState>,
     /// The card's own sender.
     pub sender: &'a BusSender,
     /// Bus messages for the session: handed to [`FrpSession::bus`] in this
@@ -198,7 +191,7 @@ impl<D: FrpDriver, H: Hooks<D>> Hooked<D, H> {
     /// Run `f` on the hooks with their context.
     fn with<R>(
         &mut self,
-        state: &SystemState,
+        state: &Arc<SystemState>,
         sender: &BusSender,
         f: impl FnOnce(&mut H, &mut HookCtx<'_, H::Section>) -> R,
     ) -> R {
@@ -3584,6 +3577,27 @@ pub(crate) mod tests {
                 ]
                 .map(String::from)
             )
+        );
+
+        let pureplay = flighthook::PureplaySection {
+            name: "Pureplay".into(),
+            actor_id: Some("out-1".into()),
+            enabled: false,
+            driver: flighthook::PureplayConfig::default(),
+            full_monitor: Some("lm-1".into()),
+            chipping_monitor: Some("lm-2".into()),
+            putting_monitor: Some("lm-3".into()),
+        };
+        let full = flighthook::PureplaySection {
+            driver: flighthook::PureplayConfig {
+                address: Some("192.168.1.20:9760".into()),
+            },
+            ..pureplay.clone()
+        };
+        keys_apart(&pureplay, &full);
+        assert_eq!(
+            driver_keys::<flighthook::PureplayConfig>(),
+            BTreeSet::from(["address".to_owned()])
         );
 
         let exputt = flighthook::ExPuttSection {

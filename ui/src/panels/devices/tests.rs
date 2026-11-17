@@ -1104,7 +1104,9 @@ fn a_configured_pureplay_connect_output_saves_its_address_and_routing() {
         "0".into(),
         crate::types::PureplaySection {
             name: "Pureplay Connect".into(),
-            address: Some("127.0.0.1:9760".into()),
+            driver: flighthook::PureplayConfig {
+                address: Some("127.0.0.1:9760".into()),
+            },
             ..Default::default()
         },
     );
@@ -1129,7 +1131,9 @@ fn a_configured_pureplay_connect_output_saves_its_address_and_routing() {
             name: "Pureplay Connect".into(),
             enabled: true,
             actor_id: None,
-            address: Some("192.168.1.20:9760".into()),
+            driver: flighthook::PureplayConfig {
+                address: Some("192.168.1.20:9760".into()),
+            },
             full_monitor: None,
             chipping_monitor: None,
             putting_monitor: Some("mevo.0".into()),
@@ -1308,7 +1312,9 @@ fn the_golfers_card_and_a_pureplay_output_save_apart() {
         "0".into(),
         crate::types::PureplaySection {
             name: "Pureplay".into(),
-            address: Some("192.168.1.20:9760".into()),
+            driver: flighthook::PureplayConfig {
+                address: Some("192.168.1.20:9760".into()),
+            },
             ..Default::default()
         },
     );

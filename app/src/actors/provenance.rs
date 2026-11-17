@@ -73,6 +73,7 @@ impl ShotSource {
 
     /// Whether the source is a launch monitor card (configured, with a
     /// status and readiness of its own); Auto-chip is not.
+    #[cfg(test)]
     #[must_use]
     pub fn is_launch_monitor(self) -> bool {
         match self {
