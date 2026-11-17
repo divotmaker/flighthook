@@ -1949,6 +1949,79 @@ mod tests {
         ));
     }
 
+    /// A 100 fps clip of one mock shot from the unpaced test pattern,
+    /// dated from 0: triggered at 500 ms, at generation `g`.
+    fn unpaced_clip(g: u64) -> stance::Clip<Tag> {
+        let mut pattern = TestPattern::new(stance::TestPatternConfig {
+            width: 64,
+            height: 48,
+            fps: 100,
+            paced: false,
+            origin_ns: Some(0),
+            ..stance::TestPatternConfig::default()
+        })
+        .expect("pattern");
+        let mut recorder = ClipRecorder::new(RecorderConfig {
+            pre_roll: Duration::from_millis(100),
+            post_roll: Duration::from_millis(100),
+            ..RecorderConfig::default()
+        });
+        let tag = Tag {
+            shot: ClipShot {
+                key: ShotKey {
+                    shot_id: format!("shot-{g}"),
+                    shot_number: 1,
+                },
+                device: "mock".into(),
+                impact_lead_ms: 0,
+                hand: None,
+                golfer: None,
+            },
+            generation: g,
+        };
+        for seq in 0..100 {
+            if seq == 50 {
+                recorder.trigger(Trigger::new(500_000_000, "mock_monitor.0", tag.clone()));
+            }
+            let frame = pattern
+                .next_frame(Duration::ZERO)
+                .expect("frame")
+                .expect("frame");
+            for event in recorder.push(frame) {
+                if let RecorderEvent::Finished(clip) = event {
+                    return clip;
+                }
+            }
+        }
+        panic!("no clip");
+    }
+
+    #[test]
+    fn a_clip_with_its_whole_post_roll_is_saved_complete() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flighthook-camera-save-{}",
+            uuid::Uuid::new_v4().simple()
+        )));
+        std::fs::create_dir_all(&dir.0).expect("dir");
+        let (state, _writer) = SystemState::new(dir.0.join("config.toml"));
+        let state = Arc::new(state);
+        state.system.update(|c| {
+            c.replay.clip_dir = Some(dir.0.join("clips").display().to_string());
+        });
+        let (bus, mut rx) = broadcast::channel(16);
+        let sender = BusSender::new("camera.0".into(), bus, Arc::new(AtomicBool::new(false)));
+        let generation = state.clips.generation();
+        let clip = unpaced_clip(generation);
+        assert!(clip.complete);
+        save(&state, &sender, &clip);
+        let msg = rx.try_recv().expect("shot_video");
+        assert!(matches!(
+            msg.as_local(),
+            Some((_, LocalEvent::ShotVideo { complete: true, .. }))
+        ));
+        assert!(state.clips.videos(&format!("shot-{generation}"))[0].complete);
+    }
+
     #[test]
     fn a_clip_of_shots_cleared_since_their_trigger_is_not_written() {
         let dir = TempDir(std::env::temp_dir().join(format!(
@@ -1965,59 +2038,13 @@ mod tests {
         let (bus, mut rx) = broadcast::channel(16);
         let sender = BusSender::new("camera.0".into(), bus, Arc::new(AtomicBool::new(false)));
 
-        // A 100 fps clip of one mock shot, triggered at generation `g`.
-        let clip = |g: u64| {
-            let mut pattern = TestPattern::new(stance::TestPatternConfig {
-                width: 64,
-                height: 48,
-                fps: 100,
-                paced: false,
-                origin_ns: Some(0),
-                ..stance::TestPatternConfig::default()
-            })
-            .expect("pattern");
-            let mut recorder = ClipRecorder::new(RecorderConfig {
-                pre_roll: Duration::from_millis(100),
-                post_roll: Duration::from_millis(100),
-                ..RecorderConfig::default()
-            });
-            let tag = Tag {
-                shot: ClipShot {
-                    key: ShotKey {
-                        shot_id: format!("shot-{g}"),
-                        shot_number: 1,
-                    },
-                    device: "mock".into(),
-                    impact_lead_ms: 0,
-                    hand: None,
-                    golfer: None,
-                },
-                generation: g,
-            };
-            for seq in 0..100 {
-                if seq == 50 {
-                    recorder.trigger(Trigger::new(500_000_000, "mock_monitor.0", tag.clone()));
-                }
-                let frame = pattern
-                    .next_frame(Duration::ZERO)
-                    .expect("frame")
-                    .expect("frame");
-                for event in recorder.push(frame) {
-                    if let RecorderEvent::Finished(clip) = event {
-                        return clip;
-                    }
-                }
-            }
-            panic!("no clip");
-        };
-
-        let before = clip(state.clips.generation());
+        let before = unpaced_clip(state.clips.generation());
         state.clips.clear();
         save(&state, &sender, &before);
         assert!(rx.try_recv().is_err(), "no shot_video");
         assert_eq!(std::fs::read_dir(&clips_dir).map_or(0, Iterator::count), 0);
 
-        let after = clip(state.clips.generation());
+        let after = unpaced_clip(state.clips.generation());
         save(&state, &sender, &after);
         let msg = rx.try_recv().expect("shot_video");
         assert!(matches!(
@@ -2208,6 +2235,31 @@ mod tests {
             None
         }
 
+        /// Wait until the clip queue has no clip waiting or being tracked
+        /// and its worker has ended.
+        fn idle_clips(&self) {
+            let clips = &self.state.pose.clips;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while clips.working() || !clips.waiting().is_empty() {
+                assert!(Instant::now() < deadline, "the clip queue did not go idle");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Whether a `shot_pose` is among the bus messages not read yet.
+        fn saw_pose(&mut self) -> bool {
+            loop {
+                match self.rx.try_recv() {
+                    Ok(BusMsg::Local {
+                        event: LocalEvent::ShotPose { .. },
+                        ..
+                    }) => return true,
+                    Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                    Err(_) => return false,
+                }
+            }
+        }
+
         /// The next `shot_video`'s keys.
         fn next_video(&mut self) -> Option<(Vec<ShotKey>, bool)> {
             self.wait_for(Duration::from_secs(10), |m| {
@@ -2344,9 +2396,8 @@ mod tests {
     fn a_mock_shot_records_a_clip_that_is_served_with_the_shot() {
         let mut rig = Rig::start(20);
         let key = rig.shot("mock_monitor.0", 1);
-        let (keys, complete) = rig.next_video().expect("shot_video");
+        let (keys, _) = rig.next_video().expect("shot_video");
         assert_eq!(keys, std::slice::from_ref(&key));
-        assert!(complete);
         assert_eq!(rig.folders(), 1);
 
         // On disk: the camera's AVI and sidecar, and flighthook's shot.json.
@@ -2374,7 +2425,7 @@ mod tests {
         let video = &row["video"][0];
         assert_eq!(video["camera"], "camera.0");
         assert_eq!(video["position"], "golfer_front");
-        assert_eq!(video["complete"], true);
+        assert!(video["complete"].is_boolean());
         assert!(video["fps"].as_f64().unwrap() > 20.0, "{video}");
         // 0.4 s pre-roll + 0.6 s post-roll, the trigger 0.4 s in.
         let duration = video["duration_ms"].as_u64().unwrap();
@@ -2525,12 +2576,11 @@ mod tests {
             "the camera was not reopened: {statuses:?}"
         );
         assert_eq!(latency(&rig.state, "camera.0"), millis(300));
-        // The next shot's clip is made from frames dated 0.3 s earlier, and
-        // still waits for the frames of its window.
+        // The next shot still makes a clip (that it waits for the frames of
+        // its window is `the_shifted_clock_keeps_a_clip_open_for_late_frames`).
         let key = rig.shot("mock_monitor.0", 1);
-        let (keys, complete) = rig.next_video().expect("shot_video");
+        let (keys, _) = rig.next_video().expect("shot_video");
         assert_eq!(keys, [key]);
-        assert!(complete);
     }
 
     #[test]
@@ -3067,12 +3117,9 @@ mod tests {
         assert_eq!(code, 200);
         assert!(!headers.contains_key("x-pose"));
         assert_eq!(headers["x-pose-state"], "off");
-        assert!(
-            rig.wait_for(Duration::from_millis(3500), |m| {
-                matches!(m.event, LocalEvent::ShotPose { .. })
-            })
-            .is_none()
-        );
+        // Nothing queued, so nothing can be tracked.
+        assert!(rig.state.pose.clips.waiting().is_empty());
+        assert!(!rig.state.pose.clips.working());
         assert!(rig.state.pose.models.state(model).is_none());
         assert!(
             !rig.dir
@@ -3115,13 +3162,10 @@ mod tests {
                 "off"
             };
             assert_eq!(headers["x-pose-state"], live_state, "{mode:?}");
-            assert!(
-                rig.wait_for(Duration::from_millis(3500), |m| {
-                    matches!(m.event, LocalEvent::ShotPose { .. })
-                })
-                .is_none(),
-                "{mode:?}"
-            );
+            // The clip has had its turn (at once when viewed, its 3 s in
+            // Live) and was left untracked.
+            rig.idle_clips();
+            assert!(!rig.saw_pose(), "{mode:?}");
             assert!(!rig.state.pose.models.downloading(), "{mode:?}");
             assert!(
                 !rig.state.pose.models.dir().exists(),
@@ -3166,14 +3210,8 @@ mod tests {
         rig.next_video().expect("shot_video");
         assert!(rig.state.pose.clips.working(), "queued for its pass");
         save(&mut rig, BodyTrackingMode::Historical);
-        assert!(
-            rig.wait_for(
-                crate::pose::clips::CLIP_DELAY + Duration::from_secs(1),
-                |m| { matches!(m.event, LocalEvent::ShotPose { .. }) }
-            )
-            .is_none(),
-            "no automatic pass out of Live"
-        );
+        rig.idle_clips();
+        assert!(!rig.saw_pose(), "no automatic pass out of Live");
         // Historical keeps the models for the clips viewed; Off lets them go
         // and drops what waits.
         assert!(rig.state.pose.models.state(model).is_some());

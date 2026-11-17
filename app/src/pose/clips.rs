@@ -390,24 +390,47 @@ impl Drop for Idle<'_> {
     }
 }
 
-/// Sleep until `job`'s turn: [`CLIP_DELAY`] after a recorded clip was
-/// written, at once for a viewed one. False when the clip is pruned or
-/// cleared meanwhile.
-fn wait_turn(state: &SystemState, job: &ClipJob) -> bool {
+/// What a clip does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// Its turn comes in this long.
+    Wait(Duration),
+    /// Its turn has come and it is wanted: track it.
+    Run,
+    /// Its turn has come and it is no longer wanted ([`wanted`]).
+    Skip,
+}
+
+/// What `job` does at `now` in `mode`: a recorded clip's turn comes
+/// [`CLIP_DELAY`] after it was written, a viewed one's at once; then it
+/// runs if it is still [`wanted`].
+fn turn(job: &ClipJob, mode: BodyTrackingMode, now: Instant) -> Turn {
     let due = if job.on_demand {
         job.written
     } else {
         job.written + CLIP_DELAY
     };
+    if now < due {
+        Turn::Wait(due - now)
+    } else if wanted(job, mode) {
+        Turn::Run
+    } else {
+        Turn::Skip
+    }
+}
+
+/// Sleep until `job`'s [`turn`]. True when it runs; false when it is
+/// skipped, or pruned or cleared meanwhile.
+fn wait_turn(state: &SystemState, job: &ClipJob) -> bool {
     loop {
         if !state.clips.is_current(&job.slot) {
             return false;
         }
-        let now = Instant::now();
-        if now >= due {
-            return true;
+        match turn(job, state.system.body_tracking().mode, Instant::now()) {
+            Turn::Wait(left) => std::thread::sleep(left.min(MODEL_POLL)),
+            Turn::Run => return true,
+            Turn::Skip => return false,
         }
-        std::thread::sleep((due - now).min(MODEL_POLL));
     }
 }
 
@@ -429,9 +452,6 @@ fn run(state: &SystemState, job: &ClipJob) -> bool {
         return false;
     }
     let settings = state.system.body_tracking();
-    if !wanted(job, settings.mode) {
-        return false;
-    }
     #[cfg(test)]
     if let Some(pass) = *state
         .pose
@@ -1069,14 +1089,54 @@ mod tests {
     }
 
     #[test]
-    fn a_viewed_clip_starts_at_once() {
+    fn a_recorded_clips_turn_comes_clip_delay_after_it_was_written_and_only_in_live() {
         let (dir, state) = state();
-        set_mode(&state, BodyTrackingMode::Historical);
-        state.pose.clips.fake(counting_pass);
+        let job = clip(&state, &dir, 1);
+        let at = |after: Duration| job.written + after;
+        let ms = Duration::from_millis;
+        for mode in [
+            BodyTrackingMode::Live,
+            BodyTrackingMode::Historical,
+            BodyTrackingMode::Off,
+        ] {
+            assert_eq!(
+                turn(&job, mode, at(ms(0))),
+                Turn::Wait(CLIP_DELAY),
+                "{mode:?}"
+            );
+            assert_eq!(
+                turn(&job, mode, at(CLIP_DELAY - ms(1))),
+                Turn::Wait(ms(1)),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            turn(&job, BodyTrackingMode::Live, at(CLIP_DELAY)),
+            Turn::Run
+        );
+        assert_eq!(
+            turn(&job, BodyTrackingMode::Live, at(CLIP_DELAY * 9)),
+            Turn::Run
+        );
+        assert_eq!(
+            turn(&job, BodyTrackingMode::Historical, at(CLIP_DELAY)),
+            Turn::Skip
+        );
+        assert_eq!(
+            turn(&job, BodyTrackingMode::Off, at(CLIP_DELAY)),
+            Turn::Skip
+        );
+    }
+
+    #[test]
+    fn a_viewed_clip_runs_at_once_in_any_mode_but_off() {
+        let (dir, state) = state();
         let mut job = clip(&state, &dir, 1);
-        job.written = Instant::now();
         job.on_demand = true;
-        assert!(run(&state, &job));
+        let now = job.written;
+        assert_eq!(turn(&job, BodyTrackingMode::Live, now), Turn::Run);
+        assert_eq!(turn(&job, BodyTrackingMode::Historical, now), Turn::Run);
+        assert_eq!(turn(&job, BodyTrackingMode::Off, now), Turn::Skip);
     }
 
     #[test]
@@ -1249,26 +1309,13 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_waits_its_turn_after_it_was_written() {
+    fn a_clip_cleared_while_it_waits_its_turn_is_skipped_without_running() {
         let (dir, state) = state();
-        static STARTED: Mutex<Option<Instant>> = Mutex::new(None);
-        fn pass(_: &std::path::Path, _: &PoseConfig) -> stance::Result<PoseTrack> {
-            *STARTED.lock().unwrap() = Some(Instant::now());
-            Ok(track(2))
-        }
-        state.pose.clips.fake(pass);
+        state.pose.clips.fake(|_, _| panic!("the pass ran"));
         let mut job = clip(&state, &dir, 1);
-        job.written = Instant::now() - CLIP_DELAY + Duration::from_millis(300);
-        assert!(run(&state, &job));
-        let started = STARTED.lock().unwrap().expect("ran");
-        assert!(started >= job.written + CLIP_DELAY);
-        // Cleared while it waits: skipped without running.
-        let mut job = clip(&state, &dir, 2);
         job.written = Instant::now();
         state.clips.clear();
-        *STARTED.lock().unwrap() = None;
         assert!(!run(&state, &job));
-        assert!(STARTED.lock().unwrap().is_none());
     }
 
     #[test]
