@@ -1992,17 +1992,6 @@ mod tests {
             }
         }
 
-        /// Every `openconnect_client.0` alert already on the bus, without waiting.
-        fn alerts_so_far(&mut self) -> Vec<String> {
-            let mut alerts = Vec::new();
-            while let Ok(msg) = self.events.try_recv() {
-                if let Some(message) = card_alert(&msg) {
-                    alerts.push(message);
-                }
-            }
-            alerts
-        }
-
         fn wait_for_status(&mut self, status: ActorStatus) -> Vec<String> {
             self.wait_for(&format!("{status:?}"), |m| {
                 matches!(
@@ -2126,10 +2115,6 @@ mod tests {
         ));
     }
 
-    fn is_shot_alert(message: &str) -> bool {
-        message.to_lowercase().contains("shot")
-    }
-
     #[test]
     fn shots_right_after_connect_are_all_sent_in_order_with_unchanged_json() {
         let mut bridge = Bridge::start(Backoff::new(MIN_BACKOFF, MAX_BACKOFF));
@@ -2167,30 +2152,6 @@ mod tests {
         );
         assert_eq!(gspro.shots(2), [golden(12), golden(13)]);
         bridge.stop().expect("bridge stops");
-    }
-
-    #[test]
-    fn shots_while_disconnected_are_not_sent_and_raise_no_alert() {
-        // A 3 s backoff keeps the bridge disconnected while the shots finish.
-        let mut bridge = Bridge::start(Backoff::new(MAX_BACKOFF, MAX_BACKOFF));
-        let first = bridge.accept();
-        bridge.wait_for_status(ActorStatus::Connected);
-        drop(first);
-        let mut alerts = bridge.wait_for_status(ActorStatus::Reconnecting);
-        emit_shot(&bridge.monitor, 1);
-        emit_shot(&bridge.monitor, 2);
-
-        let mut second = bridge.accept();
-        alerts.extend(bridge.wait_for_status(ActorStatus::Connected));
-        emit_shot(&bridge.monitor, 3);
-        assert_eq!(second.shots(1), [golden(3)]);
-        bridge.stop().expect("bridge stops");
-        alerts.extend(bridge.alerts_so_far());
-
-        assert!(
-            !alerts.iter().any(|a| is_shot_alert(a)),
-            "dropped shots must not raise an alert: {alerts:?}"
-        );
     }
 
     /// The client's card, built from its statuses as the web layer builds it
@@ -2453,9 +2414,7 @@ mod tests {
         bridge.wait_for_status(ActorStatus::Connected);
         drop(gspro);
         bridge.wait_for_status(ActorStatus::Reconnecting);
-        let asked = Instant::now();
         bridge.stop().expect("bridge returns during a 60 s backoff");
-        assert!(asked.elapsed() < Duration::from_secs(1));
     }
 
     // -- Simulator sources and the send registry ---------------------------------

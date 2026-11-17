@@ -1490,10 +1490,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("timed out waiting for {what}"))
         }
 
-        /// Asserts the server writes nothing for a while.
-        fn expect_quiet(&mut self) {
-            let extra = self.next(Duration::from_millis(500));
-            assert_eq!(extra, None, "an unexpected message");
+        /// Sends a heartbeat and asserts the next object the server writes
+        /// is its 200: nothing else was written before it.
+        fn expect_only_the_200(&mut self) {
+            self.send(HEARTBEAT);
+            assert_eq!(
+                self.expect("the 200"),
+                OK_HEARTBEAT,
+                "an unexpected message"
+            );
         }
     }
 
@@ -1520,16 +1525,14 @@ mod tests {
         rig.set_club(Club::Iron7);
         let bind = rig.server([127, 0, 0, 1]);
         let mut monitor = Monitor::connect(bind);
-        // Nothing before the monitor has spoken.
-        assert_eq!(monitor.next(Duration::from_millis(300)), None);
-
+        // Nothing before the monitor has spoken: the first object is the 200.
         monitor.send(HEARTBEAT);
         assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
         assert_eq!(
             monitor.expect("the 201"),
             r#"{"Code":201,"Message":"GSPro Player Information","Player":{"Handed":"LH","Club":"I7"}}"#
         );
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
     }
 
     #[test]
@@ -1546,31 +1549,31 @@ mod tests {
             player_info(Some("RH"), Some("DR"))
         );
         // No change, no message, however many passes the loop makes.
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
 
         rig.set_hand(Handedness::Left);
         assert_eq!(
             monitor.expect("the 201 for the hand"),
             player_info(Some("LH"), Some("DR"))
         );
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
 
         rig.set_club(Club::Putter);
         assert_eq!(
             monitor.expect("the 201 for the club"),
             player_info(Some("LH"), Some("PT"))
         );
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
 
         // Setting what is already set is no change.
         rig.set_hand(Handedness::Left);
         rig.set_club(Club::Putter);
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
 
         // The 200 reply to a later message is still just the 200.
         monitor.send(HEARTBEAT);
         assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
     }
 
     /// A hand set in the UI is the session's hand like any other: the
@@ -1597,7 +1600,7 @@ mod tests {
             monitor.expect("the 201 for the hand"),
             player_info(Some("LH"), Some("DR"))
         );
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
     }
 
     #[test]
@@ -1607,18 +1610,18 @@ mod tests {
         let mut monitor = Monitor::connect(bind);
         monitor.send(HEARTBEAT);
         assert_eq!(monitor.expect("the 200"), OK_HEARTBEAT);
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
 
         // GSPro always sends the club with the hand: nothing goes out until
         // the club is known, and then the hand goes with it.
         rig.set_hand(Handedness::Left);
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
         rig.set_club(Club::Wood3);
         assert_eq!(
             monitor.expect("the 201 with both"),
             player_info(Some("LH"), Some("W3"))
         );
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
     }
 
     /// The session starts right-handed, so a club alone goes out with that
@@ -1635,7 +1638,7 @@ mod tests {
             monitor.expect("the 201 with the club"),
             player_info(Some("RH"), Some("DR"))
         );
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
         rig.set_hand(Handedness::Left);
         assert_eq!(
             monitor.expect("the 201 with both"),
@@ -1698,7 +1701,7 @@ mod tests {
             monitor.read_once(WAIT),
             Some(player_info(Some("RH"), Some("DR")))
         );
-        monitor.expect_quiet();
+        monitor.expect_only_the_200();
     }
 
     #[test]
