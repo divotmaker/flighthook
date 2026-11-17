@@ -161,6 +161,9 @@ pub struct HookCtx<'a, S> {
     pub state: &'a Arc<SystemState>,
     /// The card's own sender.
     pub sender: &'a BusSender,
+    /// The card's status as the host last sent it: a hook that sends rows
+    /// ([`LocalEvent::CardStatus`]) repeats it, the host owns it.
+    pub status: ActorStatus,
     /// Bus messages for the session: handed to [`FrpSession::bus`] in this
     /// order before its next step.
     pub to_session: &'a mut Vec<FrpMessage>,
@@ -193,12 +196,14 @@ impl<D: FrpDriver, H: Hooks<D>> Hooked<D, H> {
         &mut self,
         state: &Arc<SystemState>,
         sender: &BusSender,
+        status: ActorStatus,
         f: impl FnOnce(&mut H, &mut HookCtx<'_, H::Section>) -> R,
     ) -> R {
         let mut ctx = HookCtx {
             section: &self.section,
             state,
             sender,
+            status,
             to_session: &mut self.to_session,
         };
         f(&mut self.hooks, &mut ctx)
@@ -466,9 +471,14 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                     let since = Instant::now();
                     start_session(sink, &mut self.hooked.borrow_mut(), session.identity());
                     let ended = self.drive(&mut session, &mut driver, host, sink, flags);
-                    self.hooked
-                        .borrow_mut()
-                        .with(&sink.state, &sink.sender, |h, ctx| h.session_ended(ctx));
+                    self.hooked.borrow_mut().with(
+                        &sink.state,
+                        &sink.sender,
+                        sink.status,
+                        |h, ctx| {
+                            h.session_ended(ctx);
+                        },
+                    );
                     match ended {
                         Err(e) if !host.stopped() => {
                             drop(session);
@@ -621,7 +631,9 @@ fn start_session<D: FrpDriver, H: Hooks<D>>(
 ) {
     sink.connected(identity);
     hooked.to_session.clear();
-    hooked.with(&sink.state, &sink.sender, |h, ctx| h.session_started(ctx));
+    hooked.with(&sink.state, &sink.sender, sink.status, |h, ctx| {
+        h.session_started(ctx);
+    });
 }
 
 /// One pass of a session after the bus was drained: what the hooks pushed
@@ -705,6 +717,9 @@ struct Host<D: FrpDriver, H> {
 struct Synced {
     sender: BusSender,
     published: Arc<Mutex<Option<BusActor>>>,
+    /// The card's status last sent, shared with the [`Sink`], for the hooks
+    /// the host runs while it drains the bus.
+    status: Arc<Mutex<ActorStatus>>,
 }
 
 impl Synced {
@@ -712,6 +727,7 @@ impl Synced {
         Self {
             sender: sink.sender.clone(),
             published: Arc::clone(&sink.published),
+            status: Arc::clone(&sink.shown),
         }
     }
 
@@ -772,7 +788,8 @@ impl<D: FrpDriver, H: Hooks<D>> Host<D, H> {
             if let Some(action) = H::action(&msg, &self.actor) {
                 self.actions.push_back(action);
             }
-            hooked.with(&self.state, &self.synced.sender, |h, ctx| {
+            let status = *lock(&self.synced.status);
+            hooked.with(&self.state, &self.synced.sender, status, |h, ctx| {
                 h.route(&msg, ctx);
             });
         }
@@ -835,6 +852,8 @@ struct Sink<D: FrpDriver, H: Hooks<D>> {
     identity: Option<DeviceIdentity>,
     /// The card's status last sent.
     status: ActorStatus,
+    /// `status`, shared with [`Synced`].
+    shown: Arc<Mutex<ActorStatus>>,
     /// The device's status, as the card's `bus.actor` carries it.
     device_status: DeviceStatus,
     /// The `bus.actor` last published, shared with [`Host`], which
@@ -971,6 +990,7 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             device: None,
             identity: None,
             status: ActorStatus::Starting,
+            shown: Arc::new(Mutex::new(ActorStatus::Starting)),
             device_status: DeviceStatus::not_armed(),
             published: Arc::new(Mutex::new(None)),
             connecting: false,
@@ -1048,6 +1068,7 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
     /// an `error` of its own (a Starting status drops what the card held).
     fn status(&mut self, status: ActorStatus, mut telemetry: HashMap<String, String>) {
         self.status = status;
+        *lock(&self.shown) = status;
         self.hold_connect_error(&mut telemetry);
         self.sender
             .local(LocalEvent::CardStatus { status, telemetry });
@@ -1254,7 +1275,9 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             }
             return;
         }
-        let pass = hooked.with(&self.state, &self.sender, |h, ctx| h.on_frp(&mut body, ctx));
+        let pass = hooked.with(&self.state, &self.sender, self.status, |h, ctx| {
+            h.on_frp(&mut body, ctx)
+        });
         if pass == Pass::Drop {
             if let FrpBody::ShotTrigger(trigger) = body {
                 self.dropped.insert(trigger.key.shot_id, Instant::now());
@@ -1338,7 +1361,7 @@ impl<D: FrpDriver, H: Hooks<D>> Sink<D, H> {
             },
             |(shot, _)| shot,
         );
-        let extra = hooked.with(&self.state, &self.sender, |h, ctx| {
+        let extra = hooked.with(&self.state, &self.sender, self.status, |h, ctx| {
             h.before_finished(&shot, ctx)
         });
         for body in extra {
@@ -2323,22 +2346,20 @@ pub(crate) mod tests {
             );
         }
 
-        /// Messages of `fake.0` until one matches `want`, within 5 s.
+        /// Messages of `fake.0` until one matches `want`; blocks on the bus.
         fn until(&mut self, mut want: impl FnMut(&BusMsg) -> bool) -> Vec<BusMsg> {
-            let deadline = Instant::now() + Duration::from_secs(5);
             let mut seen = Vec::new();
             loop {
-                assert!(Instant::now() < deadline, "timed out: {:?}", kinds(&seen));
-                match self.rx.try_recv() {
-                    Ok(m) if of_fake(&m) => {
+                match crate::actors::scripted::recv_within(&mut self.rx) {
+                    Some(m) if of_fake(&m) => {
                         let done = want(&m);
                         seen.push(m);
                         if done {
                             return seen;
                         }
                     }
-                    Ok(_) => {}
-                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    Some(_) => {}
+                    None => panic!("timed out: {:?}", kinds(&seen)),
                 }
             }
         }
@@ -3240,7 +3261,7 @@ pub(crate) mod tests {
         assert_eq!(activity, Activity::Idle);
         let started = flightrelay::FrpMessage::new(state.flighthook_id(), state.session.turn());
         assert_eq!(
-            *lock(&seen),
+            *seen.lock(),
             [
                 Seen::Bus(Box::new(started)),
                 Seen::Bus(Box::new(turn)),
@@ -3296,12 +3317,8 @@ pub(crate) mod tests {
         assert_eq!(actor.device.and_then(|d| d.source), None);
         let aim = game_aim();
         rig.tx.send(BusMsg::frp(aim.clone())).expect("sent");
-        let deadline = Instant::now() + crate::actors::GIVE_UP;
-        while !lock(&seen).contains(&Seen::Action("aim".into())) {
-            assert!(Instant::now() < deadline, "{:?}", lock(&seen));
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let buses: Vec<_> = lock(&seen)
+        let handed = seen.wait_until(|seen| seen.contains(&Seen::Action("aim".into())));
+        let buses: Vec<_> = handed
             .iter()
             .filter_map(|s| match s {
                 Seen::Bus(m) => Some((**m).clone()),

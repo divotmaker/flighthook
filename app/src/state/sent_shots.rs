@@ -5,15 +5,16 @@
 //! the shot it then plays: Pureplay's Accessory API reports every shot,
 //! the ones flighthook sent included. Every simulator output (the Open
 //! Connect client and the Pureplay Connect output) records each shot here
-//! just before it writes it, with the simulator's address, so the Pureplay
-//! card can tell a shot flighthook sent (an echo) from one Pureplay had
-//! from elsewhere: [`SentShots::take_echo`].
+//! with the simulator's address: the Open Connect client just before it
+//! writes the shot, Pureplay Connect once its write succeeded. So the
+//! Pureplay card can tell a shot flighthook sent (an echo) from one
+//! Pureplay had from elsewhere: [`SentShots::take_echo`].
 //!
 //! A record is consumed by the echo it matches, together with any other
 //! record of the same shot (the same shot sent by a second output), and is
-//! forgotten once it is older than [`ECHO_WINDOW`]. A write that fails
-//! takes its record back ([`SentShots::forget`]). At most [`CAPACITY`] are
-//! kept.
+//! forgotten once it is older than [`ECHO_WINDOW`]. The Open Connect
+//! client takes the record of a write that fails back
+//! ([`SentShots::forget`]). At most [`CAPACITY`] are kept.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};

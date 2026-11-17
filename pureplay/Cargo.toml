@@ -10,7 +10,7 @@ repository = "https://github.com/divotmaker/flighthook"
 readme = false
 
 [features]
-default = []
+default = ["driver"]
 # The settings types only (serde), so the WASM UI builds them.
 config = ["dep:flightrelay", "flightrelay/config", "dep:serde"]
 # The flightrelay drivers, their sessions and transports (`controller`: the

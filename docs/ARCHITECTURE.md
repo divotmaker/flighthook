@@ -1530,8 +1530,7 @@ with no address comparison: `Feed::feeds_simulators(actor)` (`simout.rs`) is fal
 for an actor whose registered `ShotSource::is_simulator()` (the Pureplay
 card) or whose ID starts `pureplay_accessory.` (before it registers). It is
 the one predicate behind `Feed::passes`, the outputs' readiness (`Feed::ready`)
-and the monitors they report (ready, connection state, battery) and
-`monitor_names`. The
+and the monitors they report (ready, connection state, battery). The
 Open Connect client's `Relay` holds a `gspro::Registry` (the app state, for
 the source types, and the send registry) for it. A save that
 routes an output to a `pureplay_accessory.N` ID is refused with `400` ("An
@@ -1980,7 +1979,7 @@ no round of its own, and nothing else changes during one.
   finished shot carries the source its launch monitor declared
   (`CompletedShot::source`); unknown counts as not measured.
 - **Which shots go out.** In strict mode Pureplay Connect sends only the
-  shots of measured launch monitors (`pureplay::sends`) and ignores every
+  shots of measured launch monitors (`connect::sends`) and ignores every
   `shot.flight`, so it never sends a simulated or estimated value. It sends
   `launch`, `club` and `impact` as the launch monitor sent them, so the
   values a real launch monitor reports (the R10's back and side spin, the Xi's

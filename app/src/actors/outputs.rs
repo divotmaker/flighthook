@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use flighthook::{ActorStatus, PureplayConfig, PureplaySection};
+use flighthook::{PureplayConfig, PureplaySection};
 use flighthook_pureplay::connect::Connect;
 use flightrelay::driver::FrpDriver;
 use flightrelay::{BusSync, FrpBody, RawDir};
@@ -101,10 +101,10 @@ fn feed<'a>(slot: &'a mut Option<Feed>, ctx: &HookCtx<'_, PureplaySection>) -> &
     feed
 }
 
-/// Rows for the card while it is linked.
+/// Rows for the card, with the status the host last sent.
 fn rows(ctx: &HookCtx<'_, PureplaySection>, telemetry: HashMap<String, String>) {
     ctx.sender.local(LocalEvent::CardStatus {
-        status: ActorStatus::Connected,
+        status: ctx.status,
         telemetry,
     });
 }

@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use flightrelay::FrpMessage;
@@ -21,6 +21,26 @@ use flightrelay::driver::{
     Activity, ConnectCtx, DeviceEvent, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession,
     Stopped, TurnHints,
 };
+use tokio::sync::broadcast;
+
+/// The next message on `rx`, blocking until one arrives; `None` when the
+/// bus closes or nothing arrives within [`GIVE_UP`](crate::actors::GIVE_UP)
+/// (the only bound: a test waits on the message it expects).
+pub(crate) fn recv_within<T: Clone>(rx: &mut broadcast::Receiver<T>) -> Option<T> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        loop {
+            match tokio::time::timeout(crate::actors::GIVE_UP, rx.recv()).await {
+                Ok(Ok(msg)) => return Some(msg),
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return None,
+            }
+        }
+    })
+}
 
 /// Scripted devices of type `T` waiting for a driver, by key `K`.
 pub(crate) struct Handoff<K, T>(Mutex<Option<HashMap<K, T>>>);
@@ -77,13 +97,47 @@ pub(crate) enum Seen {
     Step(Instant),
 }
 
+/// What a session was handed, with a signal for each addition.
+#[derive(Debug, Default)]
+pub(crate) struct SeenLog {
+    seen: Mutex<Vec<Seen>>,
+    added: Condvar,
+}
+
+impl SeenLog {
+    /// What was handed so far.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Vec<Seen>> {
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&self, seen: Seen) {
+        self.lock().push(seen);
+        self.added.notify_all();
+    }
+
+    /// What was handed, once `done` holds of it: blocks on the signal for
+    /// each addition, bounded only by [`GIVE_UP`](crate::actors::GIVE_UP).
+    ///
+    /// # Panics
+    ///
+    /// When `done` does not hold within the bound.
+    pub(crate) fn wait_until(&self, done: impl Fn(&[Seen]) -> bool) -> Vec<Seen> {
+        let (seen, timeout) = self
+            .added
+            .wait_timeout_while(self.lock(), crate::actors::GIVE_UP, |seen| !done(seen))
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(!timeout.timed_out(), "never handed: {:?}", *seen);
+        seen.clone()
+    }
+}
+
 /// A software driver's script: the events each step emits (a step past
 /// the last emits nothing and idles), and where its session records what it
 /// was handed.
 #[derive(Debug, Default)]
 pub(crate) struct Script {
     pub(crate) steps: VecDeque<Vec<DeviceEvent>>,
-    pub(crate) seen: Arc<Mutex<Vec<Seen>>>,
+    pub(crate) seen: Arc<SeenLog>,
 }
 
 /// Scripts waiting for a [`Software`] driver, by [`SoftwareConfig::key`].
@@ -116,11 +170,7 @@ impl<C> SoftwareSession<C> {
     }
 
     fn see(&self, seen: Seen) {
-        self.script
-            .seen
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(seen);
+        self.script.seen.push(seen);
     }
 }
 

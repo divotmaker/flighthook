@@ -4,9 +4,8 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::time::Duration;
 
-use flighthook::{Club, Handedness, Mode};
+use flighthook::{ActorStatus, Club, Handedness, Mode};
 use flighthook_pureplay::connect::Config;
 use flightrelay::driver::{DeviceEvent, DriverInfo};
 use flightrelay::types::roles;
@@ -17,7 +16,7 @@ use flightrelay::{
 use tokio::sync::broadcast;
 
 use super::*;
-use crate::actors::scripted::{SOFTWARE, Script, Seen, Software, SoftwareConfig};
+use crate::actors::scripted::{SOFTWARE, Script, Seen, Software, SoftwareConfig, recv_within};
 use crate::actors::web::tests::TempDir;
 use crate::bus::{BusReceiver, BusSender, PeerId};
 use crate::state::SystemState;
@@ -29,6 +28,8 @@ struct Rig {
     section: PureplaySection,
     state: Arc<SystemState>,
     card: BusSender,
+    /// The status the host lends the hooks.
+    status: ActorStatus,
     tx: broadcast::Sender<BusMsg>,
     /// What the hooks put on the bus.
     seen: BusReceiver,
@@ -93,6 +94,7 @@ impl Rig {
             },
             state,
             card,
+            status: ActorStatus::Connected,
             tx,
             seen,
             _dir: dir,
@@ -115,6 +117,7 @@ impl Rig {
             section: &self.section,
             state: &self.state,
             sender: &self.card,
+            status: self.status,
             to_session: &mut to_session,
         };
         f(&mut self.hooks, &mut ctx);
@@ -418,11 +421,12 @@ fn a_card_added_after_the_omni_connected_sends_its_first_shot_in_strict_mode() {
 
 /// Each BallData the driver wrote with a shot's key is recorded in the
 /// send registry under Pureplay's configured address, and counted on the
-/// card; other frames are not.
+/// card, with the status the host has sent for it; other frames are not.
 #[test]
 fn each_written_shot_is_recorded_as_sent() {
     let mut rig = Rig::any();
     rig.start();
+    rig.status = ActorStatus::Reconnecting;
     rig.sent();
     let frame = |key: Option<ShotKey>, dir| {
         FrpBody::ShotRaw(RawFrame {
@@ -456,7 +460,7 @@ fn each_written_shot_is_recorded_as_sent() {
             _ => None,
         })
         .collect();
-    let [(ActorStatus::Connected, telemetry)] = &rows[..] else {
+    let [(ActorStatus::Reconnecting, telemetry)] = &rows[..] else {
         panic!("{rows:?}");
     };
     assert_eq!(telemetry["shots_sent"], "1");
@@ -558,26 +562,23 @@ fn the_started_actor_records_its_shots_in_the_apps_registry() {
     );
     // The card asks the actors up for their state; the Omni answers.
     while !matches!(
-        bus.blocking_recv().expect("bus"),
+        recv_within(&mut bus).expect("the card's bus.sync"),
         BusMsg::Frp { msg, .. } if msg.from == "pureplay.0" && matches!(msg.body, FrpBody::BusSync(_))
     ) {}
     let monitor = BusSender::new("square.0".into(), rig.tx.clone(), Arc::default())
         .with_frp_id(Some("square.0".into()));
     monitor.frp(hosted("square.0"));
-    let deadline = Instant::now() + crate::actors::GIVE_UP;
     let pureplay = SimAddr::of(None, address.parse().expect("addr"));
-    while !seen
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .any(|s| matches!(s, Seen::Bus(m) if m.from == "square.0"))
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the session never saw the monitor"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    // The card's `shots_sent` row follows the record of the shot.
+    while !matches!(
+        recv_within(&mut bus).expect("the card's shots_sent row"),
+        BusMsg::Local { card, event: LocalEvent::CardStatus { telemetry, .. } }
+            if card == "pureplay.0" && telemetry.get("shots_sent").is_some_and(|n| n == "1")
+    ) {}
+    seen.wait_until(|seen| {
+        seen.iter()
+            .any(|s| matches!(s, Seen::Bus(m) if m.from == "square.0"))
+    });
     assert_eq!(
         rig.state.sent_shots.take_echo(pureplay, Instant::now()),
         Some(key)

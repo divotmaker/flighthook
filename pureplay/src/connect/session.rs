@@ -35,10 +35,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long Pureplay has to answer Hello.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Oldest a finished shot may be when it is sent, counted from when the
-/// session was handed its finish.
-pub const STALE_SHOT: Duration = Duration::from_secs(5);
-
 /// Longest a launch monitor counts as processing a shot after its trigger
 /// when the shot never finishes.
 pub const PROCESSING_LIMIT: Duration = Duration::from_secs(10);
@@ -204,8 +200,8 @@ pub struct Session<S = TcpStream> {
     /// When each launch monitor's shot in progress was triggered.
     processing: HashMap<String, Instant>,
     shots: ShotAggregator,
-    /// Finished shots not sent yet, with when the session was handed them.
-    outbox: VecDeque<(CompletedShot, Instant)>,
+    /// Finished shots not sent yet.
+    outbox: VecDeque<CompletedShot>,
     /// The time of the last step, which stamps what the session is handed.
     now: Instant,
     /// What Pureplay's SetClubInfo and SetShotContext gave.
@@ -320,7 +316,7 @@ impl<S: Read + Write> Session<S> {
             _ => {}
         }
         if let Some(ShotEvent::Finished(shot)) = self.shots.feed_at(msg, self.now) {
-            self.outbox.push_back((shot, self.now));
+            self.outbox.push_back(shot);
         }
     }
 
@@ -340,7 +336,7 @@ impl<S: Read + Write> Session<S> {
             return Ok(Activity::Active);
         };
         if !self.handshaken {
-            for (shot, _) in self.outbox.drain(..) {
+            for shot in self.outbox.drain(..) {
                 out.log(
                     Level::Debug,
                     format!(
@@ -364,7 +360,7 @@ impl<S: Read + Write> Session<S> {
                 Activity::Idle
             });
         }
-        let sent = self.send_shots(now, out)?;
+        let sent = self.send_shots(out)?;
         let pushed = self.push_ready(now, out)?;
         Ok(if read || sent || pushed {
             Activity::Active
@@ -780,20 +776,9 @@ impl<S: Read + Write> Session<S> {
     }
 
     /// Send every shot waiting, oldest first. Returns whether one went out.
-    fn send_shots(&mut self, now: Instant, out: &mut Events<'_>) -> Result<bool, Error> {
+    fn send_shots(&mut self, out: &mut Events<'_>) -> Result<bool, Error> {
         let mut sent = false;
-        while let Some((done, at)) = self.outbox.pop_front() {
-            let age = now.saturating_duration_since(at);
-            if age > STALE_SHOT {
-                out.log(
-                    Level::Debug,
-                    format!(
-                        "dropping shot #{} from '{}', finished {age:?} ago",
-                        done.key.shot_number, done.from
-                    ),
-                );
-                continue;
-            }
+        while let Some(done) = self.outbox.pop_front() {
             let shot = if self.strict {
                 measured_shot(&done, &done.from)
             } else {

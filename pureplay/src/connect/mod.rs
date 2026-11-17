@@ -30,8 +30,7 @@
 //! bus, chosen by the host: the `bus.actor` of each launch monitor it stands
 //! for (and that actor's removal when it leaves the view), and the messages of
 //! the shots it may send. It composes each shot from those messages itself.
-//! A shot that finishes before the handshake, or is older than
-//! [`STALE_SHOT`] when it could be sent, is dropped. The launch monitors in
+//! A shot that finishes before the handshake is dropped. The launch monitors in
 //! view give the device's state: the ready state and the connection state
 //! are the best of theirs (a monitor whose `bus.actor` is blocked by
 //! `not_armed` is connecting, any other is connected), and the name in Hello
@@ -58,8 +57,7 @@ mod shot;
 
 #[cfg(feature = "driver")]
 pub use session::{
-    Connect, Error, HELLO_TIMEOUT, HOST_ERROR_BURST_GAP, PROCESSING_LIMIT, STALE_SHOT, Session,
-    mode_for_lie,
+    Connect, Error, HELLO_TIMEOUT, HOST_ERROR_BURST_GAP, PROCESSING_LIMIT, Session, mode_for_lie,
 };
 #[cfg(feature = "driver")]
 pub use shot::{OutputShot, measured_shot, output_shot, sends};

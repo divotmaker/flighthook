@@ -771,10 +771,9 @@ fn shots_go_out_as_ball_then_club_data() {
     );
 }
 
-/// A shot that finished before the handshake is dropped, and so is one
-/// older than the stale limit when it could be sent.
+/// A shot that finished before the handshake is dropped.
 #[test]
-fn shots_finished_before_the_handshake_or_stale_are_dropped() {
+fn shots_finished_before_the_handshake_are_dropped() {
     let mut link = Link::new();
     link.shot("omni", 1, &full_shot());
     link.shake();
@@ -782,24 +781,6 @@ fn shots_finished_before_the_handshake_or_stale_are_dropped() {
 
     link.shot("omni", 2, &ball_only_shot());
     assert_eq!(link.balls()[0].shot_id, 1);
-
-    link.hand("omni", ShotTrigger::new(key_of("omni", 3)));
-    link.hand(
-        "omni",
-        ShotLaunch {
-            key: key_of("omni", 3),
-            launch: ball_only_shot().launch.expect("launch"),
-        },
-    );
-    link.hand(
-        "omni",
-        ShotFinished {
-            key: key_of("omni", 3),
-        },
-    );
-    link.host.advance(STALE_SHOT + Duration::from_millis(1));
-    link.settle();
-    assert!(link.balls().is_empty(), "stale");
 }
 
 /// A missed read (a shot that finished with no data) takes no ShotId.
