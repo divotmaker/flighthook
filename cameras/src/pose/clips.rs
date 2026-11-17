@@ -250,6 +250,13 @@ impl ClipQueue {
         *self.fake.lock().unwrap_or_else(|e| e.into_inner()) = Some(pass);
     }
 
+    /// Hold the worker off, as if it were busy with a clip (tests): what
+    /// is pushed from now on waits and starts no thread.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold(&self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).working = true;
+    }
+
     /// Clips waiting, in the order they are taken, by their AVI (tests).
     #[cfg(any(test, feature = "testing"))]
     pub fn waiting(&self) -> Vec<PathBuf> {

@@ -41,14 +41,19 @@
 //! after the camera is lost (a clip that holds its impact frame is saved,
 //! marked incomplete), `disconnected` when stopped or when the platform has
 //! no camera support.
+//!
+//! The recording rules live in [`Recording`] (the recorder and the triggers
+//! seen, across capture sessions) and [`Pass`] (one capture session's
+//! still, dating and telemetry). Neither reads a clock: the loop around
+//! them reads the time, the bus and the camera, and passes them in.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use stance::{
-    Capture, CaptureConfig, CaptureStatus, ClipRecorder, FormatRequest, Frame, RecorderConfig,
-    RecorderEvent, Source, TestPattern, Trigger, clock,
+    Capture, CaptureConfig, CaptureStats, CaptureStatus, ClipRecorder, FormatRequest, Frame,
+    RecorderConfig, RecorderEvent, Source, TestPattern, Trigger, clock,
 };
 use tracing::{debug, info, warn};
 
@@ -57,16 +62,16 @@ use crate::actors::{Actor, ReconfigureOutcome};
 use crate::bus::{BusReceiver, BusSender, PollError, camera_event};
 use crate::state::SystemState;
 use flighthook::{
-    ActorStatus, BodyTrackingMode, CameraSection, MAX_IMPACT_LEAD_S, MAX_TRIGGER_DELAY_S,
-    ReplaySection, ShotKey, ShotVideo,
+    ActorStatus, BodyTrackingMode, CameraSection, FlighthookConfig, GolferTurn, MAX_IMPACT_LEAD_S,
+    MAX_TRIGGER_DELAY_S, ReplaySection, ShotKey, ShotVideo,
 };
-use flighthook_cameras::Event;
 use flighthook_cameras::clips::{self, ClipShot, clip_impact};
 use flighthook_cameras::pose::clips::{ClipJob, ClipTiming};
 use flighthook_cameras::pose::live::LIVE_FPS;
 use flighthook_cameras::pose::live::{self, LiveWorker};
 use flighthook_cameras::pose::models;
 use flighthook_cameras::settings;
+use flighthook_cameras::{Cameras, Event, Out};
 
 /// Recorder history beyond the pre-roll and the longest reach.
 const BUFFER_MARGIN: Duration = Duration::from_millis(500);
@@ -107,8 +112,8 @@ pub(crate) const UNSUPPORTED: &str = "cameras are not supported on macOS yet";
 /// (Auto-chip). These are beta estimates: FlightScope triggers at impact; the
 /// others report once the shot is measured, which the clip's pre-roll has to
 /// reach back over.
-pub(crate) fn impact_lead(state: &SystemState, actor: &str) -> Option<Duration> {
-    settings::impact_lead_s(&state.system.view().read(), actor).map(lead)
+fn impact_lead(config: &FlighthookConfig, actor: &str) -> Option<Duration> {
+    settings::impact_lead_s(config, actor).map(lead)
 }
 
 /// A lead in seconds as a duration, clamped to the valid range.
@@ -389,8 +394,8 @@ fn recorder_config(
 /// How far before a trigger's arrival its impact can lie, over the
 /// configured launch monitors: the longest impact lead in effect plus the
 /// monitor type's trigger delay (`flighthook::trigger_delay_s`).
-fn longest_reach(state: &SystemState) -> Duration {
-    reach(settings::longest_reach_s(&state.system.view().read()))
+fn longest_reach(config: &FlighthookConfig) -> Duration {
+    reach(settings::longest_reach_s(config))
 }
 
 /// When a trigger read at `now_ns` (host monotonic clock) happened: its
@@ -439,6 +444,132 @@ impl SeenTriggers {
         }
         self.0.push_back(entry);
         true
+    }
+}
+
+/// A launch monitor's `shot_trigger`, as the camera takes it.
+#[derive(Debug, Clone)]
+struct ShotTrigger {
+    /// The monitor's card (e.g. `mevo.0`), or a remote monitor's actor id.
+    card: String,
+    /// The kind of device, for the clip's shot (e.g. `flightscope`).
+    device: String,
+    key: ShotKey,
+    /// The strike's time (UTC ms) when the trigger carries one.
+    timestamp: Option<u64>,
+}
+
+/// What outlives a capture session: the recorder, with its history and its
+/// open clips, and the triggers seen. It never reads a clock: every time is
+/// passed in.
+struct Recording {
+    recorder: ClipRecorder<Tag>,
+    seen: SeenTriggers,
+}
+
+impl Recording {
+    /// A recorder for `config`'s `[replay]` and launch monitors, before the
+    /// camera's frame rate is known.
+    fn new(config: &FlighthookConfig) -> Self {
+        Self {
+            recorder: ClipRecorder::new(recorder_config(
+                &config.replay,
+                longest_reach(config),
+                None,
+            )),
+            seen: SeenTriggers::default(),
+        }
+    }
+
+    /// The camera delivers `nominal` frames a second (0 when unknown): the
+    /// recorder counts dropped frames by it.
+    fn set_fps(&mut self, nominal: f64) {
+        let mut config = self.recorder.config().clone();
+        config.fps = (nominal > 0.0).then_some(nominal);
+        self.recorder.set_config(config);
+    }
+
+    /// Apply trigger `t`, dated `at_ns`: its `timestamp` when it has one,
+    /// else its arrival. Auto-chip, and repeats are ignored. The lead and
+    /// the rolls come from `config` (the source's `impact_lead_s`, the
+    /// `[replay]` section), the clip's hand and golfer from `turn`, and
+    /// `generation` is the clip store's. A trigger without a timestamp from
+    /// a type that dates its triggers at the strike and sends them late (an
+    /// ExPutt putt reported without its strike message) takes the generic
+    /// lead instead ([`flighthook::undated_impact_lead_s`]): it is dated at
+    /// the result's arrival.
+    fn trigger(
+        &mut self,
+        config: &FlighthookConfig,
+        t: &ShotTrigger,
+        at_ns: u64,
+        turn: &GolferTurn,
+        generation: u64,
+    ) {
+        let source = t.card.as_str();
+        let key = &t.key;
+        let Some(mut lead) = impact_lead(config, source) else {
+            return;
+        };
+        if !self.seen.first(source, key) {
+            debug!("camera: repeated trigger for {source} shot {}", key.shot_id);
+            return;
+        }
+        let prefix = source.split_once('.').map_or(source, |(p, _)| p);
+        let mut delay = reach(flighthook::trigger_delay_s(prefix));
+        if t.timestamp.is_none()
+            && let Some(undated) = flighthook::undated_impact_lead_s(prefix)
+        {
+            debug!(
+                "camera: {source} shot {} has no strike time; dated at its arrival, {undated} s lead",
+                key.shot_number
+            );
+            lead = self::lead(undated);
+            // It arrived when it is dated: nothing late to reach back over.
+            delay = Duration::ZERO;
+        }
+        let recorder = &mut self.recorder;
+        // The history covers this monitor's reach even if its section is gone.
+        let mut cut = recorder_config(
+            &config.replay,
+            longest_reach(config).max(lead + delay),
+            recorder.config().fps,
+        );
+        cut.merge_window = recorder.config().merge_window;
+        if cut.buffer != recorder.config().buffer {
+            recorder.set_config(cut.clone());
+        }
+        let shot = ClipShot {
+            key: key.clone(),
+            device: t.device.clone(),
+            impact_lead_ms: u64::try_from(lead.as_millis()).unwrap_or(u64::MAX),
+            hand: turn.handedness,
+            golfer: turn.golfer.as_ref().map(|g| g.as_str().to_owned()),
+        };
+        let tag = Tag { shot, generation };
+        let outcome = recorder.trigger(
+            Trigger::new(at_ns, source, tag)
+                .with_impact_lead(lead)
+                .with_pre_roll(cut.pre_roll)
+                .with_post_roll(cut.post_roll),
+        );
+        debug!("camera: {source} shot {} -> {outcome:?}", key.shot_number);
+    }
+
+    /// Take a frame, dated as it is to be recorded.
+    fn push(&mut self, frame: Frame) -> Vec<RecorderEvent<Tag>> {
+        self.recorder.push(frame)
+    }
+
+    /// The clips finished at host time `now_ns` for a camera `latency`
+    /// behind, on [`frame_clock`].
+    fn poll(&mut self, now_ns: u64, latency: Duration) -> Vec<RecorderEvent<Tag>> {
+        self.recorder.poll(frame_clock(now_ns, latency))
+    }
+
+    /// Frames stopped: finish the open clips with what arrived.
+    fn flush(&mut self) -> Vec<RecorderEvent<Tag>> {
+        self.recorder.flush()
     }
 }
 
@@ -546,24 +677,20 @@ fn alert(sender: &BusSender, message: String) {
 
 /// The camera's display name, for alerts and logs: the actor's configured
 /// name, else its ID.
-fn display_name(state: &SystemState, actor: &str) -> String {
+fn display_name(config: &FlighthookConfig, actor: &str) -> String {
     let index = actor.strip_prefix("camera.").unwrap_or("");
-    state
-        .system
-        .camera(index)
-        .map(|c| c.name)
+    config
+        .camera
+        .get(index)
+        .map(|c| c.name.as_str())
         .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| actor.to_owned())
+        .unwrap_or(actor)
+        .to_owned()
 }
 
 fn run(state: &Arc<SystemState>, section: &CameraSection, sender: &BusSender, mut rx: BusReceiver) {
     let actor = sender.actor_id().to_owned();
-    let mut recorder: ClipRecorder<Tag> = ClipRecorder::new(recorder_config(
-        &state.system.replay(),
-        longest_reach(state),
-        None,
-    ));
-    let mut seen = SeenTriggers::default();
+    let mut recording = Recording::new(&state.system.view().read());
     let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(15));
     let mut ever_connected = false;
     status(sender, ActorStatus::Starting, HashMap::new());
@@ -577,12 +704,11 @@ fn run(state: &Arc<SystemState>, section: &CameraSection, sender: &BusSender, mu
             Ok(capture) => {
                 ever_connected = true;
                 let started = Instant::now();
-                let ended =
-                    capture_session(state, sender, &mut rx, &capture, &mut recorder, &mut seen);
+                let ended = capture_session(state, sender, &mut rx, &capture, &mut recording);
                 state.cameras.frames.set_open(&actor, None);
                 capture.request_stop();
                 // Frames stopped: finish the open clips with what arrived.
-                for event in recorder.flush() {
+                for event in recording.flush() {
                     finished(state, sender, event);
                 }
                 drop(capture);
@@ -622,17 +748,16 @@ fn run(state: &Arc<SystemState>, section: &CameraSection, sender: &BusSender, mu
         info!("{actor}: retrying in {}s", delay.as_secs());
         let deadline = Instant::now() + delay;
         while Instant::now() < deadline {
-            if !drain_bus(state, &mut rx, &mut recorder, &mut seen) {
+            if !drain_bus(state, &mut rx, &mut recording) {
                 break;
             }
-            let now = frame_clock(clock::now_ns(), latency(state, &actor));
-            for event in recorder.poll(now) {
+            for event in recording.poll(clock::now_ns(), latency(state, &actor)) {
                 finished(state, sender, event);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    for event in recorder.flush() {
+    for event in recording.flush() {
         finished(state, sender, event);
     }
     state.cameras.frames.remove(&actor);
@@ -692,6 +817,115 @@ impl FpsReport {
     }
 }
 
+/// One capture session, fed the time: when the still is due, the frames'
+/// dating ([`Restamp`]), the telemetry last sent and the slow-camera
+/// warning. It never reads a clock.
+struct Pass {
+    restamp: Restamp,
+    /// When the still was last put.
+    last_still: Option<Instant>,
+    /// When the telemetry was last due.
+    last_telemetry: Instant,
+    /// The telemetry last sent.
+    reported: Option<Live>,
+    fps: FpsReport,
+    /// Since when the camera has been slow.
+    slow_since: Option<Instant>,
+    /// The slow-camera alert went out.
+    warned_slow: bool,
+    /// When the session began.
+    started: Instant,
+}
+
+impl Pass {
+    /// A session begun at `now`.
+    fn new(now: Instant) -> Self {
+        Self {
+            restamp: Restamp::default(),
+            last_still: None,
+            last_telemetry: now,
+            reported: None,
+            fps: FpsReport::default(),
+            slow_since: None,
+            warned_slow: false,
+            started: now,
+        }
+    }
+
+    /// A frame read at `now`, dated `latency` before it arrived: its
+    /// picture when the still is due ([`STILL_EVERY`]), and the frame for
+    /// the recorder, `None` when its date is not after the last one's.
+    fn frame(
+        &mut self,
+        frame: Frame,
+        latency: Duration,
+        now: Instant,
+    ) -> (Option<Arc<[u8]>>, Option<Frame>) {
+        let still = if self
+            .last_still
+            .is_none_or(|t| now.duration_since(t) >= STILL_EVERY)
+        {
+            self.last_still = Some(now);
+            Some(Arc::clone(&frame.jpeg))
+        } else {
+            None
+        };
+        (still, self.restamp.apply(frame, latency))
+    }
+
+    /// Whether the telemetry is due at `now`: [`TELEMETRY_EVERY`] since it
+    /// last was.
+    fn telemetry_due(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.last_telemetry) < TELEMETRY_EVERY {
+            return false;
+        }
+        self.last_telemetry = now;
+        true
+    }
+
+    /// At `now`, with the capture's `stats` in a `nominal` fps mode and the
+    /// camera at `position`: the card rows to send, when they changed since
+    /// last sent, and the measured rate to warn about, once a session, when
+    /// the camera has delivered under half its rate for [`SLOW_FOR`].
+    fn tick(
+        &mut self,
+        now: Instant,
+        stats: &CaptureStats,
+        nominal: f64,
+        position: String,
+    ) -> (Option<HashMap<String, String>>, Option<f64>) {
+        let live = Live {
+            fps: format!("{:.0}", self.fps.update(stats.fps, nominal)),
+            dropped: stats.dropped.to_string(),
+            position,
+        };
+        let mut rows = None;
+        if self.reported.as_ref() != Some(&live) {
+            rows = Some(HashMap::from([
+                ("fps".to_owned(), live.fps.clone()),
+                ("dropped".to_owned(), live.dropped.clone()),
+                ("position".to_owned(), live.position.clone()),
+            ]));
+            self.reported = Some(live);
+        }
+        // The rate is measured over the last second of frames.
+        let slow = nominal > 0.0
+            && now.duration_since(self.started) >= TELEMETRY_EVERY
+            && stats.fps < nominal / 2.0;
+        let mut warn = None;
+        match (slow, self.slow_since) {
+            (false, _) => self.slow_since = None,
+            (true, None) => self.slow_since = Some(now),
+            (true, Some(since)) if now.duration_since(since) >= SLOW_FOR && !self.warned_slow => {
+                self.warned_slow = true;
+                warn = Some(stats.fps);
+            }
+            (true, Some(_)) => {}
+        }
+        (rows, warn)
+    }
+}
+
 /// Run one capture: frames into the recorder, triggers from the bus,
 /// finished clips out, telemetry and the still. Returns why it ended.
 fn capture_session(
@@ -699,8 +933,7 @@ fn capture_session(
     sender: &BusSender,
     rx: &mut BusReceiver,
     capture: &Capture,
-    recorder: &mut ClipRecorder<Tag>,
-    seen: &mut SeenTriggers,
+    recording: &mut Recording,
 ) -> SessionEnd {
     let actor = sender.actor_id().to_owned();
     let index = actor.strip_prefix("camera.").unwrap_or("").to_owned();
@@ -708,9 +941,7 @@ fn capture_session(
     let format = capture.format().clone();
     let nominal = format.fps();
     state.cameras.frames.set_open(&actor, Some(&info.id));
-    let mut config = recorder.config().clone();
-    config.fps = (nominal > 0.0).then_some(nominal);
-    recorder.set_config(config);
+    recording.set_fps(nominal);
 
     let position = |state: &SystemState| {
         state
@@ -736,21 +967,14 @@ fn capture_session(
         ]),
     );
 
-    let started = Instant::now();
+    let mut pass = Pass::new(Instant::now());
     let mut cursor = None;
-    let mut last_still: Option<Instant> = None;
     let mut live = LiveRoute::default();
-    let mut last_telemetry = Instant::now();
-    let mut reported: Option<Live> = None;
-    let mut fps = FpsReport::default();
-    let mut restamp = Restamp::default();
-    let mut slow_since: Option<Instant> = None;
-    let mut warned_slow = false;
 
     loop {
         // Triggers first, so a stamp lags its arrival by one short wait at
         // most.
-        if !drain_bus(state, rx, recorder, seen) {
+        if !drain_bus(state, rx, recording) {
             return SessionEnd::Shutdown;
         }
         let lag = latency(state, &actor);
@@ -758,18 +982,15 @@ fn capture_session(
         let mut newest = None;
         for frame in capture.wait_frames_after(cursor, FRAME_WAIT) {
             cursor = Some(frame.seq);
-            if last_still.is_none_or(|t| t.elapsed() >= STILL_EVERY) {
-                state
-                    .cameras
-                    .frames
-                    .set_still(&actor, Arc::clone(&frame.jpeg));
-                last_still = Some(Instant::now());
-            }
             newest = Some((frame_clock(frame.host_ns, lag), Arc::clone(&frame.jpeg)));
-            let Some(frame) = restamp.apply(frame, lag) else {
+            let (still, frame) = pass.frame(frame, lag, Instant::now());
+            if let Some(jpeg) = still {
+                state.cameras.frames.set_still(&actor, jpeg);
+            }
+            let Some(frame) = frame else {
                 continue;
             };
-            for event in recorder.push(frame) {
+            for event in recording.push(frame) {
                 finished(state, sender, event);
             }
         }
@@ -778,55 +999,32 @@ fn capture_session(
             let wanted = state.cameras.frames.live_wanted(&actor, now);
             live.route(state, &actor, wanted, now, time_ns, jpeg);
         }
-        for event in recorder.poll(frame_clock(clock::now_ns(), lag)) {
+        for event in recording.poll(clock::now_ns(), lag) {
             finished(state, sender, event);
         }
         if let CaptureStatus::Failed(error) = capture.status() {
             return SessionEnd::Lost(error.to_string());
         }
 
-        if last_telemetry.elapsed() >= TELEMETRY_EVERY {
-            last_telemetry = Instant::now();
+        let now = Instant::now();
+        if pass.telemetry_due(now) {
             let stats = capture.stats();
-            let now = Live {
-                fps: format!("{:.0}", fps.update(stats.fps, nominal)),
-                dropped: stats.dropped.to_string(),
-                position: position(state),
-            };
-            if reported.as_ref() != Some(&now) {
-                status(
-                    sender,
-                    ActorStatus::Connected,
-                    HashMap::from([
-                        ("fps".to_owned(), now.fps.clone()),
-                        ("dropped".to_owned(), now.dropped.clone()),
-                        ("position".to_owned(), now.position.clone()),
-                    ]),
-                );
-                reported = Some(now);
+            let (rows, slow) = pass.tick(now, &stats, nominal, position(state));
+            if let Some(rows) = rows {
+                status(sender, ActorStatus::Connected, rows);
             }
             // Body tracking's models load once it is on and a camera runs.
             want_models(state);
-            // The rate is measured over the last second of frames.
-            let slow =
-                nominal > 0.0 && started.elapsed() >= TELEMETRY_EVERY && stats.fps < nominal / 2.0;
-            match (slow, slow_since) {
-                (false, _) => slow_since = None,
-                (true, None) => slow_since = Some(Instant::now()),
-                (true, Some(since)) if since.elapsed() >= SLOW_FOR && !warned_slow => {
-                    warned_slow = true;
-                    alert(
-                        sender,
-                        format!(
-                            "Camera {}: {:.0} fps of the {nominal:.0} requested. Another \
-                             camera on the same USB controller, or a long exposure in low \
-                             light, can slow it down.",
-                            display_name(state, &actor),
-                            stats.fps
-                        ),
-                    );
-                }
-                (true, Some(_)) => {}
+            if let Some(fps) = slow {
+                let name = display_name(&state.system.view().read(), &actor);
+                alert(
+                    sender,
+                    format!(
+                        "Camera {name}: {fps:.0} fps of the {nominal:.0} requested. Another \
+                         camera on the same USB controller, or a long exposure in low \
+                         light, can slow it down."
+                    ),
+                );
             }
         }
     }
@@ -834,12 +1032,7 @@ fn capture_session(
 
 /// Apply the bus's waiting messages: each launch monitor trigger becomes a
 /// recorder trigger. Returns false once the actor is to stop.
-fn drain_bus(
-    state: &SystemState,
-    rx: &mut BusReceiver,
-    recorder: &mut ClipRecorder<Tag>,
-    seen: &mut SeenTriggers,
-) -> bool {
+fn drain_bus(state: &SystemState, rx: &mut BusReceiver, recording: &mut Recording) -> bool {
     loop {
         match rx.poll() {
             Err(PollError::Shutdown) => return false,
@@ -865,78 +1058,26 @@ fn drain_bus(
                             at
                         }
                     };
-                    trigger(state, recorder, seen, &source, key, at, timestamp.is_some());
+                    let prefix = source.split_once('.').map_or(source.as_str(), |(p, _)| p);
+                    let shot = ShotTrigger {
+                        device: crate::actors::web::device_kind(prefix).to_owned(),
+                        card: source,
+                        key: key.clone(),
+                        timestamp: *timestamp,
+                    };
+                    trigger(state, recording, &shot, at);
                 }
             }
         }
     }
 }
 
-/// Apply `source`'s trigger for shot `key`, dated `at_ns`: its
-/// `timestamp` when `dated`, else its arrival. Auto-chip, and repeats are
-/// ignored. The lead and the rolls come from the live config (the source's
-/// `impact_lead_s`, the `[replay]` section). A trigger without a timestamp
-/// from a type that dates its triggers at the strike and sends them late
-/// (an ExPutt putt reported without its strike message) takes the generic
-/// lead instead ([`flighthook::undated_impact_lead_s`]): it is dated at the
-/// result's arrival.
-fn trigger(
-    state: &SystemState,
-    recorder: &mut ClipRecorder<Tag>,
-    seen: &mut SeenTriggers,
-    source: &str,
-    key: &ShotKey,
-    at_ns: u64,
-    dated: bool,
-) {
-    let Some(mut lead) = impact_lead(state, source) else {
-        return;
-    };
-    if !seen.first(source, key) {
-        debug!("camera: repeated trigger for {source} shot {}", key.shot_id);
-        return;
-    }
-    let replay = state.system.replay();
-    let prefix = source.split_once('.').map_or(source, |(p, _)| p);
-    let mut delay = reach(flighthook::trigger_delay_s(prefix));
-    if !dated && let Some(undated) = flighthook::undated_impact_lead_s(prefix) {
-        debug!(
-            "camera: {source} shot {} has no strike time; dated at its arrival, {undated} s lead",
-            key.shot_number
-        );
-        lead = self::lead(undated);
-        // It arrived when it is dated: nothing late to reach back over.
-        delay = Duration::ZERO;
-    }
-    // The history covers this monitor's reach even if its section is gone.
-    let mut config = recorder_config(
-        &replay,
-        longest_reach(state).max(lead + delay),
-        recorder.config().fps,
-    );
-    config.merge_window = recorder.config().merge_window;
-    if config.buffer != recorder.config().buffer {
-        recorder.set_config(config.clone());
-    }
+/// Apply trigger `shot`, dated `at_ns`, to `recording`, with the turn, the
+/// clip store's generation and the config as they are now.
+fn trigger(state: &SystemState, recording: &mut Recording, shot: &ShotTrigger, at_ns: u64) {
     let turn = state.cameras.turn();
-    let shot = ClipShot {
-        key: key.clone(),
-        device: crate::actors::web::device_kind(prefix).to_owned(),
-        impact_lead_ms: u64::try_from(lead.as_millis()).unwrap_or(u64::MAX),
-        hand: turn.handedness,
-        golfer: turn.golfer.map(|g| g.as_str().to_owned()),
-    };
-    let tag = Tag {
-        shot,
-        generation: state.cameras.clips.generation(),
-    };
-    let outcome = recorder.trigger(
-        Trigger::new(at_ns, source, tag)
-            .with_impact_lead(lead)
-            .with_pre_roll(config.pre_roll)
-            .with_post_roll(config.post_roll),
-    );
-    debug!("camera: {source} shot {} -> {outcome:?}", key.shot_number);
+    let generation = state.cameras.clips.generation();
+    recording.trigger(&state.system.view().read(), shot, at_ns, &turn, generation);
 }
 
 /// Handle a clip leaving the recorder: a finished one is written and
@@ -953,17 +1094,25 @@ fn finished(state: &Arc<SystemState>, sender: &BusSender, event: RecorderEvent<T
             );
         }
         RecorderEvent::Finished(clip) => {
-            let state = Arc::clone(state);
-            let sender = sender.clone();
-            let name = format!("clip:{}", sender.actor_id());
+            let cameras = Arc::clone(&state.cameras);
+            let actor = sender.actor_id().to_owned();
+            let out = out(sender);
+            let raw = crate::bus::camera_raw(sender.raw_sender(), &actor);
             let spawned = std::thread::Builder::new()
-                .name(name)
-                .spawn(move || save(&state, &sender, &clip));
+                .name(format!("clip:{actor}"))
+                .spawn(move || save(&cameras, &actor, &out, &raw, &clip));
             if let Err(e) = spawned {
                 warn!("camera: no thread to save a clip: {e}");
             }
         }
     }
+}
+
+/// The actor's events on its muted `sender`: nothing goes out once a new
+/// instance of the actor has replaced it.
+fn out(sender: &BusSender) -> Out {
+    let sender = sender.clone();
+    Arc::new(move |event| sender.local(camera_event(event)))
 }
 
 /// Milliseconds of a relative nanosecond time, rounded.
@@ -989,13 +1138,14 @@ const PRE_ROLL_SLACK: Duration = Duration::from_millis(100);
 
 /// Write a finished clip into the clip store and announce it: one
 /// `shot_video`, and `shot_video_removed` for the clips pruned to make
-/// room. A failed write (disk full) raises a warning alert.
-fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) {
-    let actor = sender.actor_id().to_owned();
-    let replay = state.system.replay();
+/// room, on `out`. A failed write (disk full) raises a warning alert. In
+/// Live mode the clip is queued for body tracking, which announces on
+/// `raw`.
+fn save(cameras: &Arc<Cameras>, actor: &str, out: &Out, raw: &Out, clip: &stance::Clip<Tag>) {
+    let replay = cameras.settings().replay();
     // Shots a Clear history removed since they triggered are left out; a
     // clip with none left is not written.
-    let generation = state.cameras.clips.generation();
+    let generation = cameras.clips.generation();
     let shots: Vec<ClipShot> = clip
         .tags
         .iter()
@@ -1020,60 +1170,55 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
             short.as_millis()
         );
     }
-    let slot = match state
-        .cameras
+    let slot = match cameras
         .clips
         .begin(&clips::clip_dir(&replay), &shots, generation)
     {
         Ok(slot) => slot,
         Err(e) => {
             warn!("{actor}: creating the clip folder: {e}");
-            alert(
-                sender,
-                format!(
-                    "Camera {}: couldn't save a clip: {e}",
-                    display_name(state, &actor)
-                ),
-            );
+            let name = display_name(&cameras.settings().read(), actor);
+            out(Event::Alert(format!(
+                "Camera {name}: couldn't save a clip: {e}"
+            )));
             return;
         }
     };
     // History cleared since the swing: nothing to write.
-    if !state.cameras.clips.is_current(&slot) {
-        state.cameras.clips.abandon(&slot);
+    if !cameras.clips.is_current(&slot) {
+        cameras.clips.abandon(&slot);
         return;
     }
-    let files = match stance::write_clip(&slot.dir, &actor, clip) {
+    let files = match stance::write_clip(&slot.dir, actor, clip) {
         Ok(files) => files,
-        Err(_) if !state.cameras.clips.is_current(&slot) => {
+        Err(_) if !cameras.clips.is_current(&slot) => {
             // Cleared while writing: the folder went with it.
-            state.cameras.clips.abandon(&slot);
+            cameras.clips.abandon(&slot);
             return;
         }
         Err(e) => {
             warn!("{actor}: writing the clip: {e}");
-            state.cameras.clips.abandon(&slot);
-            alert(
-                sender,
-                format!(
-                    "Camera {}: couldn't save a clip: {e}",
-                    display_name(state, &actor)
-                ),
-            );
+            cameras.clips.abandon(&slot);
+            let name = display_name(&cameras.settings().read(), actor);
+            out(Event::Alert(format!(
+                "Camera {name}: couldn't save a clip: {e}"
+            )));
             return;
         }
     };
     let sidecar = &files.sidecar;
     let index = actor.strip_prefix("camera.").unwrap_or("");
-    let position = state
-        .system
-        .camera(index)
+    let position = cameras
+        .settings()
+        .read()
+        .camera
+        .get(index)
         .map(|c| c.position)
         .unwrap_or_default();
     let duration = sidecar.frames.last().map_or(0, |f| f.t_ns) / 1_000_000;
-    let lag = latency(state, &actor);
+    let lag = settings::latency(&cameras.settings().read(), actor);
     let video = ShotVideo {
-        camera: actor.clone(),
+        camera: actor.to_owned(),
         position,
         duration_ms: duration,
         fps: sidecar.fps.measured,
@@ -1086,8 +1231,7 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
         rotation: 0,
         analyzed_with: None,
     };
-    let done = state
-        .cameras
+    let done = cameras
         .clips
         .finish(&slot, video.clone(), clips::keep(&replay));
     if done.kept {
@@ -1116,11 +1260,11 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
         // Body tracking of the clip in Live mode, announced on the bus
         // directly: its keypoints are files beside the clip, worth
         // announcing even when this camera has been restarted since.
-        if state.system.body_tracking().mode == BodyTrackingMode::Live {
+        if cameras.settings().body_tracking().mode == BodyTrackingMode::Live {
             let job = ClipJob {
                 avi: files.avi.clone(),
                 slot: slot.clone(),
-                camera: actor.clone(),
+                camera: actor.to_owned(),
                 keys: keys.clone(),
                 position,
                 hand,
@@ -1129,15 +1273,15 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
                 written: Instant::now(),
                 on_demand: false,
                 timing,
-                out: crate::bus::camera_raw(sender.raw_sender(), &actor),
+                out: Arc::clone(raw),
             };
-            state.cameras.pose.clips.push(
-                &state.cameras,
+            cameras.pose.clips.push(
+                cameras,
                 job,
-                flighthook_cameras::pose::clips::bound(&state.cameras),
+                flighthook_cameras::pose::clips::bound(cameras),
             );
         }
-        sender.local(camera_event(Event::Video {
+        out(Event::Video {
             keys,
             position: video.position,
             duration_ms: video.duration_ms,
@@ -1146,12 +1290,15 @@ fn save(state: &Arc<SystemState>, sender: &BusSender, clip: &stance::Clip<Tag>) 
             impact_offset_ms: video.impact_offset_ms,
             complete: video.complete,
             dropped: video.dropped,
-        }));
+        });
     }
     if !done.removed.is_empty() {
-        sender.local(camera_event(Event::VideoRemoved { keys: done.removed }));
+        out(Event::VideoRemoved { keys: done.removed });
     }
 }
+
+#[cfg(test)]
+mod bench;
 
 #[cfg(test)]
 mod tests {
@@ -1185,7 +1332,18 @@ mod tests {
     const LIVE: &str = "[body_tracking]\nmode = \"live\"\n";
 
     fn ms(state: &SystemState, actor: &str) -> Option<u128> {
-        impact_lead(state, actor).map(|d| d.as_millis())
+        impact_lead(&state.system.view().read(), actor).map(|d| d.as_millis())
+    }
+
+    /// `card`'s trigger for shot `key`, with a strike time when `dated`.
+    fn shot(card: &str, key: &ShotKey, dated: bool) -> ShotTrigger {
+        let prefix = card.split_once('.').map_or(card, |(p, _)| p);
+        ShotTrigger {
+            card: card.to_owned(),
+            device: crate::actors::web::device_kind(prefix).to_owned(),
+            key: key.clone(),
+            timestamp: dated.then_some(0),
+        }
     }
 
     #[test]
@@ -1204,7 +1362,7 @@ mod tests {
         assert_eq!(ms(&state, "trackball.0"), None, "no swing a camera films");
         for actor in ["mevo.0", "square.0", "r10.0", "openconnect_server.0"] {
             assert!(
-                impact_lead(&state, actor).unwrap() <= lead(MAX_IMPACT_LEAD_S),
+                impact_lead(&state.system.view().read(), actor).unwrap() <= lead(MAX_IMPACT_LEAD_S),
                 "{actor}"
             );
         }
@@ -1251,39 +1409,18 @@ mod tests {
     #[test]
     fn the_impact_lead_is_read_live_at_every_trigger() {
         let (_dir, state) = state_with("[mevo.0]\nname = \"Mevo\"\n");
-        let mut recorder: ClipRecorder<Tag> = ClipRecorder::new(recorder_config(
-            &state.system.replay(),
-            longest_reach(&state),
-            None,
-        ));
-        let mut seen = SeenTriggers::default();
+        let mut recording = Recording::new(&state.system.view().read());
         let key = |n: u32| ShotKey {
             shot_id: format!("s{n}"),
             shot_number: n,
         };
         assert_eq!(ms(&state, "mevo.0"), Some(0));
-        trigger(
-            &state,
-            &mut recorder,
-            &mut seen,
-            "mevo.0",
-            &key(1),
-            1,
-            false,
-        );
+        trigger(&state, &mut recording, &shot("mevo.0", &key(1), false), 1);
         state.system.update(|c| {
             c.mevo.get_mut("0").unwrap().impact_lead_s = Some(0.4);
         });
         assert_eq!(ms(&state, "mevo.0"), Some(400));
-        trigger(
-            &state,
-            &mut recorder,
-            &mut seen,
-            "mevo.0",
-            &key(2),
-            2,
-            false,
-        );
+        trigger(&state, &mut recording, &shot("mevo.0", &key(2), false), 2);
         state.system.update(|c| {
             c.mevo.get_mut("0").unwrap().impact_lead_s = None;
         });
@@ -1320,35 +1457,35 @@ mod tests {
         let (_dir, state) =
             state_with("[mevo.0]\nname = \"Mevo\"\n\n[square.0]\nname = \"Omni\"\n");
         // Defaults only: Square's 1 s is the longest.
-        assert_eq!(longest_reach(&state), Duration::from_secs(1));
+        let reach = |state: &SystemState| longest_reach(&state.system.view().read());
+        assert_eq!(reach(&state), Duration::from_secs(1));
         state.system.update(|c| {
             c.mevo.get_mut("0").unwrap().impact_lead_s = Some(3.5);
         });
-        assert_eq!(longest_reach(&state), Duration::from_millis(3500));
+        assert_eq!(reach(&state), Duration::from_millis(3500));
         // A setting above the maximum is not in effect.
         state.system.update(|c| {
             c.mevo.get_mut("0").unwrap().impact_lead_s = Some(8.0);
         });
-        assert_eq!(longest_reach(&state), Duration::from_secs(1));
+        assert_eq!(reach(&state), Duration::from_secs(1));
         // With no monitor configured there is no lead to cover.
         let (_dir2, empty) = state_with("");
-        assert_eq!(longest_reach(&empty), Duration::ZERO);
+        assert_eq!(reach(&empty), Duration::ZERO);
 
         // The recorder grows its history when a setting grows, at the next
         // trigger, and never lets a lead outrun it.
         let replay = state.system.replay();
-        let mut recorder: ClipRecorder<Tag> =
-            ClipRecorder::new(recorder_config(&replay, longest_reach(&state), None));
-        let before = recorder.config().buffer;
+        let mut recording = Recording::new(&state.system.view().read());
+        let before = recording.recorder.config().buffer;
         state.system.update(|c| {
             c.square.get_mut("0").unwrap().impact_lead_s = Some(5.0);
         });
-        let mut seen = SeenTriggers::default();
         let key = ShotKey {
             shot_id: "a".into(),
             shot_number: 1,
         };
-        trigger(&state, &mut recorder, &mut seen, "square.0", &key, 1, true);
+        trigger(&state, &mut recording, &shot("square.0", &key, true), 1);
+        let recorder = &recording.recorder;
         assert!(recorder.config().buffer > before);
         assert!(recorder.config().buffer_covers(Duration::from_secs(5)));
         assert_eq!(
@@ -1400,40 +1537,36 @@ mod tests {
         let (_dir, state) = state_with("[exputt.0]\nname = \"Putt\"\n");
         assert_eq!(ms(&state, "exputt.0"), Some(0));
         assert_eq!(
-            longest_reach(&state),
+            longest_reach(&state.system.view().read()),
             Duration::from_secs_f64(flighthook::MAX_TRIGGER_DELAY_S)
         );
         let replay = state.system.replay();
-        let mut recorder: ClipRecorder<Tag> =
-            ClipRecorder::new(recorder_config(&replay, longest_reach(&state), Some(100.0)));
+        let mut recording = Recording::new(&state.system.view().read());
+        recording.set_fps(100.0);
         assert_eq!(
-            recorder.config().buffer,
+            recording.recorder.config().buffer,
             roll(replay.pre_roll_s) + Duration::from_secs(5) + BUFFER_MARGIN
         );
         // 12 s of frames at 100 fps; the result arrives at 12 s, its strike
         // was at 8.6 s.
         let mut events = Vec::new();
         for i in 0..=1200 {
-            events.extend(recorder.push(at(i * 10 * MS, None)));
+            events.extend(recording.push(at(i * 10 * MS, None)));
         }
         assert!(events.is_empty());
-        let mut seen = SeenTriggers::default();
         let key = ShotKey {
             shot_id: "putt".into(),
             shot_number: 1,
         };
         trigger(
             &state,
-            &mut recorder,
-            &mut seen,
-            "exputt.0",
-            &key,
+            &mut recording,
+            &shot("exputt.0", &key, true),
             8600 * MS,
-            true,
         );
         let mut i = 1201;
         while events.is_empty() {
-            events.extend(recorder.push(at(i * 10 * MS, None)));
+            events.extend(recording.push(at(i * 10 * MS, None)));
             i += 1;
         }
         let [RecorderEvent::Finished(clip)] = events.as_slice() else {
@@ -1467,33 +1600,32 @@ mod tests {
     fn an_exputt_putt_without_a_strike_takes_the_generic_lead() {
         let (_dir, state) = state_with("[exputt.0]\nname = \"Putt\"\nimpact_lead_s = 0.2\n");
         assert_eq!(ms(&state, "exputt.0"), Some(200));
-        let replay = state.system.replay();
-        let mut recorder: ClipRecorder<Tag> =
-            ClipRecorder::new(recorder_config(&replay, longest_reach(&state), Some(100.0)));
-        let buffer = recorder.config().buffer;
+        let mut recording = Recording::new(&state.system.view().read());
+        recording.set_fps(100.0);
+        let buffer = recording.recorder.config().buffer;
         // 12 s of frames at 100 fps; the result arrives at 12 s.
         let mut events = Vec::new();
         for i in 0..=1200 {
-            events.extend(recorder.push(at(i * 10 * MS, None)));
+            events.extend(recording.push(at(i * 10 * MS, None)));
         }
-        let mut seen = SeenTriggers::default();
         let key = ShotKey {
             shot_id: "putt".into(),
             shot_number: 1,
         };
         trigger(
             &state,
-            &mut recorder,
-            &mut seen,
-            "exputt.0",
-            &key,
+            &mut recording,
+            &shot("exputt.0", &key, false),
             12_000 * MS,
-            false,
         );
-        assert_eq!(recorder.config().buffer, buffer, "the history is enough");
+        assert_eq!(
+            recording.recorder.config().buffer,
+            buffer,
+            "the history is enough"
+        );
         let mut i = 1201;
         while events.is_empty() {
-            events.extend(recorder.push(at(i * 10 * MS, None)));
+            events.extend(recording.push(at(i * 10 * MS, None)));
             i += 1;
         }
         let [RecorderEvent::Finished(clip)] = events.as_slice() else {
@@ -1503,25 +1635,21 @@ mod tests {
         assert_eq!(clip.tags[0].shot.impact_lead_ms, 1500);
 
         // The same putt with its strike time keeps the configured lead.
-        let mut seen = SeenTriggers::default();
-        let mut recorder: ClipRecorder<Tag> =
-            ClipRecorder::new(recorder_config(&replay, longest_reach(&state), Some(100.0)));
+        let mut recording = Recording::new(&state.system.view().read());
+        recording.set_fps(100.0);
         let mut events = Vec::new();
         for i in 0..=1200 {
-            events.extend(recorder.push(at(i * 10 * MS, None)));
+            events.extend(recording.push(at(i * 10 * MS, None)));
         }
         trigger(
             &state,
-            &mut recorder,
-            &mut seen,
-            "exputt.0",
-            &key,
+            &mut recording,
+            &shot("exputt.0", &key, true),
             8600 * MS,
-            true,
         );
         let mut i = 1201;
         while events.is_empty() {
-            events.extend(recorder.push(at(i * 10 * MS, None)));
+            events.extend(recording.push(at(i * 10 * MS, None)));
             i += 1;
         }
         let [RecorderEvent::Finished(clip)] = events.as_slice() else {
@@ -1991,6 +2119,12 @@ mod tests {
         panic!("no clip");
     }
 
+    /// [`save`] as the actor runs it, announcing on `sender`.
+    fn save_on(state: &SystemState, sender: &BusSender, clip: &stance::Clip<Tag>) {
+        let raw = crate::bus::camera_raw(sender.raw_sender(), sender.actor_id());
+        save(&state.cameras, sender.actor_id(), &out(sender), &raw, clip);
+    }
+
     #[test]
     fn a_clip_with_its_whole_post_roll_is_saved_complete() {
         let dir = TempDir(std::env::temp_dir().join(format!(
@@ -2008,7 +2142,7 @@ mod tests {
         let generation = state.cameras.clips.generation();
         let clip = unpaced_clip(generation);
         assert!(clip.complete);
-        save(&state, &sender, &clip);
+        save_on(&state, &sender, &clip);
         let msg = rx.try_recv().expect("shot_video");
         assert!(matches!(
             msg.as_local(),
@@ -2035,12 +2169,12 @@ mod tests {
 
         let before = unpaced_clip(state.cameras.clips.generation());
         state.cameras.clips.clear();
-        save(&state, &sender, &before);
+        save_on(&state, &sender, &before);
         assert!(rx.try_recv().is_err(), "no shot_video");
         assert_eq!(std::fs::read_dir(&clips_dir).map_or(0, Iterator::count), 0);
 
         let after = unpaced_clip(state.cameras.clips.generation());
-        save(&state, &sender, &after);
+        save_on(&state, &sender, &after);
         let msg = rx.try_recv().expect("shot_video");
         assert!(matches!(
             msg.as_local(),

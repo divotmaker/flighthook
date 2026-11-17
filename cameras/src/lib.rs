@@ -61,6 +61,11 @@ impl Cameras {
     pub fn turn(&self) -> GolferTurn {
         self.host.turn()
     }
+
+    /// The live config the cameras read.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
 }
 
 /// What the cameras need from the host.
