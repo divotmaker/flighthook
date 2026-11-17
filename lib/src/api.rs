@@ -144,10 +144,10 @@ impl ActorStatusResponse {
     }
 
     /// Apply an `actor_status` event: record `status` at `now_ms`, then fold
-    /// in the keys it carries: each key replaces the one held, and an empty
-    /// value removes it. A key held stays through every status: its
-    /// reporter sends an explicit value (`none`) for what it no longer
-    /// knows. A card that is not Connected reads `ready` false.
+    /// in the keys it carries, each replacing the one held. A key held stays
+    /// through every status: its reporter sends an explicit value (`none`)
+    /// for what it no longer knows. A card that is not Connected reads
+    /// `ready` false.
     pub fn apply_status(
         &mut self,
         status: ActorStatus,
@@ -155,7 +155,8 @@ impl ActorStatusResponse {
         now_ms: u64,
     ) {
         self.observe(status, now_ms);
-        merge_telemetry(&mut self.telemetry, telemetry);
+        self.telemetry
+            .extend(telemetry.iter().map(|(k, v)| (k.clone(), v.clone())));
         if status != ActorStatus::Connected
             && let Some(ready) = self.telemetry.get_mut("ready")
         {
@@ -320,18 +321,6 @@ pub struct NewBlockRequest {
     pub new_session: bool,
 }
 
-/// Merge an `actor_status` event's telemetry into an actor's: each key
-/// replaces the one held, and an empty value removes the key.
-fn merge_telemetry(held: &mut HashMap<String, String>, update: &HashMap<String, String>) {
-    for (k, v) in update {
-        if v.is_empty() {
-            held.remove(k);
-        } else {
-            held.insert(k.clone(), v.clone());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,18 +426,12 @@ mod tests {
         let mut a = ActorStatusResponse::new("Mevo", ActorStatus::Disconnected);
         a.apply_status(ActorStatus::Disconnected, &tel(&[("error", "refused")]), 1);
         a.apply_status(ActorStatus::Reconnecting, &tel(&[("attempt", "2")]), 2);
-        a.apply_status(ActorStatus::Disconnected, &tel(&[("error", "")]), 3);
-        assert_eq!(a.telemetry, tel(&[("attempt", "2")]));
+        assert_eq!(a.telemetry, tel(&[("attempt", "2"), ("error", "refused")]));
 
-        // Connected stays Connected, or comes from Starting: merge, an empty
-        // value removes a key.
+        // Connected stays Connected, or comes from Starting: merge.
         let mut a = connected_with(&[("club", "DR"), ("error", "x")]);
-        a.apply_status(
-            ActorStatus::Connected,
-            &tel(&[("club", "7I"), ("error", "")]),
-            4,
-        );
-        assert_eq!(a.telemetry, tel(&[("club", "7I")]));
+        a.apply_status(ActorStatus::Connected, &tel(&[("club", "7I")]), 4);
+        assert_eq!(a.telemetry, tel(&[("club", "7I"), ("error", "x")]));
         let mut a = ActorStatusResponse::new("Mevo", ActorStatus::Starting);
         a.telemetry = tel(&[("address", "x")]);
         a.apply_status(ActorStatus::Connected, &tel(&[("ready", "true")]), 5);

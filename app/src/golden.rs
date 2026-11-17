@@ -1026,10 +1026,7 @@ impl Heard {
                 let card = crate::actors::web::stored::card_of(root, &msg.from);
                 match &msg.body {
                     FrpBody::BusActor(a) if a.has_role(flightrelay::roles::LAUNCH_MONITOR) => {
-                        let ready = flighthook::bus_actor_rows(a)
-                            .get("ready")
-                            .map(|r| r == "true");
-                        (card, Event::Actor, ready)
+                        (card, Event::Actor, Some(a.is_clear()))
                     }
                     FrpBody::BusSync(_) => (card, Event::Sync, None),
                     FrpBody::ShotFinished(_) => (card, Event::ShotFinished, None),

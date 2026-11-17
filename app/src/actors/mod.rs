@@ -55,51 +55,12 @@ pub const STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// The longest [`Actor::stop_wait`] of any actor: the Omni's. A config
 /// command stops the actors it restarts or removes together, so this bounds
-/// how long it waits for them.
+/// how long it waits for them. The build checks every driver card's
+/// `STOP_WAIT` against it (`DriverActor::stop_wait`).
 pub const MAX_STOP_WAIT: Duration =
     <allsquare::driver::Omni as flightrelay::driver::FrpDriver>::STOP_WAIT;
 
 const _: () = assert!(STOP_WAIT.as_millis() <= MAX_STOP_WAIT.as_millis());
-const _: () = assert!(
-    <threeputt::driver::ExPutt as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
-        <= MAX_STOP_WAIT.as_millis()
-);
-const _: () = assert!(
-    <ironsight::driver::Mevo as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
-        <= MAX_STOP_WAIT.as_millis()
-);
-const _: () = assert!(
-    <tenover::driver::R10 as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
-        <= MAX_STOP_WAIT.as_millis()
-);
-const _: () = assert!(
-    <flightrelay::mock::MockDriver as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
-        <= MAX_STOP_WAIT.as_millis()
-);
-const _: () = assert!(
-    <thumbswing::driver::Thumbswing as flightrelay::driver::FrpDriver>::STOP_WAIT.as_millis()
-        <= MAX_STOP_WAIT.as_millis()
-);
-const _: () = assert!(
-    <flighthook_pureplay::connect::Connect as flightrelay::driver::FrpDriver>::STOP_WAIT
-        .as_millis()
-        <= MAX_STOP_WAIT.as_millis()
-);
-const _: () = assert!(
-    <flighthook_pureplay::accessory::Accessory as flightrelay::driver::FrpDriver>::STOP_WAIT
-        .as_millis()
-        <= MAX_STOP_WAIT.as_millis()
-);
-const _: () = assert!(
-    <flighthook_openconnect::client::Client as flightrelay::driver::FrpDriver>::STOP_WAIT
-        .as_millis()
-        <= MAX_STOP_WAIT.as_millis()
-);
-const _: () = assert!(
-    <flighthook_openconnect::server::Server as flightrelay::driver::FrpDriver>::STOP_WAIT
-        .as_millis()
-        <= MAX_STOP_WAIT.as_millis()
-);
 
 /// Common trait for self-managed actors. Each actor struct holds its own config;
 /// `start()` clones what it needs and spawns a thread.

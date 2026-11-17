@@ -261,7 +261,10 @@ A card's `telemetry` holds its rows as key/value strings. A row, once
 shown, always has a value: what its source does not know reads `none`
 (or `unknown`, `idle`, `0`), and the rows stay while the card is
 reconnecting or disconnected. Only `battery_pct` leaves when there is no
-reading. A key is reported by one source only:
+reading. A key is reported by one source only, except `error` on the
+Pureplay Connect and Pureplay Accessory cards: their driver reports it,
+and the card's own error (a failed connect, giving up) takes its place
+while it lasts:
 - **Device-reported** (reported by the device): `battery_pct`, `tilt`
   and `roll` (degrees, `0.4°`; a Mevo+ and an R10, which flags both while it
   reports it is not level), `temp_c`, `external_power` (a Mevo+), `zero_spin_discards` (a Square Golf), and a device driver's own state keys

@@ -80,9 +80,12 @@ fn rows(actor: &BusActor) -> HashMap<String, String> {
         .into_iter()
         .filter(|(_, v)| !v.is_empty())
         .collect();
-    if !actor.blockers.is_empty() {
-        rows.insert("ready".into(), actor.blockers.join(", "));
-    }
+    let ready = if actor.blockers.is_empty() {
+        "true".to_owned()
+    } else {
+        actor.blockers.join(", ")
+    };
+    rows.insert("ready".into(), ready);
     if let Some(device) = &actor.device {
         let info: Vec<&str> = [&device.manufacturer, &device.model, &device.firmware]
             .into_iter()

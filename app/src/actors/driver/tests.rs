@@ -408,7 +408,7 @@ fn connecting_sink<H: Hooks<FakeDriver, Section = FakeSection>>(
         sink: Sink::new(state, sender, FakeDriver::info(&section.driver)),
         hooked: Hooked::new(section),
     };
-    sink.begin_session();
+    sink.begin_connect();
     (dir, sink, rx, writer)
 }
 
@@ -481,7 +481,7 @@ pub(crate) fn card_bus<D: FrpDriver, H: Hooks<D>>(
     let sender = BusSender::new(card.into(), tx, Arc::default()).with_frp_id(Some(card.into()));
     let mut sink = Sink::<D, H>::new(state, sender, D::info(&section.driver_settings()));
     let mut hooked = Hooked::new(section);
-    sink.begin_session();
+    sink.begin_connect();
     start_session(&mut sink, &mut hooked, identity);
     sink.session_mode = mode;
     for event in events {
@@ -695,7 +695,7 @@ fn raw_frames_are_captured_with_their_label_and_numbered_across_sessions() {
     );
     assert_eq!(sink.seqs["FAKE-1"], 4);
 
-    sink.begin_session();
+    sink.begin_connect();
     sink.connected(&DeviceIdentity::new("FAKE-1"));
     sink.handle(frame(Rx, "again", &[0x02]));
     assert_eq!(sink.seqs["FAKE-1"], 5, "counting on in the next session");
@@ -1203,6 +1203,32 @@ fn a_failed_connect_reads_connecting_until_the_next_one_sets_its_phase() {
         ]
     );
     rig.state.stop_and_wait("fake.0");
+}
+
+/// A connect that fails again with the same text puts the card back at
+/// `phase` `connecting` too, with its `error`.
+#[test]
+fn every_failed_connect_reads_connecting_with_its_error() {
+    let (_dir, mut sink, mut rx, _w) = connecting_sink::<FakeHooks>("");
+    drain(&mut rx);
+    for _ in 0..2 {
+        sink.handle(DeviceEvent::Phase("handshaking"));
+        sink.connect_failed("no answer");
+        sink.begin_connect();
+    }
+    let rows: Vec<(Option<String>, Option<String>)> = drain(&mut rx)
+        .iter()
+        .filter_map(card_status)
+        .map(|(_, rows)| (rows.get("phase").cloned(), rows.get("error").cloned()))
+        .collect();
+    let (handshaking, failed) = (
+        (Some("handshaking".to_owned()), None),
+        (Some("connecting".to_owned()), Some("no answer".to_owned())),
+    );
+    assert_eq!(
+        rows,
+        [handshaking.clone(), failed.clone(), handshaking, failed]
+    );
 }
 
 /// A driver that gives up after a failed connect leaves the card
@@ -1800,67 +1826,6 @@ fn soft_sink<H: Hooks<Soft, Section = SoftSection>>(
         hooked: Hooked::new(section),
     };
     (dir, sink, rx)
-}
-
-/// The kinds a driver's messages may have, by its roles and namespaces:
-/// any driver sends alerts, selects and replies; a game, or a driver
-/// that issues golfer ids, `game.*` and `golfer.profile` with their
-/// removals; a launch monitor `shot.*`. The host's own kinds never
-/// pass.
-#[test]
-fn a_drivers_roles_decide_the_kinds_it_sends() {
-    use flightrelay::{GolferId, GolferProfile, GolferSelect, GolferTurn, PracticeBlock};
-    let output = DriverInfo::new("o", "O", Source::Virtual).with_roles(&[]);
-    let game = DriverInfo::new("g", "G", Source::Virtual).with_roles(&[roles::GAME]);
-    let issuer = DriverInfo::new("i", "I", Source::Virtual)
-        .with_roles(&[])
-        .with_namespaces(&["soft"]);
-    let monitor = DriverInfo::new("m", "M", Source::Measured);
-    let bodies: Vec<(FrpBody, [bool; 4])> = vec![
-        (
-            flightrelay::BusAlert::new(Severity::Warn, "w").into(),
-            [true; 4],
-        ),
-        (GolferSelect::new("r").into(), [true; 4]),
-        (
-            flightrelay::BusReply::ok("fake.0", "golfer.select", "r").into(),
-            [true; 4],
-        ),
-        (game_round().into(), [false, true, true, false]),
-        (
-            Removal::of(StateKind::GameRound).into(),
-            [false, true, true, false],
-        ),
-        (
-            GolferProfile::new(GolferId::new("soft", "1").expect("an id"), "Ann").into(),
-            [false, true, true, false],
-        ),
-        (trigger(key(1)), [false, false, false, true]),
-        (finished(key(1)), [false, false, false, true]),
-        (BusActor::new("x", 2.0).into(), [false; 4]),
-        (Removal::of(StateKind::BusActor).into(), [false; 4]),
-        (
-            GolferTurn::new(None, None, flightrelay::Handedness::Right, Mode::Full).into(),
-            [false; 4],
-        ),
-        (
-            PracticeBlock {
-                id: "b".into(),
-                golfer: None,
-                club: None,
-                number: 1,
-                session: 1,
-                started_at: 0,
-            }
-            .into(),
-            [false; 4],
-        ),
-        (flightrelay::BusSync::new().into(), [false; 4]),
-    ];
-    for (body, want) in bodies {
-        let got = [&output, &game, &issuer, &monitor].map(|info| role_sends(info, &body));
-        assert_eq!(got, want, "{}", body.kind());
-    }
 }
 
 /// Through the sink: a game card's `game.round` and `golfer.select` go

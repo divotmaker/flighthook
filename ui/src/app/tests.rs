@@ -290,36 +290,6 @@ fn a_status_reply_keeps_the_red_and_live_statuses_carry_it_on() {
 }
 
 #[test]
-fn an_empty_status_telemetry_value_removes_the_key() {
-    let mut app = FlighthookApp::with_pending(net::new_pending());
-    let status = |status, telemetry: &[(&str, &str)]| {
-        crate::socket::feed::card_msg("openconnect_client.0", status, telemetry)
-    };
-    app.handle_ui_message(status(
-        ActorStatus::Reconnecting,
-        &[("error", "refused"), ("club", "DR")],
-    ));
-    assert_eq!(
-        app.actors["openconnect_client.0"]
-            .telemetry
-            .get("error")
-            .map(String::as_str),
-        Some("refused")
-    );
-    // A status without the key keeps it.
-    app.handle_ui_message(status(ActorStatus::Reconnecting, &[]));
-    assert!(
-        app.actors["openconnect_client.0"]
-            .telemetry
-            .contains_key("error")
-    );
-    app.handle_ui_message(status(ActorStatus::Connected, &[("error", "")]));
-    let telemetry = &app.actors["openconnect_client.0"].telemetry;
-    assert!(!telemetry.contains_key("error"));
-    assert_eq!(telemetry.get("club").map(String::as_str), Some("DR"));
-}
-
-#[test]
 fn a_cards_rows_stay_through_a_lost_connection_and_flags_follow_its_bus_actor() {
     let mut app = FlighthookApp::with_pending(net::new_pending());
     let status = |status, telemetry: &[(&str, &str)]| {

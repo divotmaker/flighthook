@@ -117,10 +117,11 @@ pub enum UiLocalEvent {
     ShotSwing { keys: Vec<ShotKey> },
 }
 
-/// A `bus.actor`'s values as card rows: `ready` (no blockers),
-/// `battery_pct` and the actor's own telemetry. A battery the actor does
-/// not report is empty, which removes the row; telemetry always carries
-/// every key the actor uses.
+/// A `bus.actor`'s values as card rows: `battery_pct` and the actor's own
+/// telemetry. A battery the actor does not report is empty, which removes
+/// the row; telemetry always carries every key the actor uses. A card's
+/// `ready` row is its own rule
+/// ([`ActorStatusResponse::apply_actor`](crate::ActorStatusResponse::apply_actor)).
 #[must_use]
 pub fn bus_actor_rows(actor: &flightrelay::BusActor) -> HashMap<String, String> {
     let device = actor.device.clone().unwrap_or_default();
@@ -130,7 +131,6 @@ pub fn bus_actor_rows(actor: &flightrelay::BusActor) -> HashMap<String, String> 
         .unwrap_or_default()
         .into_iter()
         .collect();
-    rows.insert("ready".into(), actor.is_clear().to_string());
     rows.insert(
         "battery_pct".into(),
         device
