@@ -1254,7 +1254,7 @@ What a stop does, by actor:
 | Open Connect server | always: the accept loop, the wait for a peer's first message and the card between session steps (5 ms apart while the monitor is quiet; reads and writes do not block); the listen port is free once it ends | the driver's `STOP_WAIT` (3 s); the driver is exclusive, so a new instance waits for the old one to let go of the port |
 | Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
 | Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
-| ExPutt | discovering (250 ms slices), measuring (checked between session steps, 5 ms apart while the device is quiet; the session closes at once) or waiting to reconnect | the driver's `STOP_WAIT` (3 s: discovery, the connect and the handshake each check for a stop on every pass; the close says goodbye and waits at most half a second for the device to hang up) |
+| ExPutt | always: discovery, the connect and the handshake check on every pass, a session between its steps (5 ms apart while the device is quiet; the session closes at once), and a wait to reconnect | the driver's `STOP_WAIT` (3 s: discovery, the connect and the handshake each check for a stop on every pass; the close says goodbye and waits at most half a second for the device to hang up) |
 | Trackball | always: opening the device is a few system calls, checked for a stop before and after; the card checks between session steps (5 ms apart while the device is quiet); closing drops the device | the driver's `STOP_WAIT` (1 s: closing joins the device's reader thread, which wakes every 100 ms); not exclusive (the card never grabs the device), so an old instance still closing is replaced beside it |
 | Mock monitor | always (checked between session steps; a device driver's connect checks the stop between steps) | the driver's `STOP_WAIT` (3 s) |
 | Random club | always (100 ms loop) | -- |
@@ -1358,7 +1358,7 @@ the card is exclusive: a new instance waits for the old one to close.
 `DriverActor` (`actors::exputt::ExPuttHooks`: section `ExPuttSection`, source
 `ExPutt`; its `action` turns a `FindMat` for this card into the driver's
 `Action::FindMat`). With no address the driver waits for the device to
-announce itself on the network (`phase: discovering`, 250 ms at a time), then
+announce itself on the network (`phase: discovering`, polled every 5 ms), then
 connects (`phase: connecting`) and starts measuring with the turn's hand
 (the session's, right-handed when unknown; `phase: measuring`, which the
 `Connected` status keeps). The card is then `Connected` (`device_info`

@@ -1600,7 +1600,7 @@ itself later:
   earlier request (see below); the actor's `error` telemetry says
   `"The previous connection has not closed yet. It reconnects when it does."`;
 - another save or reconnect is restarting it already;
-- SystemActor has not finished within 22 s (see
+- SystemActor has not finished within 10 s (see
   [config timeout](#config-timeout)). Until it has, the actor counts as in
   flight, so another request for it is `409`.
 
