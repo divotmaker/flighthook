@@ -264,44 +264,48 @@ impl LivePostureFilter {
     }
 }
 
+/// A right-handed golfer face-on at address, about 300 px tall: the
+/// Halpe-26 keypoints, all scoring 0.9, with the hands at `hands` (tests).
 #[cfg(any(test, feature = "testing"))]
-#[cfg_attr(not(test), allow(dead_code))]
-pub mod tests {
-    use super::*;
-    use stance::pose::{BBox, Keypoint, PoseFrame, Skeleton};
-
-    /// A right-handed golfer face-on at address, about 300 px tall: the
-    /// Halpe-26 keypoints, all scoring 0.9, with the hands at `hands`.
-    pub fn golfer(hands: (f32, f32)) -> Pose {
-        let at = |x: f32, y: f32| Keypoint { x, y, score: 0.9 };
-        let mut k = vec![at(0.0, 0.0); 26];
-        k[0] = at(300.0, 110.0); // nose
-        k[1] = at(305.0, 105.0);
-        k[2] = at(295.0, 105.0);
-        k[3] = at(312.0, 108.0);
-        k[4] = at(288.0, 108.0);
-        k[5] = at(335.0, 150.0); // left (lead) shoulder
-        k[6] = at(265.0, 150.0);
-        k[7] = at(330.0, 200.0);
-        k[8] = at(270.0, 200.0);
-        k[9] = at(hands.0 + 4.0, hands.1); // left wrist
-        k[10] = at(hands.0 - 4.0, hands.1);
-        k[11] = at(322.0, 250.0); // left hip
-        k[12] = at(278.0, 250.0);
-        k[13] = at(325.0, 320.0);
-        k[14] = at(275.0, 320.0);
-        k[15] = at(330.0, 390.0); // left ankle
-        k[16] = at(270.0, 390.0);
-        k[17] = at(300.0, 85.0); // head
-        k[18] = at(300.0, 140.0); // neck
-        k[19] = at(300.0, 250.0); // hip center
-        for (i, x) in [(20, 340.0), (21, 260.0), (22, 345.0), (23, 255.0)] {
-            k[i] = at(x, 398.0);
-        }
-        k[24] = at(325.0, 395.0);
-        k[25] = at(275.0, 395.0);
-        Pose::new(Skeleton::Halpe26, k, BBox::new(240.0, 80.0, 360.0, 400.0))
+pub fn golfer(hands: (f32, f32)) -> Pose {
+    let at = |x: f32, y: f32| stance::pose::Keypoint { x, y, score: 0.9 };
+    let mut k = vec![at(0.0, 0.0); 26];
+    k[0] = at(300.0, 110.0); // nose
+    k[1] = at(305.0, 105.0);
+    k[2] = at(295.0, 105.0);
+    k[3] = at(312.0, 108.0);
+    k[4] = at(288.0, 108.0);
+    k[5] = at(335.0, 150.0); // left (lead) shoulder
+    k[6] = at(265.0, 150.0);
+    k[7] = at(330.0, 200.0);
+    k[8] = at(270.0, 200.0);
+    k[9] = at(hands.0 + 4.0, hands.1); // left wrist
+    k[10] = at(hands.0 - 4.0, hands.1);
+    k[11] = at(322.0, 250.0); // left hip
+    k[12] = at(278.0, 250.0);
+    k[13] = at(325.0, 320.0);
+    k[14] = at(275.0, 320.0);
+    k[15] = at(330.0, 390.0); // left ankle
+    k[16] = at(270.0, 390.0);
+    k[17] = at(300.0, 85.0); // head
+    k[18] = at(300.0, 140.0); // neck
+    k[19] = at(300.0, 250.0); // hip center
+    for (i, x) in [(20, 340.0), (21, 260.0), (22, 345.0), (23, 255.0)] {
+        k[i] = at(x, 398.0);
     }
+    k[24] = at(325.0, 395.0);
+    k[25] = at(275.0, 395.0);
+    Pose::new(
+        stance::pose::Skeleton::Halpe26,
+        k,
+        stance::pose::BBox::new(240.0, 80.0, 360.0, 400.0),
+    )
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use stance::pose::{PoseFrame, Skeleton};
 
     /// A face-on swing at 60 fps: still hands at address, a backswing to
     /// the trail side and up, a downswing through the address point, and a

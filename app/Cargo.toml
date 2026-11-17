@@ -60,8 +60,8 @@ dimple = "0.0.7"
 glam = "0.32"
 # The ExPutt RG's device driver (`driver`: `threeputt::driver::ExPutt`).
 threeputt = { version = "0.2.0", features = ["driver"] }
-# Swing cameras: capture, pre-roll and trigger-cut MJPEG clips; `pose` is
-# body tracking (RTMPose on the CPU), `pose-download` fetches its models.
+# A camera's video mode (`stance::FormatRequest`) is checked when the config
+# resolves; the cameras themselves are `flighthook-cameras`.
 stance = { version = "0.0.5", features = ["pose", "pose-download"] }
 # The Trackball's device driver (`driver`: `thumbswing::driver::Thumbswing`).
 # It reads Linux evdev; on other platforms it builds and its connect reports

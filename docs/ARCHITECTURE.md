@@ -2252,8 +2252,7 @@ on the bus: only one local `ShotVideo` event per finished clip.
 
 The `flighthook-cameras` workspace crate does the camera work: the camera
 loop, the clip store, the frame slots and body tracking. It knows nothing of
-the bus, the actor registry or the app's state. The app hands it two things
-and hears from it through a third:
+the bus, the actor registry or the app's state. The seam is four things:
 
 - `Cameras`, everything the cameras share, one per process (`clips`, `frames`
   and `pose`), built over the live config and a `Host`.
@@ -2262,13 +2261,24 @@ and hears from it through a third:
   and card rows, alerts, `Video` and `VideoRemoved` for the clips, `Pose` and
   `Swing` for body tracking. The app turns each into its bus event.
 - `Camera::run` is the loop of one `[camera.N]`. It takes the camera's section
-  and an `Out`, and asks a `poll` closure for an `Input` (`Stop`, `Idle` or
-  `Trigger`) at least every 10 ms.
+  and two `Out`s, and asks a `poll` closure for an `Input` (`Stop`, `Idle` or
+  `Trigger`), one input per call. While the camera is capturing, `poll` is
+  asked at least every 10 ms. While the loop waits to reopen a lost camera it
+  is asked every 100 ms, on a platform without cameras every 250 ms, and not
+  at all while the camera opens (which blocks).
+
+The two `Out`s differ in what the app does with them. `out` carries the
+camera's own events (status, alerts, `Video`, `VideoRemoved`); the app
+silences it once a new instance of the camera has replaced this one, so a
+stopped loop says nothing. `raw` carries the events of the camera's clip jobs
+(`Pose`, `Swing`); the app never silences it, so the body tracking of a clip is
+announced even when its camera has been restarted since.
 
 The app's `CameraActor` (`app/src/actors/camera.rs`) is the thin wrapper: it
 runs `Camera::run` on the camera's thread and turns bus messages into `Input`s
 and `Event`s into bus events. In the crate, the tests drive the loop's pure
-step with explicit times; no test depends on the clock.
+steps with explicit times, and a single-threaded bench runs the loop's
+saving rules without a camera.
 
 ### Camera actor
 
@@ -2534,7 +2544,7 @@ sends them; the rotation is metadata applied where a frame is analyzed or
 drawn:
 
 - **Clip pass**: `pose::clips::clip_config(model, rotation)` puts
-  `SystemConfig::camera_rotation(actor)` (the value in effect at the time
+  `settings::camera_rotation(config, actor)` (the value in effect at the time
   the clip runs) in stance's `PoseConfig::rotation`; stance turns every
   decoded frame before detection, and the track's keypoints and
   `width`/`height` are in the turned frame (the track records it).
@@ -2701,7 +2711,7 @@ camera's entry and `shot_swing` sets `swing`. Routes
   camera clip's keypoints, and its swing analysis, once each is done,
   served like the `.avi`.
 - `POST /api/shots/{shot_id}/video/{camera}/analyze`: track that clip now
-  for a viewer (`pose::clips::request`): `202 {"state":"queued"}`, `200
+  for a viewer (`Cameras::request`): `202 {"state":"queued"}`, `200
   {"state":"done"}` when its keypoints are there, `409` in Off mode, `404`
   without the clip. `?force=1` first clears the clip's analysis
   (`ClipStore::clear_analysis`: deletes `<camera>.pose.json` and
@@ -2726,7 +2736,7 @@ numbers measured on them by stance's golf analysis (`stance::golf`): each
 recorded swing's events, tempo and metrics, and the live posture. The code
 is `cameras/src/pose/` (`models.rs`, `live.rs`, `clips.rs`, `priority.rs`,
 `swing.rs` and `grades.rs`, the modules that call `stance::golf`), held in `Cameras::pose`. `[body_tracking]` is read live
-through `SystemConfig::body_tracking()` (out-of-range values at their
+through the cameras' own view of the config (out-of-range values at their
 defaults): no change restarts a camera.
 
 | Field | Default | Range | Used by |
@@ -2749,7 +2759,7 @@ without the section stays byte-identical. The Body
 tracking card (Cameras) edits every field, saved with the global cards.
 
 The golfer's facts are the record of the golfer the shot names, by the lookup
-rule (`SystemConfig::golfer_facts`, read live; a height out of range is none): `sex` (`male` | `female`, for the
+rule (`settings::golfer_facts`, read live; a height out of range is none): `sex` (`male` | `female`, for the
 tour averages) and `height` (100 to 250 cm: the swing analysis' distances in
 cm). The Golfers card (Settings, Golfers) edits both (height typed in inches
 with imperial default units, centimeters with metric) and saves with
@@ -2870,7 +2880,7 @@ the camera's live worker) on every answer, the `204` included.
 **Recorded swings** (`pose::clips`). In Live mode a camera's clip is queued
 for body tracking when it is saved and announced (`ShotVideo`), to start no
 sooner than 3 s after it was written (`CLIP_DELAY`), so the pass stays clear
-of the shot itself. A viewer's request (`clips::request`, from
+of the shot itself. A viewer's request (`Cameras::request`, from
 `POST /api/shots/{shot_id}/video/{camera}/analyze`; the UI sends it in
 Historical and Live mode for each clip it shows without `pose`) builds the
 same `ClipJob` from the clip store (`ClipStore::camera_clip`: folder, AVI,
@@ -2918,7 +2928,7 @@ the shot (the game's hand when the camera saw the trigger, carried with the
 recorder's tag; right-handed when unknown), the clip's estimated impact (the
 sidecar's `impact_ns`, the launch monitor's impact shifted by its camera
 timing, when it falls inside the clip's frames: at or after the first, at
-or before the last), the golfer's height (`SystemConfig::golfer_facts`), and whether the
+or before the last), the golfer's height (`settings::golfer_facts`), and whether the
 camera's picture is mirrored (`swing::mirrored`, the one place a mirror
 setting plugs in; no camera is mirrored yet). stance takes the impact as a
 prior: it moves it to the hands' low point within 0.3 s (`refined`), or,

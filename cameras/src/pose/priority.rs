@@ -47,7 +47,7 @@ pub fn worker_hook() -> WorkerHook {
 
 /// The calling thread's priority as the platform states it: the nice value
 /// on Linux, the thread priority on Windows (tests).
-#[cfg(all(any(test, feature = "testing"), any(target_os = "linux", windows)))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 pub fn current() -> i32 {
     #[cfg(target_os = "linux")]
     {
@@ -64,7 +64,7 @@ pub fn current() -> i32 {
 
 /// What [`current`] reads on a thread that started at `base` and then
 /// lowered itself (tests).
-#[cfg(all(any(test, feature = "testing"), any(target_os = "linux", windows)))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 pub fn lowered_from(base: i32) -> i32 {
     #[cfg(target_os = "linux")]
     {

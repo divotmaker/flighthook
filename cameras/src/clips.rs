@@ -1,9 +1,9 @@
 //! The replay clip store: one folder per recorded swing, shared by every
-//! camera actor (beta).
+//! camera (beta).
 //!
 //! A clip folder is `<clip-id>/` under the clip folder
 //! (`[replay] clip_dir`, default `flighthook/clips` in the user's local data
-//! folder). Each camera writes `<camera-actor>.avi` and `<camera-actor>.json`
+//! folder). Each camera writes `<camera>.avi` and `<camera>.json`
 //! (stance's MJPEG AVI and sidecar, sidecar last), and the store
 //! writes `shot.json`: the shots the swing belongs to, the launch monitor
 //! kind behind each, and every camera's clip. Clip ids start with the UTC
@@ -1085,5 +1085,44 @@ mod tests {
         assert!(!store.clear_analysis(&slot, "camera.7"));
         store.clear();
         assert!(!store.clear_analysis(&slot, "camera.0"));
+    }
+
+    #[test]
+    fn an_impact_outside_the_clip_is_no_prior() {
+        use stance::sidecar::{Sidecar, SidecarFps, SidecarFrame};
+        let frames = (0..10u64)
+            .map(|i| SidecarFrame {
+                t_ns: i * 100_000_000,
+                offset: 0,
+                len: 0,
+            })
+            .collect();
+        let mut sidecar = Sidecar {
+            version: stance::sidecar::SIDECAR_VERSION,
+            fourcc: "MJPG".into(),
+            width: 64,
+            height: 48,
+            fps: SidecarFps {
+                nominal: Some(10.0),
+                measured: 10.0,
+            },
+            start_ns: 0,
+            frames,
+            trigger_index: 9,
+            impact_index: 5,
+            trigger_ns: 900_000_000,
+            impact_ns: 500_000_000,
+            complete: true,
+            dropped: 0,
+            truncated: false,
+        };
+        assert_eq!(clip_impact(&sidecar), Some(500_000_000));
+        sidecar.impact_ns = 900_000_000;
+        assert_eq!(clip_impact(&sidecar), Some(900_000_000), "the last frame");
+        // A clip cut short before the impact.
+        sidecar.impact_ns = 950_000_000;
+        assert_eq!(clip_impact(&sidecar), None);
+        sidecar.impact_ns = -1;
+        assert_eq!(clip_impact(&sidecar), None);
     }
 }

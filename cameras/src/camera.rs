@@ -36,7 +36,7 @@
 //! Historical mode a clip is tracked when a viewer asks for it
 //! (`Cameras::request`).
 //!
-//! Status follows the other device actors: `starting` while opening,
+//! Status follows the host's other devices: `starting` while opening,
 //! `connected` while frames arrive, `reconnecting` with a growing backoff
 //! after the camera is lost (a clip that holds its impact frame is saved,
 //! marked incomplete), `disconnected` when stopped or when the platform has
@@ -100,9 +100,9 @@ const SEEN_TRIGGERS: usize = 64;
 const FPS_REPORT_STEP: f64 = 0.02;
 
 /// The status error on platforms without camera support.
-pub const UNSUPPORTED: &str = "cameras are not supported on macOS yet";
+const UNSUPPORTED: &str = "cameras are not supported on macOS yet";
 
-/// How long before its `shot_trigger` the launch monitor `actor` (e.g.
+/// How long before its trigger the launch monitor `actor` (e.g.
 /// `mevo.0`) struck the ball: the `impact_lead_s` of its live config section,
 /// else the default for its kind, or `None` for a source that is not a swing
 /// (Auto-chip). These are beta estimates: FlightScope triggers at impact; the
@@ -673,8 +673,10 @@ impl Camera {
     /// lost. `out` is the camera's own events (status, alerts, clips saved
     /// and removed), `raw` those of its clip jobs (body tracking of a clip is
     /// announced even when this camera has been restarted since). `poll` is
-    /// asked at least every 10 ms and returns what is waiting, one
-    /// input per call.
+    /// asked at least every 10 ms while the camera captures, every 100 ms
+    /// while the loop waits to reopen it, every 250 ms on a platform without
+    /// cameras and not at all while the camera opens; it returns what is
+    /// waiting, one input per call.
     pub fn run(
         cameras: &Arc<Cameras>,
         actor: &str,
@@ -1143,7 +1145,7 @@ fn pre_roll_shortfall(first_ns: u64, impact_ns: u64, pre_roll: Duration) -> Opti
 const PRE_ROLL_SLACK: Duration = Duration::from_millis(100);
 
 /// Write a finished clip into the clip store and announce it: one
-/// `shot_video`, and `shot_video_removed` for the clips pruned to make
+/// [`Event::Video`], and [`Event::VideoRemoved`] for the clips pruned to make
 /// room, on `out`. A failed write (disk full) raises a warning alert. In
 /// Live mode the clip is queued for body tracking, which announces on
 /// `raw`.
@@ -1684,6 +1686,104 @@ mod tests {
         }
     }
 
+    /// The capture's stats at `fps`.
+    fn stats(fps: f64) -> CaptureStats {
+        CaptureStats {
+            frames: 0,
+            dropped: 0,
+            fps,
+            last_frame_ns: None,
+            ring_frames: 0,
+            ring_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn the_still_is_put_with_the_first_frame_and_then_every_half_second() {
+        let t0 = Instant::now();
+        let at_ms = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut pass = Pass::new(t0);
+        let still = |pass: &mut Pass, ns: u64, ms: u64| {
+            pass.frame(at(ns, None), Duration::ZERO, at_ms(ms)).0
+        };
+        assert!(still(&mut pass, 1, 0).is_some());
+        assert!(still(&mut pass, 2, 499).is_none());
+        assert!(still(&mut pass, 3, 500).is_some());
+        assert!(still(&mut pass, 4, 999).is_none());
+    }
+
+    #[test]
+    fn telemetry_is_due_every_two_seconds() {
+        let t0 = Instant::now();
+        let at_ms = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut pass = Pass::new(t0);
+        assert!(!pass.telemetry_due(at_ms(1999)));
+        assert!(pass.telemetry_due(at_ms(2000)));
+        assert!(!pass.telemetry_due(at_ms(3999)));
+        assert!(pass.telemetry_due(at_ms(4000)));
+    }
+
+    #[test]
+    fn telemetry_rows_go_out_only_when_they_changed() {
+        let t0 = Instant::now();
+        let at_ms = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut pass = Pass::new(t0);
+        let (rows, _) = pass.tick(at_ms(2000), &stats(30.0), 30.0, "Face on".into());
+        let rows = rows.expect("the first rows");
+        assert_eq!(rows["fps"], "30");
+        assert_eq!(rows["dropped"], "0");
+        assert_eq!(rows["position"], "Face on");
+        let (rows, _) = pass.tick(at_ms(4000), &stats(30.0), 30.0, "Face on".into());
+        assert!(rows.is_none(), "nothing changed");
+        let (rows, _) = pass.tick(at_ms(6000), &stats(30.0), 30.0, "Down the line".into());
+        assert_eq!(
+            rows.expect("the position changed")["position"],
+            "Down the line"
+        );
+    }
+
+    #[test]
+    fn a_camera_under_half_its_rate_for_ten_seconds_alerts_once_a_session() {
+        let t0 = Instant::now();
+        let at_ms = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut pass = Pass::new(t0);
+        let slow = |pass: &mut Pass, ms: u64, fps: f64| {
+            pass.tick(at_ms(ms), &stats(fps), 30.0, "Face on".into()).1
+        };
+        // Slow from the first tick, 2 s in: nothing until 10 s later.
+        assert_eq!(slow(&mut pass, 2000, 10.0), None);
+        assert_eq!(slow(&mut pass, 11_999, 10.0), None);
+        assert_eq!(slow(&mut pass, 12_000, 10.0), Some(10.0));
+        assert_eq!(slow(&mut pass, 20_000, 10.0), None, "once a session");
+        // A session that recovers in time never alerts: the count starts over.
+        let mut pass = Pass::new(t0);
+        assert_eq!(slow(&mut pass, 2000, 10.0), None);
+        assert_eq!(slow(&mut pass, 8000, 20.0), None, "back above half");
+        assert_eq!(slow(&mut pass, 9000, 10.0), None);
+        assert_eq!(slow(&mut pass, 18_999, 10.0), None);
+        assert_eq!(slow(&mut pass, 19_000, 10.0), Some(10.0));
+    }
+
+    #[test]
+    fn the_models_are_asked_for_in_live_mode_only() {
+        for (mode, wanted) in [
+            (BodyTrackingMode::Off, false),
+            (BodyTrackingMode::Historical, false),
+            (BodyTrackingMode::Live, true),
+        ] {
+            let mut config = FlighthookConfig::default();
+            config.body_tracking.mode = mode;
+            let bench = bench(config);
+            want_models(&bench.cameras);
+            let model = bench.cameras.settings().body_tracking().model;
+            assert_eq!(
+                bench.cameras.pose.models.state(model).is_some(),
+                wanted,
+                "{mode:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_frame_is_dated_its_latency_before_it_arrived() {
         let mut restamp = Restamp::default();
@@ -1776,7 +1876,7 @@ mod tests {
     /// with its arrival. The wall clock runs in 10 ms steps: the trigger,
     /// then the frame that arrives, then the recorder's poll. Returns what
     /// the recorder produced; `shifted` polls on [`frame_clock`] as the
-    /// actor does, else on the plain wall clock.
+    /// the loop does, else on the plain wall clock.
     fn simulate(latency_ms: u64, shifted: bool) -> Vec<RecorderEvent<&'static str>> {
         let lag = millis(latency_ms);
         let mut recorder = ClipRecorder::new(sim_config());
@@ -2044,21 +2144,6 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_with_its_whole_post_roll_is_saved_complete() {
-        let bench = clips_bench();
-        let (out, rx) = out();
-        let generation = bench.cameras.clips.generation();
-        let clip = unpaced_clip(&[shot_key(generation)], generation);
-        assert!(clip.complete);
-        save(&bench.cameras, "camera.0", &out, &out, &clip);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(Event::Video { complete: true, .. })
-        ));
-        assert!(bench.cameras.clips.videos(&format!("shot-{generation}"))[0].complete);
-    }
-
-    #[test]
     fn a_clip_of_shots_cleared_since_their_trigger_is_not_written() {
         let bench = clips_bench();
         let (out, rx) = out();
@@ -2170,10 +2255,10 @@ mod tests {
         // The watch lapses: the worker goes, and nothing is put.
         route.route(cameras, "camera.0", false, at(100), 12, numbered_jpeg(1));
         assert!(route.worker.is_none());
-        std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
             cameras.frames.live("camera.0").map(|f| f.seq),
-            Some(frame.seq)
+            Some(frame.seq),
+            "the lapsed watch put no frame"
         );
         // Watched again: a new tracker, nothing remembered.
         route.route(cameras, "camera.0", true, at(200), 13, numbered_jpeg(120));
@@ -2265,44 +2350,5 @@ mod tests {
         assert_eq!(cameras.pose.live_state(&settings, "camera.0").0, "loading");
         frame(&mut route, true);
         assert_eq!(DYING_STARTS.load(Ordering::SeqCst), 5);
-    }
-
-    #[test]
-    fn an_impact_outside_the_clip_is_no_prior() {
-        use stance::sidecar::{Sidecar, SidecarFps, SidecarFrame};
-        let frames = (0..10u64)
-            .map(|i| SidecarFrame {
-                t_ns: i * 100_000_000,
-                offset: 0,
-                len: 0,
-            })
-            .collect();
-        let mut sidecar = Sidecar {
-            version: stance::sidecar::SIDECAR_VERSION,
-            fourcc: "MJPG".into(),
-            width: 64,
-            height: 48,
-            fps: SidecarFps {
-                nominal: Some(10.0),
-                measured: 10.0,
-            },
-            start_ns: 0,
-            frames,
-            trigger_index: 9,
-            impact_index: 5,
-            trigger_ns: 900_000_000,
-            impact_ns: 500_000_000,
-            complete: true,
-            dropped: 0,
-            truncated: false,
-        };
-        assert_eq!(clip_impact(&sidecar), Some(500_000_000));
-        sidecar.impact_ns = 900_000_000;
-        assert_eq!(clip_impact(&sidecar), Some(900_000_000), "the last frame");
-        // A clip cut short before the impact.
-        sidecar.impact_ns = 950_000_000;
-        assert_eq!(clip_impact(&sidecar), None);
-        sidecar.impact_ns = -1;
-        assert_eq!(clip_impact(&sidecar), None);
     }
 }

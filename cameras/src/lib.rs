@@ -1,5 +1,5 @@
-//! Swing cameras for flighthook (beta): the clip store, the camera frame
-//! slots and body tracking (alpha).
+//! Swing cameras for flighthook (beta): the camera loop, the clip store,
+//! the camera frame slots and body tracking (alpha).
 //!
 //! [`Cameras`] is everything the cameras share, one per process. The host
 //! builds it over its live config and its [`Host`], and hears from it
@@ -27,7 +27,7 @@ pub mod settings;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use camera::{Camera, Input, Trigger, UNSUPPORTED, restart_needed};
+pub use camera::{Camera, Input, Trigger, restart_needed};
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -70,7 +70,7 @@ impl Cameras {
     }
 
     /// The host's turn now.
-    pub fn turn(&self) -> GolferTurn {
+    pub(crate) fn turn(&self) -> GolferTurn {
         self.host.turn()
     }
 
@@ -121,11 +121,10 @@ pub enum Event {
 pub type Out = Arc<dyn Fn(Event) + Send + Sync>;
 
 /// Removes the directory on drop, so a failing assertion doesn't leak it.
-#[cfg(any(test, feature = "testing"))]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) struct TempDir(pub(crate) std::path::PathBuf);
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -133,8 +132,7 @@ impl Drop for TempDir {
 }
 
 /// How long a test waits for a thread's answer before it gives up.
-#[cfg(any(test, feature = "testing"))]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The crate's test bench: [`Cameras`] over a scratch folder and a config

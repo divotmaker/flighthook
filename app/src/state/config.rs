@@ -698,8 +698,7 @@ impl ConfigView {
         self.0.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The live config itself, which the cameras read
-    /// ([`flighthook_cameras::settings::Settings`]).
+    /// The live config itself, which the cameras read.
     pub fn shared(&self) -> Arc<RwLock<FlighthookConfig>> {
         Arc::clone(&self.0)
     }

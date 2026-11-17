@@ -2,10 +2,10 @@
 //! (`pose:camera.N`) that finds the golfer's keypoints on the newest live
 //! frame and puts the frame in the camera's live slot together with them.
 //!
-//! The camera actor runs a worker only while a viewer watches the camera's
+//! The camera's loop runs a worker only while a viewer watches the camera's
 //! live view and body tracking is in Live mode; it stops it when the watch
 //! lapses or the mode changes, which forgets the tracked golfer. Frames reach the worker through a
-//! one-frame handoff: the camera actor offers every frame, each replacing
+//! one-frame handoff: the camera's loop offers every frame, each replacing
 //! the one waiting, and the worker takes the newest when it is free, at most
 //! [`LIVE_FPS`] times a second. A frame replaced before the worker took it
 //! is skipped: never shown, never queued. So the live view runs at the pose
@@ -395,9 +395,8 @@ impl Smoother {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-#[cfg_attr(not(test), allow(dead_code))]
-pub mod tests {
+#[cfg(test)]
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 

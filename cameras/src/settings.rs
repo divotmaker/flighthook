@@ -1,7 +1,6 @@
-//! The cameras' settings: the live config ([`Settings`]), and what the
-//! cameras read from it, each in effect (a value out of range is its
-//! default). Everything is read at the point of use, so a change applies
-//! without restarting a camera.
+//! What the cameras read from the live config: each setting in effect (a
+//! value out of range is its default). Everything is read at the point of
+//! use, so a change applies without restarting a camera.
 
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
@@ -10,26 +9,26 @@ use flighthook::{BodyTrackingSection, FlighthookConfig, MAX_LATENCY_S, ReplaySec
 
 /// The live config, shared with the host, which changes it.
 #[derive(Clone)]
-pub struct Settings(Arc<RwLock<FlighthookConfig>>);
+pub(crate) struct Settings(Arc<RwLock<FlighthookConfig>>);
 
 impl Settings {
     /// The cameras' view of the host's live `config`.
-    pub fn new(config: Arc<RwLock<FlighthookConfig>>) -> Self {
+    pub(crate) fn new(config: Arc<RwLock<FlighthookConfig>>) -> Self {
         Self(config)
     }
 
     /// The config as it is now.
-    pub fn read(&self) -> RwLockReadGuard<'_, FlighthookConfig> {
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, FlighthookConfig> {
         self.0.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The `[body_tracking]` settings in effect.
-    pub fn body_tracking(&self) -> BodyTrackingSection {
+    pub(crate) fn body_tracking(&self) -> BodyTrackingSection {
         self.read().body_tracking.in_effect()
     }
 
     /// The `[replay]` section.
-    pub fn replay(&self) -> ReplaySection {
+    pub(crate) fn replay(&self) -> ReplaySection {
         self.read().replay.clone()
     }
 }

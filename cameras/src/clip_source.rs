@@ -3,7 +3,7 @@
 //!
 //! A camera section whose `camera` is `clip:<path to an .avi>` plays that
 //! stance clip (its sidecar beside it) in a loop at its own pace, every
-//! frame stamped afresh on the host clock as it is delivered, so the actor
+//! frame stamped afresh on the host clock as it is delivered, so the loop
 //! records, goes live and tracks bodies on it as on a real camera. With the
 //! screenshot grid on ([`crate::screens`]), each loop starts so that the
 //! clip's labeled impact lands on the grid, with no frames in between.

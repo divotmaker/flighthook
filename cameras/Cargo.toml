@@ -3,16 +3,17 @@ name = "flighthook-cameras"
 version = "0.2.2"
 edition = "2024"
 rust-version = "1.94"
-description = "Swing cameras for flighthook: the clip store, the camera frame slots and body tracking"
+description = "Swing cameras for flighthook: the camera loop, the clip store, the frame slots and body tracking"
 license = "MIT OR Apache-2.0"
 keywords = ["golf", "launch-monitor", "camera"]
 repository = "https://github.com/divotmaker/flighthook"
 readme = false
+publish = false
 
 [features]
-# Test support for the host's tests: the fake model sources and the test
-# helpers of the body tracking tests.
-testing = ["dep:jpeg-encoder"]
+# Test support for the host's tests: the fake model sources and clip pass, and
+# `testing::store_clip`.
+testing = []
 
 [dependencies]
 flighthook = { path = "../lib" }
@@ -27,8 +28,6 @@ chrono = "0.4"
 dirs = "6"
 # The frame slots' watch channel and its timed wait; no runtime is started here.
 tokio = { version = "1", features = ["sync", "time"] }
-# Encodes the numbered test frames of the body tracking tests (`testing`).
-jpeg-encoder = { version = "0.7", optional = true }
 
 # The body tracking clip pass runs at a higher nice value (setpriority).
 [target.'cfg(target_os = "linux")'.dependencies]

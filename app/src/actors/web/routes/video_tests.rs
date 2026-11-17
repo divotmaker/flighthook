@@ -16,7 +16,7 @@ fn fake_pass(
     use stance::pose::{PoseFrame, PoseTrack, Skeleton};
     let name = avi.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
     let (_, sidecar) = stance::open_clip(avi.parent().expect("folder"), name)?;
-    let pose = flighthook_cameras::pose::swing::tests::golfer((300.0, 260.0));
+    let pose = flighthook_cameras::pose::swing::golfer((300.0, 260.0));
     Ok(PoseTrack {
         version: stance::pose::POSE_TRACK_VERSION,
         skeleton: Skeleton::Halpe26,
@@ -99,18 +99,22 @@ fn json(body: &[u8]) -> serde_json::Value {
     serde_json::from_slice(body).unwrap_or_default()
 }
 
-/// Wait for the next bus event `want` picks.
+/// Wait for the next bus event `want` picks, and check it is the camera's:
+/// the web layer finds the clip's row by the card.
 async fn next_event(rx: &mut broadcast::Receiver<BusMsg>, want: fn(&LocalEvent) -> bool) {
-    tokio::time::timeout(crate::actors::GIVE_UP, async {
+    let card = tokio::time::timeout(crate::actors::GIVE_UP, async {
         loop {
             let msg = rx.recv().await.expect("the bus");
-            if msg.as_local().is_some_and(|(_, e)| want(e)) {
-                return;
+            if let Some((card, e)) = msg.as_local()
+                && want(e)
+            {
+                return card.to_owned();
             }
         }
     })
     .await
     .expect("the event");
+    assert_eq!(card, "camera.0");
 }
 
 #[tokio::test]

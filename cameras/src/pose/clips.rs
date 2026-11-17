@@ -54,7 +54,7 @@ pub struct ClipJob {
     pub avi: PathBuf,
     /// The clip's folder in the store.
     pub slot: ClipSlot,
-    /// The camera actor that recorded it (`camera.0`).
+    /// The camera that recorded it (`camera.0`).
     pub camera: String,
     /// The clip's shots.
     pub keys: Vec<ShotKey>,
@@ -252,7 +252,7 @@ impl ClipQueue {
 
     /// Hold the worker off, as if it were busy with a clip (tests): what
     /// is pushed from now on waits and starts no thread.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub fn hold(&self) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).working = true;
     }

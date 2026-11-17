@@ -50,7 +50,7 @@ use tracing::info;
 pub struct BodyTracking {
     pub models: models::Models,
     pub clips: clips::ClipQueue,
-    /// Why each camera's live tracking stopped, by camera actor.
+    /// Why each camera's live tracking stopped, by camera.
     live_failed: Mutex<HashMap<String, String>>,
     /// The mode [`BodyTracking::follow`] last saw.
     mode: Mutex<Option<BodyTrackingMode>>,

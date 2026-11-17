@@ -1,12 +1,13 @@
-//! What the camera actors share with the web layer (beta): each actor's
+//! What the cameras share with the host's web layer (beta): each camera's
 //! latest frame, for the device card's still, its live frame for the
-//! Shots tab's Live view, and the camera it holds; and the camera list, enumerated at
-//! most every few seconds.
+//! Shots tab's Live view, and the camera it holds; and the camera list,
+//! enumerated at most every few seconds.
 //!
-//! Frames never travel on the bus: an actor puts its newest JPEG here at
-//! most twice a second, and `GET /api/cameras/{actor}/still` reads it. While
-//! a viewer has asked within [`LIVE_WATCH`], the actor also puts frames in
-//! the live slot, which `GET /api/cameras/{actor}/live` long-polls.
+//! Frames never travel in an [`Event`](crate::Event): a camera loop puts its
+//! newest JPEG here at most twice a second, and `GET /api/cameras/{actor}/still`
+//! reads it. While a viewer has asked within [`LIVE_WATCH`], the loop also
+//! puts frames in the live slot, which `GET /api/cameras/{actor}/live`
+//! long-polls.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -63,7 +64,7 @@ pub enum LiveWait {
     Busy,
 }
 
-/// One camera actor's slot.
+/// One camera's slot.
 #[derive(Debug)]
 struct Slot {
     /// The camera id it has open.
@@ -115,7 +116,7 @@ impl Drop for Waiter {
 /// An enumeration: when it ran, the cameras it found, and why it failed.
 type Listing = (Instant, Vec<CameraInfo>, Option<String>);
 
-/// The camera actors' slots and the cached camera list.
+/// The cameras' slots and the cached camera list.
 #[derive(Debug, Default)]
 pub struct Frames {
     slots: RwLock<HashMap<String, Slot>>,
@@ -189,7 +190,7 @@ impl Frames {
     }
 
     /// Actor `actor`'s live frame, if it has one.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub fn live(&self, actor: &str) -> Option<Arc<LiveFrame>> {
         let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
         slots.get(actor).and_then(|s| s.live.borrow().clone())
@@ -269,7 +270,7 @@ impl Frames {
 
     /// The camera list (`GET /api/cameras`), from an enumeration at most
     /// [`LIST_CACHE`] old; blocks while it enumerates. stance never
-    /// opens a camera this process has open (an actor recording from it) to
+    /// opens a camera this process has open (a camera loop recording from it) to
     /// list it, on any platform: its entry is the one read when it was
     /// opened.
     pub fn list(&self) -> CameraListResponse {

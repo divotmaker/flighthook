@@ -302,3 +302,15 @@ fn a_clip_saved_in_live_mode_is_queued_for_body_tracking() {
         .expect("avi");
     assert_eq!(bench.cameras.pose.clips.waiting(), [avi]);
 }
+
+#[test]
+fn a_clip_saved_outside_live_mode_is_not_queued_for_body_tracking() {
+    for mode in [BodyTrackingMode::Off, BodyTrackingMode::Historical] {
+        let mut bench = Bench::new(20, mode);
+        bench.run_to(1000);
+        let a = bench.trigger("mock_monitor.0", 1);
+        bench.run_to(3000);
+        assert_eq!(bench.clips(), [vec![a]], "{mode:?}");
+        assert!(bench.cameras.pose.clips.waiting().is_empty(), "{mode:?}");
+    }
+}
