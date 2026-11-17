@@ -17,6 +17,9 @@ and whether it runs on external power (`external_power`). While it is
 connected, the header's Energy icon turns yellow under 20 % and red under 10 %; click it for each device's
 charge. The Mevo Gen2 and the
 Xi report none of the three. Every model reports `ready`, `tilt` and `roll`.
+`tilt` and `roll` turn red while outside FlightScope's recommended range for
+the model: Mevo+ tilt 10.5° to 13.5° and roll -1.5° to 1.5°, Mevo Gen2 10.0°
+to 16.0° and -2.5° to 2.5°, Xi 8.5° to 11.5° and -1.5° to 1.5°.
 
 ## Connection
 

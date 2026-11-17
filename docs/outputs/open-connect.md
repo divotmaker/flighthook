@@ -92,4 +92,4 @@ turning the card off and on, changing its address, or closing flighthook),
 GSPro stops taking shots until you restart its Open Connect window. The card
 may still connect and show **CONNECTED**; the first shot that goes unanswered
 sets `error` as described above. After you restart GSPro's Open Connect window,
-the card connects to the new window. Pureplay and Muni Golf aren't affected.
+the card connects to the new window. Pureplay isn't affected.
