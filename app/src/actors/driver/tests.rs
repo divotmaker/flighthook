@@ -212,9 +212,7 @@ impl FrpDriver for FakeDriver {
         _: &mut Backoff,
         out: &mut Events<'_>,
     ) -> Option<Duration> {
-        if let Some(error) = ended.error {
-            out.alert(Severity::Warn, error.to_string());
-        }
+        out.alert(Severity::Warn, ended.error.to_string());
         Some(
             lock(&self.script)
                 .retry
@@ -255,10 +253,9 @@ impl FrpSession for FakeSession {
         &self.identity
     }
 
-    fn close(self, out: &mut Events<'_>) -> Result<(), FakeError> {
+    fn close(self, out: &mut Events<'_>) {
         lock(&self.script).closes += 1;
         out.ready(false);
-        Ok(())
     }
 }
 

@@ -460,7 +460,7 @@ impl Card {
             ),
         );
         out.log(Level::Debug, format!("shot from {raw}"));
-        out.shot_trigger(key.clone());
+        out.shot_trigger(key.clone(), None);
         out.launch(key.clone(), launch);
         out.shot_finished(key.clone());
         if !id.is_empty() {

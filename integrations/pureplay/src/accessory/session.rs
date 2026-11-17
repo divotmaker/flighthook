@@ -477,18 +477,18 @@ impl FrpDriver for Accessory {
             }
         }
         let delay = match ended.error {
-            Some(Error::Lost(_)) => {
+            Error::Lost(_) => {
                 card.rows.remove(PAIRING);
                 Some(self.backoff.delay())
             }
-            Some(Error::TooMany) => Some(self.backoff.delay()),
-            Some(Error::Retry { delay, .. }) => Some(*delay),
-            Some(Error::Cooldown { wait, retry }) => {
+            Error::TooMany => Some(self.backoff.delay()),
+            Error::Retry { delay, .. } => Some(*delay),
+            Error::Cooldown { wait, retry } => {
                 self.cooldown = Some((*wait, *retry));
                 Some(Duration::ZERO)
             }
-            Some(Error::Refused) => None,
-            Some(Error::Again | Error::Stopped) | None => Some(Duration::ZERO),
+            Error::Refused => None,
+            Error::Again | Error::Stopped => Some(Duration::ZERO),
         };
         card.show(out);
         if let Some(wait) = delay {
@@ -605,10 +605,9 @@ impl<L: Link> FrpSession for Session<L> {
     }
 
     /// The card's game state leaves the bus and the link closes.
-    fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
+    fn close(mut self, out: &mut Events<'_>) {
         lock(&self.card).end_link(out);
         self.link.close();
-        Ok(())
     }
 }
 

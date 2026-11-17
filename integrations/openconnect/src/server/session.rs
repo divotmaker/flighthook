@@ -219,10 +219,9 @@ impl FrpDriver for Server {
         out: &mut Events<'_>,
     ) -> Option<Duration> {
         match ended.error {
-            Some(Error::PeerLeft | Error::OwnClient) => return Some(Duration::ZERO),
-            Some(error @ Error::Bind { .. }) => out.alert(Severity::Error, error.to_string()),
-            Some(error) => out.alert(Severity::Warn, error.to_string()),
-            None => {}
+            Error::PeerLeft | Error::OwnClient => return Some(Duration::ZERO),
+            error @ Error::Bind { .. } => out.alert(Severity::Error, error.to_string()),
+            error => out.alert(Severity::Warn, error.to_string()),
         }
         Some(backoff.delay(ended.connected_for))
     }
@@ -397,9 +396,7 @@ impl<S: Read + Write> FrpSession for Session<S> {
     }
 
     /// Dropping the stream closes the connection.
-    fn close(self, _: &mut Events<'_>) -> Result<(), Error> {
-        Ok(())
-    }
+    fn close(self, _: &mut Events<'_>) {}
 }
 
 impl<S: Read + Write> Session<S> {
@@ -529,7 +526,7 @@ impl<S: Read + Write> Session<S> {
                 ball.sidespin_rpm.unwrap_or(0),
             ),
         );
-        out.shot_trigger(key.clone());
+        out.shot_trigger(key.clone(), None);
         out.launch(key.clone(), ball);
         if let Some(flight) = mapper::map_flight(msg) {
             out.flight(key.clone(), flight);

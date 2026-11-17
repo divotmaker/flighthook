@@ -387,9 +387,9 @@ fn retries_back_off_one_to_three_seconds_and_a_handshake_failure_shows() {
     let refused = Error::Io(io::ErrorKind::ConnectionRefused.into());
     let delays: Vec<_> = (0..4)
         .map(|_| {
-            host.with(|_, out| {
+            host.with(|now, out| {
                 driver.retry_delay(
-                    &SessionEnd::new(Some(&refused), None, 1),
+                    &SessionEnd::new(&refused, now, None, 1),
                     &mut Backoff::default(),
                     out,
                 )
@@ -404,9 +404,9 @@ fn retries_back_off_one_to_three_seconds_and_a_handshake_failure_shows() {
     assert!(host.take().is_empty(), "no alert, no row");
 
     let failed = Error::Handshake("no reply".into());
-    host.with(|_, out| {
+    host.with(|now, out| {
         driver.retry_delay(
-            &SessionEnd::new(Some(&failed), Some(Duration::ZERO), 0),
+            &SessionEnd::new(&failed, now, Some(Duration::ZERO), 0),
             &mut Backoff::default(),
             out,
         )

@@ -480,9 +480,7 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                     );
                     {
                         let mut emit = |e| sink.handle(e, &mut self.hooked.borrow_mut());
-                        if let Err(e) = session.close(&mut Events::new(&mut emit, flags)) {
-                            warn!("{actor}: the device was not released cleanly: {e}");
-                        }
+                        session.close(&mut Events::new(&mut emit, flags));
                     }
                     match ended {
                         Err(e) if !host.stopped() => {
@@ -493,7 +491,7 @@ impl<D: FrpDriver, H: Hooks<D>> Run<D, H> {
                     }
                 }
             };
-            let ended = SessionEnd::new(Some(&error), connected_for, attempts);
+            let ended = SessionEnd::new(&error, Instant::now(), connected_for, attempts);
             let delay = {
                 let mut emit = |e| sink.handle(e, &mut self.hooked.borrow_mut());
                 driver.retry_delay(&ended, &mut backoff, &mut Events::new(&mut emit, flags))

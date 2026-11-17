@@ -89,7 +89,9 @@ fn swung(section: &TrackballSection, mode: Mode, samples: &[Sample]) -> Vec<BusM
     let hints = TurnHints::default().with_mode(mode);
     let mut host = Stepped::new(hints);
     let mut driver = Thumbswing::new(section.driver_settings()).expect("driver");
-    let mut session = driver.connect_with(Played::new(samples), &hints);
+    let mut session = host
+        .connect(|ctx| driver.connect_with(ctx, Played::new(samples)))
+        .expect("connect");
     host.until(|now, out| session.step(now, out), is_finished);
     let identity = session.identity().clone();
     card_bus::<Thumbswing, TrackballHooks>(

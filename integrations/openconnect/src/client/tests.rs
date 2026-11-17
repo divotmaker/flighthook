@@ -441,7 +441,7 @@ fn a_lost_connection_is_a_status_not_an_alert() {
     let error = Error::Io(io::ErrorKind::ConnectionRefused.into());
     let mut delays = Vec::new();
     for connected_for in [None, None, None, None, Some(Duration::from_secs(60))] {
-        let ended = SessionEnd::new(Some(&error), connected_for, 1);
+        let ended = SessionEnd::new(&error, host.now(), connected_for, 1);
         let delay = host.with(|_, out| driver.retry_delay(&ended, &mut Backoff::default(), out));
         delays.push(delay.expect("retries").as_secs());
     }

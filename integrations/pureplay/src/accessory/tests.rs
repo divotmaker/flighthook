@@ -341,7 +341,7 @@ impl Rig {
             self.connect_error = true;
             self.view.insert("error".into(), error.to_string());
         }
-        let ended = SessionEnd::new(Some(&error), connected_for, self.attempts);
+        let ended = SessionEnd::new(&error, self.host.now(), connected_for, self.attempts);
         let mut backoff = HostBackoff::default();
         let driver = &mut self.driver;
         self.delay = self

@@ -391,9 +391,7 @@ impl<C: SoftwareConfig> FrpSession for SoftwareSession<C> {
         &self.identity
     }
 
-    fn close(self, _: &mut Events<'_>) -> Result<(), SoftwareError> {
-        Ok(())
-    }
+    fn close(self, _: &mut Events<'_>) {}
 }
 
 #[cfg(test)]

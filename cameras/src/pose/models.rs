@@ -13,7 +13,7 @@
 //! A download runs only through [`Models::download`] (`POST
 //! /api/body_tracking/models/download`, sent by the UI's Download button):
 //! one at a time, the files the model lacks from their official sources
-//! (stance's `fetch_model_with`, HTTPS, hash-verified), reporting its
+//! (stance's `fetch_model`, HTTPS, hash-verified), reporting its
 //! progress in [`Models::files`]. [`Models::cancel_download`] stops it; the
 //! partial file is deleted. Once it is done, the models wanted while their
 //! files were missing load on the next request. A download left unfinished
@@ -150,7 +150,7 @@ impl Source for Official {
         progress: &mut dyn FnMut(FetchProgress),
         cancel: &AtomicBool,
     ) -> stance::Result<()> {
-        stance::pose::fetch_model_with(spec, dir, Some(progress), Some(cancel)).map(|_| ())
+        stance::pose::fetch_model(spec, dir, Some(progress), Some(cancel)).map(|_| ())
     }
 }
 

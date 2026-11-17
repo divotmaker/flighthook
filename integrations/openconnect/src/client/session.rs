@@ -240,9 +240,7 @@ impl<S: Read + Write> FrpSession for Session<S> {
     }
 
     /// Dropping the stream closes the connection.
-    fn close(self, _: &mut Events<'_>) -> Result<(), Error> {
-        Ok(())
-    }
+    fn close(self, _: &mut Events<'_>) {}
 }
 
 impl<S: Read + Write> Session<S> {

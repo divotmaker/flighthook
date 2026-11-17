@@ -2817,7 +2817,7 @@ weights).
 only download path is `POST /api/body_tracking/models/download`, which the
 UI sends after the user confirms the download dialog. It fetches the files
 the configured model lacks, one after the other, on a `pose-download`
-thread, through stance's `fetch_model_with` (OpenMMLab's zip for RTMPose,
+thread, through stance's `fetch_model` (OpenMMLab's zip for RTMPose,
 Megvii's GitHub release for YOLOX; HTTPS, hash-verified, written through a
 `.part` file and a rename) with a progress callback and a cancel flag. One
 download runs at a time: a POST while one runs starts nothing (`202`), a

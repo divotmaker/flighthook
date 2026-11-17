@@ -704,9 +704,9 @@ fn a_monitor_that_leaves_ends_the_session_and_the_next_connect_is_at_once() {
     let mut server = Server::new(Config::default()).expect("server");
     let mut backoff = Backoff::default();
     let mut host = TestHost::new();
-    let delay = host.with(|_, out| {
+    let delay = host.with(|now, out| {
         server.retry_delay(
-            &SessionEnd::new(Some(&ended), Some(Duration::from_secs(5)), 0),
+            &SessionEnd::new(&ended, now, Some(Duration::from_secs(5)), 0),
             &mut backoff,
             out,
         )
@@ -730,9 +730,9 @@ fn a_bind_that_fails_is_an_error_alert_and_backs_off() {
     let mut backoff = Backoff::default();
     let delays: Vec<_> = (0..3)
         .map(|attempts| {
-            host.with(|_, out| {
+            host.with(|now, out| {
                 server.retry_delay(
-                    &SessionEnd::new(Some(&error), None, attempts),
+                    &SessionEnd::new(&error, now, None, attempts),
                     &mut backoff,
                     out,
                 )

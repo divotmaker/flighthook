@@ -160,7 +160,7 @@ impl FrpDriver for Connect {
         _backoff: &mut Backoff,
         out: &mut Events<'_>,
     ) -> Option<Duration> {
-        if let Some(Error::Handshake(reason)) = ended.error {
+        if let Error::Handshake(reason) = ended.error {
             out.telemetry([(ERROR, reason.clone())]);
         }
         Some(self.backoff.delay(ended.connected_for))
@@ -301,9 +301,7 @@ impl<S: Read + Write> FrpSession for Session<S> {
     }
 
     /// Dropping the stream closes the link.
-    fn close(self, _: &mut Events<'_>) -> Result<(), Error> {
-        Ok(())
-    }
+    fn close(self, _: &mut Events<'_>) {}
 }
 
 /// Whether a launch monitor's `bus.actor` says it is connected: it is not
