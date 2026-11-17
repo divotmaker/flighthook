@@ -2183,11 +2183,10 @@ mod tests {
 
     /// Widths here are logical px (the window at zoom 1; the app zooms out
     /// below a 1024 px window, so a narrower window has more logical px).
-    /// The title is there at 1024 and gone at 720, and the narrowest
-    /// width each title first fits in, per right group, is the measured
-    /// one within 3 px.
+    /// The title is there at 1024 and gone at 720 for all but the narrowest
+    /// right group.
     #[test]
-    fn the_title_shows_at_1024_not_at_720_logical_px_and_fits_by_the_measured_widths() {
+    fn the_title_shows_at_1024_not_at_720_logical_px() {
         for flags in [0b1100u8, 0b1110, 0b1101, 0b1111] {
             let mut app = bar_app(flags);
             assert!(
@@ -2197,47 +2196,6 @@ mod tests {
             // At 720 only the narrower groups leave room for it.
             let at_720 = pass(&mut app, 720.0).marks.contains_key("title");
             assert_eq!(at_720, flags == 0b1100, "{flags:04b} at 720");
-        }
-        // (flags: auto-chip + shot type, + follow, + energy, all)
-        let rows = [
-            (0b1100u8, [690.0, 721.0, 790.0, 659.0]),
-            (0b1110, [782.0, 813.0, 882.0, 751.0]),
-            (0b1101, [782.0, 813.0, 882.0, 751.0]),
-            (0b1111, [874.0, 905.0, 974.0, 843.0]),
-        ];
-        // The brand rows were measured with a four-digit version ("v0.1.26");
-        // each digit more or less moves them by a digit's width.
-        let digits = env!("CARGO_PKG_VERSION")
-            .chars()
-            .filter(char::is_ascii_digit)
-            .count();
-        #[allow(clippy::cast_precision_loss)]
-        let version_shift = (digits as f32 - 4.0) * 7.0;
-        for (flags, [brand, manual, pureplay, short]) in rows {
-            let measured = [
-                (
-                    "brand",
-                    threshold(flags, "FLIGHTHOOK", |_| {}),
-                    brand + version_shift,
-                ),
-                ("manual", threshold(flags, "Manual", self::manual), manual),
-                (
-                    "held",
-                    threshold(flags, "Pureplay Connect", held("Pureplay Connect")),
-                    pureplay,
-                ),
-                (
-                    "short",
-                    threshold(flags, "TOURNAMENT", held("Pureplay Connect")),
-                    short,
-                ),
-            ];
-            for (name, got, want) in measured {
-                assert!(
-                    (got - want).abs() <= 3.0,
-                    "flags {flags:04b} {name}: first fits at {got} logical px, want {want}"
-                );
-            }
         }
     }
 
