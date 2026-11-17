@@ -852,10 +852,10 @@ pub enum ActorStatus { Starting, Disconnected, Connected, Reconnecting }
 `ActorStatusResponse` (in `lib/src/api.rs`) adds a `name` field and is the
 cached per-card state in both the web layer and the dashboard. Both merge a
 card's `bus.actor` telemetry and its status rows into one map per card. A key
-in a status replaces the one held; an empty value removes it (only a battery
-with no reading leaves that way). A web server sets `error` to
-`bind failed` while it cannot bind its address, and to `none` with every other
-status. An `error` that reads `none` is no error: no banner, and no row on the
+in a status replaces the one held. A `bus.actor` that reports no battery
+takes the `battery_pct` row away; no other row leaves. A web server sets
+`error` to `bind failed` while it cannot bind its address, and to `none` with
+every other status. An `error` that reads `none` is no error: no banner, and no row on the
 card.
 
 A card's rows stay through every status, each at the last value sent: a

@@ -1211,6 +1211,9 @@ fn a_failed_connect_reads_connecting_until_the_next_one_sets_its_phase() {
 fn every_failed_connect_reads_connecting_with_its_error() {
     let (_dir, mut sink, mut rx, _w) = connecting_sink::<FakeHooks>("");
     drain(&mut rx);
+    sink.handle(DeviceEvent::Status(
+        DeviceStatus::new().with_telemetry("blockers", "warming up"),
+    ));
     for _ in 0..2 {
         sink.handle(DeviceEvent::Phase("handshaking"));
         sink.connect_failed("no answer");
@@ -1229,6 +1232,14 @@ fn every_failed_connect_reads_connecting_with_its_error() {
         rows,
         [handshaking.clone(), failed.clone(), handshaking, failed]
     );
+    // The failed connect's telemetry does not carry into the next connect.
+    sink.handle(DeviceEvent::StatusChange(
+        flightrelay::driver::StatusChange::Telemetry(
+            [("ready".to_owned(), "false".to_owned())].into(),
+        ),
+    ));
+    let actor = lock(&sink.published).clone().expect("published");
+    assert_eq!(actor.telemetry.expect("telemetry")["blockers"], "none");
 }
 
 /// A driver that gives up after a failed connect leaves the card
