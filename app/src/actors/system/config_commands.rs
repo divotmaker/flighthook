@@ -29,7 +29,7 @@ pub(crate) fn handle_config_command(
     waits: &mut StopWaits,
 ) {
     apply_config_command(event, state, bus_tx, sender, waits);
-    state.pose.follow(&state.system.body_tracking());
+    state.cameras.pose.follow(&state.system.body_tracking());
 }
 
 /// [`handle_config_command`] but for body tracking.

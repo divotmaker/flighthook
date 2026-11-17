@@ -2,14 +2,15 @@
 //! (`pose:clips`) finds the golfer's keypoints on every frame of a clip and
 //! stores them beside it as `<camera>.pose.json`, then analyzes the swing
 //! in them and stores `<camera>.swing.json` (a face-on or down-the-line
-//! camera only; see [`flighthook_cameras::pose::swing`]).
+//! camera only; see [`super::swing`]).
 //!
 //! Which clips are tracked follows `[body_tracking] mode`:
 //!
 //! - Live: every clip, queued when its camera writes it, no sooner than
 //!   [`CLIP_DELAY`] after, so the pass stays clear of the shot itself.
-//! - Historical: a clip the first time it is viewed ([`request`]), at once.
-//!   A clip already tracked, queued or being tracked is not queued again.
+//! - Historical: a clip the first time it is viewed ([`Cameras::request`]),
+//!   at once. A clip already tracked, queued or being tracked is not queued
+//!   again.
 //! - Off: none. Turning it off drops the clips waiting
 //!   ([`ClipQueue::clear`]); a pass already running finishes.
 //!
@@ -20,12 +21,12 @@
 //! ago is dropped with a warning. A clip pruned or cleared before its turn
 //! is skipped, and so is a recorded clip whose turn comes after the mode
 //! left Live. Each clip runs on a quarter of the computer's logical CPUs
-//! ([`clip_threads`]), at below-normal priority ([`flighthook_cameras::pose::priority`]), so a
+//! ([`clip_threads`]), at below-normal priority ([`super::priority`]), so a
 //! simulator on the same computer keeps the CPU it needs. A clip whose pass
 //! fails unexpectedly (a panic) is logged and the queue goes on. When its
-//! pose file is written the clip store marks it and one `shot_pose` event
-//! tells the UI; when its swing file is, one `shot_swing` event. No
-//! keypoints or numbers go on the bus.
+//! pose file is written the clip store marks it and one [`Event::Pose`]
+//! tells the host; when its swing file is, one [`Event::Swing`]. The
+//! keypoints and numbers stay in the files.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -34,14 +35,12 @@ use std::time::{Duration, Instant};
 
 use flighthook::{BodyTrackingMode, CameraPosition, Handedness, PoseModel, ShotKey};
 use stance::pose::{PoseConfig, PoseTrack, Rotation};
-use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::bus::{BusMsg, LocalEvent};
-use crate::state::SystemState;
-use flighthook_cameras::clips::ClipSlot;
-use flighthook_cameras::pose::models::{ModelState, pose_config};
-use flighthook_cameras::pose::swing::{SwingInput, SwingWritten, write_report};
+use super::models::{ModelState, pose_config};
+use super::swing::{SwingInput, SwingWritten, write_report};
+use crate::clips::ClipSlot;
+use crate::{Cameras, Event, Out, settings};
 
 /// How often a clip waiting for the models or its turn looks again.
 const MODEL_POLL: Duration = Duration::from_millis(250);
@@ -72,13 +71,13 @@ pub struct ClipJob {
     /// When the clip was written: a recorded clip's pass starts
     /// [`CLIP_DELAY`] after.
     pub written: Instant,
-    /// A viewer asked for it ([`request`]): its pass starts at once, and
-    /// in any mode but Off.
+    /// A viewer asked for it ([`Cameras::request`]): its pass starts at
+    /// once, and in any mode but Off.
     pub on_demand: bool,
     /// How the estimate was made, for the impact log line.
     pub timing: ClipTiming,
-    /// Where `shot_pose` and `shot_swing` go, with the camera as its actor.
-    pub bus: broadcast::Sender<BusMsg>,
+    /// Where its [`Event::Pose`] and [`Event::Swing`] go, as the camera's.
+    pub out: Out,
 }
 
 /// How a clip's impact was estimated: the launch monitor, its camera
@@ -141,19 +140,13 @@ pub enum Pushed {
 pub struct ClipQueue {
     inner: Arc<Mutex<Inner>>,
     /// A stand-in for the models and the clip pass, in tests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     fake: Mutex<Option<FakePass>>,
 }
 
 /// A clip pass without models, for tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub type FakePass = fn(&std::path::Path, &PoseConfig) -> stance::Result<PoseTrack>;
-
-impl flighthook_cameras::pose::Waiting for ClipQueue {
-    fn clear(&self) -> usize {
-        ClipQueue::clear(self)
-    }
-}
 
 /// Worker threads for one clip: a quarter of the logical CPUs, at least 1.
 pub fn clip_threads() -> usize {
@@ -162,22 +155,22 @@ pub fn clip_threads() -> usize {
 
 /// The clip pass's settings for `model` on a camera turned by `rotation`:
 /// [`clip_threads`] workers, each lowering its own priority first
-/// ([`flighthook_cameras::pose::priority::worker_hook`]), detecting every 10 frames, every
+/// ([`super::priority::worker_hook`]), detecting every 10 frames, every
 /// frame turned upright before detection.
 pub fn clip_config(model: PoseModel, rotation: Rotation) -> PoseConfig {
     PoseConfig {
         threads: clip_threads(),
-        on_worker_start: Some(flighthook_cameras::pose::priority::worker_hook()),
+        on_worker_start: Some(super::priority::worker_hook()),
         rotation,
         ..pose_config(model, PoseConfig::default().detect_every)
     }
 }
 
 /// Most clips waiting: one per clip the store keeps.
-pub fn bound(state: &SystemState) -> usize {
-    let keep =
-        usize::try_from(flighthook_cameras::clips::keep(&state.system.replay())).unwrap_or(1);
-    keep.saturating_mul(state.system.camera_count().max(1))
+pub fn bound(cameras: &Cameras) -> usize {
+    let config = cameras.settings.read();
+    let keep = usize::try_from(crate::clips::keep(&config.replay)).unwrap_or(1);
+    keep.saturating_mul(config.camera.len().max(1))
 }
 
 impl ClipQueue {
@@ -185,7 +178,7 @@ impl ClipQueue {
     /// clip (`on_demand`) first, a recorded one last. With `bound` clips
     /// already waiting, the one queued longest ago is dropped first. A clip
     /// already waiting or being tracked is not queued twice.
-    pub fn push(&self, state: &Arc<SystemState>, job: ClipJob, bound: usize) -> Pushed {
+    pub fn push(&self, cameras: &Arc<Cameras>, job: ClipJob, bound: usize) -> Pushed {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.is_running(&job.slot.id, &job.camera)
             || inner.position(&job.slot.id, &job.camera).is_some()
@@ -222,10 +215,10 @@ impl ClipQueue {
         inner.working = true;
         drop(inner);
         let queue = Arc::clone(&self.inner);
-        let state = Arc::clone(state);
+        let cameras = Arc::clone(cameras);
         let spawned = std::thread::Builder::new()
             .name("pose:clips".to_owned())
-            .spawn(move || work(&state, &queue));
+            .spawn(move || work(&cameras, &queue));
         if let Err(e) = spawned {
             warn!("body tracking: no thread for the recorded clips: {e}");
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -252,26 +245,26 @@ impl ClipQueue {
     }
 
     /// Run `pass` instead of the models from now on (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn fake(&self, pass: FakePass) {
         *self.fake.lock().unwrap_or_else(|e| e.into_inner()) = Some(pass);
     }
 
     /// Clips waiting, in the order they are taken, by their AVI (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn waiting(&self) -> Vec<PathBuf> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.jobs.iter().map(|q| q.job.avi.clone()).collect()
     }
 
     /// Whether the worker thread is running (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn working(&self) -> bool {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).working
     }
 }
 
-/// What [`request`] did.
+/// What [`Cameras::request`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requested {
     /// The clip's keypoints are there already.
@@ -284,75 +277,73 @@ pub enum Requested {
     NoClip,
 }
 
-/// Track camera `camera`'s clip of shot `shot_id` now, for a viewer: queued
-/// first ([`ClipQueue::push`]), its pass starting at once, unless its
-/// keypoints are there already, it is already queued, or body tracking is
-/// off. With `force`, a clip tracked already has its body tracking and
-/// swing analysis deleted ([`ClipStore::clear_analysis`]) and is tracked
-/// again. The models load with the first such clip; while their files are
-/// not downloaded, the clip is left untracked. Its
-/// `shot_pose` and `shot_swing` go out on `bus` with the camera as their
-/// actor.
-///
-/// [`ClipStore::clear_analysis`]: flighthook_cameras::clips::ClipStore::clear_analysis
-pub fn request(
-    state: &Arc<SystemState>,
-    shot_id: &str,
-    camera: &str,
-    force: bool,
-    bus: &broadcast::Sender<BusMsg>,
-) -> Requested {
-    let Some(clip) = state.clips.camera_clip(shot_id, camera) else {
-        return Requested::NoClip;
-    };
-    if !state.system.body_tracking().mode.is_on() {
-        return Requested::Off;
-    }
-    if force {
-        state.clips.clear_analysis(&clip.slot, camera);
-    } else if clip.video.pose {
-        return Requested::Done;
-    }
-    if state.pose.clips.has(&clip.slot.id, camera) {
-        return Requested::Queued;
-    }
-    let sidecar = match stance::read_sidecar(&clip.avi.with_extension("json")) {
-        Ok(sidecar) => Some(sidecar),
-        Err(e) => {
-            debug!("{camera}: no impact for a clip's swing analysis: {e}");
-            None
+impl Cameras {
+    /// Track camera `camera`'s clip of shot `shot_id` now, for a viewer:
+    /// queued first ([`ClipQueue::push`]), its pass starting at once, unless
+    /// its keypoints are there already, it is already queued, or body
+    /// tracking is off. With `force`, a clip tracked already has its body
+    /// tracking and swing analysis deleted
+    /// ([`ClipStore::clear_analysis`](crate::clips::ClipStore::clear_analysis))
+    /// and is tracked again. The models load with the first such clip;
+    /// while their files are not downloaded, the clip is left untracked.
+    /// Its [`Event::Pose`] and [`Event::Swing`] go to `out`.
+    pub fn request(
+        self: &Arc<Self>,
+        shot_id: &str,
+        camera: &str,
+        force: bool,
+        out: Out,
+    ) -> Requested {
+        let Some(clip) = self.clips.camera_clip(shot_id, camera) else {
+            return Requested::NoClip;
+        };
+        if !self.settings.body_tracking().mode.is_on() {
+            return Requested::Off;
         }
-    };
-    let first = clip.shots.first();
-    let job = ClipJob {
-        avi: clip.avi,
-        slot: clip.slot,
-        camera: camera.to_owned(),
-        keys: clip.shots.iter().map(|s| s.key.clone()).collect(),
-        position: clip.video.position,
-        hand: first.and_then(|s| s.hand),
-        golfer: first.and_then(|s| s.golfer.clone()),
-        impact_ns: sidecar
-            .as_ref()
-            .and_then(crate::actors::camera::clip_impact),
-        written: Instant::now(),
-        on_demand: true,
-        timing: ClipTiming {
-            device: first.map(|s| s.device.clone()).unwrap_or_default(),
-            impact_lead_ms: first.map_or(0, |s| s.impact_lead_ms),
-            latency_ms: u64::try_from(crate::actors::camera::latency(state, camera).as_millis())
-                .unwrap_or(u64::MAX),
-        },
-        bus: bus.clone(),
-    };
-    state.pose.clips.push(state, job, bound(state));
-    Requested::Queued
+        if force {
+            self.clips.clear_analysis(&clip.slot, camera);
+        } else if clip.video.pose {
+            return Requested::Done;
+        }
+        if self.pose.clips.has(&clip.slot.id, camera) {
+            return Requested::Queued;
+        }
+        let sidecar = match stance::read_sidecar(&clip.avi.with_extension("json")) {
+            Ok(sidecar) => Some(sidecar),
+            Err(e) => {
+                debug!("{camera}: no impact for a clip's swing analysis: {e}");
+                None
+            }
+        };
+        let first = clip.shots.first();
+        let latency = settings::latency(&self.settings.read(), camera);
+        let job = ClipJob {
+            avi: clip.avi,
+            slot: clip.slot,
+            camera: camera.to_owned(),
+            keys: clip.shots.iter().map(|s| s.key.clone()).collect(),
+            position: clip.video.position,
+            hand: first.and_then(|s| s.hand),
+            golfer: first.and_then(|s| s.golfer.clone()),
+            impact_ns: sidecar.as_ref().and_then(crate::clips::clip_impact),
+            written: Instant::now(),
+            on_demand: true,
+            timing: ClipTiming {
+                device: first.map(|s| s.device.clone()).unwrap_or_default(),
+                impact_lead_ms: first.map_or(0, |s| s.impact_lead_ms),
+                latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+            },
+            out,
+        };
+        self.pose.clips.push(self, job, bound(self));
+        Requested::Queued
+    }
 }
 
 /// Take the jobs one at a time until none is left, at below-normal
 /// priority. A job that panics is logged and the next one taken.
-fn work(state: &SystemState, queue: &Mutex<Inner>) {
-    flighthook_cameras::pose::priority::lower_this_thread();
+fn work(cameras: &Cameras, queue: &Mutex<Inner>) {
+    super::priority::lower_this_thread();
     // Should the thread unwind anyway, the next push starts a new worker.
     let _unwinding = Idle(queue);
     loop {
@@ -372,7 +363,7 @@ fn work(state: &SystemState, queue: &Mutex<Inner>) {
                 }
             }
         };
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(state, &job)));
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(cameras, &job)));
         queue.lock().unwrap_or_else(|e| e.into_inner()).running = None;
         if ran.is_err() {
             warn!(
@@ -428,22 +419,22 @@ fn turn(job: &ClipJob, mode: BodyTrackingMode, now: Instant) -> Turn {
 
 /// Sleep until `job`'s [`turn`]. True when it runs; false when it is
 /// skipped, or pruned or cleared meanwhile.
-fn wait_turn(state: &SystemState, job: &ClipJob) -> bool {
-    wait_turn_on(state, job, Instant::now, std::thread::sleep)
+fn wait_turn(cameras: &Cameras, job: &ClipJob) -> bool {
+    wait_turn_on(cameras, job, Instant::now, std::thread::sleep)
 }
 
 /// [`wait_turn`] on the clock `now`, sleeping with `sleep`.
 fn wait_turn_on(
-    state: &SystemState,
+    cameras: &Cameras,
     job: &ClipJob,
     mut now: impl FnMut() -> Instant,
     mut sleep: impl FnMut(Duration),
 ) -> bool {
     loop {
-        if !state.clips.is_current(&job.slot) {
+        if !cameras.clips.is_current(&job.slot) {
             return false;
         }
-        match turn(job, state.system.body_tracking().mode, now()) {
+        match turn(job, cameras.settings.body_tracking().mode, now()) {
             Turn::Wait(left) => sleep(left.min(MODEL_POLL)),
             Turn::Run => return true,
             Turn::Skip => return false,
@@ -464,26 +455,28 @@ fn wanted(job: &ClipJob, mode: BodyTrackingMode) -> bool {
 /// Track one clip with the models of the settings in effect, once its turn
 /// has come, waiting while they load. Returns whether its pose file is
 /// kept.
-fn run(state: &SystemState, job: &ClipJob) -> bool {
-    if !wait_turn(state, job) {
+fn run(cameras: &Cameras, job: &ClipJob) -> bool {
+    if !wait_turn(cameras, job) {
         return false;
     }
-    let settings = state.system.body_tracking();
-    #[cfg(test)]
-    if let Some(pass) = *state
+    let settings = cameras.settings.body_tracking();
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(pass) = *cameras
         .pose
         .clips
         .fake
         .lock()
         .unwrap_or_else(|e| e.into_inner())
     {
-        return process(state, job, settings.model, &pass);
+        return process(cameras, job, settings.model, &pass);
     }
     let models = loop {
-        if !state.clips.is_current(&job.slot) || !wanted(job, state.system.body_tracking().mode) {
+        if !cameras.clips.is_current(&job.slot)
+            || !wanted(job, cameras.settings.body_tracking().mode)
+        {
             return false;
         }
-        match state.pose.models.want(settings.model) {
+        match cameras.pose.models.want(settings.model) {
             ModelState::Ready(models) => break models,
             ModelState::Failed(e) => {
                 // The failed load was logged once already.
@@ -507,7 +500,7 @@ fn run(state: &SystemState, job: &ClipJob) -> bool {
             return false;
         }
     };
-    process(state, job, settings.model, &|avi, config| {
+    process(cameras, job, settings.model, &|avi, config| {
         stance::pose::analyze_clip(&models, avi, config)
     })
 }
@@ -518,12 +511,12 @@ type Analyze<'a> = &'a dyn Fn(&std::path::Path, &PoseConfig) -> stance::Result<P
 
 /// Track one clip with `model` and store its keypoints, then announce
 /// them. Returns whether the pose file is kept.
-fn process(state: &SystemState, job: &ClipJob, model: PoseModel, analyze: Analyze<'_>) -> bool {
+fn process(cameras: &Cameras, job: &ClipJob, model: PoseModel, analyze: Analyze<'_>) -> bool {
     let camera = &job.camera;
-    if !state.clips.is_current(&job.slot) {
+    if !cameras.clips.is_current(&job.slot) {
         return false;
     }
-    let rotation = state.system.camera_rotation(camera);
+    let rotation = settings::camera_rotation(&cameras.settings.read(), camera);
     let config = clip_config(model, Rotation::from_degrees(rotation).unwrap_or_default());
     let threads = config.threads;
     let started = Instant::now();
@@ -542,13 +535,13 @@ fn process(state: &SystemState, job: &ClipJob, model: PoseModel, analyze: Analyz
         Ok(path) => path,
         Err(e) => {
             // The folder may have gone (pruned, cleared) while it ran.
-            if state.clips.is_current(&job.slot) {
+            if cameras.clips.is_current(&job.slot) {
                 warn!("{camera}: writing the body tracking of a clip: {e}");
             }
             return false;
         }
     };
-    if !state.clips.set_pose(&job.slot, camera, rotation) {
+    if !cameras.clips.set_pose(&job.slot, camera, rotation) {
         let _ = std::fs::remove_file(&path);
         return false;
     }
@@ -562,14 +555,11 @@ fn process(state: &SystemState, job: &ClipJob, model: PoseModel, analyze: Analyz
         "{}",
         timing_line(camera, shot_id, track.frames.len(), took, threads, found)
     );
-    announce(
-        job,
-        LocalEvent::ShotPose {
-            keys: job.keys.clone(),
-            rotation,
-        },
-    );
-    swing(state, job, &track);
+    (job.out)(Event::Pose {
+        keys: job.keys.clone(),
+        rotation,
+    });
+    swing(cameras, job, &track);
     true
 }
 
@@ -593,53 +583,42 @@ fn timing_line(
     )
 }
 
-/// Send `event` for `job`'s clip, with its camera as the card.
-fn announce(job: &ClipJob, event: LocalEvent) {
-    let _ = job.bus.send(BusMsg::local(job.camera.clone(), event));
-}
-
 /// The facts of a clip's golfer (`golfer`, recorded at the trigger), by the
 /// lookup rule, for its swing report and its grades alike: a clip with no
 /// golfer has no height and the default sex, never the golfer up's.
-pub(crate) fn clip_golfer_facts(
-    state: &SystemState,
-    golfer: Option<&str>,
-) -> flighthook::PlayerSection {
-    state.system.golfer_facts(golfer)
+pub fn clip_golfer_facts(cameras: &Cameras, golfer: Option<&str>) -> flighthook::PlayerSection {
+    settings::golfer_facts(&cameras.settings.read(), golfer)
 }
 
 /// Analyze the swing in `track`, `job`'s keypoints, store it beside the
 /// clip and announce it. Returns whether the swing file is kept.
-fn swing(state: &SystemState, job: &ClipJob, track: &PoseTrack) -> bool {
+fn swing(cameras: &Cameras, job: &ClipJob, track: &PoseTrack) -> bool {
     let camera = &job.camera;
     let input = SwingInput {
         position: job.position,
         hand: job.hand,
         impact_ns: job.impact_ns,
-        height_cm: clip_golfer_facts(state, job.golfer.as_deref()).height,
-        mirrored: flighthook_cameras::pose::swing::mirrored(camera),
+        height_cm: clip_golfer_facts(cameras, job.golfer.as_deref()).height,
+        mirrored: super::swing::mirrored(camera),
     };
     let written = match write_report(camera, track, &job.avi, &input) {
         Ok(Some(written)) => written,
         Ok(None) => return false,
         Err(e) => {
-            if state.clips.is_current(&job.slot) {
+            if cameras.clips.is_current(&job.slot) {
                 info!("{camera}: no swing analysis of {}: {e}", job.avi.display());
             }
             return false;
         }
     };
-    if !state.clips.set_swing(&job.slot, camera) {
+    if !cameras.clips.set_swing(&job.slot, camera) {
         let _ = std::fs::remove_file(&written.path);
         return false;
     }
     log_impact(job, &written);
-    announce(
-        job,
-        LocalEvent::ShotSwing {
-            keys: job.keys.clone(),
-        },
-    );
+    (job.out)(Event::Swing {
+        keys: job.keys.clone(),
+    });
     true
 }
 
@@ -685,31 +664,24 @@ fn impact_line(job: &ClipJob, written: &SwingWritten) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actors::web::tests::TempDir;
-    use flighthook::{CameraPosition, ShotVideo};
-    use flighthook_cameras::clips::ClipShot;
+    use crate::bench::{Bench, bench, out};
+    use crate::clips::ClipShot;
+    use flighthook::{CameraPosition, FlighthookConfig, ShotVideo};
 
-    fn state() -> (TempDir, Arc<SystemState>) {
-        state_with("")
+    fn state() -> (Bench, Arc<Cameras>) {
+        state_with(FlighthookConfig::default())
     }
 
-    /// A state loaded from config text `toml`, body tracking Live.
-    fn state_with(toml: &str) -> (TempDir, Arc<SystemState>) {
-        let dir = TempDir(std::env::temp_dir().join(format!(
-            "flighthook-pose-queue-{}",
-            uuid::Uuid::new_v4().simple()
-        )));
-        std::fs::create_dir_all(&dir.0).expect("dir");
-        std::fs::write(dir.0.join("config.toml"), toml).expect("config");
-        let (state, _writer) = SystemState::new(dir.0.join("config.toml"));
-        state
-            .system
-            .update(|c| c.body_tracking.mode = BodyTrackingMode::Live);
-        (dir, Arc::new(state))
+    /// A bench over `config`, body tracking Live.
+    fn state_with(mut config: FlighthookConfig) -> (Bench, Arc<Cameras>) {
+        config.body_tracking.mode = BodyTrackingMode::Live;
+        let bench = bench(config);
+        let cameras = Arc::clone(&bench.cameras);
+        (bench, cameras)
     }
 
-    fn set_mode(state: &SystemState, mode: BodyTrackingMode) {
-        state.system.update(|c| c.body_tracking.mode = mode);
+    fn set_mode(bench: &Bench, mode: BodyTrackingMode) {
+        bench.update(|c| c.body_tracking.mode = mode);
     }
 
     fn key(n: u32) -> ShotKey {
@@ -721,7 +693,7 @@ mod tests {
 
     /// A finished camera.0 clip of shot `n` in the store, with a stand-in
     /// AVI.
-    fn clip(state: &SystemState, dir: &TempDir, n: u32) -> ClipJob {
+    fn clip(state: &Cameras, bench: &Bench, n: u32) -> ClipJob {
         let shot = ClipShot {
             key: key(n),
             device: "mock".into(),
@@ -731,7 +703,11 @@ mod tests {
         };
         let slot = state
             .clips
-            .begin(&dir.0.join("clips"), &[shot], state.clips.generation())
+            .begin(
+                &bench.dir.0.join("clips"),
+                &[shot],
+                state.clips.generation(),
+            )
             .expect("begin");
         let avi = slot.dir.join("camera.0.avi");
         std::fs::write(&avi, b"RIFF").expect("avi");
@@ -764,7 +740,7 @@ mod tests {
                 .unwrap_or_else(Instant::now),
             on_demand: false,
             timing: ClipTiming::default(),
-            bus: broadcast::channel(16).0,
+            out: out().0,
         }
     }
 
@@ -785,12 +761,12 @@ mod tests {
 
     #[test]
     fn the_queue_is_bounded_and_drops_the_oldest() {
-        let (dir, state) = state();
+        let (bench, state) = state();
         let queue = ClipQueue::default();
         // Hold the worker off, as if it were busy with a clip.
         queue.inner.lock().unwrap().working = true;
         for n in 1..=4 {
-            queue.push(&state, clip(&state, &dir, n), 3);
+            queue.push(&state, clip(&state, &bench, n), 3);
         }
         let waiting: Vec<String> = queue
             .waiting()
@@ -818,8 +794,8 @@ mod tests {
 
     #[test]
     fn the_impact_line_gives_the_refined_shift_per_shot_and_camera() {
-        let (dir, state) = state();
-        let mut job = clip(&state, &dir, 3);
+        let (bench, state) = state();
+        let mut job = clip(&state, &bench, 3);
         job.timing = ClipTiming {
             device: "garmin_r10".into(),
             impact_lead_ms: 2000,
@@ -851,8 +827,8 @@ mod tests {
 
     #[test]
     fn the_cameras_rotation_reaches_the_pass_and_is_recorded() {
-        let (dir, state) = state();
-        state.system.update(|c| {
+        let (bench, state) = state();
+        bench.update(|c| {
             c.camera.insert(
                 "0".into(),
                 flighthook::CameraSection {
@@ -862,9 +838,9 @@ mod tests {
                 },
             );
         });
-        let mut job = clip(&state, &dir, 1);
-        let (tx, mut rx) = broadcast::channel(16);
-        job.bus = tx;
+        let mut job = clip(&state, &bench, 1);
+        let (tx, rx) = out();
+        job.out = tx;
         let seen = Mutex::new(None);
         assert!(process(&state, &job, PoseModel::RtmposeM, &|_, config| {
             *seen.lock().unwrap() = Some(config.rotation);
@@ -875,14 +851,9 @@ mod tests {
         assert_eq!(video.rotation, 90);
         assert_eq!(video.analyzed_with.as_deref(), Some(stance::VERSION));
         let msg = rx.try_recv().expect("shot_pose");
-        assert!(matches!(
-            msg.as_local(),
-            Some((_, crate::bus::LocalEvent::ShotPose { rotation: 90, .. }))
-        ));
+        assert!(matches!(msg, Event::Pose { rotation: 90, .. }));
         // A rotation that is not one of the four is no rotation.
-        state
-            .system
-            .update(|c| c.camera.get_mut("0").unwrap().rotation_deg = 45);
+        bench.update(|c| c.camera.get_mut("0").unwrap().rotation_deg = 45);
         assert!(process(&state, &job, PoseModel::RtmposeM, &|_, config| {
             *seen.lock().unwrap() = Some(config.rotation);
             Ok(track(3))
@@ -959,10 +930,10 @@ mod tests {
 
     #[test]
     fn a_tracked_clip_gets_its_pose_file_and_one_shot_pose_event() {
-        let (dir, state) = state();
-        let mut job = clip(&state, &dir, 1);
-        let (tx, mut rx) = broadcast::channel(16);
-        job.bus = tx;
+        let (bench, state) = state();
+        let mut job = clip(&state, &bench, 1);
+        let (tx, rx) = out();
+        job.out = tx;
         let seen = Mutex::new(None);
         let kept = process(&state, &job, PoseModel::RtmposeM, &|avi, config| {
             *seen.lock().unwrap() = Some((
@@ -986,9 +957,7 @@ mod tests {
             Some(pose)
         );
         let msg = rx.try_recv().expect("shot_pose");
-        assert!(
-            matches!(msg.as_local(), Some(("camera.0", crate::bus::LocalEvent::ShotPose { keys, .. })) if keys == &[key(1)])
-        );
+        assert!(matches!(msg, Event::Pose { keys, .. } if keys == [key(1)]));
         assert!(rx.try_recv().is_err(), "one event");
     }
 
@@ -997,33 +966,40 @@ mod tests {
         use stance::golf::{Handed, SwingReport, View};
         // The height of the clip's golfer (the turn's at the trigger, here
         // A's linked game id) is the one used, not the golfer up's (B).
-        let (dir, state) = state_with(
-            "selected_golfer = \"flighthook.b\"\n\
-             [[golfers]]\nidentifiers = [\"flighthook.a\", \"pureplay.local-2\"]\nname = \"A\"\nheight = 175\n\
-             [[golfers]]\nidentifiers = [\"flighthook.b\"]\nname = \"B\"\nheight = 160\n",
+        let golfer = |ids: &[&str], name: &str, height| flighthook::GolferRecord {
+            identifiers: ids.iter().map(|id| (*id).to_owned()).collect(),
+            name: name.into(),
+            height: Some(height),
+            ..flighthook::GolferRecord::default()
+        };
+        let (bench, state) = state_with(FlighthookConfig {
+            selected_golfer: Some("flighthook.b".into()),
+            golfers: vec![
+                golfer(&["flighthook.a", "pureplay.local-2"], "A", 175.0),
+                golfer(&["flighthook.b"], "B", 160.0),
+            ],
+            ..FlighthookConfig::default()
+        });
+        assert_eq!(
+            settings::golfer_facts(&bench.config.read().unwrap(), Some("flighthook.b")).height,
+            Some(160.0)
         );
-        assert_eq!(state.golfer_up_facts().height, Some(160.0));
-        let mut job = clip(&state, &dir, 1);
+        let mut job = clip(&state, &bench, 1);
         job.golfer = Some("pureplay.local-2".into());
-        let (tx, mut rx) = broadcast::channel(16);
-        job.bus = tx;
+        let (tx, rx) = out();
+        job.out = tx;
         job.position = CameraPosition::TargetLine;
         job.hand = Some(Handedness::Left);
         job.impact_ns = Some(93 * 16_666_667);
         let kept = process(&state, &job, PoseModel::RtmposeM, &|_, _| {
-            Ok(flighthook_cameras::pose::swing::tests::swing_track())
+            Ok(super::super::swing::tests::swing_track())
         });
         assert!(kept);
         // shot_pose first, then shot_swing, one each.
         let first = rx.try_recv().expect("shot_pose");
-        assert!(matches!(
-            first.as_local(),
-            Some((_, crate::bus::LocalEvent::ShotPose { .. }))
-        ));
+        assert!(matches!(first, Event::Pose { .. }));
         let second = rx.try_recv().expect("shot_swing");
-        assert!(
-            matches!(second.as_local(), Some(("camera.0", crate::bus::LocalEvent::ShotSwing { keys })) if keys == &[key(1)])
-        );
+        assert!(matches!(second, Event::Swing { keys } if keys == [key(1)]));
         assert!(rx.try_recv().is_err());
         let path = job.slot.dir.join("camera.0.swing.json");
         assert_eq!(
@@ -1039,10 +1015,10 @@ mod tests {
         let impact = report.events.impact.expect("impact").t_ns;
         assert!(impact.abs_diff(job.impact_ns.unwrap()) <= 300_000_000);
         // A camera behind the golfer: keypoints only.
-        let mut behind = clip(&state, &dir, 2);
+        let mut behind = clip(&state, &bench, 2);
         behind.position = CameraPosition::GolferBack;
         assert!(process(&state, &behind, PoseModel::RtmposeM, &|_, _| {
-            Ok(flighthook_cameras::pose::swing::tests::swing_track())
+            Ok(super::super::swing::tests::swing_track())
         }));
         assert!(behind.slot.dir.join("camera.0.pose.json").exists());
         assert!(!behind.slot.dir.join("camera.0.swing.json").exists());
@@ -1056,18 +1032,18 @@ mod tests {
 
     #[test]
     fn a_clip_cleared_or_without_models_or_with_tracking_off_is_skipped() {
-        let (dir, state) = state();
+        let (bench, state) = state();
         // No models in the test folder: the load fails, the clip is skipped.
-        let job = clip(&state, &dir, 1);
+        let job = clip(&state, &bench, 1);
         assert!(!run(&state, &job));
         assert!(!job.slot.dir.join("camera.0.pose.json").exists());
         // Cleared before its turn.
-        let job = clip(&state, &dir, 2);
+        let job = clip(&state, &bench, 2);
         state.clips.clear();
         let m = PoseModel::RtmposeM;
         assert!(!process(&state, &job, m, &|_, _| panic!("cleared")));
         // Cleared while it ran: the file it wrote goes too.
-        let job = clip(&state, &dir, 3);
+        let job = clip(&state, &bench, 3);
         let kept = process(&state, &job, m, &|_, _| {
             state.clips.clear();
             Ok(track(1))
@@ -1075,8 +1051,8 @@ mod tests {
         assert!(!kept);
         assert!(!job.slot.dir.join("camera.0.pose.json").exists());
         // Body tracking off: nothing runs.
-        set_mode(&state, BodyTrackingMode::Off);
-        let job = clip(&state, &dir, 4);
+        set_mode(&bench, BodyTrackingMode::Off);
+        let job = clip(&state, &bench, 4);
         assert!(!run(&state, &job));
     }
 
@@ -1089,17 +1065,17 @@ mod tests {
 
     #[test]
     fn a_recorded_clip_runs_only_in_live_and_a_viewed_one_in_any_mode_but_off() {
-        let (dir, state) = state();
+        let (bench, state) = state();
         state.pose.clips.fake(counting_pass);
         for (mode, recorded, viewed) in [
             (BodyTrackingMode::Live, true, true),
             (BodyTrackingMode::Historical, false, true),
             (BodyTrackingMode::Off, false, false),
         ] {
-            set_mode(&state, mode);
-            let job = clip(&state, &dir, 1);
+            set_mode(&bench, mode);
+            let job = clip(&state, &bench, 1);
             assert_eq!(run(&state, &job), recorded, "{mode:?} recorded");
-            let mut job = clip(&state, &dir, 2);
+            let mut job = clip(&state, &bench, 2);
             job.on_demand = true;
             assert_eq!(run(&state, &job), viewed, "{mode:?} viewed");
         }
@@ -1110,17 +1086,17 @@ mod tests {
     /// while it waits is not tracked.
     #[test]
     fn a_recorded_clip_waits_clip_delay_on_the_clock() {
-        let (dir, state) = state();
-        set_mode(&state, BodyTrackingMode::Live);
+        let (bench, state) = state();
+        set_mode(&bench, BodyTrackingMode::Live);
         let written = Instant::now();
-        let mut job = clip(&state, &dir, 1);
+        let mut job = clip(&state, &bench, 1);
         job.written = written;
         let clock = std::cell::Cell::new(written);
         let wait = |d: Duration| clock.set(clock.get() + d);
         assert!(wait_turn_on(&state, &job, || clock.get(), wait));
         assert_eq!(clock.get(), written + CLIP_DELAY);
 
-        let mut job = clip(&state, &dir, 2);
+        let mut job = clip(&state, &bench, 2);
         job.written = written;
         clock.set(written);
         let cleared = |d: Duration| {
@@ -1133,8 +1109,8 @@ mod tests {
 
     #[test]
     fn a_recorded_clips_turn_comes_clip_delay_after_it_was_written_and_only_in_live() {
-        let (dir, state) = state();
-        let job = clip(&state, &dir, 1);
+        let (bench, state) = state();
+        let job = clip(&state, &bench, 1);
         let at = |after: Duration| job.written + after;
         let ms = Duration::from_millis;
         for mode in [
@@ -1173,8 +1149,8 @@ mod tests {
 
     #[test]
     fn a_viewed_clip_runs_at_once_in_any_mode_but_off() {
-        let (dir, state) = state();
-        let mut job = clip(&state, &dir, 1);
+        let (bench, state) = state();
+        let mut job = clip(&state, &bench, 1);
         job.on_demand = true;
         let now = job.written;
         assert_eq!(turn(&job, BodyTrackingMode::Live, now), Turn::Run);
@@ -1184,11 +1160,11 @@ mod tests {
 
     #[test]
     fn a_clip_is_queued_once_and_a_viewed_one_goes_first() {
-        let (dir, state) = state();
+        let (bench, state) = state();
         let queue = ClipQueue::default();
         // Hold the worker off, as if it were busy with a clip.
         queue.inner.lock().unwrap().working = true;
-        let recorded: Vec<ClipJob> = (1..=3).map(|n| clip(&state, &dir, n)).collect();
+        let recorded: Vec<ClipJob> = (1..=3).map(|n| clip(&state, &bench, n)).collect();
         let avis: Vec<PathBuf> = recorded.iter().map(|j| j.avi.clone()).collect();
         for job in recorded {
             assert_eq!(queue.push(&state, job, 8), Pushed::Queued);
@@ -1200,7 +1176,7 @@ mod tests {
                 .clips
                 .camera_clip(&key(n).shot_id, "camera.0")
                 .expect("clip");
-            let mut job = clip(&state, &dir, 9);
+            let mut job = clip(&state, &bench, 9);
             job.slot = found.slot;
             job.avi = found.avi;
             job.on_demand = on_demand;
@@ -1213,7 +1189,7 @@ mod tests {
         assert_eq!(queue.waiting(), avis);
         assert!(!queue.inner.lock().unwrap().jobs[2].job.on_demand);
         // A new viewed clip goes first too.
-        let mut viewed = clip(&state, &dir, 4);
+        let mut viewed = clip(&state, &bench, 4);
         viewed.on_demand = true;
         let viewed_avi = viewed.avi.clone();
         assert_eq!(queue.push(&state, viewed, 8), Pushed::Queued);
@@ -1230,7 +1206,7 @@ mod tests {
             )
         );
         // Full: the clip queued longest ago goes, wherever it waits.
-        let more = clip(&state, &dir, 5);
+        let more = clip(&state, &bench, 5);
         assert_eq!(queue.push(&state, more, 4), Pushed::Queued);
         let waiting = queue.waiting();
         assert_eq!(waiting.len(), 4);
@@ -1253,34 +1229,34 @@ mod tests {
 
     #[test]
     fn a_viewed_clip_is_requested_once_and_tracked_with_its_events() {
-        let (dir, state) = state();
-        set_mode(&state, BodyTrackingMode::Historical);
+        let (bench, state) = state();
+        set_mode(&bench, BodyTrackingMode::Historical);
         state.pose.clips.fake(counting_pass);
-        let job = clip(&state, &dir, 1);
-        let (tx, mut rx) = broadcast::channel(16);
+        let job = clip(&state, &bench, 1);
+        let (tx, rx) = out();
         assert_eq!(
-            request(&state, "shot-9", "camera.0", false, &tx),
+            state.request("shot-9", "camera.0", false, Arc::clone(&tx)),
             Requested::NoClip
         );
         assert_eq!(
-            request(&state, "shot-1", "camera.1", false, &tx),
+            state.request("shot-1", "camera.1", false, Arc::clone(&tx)),
             Requested::NoClip
         );
-        set_mode(&state, BodyTrackingMode::Off);
+        set_mode(&bench, BodyTrackingMode::Off);
         assert_eq!(
-            request(&state, "shot-1", "camera.0", false, &tx),
+            state.request("shot-1", "camera.0", false, Arc::clone(&tx)),
             Requested::Off
         );
         assert!(!state.pose.clips.working());
-        set_mode(&state, BodyTrackingMode::Historical);
+        set_mode(&bench, BodyTrackingMode::Historical);
         // Hold the worker off to see the queue.
         state.pose.clips.inner.lock().unwrap().working = true;
         assert_eq!(
-            request(&state, "shot-1", "camera.0", false, &tx),
+            state.request("shot-1", "camera.0", false, Arc::clone(&tx)),
             Requested::Queued
         );
         assert_eq!(
-            request(&state, "shot-1", "camera.0", false, &tx),
+            state.request("shot-1", "camera.0", false, Arc::clone(&tx)),
             Requested::Queued
         );
         assert_eq!(state.pose.clips.waiting(), std::slice::from_ref(&job.avi));
@@ -1297,45 +1273,43 @@ mod tests {
         state.pose.clips.inner.lock().unwrap().working = false;
         assert!(queued.job.on_demand);
         state.pose.clips.push(&state, queued.job, 8);
-        let first = rx.blocking_recv().expect("shot_pose");
-        assert!(
-            matches!(first.as_local(), Some(("camera.0", crate::bus::LocalEvent::ShotPose { keys, .. })) if keys == &[key(1)])
-        );
+        let first = rx.recv_timeout(crate::GIVE_UP).expect("shot_pose");
+        assert!(matches!(first, Event::Pose { keys, .. } if keys == [key(1)]));
         assert!(job.slot.dir.join("camera.0.pose.json").exists());
         assert_eq!(
-            request(&state, "shot-1", "camera.0", false, &tx),
+            state.request("shot-1", "camera.0", false, Arc::clone(&tx)),
             Requested::Done
         );
     }
 
     #[test]
     fn a_forced_request_clears_a_done_clip_and_queues_it_again() {
-        let (dir, state) = state();
-        set_mode(&state, BodyTrackingMode::Historical);
-        let job = clip(&state, &dir, 1);
-        let (tx, _rx) = broadcast::channel(16);
+        let (bench, state) = state();
+        set_mode(&bench, BodyTrackingMode::Historical);
+        let job = clip(&state, &bench, 1);
+        let (tx, _rx) = out();
         assert!(process(&state, &job, PoseModel::RtmposeM, &|_, _| Ok(
-            flighthook_cameras::pose::swing::tests::swing_track()
+            super::super::swing::tests::swing_track()
         )));
         let pose = job.slot.dir.join("camera.0.pose.json");
         assert!(pose.exists());
         assert!(state.clips.videos("shot-1")[0].pose);
         assert_eq!(
-            request(&state, "shot-1", "camera.0", false, &tx),
+            state.request("shot-1", "camera.0", false, Arc::clone(&tx)),
             Requested::Done
         );
         // Off: nothing is cleared.
-        set_mode(&state, BodyTrackingMode::Off);
+        set_mode(&bench, BodyTrackingMode::Off);
         assert_eq!(
-            request(&state, "shot-1", "camera.0", true, &tx),
+            state.request("shot-1", "camera.0", true, Arc::clone(&tx)),
             Requested::Off
         );
         assert!(pose.exists());
-        set_mode(&state, BodyTrackingMode::Historical);
+        set_mode(&bench, BodyTrackingMode::Historical);
         // Hold the worker off to see the queue.
         state.pose.clips.inner.lock().unwrap().working = true;
         assert_eq!(
-            request(&state, "shot-1", "camera.0", true, &tx),
+            state.request("shot-1", "camera.0", true, Arc::clone(&tx)),
             Requested::Queued
         );
         assert!(!pose.exists(), "the old keypoints are gone");
@@ -1345,7 +1319,7 @@ mod tests {
         assert_eq!(state.pose.clips.waiting(), std::slice::from_ref(&job.avi));
         // Asked again while it waits: still queued once.
         assert_eq!(
-            request(&state, "shot-1", "camera.0", true, &tx),
+            state.request("shot-1", "camera.0", true, Arc::clone(&tx)),
             Requested::Queued
         );
         assert_eq!(state.pose.clips.waiting().len(), 1);
@@ -1353,9 +1327,9 @@ mod tests {
 
     #[test]
     fn a_clip_cleared_while_it_waits_its_turn_is_skipped_without_running() {
-        let (dir, state) = state();
+        let (bench, state) = state();
         state.pose.clips.fake(|_, _| panic!("the pass ran"));
-        let mut job = clip(&state, &dir, 1);
+        let mut job = clip(&state, &bench, 1);
         job.written = Instant::now();
         state.clips.clear();
         assert!(!run(&state, &job));
@@ -1364,7 +1338,7 @@ mod tests {
     #[test]
     fn a_pass_that_panics_is_logged_and_the_queue_goes_on() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let (dir, state) = state();
+        let (bench, state) = state();
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         fn pass(_: &std::path::Path, _: &PoseConfig) -> stance::Result<PoseTrack> {
             assert!(
@@ -1374,8 +1348,8 @@ mod tests {
             Ok(track(2))
         }
         state.pose.clips.fake(pass);
-        let first = clip(&state, &dir, 1);
-        let second = clip(&state, &dir, 2);
+        let first = clip(&state, &bench, 1);
+        let second = clip(&state, &bench, 2);
         let pose = second.slot.dir.join("camera.0.pose.json");
         state.pose.clips.push(&state, first, 8);
         state.pose.clips.push(&state, second, 8);
@@ -1390,7 +1364,7 @@ mod tests {
             assert!(Instant::now() < deadline, "the worker did not end");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let third = clip(&state, &dir, 3);
+        let third = clip(&state, &bench, 3);
         let pose = third.slot.dir.join("camera.0.pose.json");
         state.pose.clips.push(&state, third, 8);
         while !pose.exists() {
@@ -1422,7 +1396,7 @@ mod tests {
             self.0
                 .lock()
                 .unwrap()
-                .push(flighthook_cameras::pose::priority::current());
+                .push(crate::pose::priority::current());
             #[allow(clippy::cast_precision_loss)]
             let (w, h) = (image.width() as f32, image.height() as f32);
             Ok(vec![stance::pose::Detection {
@@ -1440,8 +1414,8 @@ mod tests {
     #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn the_clip_pass_workers_run_below_normal() {
-        use flighthook_cameras::pose::live::tests::{FakePose, numbered_jpeg};
-        use flighthook_cameras::pose::priority::{current, lowered_from};
+        use crate::pose::live::tests::{FakePose, numbered_jpeg};
+        use crate::pose::priority::{current, lowered_from};
         let base = current();
         let seen: Arc<Mutex<Vec<i32>>> = Arc::default();
         let models = stance::pose::PoseModels::new(
@@ -1479,7 +1453,7 @@ mod tests {
     /// them.
     #[test]
     fn the_real_pass_tracks_a_clip_when_there_is_one() {
-        use flighthook_cameras::pose::models::{Models, Official};
+        use crate::pose::models::{Models, Official};
         let (Some(models), Some(avi)) = (
             std::env::var_os("STANCE_MODEL_DIR"),
             std::env::var_os("STANCE_TEST_CLIP"),
@@ -1504,7 +1478,7 @@ mod tests {
         let forked = shared.fork().expect("fork");
         let config = clip_config(model, Rotation::None);
         let (took, frames) = std::thread::spawn(move || {
-            flighthook_cameras::pose::priority::lower_this_thread();
+            crate::pose::priority::lower_this_thread();
             let started = Instant::now();
             let track = stance::pose::analyze_clip(&forked, &avi, &config).expect("pass");
             (started.elapsed(), track.frames.len())

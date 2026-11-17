@@ -65,6 +65,7 @@ pub fn start_turn_for(config: &FlighthookConfig) -> GolferTurn {
 type LastClub = (Option<Club>, u64);
 
 /// The session's turn, read side.
+#[derive(Clone)]
 pub struct Session {
     inner: Arc<RwLock<GolferTurn>>,
 }

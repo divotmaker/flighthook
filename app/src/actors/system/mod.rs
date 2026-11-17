@@ -244,7 +244,7 @@ pub(crate) fn expire_remotes(
 /// Delete every replay clip (Clear history). Folders that can't be deleted
 /// now are retried later.
 pub(crate) fn clear_clips(state: &SystemState) {
-    let removed = state.clips.clear();
+    let removed = state.cameras.clips.clear();
     if !removed.is_empty() {
         tracing::info!(
             "clear history: deleted the clips of {} shot(s)",
@@ -264,6 +264,7 @@ fn follow_clip_dir(state: &SystemState, sender: &BusSender, before: &std::path::
         return;
     }
     let removed = state
+        .cameras
         .clips
         .reindex(&dir, flighthook_cameras::clips::keep(&replay));
     tracing::info!(

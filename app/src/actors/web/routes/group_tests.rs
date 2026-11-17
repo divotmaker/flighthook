@@ -1472,7 +1472,9 @@ async fn a_clip_is_graded_with_its_own_golfers_facts() {
         c.golfers = vec![a, b];
         c.selected_golfer = Some("flighthook.b".into());
     });
-    let facts = |clip: Option<&str>| crate::pose::clips::clip_golfer_facts(&state.root, clip);
+    let facts = |clip: Option<&str>| {
+        flighthook_cameras::pose::clips::clip_golfer_facts(&state.root.cameras, clip)
+    };
     let eric = facts(Some("pureplay.local-2"));
     assert_eq!(
         (eric.height, eric.sex),

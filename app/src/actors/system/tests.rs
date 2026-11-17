@@ -833,7 +833,11 @@ fn set_golfers_takes_the_golfers_and_replace_global_leaves_them() {
     );
     assert_eq!(state.system.snapshot().golfers, golfers, "persisted");
     assert_eq!(
-        state.system.golfer_facts(Some("flighthook.a")).height,
+        flighthook_cameras::settings::golfer_facts(
+            &state.system.view().read(),
+            Some("flighthook.a")
+        )
+        .height,
         Some(190.0)
     );
     let outcome = std::iter::from_fn(|| rx.poll().ok().flatten())
@@ -1222,8 +1226,9 @@ fn a_new_clip_folder_is_followed_and_the_old_clips_are_no_longer_served() {
         golfer: None,
     };
     let slot = state
+        .cameras
         .clips
-        .begin(&old, &[shot], state.clips.generation())
+        .begin(&old, &[shot], state.cameras.clips.generation())
         .expect("begin");
     let video = flighthook::ShotVideo {
         camera: "camera.0".into(),
@@ -1239,7 +1244,7 @@ fn a_new_clip_folder_is_followed_and_the_old_clips_are_no_longer_served() {
         rotation: 0,
         analyzed_with: None,
     };
-    assert!(state.clips.finish(&slot, video, 20).kept);
+    assert!(state.cameras.clips.finish(&slot, video, 20).kept);
 
     let mut body = state.system.snapshot();
     body.replay.clip_dir = Some(dir.0.join("new").display().to_string());
@@ -1254,7 +1259,7 @@ fn a_new_clip_folder_is_followed_and_the_old_clips_are_no_longer_served() {
         sender.raw_sender(),
         &sender,
     );
-    assert!(state.clips.videos("a").is_empty());
+    assert!(state.cameras.clips.videos("a").is_empty());
     assert!(slot.dir.is_dir(), "the old folder is left as it is");
     let removed = std::iter::from_fn(|| rx.try_recv().ok())
         .filter_map(local_of)
@@ -1281,8 +1286,9 @@ fn clear_history_deletes_the_clips() {
         golfer: None,
     };
     let slot = state
+        .cameras
         .clips
-        .begin(&clips, &[shot], state.clips.generation())
+        .begin(&clips, &[shot], state.cameras.clips.generation())
         .expect("begin");
     let video = flighthook::ShotVideo {
         camera: "camera.0".into(),
@@ -1298,10 +1304,10 @@ fn clear_history_deletes_the_clips() {
         rotation: 0,
         analyzed_with: None,
     };
-    assert!(state.clips.finish(&slot, video, 20).kept);
-    assert_eq!(state.clips.videos("a").len(), 1);
+    assert!(state.cameras.clips.finish(&slot, video, 20).kept);
+    assert_eq!(state.cameras.clips.videos("a").len(), 1);
     clear_clips(&state);
-    assert!(state.clips.videos("a").is_empty());
+    assert!(state.cameras.clips.videos("a").is_empty());
     assert!(!slot.dir.exists());
 }
 

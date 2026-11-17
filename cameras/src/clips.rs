@@ -83,6 +83,15 @@ pub fn keep(replay: &ReplaySection) -> u32 {
     replay.keep_shots.clamp(1, ReplaySection::MAX_KEEP_SHOTS)
 }
 
+/// A clip's estimated impact for its swing analysis, ns after its first
+/// frame: `None` when it falls outside the clip's frames (before the first,
+/// or after the last of a clip cut short).
+#[must_use]
+pub fn clip_impact(sidecar: &stance::sidecar::Sidecar) -> Option<u64> {
+    let last = sidecar.frames.last()?.t_ns;
+    u64::try_from(sidecar.impact_ns).ok().filter(|t| *t <= last)
+}
+
 /// One clip folder.
 #[derive(Debug, Clone)]
 struct StoredClip {

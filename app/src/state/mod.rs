@@ -17,8 +17,7 @@ use std::time::{Duration, Instant};
 use crate::actors::{Actor, ReconfigureOutcome};
 use crate::bus::BusSender;
 use config::SystemConfig;
-use flighthook_cameras::clips::ClipStore;
-use flighthook_cameras::frames::Frames;
+use flighthook_cameras::Cameras;
 use sent_shots::SentShots;
 use sources::Sources;
 
@@ -36,12 +35,8 @@ pub struct SystemState {
     pub sent_shots: Arc<SentShots>,
     /// Every local shot source's type.
     pub sources: Arc<Sources>,
-    /// The replay clips on disk, shared by the camera actors (beta).
-    pub clips: ClipStore,
-    /// The camera actors' latest frames and the camera list (beta).
-    pub cameras: Frames,
-    /// Body tracking's models and recorded-clip queue (alpha).
-    pub pose: flighthook_cameras::pose::BodyTracking<crate::pose::clips::ClipQueue>,
+    /// The cameras' clips, frames and body tracking (beta).
+    pub cameras: Arc<Cameras>,
     /// The Pureplay Accessory cards' pairing tokens (beta), kept out of the config.
     pub pureplay_tokens: Arc<flighthook_pureplay::accessory::token::TokenStore>,
     /// The mode each running local launch monitor with a fixed mode arms
@@ -99,7 +94,7 @@ pub enum Stopped {
 /// sources. Tests never download: each state has an empty folder of its own
 /// and a stand-in source (`models::fake`, a "download" of about 0.4 s per
 /// file).
-fn body_tracking() -> flighthook_cameras::pose::BodyTracking<crate::pose::clips::ClipQueue> {
+fn body_tracking() -> flighthook_cameras::pose::BodyTracking {
     #[cfg(test)]
     {
         flighthook_cameras::pose::BodyTracking::new(
@@ -116,6 +111,15 @@ fn body_tracking() -> flighthook_cameras::pose::BodyTracking<crate::pose::clips:
             flighthook_cameras::pose::models::default_dir(),
             std::sync::Arc::new(flighthook_cameras::pose::models::Official::default()),
         )
+    }
+}
+
+/// What the cameras read from flighthook: the session's turn.
+struct AppHost(Session);
+
+impl flighthook_cameras::Host for AppHost {
+    fn turn(&self) -> flightrelay::GolferTurn {
+        self.0.turn()
     }
 }
 
@@ -168,22 +172,27 @@ impl SystemState {
     #[cfg(test)]
     pub fn golfer_up_facts(&self) -> flighthook::PlayerSection {
         let turn = self.session.turn();
-        self.system
-            .golfer_facts(turn.golfer.as_ref().map(flightrelay::GolferId::as_str))
+        flighthook_cameras::settings::golfer_facts(
+            &self.system.view().read(),
+            turn.golfer.as_ref().map(flightrelay::GolferId::as_str),
+        )
     }
 
     pub fn new(config_path: PathBuf) -> (Self, SessionWriter) {
         let system = SystemConfig::new(config_path);
         let (session, writer) = Session::with_config(system.view());
+        let cameras = Cameras::new(
+            system.view().shared(),
+            Arc::new(AppHost(session.clone())),
+            body_tracking(),
+        );
         (
             Self {
                 system,
                 session,
+                cameras,
                 sent_shots: Arc::default(),
                 sources: Arc::default(),
-                clips: ClipStore::default(),
-                cameras: Frames::default(),
-                pose: body_tracking(),
                 pureplay_tokens: pureplay_tokens(),
                 fixed_modes: FixedModes::default(),
                 beats: crate::bus::Beats::default(),

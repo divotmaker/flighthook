@@ -10,7 +10,7 @@ use super::*;
 /// the enumeration thread fails.
 pub async fn get_cameras(State(state): State<Arc<WebState>>) -> Response {
     let root = Arc::clone(&state.root);
-    match tokio::task::spawn_blocking(move || root.cameras.list()).await {
+    match tokio::task::spawn_blocking(move || root.cameras.frames.list()).await {
         Ok(list) => Json::<CameraListResponse>(list).into_response(),
         Err(e) => {
             tracing::warn!("cameras: listing failed: {e}");
@@ -46,7 +46,7 @@ pub async fn get_camera_still(
     State(state): State<Arc<WebState>>,
     Path(actor): Path<String>,
 ) -> Response {
-    let Some(jpeg) = state.root.cameras.still(&actor) else {
+    let Some(jpeg) = state.root.cameras.frames.still(&actor) else {
         return not_found(format!("no frame from '{actor}'"));
     };
     Response::builder()
@@ -105,12 +105,12 @@ pub(super) async fn get_camera_live_with(
     if !configured {
         return not_found(format!("no camera '{actor}'"));
     }
-    let cameras = &state.root.cameras;
+    let cameras = &state.root.cameras.frames;
     cameras.watch_live(actor, std::time::Instant::now());
     let answer = cameras.next_live(actor, after, wait).await;
     let pose_state = || {
         let settings = state.root.system.body_tracking();
-        state.root.pose.live_state(&settings, actor)
+        state.root.cameras.pose.live_state(&settings, actor)
     };
     match answer {
         LiveWait::Frame(frame) => {

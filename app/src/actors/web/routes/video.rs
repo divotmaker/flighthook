@@ -7,7 +7,7 @@ pub async fn get_shot_video(
     State(state): State<Arc<WebState>>,
     Path(shot_id): Path<String>,
 ) -> Json<Vec<ShotVideo>> {
-    Json(state.root.clips.videos(&shot_id))
+    Json(state.root.cameras.clips.videos(&shot_id))
 }
 
 /// GET /api/shots/{shot_id}/video/{camera}.avi | .json | .pose.json |
@@ -33,7 +33,7 @@ pub async fn get_shot_video_file(
                 .map(|camera| (camera, "swing.json"))
         })
         .or_else(|| file.rsplit_once('.'))
-        .and_then(|(camera, ext)| state.root.clips.file(&shot_id, camera, ext));
+        .and_then(|(camera, ext)| state.root.cameras.clips.file(&shot_id, camera, ext));
     let Some(path) = path else {
         return not_found(format!("no clip '{file}' for shot '{shot_id}'"));
     };
@@ -73,7 +73,12 @@ pub async fn get_shot_grades(
         )
             .into_response()
     };
-    let Some(path) = state.root.clips.file(&shot_id, &camera, "swing.json") else {
+    let Some(path) = state
+        .root
+        .cameras
+        .clips
+        .file(&shot_id, &camera, "swing.json")
+    else {
         return missing();
     };
     let (club, hand) = {
@@ -86,10 +91,14 @@ pub async fn get_shot_grades(
     };
     let clip_golfer = state
         .root
+        .cameras
         .clips
         .camera_clip(&shot_id, &camera)
         .and_then(|c| c.shots.first().and_then(|s| s.golfer.clone()));
-    let player = crate::pose::clips::clip_golfer_facts(&state.root, clip_golfer.as_deref());
+    let player = flighthook_cameras::pose::clips::clip_golfer_facts(
+        &state.root.cameras,
+        clip_golfer.as_deref(),
+    );
     let input = GradeInput { club, hand, player };
     let (shot, cam) = (shot_id.clone(), camera.clone());
     match tokio::task::spawn_blocking(move || grade_file(&path, &shot, &cam, input)).await {
@@ -120,7 +129,7 @@ impl AnalyzeQuery {
 
 /// POST /api/shots/{shot_id}/video/{camera}/analyze — track camera
 /// `camera`'s clip of the shot now (body tracking, for a viewer), unless it
-/// is done or already queued ([`crate::pose::clips::request`]): `202
+/// is done or already queued ([`flighthook_cameras::Cameras::request`]): `202
 /// {"state":"queued"}` (its `shot_pose`, then `shot_swing`, follow on the
 /// bus), `200 {"state":"done"}` when its keypoints are there, `409` while
 /// body tracking is off, `404` when the shot has no clip from the camera;
@@ -131,14 +140,15 @@ pub async fn post_analyze_clip(
     Path((shot_id, camera)): Path<(String, String)>,
     Query(query): Query<AnalyzeQuery>,
 ) -> Response {
-    use crate::pose::clips::{Requested, request};
-    let root = Arc::clone(&state.root);
-    let bus = state.bus_tx.clone();
+    use flighthook_cameras::pose::clips::Requested;
+    let cameras = Arc::clone(&state.root.cameras);
+    let out = crate::bus::camera_raw(&state.bus_tx, &camera);
     let (shot, cam) = (shot_id.clone(), camera.clone());
     let force = query.forced();
     if force && state.root.system.body_tracking().mode.is_on() {
         let keys: Option<Vec<flighthook::ShotKey>> = state
             .root
+            .cameras
             .clips
             .camera_clip(&shot_id, &camera)
             .map(|clip| clip.shots.into_iter().map(|s| s.key).collect());
@@ -147,7 +157,7 @@ pub async fn post_analyze_clip(
         }
     }
     let requested =
-        tokio::task::spawn_blocking(move || request(&root, &shot, &cam, force, &bus)).await;
+        tokio::task::spawn_blocking(move || cameras.request(&shot, &cam, force, out)).await;
     let json = |status: StatusCode, body: serde_json::Value| (status, Json(body)).into_response();
     match requested {
         Ok(Requested::Queued) => json(

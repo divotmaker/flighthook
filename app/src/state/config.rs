@@ -697,6 +697,12 @@ impl ConfigView {
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, FlighthookConfig> {
         self.0.read().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// The live config itself, which the cameras read
+    /// ([`flighthook_cameras::settings::Settings`]).
+    pub fn shared(&self) -> Arc<RwLock<FlighthookConfig>> {
+        Arc::clone(&self.0)
+    }
 }
 
 impl SystemConfig {
@@ -823,81 +829,6 @@ impl SystemConfig {
             .clone()
     }
 
-    /// The impact lead in effect for launch monitor `actor` (e.g. `mevo.0`),
-    /// seconds: its section's `impact_lead_s` when valid, else the monitor
-    /// type's default. `None` for a source that is not a swing (Auto-chip).
-    /// Camera actors read it at every trigger, so a change applies to the
-    /// next shot without restarting anything.
-    pub fn impact_lead_s(&self, actor: &str) -> Option<f64> {
-        let prefix = actor.split_once('.').map_or(actor, |(prefix, _)| prefix);
-        let configured = self
-            .inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .configured_impact_lead_s(actor);
-        flighthook::impact_lead_in_effect_s(prefix, configured)
-    }
-
-    /// How far before a trigger's arrival the cameras' history has to
-    /// reach for the configured launch monitors, seconds (0 with none): the
-    /// largest impact lead in effect plus the monitor type's trigger delay
-    /// ([`flighthook::trigger_delay_s`]).
-    pub fn longest_reach_s(&self) -> f64 {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .launch_monitor_leads()
-            .into_iter()
-            .filter_map(|(kind, _, lead)| {
-                flighthook::impact_lead_in_effect_s(kind, lead)
-                    .map(|lead| lead + flighthook::trigger_delay_s(kind))
-            })
-            .fold(0.0, f64::max)
-    }
-
-    /// The latency in effect for camera `actor` (e.g. `camera.0`), seconds:
-    /// its section's `latency_s` when valid, else 0. The camera actor reads
-    /// it for every frame, so a change applies at once without reopening
-    /// the camera.
-    pub fn camera_latency_s(&self, actor: &str) -> f64 {
-        let configured = actor.strip_prefix("camera.").and_then(|index| {
-            self.inner
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .camera
-                .get(index)
-                .and_then(|c| c.latency_s)
-        });
-        flighthook::latency_in_effect_s(configured)
-    }
-
-    /// The rotation in effect for camera `actor` (e.g. `camera.0`),
-    /// clockwise degrees: its section's `rotation_deg` when valid, else 0.
-    /// Read for every live frame and every clip pass, so a change applies at
-    /// once without reopening the camera.
-    pub fn camera_rotation(&self, actor: &str) -> u16 {
-        let configured = actor.strip_prefix("camera.").and_then(|index| {
-            self.inner
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .camera
-                .get(index)
-                .map(|c| c.rotation_deg)
-        });
-        configured.map_or(0, flighthook::rotation_in_effect_deg)
-    }
-
-    /// The facts (sex, height) of the golfer golfer id `golfer` means, by
-    /// the lookup rule; a height out of range is no height. The defaults
-    /// when no golfer has the id. Read by the swing analysis of every clip.
-    pub fn golfer_facts(&self, golfer: Option<&str>) -> flighthook::PlayerSection {
-        let config = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        golfer
-            .and_then(|id| config.golfer_of(id))
-            .map(flighthook::GolferRecord::facts)
-            .unwrap_or_default()
-    }
-
     /// The `[body_tracking]` settings in effect: a value out of range is its
     /// default. Read live by the camera actors and the body tracking
     /// workers, so every change applies without a restart.
@@ -907,15 +838,6 @@ impl SystemConfig {
             .unwrap_or_else(|e| e.into_inner())
             .body_tracking
             .in_effect()
-    }
-
-    /// Number of configured cameras.
-    pub fn camera_count(&self) -> usize {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .camera
-            .len()
     }
 
     /// Clone just the `[replay]` section. Camera actors read it at every
@@ -976,6 +898,7 @@ impl SystemConfig {
 mod tests {
     use super::*;
     use flighthook::{DeviceSection, SimMode};
+    use flighthook_cameras::settings;
 
     /// `FlighthookConfig::default()` as written to disk, with no
     /// `[simulation]` table. An untouched config gains one only to hold the
@@ -1430,8 +1353,11 @@ bind = "0.0.0.0:5880"
         std::fs::write(&path, "[square.0]\nname = \"Omni\"\nimpact_lead_s = 7.5\n").expect("write");
         let cfg = SystemConfig::new(path);
         assert!(cfg.snapshot().impact_lead_error().is_some());
-        assert_eq!(cfg.impact_lead_s("square.0"), Some(1.0));
-        assert_eq!(cfg.longest_reach_s(), 1.0);
+        assert_eq!(
+            settings::impact_lead_s(&cfg.view().read(), "square.0"),
+            Some(1.0)
+        );
+        assert_eq!(settings::longest_reach_s(&cfg.view().read()), 1.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1465,10 +1391,22 @@ bind = "0.0.0.0:5880"
         .expect("write");
         let cfg = SystemConfig::new(path);
         assert!(cfg.snapshot().latency_error().is_some());
-        assert_eq!(cfg.camera_latency_s("camera.0"), 0.0);
-        assert_eq!(cfg.camera_latency_s("camera.1"), 1.5);
-        assert_eq!(cfg.camera_latency_s("camera.9"), 0.0);
-        assert_eq!(cfg.camera_latency_s("mevo.0"), 0.0);
+        assert_eq!(
+            settings::camera_latency_s(&cfg.view().read(), "camera.0"),
+            0.0
+        );
+        assert_eq!(
+            settings::camera_latency_s(&cfg.view().read(), "camera.1"),
+            1.5
+        );
+        assert_eq!(
+            settings::camera_latency_s(&cfg.view().read(), "camera.9"),
+            0.0
+        );
+        assert_eq!(
+            settings::camera_latency_s(&cfg.view().read(), "mevo.0"),
+            0.0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2858,8 +2796,14 @@ surface = "firm_green"
         assert_eq!(std::fs::read_to_string(&path).expect("read"), migrated);
         assert_eq!(files(&dir.0), [backup_name(), "config.toml".to_string()]);
         let cfg = SystemConfig::new(path);
-        assert_eq!(cfg.golfer_facts(Some(&id)).height, Some(182.5));
-        assert_eq!(cfg.golfer_facts(None).height, None);
+        assert_eq!(
+            settings::golfer_facts(&cfg.view().read(), Some(&id)).height,
+            Some(182.5)
+        );
+        assert_eq!(
+            settings::golfer_facts(&cfg.view().read(), None).height,
+            None
+        );
     }
 
     /// `[player]` moves into the golfers in one rewrite with a backup: into
@@ -2883,7 +2827,7 @@ surface = "firm_green"
         assert_eq!(second.golfers, first.golfers, "same id and height again");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), migrated);
         assert_eq!(
-            SystemConfig::new(path).golfer_facts(Some(&id)).height,
+            settings::golfer_facts(&SystemConfig::new(path).view().read(), Some(&id)).height,
             Some(170.0)
         );
 
@@ -2924,13 +2868,24 @@ surface = "firm_green"
         );
         let cfg = SystemConfig::new(path);
         assert!(cfg.snapshot().camera_error().is_some());
-        assert_eq!(cfg.camera_rotation("camera.0"), 90);
-        assert_eq!(cfg.camera_rotation("camera.1"), 0, "not one of the four");
-        assert_eq!(cfg.camera_rotation("camera.7"), 0, "no such camera");
-        assert_eq!(cfg.camera_rotation("mevo.0"), 0);
+        assert_eq!(
+            settings::camera_rotation(&cfg.view().read(), "camera.0"),
+            90
+        );
+        assert_eq!(
+            settings::camera_rotation(&cfg.view().read(), "camera.1"),
+            0,
+            "not one of the four"
+        );
+        assert_eq!(
+            settings::camera_rotation(&cfg.view().read(), "camera.7"),
+            0,
+            "no such camera"
+        );
+        assert_eq!(settings::camera_rotation(&cfg.view().read(), "mevo.0"), 0);
         let id = cfg.snapshot().golfers[0].own_id().expect("id").to_owned();
         assert_eq!(
-            cfg.golfer_facts(Some(&id)),
+            settings::golfer_facts(&cfg.view().read(), Some(&id)),
             flighthook::PlayerSection {
                 sex: flighthook::Sex::Female,
                 height: None,

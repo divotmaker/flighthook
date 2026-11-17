@@ -10,7 +10,10 @@ use super::*;
 pub async fn get_body_tracking_models(State(state): State<Arc<WebState>>) -> Response {
     let root = Arc::clone(&state.root);
     match tokio::task::spawn_blocking(move || {
-        root.pose.models.files(root.system.body_tracking().model)
+        root.cameras
+            .pose
+            .models
+            .files(root.system.body_tracking().model)
     })
     .await
     {
@@ -33,8 +36,8 @@ pub async fn post_body_tracking_models_download(State(state): State<Arc<WebState
     let root = Arc::clone(&state.root);
     let answered = tokio::task::spawn_blocking(move || {
         let model = root.system.body_tracking().model;
-        let started = root.pose.models.download(model);
-        (started, root.pose.models.files(model))
+        let started = root.cameras.pose.models.download(model);
+        (started, root.cameras.pose.models.files(model))
     })
     .await;
     match answered {
@@ -55,8 +58,11 @@ pub async fn post_body_tracking_models_download(State(state): State<Arc<WebState
 pub async fn delete_body_tracking_models_download(State(state): State<Arc<WebState>>) -> Response {
     let root = Arc::clone(&state.root);
     let answered = tokio::task::spawn_blocking(move || {
-        root.pose.models.cancel_download();
-        root.pose.models.files(root.system.body_tracking().model)
+        root.cameras.pose.models.cancel_download();
+        root.cameras
+            .pose
+            .models
+            .files(root.system.body_tracking().model)
     })
     .await;
     match answered {

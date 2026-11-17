@@ -33,7 +33,7 @@ async fn settle(state: &Arc<WebState>) -> BodyTrackingModels {
 async fn the_models_download_only_when_posted_and_stop_when_deleted() {
     let (state, _writer, _dir) = test_state();
     let state = Arc::new(state);
-    let models_dir = state.root.pose.models.dir();
+    let models_dir = state.root.cameras.pose.models.dir();
     // Missing, nothing downloading, nothing written.
     let m = get(&state).await;
     assert_eq!(m.state, ModelFilesState::Missing);

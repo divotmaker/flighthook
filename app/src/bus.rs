@@ -191,6 +191,52 @@ pub enum LocalEvent {
     ActorGone { actor: String },
 }
 
+/// A camera's event as the app's local event: the one place the cameras'
+/// events are mapped.
+pub fn camera_event(event: flighthook_cameras::Event) -> LocalEvent {
+    use flighthook_cameras::Event;
+    match event {
+        Event::Status { status, telemetry } => LocalEvent::CardStatus { status, telemetry },
+        Event::Alert(message) => LocalEvent::Alert {
+            severity: Severity::Warn,
+            message,
+        },
+        Event::Video {
+            keys,
+            position,
+            duration_ms,
+            fps,
+            trigger_offset_ms,
+            impact_offset_ms,
+            complete,
+            dropped,
+        } => LocalEvent::ShotVideo {
+            keys,
+            position,
+            duration_ms,
+            fps,
+            trigger_offset_ms,
+            impact_offset_ms,
+            complete,
+            dropped,
+        },
+        Event::VideoRemoved { keys } => LocalEvent::ShotVideoRemoved { keys },
+        Event::Pose { keys, rotation } => LocalEvent::ShotPose { keys, rotation },
+        Event::Swing { keys } => LocalEvent::ShotSwing { keys },
+    }
+}
+
+/// Camera `camera`'s events straight onto the bus `tx`, never muted: a
+/// clip's body tracking is announced even when its camera has been
+/// restarted since.
+pub fn camera_raw(tx: &broadcast::Sender<BusMsg>, camera: &str) -> flighthook_cameras::Out {
+    let tx = tx.clone();
+    let camera = camera.to_owned();
+    std::sync::Arc::new(move |event| {
+        let _ = tx.send(BusMsg::local(camera.clone(), camera_event(event)));
+    })
+}
+
 // ---------------------------------------------------------------------------
 // PollError
 // ---------------------------------------------------------------------------
