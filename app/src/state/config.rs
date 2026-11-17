@@ -3263,7 +3263,7 @@ name = "Clubs"
         assert_eq!(c.square["0"].driver.dot_bottom_to_face_center_mm.len(), 2);
         assert_eq!(c.mock_monitor["0"].name, "Mock");
         assert_eq!(
-            c.openconnect_server["0"].bind.as_deref(),
+            c.openconnect_server["0"].driver.bind.as_deref(),
             Some("0.0.0.0:921")
         );
         assert_eq!(c.openconnect_client["0"].name, "GSPro");

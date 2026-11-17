@@ -1380,6 +1380,7 @@ fn the_generic_openconnect_server_edits_its_bind_address() {
     assert!(enabled(&marks, &format!("save:{id}")));
     let bind = |app: &FlighthookApp| {
         app.settings.build_actor_request(id).openconnect_server["0"]
+            .driver
             .bind
             .clone()
     };
@@ -1569,7 +1570,9 @@ fn a_saved_openconnect_server_shows_its_bind_on_the_settings_side() {
             name: "Range Bridge".into(),
             enabled: true,
             actor_id: None,
-            bind: Some("0.0.0.0:9921".into()),
+            driver: flighthook::OpenConnectServerConfig {
+                bind: Some("0.0.0.0:9921".into()),
+            },
             impact_lead_s: None,
         },
     );

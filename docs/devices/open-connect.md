@@ -117,7 +117,7 @@ flighthook, round and round. flighthook refuses that connection. The server
 raises an error alert in the Log, "Refused Open Connect Client "<name>" from
 <address>: it is this flighthook's own client, which would loop shots
 back…". The client's card and an error banner say "Refused by this
-flighthook's own Open Connect Server "<name>": this address points at it…",
+flighthook's own Open Connect Server on <address>: this address points at it…",
 and the card stays at CONNECTING. Fix the client's address; the error
 clears once it connects elsewhere.
 

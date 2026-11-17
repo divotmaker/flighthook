@@ -9,7 +9,7 @@ pub mod exputt;
 pub mod flight_model;
 pub mod mevo;
 pub mod mock;
-pub mod openconnect;
+pub mod openconnect_server;
 pub mod outputs;
 pub mod provenance;
 pub mod pureplay_accessory;
@@ -235,20 +235,13 @@ pub fn resolve_actors(config: &FlighthookConfig) -> Vec<ResolvedActor> {
 
     // Open Connect servers (launch monitor software that sends Open Connect)
     for (index, section) in &config.openconnect_server {
-        let id = global_id("openconnect_server", index);
-        let bind_str = section.bind.as_deref().unwrap_or("0.0.0.0:921");
-        match bind_str.parse::<SocketAddr>() {
-            Ok(bind) => {
-                actors.push(ResolvedActor {
-                    id,
-                    name: section.name.clone(),
-                    actor: Box::new(openconnect::OpenConnectServerActor { bind }),
-                });
-            }
-            Err(e) => {
-                tracing::warn!("device '{id}': invalid bind address '{bind_str}': {e}");
-            }
-        }
+        actors.push(ResolvedActor {
+            id: global_id("openconnect_server", index),
+            name: section.name.clone(),
+            actor: Box::new(openconnect_server::OpenConnectServerActor::new(
+                section.clone(),
+            )),
+        });
     }
 
     // Open Connect clients (GSPro, Pureplay, Muni Golf, ...)
@@ -650,7 +643,7 @@ mod tests {
                 flighthook::OpenConnectServerSection {
                     name: (*name).to_owned(),
                     enabled: true,
-                    bind: None,
+                    driver: flighthook::OpenConnectServerConfig::default(),
                     impact_lead_s: None,
                     actor_id: None,
                 },

@@ -24,13 +24,13 @@ pub(crate) fn clients() -> &'static LocalClients {
 /// The actor ID of this process's own Open Connect client whose connection
 /// comes from `peer`, if it is one.
 #[must_use]
-pub fn client_at(peer: SocketAddr) -> Option<String> {
+pub(crate) fn client_at(peer: SocketAddr) -> Option<String> {
     CLIENTS.client_at(peer)
 }
 
 /// Tell this process's own client connected from `peer` that its
 /// connection is refused, and why.
-pub fn refuse(peer: SocketAddr, reason: &str) {
+pub(crate) fn refuse(peer: SocketAddr, reason: &str) {
     CLIENTS.refuse(peer, reason);
 }
 

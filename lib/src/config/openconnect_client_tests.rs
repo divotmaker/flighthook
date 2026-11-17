@@ -141,7 +141,9 @@ fn every_field() -> FlighthookConfig {
             actor_id: None,
             name: "Range Bridge".into(),
             enabled: true,
-            bind: Some("0.0.0.0:921".into()),
+            driver: OpenConnectServerConfig {
+                bind: Some("0.0.0.0:921".into()),
+            },
             impact_lead_s: None,
         }),
         openconnect_client: one(OpenConnectClientSection {

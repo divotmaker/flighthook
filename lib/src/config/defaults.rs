@@ -125,7 +125,9 @@ impl Default for OpenConnectServerSection {
             actor_id: None,
             name: "Open Connect Server".into(),
             enabled: true,
-            bind: Some("0.0.0.0:921".into()),
+            driver: OpenConnectServerConfig {
+                bind: Some("0.0.0.0:921".into()),
+            },
             impact_lead_s: None,
         }
     }

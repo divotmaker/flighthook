@@ -4,9 +4,8 @@
 //!
 //! The driver ([`Client`], feature `driver`) connects to the simulator, and
 //! each [`Session`] runs one connection. The connection is registered as
-//! this process's own ([`local`](crate::local)) before anything is sent; the
-//! connect then waits [`REFUSAL_VERDICT`], and a refusal by this process's
-//! own Open Connect server (the client points at it, which would loop shots
+//! this process's own before anything is sent; the connect then waits
+//! [`REFUSAL_VERDICT`], and a refusal by this process's own Open Connect server (the client points at it, which would loop shots
 //! back) fails the connect with the server's reason. The session then:
 //!
 //! - sends each finished shot as one shot message. Its `ShotNumber` is the
@@ -71,8 +70,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     /// The actor id the connection is registered under as this process's
-    /// own ([`local::client_at`](crate::local::client_at)); the host puts it
-    /// in. Not a setting.
+    /// own; the host puts it in. Not a setting.
     #[serde(skip)]
     pub actor: String,
 }

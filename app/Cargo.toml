@@ -99,6 +99,9 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+# The Open Connect integration's test support: a look at the registry of this
+# process's own clients.
+flighthook-openconnect = { path = "../integrations/openconnect", features = ["driver", "testing"] }
 # ironsight's test support: a scripted device and recorded result frames.
 ironsight = { version = "0.8.0", features = ["driver", "testing"] }
 # tenover's test support: GFDI frame builders with synthetic identity.

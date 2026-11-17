@@ -1627,8 +1627,8 @@ How long the old connection is given to close depends on the device: up to
 cannot be cut short), 1 s for a Trackball. A Mevo/Xi, an Open Connect client,
 a mock or a Trackball still
 closing after that is replaced anyway (it holds nothing the new one needs and
-closes itself); so is an Open Connect server once its port is free. A Garmin
-R10, a Square Golf or an ExPutt is not: the request answers `202`, the
+closes itself). A Garmin R10, a Square Golf, an ExPutt or an Open Connect
+server (it holds its listen port) is not: the request answers `202`, the
 actor's `error` telemetry and an Error alert say the previous connection has
 not closed yet, and the actor starts again by itself once it has. Its `error` is
 cleared then, and a `config_outcome` without `request_id` lists it in

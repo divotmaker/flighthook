@@ -1143,6 +1143,11 @@ impl Rig {
         let xi = FsDevice::serve(true);
         let gspro = TcpListener::bind("127.0.0.1:0").expect("bind");
         let gspro_addr = gspro.local_addr().expect("addr");
+        // The Open Connect server's address: a free port, found before it
+        // binds.
+        let oc_addr = TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free port");
         let range = match output {
             Output::GsPro => "7ft",
             Output::Pureplay => "8ft",
@@ -1181,7 +1186,7 @@ impl Rig {
             );
             c.openconnect_server.insert(
                 "0".into(),
-                section(serde_json::json!({"name": "Bay LM", "bind": "127.0.0.1:0"})),
+                section(serde_json::json!({"name": "Bay LM", "bind": oc_addr.to_string()})),
             );
             let mut out = routing.clone();
             out["address"] = serde_json::Value::String(gspro_addr.to_string());
@@ -1272,15 +1277,15 @@ impl Rig {
         for id in ["mevo.0", "mevo.1", "r10.0", "square.0"] {
             rig_seen.ready(id);
         }
-        let oc_addr = rig_seen.until(|m| {
+        rig_seen.until(|m| {
             if m.actor != "openconnect_server.0" {
                 return None;
             }
             match &m.event {
                 Event::Status { telemetry, .. } => telemetry
-                    .get("bind")
-                    .and_then(|b| b.parse::<SocketAddr>().ok())
-                    .filter(|a| a.port() != 0),
+                    .get("phase")
+                    .filter(|p| *p == "listening")
+                    .map(|_| ()),
                 _ => None,
             }
         });

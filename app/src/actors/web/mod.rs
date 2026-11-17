@@ -786,11 +786,6 @@ async fn shot_context(
     {
         scrub.push(id.clone());
     }
-    if let Some(actor) = state.actors.read().await.get(actor)
-        && let Some(v) = actor.telemetry.get("peer")
-    {
-        scrub.push(v.clone());
-    }
     normalize_scrub(&mut scrub);
 
     ExportContext {

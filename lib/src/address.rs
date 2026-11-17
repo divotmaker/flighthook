@@ -173,7 +173,7 @@ impl FlighthookConfig {
             &mut out,
             "openconnect_server",
             &self.openconnect_server,
-            |s| (s.enabled, s.bind.as_deref()),
+            |s| (s.enabled, s.driver.bind.as_deref()),
         );
         push(
             &mut out,
@@ -307,6 +307,7 @@ impl FlighthookConfig {
 mod tests {
     use super::*;
     use crate::MevoConfig;
+    use crate::OpenConnectServerConfig;
     use crate::config::{
         FlighthookConfig, MevoSection, OpenConnectClientSection, OpenConnectServerSection,
     };
@@ -333,7 +334,9 @@ mod tests {
             actor_id: None,
             name: "Server".into(),
             enabled,
-            bind: Some(bind.into()),
+            driver: OpenConnectServerConfig {
+                bind: Some(bind.into()),
+            },
             impact_lead_s: None,
         }
     }
@@ -424,13 +427,13 @@ mod tests {
             None,
             "another port"
         );
-        c.openconnect_server.get_mut("0").unwrap().bind = Some("127.0.0.2:921".into());
+        c.openconnect_server.get_mut("0").unwrap().driver.bind = Some("127.0.0.2:921".into());
         assert_eq!(
             c.address_clash("openconnect_server.1"),
             None,
             "disjoint hosts"
         );
-        c.openconnect_server.get_mut("0").unwrap().bind = Some("127.0.0.1:921".into());
+        c.openconnect_server.get_mut("0").unwrap().driver.bind = Some("127.0.0.1:921".into());
         assert!(
             c.address_clash("openconnect_server.1").is_some(),
             "same host"

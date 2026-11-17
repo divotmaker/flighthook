@@ -5,6 +5,7 @@ use std::fmt;
 
 use allsquare::config::Config as SquareConfig;
 use flighthook_openconnect::client::Config as OpenConnectClientConfig;
+use flighthook_openconnect::server::Config as OpenConnectServerConfig;
 use flighthook_pureplay::connect::Config as PureplayConfig;
 use flightrelay::config::DriverConfig;
 use flightrelay::mock::MockConfig;

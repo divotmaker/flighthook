@@ -38,6 +38,11 @@ pub use allsquare::config::Config as SquareConfig;
 pub use flighthook_openconnect::client::{
     Config as OpenConnectClientConfig, DEFAULT_ADDRESS as OPENCONNECT_DEFAULT_ADDRESS,
 };
+/// The Open Connect server's settings, and the address it listens on when
+/// none is set.
+pub use flighthook_openconnect::server::{
+    Config as OpenConnectServerConfig, DEFAULT_BIND as OPENCONNECT_DEFAULT_BIND,
+};
 pub use flighthook_pureplay::connect::{
     Config as PureplayConfig, DEFAULT_ADDRESS as PUREPLAY_DEFAULT_ADDRESS,
 };

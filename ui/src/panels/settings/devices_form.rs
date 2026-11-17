@@ -561,7 +561,7 @@ impl DeviceFormEntry {
             monitor_type: "openconnect_server".into(),
             name: s.name.clone(),
             enabled: s.enabled,
-            address: s.bind.clone().unwrap_or_default(),
+            address: s.driver.bind.clone().unwrap_or_default(),
             ball_type: 0,
             tee_height_val: "1.5".into(),
             tee_height_unit: "inches".into(),

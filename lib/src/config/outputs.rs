@@ -27,8 +27,10 @@ pub struct OpenConnectServerSection {
     /// with the card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
-    /// Bind address. Defaults to `0.0.0.0:921`.
-    pub bind: Option<String>,
+    /// The Open Connect server's settings: `bind`, the address to listen
+    /// on (`ip:port`, default `0.0.0.0:921`).
+    #[serde(flatten)]
+    pub driver: OpenConnectServerConfig,
     /// Seconds before the shot's report that the swing's impact happened, for
     /// the cameras' clips (beta), 0 to [`MAX_IMPACT_LEAD_S`]. Absent uses the
     /// device's default ([`impact_lead_default_s`]).
@@ -100,6 +102,19 @@ pub fn routed_to_simulator(config: &FlighthookConfig, routed: Option<&str>) -> b
             .unwrap_or(id)
             .starts_with("pureplay_accessory.")
     })
+}
+
+impl DeviceSection for OpenConnectServerSection {
+    type Driver = OpenConnectServerConfig;
+    const KIND: &'static str = "openconnect_server";
+
+    fn driver(&self) -> &OpenConnectServerConfig {
+        &self.driver
+    }
+
+    fn sections(config: &FlighthookConfig) -> &std::collections::HashMap<String, Self> {
+        &config.openconnect_server
+    }
 }
 
 impl OpenConnectClientSection {

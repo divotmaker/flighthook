@@ -1820,7 +1820,9 @@ fn an_open_connect_client_reconnects_and_is_not_refused_as_its_old_self() {
                 actor_id: None,
                 name: "Range Bridge".into(),
                 enabled: true,
-                bind: Some("127.0.0.1:0".into()),
+                driver: flighthook::OpenConnectServerConfig {
+                    bind: Some("127.0.0.1:0".into()),
+                },
                 impact_lead_s: None,
             },
         );
@@ -1830,7 +1832,7 @@ fn an_open_connect_client_reconnects_and_is_not_refused_as_its_old_self() {
     let actor = state.actor_of_card(id).expect("an actor id");
     let first = sim.peers()[0];
     assert_eq!(
-        flighthook_openconnect::local::client_at(first).as_deref(),
+        flighthook_openconnect::testing::client_at(first).as_deref(),
         Some(actor.as_str()),
         "registered as this process's client"
     );
@@ -1838,7 +1840,7 @@ fn an_open_connect_client_reconnects_and_is_not_refused_as_its_old_self() {
     let (restarted, _) = reconnect_through_command(&state, &bus_tx, &mut rx, id);
     assert_eq!(restarted, [id]);
     assert_eq!(
-        flighthook_openconnect::local::client_at(first),
+        flighthook_openconnect::testing::client_at(first),
         None,
         "the old connection's registration is released"
     );
@@ -1853,7 +1855,7 @@ fn an_open_connect_client_reconnects_and_is_not_refused_as_its_old_self() {
     let peers = sim.peers();
     assert_eq!(peers.len(), 2, "{peers:?}");
     assert_eq!(
-        flighthook_openconnect::local::client_at(peers[1]).as_deref(),
+        flighthook_openconnect::testing::client_at(peers[1]).as_deref(),
         Some(actor.as_str())
     );
     stop_all(&state);
@@ -3082,7 +3084,7 @@ fn an_open_connect_client_on_a_silent_simulator_stops_at_once_and_unregisters() 
     until(&mut rx, "connected", |m| connected(m, id));
     let peer = sim.peers()[0];
     stop_exits(&state, id);
-    assert_eq!(flighthook_openconnect::local::client_at(peer), None);
+    assert_eq!(flighthook_openconnect::testing::client_at(peer), None);
 }
 
 #[test]
@@ -3123,7 +3125,9 @@ fn an_open_connect_server_with_a_silent_monitor_stops_at_once_and_frees_its_port
                 actor_id: None,
                 name: "Range Bridge".into(),
                 enabled: true,
-                bind: Some(bind.to_string()),
+                driver: flighthook::OpenConnectServerConfig {
+                    bind: Some(bind.to_string()),
+                },
                 impact_lead_s: None,
             },
         );
@@ -3135,7 +3139,12 @@ fn an_open_connect_server_with_a_silent_monitor_stops_at_once_and_frees_its_port
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    until(&mut rx, "monitor connected", |m| connected(m, id));
+    // The server has taken the monitor and waits for its first message.
+    until(&mut rx, "monitor accepted", |m| {
+        m.actor == id
+            && matches!(&m.event, LocalEvent::CardStatus { telemetry, .. }
+                if telemetry.get("phase").is_some_and(|p| p == "handshaking"))
+    });
     stop_exits(&state, id);
     monitor
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -3155,7 +3164,9 @@ fn an_open_connect_server_waiting_to_bind_stops_at_once() {
                 actor_id: None,
                 name: "Range Bridge".into(),
                 enabled: true,
-                bind: Some(bind.to_string()),
+                driver: flighthook::OpenConnectServerConfig {
+                    bind: Some(bind.to_string()),
+                },
                 impact_lead_s: None,
             },
         );
@@ -3229,8 +3240,7 @@ impl Actor for HeldPort {
     }
 
     fn replaceable_while_stopping(&self) -> bool {
-        crate::actors::openconnect::OpenConnectServerActor { bind: self.bind }
-            .replaceable_while_stopping()
+        std::net::TcpListener::bind(self.bind).is_ok()
     }
 
     fn reconfigure(&self, _state: &Arc<SystemState>, _sender: &BusSender) -> ReconfigureOutcome {
@@ -3259,7 +3269,9 @@ fn with_held_port(
                 actor_id: None,
                 name: "Range Bridge".into(),
                 enabled: true,
-                bind: Some(bind.to_string()),
+                driver: flighthook::OpenConnectServerConfig {
+                    bind: Some(bind.to_string()),
+                },
                 impact_lead_s: None,
             },
         );

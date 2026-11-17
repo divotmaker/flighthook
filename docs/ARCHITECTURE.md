@@ -1093,16 +1093,17 @@ failed attempt, capped at 15s (3s for the Open Connect client and Pureplay
 Connect, a loopback/LAN TCP connect). The Open Connect client restarts at 1s
 after a connection that lasted at least 10s; one that drops sooner counts as
 a failed attempt, so a link that keeps connecting and dropping still backs
-off to the cap. The Open Connect server restarts at 1s after a successful
-bind. A card on a driver (the FlightScope, the R10, the Square Golf, the
-ExPutt, the trackball, the mock, the Open Connect client, Pureplay Connect)
-waits the delay its driver asks for: the FlightScope, the R10, the Square
-Golf and the trackball use the SDK's `Backoff`, 1 s per failed attempt up to
+off to the cap. A card on a driver (the FlightScope, the R10, the Square Golf,
+the ExPutt, the trackball, the mock, the Open Connect client and server,
+Pureplay Connect) waits the delay its driver asks for. The Open Connect
+server's next listen follows a monitor that left at once; a failed bind
+raises an Error alert and waits the SDK's `Backoff`, 1 s growing to 15 s.
+The FlightScope, the R10, the Square Golf and the trackball use the same
+`Backoff`, 1 s per failed attempt up to
 15 s, back to 1 s after a session of at least 10 s; the ExPutt adjusts the
 same backoff (below). The trackball's driver gives up off
-Linux (the card ends Disconnected with the error). Every actor polls its shutdown flag during the backoff wait
-(the Open Connect server during its bind retry delay too), so stopping one
-never waits out the delay. The TCP connect of the FlightScope driver, the
+Linux (the card ends Disconnected with the error). Every actor polls its shutdown flag during the backoff wait,
+so stopping one never waits out the delay. The TCP connect of the FlightScope driver, the
 Open Connect client and Pureplay Connect (up to 5 s, the SDK's
 `connect_tcp`) gives up at once on a stop. The ExPutt's
 session start cannot be cut short: the TCP connect and the device's greeting
@@ -1142,11 +1143,10 @@ actor and the command waits for it on a helper thread (see
    decides: a Mevo/Xi, an Open Connect client, the mock actors and the web
    server hold nothing a new instance needs (a TCP client, nothing, or a port
    the new one retries), nor does a trackball (it never grabs the input, and
-   several programs can read one input), and an Open Connect server is replaceable
-   once its listen port binds again. A replaceable one is retired: taken out of the
+   several programs can read one input). A replaceable one is retired: taken out of the
    registry, its bus sender muted so nothing it still sends speaks for its
-   successor, its thread left to end. An R10, Square Golf, ExPutt or camera
-   is not: it is retired the same way and watched
+   successor, its thread left to end. An R10, Square Golf, ExPutt, Open
+   Connect server (it holds its listen port) or camera is not: it is retired the same way and watched
    (`SystemState::close_in_background`: a `closing:<id>` thread joins it),
    nothing is started, and the card's `error` telemetry and an Error alert
    say "The previous connection has not closed yet. It reconnects when it
@@ -1239,7 +1239,7 @@ What a stop does, by actor:
 | FlightScope (Mevo+, Gen2, Xi) | always: the TCP connect gives up at once on a stop, the handshake checks for one between passes, the card between session steps (5 ms apart while the device is quiet); closing sends nothing | the driver's `STOP_WAIT` (3 s); the driver is not exclusive, so an old instance still closing is replaced beside it (a second socket to the device can overlap the old one until it closes) |
 | Open Connect client | always: the TCP connect and the 1 s refusal wait give up at once on a stop, the card between session steps (5 ms apart while the connection is quiet; reads and writes do not block); its local-client registration ends with the session | the driver's `STOP_WAIT` (3 s) |
 | Pureplay | always: the TCP connect gives up at once on a stop, the card between session steps (5 ms apart while the link is quiet; reads and writes do not block); closing sends nothing | the driver's `STOP_WAIT` (3 s) |
-| Open Connect server | always: 100 ms accepts and reads, 2s write timeout, the bind retry wait polls the flag; the listen port is free once it ends | a write in progress (2s) |
+| Open Connect server | always: the accept loop, the wait for a peer's first message and the card between session steps (5 ms apart while the monitor is quiet; reads and writes do not block); the listen port is free once it ends | the driver's `STOP_WAIT` (3 s); the driver is exclusive, so a new instance waits for the old one to let go of the port |
 | Square Golf | always: allsquare's scan, connect and identity read run on a helper thread and see the stop within about a second, and a connection that comes up after a stop is disconnected; a session disarms the device, then disconnects it, with BlueZ and with btleplug | the driver's `STOP_WAIT` (6 s: a stopped connect lets go within 5 s, every BlueZ call gives up after 2.5 s; close is a disarm given up after 2 s (btleplug) or 2.5 s (BlueZ) and a disconnect of at most 3 s or 2.5 s) |
 | Garmin R10 | always: tenover's scan and connect check the stop at least every 100 ms (the connect runs on a helper thread); a connect that comes up after a stop is let go | the driver's `STOP_WAIT` (6 s: one D-Bus call of at most 3 s and a disconnect bounded the same way) |
 | ExPutt | discovering (250 ms slices), measuring (checked between session steps, 5 ms apart while the device is quiet; the session closes at once) or waiting to reconnect | the driver's `STOP_WAIT` (18 s: a session start of up to 17 s, which cannot be cut short: connect and greeting, two handshake replies, mat search; then the close) |
@@ -1445,39 +1445,52 @@ card's `error` row (the host shows a failed connect's reason until a
 connection succeeds) and the log, with no alert: a simulator not running is
 normal when another one is in use.
 
-**Open Connect server (input)** is a launch monitor actor with source `measured`
-(another vendor's companion software counts as measured). It publishes
-`shot.*` from the Open Connect shots, and its own flight with `basis: modeled`
-unless it knows the values were tracked. The player information it sends back
-in its `201` (hand, club) comes from flighthook's `golfer.turn`; because the turn
-always has a hand, `Handed` is always sent (`RH` until a hand is chosen). It does
-not re-assert.
+**Open Connect server (input)** is a launch monitor card on the driver host:
+the workspace crate `flighthook-openconnect` (`integrations/openconnect/`),
+module `server`, a flightrelay driver (`server::Server`, feature `driver`)
+whose settings (`server::Config`: `bind`, feature `config`, which `lib` and the
+WASM UI build) `OpenConnectServerSection` flattens next to its own fields, so
+the config keys are unchanged. The card is a `DriverActor` with the hooks in
+`actors/openconnect_server.rs` (`OpenConnectServerHooks`: the shot source
+`measured`, since another vendor's companion software counts as measured, and
+the naming of a refused client). The driver keeps its listener across
+sessions; a connect binds once, accepts, and waits for the peer's first
+message, whose `DeviceID` is the session's model (the card's `device_info`
+row reads `<DeviceID> (<peer address>)`; the peer's address is the identity's
+`device`, so the shot capture scrubs it on export). A monitor that leaves ends
+the session at once with no alert, and the card listens again on the same
+socket. A change of `bind` restarts the card. The card publishes `shot.*` from
+the Open Connect shots, and its own flight with `basis: modeled` unless it
+knows the values were tracked. The player information it sends back in its
+`201` (hand, club) comes from flighthook's `golfer.turn`, which reaches the
+session as its hints; because the turn always has a hand, `Handed` is always
+sent (`RH` until a hand is chosen). It does not re-assert.
 
 **Open Connect self-loop guard**: an Open Connect client pointed at this
 process's own Open Connect server (e.g. client `127.0.0.1:921`, server bind
 `0.0.0.0:921`, GSPro closed) would send every shot client -> server -> bus ->
-client, forever. The crate's `flighthook_openconnect::local` holds the local
-socket address of every connected Open Connect client of the process (one
-static registry), registered by the client's connect right after the TCP
-connect and before anything is sent, under the card's actor id, and removed
-when the session ends. The server looks up each peer it accepts
-(`local::client_at`), comparing IP and port with IPv4-mapped IPv6 read as IPv4
-and every loopback address as `127.0.0.1`. It looks the peer up again after
-each read, before handling it, so the connection's data never reaches the bus
-even if the client registered a moment after the accept. The server reports
-`Connected` only once the first read (up to 100 ms) has passed that look-up
-too. A match is closed at once, unread, and refused (`local::refuse`):
+client, forever. The crate holds the local socket address of every connected
+Open Connect client of the process (one static registry, private to the
+crate), registered by the client's connect right after the TCP connect and
+before anything is sent, under the card's actor id, and removed when the
+session ends. The server looks up each peer it accepts, comparing IP and port
+with IPv4-mapped IPv6 read as IPv4 and every loopback address as `127.0.0.1`.
+It looks the peer up again after each read, before handling it, so the
+connection's data never reaches the bus even if the client registered a moment
+after the accept; the connect returns a session only once the first message has
+passed that look-up too. A match is closed at once, unread, and refused:
 
 - the server raises one `Error` alert per burst of that client's reconnect
   attempts (refusals less than 30 s apart are one burst), shown in the Log
   after the server's name: "Refused Open Connect Client "<client name>" from
   <peer>: it is this flighthook's own client, which would loop shots back.
-  Point it at the simulator's port.";
+  Point it at the simulator's port." The driver names the client by its actor
+  id, and the card's hook replaces it with the name its card shows;
 - the client's connect waits 1 s after the TCP connect before it succeeds
   (`client::REFUSAL_VERDICT`) and fails with the server's reason when it was
   refused, so a refused connection never shows as connected. The card shows
   the reason as its `error` row, after the client's name in the banner:
-  "Refused by this flighthook's own Open Connect Server "<server name>": this
+  "Refused by this flighthook's own Open Connect Server on <bind address>: this
   address points at it, which would loop shots back. Use the simulator's port
   instead." It keeps retrying with its usual backoff; the row goes when a
   connection succeeds.

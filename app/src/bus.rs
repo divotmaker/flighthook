@@ -408,17 +408,6 @@ impl BusSender {
         }
     }
 
-    /// Raise an alert: a `bus.alert` from a card that is an FRP actor, else
-    /// a local alert of the card.
-    pub fn alert(&self, severity: Severity, message: impl Into<String>) {
-        let message = message.into();
-        if self.frp_id.is_some() {
-            self.frp(flightrelay::BusAlert::new(severity, message));
-        } else {
-            self.local(LocalEvent::Alert { severity, message });
-        }
-    }
-
     /// Send an FRP message body as this card's actor with an internal
     /// `cause` (the session's turn).
     pub fn frp_caused(&self, body: impl Into<FrpBody>, cause: Option<String>) {

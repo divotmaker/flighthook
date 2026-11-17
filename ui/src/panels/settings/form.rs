@@ -1064,10 +1064,12 @@ pub(super) fn apply_actor_to_config(
                             actor_id: actor_id.clone(),
                             name: dev.name.clone(),
                             enabled: dev.enabled,
-                            bind: if dev.address.is_empty() {
-                                None
-                            } else {
-                                Some(dev.address.clone())
+                            driver: flighthook::OpenConnectServerConfig {
+                                bind: if dev.address.is_empty() {
+                                    None
+                                } else {
+                                    Some(dev.address.clone())
+                                },
                             },
                             impact_lead_s: impact_lead_value(&dev.impact_lead).flatten(),
                         },
