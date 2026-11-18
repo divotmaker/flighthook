@@ -46,7 +46,7 @@ ClubData ClubData(ClubData { shot_id: 9, valid: 57, club_head_speed_ms: 44.0, sm
 ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
 # [simulation] mode = On
 == 13 Auto-chip 3 yd (Full)
-BallData BallData(BallData { shot_id: 10, valid: 55, ball_speed_ms: 4.892239, vla: 45.0, hla: 0.0, total_spin_rpm: 0.0, back_spin_rpm: 3283.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+BallData BallData(BallData { shot_id: 10, valid: 55, ball_speed_ms: 4.0966535, vla: 45.0, hla: 0.0, total_spin_rpm: 0.0, back_spin_rpm: 2749.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
 ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
 == 14 simulator: RH, SW (Chipping)
 ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
@@ -78,7 +78,7 @@ ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 2
 == 21 R10 full shot (Chipping: not routed)
 ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
 == 22 Auto-chip 1 yd (Chipping)
-BallData BallData(BallData { shot_id: 16, valid: 55, ball_speed_ms: 2.7521708, vla: 45.0, hla: 0.0, total_spin_rpm: 0.0, back_spin_rpm: 1847.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+BallData BallData(BallData { shot_id: 16, valid: 55, ball_speed_ms: 2.2868063, vla: 45.0, hla: 0.0, total_spin_rpm: 0.0, back_spin_rpm: 1535.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
 ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
 == 23 header picks Full (club stays SW)
 ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
@@ -100,7 +100,7 @@ ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 2
 == 30 Omni putt (Putting: not routed)
 ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
 == 31 Auto-chip 5 yd (Putting)
-BallData BallData(BallData { shot_id: 19, valid: 55, ball_speed_ms: 6.428353, vla: 45.0, hla: 0.0, total_spin_rpm: 0.0, back_spin_rpm: 4314.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
+BallData BallData(BallData { shot_id: 19, valid: 55, ball_speed_ms: 5.44941, vla: 45.0, hla: 0.0, total_spin_rpm: 0.0, back_spin_rpm: 3657.0, side_spin_rpm: 0.0, spin_axis_deg: 0.0 })
 ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }
 == 32 simulator: LH, 7I (Full)
 ping-reply Heartbeat Heartbeat { connection_state: 2, ready_state: 1, battery: 255 }

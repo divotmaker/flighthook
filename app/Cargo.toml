@@ -54,7 +54,7 @@ dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 # Ball-flight physics for simulated (derived) shot values.
-dimple = "0.0.8"
+dimple = "0.0.9"
 # The ExPutt RG's device driver (`driver`: `threeputt::driver::ExPutt`).
 threeputt = { version = "0.3.0", features = ["driver"] }
 # A camera's video mode (`stance::FormatRequest`) is checked when the config

@@ -1039,9 +1039,9 @@ dependencies = [
 
 [[package]]
 name = "dimple"
-version = "0.0.8"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07a658188e95f41ff0f1d3d40a3440d64594f3ad18a230750bff8458ba436b3f"
+checksum = "5d01bac98f3c1e4364d35e3c6cca460debe27d9b9ea5bbd2b1e9e31f7f735f1f"
 
 [[package]]
 name = "dirs"

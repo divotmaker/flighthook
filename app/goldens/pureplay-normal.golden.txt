@@ -46,7 +46,7 @@ ClubData 50 4C 01 00 11 26 00 09 00 00 00 39 00 00 00 30 42 00 00 00 00 00 00 00
 ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
 # [simulation] mode = On
 == 13 Auto-chip 3 yd (Full)
-BallData 50 4C 01 00 10 22 00 0A 00 00 00 37 00 39 8D 9C 40 00 00 34 42 00 00 00 00 00 00 00 00 00 30 4D 45 00 00 00 00 00 00 00 00 7B 3B 19 10
+BallData 50 4C 01 00 10 22 00 0A 00 00 00 37 00 C9 17 83 40 00 00 34 42 00 00 00 00 00 00 00 00 00 D0 2B 45 00 00 00 00 00 00 00 00 E9 4D FF C0
 ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
 == 14 simulator: RH, SW (Chipping)
 ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
@@ -78,7 +78,7 @@ ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
 == 21 R10 full shot (Chipping: not routed)
 ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
 == 22 Auto-chip 1 yd (Chipping)
-BallData 50 4C 01 00 10 22 00 10 00 00 00 37 00 91 23 30 40 00 00 34 42 00 00 00 00 00 00 00 00 00 E0 E6 44 00 00 00 00 00 00 00 00 D6 61 2D 26
+BallData 50 4C 01 00 10 22 00 10 00 00 00 37 00 09 5B 12 40 00 00 34 42 00 00 00 00 00 00 00 00 00 E0 BF 44 00 00 00 00 00 00 00 00 5C E2 3D EA
 ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
 == 23 header picks Full (club stays SW)
 ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
@@ -100,7 +100,7 @@ ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
 == 30 Omni putt (Putting: not routed)
 ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
 == 31 Auto-chip 5 yd (Putting)
-BallData 50 4C 01 00 10 22 00 13 00 00 00 37 00 11 B5 CD 40 00 00 34 42 00 00 00 00 00 00 00 00 00 D0 86 45 00 00 00 00 00 00 00 00 B6 1F FD 45
+BallData 50 4C 01 00 10 22 00 13 00 00 00 37 00 91 61 AE 40 00 00 34 42 00 00 00 00 00 00 00 00 00 90 64 45 00 00 00 00 00 00 00 00 14 9A 76 98
 ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF
 == 32 simulator: LH, 7I (Full)
 ping-reply Heartbeat 50 4C 01 00 02 03 00 02 01 FF F7 6E 2A CF

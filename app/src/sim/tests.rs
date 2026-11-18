@@ -999,7 +999,7 @@ fn measured_total_below_carry_runs_straight() {
 #[test]
 fn spin_back_against_a_measured_run_out_runs_straight() {
     // A high-spin wedge that checks up while the device says it ran out.
-    let mut b = ball(100.0, 30.0, 0.0, 11_000, 0);
+    let mut b = ball(100.0, 36.0, 0.0, 12_000, 0);
     let raw = raw_path(&b);
     let carry = sim_carry(&raw);
     assert!(
@@ -1549,12 +1549,12 @@ fn roll_live(sim: SimulationSection, live: Option<Mode>) -> f64 {
 #[test]
 fn putting_mode_rolls_a_ground_ball_on_the_green() {
     let putting = roll_live(cfg(), Some(Mode::Putting));
-    assert!((putting - 5.03).abs() < 0.01, "{putting}");
+    assert!((putting - 4.68).abs() < 0.01, "{putting}");
     assert_eq!(putting, roll_on(3.0, SimSurface::Green));
     // Any other mode, or none yet, rolls on the configured fairway.
     for live in [Some(Mode::Full), Some(Mode::Chipping), None] {
         let fairway = roll_live(cfg(), live);
-        assert!((fairway - 2.61).abs() < 0.01, "{live:?} {fairway}");
+        assert!((fairway - 2.84).abs() < 0.01, "{live:?} {fairway}");
         assert_eq!(fairway, roll_on(3.0, SimSurface::Fairway), "{live:?}");
     }
 }
@@ -1580,7 +1580,7 @@ fn a_configured_green_is_kept_in_putting_mode() {
         assert_eq!(putting, roll_live(sim, Some(Mode::Full)));
     }
     let firm = roll_on(3.0, SimSurface::FirmGreen);
-    assert!((firm - 5.37).abs() < 0.01, "{firm}");
+    assert!((firm - 4.82).abs() < 0.01, "{firm}");
 }
 
 #[test]
