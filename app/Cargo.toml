@@ -20,7 +20,7 @@ gui = ["dep:flighthook-ui", "dep:eframe", "dep:egui", "dep:image"]
 
 [dependencies]
 # The FlightScope device driver (`driver`: `ironsight::driver::Mevo`).
-ironsight = { version = "0.9.0", features = ["driver"] }
+ironsight = { version = "=0.9.1-rc1", features = ["driver"] }
 # The R10's device driver (`driver`: `tenover::driver::R10`).
 tenover = { version = "0.7.0", features = ["driver"] }
 flighthook = { path = "../lib", features = ["clap"] }
@@ -90,7 +90,7 @@ tungstenite = "0.29"
 # process's own clients.
 flighthook-openconnect = { path = "../integrations/openconnect", features = ["driver", "testing"] }
 # ironsight's test support: a scripted device and recorded result frames.
-ironsight = { version = "0.9.0", features = ["driver", "testing"] }
+ironsight = { version = "=0.9.1-rc1", features = ["driver", "testing"] }
 # tenover's test support: GFDI frame builders with synthetic identity.
 tenover = { version = "0.7.0", features = ["driver", "testing"] }
 # allsquare's test support: notification fixtures and encoders, and the

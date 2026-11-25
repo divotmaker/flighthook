@@ -19,7 +19,7 @@ clap = ["dep:clap"]
 flightrelay = { version = "0.7.0", features = ["mock"] }
 # The FlightScope driver's settings (`ironsight::config::Config`, the
 # `config` feature: no device stack, so the WASM UI builds it too).
-ironsight = { version = "0.9.0", default-features = false, features = ["config"] }
+ironsight = { version = "=0.9.1-rc1", default-features = false, features = ["config"] }
 # The R10 driver's settings (`tenover::config::Config`, the `config`
 # feature: no BLE stack, so the WASM UI builds it too).
 tenover = { version = "0.7.0", default-features = false, features = ["config"] }
