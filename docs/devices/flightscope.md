@@ -1,15 +1,15 @@
-# FlightScope Mevo+ / Mevo Gen2 / Xi
+# FlightScope Mevo+ / Mevo Gen2 / Xi / X2
 
-**Status: Supported** (Mevo+, Mevo Gen2, Xi) — decoded by
+**Status: Supported** (Mevo+, Mevo Gen2, Xi; X2 beta) — decoded by
 [ironsight](https://crates.io/crates/ironsight) over the device's binary TCP
 protocol on port 5100.
 
 Driver: [ironsight](https://github.com/divotmaker/ironsight)
 ([docs.rs](https://docs.rs/ironsight)).
 
-All three use the same `[mevo.N]` device. flighthook detects which one it is
-talking to when it connects. See [FlightScope Xi](#flightscope-xi) for
-how the Xi differs.
+All four use the same `[mevo.N]` device. flighthook detects which one it is
+talking to when it connects. See [FlightScope Xi](#flightscope-xi) and
+[FlightScope X2](#flightscope-x2-beta) for how they differ.
 
 Connect over the launch monitor's WiFi network. A Mevo+ or Mevo Gen2 reports
 its SSID during the handshake, and flighthook uses that as the FRP device
@@ -29,7 +29,7 @@ to 16.0° and -2.5° to 2.5°, Xi 8.5° to 11.5° and -1.5° to 1.5°.
 The card connects over TCP to `address` (`phase` `connecting`, given up after
 5 s), runs the handshake (`handshaking`) and configures the model it found
 (`configuring`), then reads Connected with "FlightScope Mevo+", "FlightScope
-Mevo Gen2" or "FlightScope Xi" and, once the device is armed, `measuring`. It starts in
+Mevo Gen2", "FlightScope Xi" or "FlightScope X2" and, once the device is armed, `measuring`. It starts in
 the detection mode in effect then, also after a reconnect, so a mode change
 made while the device was away is not lost. A mode change re-arms the device
 (`configuring`, not ready, then `measuring` and ready again), right away when
@@ -409,3 +409,17 @@ effect on a Mevo+ or Mevo Gen2, which report a single spin value.
 **Chips and pitches:** in Chipping (and Putting) mode flighthook sets the Xi
 to its **Pitching** shot type. To compare short shots with FS Golf, use its
 Pitching mode.
+
+## FlightScope X2 (beta)
+
+Connects through ironsight like the Mevo+; it has not yet run against a real
+X2. Feedback welcome on
+[ironsight issue #5](https://github.com/divotmaker/ironsight/issues/5).
+
+Add it as a normal `[mevo.N]` device; the X2 uses the same address and port
+(`192.168.2.1:5100`). flighthook recognizes it during the handshake and shows
+it as **FlightScope X2**. It takes the Mevo+'s settings and has no camera.
+Only `limited_flight` is tested on the X2. Ball speed, club speed, launch
+angles, total spin, attack angle, club path and swing plane match what FS
+Golf displays; on the driver, the spin axis and the flight numbers (carry,
+apex, flight time) are the device's own and can differ from FS Golf's.

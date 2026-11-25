@@ -37,6 +37,7 @@ card in Settings has its guide in the [docs index](docs/README.md).
 | [FlightScope Mevo+](docs/devices/flightscope.md)     | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
 | [FlightScope Mevo Gen2](docs/devices/flightscope.md) | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
 | [FlightScope Xi](docs/devices/flightscope.md)        | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Supported        |
+| [FlightScope X2](docs/devices/flightscope.md#flightscope-x2-beta) | TCP (binary, port 5100) | [ironsight](https://crates.io/crates/ironsight) | Beta |
 | [Square Golf Omni](docs/devices/square-golf.md)      | BLE (GATT)              | [allsquare](https://crates.io/crates/allsquare) | Supported        |
 | [Garmin R10](docs/devices/garmin-r10.md)             | BLE / GFDI / Protobuf   | [tenover](https://crates.io/crates/tenover)     | Supported        |
 | ExPutt RG                                            | WiFi                    | [threeputt](https://crates.io/crates/threeputt) | Alpha            |
