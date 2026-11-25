@@ -47,25 +47,50 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+  # A plain vX.Y.Z tag is a release and must be on main. A tag with a
+  # -betaN or -rcN suffix (v0.3.2-beta1, v0.3.2-rc1) is a pre-release test
+  # build: it may come from develop, gets a GitHub pre-release with the
+  # binaries, and skips the version bump. No job here publishes crates.
   version-check:
     name: Version check
     needs: test
     runs-on: ubuntu-24.04
+    outputs:
+      prerelease: ${{ steps.kind.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Verify tag matches Cargo.toml version
+        id: kind
         run: |
           tag="${GITHUB_REF_NAME#v}"
+          base="${tag%%-*}"
+          suffix="${tag#"$base"}"
           cargo_version=$(grep '^version' lib/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$tag" != "$cargo_version" ]; then
+          if [ "$base" != "$cargo_version" ]; then
             echo "::error::Tag v${tag} does not match lib/Cargo.toml version ${cargo_version}"
             exit 1
+          fi
+          if [ -n "$suffix" ]; then
+            if ! [[ "$suffix" =~ ^-(beta|rc)\.?[0-9]+$ ]]; then
+              echo "::error::Pre-release suffix must be -betaN or -rcN, got ${suffix}"
+              exit 1
+            fi
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            if ! git merge-base --is-ancestor "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" origin/main; then
+              echo "::error::v${tag} is not on main; a build from develop needs a -betaN or -rcN suffix"
+              exit 1
+            fi
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
   version-bump:
     name: Version bump
     needs: [test, version-check]
+    if: needs.version-check.outputs.prerelease == 'false'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -98,7 +123,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.name }})
-    needs: test
+    needs: [test, version-check]
     strategy:
       matrix:
         include:
@@ -158,7 +183,7 @@ jobs:
 
   release:
     name: Release
-    needs: build
+    needs: [build, version-check]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -181,6 +206,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ needs.version-check.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.version-check.outputs.prerelease == 'true' && 'false' || 'true' }}
           files: |
             dist/flighthook-windows-x86_64.exe
             dist/flighthook-linux-x86_64
