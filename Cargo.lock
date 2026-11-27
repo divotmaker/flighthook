@@ -2260,9 +2260,9 @@ dependencies = [
 
 [[package]]
 name = "ironsight"
-version = "0.9.1-rc1"
+version = "0.9.1-rc2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48a943f2dc961763673e1c21fec18504fdb41ac396babaf0db02cd8989a36d8a"
+checksum = "3202fc1cf9c7762516a41c7dff4c70cee33e14856f8e3b7606c4b2e87bc7225d"
 dependencies = [
  "flightrelay",
  "serde",
